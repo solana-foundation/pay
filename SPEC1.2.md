@@ -49,7 +49,7 @@ A single `amount` field is allowed as an optional query parameter. The value mus
 
 `0` is a valid value. If the value is a decimal number less than `1`, it must have a leading `0` before the `.`. Scientific notation is prohibited.
 
-If a value is not provided, the wallet must prompt the user for the amount. If the number of decimal places exceed what's supported for SOL (9) or the SPL Token (mint specific), the wallet must reject the URL as **malformed**.
+If a value is not provided, the wallet must prompt the user for the amount. If the number of decimal places exceeds what's supported for SOL (9) or the SPL Token (mint specific), the wallet must reject the URL as **malformed**.
 
 ### SPL Token
 A single `spl-token` field is allowed as an optional query parameter. The value must be the base58-encoded public key of an SPL Token mint account.
