@@ -208,7 +208,7 @@ In either case, the wallet must [URL-decode](https://developer.mozilla.org/en-US
 The wallet should make an HTTP `GET` JSON request to the URL. The request should not identify the wallet or the user.
 
 The wallet should make the request with an [Accept-Encoding header](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Accept-Encoding), and 
-should respond with a [Content-Encoding header](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Content-Encoding) for HTTP compression.
+the server’s response should include a [Content-Encoding header](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Content-Encoding) for HTTP compression.
 
 The wallet should display the domain of the URL as the request is being made.
 
