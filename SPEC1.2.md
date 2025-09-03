@@ -118,7 +118,7 @@ A single `fee-payer` field is allowed as an optional query parameter. The value 
 Rules:
 - If provided, wallets that support fee relaying should set the transaction `feePayer` to the specified account and must not attempt to sign as that account.
 - Wallets may submit the partially signed transaction to a configured relayer service (e.g., a Kora server) to finalize and broadcast. Relayer configuration and discovery are wallet-defined and out of scope for this specification.
-- If fee relaying is unsupported or unavailable, wallets should either ignore `fee-payer` and proceed with the sender as the fee payer, or surface a structured error as defined in the Error Handling section (`SP2_FEE_PAYER_UNAVAILABLE`). Implementations should prefer not breaking payment flows; merchants relying on relayers should also offer a fallback.
+- If fee relaying is unsupported or unavailable, wallets should either ignore `fee-payer` and proceed with the sender as the fee payer, or surface a structured error as defined in the Error Handling section (`SP_FEE_PAYER_UNAVAILABLE`). Implementations should prefer not breaking payment flows; merchants relying on relayers should also offer a fallback.
 
 ### Fee Payer Server
 A single `fee-payer-server` field is allowed as an optional query parameter. If this option is provided, then the `fee-payer` field is required. The value must be an absolute HTTPS URL designating the relayer service endpoint that will accept and process the fee-payer flow for this transaction. This relayer should adhere to the sRFC-34 specification like Kora.
