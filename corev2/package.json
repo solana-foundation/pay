@@ -1,0 +1,28 @@
+{
+  "name": "@solana/payv2",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsup src/index.ts --format cjs,esm --dts --clean --external gill --external ws --external node-fetch",
+    "dev": "tsup src/index.ts --format cjs,esm --dts --watch --external gill --external ws --external node-fetch",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "clean": "rm -rf .turbo dist node_modules"
+  },
+  "dependencies": {
+    "bignumber.js": "4.0.4",
+    "gill": "^0.10.2",
+    "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.0.2",
+    "@types/qrcode": "^1.5.5",
+    "jest": "^29.0.3",
+    "ts-jest": "^29.0.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.0.0"
+  }
+}
