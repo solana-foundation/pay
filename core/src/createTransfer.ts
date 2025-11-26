@@ -144,7 +144,7 @@ async function createSPLTokenInstruction(
     const accountInfo = await connection.getParsedAccountInfo(splToken);
     const accountOwner = accountInfo.value?.owner;
     const tokenProgram =
-        accountOwner && accountOwner === TOKEN_2022_PROGRAM_ID ? TOKEN_2022_PROGRAM_ID : TOKEN_PROGRAM_ID;
+        accountOwner && accountOwner.equals(TOKEN_2022_PROGRAM_ID) ? TOKEN_2022_PROGRAM_ID : TOKEN_PROGRAM_ID;
 
     // Check that the token provided is an initialized mint
     const mint = await getMint(connection, splToken, undefined, tokenProgram);
