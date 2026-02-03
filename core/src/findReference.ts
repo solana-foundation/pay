@@ -12,7 +12,7 @@ export class FindReferenceError extends Error {
  * Find the oldest transaction signature referencing a given public key.
  *
  * @param connection - A connection to the cluster.
- * @param reference - `reference` in the [Solana Pay spec](https://github.com/solana-labs/solana-pay/blob/master/SPEC.md#reference).
+ * @param reference - `reference` in the [Solana Pay spec](https://github.com/solana-foundation/solana-pay/blob/master/SPEC.md#reference).
  * @param options - Options for `getSignaturesForAddress`.
  *
  * @throws {FindReferenceError}

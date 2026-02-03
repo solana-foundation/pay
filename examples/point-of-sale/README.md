@@ -42,12 +42,12 @@ These instructions will get you a copy of the project up and running on your loc
 
 #### With Git
 ```shell
-git clone https://github.com/solana-labs/solana-pay.git
+git clone https://github.com/solana-foundation/solana-pay.git
 ```
 
 #### With Github CLI
 ```shell
-gh repo clone solana-labs/solana-pay
+gh repo clone solana-foundation/solana-pay
 ```
 
 ### Install dependencies
@@ -74,7 +74,7 @@ open "https://localhost:3001?recipient=Your+Merchant+Address&label=Your+Store+Na
 You may need to accept a locally signed SSL certificate to open the page.
 
 ## Accepting USDC on Mainnet
-Import the Mainnet endpoint, along with USDC's mint address and icon in the [`client/components/pages/App.tsx`](https://github.com/solana-labs/solana-pay/blob/master/examples/point-of-sale/src/client/components/pages/App.tsx) file.
+Import the Mainnet endpoint, along with USDC's mint address and icon in the [`client/components/pages/App.tsx`](https://github.com/solana-foundation/solana-pay/blob/master/examples/point-of-sale/src/client/components/pages/App.tsx) file.
 ```tsx
 import { MAINNET_ENDPOINT, MAINNET_USDC_MINT } from '../../utils/constants';
 import { USDCIcon } from '../images/USDCIcon';
@@ -115,9 +115,9 @@ When you're done, it should look like this:
 
 ## Using Transaction Requests
 
-[Transaction Requests](https://github.com/solana-labs/solana-pay/blob/master/SPEC.md#specification-transaction-request) are a new feature in Solana Pay.
+[Transaction Requests](https://github.com/solana-foundation/solana-pay/blob/master/SPEC.md#specification-transaction-request) are a new feature in Solana Pay.
 
-In the [`client/components/pages/App.tsx`](https://github.com/solana-labs/solana-pay/blob/master/examples/point-of-sale/src/client/components/pages/App.tsx) file, toggle these lines:
+In the [`client/components/pages/App.tsx`](https://github.com/solana-foundation/solana-pay/blob/master/examples/point-of-sale/src/client/components/pages/App.tsx) file, toggle these lines:
 
 ```tsx
     // Toggle comments on these lines to use transaction requests instead of transfer requests.
@@ -133,7 +133,7 @@ When you're done, it should look like this:
     const link = useMemo(() => new URL(`${baseURL}/api/`), [baseURL]);
 ```
 
-The generated QR codes in the app should now use transaction requests. To see what's going on and customize it, check out the [`server/api/index.ts`](https://github.com/solana-labs/solana-pay/blob/master/examples/point-of-sale/src/server/api/index.ts) file.
+The generated QR codes in the app should now use transaction requests. To see what's going on and customize it, check out the [`server/api/index.ts`](https://github.com/solana-foundation/solana-pay/blob/master/examples/point-of-sale/src/server/api/index.ts) file.
 
 ## Deploying to Vercel
 

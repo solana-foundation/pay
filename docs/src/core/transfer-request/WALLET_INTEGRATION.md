@@ -143,6 +143,6 @@ URLs can be embedded in the environment in web pages, QR codes, NFC tags and pot
 
 <!-- References -->
 
-[9]: https://github.com/solana-labs/solana-pay/blob/master/core/example/payment-flow-merchant/simulateWalletInteraction.ts#L13
-[10]: https://github.com/solana-labs/solana-pay/blob/master/core/example/payment-flow-merchant/simulateWalletInteraction.ts#L27
-[11]: https://github.com/solana-labs/solana-pay/blob/master/core/example/payment-flow-merchant/simulateWalletInteraction.ts#L35
+[9]: https://github.com/solana-foundation/solana-pay/blob/master/core/example/payment-flow-merchant/simulateWalletInteraction.ts#L13
+[10]: https://github.com/solana-foundation/solana-pay/blob/master/core/example/payment-flow-merchant/simulateWalletInteraction.ts#L27
+[11]: https://github.com/solana-foundation/solana-pay/blob/master/core/example/payment-flow-merchant/simulateWalletInteraction.ts#L35

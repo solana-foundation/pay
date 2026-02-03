@@ -29,7 +29,7 @@ const config = {
                     sidebarCollapsed: false,
                     path: 'src',
                     routeBasePath: '/',
-                    editUrl: 'https://github.com/solana-labs/solana-pay/tree/master/docs',
+                    editUrl: 'https://github.com/solana-foundation/solana-pay/tree/master/docs',
                 },
                 theme: {
                     customCss: require.resolve('./src/css/custom.css'),
@@ -63,7 +63,7 @@ const config = {
                 },
                 items: [
                     {
-                        href: 'https://github.com/solana-labs/solana-pay',
+                        href: 'https://github.com/solana-foundation/solana-pay',
                         label: 'GitHub',
                         position: 'right',
                     },
@@ -99,7 +99,7 @@ const config = {
                         items: [
                             {
                                 label: 'GitHub',
-                                href: 'https://github.com/solana-labs/solana-pay',
+                                href: 'https://github.com/solana-foundation/solana-pay',
                             },
                         ],
                     },

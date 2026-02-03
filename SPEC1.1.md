@@ -287,4 +287,4 @@ Additional formats and fields may be incorporated into this specification to ena
 
 Please open a Github issue to propose changes to the specification in order to solicit feedback from application and wallet developers.
 
-[An actual example of such a proposal.](https://github.com/solana-labs/solana-pay/issues/26)
+[An actual example of such a proposal.](https://github.com/solana-foundation/solana-pay/issues/26)

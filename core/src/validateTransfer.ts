@@ -29,15 +29,15 @@ export class ValidateTransferError extends Error {
  * Fields of a Solana Pay transfer request to validate.
  */
 export interface ValidateTransferFields {
-    /** `recipient` in the [Solana Pay spec](https://github.com/solana-labs/solana-pay/blob/master/SPEC.md#recipient). */
+    /** `recipient` in the [Solana Pay spec](https://github.com/solana-foundation/solana-pay/blob/master/SPEC.md#recipient). */
     recipient: Recipient;
-    /** `amount` in the [Solana Pay spec](https://github.com/solana-labs/solana-pay/blob/master/SPEC.md#amount). */
+    /** `amount` in the [Solana Pay spec](https://github.com/solana-foundation/solana-pay/blob/master/SPEC.md#amount). */
     amount: Amount;
-    /** `spl-token` in the [Solana Pay spec](https://github.com/solana-labs/solana-pay/blob/master/SPEC.md#spl-token). */
+    /** `spl-token` in the [Solana Pay spec](https://github.com/solana-foundation/solana-pay/blob/master/SPEC.md#spl-token). */
     splToken?: SPLToken;
-    /** `reference` in the [Solana Pay spec](https://github.com/solana-labs/solana-pay/blob/master/SPEC.md#reference). */
+    /** `reference` in the [Solana Pay spec](https://github.com/solana-foundation/solana-pay/blob/master/SPEC.md#reference). */
     reference?: References;
-    /** `memo` in the [Solana Pay spec](https://github.com/solana-labs/solana-pay/blob/master/SPEC.md#memo). */
+    /** `memo` in the [Solana Pay spec](https://github.com/solana-foundation/solana-pay/blob/master/SPEC.md#memo). */
     memo?: Memo;
 }
 
