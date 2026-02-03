@@ -21,6 +21,7 @@ The Solana blockchain confirms transactions in less than a second and costs on a
 - **Decaf Wallet** ([iOS](https://apps.apple.com/nz/app/decaf-wallet/id1616564038), [Android](https://play.google.com/store/apps/details?id=so.decaf.wallet))
 - **Espresso Cash** ([iOS](https://apps.apple.com/us/app/crypto-please/id1559625715), [Android](https://play.google.com/store/apps/details?id=com.pleasecrypto.flutter))
 - **Tiplink** ([Web](https://tiplink.io))
+- **Bitget Wallet** ([iOS](https://apps.apple.com/app/id1395301115), [Android](https://play.google.com/store/apps/details?id=com.bitkeep.wallet))
 
 ## How to use Solana Pay
 
