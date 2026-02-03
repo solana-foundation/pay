@@ -71,5 +71,5 @@ While coding:
 
 ## Reporting Bugs or Requesting Features
 
-- Please use [GitHub Issues](link-to-issues) to report bugs or request features.
+- Please use [GitHub Issues](https://github.com/solana-foundation/solana-pay/issues) to report bugs or request features.
 - Include as much detail as possible.
