@@ -8,7 +8,7 @@ slug: /spec
 ## Summary
 A standard protocol to encode Solana transaction requests within URLs to enable payments and other use cases.
 
-Rough consensus on this spec has been reached, and implementations exist in Phantom, FTX, and Slope.
+Rough consensus on this spec has been reached, and implementations exist in several major wallets.
 
 This standard draws inspiration from [BIP 21](https://github.com/bitcoin/bips/blob/master/bip-0021.mediawiki) and [EIP 681](https://github.com/ethereum/EIPs/blob/master/EIPS/eip-681.md).
 
