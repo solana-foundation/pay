@@ -1,5 +1,4 @@
-import { useWallet } from '@solana/wallet-adapter-react';
-import { useWalletModal, WalletMultiButton } from '@solana/wallet-adapter-react-ui';
+import { useAccount, useConnectWallet, useWalletConnectors } from '@solana/connector/react';
 import { NextPage } from 'next';
 import React, { useEffect } from 'react';
 import { useConfig } from '../../hooks/useConfig';
@@ -11,22 +10,33 @@ import { QRCode } from '../sections/QRCode';
 import css from './PendingPage.module.css';
 
 const PendingPage: NextPage = () => {
-    const { symbol, connectWallet } = useConfig();
+    const { symbol, connectWallet: connectWalletConfig } = useConfig();
     const { amount, reset } = usePayment();
-    const { publicKey } = useWallet();
-    const { setVisible } = useWalletModal();
+    const { address, connected } = useAccount();
+    const { connect } = useConnectWallet();
+    const connectors = useWalletConnectors();
 
     useEffect(() => {
-        if (connectWallet && !publicKey) {
-            setVisible(true);
+        if (connectWalletConfig && !connected && connectors.length > 0) {
+            // Auto-connect to first available wallet
+            connect(connectors[0].id);
         }
-    }, [connectWallet, publicKey, setVisible]);
+    }, [connectWalletConfig, connected, connectors, connect]);
 
     return (
         <div className={css.root}>
             <div className={css.header}>
                 <BackButton onClick={reset}>Cancel</BackButton>
-                {connectWallet ? <WalletMultiButton /> : null}
+                {connectWalletConfig && connectors.length > 0 ? (
+                    <button
+                        onClick={() => {
+                            if (connected) return;
+                            connect(connectors[0].id);
+                        }}
+                    >
+                        {connected && address ? `${address.slice(0, 4)}...${address.slice(-4)}` : 'Connect Wallet'}
+                    </button>
+                ) : null}
             </div>
             <div className={css.main}>
                 <div className={css.amount}>
@@ -49,9 +59,6 @@ const PendingPage: NextPage = () => {
 export default PendingPage;
 
 export function getServerSideProps() {
-    // Required so getInitialProps re-runs on the server-side
-    // If it runs on client-side then there's no req and the URL reading doesn't work
-    // See https://nextjs.org/docs/api-reference/data-fetching/get-initial-props
     return {
         props: {},
     };

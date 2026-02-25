@@ -1,23 +1,28 @@
-import type { Connection, PublicKey } from '@solana/web3.js';
-import { Keypair } from '@solana/web3.js';
-import { findReference } from '../src';
+import { address } from '@solana/kit';
+import { findReference } from '../src/index.js';
+import { describe, it, expect } from 'vitest';
 
-const reference = Keypair.generate().publicKey;
-const signaturesForAddress = {
-    [reference.toBase58()]: [{ signature: 'signature' }],
-};
+const reference = address('9aE476sH92Vz7DMPyq5WLPkrKWivxeuTKEFKd2sZZcde');
 
-const connection = {
-    async getSignaturesForAddress(reference: PublicKey) {
-        return signaturesForAddress[reference.toBase58()] || [];
+// Mock RPC that returns signatures for the known reference address
+const rpc = {
+    getSignaturesForAddress(addr: string, _config?: unknown) {
+        return {
+            async send() {
+                if (addr === reference) {
+                    return [{ signature: 'signature' }];
+                }
+                return [];
+            },
+        };
     },
-} as Connection;
+} as any;
 
 describe('findTransactionSignature', () => {
     it('should return the last signature', async () => {
         expect.assertions(1);
 
-        const found = await findReference(connection, reference);
+        const found = await findReference(rpc, reference);
 
         expect(found).toEqual({ signature: 'signature' });
     });
@@ -25,8 +30,8 @@ describe('findTransactionSignature', () => {
     it('throws an error on signature not found', async () => {
         expect.assertions(1);
 
-        const reference = Keypair.generate().publicKey;
+        const unknownRef = address('2jDmYQMRCBnXUQeFRvQABcU6hLcvjVTdG7AoHravxWJX');
 
-        await expect(async () => await findReference(connection, reference)).rejects.toThrow('not found');
+        await expect(findReference(rpc, unknownRef)).rejects.toThrow('not found');
     });
 });

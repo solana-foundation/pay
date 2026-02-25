@@ -7,3 +7,4 @@ lib
 docs
 
 node_modules
+dist/

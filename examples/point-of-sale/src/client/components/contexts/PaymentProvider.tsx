@@ -8,8 +8,19 @@ import {
     validateTransfer,
     ValidateTransferError,
 } from '@solana/pay';
-import { useConnection, useWallet } from '@solana/wallet-adapter-react';
-import { ConfirmedSignatureInfo, Keypair, PublicKey, Transaction, TransactionSignature } from '@solana/web3.js';
+import { useAccount, useKitTransactionSigner } from '@solana/connector/react';
+import type { Address, Signature } from '@solana/kit';
+import {
+    address,
+    createSolanaRpc,
+    createTransactionMessage,
+    setTransactionMessageFeePayer,
+    setTransactionMessageLifetimeUsingBlockhash,
+    appendTransactionMessageInstructions,
+    compileTransaction,
+    generateKeyPairSigner,
+    getBase64EncodedWireTransaction,
+} from '@solana/kit';
 import BigNumber from 'bignumber.js';
 import { useRouter } from 'next/router';
 import React, { FC, ReactNode, useCallback, useEffect, useMemo, useState } from 'react';
@@ -17,20 +28,23 @@ import { useConfig } from '../../hooks/useConfig';
 import { useNavigateWithQuery } from '../../hooks/useNavigateWithQuery';
 import { PaymentContext, PaymentStatus } from '../../hooks/usePayment';
 import { Confirmations } from '../../types';
+import { DEVNET_ENDPOINT } from '../../utils/constants';
 
 export interface PaymentProviderProps {
     children: ReactNode;
 }
 
 export const PaymentProvider: FC<PaymentProviderProps> = ({ children }) => {
-    const { connection } = useConnection();
     const { link, recipient, splToken, label, message, requiredConfirmations, connectWallet } = useConfig();
-    const { publicKey, sendTransaction } = useWallet();
+    const { address: walletAddress } = useAccount();
+    const { signer: txSigner } = useKitTransactionSigner();
+
+    // Create a direct RPC client for @solana/pay functions
+    const rpc = useMemo(() => createSolanaRpc(DEVNET_ENDPOINT), []);
 
     const router = useRouter();
 
     const [amount, setAmount] = useState<BigNumber | undefined>(() => {
-        // Use the amount query param as initial value if set
         const { amount } = router.query;
         if (!amount) return undefined;
 
@@ -44,8 +58,8 @@ export const PaymentProvider: FC<PaymentProviderProps> = ({ children }) => {
     });
 
     const [memo, setMemo] = useState<string>();
-    const [reference, setReference] = useState<PublicKey>();
-    const [signature, setSignature] = useState<TransactionSignature>();
+    const [reference, setReference] = useState<Address>();
+    const [signature, setSignature] = useState<Signature>();
     const [status, setStatus] = useState(PaymentStatus.New);
     const [confirmations, setConfirmations] = useState<Confirmations>(0);
     const navigate = useNavigateWithQuery();
@@ -55,18 +69,18 @@ export const PaymentProvider: FC<PaymentProviderProps> = ({ children }) => {
         if (link) {
             const url = new URL(String(link));
 
-            url.searchParams.append('recipient', recipient.toBase58());
+            url.searchParams.append('recipient', recipient);
 
             if (amount) {
                 url.searchParams.append('amount', amount.toFixed(amount.decimalPlaces() ?? 0));
             }
 
             if (splToken) {
-                url.searchParams.append('spl-token', splToken.toBase58());
+                url.searchParams.append('spl-token', splToken);
             }
 
             if (reference) {
-                url.searchParams.append('reference', reference.toBase58());
+                url.searchParams.append('reference', reference);
             }
 
             if (memo) {
@@ -105,9 +119,10 @@ export const PaymentProvider: FC<PaymentProviderProps> = ({ children }) => {
         navigate('/new', true);
     }, [navigate]);
 
-    const generate = useCallback(() => {
+    const generate = useCallback(async () => {
         if (status === PaymentStatus.New && !reference) {
-            setReference(Keypair.generate().publicKey);
+            const keypair = await generateKeyPairSigner();
+            setReference(keypair.address);
             setStatus(PaymentStatus.Pending);
             navigate('/pending');
         }
@@ -115,35 +130,55 @@ export const PaymentProvider: FC<PaymentProviderProps> = ({ children }) => {
 
     // If there's a connected wallet, use it to sign and send the transaction
     useEffect(() => {
-        if (status === PaymentStatus.Pending && connectWallet && publicKey) {
+        if (status === PaymentStatus.Pending && connectWallet && walletAddress && txSigner) {
             let changed = false;
 
             const run = async () => {
                 try {
                     const request = parseURL(url);
-                    let transaction: Transaction;
 
                     if ('link' in request) {
                         const { link } = request;
-                        transaction = await fetchTransaction(connection, publicKey, link);
+                        const compiledTx = await fetchTransaction(rpc, address(walletAddress), link);
+                        if (!changed) {
+                            const [signedTx] = await txSigner.modifyAndSignTransactions([compiledTx]);
+                            const wireBase64 = getBase64EncodedWireTransaction(signedTx);
+                            await rpc.sendTransaction(wireBase64, { encoding: 'base64' }).send();
+                        }
                     } else {
                         const { recipient, amount, splToken, reference, memo } = request;
                         if (!amount) return;
 
-                        transaction = await createTransfer(connection, publicKey, {
+                        // createTransfer now returns Instruction[]
+                        const instructions = await createTransfer(rpc, txSigner, {
                             recipient,
                             amount,
                             splToken,
                             reference,
                             memo,
                         });
-                    }
 
-                    if (!changed) {
-                        await sendTransaction(transaction, connection);
+                        // Build transaction message
+                        const { value: latestBlockhash } = await rpc.getLatestBlockhash().send();
+                        const txMessage = appendTransactionMessageInstructions(
+                            instructions,
+                            setTransactionMessageLifetimeUsingBlockhash(
+                                latestBlockhash,
+                                setTransactionMessageFeePayer(
+                                    address(walletAddress),
+                                    createTransactionMessage({ version: 0 })
+                                )
+                            )
+                        );
+
+                        const compiled = compileTransaction(txMessage);
+                        if (!changed) {
+                            const [signedTx] = await txSigner.modifyAndSignTransactions([compiled]);
+                            const wireBase64 = getBase64EncodedWireTransaction(signedTx);
+                            await rpc.sendTransaction(wireBase64, { encoding: 'base64' }).send();
+                        }
                     }
                 } catch (error) {
-                    // If the transaction is declined or fails, try again
                     console.error(error);
                     timeout = setTimeout(run, 5000);
                 }
@@ -155,7 +190,7 @@ export const PaymentProvider: FC<PaymentProviderProps> = ({ children }) => {
                 clearTimeout(timeout);
             };
         }
-    }, [status, connectWallet, publicKey, url, connection, sendTransaction]);
+    }, [status, connectWallet, walletAddress, txSigner, url, rpc]);
 
     // When the status is pending, poll for the transaction using the reference key
     useEffect(() => {
@@ -163,18 +198,16 @@ export const PaymentProvider: FC<PaymentProviderProps> = ({ children }) => {
         let changed = false;
 
         const interval = setInterval(async () => {
-            let signature: ConfirmedSignatureInfo;
             try {
-                signature = await findReference(connection, reference);
+                const sigInfo = await findReference(rpc, reference);
 
                 if (!changed) {
                     clearInterval(interval);
-                    setSignature(signature.signature);
+                    setSignature(sigInfo.signature);
                     setStatus(PaymentStatus.Confirmed);
                     navigate('/confirmed', true);
                 }
-            } catch (error: any) {
-                // If the RPC node doesn't have the transaction signature yet, try again
+            } catch (error) {
                 if (!(error instanceof FindReferenceError)) {
                     console.error(error);
                 }
@@ -185,7 +218,7 @@ export const PaymentProvider: FC<PaymentProviderProps> = ({ children }) => {
             changed = true;
             clearInterval(interval);
         };
-    }, [status, reference, signature, connection, navigate]);
+    }, [status, reference, signature, rpc, navigate]);
 
     // When the status is confirmed, validate the transaction against the provided params
     useEffect(() => {
@@ -194,13 +227,12 @@ export const PaymentProvider: FC<PaymentProviderProps> = ({ children }) => {
 
         const run = async () => {
             try {
-                await validateTransfer(connection, signature, { recipient, amount, splToken, reference });
+                await validateTransfer(rpc, signature, { recipient, amount, splToken, reference });
 
                 if (!changed) {
                     setStatus(PaymentStatus.Valid);
                 }
-            } catch (error: any) {
-                // If the RPC node doesn't have the transaction yet, try again
+            } catch (error) {
                 if (
                     error instanceof ValidateTransferError &&
                     (error.message === 'not found' || error.message === 'missing meta')
@@ -220,7 +252,7 @@ export const PaymentProvider: FC<PaymentProviderProps> = ({ children }) => {
             changed = true;
             clearTimeout(timeout);
         };
-    }, [status, signature, amount, connection, recipient, splToken, reference]);
+    }, [status, signature, amount, rpc, recipient, splToken, reference]);
 
     // When the status is valid, poll for confirmations until the transaction is finalized
     useEffect(() => {
@@ -229,21 +261,21 @@ export const PaymentProvider: FC<PaymentProviderProps> = ({ children }) => {
 
         const interval = setInterval(async () => {
             try {
-                const response = await connection.getSignatureStatus(signature);
-                const status = response.value;
-                if (!status) return;
-                if (status.err) throw status.err;
+                const response = await rpc.getSignatureStatuses([signature]).send();
+                const sigStatus = response.value[0];
+                if (!sigStatus) return;
+                if (sigStatus.err) throw sigStatus.err;
 
                 if (!changed) {
-                    const confirmations = (status.confirmations || 0) as Confirmations;
+                    const confirmations = (sigStatus.confirmations || 0) as Confirmations;
                     setConfirmations(confirmations);
 
-                    if (confirmations >= requiredConfirmations || status.confirmationStatus === 'finalized') {
+                    if (confirmations >= requiredConfirmations || sigStatus.confirmationStatus === 'finalized') {
                         clearInterval(interval);
                         setStatus(PaymentStatus.Finalized);
                     }
                 }
-            } catch (error: any) {
+            } catch (error) {
                 console.log(error);
             }
         }, 250);
@@ -252,7 +284,7 @@ export const PaymentProvider: FC<PaymentProviderProps> = ({ children }) => {
             changed = true;
             clearInterval(interval);
         };
-    }, [status, signature, connection, requiredConfirmations]);
+    }, [status, signature, rpc, requiredConfirmations]);
 
     return (
         <PaymentContext.Provider

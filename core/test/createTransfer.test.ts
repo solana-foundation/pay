@@ -1,518 +1,458 @@
-import { Keypair, type PublicKey, SystemProgram, Transaction } from '@solana/web3.js';
-import BigNumber from 'bignumber.js';
-import { createTransfer, CreateTransferError } from '../src';
-import type { Connection } from '@solana/web3.js';
-import * as spl from '@solana/spl-token';
+import { AccountRole, address, type Address, type TransactionSigner } from '@solana/kit';
+import { SYSTEM_PROGRAM_ADDRESS } from '@solana-program/system';
+import { TOKEN_PROGRAM_ADDRESS } from '@solana-program/token';
+import { createTransfer, CreateTransferError } from '../src/index.js';
+import { MEMO_PROGRAM_ADDRESS, TOKEN_2022_PROGRAM_ADDRESS } from '../src/constants.js';
+import { describe, it, expect, beforeEach, vi, type Mock } from 'vitest';
 
-jest.mock('@solana/spl-token', () => {
-    const actual = jest.requireActual('@solana/spl-token');
+// --- Mock functions ---
+const mockedFetchMint = vi.fn();
+const mockedFetchToken = vi.fn();
+const mockedFindAssociatedTokenPda = vi.fn();
+
+vi.mock('@solana-program/token', async () => {
+    // Re-export actual constants manually to avoid vi.importActual
     return {
-        ...actual,
-        getMint: jest.fn(),
-        getAccount: jest.fn(),
-        getAssociatedTokenAddress: jest.fn(),
+        TOKEN_PROGRAM_ADDRESS: 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
+        fetchMint: (...args: unknown[]) => mockedFetchMint(...args),
+        fetchToken: (...args: unknown[]) => mockedFetchToken(...args),
+        findAssociatedTokenPda: (...args: unknown[]) => mockedFindAssociatedTokenPda(...args),
+        getTransferCheckedInstruction: vi.fn().mockImplementation((input: any, config?: any) => {
+            // Return a minimal instruction-like object
+            return {
+                programAddress: config?.programAddress ?? 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
+                accounts: [
+                    { address: input.source, role: 1 },
+                    { address: input.mint, role: 0 },
+                    { address: input.destination, role: 1 },
+                    { address: input.authority?.address ?? input.authority, role: 2 },
+                ],
+                data: new Uint8Array([12]), // TransferChecked discriminator
+            };
+        }),
     };
 });
 
-const mockedSplToken = jest.mocked(spl);
+// --- Constants ---
+const TOKEN_2022_PROGRAM = TOKEN_2022_PROGRAM_ADDRESS;
 
-// Test Constants
 const TEST_AMOUNTS = {
-    ONE_TOKEN: new BigNumber(1),
-    TWO_TOKENS: new BigNumber(2),
+    ONE_TOKEN: 1,
+    TWO_TOKENS: 2,
 } as const;
 
-const TEST_BALANCES = {
-    SENDER_SOL: 1000000000, // 1 SOL in lamports
-    RECIPIENT_SOL: 0,
-    SENDER_TOKENS: BigInt(1000000), // 1 token with 6 decimals
-    RECIPIENT_TOKENS: BigInt(0),
-    INSUFFICIENT_TOKENS: BigInt(1),
-} as const;
+const ADDRESSES = {
+    sender: address('FnHyam9w4NZoWR6mKN1CuGBritdsEWZQa4Z4oawLZGxa'),
+    recipient: address('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'),
+    splToken: address('9aE476sH92Vz7DMPyq5WLPkrKWivxeuTKEFKd2sZZcde'),
+    senderATA: address('2jDmYQMRCBnXUQeFRvQABcU6hLcvjVTdG7AoHravxWJX'),
+    recipientATA: address('GfC73miMwXBoRYDn7gvEZVbhM7n6SUHxJb4LdBz2Mfp6'),
+};
 
-const MOCK_VALUES = {
-    BLOCKHASH: 'blockhash',
-    BLOCK_HEIGHT: 100,
-    MINT_DECIMALS: 6,
-    SLOT: 1,
-} as const;
-
-// Test Fixtures
-class TestFixtures {
-    readonly sender = Keypair.generate().publicKey;
-    readonly recipient = Keypair.generate().publicKey;
-    readonly splToken = Keypair.generate().publicKey;
-    readonly mintAuthority = Keypair.generate().publicKey;
-    readonly senderATA = Keypair.generate().publicKey;
-    readonly recipientATA = Keypair.generate().publicKey;
+// --- Helper: create mock TransactionSigner ---
+function createMockSigner(addr: Address): TransactionSigner {
+    return {
+        address: addr,
+        signTransactions: vi.fn(),
+    } as unknown as TransactionSigner;
 }
 
-// Mock Factories
-class MockFactories {
-    static createAccountInfo(owner: PublicKey, lamports: number, executable = false) {
-        return {
-            owner,
-            executable,
-            lamports,
-            data: Buffer.alloc(0),
-        };
-    }
+// --- Helper: create mock RPC ---
+function createMockRpc(accountInfoResponses: Map<string, any>) {
+    return {
+        getAccountInfo(addr: Address, _config?: unknown) {
+            return {
+                send: vi.fn().mockResolvedValue({
+                    value: accountInfoResponses.get(addr) ?? null,
+                }),
+            };
+        },
+    } as any;
+}
 
-    static createParsedAccountInfo(owner: PublicKey) {
-        return {
-            context: { slot: MOCK_VALUES.SLOT },
-            value: {
-                owner,
-                executable: false,
-                lamports: 0,
-                data: Buffer.alloc(0),
-            },
-        };
-    }
+function makeAccountInfo(owner: Address, lamports: number | bigint, executable = false) {
+    return {
+        owner,
+        executable,
+        lamports: BigInt(lamports),
+        data: new Uint8Array(0),
+        rentEpoch: 0n,
+    };
+}
 
-    static createMint(params: {
-        address: PublicKey;
-        mintAuthority: PublicKey;
-        isInitialized?: boolean;
-        decimals?: number;
-    }) {
-        const { address, mintAuthority, isInitialized = true, decimals = MOCK_VALUES.MINT_DECIMALS } = params;
-        return {
-            address,
-            mintAuthority,
-            supply: BigInt(1000000000),
+function makeMintData(decimals = 6, isInitialized = true) {
+    return {
+        address: ADDRESSES.splToken,
+        data: {
+            mintAuthority: address('11111111111111111111111111111112'),
+            supply: 1_000_000_000n,
             decimals,
             isInitialized,
             freezeAuthority: null,
-            tlvData: Buffer.alloc(0),
-        };
-    }
-
-    static createTokenAccount(params: {
-        address: PublicKey;
-        mint: PublicKey;
-        owner: PublicKey;
-        amount?: bigint;
-        isInitialized?: boolean;
-        isFrozen?: boolean;
-    }) {
-        const { address, mint, owner, amount = BigInt(0), isInitialized = true, isFrozen = false } = params;
-        return {
-            address,
-            mint,
-            owner,
-            amount,
-            delegate: null,
-            delegatedAmount: BigInt(0),
-            isInitialized,
-            isFrozen,
-            isNative: false,
-            rentExemptReserve: BigInt(0),
-            closeAuthority: null,
-            tlvData: Buffer.alloc(0),
-        };
-    }
-
-    static createBlockhash() {
-        return {
-            blockhash: MOCK_VALUES.BLOCKHASH,
-            lastValidBlockHeight: MOCK_VALUES.BLOCK_HEIGHT,
-        };
-    }
+        },
+        executable: false,
+        lamports: 0n,
+        programAddress: TOKEN_PROGRAM_ADDRESS,
+    } as any;
 }
 
-// Test Helpers
-class TestHelpers {
-    static setupBasicMocks(connection: jest.Mocked<Connection>, fixtures: TestFixtures) {
-        connection.getLatestBlockhash.mockResolvedValue(MockFactories.createBlockhash());
-
-        // Setup sender and recipient accounts for SOL transfers
-        connection.getAccountInfo
-            .mockResolvedValueOnce(MockFactories.createAccountInfo(SystemProgram.programId, TEST_BALANCES.SENDER_SOL))
-            .mockResolvedValueOnce(
-                MockFactories.createAccountInfo(SystemProgram.programId, TEST_BALANCES.RECIPIENT_SOL)
-            );
-    }
-
-    static setupSolTransferMocks(connection: jest.Mocked<Connection>, fixtures: TestFixtures) {
-        this.setupBasicMocks(connection, fixtures);
-
-        // Additional calls for the SystemProgram instruction creation
-        connection.getAccountInfo
-            .mockResolvedValueOnce(MockFactories.createAccountInfo(SystemProgram.programId, TEST_BALANCES.SENDER_SOL))
-            .mockResolvedValueOnce(
-                MockFactories.createAccountInfo(SystemProgram.programId, TEST_BALANCES.RECIPIENT_SOL)
-            );
-    }
-
-    static setupSplTokenMocks(
-        connection: jest.Mocked<Connection>,
-        fixtures: TestFixtures,
-        tokenProgram: PublicKey = spl.TOKEN_PROGRAM_ID
-    ) {
-        this.setupBasicMocks(connection, fixtures);
-
-        // Mock token account owner checks
-        connection.getParsedAccountInfo.mockResolvedValue(MockFactories.createParsedAccountInfo(tokenProgram));
-
-        // Mock mint and token accounts
-        mockedSplToken.getMint.mockResolvedValue(
-            MockFactories.createMint({
-                address: fixtures.splToken,
-                mintAuthority: fixtures.mintAuthority,
-            })
-        );
-
-        mockedSplToken.getAssociatedTokenAddress
-            .mockResolvedValueOnce(fixtures.senderATA)
-            .mockResolvedValueOnce(fixtures.recipientATA);
-
-        mockedSplToken.getAccount
-            .mockResolvedValueOnce(
-                MockFactories.createTokenAccount({
-                    address: fixtures.senderATA,
-                    mint: fixtures.splToken,
-                    owner: fixtures.sender,
-                    amount: TEST_BALANCES.SENDER_TOKENS,
-                })
-            )
-            .mockResolvedValueOnce(
-                MockFactories.createTokenAccount({
-                    address: fixtures.recipientATA,
-                    mint: fixtures.splToken,
-                    owner: fixtures.recipient,
-                    amount: TEST_BALANCES.RECIPIENT_TOKENS,
-                })
-            );
-    }
-
-    static assertSplTokenTransfer(transaction: Transaction, fixtures: TestFixtures, tokenProgram: PublicKey) {
-        expect(transaction).toBeInstanceOf(Transaction);
-        expect(transaction.instructions.length).toBeGreaterThan(0);
-
-        const tokenInstruction = transaction.instructions.find((ix) => ix.programId.equals(tokenProgram));
-        expect(tokenInstruction).toBeDefined();
-
-        if (tokenInstruction) {
-            const keyPubkeys = tokenInstruction.keys.map((k) => k.pubkey.toBase58());
-            expect(keyPubkeys).toContain(fixtures.senderATA.toBase58());
-            expect(keyPubkeys).toContain(fixtures.recipientATA.toBase58());
-        }
-    }
+function makeTokenAccountData(opts: { addr: Address; mint: Address; owner: Address; amount?: bigint; state?: number }) {
+    return {
+        address: opts.addr,
+        data: {
+            mint: opts.mint,
+            owner: opts.owner,
+            amount: opts.amount ?? 0n,
+            delegate: null,
+            delegateAmount: 0n,
+            state: opts.state ?? 1,
+            isNative: null,
+            closeAuthority: null,
+        },
+        executable: false,
+        lamports: 0n,
+        programAddress: TOKEN_PROGRAM_ADDRESS,
+    } as any;
 }
 
 describe('CreateTransferError', () => {
     it('should create error with correct name and message', () => {
-        const errorMessage = 'Test error message';
-        const error = new CreateTransferError(errorMessage);
-
+        const error = new CreateTransferError('Test error message');
         expect(error.name).toBe('CreateTransferError');
-        expect(error.message).toBe(errorMessage);
+        expect(error.message).toBe('Test error message');
         expect(error).toBeInstanceOf(Error);
     });
 });
 
 describe('createTransfer', () => {
-    let connection: jest.Mocked<Connection>;
-    let fixtures: TestFixtures;
+    let sender: TransactionSigner;
 
     beforeEach(() => {
-        fixtures = new TestFixtures();
-        connection = {
-            getParsedAccountInfo: jest.fn(),
-            getAccountInfo: jest.fn(),
-            getLatestBlockhash: jest.fn(),
-        } as any;
-        jest.clearAllMocks();
+        sender = createMockSigner(ADDRESSES.sender);
+        vi.clearAllMocks();
     });
 
     describe('SOL transfers', () => {
-        it('should create a valid SOL transfer transaction', async () => {
-            TestHelpers.setupSolTransferMocks(connection, fixtures);
+        it('should create valid SOL transfer with correct instruction shape', async () => {
+            const accounts = new Map<string, any>([
+                [ADDRESSES.sender, makeAccountInfo(SYSTEM_PROGRAM_ADDRESS, 1_000_000_000)],
+                [ADDRESSES.recipient, makeAccountInfo(SYSTEM_PROGRAM_ADDRESS, 0)],
+            ]);
+            const rpc = createMockRpc(accounts);
 
-            const transaction = await createTransfer(connection, fixtures.sender, {
-                recipient: fixtures.recipient,
+            const instructions = await createTransfer(rpc, sender, {
+                recipient: ADDRESSES.recipient,
                 amount: TEST_AMOUNTS.ONE_TOKEN,
             });
 
-            expect(transaction).toBeInstanceOf(Transaction);
-            expect(connection.getAccountInfo).toHaveBeenCalledTimes(4);
-            expect(connection.getLatestBlockhash).toHaveBeenCalledTimes(1);
+            expect(Array.isArray(instructions)).toBe(true);
+            expect(instructions.length).toBe(1);
+
+            // Instruction shape assertions
+            const ix = instructions[0];
+            expect(ix.programAddress).toBe(SYSTEM_PROGRAM_ADDRESS);
+            expect(ix.data).toBeInstanceOf(Uint8Array);
+            expect(ix.accounts).toBeDefined();
+            // Should have source and destination accounts
+            const accountAddresses = ix.accounts!.map((a: any) => a.address);
+            expect(accountAddresses).toContain(ADDRESSES.sender);
+            expect(accountAddresses).toContain(ADDRESSES.recipient);
+        });
+
+        it('should create SOL transfer with memo — correct program addresses', async () => {
+            const accounts = new Map<string, any>([
+                [ADDRESSES.sender, makeAccountInfo(SYSTEM_PROGRAM_ADDRESS, 1_000_000_000)],
+                [ADDRESSES.recipient, makeAccountInfo(SYSTEM_PROGRAM_ADDRESS, 0)],
+            ]);
+            const rpc = createMockRpc(accounts);
+
+            const instructions = await createTransfer(rpc, sender, {
+                recipient: ADDRESSES.recipient,
+                amount: TEST_AMOUNTS.ONE_TOKEN,
+                memo: 'test memo',
+            });
+
+            expect(instructions.length).toBe(2);
+            // First instruction is memo
+            expect(instructions[0].programAddress).toBe(MEMO_PROGRAM_ADDRESS);
+            expect(instructions[0].data).toBeInstanceOf(Uint8Array);
+            // Second instruction is transfer
+            expect(instructions[1].programAddress).toBe(SYSTEM_PROGRAM_ADDRESS);
+        });
+
+        it('should create SOL transfer with reference — reference has AccountRole.READONLY', async () => {
+            const accounts = new Map<string, any>([
+                [ADDRESSES.sender, makeAccountInfo(SYSTEM_PROGRAM_ADDRESS, 1_000_000_000)],
+                [ADDRESSES.recipient, makeAccountInfo(SYSTEM_PROGRAM_ADDRESS, 0)],
+            ]);
+            const rpc = createMockRpc(accounts);
+            const ref = address('82ZJ7nbGpixjeDCmEhUcmwXYfvurzAgGdtSMuHnUgyny');
+
+            const instructions = await createTransfer(rpc, sender, {
+                recipient: ADDRESSES.recipient,
+                amount: TEST_AMOUNTS.ONE_TOKEN,
+                reference: ref,
+            });
+
+            expect(instructions.length).toBe(1);
+            const transferIx = instructions[0];
+            const refAccount = transferIx.accounts!.find((a: any) => a.address === ref);
+            expect(refAccount).toBeDefined();
+            expect(refAccount!.role).toBe(AccountRole.READONLY);
+        });
+
+        it('should handle multiple references', async () => {
+            const accounts = new Map<string, any>([
+                [ADDRESSES.sender, makeAccountInfo(SYSTEM_PROGRAM_ADDRESS, 1_000_000_000)],
+                [ADDRESSES.recipient, makeAccountInfo(SYSTEM_PROGRAM_ADDRESS, 0)],
+            ]);
+            const rpc = createMockRpc(accounts);
+            const ref1 = address('82ZJ7nbGpixjeDCmEhUcmwXYfvurzAgGdtSMuHnUgyny');
+            const ref2 = address('9aE476sH92Vz7DMPyq5WLPkrKWivxeuTKEFKd2sZZcde');
+
+            const instructions = await createTransfer(rpc, sender, {
+                recipient: ADDRESSES.recipient,
+                amount: TEST_AMOUNTS.ONE_TOKEN,
+                reference: [ref1, ref2],
+            });
+
+            expect(instructions.length).toBe(1);
+            const accts = instructions[0].accounts!;
+            expect(accts.find((a: any) => a.address === ref1)).toBeDefined();
+            expect(accts.find((a: any) => a.address === ref2)).toBeDefined();
+            // Both should be READONLY
+            expect(accts.find((a: any) => a.address === ref1)!.role).toBe(AccountRole.READONLY);
+            expect(accts.find((a: any) => a.address === ref2)!.role).toBe(AccountRole.READONLY);
         });
 
         it('should throw when sender account does not exist', async () => {
-            connection.getAccountInfo.mockResolvedValueOnce(null);
+            const accounts = new Map<string, any>();
+            const rpc = createMockRpc(accounts);
 
             await expect(
-                createTransfer(connection, fixtures.sender, {
-                    recipient: fixtures.recipient,
+                createTransfer(rpc, sender, {
+                    recipient: ADDRESSES.recipient,
                     amount: TEST_AMOUNTS.ONE_TOKEN,
                 })
             ).rejects.toThrow(CreateTransferError);
         });
 
         it('should throw when recipient account does not exist', async () => {
-            connection.getAccountInfo
-                .mockResolvedValueOnce(
-                    MockFactories.createAccountInfo(SystemProgram.programId, TEST_BALANCES.SENDER_SOL)
-                )
-                .mockResolvedValueOnce(null);
+            const accounts = new Map<string, any>([
+                [ADDRESSES.sender, makeAccountInfo(SYSTEM_PROGRAM_ADDRESS, 1_000_000_000)],
+            ]);
+            const rpc = createMockRpc(accounts);
 
             await expect(
-                createTransfer(connection, fixtures.sender, {
-                    recipient: fixtures.recipient,
+                createTransfer(rpc, sender, {
+                    recipient: ADDRESSES.recipient,
                     amount: TEST_AMOUNTS.ONE_TOKEN,
                 })
             ).rejects.toThrow(CreateTransferError);
         });
+
+        it('should throw when sender owner is invalid', async () => {
+            const accounts = new Map<string, any>([
+                [ADDRESSES.sender, makeAccountInfo(ADDRESSES.splToken, 1_000_000_000)],
+                [ADDRESSES.recipient, makeAccountInfo(SYSTEM_PROGRAM_ADDRESS, 0)],
+            ]);
+            const rpc = createMockRpc(accounts);
+
+            await expect(
+                createTransfer(rpc, sender, {
+                    recipient: ADDRESSES.recipient,
+                    amount: TEST_AMOUNTS.ONE_TOKEN,
+                })
+            ).rejects.toThrow('sender owner invalid');
+        });
+
+        it('should throw when sender is executable', async () => {
+            const accounts = new Map<string, any>([
+                [ADDRESSES.sender, makeAccountInfo(SYSTEM_PROGRAM_ADDRESS, 1_000_000_000, true)],
+                [ADDRESSES.recipient, makeAccountInfo(SYSTEM_PROGRAM_ADDRESS, 0)],
+            ]);
+            const rpc = createMockRpc(accounts);
+
+            await expect(
+                createTransfer(rpc, sender, {
+                    recipient: ADDRESSES.recipient,
+                    amount: TEST_AMOUNTS.ONE_TOKEN,
+                })
+            ).rejects.toThrow('sender executable');
+        });
+
+        it('should throw on insufficient funds', async () => {
+            const accounts = new Map<string, any>([
+                [ADDRESSES.sender, makeAccountInfo(SYSTEM_PROGRAM_ADDRESS, 100)], // only 100 lamports
+                [ADDRESSES.recipient, makeAccountInfo(SYSTEM_PROGRAM_ADDRESS, 0)],
+            ]);
+            const rpc = createMockRpc(accounts);
+
+            await expect(
+                createTransfer(rpc, sender, {
+                    recipient: ADDRESSES.recipient,
+                    amount: TEST_AMOUNTS.ONE_TOKEN, // 1 SOL = 1B lamports
+                })
+            ).rejects.toThrow('insufficient funds');
+        });
     });
 
     describe('SPL Token transfers', () => {
-        it('should create a valid SPL token transfer transaction', async () => {
-            TestHelpers.setupSplTokenMocks(connection, fixtures);
+        function setupTokenMocks(overrides?: {
+            mintInitialized?: boolean;
+            senderState?: number;
+            senderAmount?: bigint;
+            recipientState?: number;
+            tokenProgram?: Address;
+        }) {
+            const tokenProgram = overrides?.tokenProgram ?? (TOKEN_PROGRAM_ADDRESS as Address);
 
-            const transaction = await createTransfer(connection, fixtures.sender, {
-                recipient: fixtures.recipient,
-                amount: TEST_AMOUNTS.ONE_TOKEN,
-                splToken: fixtures.splToken,
+            const accounts = new Map<string, any>([
+                [ADDRESSES.sender, makeAccountInfo(SYSTEM_PROGRAM_ADDRESS, 1_000_000_000)],
+                [ADDRESSES.recipient, makeAccountInfo(SYSTEM_PROGRAM_ADDRESS, 0)],
+                [ADDRESSES.splToken, makeAccountInfo(tokenProgram, 0)],
+            ]);
+            const rpc = createMockRpc(accounts);
+
+            mockedFetchMint.mockReset();
+            mockedFetchToken.mockReset();
+            mockedFindAssociatedTokenPda.mockReset();
+
+            mockedFetchMint.mockResolvedValue(makeMintData(6, overrides?.mintInitialized ?? true));
+
+            mockedFindAssociatedTokenPda.mockImplementation(async (args: any) => {
+                if (args.owner === ADDRESSES.sender) return [ADDRESSES.senderATA, 255] as any;
+                if (args.owner === ADDRESSES.recipient) return [ADDRESSES.recipientATA, 255] as any;
+                return [ADDRESSES.senderATA, 255] as any;
             });
 
-            TestHelpers.assertSplTokenTransfer(transaction, fixtures, spl.TOKEN_PROGRAM_ID);
-            expect(mockedSplToken.getMint).toHaveBeenCalledTimes(1);
-            expect(mockedSplToken.getAccount).toHaveBeenCalledTimes(2);
+            const senderTokenData = makeTokenAccountData({
+                addr: ADDRESSES.senderATA,
+                mint: ADDRESSES.splToken,
+                owner: ADDRESSES.sender,
+                amount: overrides?.senderAmount ?? 1_000_000n,
+                state: overrides?.senderState ?? 1,
+            });
+            const recipientTokenData = makeTokenAccountData({
+                addr: ADDRESSES.recipientATA,
+                mint: ADDRESSES.splToken,
+                owner: ADDRESSES.recipient,
+                amount: 0n,
+                state: overrides?.recipientState ?? 1,
+            });
+
+            mockedFetchToken.mockImplementation(async (_rpc: any, addr: any) => {
+                if (addr === ADDRESSES.senderATA) return senderTokenData;
+                if (addr === ADDRESSES.recipientATA) return recipientTokenData;
+                return senderTokenData;
+            });
+
+            return rpc;
+        }
+
+        it('should create valid SPL token transfer with correct shape', async () => {
+            const rpc = setupTokenMocks();
+
+            const instructions = await createTransfer(rpc, sender, {
+                recipient: ADDRESSES.recipient,
+                amount: TEST_AMOUNTS.ONE_TOKEN,
+                splToken: ADDRESSES.splToken,
+            });
+
+            expect(Array.isArray(instructions)).toBe(true);
+            expect(instructions.length).toBe(1);
+            expect(mockedFetchMint).toHaveBeenCalledTimes(1);
+            expect(mockedFetchToken).toHaveBeenCalledTimes(2);
+
+            // Shape assertion: SPL transfer should use token program
+            const ix = instructions[0];
+            expect(ix.programAddress).toBe(TOKEN_PROGRAM_ADDRESS);
+            expect(ix.data).toBeInstanceOf(Uint8Array);
         });
 
-        it('should create a valid Token-2022 transfer transaction', async () => {
-            TestHelpers.setupSplTokenMocks(connection, fixtures, spl.TOKEN_2022_PROGRAM_ID);
+        it('should use Token-2022 program address when token is owned by Token-2022', async () => {
+            const rpc = setupTokenMocks({ tokenProgram: TOKEN_2022_PROGRAM });
 
-            const transaction = await createTransfer(connection, fixtures.sender, {
-                recipient: fixtures.recipient,
+            const instructions = await createTransfer(rpc, sender, {
+                recipient: ADDRESSES.recipient,
                 amount: TEST_AMOUNTS.ONE_TOKEN,
-                splToken: fixtures.splToken,
+                splToken: ADDRESSES.splToken,
             });
 
-            TestHelpers.assertSplTokenTransfer(transaction, fixtures, spl.TOKEN_2022_PROGRAM_ID);
+            expect(instructions.length).toBe(1);
+            expect(instructions[0].programAddress).toBe(TOKEN_2022_PROGRAM);
         });
 
-        describe('SPL Token validation errors', () => {
-            it('should throw when mint is not initialized', async () => {
-                TestHelpers.setupBasicMocks(connection, fixtures);
-                connection.getParsedAccountInfo.mockResolvedValue(
-                    MockFactories.createParsedAccountInfo(spl.TOKEN_PROGRAM_ID)
-                );
+        it('should throw when mint is not initialized', async () => {
+            const rpc = setupTokenMocks({ mintInitialized: false });
 
-                mockedSplToken.getMint.mockResolvedValue(
-                    MockFactories.createMint({
-                        address: fixtures.splToken,
-                        mintAuthority: fixtures.mintAuthority,
-                        isInitialized: false,
-                    })
-                );
+            await expect(
+                createTransfer(rpc, sender, {
+                    recipient: ADDRESSES.recipient,
+                    amount: TEST_AMOUNTS.ONE_TOKEN,
+                    splToken: ADDRESSES.splToken,
+                })
+            ).rejects.toThrow('mint not initialized');
+        });
 
-                await expect(
-                    createTransfer(connection, fixtures.sender, {
-                        recipient: fixtures.recipient,
-                        amount: TEST_AMOUNTS.ONE_TOKEN,
-                        splToken: fixtures.splToken,
-                    })
-                ).rejects.toThrow(CreateTransferError);
-            });
+        it('should throw when sender token account is not initialized', async () => {
+            const rpc = setupTokenMocks({ senderState: 0 });
 
-            it('should throw when sender token account is not initialized', async () => {
-                TestHelpers.setupBasicMocks(connection, fixtures);
-                connection.getParsedAccountInfo.mockResolvedValue(
-                    MockFactories.createParsedAccountInfo(spl.TOKEN_PROGRAM_ID)
-                );
+            await expect(
+                createTransfer(rpc, sender, {
+                    recipient: ADDRESSES.recipient,
+                    amount: TEST_AMOUNTS.ONE_TOKEN,
+                    splToken: ADDRESSES.splToken,
+                })
+            ).rejects.toThrow('sender not initialized');
+        });
 
-                mockedSplToken.getMint.mockResolvedValue(
-                    MockFactories.createMint({
-                        address: fixtures.splToken,
-                        mintAuthority: fixtures.mintAuthority,
-                    })
-                );
+        it('should throw when sender token account is frozen', async () => {
+            const rpc = setupTokenMocks({ senderState: 2 });
 
-                mockedSplToken.getAssociatedTokenAddress.mockResolvedValueOnce(fixtures.senderATA);
-                mockedSplToken.getAccount.mockResolvedValueOnce(
-                    MockFactories.createTokenAccount({
-                        address: fixtures.senderATA,
-                        mint: fixtures.splToken,
-                        owner: fixtures.sender,
-                        isInitialized: false,
-                    })
-                );
+            await expect(
+                createTransfer(rpc, sender, {
+                    recipient: ADDRESSES.recipient,
+                    amount: TEST_AMOUNTS.ONE_TOKEN,
+                    splToken: ADDRESSES.splToken,
+                })
+            ).rejects.toThrow('sender frozen');
+        });
 
-                await expect(
-                    createTransfer(connection, fixtures.sender, {
-                        recipient: fixtures.recipient,
-                        amount: TEST_AMOUNTS.ONE_TOKEN,
-                        splToken: fixtures.splToken,
-                    })
-                ).rejects.toThrow(CreateTransferError);
-            });
+        it('should throw when recipient token account is not initialized', async () => {
+            const rpc = setupTokenMocks({ recipientState: 0 });
 
-            it('should throw when sender token account is frozen', async () => {
-                TestHelpers.setupBasicMocks(connection, fixtures);
-                connection.getParsedAccountInfo.mockResolvedValue(
-                    MockFactories.createParsedAccountInfo(spl.TOKEN_PROGRAM_ID)
-                );
+            await expect(
+                createTransfer(rpc, sender, {
+                    recipient: ADDRESSES.recipient,
+                    amount: TEST_AMOUNTS.ONE_TOKEN,
+                    splToken: ADDRESSES.splToken,
+                })
+            ).rejects.toThrow('recipient not initialized');
+        });
 
-                mockedSplToken.getMint.mockResolvedValue(
-                    MockFactories.createMint({
-                        address: fixtures.splToken,
-                        mintAuthority: fixtures.mintAuthority,
-                    })
-                );
+        it('should throw when recipient token account is frozen', async () => {
+            const rpc = setupTokenMocks({ recipientState: 2 });
 
-                mockedSplToken.getAssociatedTokenAddress.mockResolvedValueOnce(fixtures.senderATA);
-                mockedSplToken.getAccount.mockResolvedValueOnce(
-                    MockFactories.createTokenAccount({
-                        address: fixtures.senderATA,
-                        mint: fixtures.splToken,
-                        owner: fixtures.sender,
-                        isFrozen: true,
-                        amount: TEST_BALANCES.SENDER_TOKENS,
-                    })
-                );
+            await expect(
+                createTransfer(rpc, sender, {
+                    recipient: ADDRESSES.recipient,
+                    amount: TEST_AMOUNTS.ONE_TOKEN,
+                    splToken: ADDRESSES.splToken,
+                })
+            ).rejects.toThrow('recipient frozen');
+        });
 
-                await expect(
-                    createTransfer(connection, fixtures.sender, {
-                        recipient: fixtures.recipient,
-                        amount: TEST_AMOUNTS.ONE_TOKEN,
-                        splToken: fixtures.splToken,
-                    })
-                ).rejects.toThrow(CreateTransferError);
-            });
+        it('should throw when sender has insufficient token balance', async () => {
+            const rpc = setupTokenMocks({ senderAmount: 1n });
 
-            it('should throw when recipient token account is not initialized', async () => {
-                TestHelpers.setupBasicMocks(connection, fixtures);
-                connection.getParsedAccountInfo.mockResolvedValue(
-                    MockFactories.createParsedAccountInfo(spl.TOKEN_PROGRAM_ID)
-                );
-
-                mockedSplToken.getMint.mockResolvedValue(
-                    MockFactories.createMint({
-                        address: fixtures.splToken,
-                        mintAuthority: fixtures.mintAuthority,
-                    })
-                );
-
-                mockedSplToken.getAssociatedTokenAddress
-                    .mockResolvedValueOnce(fixtures.senderATA)
-                    .mockResolvedValueOnce(fixtures.recipientATA);
-
-                mockedSplToken.getAccount
-                    .mockResolvedValueOnce(
-                        MockFactories.createTokenAccount({
-                            address: fixtures.senderATA,
-                            mint: fixtures.splToken,
-                            owner: fixtures.sender,
-                            amount: TEST_BALANCES.SENDER_TOKENS,
-                        })
-                    )
-                    .mockResolvedValueOnce(
-                        MockFactories.createTokenAccount({
-                            address: fixtures.recipientATA,
-                            mint: fixtures.splToken,
-                            owner: fixtures.recipient,
-                            isInitialized: false,
-                        })
-                    );
-
-                await expect(
-                    createTransfer(connection, fixtures.sender, {
-                        recipient: fixtures.recipient,
-                        amount: TEST_AMOUNTS.ONE_TOKEN,
-                        splToken: fixtures.splToken,
-                    })
-                ).rejects.toThrow(CreateTransferError);
-            });
-
-            it('should throw when recipient token account is frozen', async () => {
-                TestHelpers.setupBasicMocks(connection, fixtures);
-                connection.getParsedAccountInfo.mockResolvedValue(
-                    MockFactories.createParsedAccountInfo(spl.TOKEN_PROGRAM_ID)
-                );
-
-                mockedSplToken.getMint.mockResolvedValue(
-                    MockFactories.createMint({
-                        address: fixtures.splToken,
-                        mintAuthority: fixtures.mintAuthority,
-                    })
-                );
-
-                mockedSplToken.getAssociatedTokenAddress
-                    .mockResolvedValueOnce(fixtures.senderATA)
-                    .mockResolvedValueOnce(fixtures.recipientATA);
-
-                mockedSplToken.getAccount
-                    .mockResolvedValueOnce(
-                        MockFactories.createTokenAccount({
-                            address: fixtures.senderATA,
-                            mint: fixtures.splToken,
-                            owner: fixtures.sender,
-                            amount: TEST_BALANCES.SENDER_TOKENS,
-                        })
-                    )
-                    .mockResolvedValueOnce(
-                        MockFactories.createTokenAccount({
-                            address: fixtures.recipientATA,
-                            mint: fixtures.splToken,
-                            owner: fixtures.recipient,
-                            isFrozen: true,
-                        })
-                    );
-
-                await expect(
-                    createTransfer(connection, fixtures.sender, {
-                        recipient: fixtures.recipient,
-                        amount: TEST_AMOUNTS.ONE_TOKEN,
-                        splToken: fixtures.splToken,
-                    })
-                ).rejects.toThrow(CreateTransferError);
-            });
-
-            it('should throw when sender has insufficient token balance', async () => {
-                TestHelpers.setupBasicMocks(connection, fixtures);
-                connection.getParsedAccountInfo.mockResolvedValue(
-                    MockFactories.createParsedAccountInfo(spl.TOKEN_PROGRAM_ID)
-                );
-
-                mockedSplToken.getMint.mockResolvedValue(
-                    MockFactories.createMint({
-                        address: fixtures.splToken,
-                        mintAuthority: fixtures.mintAuthority,
-                    })
-                );
-
-                mockedSplToken.getAssociatedTokenAddress
-                    .mockResolvedValueOnce(fixtures.senderATA)
-                    .mockResolvedValueOnce(fixtures.recipientATA);
-
-                mockedSplToken.getAccount
-                    .mockResolvedValueOnce(
-                        MockFactories.createTokenAccount({
-                            address: fixtures.senderATA,
-                            mint: fixtures.splToken,
-                            owner: fixtures.sender,
-                            amount: TEST_BALANCES.INSUFFICIENT_TOKENS,
-                        })
-                    )
-                    .mockResolvedValueOnce(
-                        MockFactories.createTokenAccount({
-                            address: fixtures.recipientATA,
-                            mint: fixtures.splToken,
-                            owner: fixtures.recipient,
-                        })
-                    );
-
-                await expect(
-                    createTransfer(connection, fixtures.sender, {
-                        recipient: fixtures.recipient,
-                        amount: TEST_AMOUNTS.TWO_TOKENS,
-                        splToken: fixtures.splToken,
-                    })
-                ).rejects.toThrow(CreateTransferError);
-            });
+            await expect(
+                createTransfer(rpc, sender, {
+                    recipient: ADDRESSES.recipient,
+                    amount: TEST_AMOUNTS.TWO_TOKENS,
+                    splToken: ADDRESSES.splToken,
+                })
+            ).rejects.toThrow('insufficient funds');
         });
     });
 });

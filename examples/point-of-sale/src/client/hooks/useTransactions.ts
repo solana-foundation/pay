@@ -1,12 +1,14 @@
-import { TransactionConfirmationStatus, TransactionError, TransactionSignature } from '@solana/web3.js';
+import type { Signature } from '@solana/kit';
 import { createContext, useContext } from 'react';
 import { Confirmations } from '../types';
 
+export type TransactionConfirmationStatus = 'processed' | 'confirmed' | 'finalized';
+
 export interface Transaction {
-    signature: TransactionSignature;
+    signature: Signature;
     amount: string;
     timestamp: number;
-    error: TransactionError | null;
+    error: unknown | null;
     status: TransactionConfirmationStatus;
     confirmations: Confirmations;
 }

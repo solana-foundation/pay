@@ -1,4 +1,4 @@
-import { PublicKey } from '@solana/web3.js';
+import type { Address } from '@solana/kit';
 import React, { FC, ReactElement, ReactNode } from 'react';
 import { ConfigContext } from '../../hooks/useConfig';
 import { Confirmations, Digits } from '../../types';
@@ -7,10 +7,10 @@ export interface ConfigProviderProps {
     children: ReactNode;
     baseURL: string;
     link?: URL;
-    recipient: PublicKey;
+    recipient: Address;
     label: string;
     message?: string;
-    splToken?: PublicKey;
+    splToken?: Address;
     symbol: string;
     icon: ReactElement;
     decimals: Digits;

@@ -1,4 +1,4 @@
-import { PublicKey, TransactionSignature } from '@solana/web3.js';
+import type { Address, Signature } from '@solana/kit';
 import BigNumber from 'bignumber.js';
 import { createContext, useContext } from 'react';
 import { Confirmations } from '../types';
@@ -17,8 +17,8 @@ export interface PaymentContextState {
     setAmount(amount: BigNumber | undefined): void;
     memo: string | undefined;
     setMemo(memo: string | undefined): void;
-    reference: PublicKey | undefined;
-    signature: TransactionSignature | undefined;
+    reference: Address | undefined;
+    signature: Signature | undefined;
     status: PaymentStatus;
     confirmations: Confirmations;
     progress: number;

@@ -1,7 +1,6 @@
-import { PublicKey } from '@solana/web3.js';
-import BigNumber from 'bignumber.js';
-import type { TransferRequestURL } from '../src';
-import { parseURL } from '../src';
+import type { TransferRequestURL } from '../src/index.js';
+import { parseURL } from '../src/index.js';
+import { describe, it, expect } from 'vitest';
 
 describe('parseURL', () => {
     describe('parsing', () => {
@@ -14,11 +13,11 @@ describe('parseURL', () => {
                     url
                 ) as TransferRequestURL;
 
-                expect(recipient.equals(new PublicKey('mvines9iiHiQTysrwkJjGf2gb9Ex9jXJX8ns3qwf2kN'))).toBe(true);
-                expect(amount!.eq(new BigNumber('0.000000001'))).toBe(true);
+                expect(recipient).toBe('mvines9iiHiQTysrwkJjGf2gb9Ex9jXJX8ns3qwf2kN');
+                expect(amount).toBe(0.000000001);
                 expect(splToken).toBeUndefined();
                 expect(reference).toHaveLength(1);
-                expect(reference![0]!.equals(new PublicKey('82ZJ7nbGpixjeDCmEhUcmwXYfvurzAgGdtSMuHnUgyny'))).toBe(true);
+                expect(reference![0]).toBe('82ZJ7nbGpixjeDCmEhUcmwXYfvurzAgGdtSMuHnUgyny');
                 expect(label).toBe('Michael');
                 expect(message).toBe('Thanks for all the fish');
                 expect(memo).toBe('OrderId5678');
@@ -32,9 +31,9 @@ describe('parseURL', () => {
                     url
                 ) as TransferRequestURL;
 
-                expect(recipient.equals(new PublicKey('mvines9iiHiQTysrwkJjGf2gb9Ex9jXJX8ns3qwf2kN'))).toBe(true);
-                expect(amount!.eq(new BigNumber('1.01'))).toBe(true);
-                expect(splToken!.equals(new PublicKey('82ZJ7nbGpixjeDCmEhUcmwXYfvurzAgGdtSMuHnUgyny'))).toBe(true);
+                expect(recipient).toBe('mvines9iiHiQTysrwkJjGf2gb9Ex9jXJX8ns3qwf2kN');
+                expect(amount).toBe(1.01);
+                expect(splToken).toBe('82ZJ7nbGpixjeDCmEhUcmwXYfvurzAgGdtSMuHnUgyny');
                 expect(reference).toBeUndefined();
                 expect(label).toBe('Michael');
                 expect(message).toBe('Thanks for all the fish');
@@ -49,11 +48,11 @@ describe('parseURL', () => {
                     url
                 ) as TransferRequestURL;
 
-                expect(recipient.equals(new PublicKey('mvines9iiHiQTysrwkJjGf2gb9Ex9jXJX8ns3qwf2kN'))).toBe(true);
+                expect(recipient).toBe('mvines9iiHiQTysrwkJjGf2gb9Ex9jXJX8ns3qwf2kN');
                 expect(amount).toBeUndefined();
                 expect(splToken).toBeUndefined();
                 expect(reference).toHaveLength(1);
-                expect(reference![0]!.equals(new PublicKey('82ZJ7nbGpixjeDCmEhUcmwXYfvurzAgGdtSMuHnUgyny'))).toBe(true);
+                expect(reference![0]).toBe('82ZJ7nbGpixjeDCmEhUcmwXYfvurzAgGdtSMuHnUgyny');
                 expect(label).toBe('Michael');
                 expect(message).toBe('Thanks for all the fish');
                 expect(memo).toBe('OrderId5678');

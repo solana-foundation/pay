@@ -69,24 +69,25 @@ function encodeTransferRequestURL({
     message,
     memo,
 }: TransferRequestURLFields): URL {
-    const pathname = recipient.toBase58();
+    const pathname = recipient;
     const url = new URL(SOLANA_PROTOCOL + pathname);
 
-    if (amount) {
-        url.searchParams.append('amount', amount.toFixed(amount.decimalPlaces() ?? 0));
+    if (amount != null) {
+        // Handle scientific notation (e.g., 1e-9 for 0.000000001)
+        const s = amount.toString();
+        const formatted = s.includes('e') ? amount.toFixed(20).replace(/0+$/, '').replace(/\.$/, '') : s;
+        url.searchParams.append('amount', formatted);
     }
 
     if (splToken) {
-        url.searchParams.append('spl-token', splToken.toBase58());
+        url.searchParams.append('spl-token', splToken);
     }
 
     if (reference) {
-        if (!Array.isArray(reference)) {
-            reference = [reference];
-        }
+        const refs = Array.isArray(reference) ? reference : [reference];
 
-        for (const pubkey of reference) {
-            url.searchParams.append('reference', pubkey.toBase58());
+        for (const ref of refs) {
+            url.searchParams.append('reference', ref);
         }
     }
 

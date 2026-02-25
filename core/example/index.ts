@@ -1,91 +1,101 @@
-import { createAssociatedTokenAccount } from '@solana/spl-token';
-import { clusterApiUrl, Connection, Keypair, LAMPORTS_PER_SOL, sendAndConfirmRawTransaction } from '@solana/web3.js';
-import type { TransferRequestURL } from '../src.js';
-import { createTransfer, encodeURL, findReference, parseURL, validateTransfer } from '../src.js';
+/**
+ * Solana Pay — Example payment flow
+ *
+ * This example demonstrates the full lifecycle of a Solana Pay transfer request:
+ * 1. Merchant encodes a payment URL with recipient, amount, and reference
+ * 2. Wallet parses the URL and creates transfer instructions
+ * 3. Wallet signs and sends the transaction
+ * 4. Merchant finds and validates the payment using the reference
+ *
+ * Requirements:
+ *   - @solana/kit, @solana/kit-plugins, @solana/pay
+ *   - A running Solana validator (devnet or local)
+ */
+
+import {
+    address,
+    createSolanaRpc,
+    generateKeyPairSigner,
+    pipe,
+    createTransactionMessage,
+    setTransactionMessageFeePayer,
+    setTransactionMessageLifetimeUsingBlockhash,
+    appendTransactionMessageInstructions,
+    signTransaction,
+    getBase64EncodedWireTransaction,
+    compileTransaction,
+} from '@solana/kit';
+import type { TransferRequestURL } from '../src/index.js';
+import { createTransfer, encodeURL, findReference, parseURL, validateTransfer } from '../src/index.js';
 
 (async function () {
-    const cluster = 'devnet';
-    const endpoint = clusterApiUrl(cluster);
-    const connection = new Connection(endpoint, 'confirmed');
+    const rpc = createSolanaRpc('https://api.devnet.solana.com');
 
-    // Merchant app generates a random public key referenced by the transaction, in order to locate it after it's sent
-    const originalReference = Keypair.generate().publicKey;
+    // Merchant app generates a random reference address to locate the transaction later
+    const referenceSigner = await generateKeyPairSigner();
+    const originalReference = referenceSigner.address;
 
-    const NATIVE_URL =
-        'solana:mvines9iiHiQTysrwkJjGf2gb9Ex9jXJX8ns3qwf2kN' +
-        '?amount=0.01' +
-        '&reference=' +
-        encodeURIComponent(String(originalReference)) +
-        '&label=Michael' +
-        '&message=Thanks%20for%20all%20the%20fish' +
-        '&memo=OrderId5678';
+    const recipient = address('mvines9iiHiQTysrwkJjGf2gb9Ex9jXJX8ns3qwf2kN');
+    const amount = 0.01;
 
-    const USDC_URL =
-        'solana:mvines9iiHiQTysrwkJjGf2gb9Ex9jXJX8ns3qwf2kN' +
-        '?amount=0.01' +
-        '&spl-token=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v' +
-        '&reference=' +
-        encodeURIComponent(String(originalReference)) +
-        '&label=Michael' +
-        '&message=Thanks%20for%20all%20the%20fish' +
-        '&memo=OrderId5678';
-
-    const originalURL = NATIVE_URL;
-    console.log(originalURL);
-
-    // Wallet gets URL from deep link / QR code
-    const { recipient, amount, splToken, reference, label, message, memo } = parseURL(
-        originalURL
-    ) as TransferRequestURL;
-
-    // Apps can encode the URL from the required and optional parameters
-    const encodedURL = encodeURL({ recipient, amount, splToken, reference, label, message, memo });
-
-    console.log(originalURL);
-    console.log(encodedURL);
-
-    // This just represents the wallet's keypair for testing, in practice it will have a way of signing already
-    const wallet = Keypair.generate();
-
-    const airdrop = await connection.requestAirdrop(wallet.publicKey, LAMPORTS_PER_SOL);
-    await connection.confirmTransaction(airdrop, 'confirmed');
-
-    if (splToken) {
-        await createAssociatedTokenAccount(connection, wallet, splToken, wallet.publicKey, { commitment: 'confirmed' });
-    }
-
-    // Create a transaction to transfer native SOL or SPL tokens
-    const transaction = await createTransfer(connection, wallet.publicKey, {
+    // 1. Encode the payment URL
+    const url = encodeURL({
         recipient,
         amount,
-        splToken,
-        reference,
-        memo,
+        reference: originalReference,
+        label: 'Michael',
+        message: 'Thanks for all the fish',
+        memo: 'OrderId5678',
+    });
+    console.log('Payment URL:', url.toString());
+
+    // 2. Wallet parses the URL
+    const parsed = parseURL(url) as TransferRequestURL;
+    console.log('Parsed recipient:', parsed.recipient);
+    console.log('Parsed amount:', parsed.amount?.toString());
+
+    // 3. Wallet creates transfer instructions
+    const wallet = await generateKeyPairSigner();
+    // Note: In a real app, fund the wallet first via airdrop or other means
+
+    const instructions = await createTransfer(rpc, wallet, {
+        recipient: parsed.recipient,
+        amount: parsed.amount!,
+        splToken: parsed.splToken,
+        reference: parsed.reference,
+        memo: parsed.memo,
     });
 
-    // Sign, send, and confirm the transaction
-    transaction.sign(wallet);
+    // 4. Compose and sign the transaction using kit's pipe() pattern
+    const { value: latestBlockhash } = await rpc.getLatestBlockhash().send();
 
-    const rawTransaction = transaction.serialize();
-    const signature = await sendAndConfirmRawTransaction(connection, rawTransaction);
+    const transactionMessage = pipe(
+        createTransactionMessage({ version: 0 }),
+        (m) => setTransactionMessageFeePayer(wallet.address, m),
+        (m) => setTransactionMessageLifetimeUsingBlockhash(latestBlockhash, m),
+        (m) => appendTransactionMessageInstructions(instructions, m)
+    );
 
-    console.log(signature);
+    const compiled = compileTransaction(transactionMessage);
+    const signed = await signTransaction([wallet.keyPair], compiled);
+    const wireTransaction = getBase64EncodedWireTransaction(signed);
 
-    // Merchant app locates the transaction signature from the unique reference address it provided in the transfer link
-    const found = await findReference(connection, originalReference);
+    // 5. Send the transaction
+    const signature = await rpc.sendTransaction(wireTransaction, { encoding: 'base64' }).send();
+    console.log('Transaction signature:', signature);
 
-    // Matches the signature of the transaction
-    console.log(found.signature);
+    // 6. Merchant finds the transaction by reference
+    const found = await findReference(rpc, originalReference);
+    console.log('Found signature:', found.signature);
+    console.log('Found memo:', found.memo);
 
-    // Contains the memo provided, prefixed with its length: `[11] OrderId5678`
-    console.log(found.memo);
-
-    // Merchant app should always validate that the transaction transferred the expected amount to the recipient
-    const response = await validateTransfer(connection, found.signature, {
-        recipient,
-        amount,
-        splToken,
-        reference,
-        memo,
+    // 7. Merchant validates the transfer
+    const response = await validateTransfer(rpc, found.signature, {
+        recipient: parsed.recipient,
+        amount: parsed.amount!,
+        splToken: parsed.splToken,
+        reference: parsed.reference,
+        memo: parsed.memo,
     });
+    console.log('Transfer validated!');
 })();

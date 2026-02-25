@@ -1,20 +1,31 @@
-import { getAssociatedTokenAddress } from '@solana/spl-token';
-import { useConnection } from '@solana/wallet-adapter-react';
-import {
-    LAMPORTS_PER_SOL,
-    ParsedTransactionWithMeta,
-    PublicKey,
-    RpcResponseAndContext,
-    SignatureStatus,
-    TransactionSignature,
-} from '@solana/web3.js';
+import { findAssociatedTokenPda, TOKEN_PROGRAM_ADDRESS } from '@solana-program/token';
+import type { Address, Signature } from '@solana/kit';
+import { createSolanaRpc } from '@solana/kit';
 import BigNumber from 'bignumber.js';
-import React, { FC, ReactNode, useEffect, useState } from 'react';
+import React, { FC, ReactNode, useEffect, useMemo, useState } from 'react';
 import { useConfig } from '../../hooks/useConfig';
-import { Transaction, TransactionsContext } from '../../hooks/useTransactions';
+import { Transaction, TransactionsContext, TransactionConfirmationStatus } from '../../hooks/useTransactions';
 import { Confirmations } from '../../types';
 import { arraysEqual } from '../../utils/arraysEqual';
-import { MAX_CONFIRMATIONS } from '../../utils/constants';
+import { DEVNET_ENDPOINT, MAX_CONFIRMATIONS } from '../../utils/constants';
+
+const LAMPORTS_PER_SOL = 1_000_000_000;
+
+/** Minimal shape for accessing jsonParsed transaction fields from the RPC */
+interface ParsedTransactionShape {
+    message?: {
+        readonly instructions?: ReadonlyArray<{
+            program?: string;
+            parsed?: {
+                type: string;
+                info: Record<string, unknown>;
+            };
+        }>;
+        readonly accountKeys?: ReadonlyArray<{
+            pubkey?: string;
+        }>;
+    };
+}
 
 export interface TransactionsProviderProps {
     children: ReactNode;
@@ -24,10 +35,10 @@ export interface TransactionsProviderProps {
 export const TransactionsProvider: FC<TransactionsProviderProps> = ({ children, pollInterval }) => {
     pollInterval ||= 10000;
 
-    const { connection } = useConnection();
+    const rpc = useMemo(() => createSolanaRpc(DEVNET_ENDPOINT), []);
     const { recipient, splToken } = useConfig();
-    const [associatedToken, setAssociatedToken] = useState<PublicKey>();
-    const [signatures, setSignatures] = useState<TransactionSignature[]>([]);
+    const [associatedToken, setAssociatedToken] = useState<Address>();
+    const [signatures, setSignatures] = useState<Signature[]>([]);
     const [transactions, setTransactions] = useState<Transaction[]>([]);
     const [loading, setLoading] = useState(false);
 
@@ -40,10 +51,14 @@ export const TransactionsProvider: FC<TransactionsProviderProps> = ({ children, 
         let changed = false;
 
         (async () => {
-            const associatedToken = await getAssociatedTokenAddress(splToken, recipient);
+            const [ata] = await findAssociatedTokenPda({
+                owner: recipient,
+                tokenProgram: TOKEN_PROGRAM_ADDRESS,
+                mint: splToken,
+            });
             if (changed) return;
 
-            setAssociatedToken(associatedToken);
+            setAssociatedToken(ata);
         })();
 
         return () => {
@@ -60,18 +75,16 @@ export const TransactionsProvider: FC<TransactionsProviderProps> = ({ children, 
             try {
                 setLoading(true);
 
-                const confirmedSignatureInfos = await connection.getSignaturesForAddress(
-                    associatedToken || recipient,
-                    { limit: 10 },
-                    'confirmed'
-                );
+                const confirmedSignatureInfos = await rpc
+                    .getSignaturesForAddress(associatedToken || recipient, { limit: 10, commitment: 'confirmed' })
+                    .send();
                 if (changed) return;
 
                 setSignatures((prevSignatures) => {
-                    const nextSignatures = confirmedSignatureInfos.map(({ signature }) => signature);
+                    const nextSignatures = confirmedSignatureInfos.map(({ signature }) => signature as Signature);
                     return arraysEqual(prevSignatures, nextSignatures) ? prevSignatures : nextSignatures;
                 });
-            } catch (error: any) {
+            } catch (error) {
                 console.error(error);
             } finally {
                 setLoading(false);
@@ -86,7 +99,7 @@ export const TransactionsProvider: FC<TransactionsProviderProps> = ({ children, 
             clearInterval(interval);
             setSignatures([]);
         };
-    }, [connection, associatedToken, recipient]);
+    }, [rpc, associatedToken, recipient]);
 
     // When the signatures change, poll and update the transactions
     useEffect(() => {
@@ -94,114 +107,108 @@ export const TransactionsProvider: FC<TransactionsProviderProps> = ({ children, 
         let changed = false;
 
         const run = async () => {
-            let parsedTransactions: (ParsedTransactionWithMeta | null)[],
-                signatureStatuses: RpcResponseAndContext<(SignatureStatus | null)[]>;
             try {
                 setLoading(true);
 
-                [parsedTransactions, signatureStatuses] = await Promise.all([
-                    connection.getParsedTransactions(signatures),
-                    connection.getSignatureStatuses(signatures, { searchTransactionHistory: true }),
+                const [parsedTransactions, signatureStatuses] = await Promise.all([
+                    Promise.all(
+                        signatures.map((sig) =>
+                            rpc.getTransaction(sig, { maxSupportedTransactionVersion: 0, encoding: 'jsonParsed' }).send()
+                        )
+                    ),
+                    rpc.getSignatureStatuses(signatures, { searchTransactionHistory: true }).send(),
                 ]);
+
+                if (changed) return;
+
+                setTransactions(
+                    signatures
+                        .map((sig, signatureIndex): Transaction | undefined => {
+                            const parsedTransaction = parsedTransactions[signatureIndex];
+                            const signatureStatus = signatureStatuses.value[signatureIndex];
+                            if (!parsedTransaction?.meta || !signatureStatus) return;
+
+                            const timestamp = parsedTransaction.blockTime;
+                            const error = parsedTransaction.meta.err;
+                            const status = signatureStatus.confirmationStatus as TransactionConfirmationStatus;
+                            if (!timestamp || !status) return;
+
+                            const instructions = (parsedTransaction.transaction as unknown as ParsedTransactionShape).message?.instructions;
+                            if (!instructions || instructions.length !== 1) return;
+                            const instruction = instructions[0];
+                            if (!('program' in instruction)) return;
+                            const program = instruction.program;
+                            const type = instruction.parsed?.type;
+                            const info = instruction.parsed?.info;
+
+                            let preAmount: BigNumber, postAmount: BigNumber;
+                            if (!associatedToken) {
+                                if (!(program === 'system' && type === 'transfer')) return;
+                                if (info?.destination !== recipient) return;
+                                if (info.source === recipient) return;
+
+                                const accountKeys = (parsedTransaction.transaction as unknown as ParsedTransactionShape).message?.accountKeys;
+                                const accountIndex = accountKeys?.findIndex(
+                                    (k: { pubkey?: string }) => k.pubkey === recipient
+                                );
+                                if (accountIndex === -1 || accountIndex == null) return;
+
+                                const preBalance = parsedTransaction.meta.preBalances[accountIndex];
+                                const postBalance = parsedTransaction.meta.postBalances[accountIndex];
+
+                                preAmount = new BigNumber(Number(preBalance)).div(LAMPORTS_PER_SOL);
+                                postAmount = new BigNumber(Number(postBalance)).div(LAMPORTS_PER_SOL);
+                            } else {
+                                if (!(program === 'spl-token' && (type === 'transfer' || type === 'transferChecked')))
+                                    return;
+                                if (info?.destination !== associatedToken) return;
+                                if (info.source === associatedToken) return;
+
+                                const accountKeys = (parsedTransaction.transaction as unknown as ParsedTransactionShape).message?.accountKeys;
+                                const accountIndex = accountKeys?.findIndex(
+                                    (k: { pubkey?: string }) => k.pubkey === associatedToken
+                                );
+                                if (accountIndex === -1 || accountIndex == null) return;
+
+                                const preBalance = parsedTransaction.meta.preTokenBalances?.find(
+                                    (x: { accountIndex: number }) => x.accountIndex === accountIndex
+                                );
+                                if (!preBalance?.uiTokenAmount?.uiAmountString) return;
+
+                                const postBalance = parsedTransaction.meta.postTokenBalances?.find(
+                                    (x: { accountIndex: number }) => x.accountIndex === accountIndex
+                                );
+                                if (!postBalance?.uiTokenAmount?.uiAmountString) return;
+
+                                preAmount = new BigNumber(preBalance.uiTokenAmount.uiAmountString);
+                                postAmount = new BigNumber(postBalance.uiTokenAmount.uiAmountString);
+                            }
+
+                            if (postAmount.lt(preAmount)) return;
+
+                            const amount = postAmount.minus(preAmount).toString();
+                            const confirmations =
+                                status === 'finalized'
+                                    ? MAX_CONFIRMATIONS
+                                    : ((signatureStatus.confirmations || 0) as Confirmations);
+
+                            return {
+                                signature: sig,
+                                amount,
+                                timestamp: Number(timestamp),
+                                error,
+                                status,
+                                confirmations,
+                            };
+                        })
+                        .filter((transaction): transaction is Transaction => !!transaction)
+                );
             } catch (error) {
                 if (changed) return;
                 console.error(error);
-                return;
             } finally {
                 setLoading(false);
             }
-            if (changed) return;
-
-            setTransactions(
-                signatures
-                    .map((signature, signatureIndex): Transaction | undefined => {
-                        const parsedTransaction = parsedTransactions[signatureIndex];
-                        const signatureStatus = signatureStatuses.value[signatureIndex];
-                        if (!parsedTransaction?.meta || !signatureStatus) return;
-
-                        const timestamp = parsedTransaction.blockTime;
-                        const error = parsedTransaction.meta.err;
-                        const status = signatureStatus.confirmationStatus;
-                        if (!timestamp || !status) return;
-
-                        if (parsedTransaction.transaction.message.instructions.length !== 1) return;
-                        const instruction = parsedTransaction.transaction.message.instructions[0];
-                        if (!('program' in instruction)) return;
-                        const program = instruction.program;
-                        const type = instruction.parsed?.type;
-                        const info = instruction.parsed.info;
-
-                        let preAmount: BigNumber, postAmount: BigNumber;
-                        if (!associatedToken) {
-                            // Include only SystemProgram.transfer instructions
-                            if (!(program === 'system' && type === 'transfer')) return;
-
-                            // Include only transfers to the recipient
-                            if (info?.destination !== recipient.toBase58()) return;
-
-                            // Exclude self-transfers
-                            if (info.source === recipient.toBase58()) return;
-
-                            const accountIndex = parsedTransaction.transaction.message.accountKeys.findIndex(
-                                ({ pubkey }) => pubkey.equals(recipient)
-                            );
-                            if (accountIndex === -1) return;
-
-                            const preBalance = parsedTransaction.meta.preBalances[accountIndex];
-                            const postBalance = parsedTransaction.meta.postBalances[accountIndex];
-
-                            preAmount = new BigNumber(preBalance).div(LAMPORTS_PER_SOL);
-                            postAmount = new BigNumber(postBalance).div(LAMPORTS_PER_SOL);
-                        } else {
-                            // Include only TokenProgram.transfer / TokenProgram.transferChecked instructions
-                            if (!(program === 'spl-token' && (type === 'transfer' || type === 'transferChecked')))
-                                return;
-
-                            // Include only transfers to the recipient ATA
-                            if (info?.destination !== associatedToken.toBase58()) return;
-
-                            // Exclude self-transfers
-                            if (info.source === associatedToken.toBase58()) return;
-
-                            const accountIndex = parsedTransaction.transaction.message.accountKeys.findIndex(
-                                ({ pubkey }) => pubkey.equals(associatedToken)
-                            );
-                            if (accountIndex === -1) return;
-
-                            const preBalance = parsedTransaction.meta.preTokenBalances?.find(
-                                (x) => x.accountIndex === accountIndex
-                            );
-                            if (!preBalance?.uiTokenAmount.uiAmountString) return;
-
-                            const postBalance = parsedTransaction.meta.postTokenBalances?.find(
-                                (x) => x.accountIndex === accountIndex
-                            );
-                            if (!postBalance?.uiTokenAmount.uiAmountString) return;
-
-                            preAmount = new BigNumber(preBalance.uiTokenAmount.uiAmountString);
-                            postAmount = new BigNumber(postBalance.uiTokenAmount.uiAmountString);
-                        }
-
-                        // Exclude negative amounts
-                        if (postAmount.lt(preAmount)) return;
-
-                        const amount = postAmount.minus(preAmount).toString();
-                        const confirmations =
-                            status === 'finalized'
-                                ? MAX_CONFIRMATIONS
-                                : ((signatureStatus.confirmations || 0) as Confirmations);
-
-                        return {
-                            signature,
-                            amount,
-                            timestamp,
-                            error,
-                            status,
-                            confirmations,
-                        };
-                    })
-                    .filter((transaction): transaction is Transaction => !!transaction)
-            );
         };
 
         const interval = setInterval(run, pollInterval);
@@ -211,7 +218,7 @@ export const TransactionsProvider: FC<TransactionsProviderProps> = ({ children, 
             changed = true;
             clearInterval(interval);
         };
-    }, [signatures, connection, associatedToken, recipient, pollInterval]);
+    }, [signatures, rpc, associatedToken, recipient, pollInterval]);
 
     return <TransactionsContext.Provider value={{ transactions, loading }}>{children}</TransactionsContext.Provider>;
 };

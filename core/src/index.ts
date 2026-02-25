@@ -7,3 +7,4 @@ export * from './findReference.js';
 export * from './parseURL.js';
 export * from './types.js';
 export * from './validateTransfer.js';
+export * from './plugin.js';

@@ -1,17 +1,16 @@
-import type { PublicKey } from '@solana/web3.js';
-import type BigNumber from 'bignumber.js';
+import type { Address } from '@solana/kit';
 
 /** `recipient` in the [Solana Pay spec](https://github.com/solana-labs/solana-pay/blob/master/SPEC.md#recipient). */
-export type Recipient = PublicKey;
+export type Recipient = Address;
 
 /** `amount` in the [Solana Pay spec](https://github.com/solana-labs/solana-pay/blob/master/SPEC.md#amount). */
-export type Amount = BigNumber;
+export type Amount = number;
 
 /** `spl-token` in the [Solana Pay spec](https://github.com/solana-labs/solana-pay/blob/master/SPEC.md#spl-token). */
-export type SPLToken = PublicKey;
+export type SPLToken = Address;
 
 /** `reference` in the [Solana Pay spec](https://github.com/solana-labs/solana-pay/blob/master/SPEC.md#reference). */
-export type Reference = PublicKey;
+export type Reference = Address;
 
 /** `reference` in the [Solana Pay spec](https://github.com/solana-labs/solana-pay/blob/master/SPEC.md#reference). */
 export type References = Reference | Reference[];
@@ -27,3 +26,6 @@ export type Memo = string;
 
 /** `link` in the [Solana Pay spec](https://github.com/solana-labs/solana-pay/blob/master/SPEC.md#link). */
 export type Link = URL;
+
+/** Commitment level for transaction finality. */
+export type Finality = 'confirmed' | 'finalized';

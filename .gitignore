@@ -7,3 +7,9 @@ node_modules
 build
 .env
 .next
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+bun.lock
+bun.lockb
+tsconfig.tsbuildinfo

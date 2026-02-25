@@ -1,8 +1,7 @@
-import { WalletAdapterNetwork } from '@solana/wallet-adapter-base';
-import { ConnectionProvider, WalletProvider } from '@solana/wallet-adapter-react';
-import { WalletModalProvider } from '@solana/wallet-adapter-react-ui';
-import { GlowWalletAdapter, PhantomWalletAdapter, SolflareWalletAdapter } from '@solana/wallet-adapter-wallets';
-import { PublicKey } from '@solana/web3.js';
+import { AppProvider } from '@solana/connector/react';
+import { getDefaultConfig } from '@solana/connector/headless';
+import type { Address } from '@solana/kit';
+import { address } from '@solana/kit';
 import { AppContext, AppProps as NextAppProps, default as NextApp } from 'next/app';
 import { AppInitialProps } from 'next/dist/shared/lib/utils';
 import { FC, useMemo } from 'react';
@@ -25,6 +24,12 @@ interface AppProps extends NextAppProps {
     };
 }
 
+const connectorConfig = getDefaultConfig({
+    appName: 'Solana Pay Point of Sale',
+    autoConnect: true,
+    network: 'devnet',
+});
+
 const App: FC<AppProps> & { getInitialProps(appContext: AppContext): Promise<AppInitialProps> } = ({
     Component,
     host,
@@ -35,27 +40,16 @@ const App: FC<AppProps> & { getInitialProps(appContext: AppContext): Promise<App
 
     // If you're testing without a mobile wallet, set this to true to allow a browser wallet to be used.
     const connectWallet = false;
-    // If you're testing without a mobile wallet, set this to Devnet or Mainnet to configure some browser wallets.
-    const network = WalletAdapterNetwork.Devnet;
-
-    const wallets = useMemo(
-        () => (connectWallet ? [
-            new GlowWalletAdapter({ network }),
-            new PhantomWalletAdapter(),
-            new SolflareWalletAdapter({ network })
-        ] : []),
-        [connectWallet, network]
-    );
 
     // Toggle comments on these lines to use transaction requests instead of transfer requests.
     const link = undefined;
     // const link = useMemo(() => new URL(`${baseURL}/api/`), [baseURL]);
 
-    let recipient: PublicKey | undefined = undefined;
+    let recipient: Address | undefined = undefined;
     const { recipient: recipientParam, label, message } = query;
     if (recipientParam && label) {
         try {
-            recipient = new PublicKey(recipientParam);
+            recipient = address(recipientParam);
         } catch (error) {
             console.error(error);
         }
@@ -65,30 +59,26 @@ const App: FC<AppProps> & { getInitialProps(appContext: AppContext): Promise<App
         <ThemeProvider>
             <FullscreenProvider>
                 {recipient && label ? (
-                    <ConnectionProvider endpoint={DEVNET_ENDPOINT}>
-                        <WalletProvider wallets={wallets} autoConnect={connectWallet}>
-                            <WalletModalProvider>
-                                <ConfigProvider
-                                    baseURL={baseURL}
-                                    link={link}
-                                    recipient={recipient}
-                                    label={label}
-                                    message={message}
-                                    symbol="SOL"
-                                    icon={<SOLIcon />}
-                                    decimals={9}
-                                    minDecimals={1}
-                                    connectWallet={connectWallet}
-                                >
-                                    <TransactionsProvider>
-                                        <PaymentProvider>
-                                            <Component {...pageProps} />
-                                        </PaymentProvider>
-                                    </TransactionsProvider>
-                                </ConfigProvider>
-                            </WalletModalProvider>
-                        </WalletProvider>
-                    </ConnectionProvider>
+                    <AppProvider connectorConfig={connectorConfig}>
+                        <ConfigProvider
+                            baseURL={baseURL}
+                            link={link}
+                            recipient={recipient}
+                            label={label}
+                            message={message}
+                            symbol="SOL"
+                            icon={<SOLIcon />}
+                            decimals={9}
+                            minDecimals={1}
+                            connectWallet={connectWallet}
+                        >
+                            <TransactionsProvider>
+                                <PaymentProvider>
+                                    <Component {...pageProps} />
+                                </PaymentProvider>
+                            </TransactionsProvider>
+                        </ConfigProvider>
+                    </AppProvider>
                 ) : (
                     <div className={css.logo}>
                         <SolanaPayLogo width={240} height={88} />

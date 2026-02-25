@@ -18,8 +18,10 @@ import QRCodeStyling from '@solana/qr-code-styling';
  * @param background - Background color, which should be light for device compatibility.
  * @param color - Foreground color, which should be dark for device compatibility.
  */
-export function createQR(url: string | URL, size = 512, background = 'white', color = 'black'): QRCodeStyling {
-    return new QRCodeStyling(createQROptions(url, size, background, color));
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function createQR(url: string | URL, size = 512, background = 'white', color = 'black'): any {
+    const Ctor = QRCodeStyling as unknown as new (options: Options) => unknown;
+    return new Ctor(createQROptions(url, size, background, color));
 }
 
 /** @ignore */

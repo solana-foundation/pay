@@ -22,7 +22,7 @@
     }
 }
 
-.header :global(.wallet-adapter-button) {
+.header button {
     margin: 16px;
 }
 

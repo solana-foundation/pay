@@ -1,16 +1,16 @@
 {
     "name": "@solana/pay",
-    "version": "0.2.6",
+    "version": "1.0.0",
     "author": "Solana Maintainers <maintainers@solana.foundation>",
     "repository": "https://github.com/solana-foundation/solana-pay",
     "license": "Apache-2.0",
     "type": "module",
     "sideEffects": false,
     "engines": {
-        "node": ">=16"
+        "node": ">=20"
     },
     "files": [
-        "lib",
+        "dist",
         "src",
         "LICENSE",
         "README.md"
@@ -18,64 +18,53 @@
     "publishConfig": {
         "access": "public"
     },
-    "main": "./lib/cjs/index.js",
-    "module": "./lib/esm/index.js",
-    "types": "./lib/types/index.d.ts",
+    "main": "./dist/index.cjs",
+    "module": "./dist/index.js",
+    "types": "./dist/index.d.ts",
     "exports": {
-        "require": "./lib/cjs/index.js",
-        "import": "./lib/esm/index.js",
-        "types": "./lib/types/index.d.ts"
+        ".": {
+            "import": {
+                "types": "./dist/index.d.ts",
+                "default": "./dist/index.js"
+            },
+            "require": {
+                "types": "./dist/index.d.cts",
+                "default": "./dist/index.cjs"
+            }
+        }
     },
     "scripts": {
-        "nuke": "shx rm -rf node_modules package-lock.json || true",
-        "reinstall": "npm run nuke && npm install",
-        "clean": "shx rm -rf lib **/*.tsbuildinfo || true",
-        "build": "tsc --build --verbose tsconfig.all.json",
-        "postbuild": "shx echo '{ \"type\": \"commonjs\" }' > lib/cjs/package.json",
-        "watch": "tsc --build --verbose --watch tsconfig.all.json",
-        "release": "npm run clean && npm run build",
+        "clean": "rm -rf dist *.tsbuildinfo || true",
+        "build": "tsup",
+        "watch": "tsup --watch",
+        "test": "vitest run",
+        "test:watch": "vitest",
+        "typecheck": "tsc --noEmit",
         "fmt": "prettier --write '{*,**/*}.{ts,tsx,js,jsx,json}'",
-        "lint": "prettier --check '{*,**/*}.{ts,tsx,js,jsx,json}' && eslint --max-warnings 0 .",
-        "lint:fix": "npm run fmt && eslint --fix .",
-        "example": "node --experimental-specifier-resolution=node --loader ts-node/esm example/index.ts",
-        "example:merchant": "node --experimental-specifier-resolution=node --loader ts-node/esm example/payment-flow-merchant/main.ts",
-        "test": "jest",
-        "deploy": "npm run deploy:docs",
-        "docs": "shx rm -rf docs && typedoc && shx cp .nojekyll docs/",
-        "deploy:docs": "npm run docs && gh-pages --dist token/js --dotfiles"
+        "lint": "prettier --check '{*,**/*}.{ts,tsx,js,jsx,json}'",
+        "release": "npm run clean && npm run build"
     },
     "dependencies": {
-        "@solana/qr-code-styling": "^1.6.0",
-        "@solana/spl-token": "^0.4.13",
-        "@solana/web3.js": "^1.98.2",
-        "bignumber.js": "^9.1.0",
-        "cross-fetch": "^3.1.5",
-        "js-base64": "^3.7.2",
-        "tweetnacl": "^1.0.3"
+        "@solana/qr-code-styling": "^1.6.0"
+    },
+    "peerDependencies": {
+        "@solana-program/memo": "^0.11.0",
+        "@solana-program/system": "^0.12.0",
+        "@solana-program/token": "^0.11.0",
+        "@solana-program/token-2022": "^0.9.0",
+        "@solana/kit": "^6.1.0"
     },
     "devDependencies": {
-        "@types/eslint": "^8.4.6",
-        "@types/eslint-plugin-prettier": "^3.1.0",
-        "@types/jest": "^29.0.2",
+        "@solana-program/memo": "^0.11.0",
+        "@solana-program/system": "^0.12.0",
+        "@solana-program/token": "^0.11.0",
+        "@solana-program/token-2022": "^0.9.0",
+        "@solana/kit": "^6.1.0",
+        "@solana/kit-plugins": "^0.5.0",
         "@types/node": "^20.0.0",
-        "@types/node-fetch": "^2.6.2",
-        "@types/prettier": "^2.7.0",
-        "@typescript-eslint/eslint-plugin": "^5.34.0",
-        "@typescript-eslint/parser": "^5.34.0",
-        "eslint": "^8.23.1",
-        "eslint-config-prettier": "^8.5.0",
-        "eslint-plugin-prettier": "^4.2.1",
-        "eslint-plugin-require-extensions": "^0.1.1",
-        "gh-pages": "^6.3.0",
-        "jest": "^29.0.3",
-        "jest-environment-jsdom": "^29.0.3",
-        "prettier": "^2.7.1",
-        "shx": "^0.3.4",
-        "ts-jest": "^29.0.0",
-        "ts-node": "^10.9.1",
-        "tslib": "^2.4.0",
-        "typedoc": "^0.26.0",
-        "typescript": "^5.3.3",
-        "typescript-esm": "^2.0.0"
+        "prettier": "^3.8.1",
+        "tsup": "^8.5.1",
+        "typescript": "^5.9.3",
+        "vitest": "^4.0.18"
     }
 }

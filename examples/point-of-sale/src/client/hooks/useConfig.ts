@@ -1,14 +1,14 @@
-import { PublicKey } from '@solana/web3.js';
+import type { Address } from '@solana/kit';
 import { createContext, ReactElement, useContext } from 'react';
 import { Confirmations, Digits } from '../types';
 
 export interface ConfigContextState {
     baseURL: string;
     link: URL | undefined;
-    recipient: PublicKey;
+    recipient: Address;
     label: string;
     message?: string;
-    splToken: PublicKey | undefined;
+    splToken: Address | undefined;
     symbol: string;
     icon: ReactElement;
     decimals: Digits;

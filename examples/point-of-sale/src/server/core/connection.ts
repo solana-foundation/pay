@@ -1,4 +1,4 @@
-import { Connection } from '@solana/web3.js';
+import { createSolanaRpc } from '@solana/kit';
 import { CLUSTER_ENDPOINT } from './env';
 
-export const connection = new Connection(CLUSTER_ENDPOINT, 'confirmed');
+export const rpc = createSolanaRpc(CLUSTER_ENDPOINT);

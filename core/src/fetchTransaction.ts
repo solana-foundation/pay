@@ -1,8 +1,15 @@
-import type { Commitment, Connection, GetLatestBlockhashConfig, PublicKey } from '@solana/web3.js';
-import { Transaction } from '@solana/web3.js';
-import fetch from 'cross-fetch';
-import { toUint8Array } from 'js-base64';
-import nacl from 'tweetnacl';
+import type { Address, Commitment, Rpc, GetLatestBlockhashApi, Transaction, ReadonlyUint8Array, CompiledTransactionMessage, CompiledTransactionMessageWithLifetime } from '@solana/kit';
+import {
+    getBase64Encoder,
+    getAddressEncoder,
+    getTransactionDecoder,
+    getCompiledTransactionMessageDecoder,
+    decompileTransactionMessage,
+    setTransactionMessageFeePayer,
+    setTransactionMessageLifetimeUsingBlockhash,
+    compileTransaction,
+} from '@solana/kit';
+import { verifySignature, assertIsSignatureBytes } from '@solana/keys';
 
 /**
  * Thrown when a transaction response can't be fetched.
@@ -12,65 +19,135 @@ export class FetchTransactionError extends Error {
 }
 
 /**
+ * A compiled transaction with message bytes and signatures.
+ */
+export type FetchedTransaction = Transaction;
+
+/**
  * Fetch a transaction from a Solana Pay transaction request link.
  *
- * @param connection - A connection to the cluster.
- * @param account - Account that may sign the transaction.
+ * @param rpc - An RPC client supporting `getLatestBlockhash`.
+ * @param account - Address of the account that may sign the transaction.
  * @param link - `link` in the [Solana Pay spec](https://github.com/solana-labs/solana-pay/blob/master/SPEC.md#link).
  * @param options - Options for `getLatestBlockhash`.
  *
  * @throws {FetchTransactionError}
  */
 export async function fetchTransaction(
-    connection: Connection,
-    account: PublicKey,
+    rpc: Rpc<GetLatestBlockhashApi>,
+    account: Address,
     link: string | URL,
-    { commitment }: { commitment?: Commitment | GetLatestBlockhashConfig } = {}
-): Promise<Transaction> {
-    const response = await fetch(String(link), {
-        method: 'POST',
-        mode: 'cors',
-        cache: 'no-cache',
-        credentials: 'omit',
-        headers: {
-            Accept: 'application/json',
-            'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ account }),
-    });
+    { commitment }: { commitment?: Commitment } = {}
+): Promise<FetchedTransaction> {
+    let response: Response;
+    try {
+        response = await fetch(String(link), {
+            method: 'POST',
+            mode: 'cors',
+            credentials: 'omit',
+            headers: {
+                'Cache-Control': 'no-cache',
+                Accept: 'application/json',
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ account }),
+        });
+    } catch (error) {
+        throw new FetchTransactionError(`network error: ${error instanceof Error ? error.message : String(error)}`);
+    }
 
-    const json = await response.json();
+    if (!response.ok) throw new FetchTransactionError(`request failed: ${response.status}`);
+
+    let json: Record<string, unknown>;
+    try {
+        json = (await response.json()) as Record<string, unknown>;
+    } catch {
+        throw new FetchTransactionError('response is not valid JSON');
+    }
     if (!json?.transaction) throw new FetchTransactionError('missing transaction');
     if (typeof json.transaction !== 'string') throw new FetchTransactionError('invalid transaction');
 
-    const transaction = Transaction.from(toUint8Array(json.transaction));
-    const { signatures, feePayer, recentBlockhash } = transaction;
+    // Decode the base64 transaction string to bytes, then decode the transaction
+    let transactionBytes: ReadonlyUint8Array;
+    try {
+        transactionBytes = getBase64Encoder().encode(json.transaction as string);
+    } catch {
+        throw new FetchTransactionError('invalid base64 in transaction');
+    }
 
-    if (signatures.length) {
+    let transaction: Transaction;
+    try {
+        transaction = getTransactionDecoder().decode(transactionBytes as Uint8Array);
+    } catch {
+        throw new FetchTransactionError('failed to decode transaction wire format');
+    }
+
+    let compiledMessage: CompiledTransactionMessage & CompiledTransactionMessageWithLifetime;
+    try {
+        compiledMessage = getCompiledTransactionMessageDecoder().decode(transaction.messageBytes);
+    } catch {
+        throw new FetchTransactionError('failed to decode compiled transaction message');
+    }
+
+    // Extract signatures map
+    const signatures = transaction.signatures;
+    const signerAddresses = Object.keys(signatures) as Address[];
+
+    // Check if there are any non-null signatures (non-zero bytes)
+    const hasSignatures = signerAddresses.some((addr) => {
+        const sig = signatures[addr];
+        return sig != null && !sig.every((b: number) => b === 0);
+    });
+
+    if (hasSignatures) {
+        // Fee payer is the first static account in the message
+        const feePayer = signerAddresses[0];
         if (!feePayer) throw new FetchTransactionError('missing fee payer');
-        if (!feePayer.equals(signatures[0].publicKey)) throw new FetchTransactionError('invalid fee payer');
-        if (!recentBlockhash) throw new FetchTransactionError('missing recent blockhash');
 
-        // A valid signature for everything except `account` must be provided.
-        const message = transaction.serializeMessage();
-        for (const { signature, publicKey } of signatures) {
-            if (signature) {
-                if (!nacl.sign.detached.verify(message, signature, publicKey.toBuffer()))
-                    throw new FetchTransactionError('invalid signature');
-            } else if (publicKey.equals(account)) {
-                // If the only signature expected is for `account`, ignore the recent blockhash in the transaction.
-                if (signatures.length === 1) {
-                    transaction.recentBlockhash = (await connection.getLatestBlockhash(commitment)).blockhash;
+        // Verify the fee payer matches the first account
+        if (compiledMessage.staticAccounts.length === 0 || compiledMessage.staticAccounts[0] !== feePayer) {
+            throw new FetchTransactionError('invalid fee payer');
+        }
+
+        // Check that a blockhash lifetime exists
+        if (!compiledMessage.lifetimeToken) {
+            throw new FetchTransactionError('missing recent blockhash');
+        }
+
+        // Verify each non-null signature using kit verifySignature
+        const addressEncoder = getAddressEncoder();
+        for (const addr of signerAddresses) {
+            const sig = signatures[addr];
+            const isNonZero = sig != null && !sig.every((b: number) => b === 0);
+
+            if (isNonZero) {
+                const publicKeyBytes = addressEncoder.encode(addr);
+                const cryptoKey = await crypto.subtle.importKey('raw', publicKeyBytes, { name: 'Ed25519' }, false, [
+                    'verify',
+                ]);
+                assertIsSignatureBytes(sig);
+                const isValid = await verifySignature(cryptoKey, sig, transaction.messageBytes);
+                if (!isValid) throw new FetchTransactionError('invalid signature');
+            } else if (addr === account) {
+                // If the only signature needed is for `account`, refresh the blockhash
+                if (signerAddresses.length === 1) {
+                    const { value } = await rpc.getLatestBlockhash({ commitment }).send();
+                    const msg = decompileTransactionMessage(compiledMessage);
+                    const updatedMsg = setTransactionMessageLifetimeUsingBlockhash(value, msg);
+                    return compileTransaction(updatedMsg);
                 }
             } else {
                 throw new FetchTransactionError('missing signature');
             }
         }
-    } else {
-        // Ignore the fee payer and recent blockhash in the transaction and initialize them.
-        transaction.feePayer = account;
-        transaction.recentBlockhash = (await connection.getLatestBlockhash(commitment)).blockhash;
-    }
 
-    return transaction;
+        return transaction;
+    } else {
+        // No signatures — set fee payer and fresh blockhash
+        const { value } = await rpc.getLatestBlockhash({ commitment }).send();
+        const msg = decompileTransactionMessage(compiledMessage);
+        const withFeePayer = setTransactionMessageFeePayer(account, msg);
+        const withLifetime = setTransactionMessageLifetimeUsingBlockhash(value, withFeePayer);
+        return compileTransaction(withLifetime);
+    }
 }

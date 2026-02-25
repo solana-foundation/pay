@@ -1,5 +1,4 @@
-import { PublicKey } from '@solana/web3.js';
-import BigNumber from 'bignumber.js';
+import { address } from '@solana/kit';
 import { HTTPS_PROTOCOL, SOLANA_PROTOCOL } from './constants.js';
 import type { Amount, Label, Link, Memo, Message, Recipient, Reference, SPLToken } from './types.js';
 
@@ -76,38 +75,38 @@ function parseTransactionRequestURL({ pathname, searchParams }: URL): Transactio
 }
 
 function parseTransferRequestURL({ pathname, searchParams }: URL): TransferRequestURL {
-    let recipient: PublicKey;
+    let recipient: Recipient;
     try {
-        recipient = new PublicKey(pathname);
-    } catch (error: any) {
+        recipient = address(pathname);
+    } catch (error) {
         throw new ParseURLError('recipient invalid');
     }
 
-    let amount: BigNumber | undefined;
+    let amount: number | undefined;
     const amountParam = searchParams.get('amount');
     if (amountParam != null) {
         if (!/^\d+(\.\d+)?$/.test(amountParam)) throw new ParseURLError('amount invalid');
 
-        amount = new BigNumber(amountParam);
-        if (amount.isNaN()) throw new ParseURLError('amount NaN');
-        if (amount.isNegative()) throw new ParseURLError('amount negative');
+        amount = Number(amountParam);
+        if (Number.isNaN(amount)) throw new ParseURLError('amount NaN');
+        if (amount < 0) throw new ParseURLError('amount negative');
     }
 
-    let splToken: PublicKey | undefined;
+    let splToken: SPLToken | undefined;
     const splTokenParam = searchParams.get('spl-token');
     if (splTokenParam != null) {
         try {
-            splToken = new PublicKey(splTokenParam);
+            splToken = address(splTokenParam);
         } catch (error) {
             throw new ParseURLError('spl-token invalid');
         }
     }
 
-    let reference: PublicKey[] | undefined;
+    let reference: Reference[] | undefined;
     const referenceParams = searchParams.getAll('reference');
     if (referenceParams.length) {
         try {
-            reference = referenceParams.map((reference) => new PublicKey(reference));
+            reference = referenceParams.map((ref) => address(ref));
         } catch (error) {
             throw new ParseURLError('reference invalid');
         }
