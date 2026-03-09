@@ -1,4 +1,3 @@
-import BigNumber from 'bignumber.js';
 import React, { FC, useCallback, useEffect, useMemo, useState } from 'react';
 import { useConfig } from '../../hooks/useConfig';
 import { usePayment } from '../../hooks/usePayment';
@@ -40,7 +39,7 @@ export const NumPad: FC = () => {
     const onBackspace = useCallback(() => setValue((value) => (value.length ? value.slice(0, -1) || '0' : value)), []);
 
     const { setAmount } = usePayment();
-    useEffect(() => setAmount(value ? new BigNumber(value) : undefined), [setAmount, value]);
+    useEffect(() => setAmount(value ? parseFloat(value) : undefined), [setAmount, value]);
 
     return (
         <div className={css.root}>

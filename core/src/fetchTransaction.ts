@@ -17,6 +17,7 @@ import {
     setTransactionMessageFeePayer,
     setTransactionMessageLifetimeUsingBlockhash,
     compileTransaction,
+    address,
 } from '@solana/kit';
 import { verifySignature, assertIsSignatureBytes } from '@solana/keys';
 
@@ -79,14 +80,14 @@ export async function fetchTransaction(
     // Decode the base64 transaction string to bytes, then decode the transaction
     let transactionBytes: ReadonlyUint8Array;
     try {
-        transactionBytes = getBase64Encoder().encode(json.transaction as string);
+        transactionBytes = getBase64Encoder().encode(json.transaction);
     } catch {
         throw new FetchTransactionError('invalid base64 in transaction');
     }
 
     let transaction: Transaction;
     try {
-        transaction = getTransactionDecoder().decode(transactionBytes as Uint8Array);
+        transaction = getTransactionDecoder().decode(transactionBytes);
     } catch {
         throw new FetchTransactionError('failed to decode transaction wire format');
     }
@@ -100,7 +101,7 @@ export async function fetchTransaction(
 
     // Extract signatures map
     const signatures = transaction.signatures;
-    const signerAddresses = Object.keys(signatures) as Address[];
+    const signerAddresses = Object.keys(signatures).map((addr) => address(addr));
 
     const hasSignatures = signerAddresses.some((addr) => {
         const sig = signatures[addr];

@@ -1,5 +1,4 @@
 import type { Address, Signature } from '@solana/kit';
-import BigNumber from 'bignumber.js';
 import { createContext, useContext } from 'react';
 import { Confirmations } from '../types';
 
@@ -13,8 +12,8 @@ export enum PaymentStatus {
 }
 
 export interface PaymentContextState {
-    amount: BigNumber | undefined;
-    setAmount(amount: BigNumber | undefined): void;
+    amount: number | undefined;
+    setAmount(amount: number | undefined): void;
     memo: string | undefined;
     setMemo(memo: string | undefined): void;
     reference: Address | undefined;

@@ -1,6 +1,5 @@
 import type { Connection } from '@solana/web3.js';
 import { LAMPORTS_PER_SOL, sendAndConfirmTransaction } from '@solana/web3.js';
-import BigNumber from 'bignumber.js';
 import type { TransferRequestURL } from '../../lib/types.js';
 import { createTransfer, parseURL } from '../../src.js';
 import { CUSTOMER_WALLET } from './constants.js';

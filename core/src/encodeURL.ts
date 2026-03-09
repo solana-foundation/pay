@@ -73,10 +73,7 @@ function encodeTransferRequestURL({
     const url = new URL(SOLANA_PROTOCOL + pathname);
 
     if (amount != null) {
-        // Handle scientific notation (e.g., 1e-9 for 0.000000001)
-        const s = amount.toString();
-        const formatted = s.includes('e') ? amount.toFixed(20).replace(/0+$/, '').replace(/\.$/, '') : s;
-        url.searchParams.append('amount', formatted);
+        url.searchParams.append('amount', amount.toFixed(10).replace(/0+$/, '').replace(/\.$/, ''));
     }
 
     if (splToken) {

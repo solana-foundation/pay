@@ -1,4 +1,4 @@
-import type { Address, GetTransactionApi, Rpc, Signature } from '@solana/kit';
+import type { Address, GetTransactionApi, Lamports, Rpc, Signature, TokenBalance, TransactionError } from '@solana/kit';
 import { getBase58Encoder } from '@solana/kit';
 import { SYSTEM_PROGRAM_ADDRESS } from '@solana-program/system';
 import { findAssociatedTokenPda, TOKEN_PROGRAM_ADDRESS } from '@solana-program/token';
@@ -45,17 +45,11 @@ interface RpcTransactionInstruction {
  */
 export interface GetTransactionJsonResponse {
     meta: {
-        err: unknown;
-        preBalances: readonly bigint[];
-        postBalances: readonly bigint[];
-        preTokenBalances?: readonly {
-            accountIndex: number;
-            uiTokenAmount: { uiAmountString: string; amount: string; decimals: number };
-        }[];
-        postTokenBalances?: readonly {
-            accountIndex: number;
-            uiTokenAmount: { uiAmountString: string; amount: string; decimals: number };
-        }[];
+        err: TransactionError | null;
+        preBalances: readonly Lamports[];
+        postBalances: readonly Lamports[];
+        preTokenBalances?: readonly TokenBalance[];
+        postTokenBalances?: readonly TokenBalance[];
     } | null;
     transaction: {
         message: {
@@ -139,7 +133,7 @@ export async function validateTransfer(
     return response;
 }
 
-function decodeBase58(data: string) {
+function base58ToBytes(data: string) {
     try {
         return base58Encoder.encode(data);
     } catch {
@@ -154,7 +148,7 @@ function validateMemo(instruction: RpcTransactionInstruction, accountKeys: reado
     // Decode the base58 instruction data and compare with expected memo
     const encoder = new TextEncoder();
     const expectedBytes = encoder.encode(memo);
-    const decodedData = decodeBase58(instruction.data);
+    const decodedData = base58ToBytes(instruction.data);
     if (decodedData.length !== expectedBytes.length) throw new ValidateTransferError('invalid memo');
     for (let i = 0; i < decodedData.length; i++) {
         if (decodedData[i] !== expectedBytes[i]) throw new ValidateTransferError('invalid memo');
@@ -219,7 +213,7 @@ async function validateSPLTokenTransfer(
 
         // For transferChecked: accounts = [source, mint, destination, authority, ...multiSigners]
         // For transfer: accounts = [source, destination, authority, ...multiSigners]
-        const decoded = decodeBase58(instruction.data);
+        const decoded = base58ToBytes(instruction.data);
         const transferDataByte = decoded[0];
         if (transferDataByte !== 3 && transferDataByte !== 12) {
             throw new ValidateTransferError('invalid transfer instruction');

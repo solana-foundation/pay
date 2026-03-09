@@ -54,7 +54,7 @@ export async function findReference(
 
     // If one or more transaction signatures are found under the limit, return the oldest one.
     const oldest = signatures[length - 1];
-    if (length < (options?.limit || 1000)) return oldest as ConfirmedSignatureInfo;
+    if (length < (options?.limit || 1000)) return oldest;
 
     try {
         // In the unlikely event that signatures up to the limit are found, recursively find the oldest one.
@@ -65,7 +65,7 @@ export async function findReference(
         });
     } catch (error) {
         // If the signatures found were exactly at the limit, there won't be more to find, so return the oldest one.
-        if (error instanceof FindReferenceError) return oldest as ConfirmedSignatureInfo;
+        if (error instanceof FindReferenceError) return oldest;
         throw error;
     }
 }

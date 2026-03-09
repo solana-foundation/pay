@@ -1,11 +1,11 @@
 /**
  * Convert a decimal amount to base units via string manipulation (avoids float precision issues).
  *
- * **Precision note:** JavaScript `number` has ~15-17 significant digits of precision.
- * For tokens with high decimals (e.g., 10), amounts above ~100,000 may silently lose
- * sub-unit precision before reaching this function. This covers 99.9% of real payment
- * use cases. If you need arbitrary-precision amounts, convert to base units (bigint)
- * at the source rather than passing through a `number`.
+ * **Precision note:** JavaScript `number` has ~15 significant digits of precision.
+ * For tokens with high decimals (e.g., 10), amounts above ~100,000 with full fractional
+ * precision may exceed this limit. The function throws when this happens rather than
+ * silently rounding. If you need arbitrary-precision amounts, convert to base units
+ * (bigint) at the source rather than passing through a `number`.
  *
  * @internal
  */

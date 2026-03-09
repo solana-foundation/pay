@@ -1,7 +1,6 @@
 import { findAssociatedTokenPda, TOKEN_PROGRAM_ADDRESS } from '@solana-program/token';
 import type { Address, Signature } from '@solana/kit';
 import { createSolanaRpc } from '@solana/kit';
-import BigNumber from 'bignumber.js';
 import React, { FC, ReactNode, useEffect, useMemo, useState } from 'react';
 import { useConfig } from '../../hooks/useConfig';
 import { Transaction, TransactionsContext, TransactionConfirmationStatus } from '../../hooks/useTransactions';
@@ -141,7 +140,7 @@ export const TransactionsProvider: FC<TransactionsProviderProps> = ({ children, 
                             const type = instruction.parsed?.type;
                             const info = instruction.parsed?.info;
 
-                            let preAmount: BigNumber, postAmount: BigNumber;
+                            let preAmount: number, postAmount: number;
                             if (!associatedToken) {
                                 if (!(program === 'system' && type === 'transfer')) return;
                                 if (info?.destination !== recipient) return;
@@ -156,8 +155,8 @@ export const TransactionsProvider: FC<TransactionsProviderProps> = ({ children, 
                                 const preBalance = parsedTransaction.meta.preBalances[accountIndex];
                                 const postBalance = parsedTransaction.meta.postBalances[accountIndex];
 
-                                preAmount = new BigNumber(Number(preBalance)).div(LAMPORTS_PER_SOL);
-                                postAmount = new BigNumber(Number(postBalance)).div(LAMPORTS_PER_SOL);
+                                preAmount = Number(preBalance) / LAMPORTS_PER_SOL;
+                                postAmount = Number(postBalance) / LAMPORTS_PER_SOL;
                             } else {
                                 if (!(program === 'spl-token' && (type === 'transfer' || type === 'transferChecked')))
                                     return;
@@ -180,13 +179,13 @@ export const TransactionsProvider: FC<TransactionsProviderProps> = ({ children, 
                                 );
                                 if (!postBalance?.uiTokenAmount?.uiAmountString) return;
 
-                                preAmount = new BigNumber(preBalance.uiTokenAmount.uiAmountString);
-                                postAmount = new BigNumber(postBalance.uiTokenAmount.uiAmountString);
+                                preAmount = parseFloat(preBalance.uiTokenAmount.uiAmountString);
+                                postAmount = parseFloat(postBalance.uiTokenAmount.uiAmountString);
                             }
 
-                            if (postAmount.lt(preAmount)) return;
+                            if (postAmount < preAmount) return;
 
-                            const amount = postAmount.minus(preAmount).toString();
+                            const amount = String(postAmount - preAmount);
                             const confirmations =
                                 status === 'finalized'
                                     ? MAX_CONFIRMATIONS

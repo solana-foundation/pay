@@ -10,7 +10,6 @@ import {
     compileTransaction,
     getBase64EncodedWireTransaction,
 } from '@solana/kit';
-import BigNumber from 'bignumber.js';
 import { NextApiHandler } from 'next';
 import { rpc } from '../core';
 import { cors, rateLimit } from '../middleware';
@@ -47,7 +46,7 @@ const post: NextApiHandler<PostResponse> = async (request, response) => {
     const amountField = request.query.amount;
     if (!amountField) throw new Error('missing amount');
     if (typeof amountField !== 'string') throw new Error('invalid amount');
-    const amount = new BigNumber(amountField);
+    const amount = parseFloat(amountField);
 
     const splTokenField = request.query['spl-token'];
     if (splTokenField && typeof splTokenField !== 'string') throw new Error('invalid spl-token');
@@ -71,7 +70,6 @@ const post: NextApiHandler<PostResponse> = async (request, response) => {
     if (typeof accountField !== 'string') throw new Error('invalid account');
     const account = address(accountField);
 
-    // createTransfer now returns Instruction[]
     const senderSigner = createNoopSigner(account);
     const instructions = await createTransfer(rpc, senderSigner, {
         recipient,

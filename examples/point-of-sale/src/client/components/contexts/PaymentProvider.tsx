@@ -21,7 +21,6 @@ import {
     generateKeyPairSigner,
     getBase64EncodedWireTransaction,
 } from '@solana/kit';
-import BigNumber from 'bignumber.js';
 import { useRouter } from 'next/router';
 import React, { FC, ReactNode, useCallback, useEffect, useMemo, useState } from 'react';
 import { useConfig } from '../../hooks/useConfig';
@@ -44,17 +43,17 @@ export const PaymentProvider: FC<PaymentProviderProps> = ({ children }) => {
 
     const router = useRouter();
 
-    const [amount, setAmount] = useState<BigNumber | undefined>(() => {
+    const [amount, setAmount] = useState<number | undefined>(() => {
         const { amount } = router.query;
         if (!amount) return undefined;
 
-        const asBigNumber = Array.isArray(amount) ? new BigNumber(amount[0]) : new BigNumber(amount);
-        if (asBigNumber.isNaN() || !asBigNumber.isFinite() || asBigNumber.isLessThanOrEqualTo(0)) {
+        const parsed = parseFloat(Array.isArray(amount) ? amount[0] : amount);
+        if (isNaN(parsed) || !isFinite(parsed) || parsed <= 0) {
             console.error('Invalid amount', amount);
             return undefined;
         }
 
-        return asBigNumber;
+        return parsed;
     });
 
     const [memo, setMemo] = useState<string>();
@@ -72,7 +71,7 @@ export const PaymentProvider: FC<PaymentProviderProps> = ({ children }) => {
             url.searchParams.append('recipient', recipient);
 
             if (amount) {
-                url.searchParams.append('amount', amount.toFixed(amount.decimalPlaces() ?? 0));
+                url.searchParams.append('amount', String(amount));
             }
 
             if (splToken) {
@@ -149,7 +148,6 @@ export const PaymentProvider: FC<PaymentProviderProps> = ({ children }) => {
                         const { recipient, amount, splToken, reference, memo } = request;
                         if (!amount) return;
 
-                        // createTransfer now returns Instruction[]
                         const instructions = await createTransfer(rpc, txSigner, {
                             recipient,
                             amount,

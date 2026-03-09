@@ -50,17 +50,18 @@
     "peerDependencies": {
         "@solana-program/memo": "^0.11.0",
         "@solana-program/system": "^0.12.0",
-        "@solana-program/token": "^0.11.0",
+        "@solana-program/token": "^0.12.0",
         "@solana-program/token-2022": "^0.9.0",
-        "@solana/kit": "^6.1.0"
+        "@solana/kit": "^6.2.0"
     },
     "devDependencies": {
         "@solana-program/memo": "^0.11.0",
         "@solana-program/system": "^0.12.0",
-        "@solana-program/token": "^0.11.0",
+        "@solana-program/token": "^0.12.0",
         "@solana-program/token-2022": "^0.9.0",
-        "@solana/kit": "^6.1.0",
-        "@solana/kit-plugins": "^0.5.0",
+        "@solana/kit": "^6.2.0",
+        "@solana/kit-client-litesvm": "^0.6.2",
+        "@solana/kit-plugins": "^0.6.0",
         "@types/node": "^20.0.0",
         "prettier": "^3.8.1",
         "tsup": "^8.5.1",

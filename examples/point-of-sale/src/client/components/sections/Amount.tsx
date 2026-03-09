@@ -1,10 +1,9 @@
-import BigNumber from 'bignumber.js';
 import React, { FC, useMemo } from 'react';
 import { useConfig } from '../../hooks/useConfig';
 import { NON_BREAKING_SPACE } from '../../utils/constants';
 
 export interface AmountProps {
-    amount: BigNumber | undefined;
+    amount: number | undefined;
     showZero?: boolean;
 }
 
@@ -12,10 +11,13 @@ export const Amount: FC<AmountProps> = ({ amount, showZero }) => {
     const { minDecimals } = useConfig();
 
     const value = useMemo(() => {
-        if (!amount) return NON_BREAKING_SPACE;
-        if (amount.isGreaterThan(0)) {
-            const decimals = amount.decimalPlaces() ?? 0
-            return amount.toFormat(decimals < minDecimals ? minDecimals : decimals);
+        if (amount == null) return NON_BREAKING_SPACE;
+        if (amount > 0) {
+            const decimals = (amount.toString().split('.')[1] || '').length;
+            return amount.toLocaleString(undefined, {
+                minimumFractionDigits: decimals < minDecimals ? minDecimals : decimals,
+                maximumFractionDigits: Math.max(decimals, minDecimals),
+            });
         } else {
             return showZero ? '0' : NON_BREAKING_SPACE;
         }

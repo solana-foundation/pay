@@ -8,7 +8,7 @@ import type {
     Options,
     TypeNumber,
 } from '@solana/qr-code-styling';
-import QRCodeStyling from '@solana/qr-code-styling';
+import QRCodeStylingModule from '@solana/qr-code-styling';
 
 /**
  * Create a QR code from a Solana Pay URL.
@@ -18,10 +18,13 @@ import QRCodeStyling from '@solana/qr-code-styling';
  * @param background - Background color, which should be light for device compatibility.
  * @param color - Foreground color, which should be dark for device compatibility.
  */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-export function createQR(url: string | URL, size = 512, background = 'white', color = 'black'): any {
-    const Ctor = QRCodeStyling as unknown as new (options: Options) => unknown;
-    return new Ctor(createQROptions(url, size, background, color));
+export function createQR(
+    url: string | URL,
+    size = 512,
+    background = 'white',
+    color = 'black'
+): InstanceType<typeof QRCodeStylingModule.default> {
+    return new QRCodeStylingModule.default(createQROptions(url, size, background, color));
 }
 
 /** @ignore */

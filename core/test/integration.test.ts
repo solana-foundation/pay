@@ -1,56 +1,40 @@
 import { describe, it, expect, beforeAll } from 'vitest';
+import type { GetSignaturesForAddressApi, GetTransactionApi, Rpc } from '@solana/kit';
+import { generateKeyPairSigner, lamports, TransactionSigner } from '@solana/kit';
+import { createClient } from '@solana/kit-client-litesvm';
 import {
-    createEmptyClient,
-    createTransactionMessage,
-    createTransactionPlanner,
-    generateKeyPairSigner,
-    lamports,
-    pipe,
-    setTransactionMessageFeePayerSigner,
-    TransactionSigner,
-} from '@solana/kit';
-import {
-    localhostRpc,
-    planAndSendTransactions,
-    generatedPayerWithSol,
-    airdrop,
-    defaultTransactionPlannerAndExecutorFromLitesvm,
-} from '@solana/kit-plugins';
-import { litesvm } from '@solana/kit-plugin-litesvm';
-import {
-    fetchToken,
     findAssociatedTokenPda,
     getCreateAssociatedTokenIdempotentInstructionAsync,
     TOKEN_PROGRAM_ADDRESS,
-    getMintToATAInstructionPlanAsync,
-    getCreateMintInstructionPlan,
+    tokenProgram,
 } from '@solana-program/token';
 import { solanaPay, encodeURL, parseURL } from '../src/index.js';
 
-async function createTestClient() {
-    const client = await createEmptyClient()
-        .use(localhostRpc())
-        .use(litesvm())
-        .use(airdrop())
-        .use(generatedPayerWithSol(lamports(100_000_000_000n)))
-        .use(defaultTransactionPlannerAndExecutorFromLitesvm())
-        // Override the transaction planner to remove the provisory SetComputeUnitLimit(0)
-        // instruction added by defaultTransactionPlannerAndExecutorFromLitesvm(). The LiteSVM
-        // executor never resolves this placeholder (unlike the RPC executor), causing all
-        // transactions to fail with ComputationalBudgetExceeded.
-        // This must come before planAndSendTransactions() since it captures the planner at call time.
-        .use((client) => ({
-            ...client,
-            transactionPlanner: createTransactionPlanner({
-                createTransactionMessage: () =>
-                    pipe(createTransactionMessage({ version: 0 }), (tx) =>
-                        setTransactionMessageFeePayerSigner(client.payer, tx)
-                    ),
-            }),
-        }))
-        .use(planAndSendTransactions())
-        .use(solanaPay());
+/**
+ *
+ * Stub unsupported RPC methods so the client satisfies SolanaPayCompatibleClient.
+ * LiteSVM's RPC doesn't include getSignaturesForAddress/getTransaction,
+ * but integration tests only exercise createTransfer which doesn't need them.
+ * This allows us to maintain type safety while still allowing us to run the tests.
+ */
+function withUnsupportedRpcStubs() {
+    return <T extends { rpc: Rpc<object> }>(client: T) => ({
+        ...client,
+        rpc: new Proxy(client.rpc, {
+            get(target, prop, receiver) {
+                if (prop === 'getSignaturesForAddress' || prop === 'getTransaction') {
+                    return () => {
+                        throw new Error(`${String(prop)} is not supported by LiteSVM`);
+                    };
+                }
+                return Reflect.get(target, prop, receiver);
+            },
+        }) as T['rpc'] & Rpc<GetSignaturesForAddressApi & GetTransactionApi>,
+    });
+}
 
+async function createTestClient() {
+    const client = await createClient().use(withUnsupportedRpcStubs()).use(solanaPay()).use(tokenProgram());
     return client;
 }
 
@@ -171,32 +155,28 @@ describe('Integration: SPL token transfers', () => {
         recipient = await generateKeyPairSigner();
         client.svm.airdrop(recipient.address, lamports(10_000_000n));
         mint = await generateKeyPairSigner();
-
-        await client.sendTransaction(
-            getCreateMintInstructionPlan({ payer, newMint: mint, decimals: DECIMALS, mintAuthority: payer.address })
-        );
-
-        await client.sendTransaction(
-            await getMintToATAInstructionPlanAsync({
-                payer,
-                mint: mint.address,
-                mintAuthority: payer,
-                amount: MINT_AMOUNT,
-                decimals: DECIMALS,
-                owner: payer.address,
-            })
-        );
-
-        await client.sendTransaction(
-            await getMintToATAInstructionPlanAsync({
-                payer,
-                mint: mint.address,
-                mintAuthority: payer,
-                amount: 0n,
-                decimals: DECIMALS,
-                owner: recipient.address,
-            })
-        );
+        await client.token.instructions.createMint({
+            payer,
+            newMint: mint,
+            decimals: DECIMALS,
+            mintAuthority: payer.address,
+        }).sendTransaction();
+        await client.token.instructions.mintToATA({
+            payer,
+            mint: mint.address,
+            amount: MINT_AMOUNT,
+            decimals: DECIMALS,
+            mintAuthority: payer,
+            owner: payer.address,
+        }).sendTransaction();
+        await client.token.instructions.mintToATA({
+            payer,
+            mint: mint.address,
+            amount: 0n,
+            decimals: DECIMALS,
+            mintAuthority: payer,
+            owner: recipient.address,
+        }).sendTransaction();
     });
 
     it('should transfer SPL tokens', async () => {
@@ -212,7 +192,7 @@ describe('Integration: SPL token transfers', () => {
             tokenProgram: TOKEN_PROGRAM_ADDRESS,
             mint: mint.address,
         });
-        const account = await fetchToken(client.rpc, recipientATA);
+        const account = await client.token.accounts.token.fetch(recipientATA);
         expect(account.data.amount).toBe(MINT_AMOUNT);
     });
 

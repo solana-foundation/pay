@@ -25,7 +25,6 @@
         "@solana/kit": "^6.1.0",
         "@solana/pay": "workspace:*",
         "@walletconnect/universal-provider": "^2.23.6",
-        "bignumber.js": "^9.1.0",
         "cache-manager": "^4.1.0",
         "clsx": "^1.2.1",
         "color-interpolate": "^1.0.5",
