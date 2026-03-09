@@ -19,11 +19,12 @@
         "proxy": "local-ssl-proxy --source 3001 --target 3000"
     },
     "dependencies": {
-        "@solana-program/system": "^0.7.0",
-        "@solana-program/token": "^0.5.0",
+        "@solana-program/system": "^0.12.0",
+        "@solana-program/token": "^0.12.0",
         "@solana/connector": "^0.2.4",
-        "@solana/kit": "^6.1.0",
-        "@solana/pay": "workspace:*",
+        "@solana/kit": "^6.2.0",
+        "@solana/pay": "file:../../core",
+        "@solana/qr-code-styling": "^1.6.0",
         "@walletconnect/universal-provider": "^2.23.6",
         "cache-manager": "^4.1.0",
         "clsx": "^1.2.1",
@@ -55,7 +56,8 @@
         "postcss-flexbugs-fixes": "^5.0.2",
         "postcss-nesting": "^10.1.10",
         "postcss-preset-env": "^7.8.0",
-        "prettier": "^2.7.1",
+        "@solana/prettier-config-solana": "^0.0.6",
+        "prettier": "^3.8.1",
         "shx": "^0.3.4",
         "typescript": "^5.9.3"
     }
