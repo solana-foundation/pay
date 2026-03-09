@@ -5,20 +5,17 @@ import { createTransfer, CreateTransferError } from '../src/index.js';
 import { MEMO_PROGRAM_ADDRESS, TOKEN_2022_PROGRAM_ADDRESS } from '../src/constants.js';
 import { describe, it, expect, beforeEach, vi, type Mock } from 'vitest';
 
-// --- Mock functions ---
 const mockedFetchMint = vi.fn();
 const mockedFetchToken = vi.fn();
 const mockedFindAssociatedTokenPda = vi.fn();
 
 vi.mock('@solana-program/token', async () => {
-    // Re-export actual constants manually to avoid vi.importActual
     return {
         TOKEN_PROGRAM_ADDRESS: 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
         fetchMint: (...args: unknown[]) => mockedFetchMint(...args),
         fetchToken: (...args: unknown[]) => mockedFetchToken(...args),
         findAssociatedTokenPda: (...args: unknown[]) => mockedFindAssociatedTokenPda(...args),
         getTransferCheckedInstruction: vi.fn().mockImplementation((input: any, config?: any) => {
-            // Return a minimal instruction-like object
             return {
                 programAddress: config?.programAddress ?? 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
                 accounts: [
@@ -33,7 +30,6 @@ vi.mock('@solana-program/token', async () => {
     };
 });
 
-// --- Constants ---
 const TOKEN_2022_PROGRAM = TOKEN_2022_PROGRAM_ADDRESS;
 
 const TEST_AMOUNTS = {
@@ -49,7 +45,6 @@ const ADDRESSES = {
     recipientATA: address('GfC73miMwXBoRYDn7gvEZVbhM7n6SUHxJb4LdBz2Mfp6'),
 };
 
-// --- Helper: create mock TransactionSigner ---
 function createMockSigner(addr: Address): TransactionSigner {
     return {
         address: addr,
@@ -57,7 +52,6 @@ function createMockSigner(addr: Address): TransactionSigner {
     } as unknown as TransactionSigner;
 }
 
-// --- Helper: create mock RPC ---
 function createMockRpc(accountInfoResponses: Map<string, any>) {
     return {
         getAccountInfo(addr: Address, _config?: unknown) {

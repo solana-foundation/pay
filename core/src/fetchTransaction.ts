@@ -1,4 +1,13 @@
-import type { Address, Commitment, Rpc, GetLatestBlockhashApi, Transaction, ReadonlyUint8Array, CompiledTransactionMessage, CompiledTransactionMessageWithLifetime } from '@solana/kit';
+import type {
+    Address,
+    Commitment,
+    Rpc,
+    GetLatestBlockhashApi,
+    Transaction,
+    ReadonlyUint8Array,
+    CompiledTransactionMessage,
+    CompiledTransactionMessageWithLifetime,
+} from '@solana/kit';
 import {
     getBase64Encoder,
     getAddressEncoder,
@@ -93,28 +102,24 @@ export async function fetchTransaction(
     const signatures = transaction.signatures;
     const signerAddresses = Object.keys(signatures) as Address[];
 
-    // Check if there are any non-null signatures (non-zero bytes)
     const hasSignatures = signerAddresses.some((addr) => {
         const sig = signatures[addr];
         return sig != null && !sig.every((b: number) => b === 0);
     });
 
     if (hasSignatures) {
-        // Fee payer is the first static account in the message
         const feePayer = signerAddresses[0];
         if (!feePayer) throw new FetchTransactionError('missing fee payer');
 
-        // Verify the fee payer matches the first account
         if (compiledMessage.staticAccounts.length === 0 || compiledMessage.staticAccounts[0] !== feePayer) {
             throw new FetchTransactionError('invalid fee payer');
         }
 
-        // Check that a blockhash lifetime exists
         if (!compiledMessage.lifetimeToken) {
             throw new FetchTransactionError('missing recent blockhash');
         }
 
-        // Verify each non-null signature using kit verifySignature
+        // A valid signature for everything except `account` must be provided.
         const addressEncoder = getAddressEncoder();
         for (const addr of signerAddresses) {
             const sig = signatures[addr];
@@ -143,7 +148,7 @@ export async function fetchTransaction(
 
         return transaction;
     } else {
-        // No signatures — set fee payer and fresh blockhash
+        // Ignore the fee payer and recent blockhash in the transaction and initialize them.
         const { value } = await rpc.getLatestBlockhash({ commitment }).send();
         const msg = decompileTransactionMessage(compiledMessage);
         const withFeePayer = setTransactionMessageFeePayer(account, msg);

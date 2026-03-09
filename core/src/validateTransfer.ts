@@ -6,7 +6,6 @@ import { MEMO_PROGRAM_ADDRESS, SOL_DECIMALS, TOKEN_2022_PROGRAM_ADDRESS } from '
 import { amountToBaseUnits } from './utils/amount.js';
 import type { Amount, Finality, Memo, Recipient, Reference, References, SPLToken } from './types.js';
 
-/** Reusable base58 encoder (string → bytes) from kit. */
 const base58Encoder = getBase58Encoder();
 
 /**

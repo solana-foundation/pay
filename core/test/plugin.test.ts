@@ -2,7 +2,6 @@ import { address, type Address, type TransactionSigner } from '@solana/kit';
 import { describe, it, expect, vi } from 'vitest';
 import { solanaPay } from '../src/plugin.js';
 
-// --- Helper: create mock TransactionSigner ---
 function createMockSigner(addr: Address): TransactionSigner {
     return {
         address: addr,
@@ -10,7 +9,6 @@ function createMockSigner(addr: Address): TransactionSigner {
     } as unknown as TransactionSigner;
 }
 
-// --- Helper: create a minimal mock client ---
 function createMockClient(payer?: TransactionSigner) {
     return {
         rpc: {} as any,
@@ -136,7 +134,6 @@ describe('solanaPay plugin', () => {
                     }),
                 }),
             };
-            // Mock for recipient too
             const recipientAddr = address('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v');
             mockRpc.getAccountInfo.mockImplementation((addr: any) => ({
                 send: vi.fn().mockResolvedValue({
@@ -192,7 +189,6 @@ describe('solanaPay plugin', () => {
             );
 
             expect(Array.isArray(instructions)).toBe(true);
-            // Verify the instruction uses the explicit sender's address, not payer's
             const transferIx = instructions[0] as any;
             const senderAccount = transferIx.accounts?.find((a: any) => a.address === sender.address);
             expect(senderAccount).toBeDefined();

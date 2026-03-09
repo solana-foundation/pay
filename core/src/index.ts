@@ -1,4 +1,5 @@
 export * from './constants.js';
+export * from './client.js';
 export * from './createQR.js';
 export * from './createTransfer.js';
 export * from './encodeURL.js';

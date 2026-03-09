@@ -27,14 +27,7 @@ import {
 } from '@solana-program/token';
 import { solanaPay, encodeURL, parseURL } from '../src/index.js';
 
-// --- Client Setup ---
-
 async function createTestClient() {
-    // Note: This is a test client for LiteSVM--b/c Solana Pay requires an RPC plugin and liteSVM only
-    // exposes a subset of the RPC API, we include the localhost RPC plugin to make the test
-    // client compatible with Solana Pay.
-    // The tests do not test non-liteSVM methods (e.g., getSignaturesForAddress) which means we do not have
-    // test cases for verify or fetchTransaction.
     const client = await createEmptyClient()
         .use(localhostRpc())
         .use(litesvm())
@@ -62,8 +55,6 @@ async function createTestClient() {
 }
 
 type TestClient = Awaited<ReturnType<typeof createTestClient>>;
-
-// --- SOL Transfers ---
 
 describe('Integration: SOL transfers', () => {
     let client: TestClient;
@@ -142,8 +133,6 @@ describe('Integration: SOL transfers', () => {
     });
 });
 
-// --- URL Round-trip ---
-
 describe('Integration: URL round-trip', () => {
     let client: TestClient;
 
@@ -169,8 +158,6 @@ describe('Integration: URL round-trip', () => {
     });
 });
 
-// --- SPL Token Transfers ---
-
 describe('Integration: SPL token transfers', () => {
     let client: TestClient;
     let mint: TransactionSigner;
@@ -185,12 +172,10 @@ describe('Integration: SPL token transfers', () => {
         client.svm.airdrop(recipient.address, lamports(10_000_000n));
         mint = await generateKeyPairSigner();
 
-        // Create mint
         await client.sendTransaction(
             getCreateMintInstructionPlan({ payer, newMint: mint, decimals: DECIMALS, mintAuthority: payer.address })
         );
 
-        // Mint tokens to payer's ATA
         await client.sendTransaction(
             await getMintToATAInstructionPlanAsync({
                 payer,
@@ -202,7 +187,6 @@ describe('Integration: SPL token transfers', () => {
             })
         );
 
-        // Create recipient ATA (empty)
         await client.sendTransaction(
             await getMintToATAInstructionPlanAsync({
                 payer,
@@ -236,7 +220,6 @@ describe('Integration: SPL token transfers', () => {
         const poorSender = await generateKeyPairSigner();
         client.svm.airdrop(poorSender.address, lamports(1_000_000_000n));
 
-        // Create ATA for poorSender with 0 tokens
         const createATAIx = await getCreateAssociatedTokenIdempotentInstructionAsync({
             payer: client.payer,
             owner: poorSender.address,
