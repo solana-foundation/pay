@@ -71,9 +71,9 @@ import { createTransfer, encodeURL, findReference, parseURL, validateTransfer } 
 
     const transactionMessage = pipe(
         createTransactionMessage({ version: 0 }),
-        (m) => setTransactionMessageFeePayer(wallet.address, m),
-        (m) => setTransactionMessageLifetimeUsingBlockhash(latestBlockhash, m),
-        (m) => appendTransactionMessageInstructions(instructions, m)
+        m => setTransactionMessageFeePayer(wallet.address, m),
+        m => setTransactionMessageLifetimeUsingBlockhash(latestBlockhash, m),
+        m => appendTransactionMessageInstructions(instructions, m),
     );
 
     const compiled = compileTransaction(transactionMessage);

@@ -112,7 +112,7 @@ describe('Integration: SOL transfers', () => {
         client.svm.airdrop(r.address, lamports(1n));
 
         await expect(client.pay.createTransfer({ recipient: r.address, amount: 1 }, poorSender)).rejects.toThrow(
-            'insufficient funds'
+            'insufficient funds',
         );
     });
 });
@@ -155,28 +155,34 @@ describe('Integration: SPL token transfers', () => {
         recipient = await generateKeyPairSigner();
         client.svm.airdrop(recipient.address, lamports(10_000_000n));
         mint = await generateKeyPairSigner();
-        await client.token.instructions.createMint({
-            payer,
-            newMint: mint,
-            decimals: DECIMALS,
-            mintAuthority: payer.address,
-        }).sendTransaction();
-        await client.token.instructions.mintToATA({
-            payer,
-            mint: mint.address,
-            amount: MINT_AMOUNT,
-            decimals: DECIMALS,
-            mintAuthority: payer,
-            owner: payer.address,
-        }).sendTransaction();
-        await client.token.instructions.mintToATA({
-            payer,
-            mint: mint.address,
-            amount: 0n,
-            decimals: DECIMALS,
-            mintAuthority: payer,
-            owner: recipient.address,
-        }).sendTransaction();
+        await client.token.instructions
+            .createMint({
+                payer,
+                newMint: mint,
+                decimals: DECIMALS,
+                mintAuthority: payer.address,
+            })
+            .sendTransaction();
+        await client.token.instructions
+            .mintToATA({
+                payer,
+                mint: mint.address,
+                amount: MINT_AMOUNT,
+                decimals: DECIMALS,
+                mintAuthority: payer,
+                owner: payer.address,
+            })
+            .sendTransaction();
+        await client.token.instructions
+            .mintToATA({
+                payer,
+                mint: mint.address,
+                amount: 0n,
+                decimals: DECIMALS,
+                mintAuthority: payer,
+                owner: recipient.address,
+            })
+            .sendTransaction();
     });
 
     it('should transfer SPL tokens', async () => {
@@ -208,7 +214,7 @@ describe('Integration: SPL token transfers', () => {
         await client.sendTransaction([createATAIx]);
 
         await expect(
-            client.pay.createTransfer({ recipient: recipient.address, amount: 1, splToken: mint.address }, poorSender)
+            client.pay.createTransfer({ recipient: recipient.address, amount: 1, splToken: mint.address }, poorSender),
         ).rejects.toThrow('insufficient funds');
     });
 
@@ -216,7 +222,7 @@ describe('Integration: SPL token transfers', () => {
         const fakeMint = (await generateKeyPairSigner()).address;
 
         await expect(
-            client.pay.createTransfer({ recipient: recipient.address, amount: 1, splToken: fakeMint })
+            client.pay.createTransfer({ recipient: recipient.address, amount: 1, splToken: fakeMint }),
         ).rejects.toThrow('mint account not found');
     });
 });

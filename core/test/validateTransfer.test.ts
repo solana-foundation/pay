@@ -91,7 +91,7 @@ describe('validateTransfer', () => {
                 validateTransfer(rpc, SIGNATURE, {
                     recipient: ADDRESSES.recipient,
                     amount: -1,
-                })
+                }),
             ).rejects.toThrow('amount invalid');
         });
 
@@ -102,7 +102,7 @@ describe('validateTransfer', () => {
                 validateTransfer(rpc, SIGNATURE, {
                     recipient: ADDRESSES.recipient,
                     amount: NaN,
-                })
+                }),
             ).rejects.toThrow('amount invalid');
         });
     });
@@ -127,7 +127,7 @@ describe('validateTransfer', () => {
                 validateTransfer(rpc, SIGNATURE, {
                     recipient: ADDRESSES.recipient,
                     amount: 1,
-                })
+                }),
             ).rejects.toThrow('not found');
         });
 
@@ -141,7 +141,7 @@ describe('validateTransfer', () => {
                 validateTransfer(rpc, SIGNATURE, {
                     recipient: ADDRESSES.recipient,
                     amount: 1,
-                })
+                }),
             ).rejects.toThrow('missing meta');
         });
 
@@ -153,7 +153,7 @@ describe('validateTransfer', () => {
                 validateTransfer(rpc, SIGNATURE, {
                     recipient: ADDRESSES.recipient,
                     amount: 1,
-                })
+                }),
             ).rejects.toThrow(ValidateTransferError);
         });
 
@@ -165,7 +165,7 @@ describe('validateTransfer', () => {
                 validateTransfer(rpc, SIGNATURE, {
                     recipient: ADDRESSES.recipient,
                     amount: 1, // 1 SOL
-                })
+                }),
             ).rejects.toThrow('amount not transferred');
         });
 
@@ -195,7 +195,7 @@ describe('validateTransfer', () => {
                     recipient: ADDRESSES.recipient,
                     amount: 1,
                     reference: ADDRESSES.reference, // expects reference but none in tx
-                })
+                }),
             ).rejects.toThrow('invalid references');
         });
     });
@@ -249,7 +249,7 @@ describe('validateTransfer', () => {
                     recipient: ADDRESSES.recipient,
                     amount: 1,
                     memo: 'test',
-                })
+                }),
             ).rejects.toThrow('missing memo instruction');
         });
 
@@ -265,7 +265,7 @@ describe('validateTransfer', () => {
                     recipient: ADDRESSES.recipient,
                     amount: 1,
                     memo: 'wrong memo',
-                })
+                }),
             ).rejects.toThrow('invalid memo');
         });
     });

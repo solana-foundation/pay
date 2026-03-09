@@ -1,4 +1,5 @@
 import { address } from '@solana/kit';
+
 import { HTTPS_PROTOCOL, SOLANA_PROTOCOL } from './constants.js';
 import type { Amount, Label, Link, Memo, Message, Recipient, Reference, SPLToken } from './types.js';
 
@@ -48,7 +49,7 @@ export class ParseURLError extends Error {
  *
  * @throws {ParseURLError}
  */
-export function parseURL(url: string | URL): TransactionRequestURL | TransferRequestURL {
+export function parseURL(url: URL | string): TransactionRequestURL | TransferRequestURL {
     if (typeof url === 'string') {
         if (url.length > 2048) throw new ParseURLError('length invalid');
         url = new URL(url);
@@ -78,7 +79,7 @@ function parseTransferRequestURL({ pathname, searchParams }: URL): TransferReque
     let recipient: Recipient;
     try {
         recipient = address(pathname);
-    } catch (error) {
+    } catch {
         throw new ParseURLError('recipient invalid');
     }
 
@@ -97,7 +98,7 @@ function parseTransferRequestURL({ pathname, searchParams }: URL): TransferReque
     if (splTokenParam != null) {
         try {
             splToken = address(splTokenParam);
-        } catch (error) {
+        } catch {
             throw new ParseURLError('spl-token invalid');
         }
     }
@@ -106,8 +107,8 @@ function parseTransferRequestURL({ pathname, searchParams }: URL): TransferReque
     const referenceParams = searchParams.getAll('reference');
     if (referenceParams.length) {
         try {
-            reference = referenceParams.map((ref) => address(ref));
-        } catch (error) {
+            reference = referenceParams.map(ref => address(ref));
+        } catch {
             throw new ParseURLError('reference invalid');
         }
     }

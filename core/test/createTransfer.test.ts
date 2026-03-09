@@ -227,7 +227,7 @@ describe('createTransfer', () => {
                 createTransfer(rpc, sender, {
                     recipient: ADDRESSES.recipient,
                     amount: TEST_AMOUNTS.ONE_TOKEN,
-                })
+                }),
             ).rejects.toThrow(CreateTransferError);
         });
 
@@ -241,7 +241,7 @@ describe('createTransfer', () => {
                 createTransfer(rpc, sender, {
                     recipient: ADDRESSES.recipient,
                     amount: TEST_AMOUNTS.ONE_TOKEN,
-                })
+                }),
             ).rejects.toThrow(CreateTransferError);
         });
 
@@ -256,7 +256,7 @@ describe('createTransfer', () => {
                 createTransfer(rpc, sender, {
                     recipient: ADDRESSES.recipient,
                     amount: TEST_AMOUNTS.ONE_TOKEN,
-                })
+                }),
             ).rejects.toThrow('sender owner invalid');
         });
 
@@ -271,7 +271,7 @@ describe('createTransfer', () => {
                 createTransfer(rpc, sender, {
                     recipient: ADDRESSES.recipient,
                     amount: TEST_AMOUNTS.ONE_TOKEN,
-                })
+                }),
             ).rejects.toThrow('sender executable');
         });
 
@@ -286,7 +286,7 @@ describe('createTransfer', () => {
                 createTransfer(rpc, sender, {
                     recipient: ADDRESSES.recipient,
                     amount: TEST_AMOUNTS.ONE_TOKEN, // 1 SOL = 1B lamports
-                })
+                }),
             ).rejects.toThrow('insufficient funds');
         });
     });
@@ -385,7 +385,7 @@ describe('createTransfer', () => {
                     recipient: ADDRESSES.recipient,
                     amount: TEST_AMOUNTS.ONE_TOKEN,
                     splToken: ADDRESSES.splToken,
-                })
+                }),
             ).rejects.toThrow('mint not initialized');
         });
 
@@ -397,7 +397,7 @@ describe('createTransfer', () => {
                     recipient: ADDRESSES.recipient,
                     amount: TEST_AMOUNTS.ONE_TOKEN,
                     splToken: ADDRESSES.splToken,
-                })
+                }),
             ).rejects.toThrow('sender not initialized');
         });
 
@@ -409,7 +409,7 @@ describe('createTransfer', () => {
                     recipient: ADDRESSES.recipient,
                     amount: TEST_AMOUNTS.ONE_TOKEN,
                     splToken: ADDRESSES.splToken,
-                })
+                }),
             ).rejects.toThrow('sender frozen');
         });
 
@@ -421,7 +421,7 @@ describe('createTransfer', () => {
                     recipient: ADDRESSES.recipient,
                     amount: TEST_AMOUNTS.ONE_TOKEN,
                     splToken: ADDRESSES.splToken,
-                })
+                }),
             ).rejects.toThrow('recipient not initialized');
         });
 
@@ -433,7 +433,7 @@ describe('createTransfer', () => {
                     recipient: ADDRESSES.recipient,
                     amount: TEST_AMOUNTS.ONE_TOKEN,
                     splToken: ADDRESSES.splToken,
-                })
+                }),
             ).rejects.toThrow('recipient frozen');
         });
 
@@ -445,7 +445,7 @@ describe('createTransfer', () => {
                     recipient: ADDRESSES.recipient,
                     amount: TEST_AMOUNTS.TWO_TOKENS,
                     splToken: ADDRESSES.splToken,
-                })
+                }),
             ).rejects.toThrow('insufficient funds');
         });
     });

@@ -24,7 +24,7 @@ export function amountToBaseUnits(amount: number, decimals: number): bigint {
     if (significantDigits > 15) {
         throw new Error(
             `Amount ${amount} with ${decimals} decimals exceeds safe floating-point precision (${significantDigits} significant digits > 15). ` +
-                'Use a smaller amount or fewer decimals to avoid silent precision loss.'
+                'Use a smaller amount or fewer decimals to avoid silent precision loss.',
         );
     }
 

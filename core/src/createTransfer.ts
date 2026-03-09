@@ -6,6 +6,7 @@ import {
     type Rpc,
     type TransactionSigner,
 } from '@solana/kit';
+import { getAddMemoInstruction } from '@solana-program/memo';
 import { getTransferSolInstruction, SYSTEM_PROGRAM_ADDRESS } from '@solana-program/system';
 import {
     fetchMint,
@@ -14,10 +15,10 @@ import {
     getTransferCheckedInstruction,
     TOKEN_PROGRAM_ADDRESS,
 } from '@solana-program/token';
-import { getAddMemoInstruction } from '@solana-program/memo';
+
 import { SOL_DECIMALS, TOKEN_2022_PROGRAM_ADDRESS } from './constants.js';
-import { amountToBaseUnits, decimalPlaces } from './utils/amount.js';
 import type { Amount, Memo, Recipient, References, SPLToken } from './types.js';
+import { amountToBaseUnits, decimalPlaces } from './utils/amount.js';
 
 /**
  * Thrown when a Solana Pay transfer transaction can't be created from the fields provided.
@@ -57,7 +58,7 @@ export interface CreateTransferFields {
 export async function createTransfer(
     rpc: Rpc<GetAccountInfoApi>,
     sender: TransactionSigner,
-    { recipient, amount, splToken, reference, memo }: CreateTransferFields
+    { recipient, amount, splToken, reference, memo }: CreateTransferFields,
 ): Promise<Instruction[]> {
     const instructions: Instruction[] = [];
 
@@ -75,7 +76,7 @@ export async function createTransfer(
     if (reference) {
         const refs = Array.isArray(reference) ? reference : [reference];
         const existingAccounts = transferInstruction.accounts ?? [];
-        const refAccounts = refs.map((ref) => ({
+        const refAccounts = refs.map(ref => ({
             address: ref,
             role: AccountRole.READONLY as const,
         }));
@@ -95,7 +96,7 @@ async function createSystemInstruction(
     recipient: Address,
     amount: number,
     sender: TransactionSigner,
-    rpc: Rpc<GetAccountInfoApi>
+    rpc: Rpc<GetAccountInfoApi>,
 ): Promise<Instruction> {
     // Check that the sender and recipient accounts exist
     const senderInfo = (await rpc.getAccountInfo(sender.address, { encoding: 'base64' }).send()).value;
@@ -132,7 +133,7 @@ async function createSPLTokenInstruction(
     amount: number,
     splToken: Address,
     sender: TransactionSigner,
-    rpc: Rpc<GetAccountInfoApi>
+    rpc: Rpc<GetAccountInfoApi>,
 ): Promise<Instruction> {
     // Check if token is owned by Token-2022 Program
     const accountInfo = (await rpc.getAccountInfo(splToken, { encoding: 'base64' }).send()).value;
@@ -183,6 +184,6 @@ async function createSPLTokenInstruction(
             amount: tokens,
             decimals: mint.data.decimals,
         },
-        { programAddress: tokenProgram }
+        { programAddress: tokenProgram },
     );
 }

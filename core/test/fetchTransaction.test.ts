@@ -60,7 +60,7 @@ describe('fetchTransaction', () => {
                     Accept: 'application/json',
                 }),
                 body: JSON.stringify({ account: ACCOUNT }),
-            })
+            }),
         );
     });
 

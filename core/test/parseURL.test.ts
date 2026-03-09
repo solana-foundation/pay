@@ -10,7 +10,7 @@ describe('parseURL', () => {
                     'solana:mvines9iiHiQTysrwkJjGf2gb9Ex9jXJX8ns3qwf2kN?amount=0.000000001&reference=82ZJ7nbGpixjeDCmEhUcmwXYfvurzAgGdtSMuHnUgyny&label=Michael&message=Thanks%20for%20all%20the%20fish&memo=OrderId5678';
 
                 const { recipient, amount, splToken, reference, label, message, memo } = parseURL(
-                    url
+                    url,
                 ) as TransferRequestURL;
 
                 expect(recipient).toBe('mvines9iiHiQTysrwkJjGf2gb9Ex9jXJX8ns3qwf2kN');
@@ -28,7 +28,7 @@ describe('parseURL', () => {
                     'solana:mvines9iiHiQTysrwkJjGf2gb9Ex9jXJX8ns3qwf2kN?amount=1.01&spl-token=82ZJ7nbGpixjeDCmEhUcmwXYfvurzAgGdtSMuHnUgyny&label=Michael&message=Thanks%20for%20all%20the%20fish&memo=OrderId5678';
 
                 const { recipient, amount, splToken, reference, label, message, memo } = parseURL(
-                    url
+                    url,
                 ) as TransferRequestURL;
 
                 expect(recipient).toBe('mvines9iiHiQTysrwkJjGf2gb9Ex9jXJX8ns3qwf2kN');
@@ -45,7 +45,7 @@ describe('parseURL', () => {
                     'solana:mvines9iiHiQTysrwkJjGf2gb9Ex9jXJX8ns3qwf2kN?reference=82ZJ7nbGpixjeDCmEhUcmwXYfvurzAgGdtSMuHnUgyny&label=Michael&message=Thanks%20for%20all%20the%20fish&memo=OrderId5678';
 
                 const { recipient, amount, splToken, reference, label, message, memo } = parseURL(
-                    url
+                    url,
                 ) as TransferRequestURL;
 
                 expect(recipient).toBe('mvines9iiHiQTysrwkJjGf2gb9Ex9jXJX8ns3qwf2kN');
@@ -76,7 +76,7 @@ describe('parseURL', () => {
             expect(() => parseURL(url)).toThrow('recipient invalid');
         });
 
-        it.each([['1milliondollars'], [-0.1], [-100]])('throws an error on invalid amount: %p', (amount) => {
+        it.each([['1milliondollars'], [-0.1], [-100]])('throws an error on invalid amount: %p', amount => {
             const url = `solana:mvines9iiHiQTysrwkJjGf2gb9Ex9jXJX8ns3qwf2kN?amount=${amount}`;
 
             expect(() => parseURL(url)).toThrow('amount invalid');

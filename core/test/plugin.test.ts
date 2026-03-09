@@ -115,7 +115,7 @@ describe('solanaPay plugin', () => {
                 extended.pay.createTransfer({
                     recipient: address('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'),
                     amount: 1,
-                })
+                }),
             ).rejects.toThrow('requires a sender or client.payer');
         });
 
@@ -185,7 +185,7 @@ describe('solanaPay plugin', () => {
                     recipient: address('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'),
                     amount: 1,
                 },
-                sender
+                sender,
             );
 
             expect(Array.isArray(instructions)).toBe(true);

@@ -2,9 +2,10 @@ import type { Address, GetTransactionApi, Lamports, Rpc, Signature, TokenBalance
 import { getBase58Encoder } from '@solana/kit';
 import { SYSTEM_PROGRAM_ADDRESS } from '@solana-program/system';
 import { findAssociatedTokenPda, TOKEN_PROGRAM_ADDRESS } from '@solana-program/token';
+
 import { MEMO_PROGRAM_ADDRESS, SOL_DECIMALS, TOKEN_2022_PROGRAM_ADDRESS } from './constants.js';
-import { amountToBaseUnits } from './utils/amount.js';
 import type { Amount, Finality, Memo, Recipient, Reference, References, SPLToken } from './types.js';
+import { amountToBaseUnits } from './utils/amount.js';
 
 const base58Encoder = getBase58Encoder();
 
@@ -81,7 +82,7 @@ export async function validateTransfer(
     rpc: Rpc<GetTransactionApi>,
     signature: Signature,
     { recipient, amount, splToken, reference, memo }: ValidateTransferFields,
-    options?: { commitment?: Finality }
+    options?: { commitment?: Finality },
 ): Promise<GetTransactionJsonResponse> {
     if (!Number.isFinite(amount) || amount < 0) {
         throw new ValidateTransferError('amount invalid');
@@ -160,7 +161,7 @@ function validateSystemTransfer(
     accountKeys: readonly Address[],
     meta: NonNullable<GetTransactionJsonResponse['meta']>,
     recipient: Address,
-    references?: Reference[]
+    references?: Reference[],
 ): BalanceChange {
     const accountIndex = accountKeys.indexOf(recipient);
     if (accountIndex === -1) throw new ValidateTransferError('recipient not found');
@@ -192,7 +193,7 @@ async function validateSPLTokenTransfer(
     meta: NonNullable<GetTransactionJsonResponse['meta']>,
     recipient: Address,
     splToken: Address,
-    references?: Reference[]
+    references?: Reference[],
 ): Promise<BalanceChange> {
     // Use programId from the instruction itself to derive correct ATA
     const programId = accountKeys[instruction.programIdIndex];
@@ -229,8 +230,8 @@ async function validateSPLTokenTransfer(
         }
     }
 
-    const preBalance = meta.preTokenBalances?.find((x) => x.accountIndex === accountIndex);
-    const postBalance = meta.postTokenBalances?.find((x) => x.accountIndex === accountIndex);
+    const preBalance = meta.preTokenBalances?.find(x => x.accountIndex === accountIndex);
+    const postBalance = meta.postTokenBalances?.find(x => x.accountIndex === accountIndex);
     if (!preBalance || !postBalance) throw new ValidateTransferError('missing balance data');
 
     return {

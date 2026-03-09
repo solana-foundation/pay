@@ -1,6 +1,7 @@
 import { createEmptyClient, type TransactionSigner } from '@solana/kit';
-import { rpc } from '@solana/kit-plugin-rpc';
 import { payer } from '@solana/kit-plugin-payer';
+import { rpc } from '@solana/kit-plugin-rpc';
+
 import { solanaPay } from './plugin.js';
 
 /** Configuration for {@link createSolanaPayClient}. */

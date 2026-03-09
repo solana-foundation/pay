@@ -1,25 +1,25 @@
+import { assertIsSignatureBytes, verifySignature } from '@solana/keys';
 import type {
     Address,
     Commitment,
-    Rpc,
-    GetLatestBlockhashApi,
-    Transaction,
-    ReadonlyUint8Array,
     CompiledTransactionMessage,
     CompiledTransactionMessageWithLifetime,
+    GetLatestBlockhashApi,
+    ReadonlyUint8Array,
+    Rpc,
+    Transaction,
 } from '@solana/kit';
 import {
-    getBase64Encoder,
-    getAddressEncoder,
-    getTransactionDecoder,
-    getCompiledTransactionMessageDecoder,
+    address,
+    compileTransaction,
     decompileTransactionMessage,
+    getAddressEncoder,
+    getBase64Encoder,
+    getCompiledTransactionMessageDecoder,
+    getTransactionDecoder,
     setTransactionMessageFeePayer,
     setTransactionMessageLifetimeUsingBlockhash,
-    compileTransaction,
-    address,
 } from '@solana/kit';
-import { verifySignature, assertIsSignatureBytes } from '@solana/keys';
 
 /**
  * Thrown when a transaction response can't be fetched.
@@ -46,8 +46,8 @@ export type FetchedTransaction = Transaction;
 export async function fetchTransaction(
     rpc: Rpc<GetLatestBlockhashApi>,
     account: Address,
-    link: string | URL,
-    { commitment }: { commitment?: Commitment } = {}
+    link: URL | string,
+    { commitment }: { commitment?: Commitment } = {},
 ): Promise<FetchedTransaction> {
     let response: Response;
     try {
@@ -101,9 +101,9 @@ export async function fetchTransaction(
 
     // Extract signatures map
     const signatures = transaction.signatures;
-    const signerAddresses = Object.keys(signatures).map((addr) => address(addr));
+    const signerAddresses = Object.keys(signatures).map(addr => address(addr));
 
-    const hasSignatures = signerAddresses.some((addr) => {
+    const hasSignatures = signerAddresses.some(addr => {
         const sig = signatures[addr];
         return sig != null && !sig.every((b: number) => b === 0);
     });

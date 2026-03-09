@@ -1,5 +1,6 @@
 import type { Address, GetSignaturesForAddressApi, Rpc } from '@solana/kit';
 import type { Commitment, Signature } from '@solana/kit';
+
 import type { Reference } from './types.js';
 
 /**
@@ -24,10 +25,10 @@ export interface FindReferenceOptions {
 /** A confirmed signature info entry returned by the RPC. */
 export interface ConfirmedSignatureInfo {
     signature: Signature;
-    slot: number | bigint;
+    slot: bigint | number;
     err: unknown | null;
     memo: string | null;
-    blockTime: number | bigint | null;
+    blockTime: bigint | number | null;
     confirmationStatus: Commitment | null;
 }
 
@@ -43,7 +44,7 @@ export interface ConfirmedSignatureInfo {
 export async function findReference(
     rpc: Rpc<GetSignaturesForAddressApi>,
     reference: Reference,
-    { commitment, ...options }: FindReferenceOptions = {}
+    { commitment, ...options }: FindReferenceOptions = {},
 ): Promise<ConfirmedSignatureInfo> {
     const signatures = await rpc
         .getSignaturesForAddress(reference as Address, { ...options, ...(commitment ? { commitment } : {}) })

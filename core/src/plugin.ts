@@ -10,20 +10,21 @@ import type {
     Signature,
     TransactionSigner,
 } from '@solana/kit';
-import { createTransfer } from './createTransfer.js';
-import type { CreateTransferFields } from './createTransfer.js';
-import { encodeURL } from './encodeURL.js';
-import type { TransactionRequestURLFields, TransferRequestURLFields } from './encodeURL.js';
-import { parseURL } from './parseURL.js';
-import type { TransactionRequestURL, TransferRequestURL } from './parseURL.js';
+
 import { createQR, createQROptions } from './createQR.js';
-import { findReference } from './findReference.js';
-import type { FindReferenceOptions, ConfirmedSignatureInfo } from './findReference.js';
-import { validateTransfer } from './validateTransfer.js';
-import type { ValidateTransferFields } from './validateTransfer.js';
-import { fetchTransaction } from './fetchTransaction.js';
+import type { CreateTransferFields } from './createTransfer.js';
+import { createTransfer } from './createTransfer.js';
+import type { TransactionRequestURLFields, TransferRequestURLFields } from './encodeURL.js';
+import { encodeURL } from './encodeURL.js';
 import type { FetchedTransaction } from './fetchTransaction.js';
+import { fetchTransaction } from './fetchTransaction.js';
+import type { ConfirmedSignatureInfo, FindReferenceOptions } from './findReference.js';
+import { findReference } from './findReference.js';
+import type { TransactionRequestURL, TransferRequestURL } from './parseURL.js';
+import { parseURL } from './parseURL.js';
 import type { Finality, Reference } from './types.js';
+import type { ValidateTransferFields } from './validateTransfer.js';
+import { validateTransfer } from './validateTransfer.js';
 
 /**
  * RPC API methods required by the Solana Pay plugin.
@@ -61,22 +62,22 @@ export interface SolanaPayMethods {
         /**
          * Parse a Solana Pay URL into its constituent fields.
          */
-        parseURL(url: string | URL): TransactionRequestURL | TransferRequestURL;
+        parseURL(url: URL | string): TransactionRequestURL | TransferRequestURL;
 
         /**
          * Create a QR code for a Solana Pay URL.
          * @returns A QRCodeStyling instance (typed as `any` due to CJS/ESM compat).
          */
-        createQR(url: string | URL, size?: number, background?: string, color?: string): any;
+        createQR(url: URL | string, size?: number, background?: string, color?: string): any;
 
         /**
          * Create QR code options without instantiating the QR code.
          */
         createQROptions(
-            url: string | URL,
+            url: URL | string,
             size?: number,
             background?: string,
-            color?: string
+            color?: string,
         ): ReturnType<typeof createQROptions>;
 
         /**
@@ -90,7 +91,7 @@ export interface SolanaPayMethods {
         validateTransfer(
             signature: Signature,
             fields: ValidateTransferFields,
-            options?: { commitment?: Finality }
+            options?: { commitment?: Finality },
         ): Promise<Awaited<ReturnType<typeof validateTransfer>>>;
 
         /**
@@ -98,8 +99,8 @@ export interface SolanaPayMethods {
          */
         fetchTransaction(
             account: Address,
-            link: string | URL,
-            options?: { commitment?: Commitment }
+            link: URL | string,
+            options?: { commitment?: Commitment },
         ): Promise<FetchedTransaction>;
     };
 }
@@ -126,47 +127,47 @@ export interface SolanaPayMethods {
  */
 export function solanaPay() {
     return function installSolanaPay<TClient extends SolanaPayCompatibleClient>(
-        client: TClient
-    ): TClient & SolanaPayMethods {
+        client: TClient,
+    ): SolanaPayMethods & TClient {
         const pay: SolanaPayMethods['pay'] = {
             async createTransfer(fields: CreateTransferFields, sender?: TransactionSigner): Promise<Instruction[]> {
                 const signer = sender ?? client.payer;
                 if (!signer) {
                     throw new Error('solanaPay.createTransfer requires a sender or client.payer');
                 }
-                return createTransfer(client.rpc, signer, fields);
+                return await createTransfer(client.rpc, signer, fields);
             },
             encodeURL(fields: TransactionRequestURLFields | TransferRequestURLFields): URL {
                 return encodeURL(fields);
             },
-            parseURL(url: string | URL): TransactionRequestURL | TransferRequestURL {
+            parseURL(url: URL | string): TransactionRequestURL | TransferRequestURL {
                 return parseURL(url);
             },
-            createQR(url: string | URL, size?: number, background?: string, color?: string): any {
+            createQR(url: URL | string, size?: number, background?: string, color?: string): any {
                 return createQR(url, size, background, color);
             },
-            createQROptions(url: string | URL, size?: number, background?: string, color?: string) {
+            createQROptions(url: URL | string, size?: number, background?: string, color?: string) {
                 return createQROptions(url, size, background, color);
             },
             async findReference(reference: Reference, options?: FindReferenceOptions): Promise<ConfirmedSignatureInfo> {
-                return findReference(client.rpc, reference, options);
+                return await findReference(client.rpc, reference, options);
             },
             async validateTransfer(
                 signature: Signature,
                 fields: ValidateTransferFields,
-                options?: { commitment?: Finality }
+                options?: { commitment?: Finality },
             ) {
-                return validateTransfer(client.rpc, signature, fields, options);
+                return await validateTransfer(client.rpc, signature, fields, options);
             },
             async fetchTransaction(
                 account: Address,
-                link: string | URL,
-                options?: { commitment?: Commitment }
+                link: URL | string,
+                options?: { commitment?: Commitment },
             ): Promise<FetchedTransaction> {
-                return fetchTransaction(client.rpc, account, link, options);
+                return await fetchTransaction(client.rpc, account, link, options);
             },
         };
 
-        return Object.freeze({ ...client, pay }) as TClient & SolanaPayMethods;
+        return Object.freeze({ ...client, pay }) as SolanaPayMethods & TClient;
     };
 }

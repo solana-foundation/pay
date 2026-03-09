@@ -19,7 +19,7 @@ describe('encodeURL', () => {
             const url = encodeURL({ recipient, amount, splToken, reference, label, message, memo });
 
             expect(String(url)).toBe(
-                `solana:${recipient}?amount=0.000000001&spl-token=${splToken}&reference=${reference1}&reference=${reference2}&label=${label}&message=${message}&memo=${memo}`
+                `solana:${recipient}?amount=0.000000001&spl-token=${splToken}&reference=${reference1}&reference=${reference2}&label=${label}&message=${message}&memo=${memo}`,
             );
         });
 
