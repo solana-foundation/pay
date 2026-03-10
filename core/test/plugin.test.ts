@@ -122,31 +122,22 @@ describe('solanaPay plugin', () => {
 
         it('should use client.payer when no explicit sender is provided', async () => {
             const payer = createMockSigner(address('FnHyam9w4NZoWR6mKN1CuGBritdsEWZQa4Z4oawLZGxa'));
-            const mockRpc = {
-                getAccountInfo: vi.fn().mockReturnValue({
-                    send: vi.fn().mockResolvedValue({
-                        value: {
-                            owner: address('11111111111111111111111111111111'),
-                            executable: false,
-                            lamports: 1_000_000_000n,
-                            data: new Uint8Array(0),
-                            rentEpoch: 0n,
-                        },
-                    }),
-                }),
-            };
             const recipientAddr = address('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v');
-            mockRpc.getAccountInfo.mockImplementation((addr: any) => ({
-                send: vi.fn().mockResolvedValue({
-                    value: {
-                        owner: address('11111111111111111111111111111111'),
-                        executable: false,
-                        lamports: addr === payer.address ? 1_000_000_000n : 0n,
-                        data: new Uint8Array(0),
-                        rentEpoch: 0n,
-                    },
-                }),
-            }));
+            const makeInfo = (addr: any) => ({
+                owner: address('11111111111111111111111111111111'),
+                executable: false,
+                lamports: addr === payer.address ? 1_000_000_000n : 0n,
+                data: new Uint8Array(0),
+                rentEpoch: 0n,
+            });
+            const mockRpc = {
+                getAccountInfo: vi.fn().mockImplementation((addr: any) => ({
+                    send: vi.fn().mockResolvedValue({ value: makeInfo(addr) }),
+                })),
+                getMultipleAccounts: vi.fn().mockImplementation((addrs: any[]) => ({
+                    send: vi.fn().mockResolvedValue({ value: addrs.map(makeInfo) }),
+                })),
+            };
 
             const client = { rpc: mockRpc as any, payer };
             const extended = solanaPay()(client);
@@ -164,17 +155,19 @@ describe('solanaPay plugin', () => {
             const payer = createMockSigner(address('FnHyam9w4NZoWR6mKN1CuGBritdsEWZQa4Z4oawLZGxa'));
             const sender = createMockSigner(address('82ZJ7nbGpixjeDCmEhUcmwXYfvurzAgGdtSMuHnUgyny'));
 
+            const accountInfo = {
+                owner: address('11111111111111111111111111111111'),
+                executable: false,
+                lamports: 1_000_000_000n,
+                data: new Uint8Array(0),
+                rentEpoch: 0n,
+            };
             const mockRpc = {
                 getAccountInfo: vi.fn().mockImplementation(() => ({
-                    send: vi.fn().mockResolvedValue({
-                        value: {
-                            owner: address('11111111111111111111111111111111'),
-                            executable: false,
-                            lamports: 1_000_000_000n,
-                            data: new Uint8Array(0),
-                            rentEpoch: 0n,
-                        },
-                    }),
+                    send: vi.fn().mockResolvedValue({ value: accountInfo }),
+                })),
+                getMultipleAccounts: vi.fn().mockImplementation((addrs: any[]) => ({
+                    send: vi.fn().mockResolvedValue({ value: addrs.map(() => accountInfo) }),
                 })),
             };
 

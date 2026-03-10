@@ -63,6 +63,13 @@ function createMockRpc(accountInfoResponses: Map<string, any>) {
                 }),
             };
         },
+        getMultipleAccounts(addrs: Address[], _config?: unknown) {
+            return {
+                send: vi.fn().mockResolvedValue({
+                    value: addrs.map(addr => accountInfoResponses.get(addr) ?? null),
+                }),
+            };
+        },
     } as any;
 }
 
@@ -76,7 +83,7 @@ function makeAccountInfo(owner: Address, lamports: bigint | number, executable =
     };
 }
 
-function makeMintData(decimals = 6, isInitialized = true) {
+function makeMintData(decimals = 6, isInitialized = true, tokenProgram: Address = TOKEN_PROGRAM_ADDRESS) {
     return {
         address: ADDRESSES.splToken,
         data: {
@@ -88,7 +95,7 @@ function makeMintData(decimals = 6, isInitialized = true) {
         },
         executable: false,
         lamports: 0n,
-        programAddress: TOKEN_PROGRAM_ADDRESS,
+        programAddress: tokenProgram,
     } as any;
 }
 
@@ -314,7 +321,7 @@ describe('createTransfer', () => {
             mockedFetchToken.mockReset();
             mockedFindAssociatedTokenPda.mockReset();
 
-            mockedFetchMint.mockResolvedValue(makeMintData(6, overrides?.mintInitialized ?? true));
+            mockedFetchMint.mockResolvedValue(makeMintData(6, overrides?.mintInitialized ?? true, tokenProgram));
 
             mockedFindAssociatedTokenPda.mockImplementation(async (args: any) => {
                 if (args.owner === ADDRESSES.sender) return [ADDRESSES.senderATA, 255] as any;

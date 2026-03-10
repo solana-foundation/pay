@@ -9,6 +9,3 @@ export const HTTPS_PROTOCOL = 'https:';
 
 /** @internal */
 export const SOL_DECIMALS = 9;
-
-/** The number of lamports per SOL. @internal */
-export const LAMPORTS_PER_SOL = 1_000_000_000;

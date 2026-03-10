@@ -19,7 +19,7 @@ const rpc = {
     },
 } as any;
 
-describe('findTransactionSignature', () => {
+describe('findReference', () => {
     it('should return the last signature', async () => {
         expect.assertions(1);
 

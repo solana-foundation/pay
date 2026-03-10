@@ -3,6 +3,7 @@ import type {
     Commitment,
     GetAccountInfoApi,
     GetLatestBlockhashApi,
+    GetMultipleAccountsApi,
     GetSignaturesForAddressApi,
     GetTransactionApi,
     Instruction,
@@ -12,7 +13,6 @@ import type {
 } from '@solana/kit';
 
 import { createQR, createQROptions } from './createQR.js';
-import type { CreateTransferFields } from './createTransfer.js';
 import { createTransfer } from './createTransfer.js';
 import type { TransactionRequestURLFields, TransferRequestURLFields } from './encodeURL.js';
 import { encodeURL } from './encodeURL.js';
@@ -22,8 +22,7 @@ import type { ConfirmedSignatureInfo, FindReferenceOptions } from './findReferen
 import { findReference } from './findReference.js';
 import type { TransactionRequestURL, TransferRequestURL } from './parseURL.js';
 import { parseURL } from './parseURL.js';
-import type { Finality, Reference } from './types.js';
-import type { ValidateTransferFields } from './validateTransfer.js';
+import type { Finality, Reference, TransferFields } from './types.js';
 import { validateTransfer } from './validateTransfer.js';
 
 /**
@@ -32,7 +31,11 @@ import { validateTransfer } from './validateTransfer.js';
  * A client that installs this plugin must have an `rpc` property
  * supporting at least these API methods.
  */
-type SolanaPayRpcApi = GetAccountInfoApi & GetLatestBlockhashApi & GetSignaturesForAddressApi & GetTransactionApi;
+type SolanaPayRpcApi = GetAccountInfoApi &
+    GetLatestBlockhashApi &
+    GetMultipleAccountsApi &
+    GetSignaturesForAddressApi &
+    GetTransactionApi;
 
 /**
  * The shape of a client that can accept the Solana Pay plugin.
@@ -52,7 +55,7 @@ export interface SolanaPayMethods {
          * Create transfer instructions for a Solana Pay transfer request.
          * If `sender` is omitted, falls back to `client.payer`.
          */
-        createTransfer(fields: CreateTransferFields, sender?: TransactionSigner): Promise<Instruction[]>;
+        createTransfer(fields: TransferFields, sender?: TransactionSigner): Promise<Instruction[]>;
 
         /**
          * Encode a Solana Pay URL from transfer or transaction request fields.
@@ -90,7 +93,7 @@ export interface SolanaPayMethods {
          */
         validateTransfer(
             signature: Signature,
-            fields: ValidateTransferFields,
+            fields: TransferFields,
             options?: { commitment?: Finality },
         ): Promise<Awaited<ReturnType<typeof validateTransfer>>>;
 
@@ -130,7 +133,7 @@ export function solanaPay() {
         client: TClient,
     ): SolanaPayMethods & TClient {
         const pay: SolanaPayMethods['pay'] = {
-            async createTransfer(fields: CreateTransferFields, sender?: TransactionSigner): Promise<Instruction[]> {
+            async createTransfer(fields: TransferFields, sender?: TransactionSigner): Promise<Instruction[]> {
                 const signer = sender ?? client.payer;
                 if (!signer) {
                     throw new Error('solanaPay.createTransfer requires a sender or client.payer');
@@ -152,11 +155,7 @@ export function solanaPay() {
             async findReference(reference: Reference, options?: FindReferenceOptions): Promise<ConfirmedSignatureInfo> {
                 return await findReference(client.rpc, reference, options);
             },
-            async validateTransfer(
-                signature: Signature,
-                fields: ValidateTransferFields,
-                options?: { commitment?: Finality },
-            ) {
+            async validateTransfer(signature: Signature, fields: TransferFields, options?: { commitment?: Finality }) {
                 return await validateTransfer(client.rpc, signature, fields, options);
             },
             async fetchTransaction(

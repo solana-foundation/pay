@@ -1,7 +1,9 @@
 import {
+    Account,
     AccountRole,
     type Address,
     type GetAccountInfoApi,
+    type GetMultipleAccountsApi,
     type Instruction,
     type Rpc,
     type TransactionSigner,
@@ -14,11 +16,12 @@ import {
     fetchToken,
     findAssociatedTokenPda,
     getTransferCheckedInstruction,
+    Mint,
     TOKEN_PROGRAM_ADDRESS,
 } from '@solana-program/token';
 
 import { SOL_DECIMALS, TOKEN_2022_PROGRAM_ADDRESS } from './constants.js';
-import type { Amount, Memo, Recipient, References, SPLToken } from './types.js';
+import type { TransferFields } from './types.js';
 import { amountToBaseUnits, decimalPlaces } from './utils/amount.js';
 
 /**
@@ -26,22 +29,6 @@ import { amountToBaseUnits, decimalPlaces } from './utils/amount.js';
  */
 export class CreateTransferError extends Error {
     name = 'CreateTransferError';
-}
-
-/**
- * Fields of a Solana Pay transfer request URL.
- */
-export interface CreateTransferFields {
-    /** `recipient` in the [Solana Pay spec](https://github.com/solana-labs/solana-pay/blob/master/SPEC.md#recipient). */
-    recipient: Recipient;
-    /** `amount` in the [Solana Pay spec](https://github.com/solana-labs/solana-pay/blob/master/SPEC.md#amount). */
-    amount: Amount;
-    /** `spl-token` in the [Solana Pay spec](https://github.com/solana-labs/solana-pay/blob/master/SPEC.md#spl-token). */
-    splToken?: SPLToken;
-    /** `reference` in the [Solana Pay spec](https://github.com/solana-labs/solana-pay/blob/master/SPEC.md#reference). */
-    reference?: References;
-    /** `memo` in the [Solana Pay spec](https://github.com/solana-labs/solana-pay/blob/master/SPEC.md#memo). */
-    memo?: Memo;
 }
 
 /**
@@ -57,9 +44,9 @@ export interface CreateTransferFields {
  * @throws {CreateTransferError}
  */
 export async function createTransfer(
-    rpc: Rpc<GetAccountInfoApi>,
+    rpc: Rpc<GetAccountInfoApi & GetMultipleAccountsApi>,
     sender: TransactionSigner,
-    { recipient, amount, splToken, reference, memo }: CreateTransferFields,
+    { recipient, amount, splToken, reference, memo }: TransferFields,
 ): Promise<Instruction[]> {
     const instructions: Instruction[] = [];
 
@@ -97,13 +84,13 @@ async function createSystemInstruction(
     recipient: Address,
     amount: number,
     sender: TransactionSigner,
-    rpc: Rpc<GetAccountInfoApi>,
+    rpc: Rpc<GetMultipleAccountsApi>,
 ): Promise<Instruction> {
     // Check that the sender and recipient accounts exist
-    const { value: senderInfo } = await rpc.getAccountInfo(sender.address, { encoding: 'base64' }).send();
+    const {
+        value: [senderInfo, recipientInfo],
+    } = await rpc.getMultipleAccounts([sender.address, recipient], { encoding: 'base64' }).send();
     if (!senderInfo) throw new CreateTransferError('sender not found');
-
-    const { value: recipientInfo } = await rpc.getAccountInfo(recipient, { encoding: 'base64' }).send();
     if (!recipientInfo) throw new CreateTransferError('recipient not found');
 
     // Check that the sender and recipient are valid native accounts
@@ -136,15 +123,16 @@ async function createSPLTokenInstruction(
     sender: TransactionSigner,
     rpc: Rpc<GetAccountInfoApi>,
 ): Promise<Instruction> {
-    // Check if token is owned by Token-2022 Program
-    const { value: accountInfo } = await rpc.getAccountInfo(splToken, { encoding: 'base64' }).send();
-    if (!accountInfo) throw new CreateTransferError('mint account not found');
-    const tokenProgram: Address =
-        accountInfo.owner === TOKEN_2022_PROGRAM_ADDRESS ? TOKEN_2022_PROGRAM_ADDRESS : TOKEN_PROGRAM_ADDRESS;
-
-    // Check that the token provided is an initialized mint
-    const mint = await fetchMint(rpc, splToken);
+    // Fetch the mint and determine the token program from its owner
+    let mint: Account<Mint>;
+    try {
+        mint = await fetchMint(rpc, splToken);
+    } catch {
+        throw new CreateTransferError('mint account not found');
+    }
     if (!mint.data.isInitialized) throw new CreateTransferError('mint not initialized');
+    const tokenProgram: Address =
+        mint.programAddress === TOKEN_2022_PROGRAM_ADDRESS ? TOKEN_2022_PROGRAM_ADDRESS : TOKEN_PROGRAM_ADDRESS;
 
     // Check that the amount provided doesn't have greater precision than the mint
     if (decimalPlaces(amount) > mint.data.decimals) throw new CreateTransferError('amount decimals invalid');
@@ -152,24 +140,21 @@ async function createSPLTokenInstruction(
     // Convert input decimal amount to integer tokens according to the mint decimals
     const tokens = amountToBaseUnits(amount, mint.data.decimals);
 
-    // Get the sender's ATA and check that the account exists and can send tokens
-    const [senderATA] = await findAssociatedTokenPda({
-        owner: sender.address,
-        tokenProgram,
-        mint: splToken,
-    });
-    const senderAccount = await fetchToken(rpc, senderATA);
+    // Derive sender and recipient ATAs in parallel
+    const [[senderATA], [recipientATA]] = await Promise.all([
+        findAssociatedTokenPda({ owner: sender.address, tokenProgram, mint: splToken }),
+        findAssociatedTokenPda({ owner: recipient, tokenProgram, mint: splToken }),
+    ]);
+
+    // Fetch both token accounts in parallel
+    const [senderAccount, recipientAccount] = await Promise.all([
+        fetchToken(rpc, senderATA),
+        fetchToken(rpc, recipientATA),
+    ]);
+
     if (senderAccount.data.state === AccountState.Uninitialized)
         throw new CreateTransferError('sender not initialized');
     if (senderAccount.data.state === AccountState.Frozen) throw new CreateTransferError('sender frozen');
-
-    // Get the recipient's ATA and check that the account exists and can receive tokens
-    const [recipientATA] = await findAssociatedTokenPda({
-        owner: recipient,
-        tokenProgram,
-        mint: splToken,
-    });
-    const recipientAccount = await fetchToken(rpc, recipientATA);
     if (recipientAccount.data.state === AccountState.Uninitialized)
         throw new CreateTransferError('recipient not initialized');
     if (recipientAccount.data.state === AccountState.Frozen) throw new CreateTransferError('recipient frozen');

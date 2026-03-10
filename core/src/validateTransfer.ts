@@ -35,7 +35,7 @@ import {
 } from '@solana-program/token';
 
 import { MEMO_PROGRAM_ADDRESS, SOL_DECIMALS, TOKEN_2022_PROGRAM_ADDRESS } from './constants.js';
-import type { Amount, Finality, Memo, Recipient, Reference, References, SPLToken } from './types.js';
+import type { Finality, Reference, TransferFields } from './types.js';
 import { amountToBaseUnits } from './utils/amount.js';
 
 /**
@@ -43,22 +43,6 @@ import { amountToBaseUnits } from './utils/amount.js';
  */
 export class ValidateTransferError extends Error {
     name = 'ValidateTransferError';
-}
-
-/**
- * Fields of a Solana Pay transfer request to validate.
- */
-export interface ValidateTransferFields {
-    /** `recipient` in the [Solana Pay spec](https://github.com/solana-labs/solana-pay/blob/master/SPEC.md#recipient). */
-    recipient: Recipient;
-    /** `amount` in the [Solana Pay spec](https://github.com/solana-labs/solana-pay/blob/master/SPEC.md#amount). */
-    amount: Amount;
-    /** `spl-token` in the [Solana Pay spec](https://github.com/solana-labs/solana-pay/blob/master/SPEC.md#spl-token). */
-    splToken?: SPLToken;
-    /** `reference` in the [Solana Pay spec](https://github.com/solana-labs/solana-pay/blob/master/SPEC.md#reference). */
-    reference?: References;
-    /** `memo` in the [Solana Pay spec](https://github.com/solana-labs/solana-pay/blob/master/SPEC.md#memo). */
-    memo?: Memo;
 }
 
 /** A decompiled instruction with accounts and data present. */
@@ -132,7 +116,7 @@ function validateInstruction(instruction: Instruction | undefined): asserts inst
 export async function validateTransfer(
     rpc: Rpc<GetTransactionApi>,
     signature: Signature,
-    { recipient, amount, splToken, reference, memo }: ValidateTransferFields,
+    { recipient, amount, splToken, reference, memo }: TransferFields,
     options?: { commitment?: Finality },
 ) {
     validateAmount(amount);

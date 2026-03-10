@@ -29,3 +29,17 @@ export type Link = URL;
 
 /** Commitment level for transaction finality. */
 export type Finality = 'confirmed' | 'finalized';
+
+/** Fields of a Solana Pay transfer request URL. */
+export interface TransferFields {
+    /** `recipient` in the [Solana Pay spec](https://github.com/solana-labs/solana-pay/blob/master/SPEC.md#recipient). */
+    recipient: Recipient;
+    /** `amount` in the [Solana Pay spec](https://github.com/solana-labs/solana-pay/blob/master/SPEC.md#amount). */
+    amount: Amount;
+    /** `spl-token` in the [Solana Pay spec](https://github.com/solana-labs/solana-pay/blob/master/SPEC.md#spl-token). */
+    splToken?: SPLToken;
+    /** `reference` in the [Solana Pay spec](https://github.com/solana-labs/solana-pay/blob/master/SPEC.md#reference). */
+    reference?: References;
+    /** `memo` in the [Solana Pay spec](https://github.com/solana-labs/solana-pay/blob/master/SPEC.md#memo). */
+    memo?: Memo;
+}
