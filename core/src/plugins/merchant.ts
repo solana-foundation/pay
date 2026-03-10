@@ -1,4 +1,5 @@
-import type { GetSignaturesForAddressApi, GetTransactionApi, Rpc, Signature } from '@solana/kit';
+import type { GetSignaturesForAddressApi, GetTransactionApi, Signature } from '@solana/kit';
+import type { ClientWithRpc } from '@solana/plugin-interfaces';
 
 import { createQR, createQROptions } from '../createQR.js';
 import type { TransactionRequestURLFields, TransferRequestURLFields } from '../encodeURL.js';
@@ -10,9 +11,7 @@ import { validateTransfer } from '../validateTransfer.js';
 
 type MerchantRpcApi = GetSignaturesForAddressApi & GetTransactionApi;
 
-interface MerchantCompatibleClient {
-    readonly rpc: Rpc<MerchantRpcApi>;
-}
+type MerchantCompatibleClient = ClientWithRpc<MerchantRpcApi>;
 
 /** Methods added to a client by the merchant plugin. */
 export interface SolanaPayMerchantMethods {

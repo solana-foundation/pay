@@ -5,9 +5,9 @@ import type {
     GetLatestBlockhashApi,
     GetMultipleAccountsApi,
     Instruction,
-    Rpc,
     TransactionSigner,
 } from '@solana/kit';
+import type { ClientWithPayer, ClientWithRpc } from '@solana/plugin-interfaces';
 
 import { createTransfer } from '../createTransfer.js';
 import type { FetchedTransaction } from '../fetchTransaction.js';
@@ -18,10 +18,7 @@ import type { TransferFields } from '../types.js';
 
 type WalletRpcApi = GetAccountInfoApi & GetLatestBlockhashApi & GetMultipleAccountsApi;
 
-interface WalletCompatibleClient {
-    readonly rpc: Rpc<WalletRpcApi>;
-    readonly payer?: TransactionSigner;
-}
+type WalletCompatibleClient = ClientWithRpc<WalletRpcApi> & Partial<ClientWithPayer>;
 
 /** Methods added to a client by the wallet plugin. */
 export interface SolanaPayWalletMethods {
