@@ -37,6 +37,7 @@ import {
 import { MEMO_PROGRAM_ADDRESS, SOL_DECIMALS, TOKEN_2022_PROGRAM_ADDRESS } from './constants.js';
 import type { Finality, Reference, TransferFields } from './types.js';
 import { amountToBaseUnits } from './utils/amount.js';
+import { normalizeReferences } from './utils/reference.js';
 
 /**
  * Thrown when a transaction doesn't contain a valid Solana Pay transfer.
@@ -120,7 +121,7 @@ export async function validateTransfer(
     options?: { commitment?: Finality },
 ) {
     validateAmount(amount);
-    const refs: Reference[] | undefined = reference ? (Array.isArray(reference) ? reference : [reference]) : undefined;
+    const refs = normalizeReferences(reference);
 
     const response = await rpc
         .getTransaction(signature, {

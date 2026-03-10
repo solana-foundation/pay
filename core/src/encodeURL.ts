@@ -1,5 +1,6 @@
 import { SOLANA_PROTOCOL } from './constants.js';
 import type { Amount, Label, Memo, Message, Recipient, References, SPLToken } from './types.js';
+import { normalizeReferences } from './utils/reference.js';
 
 /**
  * Fields of a Solana Pay transaction request URL.
@@ -80,9 +81,8 @@ function encodeTransferRequestURL({
         url.searchParams.append('spl-token', splToken);
     }
 
-    if (reference) {
-        const refs = Array.isArray(reference) ? reference : [reference];
-
+    const refs = normalizeReferences(reference);
+    if (refs) {
         for (const ref of refs) {
             url.searchParams.append('reference', ref);
         }

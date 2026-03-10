@@ -23,6 +23,7 @@ import {
 import { SOL_DECIMALS, TOKEN_2022_PROGRAM_ADDRESS } from './constants.js';
 import type { TransferFields } from './types.js';
 import { amountToBaseUnits, decimalPlaces } from './utils/amount.js';
+import { normalizeReferences } from './utils/reference.js';
 
 /**
  * Thrown when a Solana Pay transfer transaction can't be created from the fields provided.
@@ -61,8 +62,8 @@ export async function createTransfer(
         : await createSystemInstruction(recipient, amount, sender, rpc);
 
     // If reference accounts are provided, add them to the transfer instruction
-    if (reference) {
-        const refs = Array.isArray(reference) ? reference : [reference];
+    const refs = normalizeReferences(reference);
+    if (refs) {
         const existingAccounts = transferInstruction.accounts ?? [];
         const refAccounts = refs.map(ref => ({
             address: ref,
