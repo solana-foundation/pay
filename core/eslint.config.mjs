@@ -12,11 +12,4 @@ export default [
             'typescript-sort-keys/interface': 'off',
         },
     },
-    {
-        files: ['example/**/*', 'test/**/*'],
-        rules: {
-            '@typescript-eslint/no-floating-promises': 'off',
-            '@typescript-eslint/no-non-null-assertion': 'off',
-        },
-    },
 ];

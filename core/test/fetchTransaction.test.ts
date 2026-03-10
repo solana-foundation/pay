@@ -1,5 +1,6 @@
-import { address, type Address } from '@solana/kit';
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { address } from '@solana/kit';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
 import { fetchTransaction, FetchTransactionError } from '../src/index.js';
 
 const ACCOUNT = address('FnHyam9w4NZoWR6mKN1CuGBritdsEWZQa4Z4oawLZGxa');

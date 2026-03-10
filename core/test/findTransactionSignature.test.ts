@@ -1,6 +1,7 @@
 import { address } from '@solana/kit';
+import { describe, expect, it } from 'vitest';
+
 import { findReference } from '../src/index.js';
-import { describe, it, expect } from 'vitest';
 
 const reference = address('9aE476sH92Vz7DMPyq5WLPkrKWivxeuTKEFKd2sZZcde');
 

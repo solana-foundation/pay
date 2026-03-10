@@ -1,4 +1,3 @@
-import { describe, it, expect, beforeAll } from 'vitest';
 import type { GetSignaturesForAddressApi, GetTransactionApi, Rpc } from '@solana/kit';
 import { generateKeyPairSigner, lamports, TransactionSigner } from '@solana/kit';
 import { createClient } from '@solana/kit-client-litesvm';
@@ -8,7 +7,9 @@ import {
     TOKEN_PROGRAM_ADDRESS,
     tokenProgram,
 } from '@solana-program/token';
-import { solanaPay, encodeURL, parseURL } from '../src/index.js';
+import { beforeAll, describe, expect, it } from 'vitest';
+
+import { encodeURL, parseURL, solanaPay } from '../src/index.js';
 
 /**
  *
@@ -29,7 +30,7 @@ function withUnsupportedRpcStubs() {
                 }
                 return Reflect.get(target, prop, receiver);
             },
-        }) as T['rpc'] & Rpc<GetSignaturesForAddressApi & GetTransactionApi>,
+        }) as Rpc<GetSignaturesForAddressApi & GetTransactionApi> & T['rpc'],
     });
 }
 

@@ -1,5 +1,6 @@
-import { address, type Address, type TransactionSigner } from '@solana/kit';
-import { describe, it, expect, vi } from 'vitest';
+import { type Address, address, type TransactionSigner } from '@solana/kit';
+import { describe, expect, it, vi } from 'vitest';
+
 import { solanaPay } from '../src/plugin.js';
 
 function createMockSigner(addr: Address): TransactionSigner {

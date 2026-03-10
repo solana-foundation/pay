@@ -1,6 +1,7 @@
+import { describe, expect, it } from 'vitest';
+
 import type { TransferRequestURL } from '../src/index.js';
 import { parseURL } from '../src/index.js';
-import { describe, it, expect } from 'vitest';
 
 describe('parseURL', () => {
     describe('parsing', () => {

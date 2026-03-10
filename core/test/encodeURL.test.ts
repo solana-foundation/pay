@@ -1,6 +1,7 @@
 import { address } from '@solana/kit';
+import { describe, expect, it } from 'vitest';
+
 import { encodeURL } from '../src/index.js';
-import { describe, it, expect } from 'vitest';
 
 describe('encodeURL', () => {
     describe('TransferRequestURL', () => {

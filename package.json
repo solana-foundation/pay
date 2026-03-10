@@ -1,0 +1,16 @@
+{
+    "private": true,
+    "name": "solana-pay",
+    "scripts": {
+        "build": "pnpm --filter @solana/pay build",
+        "test": "pnpm --filter @solana/pay test",
+        "lint": "pnpm --filter @solana/pay lint",
+        "fmt": "pnpm --filter @solana/pay fmt",
+        "typecheck": "pnpm --filter @solana/pay typecheck",
+        "clean": "pnpm --filter @solana/pay clean"
+    },
+    "engines": {
+        "node": ">=20"
+    },
+    "packageManager": "pnpm@10.29.2"
+}

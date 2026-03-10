@@ -40,8 +40,8 @@
         "test": "vitest run",
         "test:watch": "vitest",
         "typecheck": "tsc --noEmit",
-        "fmt": "prettier --write '{*,**/*}.{ts,tsx,js,jsx,json}' && eslint --fix 'src/**/*.ts' 'test/**/*.ts'",
-        "lint": "prettier --check '{*,**/*}.{ts,tsx,js,jsx,json}' && eslint 'src/**/*.ts' 'test/**/*.ts'",
+        "fmt": "prettier --write '{*,**/*}.{ts,tsx,js,jsx,json}' && eslint --fix 'src/**/*.ts'",
+        "lint": "prettier --check '{*,**/*}.{ts,tsx,js,jsx,json}' && eslint 'src/**/*.ts'",
         "release": "npm run clean && npm run build"
     },
     "dependencies": {

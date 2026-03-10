@@ -1,7 +1,8 @@
-import { address, type Address, type Signature } from '@solana/kit';
-import { SYSTEM_PROGRAM_ADDRESS } from '@solana-program/system';
+import { type Address, address, type Signature } from '@solana/kit';
 import { MEMO_PROGRAM_ADDRESS } from '@solana-program/memo';
-import { describe, it, expect, vi } from 'vitest';
+import { SYSTEM_PROGRAM_ADDRESS } from '@solana-program/system';
+import { describe, expect, it, vi } from 'vitest';
+
 import { validateTransfer, ValidateTransferError } from '../src/index.js';
 
 // Mock findAssociatedTokenPda

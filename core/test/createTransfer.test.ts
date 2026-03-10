@@ -1,9 +1,10 @@
-import { AccountRole, address, type Address, type TransactionSigner } from '@solana/kit';
+import { AccountRole, type Address, address, type TransactionSigner } from '@solana/kit';
 import { SYSTEM_PROGRAM_ADDRESS } from '@solana-program/system';
 import { TOKEN_PROGRAM_ADDRESS } from '@solana-program/token';
-import { createTransfer, CreateTransferError } from '../src/index.js';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
 import { MEMO_PROGRAM_ADDRESS, TOKEN_2022_PROGRAM_ADDRESS } from '../src/constants.js';
-import { describe, it, expect, beforeEach, vi, type Mock } from 'vitest';
+import { createTransfer, CreateTransferError } from '../src/index.js';
 
 const mockedFetchMint = vi.fn();
 const mockedFetchToken = vi.fn();
@@ -64,7 +65,7 @@ function createMockRpc(accountInfoResponses: Map<string, any>) {
     } as any;
 }
 
-function makeAccountInfo(owner: Address, lamports: number | bigint, executable = false) {
+function makeAccountInfo(owner: Address, lamports: bigint | number, executable = false) {
     return {
         owner,
         executable,
