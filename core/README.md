@@ -31,12 +31,56 @@ npm install @solana/pay @solana/kit
 
 ## Quick Start
 
-### Client usage
+### Merchant client
 
-The fastest way to get started — creates a client with RPC, payer, and all Solana Pay methods:
+For the receiving side — encode payment URLs, generate QR codes, find and validate payments. No signer needed.
 
 ```ts
 import { address } from '@solana/kit';
+import { createMerchantClient } from '@solana/pay';
+
+const merchant = createMerchantClient({
+  rpcUrl: 'https://api.devnet.solana.com',
+});
+
+const recipient = address('MERCHANT_WALLET_ADDRESS');
+const reference = address('UNIQUE_REFERENCE_ADDRESS');
+
+// Encode a payment URL and show as QR code
+const url = merchant.pay.encodeURL({ recipient, amount: 1, reference });
+const qr = merchant.pay.createQR(url);
+
+// After customer pays, find and validate the transaction
+const found = await merchant.pay.findReference(reference);
+await merchant.pay.validateTransfer(found.signature, { recipient, amount: 1, reference });
+```
+
+### Wallet client
+
+For the paying side — parse payment URLs, create transfers, and send transactions. Includes a transaction planner/executor so you don't need to manually compose transactions.
+
+```ts
+import { createWalletClient } from '@solana/pay';
+
+const wallet = createWalletClient({
+  rpcUrl: 'https://api.devnet.solana.com',
+  payer: myWalletSigner,
+});
+
+// Parse a Solana Pay URL and send the payment
+const parsed = wallet.pay.parseURL(url);
+const instructions = await wallet.pay.createTransfer({
+  recipient: parsed.recipient,
+  amount: parsed.amount,
+});
+await wallet.sendTransaction(instructions);
+```
+
+### Combined client
+
+Use `createSolanaPayClient` when you need both merchant and wallet methods on one client:
+
+```ts
 import { createSolanaPayClient } from '@solana/pay';
 
 const client = createSolanaPayClient({
@@ -44,19 +88,9 @@ const client = createSolanaPayClient({
   payer: myWalletSigner,
 });
 
-const recipient = address('MERCHANT_WALLET_ADDRESS');
-
-// Encode a payment URL and show as QR code
 const url = client.pay.encodeURL({ recipient, amount: 1 });
-const qr = client.pay.createQR(url);
-
-// Create transfer instructions
 const instructions = await client.pay.createTransfer({ recipient, amount: 1 });
-
-// Find and validate a transaction by reference
-const reference = address('UNIQUE_REFERENCE_ADDRESS');
-const { signature } = await client.pay.findReference(reference);
-await client.pay.validateTransfer(signature, { recipient, amount: 1 });
+await client.sendTransaction(instructions);
 ```
 
 ### Standalone usage
@@ -85,12 +119,13 @@ Compose with other kit plugins for full control:
 ```ts
 import { createEmptyClient } from '@solana/kit';
 import { rpc, payerFromFile } from '@solana/kit-plugins';
-import { solanaPay } from '@solana/pay';
+import { solanaPayMerchant, solanaPayWallet } from '@solana/pay';
 
 const client = await createEmptyClient()
   .use(rpc('https://api.devnet.solana.com'))
   .use(payerFromFile('~/.config/solana/id.json'))
-  .use(solanaPay());
+  .use(solanaPayMerchant())
+  .use(solanaPayWallet());
 
 const url = client.pay.encodeURL({ recipient, amount: 1 });
 const instructions = await client.pay.createTransfer({ recipient, amount: 1 });
@@ -109,7 +144,7 @@ const instructions = await client.pay.createTransfer({ recipient, amount: 1 });
 
 ### Transfers
 
-- **`createTransfer(rpc, sender, fields)`** — Create transfer `Instruction[]` for a payment. The caller composes the transaction using kit's `pipe()` pattern.
+- **`createTransfer(rpc, sender, fields)`** — Create transfer `Instruction[]` for a payment.
 - **`findReference(rpc, reference, options?)`** — Find a transaction signature by reference address.
 - **`validateTransfer(rpc, signature, fields, options?)`** — Validate that a confirmed transaction matches the expected payment.
 
@@ -117,13 +152,16 @@ const instructions = await client.pay.createTransfer({ recipient, amount: 1 });
 
 - **`fetchTransaction(rpc, account, link, options?)`** — Fetch a transaction from a transaction request endpoint.
 
-### Client
+### Clients
 
-- **`createSolanaPayClient({ rpcUrl, payer })`** — Create a ready-to-use client with RPC, payer, and the `pay` namespace pre-configured.
+- **`createMerchantClient({ rpcUrl })`** — Merchant client with RPC and merchant plugin. No signer needed.
+- **`createWalletClient({ rpcUrl, payer })`** — Wallet client with RPC, payer, transaction planner/executor, and wallet plugin.
+- **`createSolanaPayClient({ rpcUrl, payer })`** — Combined client with all merchant + wallet methods.
 
-### Plugin
+### Plugins
 
-- **`solanaPay()`** — Kit plugin that adds a `pay` namespace to any client with `rpc` (and optionally `payer`).
+- **`solanaPayMerchant()`** — Merchant plugin: `encodeURL`, `createQR`, `createQROptions`, `findReference`, `validateTransfer`.
+- **`solanaPayWallet()`** — Wallet plugin: `parseURL`, `createTransfer`, `fetchTransaction`.
 
 ## How it works
 

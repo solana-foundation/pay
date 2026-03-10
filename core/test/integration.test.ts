@@ -9,7 +9,7 @@ import {
 } from '@solana-program/token';
 import { beforeAll, describe, expect, it } from 'vitest';
 
-import { encodeURL, parseURL, solanaPay } from '../src/index.js';
+import { encodeURL, parseURL, solanaPayMerchant, solanaPayWallet } from '../src/index.js';
 
 /**
  *
@@ -35,7 +35,11 @@ function withUnsupportedRpcStubs() {
 }
 
 async function createTestClient() {
-    const client = await createClient().use(withUnsupportedRpcStubs()).use(solanaPay()).use(tokenProgram());
+    const client = await createClient()
+        .use(withUnsupportedRpcStubs())
+        .use(solanaPayMerchant())
+        .use(solanaPayWallet())
+        .use(tokenProgram());
     return client;
 }
 
