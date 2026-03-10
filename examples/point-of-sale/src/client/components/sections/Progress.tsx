@@ -5,6 +5,12 @@ import 'react-circular-progressbar/dist/styles.css';
 import { PaymentStatus, usePayment } from '../../hooks/usePayment';
 import css from './Progress.module.css';
 
+const ProgressBar = CircularProgressbar as unknown as FC<{
+    maxValue: number;
+    styles: ReturnType<typeof buildStyles>;
+    value: number;
+}>;
+
 export const Progress: FC = () => {
     const { status, progress } = usePayment();
     const [value, text] = useMemo(() => {
@@ -32,7 +38,7 @@ export const Progress: FC = () => {
 
     return (
         <div className={css.root}>
-            <CircularProgressbar maxValue={1} value={value} styles={styles} />
+            <ProgressBar maxValue={1} value={value} styles={styles} />
             <div className={css.text}>{text}</div>
         </div>
     );
