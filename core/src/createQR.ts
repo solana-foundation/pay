@@ -10,6 +10,14 @@ import type {
 } from '@solana/qr-code-styling';
 import QRCodeStylingModule from '@solana/qr-code-styling';
 
+// Resolve the QRCodeStyling constructor across ESM/CJS bundler variations.
+// Some bundlers (webpack/Next.js) resolve the default import directly as the class,
+// while others (tsup/esbuild) wrap it in a module namespace with a `.default` property.
+const QRCodeStyling: typeof QRCodeStylingModule.default =
+    typeof (QRCodeStylingModule as unknown as { default?: unknown }).default === 'function'
+        ? QRCodeStylingModule.default
+        : (QRCodeStylingModule as unknown as typeof QRCodeStylingModule.default);
+
 /**
  * Create a QR code from a Solana Pay URL.
  *
@@ -24,7 +32,7 @@ export function createQR(
     background = 'white',
     color = 'black',
 ): InstanceType<typeof QRCodeStylingModule.default> {
-    return new QRCodeStylingModule.default(createQROptions(url, size, background, color));
+    return new QRCodeStyling(createQROptions(url, size, background, color));
 }
 
 /** @ignore */

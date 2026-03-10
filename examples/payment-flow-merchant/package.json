@@ -12,6 +12,7 @@
     },
     "dependencies": {
         "@solana/kit": "^6.2.0",
+        "@solana/kit-plugin-airdrop": "^0.5.0",
         "@solana/pay": "file:../../core"
     },
     "devDependencies": {

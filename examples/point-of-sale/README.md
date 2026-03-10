@@ -67,8 +67,11 @@ npm run proxy
 ```
 
 ### Open the point of sale app
+
+Update `recipient` with your  destination wallet:
+
 ```shell
-open "https://localhost:3001?recipient=Your+Merchant+Address&label=Your+Store+Name"
+open "https://localhost:3001/new?recipient=11111111111111111111111111111111&label=Test%20Store"
 ```
 
 You may need to accept a locally signed SSL certificate to open the page.

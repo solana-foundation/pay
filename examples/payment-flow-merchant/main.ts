@@ -1,5 +1,4 @@
-import { createSolanaRpc, devnet } from '@solana/kit';
-import { encodeURL, findReference, FindReferenceError, validateTransfer } from '@solana/pay';
+import { createMerchantClient, FindReferenceError } from '@solana/pay';
 import type { ConfirmedSignatureInfo } from '@solana/pay';
 import { MERCHANT_WALLET } from './constants.js';
 import { simulateCheckout } from './simulateCheckout.js';
@@ -8,8 +7,13 @@ import { simulateWalletInteraction } from './simulateWalletInteraction.js';
 async function main() {
     console.log("Let's simulate a Solana Pay flow ... \n");
 
+    /**
+     * 1. Merchant creates a client — no signer needed, just RPC for reading.
+     */
     console.log('1. ✅ Establish connection to the cluster');
-    const rpc = createSolanaRpc(devnet('https://api.devnet.solana.com'));
+    const merchant = createMerchantClient({
+        rpcUrl: 'https://api.devnet.solana.com',
+    });
 
     /**
      * Simulate a checkout experience
@@ -29,7 +33,7 @@ async function main() {
      * Several parameters are encoded within the link representing an intent to collect payment from a customer.
      */
     console.log('3. 💰 Create a payment request link \n');
-    const url = encodeURL({ recipient: MERCHANT_WALLET, amount, reference, label, message, memo });
+    const url = merchant.pay.encodeURL({ recipient: MERCHANT_WALLET, amount, reference, label, message, memo });
 
     /**
      * Simulate wallet interaction
@@ -37,7 +41,7 @@ async function main() {
      * This is only for example purposes. This interaction will be handled by a wallet provider.
      */
     console.log('4. 🔐 Simulate wallet interaction \n');
-    simulateWalletInteraction(rpc, url);
+    simulateWalletInteraction(url);
 
     /**
      * Wait for payment to be confirmed
@@ -51,7 +55,7 @@ async function main() {
         const interval = setInterval(async () => {
             console.count('Checking for transaction...');
             try {
-                const signatureInfo = await findReference(rpc, reference, { commitment: 'confirmed' });
+                const signatureInfo = await merchant.pay.findReference(reference, { commitment: 'confirmed' });
                 console.log('\n 🖌  Signature found: ', signatureInfo.signature);
                 clearInterval(interval);
                 resolve(signatureInfo);
@@ -77,7 +81,7 @@ async function main() {
     console.log('\n6. 🔗 Validate transaction \n');
 
     try {
-        await validateTransfer(rpc, signature, { recipient: MERCHANT_WALLET, amount });
+        await merchant.pay.validateTransfer(signature, { recipient: MERCHANT_WALLET, amount });
         console.log('✅ Payment validated');
         console.log('📦 Ship order to customer');
     } catch (error) {
