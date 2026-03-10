@@ -10,9 +10,10 @@ const mockedFetchMint = vi.fn();
 const mockedFetchToken = vi.fn();
 const mockedFindAssociatedTokenPda = vi.fn();
 
-vi.mock('@solana-program/token', async () => {
+vi.mock('@solana-program/token', async importOriginal => {
+    const actual = await importOriginal<typeof import('@solana-program/token')>();
     return {
-        TOKEN_PROGRAM_ADDRESS: 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
+        ...actual,
         fetchMint: (...args: unknown[]) => mockedFetchMint(...args),
         fetchToken: (...args: unknown[]) => mockedFetchToken(...args),
         findAssociatedTokenPda: (...args: unknown[]) => mockedFindAssociatedTokenPda(...args),

@@ -9,6 +9,7 @@ import {
 import { getAddMemoInstruction } from '@solana-program/memo';
 import { getTransferSolInstruction, SYSTEM_PROGRAM_ADDRESS } from '@solana-program/system';
 import {
+    AccountState,
     fetchMint,
     fetchToken,
     findAssociatedTokenPda,
@@ -99,10 +100,10 @@ async function createSystemInstruction(
     rpc: Rpc<GetAccountInfoApi>,
 ): Promise<Instruction> {
     // Check that the sender and recipient accounts exist
-    const senderInfo = (await rpc.getAccountInfo(sender.address, { encoding: 'base64' }).send()).value;
+    const { value: senderInfo } = await rpc.getAccountInfo(sender.address, { encoding: 'base64' }).send();
     if (!senderInfo) throw new CreateTransferError('sender not found');
 
-    const recipientInfo = (await rpc.getAccountInfo(recipient, { encoding: 'base64' }).send()).value;
+    const { value: recipientInfo } = await rpc.getAccountInfo(recipient, { encoding: 'base64' }).send();
     if (!recipientInfo) throw new CreateTransferError('recipient not found');
 
     // Check that the sender and recipient are valid native accounts
@@ -136,7 +137,7 @@ async function createSPLTokenInstruction(
     rpc: Rpc<GetAccountInfoApi>,
 ): Promise<Instruction> {
     // Check if token is owned by Token-2022 Program
-    const accountInfo = (await rpc.getAccountInfo(splToken, { encoding: 'base64' }).send()).value;
+    const { value: accountInfo } = await rpc.getAccountInfo(splToken, { encoding: 'base64' }).send();
     if (!accountInfo) throw new CreateTransferError('mint account not found');
     const tokenProgram: Address =
         accountInfo.owner === TOKEN_2022_PROGRAM_ADDRESS ? TOKEN_2022_PROGRAM_ADDRESS : TOKEN_PROGRAM_ADDRESS;
@@ -158,8 +159,9 @@ async function createSPLTokenInstruction(
         mint: splToken,
     });
     const senderAccount = await fetchToken(rpc, senderATA);
-    if (senderAccount.data.state === 0) throw new CreateTransferError('sender not initialized');
-    if (senderAccount.data.state === 2) throw new CreateTransferError('sender frozen');
+    if (senderAccount.data.state === AccountState.Uninitialized)
+        throw new CreateTransferError('sender not initialized');
+    if (senderAccount.data.state === AccountState.Frozen) throw new CreateTransferError('sender frozen');
 
     // Get the recipient's ATA and check that the account exists and can receive tokens
     const [recipientATA] = await findAssociatedTokenPda({
@@ -168,8 +170,9 @@ async function createSPLTokenInstruction(
         mint: splToken,
     });
     const recipientAccount = await fetchToken(rpc, recipientATA);
-    if (recipientAccount.data.state === 0) throw new CreateTransferError('recipient not initialized');
-    if (recipientAccount.data.state === 2) throw new CreateTransferError('recipient frozen');
+    if (recipientAccount.data.state === AccountState.Uninitialized)
+        throw new CreateTransferError('recipient not initialized');
+    if (recipientAccount.data.state === AccountState.Frozen) throw new CreateTransferError('recipient frozen');
 
     // Check that the sender has enough tokens
     if (tokens > senderAccount.data.amount) throw new CreateTransferError('insufficient funds');
