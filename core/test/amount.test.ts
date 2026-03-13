@@ -82,4 +82,48 @@ describe('amountToBaseUnits', () => {
         // 99999.999999 with 6 decimals = 11 significant digits
         expect(amountToBaseUnits(99999.999999, 6)).toBe(99_999_999_999n);
     });
+
+    describe('precision budget: ~15 significant digits shared between whole and fractional', () => {
+        it('SOL (9 decimals): 6 whole digits + 9 fractional = 15 sig digits', () => {
+            // 999,999.999999999 SOL — max amount with full 9-decimal precision
+            // That's ~$150M at $150/SOL, more than enough for any payment
+            expect(amountToBaseUnits(999_999.999999999, 9)).toBe(999_999_999_999_999n);
+        });
+
+        it('SOL: large whole amounts safe when fractional part is zero', () => {
+            // 999,999 SOL with no fractional part — only 6 sig digits
+            expect(amountToBaseUnits(999_999, 9)).toBe(999_999_000_000_000n);
+            // Even very large whole SOL is fine when there's no fraction
+            expect(amountToBaseUnits(100_000_000, 9)).toBe(100_000_000_000_000_000n);
+        });
+
+        it('USDC (6 decimals): 9 whole digits + 6 fractional = 15 sig digits', () => {
+            // $999,999,999.999999 — nearly $1B at full cent precision
+            expect(amountToBaseUnits(999_999_999.999999, 6)).toBe(999_999_999_999_999n);
+        });
+
+        it('0-decimal token: safe up to 999 trillion', () => {
+            expect(amountToBaseUnits(999_999_999_999_999, 0)).toBe(999_999_999_999_999n);
+        });
+
+        it('rejects when digits exceed budget', () => {
+            // 123456789.0123456 with 10 decimals = 19 sig digits after toFixed
+            expect(() => amountToBaseUnits(123_456_789.0123456, 10)).toThrow(
+                'exceeds safe floating-point precision',
+            );
+        });
+
+        it('fewer decimals = more whole digits available', () => {
+            // 6 decimals: 9 whole digits safe
+            expect(amountToBaseUnits(999_999_999.999999, 6)).toBe(999_999_999_999_999n);
+            // 0 decimals: 15 whole digits safe
+            expect(amountToBaseUnits(999_999_999_999_999, 0)).toBe(999_999_999_999_999n);
+        });
+
+        it('USDC with 2 decimals: safe up to ~$9.9 trillion', () => {
+            // Trade fractional precision for whole-number range
+            // 13 whole digits + 2 fractional = 15 sig digits
+            expect(amountToBaseUnits(9_999_999_999_999.99, 2)).toBe(999_999_999_999_999n);
+        });
+    });
 });
