@@ -108,9 +108,7 @@ describe('amountToBaseUnits', () => {
 
         it('rejects when digits exceed budget', () => {
             // 123456789.0123456 with 10 decimals = 19 sig digits after toFixed
-            expect(() => amountToBaseUnits(123_456_789.0123456, 10)).toThrow(
-                'exceeds safe floating-point precision',
-            );
+            expect(() => amountToBaseUnits(123_456_789.0123456, 10)).toThrow('exceeds safe floating-point precision');
         });
 
         it('fewer decimals = more whole digits available', () => {
