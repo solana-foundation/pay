@@ -92,13 +92,17 @@ async function createSystemInstruction(
         value: [senderInfo, recipientInfo],
     } = await rpc.getMultipleAccounts([sender.address, recipient], { encoding: 'base64' }).send();
     if (!senderInfo) throw new CreateTransferError('sender not found');
-    if (!recipientInfo) throw new CreateTransferError('recipient not found');
 
-    // Check that the sender and recipient are valid native accounts
+    // Check that the sender is a valid native account
     if (senderInfo.owner !== SYSTEM_PROGRAM_ADDRESS) throw new CreateTransferError('sender owner invalid');
     if (senderInfo.executable) throw new CreateTransferError('sender executable');
-    if (recipientInfo.owner !== SYSTEM_PROGRAM_ADDRESS) throw new CreateTransferError('recipient owner invalid');
-    if (recipientInfo.executable) throw new CreateTransferError('recipient executable');
+
+    // If the recipient exists, validate it's a valid native account.
+    // A non-existent recipient is fine — the System Program will create it on transfer.
+    if (recipientInfo) {
+        if (recipientInfo.owner !== SYSTEM_PROGRAM_ADDRESS) throw new CreateTransferError('recipient owner invalid');
+        if (recipientInfo.executable) throw new CreateTransferError('recipient executable');
+    }
 
     // Check that the amount provided doesn't have greater precision than SOL
     if (decimalPlaces(amount) > SOL_DECIMALS) throw new CreateTransferError('amount decimals invalid');

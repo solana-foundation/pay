@@ -240,18 +240,19 @@ describe('createTransfer', () => {
             ).rejects.toThrow(CreateTransferError);
         });
 
-        it('should throw when recipient account does not exist', async () => {
+        it('should succeed when recipient account does not exist', async () => {
             const accounts = new Map<string, any>([
                 [ADDRESSES.sender, makeAccountInfo(SYSTEM_PROGRAM_ADDRESS, 1_000_000_000)],
             ]);
             const rpc = createMockRpc(accounts);
 
-            await expect(
-                createTransfer(rpc, sender, {
-                    recipient: ADDRESSES.recipient,
-                    amount: TEST_AMOUNTS.ONE_TOKEN,
-                }),
-            ).rejects.toThrow(CreateTransferError);
+            const instructions = await createTransfer(rpc, sender, {
+                recipient: ADDRESSES.recipient,
+                amount: TEST_AMOUNTS.ONE_TOKEN,
+            });
+
+            expect(instructions).toHaveLength(1);
+            expect(instructions[0].programAddress).toBe(SYSTEM_PROGRAM_ADDRESS);
         });
 
         it('should throw when sender owner is invalid', async () => {
