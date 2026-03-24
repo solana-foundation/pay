@@ -1,4 +1,4 @@
-import { createEmptyClient, type TransactionSigner } from '@solana/kit';
+import { createEmptyClient, type DefaultRpcSubscriptionsChannelConfig, type TransactionSigner } from '@solana/kit';
 import { planAndSendTransactions } from '@solana/kit-plugin-instruction-plan';
 import { payer } from '@solana/kit-plugin-payer';
 import { rpc, rpcTransactionPlanExecutor, rpcTransactionPlanner } from '@solana/kit-plugin-rpc';
@@ -10,6 +10,8 @@ import { solanaPayWallet } from './plugins/wallet.js';
 export interface MerchantClientConfig {
     /** Solana RPC URL (e.g. 'https://api.mainnet-beta.solana.com'). */
     rpcUrl: string;
+    /** Optional RPC subscriptions config (e.g. custom WebSocket URL for localhost). */
+    rpcSubscriptionsConfig?: DefaultRpcSubscriptionsChannelConfig<string>;
 }
 
 /** The type returned by {@link createMerchantClient}. */
@@ -32,7 +34,7 @@ export type MerchantClient = ReturnType<typeof createMerchantClient>;
  * ```
  */
 export function createMerchantClient(config: MerchantClientConfig) {
-    return createEmptyClient().use(rpc(config.rpcUrl)).use(solanaPayMerchant());
+    return createEmptyClient().use(rpc(config.rpcUrl, config.rpcSubscriptionsConfig)).use(solanaPayMerchant());
 }
 
 /** Configuration for {@link createWalletClient}. */
@@ -41,6 +43,8 @@ export interface WalletClientConfig {
     rpcUrl: string;
     /** Wallet signer that will be used as the default sender / fee payer. */
     payer: TransactionSigner;
+    /** Optional RPC subscriptions config (e.g. custom WebSocket URL for localhost). */
+    rpcSubscriptionsConfig?: DefaultRpcSubscriptionsChannelConfig<string>;
 }
 
 /** The type returned by {@link createWalletClient}. */
@@ -65,7 +69,7 @@ export type WalletClient = ReturnType<typeof createWalletClient>;
  */
 export function createWalletClient(config: WalletClientConfig) {
     return createEmptyClient()
-        .use(rpc(config.rpcUrl))
+        .use(rpc(config.rpcUrl, config.rpcSubscriptionsConfig))
         .use(payer(config.payer))
         .use(rpcTransactionPlanner())
         .use(rpcTransactionPlanExecutor())
@@ -79,6 +83,8 @@ export interface SolanaPayClientConfig {
     rpcUrl: string;
     /** Wallet signer that will be used as the default sender / fee payer. */
     payer: TransactionSigner;
+    /** Optional RPC subscriptions config (e.g. custom WebSocket URL for localhost). */
+    rpcSubscriptionsConfig?: DefaultRpcSubscriptionsChannelConfig<string>;
 }
 
 /** The type returned by {@link createSolanaPayClient}. */
@@ -101,7 +107,7 @@ export type SolanaPayClient = ReturnType<typeof createSolanaPayClient>;
  */
 export function createSolanaPayClient(config: SolanaPayClientConfig) {
     return createEmptyClient()
-        .use(rpc(config.rpcUrl))
+        .use(rpc(config.rpcUrl, config.rpcSubscriptionsConfig))
         .use(payer(config.payer))
         .use(rpcTransactionPlanner())
         .use(rpcTransactionPlanExecutor())
