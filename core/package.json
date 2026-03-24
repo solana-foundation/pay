@@ -1,6 +1,6 @@
 {
     "name": "@solana/pay",
-    "version": "1.0.0",
+    "version": "1.0.0-alpha.0",
     "author": "Solana Maintainers <maintainers@solana.foundation>",
     "repository": "https://github.com/solana-foundation/solana-pay",
     "license": "Apache-2.0",
