@@ -1,5 +1,6 @@
 import type { GetSignaturesForAddressApi, GetTransactionApi, Signature } from '@solana/kit';
-import type { ClientWithRpc } from '@solana/plugin-interfaces';
+import type { ClientWithRpc, ClientWithRpcSubscriptions } from '@solana/plugin-interfaces';
+import type { LogsNotificationsApi } from '@solana/rpc-subscriptions-api';
 
 import { createQR, createQROptions } from '../createQR.js';
 import type { TransactionRequestURLFields, TransferRequestURLFields } from '../encodeURL.js';
@@ -8,10 +9,14 @@ import type { ConfirmedSignatureInfo, FindReferenceOptions } from '../findRefere
 import { findReference } from '../findReference.js';
 import type { Finality, Reference, TransferFields } from '../types.js';
 import { validateTransfer } from '../validateTransfer.js';
+import type { WatchReferenceOptions, WatchReferenceResult } from '../watchReference.js';
+import { watchReference } from '../watchReference.js';
 
 type MerchantRpcApi = GetSignaturesForAddressApi & GetTransactionApi;
 
-type MerchantCompatibleClient = ClientWithRpc<MerchantRpcApi>;
+type MerchantRpcSubscriptionsApi = LogsNotificationsApi;
+
+type MerchantCompatibleClient = ClientWithRpc<MerchantRpcApi> & ClientWithRpcSubscriptions<MerchantRpcSubscriptionsApi>;
 
 /** Methods added to a client by the merchant plugin. */
 export interface SolanaPayMerchantMethods {
@@ -25,6 +30,7 @@ export interface SolanaPayMerchantMethods {
             color?: string,
         ): ReturnType<typeof createQROptions>;
         findReference(reference: Reference, options?: FindReferenceOptions): Promise<ConfirmedSignatureInfo>;
+        watchReference(reference: Reference, options?: WatchReferenceOptions): Promise<WatchReferenceResult>;
         validateTransfer(
             signature: Signature,
             fields: TransferFields,
@@ -58,6 +64,9 @@ export function solanaPayMerchant() {
             },
             async findReference(reference: Reference, options?: FindReferenceOptions): Promise<ConfirmedSignatureInfo> {
                 return await findReference(client.rpc, reference, options);
+            },
+            async watchReference(reference: Reference, options?: WatchReferenceOptions): Promise<WatchReferenceResult> {
+                return await watchReference(client.rpcSubscriptions, reference, options);
             },
             async validateTransfer(signature: Signature, fields: TransferFields, options?: { commitment?: Finality }) {
                 return await validateTransfer(client.rpc, signature, fields, options);
