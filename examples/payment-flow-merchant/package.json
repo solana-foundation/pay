@@ -11,8 +11,8 @@
         "start": "tsx main.ts"
     },
     "dependencies": {
-        "@solana/kit": "^6.2.0",
-        "@solana/kit-plugin-airdrop": "^0.5.0",
+        "@solana/kit": "^6.5.0",
+        "@solana/kit-plugin-airdrop": "^0.8.0",
         "@solana/pay": "file:../../core"
     },
     "devDependencies": {

@@ -10,7 +10,8 @@ export async function simulateWalletInteraction(url: URL) {
      * Includes transaction planner/executor so we can just call sendTransaction().
      */
     const wallet = createWalletClient({
-        rpcUrl: 'https://api.devnet.solana.com',
+        rpcUrl: 'http://127.0.0.1:8899',
+        rpcSubscriptionsConfig: { url: 'ws://127.0.0.1:8900' },
         payer: CUSTOMER_WALLET,
     }).use(airdrop());
 

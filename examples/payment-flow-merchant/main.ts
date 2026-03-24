@@ -1,5 +1,4 @@
-import { createMerchantClient, FindReferenceError } from '@solana/pay';
-import type { ConfirmedSignatureInfo } from '@solana/pay';
+import { createMerchantClient } from '@solana/pay';
 import { MERCHANT_WALLET } from './constants.js';
 import { simulateCheckout } from './simulateCheckout.js';
 import { simulateWalletInteraction } from './simulateWalletInteraction.js';
@@ -12,8 +11,9 @@ async function main() {
      */
     console.log('1. ✅ Establish connection to the cluster');
     const merchant = createMerchantClient({
-        rpcUrl: 'https://api.devnet.solana.com',
-    });
+        rpcUrl: 'http://127.0.0.1:8899',
+        rpcSubscriptionsConfig: { url: 'ws://127.0.0.1:8900' },
+    })
 
     /**
      * Simulate a checkout experience
@@ -48,26 +48,14 @@ async function main() {
      *
      * When a customer approves the payment request in their wallet, this transaction exists on-chain.
      * You can use any references encoded into the payment link to find the exact transaction on-chain.
+     *
+     * `watchReference` subscribes via WebSocket (logsNotifications) instead of polling,
+     * so the merchant is notified instantly when a matching transaction lands.
      */
-    console.log('\n5. Find the transaction');
+    console.log('\n5. Watch for the transaction');
 
-    const { signature } = await new Promise<ConfirmedSignatureInfo>((resolve, reject) => {
-        const interval = setInterval(async () => {
-            console.count('Checking for transaction...');
-            try {
-                const signatureInfo = await merchant.pay.findReference(reference, { commitment: 'confirmed' });
-                console.log('\n 🖌  Signature found: ', signatureInfo.signature);
-                clearInterval(interval);
-                resolve(signatureInfo);
-            } catch (error: any) {
-                if (!(error instanceof FindReferenceError)) {
-                    console.error(error);
-                    clearInterval(interval);
-                    reject(error);
-                }
-            }
-        }, 250);
-    });
+    const { signature } = await merchant.pay.watchReference(reference, { commitment: 'confirmed' });
+    console.log('\n 🖌  Signature found: ', signature);
 
     /**
      * Validate transaction
@@ -81,7 +69,7 @@ async function main() {
     console.log('\n6. 🔗 Validate transaction \n');
 
     try {
-        await merchant.pay.validateTransfer(signature, { recipient: MERCHANT_WALLET, amount });
+        await merchant.pay.validateTransfer(signature, { recipient: MERCHANT_WALLET, amount }, { commitment: 'confirmed' });
         console.log('✅ Payment validated');
         console.log('📦 Ship order to customer');
     } catch (error) {
