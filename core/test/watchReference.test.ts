@@ -137,4 +137,13 @@ describe('watchReference', () => {
 
         await expect(promise).rejects.toThrow(FindReferenceError);
     });
+
+    it('should throw immediately when given a pre-aborted signal', async () => {
+        const abortController = new AbortController();
+        abortController.abort();
+
+        await expect(watchReference({} as any, reference, { abortSignal: abortController.signal })).rejects.toThrow(
+            FindReferenceError,
+        );
+    });
 });

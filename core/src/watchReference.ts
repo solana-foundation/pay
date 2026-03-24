@@ -41,6 +41,10 @@ export async function watchReference(
 ): Promise<WatchReferenceResult> {
     const { commitment = 'confirmed', abortSignal: externalSignal } = options ?? {};
 
+    if (externalSignal?.aborted) {
+        throw new FindReferenceError('aborted');
+    }
+
     const abortController = new AbortController();
     if (externalSignal) {
         externalSignal.addEventListener('abort', () => abortController.abort(externalSignal.reason), { once: true });
