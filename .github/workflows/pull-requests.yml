@@ -4,11 +4,12 @@ on:
   pull_request:
 
 jobs:
+  # ── TypeScript SDK (typescript/core/) ──
   unit-test:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: ./core
+        working-directory: ./typescript/core
 
     strategy:
       matrix:
@@ -32,3 +33,29 @@ jobs:
 
       - name: Run unit tests
         run: npm test
+
+  # ── Rust CLI (rust/) ──
+  cli-check:
+    name: CLI check
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./rust
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace

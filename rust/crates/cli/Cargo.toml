@@ -1,0 +1,37 @@
+[package]
+name = "pay"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "pay"
+path = "src/main.rs"
+
+[features]
+default = []
+vendored-openssl = ["pay-core/vendored-openssl"]
+
+[dependencies]
+pay-core = { workspace = true }
+pay-keystore = { workspace = true }
+pay-types = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+pay-mcp = { workspace = true }
+reqwest = { workspace = true }
+solana-mpp = { workspace = true }
+tokio = { workspace = true }
+owo-colors = { workspace = true }
+shellexpand = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+bs58 = { workspace = true }
+chrono = { workspace = true }
+dialoguer = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+qrcode = { workspace = true }

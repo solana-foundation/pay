@@ -1,0 +1,218 @@
+name: Release CLI
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (e.g. 0.2.0). Will create tag pay-v<version>."
+        required: true
+        type: string
+      dry-run:
+        description: "Dry run — build and package but skip tagging and GitHub release"
+        required: false
+        type: boolean
+        default: false
+  push:
+    tags: ["pay-v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: pay
+
+jobs:
+  # ── Preflight: validate version, run checks, create tag ──────────────────
+  preflight:
+    name: Preflight
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+    defaults:
+      run:
+        working-directory: ./rust
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version and tag
+        id: resolve
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.version }}"
+            TAG="pay-v${VERSION}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+            VERSION="${TAG#pay-v}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "### Release: ${TAG}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Validate version matches Cargo.toml
+        run: |
+          CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          if [ "${{ steps.resolve.outputs.version }}" != "${CARGO_VERSION}" ]; then
+            echo "::error::Version mismatch: input=${{ steps.resolve.outputs.version }} Cargo.toml=${CARGO_VERSION}"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Format
+        run: cargo fmt --check
+      - name: Lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Create tag
+        if: github.event_name == 'workflow_dispatch' && inputs.dry-run == false
+        run: |
+          git tag "${{ steps.resolve.outputs.tag }}"
+          git push origin "${{ steps.resolve.outputs.tag }}"
+
+  # ── Build matrix ─────────────────────────────────────────────────────────
+  build:
+    name: Build ${{ matrix.target }}
+    needs: preflight
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: ./rust
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            use-cross: true
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use-cross
+        run: cargo install cross --locked
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: release-${{ matrix.target }}
+
+      - name: Build
+        run: >-
+          ${{ matrix.use-cross && 'cross' || 'cargo' }} build --release
+          --target ${{ matrix.target }}
+          ${{ matrix.use-cross && '--features vendored-openssl' || '' }}
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../${{ env.BINARY_NAME }}-${{ matrix.target }}.tar.gz ${{ env.BINARY_NAME }}
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}.exe" -DestinationPath "${{ env.BINARY_NAME }}-${{ matrix.target }}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}-${{ matrix.target }}
+          path: |
+            rust/${{ env.BINARY_NAME }}-${{ matrix.target }}.tar.gz
+            rust/${{ env.BINARY_NAME }}-${{ matrix.target }}.zip
+
+  # ── Create GitHub release ────────────────────────────────────────────────
+  release:
+    name: Release
+    needs: [preflight, build]
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry-run) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          sha256sum *.tar.gz *.zip > sha256sums.txt
+          echo "### Checksums" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat sha256sums.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.preflight.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.zip
+            artifacts/sha256sums.txt
+
+  # ── Update Homebrew tap ──────────────────────────────────────────────────
+  # Disabled: the first Homebrew submission must be manual.
+  # Uncomment after solana-foundation/homebrew-tap has the pay formula.
+  # homebrew:
+  #   name: Update Homebrew formula
+  #   needs: [preflight, release]
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - name: Update Homebrew tap
+  #       uses: mislav/bump-homebrew-formula-action@v3
+  #       with:
+  #         formula-name: pay
+  #         homebrew-tap: solana-foundation/homebrew-tap
+  #         tag-name: ${{ needs.preflight.outputs.tag }}
+  #         download-url: https://github.com/solana-foundation/pay/archive/refs/tags/${{ needs.preflight.outputs.tag }}.tar.gz
+  #       env:
+  #         COMMITTER_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+  # ── Update winget manifest ───────────────────────────────────────────────
+  # Disabled: the first winget submission must be manual.
+  # Uncomment after SolanaFoundation.pay exists in microsoft/winget-pkgs.
+  # winget:
+  #   name: Update winget manifest
+  #   needs: [preflight, release]
+  #   runs-on: windows-latest
+  #   steps:
+  #     - name: Submit to winget
+  #       uses: vedantmgoyal9/winget-releaser@v2
+  #       with:
+  #         identifier: SolanaFoundation.pay
+  #         installers-regex: '-pc-windows-.*\.zip$'
+  #         release-tag: ${{ needs.preflight.outputs.tag }}
+  #       env:
+  #         WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}

@@ -1,0 +1,96 @@
+[workspace]
+members = ["crates/*"]
+default-members = ["crates/cli"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+# Internal crates
+pay-core = { path = "crates/core" }
+pay-types = { path = "crates/types" }
+pay-keystore = { path = "crates/keystore" }
+pay-mcp = { path = "crates/mcp" }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yml = "0.0.12"
+base64 = "0.22"
+
+# Error handling
+thiserror = "2"
+
+# Colors
+owo-colors = "4"
+
+# Interactive prompts
+dialoguer = "0.12"
+
+# Time
+chrono = "0.4"
+
+# MCP
+rmcp = { version = "0.9", features = ["server", "transport-io"] }
+schemars = "0.8"
+
+# TUI
+ratatui = { version = "0.29", features = [
+    "crossterm",
+], default-features = false }
+crossterm = { version = "0.28", default-features = false }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Configuration
+figment = { version = "0.10", features = ["toml", "env"] }
+toml = "0.8"
+
+# Temp files
+tempfile = "3"
+
+# Path expansion
+shellexpand = "3"
+
+# Async (for solana-mpp charge builder)
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+# HTTP client (for built-in fetch)
+reqwest = { version = "0.12", features = [
+    "blocking",
+    "rustls-tls",
+], default-features = false }
+
+# Crypto (already in dep tree via solana crates)
+ed25519-dalek = { version = "2", default-features = false }
+rand = "0.8"
+bs58 = "0.5"
+qrcode = { version = "0.14", default-features = false }
+
+# Solana MPP (includes keypair loading + charge building)
+solana-mpp = { git = "https://github.com/solana-foundation/mpp-sdk", default-features = false, features = [
+    "client",
+] }
+
+# Solana x402
+solana-x402 = { git = "https://github.com/txtx/moneymq", rev = "c63b77a", default-features = false, features = [
+    "client",
+] }
+
+# Solana primitives (pinned to versions used by solana-mpp)
+bincode = "1"
+solana-hash = "3.1"
+solana-instruction = "3.2"
+solana-message = "3.1"
+solana-pubkey = "3.0"
+solana-signature = "3.2"
+solana-system-interface = "2.0"
+solana-transaction = "3.1"

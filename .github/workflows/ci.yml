@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  # ── TypeScript SDK (typescript/core/) ──
+  core-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./typescript/core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+      - run: npm install
+      - run: npm test
+
+  # ── Rust CLI (rust/) ──
+  cli-check:
+    name: CLI check
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace

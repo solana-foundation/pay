@@ -1,0 +1,42 @@
+[package]
+name = "pay-core"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# Build OpenSSL from source for cross-compilation (no system libssl-dev needed).
+# Activates openssl-sys/vendored which is pulled in transitively by
+# solana-rpc-client → reqwest → native-tls → openssl-sys.
+vendored-openssl = ["openssl-sys/vendored"]
+
+[dependencies]
+openssl-sys = { version = "0.9", optional = true }
+pay-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yml = { workspace = true }
+base64 = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+figment = { workspace = true }
+toml = { workspace = true }
+tempfile = { workspace = true }
+shellexpand = { workspace = true }
+tokio = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+bs58 = { workspace = true }
+reqwest = { workspace = true }
+pay-keystore = { workspace = true }
+solana-mpp = { workspace = true }
+solana-x402 = { workspace = true }
+bincode = { workspace = true }
+solana-hash = { workspace = true }
+solana-instruction = { workspace = true }
+solana-message = { workspace = true }
+solana-pubkey = { workspace = true }
+solana-signature = { workspace = true }
+solana-system-interface = { workspace = true }
+solana-transaction = { workspace = true }

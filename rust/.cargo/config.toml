@@ -1,0 +1,2 @@
+[alias]
+cli-install = "install --path crates/cli --locked --force"
