@@ -125,7 +125,7 @@ export async function validateTransfer(
 
     const response = await rpc
         .getTransaction(signature, {
-            commitment: options?.commitment,
+            commitment: options?.commitment ?? 'confirmed',
             maxSupportedTransactionVersion: 0,
             encoding: 'base64',
         })
