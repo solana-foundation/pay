@@ -29,10 +29,7 @@ impl ClaudeCommand {
             );
         }
         if let Ok(url) = std::env::var("PAY_RPC_URL") {
-            env.insert(
-                "PAY_RPC_URL".to_string(),
-                serde_json::Value::String(url),
-            );
+            env.insert("PAY_RPC_URL".to_string(), serde_json::Value::String(url));
         }
         if !env.is_empty() {
             mcp_server["env"] = serde_json::Value::Object(env);

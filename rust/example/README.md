@@ -61,7 +61,7 @@ curl http://localhost:3402/health
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `RPC_URL` | `http://402.surfnet.dev:8899` | Surfpool RPC endpoint |
+| `RPC_URL` | `https://402.surfnet.dev:8899` | Surfpool RPC endpoint |
 | `PORT` | `3402` | Server port |
 | `NETWORK` | `localnet` | Solana network |
 | `SECRET_KEY` | `test-secret-key-for-dev` | MPP secret key |

@@ -12,10 +12,10 @@ Wrap `curl` or `wget` — when an API returns 402, `pay` detects the payment pro
 
 ```sh
 # Without pay — you get a 402
-curl http://402-demo-api.vercel.app/
+curl https://402-demo-api.vercel.app/
 
 # With pay — it handles the 402 and you get the response
-pay --dev curl http://402-demo-api.vercel.app/
+pay --dev curl https://402-demo-api.vercel.app/
 ```
 
 ## Key Features
@@ -92,7 +92,7 @@ pay --version
 pay setup
 
 # 2. Make a paid API call (--dev uses an ephemeral funded keypair)
-pay --dev curl http://402-demo-api.vercel.app/
+pay --dev curl https://402-demo-api.vercel.app/
 
 # 3. Or let your AI agent handle it
 pay --dev claude

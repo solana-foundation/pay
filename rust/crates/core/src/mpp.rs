@@ -33,8 +33,8 @@ pub fn build_credential(challenge: &Challenge, keypair_source: &str) -> Result<S
         .network
         .as_deref()
         .unwrap_or("mainnet-beta");
-    let rpc_url = std::env::var("PAY_RPC_URL")
-        .unwrap_or_else(|_| default_rpc_url(network).to_string());
+    let rpc_url =
+        std::env::var("PAY_RPC_URL").unwrap_or_else(|_| default_rpc_url(network).to_string());
     let rpc = RpcClient::new(rpc_url.clone());
 
     info!(

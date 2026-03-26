@@ -87,8 +87,7 @@ fn main() {
                 if opts.verbose {
                     eprintln!(
                         "{}",
-                        format!("Dev mode: ephemeral account {} ({})", kp.pubkey, rpc_url)
-                            .dimmed()
+                        format!("Dev mode: ephemeral account {} ({})", kp.pubkey, rpc_url).dimmed()
                     );
                 }
                 keypair_override = Some(kp.path.clone());

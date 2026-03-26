@@ -30,10 +30,8 @@ impl CodexCommand {
             env_parts.push(format!("PAY_RPC_URL=\"{url}\""));
         }
         if !env_parts.is_empty() {
-            cmd.arg("-c").arg(format!(
-                "mcp_servers.pay.env={{{}}}",
-                env_parts.join(",")
-            ));
+            cmd.arg("-c")
+                .arg(format!("mcp_servers.pay.env={{{}}}", env_parts.join(",")));
         }
 
         let status = cmd

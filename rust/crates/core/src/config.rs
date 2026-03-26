@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 pub const LOCAL_RPC_URL: &str = "http://localhost:8899";
-pub const DEV_RPC_URL: &str = "http://402.surfnet.dev:8899";
+pub const DEV_RPC_URL: &str = "https://402.surfnet.dev:8899";
 
 /// Logging format for operational logs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
