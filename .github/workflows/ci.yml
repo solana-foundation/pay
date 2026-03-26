@@ -10,14 +10,17 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: ./typescript/packages/solana-pay/core
+        working-directory: ./typescript
     steps:
       - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
       - uses: actions/setup-node@v4
         with:
           node-version: lts/*
-      - run: npm install
-      - run: npm test
+      - run: pnpm install
+      - run: pnpm --filter @solana/pay test
 
   # ── Rust CLI (rust/) ──
   cli-check:
