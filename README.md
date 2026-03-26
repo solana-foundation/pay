@@ -1,10 +1,8 @@
-<div align="center">
-
 # pay
 
-**`curl` for paid APIs.**
+**The missing [HTTP 402](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Status/402) client.**
 
-Handle [HTTP 402 Payment Required](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Status/402) automatically — detect the payment protocol, sign a Solana transaction, retry. The response lands on stdout as if nothing happened.
+Wrap `curl` or `wget` — when an API returns 402, `pay` detects the payment protocol, signs a Solana transaction, and retries. The response lands on stdout as if nothing happened.
 
 [Install](#installation) · [Quick Start](#quick-start) · [Docs](https://docs.solanapay.com)
 
@@ -68,12 +66,6 @@ pay --dev curl http://localhost:8080/data
 ```
 
 ## Installation
-
-### Homebrew
-
-```sh
-brew install pay
-```
 
 ### From Source
 
