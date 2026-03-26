@@ -1,66 +1,118 @@
-# Solana Pay
+<div align="center">
 
-Solana Pay is a standard protocol and set of reference implementations that enable developers to incorporate decentralized payments into their apps and services.
+# pay
 
-[Read the specification.](SPEC.md)
+**`curl` for paid APIs.**
 
-The Solana blockchain confirms transactions in less than a second and costs on average $0.0005, providing users a seamless experience with no intermediaries.
+Handle [HTTP 402 Payment Required](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Status/402) automatically — detect the payment protocol, sign a Solana transaction, retry. The response lands on stdout as if nothing happened.
 
-[Read the docs to get started.](https://docs.solanapay.com)
+[Install](#installation) · [Quick Start](#quick-start) · [Docs](https://docs.solanapay.com)
 
-## Supporting Wallets
+</div>
 
-- **Phantom** ([iOS](https://apps.apple.com/us/app/phantom-solana-wallet/id1598432977), [Android](https://play.google.com/store/apps/details?id=app.phantom&hl=en_US&gl=US))
-- **Solflare** ([iOS](https://apps.apple.com/us/app/solflare/id1580902717), [Android](https://play.google.com/store/apps/details?id=com.solflare.mobile))
-- **Glow** ([iOS](https://apps.apple.com/app/id1599584512), [Android](https://play.google.com/store/apps/details?id=com.luma.wallet.prod))
-- **Decaf Wallet** ([iOS](https://apps.apple.com/nz/app/decaf-wallet/id1616564038), [Android](https://play.google.com/store/apps/details?id=so.decaf.wallet))
-- **Espresso Cash** ([iOS](https://apps.apple.com/us/app/crypto-please/id1559625715), [Android](https://play.google.com/store/apps/details?id=com.pleasecrypto.flutter))
-- **Tiplink** ([Web](https://tiplink.io))
-- **Bitget Wallet** ([iOS](https://apps.apple.com/app/id1395301115), [Android](https://play.google.com/store/apps/details?id=com.bitkeep.wallet))
+---
 
-## How to use Solana Pay
+```sh
+# Just like curl, but it handles 402s
+pay --dev curl https://api.example.com/data
 
-### Accept payments in your web app
+# Works with wget too
+pay --dev wget https://api.example.com/report.csv
+```
 
-Use the [`@solana/pay` JavaScript SDK](https://github.com/solana-labs/solana-pay/tree/master/core) to start accepting payments in your app today.
+## Key Features
 
-### Accept payments in person
+### Transparent 402 Handling
 
-Run the open-source [Solana Pay Point of Sale app](https://github.com/solana-labs/solana-pay/tree/master/examples/point-of-sale) to start accepting payments in-person.
+Wrap `curl` or `wget` — when an API returns 402, `pay` detects the payment protocol, signs the transaction, and retries. You get the response body. That's it.
 
-## Getting Involved
+Supports both live payment standards on Solana:
+- **[MPP](https://www.mppstd.org/)** — Machine Payments Protocol
+- **[x402](https://www.x402.org/)** — x402 Payment Protocol
 
-Solana Pay is an open standard to facilitate commerce on Solana. We are looking for more contributors to help develop the ecosystem. Here are a few ideas if you're looking to get involved.
+SOL and SPL tokens (USDC, USDT, etc.) are supported out of the box.
 
-### Hackathon Projects
+### Touch ID & 1Password Key Storage
 
-The [Solana Grizzlython Hackathon](https://solana.com/grizzlython) is happening right now. There's a dedicated Payments track, presented by Stripe.
+Your keys never touch disk in plaintext. `pay` stores keypairs in:
 
-Here are some [Solana Pay hackathon ideas](https://www.figma.com/community/file/1070574785723157359) to get started thinking about how you can build the future of payments.
+- **macOS Keychain** with Touch ID biometric protection
+- **1Password** vault integration (cross-platform)
+- **File-based** fallback for CI and scripting
 
-### eCommerce Platform Integrations
+```sh
+pay setup --backend keychain    # Touch ID protected
+pay setup --backend 1password   # Cross-platform vault
+```
 
-To get as many merchants accepting payments on Solana as possible we need to provide easy ways to set up Solana Pay on all eCommerce platforms.
+### Session Budgets via TUI
 
-Solana Labs has started a reference implementation for Shopify which you can see [here](https://github.com/solana-labs/solana-pay/blob/shopify/shopify) to get a sense of how this might work.
+Set a spending cap and expiration before making requests. The interactive TUI lets you control exactly how much you're willing to spend per session — no surprise charges.
 
-Here are some of the top eCommerce platforms that we're looking to integrate to:
+### AI-Native with MCP
 
-- WooCommerce
-- Magento
-- BigCommerce
-- Wix
-- Squarespace
+`pay` ships with a built-in [MCP](https://modelcontextprotocol.io/) server, giving AI assistants the ability to make paid API calls on your behalf.
 
-### Other possible projects
+```sh
+# Run Claude Code or Codex with pay injected automatically
+pay claude
+pay codex
+```
 
-- Mobile SDKs
-- Checkout UX Components
+### Dev Mode
 
-Do you have another idea? Feel free to open an issue to discuss it with the community.
+Spin up a local environment with an ephemeral keypair auto-funded via [Surfpool](https://github.com/txtx/surfpool). No mainnet tokens needed.
+
+```sh
+pay --dev curl http://localhost:8080/data
+```
+
+## Installation
+
+### Homebrew
+
+```sh
+brew install pay
+```
+
+### From Source
+
+```sh
+git clone https://github.com/solana-foundation/pay.git
+cd pay/rust
+cargo install --path crates/cli
+```
+
+### Verify
+
+```sh
+pay --version
+```
+
+## Quick Start
+
+```sh
+# 1. Generate a keypair (Touch ID protected on macOS)
+pay setup
+
+# 2. Make a paid API call (--dev uses an ephemeral funded keypair)
+pay --dev curl https://api.example.com/data
+
+# 3. Or let your AI agent handle it
+pay --dev claude
+```
+
+## Contributing
+
+```sh
+cd rust
+just build   # release binary
+just test    # all tests
+just lint    # clippy (warnings = errors)
+```
+
+We welcome contributions — check [open issues](https://github.com/solana-foundation/pay/issues) to get started.
 
 ## License
 
-Solana Pay is open source and available under the Apache License, Version 2.0. See the [LICENSE](./LICENSE) file for more info.
-
-![Solana Pay](solana-pay.png)
+Apache-2.0 — see [LICENSE](./LICENSE).
