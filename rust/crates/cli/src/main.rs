@@ -26,10 +26,14 @@ struct Opts {
     #[arg(long, global = true)]
     yolo: bool,
 
-    /// Dev mode: generate a fresh ephemeral keypair, fund it on localnet via surfpool.
-    /// Requires surfpool running on localhost:8899.
+    /// Dev mode: generate a fresh ephemeral keypair funded via Surfpool.
+    /// Uses 402.surfnet.dev by default; combine with --local for localhost:8899.
     #[arg(long, global = true)]
     dev: bool,
+
+    /// Use local Surfpool (localhost:8899) instead of the public devnet.
+    #[arg(long, global = true)]
+    local: bool,
 
     /// Output format for status messages (text or json).
     /// Defaults to json when NO_DNA is set or stdout is piped.
@@ -71,16 +75,25 @@ fn main() {
     let keypair_override: Option<String>;
 
     if opts.dev {
-        let rpc_url = config.rpc_url().to_string();
+        let rpc_url = if opts.local {
+            pay_core::config::LOCAL_RPC_URL.to_string()
+        } else if let Ok(url) = std::env::var("PAY_DEV_RPC_URL") {
+            url
+        } else {
+            pay_core::config::DEV_RPC_URL.to_string()
+        };
         match pay_core::dev::setup_dev_keypair(&rpc_url) {
             Ok(kp) => {
                 if opts.verbose {
                     eprintln!(
                         "{}",
-                        format!("Dev mode: ephemeral account {}", kp.pubkey).dimmed()
+                        format!("Dev mode: ephemeral account {} ({})", kp.pubkey, rpc_url).dimmed()
                     );
                 }
                 keypair_override = Some(kp.path.clone());
+                // Make the dev RPC URL available to payment signing and MCP subprocesses
+                // SAFETY: called before any threads are spawned
+                unsafe { std::env::set_var("PAY_RPC_URL", &rpc_url) };
                 // Keep the DevKeypair alive (owns the temp file)
                 std::mem::forget(kp);
             }
@@ -89,7 +102,6 @@ fn main() {
                     "{}",
                     format!("Error setting up dev keypair: {err}").dimmed()
                 );
-                eprintln!("{}", format!("Is surfpool running on {rpc_url}?").dimmed());
                 std::process::exit(1);
             }
         }

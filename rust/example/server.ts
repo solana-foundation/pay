@@ -6,7 +6,7 @@ import { paymentMiddleware } from 'x402-express'
 
 const PORT = Number(process.env.PORT || 3402)
 const NETWORK = process.env.NETWORK || 'localnet'
-const RPC_URL = process.env.RPC_URL || 'http://localhost:8899'
+const RPC_URL = process.env.RPC_URL || 'https://402.surfnet.dev:8899'
 const SECRET_KEY = process.env.SECRET_KEY || 'test-secret-key-for-dev'
 
 // USDC mint (same address used on localnet via surfpool)

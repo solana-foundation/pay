@@ -20,11 +20,19 @@ impl ClaudeCommand {
             "args": ["mcp"]
         });
 
-        // Pass the keypair source to the MCP server via env var
+        // Pass config to the MCP server via env vars
+        let mut env = serde_json::Map::new();
         if let Some(source) = keypair_source {
-            mcp_server["env"] = serde_json::json!({
-                "PAY_SECRET_KEY": source
-            });
+            env.insert(
+                "PAY_SECRET_KEY".to_string(),
+                serde_json::Value::String(source.to_string()),
+            );
+        }
+        if let Ok(url) = std::env::var("PAY_RPC_URL") {
+            env.insert("PAY_RPC_URL".to_string(), serde_json::Value::String(url));
+        }
+        if !env.is_empty() {
+            mcp_server["env"] = serde_json::Value::Object(env);
         }
 
         let mcp_config = serde_json::json!({

@@ -21,11 +21,17 @@ impl CodexCommand {
             .arg("-c")
             .arg("mcp_servers.pay.args=[\"mcp\"]");
 
-        // Pass keypair to MCP server via env
+        // Pass config to MCP server via env
+        let mut env_parts = Vec::new();
         if let Some(source) = keypair_source {
-            cmd.arg("-c").arg(format!(
-                "mcp_servers.pay.env={{PAY_SECRET_KEY=\"{source}\"}}"
-            ));
+            env_parts.push(format!("PAY_SECRET_KEY=\"{source}\""));
+        }
+        if let Ok(url) = std::env::var("PAY_RPC_URL") {
+            env_parts.push(format!("PAY_RPC_URL=\"{url}\""));
+        }
+        if !env_parts.is_empty() {
+            cmd.arg("-c")
+                .arg(format!("mcp_servers.pay.env={{{}}}", env_parts.join(",")));
         }
 
         let status = cmd

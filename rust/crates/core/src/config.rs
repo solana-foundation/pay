@@ -3,7 +3,8 @@ use figment::providers::{Env, Format, Serialized, Toml};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-pub const DEFAULT_RPC_URL: &str = "http://localhost:8899";
+pub const LOCAL_RPC_URL: &str = "http://localhost:8899";
+pub const DEV_RPC_URL: &str = "https://402.surfnet.dev:8899";
 
 /// Logging format for operational logs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,7 +64,7 @@ impl Config {
         self.rpc_url
             .as_deref()
             .filter(|url| !url.trim().is_empty())
-            .unwrap_or(DEFAULT_RPC_URL)
+            .unwrap_or(LOCAL_RPC_URL)
     }
 
     /// Resolve the preferred keypair source for commands that need to sign.
@@ -166,7 +167,7 @@ mod tests {
     fn rpc_url_falls_back_to_default() {
         let config = Config::default();
 
-        assert_eq!(config.rpc_url(), super::DEFAULT_RPC_URL);
+        assert_eq!(config.rpc_url(), super::LOCAL_RPC_URL);
     }
 
     #[test]
