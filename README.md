@@ -11,11 +11,11 @@ Wrap `curl` or `wget` — when an API returns 402, `pay` detects the payment pro
 ---
 
 ```sh
-# Just like curl, but it handles 402s
-pay --dev curl https://api.example.com/data
+# Without pay — you get a 402
+curl http://402-demo-api.vercel.app/
 
-# Works with wget too
-pay --dev wget https://api.example.com/report.csv
+# With pay — it handles the 402 and you get the response
+pay --dev curl http://402-demo-api.vercel.app/
 ```
 
 ## Key Features
@@ -25,8 +25,8 @@ pay --dev wget https://api.example.com/report.csv
 Wrap `curl` or `wget` — when an API returns 402, `pay` detects the payment protocol, signs the transaction, and retries. You get the response body. That's it.
 
 Supports both live payment standards on Solana:
-- **[MPP](https://www.mppstd.org/)** — Machine Payments Protocol
-- **[x402](https://www.x402.org/)** — x402 Payment Protocol
+- **[MPP](https://mpp.dev/)** — Machine Payments Protocol
+- **[x402](https://x402.org/)** — x402 Payment Protocol
 
 SOL and SPL tokens (USDC, USDT, etc.) are supported out of the box.
 
@@ -53,16 +53,20 @@ Set a spending cap and expiration before making requests. The interactive TUI le
 
 ```sh
 # Run Claude Code or Codex with pay injected automatically
-pay claude
-pay codex
+pay --dev claude
+pay --dev codex
 ```
 
 ### Dev Mode
 
-Spin up a local environment with an ephemeral keypair auto-funded via [Surfpool](https://github.com/txtx/surfpool). No mainnet tokens needed.
+Get started instantly with an ephemeral keypair auto-funded via [Surfpool](https://github.com/txtx/surfpool). No setup, no mainnet tokens needed.
 
 ```sh
-pay --dev curl http://localhost:8080/data
+# Uses public devnet (402.surfnet.dev) by default
+pay --dev curl https://402-demo-api.vercel.app/mpp/quote/SOL
+
+# Or use a local Surfpool instance
+pay --dev --local curl http://localhost:3402/mpp/quote/SOL
 ```
 
 ## Installation
@@ -88,7 +92,7 @@ pay --version
 pay setup
 
 # 2. Make a paid API call (--dev uses an ephemeral funded keypair)
-pay --dev curl https://api.example.com/data
+pay --dev curl http://402-demo-api.vercel.app/
 
 # 3. Or let your AI agent handle it
 pay --dev claude
