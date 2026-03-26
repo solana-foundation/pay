@@ -1,0 +1,29 @@
+# Task runner for pay CLI
+
+# Format check
+fmt:
+    cargo fmt --check
+
+# Lint with clippy (warnings as errors)
+lint:
+    cargo clippy --workspace --all-targets -- -D warnings
+
+# Run all unit tests
+test:
+    cargo test --workspace
+
+# Run unit tests only (exclude integration)
+unit-test:
+    cargo test --workspace --exclude pay-integration
+
+# Run integration tests only
+integration-test:
+    cargo test -p pay-integration
+
+# Build release binary
+build:
+    cargo build --release
+
+# Run the CLI (pass args after --)
+run *ARGS:
+    cargo run -- {{ARGS}}

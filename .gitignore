@@ -1,9 +1,18 @@
 .idea
 .vscode
-
 .DS_Store
 
+# TypeScript
 node_modules
 build
 .env
 .next
+
+# Rust
+rust/target
+*.swp
+*.swo
+
+# Example
+rust/example/node_modules
+rust/example/pnpm-lock.yaml

@@ -1,0 +1,11 @@
+[package]
+name = "pay-integration"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish = false
+
+[dev-dependencies]
+pay-core = { workspace = true }
+pay-types = { workspace = true }
+serde_json = { workspace = true }

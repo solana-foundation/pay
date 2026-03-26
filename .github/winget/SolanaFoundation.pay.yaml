@@ -1,0 +1,52 @@
+# Reference manifest for winget-pkgs PR
+# The vedantmgoyal9/winget-releaser action auto-generates the versioned manifests,
+# but this serves as the initial template for the first submission.
+#
+# First-time setup:
+#   1. Fork https://github.com/microsoft/winget-pkgs
+#   2. Create manifests/s/SolanaFoundation/pay/0.1.0/
+#   3. Add the three manifest files below
+#   4. PR to microsoft/winget-pkgs
+#
+# After that, the winget-releaser action handles updates automatically.
+
+PackageIdentifier: SolanaFoundation.pay
+PackageVersion: 0.1.0
+PackageName: pay
+Publisher: Solana Foundation
+PublisherUrl: https://solana.org
+License: MIT
+LicenseUrl: https://github.com/solana-foundation/pay/blob/main/LICENSE
+ShortDescription: HTTP client with 402 Payment Required support (MPP, x402)
+Description: |-
+  pay wraps curl, wget, httpie, or its built-in fetch to transparently handle
+  HTTP 402 Payment Required flows. When a server returns 402 with an MPP
+  challenge, pay can automatically sign and submit a Solana payment, then
+  retry the request with the payment credential.
+Tags:
+  - cli
+  - http
+  - payments
+  - solana
+  - 402
+PackageUrl: https://github.com/solana-foundation/pay
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/solana-foundation/pay/releases/download/v0.1.0/pay-x86_64-pc-windows-msvc.zip
+    InstallerSha256: PLACEHOLDER
+    InstallerType: zip
+    NestedInstallerType: portable
+    NestedInstallerFiles:
+      - RelativeFilePath: pay.exe
+        PortableCommandAlias: pay
+  - Architecture: arm64
+    InstallerUrl: https://github.com/solana-foundation/pay/releases/download/v0.1.0/pay-aarch64-pc-windows-msvc.zip
+    InstallerSha256: PLACEHOLDER
+    InstallerType: zip
+    NestedInstallerType: portable
+    NestedInstallerFiles:
+      - RelativeFilePath: pay.exe
+        PortableCommandAlias: pay
+PackageLocale: en-US
+ManifestType: singleton
+ManifestVersion: 1.9.0
