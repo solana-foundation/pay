@@ -28,8 +28,9 @@ pub fn build_payment(requirements: &PaymentRequirements, keypair_source: &str) -
     let signer = crate::signer::load_signer_with_reason(keypair_source, &reason)?;
 
     let cluster = requirements.cluster.as_deref().unwrap_or("mainnet-beta");
-    let rpc_url = default_rpc_url(cluster);
-    let rpc = RpcClient::new(rpc_url.to_string());
+    let rpc_url = std::env::var("PAY_RPC_URL")
+        .unwrap_or_else(|_| default_rpc_url(cluster).to_string());
+    let rpc = RpcClient::new(rpc_url.clone());
 
     info!(
         amount = %requirements.amount,
