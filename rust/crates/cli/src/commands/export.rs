@@ -33,8 +33,7 @@ impl ExportCommand {
         let keypair_bytes = reload_raw_bytes(&source)?;
 
         // Solana CLI format: JSON array of 64 u8 values
-        let bytes_vec: Vec<u8> = keypair_bytes.to_vec();
-        let json = serde_json::to_string(&bytes_vec)
+        let json = serde_json::to_string(&*keypair_bytes)
             .map_err(|e| pay_core::Error::Config(format!("JSON error: {e}")))?;
 
         if self.path == "-" {
@@ -64,7 +63,7 @@ impl ExportCommand {
     }
 }
 
-fn reload_raw_bytes(source: &str) -> pay_core::Result<Vec<u8>> {
+fn reload_raw_bytes(source: &str) -> pay_core::Result<pay_core::keystore::Zeroizing<Vec<u8>>> {
     use pay_core::keystore::KeystoreBackend;
 
     if let Some(account) = source.strip_prefix("keychain:") {
@@ -80,6 +79,23 @@ fn reload_raw_bytes(source: &str) -> pay_core::Result<Vec<u8>> {
             let _ = account;
             return Err(pay_core::Error::Config(
                 "Keychain not available on this platform".to_string(),
+            ));
+        }
+    }
+
+    if let Some(account) = source.strip_prefix("gnome-keyring:") {
+        #[cfg(target_os = "linux")]
+        {
+            use pay_core::keystore::GnomeKeyring;
+            return GnomeKeyring
+                .load_keypair(account, "export keypair")
+                .map_err(|e| pay_core::Error::Config(format!("GNOME Keyring: {e}")));
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = account;
+            return Err(pay_core::Error::Config(
+                "GNOME Keyring not available on this platform".to_string(),
             ));
         }
     }
@@ -103,5 +119,5 @@ fn reload_raw_bytes(source: &str) -> pay_core::Result<Vec<u8>> {
             bytes.len()
         )));
     }
-    Ok(bytes)
+    Ok(pay_core::keystore::Zeroizing::new(bytes))
 }

@@ -9,3 +9,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 shellexpand = { workspace = true }
 thiserror = { workspace = true }
+zeroize = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+secret-service = { version = "3", features = ["rt-tokio-crypto-rust"] }
+tokio = { version = "1", features = ["rt"] }
+zbus = { version = "3", default-features = false, features = ["tokio"] }

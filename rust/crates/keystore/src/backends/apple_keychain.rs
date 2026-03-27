@@ -14,7 +14,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use crate::{Error, KeystoreBackend, Result, SyncMode};
+use crate::{Error, KeystoreBackend, Result, SyncMode, Zeroizing};
 
 /// macOS Keychain backend with hardware-enforced Touch ID.
 pub struct AppleKeychain;
@@ -56,9 +56,9 @@ impl KeystoreBackend for AppleKeychain {
         hex_to_bytes(hex.trim())
     }
 
-    fn load_keypair(&self, account: &str, reason: &str) -> Result<Vec<u8>> {
+    fn load_keypair(&self, account: &str, reason: &str) -> Result<Zeroizing<Vec<u8>>> {
         let hex = helper_run(&["read-protected", account, reason])?;
-        hex_to_bytes(hex.trim())
+        hex_to_bytes(hex.trim()).map(Zeroizing::new)
     }
 }
 

@@ -30,6 +30,7 @@ const ACCOUNTS_FILE: &str = "~/.config/pay/accounts.yml";
 #[serde(rename_all = "kebab-case")]
 pub enum Keystore {
     AppleKeychain,
+    GnomeKeyring,
     OnePassword,
     File,
 }
@@ -38,6 +39,7 @@ impl std::fmt::Display for Keystore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Keystore::AppleKeychain => write!(f, "apple-keychain"),
+            Keystore::GnomeKeyring => write!(f, "gnome-keyring"),
             Keystore::OnePassword => write!(f, "1password"),
             Keystore::File => write!(f, "file"),
         }
@@ -68,6 +70,7 @@ impl Account {
     pub fn signer_source(&self, name: &str) -> String {
         match self.keystore {
             Keystore::AppleKeychain => format!("keychain:{name}"),
+            Keystore::GnomeKeyring => format!("gnome-keyring:{name}"),
             Keystore::OnePassword => format!("1password:{name}"),
             Keystore::File => self
                 .path

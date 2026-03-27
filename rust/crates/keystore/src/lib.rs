@@ -8,6 +8,7 @@ pub mod backends;
 mod error;
 
 pub use error::{Error, Result};
+pub use zeroize::Zeroizing;
 
 /// Controls whether the key syncs to cloud storage.
 #[derive(Debug, Clone, Copy, Default)]
@@ -34,5 +35,6 @@ pub trait KeystoreBackend {
     fn pubkey(&self, account: &str) -> Result<Vec<u8>>;
 
     /// Load the full keypair (64 bytes). May trigger auth (Touch ID, password, etc.).
-    fn load_keypair(&self, account: &str, reason: &str) -> Result<Vec<u8>>;
+    /// Returns a `Zeroizing` wrapper that wipes the bytes from memory on drop.
+    fn load_keypair(&self, account: &str, reason: &str) -> Result<Zeroizing<Vec<u8>>>;
 }

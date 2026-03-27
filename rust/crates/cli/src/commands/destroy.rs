@@ -117,6 +117,19 @@ impl DestroyCommand {
                     "Cannot delete Keychain entries on this platform".to_string(),
                 ));
             }
+            #[cfg(target_os = "linux")]
+            Keystore::GnomeKeyring => {
+                use pay_core::keystore::GnomeKeyring;
+                GnomeKeyring
+                    .delete(&self.account)
+                    .map_err(|e| pay_core::Error::Config(format!("GNOME Keyring delete: {e}")))?;
+            }
+            #[cfg(not(target_os = "linux"))]
+            Keystore::GnomeKeyring => {
+                return Err(pay_core::Error::Config(
+                    "Cannot delete GNOME Keyring entries on this platform".to_string(),
+                ));
+            }
             Keystore::OnePassword => {
                 use pay_core::keystore::OnePassword;
                 let backend = OnePassword::new();
@@ -171,6 +184,22 @@ fn discover_legacy_account(name: &str) -> Option<Account> {
             let pubkey = kc.pubkey(name).ok().map(|b| bs58::encode(&b).into_string());
             return Some(Account {
                 keystore: Keystore::AppleKeychain,
+                pubkey,
+                vault: None,
+                path: None,
+            });
+        }
+    }
+
+    // Try GNOME Keyring (Linux)
+    #[cfg(target_os = "linux")]
+    {
+        use pay_core::keystore::GnomeKeyring;
+        let kr = GnomeKeyring;
+        if kr.exists(name) {
+            let pubkey = kr.pubkey(name).ok().map(|b| bs58::encode(&b).into_string());
+            return Some(Account {
+                keystore: Keystore::GnomeKeyring,
                 pubkey,
                 vault: None,
                 path: None,

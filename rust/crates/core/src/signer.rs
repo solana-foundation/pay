@@ -15,11 +15,13 @@ pub fn load_signer(source: &str) -> Result<MemorySigner> {
 
 /// Load a `MemorySigner` with a custom reason string.
 ///
-/// For Keychain sources, the reason is shown in the Touch ID prompt.
+/// For Keychain/GNOME Keyring sources, the reason is shown in the auth prompt.
 /// For 1Password and file-based keypairs, the reason is ignored.
 pub fn load_signer_with_reason(source: &str, reason: &str) -> Result<MemorySigner> {
     if let Some(account) = source.strip_prefix("keychain:") {
         load_from_keychain(account, reason)
+    } else if let Some(account) = source.strip_prefix("gnome-keyring:") {
+        load_from_gnome_keyring(account, reason)
     } else if let Some(account) = source.strip_prefix("1password:") {
         load_from_1password(account, reason)
     } else {
@@ -49,6 +51,25 @@ fn load_from_keychain(account: &str, reason: &str) -> Result<MemorySigner> {
 fn load_from_keychain(_account: &str, _reason: &str) -> Result<MemorySigner> {
     Err(Error::Config(
         "Keychain not available on this platform".to_string(),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn load_from_gnome_keyring(account: &str, reason: &str) -> Result<MemorySigner> {
+    use crate::keystore::{GnomeKeyring, KeystoreBackend};
+
+    let bytes = GnomeKeyring
+        .load_keypair(account, reason)
+        .map_err(|e| Error::Config(format!("GNOME Keyring: {e}")))?;
+
+    MemorySigner::from_bytes(&bytes)
+        .map_err(|e| Error::Config(format!("Invalid keypair from GNOME Keyring: {e}")))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn load_from_gnome_keyring(_account: &str, _reason: &str) -> Result<MemorySigner> {
+    Err(Error::Config(
+        "GNOME Keyring not available on this platform".to_string(),
     ))
 }
 

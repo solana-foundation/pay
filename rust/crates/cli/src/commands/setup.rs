@@ -43,9 +43,15 @@ impl SetupCommand {
             "keychain" => Err(pay_core::Error::Config(
                 "Keychain backend is only available on macOS".to_string(),
             )),
+            #[cfg(target_os = "linux")]
+            "gnome-keyring" => self.run_gnome_keyring(),
+            #[cfg(not(target_os = "linux"))]
+            "gnome-keyring" => Err(pay_core::Error::Config(
+                "GNOME Keyring is only available on Linux".to_string(),
+            )),
             "1password" => self.run_1password(),
             other => Err(pay_core::Error::Config(format!(
-                "Unknown backend: {other}. Use 'keychain' or '1password'."
+                "Unknown backend: {other}. Use 'keychain', 'gnome-keyring', or '1password'."
             ))),
         }
     }
@@ -61,6 +67,16 @@ impl SetupCommand {
         }
 
         let keychain_available = cfg!(target_os = "macos");
+        let gnome_available = {
+            #[cfg(target_os = "linux")]
+            {
+                pay_core::keystore::GnomeKeyring::is_available()
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                false
+            }
+        };
         let op_available = pay_core::keystore::OnePassword::is_available();
 
         let options = [
@@ -72,6 +88,15 @@ impl SetupCommand {
                     "macOS Keychain (Touch ID) — macOS only".to_string()
                 },
                 available: keychain_available,
+            },
+            BackendOption {
+                id: "gnome-keyring",
+                label: if gnome_available {
+                    "GNOME Keyring (password prompt)".to_string()
+                } else {
+                    "GNOME Keyring — not available (desktop session required)".to_string()
+                },
+                available: gnome_available,
             },
             BackendOption {
                 id: "1password",
@@ -110,6 +135,9 @@ impl SetupCommand {
         if !chosen.available {
             let hint = match chosen.id {
                 "keychain" => "Keychain is only available on macOS.",
+                "gnome-keyring" => {
+                    "GNOME Keyring requires a GNOME or KDE (Plasma 6+) desktop session."
+                }
                 "1password" => {
                     "Install the 1Password CLI: https://developer.1password.com/docs/cli/get-started"
                 }
@@ -155,6 +183,50 @@ impl SetupCommand {
         save_account(
             "default",
             pay_core::accounts::Keystore::AppleKeychain,
+            &pubkey_b58,
+            None,
+            None,
+        )?;
+        self.show_next_steps(&pubkey_b58)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn run_gnome_keyring(&self) -> pay_core::Result<()> {
+        use pay_core::keystore::GnomeKeyring;
+
+        if !GnomeKeyring::is_available() {
+            return Err(pay_core::Error::Config(
+                "GNOME Keyring is not available. A GNOME or KDE (Plasma 6+) desktop session is required.".to_string(),
+            ));
+        }
+
+        let backend = GnomeKeyring;
+
+        if backend.exists("default") && !self.force {
+            return self.show_existing(&backend);
+        }
+
+        let (keypair_bytes, pubkey_b58) = generate_keypair();
+
+        backend
+            .import(
+                "default",
+                &keypair_bytes,
+                pay_core::keystore::SyncMode::ThisDeviceOnly,
+            )
+            .map_err(|e| pay_core::Error::Config(format!("{e}")))?;
+
+        eprintln!();
+        eprintln!("  {} {pubkey_b58}", "Your account:".dimmed());
+        eprintln!();
+        eprintln!(
+            "{}",
+            "  Stored in GNOME Keyring — password prompt required to pay.".dimmed()
+        );
+
+        save_account(
+            "default",
+            pay_core::accounts::Keystore::GnomeKeyring,
             &pubkey_b58,
             None,
             None,

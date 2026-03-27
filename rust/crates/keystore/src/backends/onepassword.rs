@@ -13,7 +13,7 @@
 
 use std::process::Command;
 
-use crate::{Error, KeystoreBackend, Result, SyncMode};
+use crate::{Error, KeystoreBackend, Result, SyncMode, Zeroizing};
 
 const TAG: &str = "pay";
 
@@ -156,7 +156,7 @@ impl KeystoreBackend for OnePassword {
         hex_to_bytes(&hex)
     }
 
-    fn load_keypair(&self, account: &str, _reason: &str) -> Result<Vec<u8>> {
+    fn load_keypair(&self, account: &str, _reason: &str) -> Result<Zeroizing<Vec<u8>>> {
         // 1Password handles its own auth (biometrics/password) via the `op` CLI.
         // The `reason` parameter is not used — 1Password shows its own prompt.
         let title = Self::item_title(account);
@@ -176,7 +176,7 @@ impl KeystoreBackend for OnePassword {
             return Err(Error::Backend(format!("op item get failed: {err}")));
         }
         let hex = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        hex_to_bytes(&hex)
+        hex_to_bytes(&hex).map(Zeroizing::new)
     }
 }
 

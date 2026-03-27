@@ -103,6 +103,13 @@ impl Config {
                 return Some("keychain:default".to_string());
             }
         }
+        #[cfg(target_os = "linux")]
+        {
+            use crate::keystore::{GnomeKeyring, KeystoreBackend};
+            if GnomeKeyring.exists("default") {
+                return Some("gnome-keyring:default".to_string());
+            }
+        }
 
         {
             use crate::keystore::{KeystoreBackend, OnePassword};

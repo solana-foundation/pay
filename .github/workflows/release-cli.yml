@@ -182,6 +182,31 @@ jobs:
             artifacts/*.zip
             artifacts/sha256sums.txt
 
+  # ── Publish to Snap Store ────────────────────────────────────────────────
+  snap:
+    name: Snap
+    needs: [preflight, release]
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry-run) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.tag }}
+
+      - name: Set snap version
+        run: |
+          sed -i "s/^version:.*/version: \"${{ needs.preflight.outputs.version }}\"/" snap/snapcraft.yaml
+
+      - uses: snapcore/action-build@v1
+        id: build
+
+      - uses: snapcore/action-publish@v1
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+        with:
+          snap: ${{ steps.build.outputs.snap }}
+          release: stable
+
   # ── Update Homebrew tap ──────────────────────────────────────────────────
   # Disabled: the first Homebrew submission must be manual.
   # Uncomment after solana-foundation/homebrew-tap has the pay formula.
