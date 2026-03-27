@@ -344,6 +344,7 @@ fn run_topup(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_topup_selector(
     frame: &mut ratatui::Frame,
     area: Rect,
@@ -706,6 +707,7 @@ fn open_url(url: &str) -> io::Result<()> {
 
     #[cfg(not(target_os = "macos"))]
     {
+        let _ = url;
         Ok(())
     }
 }
