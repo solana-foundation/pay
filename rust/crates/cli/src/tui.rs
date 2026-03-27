@@ -26,7 +26,6 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
-const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const POLL_DELAY: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -37,13 +36,13 @@ struct TopupDetected {
 }
 
 /// What the status line should show.
-enum PollStatus<'a> {
+enum PollStatus {
     /// Initial balance fetch failed — no polling possible.
-    RpcUnavailable(&'a str),
+    RpcUnavailable,
     /// Waiting for the 10s delay before polling starts.
-    Waiting { secs_left: u64 },
+    Waiting,
     /// Actively polling for incoming funds.
-    Polling { spinner_idx: usize },
+    Polling,
 }
 
 /// Slider range: $0.00 to $15.00 in $0.50 increments = 30 steps, + 1 YOLO step = 31
@@ -52,6 +51,15 @@ const STEP_AMOUNT: u64 = 500_000; // 0.50 USDC in base units (6 decimals)
 
 const CARD_WIDTH: u16 = 36;
 const CARD_BG: Color = Color::Rgb(35, 40, 50);
+const TOPUP_SIDEBAR_BG: Color = Color::Rgb(24, 24, 27);
+const TOPUP_MAIN_BG: Color = Color::Rgb(9, 9, 11);
+const TOPUP_CARD_BG: Color = Color::Rgb(39, 39, 42);
+const TOPUP_CARD_ACTIVE_BG: Color = Color::Rgb(74, 222, 128);
+const TOPUP_CARD_INACTIVE_SELECTED_BG: Color = Color::Rgb(34, 84, 61);
+const TOPUP_CARD_ACTIVE_FG: Color = Color::Rgb(24, 24, 27);
+const SOLANA_PURPLE: Color = Color::Rgb(153, 69, 255);
+const SOLANA_BLUE: Color = Color::Rgb(80, 120, 255);
+const SOLANA_GREEN: Color = Color::Rgb(20, 241, 149);
 
 /// Expiration presets: (seconds, label)
 const EXPIRY_OPTIONS: &[(u64, &str)] = &[
@@ -105,57 +113,69 @@ const DEFAULT_ONRAMP_URL: &str = "https://www.coinbase.com/";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TopupOption {
-    MobileWallet,
-    CryptoBro,
-    Onramp,
+    TransferFromExistingAccount,
+    BuyStablecoins,
 }
 
 impl TopupOption {
-    fn all() -> [Self; 3] {
-        [Self::MobileWallet, Self::CryptoBro, Self::Onramp]
+    fn all() -> [Self; 2] {
+        [Self::TransferFromExistingAccount, Self::BuyStablecoins]
     }
 
     fn title(self) -> &'static str {
         match self {
-            Self::MobileWallet => "I have a mobile wallet and can scan a QR code",
-            Self::CryptoBro => "I have a crypto bro and ask onboard",
-            Self::Onramp => "I'll crypto onramp (open a webpage)",
+            Self::TransferFromExistingAccount => "Top-up from existing account",
+            Self::BuyStablecoins => "Buy stablecoins",
         }
     }
 
-    fn short_label(self) -> &'static str {
+    fn subtitle(self) -> &'static str {
         match self {
-            Self::MobileWallet => "Mobile wallet",
-            Self::CryptoBro => "Crypto bro",
-            Self::Onramp => "Onramp",
+            Self::TransferFromExistingAccount => "Scan or copy this Solana address",
+            Self::BuyStablecoins => "Choose an onramp provider",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TopupFocus {
+    Methods,
+    Providers,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BuyProvider {
+    Venmo,
+    Paypal,
+    Coinbase,
+}
+
+impl BuyProvider {
+    fn all() -> [Self; 3] {
+        [Self::Coinbase, Self::Paypal, Self::Venmo]
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Venmo => "Venmo",
+            Self::Paypal => "PayPal",
+            Self::Coinbase => "Coinbase",
         }
     }
 
-    fn detail_title(self) -> &'static str {
+    fn subtitle(self) -> &'static str {
         match self {
-            Self::MobileWallet => "Scan this QR code with your wallet",
-            Self::CryptoBro => "Send this address to your crypto bro",
-            Self::Onramp => "Opening your onramp",
+            Self::Venmo => "Buy stablecoins like PYUSD",
+            Self::Paypal => "Buy stablecoins like PYUSD",
+            Self::Coinbase => "Buy stablecoins like USDC",
         }
     }
 
-    fn body(self, pubkey: &str) -> Vec<String> {
+    fn url(self) -> &'static str {
         match self {
-            Self::MobileWallet => vec![
-                "Fund this wallet with SOL so you can start paying for APIs.".to_string(),
-                "Any Solana wallet that can scan wallet addresses should work.".to_string(),
-                format!("Address: {pubkey}"),
-            ],
-            Self::CryptoBro => vec![
-                "Send this wallet address to the person onboarding you.".to_string(),
-                "Ask them to transfer enough SOL to cover your first paid requests.".to_string(),
-                format!("Address: {pubkey}"),
-            ],
-            Self::Onramp => vec![
-                "A browser window will open so you can buy SOL.".to_string(),
-                "After purchase, withdraw or send the funds to this address:".to_string(),
-                pubkey.to_string(),
-            ],
+            Self::Venmo => "https://venmo.com/",
+            Self::Paypal => "https://www.paypal.com/",
+            Self::Coinbase => "https://www.coinbase.com/",
         }
     }
 }
@@ -194,7 +214,10 @@ fn run_topup(
     rpc_url: &str,
 ) -> io::Result<Option<TopupDetected>> {
     let options = TopupOption::all();
+    let providers = BuyProvider::all();
     let mut selected = 0usize;
+    let mut provider_selected = 0usize;
+    let mut focus = TopupFocus::Methods;
     let started_at = Instant::now();
 
     // Fetch initial balances (best-effort; skip polling if RPC is unreachable)
@@ -246,19 +269,28 @@ fn run_topup(
         }
 
         let status = if !has_baseline {
-            PollStatus::RpcUnavailable(rpc_url)
+            PollStatus::RpcUnavailable
         } else if !polling_active {
-            let secs_left = POLL_DELAY.as_secs().saturating_sub(elapsed.as_secs());
-            PollStatus::Waiting { secs_left }
+            let _secs_left = POLL_DELAY.as_secs().saturating_sub(elapsed.as_secs());
+            PollStatus::Waiting
         } else {
-            PollStatus::Polling {
-                spinner_idx: (elapsed.as_millis() / 80) as usize,
-            }
+            let _spinner_idx = (elapsed.as_millis() / 80) as usize;
+            PollStatus::Polling
         };
 
         terminal.draw(|frame| {
             let area = frame.area();
-            render_topup_selector(frame, area, pubkey, &options, selected, &status);
+            render_topup_selector(
+                frame,
+                area,
+                pubkey,
+                &options,
+                selected,
+                &providers,
+                provider_selected,
+                focus,
+                &status,
+            );
         })?;
 
         if event::poll(Duration::from_millis(50))?
@@ -269,12 +301,31 @@ fn run_topup(
             }
 
             match key.code {
-                KeyCode::Up => selected = selected.saturating_sub(1),
-                KeyCode::Down if selected < options.len() - 1 => selected += 1,
+                KeyCode::Up => match focus {
+                    TopupFocus::Methods => selected = selected.saturating_sub(1),
+                    TopupFocus::Providers => {
+                        provider_selected = provider_selected.saturating_sub(1);
+                    }
+                },
+                KeyCode::Down if focus == TopupFocus::Methods && selected < options.len() - 1 => {
+                    selected += 1
+                }
+                KeyCode::Down
+                    if focus == TopupFocus::Providers
+                        && provider_selected < providers.len() - 1 =>
+                {
+                    provider_selected += 1
+                }
                 KeyCode::Down => {}
+                KeyCode::Left => focus = TopupFocus::Methods,
+                KeyCode::Right if options[selected] == TopupOption::BuyStablecoins => {
+                    focus = TopupFocus::Providers;
+                }
                 KeyCode::Enter => {
-                    if options[selected] == TopupOption::Onramp {
-                        open_onramp(pubkey)?;
+                    if options[selected] == TopupOption::BuyStablecoins
+                        && focus == TopupFocus::Providers
+                    {
+                        open_url(providers[provider_selected].url())?;
                     }
                     cleanup(&stop);
                     return Ok(None);
@@ -299,176 +350,236 @@ fn render_topup_selector(
     pubkey: &str,
     options: &[TopupOption],
     selected: usize,
+    providers: &[BuyProvider],
+    provider_selected: usize,
+    focus: TopupFocus,
     status: &PollStatus,
 ) {
-    let chunks = Layout::vertical([
-        Constraint::Length(3),
+    frame.render_widget(
+        Block::default().style(Style::default().bg(TOPUP_MAIN_BG)),
+        area,
+    );
+
+    let full_columns =
+        Layout::horizontal([Constraint::Length(38), Constraint::Min(32)]).split(area);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(TOPUP_SIDEBAR_BG)),
+        full_columns[0],
+    );
+
+    let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
+    let columns =
+        Layout::horizontal([Constraint::Length(38), Constraint::Min(32)]).split(chunks[0]);
+
+    let sidebar = Layout::horizontal([
+        Constraint::Length(2),
         Constraint::Min(0),
-        Constraint::Length(1), // status line (polling indicator)
         Constraint::Length(2),
     ])
-    .margin(1)
-    .split(area);
-    let columns =
-        Layout::horizontal([Constraint::Length(38), Constraint::Min(32)]).split(chunks[1]);
+    .split(columns[0]);
     let left = Layout::vertical([
         Constraint::Length(3),
-        Constraint::Length((options.len() as u16) * 4),
+        Constraint::Length(3),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length((options.len() as u16) * 4 - 1),
         Constraint::Min(0),
     ])
-    .split(columns[0]);
-    let right = Layout::vertical([Constraint::Length(3), Constraint::Min(8)]).split(columns[1]);
+    .split(sidebar[1]);
+    let right = Layout::vertical([Constraint::Length(1), Constraint::Min(8)])
+        .margin(2)
+        .split(columns[1]);
 
-    let header = Paragraph::new(vec![
-        Line::from(Span::styled(
-            "Top up your pay account",
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled(
-            "Pick how you want to get your first SOL onto this wallet.",
-            Style::default().fg(Color::DarkGray),
-        )),
-    ]);
-    frame.render_widget(header, chunks[0]);
-
-    let address = Paragraph::new(vec![
-        Line::from(Span::styled(
-            "Wallet address",
-            Style::default().fg(Color::DarkGray),
-        )),
-        Line::from(Span::styled(
-            pubkey,
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )),
-    ]);
-    frame.render_widget(address, left[0]);
+    let logo = Paragraph::new(vec![
+        solana_logo_line(
+            "",
+            "⣠⣶",
+            SOLANA_BLUE,
+            "⣶⣶",
+            SOLANA_GREEN,
+            "⣶⣶⠖",
+            SOLANA_GREEN,
+        ),
+        solana_logo_line(
+            "",
+            "⠲⣶",
+            SOLANA_PURPLE,
+            "⣶⣶",
+            SOLANA_BLUE,
+            "⣶⣶⣄",
+            SOLANA_GREEN,
+        ),
+        solana_logo_line(
+            "",
+            "⣠⣶",
+            SOLANA_PURPLE,
+            "⣶⣶",
+            SOLANA_PURPLE,
+            "⣶⣶⠖",
+            SOLANA_BLUE,
+        ),
+    ])
+    .centered();
+    frame.render_widget(logo, left[1]);
 
     let option_chunks = Layout::vertical(
         options
             .iter()
-            .map(|_| Constraint::Length(4))
+            .enumerate()
+            .flat_map(|(idx, _)| {
+                let mut rows = vec![Constraint::Length(3)];
+                if idx + 1 < options.len() {
+                    rows.push(Constraint::Length(1));
+                }
+                rows
+            })
             .collect::<Vec<_>>(),
     )
-    .split(left[1]);
+    .split(left[4]);
 
     for (idx, option) in options.iter().enumerate() {
+        let chunk_idx = idx * 2;
         let is_selected = idx == selected;
-        let lines = vec![
+        let is_active = is_selected && focus == TopupFocus::Methods;
+        let card_bg = if is_active {
+            TOPUP_CARD_ACTIVE_BG
+        } else if is_selected {
+            TOPUP_CARD_INACTIVE_SELECTED_BG
+        } else {
+            TOPUP_CARD_BG
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(card_bg))
+            .style(Style::default().bg(card_bg));
+        let card = Paragraph::new(vec![
             Line::from(Span::styled(
-                if is_selected {
-                    format!("> {}", option.short_label())
-                } else {
-                    format!("  {}", option.short_label())
-                },
+                option.title(),
                 Style::default()
                     .fg(if is_selected {
-                        Color::Cyan
+                        TOPUP_CARD_ACTIVE_FG
                     } else {
                         Color::White
                     })
                     .add_modifier(Modifier::BOLD),
             )),
-            Line::from(Span::styled(
-                option.title(),
-                Style::default().fg(Color::DarkGray),
-            )),
-        ];
-
-        let card = Paragraph::new(lines);
-        frame.render_widget(card, option_chunks[idx]);
+            Line::from(vec![
+                Span::styled(
+                    if is_active { "● " } else { "  " },
+                    Style::default().fg(if is_selected {
+                        TOPUP_CARD_ACTIVE_FG
+                    } else {
+                        Color::DarkGray
+                    }),
+                ),
+                Span::styled(
+                    option.subtitle(),
+                    Style::default().fg(if is_selected {
+                        TOPUP_CARD_ACTIVE_FG
+                    } else {
+                        Color::Gray
+                    }),
+                ),
+            ]),
+        ])
+        .block(block);
+        frame.render_widget(card, option_chunks[chunk_idx]);
     }
 
     let active = options[selected];
-    let header = Paragraph::new(vec![
-        Line::from(Span::styled(
-            active.detail_title(),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled(
-            match active {
-                TopupOption::Onramp => "Press Enter to open the onramp page.",
-                _ => "Press Enter when you're done funding this wallet.",
-            },
-            Style::default().fg(Color::DarkGray),
-        )),
-    ]);
-    frame.render_widget(header, right[0]);
-
     match active {
-        TopupOption::MobileWallet => render_qr_detail(frame, right[1], pubkey),
-        TopupOption::CryptoBro | TopupOption::Onramp => {
-            render_address_detail(frame, right[1], pubkey, active)
+        TopupOption::TransferFromExistingAccount => render_qr_detail(frame, right[1], pubkey),
+        TopupOption::BuyStablecoins => {
+            render_provider_list(frame, right[1], providers, provider_selected, focus)
         }
     }
 
-    // Status line
-    let status_widget = match status {
-        PollStatus::RpcUnavailable(url) => Some(Paragraph::new(Line::from(vec![
-            Span::styled("! ", Style::default().fg(Color::Red)),
-            Span::styled(
-                format!("Cannot reach RPC ({url}) — polling disabled"),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]))),
-        PollStatus::Waiting { secs_left } => Some(Paragraph::new(Line::from(Span::styled(
-            format!("  Polling starts in {secs_left}s…"),
-            Style::default().fg(Color::Rgb(60, 65, 75)),
-        )))),
-        PollStatus::Polling { spinner_idx } => {
-            let ch = SPINNER[spinner_idx % SPINNER.len()];
-            Some(Paragraph::new(Line::from(vec![
-                Span::styled(format!("{ch} "), Style::default().fg(Color::Yellow)),
-                Span::styled(
-                    "Watching for incoming funds…",
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ])))
-        }
-    };
-    if let Some(w) = status_widget {
-        frame.render_widget(w, chunks[2]);
-    }
-
-    render_topup_controls(frame, chunks[3], false);
+    render_topup_controls(frame, chunks[1], false, status);
 }
 
 fn render_qr_detail(frame: &mut ratatui::Frame, area: Rect, pubkey: &str) {
-    let mut lines = render_qr(pubkey).unwrap_or_else(|_| {
+    let qr_lines = render_qr(pubkey).unwrap_or_else(|_| {
         vec![Line::from(Span::styled(
             "QR unavailable",
             Style::default().fg(Color::DarkGray),
         ))]
     });
-    lines.push(Line::default());
-    lines.push(Line::from(Span::styled(
-        pubkey,
-        Style::default().fg(Color::Cyan),
-    )));
+    let content = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(qr_lines.len() as u16),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .split(area);
 
-    let body = Paragraph::new(lines).centered();
-    frame.render_widget(body, area);
+    let qr = Paragraph::new(qr_lines).centered();
+    frame.render_widget(qr, content[1]);
+
+    let pubkey_line = Paragraph::new(Line::from(Span::styled(
+        pubkey,
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::DIM),
+    )))
+    .centered();
+    frame.render_widget(pubkey_line, content[3]);
 }
 
-fn render_address_detail(
+fn render_provider_list(
     frame: &mut ratatui::Frame,
     area: Rect,
-    pubkey: &str,
-    option: TopupOption,
+    providers: &[BuyProvider],
+    selected: usize,
+    focus: TopupFocus,
 ) {
-    let lines = option
-        .body(pubkey)
-        .into_iter()
-        .map(|line| Line::from(Span::styled(line, Style::default().fg(Color::White))))
+    let lines = providers
+        .iter()
+        .enumerate()
+        .flat_map(|(idx, provider)| {
+            let is_selected = idx == selected;
+            let is_active = is_selected && focus == TopupFocus::Providers;
+            let title = Line::from(vec![
+                Span::styled(
+                    if is_selected { "⏵ " } else { "  " },
+                    Style::default().fg(if is_active {
+                        Color::Green
+                    } else if is_selected {
+                        TOPUP_CARD_INACTIVE_SELECTED_BG
+                    } else {
+                        Color::Black
+                    }),
+                ),
+                Span::styled(
+                    provider.title(),
+                    Style::default()
+                        .fg(if is_selected {
+                            Color::Green
+                        } else {
+                            Color::White
+                        })
+                        .add_modifier(if is_selected {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+            ]);
+            let subtitle = Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    provider.subtitle(),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
+                ),
+            ]);
+
+            [title, subtitle, Line::default()]
+        })
         .collect::<Vec<_>>();
 
-    let body = Paragraph::new(lines);
-    frame.render_widget(body, area);
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn render_qr(data: &str) -> Result<Vec<Line<'static>>, qrcode::types::QrError> {
@@ -491,34 +602,62 @@ fn render_qr(data: &str) -> Result<Vec<Line<'static>>, qrcode::types::QrError> {
         .collect())
 }
 
-fn render_topup_controls(frame: &mut ratatui::Frame, area: Rect, in_detail: bool) {
-    let line = if in_detail {
-        Line::from(vec![
+fn render_topup_controls(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    in_detail: bool,
+    status: &PollStatus,
+) {
+    let mut spans = if in_detail {
+        vec![
             Span::styled("Enter", Style::default().fg(Color::Green).bold()),
             Span::styled(" done  │  ", Style::default().dim()),
             Span::styled("Esc", Style::default().fg(Color::Red).bold()),
             Span::styled(" back", Style::default().dim()),
-        ])
+        ]
     } else {
-        Line::from(vec![
+        vec![
             Span::styled("↑ ↓", Style::default().fg(Color::Cyan).bold()),
-            Span::styled(" choose  │  ", Style::default().dim()),
+            Span::styled(" move  │  ", Style::default().dim()),
+            Span::styled("← →", Style::default().fg(Color::Cyan).bold()),
+            Span::styled(" switch pane  │  ", Style::default().dim()),
             Span::styled("Enter", Style::default().fg(Color::Green).bold()),
-            Span::styled(" continue  │  ", Style::default().dim()),
+            Span::styled(" confirm/open  │  ", Style::default().dim()),
             Span::styled("Esc", Style::default().fg(Color::Red).bold()),
             Span::styled(" skip", Style::default().dim()),
-        ])
+        ]
     };
 
-    frame.render_widget(Paragraph::new(vec![Line::default(), line]), area);
+    let status_spans = match status {
+        PollStatus::RpcUnavailable => vec![Span::styled(
+            "offline",
+            Style::default().fg(Color::Red).bold(),
+        )],
+        PollStatus::Waiting | PollStatus::Polling => vec![Span::styled(
+            "online",
+            Style::default().fg(Color::Green).bold(),
+        )],
+    };
+
+    let controls_width: usize = spans.iter().map(|span| span.content.len()).sum();
+    let status_width: usize = status_spans.iter().map(|span| span.content.len()).sum();
+    let gap = area.width as usize - controls_width.saturating_add(status_width);
+    spans.push(Span::raw(" ".repeat(gap.max(1))));
+    spans.extend(status_spans);
+
+    let line = Line::from(spans);
+
+    frame.render_widget(
+        Paragraph::new(line).style(Style::default().bg(TOPUP_SIDEBAR_BG)),
+        area,
+    );
 }
 
 fn print_topup_instructions(pubkey: &str) {
     eprintln!("Top up your pay account:");
     eprintln!("  Address: {pubkey}");
-    eprintln!("  1. Scan the address with a mobile wallet.");
-    eprintln!("  2. Send the address to the person onboarding you.");
-    eprintln!("  3. Buy SOL via an onramp: {DEFAULT_ONRAMP_URL}");
+    eprintln!("  1. Transfer funds from an existing Solana account.");
+    eprintln!("  2. Buy funds using an onramp such as Coinbase: {DEFAULT_ONRAMP_URL}");
 }
 
 fn print_received(received: &ReceivedFunds, current: &AccountBalances) {
@@ -555,14 +694,12 @@ fn print_received(received: &ReceivedFunds, current: &AccountBalances) {
     }
 }
 
-fn open_onramp(_pubkey: &str) -> io::Result<()> {
+fn open_url(url: &str) -> io::Result<()> {
     #[cfg(target_os = "macos")]
     {
-        let status = ProcessCommand::new("open")
-            .arg(DEFAULT_ONRAMP_URL)
-            .status()?;
+        let status = ProcessCommand::new("open").arg(url).status()?;
         if !status.success() {
-            return Err(io::Error::other("failed to open onramp URL"));
+            return Err(io::Error::other("failed to open URL"));
         }
         Ok(())
     }
@@ -584,14 +721,7 @@ fn run(
     loop {
         terminal.draw(|frame| {
             let area = frame.area();
-
-            let right_col_width = CARD_WIDTH + 4; // card + 2 padding each side
-            let columns =
-                Layout::horizontal([Constraint::Min(30), Constraint::Length(right_col_width)])
-                    .split(area);
-
-            render_left_panel(frame, columns[0], budget_pos, expiry_pos, &focus);
-            render_card_panel(frame, columns[1], budget_pos, expiry_pos, tool);
+            render_session_setup(frame, area, budget_pos, expiry_pos, &focus, tool);
         })?;
 
         if event::poll(std::time::Duration::from_millis(50))?
@@ -654,6 +784,33 @@ fn run(
 
 // ── Left panel: controls ──
 
+fn render_session_setup(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    budget_pos: usize,
+    expiry_pos: usize,
+    focus: &Focus,
+    tool: ToolKind,
+) {
+    frame.render_widget(
+        Block::default().style(Style::default().bg(TOPUP_MAIN_BG)),
+        area,
+    );
+
+    let full_columns = Layout::horizontal([Constraint::Min(0), Constraint::Length(44)]).split(area);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(TOPUP_SIDEBAR_BG)),
+        full_columns[0],
+    );
+
+    let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
+    let columns = Layout::horizontal([Constraint::Min(0), Constraint::Length(44)]).split(chunks[0]);
+
+    render_left_panel(frame, columns[0], budget_pos, expiry_pos, focus);
+    render_card_panel(frame, columns[1], budget_pos, expiry_pos, tool);
+    render_controls(frame, chunks[1]);
+}
+
 fn render_left_panel(
     frame: &mut ratatui::Frame,
     area: Rect,
@@ -661,18 +818,56 @@ fn render_left_panel(
     expiry_pos: usize,
     focus: &Focus,
 ) {
-    let chunks = Layout::vertical([
-        Constraint::Min(0),    // top spacer
-        Constraint::Length(5), // budget box
-        Constraint::Length(1), // spacer
-        Constraint::Length(5), // expiry box
-        Constraint::Min(0),    // bottom spacer
-        Constraint::Length(2), // controls (pinned to bottom)
+    let sidebar = Layout::horizontal([
+        Constraint::Length(2),
+        Constraint::Min(0),
+        Constraint::Length(2),
     ])
     .split(area);
+    let content = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Length(3),
+        Constraint::Length(1),
+        Constraint::Length(5),
+        Constraint::Length(1),
+        Constraint::Length(5),
+        Constraint::Min(0),
+    ])
+    .split(sidebar[1]);
 
-    // Center horizontally with max width
-    let max_w = 50.min(area.width.saturating_sub(4));
+    let logo = Paragraph::new(vec![
+        solana_logo_line(
+            "",
+            "⣠⣶",
+            SOLANA_BLUE,
+            "⣶⣶",
+            SOLANA_GREEN,
+            "⣶⣶⠖",
+            SOLANA_GREEN,
+        ),
+        solana_logo_line(
+            "",
+            "⠲⣶",
+            SOLANA_PURPLE,
+            "⣶⣶",
+            SOLANA_BLUE,
+            "⣶⣶⣄",
+            SOLANA_GREEN,
+        ),
+        solana_logo_line(
+            "",
+            "⣠⣶",
+            SOLANA_PURPLE,
+            "⣶⣶",
+            SOLANA_PURPLE,
+            "⣶⣶⠖",
+            SOLANA_BLUE,
+        ),
+    ])
+    .centered();
+    frame.render_widget(logo, content[1]);
+
+    let max_w = sidebar[1].width.min(40);
     let center = |r: Rect| -> Rect {
         let h = Layout::horizontal([
             Constraint::Min(0),
@@ -683,9 +878,8 @@ fn render_left_panel(
         h[1]
     };
 
-    render_budget_box(frame, center(chunks[1]), budget_pos, max_w, focus);
-    render_expiry_box(frame, center(chunks[3]), expiry_pos, focus);
-    render_controls(frame, center(chunks[5]));
+    render_budget_box(frame, center(content[3]), budget_pos, max_w, focus);
+    render_expiry_box(frame, center(content[5]), expiry_pos, focus);
 }
 
 fn render_budget_box(
@@ -696,7 +890,7 @@ fn render_budget_box(
     focus: &Focus,
 ) {
     let border_color = if *focus == Focus::Budget {
-        Color::Cyan
+        Color::Green
     } else {
         Color::DarkGray
     };
@@ -734,7 +928,7 @@ fn render_budget_box(
 
 fn render_expiry_box(frame: &mut ratatui::Frame, area: Rect, position: usize, focus: &Focus) {
     let border_color = if *focus == Focus::Expiry {
-        Color::Cyan
+        Color::Green
     } else {
         Color::DarkGray
     };
@@ -750,7 +944,7 @@ fn render_expiry_box(frame: &mut ratatui::Frame, area: Rect, position: usize, fo
         let style = if i == position {
             Style::default()
                 .fg(Color::Black)
-                .bg(Color::Cyan)
+                .bg(Color::Green)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::DarkGray)
@@ -792,24 +986,22 @@ fn render_card_panel(
     } else {
         format!(" ${:.2} ", dollars)
     };
+    let amount_bg = bar_color(budget_pos, MAX_STEPS, true);
     let (expiry_secs, _) = EXPIRY_OPTIONS[expiry_pos];
     let expires_at = std::time::SystemTime::now() + std::time::Duration::from_secs(expiry_secs);
     let datetime: chrono::DateTime<chrono::Local> = expires_at.into();
     let expiry_str = datetime.format("Exp %d/%m at %H:%M").to_string();
 
-    // Layout: top padding + card + rest is background
     let v = Layout::vertical([
-        Constraint::Length(2),  // top padding
-        Constraint::Length(11), // card
-        Constraint::Min(0),     // rest (background)
+        Constraint::Min(0),
+        Constraint::Length(11),
+        Constraint::Min(0),
     ])
     .split(area);
-
-    // Center card horizontally with 2-char padding on each side
     let h = Layout::horizontal([
-        Constraint::Length(2),
+        Constraint::Min(0),
         Constraint::Length(CARD_WIDTH),
-        Constraint::Length(2),
+        Constraint::Min(0),
     ])
     .split(v[1]);
     let card_area = h[1];
@@ -840,15 +1032,48 @@ fn render_card_panel(
                 Line::default(),
             ]
         }
+        ToolKind::Codex => vec![
+            Line::default(),
+            solana_logo_line(
+                "  ",
+                "⣠⣶",
+                SOLANA_BLUE,
+                "⣶⣶",
+                SOLANA_GREEN,
+                "⣶⣶⠖",
+                SOLANA_GREEN,
+            ),
+            solana_logo_line(
+                "  ",
+                "⠲⣶",
+                SOLANA_PURPLE,
+                "⣶⣶",
+                SOLANA_BLUE,
+                "⣶⣶⣄",
+                SOLANA_GREEN,
+            ),
+            solana_logo_line(
+                "  ",
+                "⣠⣶",
+                SOLANA_PURPLE,
+                "⣶⣶",
+                SOLANA_PURPLE,
+                "⣶⣶⠖",
+                SOLANA_BLUE,
+            ),
+            Line::from(Span::styled(
+                "  codex",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ],
         _ => {
             let tool_label = match tool {
                 ToolKind::Curl => "curl",
                 ToolKind::Wget => "wget",
                 ToolKind::Httpie => "httpie",
                 ToolKind::Fetch => "fetch",
-                ToolKind::Codex => "codex",
                 ToolKind::Mcp => "mcp",
-                ToolKind::Claude => unreachable!(),
+                ToolKind::Claude | ToolKind::Codex => unreachable!(),
             };
             vec![
                 Line::default(),
@@ -877,7 +1102,7 @@ fn render_card_panel(
                 budget_str,
                 Style::default()
                     .fg(CARD_FACE)
-                    .bg(Color::White)
+                    .bg(amount_bg)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(" ".repeat(gap), Style::default()),
@@ -891,8 +1116,33 @@ fn render_card_panel(
 
 // ── Helpers ──
 
+fn solana_logo_line(
+    prefix: &'static str,
+    left: &'static str,
+    left_color: Color,
+    middle: &'static str,
+    middle_color: Color,
+    right: &'static str,
+    right_color: Color,
+) -> Line<'static> {
+    Line::from(vec![
+        Span::raw(prefix),
+        Span::styled(left, Style::default().fg(left_color)),
+        Span::styled(middle, Style::default().fg(middle_color)),
+        Span::styled(right, Style::default().fg(right_color)),
+    ])
+}
+
 /// Interpolate bar color from green → yellow → red based on position.
 fn bar_color(index: usize, total: usize, bright: bool) -> Color {
+    if index == 0 {
+        return if bright {
+            Color::Rgb(180, 180, 185)
+        } else {
+            Color::Rgb(110, 110, 115)
+        };
+    }
+
     let t = index as f64 / total.max(1) as f64;
 
     let (r, g) = if t < 0.5 {
@@ -947,5 +1197,8 @@ fn render_controls(frame: &mut ratatui::Frame, area: Rect) {
         Span::styled("Esc", Style::default().fg(Color::Red).bold()),
         Span::styled(" cancel", Style::default().dim()),
     ]);
-    frame.render_widget(Paragraph::new(vec![Line::default(), line]), area);
+    frame.render_widget(
+        Paragraph::new(line).style(Style::default().bg(TOPUP_SIDEBAR_BG)),
+        area,
+    );
 }
