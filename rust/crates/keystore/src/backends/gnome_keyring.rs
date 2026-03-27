@@ -38,7 +38,7 @@ impl GnomeKeyring {
     /// Check if the Secret Service D-Bus interface is reachable.
     /// Returns false on headless/server systems where GNOME Keyring is not running.
     pub fn is_available() -> bool {
-        run(async { SecretService::connect(EncryptionType::Plain).await.is_ok() })
+        run(async { SecretService::connect(EncryptionType::Dh).await.is_ok() })
     }
 }
 
