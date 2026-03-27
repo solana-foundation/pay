@@ -4,12 +4,43 @@ on:
   pull_request:
 
 jobs:
-  # ── TypeScript SDK (typescript/core/) ──
+  # ── TypeScript SDK (typescript/packages/solana-pay/core/) ──
+  lint:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./typescript
+
+    name: Lint, format, and typecheck
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: current
+
+      - name: Install Dependencies
+        run: pnpm install
+
+      - name: Lint
+        run: pnpm --filter @solana/pay lint
+
+      - name: Typecheck
+        run: pnpm --filter @solana/pay typecheck
+
   unit-test:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: ./typescript/core
+        working-directory: ./typescript
 
     strategy:
       matrix:
@@ -23,16 +54,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
 
       - name: Install Dependencies
-        run: npm install
+        run: pnpm install
 
       - name: Run unit tests
-        run: npm test
+        run: pnpm --filter @solana/pay test
 
   # ── Rust CLI (rust/) ──
   cli-check:

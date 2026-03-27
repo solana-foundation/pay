@@ -1,0 +1,19 @@
+{
+    "compilerOptions": {
+        "target": "ES2022",
+        "module": "NodeNext",
+        "moduleResolution": "NodeNext",
+        "esModuleInterop": true,
+        "isolatedModules": true,
+        "resolveJsonModule": true,
+        "strict": true,
+        "stripInternal": true,
+        "declaration": true,
+        "declarationMap": true,
+        "sourceMap": true,
+        "noEmit": false,
+        "skipLibCheck": true,
+        "lib": ["ES2022"],
+        "types": ["node"]
+    }
+}

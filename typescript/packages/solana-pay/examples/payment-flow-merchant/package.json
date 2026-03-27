@@ -1,0 +1,23 @@
+{
+    "private": true,
+    "name": "@solana/pay-example-payment-flow-merchant",
+    "version": "0.0.0",
+    "type": "module",
+    "license": "Apache-2.0",
+    "engines": {
+        "node": ">=20"
+    },
+    "scripts": {
+        "start": "tsx main.ts"
+    },
+    "dependencies": {
+        "@solana/kit": "^6.5.0",
+        "@solana/kit-plugin-airdrop": "^0.8.0",
+        "@solana/pay": "file:../../core"
+    },
+    "devDependencies": {
+        "@types/node": "^20.0.0",
+        "tsx": "^4.19.4",
+        "typescript": "^5.9.3"
+    }
+}

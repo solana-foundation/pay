@@ -1,0 +1,46 @@
+# Task runner for TypeScript SDK
+
+# Install pnpm dependencies
+install:
+    pnpm install
+
+# Nuke node_modules and reinstall from scratch
+nuke:
+    rm -rf node_modules packages/solana-pay/core/node_modules packages/solana-pay/docs/node_modules packages/solana-pay/examples/*/node_modules
+    pnpm install
+
+# Build the core package
+build:
+    pnpm --filter @solana/pay build
+
+# Watch mode — rebuild on change
+watch:
+    pnpm --filter @solana/pay watch
+
+# Run tests
+test:
+    pnpm --filter @solana/pay test
+
+# Run tests in watch mode
+test-watch:
+    pnpm --filter @solana/pay test:watch
+
+# Check lint + formatting
+lint:
+    pnpm --filter @solana/pay lint
+
+# Auto-fix formatting + lint
+fmt:
+    pnpm --filter @solana/pay fmt
+
+# Typecheck
+typecheck:
+    pnpm --filter @solana/pay typecheck
+
+# Clean build artifacts
+clean:
+    pnpm --filter @solana/pay clean
+
+# Release build (clean + build)
+release:
+    pnpm --filter @solana/pay release
