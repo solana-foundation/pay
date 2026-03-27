@@ -30,18 +30,25 @@ Supports both live payment standards on Solana:
 
 SOL and SPL tokens (USDC, USDT, etc.) are supported out of the box.
 
-### Touch ID & 1Password Key Storage
+### Touch ID, GNOME Keyring & 1Password Key Storage
 
 Your keys never touch disk in plaintext. `pay` stores keypairs in:
 
 - **macOS Keychain** with Touch ID biometric protection
+- **GNOME Keyring** with password/fingerprint prompt on every use (Linux)
 - **1Password** vault integration (cross-platform)
 - **File-based** fallback for CI and scripting
 
 ```sh
-pay setup --backend keychain    # Touch ID protected
-pay setup --backend 1password   # Cross-platform vault
+pay setup    # Touch ID on macOS, GNOME Keyring on Linux, or choose 1Password
 ```
+
+> **Linux note:** GNOME Keyring auth uses polkit, which requires a one-time setup step:
+> ```sh
+> sudo cp rust/config/polkit/sh.pay.unlock-keypair.policy /usr/share/polkit-1/actions/
+> ```
+> This grants `pay` the right to prompt for your password or fingerprint before
+> accessing the keypair. Without it, `pay topup` and `pay curl` will error.
 
 ### Session Budgets via TUI
 
@@ -77,6 +84,12 @@ pay --dev --local curl http://localhost:3402/mpp/quote/SOL
 git clone https://github.com/solana-foundation/pay.git
 cd pay/rust
 cargo install --path crates/cli
+```
+
+**Linux only** — install the polkit action to enable keypair auth:
+
+```sh
+sudo cp rust/config/polkit/sh.pay.unlock-keypair.policy /usr/share/polkit-1/actions/
 ```
 
 ### Verify

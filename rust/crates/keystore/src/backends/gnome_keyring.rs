@@ -18,7 +18,7 @@
 //! This is equivalent to Touch ID on macOS — polkit never caches between calls.
 //!
 //! Requires the polkit action file to be installed:
-//!   sudo cp linux/polkit/sh.pay.unlock-keypair.policy \
+//!   sudo cp rust/config/polkit/sh.pay.unlock-keypair.policy \
 //!            /usr/share/polkit-1/actions/
 //! For snap installs this is handled automatically.
 
@@ -179,7 +179,7 @@ impl KeystoreBackend for GnomeKeyring {
 /// (if pam_fprintd is enabled via `pam-auth-update --enable fprintd`).
 ///
 /// Requires the action file to be installed:
-///   sudo cp linux/polkit/sh.pay.unlock-keypair.policy /usr/share/polkit-1/actions/
+///   sudo cp rust/config/polkit/sh.pay.unlock-keypair.policy /usr/share/polkit-1/actions/
 async fn polkit_authenticate(_reason: &str) -> Result<()> {
     use zbus::zvariant::{OwnedValue, Value};
 
@@ -234,7 +234,7 @@ async fn polkit_authenticate(_reason: &str) -> Result<()> {
                 Error::Backend(format!(
                     "polkit action '{POLKIT_ACTION}' is not installed.\n\
                      Install it with:\n\
-                     \x20 sudo cp linux/polkit/sh.pay.unlock-keypair.policy \\\n\
+                     \x20 sudo cp rust/config/polkit/sh.pay.unlock-keypair.policy \\\n\
                      \x20      /usr/share/polkit-1/actions/"
                 ))
             } else {
