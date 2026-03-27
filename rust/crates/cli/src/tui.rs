@@ -642,7 +642,8 @@ fn render_topup_controls(
 
     let controls_width: usize = spans.iter().map(|span| span.content.len()).sum();
     let status_width: usize = status_spans.iter().map(|span| span.content.len()).sum();
-    let gap = area.width as usize - controls_width.saturating_add(status_width);
+    let total_width = controls_width.saturating_add(status_width);
+    let gap = (area.width as usize).saturating_sub(total_width);
     spans.push(Span::raw(" ".repeat(gap.max(1))));
     spans.extend(status_spans);
 
