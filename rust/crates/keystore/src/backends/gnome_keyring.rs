@@ -193,15 +193,10 @@ async fn polkit_authenticate(_reason: &str) -> Result<()> {
     // Subject: the current process ("unix-process" with pid + start-time).
     // start-time prevents PID reuse attacks.
     let subject_details: HashMap<String, OwnedValue> = [
-        (
-            "pid".to_owned(),
-            OwnedValue::try_from(Value::new(pid))
-                .map_err(|e| Error::Backend(format!("polkit pid: {e}")))?,
-        ),
+        ("pid".to_owned(), OwnedValue::from(Value::new(pid))),
         (
             "start-time".to_owned(),
-            OwnedValue::try_from(Value::new(start_time))
-                .map_err(|e| Error::Backend(format!("polkit start-time: {e}")))?,
+            OwnedValue::from(Value::new(start_time)),
         ),
     ]
     .into();
