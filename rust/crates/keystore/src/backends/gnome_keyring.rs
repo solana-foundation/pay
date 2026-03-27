@@ -269,7 +269,7 @@ fn process_start_time() -> Result<u64> {
 // ── Secret Service helpers ────────────────────────────────────────────────────
 
 async fn connect() -> Result<SecretService<'static>> {
-    SecretService::connect(EncryptionType::Plain)
+    SecretService::connect(EncryptionType::Dh)
         .await
         .map_err(|e| Error::Backend(format!("Secret Service unavailable: {e}")))
 }
