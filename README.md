@@ -2,7 +2,7 @@
 
 **The missing [HTTP 402](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Status/402) client.**
 
-Wrap `curl` or `wget` — when an API returns 402, `pay` detects the payment protocol, signs a Solana transaction, and retries. The response lands on stdout as if nothing happened.
+Wrap `curl` or `wget` — when an API returns 402, `pay` detects the payment protocol, signs a transaction, and retries. The response lands on stdout as if nothing happened.
 
 [Install](#installation) · [Quick Start](#quick-start) · [Docs](https://docs.solanapay.com)
 
@@ -12,10 +12,10 @@ Wrap `curl` or `wget` — when an API returns 402, `pay` detects the payment pro
 
 ```sh
 # Without pay — you get a 402
-curl https://402-demo-api.vercel.app/
+curl https://402-demo-api.vercel.app/mpp/quote/AAPL
 
 # With pay — it handles the 402 and you get the response
-pay --dev curl https://402-demo-api.vercel.app/
+pay --dev curl https://402-demo-api.vercel.app/mpp/quote/AAPL
 ```
 
 ## Key Features
@@ -28,7 +28,7 @@ Supports both live payment standards on Solana:
 - **[MPP](https://mpp.dev/)** — Machine Payments Protocol
 - **[x402](https://x402.org/)** — x402 Payment Protocol
 
-SOL and SPL tokens (USDC, USDT, etc.) are supported out of the box.
+Stablecoins deployed to Solana are supported out of the box.
 
 ### Touch ID & 1Password Key Storage
 
@@ -63,10 +63,10 @@ Get started instantly with an ephemeral keypair auto-funded via [Surfpool](https
 
 ```sh
 # Uses public devnet (402.surfnet.dev) by default
-pay --dev curl https://402-demo-api.vercel.app/mpp/quote/SOL
+pay --dev curl https://402-demo-api.vercel.app/mpp/quote/AAPL
 
 # Or use a local Surfpool instance
-pay --dev --local curl http://localhost:3402/mpp/quote/SOL
+pay --dev --local curl http://localhost:3402/mpp/quote/AAPL
 ```
 
 ## Installation
