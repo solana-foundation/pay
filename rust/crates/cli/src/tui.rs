@@ -40,9 +40,9 @@ enum PollStatus {
     /// Initial balance fetch failed — no polling possible.
     RpcUnavailable,
     /// Waiting for the 10s delay before polling starts.
-    Waiting,
+    Waiting { secs_left: u64 },
     /// Actively polling for incoming funds.
-    Polling,
+    Polling { spinner_idx: usize },
 }
 
 /// Slider range: $0.00 to $15.00 in $0.50 increments = 30 steps, + 1 YOLO step = 31
@@ -271,11 +271,11 @@ fn run_topup(
         let status = if !has_baseline {
             PollStatus::RpcUnavailable
         } else if !polling_active {
-            let _secs_left = POLL_DELAY.as_secs().saturating_sub(elapsed.as_secs());
-            PollStatus::Waiting
+            let secs_left = POLL_DELAY.as_secs().saturating_sub(elapsed.as_secs());
+            PollStatus::Waiting { secs_left }
         } else {
-            let _spinner_idx = (elapsed.as_millis() / 80) as usize;
-            PollStatus::Polling
+            let spinner_idx = (elapsed.as_millis() / 80) as usize;
+            PollStatus::Polling { spinner_idx }
         };
 
         terminal.draw(|frame| {
@@ -634,10 +634,23 @@ fn render_topup_controls(
             "offline",
             Style::default().fg(Color::Red).bold(),
         )],
-        PollStatus::Waiting | PollStatus::Polling => vec![Span::styled(
-            "online",
-            Style::default().fg(Color::Green).bold(),
-        )],
+        PollStatus::Waiting { secs_left } => vec![
+            Span::styled("waiting ", Style::default().fg(Color::Yellow).bold()),
+            Span::styled(
+                format!("{secs_left}s…"),
+                Style::default().fg(Color::Yellow).bold(),
+            ),
+        ],
+        PollStatus::Polling { spinner_idx } => {
+            const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            vec![
+                Span::styled(
+                    SPINNER[spinner_idx % SPINNER.len()],
+                    Style::default().fg(Color::Green).bold(),
+                ),
+                Span::styled(" online", Style::default().fg(Color::Green).bold()),
+            ]
+        }
     };
 
     let controls_width: usize = spans.iter().map(|span| span.content.len()).sum();
