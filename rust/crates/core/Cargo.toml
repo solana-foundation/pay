@@ -49,6 +49,8 @@ serde_yml = { workspace = true }
 toml = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
+surfpool-sdk = { git = "https://github.com/solana-foundation/surfpool", branch = "feat/sdk" }
+serde_json = { workspace = true }
 
 [[test]]
 name = "metering_tests"
@@ -56,4 +58,8 @@ required-features = ["server"]
 
 [[test]]
 name = "server_tests"
+required-features = ["server"]
+
+[[test]]
+name = "surfpool_tests"
 required-features = ["server"]
