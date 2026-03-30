@@ -1,0 +1,53 @@
+name: Report
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  contents: read
+  pull-requests: write
+  actions: read
+
+jobs:
+  report:
+    name: Coverage Report
+    if: github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Download coverage artifact from CI
+      - uses: actions/download-artifact@v4
+        with:
+          name: rust-coverage
+          path: rust-cov
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+      # Fetch the reusable test-report action from surfpool
+      - uses: actions/checkout@v4
+        with:
+          repository: solana-foundation/surfpool
+          ref: feat/sdk
+          sparse-checkout: .github/actions
+          path: _surfpool
+
+      # Resolve PR number
+      - name: Get PR number
+        id: pr
+        run: |
+          PR=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}" --jq '.pull_requests[0].number' 2>/dev/null || true)
+          echo "number=$PR" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Post coverage comment
+      - name: Post test report
+        if: steps.pr.outputs.number != ''
+        uses: ./_surfpool/.github/actions/test-report
+        with:
+          rust-coverage-json: rust-cov/coverage.json
+          comment-header: coverage
