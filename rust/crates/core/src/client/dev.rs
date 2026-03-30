@@ -24,7 +24,7 @@ pub struct DevKeypair {
 /// Uses surfpool cheatcodes:
 /// - `surfnet_setAccount` for 100 SOL
 /// - `surfnet_setTokenAccount` for 1000 USDC
-pub fn setup_dev_keypair(rpc_url: &str) -> Result<DevKeypair> {
+pub async fn setup_dev_keypair(rpc_url: &str) -> Result<DevKeypair> {
     // Generate 64 random bytes (32 secret + 32 public via ed25519)
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
     let verifying_key = signing_key.verifying_key();
@@ -46,11 +46,11 @@ pub fn setup_dev_keypair(rpc_url: &str) -> Result<DevKeypair> {
     info!(pubkey = %pubkey, "Generated dev keypair");
 
     // Check surfpool is reachable before attempting to fund
-    check_surfpool(rpc_url)?;
+    check_surfpool(rpc_url).await?;
 
     // Fund via surfpool cheatcodes
-    fund_sol(rpc_url, &pubkey)?;
-    fund_usdc(rpc_url, &pubkey)?;
+    fund_sol(rpc_url, &pubkey).await?;
+    fund_usdc(rpc_url, &pubkey).await?;
 
     info!(pubkey = %pubkey, "Dev keypair funded (100 SOL + 1000 USDC)");
 
@@ -61,15 +61,15 @@ pub fn setup_dev_keypair(rpc_url: &str) -> Result<DevKeypair> {
     })
 }
 
-fn check_surfpool(rpc_url: &str) -> Result<()> {
-    let resp = reqwest::blocking::Client::new()
+async fn check_surfpool(rpc_url: &str) -> Result<()> {
+    let resp = reqwest::Client::new()
         .post(rpc_url)
         .json(&serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "getHealth",
         }))
-        .send();
+        .send().await;
 
     if resp.is_err() {
         return Err(Error::Config(format!(
@@ -85,7 +85,7 @@ fn check_surfpool(rpc_url: &str) -> Result<()> {
     Ok(())
 }
 
-fn rpc_call(rpc_url: &str, method: &str, params: serde_json::Value) -> Result<()> {
+async fn rpc_call(rpc_url: &str, method: &str, params: serde_json::Value) -> Result<()> {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -93,14 +93,16 @@ fn rpc_call(rpc_url: &str, method: &str, params: serde_json::Value) -> Result<()
         "params": params,
     });
 
-    let resp = reqwest::blocking::Client::new()
+    let resp = reqwest::Client::new()
         .post(rpc_url)
         .json(&body)
         .send()
+        .await
         .map_err(|e| Error::Config(format!("RPC call to {rpc_url} failed: {e}")))?;
 
     let result: serde_json::Value = resp
         .json()
+        .await
         .map_err(|e| Error::Config(format!("Invalid RPC response: {e}")))?;
 
     if let Some(err) = result.get("error") {
@@ -110,7 +112,7 @@ fn rpc_call(rpc_url: &str, method: &str, params: serde_json::Value) -> Result<()
     Ok(())
 }
 
-fn fund_sol(rpc_url: &str, pubkey: &str) -> Result<()> {
+async fn fund_sol(rpc_url: &str, pubkey: &str) -> Result<()> {
     rpc_call(
         rpc_url,
         "surfnet_setAccount",
@@ -121,9 +123,10 @@ fn fund_sol(rpc_url: &str, pubkey: &str) -> Result<()> {
             "owner": "11111111111111111111111111111111",
         }]),
     )
+    .await
 }
 
-fn fund_usdc(rpc_url: &str, pubkey: &str) -> Result<()> {
+async fn fund_usdc(rpc_url: &str, pubkey: &str) -> Result<()> {
     rpc_call(
         rpc_url,
         "surfnet_setTokenAccount",
@@ -131,4 +134,5 @@ fn fund_usdc(rpc_url: &str, pubkey: &str) -> Result<()> {
             "amount": 1_000_000_000_u64,
         }]),
     )
+    .await
 }

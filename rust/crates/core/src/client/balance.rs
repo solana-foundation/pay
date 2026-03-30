@@ -78,84 +78,70 @@ impl ReceivedFunds {
     }
 }
 
-/// Fetch SOL and all token balances in a single batched RPC request.
-///
-/// Uses JSON-RPC batch to avoid rate limiting on public endpoints.
-pub fn get_balances(rpc_url: &str, pubkey: &str) -> crate::Result<AccountBalances> {
-    let client = reqwest::blocking::Client::builder()
+/// Fetch SOL and all token balances via individual RPC requests.
+pub async fn get_balances(rpc_url: &str, pubkey: &str) -> crate::Result<AccountBalances> {
+    let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .map_err(|e| crate::Error::Config(e.to_string()))?;
 
-    // Build batch: [getBalance, getTokenAccountsByOwner(SPL), getTokenAccountsByOwner(Token-2022)]
-    // Use "confirmed" commitment for faster detection (vs default "finalized").
-    let mut batch = vec![serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 0,
-        "method": "getBalance",
-        "params": [pubkey, { "commitment": "confirmed" }]
-    })];
+    // Get SOL balance
+    let sol_resp = rpc_call(&client, rpc_url, "getBalance", serde_json::json!([pubkey, { "commitment": "confirmed" }])).await?;
+    let sol_lamports = sol_resp["result"]["value"].as_u64().unwrap_or(0);
 
-    for (i, program_id) in TOKEN_PROGRAMS.iter().enumerate() {
-        batch.push(serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": i + 1,
-            "method": "getTokenAccountsByOwner",
-            "params": [
-                pubkey,
-                { "programId": program_id },
-                { "encoding": "jsonParsed", "commitment": "confirmed" }
-            ]
-        }));
+    // Get token accounts from both token programs
+    let mut tokens = Vec::new();
+    for program_id in TOKEN_PROGRAMS {
+        let resp = rpc_call(
+            &client,
+            rpc_url,
+            "getTokenAccountsByOwner",
+            serde_json::json!([pubkey, { "programId": program_id }, { "encoding": "jsonParsed", "commitment": "confirmed" }]),
+        )
+        .await;
+
+        if let Ok(resp) = resp {
+            parse_token_accounts(&resp["result"], &mut tokens);
+        }
     }
+
+    Ok(AccountBalances { sol_lamports, tokens })
+}
+
+async fn rpc_call(
+    client: &reqwest::Client,
+    rpc_url: &str,
+    method: &str,
+    params: serde_json::Value,
+) -> crate::Result<serde_json::Value> {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+        "params": params,
+    });
 
     let resp = client
         .post(rpc_url)
-        .json(&batch)
+        .json(&body)
         .send()
+        .await
         .map_err(|e| crate::Error::Config(format!("RPC error: {e}")))?;
 
-    // Detect HTTP-level rate limiting
     if resp.status() == 429 {
         return Err(crate::Error::Config("RPC rate limited (429)".to_string()));
     }
 
-    let responses: Vec<serde_json::Value> = resp
+    let result: serde_json::Value = resp
         .json()
+        .await
         .map_err(|e| crate::Error::Config(format!("RPC parse error: {e}")))?;
 
-    let mut sol_lamports = 0u64;
-    let mut tokens = Vec::new();
-    let mut any_error = false;
-
-    for item in &responses {
-        // Detect JSON-RPC level errors (429 inside batch)
-        if item.get("error").is_some() {
-            any_error = true;
-            continue;
-        }
-
-        let id = item["id"].as_u64().unwrap_or(u64::MAX);
-        let result = &item["result"];
-
-        if id == 0 {
-            sol_lamports = result["value"].as_u64().unwrap_or(0);
-        } else {
-            parse_token_accounts(result, &mut tokens);
-        }
+    if let Some(err) = result.get("error") {
+        return Err(crate::Error::Config(format!("RPC error: {err}")));
     }
 
-    // If all responses were errors, report failure
-    if any_error && tokens.is_empty() && sol_lamports == 0 {
-        return Err(crate::Error::Config(
-            "RPC returned errors for all requests".to_string(),
-        ));
-    }
-
-    Ok(AccountBalances {
-        sol_lamports,
-        tokens,
-    })
+    Ok(result)
 }
 
 fn parse_token_accounts(result: &serde_json::Value, tokens: &mut Vec<TokenBalance>) {

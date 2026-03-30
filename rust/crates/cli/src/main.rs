@@ -82,7 +82,8 @@ fn main() {
         } else {
             pay_core::config::DEV_RPC_URL.to_string()
         };
-        match pay_core::dev::setup_dev_keypair(&rpc_url) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        match rt.block_on(pay_core::client::dev::setup_dev_keypair(&rpc_url)) {
             Ok(kp) => {
                 if opts.verbose {
                     eprintln!(

@@ -11,15 +11,6 @@
 use pay_core::client;
 use surfpool_sdk::{Keypair, Pubkey, Signer, Surfnet};
 
-/// Run a blocking function on a separate thread to avoid tokio runtime conflicts
-/// (the client modules use reqwest::blocking which creates its own runtime).
-async fn blocking<F, T>(f: F) -> T
-where
-    F: FnOnce() -> T + Send + 'static,
-    T: Send + 'static,
-{
-    tokio::task::spawn_blocking(f).await.unwrap()
-}
 
 // =============================================================================
 // Helpers
@@ -47,31 +38,28 @@ fn keypair_to_file(keypair: &Keypair) -> tempfile::NamedTempFile {
 // =============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore] // TODO: fix reqwest::blocking RPC compat with surfpool-sdk
 async fn balance_funded_account() {
     let surfnet = start_surfnet().await;
     let payer = surfnet.payer();
     let pubkey = payer.pubkey().to_string();
 
     let rpc = surfnet.rpc_url().to_string(); let pk = pubkey.clone();
-    let balances = blocking(move || client::balance::get_balances(&rpc, &pk).unwrap()).await;
+    let balances = client::balance::get_balances(&rpc, &pk).await.unwrap();
     assert!(balances.sol_lamports >= 10_000_000_000, "Expected >= 10 SOL, got {}", balances.sol_lamports);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
 async fn balance_empty_account() {
     let surfnet = start_surfnet().await;
     let empty = Keypair::new();
 
     let rpc = surfnet.rpc_url().to_string(); let pk = empty.pubkey().to_string();
-    let balances = blocking(move || client::balance::get_balances(&rpc, &pk).unwrap()).await;
+    let balances = client::balance::get_balances(&rpc, &pk).await.unwrap();
     assert_eq!(balances.sol_lamports, 0);
     assert!(balances.tokens.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
 async fn balance_diff_received() {
     use pay_core::client::balance::AccountBalances;
 
@@ -80,12 +68,12 @@ async fn balance_diff_received() {
     let pubkey = payer.pubkey().to_string();
 
     let rpc = surfnet.rpc_url().to_string(); let pk = pubkey.clone();
-    let before = blocking({ let rpc = rpc.clone(); let pk = pk.clone(); move || client::balance::get_balances(&rpc, &pk).unwrap() }).await;
+    let before = client::balance::get_balances(&rpc, &pk).await.unwrap();
 
     // Fund more SOL
     surfnet.cheatcodes().fund_sol(&payer.pubkey(), 15_000_000_000).unwrap();
 
-    let after = blocking({ let rpc = rpc.clone(); let pk = pk.clone(); move || client::balance::get_balances(&rpc, &pk).unwrap() }).await;
+    let after = client::balance::get_balances(&rpc, &pk).await.unwrap();
     let diff = after.diff_received(&before);
     assert!(diff.sol_lamports > 0, "Should have received more SOL");
 }
@@ -94,7 +82,7 @@ async fn balance_diff_received() {
 async fn balance_invalid_pubkey() {
     let surfnet = start_surfnet().await;
     let rpc = surfnet.rpc_url().to_string();
-    let result = blocking(move || client::balance::get_balances(&rpc, "not-a-pubkey")).await;
+    let result = client::balance::get_balances(&rpc, "not-a-pubkey").await;
     assert!(result.is_err());
 }
 
@@ -103,7 +91,6 @@ async fn balance_invalid_pubkey() {
 // =============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
 async fn send_sol_basic() {
     let surfnet = start_surfnet().await;
     let payer = surfnet.payer();
@@ -114,7 +101,7 @@ async fn send_sol_basic() {
     let kp_path = kp_file.path().to_string_lossy().to_string();
 
     let rpc = surfnet.rpc_url().to_string(); let recip = recipient.pubkey().to_string(); let kp = kp_path.clone();
-    let result = blocking(move || client::send::send_sol("0.5", &recip, &kp, &rpc)).await;
+    let result = client::send::send_sol("0.5", &recip, &kp, &rpc).await;
 
     assert!(result.is_ok(), "send_sol failed: {:?}", result.err());
     let result = result.unwrap();
@@ -123,12 +110,11 @@ async fn send_sol_basic() {
 
     // Verify recipient got the SOL
     let rpc2 = surfnet.rpc_url().to_string(); let rpk = recipient.pubkey().to_string();
-    let balance = blocking(move || client::balance::get_balances(&rpc2, &rpk).unwrap()).await;
+    let balance = client::balance::get_balances(&rpc2, &rpk).await.unwrap();
     assert_eq!(balance.sol_lamports, 500_000_000);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
 async fn send_sol_drain() {
     let surfnet = start_surfnet().await;
     let payer = surfnet.payer();
@@ -139,18 +125,18 @@ async fn send_sol_drain() {
 
     // "*" means drain all (minus fees)
     let rpc = surfnet.rpc_url().to_string(); let recip = recipient.pubkey().to_string(); let kp = kp_path.clone();
-    let result = blocking(move || client::send::send_sol("*", &recip, &kp, &rpc)).await;
+    let result = client::send::send_sol("*", &recip, &kp, &rpc).await;
 
     assert!(result.is_ok(), "drain failed: {:?}", result.err());
 
     // Payer should have ~0 SOL left
     let rpc2 = surfnet.rpc_url().to_string(); let ppk = payer.pubkey().to_string();
-    let payer_balance = blocking(move || client::balance::get_balances(&rpc2, &ppk).unwrap()).await;
+    let payer_balance = client::balance::get_balances(&rpc2, &ppk).await.unwrap();
     assert!(payer_balance.sol_lamports < 10_000, "Payer should be drained, got {}", payer_balance.sol_lamports);
 
     // Recipient should have almost all the SOL
     let rpc3 = surfnet.rpc_url().to_string(); let rpk2 = recipient.pubkey().to_string();
-    let recv_balance = blocking(move || client::balance::get_balances(&rpc3, &rpk2).unwrap()).await;
+    let recv_balance = client::balance::get_balances(&rpc3, &rpk2).await.unwrap();
     assert!(recv_balance.sol_lamports > 9_000_000_000, "Recipient should have most SOL");
 }
 
@@ -162,7 +148,7 @@ async fn send_sol_invalid_recipient() {
     let kp_path = kp_file.path().to_string_lossy().to_string();
 
     let rpc = surfnet.rpc_url().to_string(); let kp = kp_path.clone();
-    let result = blocking(move || client::send::send_sol("0.1", "not-a-valid-pubkey", &kp, &rpc)).await;
+    let result = client::send::send_sol("0.1", "not-a-valid-pubkey", &kp_path, surfnet.rpc_url()).await;
     assert!(result.is_err());
 }
 
@@ -178,7 +164,7 @@ async fn send_sol_insufficient_funds() {
     let kp_path = kp_file.path().to_string_lossy().to_string();
 
     let rpc = surfnet.rpc_url().to_string(); let recip = recipient.pubkey().to_string(); let kp = kp_path.clone();
-    let result = blocking(move || client::send::send_sol("1.0", &recip, &kp, &rpc)).await;
+    let result = client::send::send_sol("1.0", &recip, &kp, &rpc).await;
     assert!(result.is_err());
 }
 
@@ -187,12 +173,11 @@ async fn send_sol_insufficient_funds() {
 // =============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore]
 async fn dev_setup_keypair() {
     let surfnet = start_surfnet().await;
 
     let rpc = surfnet.rpc_url().to_string();
-    let dev = blocking(move || client::dev::setup_dev_keypair(&rpc)).await;
+    let dev = client::dev::setup_dev_keypair(&rpc).await;
     assert!(dev.is_ok(), "setup_dev_keypair failed: {:?}", dev.err());
 
     let dev = dev.unwrap();
@@ -201,7 +186,7 @@ async fn dev_setup_keypair() {
 
     // Verify the keypair is funded
     let rpc2 = surfnet.rpc_url().to_string(); let dpk = dev.pubkey.clone();
-    let balance = blocking(move || client::balance::get_balances(&rpc2, &dpk).unwrap()).await;
+    let balance = client::balance::get_balances(&rpc2, &dpk).await.unwrap();
     assert!(balance.sol_lamports >= 100_000_000_000, "Should have 100 SOL, got {}", balance.sol_lamports);
 }
 

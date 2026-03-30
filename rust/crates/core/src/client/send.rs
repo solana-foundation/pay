@@ -30,7 +30,7 @@ pub struct SendResult {
 /// - `recipient`: base-58 public key of the recipient.
 /// - `keypair_source`: keypair source string (file path or `keychain:default`).
 /// - `rpc_url`: Solana RPC endpoint.
-pub fn send_sol(
+pub async fn send_sol(
     amount_str: &str,
     recipient: &str,
     keypair_source: &str,
@@ -84,13 +84,10 @@ pub fn send_sol(
     let mut tx = Transaction::new_unsigned(message);
 
     // Sign
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| Error::Config(format!("Failed to create runtime: {e}")))?;
 
-    let sig_bytes = rt
-        .block_on(signer.sign_message(&tx.message_data()))
+    let sig_bytes = signer
+        .sign_message(&tx.message_data())
+        .await
         .map_err(|e| Error::Config(format!("Signing failed: {e}")))?;
 
     let sig = Signature::from(<[u8; 64]>::from(sig_bytes));

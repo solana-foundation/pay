@@ -16,7 +16,7 @@ use crate::commands::ToolKind;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
-use pay_core::balance::{AccountBalances, ReceivedFunds};
+use pay_core::client::balance::{AccountBalances, ReceivedFunds};
 use qrcode::QrCode;
 use qrcode::render::unicode;
 use ratatui::Terminal;
@@ -221,7 +221,7 @@ fn run_topup(
     let started_at = Instant::now();
 
     // Fetch initial balances (best-effort; skip polling if RPC is unreachable)
-    let initial_balances = pay_core::balance::get_balances(rpc_url, pubkey).ok();
+    let initial_balances = tokio::runtime::Runtime::new().unwrap().block_on(pay_core::client::balance::get_balances(rpc_url, pubkey)).ok();
 
     // Channel for the polling thread to report received funds
     let (tx, rx) = mpsc::channel::<TopupDetected>();
@@ -251,7 +251,7 @@ fn run_topup(
                     if stop_flag.load(Ordering::Relaxed) {
                         return;
                     }
-                    if let Ok(current) = pay_core::balance::get_balances(&rpc, &pk) {
+                    if let Ok(current) = tokio::runtime::Runtime::new().unwrap().block_on(pay_core::client::balance::get_balances(&rpc, &pk)) {
                         let received = current.diff_received(&initial);
                         if received.has_any() {
                             let _ = tx.send(TopupDetected { received, current });
