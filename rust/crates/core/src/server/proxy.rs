@@ -36,9 +36,7 @@ pub async fn forward_request(
     let upstream_url = format!(
         "{}{}",
         api.base_url.trim_end_matches('/'),
-        uri.path_and_query()
-            .map(|pq| pq.as_str())
-            .unwrap_or(path)
+        uri.path_and_query().map(|pq| pq.as_str()).unwrap_or(path)
     );
 
     tracing::debug!(

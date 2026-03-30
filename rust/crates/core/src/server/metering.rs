@@ -191,7 +191,7 @@ fn resolve_tier(
     tiers: &[PriceTier],
     props: &RequestProperties,
     ctx: Option<&MeteringContext>,
-    dim: &MeterDimension,
+    _dim: &MeterDimension,
 ) -> f64 {
     // If we have accounting context and tiers have up_to, resolve by cumulative usage
     let has_volume_tiers = tiers.iter().any(|t| t.up_to.is_some());
@@ -217,10 +217,8 @@ fn resolve_tier(
 
     // No volume tiers — resolve by condition
     for tier in tiers {
-        if let Some(ref condition) = tier.condition {
-            if !evaluate_condition(condition, props) {
-                continue;
-            }
+        if let Some(ref condition) = tier.condition && !evaluate_condition(condition, props) {
+            continue;
         }
         return tier.price_usd;
     }

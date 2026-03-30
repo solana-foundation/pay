@@ -184,16 +184,16 @@ fn do_paid_fetch(
     extra_headers: &[(String, String)],
     keypair_path: &str,
 ) -> Result<String, pay_core::Error> {
-    use pay_core::runner::RunOutcome;
+    use pay_core::client::runner::RunOutcome;
 
-    let outcome = pay_core::fetch::fetch(url, extra_headers)?;
+    let outcome = pay_core::client::fetch::fetch(url, extra_headers)?;
 
     match outcome {
         RunOutcome::MppChallenge { challenge, .. } => {
-            let auth_header = pay_core::mpp::build_credential(&challenge, keypair_path)?;
+            let auth_header = pay_core::client::mpp::build_credential(&challenge, keypair_path)?;
             let mut headers = extra_headers.to_vec();
             headers.push(("Authorization".to_string(), auth_header));
-            match pay_core::fetch::fetch(url, &headers)? {
+            match pay_core::client::fetch::fetch(url, &headers)? {
                 RunOutcome::Completed { body, .. } => {
                     Ok(body.unwrap_or_else(|| "Payment successful.".to_string()))
                 }
@@ -203,10 +203,11 @@ fn do_paid_fetch(
             }
         }
         RunOutcome::X402Challenge { requirements, .. } => {
-            let payment_header = pay_core::x402::build_payment(&requirements, keypair_path)?;
+            let payment_header =
+                pay_core::client::x402::build_payment(&requirements, keypair_path)?;
             let mut headers = extra_headers.to_vec();
             headers.push(("X-PAYMENT".to_string(), payment_header));
-            match pay_core::fetch::fetch(url, &headers)? {
+            match pay_core::client::fetch::fetch(url, &headers)? {
                 RunOutcome::Completed { body, .. } => {
                     Ok(body.unwrap_or_else(|| "Payment successful.".to_string()))
                 }

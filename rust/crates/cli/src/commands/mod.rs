@@ -17,6 +17,7 @@ use pay_core::runner::RunOutcome;
 use pay_core::x402;
 use pay_core::x402::Challenge as X402Challenge;
 use pay_core::{Config, run_curl_with_headers, run_httpie_with_headers, run_wget_with_headers};
+use solana_mpp::ChargeRequest;
 
 use crate::no_dna;
 use crate::output::{self, OutputFormat};
@@ -176,13 +177,14 @@ fn handle_outcome(
             challenge,
             resource_url,
         } => {
+            let req: ChargeRequest = challenge.request.decode().unwrap_or_default();
             if auto_pay {
                 if verbose && !is_json {
                     eprintln!(
                         "{}",
                         format!(
                             "402 Payment Required (MPP) — {} {}",
-                            challenge.request.amount, challenge.request.currency
+                            req.amount, req.currency
                         )
                         .dimmed()
                     );
@@ -199,15 +201,20 @@ fn handle_outcome(
 
             // Not auto-paying — always show challenge info (user needs to see it)
             if is_json {
+                let network = req
+                    .method_details
+                    .as_ref()
+                    .and_then(|v| v.get("network"))
+                    .and_then(|v| v.as_str());
                 output::print_json(&serde_json::json!({
                     "status": 402,
                     "protocol": "mpp",
                     "challenge": {
-                        "amount": challenge.request.amount,
-                        "currency": challenge.request.currency,
-                        "recipient": challenge.request.recipient,
-                        "description": challenge.request.description,
-                        "network": challenge.request.method_details.network,
+                        "amount": req.amount,
+                        "currency": req.currency,
+                        "recipient": req.recipient,
+                        "description": req.description,
+                        "network": network,
                     },
                     "resource": resource_url,
                 }))?;
@@ -216,7 +223,7 @@ fn handle_outcome(
                     "{}",
                     format!(
                         "402 Payment Required (MPP) — {} {} — use --yolo to pay automatically",
-                        challenge.request.amount, challenge.request.currency
+                        req.amount, req.currency
                     )
                     .dimmed()
                 );

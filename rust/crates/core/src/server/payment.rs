@@ -135,10 +135,10 @@ pub async fn payment_middleware<S: PaymentState>(
                 Ok(receipt) => {
                     tracing::info!(subdomain = %subdomain, path = %path, reference = %receipt.reference, "Payment verified — forwarding");
                     let mut response = next.run(req).await;
-                    if let Ok(receipt_str) = format_receipt(&receipt) {
-                        if let Ok(v) = axum::http::HeaderValue::from_str(&receipt_str) {
-                            response.headers_mut().insert(PAYMENT_RECEIPT_HEADER, v);
-                        }
+                    if let Ok(receipt_str) = format_receipt(&receipt)
+                        && let Ok(v) = axum::http::HeaderValue::from_str(&receipt_str)
+                    {
+                        response.headers_mut().insert(PAYMENT_RECEIPT_HEADER, v);
                     }
                     response
                 }
@@ -153,12 +153,11 @@ pub async fn payment_middleware<S: PaymentState>(
                         })),
                     )
                         .into_response();
-                    if let Ok(challenge) = mpp.charge("0.01") {
-                        if let Ok(www_auth) = format_www_authenticate(&challenge) {
-                            if let Ok(v) = axum::http::HeaderValue::from_str(&www_auth) {
-                                response.headers_mut().insert(WWW_AUTHENTICATE_HEADER, v);
-                            }
-                        }
+                    if let Ok(challenge) = mpp.charge("0.01")
+                        && let Ok(www_auth) = format_www_authenticate(&challenge)
+                        && let Ok(v) = axum::http::HeaderValue::from_str(&www_auth)
+                    {
+                        response.headers_mut().insert(WWW_AUTHENTICATE_HEADER, v);
                     }
                     response
                 }
@@ -181,10 +180,8 @@ fn extract_request_properties(headers: &HeaderMap, _path: &str) -> RequestProper
 fn extract_variant_hint(path: &str) -> Option<String> {
     let parts: Vec<&str> = path.split('/').collect();
     for (i, part) in parts.iter().enumerate() {
-        if *part == "models" || *part == "voices" {
-            if let Some(next) = parts.get(i + 1) {
-                return Some(next.split(':').next().unwrap_or(next).to_string());
-            }
+        if (*part == "models" || *part == "voices") && let Some(next) = parts.get(i + 1) {
+            return Some(next.split(':').next().unwrap_or(next).to_string());
         }
     }
     None

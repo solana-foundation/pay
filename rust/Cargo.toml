@@ -80,7 +80,7 @@ bs58 = "0.5"
 qrcode = { version = "0.14", default-features = false }
 
 # Solana MPP (includes keypair loading + charge building)
-solana-mpp = { git = "https://github.com/solana-foundation/mpp-sdk", default-features = false, features = [
+solana-mpp = { git = "https://github.com/solana-foundation/mpp-sdk", branch = "main", default-features = false, features = [
     "client",
     "server",
 ] }
