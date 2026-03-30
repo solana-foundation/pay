@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  pull-requests: write
+
 jobs:
   # ── TypeScript SDK ──
   core-test:
@@ -65,3 +68,34 @@ jobs:
         with:
           name: rust-coverage
           path: rust/coverage.json
+      - name: Build coverage comment
+        if: github.event_name == 'pull_request'
+        id: cov
+        run: |
+          RS_LINES=$(jq -r '[.data[0].totals.lines.percent] | .[0] | . * 10 | round / 10' coverage.json)
+          RS_FUNC=$(jq -r '[.data[0].totals.functions.percent] | .[0] | . * 10 | round / 10' coverage.json)
+          RS_REGIONS=$(jq -r '[.data[0].totals.regions.percent] | .[0] | . * 10 | round / 10' coverage.json)
+
+          badge() {
+            local val=$1
+            if [ "$(echo "$val >= 90" | bc -l)" = "1" ]; then echo "🟢"
+            elif [ "$(echo "$val >= 80" | bc -l)" = "1" ]; then echo "🟡"
+            else echo "🔴"; fi
+          }
+          BADGE=$(badge "$RS_LINES")
+
+          {
+            echo "body<<EOF"
+            echo "## Test Coverage"
+            echo ""
+            echo "| | Regions | Functions | Lines |"
+            echo "|---|---|---|---|"
+            echo "| ${BADGE} **Rust** | ${RS_REGIONS}% | ${RS_FUNC}% | ${RS_LINES}% |"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+      - name: Post coverage comment
+        if: github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: coverage
+          message: ${{ steps.cov.outputs.body }}
