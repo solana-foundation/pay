@@ -86,7 +86,13 @@ pub async fn get_balances(rpc_url: &str, pubkey: &str) -> crate::Result<AccountB
         .map_err(|e| crate::Error::Config(e.to_string()))?;
 
     // Get SOL balance
-    let sol_resp = rpc_call(&client, rpc_url, "getBalance", serde_json::json!([pubkey, { "commitment": "confirmed" }])).await?;
+    let sol_resp = rpc_call(
+        &client,
+        rpc_url,
+        "getBalance",
+        serde_json::json!([pubkey, { "commitment": "confirmed" }]),
+    )
+    .await?;
     let sol_lamports = sol_resp["result"]["value"].as_u64().unwrap_or(0);
 
     // Get token accounts from both token programs
@@ -105,7 +111,10 @@ pub async fn get_balances(rpc_url: &str, pubkey: &str) -> crate::Result<AccountB
         }
     }
 
-    Ok(AccountBalances { sol_lamports, tokens })
+    Ok(AccountBalances {
+        sol_lamports,
+        tokens,
+    })
 }
 
 async fn rpc_call(

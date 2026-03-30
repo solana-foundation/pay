@@ -20,7 +20,10 @@ fn config_from_toml_string() {
     "#;
     let cfg: Config = toml::from_str(toml).unwrap();
     assert!(cfg.auto_pay);
-    assert_eq!(cfg.rpc_url.as_deref(), Some("https://api.devnet.solana.com"));
+    assert_eq!(
+        cfg.rpc_url.as_deref(),
+        Some("https://api.devnet.solana.com")
+    );
     assert!(matches!(cfg.log_format, LogFormat::Json));
 }
 

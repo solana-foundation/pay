@@ -42,7 +42,12 @@ impl SendCommand {
         }
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(pay_core::client::send::send_sol(&self.amount, &self.recipient, &keypair, &rpc_url))?;
+        let result = rt.block_on(pay_core::client::send::send_sol(
+            &self.amount,
+            &self.recipient,
+            &keypair,
+            &rpc_url,
+        ))?;
 
         let sol_sent = result.lamports as f64 / 1_000_000_000.0;
         eprintln!(

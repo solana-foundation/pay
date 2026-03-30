@@ -69,7 +69,8 @@ async fn check_surfpool(rpc_url: &str) -> Result<()> {
             "id": 1,
             "method": "getHealth",
         }))
-        .send().await;
+        .send()
+        .await;
 
     if resp.is_err() {
         return Err(Error::Config(format!(

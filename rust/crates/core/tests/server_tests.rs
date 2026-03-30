@@ -4,16 +4,16 @@
 
 #![cfg(feature = "server")]
 
+use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::middleware;
 use axum::response::IntoResponse;
 use axum::routing::{any, get};
-use axum::Router;
+use pay_core::PaymentState;
 use pay_core::server::accounting::{AccountingKey, AccountingStore, InMemoryStore};
 use pay_core::server::metering;
 use pay_core::server::proxy;
-use pay_core::PaymentState;
 use pay_types::metering::ApiSpec;
 use serde_json::json;
 use solana_mpp::server::Mpp;
@@ -70,7 +70,10 @@ async fn start_test_server(with_mpp: bool) -> (String, tokio::task::JoinHandle<(
     };
 
     let app = Router::new()
-        .route("/__gateway/health", get(|| async { axum::Json(json!({"ok": true})) }))
+        .route(
+            "/__gateway/health",
+            get(|| async { axum::Json(json!({"ok": true})) }),
+        )
         .fallback(any(echo_handler))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -141,7 +144,9 @@ fn error_response_bad_gateway() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn middleware_skips_gateway_routes() {
     let (url, _h) = start_test_server(true).await;
-    let resp = reqwest::get(format!("{url}/__gateway/health")).await.unwrap();
+    let resp = reqwest::get(format!("{url}/__gateway/health"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
 }
 
@@ -219,7 +224,12 @@ async fn middleware_402_challenge_parseable() {
         .send()
         .await
         .unwrap();
-    let www_auth = resp.headers().get("www-authenticate").unwrap().to_str().unwrap();
+    let www_auth = resp
+        .headers()
+        .get("www-authenticate")
+        .unwrap()
+        .to_str()
+        .unwrap();
     let challenge = solana_mpp::parse_www_authenticate(www_auth).unwrap();
     assert_eq!(challenge.method.as_str(), "solana");
     assert_eq!(challenge.intent.as_str(), "charge");

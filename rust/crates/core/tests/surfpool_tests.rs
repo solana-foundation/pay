@@ -11,7 +11,6 @@
 use pay_core::client;
 use surfpool_sdk::{Keypair, Pubkey, Signer, Surfnet};
 
-
 // =============================================================================
 // Helpers
 // =============================================================================
@@ -43,9 +42,14 @@ async fn balance_funded_account() {
     let payer = surfnet.payer();
     let pubkey = payer.pubkey().to_string();
 
-    let rpc = surfnet.rpc_url().to_string(); let pk = pubkey.clone();
+    let rpc = surfnet.rpc_url().to_string();
+    let pk = pubkey.clone();
     let balances = client::balance::get_balances(&rpc, &pk).await.unwrap();
-    assert!(balances.sol_lamports >= 10_000_000_000, "Expected >= 10 SOL, got {}", balances.sol_lamports);
+    assert!(
+        balances.sol_lamports >= 10_000_000_000,
+        "Expected >= 10 SOL, got {}",
+        balances.sol_lamports
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -53,7 +57,8 @@ async fn balance_empty_account() {
     let surfnet = start_surfnet().await;
     let empty = Keypair::new();
 
-    let rpc = surfnet.rpc_url().to_string(); let pk = empty.pubkey().to_string();
+    let rpc = surfnet.rpc_url().to_string();
+    let pk = empty.pubkey().to_string();
     let balances = client::balance::get_balances(&rpc, &pk).await.unwrap();
     assert_eq!(balances.sol_lamports, 0);
     assert!(balances.tokens.is_empty());
@@ -67,11 +72,15 @@ async fn balance_diff_received() {
     let payer = surfnet.payer();
     let pubkey = payer.pubkey().to_string();
 
-    let rpc = surfnet.rpc_url().to_string(); let pk = pubkey.clone();
+    let rpc = surfnet.rpc_url().to_string();
+    let pk = pubkey.clone();
     let before = client::balance::get_balances(&rpc, &pk).await.unwrap();
 
     // Fund more SOL
-    surfnet.cheatcodes().fund_sol(&payer.pubkey(), 15_000_000_000).unwrap();
+    surfnet
+        .cheatcodes()
+        .fund_sol(&payer.pubkey(), 15_000_000_000)
+        .unwrap();
 
     let after = client::balance::get_balances(&rpc, &pk).await.unwrap();
     let diff = after.diff_received(&before);
@@ -100,7 +109,9 @@ async fn send_sol_basic() {
     let kp_file = keypair_to_file(payer);
     let kp_path = kp_file.path().to_string_lossy().to_string();
 
-    let rpc = surfnet.rpc_url().to_string(); let recip = recipient.pubkey().to_string(); let kp = kp_path.clone();
+    let rpc = surfnet.rpc_url().to_string();
+    let recip = recipient.pubkey().to_string();
+    let kp = kp_path.clone();
     let result = client::send::send_sol("0.5", &recip, &kp, &rpc).await;
 
     assert!(result.is_ok(), "send_sol failed: {:?}", result.err());
@@ -109,7 +120,8 @@ async fn send_sol_basic() {
     assert!(!result.signature.is_empty());
 
     // Verify recipient got the SOL
-    let rpc2 = surfnet.rpc_url().to_string(); let rpk = recipient.pubkey().to_string();
+    let rpc2 = surfnet.rpc_url().to_string();
+    let rpk = recipient.pubkey().to_string();
     let balance = client::balance::get_balances(&rpc2, &rpk).await.unwrap();
     assert_eq!(balance.sol_lamports, 500_000_000);
 }
@@ -124,20 +136,31 @@ async fn send_sol_drain() {
     let kp_path = kp_file.path().to_string_lossy().to_string();
 
     // "*" means drain all (minus fees)
-    let rpc = surfnet.rpc_url().to_string(); let recip = recipient.pubkey().to_string(); let kp = kp_path.clone();
+    let rpc = surfnet.rpc_url().to_string();
+    let recip = recipient.pubkey().to_string();
+    let kp = kp_path.clone();
     let result = client::send::send_sol("*", &recip, &kp, &rpc).await;
 
     assert!(result.is_ok(), "drain failed: {:?}", result.err());
 
     // Payer should have ~0 SOL left
-    let rpc2 = surfnet.rpc_url().to_string(); let ppk = payer.pubkey().to_string();
+    let rpc2 = surfnet.rpc_url().to_string();
+    let ppk = payer.pubkey().to_string();
     let payer_balance = client::balance::get_balances(&rpc2, &ppk).await.unwrap();
-    assert!(payer_balance.sol_lamports < 10_000, "Payer should be drained, got {}", payer_balance.sol_lamports);
+    assert!(
+        payer_balance.sol_lamports < 10_000,
+        "Payer should be drained, got {}",
+        payer_balance.sol_lamports
+    );
 
     // Recipient should have almost all the SOL
-    let rpc3 = surfnet.rpc_url().to_string(); let rpk2 = recipient.pubkey().to_string();
+    let rpc3 = surfnet.rpc_url().to_string();
+    let rpk2 = recipient.pubkey().to_string();
     let recv_balance = client::balance::get_balances(&rpc3, &rpk2).await.unwrap();
-    assert!(recv_balance.sol_lamports > 9_000_000_000, "Recipient should have most SOL");
+    assert!(
+        recv_balance.sol_lamports > 9_000_000_000,
+        "Recipient should have most SOL"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -147,8 +170,10 @@ async fn send_sol_invalid_recipient() {
     let kp_file = keypair_to_file(payer);
     let kp_path = kp_file.path().to_string_lossy().to_string();
 
-    let rpc = surfnet.rpc_url().to_string(); let kp = kp_path.clone();
-    let result = client::send::send_sol("0.1", "not-a-valid-pubkey", &kp_path, surfnet.rpc_url()).await;
+    let rpc = surfnet.rpc_url().to_string();
+    let kp = kp_path.clone();
+    let result =
+        client::send::send_sol("0.1", "not-a-valid-pubkey", &kp_path, surfnet.rpc_url()).await;
     assert!(result.is_err());
 }
 
@@ -157,13 +182,18 @@ async fn send_sol_insufficient_funds() {
     let surfnet = start_surfnet().await;
     // Create a wallet with very little SOL
     let broke = Keypair::new();
-    surfnet.cheatcodes().fund_sol(&broke.pubkey(), 5000).unwrap(); // 5000 lamports, not even enough for fees
+    surfnet
+        .cheatcodes()
+        .fund_sol(&broke.pubkey(), 5000)
+        .unwrap(); // 5000 lamports, not even enough for fees
     let recipient = Keypair::new();
 
     let kp_file = keypair_to_file(&broke);
     let kp_path = kp_file.path().to_string_lossy().to_string();
 
-    let rpc = surfnet.rpc_url().to_string(); let recip = recipient.pubkey().to_string(); let kp = kp_path.clone();
+    let rpc = surfnet.rpc_url().to_string();
+    let recip = recipient.pubkey().to_string();
+    let kp = kp_path.clone();
     let result = client::send::send_sol("1.0", &recip, &kp, &rpc).await;
     assert!(result.is_err());
 }
@@ -185,9 +215,14 @@ async fn dev_setup_keypair() {
     assert!(!dev.path.is_empty());
 
     // Verify the keypair is funded
-    let rpc2 = surfnet.rpc_url().to_string(); let dpk = dev.pubkey.clone();
+    let rpc2 = surfnet.rpc_url().to_string();
+    let dpk = dev.pubkey.clone();
     let balance = client::balance::get_balances(&rpc2, &dpk).await.unwrap();
-    assert!(balance.sol_lamports >= 100_000_000_000, "Should have 100 SOL, got {}", balance.sol_lamports);
+    assert!(
+        balance.sol_lamports >= 100_000_000_000,
+        "Should have 100 SOL, got {}",
+        balance.sol_lamports
+    );
 }
 
 // =============================================================================
@@ -196,18 +231,18 @@ async fn dev_setup_keypair() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn full_payment_flow_with_surfnet() {
+    use axum::Router;
     use axum::body::Body;
     use axum::http::Request;
     use axum::middleware;
     use axum::response::IntoResponse;
     use axum::routing::{any, get};
-    use axum::Router;
-    use pay_core::server::accounting::InMemoryStore;
     use pay_core::PaymentState;
+    use pay_core::server::accounting::InMemoryStore;
     use pay_types::metering::ApiSpec;
     use solana_mpp::server::Mpp;
-    use solana_mpp::solana_keychain::memory::MemorySigner;
     use solana_mpp::solana_keychain::SolanaSigner;
+    use solana_mpp::solana_keychain::memory::MemorySigner;
     use std::sync::Arc;
 
     #[derive(Clone)]
@@ -216,17 +251,24 @@ async fn full_payment_flow_with_surfnet() {
         mpp: Option<Mpp>,
     }
     impl PaymentState for S {
-        fn apis(&self) -> &[ApiSpec] { &self.apis }
-        fn mpp(&self) -> Option<&Mpp> { self.mpp.as_ref() }
+        fn apis(&self) -> &[ApiSpec] {
+            &self.apis
+        }
+        fn mpp(&self) -> Option<&Mpp> {
+            self.mpp.as_ref()
+        }
     }
 
     let surfnet = start_surfnet().await;
     let recipient = Keypair::new();
-    surfnet.cheatcodes().fund_sol(&recipient.pubkey(), 1_000_000_000).unwrap();
+    surfnet
+        .cheatcodes()
+        .fund_sol(&recipient.pubkey(), 1_000_000_000)
+        .unwrap();
 
-    let api: ApiSpec = serde_yml::from_str(
-        &std::fs::read_to_string("tests/fixtures/test-provider.yml").unwrap()
-    ).unwrap();
+    let api: ApiSpec =
+        serde_yml::from_str(&std::fs::read_to_string("tests/fixtures/test-provider.yml").unwrap())
+            .unwrap();
 
     let mpp = Mpp::new(solana_mpp::server::Config {
         recipient: recipient.pubkey().to_string(),
@@ -236,12 +278,18 @@ async fn full_payment_flow_with_surfnet() {
         rpc_url: Some(surfnet.rpc_url().to_string()),
         secret_key: Some("test-secret".to_string()),
         ..Default::default()
-    }).unwrap();
+    })
+    .unwrap();
 
-    let state = S { apis: Arc::new(vec![api]), mpp: Some(mpp.clone()) };
+    let state = S {
+        apis: Arc::new(vec![api]),
+        mpp: Some(mpp.clone()),
+    };
 
     let app = Router::new()
-        .fallback(any(|| async { axum::Json(serde_json::json!({"ok": true})) }))
+        .fallback(any(|| async {
+            axum::Json(serde_json::json!({"ok": true}))
+        }))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             pay_core::server::payment::payment_middleware::<S>,
@@ -260,17 +308,31 @@ async fn full_payment_flow_with_surfnet() {
         .post(format!("{url}/v1/simple/echo"))
         .header("host", "testapi.localhost")
         .body("{}")
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 402);
-    let www_auth = resp.headers().get("www-authenticate").unwrap().to_str().unwrap().to_string();
+    let www_auth = resp
+        .headers()
+        .get("www-authenticate")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
     let challenge = solana_mpp::parse_www_authenticate(&www_auth).unwrap();
 
     // Step 2: Build payment
     let payer = Keypair::new();
-    surfnet.cheatcodes().fund_sol(&payer.pubkey(), 2_000_000_000).unwrap();
+    surfnet
+        .cheatcodes()
+        .fund_sol(&payer.pubkey(), 2_000_000_000)
+        .unwrap();
     let signer = MemorySigner::from_bytes(&payer.to_bytes()).unwrap();
-    let rpc = solana_mpp::solana_rpc_client::rpc_client::RpcClient::new(surfnet.rpc_url().to_string());
-    let auth = solana_mpp::client::build_credential_header(&signer, &rpc, &challenge).await.unwrap();
+    let rpc =
+        solana_mpp::solana_rpc_client::rpc_client::RpcClient::new(surfnet.rpc_url().to_string());
+    let auth = solana_mpp::client::build_credential_header(&signer, &rpc, &challenge)
+        .await
+        .unwrap();
 
     // Step 3: Pay and get 200
     let resp = client
@@ -278,7 +340,9 @@ async fn full_payment_flow_with_surfnet() {
         .header("host", "testapi.localhost")
         .header("authorization", &auth)
         .body("{}")
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     assert!(resp.headers().get("payment-receipt").is_some());
 }
