@@ -58,7 +58,7 @@ jobs:
         with:
           workspaces: rust
       - name: Run tests with coverage
-        run: cargo llvm-cov --workspace --json --output-path coverage.json
+        run: cargo llvm-cov --workspace --features server --json --output-path coverage.json
       - name: Upload Rust coverage
         if: always()
         uses: actions/upload-artifact@v4

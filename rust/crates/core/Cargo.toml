@@ -46,3 +46,7 @@ solana-transaction = { workspace = true }
 
 [dev-dependencies]
 serde_yml = { workspace = true }
+
+[[test]]
+name = "metering_tests"
+required-features = ["server"]
