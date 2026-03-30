@@ -25,7 +25,7 @@ jobs:
         with:
           node-version: lts/*
       - run: pnpm install
-      - run: pnpm --filter @solana/pay test -- --coverage
+      - run: cd packages/solana-pay/core && npx vitest run --coverage
       - name: Upload TS coverage
         if: always()
         uses: actions/upload-artifact@v4
