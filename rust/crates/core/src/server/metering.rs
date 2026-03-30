@@ -217,7 +217,9 @@ fn resolve_tier(
 
     // No volume tiers — resolve by condition
     for tier in tiers {
-        if let Some(ref condition) = tier.condition && !evaluate_condition(condition, props) {
+        if let Some(ref condition) = tier.condition
+            && !evaluate_condition(condition, props)
+        {
             continue;
         }
         return tier.price_usd;

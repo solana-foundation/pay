@@ -180,7 +180,9 @@ fn extract_request_properties(headers: &HeaderMap, _path: &str) -> RequestProper
 fn extract_variant_hint(path: &str) -> Option<String> {
     let parts: Vec<&str> = path.split('/').collect();
     for (i, part) in parts.iter().enumerate() {
-        if (*part == "models" || *part == "voices") && let Some(next) = parts.get(i + 1) {
+        if (*part == "models" || *part == "voices")
+            && let Some(next) = parts.get(i + 1)
+        {
             return Some(next.split(':').next().unwrap_or(next).to_string());
         }
     }
