@@ -28,7 +28,7 @@ Supports both live payment standards on Solana:
 - **[MPP](https://mpp.dev/)** — Machine Payments Protocol
 - **[x402](https://x402.org/)** — x402 Payment Protocol
 
-Stablecoins deployed to Solana are supported out of the box.
+The platform supports Solana-deployed stablecoins out of the box.
 
 ### Touch ID & 1Password Key Storage
 
@@ -77,6 +77,12 @@ pay --dev --local curl http://localhost:3402/mpp/quote/AAPL
 git clone https://github.com/solana-foundation/pay.git
 cd pay/rust
 cargo install --path crates/cli
+```
+
+### Homebrew
+
+```sh
+brew install pay
 ```
 
 ### Verify
