@@ -46,7 +46,14 @@ solana-transaction = { workspace = true }
 
 [dev-dependencies]
 serde_yml = { workspace = true }
+toml = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
 
 [[test]]
 name = "metering_tests"
+required-features = ["server"]
+
+[[test]]
+name = "server_tests"
 required-features = ["server"]
