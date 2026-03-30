@@ -31,6 +31,7 @@ const ACCOUNTS_FILE: &str = "~/.config/pay/accounts.yml";
 pub enum Keystore {
     AppleKeychain,
     GnomeKeyring,
+    WindowsHello,
     OnePassword,
     File,
 }
@@ -40,6 +41,7 @@ impl std::fmt::Display for Keystore {
         match self {
             Keystore::AppleKeychain => write!(f, "apple-keychain"),
             Keystore::GnomeKeyring => write!(f, "gnome-keyring"),
+            Keystore::WindowsHello => write!(f, "windows-hello"),
             Keystore::OnePassword => write!(f, "1password"),
             Keystore::File => write!(f, "file"),
         }
@@ -71,6 +73,7 @@ impl Account {
         match self.keystore {
             Keystore::AppleKeychain => format!("keychain:{name}"),
             Keystore::GnomeKeyring => format!("gnome-keyring:{name}"),
+            Keystore::WindowsHello => format!("windows-hello:{name}"),
             Keystore::OnePassword => format!("1password:{name}"),
             Keystore::File => self
                 .path

@@ -130,6 +130,19 @@ impl DestroyCommand {
                     "Cannot delete GNOME Keyring entries on this platform".to_string(),
                 ));
             }
+            #[cfg(target_os = "windows")]
+            Keystore::WindowsHello => {
+                use pay_core::keystore::WindowsHello;
+                WindowsHello::new()
+                    .delete(&self.account)
+                    .map_err(|e| pay_core::Error::Config(format!("Windows Hello delete: {e}")))?;
+            }
+            #[cfg(not(target_os = "windows"))]
+            Keystore::WindowsHello => {
+                return Err(pay_core::Error::Config(
+                    "Cannot delete Windows Hello entries on this platform".to_string(),
+                ));
+            }
             Keystore::OnePassword => {
                 use pay_core::keystore::OnePassword;
                 let backend = OnePassword::new();

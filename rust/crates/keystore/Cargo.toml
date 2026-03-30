@@ -15,3 +15,10 @@ zeroize = { workspace = true }
 secret-service = { version = "3", features = ["rt-tokio-crypto-rust"] }
 tokio = { version = "1", features = ["rt"] }
 zbus = { version = "3", default-features = false, features = ["tokio"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Security_Credentials",
+    "Win32_System_Com",
+    "Security_Credentials_UI",
+] }

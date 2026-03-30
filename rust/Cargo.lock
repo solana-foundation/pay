@@ -5213,6 +5213,7 @@ dependencies = [
  "shellexpand",
  "thiserror 2.0.18",
  "tokio",
+ "windows",
  "zbus",
  "zeroize",
 ]

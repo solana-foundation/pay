@@ -8,4 +8,7 @@ pub use pay_keystore::backends::apple_keychain::AppleKeychain;
 #[cfg(target_os = "linux")]
 pub use pay_keystore::backends::gnome_keyring::GnomeKeyring;
 
+#[cfg(target_os = "windows")]
+pub use pay_keystore::backends::windows_hello::WindowsHello;
+
 pub use pay_keystore::backends::onepassword::OnePassword;

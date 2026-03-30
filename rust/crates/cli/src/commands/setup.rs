@@ -12,7 +12,8 @@ pub struct SetupCommand {
     #[arg(long)]
     pub force: bool,
 
-    /// Storage backend: "keychain" (macOS only), "1password".
+    /// Storage backend: "keychain" (macOS only), "gnome-keyring" (Linux only),
+    /// "windows-hello" (Windows only), "1password".
     /// If omitted, shows an interactive picker.
     #[arg(long)]
     pub backend: Option<String>,
@@ -49,9 +50,15 @@ impl SetupCommand {
             "gnome-keyring" => Err(pay_core::Error::Config(
                 "GNOME Keyring is only available on Linux".to_string(),
             )),
+            #[cfg(target_os = "windows")]
+            "windows-hello" => self.run_windows_hello(),
+            #[cfg(not(target_os = "windows"))]
+            "windows-hello" => Err(pay_core::Error::Config(
+                "Windows Hello is only available on Windows".to_string(),
+            )),
             "1password" => self.run_1password(),
             other => Err(pay_core::Error::Config(format!(
-                "Unknown backend: {other}. Use 'keychain', 'gnome-keyring', or '1password'."
+                "Unknown backend: {other}. Use 'keychain', 'gnome-keyring', 'windows-hello', or '1password'."
             ))),
         }
     }
@@ -77,6 +84,16 @@ impl SetupCommand {
                 false
             }
         };
+        let windows_hello_available = {
+            #[cfg(target_os = "windows")]
+            {
+                pay_core::keystore::WindowsHello::is_available()
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                false
+            }
+        };
         let op_available = pay_core::keystore::OnePassword::is_available();
 
         let options = [
@@ -97,6 +114,15 @@ impl SetupCommand {
                     "GNOME Keyring — not available (desktop session required)".to_string()
                 },
                 available: gnome_available,
+            },
+            BackendOption {
+                id: "windows-hello",
+                label: if windows_hello_available {
+                    "Windows Hello (fingerprint / face / PIN)".to_string()
+                } else {
+                    "Windows Hello — not configured (set up in Windows Settings first)".to_string()
+                },
+                available: windows_hello_available,
             },
             BackendOption {
                 id: "1password",
@@ -138,6 +164,7 @@ impl SetupCommand {
                 "gnome-keyring" => {
                     "GNOME Keyring requires a GNOME or KDE (Plasma 6+) desktop session."
                 }
+                "windows-hello" => "Set up Windows Hello in Settings → Accounts → Sign-in options.",
                 "1password" => {
                     "Install the 1Password CLI: https://developer.1password.com/docs/cli/get-started"
                 }
@@ -227,6 +254,50 @@ impl SetupCommand {
         save_account(
             "default",
             pay_core::accounts::Keystore::GnomeKeyring,
+            &pubkey_b58,
+            None,
+            None,
+        )?;
+        self.show_next_steps(&pubkey_b58)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn run_windows_hello(&self) -> pay_core::Result<()> {
+        use pay_core::keystore::WindowsHello;
+
+        if !WindowsHello::is_available() {
+            return Err(pay_core::Error::Config(
+                "Windows Hello is not configured. Set it up in Settings → Accounts → Sign-in options.".to_string(),
+            ));
+        }
+
+        let backend = WindowsHello::new();
+
+        if backend.exists("default") && !self.force {
+            return self.show_existing(&backend);
+        }
+
+        let (keypair_bytes, pubkey_b58) = generate_keypair();
+
+        backend
+            .import(
+                "default",
+                &keypair_bytes,
+                pay_core::keystore::SyncMode::ThisDeviceOnly,
+            )
+            .map_err(|e| pay_core::Error::Config(format!("{e}")))?;
+
+        eprintln!();
+        eprintln!("  {} {pubkey_b58}", "Your account:".dimmed());
+        eprintln!();
+        eprintln!(
+            "{}",
+            "  Stored in Windows Credential Manager — Windows Hello required to pay.".dimmed()
+        );
+
+        save_account(
+            "default",
+            pay_core::accounts::Keystore::WindowsHello,
             &pubkey_b58,
             None,
             None,
