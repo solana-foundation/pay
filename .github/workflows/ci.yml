@@ -11,6 +11,7 @@ permissions:
 jobs:
   # ── TypeScript SDK ──
   core-test:
+    name: TypeScript tests + coverage
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -24,7 +25,14 @@ jobs:
         with:
           node-version: lts/*
       - run: pnpm install
-      - run: pnpm --filter @solana/pay test
+      - run: pnpm --filter @solana/pay test -- --coverage
+      - name: Upload TS coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ts-coverage
+          path: typescript/packages/solana-pay/core/coverage/coverage-summary.json
+          if-no-files-found: ignore
 
   # ── Rust lint ──
   rust-check:
@@ -68,33 +76,60 @@ jobs:
         with:
           name: rust-coverage
           path: rust/coverage.json
-      - name: Build coverage comment
-        if: github.event_name == 'pull_request'
+
+  # ── Coverage comment ──
+  report:
+    name: Coverage report
+    if: github.event_name == 'pull_request'
+    needs: [core-test, rust-test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: rust-coverage
+          path: rust-cov
+        continue-on-error: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: ts-coverage
+          path: ts-cov
+        continue-on-error: true
+      - name: Build comment
         id: cov
         run: |
-          RS_LINES=$(jq -r '[.data[0].totals.lines.percent] | .[0] | . * 10 | round / 10' coverage.json)
-          RS_FUNC=$(jq -r '[.data[0].totals.functions.percent] | .[0] | . * 10 | round / 10' coverage.json)
-          RS_REGIONS=$(jq -r '[.data[0].totals.regions.percent] | .[0] | . * 10 | round / 10' coverage.json)
-
           badge() {
             local val=$1
-            if [ "$(echo "$val >= 90" | bc -l)" = "1" ]; then echo "🟢"
-            elif [ "$(echo "$val >= 80" | bc -l)" = "1" ]; then echo "🟡"
+            if [ "$(echo "$val >= 90" | bc -l 2>/dev/null)" = "1" ]; then echo "🟢"
+            elif [ "$(echo "$val >= 80" | bc -l 2>/dev/null)" = "1" ]; then echo "🟡"
             else echo "🔴"; fi
           }
-          BADGE=$(badge "$RS_LINES")
 
           {
             echo "body<<EOF"
             echo "## Test Coverage"
             echo ""
-            echo "| | Regions | Functions | Lines |"
+            echo "| | Statements | Functions | Lines |"
             echo "|---|---|---|---|"
-            echo "| ${BADGE} **Rust** | ${RS_REGIONS}% | ${RS_FUNC}% | ${RS_LINES}% |"
+
+            if [ -f ts-cov/coverage-summary.json ]; then
+              TS_STMTS=$(jq -r '.total.statements.pct' ts-cov/coverage-summary.json)
+              TS_FUNC=$(jq -r '.total.functions.pct' ts-cov/coverage-summary.json)
+              TS_LINES=$(jq -r '.total.lines.pct' ts-cov/coverage-summary.json)
+              TS_BADGE=$(badge "$TS_LINES")
+              echo "| ${TS_BADGE} **TypeScript** | ${TS_STMTS}% | ${TS_FUNC}% | ${TS_LINES}% |"
+            fi
+
+            if [ -f rust-cov/coverage.json ]; then
+              RS_LINES=$(jq -r '[.data[0].totals.lines.percent] | .[0] | . * 10 | round / 10' rust-cov/coverage.json)
+              RS_FUNC=$(jq -r '[.data[0].totals.functions.percent] | .[0] | . * 10 | round / 10' rust-cov/coverage.json)
+              RS_REGIONS=$(jq -r '[.data[0].totals.regions.percent] | .[0] | . * 10 | round / 10' rust-cov/coverage.json)
+              RS_BADGE=$(badge "$RS_LINES")
+              echo "| ${RS_BADGE} **Rust** | ${RS_REGIONS}% | ${RS_FUNC}% | ${RS_LINES}% |"
+            fi
+
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
-      - name: Post coverage comment
-        if: github.event_name == 'pull_request'
+      - name: Post comment
         uses: marocchino/sticky-pull-request-comment@v2
         with:
           header: coverage
