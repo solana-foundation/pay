@@ -5,8 +5,8 @@ use tracing::{debug, info};
 
 use solana_x402::protocol::methods::solana::PaymentRequirements;
 
-use crate::mpp;
-use crate::x402;
+use crate::client::mpp;
+use crate::client::x402;
 use crate::{Error, Result};
 
 /// The outcome of running a wrapped command.

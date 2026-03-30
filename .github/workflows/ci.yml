@@ -3,9 +3,10 @@ name: CI
 on:
   push:
     branches: [main]
+  pull_request:
 
 jobs:
-  # ── TypeScript SDK (typescript/packages/solana-pay/core/) ──
+  # ── TypeScript SDK ──
   core-test:
     runs-on: ubuntu-latest
     defaults:
@@ -22,9 +23,9 @@ jobs:
       - run: pnpm install
       - run: pnpm --filter @solana/pay test
 
-  # ── Rust CLI (rust/) ──
-  cli-check:
-    name: CLI check
+  # ── Rust lint ──
+  rust-check:
+    name: Rust lint
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -39,4 +40,28 @@ jobs:
           workspaces: rust
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+
+  # ── Rust tests + coverage ──
+  rust-test:
+    name: Rust tests + coverage
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Run tests with coverage
+        run: cargo llvm-cov --workspace --json --output-path coverage.json
+      - name: Upload Rust coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-coverage
+          path: rust/coverage.json

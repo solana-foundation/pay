@@ -6,12 +6,15 @@ license.workspace = true
 
 [features]
 default = []
+# Payment middleware for axum-based servers (metering, accounting, 402 flow).
+server = ["dep:axum"]
 # Build OpenSSL from source for cross-compilation (no system libssl-dev needed).
 # Activates openssl-sys/vendored which is pulled in transitively by
 # solana-rpc-client → reqwest → native-tls → openssl-sys.
 vendored-openssl = ["openssl-sys/vendored"]
 
 [dependencies]
+axum = { workspace = true, optional = true }
 openssl-sys = { version = "0.9", optional = true }
 pay-types = { workspace = true }
 serde = { workspace = true }
@@ -40,3 +43,6 @@ solana-pubkey = { workspace = true }
 solana-signature = { workspace = true }
 solana-system-interface = { workspace = true }
 solana-transaction = { workspace = true }
+
+[dev-dependencies]
+serde_yml = { workspace = true }

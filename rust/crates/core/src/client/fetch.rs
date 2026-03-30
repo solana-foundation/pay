@@ -3,7 +3,7 @@
 use reqwest::blocking::Client;
 use tracing::debug;
 
-use crate::runner::{self, RunOutcome};
+use crate::client::runner::{self, RunOutcome};
 use crate::{Error, Result};
 
 /// Fetch a URL, detecting 402 + MPP challenges.

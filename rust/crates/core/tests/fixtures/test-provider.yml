@@ -1,0 +1,332 @@
+name: testapi
+subdomain: testapi
+title: "Test API"
+description: "Fictive API for testing all metering patterns."
+category: ai_ml
+version: v1
+base_url: https://api.test.invalid/
+accounting: pooled
+
+endpoints:
+  # =========================================================================
+  # FREE — no metering
+  # =========================================================================
+  - method: GET
+    path: "v1/health"
+    resource: "health"
+    description: "Health check — always free"
+
+  - method: GET
+    path: "v1/models"
+    resource: "models"
+    description: "List models — free"
+
+  - method: GET
+    path: "v1/models/{modelId}"
+    resource: "models"
+    description: "Get model — free"
+
+  # =========================================================================
+  # FLAT PRICE — single tier, no volume, no conditions
+  # =========================================================================
+  - method: POST
+    path: "v1/simple/echo"
+    resource: "simple"
+    description: "Flat rate per request"
+    metering:
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 0.001
+
+  # =========================================================================
+  # VOLUME TIERS — price decreases with usage
+  # =========================================================================
+  - method: POST
+    path: "v1/volume/annotate"
+    resource: "volume"
+    description: "Volume-tiered: free → standard → discount"
+    metering:
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1000
+          tiers:
+            - up_to: 1000
+              price_usd: 0.00
+            - up_to: 5000000
+              price_usd: 1.50
+            - price_usd: 1.00
+
+  # =========================================================================
+  # CONDITIONAL TIERS — price depends on request property
+  # =========================================================================
+  - method: POST
+    path: "v1/conditional/generate"
+    resource: "conditional"
+    description: "Price varies by context length"
+    metering:
+      dimensions:
+        - direction: input
+          unit: tokens
+          scale: 1000000
+          tiers:
+            - price_usd: 1.00
+              condition:
+                field: context_length
+                op: "<="
+                value: 200000
+            - price_usd: 2.00
+              condition:
+                field: context_length
+                op: ">"
+                value: 200000
+        - direction: output
+          unit: tokens
+          scale: 1000000
+          tiers:
+            - price_usd: 4.00
+              condition:
+                field: context_length
+                op: "<="
+                value: 200000
+            - price_usd: 8.00
+              condition:
+                field: context_length
+                op: ">"
+                value: 200000
+
+  # =========================================================================
+  # VARIANT — price depends on model/voice selection
+  # =========================================================================
+  - method: POST
+    path: "v1/models/{modelId}:generate"
+    resource: "models"
+    description: "Model-variant pricing"
+    metering:
+      variants:
+        - param: model
+          value: "pro"
+          dimensions:
+            - direction: input
+              unit: tokens
+              scale: 1000000
+              tiers:
+                - price_usd: 5.00
+            - direction: output
+              unit: tokens
+              scale: 1000000
+              tiers:
+                - price_usd: 15.00
+        - param: model
+          value: "flash"
+          dimensions:
+            - direction: input
+              unit: tokens
+              scale: 1000000
+              tiers:
+                - price_usd: 0.50
+            - direction: output
+              unit: tokens
+              scale: 1000000
+              tiers:
+                - price_usd: 1.50
+        - param: model
+          value: "lite"
+          dimensions:
+            - direction: input
+              unit: tokens
+              scale: 1000000
+              tiers:
+                - price_usd: 0.10
+            - direction: output
+              unit: tokens
+              scale: 1000000
+              tiers:
+                - price_usd: 0.30
+
+  # =========================================================================
+  # VARIANT + CONDITIONAL — model selection AND context-dependent pricing
+  # =========================================================================
+  - method: POST
+    path: "v1/models/{modelId}:chat"
+    resource: "models"
+    description: "Variant + conditional combo"
+    metering:
+      variants:
+        - param: model
+          value: "expensive"
+          dimensions:
+            - direction: input
+              unit: tokens
+              scale: 1000000
+              tiers:
+                - price_usd: 2.00
+                  condition:
+                    field: context_length
+                    op: "<="
+                    value: 128000
+                - price_usd: 4.00
+                  condition:
+                    field: context_length
+                    op: ">"
+                    value: 128000
+            - direction: output
+              unit: tokens
+              scale: 1000000
+              tiers:
+                - price_usd: 10.00
+        - param: model
+          value: "cheap"
+          dimensions:
+            - direction: input
+              unit: tokens
+              scale: 1000000
+              tiers:
+                - price_usd: 0.10
+            - direction: output
+              unit: tokens
+              scale: 1000000
+              tiers:
+                - price_usd: 0.40
+
+  # =========================================================================
+  # SKU-BASED — Maps-style tiered by feature level
+  # =========================================================================
+  - method: POST
+    path: "v1/places/search"
+    resource: "places"
+    description: "SKU-based pricing"
+    metering:
+      sku_tiers:
+        - sku: "places-search-essentials"
+          level: essentials
+        - sku: "places-search-pro"
+          level: pro
+        - sku: "places-search-enterprise"
+          level: enterprise
+
+  # =========================================================================
+  # PER-CHARACTER — translation-style
+  # =========================================================================
+  - method: POST
+    path: "v1/translate"
+    resource: "translate"
+    description: "Per-character with free tier and volume discount"
+    metering:
+      dimensions:
+        - direction: usage
+          unit: characters
+          scale: 1000000
+          tiers:
+            - up_to: 500000
+              price_usd: 0.00
+            - up_to: 250000000
+              price_usd: 20.00
+            - price_usd: 10.00
+
+  # =========================================================================
+  # PER-MINUTE — speech-style
+  # =========================================================================
+  - method: POST
+    path: "v1/audio/transcribe"
+    resource: "audio"
+    description: "Per-minute with volume tiers"
+    metering:
+      dimensions:
+        - direction: usage
+          unit: minutes
+          scale: 1
+          tiers:
+            - up_to: 500000
+              price_usd: 0.016
+            - up_to: 1000000
+              price_usd: 0.010
+            - price_usd: 0.004
+
+  # =========================================================================
+  # PER-PAGE — document processing
+  # =========================================================================
+  - method: POST
+    path: "v1/documents/process"
+    resource: "documents"
+    description: "Per-page pricing"
+    metering:
+      dimensions:
+        - direction: usage
+          unit: pages
+          scale: 1000
+          tiers:
+            - up_to: 5000000
+              price_usd: 1.50
+            - price_usd: 0.60
+
+  # =========================================================================
+  # BODY SIZE CONDITION — price depends on payload size
+  # =========================================================================
+  - method: POST
+    path: "v1/upload"
+    resource: "upload"
+    description: "Price varies by body size"
+    metering:
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 0.01
+              condition:
+                field: body_size
+                op: "<="
+                value: 1048576
+            - price_usd: 0.10
+              condition:
+                field: body_size
+                op: ">"
+                value: 1048576
+
+  # =========================================================================
+  # BATCH SIZE CONDITION — price per item in batch
+  # =========================================================================
+  - method: POST
+    path: "v1/batch/embed"
+    resource: "batch"
+    description: "Batch pricing — cost depends on item count"
+    metering:
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 0.001
+              condition:
+                field: batch_size
+                op: "<="
+                value: 100
+            - price_usd: 0.0005
+              condition:
+                field: batch_size
+                op: ">"
+                value: 100
+
+  # =========================================================================
+  # MULTI-DIMENSION — input + output priced separately, no variants
+  # =========================================================================
+  - method: POST
+    path: "v1/completions"
+    resource: "completions"
+    description: "Input + output tokens priced separately"
+    metering:
+      dimensions:
+        - direction: input
+          unit: tokens
+          scale: 1000000
+          tiers:
+            - price_usd: 0.50
+        - direction: output
+          unit: tokens
+          scale: 1000000
+          tiers:
+            - price_usd: 1.50

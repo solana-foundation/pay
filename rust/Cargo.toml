@@ -60,6 +60,9 @@ tempfile = "3"
 # Path expansion
 shellexpand = "3"
 
+# Web framework (for payment middleware)
+axum = "0.8"
+
 # Async (for solana-mpp charge builder)
 tokio = { version = "1", features = ["rt-multi-thread"] }
 
@@ -79,6 +82,7 @@ qrcode = { version = "0.14", default-features = false }
 # Solana MPP (includes keypair loading + charge building)
 solana-mpp = { git = "https://github.com/solana-foundation/mpp-sdk", default-features = false, features = [
     "client",
+    "server",
 ] }
 
 # Solana x402
