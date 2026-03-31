@@ -6,6 +6,7 @@ pub mod fetch;
 pub mod send;
 pub mod server;
 pub mod setup;
+pub mod solana;
 pub mod topup;
 pub mod wget;
 
@@ -39,6 +40,8 @@ pub enum Command {
         #[command(subcommand)]
         command: account::AccountCommand,
     },
+    /// Run a Solana CLI command with your pay account keypair.
+    Solana(solana::SolanaCommand),
     /// Send SOL to a recipient address.
     Send(send::SendCommand),
     /// Generate a keypair, store it, and fund your account.
@@ -78,6 +81,7 @@ impl Command {
             | Command::Send(_)
             | Command::Setup(_)
             | Command::Topup(_)
+            | Command::Solana(_)
             | Command::Server { .. } => ToolKind::Mcp,
             Command::Mcp => ToolKind::Mcp,
         }
@@ -105,6 +109,7 @@ impl Command {
 
         match self {
             Command::Account { command } => return command.run(keypair_override),
+            Command::Solana(cmd) => std::process::exit(cmd.run(keypair_override)?),
             Command::Send(cmd) => return cmd.run(keypair_override, verbose),
             Command::Setup(cmd) => return cmd.run(),
             Command::Topup(cmd) => return cmd.run(keypair_override),

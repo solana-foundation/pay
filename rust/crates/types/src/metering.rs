@@ -33,6 +33,54 @@ pub struct ApiSpec {
     pub quotas: Option<QuotaSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
+    /// Operator config — how this proxy instance runs (signer, recipient, currency).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator: Option<OperatorConfig>,
+}
+
+// =============================================================================
+// Operator config
+// =============================================================================
+
+/// Operator-level configuration for a proxy instance.
+/// Controls signing, payment recipient, and currency.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct OperatorConfig {
+    /// Signing backend for fee sponsorship and settlement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer: Option<SignerConfig>,
+    /// Payment recipient wallet address (base58).
+    /// Overrides --recipient CLI flag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipient: Option<String>,
+    /// Payment currency (SOL, USDC, etc.).
+    /// Overrides --currency CLI flag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
+    /// Solana RPC URL. Overrides --rpc-url CLI flag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpc_url: Option<String>,
+    /// Solana network (mainnet-beta, devnet, localnet).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+    /// Whether the operator sponsors transaction fees.
+    #[serde(default)]
+    pub fee_payer: bool,
+}
+
+/// Signing backend configuration.
+/// When specified in the YAML, the proxy uses this signer directly —
+/// bypassing the keystore. For production use GCP KMS; for dev use file.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "backend", rename_all = "kebab-case")]
+pub enum SignerConfig {
+    /// GCP Cloud KMS — Ed25519 HSM key. Private key never leaves the HSM.
+    GcpKms {
+        /// Full KMS key version resource name.
+        key_name: String,
+        /// Solana public key (base58) derived from the KMS key.
+        pubkey: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

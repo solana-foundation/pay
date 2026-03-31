@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [features]
 default = []
+gcp_kms = ["solana-mpp/gcp_kms"]
 vendored-openssl = ["pay-core/vendored-openssl"]
 
 [dependencies]
@@ -29,6 +30,7 @@ solana-mpp = { workspace = true }
 tokio = { workspace = true }
 owo-colors = { workspace = true }
 shellexpand = { workspace = true }
+tempfile = { workspace = true }
 ed25519-dalek = { workspace = true }
 rand = { workspace = true }
 bs58 = { workspace = true }

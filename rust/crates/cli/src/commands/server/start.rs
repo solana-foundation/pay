@@ -8,7 +8,10 @@ use axum::routing::{any, get};
 use owo_colors::OwoColorize;
 use pay_core::PaymentState;
 use pay_types::metering::ApiSpec;
+#[cfg(feature = "gcp_kms")]
+use pay_types::metering::SignerConfig;
 use solana_mpp::server::Mpp;
+use solana_mpp::solana_keychain::SolanaSigner;
 
 /// Start the payment gateway proxy.
 ///
@@ -62,38 +65,74 @@ impl StartCommand {
         let api: ApiSpec = serde_yml::from_str(&contents)
             .map_err(|e| pay_core::Error::Config(format!("Invalid spec: {e}")))?;
 
-        let recipient = if let Some(r) = &self.recipient {
+        let op = api.operator.as_ref();
+
+        // Resolve signer — operator.signer takes priority, then CLI/keystore fallback.
+        #[cfg(feature = "gcp_kms")]
+        let fee_payer_signer: Option<std::sync::Arc<dyn solana_mpp::solana_keychain::SolanaSigner>> =
+            if let Some(signer_cfg) = op.and_then(|o| o.signer.as_ref()) {
+                Some(resolve_signer(signer_cfg)?)
+            } else {
+                None
+            };
+        #[cfg(not(feature = "gcp_kms"))]
+        let fee_payer_signer: Option<std::sync::Arc<dyn solana_mpp::solana_keychain::SolanaSigner>> =
+            if op.and_then(|o| o.signer.as_ref()).is_some() {
+                return Err(pay_core::Error::Config(
+                    "operator.signer requires the `gcp_kms` feature. Rebuild with `--features gcp_kms`.".to_string(),
+                ));
+            } else {
+                None
+            };
+
+        // Resolve recipient — operator.recipient > --recipient > signer pubkey > keystore.
+        let recipient = if let Some(r) = op.and_then(|o| o.recipient.as_ref()) {
             r.clone()
+        } else if let Some(r) = &self.recipient {
+            r.clone()
+        } else if let Some(ref signer) = fee_payer_signer {
+            signer.pubkey().to_string()
+        } else if let Some(r) = std::env::var("PAY_PAYMENT_RECIPIENT").ok() {
+            r
         } else if let Some(source) = keypair_source {
-            use solana_mpp::solana_keychain::SolanaSigner;
             let signer = pay_core::signer::load_signer(source)?;
             signer.pubkey().to_string()
         } else {
             return Err(pay_core::Error::Config(
-                "No --recipient specified and no wallet configured. Run `pay setup` first."
+                "No recipient specified. Use operator.recipient in YAML, --recipient flag, PAY_PAYMENT_RECIPIENT env, or `pay setup`."
                     .to_string(),
             ));
         };
 
-        let rpc_url = self
-            .rpc_url
+        // Resolve other config — operator overrides > CLI flags > env vars > defaults.
+        let currency = op
+            .and_then(|o| o.currency.clone())
+            .unwrap_or_else(|| self.currency.clone());
+
+        let rpc_url = op
+            .and_then(|o| o.rpc_url.clone())
+            .or(self.rpc_url.clone())
             .or_else(|| std::env::var("PAY_RPC_URL").ok())
             .unwrap_or_else(|| pay_core::config::LOCAL_RPC_URL.to_string());
+
+        let network = op
+            .and_then(|o| o.network.clone())
+            .unwrap_or_else(|| "mainnet-beta".to_string());
+
+        let fee_payer = op.map(|o| o.fee_payer).unwrap_or(false);
 
         let secret_key = std::env::var("PAY_MPP_CHALLENGE_SECRET")
             .unwrap_or_else(|_| bs58::encode(rand::random::<[u8; 32]>()).into_string());
 
         let mpp = Mpp::new(solana_mpp::server::Config {
             recipient: recipient.clone(),
-            currency: self.currency.clone(),
-            decimals: if self.currency.to_uppercase() == "SOL" {
-                9
-            } else {
-                6
-            },
-            network: "mainnet-beta".to_string(),
+            currency: currency.clone(),
+            decimals: if currency.to_uppercase() == "SOL" { 9 } else { 6 },
+            network: network.clone(),
             rpc_url: Some(rpc_url.clone()),
             secret_key: Some(secret_key),
+            fee_payer,
+            fee_payer_signer,
             ..Default::default()
         })
         .map_err(|e| pay_core::Error::Config(format!("Failed to create MPP server: {e}")))?;
@@ -261,4 +300,28 @@ fn build_endpoints_json(api: &ApiSpec) -> serde_json::Value {
         "forward_url": api.forward_url,
         "endpoints": endpoints,
     })
+}
+
+/// Create a SolanaSigner from the operator.signer config.
+#[cfg(feature = "gcp_kms")]
+fn resolve_signer(config: &SignerConfig) -> pay_core::Result<Arc<dyn SolanaSigner>> {
+    match config {
+        SignerConfig::GcpKms { key_name, pubkey } => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| pay_core::Error::Config(format!("Runtime error: {e}")))?;
+
+            let signer = rt
+                .block_on(solana_mpp::solana_keychain::GcpKmsSigner::new(
+                    key_name.clone(),
+                    pubkey.clone(),
+                ))
+                .map_err(|e| {
+                    pay_core::Error::Config(format!("Failed to create GCP KMS signer: {e}"))
+                })?;
+
+            Ok(Arc::new(signer))
+        }
+    }
 }

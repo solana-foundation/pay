@@ -24,6 +24,21 @@ lint:
 fmt:
     cargo fmt --check
 
+# Format + lint
+check: fmt lint
+
 # Run the CLI (pass args after --)
 run *ARGS:
     cargo run -- {{ARGS}}
+
+# Build Docker image
+docker-build:
+    DOCKER_BUILDKIT=1 docker build --ssh default -t pay .
+
+# Run Docker image (pass args after --)
+docker-run *ARGS:
+    docker run --rm pay {{ARGS}}
+
+# Start a payment gateway server
+serve SPEC *ARGS:
+    cargo run -- server start {{SPEC}} {{ARGS}}
