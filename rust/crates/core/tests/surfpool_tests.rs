@@ -346,3 +346,133 @@ async fn full_payment_flow_with_surfnet() {
     assert_eq!(resp.status(), 200);
     assert!(resp.headers().get("payment-receipt").is_some());
 }
+
+// =============================================================================
+// MPP build_credential (pay_core::client::mpp)
+// =============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mpp_build_credential_with_surfnet() {
+    use axum::Router;
+    use axum::middleware;
+    use axum::routing::any;
+    use pay_core::PaymentState;
+    use pay_core::server::accounting::InMemoryStore;
+    use pay_types::metering::ApiSpec;
+    use solana_mpp::server::Mpp;
+    use std::sync::Arc;
+
+    #[derive(Clone)]
+    struct S {
+        apis: Arc<Vec<ApiSpec>>,
+        mpp: Option<Mpp>,
+    }
+    impl PaymentState for S {
+        fn apis(&self) -> &[ApiSpec] {
+            &self.apis
+        }
+        fn mpp(&self) -> Option<&Mpp> {
+            self.mpp.as_ref()
+        }
+    }
+
+    let surfnet = start_surfnet().await;
+    let recipient = Keypair::new();
+    surfnet
+        .cheatcodes()
+        .fund_sol(&recipient.pubkey(), 1_000_000_000)
+        .unwrap();
+
+    let api: ApiSpec =
+        serde_yml::from_str(&std::fs::read_to_string("tests/fixtures/test-provider.yml").unwrap())
+            .unwrap();
+
+    let mpp = Mpp::new(solana_mpp::server::Config {
+        recipient: recipient.pubkey().to_string(),
+        currency: "SOL".to_string(),
+        decimals: 9,
+        network: "localnet".to_string(),
+        rpc_url: Some(surfnet.rpc_url().to_string()),
+        secret_key: Some("test-secret".to_string()),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let state = S {
+        apis: Arc::new(vec![api]),
+        mpp: Some(mpp),
+    };
+
+    let app = Router::new()
+        .fallback(any(|| async {
+            axum::Json(serde_json::json!({"ok": true}))
+        }))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            pay_core::server::payment::payment_middleware::<S>,
+        ))
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    tokio::spawn(async { axum::serve(listener, app).await.unwrap() });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Step 1: Get a 402 challenge
+    let http = reqwest::Client::new();
+    let resp = http
+        .post(format!("{url}/v1/simple/echo"))
+        .header("host", "testapi.localhost")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 402);
+    let www_auth = resp
+        .headers()
+        .get("www-authenticate")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let challenge = client::mpp::parse(&www_auth).unwrap();
+
+    // Step 2: Create a funded payer keypair file
+    let payer = Keypair::new();
+    surfnet
+        .cheatcodes()
+        .fund_sol(&payer.pubkey(), 2_000_000_000)
+        .unwrap();
+    let kp_file = keypair_to_file(&payer);
+    let kp_path = kp_file.path().to_string_lossy().to_string();
+
+    // Step 3: Build credential using pay_core (sets PAY_RPC_URL for the signer)
+    // build_credential creates its own tokio runtime, so run it from a blocking thread
+    let rpc_url = surfnet.rpc_url().to_string();
+    let challenge_clone = challenge.clone();
+    let kp = kp_path.clone();
+    let auth = tokio::task::spawn_blocking(move || {
+        // SAFETY: test-only env manipulation
+        unsafe { std::env::set_var("PAY_RPC_URL", &rpc_url) };
+        let result = client::mpp::build_credential(&challenge_clone, &kp);
+        unsafe { std::env::remove_var("PAY_RPC_URL") };
+        result
+    })
+    .await
+    .unwrap();
+
+    assert!(auth.is_ok(), "build_credential failed: {:?}", auth.err());
+    let auth = auth.unwrap();
+    assert!(!auth.is_empty());
+
+    // Step 4: Use the credential — should get 200
+    let resp = http
+        .post(format!("{url}/v1/simple/echo"))
+        .header("host", "testapi.localhost")
+        .header("authorization", &auth)
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+}

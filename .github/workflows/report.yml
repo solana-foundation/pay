@@ -18,11 +18,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Download coverage artifact from CI
+      # Download coverage artifacts from CI
       - uses: actions/download-artifact@v4
         with:
           name: rust-coverage
           path: rust-cov
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ts-coverage
+          path: ts-cov
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
         continue-on-error: true
@@ -50,4 +58,5 @@ jobs:
         uses: ./_surfpool/.github/actions/test-report
         with:
           rust-coverage-json: rust-cov/coverage.json
+          ts-coverage-json: ts-cov/coverage-summary.json
           comment-header: coverage

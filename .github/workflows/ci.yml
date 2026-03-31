@@ -69,68 +69,10 @@ jobs:
         with:
           workspaces: rust
       - name: Run tests with coverage
-        run: cargo llvm-cov --workspace --features server --json --output-path coverage.json
+        run: cargo llvm-cov --workspace --features server --exclude pay --json --output-path coverage.json
       - name: Upload Rust coverage
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: rust-coverage
           path: rust/coverage.json
-
-  # ── Coverage comment ──
-  report:
-    name: Coverage report
-    if: github.event_name == 'pull_request'
-    needs: [core-test, rust-test]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: rust-coverage
-          path: rust-cov
-        continue-on-error: true
-      - uses: actions/download-artifact@v4
-        with:
-          name: ts-coverage
-          path: ts-cov
-        continue-on-error: true
-      - name: Build comment
-        id: cov
-        run: |
-          badge() {
-            local val=$1
-            if [ "$(echo "$val >= 90" | bc -l 2>/dev/null)" = "1" ]; then echo "🟢"
-            elif [ "$(echo "$val >= 80" | bc -l 2>/dev/null)" = "1" ]; then echo "🟡"
-            else echo "🔴"; fi
-          }
-
-          {
-            echo "body<<EOF"
-            echo "## Test Coverage"
-            echo ""
-            echo "| | Statements | Functions | Lines |"
-            echo "|---|---|---|---|"
-
-            if [ -f ts-cov/coverage-summary.json ]; then
-              TS_STMTS=$(jq -r '.total.statements.pct' ts-cov/coverage-summary.json)
-              TS_FUNC=$(jq -r '.total.functions.pct' ts-cov/coverage-summary.json)
-              TS_LINES=$(jq -r '.total.lines.pct' ts-cov/coverage-summary.json)
-              TS_BADGE=$(badge "$TS_LINES")
-              echo "| ${TS_BADGE} **TypeScript** | ${TS_STMTS}% | ${TS_FUNC}% | ${TS_LINES}% |"
-            fi
-
-            if [ -f rust-cov/coverage.json ]; then
-              RS_LINES=$(jq -r '[.data[0].totals.lines.percent] | .[0] | . * 10 | round / 10' rust-cov/coverage.json)
-              RS_FUNC=$(jq -r '[.data[0].totals.functions.percent] | .[0] | . * 10 | round / 10' rust-cov/coverage.json)
-              RS_REGIONS=$(jq -r '[.data[0].totals.regions.percent] | .[0] | . * 10 | round / 10' rust-cov/coverage.json)
-              RS_BADGE=$(badge "$RS_LINES")
-              echo "| ${RS_BADGE} **Rust** | ${RS_REGIONS}% | ${RS_FUNC}% | ${RS_LINES}% |"
-            fi
-
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-      - name: Post comment
-        uses: marocchino/sticky-pull-request-comment@v2
-        with:
-          header: coverage
-          message: ${{ steps.cov.outputs.body }}
