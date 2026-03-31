@@ -39,6 +39,10 @@ pub struct StartCommand {
     /// RPC URL for payment verification.
     #[arg(long)]
     pub rpc_url: Option<String>,
+
+    /// Sandbox mode — auto-airdrop SOL to the operator's fee payer wallet.
+    #[arg(long)]
+    pub sandbox: bool,
 }
 
 #[derive(Clone)]
@@ -122,6 +126,84 @@ impl StartCommand {
             .unwrap_or_else(|| "mainnet-beta".to_string());
 
         let fee_payer = op.map(|o| o.fee_payer).unwrap_or(false);
+
+        // ── Sandbox: auto-airdrop SOL to operator wallet ──
+        if self.sandbox {
+            if let Some(ref signer) = fee_payer_signer {
+                let pubkey = signer.pubkey().to_string();
+                eprintln!(
+                    "  {} checking balance for {}…",
+                    "sandbox".yellow().bold(),
+                    &pubkey[..8]
+                );
+                let rt_airdrop = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| pay_core::Error::Config(format!("Runtime error: {e}")))?;
+                rt_airdrop.block_on(async {
+                    let client = reqwest::Client::new();
+                    // Check balance
+                    let balance_resp = client
+                        .post(&rpc_url)
+                        .json(&serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "getBalance",
+                            "params": [pubkey]
+                        }))
+                        .send()
+                        .await;
+                    let balance_lamports = match balance_resp {
+                        Ok(r) => r
+                            .json::<serde_json::Value>()
+                            .await
+                            .ok()
+                            .and_then(|v| v["result"]["value"].as_u64())
+                            .unwrap_or(0),
+                        Err(_) => 0,
+                    };
+                    let balance_sol = balance_lamports as f64 / 1_000_000_000.0;
+                    eprintln!("  {}  {:.4} SOL", "balance".dimmed(), balance_sol);
+
+                    if balance_lamports < 1_000_000_000 {
+                        eprintln!("  {} requesting airdrop…", "sandbox".yellow().bold());
+                        let airdrop_resp = client
+                            .post(&rpc_url)
+                            .json(&serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "method": "requestAirdrop",
+                                "params": [pubkey, 2_000_000_000u64]
+                            }))
+                            .send()
+                            .await;
+                        match airdrop_resp {
+                            Ok(r) => {
+                                let body: serde_json::Value = r.json().await.unwrap_or_default();
+                                if body.get("error").is_some() {
+                                    eprintln!(
+                                        "  {} airdrop failed: {}",
+                                        "sandbox".yellow().bold(),
+                                        body["error"]["message"]
+                                    );
+                                } else {
+                                    eprintln!("  {} +2 SOL airdropped", "sandbox".green().bold());
+                                }
+                            }
+                            Err(e) => eprintln!(
+                                "  {} airdrop request failed: {e}",
+                                "sandbox".yellow().bold()
+                            ),
+                        }
+                    }
+                });
+            } else {
+                eprintln!(
+                    "  {} no fee payer signer — skipping airdrop",
+                    "sandbox".yellow().bold()
+                );
+            }
+        }
 
         let secret_key = std::env::var("PAY_MPP_CHALLENGE_SECRET")
             .unwrap_or_else(|_| bs58::encode(rand::random::<[u8; 32]>()).into_string());
