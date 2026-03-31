@@ -4,6 +4,7 @@ pub mod codex;
 pub mod curl;
 pub mod fetch;
 pub mod send;
+pub mod server;
 pub mod setup;
 pub mod topup;
 pub mod wget;
@@ -44,6 +45,11 @@ pub enum Command {
     Setup(setup::SetupCommand),
     /// Fund your account on localnet via Surfpool.
     Topup(topup::TopupCommand),
+    /// Payment gateway server (start, scaffold).
+    Server {
+        #[command(subcommand)]
+        command: server::ServerCommand,
+    },
     /// Start the MCP server (for Claude Code, Cursor, etc.)
     Mcp,
 }
@@ -68,9 +74,11 @@ impl Command {
             Command::Fetch(_) => ToolKind::Fetch,
             Command::Claude(_) => ToolKind::Claude,
             Command::Codex(_) => ToolKind::Codex,
-            Command::Account { .. } | Command::Send(_) | Command::Setup(_) | Command::Topup(_) => {
-                ToolKind::Mcp
-            }
+            Command::Account { .. }
+            | Command::Send(_)
+            | Command::Setup(_)
+            | Command::Topup(_)
+            | Command::Server { .. } => ToolKind::Mcp,
             Command::Mcp => ToolKind::Mcp,
         }
     }
@@ -100,6 +108,7 @@ impl Command {
             Command::Send(cmd) => return cmd.run(keypair_override, verbose),
             Command::Setup(cmd) => return cmd.run(),
             Command::Topup(cmd) => return cmd.run(keypair_override),
+            Command::Server { command } => return command.run(keypair_override),
             Command::Mcp => {
                 let rt = tokio::runtime::Builder::new_multi_thread()
                     .enable_all()

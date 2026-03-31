@@ -41,6 +41,8 @@ pub async fn payment_middleware<S: PaymentState>(
     let apis = state.apis();
     let api = match apis.iter().find(|a| a.subdomain == subdomain) {
         Some(api) => api,
+        // Single-API mode: if only one API is configured, use it regardless of subdomain
+        None if apis.len() == 1 => &apis[0],
         None => return next.run(req).await,
     };
 

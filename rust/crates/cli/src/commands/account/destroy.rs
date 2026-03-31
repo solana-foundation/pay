@@ -47,50 +47,48 @@ impl DestroyCommand {
             }
         })?;
 
-        let pubkey = entry
+        let _pubkey = entry
             .pubkey
             .clone()
             .unwrap_or_else(|| "unknown".to_string());
         let keystore_kind = entry.keystore.clone();
 
-        eprintln!();
-        eprintln!(
-            "{}",
-            format!(
-                "  Account:  {} ({})",
-                self.account,
-                pubkey.chars().take(8).collect::<String>()
-                    + "..."
-                    + &pubkey
-                        .chars()
-                        .rev()
-                        .take(4)
-                        .collect::<String>()
-                        .chars()
-                        .rev()
-                        .collect::<String>()
-            )
-            .dimmed()
+        // Show account list with the target in red
+        super::list::print_account_list(
+            &accounts,
+            Some(super::list::Highlight::Red(&self.account)),
         );
-        eprintln!("{}", format!("  Keystore: {keystore_kind}").dimmed());
-        eprintln!();
-
-        // Suggest export
-        eprintln!(
-            "{}",
-            "  Before destroying, consider exporting your keypair:".dimmed()
-        );
-        eprintln!(
-            "{}",
-            format!("    pay export backup-{}.json", self.account).dimmed()
-        );
-        eprintln!();
 
         if !self.yes {
-            let confirmed = Confirm::new()
+            let theme = dialoguer::theme::ColorfulTheme::default();
+
+            // Offer to export first
+            let export = Confirm::with_theme(&theme)
                 .with_prompt(format!(
-                    "Permanently delete account '{}'? This cannot be undone",
-                    self.account
+                    "Export '{}' before removing?",
+                    self.account.yellow()
+                ))
+                .default(true)
+                .interact()
+                .unwrap_or(false);
+
+            if export {
+                let export_path = format!("backup-{}.json", self.account);
+                let export_cmd = super::export::ExportCommand {
+                    path: export_path.clone(),
+                    name: Some(self.account.clone()),
+                };
+                // Try exporting, but don't fail the whole remove if it errors
+                match export_cmd.run(None) {
+                    Ok(()) => {}
+                    Err(e) => eprintln!("  {}", format!("Export failed: {e}").dimmed()),
+                }
+            }
+
+            let confirmed = Confirm::with_theme(&theme)
+                .with_prompt(format!(
+                    "Permanently delete '{}'? This cannot be undone",
+                    self.account.red()
                 ))
                 .default(false)
                 .interact()
@@ -116,27 +114,40 @@ impl DestroyCommand {
         }
 
         // Remove from accounts.yml
+        let was_default = accounts.default_account.as_deref() == Some(&self.account);
         accounts.remove(&self.account);
+
+        // If we deleted the default and there are remaining accounts, prompt for new default
+        if was_default && accounts.accounts.len() > 1 {
+            let names: Vec<String> = accounts.accounts.keys().cloned().collect();
+            let has_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
+            if has_tty {
+                let selection =
+                    dialoguer::Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
+                        .with_prompt("Choose new default account")
+                        .items(&names)
+                        .default(0)
+                        .interact()
+                        .ok();
+
+                if let Some(idx) = selection {
+                    accounts.default_account = Some(names[idx].clone());
+                }
+            }
+        }
+
         accounts.save()?;
 
-        eprintln!();
-        eprintln!(
-            "{}",
-            format!("  Account '{}' destroyed.", self.account).dimmed()
-        );
-
-        if let Some(new_default) = &accounts.default_account {
+        if accounts.accounts.is_empty() {
+            eprintln!();
             eprintln!(
                 "{}",
-                format!("  New default account: {new_default}").dimmed()
+                "  No accounts remaining. Run `pay account new` to create one.".dimmed()
             );
+            eprintln!();
         } else {
-            eprintln!(
-                "{}",
-                "  No accounts remaining. Run `pay setup` to create a new one.".dimmed()
-            );
+            super::list::print_account_list(&accounts, None::<super::list::Highlight>);
         }
-        eprintln!();
 
         Ok(())
     }

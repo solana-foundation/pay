@@ -80,7 +80,7 @@ impl Keystore {
     /// macOS Keychain + Touch ID.
     #[cfg(target_os = "macos")]
     pub fn apple_keychain() -> Self {
-        Self::new(macos::TouchId, macos::AppleKeychainStore, false)
+        Self::new(macos::TouchId, macos::AppleKeychainStore, true)
     }
 
     /// Check if Touch ID is available (macOS only).
@@ -419,5 +419,125 @@ mod tests {
     #[test]
     fn hex_decode_invalid_chars() {
         assert!(store::hex_decode("zzzz").is_err());
+    }
+
+    // ── Auth denial tests ───────────────────────────────────────────────
+
+    struct DenyAuth;
+    impl AuthGate for DenyAuth {
+        fn authenticate(&self, _reason: &str) -> Result<()> {
+            Err(Error::AuthDenied("denied by test".to_string()))
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn import_denied_when_auth_on_write() {
+        let ks = Keystore {
+            auth: Box::new(DenyAuth),
+            store: Box::new(store::InMemoryStore::new()),
+            auth_on_write: true,
+        };
+        let result = ks.import("test", &test_keypair(), SyncMode::ThisDeviceOnly);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("denied"));
+        // Nothing should be stored
+        assert!(!ks.exists("test"));
+    }
+
+    #[test]
+    fn import_succeeds_without_auth_when_auth_on_write_false() {
+        let ks = Keystore {
+            auth: Box::new(DenyAuth),
+            store: Box::new(store::InMemoryStore::new()),
+            auth_on_write: false,
+        };
+        // DenyAuth would reject, but auth_on_write=false skips it for import
+        ks.import("test", &test_keypair(), SyncMode::ThisDeviceOnly)
+            .unwrap();
+        assert!(ks.exists("test"));
+    }
+
+    #[test]
+    fn load_keypair_denied() {
+        let ks = Keystore {
+            auth: Box::new(DenyAuth),
+            store: Box::new(store::InMemoryStore::new()),
+            auth_on_write: false,
+        };
+        // Import works (no auth on write)
+        ks.import("test", &test_keypair(), SyncMode::ThisDeviceOnly)
+            .unwrap();
+        // But loading requires auth — should be denied
+        let result = ks.load_keypair("test", "test reason");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("denied"));
+    }
+
+    #[test]
+    fn delete_denied_when_auth_on_write() {
+        let ks = Keystore {
+            auth: Box::new(DenyAuth),
+            store: Box::new(store::InMemoryStore::new()),
+            auth_on_write: true,
+        };
+        // Manually store without going through import (which would also be denied)
+        ks.store.store("test", &test_keypair()).unwrap();
+        ks.store.store("test.pubkey", &[0xBB; 32]).unwrap();
+
+        let result = ks.delete("test");
+        assert!(result.is_err());
+        // Key should still exist
+        assert!(ks.exists("test"));
+    }
+
+    #[test]
+    fn pubkey_does_not_require_auth() {
+        let ks = Keystore {
+            auth: Box::new(DenyAuth),
+            store: Box::new(store::InMemoryStore::new()),
+            auth_on_write: false,
+        };
+        ks.import("test", &test_keypair(), SyncMode::ThisDeviceOnly)
+            .unwrap();
+        // pubkey should work even with DenyAuth — no auth required for pubkey
+        let pk = ks.pubkey("test").unwrap();
+        assert_eq!(pk, vec![0xBB; 32]);
+    }
+
+    // ── Full lifecycle test ─────────────────────────────────────────────
+
+    #[test]
+    fn full_lifecycle_import_read_delete() {
+        let ks = Keystore::in_memory();
+
+        // Generate a realistic keypair
+        let secret = [0x42u8; 32];
+        let public = [0x7Fu8; 32];
+        let mut keypair = Vec::new();
+        keypair.extend_from_slice(&secret);
+        keypair.extend_from_slice(&public);
+
+        // Import
+        ks.import("alice", &keypair, SyncMode::ThisDeviceOnly)
+            .unwrap();
+        assert!(ks.exists("alice"));
+        assert!(!ks.exists("bob"));
+
+        // Read pubkey (no auth)
+        assert_eq!(ks.pubkey("alice").unwrap(), public);
+
+        // Load full keypair (auth required — NoAuth passes)
+        let loaded = ks.load_keypair("alice", "test").unwrap();
+        assert_eq!(&loaded[..32], &secret);
+        assert_eq!(&loaded[32..], &public);
+
+        // Delete
+        ks.delete("alice").unwrap();
+        assert!(!ks.exists("alice"));
+        assert!(ks.pubkey("alice").is_err());
+        assert!(ks.load_keypair("alice", "test").is_err());
     }
 }

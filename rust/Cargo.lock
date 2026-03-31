@@ -5134,6 +5134,7 @@ checksum = "b867cad97c0791bbd3aaa6472142568c6c9e8f71937e98379f584cfb0cf35bec"
 name = "pay"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "bs58",
  "chrono",
  "clap",
@@ -5151,6 +5152,7 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "serde_yml",
  "shellexpand",
  "solana-mpp",
  "tokio",

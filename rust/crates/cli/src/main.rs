@@ -106,7 +106,10 @@ fn main() {
                 std::process::exit(1);
             }
         }
-    } else if matches!(opts.command, Command::Setup(_) | Command::Account { .. }) {
+    } else if matches!(
+        opts.command,
+        Command::Setup(_) | Command::Account { .. } | Command::Server { .. }
+    ) {
         keypair_override = None;
     } else if matches!(opts.command, Command::Topup(_)) {
         // Topup tries to resolve but doesn't exit if missing (--account fallback)

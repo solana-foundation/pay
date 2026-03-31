@@ -12,7 +12,6 @@ use axum::response::IntoResponse;
 use axum::routing::{any, get};
 use pay_core::PaymentState;
 use pay_core::server::accounting::{AccountingKey, AccountingStore, InMemoryStore};
-use pay_core::server::metering;
 use pay_core::server::proxy;
 use pay_types::metering::ApiSpec;
 use serde_json::json;

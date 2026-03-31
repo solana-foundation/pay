@@ -130,27 +130,36 @@ async fn rpc_call(
         "params": params,
     });
 
-    let resp = client
-        .post(rpc_url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| crate::Error::Config(format!("RPC error: {e}")))?;
+    let mut last_err = None;
+    for attempt in 0..3 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
+        }
+        let resp = client
+            .post(rpc_url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| crate::Error::Config(format!("RPC error: {e}")))?;
 
-    if resp.status() == 429 {
-        return Err(crate::Error::Config("RPC rate limited (429)".to_string()));
+        if resp.status() == 429 {
+            last_err = Some(crate::Error::Config("RPC rate limited (429)".to_string()));
+            continue;
+        }
+
+        let result: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| crate::Error::Config(format!("RPC parse error: {e}")))?;
+
+        if let Some(err) = result.get("error") {
+            return Err(crate::Error::Config(format!("RPC error: {err}")));
+        }
+
+        return Ok(result);
     }
 
-    let result: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| crate::Error::Config(format!("RPC parse error: {e}")))?;
-
-    if let Some(err) = result.get("error") {
-        return Err(crate::Error::Config(format!("RPC error: {err}")));
-    }
-
-    Ok(result)
+    Err(last_err.unwrap_or_else(|| crate::Error::Config("RPC failed".to_string())))
 }
 
 fn parse_token_accounts(result: &serde_json::Value, tokens: &mut Vec<TokenBalance>) {

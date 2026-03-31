@@ -1,3 +1,4 @@
+pub mod default;
 pub mod destroy;
 pub mod export;
 pub mod import;
@@ -13,9 +14,13 @@ pub enum AccountCommand {
     /// Import an existing keypair from a Solana CLI JSON file.
     Import(import::ImportCommand),
     /// List all registered accounts with balances.
+    #[command(alias = "ls")]
     List(list::ListCommand),
+    /// Set the default account.
+    Default(default::DefaultCommand),
     /// Permanently delete an account and its secret key.
-    Destroy(destroy::DestroyCommand),
+    #[command(alias = "rm", alias = "destroy")]
+    Remove(destroy::DestroyCommand),
     /// Export a keypair to a JSON file (Solana CLI format).
     Export(export::ExportCommand),
 }
@@ -26,7 +31,8 @@ impl AccountCommand {
             Self::New(cmd) => cmd.run(),
             Self::Import(cmd) => cmd.run(),
             Self::List(cmd) => cmd.run(),
-            Self::Destroy(cmd) => cmd.run(),
+            Self::Default(cmd) => cmd.run(),
+            Self::Remove(cmd) => cmd.run(),
             Self::Export(cmd) => cmd.run(keypair_override),
         }
     }

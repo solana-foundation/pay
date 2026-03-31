@@ -9,7 +9,7 @@
 #![cfg(feature = "server")]
 
 use pay_core::client;
-use surfpool_sdk::{Keypair, Pubkey, Signer, Surfnet};
+use surfpool_sdk::{Keypair, Signer, Surfnet};
 
 // =============================================================================
 // Helpers
@@ -66,8 +66,6 @@ async fn balance_empty_account() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn balance_diff_received() {
-    use pay_core::client::balance::AccountBalances;
-
     let surfnet = start_surfnet().await;
     let payer = surfnet.payer();
     let pubkey = payer.pubkey().to_string();
@@ -170,8 +168,8 @@ async fn send_sol_invalid_recipient() {
     let kp_file = keypair_to_file(payer);
     let kp_path = kp_file.path().to_string_lossy().to_string();
 
-    let rpc = surfnet.rpc_url().to_string();
-    let kp = kp_path.clone();
+    let _rpc = surfnet.rpc_url().to_string();
+    let _kp = kp_path.clone();
     let result =
         client::send::send_sol("0.1", "not-a-valid-pubkey", &kp_path, surfnet.rpc_url()).await;
     assert!(result.is_err());
@@ -232,16 +230,11 @@ async fn dev_setup_keypair() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn full_payment_flow_with_surfnet() {
     use axum::Router;
-    use axum::body::Body;
-    use axum::http::Request;
     use axum::middleware;
-    use axum::response::IntoResponse;
-    use axum::routing::{any, get};
+    use axum::routing::any;
     use pay_core::PaymentState;
-    use pay_core::server::accounting::InMemoryStore;
     use pay_types::metering::ApiSpec;
     use solana_mpp::server::Mpp;
-    use solana_mpp::solana_keychain::SolanaSigner;
     use solana_mpp::solana_keychain::memory::MemorySigner;
     use std::sync::Arc;
 
@@ -357,7 +350,7 @@ async fn mpp_build_credential_with_surfnet() {
     use axum::middleware;
     use axum::routing::any;
     use pay_core::PaymentState;
-    use pay_core::server::accounting::InMemoryStore;
+
     use pay_types::metering::ApiSpec;
     use solana_mpp::server::Mpp;
     use std::sync::Arc;

@@ -1,5 +1,6 @@
 //! `pay account import` — import an existing keypair from a Solana CLI JSON file.
 
+use dialoguer::{Confirm, Input, theme::ColorfulTheme};
 use owo_colors::OwoColorize;
 use pay_core::keystore::Keystore;
 
@@ -10,8 +11,8 @@ pub struct ImportCommand {
     pub file: String,
 
     /// Account name. Defaults to "default".
-    #[arg(long, default_value = "default")]
-    pub name: String,
+    #[arg(long)]
+    pub name: Option<String>,
 
     /// Storage backend: "keychain", "gnome-keyring", "windows-hello", "1password".
     #[arg(long)]
@@ -24,6 +25,9 @@ pub struct ImportCommand {
 
 impl ImportCommand {
     pub fn run(self) -> pay_core::Result<()> {
+        let theme = ColorfulTheme::default();
+
+        // 1. Read and validate keypair
         let expanded = shellexpand::tilde(&self.file);
         let data = std::fs::read_to_string(expanded.as_ref())
             .map_err(|e| pay_core::Error::Config(format!("Failed to read {}: {e}", self.file)))?;
@@ -39,12 +43,24 @@ impl ImportCommand {
 
         let pubkey_b58 = bs58::encode(&keypair_bytes[32..64]).into_string();
 
+        // 2. Display balance
+        eprintln!();
+        eprintln!("  {} {pubkey_b58}", "Pubkey:".dimmed());
+        display_balance(&pubkey_b58);
+        eprintln!();
+
+        // 3. Resolve account name — check for conflicts
+        let mut accounts = pay_core::accounts::AccountsFile::load()?;
+        let name = resolve_name(&theme, self.name.as_deref(), &accounts)?;
+
+        // 4. Pick backend and import
         let backend_id = match &self.backend {
             Some(b) => b.clone(),
             None => super::new::pick_backend()?,
         };
 
-        let (ks, keystore_kind, backend_msg) = build_keystore(&backend_id, self.vault.as_deref())?;
+        let (ks, keystore_kind, _) =
+            super::import::build_keystore(&backend_id, self.vault.as_deref())?;
 
         let sync = if backend_id == "1password" {
             pay_core::keystore::SyncMode::CloudSync
@@ -52,21 +68,95 @@ impl ImportCommand {
             pay_core::keystore::SyncMode::ThisDeviceOnly
         };
 
-        ks.import(&self.name, &keypair_bytes, sync)
+        ks.import(&name, &keypair_bytes, sync)
             .map_err(|e| pay_core::Error::Config(format!("{e}")))?;
 
-        super::new::save_account(&self.name, keystore_kind, &pubkey_b58, self.vault, None)?;
+        // 5. Save to accounts.yml
+        let is_first = accounts.accounts.is_empty();
+        accounts.upsert(
+            &name,
+            pay_core::accounts::Account {
+                keystore: keystore_kind,
+                pubkey: Some(pubkey_b58),
+                vault: self.vault,
+                path: None,
+            },
+        );
 
-        eprintln!();
-        eprintln!("  {} {pubkey_b58}", "Imported:".dimmed());
-        eprintln!("  {}", backend_msg.dimmed());
-        eprintln!();
+        // 6. Prompt for default if not the only account
+        if !is_first && accounts.default_account.as_deref() != Some(&name) {
+            let make_default = Confirm::with_theme(&theme)
+                .with_prompt(format!("Set '{}' as the default account?", name.green()))
+                .default(false)
+                .interact()
+                .unwrap_or(false);
+
+            if make_default {
+                accounts.default_account = Some(name.clone());
+            }
+        }
+
+        accounts.save()?;
+
+        // 7. Show the account list with the new entry highlighted
+        super::list::print_account_list(&accounts, Some(super::list::Highlight::Green(&name)));
 
         Ok(())
     }
 }
 
-fn build_keystore(
+fn display_balance(pubkey: &str) {
+    let bal = super::list::fetch_balance(pubkey);
+    let display = super::list::format_balance_display(bal.as_ref(), Some(pubkey));
+    eprintln!("  {}  {}", "Balance:".dimmed(), display);
+}
+
+fn resolve_name(
+    theme: &ColorfulTheme,
+    explicit: Option<&str>,
+    accounts: &pay_core::accounts::AccountsFile,
+) -> pay_core::Result<String> {
+    let has_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
+
+    if let Some(name) = explicit {
+        if accounts.accounts.contains_key(name) && has_tty {
+            let overwrite = Confirm::with_theme(theme)
+                .with_prompt(format!(
+                    "Account '{}' already exists. Overwrite?",
+                    name.yellow()
+                ))
+                .default(false)
+                .interact()
+                .map_err(|e| pay_core::Error::Config(format!("Prompt error: {e}")))?;
+
+            if !overwrite {
+                return Err(pay_core::Error::Config("Import cancelled.".to_string()));
+            }
+        }
+        return Ok(name.to_string());
+    }
+
+    if accounts.accounts.contains_key("default") && has_tty {
+        let choice = dialoguer::Select::with_theme(theme)
+            .with_prompt(format!("Account '{}' already exists", "default".yellow()))
+            .items(["Overwrite 'default'", "Create with a different name"])
+            .default(1)
+            .interact()
+            .map_err(|e| pay_core::Error::Config(format!("Prompt error: {e}")))?;
+
+        if choice == 1 {
+            let name: String = Input::with_theme(theme)
+                .with_prompt("Account name")
+                .interact_text()
+                .map_err(|e| pay_core::Error::Config(format!("Prompt error: {e}")))?;
+            return Ok(name);
+        }
+    }
+
+    Ok("default".to_string())
+}
+
+pub(super) fn build_keystore(
     backend_id: &str,
     vault: Option<&str>,
 ) -> pay_core::Result<(Keystore, pay_core::accounts::Keystore, &'static str)> {

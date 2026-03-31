@@ -14,17 +14,33 @@ use pay_core::keystore::Keystore;
 pub struct ExportCommand {
     /// Output file path, or "-" for stdout.
     pub path: String,
+
+    /// Account name to export. Defaults to the default account.
+    #[arg(long)]
+    pub name: Option<String>,
 }
 
 impl ExportCommand {
     pub fn run(self, keypair_source: Option<&str>) -> pay_core::Result<()> {
-        let config = pay_core::Config::load().unwrap_or_default();
-        let source = keypair_source
-            .map(|s| s.to_string())
-            .or_else(|| config.default_keypair_source())
-            .ok_or_else(|| {
-                pay_core::Error::Config("No wallet configured. Run `pay setup` first.".to_string())
-            })?;
+        let source = if let Some(name) = &self.name {
+            let accounts = pay_core::accounts::AccountsFile::load()?;
+            let (_, account) = accounts
+                .accounts
+                .iter()
+                .find(|(n, _)| *n == name)
+                .ok_or_else(|| pay_core::Error::Config(format!("Account '{name}' not found")))?;
+            account.signer_source(name)
+        } else {
+            let config = pay_core::Config::load().unwrap_or_default();
+            keypair_source
+                .map(|s| s.to_string())
+                .or_else(|| config.default_keypair_source())
+                .ok_or_else(|| {
+                    pay_core::Error::Config(
+                        "No wallet configured. Run `pay setup` first.".to_string(),
+                    )
+                })?
+        };
 
         let signer = pay_core::signer::load_signer(&source)?;
 

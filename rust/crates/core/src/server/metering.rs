@@ -517,7 +517,7 @@ mod tests {
             description: "".to_string(),
             category: pay_types::metering::ApiCategory::AiMl,
             version: "1.0".to_string(),
-            base_url: "https://api.example.com".to_string(),
+            forward_url: "https://api.example.com".to_string(),
             accounting: AccountingMode::Pooled,
             endpoints,
             free_tier: None,

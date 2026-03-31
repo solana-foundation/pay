@@ -21,7 +21,8 @@ pub struct ApiSpec {
     pub description: String,
     pub category: ApiCategory,
     pub version: String,
-    pub base_url: String,
+    #[serde(alias = "base_url")]
+    pub forward_url: String,
     /// How volume tiers are tracked: pooled (shared counter) or per_agent (per wallet).
     #[serde(default)]
     pub accounting: AccountingMode,
@@ -544,7 +545,7 @@ mod tests {
             description: "Image analysis".to_string(),
             category: ApiCategory::AiMl,
             version: "v1".to_string(),
-            base_url: "https://vision.googleapis.com".to_string(),
+            forward_url: "https://vision.googleapis.com".to_string(),
             accounting: AccountingMode::PerAgent,
             endpoints: vec![Endpoint {
                 method: HttpMethod::Post,

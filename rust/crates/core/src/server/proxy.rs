@@ -1,6 +1,6 @@
 //! HTTP reverse proxy — forwards requests to upstream APIs.
 //!
-//! Resolves the upstream from `ApiSpec.base_url`, forwards headers and body,
+//! Resolves the upstream from `ApiSpec.forward_url`, forwards headers and body,
 //! returns the upstream response. Strips hop-by-hop and payment headers.
 
 use axum::body::{Body, Bytes};
@@ -21,7 +21,7 @@ const STRIP_HEADERS: &[&str] = &[
 
 /// Forward a request to the upstream API defined in the spec.
 ///
-/// - Builds the upstream URL from `api.base_url` + request path
+/// - Builds the upstream URL from `api.forward_url` + request path
 /// - Forwards all headers except hop-by-hop and payment headers
 /// - Forwards the request body as-is
 /// - Returns the upstream response (status, headers, body)
@@ -35,7 +35,7 @@ pub async fn forward_request(
     let path = uri.path().trim_start_matches('/');
     let upstream_url = format!(
         "{}{}",
-        api.base_url.trim_end_matches('/'),
+        api.forward_url.trim_end_matches('/'),
         uri.path_and_query().map(|pq| pq.as_str()).unwrap_or(path)
     );
 
@@ -131,7 +131,7 @@ mod tests {
             description: "".to_string(),
             category: pay_types::metering::ApiCategory::AiMl,
             version: "1.0".to_string(),
-            base_url: "https://api.example.com".to_string(),
+            forward_url: "https://api.example.com".to_string(),
             accounting: pay_types::metering::AccountingMode::Pooled,
             endpoints: vec![],
             free_tier: None,
@@ -203,7 +203,7 @@ mod tests {
         let (base_url, _handle) = spawn_upstream(app).await;
 
         let api = ApiSpec {
-            base_url: base_url.clone(),
+            forward_url: base_url.clone(),
             ..make_api("test")
         };
 
@@ -227,7 +227,7 @@ mod tests {
         let (base_url, _handle) = spawn_upstream(app).await;
 
         let api = ApiSpec {
-            base_url: base_url.clone(),
+            forward_url: base_url.clone(),
             ..make_api("test")
         };
 
@@ -263,7 +263,7 @@ mod tests {
         let (base_url, _handle) = spawn_upstream(app).await;
 
         let api = ApiSpec {
-            base_url: base_url.clone(),
+            forward_url: base_url.clone(),
             ..make_api("test")
         };
 
@@ -289,7 +289,7 @@ mod tests {
         let (base_url, _handle) = spawn_upstream(app).await;
 
         let api = ApiSpec {
-            base_url: base_url.clone(),
+            forward_url: base_url.clone(),
             ..make_api("test")
         };
 
@@ -303,7 +303,7 @@ mod tests {
     #[tokio::test]
     async fn forward_request_upstream_down() {
         let api = ApiSpec {
-            base_url: "http://127.0.0.1:1".to_string(), // nothing listening
+            forward_url: "http://127.0.0.1:1".to_string(), // nothing listening
             ..make_api("test")
         };
 
@@ -327,7 +327,7 @@ mod tests {
         let (base_url, _handle) = spawn_upstream(app).await;
 
         let api = ApiSpec {
-            base_url: base_url.clone(),
+            forward_url: base_url.clone(),
             ..make_api("test")
         };
 
