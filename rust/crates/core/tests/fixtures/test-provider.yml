@@ -4,7 +4,8 @@ title: "Test API"
 description: "Fictive API for testing all metering patterns."
 category: ai_ml
 version: v1
-forward_url: https://api.test.invalid/
+forward:
+  url: https://api.test.invalid/
 accounting: pooled
 
 endpoints:

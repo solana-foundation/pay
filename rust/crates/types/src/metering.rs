@@ -21,8 +21,8 @@ pub struct ApiSpec {
     pub description: String,
     pub category: ApiCategory,
     pub version: String,
-    #[serde(alias = "base_url")]
-    pub forward_url: String,
+    /// Forwarding config — upstream URL and optional auth injection.
+    pub forward: ForwardConfig,
     /// How volume tiers are tracked: pooled (shared counter) or per_agent (per wallet).
     #[serde(default)]
     pub accounting: AccountingMode,
@@ -38,9 +38,42 @@ pub struct ApiSpec {
     pub operator: Option<OperatorConfig>,
 }
 
+/// Upstream forwarding configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ForwardConfig {
+    /// Upstream base URL (e.g. `https://generativelanguage.googleapis.com/`).
+    pub url: String,
+    /// How the proxy injects upstream API credentials after payment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<AuthConfig>,
+}
+
 // =============================================================================
 // Operator config
 // =============================================================================
+
+/// How the proxy injects upstream API credentials after payment succeeds.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "method", rename_all = "snake_case")]
+pub enum AuthConfig {
+    /// Inject as a query parameter (e.g. `?key=API_KEY`).
+    QueryParam {
+        /// Query parameter name (e.g. "key").
+        key: String,
+        /// Environment variable holding the secret value.
+        env: String,
+    },
+    /// Inject as an HTTP header (e.g. `Authorization: Bearer TOKEN`).
+    Header {
+        /// Header name (e.g. "Authorization").
+        key: String,
+        /// Optional prefix (e.g. "Bearer ").
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prefix: Option<String>,
+        /// Environment variable holding the secret value.
+        env: String,
+    },
+}
 
 /// Operator-level configuration for a proxy instance.
 /// Controls signing, payment recipient, and currency.
@@ -593,7 +626,10 @@ mod tests {
             description: "Image analysis".to_string(),
             category: ApiCategory::AiMl,
             version: "v1".to_string(),
-            forward_url: "https://vision.googleapis.com".to_string(),
+            forward: ForwardConfig {
+                url: "https://vision.googleapis.com".to_string(),
+                auth: None,
+            },
             accounting: AccountingMode::PerAgent,
             endpoints: vec![Endpoint {
                 method: HttpMethod::Post,
@@ -632,6 +668,7 @@ mod tests {
                 notes: None,
             }),
             notes: None,
+            operator: None,
         };
         let json = serde_json::to_string(&spec).unwrap();
         let back: ApiSpec = serde_json::from_str(&json).unwrap();

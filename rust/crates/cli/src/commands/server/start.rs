@@ -69,21 +69,23 @@ impl StartCommand {
 
         // Resolve signer — operator.signer takes priority, then CLI/keystore fallback.
         #[cfg(feature = "gcp_kms")]
-        let fee_payer_signer: Option<std::sync::Arc<dyn solana_mpp::solana_keychain::SolanaSigner>> =
-            if let Some(signer_cfg) = op.and_then(|o| o.signer.as_ref()) {
-                Some(resolve_signer(signer_cfg)?)
-            } else {
-                None
-            };
+        let fee_payer_signer: Option<
+            std::sync::Arc<dyn solana_mpp::solana_keychain::SolanaSigner>,
+        > = if let Some(signer_cfg) = op.and_then(|o| o.signer.as_ref()) {
+            Some(resolve_signer(signer_cfg)?)
+        } else {
+            None
+        };
         #[cfg(not(feature = "gcp_kms"))]
-        let fee_payer_signer: Option<std::sync::Arc<dyn solana_mpp::solana_keychain::SolanaSigner>> =
-            if op.and_then(|o| o.signer.as_ref()).is_some() {
-                return Err(pay_core::Error::Config(
+        let fee_payer_signer: Option<
+            std::sync::Arc<dyn solana_mpp::solana_keychain::SolanaSigner>,
+        > = if op.and_then(|o| o.signer.as_ref()).is_some() {
+            return Err(pay_core::Error::Config(
                     "operator.signer requires the `gcp_kms` feature. Rebuild with `--features gcp_kms`.".to_string(),
                 ));
-            } else {
-                None
-            };
+        } else {
+            None
+        };
 
         // Resolve recipient — operator.recipient > --recipient > signer pubkey > keystore.
         let recipient = if let Some(r) = op.and_then(|o| o.recipient.as_ref()) {
@@ -92,7 +94,7 @@ impl StartCommand {
             r.clone()
         } else if let Some(ref signer) = fee_payer_signer {
             signer.pubkey().to_string()
-        } else if let Some(r) = std::env::var("PAY_PAYMENT_RECIPIENT").ok() {
+        } else if let Ok(r) = std::env::var("PAY_PAYMENT_RECIPIENT") {
             r
         } else if let Some(source) = keypair_source {
             let signer = pay_core::signer::load_signer(source)?;
@@ -127,7 +129,11 @@ impl StartCommand {
         let mpp = Mpp::new(solana_mpp::server::Config {
             recipient: recipient.clone(),
             currency: currency.clone(),
-            decimals: if currency.to_uppercase() == "SOL" { 9 } else { 6 },
+            decimals: if currency.to_uppercase() == "SOL" {
+                9
+            } else {
+                6
+            },
             network: network.clone(),
             rpc_url: Some(rpc_url.clone()),
             secret_key: Some(secret_key),
@@ -148,7 +154,7 @@ impl StartCommand {
         eprintln!();
         eprintln!("  {} {}", "pay server".bold(), api.title.bold());
         eprintln!();
-        eprintln!("  {}  {}", "upstream".dimmed(), api.forward_url);
+        eprintln!("  {}  {}", "upstream".dimmed(), api.forward.url);
         eprintln!(
             "  {}  {}",
             "wallet  ".dimmed(),
@@ -297,7 +303,9 @@ fn build_endpoints_json(api: &ApiSpec) -> serde_json::Value {
     serde_json::json!({
         "name": api.name,
         "title": api.title,
-        "forward_url": api.forward_url,
+        "forward": {
+            "url": api.forward.url,
+        },
         "endpoints": endpoints,
     })
 }

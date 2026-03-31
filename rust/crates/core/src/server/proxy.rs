@@ -6,7 +6,7 @@
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::response::Response;
-use pay_types::metering::ApiSpec;
+use pay_types::metering::{ApiSpec, AuthConfig};
 use serde_json::json;
 
 /// Headers to strip when forwarding to upstream.
@@ -21,7 +21,7 @@ const STRIP_HEADERS: &[&str] = &[
 
 /// Forward a request to the upstream API defined in the spec.
 ///
-/// - Builds the upstream URL from `api.forward_url` + request path
+/// - Builds the upstream URL from `api.forward.url` + request path
 /// - Forwards all headers except hop-by-hop and payment headers
 /// - Forwards the request body as-is
 /// - Returns the upstream response (status, headers, body)
@@ -32,12 +32,32 @@ pub async fn forward_request(
     headers: &HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let path = uri.path().trim_start_matches('/');
-    let upstream_url = format!(
-        "{}{}",
-        api.forward_url.trim_end_matches('/'),
-        uri.path_and_query().map(|pq| pq.as_str()).unwrap_or(path)
-    );
+    let path_and_query = uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or(uri.path());
+
+    // Build upstream URL, injecting query param auth if configured.
+    let upstream_url = match &api.forward.auth {
+        Some(AuthConfig::QueryParam { key, env }) => {
+            let secret = std::env::var(env).unwrap_or_default();
+            let separator = if path_and_query.contains('?') {
+                "&"
+            } else {
+                "?"
+            };
+            format!(
+                "{}{}{separator}{key}={secret}",
+                api.forward.url.trim_end_matches('/'),
+                path_and_query,
+            )
+        }
+        _ => format!(
+            "{}{}",
+            api.forward.url.trim_end_matches('/'),
+            path_and_query,
+        ),
+    };
 
     tracing::debug!(
         subdomain = %api.subdomain,
@@ -60,6 +80,16 @@ pub async fn forward_request(
         if let Ok(v) = value.to_str() {
             upstream_req = upstream_req.header(name_str, v);
         }
+    }
+
+    // Inject header-based auth if configured.
+    if let Some(AuthConfig::Header { key, prefix, env }) = &api.forward.auth {
+        let secret = std::env::var(env).unwrap_or_default();
+        let value = match prefix {
+            Some(p) => format!("{p}{secret}"),
+            None => secret,
+        };
+        upstream_req = upstream_req.header(key.as_str(), value);
     }
 
     // Forward body.
@@ -122,6 +152,7 @@ pub fn error_response(status: StatusCode, message: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pay_types::metering::ForwardConfig;
 
     fn make_api(subdomain: &str) -> ApiSpec {
         ApiSpec {
@@ -131,12 +162,16 @@ mod tests {
             description: "".to_string(),
             category: pay_types::metering::ApiCategory::AiMl,
             version: "1.0".to_string(),
-            forward_url: "https://api.example.com".to_string(),
+            forward: ForwardConfig {
+                url: "https://api.example.com".to_string(),
+                auth: None,
+            },
             accounting: pay_types::metering::AccountingMode::Pooled,
             endpoints: vec![],
             free_tier: None,
             quotas: None,
             notes: None,
+            operator: None,
         }
     }
 
@@ -203,7 +238,10 @@ mod tests {
         let (base_url, _handle) = spawn_upstream(app).await;
 
         let api = ApiSpec {
-            forward_url: base_url.clone(),
+            forward: ForwardConfig {
+                url: base_url.clone(),
+                auth: None,
+            },
             ..make_api("test")
         };
 
@@ -227,7 +265,10 @@ mod tests {
         let (base_url, _handle) = spawn_upstream(app).await;
 
         let api = ApiSpec {
-            forward_url: base_url.clone(),
+            forward: ForwardConfig {
+                url: base_url.clone(),
+                auth: None,
+            },
             ..make_api("test")
         };
 
@@ -263,7 +304,10 @@ mod tests {
         let (base_url, _handle) = spawn_upstream(app).await;
 
         let api = ApiSpec {
-            forward_url: base_url.clone(),
+            forward: ForwardConfig {
+                url: base_url.clone(),
+                auth: None,
+            },
             ..make_api("test")
         };
 
@@ -289,7 +333,10 @@ mod tests {
         let (base_url, _handle) = spawn_upstream(app).await;
 
         let api = ApiSpec {
-            forward_url: base_url.clone(),
+            forward: ForwardConfig {
+                url: base_url.clone(),
+                auth: None,
+            },
             ..make_api("test")
         };
 
@@ -303,7 +350,10 @@ mod tests {
     #[tokio::test]
     async fn forward_request_upstream_down() {
         let api = ApiSpec {
-            forward_url: "http://127.0.0.1:1".to_string(), // nothing listening
+            forward: ForwardConfig {
+                url: "http://127.0.0.1:1".to_string(),
+                auth: None,
+            }, // nothing listening
             ..make_api("test")
         };
 
@@ -327,7 +377,10 @@ mod tests {
         let (base_url, _handle) = spawn_upstream(app).await;
 
         let api = ApiSpec {
-            forward_url: base_url.clone(),
+            forward: ForwardConfig {
+                url: base_url.clone(),
+                auth: None,
+            },
             ..make_api("test")
         };
 

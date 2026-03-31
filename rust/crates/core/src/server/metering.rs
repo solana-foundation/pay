@@ -517,12 +517,16 @@ mod tests {
             description: "".to_string(),
             category: pay_types::metering::ApiCategory::AiMl,
             version: "1.0".to_string(),
-            forward_url: "https://api.example.com".to_string(),
+            forward: pay_types::metering::ForwardConfig {
+                url: "https://api.example.com".to_string(),
+                auth: None,
+            },
             accounting: AccountingMode::Pooled,
             endpoints,
             free_tier: None,
             quotas: None,
             notes: None,
+            operator: None,
         }
     }
 
