@@ -82,3 +82,71 @@ fn format_value(v: f64) -> String {
         format!("{v:.6}")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_value_zero() {
+        assert_eq!(format_value(0.0), "0");
+    }
+
+    #[test]
+    fn format_value_large() {
+        assert_eq!(format_value(1.5), "1.50");
+    }
+
+    #[test]
+    fn format_value_cents() {
+        assert_eq!(format_value(0.01), "0.01");
+    }
+
+    #[test]
+    fn format_value_milli() {
+        assert_eq!(format_value(0.005), "0.005");
+    }
+
+    #[test]
+    fn format_value_micro() {
+        assert_eq!(format_value(0.0005), "0.0005");
+    }
+
+    #[test]
+    fn format_value_tiny() {
+        assert_eq!(format_value(0.00005), "0.000050");
+    }
+
+    #[test]
+    fn format_amount_usdc() {
+        // 1000000 = 1.0 USDC
+        assert_eq!(format_amount("1000000", "USDC"), "$1.00");
+    }
+
+    #[test]
+    fn format_amount_sol() {
+        // 1000000000 = 1.0 SOL
+        assert_eq!(format_amount("1000000000", "SOL"), "$1.00");
+    }
+
+    #[test]
+    fn format_amount_zero() {
+        assert_eq!(format_amount("0", "USDC"), "$0");
+    }
+
+    #[test]
+    fn format_amount_invalid() {
+        assert_eq!(format_amount("not_a_number", "USDC"), "$0");
+    }
+
+    #[test]
+    fn format_amount_sol_small() {
+        // 1000000 lamports = 0.001 SOL
+        assert_eq!(format_amount("1000000", "SOL"), "$0.001");
+    }
+
+    #[test]
+    fn parse_returns_none_for_invalid() {
+        assert!(parse("not a valid header").is_none());
+    }
+}

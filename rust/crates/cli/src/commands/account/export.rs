@@ -1,5 +1,7 @@
 //! `pay export` — export keypair in Solana CLI format.
 
+use pay_core::keystore::Keystore;
+
 /// Export your keypair to a JSON file (Solana CLI format).
 ///
 /// The output is a JSON array of 64 bytes — the same format used by
@@ -29,10 +31,8 @@ impl ExportCommand {
         use solana_mpp::solana_keychain::SolanaSigner;
         let pubkey = signer.pubkey();
 
-        // MemorySigner stores the full 64-byte keypair — reload raw bytes
         let keypair_bytes = reload_raw_bytes(&source)?;
 
-        // Solana CLI format: JSON array of 64 u8 values
         let json = serde_json::to_string(&*keypair_bytes)
             .map_err(|e| pay_core::Error::Config(format!("JSON error: {e}")))?;
 
@@ -64,50 +64,57 @@ impl ExportCommand {
 }
 
 fn reload_raw_bytes(source: &str) -> pay_core::Result<pay_core::keystore::Zeroizing<Vec<u8>>> {
-    use pay_core::keystore::KeystoreBackend;
+    // Try keystore backends
+    let (backend_name, account) = if let Some(account) = source.strip_prefix("keychain:") {
+        ("keychain", account)
+    } else if let Some(account) = source.strip_prefix("gnome-keyring:") {
+        ("gnome-keyring", account)
+    } else if let Some(account) = source.strip_prefix("windows-hello:") {
+        ("windows-hello", account)
+    } else if let Some(account) = source.strip_prefix("1password:") {
+        ("1password", account)
+    } else {
+        // File-based: read the Solana CLI JSON format and return raw bytes
+        return reload_from_file(source);
+    };
 
-    if let Some(account) = source.strip_prefix("keychain:") {
+    let ks = keystore_for_backend(backend_name)?;
+    ks.load_keypair(account, "export keypair")
+        .map_err(|e| pay_core::Error::Config(format!("{backend_name}: {e}")))
+}
+
+fn keystore_for_backend(backend: &str) -> pay_core::Result<Keystore> {
+    match backend {
         #[cfg(target_os = "macos")]
-        {
-            use pay_core::keystore::AppleKeychain;
-            return AppleKeychain
-                .load_keypair(account, "export keypair")
-                .map_err(|e| pay_core::Error::Config(format!("Keychain: {e}")));
-        }
+        "keychain" => Ok(Keystore::apple_keychain()),
         #[cfg(not(target_os = "macos"))]
-        {
-            let _ = account;
-            return Err(pay_core::Error::Config(
-                "Keychain not available on this platform".to_string(),
-            ));
-        }
-    }
+        "keychain" => Err(pay_core::Error::Config(
+            "Keychain not available on this platform".to_string(),
+        )),
 
-    if let Some(account) = source.strip_prefix("gnome-keyring:") {
         #[cfg(target_os = "linux")]
-        {
-            use pay_core::keystore::GnomeKeyring;
-            return GnomeKeyring
-                .load_keypair(account, "export keypair")
-                .map_err(|e| pay_core::Error::Config(format!("GNOME Keyring: {e}")));
-        }
+        "gnome-keyring" => Ok(Keystore::gnome_keyring()),
         #[cfg(not(target_os = "linux"))]
-        {
-            let _ = account;
-            return Err(pay_core::Error::Config(
-                "GNOME Keyring not available on this platform".to_string(),
-            ));
-        }
-    }
+        "gnome-keyring" => Err(pay_core::Error::Config(
+            "GNOME Keyring not available on this platform".to_string(),
+        )),
 
-    if let Some(account) = source.strip_prefix("1password:") {
-        let backend = pay_core::keystore::OnePassword::new();
-        return backend
-            .load_keypair(account, "export keypair")
-            .map_err(|e| pay_core::Error::Config(format!("1Password: {e}")));
-    }
+        #[cfg(target_os = "windows")]
+        "windows-hello" => Ok(Keystore::windows_hello()),
+        #[cfg(not(target_os = "windows"))]
+        "windows-hello" => Err(pay_core::Error::Config(
+            "Windows Hello not available on this platform".to_string(),
+        )),
 
-    // File-based: read the Solana CLI JSON format and return raw bytes
+        "1password" => Ok(Keystore::onepassword()),
+
+        other => Err(pay_core::Error::Config(format!(
+            "Unknown backend: {other}"
+        ))),
+    }
+}
+
+fn reload_from_file(source: &str) -> pay_core::Result<pay_core::keystore::Zeroizing<Vec<u8>>> {
     let expanded = shellexpand::tilde(source);
     let data = std::fs::read_to_string(expanded.as_ref())
         .map_err(|e| pay_core::Error::Config(format!("Failed to read {source}: {e}")))?;

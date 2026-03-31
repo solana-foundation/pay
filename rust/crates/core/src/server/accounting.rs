@@ -149,4 +149,52 @@ mod tests {
         assert_eq!(store.get_usage(&march), 0);
         assert_eq!(store.get_usage(&april), 50);
     }
+
+    #[test]
+    fn test_current_period_format() {
+        let period = current_period();
+        // Should be in YYYY-MM format
+        assert!(period.contains('-'));
+        let parts: Vec<&str> = period.split('-').collect();
+        assert_eq!(parts.len(), 2);
+        let year: u64 = parts[0].parse().unwrap();
+        let month: u64 = parts[1].parse().unwrap();
+        assert!(year >= 2024);
+        assert!((1..=12).contains(&month));
+    }
+
+    #[test]
+    fn test_in_memory_store_default() {
+        let store = InMemoryStore::default();
+        let key = test_key("pool");
+        assert_eq!(store.get_usage(&key), 0);
+    }
+
+    #[test]
+    fn test_different_endpoints_independent() {
+        let store = InMemoryStore::new();
+        let key1 = AccountingKey {
+            endpoint: "v1/a".to_string(),
+            ..test_key("pool")
+        };
+        let key2 = AccountingKey {
+            endpoint: "v1/b".to_string(),
+            ..test_key("pool")
+        };
+
+        store.increment(&key1, 100);
+        store.increment(&key2, 200);
+
+        assert_eq!(store.get_usage(&key1), 100);
+        assert_eq!(store.get_usage(&key2), 200);
+    }
+
+    #[test]
+    fn test_reset_nonexistent_period_is_noop() {
+        let store = InMemoryStore::new();
+        let key = test_key("pool");
+        store.increment(&key, 100);
+        store.reset_period("2099-12");
+        assert_eq!(store.get_usage(&key), 100);
+    }
 }

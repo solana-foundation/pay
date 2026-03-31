@@ -33,3 +33,35 @@ pub fn error_json(message: &str) {
         eprintln!("{s}");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_format_default_is_text() {
+        assert_eq!(OutputFormat::default(), OutputFormat::Text);
+    }
+
+    #[test]
+    fn output_format_serde_roundtrip() {
+        for fmt in [OutputFormat::Text, OutputFormat::Json] {
+            let json = serde_json::to_string(&fmt).unwrap();
+            let back: OutputFormat = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, fmt);
+        }
+    }
+
+    #[test]
+    fn print_json_does_not_panic() {
+        let value = serde_json::json!({"test": true});
+        // This writes to stdout; just verify it doesn't panic
+        let _ = print_json(&value);
+    }
+
+    #[test]
+    fn error_json_does_not_panic() {
+        // This writes to stderr; just verify it doesn't panic
+        error_json("test error");
+    }
+}

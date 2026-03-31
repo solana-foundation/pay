@@ -72,3 +72,69 @@ fn format_value(v: f64) -> String {
         format!("{v:.6}")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_value_zero() {
+        assert_eq!(format_value(0.0), "0");
+    }
+
+    #[test]
+    fn format_value_large() {
+        assert_eq!(format_value(1.5), "1.50");
+    }
+
+    #[test]
+    fn format_value_cents() {
+        assert_eq!(format_value(0.01), "0.01");
+    }
+
+    #[test]
+    fn format_value_milli() {
+        assert_eq!(format_value(0.005), "0.005");
+    }
+
+    #[test]
+    fn format_value_micro() {
+        assert_eq!(format_value(0.0005), "0.0005");
+    }
+
+    #[test]
+    fn format_value_tiny() {
+        assert_eq!(format_value(0.00005), "0.000050");
+    }
+
+    #[test]
+    fn format_amount_usdc() {
+        assert_eq!(format_amount("1000000", "USDC"), "$1.00");
+    }
+
+    #[test]
+    fn format_amount_sol() {
+        assert_eq!(format_amount("1000000000", "SOL"), "$1.00");
+    }
+
+    #[test]
+    fn format_amount_zero() {
+        assert_eq!(format_amount("0", "USDC"), "$0");
+    }
+
+    #[test]
+    fn format_amount_invalid_number() {
+        assert_eq!(format_amount("abc", "USDC"), "$0");
+    }
+
+    #[test]
+    fn parse_empty_headers_and_body() {
+        assert!(parse(&[], None).is_none());
+    }
+
+    #[test]
+    fn parse_no_x402_headers() {
+        let headers = vec![("content-type".to_string(), "text/html".to_string())];
+        assert!(parse(&headers, None).is_none());
+    }
+}

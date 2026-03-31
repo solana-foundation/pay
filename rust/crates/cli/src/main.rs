@@ -106,7 +106,7 @@ fn main() {
                 std::process::exit(1);
             }
         }
-    } else if matches!(opts.command, Command::Setup(_)) {
+    } else if matches!(opts.command, Command::Setup(_) | Command::Account { .. }) {
         keypair_override = None;
     } else if matches!(opts.command, Command::Topup(_)) {
         // Topup tries to resolve but doesn't exit if missing (--account fallback)
@@ -119,7 +119,7 @@ fn main() {
     let is_agent = no_dna::is_agent();
     let is_http_tool = matches!(
         opts.command,
-        Command::Curl(_) | Command::Wget(_) | Command::Httpie(_) | Command::Fetch(_)
+        Command::Curl(_) | Command::Wget(_) | Command::Fetch(_)
     );
     // HTTP tools always auto-pay (Touch ID is the approval gate, not the TUI)
     let auto_pay = opts.yolo || opts.dev || is_agent || is_http_tool || config.auto_pay;
@@ -225,5 +225,53 @@ fn format_duration(secs: u64) -> String {
         s if s < 3600 => format!("{}m", s / 60),
         s if s < 86400 => format!("{}h", s / 3600),
         s => format!("{}d", s / 86400),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_cap_less_than_one() {
+        assert_eq!(format_cap(500_000), "0.50"); // 0.5 USDC
+    }
+
+    #[test]
+    fn format_cap_exactly_one() {
+        assert_eq!(format_cap(1_000_000), "1"); // 1.0 USDC
+    }
+
+    #[test]
+    fn format_cap_large() {
+        assert_eq!(format_cap(100_000_000), "100"); // 100 USDC
+    }
+
+    #[test]
+    fn format_cap_zero() {
+        assert_eq!(format_cap(0), "0.00");
+    }
+
+    #[test]
+    fn format_duration_seconds() {
+        assert_eq!(format_duration(30), "30s");
+    }
+
+    #[test]
+    fn format_duration_minutes() {
+        assert_eq!(format_duration(120), "2m");
+        assert_eq!(format_duration(3599), "59m");
+    }
+
+    #[test]
+    fn format_duration_hours() {
+        assert_eq!(format_duration(3600), "1h");
+        assert_eq!(format_duration(7200), "2h");
+    }
+
+    #[test]
+    fn format_duration_days() {
+        assert_eq!(format_duration(86400), "1d");
+        assert_eq!(format_duration(172800), "2d");
     }
 }

@@ -338,4 +338,470 @@ mod tests {
         // Missing prop → condition passes (permissive)
         assert!(evaluate_condition(&cond, &props));
     }
+
+    #[test]
+    fn test_evaluate_all_compare_ops() {
+        let props = RequestProperties {
+            body_size: Some(100),
+            ..Default::default()
+        };
+
+        assert!(evaluate_condition(
+            &MeterCondition::BodySize {
+                op: CompareOp::Eq,
+                value: 100
+            },
+            &props
+        ));
+        assert!(!evaluate_condition(
+            &MeterCondition::BodySize {
+                op: CompareOp::Eq,
+                value: 50
+            },
+            &props
+        ));
+        assert!(evaluate_condition(
+            &MeterCondition::BodySize {
+                op: CompareOp::Lt,
+                value: 200
+            },
+            &props
+        ));
+        assert!(!evaluate_condition(
+            &MeterCondition::BodySize {
+                op: CompareOp::Lt,
+                value: 100
+            },
+            &props
+        ));
+        assert!(evaluate_condition(
+            &MeterCondition::BodySize {
+                op: CompareOp::Gte,
+                value: 100
+            },
+            &props
+        ));
+        assert!(!evaluate_condition(
+            &MeterCondition::BodySize {
+                op: CompareOp::Gte,
+                value: 200
+            },
+            &props
+        ));
+    }
+
+    #[test]
+    fn test_evaluate_all_condition_fields() {
+        let props = RequestProperties {
+            input_tokens: Some(100),
+            input_characters: Some(200),
+            context_length: Some(300),
+            body_size: Some(400),
+            duration_seconds: Some(500),
+            batch_size: Some(600),
+            image_pixels: Some(700),
+        };
+
+        assert!(evaluate_condition(
+            &MeterCondition::InputTokens {
+                op: CompareOp::Eq,
+                value: 100
+            },
+            &props
+        ));
+        assert!(evaluate_condition(
+            &MeterCondition::InputCharacters {
+                op: CompareOp::Eq,
+                value: 200
+            },
+            &props
+        ));
+        assert!(evaluate_condition(
+            &MeterCondition::DurationSeconds {
+                op: CompareOp::Eq,
+                value: 500
+            },
+            &props
+        ));
+        assert!(evaluate_condition(
+            &MeterCondition::BatchSize {
+                op: CompareOp::Eq,
+                value: 600
+            },
+            &props
+        ));
+        assert!(evaluate_condition(
+            &MeterCondition::ImagePixels {
+                op: CompareOp::Eq,
+                value: 700
+            },
+            &props
+        ));
+    }
+
+    #[test]
+    fn test_path_matches_different_lengths() {
+        assert!(!path_matches("v1/a/b", "v1/a"));
+        assert!(!path_matches("v1/a", "v1/a/b"));
+    }
+
+    #[test]
+    fn test_resolve_tier_by_volume() {
+        let tiers = vec![
+            PriceTier {
+                up_to: Some(100),
+                price_usd: 0.0,
+                condition: None,
+                notes: None,
+            },
+            PriceTier {
+                up_to: Some(1000),
+                price_usd: 0.01,
+                condition: None,
+                notes: None,
+            },
+            PriceTier {
+                up_to: None,
+                price_usd: 0.005,
+                condition: None,
+                notes: None,
+            },
+        ];
+
+        // Free tier
+        assert_eq!(resolve_tier_by_volume(&tiers, 50), 0.0);
+        assert_eq!(resolve_tier_by_volume(&tiers, 100), 0.0);
+        // Second tier
+        assert_eq!(resolve_tier_by_volume(&tiers, 101), 0.01);
+        assert_eq!(resolve_tier_by_volume(&tiers, 1000), 0.01);
+        // Final tier (no cap)
+        assert_eq!(resolve_tier_by_volume(&tiers, 1001), 0.005);
+        assert_eq!(resolve_tier_by_volume(&tiers, 999_999), 0.005);
+    }
+
+    #[test]
+    fn test_first_non_free_price() {
+        let tiers = vec![
+            PriceTier {
+                up_to: Some(100),
+                price_usd: 0.0,
+                condition: None,
+                notes: None,
+            },
+            PriceTier {
+                up_to: None,
+                price_usd: 0.05,
+                condition: None,
+                notes: None,
+            },
+        ];
+        assert_eq!(first_non_free_price(&tiers), 0.05);
+    }
+
+    #[test]
+    fn test_first_non_free_price_all_free() {
+        let tiers = vec![PriceTier {
+            up_to: None,
+            price_usd: 0.0,
+            condition: None,
+            notes: None,
+        }];
+        assert_eq!(first_non_free_price(&tiers), 0.0);
+    }
+
+    fn make_api(subdomain: &str, endpoints: Vec<Endpoint>) -> ApiSpec {
+        ApiSpec {
+            name: "test".to_string(),
+            subdomain: subdomain.to_string(),
+            title: "Test API".to_string(),
+            description: "".to_string(),
+            category: pay_types::metering::ApiCategory::AiMl,
+            version: "1.0".to_string(),
+            base_url: "https://api.example.com".to_string(),
+            accounting: AccountingMode::Pooled,
+            endpoints,
+            free_tier: None,
+            quotas: None,
+            notes: None,
+        }
+    }
+
+    #[test]
+    fn test_find_endpoint_exact_match() {
+        let api = make_api(
+            "test",
+            vec![Endpoint {
+                method: pay_types::metering::HttpMethod::Get,
+                path: "v1/models".to_string(),
+                description: None,
+                resource: None,
+                metering: None,
+            }],
+        );
+        let ep = find_endpoint(&api, "GET", "v1/models");
+        assert!(ep.is_some());
+        assert_eq!(ep.unwrap().path, "v1/models");
+    }
+
+    #[test]
+    fn test_find_endpoint_pattern_match() {
+        let api = make_api(
+            "test",
+            vec![Endpoint {
+                method: pay_types::metering::HttpMethod::Post,
+                path: "v1/models/{modelId}:generate".to_string(),
+                description: None,
+                resource: None,
+                metering: None,
+            }],
+        );
+        let ep = find_endpoint(&api, "POST", "v1/models/gpt-4:generate");
+        assert!(ep.is_some());
+    }
+
+    #[test]
+    fn test_find_endpoint_no_match() {
+        let api = make_api(
+            "test",
+            vec![Endpoint {
+                method: pay_types::metering::HttpMethod::Get,
+                path: "v1/models".to_string(),
+                description: None,
+                resource: None,
+                metering: None,
+            }],
+        );
+        assert!(find_endpoint(&api, "POST", "v1/models").is_none());
+        assert!(find_endpoint(&api, "GET", "v2/models").is_none());
+    }
+
+    #[test]
+    fn test_resolve_price_no_metering() {
+        let metering = Metering {
+            dimensions: vec![],
+            variants: vec![],
+            sku_tiers: vec![],
+        };
+        assert!(resolve_price(&metering, &RequestProperties::default(), None, None).is_none());
+    }
+
+    #[test]
+    fn test_resolve_price_with_dimensions() {
+        let metering = Metering {
+            dimensions: vec![MeterDimension {
+                direction: pay_types::metering::MeterDirection::Input,
+                unit: pay_types::metering::BillingUnit::Tokens,
+                scale: 1_000_000,
+                period: None,
+                tiers: vec![PriceTier {
+                    up_to: None,
+                    price_usd: 0.01,
+                    condition: None,
+                    notes: None,
+                }],
+            }],
+            variants: vec![],
+            sku_tiers: vec![],
+        };
+        let price = resolve_price(&metering, &RequestProperties::default(), None, None);
+        assert!(price.is_some());
+        let p = price.unwrap();
+        assert_eq!(p.dimensions.len(), 1);
+        assert_eq!(p.dimensions[0].price_usd, 0.01);
+    }
+
+    #[test]
+    fn test_resolve_price_with_sku_tiers() {
+        let metering = Metering {
+            dimensions: vec![],
+            variants: vec![],
+            sku_tiers: vec![pay_types::metering::SkuTier {
+                sku: "essentials".to_string(),
+                level: pay_types::metering::SkuLevel::Essentials,
+            }],
+        };
+        let price = resolve_price(&metering, &RequestProperties::default(), None, None);
+        assert!(price.is_some());
+        assert_eq!(price.unwrap().dimensions[0].price_usd, 0.0);
+    }
+
+    #[test]
+    fn test_resolve_price_variant_match() {
+        let metering = Metering {
+            dimensions: vec![],
+            variants: vec![
+                MeterVariant {
+                    param: "model".to_string(),
+                    value: "gemini-pro".to_string(),
+                    dimensions: vec![MeterDimension {
+                        direction: pay_types::metering::MeterDirection::Input,
+                        unit: pay_types::metering::BillingUnit::Tokens,
+                        scale: 1_000_000,
+                        period: None,
+                        tiers: vec![PriceTier {
+                            up_to: None,
+                            price_usd: 0.05,
+                            condition: None,
+                            notes: None,
+                        }],
+                    }],
+                },
+                MeterVariant {
+                    param: "model".to_string(),
+                    value: "gemini-flash".to_string(),
+                    dimensions: vec![MeterDimension {
+                        direction: pay_types::metering::MeterDirection::Input,
+                        unit: pay_types::metering::BillingUnit::Tokens,
+                        scale: 1_000_000,
+                        period: None,
+                        tiers: vec![PriceTier {
+                            up_to: None,
+                            price_usd: 0.01,
+                            condition: None,
+                            notes: None,
+                        }],
+                    }],
+                },
+            ],
+            sku_tiers: vec![],
+        };
+        // Match second variant
+        let price = resolve_price(
+            &metering,
+            &RequestProperties::default(),
+            Some("gemini-flash-001"),
+            None,
+        );
+        assert!(price.is_some());
+        assert_eq!(price.unwrap().dimensions[0].price_usd, 0.01);
+    }
+
+    #[test]
+    fn test_resolve_price_variant_no_match_uses_first() {
+        let metering = Metering {
+            dimensions: vec![],
+            variants: vec![MeterVariant {
+                param: "model".to_string(),
+                value: "gemini-pro".to_string(),
+                dimensions: vec![MeterDimension {
+                    direction: pay_types::metering::MeterDirection::Input,
+                    unit: pay_types::metering::BillingUnit::Tokens,
+                    scale: 1_000_000,
+                    period: None,
+                    tiers: vec![PriceTier {
+                        up_to: None,
+                        price_usd: 0.05,
+                        condition: None,
+                        notes: None,
+                    }],
+                }],
+            }],
+            sku_tiers: vec![],
+        };
+        // No variant hint match → uses first variant as default
+        let price = resolve_price(
+            &metering,
+            &RequestProperties::default(),
+            Some("unknown-model"),
+            None,
+        );
+        assert!(price.is_some());
+        assert_eq!(price.unwrap().dimensions[0].price_usd, 0.05);
+    }
+
+    #[test]
+    fn test_resolve_price_conditional_tiers() {
+        let metering = Metering {
+            dimensions: vec![MeterDimension {
+                direction: pay_types::metering::MeterDirection::Input,
+                unit: pay_types::metering::BillingUnit::Tokens,
+                scale: 1_000_000,
+                period: None,
+                tiers: vec![
+                    PriceTier {
+                        up_to: None,
+                        price_usd: 0.01,
+                        condition: Some(MeterCondition::ContextLength {
+                            op: CompareOp::Lte,
+                            value: 128_000,
+                        }),
+                        notes: None,
+                    },
+                    PriceTier {
+                        up_to: None,
+                        price_usd: 0.02,
+                        condition: None,
+                        notes: None,
+                    },
+                ],
+            }],
+            variants: vec![],
+            sku_tiers: vec![],
+        };
+
+        // Within condition
+        let props = RequestProperties {
+            context_length: Some(64_000),
+            ..Default::default()
+        };
+        let price = resolve_price(&metering, &props, None, None);
+        assert_eq!(price.unwrap().dimensions[0].price_usd, 0.01);
+
+        // Exceeds condition — falls to second tier
+        let props = RequestProperties {
+            context_length: Some(256_000),
+            ..Default::default()
+        };
+        let price = resolve_price(&metering, &props, None, None);
+        assert_eq!(price.unwrap().dimensions[0].price_usd, 0.02);
+    }
+
+    #[test]
+    fn test_record_usage() {
+        use crate::server::accounting::InMemoryStore;
+
+        let store = InMemoryStore::new();
+        let metering = Metering {
+            dimensions: vec![MeterDimension {
+                direction: pay_types::metering::MeterDirection::Usage,
+                unit: pay_types::metering::BillingUnit::Requests,
+                scale: 1,
+                period: None,
+                tiers: vec![
+                    PriceTier {
+                        up_to: Some(100),
+                        price_usd: 0.0,
+                        condition: None,
+                        notes: None,
+                    },
+                    PriceTier {
+                        up_to: None,
+                        price_usd: 0.01,
+                        condition: None,
+                        notes: None,
+                    },
+                ],
+            }],
+            variants: vec![],
+            sku_tiers: vec![],
+        };
+
+        let ctx = MeteringContext {
+            api_name: "test",
+            endpoint_path: "v1/test",
+            accounting_mode: &AccountingMode::Pooled,
+            store: &store,
+            wallet: None,
+        };
+
+        // Record usage — should be in free tier
+        let price = record_usage(&metering, &RequestProperties::default(), None, &ctx, 50);
+        assert!(price.is_some());
+        assert_eq!(price.unwrap().dimensions[0].price_usd, 0.0);
+
+        // Record more — should push into paid tier
+        let price = record_usage(&metering, &RequestProperties::default(), None, &ctx, 60);
+        assert!(price.is_some());
+        assert_eq!(price.unwrap().dimensions[0].price_usd, 0.01);
+    }
 }

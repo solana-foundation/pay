@@ -88,25 +88,32 @@ pub enum SessionSetup {
     Cancelled,
 }
 
-/// Show the session setup TUI. Returns the user's session config.
-pub fn setup_session(tool: ToolKind) -> io::Result<SessionSetup> {
-    if !std::io::IsTerminal::is_terminal(&std::io::stderr()) {
-        return Ok(SessionSetup::Cancelled);
-    }
-
+/// Run a closure with a full-screen terminal, restoring state on exit.
+fn with_terminal<T>(
+    f: impl FnOnce(&mut Terminal<CrosstermBackend<io::Stderr>>) -> io::Result<T>,
+) -> io::Result<T> {
     terminal::enable_raw_mode()?;
-    let mut stdout = io::stderr();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
+    let mut stderr = io::stderr();
+    execute!(stderr, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stderr);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run(&mut terminal, tool);
+    let result = f(&mut terminal);
 
     let _ = terminal::disable_raw_mode();
     let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
     let _ = terminal.show_cursor();
 
     result
+}
+
+/// Show the session setup TUI. Returns the user's session config.
+pub fn setup_session(tool: ToolKind) -> io::Result<SessionSetup> {
+    if !std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        return Ok(SessionSetup::Cancelled);
+    }
+
+    with_terminal(|terminal| run(terminal, tool))
 }
 
 const DEFAULT_ONRAMP_URL: &str = "https://www.coinbase.com/";
@@ -186,25 +193,14 @@ pub fn run_topup_flow(pubkey: &str, rpc_url: &str) -> pay_core::Result<()> {
         return Ok(());
     }
 
-    terminal::enable_raw_mode()?;
-    let mut stderr = io::stderr();
-    execute!(stderr, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stderr);
-    let mut terminal = Terminal::new(backend)?;
-
-    let result = run_topup(&mut terminal, pubkey, rpc_url);
-
-    let _ = terminal::disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
-    let _ = terminal.show_cursor();
+    let result = with_terminal(|terminal| run_topup(terminal, pubkey, rpc_url))?;
 
     match result {
-        Ok(Some(detected)) => {
+        Some(detected) => {
             print_received(&detected.received, &detected.current);
             Ok(())
         }
-        Ok(None) => Ok(()),
-        Err(e) => Err(pay_core::Error::from(e)),
+        None => Ok(()),
     }
 }
 
@@ -397,37 +393,7 @@ fn render_topup_selector(
         .margin(2)
         .split(columns[1]);
 
-    let logo = Paragraph::new(vec![
-        solana_logo_line(
-            "",
-            "⣠⣶",
-            SOLANA_BLUE,
-            "⣶⣶",
-            SOLANA_GREEN,
-            "⣶⣶⠖",
-            SOLANA_GREEN,
-        ),
-        solana_logo_line(
-            "",
-            "⠲⣶",
-            SOLANA_PURPLE,
-            "⣶⣶",
-            SOLANA_BLUE,
-            "⣶⣶⣄",
-            SOLANA_GREEN,
-        ),
-        solana_logo_line(
-            "",
-            "⣠⣶",
-            SOLANA_PURPLE,
-            "⣶⣶",
-            SOLANA_PURPLE,
-            "⣶⣶⠖",
-            SOLANA_BLUE,
-        ),
-    ])
-    .centered();
-    frame.render_widget(logo, left[1]);
+    frame.render_widget(Paragraph::new(solana_logo("")).centered(), left[1]);
 
     let option_chunks = Layout::vertical(
         options
@@ -681,37 +647,55 @@ fn print_topup_instructions(pubkey: &str) {
     eprintln!("  2. Buy funds using an onramp such as Coinbase: {DEFAULT_ONRAMP_URL}");
 }
 
+fn format_balance(sol_lamports: u64, tokens: &[impl AsTokenDisplay]) -> String {
+    let mut parts = Vec::new();
+    if sol_lamports > 0 {
+        let sol = sol_lamports as f64 / 1_000_000_000.0;
+        parts.push(format!("{sol:.4} SOL"));
+    }
+    for token in tokens {
+        let label = token.display_symbol();
+        parts.push(format!("{:.2} {label}", token.display_amount()));
+    }
+    parts.join(", ")
+}
+
+trait AsTokenDisplay {
+    fn display_symbol(&self) -> &str;
+    fn display_amount(&self) -> f64;
+}
+
+impl AsTokenDisplay for pay_core::client::balance::TokenBalance {
+    fn display_symbol(&self) -> &str {
+        self.symbol.unwrap_or(&self.mint[..8])
+    }
+    fn display_amount(&self) -> f64 {
+        self.ui_amount
+    }
+}
+
+impl AsTokenDisplay for pay_core::client::balance::ReceivedToken {
+    fn display_symbol(&self) -> &str {
+        self.symbol.unwrap_or(&self.mint[..8])
+    }
+    fn display_amount(&self) -> f64 {
+        self.ui_amount
+    }
+}
+
 fn print_received(received: &ReceivedFunds, current: &AccountBalances) {
     use owo_colors::OwoColorize;
 
-    // Line 1: what was received
-    let mut parts = Vec::new();
-    if received.sol_lamports > 0 {
-        let sol = received.sol_lamports as f64 / 1_000_000_000.0;
-        parts.push(format!("{sol:.4} SOL"));
-    }
-    for token in &received.tokens {
-        let label = token.symbol.unwrap_or(&token.mint[..8]);
-        parts.push(format!("{:.2} {label}", token.ui_amount));
-    }
-    if !parts.is_empty() {
+    let received_str = format_balance(received.sol_lamports, &received.tokens);
+    if !received_str.is_empty() {
         eprint!("Received ");
-        eprintln!("{}", parts.join(", ").green());
+        eprintln!("{}", received_str.green());
     }
 
-    // Line 2: full current balance
-    let mut bal_parts = Vec::new();
-    if current.sol_lamports > 0 {
-        let sol = current.sol_lamports as f64 / 1_000_000_000.0;
-        bal_parts.push(format!("{sol:.4} SOL"));
-    }
-    for token in &current.tokens {
-        let label = token.symbol.unwrap_or(&token.mint[..8]);
-        bal_parts.push(format!("{:.2} {label}", token.ui_amount));
-    }
-    if !bal_parts.is_empty() {
+    let balance_str = format_balance(current.sol_lamports, &current.tokens);
+    if !balance_str.is_empty() {
         eprint!("{}", "Balance: ".dimmed());
-        eprintln!("{}", bal_parts.join(", ").green());
+        eprintln!("{}", balance_str.green());
     }
 }
 
@@ -857,37 +841,7 @@ fn render_left_panel(
     ])
     .split(sidebar[1]);
 
-    let logo = Paragraph::new(vec![
-        solana_logo_line(
-            "",
-            "⣠⣶",
-            SOLANA_BLUE,
-            "⣶⣶",
-            SOLANA_GREEN,
-            "⣶⣶⠖",
-            SOLANA_GREEN,
-        ),
-        solana_logo_line(
-            "",
-            "⠲⣶",
-            SOLANA_PURPLE,
-            "⣶⣶",
-            SOLANA_BLUE,
-            "⣶⣶⣄",
-            SOLANA_GREEN,
-        ),
-        solana_logo_line(
-            "",
-            "⣠⣶",
-            SOLANA_PURPLE,
-            "⣶⣶",
-            SOLANA_PURPLE,
-            "⣶⣶⠖",
-            SOLANA_BLUE,
-        ),
-    ])
-    .centered();
-    frame.render_widget(logo, content[1]);
+    frame.render_widget(Paragraph::new(solana_logo("")).centered(), content[1]);
 
     let max_w = sidebar[1].width.min(40);
     let center = |r: Rect| -> Rect {
@@ -1054,45 +1008,19 @@ fn render_card_panel(
                 Line::default(),
             ]
         }
-        ToolKind::Codex => vec![
-            Line::default(),
-            solana_logo_line(
-                "  ",
-                "⣠⣶",
-                SOLANA_BLUE,
-                "⣶⣶",
-                SOLANA_GREEN,
-                "⣶⣶⠖",
-                SOLANA_GREEN,
-            ),
-            solana_logo_line(
-                "  ",
-                "⠲⣶",
-                SOLANA_PURPLE,
-                "⣶⣶",
-                SOLANA_BLUE,
-                "⣶⣶⣄",
-                SOLANA_GREEN,
-            ),
-            solana_logo_line(
-                "  ",
-                "⣠⣶",
-                SOLANA_PURPLE,
-                "⣶⣶",
-                SOLANA_PURPLE,
-                "⣶⣶⠖",
-                SOLANA_BLUE,
-            ),
-            Line::from(Span::styled(
+        ToolKind::Codex => {
+            let mut lines = vec![Line::default()];
+            lines.extend(solana_logo("  "));
+            lines.push(Line::from(Span::styled(
                 "  codex",
                 Style::default().fg(Color::DarkGray),
-            )),
-        ],
+            )));
+            lines
+        }
         _ => {
             let tool_label = match tool {
                 ToolKind::Curl => "curl",
                 ToolKind::Wget => "wget",
-                ToolKind::Httpie => "httpie",
                 ToolKind::Fetch => "fetch",
                 ToolKind::Mcp => "mcp",
                 ToolKind::Claude | ToolKind::Codex => unreachable!(),
@@ -1137,6 +1065,14 @@ fn render_card_panel(
 }
 
 // ── Helpers ──
+
+fn solana_logo(prefix: &'static str) -> Vec<Line<'static>> {
+    vec![
+        solana_logo_line(prefix, "⣠⣶", SOLANA_BLUE, "⣶⣶", SOLANA_GREEN, "⣶⣶⠖", SOLANA_GREEN),
+        solana_logo_line(prefix, "⠲⣶", SOLANA_PURPLE, "⣶⣶", SOLANA_BLUE, "⣶⣶⣄", SOLANA_GREEN),
+        solana_logo_line(prefix, "⣠⣶", SOLANA_PURPLE, "⣶⣶", SOLANA_PURPLE, "⣶⣶⠖", SOLANA_BLUE),
+    ]
+}
 
 fn solana_logo_line(
     prefix: &'static str,

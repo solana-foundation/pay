@@ -14,10 +14,7 @@ pub use client::dev;
 pub use client::fetch;
 pub use client::mpp;
 pub use client::runner;
-pub use client::runner::{
-    run_curl, run_curl_with_headers, run_httpie, run_httpie_with_headers, run_wget,
-    run_wget_with_headers,
-};
+pub use client::runner::{run_curl, run_curl_with_headers, run_wget, run_wget_with_headers};
 pub use client::send;
 pub use client::x402;
 

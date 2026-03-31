@@ -118,3 +118,66 @@ pub fn error_response(status: StatusCode, message: &str) -> Response {
         .body(Body::from(serde_json::to_string(&body).unwrap()))
         .unwrap()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_api(subdomain: &str) -> ApiSpec {
+        ApiSpec {
+            name: "test".to_string(),
+            subdomain: subdomain.to_string(),
+            title: "Test".to_string(),
+            description: "".to_string(),
+            category: pay_types::metering::ApiCategory::AiMl,
+            version: "1.0".to_string(),
+            base_url: "https://api.example.com".to_string(),
+            accounting: pay_types::metering::AccountingMode::Pooled,
+            endpoints: vec![],
+            free_tier: None,
+            quotas: None,
+            notes: None,
+        }
+    }
+
+    #[test]
+    fn resolve_api_finds_matching_subdomain() {
+        let apis = vec![make_api("vision"), make_api("translate")];
+        let result = resolve_api(&apis, "vision.agents.solana.com");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().subdomain, "vision");
+    }
+
+    #[test]
+    fn resolve_api_no_match() {
+        let apis = vec![make_api("vision")];
+        let result = resolve_api(&apis, "translate.agents.solana.com");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn resolve_api_empty_list() {
+        let apis: Vec<ApiSpec> = vec![];
+        assert!(resolve_api(&apis, "vision.agents.solana.com").is_none());
+    }
+
+    #[test]
+    fn error_response_has_correct_status() {
+        let resp = error_response(StatusCode::BAD_GATEWAY, "upstream error");
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn error_response_has_json_content_type() {
+        let resp = error_response(StatusCode::INTERNAL_SERVER_ERROR, "oops");
+        let ct = resp.headers().get("content-type").unwrap();
+        assert_eq!(ct, "application/json");
+    }
+
+    #[test]
+    fn strip_headers_contains_expected() {
+        assert!(STRIP_HEADERS.contains(&"host"));
+        assert!(STRIP_HEADERS.contains(&"authorization"));
+        assert!(STRIP_HEADERS.contains(&"connection"));
+    }
+}

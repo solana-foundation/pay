@@ -253,75 +253,6 @@ fn parse_wget_headers(stderr: &str) -> (Option<u16>, Vec<(String, String)>) {
     (status_code, headers)
 }
 
-// ── httpie ──
-
-/// Run `http` (httpie) with the given user args, detecting 402 + MPP challenges.
-///
-/// Adds `--print=hb` to capture headers+body on stdout, parses headers from output.
-pub fn run_httpie(user_args: &[String]) -> Result<RunOutcome> {
-    run_httpie_inner(user_args, &[])
-}
-
-/// Run `http` (httpie) with extra headers injected (used for retry after payment).
-pub fn run_httpie_with_headers(
-    user_args: &[String],
-    extra_headers: &[String],
-) -> Result<RunOutcome> {
-    run_httpie_inner(user_args, extra_headers)
-}
-
-fn run_httpie_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunOutcome> {
-    // httpie can be invoked as `http` or `https`
-    check_command_exists("http")?;
-
-    debug!(args = ?user_args, extra = ?extra_headers, "Running httpie");
-
-    // First pass: capture headers + body to parse status code
-    let mut cmd = Command::new("http");
-    cmd.arg("--print=hb");
-    cmd.args(user_args);
-    for h in extra_headers {
-        cmd.arg(h.as_str());
-    }
-    cmd.stdin(Stdio::inherit());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-
-    let output = cmd.output()?;
-    let exit_code = output.status.code().unwrap_or(1);
-    let stdout_text = String::from_utf8_lossy(&output.stdout);
-    let stderr_text = String::from_utf8_lossy(&output.stderr);
-
-    let (status_code, headers, _body) = parse_httpie_output(&stdout_text);
-    let url = find_url_in_args(user_args).unwrap_or_default();
-
-    debug!(?status_code, exit_code, "httpie finished");
-
-    if status_code == Some(402) {
-        return Ok(classify_402(&headers, None, &url));
-    }
-
-    // Not 402 — re-emit everything
-    if !stderr_text.is_empty() {
-        eprint!("{stderr_text}");
-    }
-    print!("{stdout_text}");
-
-    Ok(RunOutcome::Completed {
-        exit_code,
-        body: None,
-    })
-}
-
-/// Parse httpie `--print=hb` output into status code, headers, and body.
-fn parse_httpie_output(output: &str) -> (Option<u16>, Vec<(String, String)>, &str) {
-    // Split on first double newline: headers block, then body
-    let (header_block, body) = output.split_once("\n\n").unwrap_or((output, ""));
-
-    let (status_code, headers) = parse_http_headers(header_block);
-    (status_code, headers, body)
-}
-
 /// Heuristic: find the URL from command args.
 fn find_url_in_args(args: &[String]) -> Option<String> {
     args.iter()
@@ -437,5 +368,108 @@ HTTP request sent, awaiting response...
             .map(String::from)
             .collect();
         assert_eq!(find_url_in_args(&args), None);
+    }
+
+    #[test]
+    fn find_url_http() {
+        let args = vec!["http://localhost:8080/test".to_string()];
+        assert_eq!(
+            find_url_in_args(&args),
+            Some("http://localhost:8080/test".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_empty_headers() {
+        let (status, headers) = parse_http_headers("");
+        assert_eq!(status, None);
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn parse_status_only() {
+        let raw = "HTTP/1.1 200 OK\r\n\r\n";
+        let (status, headers) = parse_http_headers(raw);
+        assert_eq!(status, Some(200));
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn parse_http2_status() {
+        let raw = "HTTP/2 404 Not Found\r\nContent-Type: text/html\r\n\r\n";
+        let (status, headers) = parse_http_headers(raw);
+        assert_eq!(status, Some(404));
+        assert_eq!(headers.len(), 1);
+    }
+
+    #[test]
+    fn parse_headers_lowercase_keys() {
+        let raw = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Custom-Header: value\r\n\r\n";
+        let (_, headers) = parse_http_headers(raw);
+        // Keys should be lowercased
+        assert!(headers.iter().any(|(k, _)| k == "content-type"));
+        assert!(headers.iter().any(|(k, _)| k == "x-custom-header"));
+    }
+
+    #[test]
+    fn parse_wget_empty() {
+        let (status, headers) = parse_wget_headers("");
+        assert_eq!(status, None);
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn parse_wget_redirect_chain() {
+        let stderr = r#"
+  HTTP/1.1 301 Moved Permanently
+  Location: https://new.example.com
+  HTTP/1.1 200 OK
+  Content-Type: text/html
+"#;
+        let (status, headers) = parse_wget_headers(stderr);
+        assert_eq!(status, Some(200));
+        assert!(headers.iter().any(|(k, _)| k == "content-type"));
+    }
+
+    #[test]
+    fn parse_wget_skips_lines_with_spaces_in_key() {
+        let stderr = r#"
+  HTTP/1.1 200 OK
+  Content-Type: text/html
+  not a header line
+"#;
+        let (status, headers) = parse_wget_headers(stderr);
+        assert_eq!(status, Some(200));
+        // "not a header line" has spaces in key, should be skipped
+        assert_eq!(headers.len(), 1);
+    }
+
+    #[test]
+    fn classify_402_empty_headers() {
+        let outcome = classify_402(&[], None, "https://example.com");
+        assert!(matches!(outcome, RunOutcome::UnknownPaymentRequired { .. }));
+    }
+
+    #[test]
+    fn classify_402_preserves_resource_url() {
+        let outcome = classify_402(&[], None, "https://api.example.com/data");
+        match outcome {
+            RunOutcome::UnknownPaymentRequired { resource_url, .. } => {
+                assert_eq!(resource_url, "https://api.example.com/data");
+            }
+            _ => panic!("Expected UnknownPaymentRequired"),
+        }
+    }
+
+    #[test]
+    fn check_command_exists_finds_ls() {
+        // `ls` should exist on any unix system
+        assert!(check_command_exists("ls").is_ok());
+    }
+
+    #[test]
+    fn check_command_exists_fails_for_nonexistent() {
+        let result = check_command_exists("nonexistent_command_xyz_12345");
+        assert!(result.is_err());
     }
 }

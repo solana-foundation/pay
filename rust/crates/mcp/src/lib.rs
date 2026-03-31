@@ -35,3 +35,23 @@ pub async fn run_server(_opts: &McpOptions) -> Result<(), String> {
     service.waiting().await.map_err(|e| e.to_string())?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mcp_options_default() {
+        let _opts = McpOptions::default();
+    }
+
+    #[test]
+    fn pay_mcp_can_be_constructed() {
+        let _mcp = PayMcp::new();
+    }
+
+    #[test]
+    fn pay_mcp_default_is_new() {
+        let _mcp = PayMcp::default();
+    }
+}

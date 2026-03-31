@@ -98,23 +98,22 @@ impl Config {
         // 4. Legacy: probe keystores directly (no accounts.yml yet)
         #[cfg(target_os = "macos")]
         {
-            use crate::keystore::{AppleKeychain, KeystoreBackend};
-            if AppleKeychain.exists("default") {
+            let ks = crate::keystore::Keystore::apple_keychain();
+            if ks.exists("default") {
                 return Some("keychain:default".to_string());
             }
         }
         #[cfg(target_os = "linux")]
         {
-            use crate::keystore::{GnomeKeyring, KeystoreBackend};
-            if GnomeKeyring.exists("default") {
+            let ks = crate::keystore::Keystore::gnome_keyring();
+            if ks.exists("default") {
                 return Some("gnome-keyring:default".to_string());
             }
         }
 
         {
-            use crate::keystore::{KeystoreBackend, OnePassword};
-            let op = OnePassword::new();
-            if op.exists("default") {
+            let ks = crate::keystore::Keystore::onepassword();
+            if ks.exists("default") {
                 return Some("1password:default".to_string());
             }
         }
@@ -194,5 +193,109 @@ mod tests {
         assert_eq!(config.keypair_path(), Some("~/.config/solana/id.json"));
         assert_eq!(config.rpc_url(), "https://rpc.example.com");
         assert_eq!(config.log_format, LogFormat::Json);
+    }
+
+    #[test]
+    fn load_from_path_with_none_uses_defaults() {
+        let config = Config::load_from_path(None).expect("load default config");
+        assert!(!config.auto_pay);
+        assert_eq!(config.keypair_path(), None);
+        assert_eq!(config.rpc_url(), super::LOCAL_RPC_URL);
+        assert_eq!(config.log_format, LogFormat::Text);
+    }
+
+    #[test]
+    fn keypair_path_returns_valid_path() {
+        let config = Config {
+            keypair: Some("/home/user/.config/solana/id.json".to_string()),
+            ..Config::default()
+        };
+        assert_eq!(
+            config.keypair_path(),
+            Some("/home/user/.config/solana/id.json")
+        );
+    }
+
+    #[test]
+    fn keypair_path_ignores_empty_string() {
+        let config = Config {
+            keypair: Some("".to_string()),
+            ..Config::default()
+        };
+        assert_eq!(config.keypair_path(), None);
+    }
+
+    #[test]
+    fn keypair_path_none_when_not_set() {
+        let config = Config::default();
+        assert_eq!(config.keypair_path(), None);
+    }
+
+    #[test]
+    fn rpc_url_ignores_blank() {
+        let config = Config {
+            rpc_url: Some("   ".to_string()),
+            ..Config::default()
+        };
+        assert_eq!(config.rpc_url(), super::LOCAL_RPC_URL);
+    }
+
+    #[test]
+    fn rpc_url_uses_custom() {
+        let config = Config {
+            rpc_url: Some("https://custom.rpc.com".to_string()),
+            ..Config::default()
+        };
+        assert_eq!(config.rpc_url(), "https://custom.rpc.com");
+    }
+
+    #[test]
+    fn config_default_values() {
+        let config = Config::default();
+        assert!(!config.auto_pay);
+        assert!(config.keypair.is_none());
+        assert!(config.rpc_url.is_none());
+        assert_eq!(config.log_format, LogFormat::Text);
+    }
+
+    #[test]
+    fn log_format_serde_roundtrip() {
+        for fmt in [LogFormat::Text, LogFormat::Json] {
+            let json = serde_json::to_string(&fmt).unwrap();
+            let back: LogFormat = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, fmt);
+        }
+    }
+
+    #[test]
+    fn load_partial_config() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config_path = temp_dir.path().join("pay.toml");
+        let mut file = std::fs::File::create(&config_path).expect("create config");
+        writeln!(file, "auto_pay = true").expect("write config");
+
+        let config = Config::load_from_path(Some(&config_path)).expect("load config");
+        assert!(config.auto_pay);
+        // Other fields should be defaults
+        assert_eq!(config.keypair_path(), None);
+        assert_eq!(config.rpc_url(), super::LOCAL_RPC_URL);
+    }
+
+    // Note: find_config_path() and default_keypair_source() depend on env vars
+    // (PAY_CONFIG, PAY_SECRET_KEY) and machine state (accounts.yml, keystores).
+    // Env-based tests are flaky under parallel execution, so we test the
+    // deterministic parts and trust the integration tests for the rest.
+
+    #[test]
+    fn default_keypair_source_returns_some_or_none() {
+        let config = Config::default();
+        let _ = config.default_keypair_source();
+    }
+
+    #[test]
+    fn expand_path_expands_tilde() {
+        let expanded = super::expand_path("~/test");
+        assert!(!expanded.starts_with('~'));
+        assert!(expanded.ends_with("/test"));
     }
 }

@@ -178,3 +178,251 @@ fn parse_token_accounts(result: &serde_json::Value, tokens: &mut Vec<TokenBalanc
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mint_symbol_usdc() {
+        assert_eq!(
+            mint_symbol("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"),
+            Some("USDC")
+        );
+    }
+
+    #[test]
+    fn mint_symbol_usdt() {
+        assert_eq!(
+            mint_symbol("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"),
+            Some("USDT")
+        );
+    }
+
+    #[test]
+    fn mint_symbol_unknown() {
+        assert_eq!(mint_symbol("SomeRandomMint1111111111111111111111111111"), None);
+    }
+
+    #[test]
+    fn mainnet_rpc_url_default() {
+        // Unset the env var to test default
+        // SAFETY: called in single-threaded test context
+        unsafe { std::env::remove_var("PAY_MAINNET_RPC_URL") };
+        assert_eq!(mainnet_rpc_url(), "https://api.mainnet-beta.solana.com");
+    }
+
+    #[test]
+    fn account_balances_default() {
+        let b = AccountBalances::default();
+        assert_eq!(b.sol_lamports, 0);
+        assert!(b.tokens.is_empty());
+    }
+
+    #[test]
+    fn received_funds_has_any_sol() {
+        let r = ReceivedFunds {
+            sol_lamports: 100,
+            tokens: vec![],
+        };
+        assert!(r.has_any());
+    }
+
+    #[test]
+    fn received_funds_has_any_tokens() {
+        let r = ReceivedFunds {
+            sol_lamports: 0,
+            tokens: vec![ReceivedToken {
+                mint: "abc".to_string(),
+                ui_amount: 1.0,
+                symbol: None,
+            }],
+        };
+        assert!(r.has_any());
+    }
+
+    #[test]
+    fn received_funds_has_any_empty() {
+        let r = ReceivedFunds {
+            sol_lamports: 0,
+            tokens: vec![],
+        };
+        assert!(!r.has_any());
+    }
+
+    #[test]
+    fn diff_received_sol_increase() {
+        let baseline = AccountBalances {
+            sol_lamports: 1_000_000,
+            tokens: vec![],
+        };
+        let current = AccountBalances {
+            sol_lamports: 2_000_000,
+            tokens: vec![],
+        };
+        let diff = current.diff_received(&baseline);
+        assert_eq!(diff.sol_lamports, 1_000_000);
+        assert!(diff.tokens.is_empty());
+    }
+
+    #[test]
+    fn diff_received_sol_decrease_is_zero() {
+        let baseline = AccountBalances {
+            sol_lamports: 2_000_000,
+            tokens: vec![],
+        };
+        let current = AccountBalances {
+            sol_lamports: 1_000_000,
+            tokens: vec![],
+        };
+        let diff = current.diff_received(&baseline);
+        assert_eq!(diff.sol_lamports, 0);
+    }
+
+    #[test]
+    fn diff_received_token_increase() {
+        let baseline = AccountBalances {
+            sol_lamports: 0,
+            tokens: vec![TokenBalance {
+                mint: "USDC_MINT".to_string(),
+                ui_amount: 10.0,
+                symbol: Some("USDC"),
+            }],
+        };
+        let current = AccountBalances {
+            sol_lamports: 0,
+            tokens: vec![TokenBalance {
+                mint: "USDC_MINT".to_string(),
+                ui_amount: 25.5,
+                symbol: Some("USDC"),
+            }],
+        };
+        let diff = current.diff_received(&baseline);
+        assert_eq!(diff.tokens.len(), 1);
+        assert!((diff.tokens[0].ui_amount - 15.5).abs() < f64::EPSILON);
+        assert_eq!(diff.tokens[0].symbol, Some("USDC"));
+    }
+
+    #[test]
+    fn diff_received_new_token() {
+        let baseline = AccountBalances {
+            sol_lamports: 0,
+            tokens: vec![],
+        };
+        let current = AccountBalances {
+            sol_lamports: 0,
+            tokens: vec![TokenBalance {
+                mint: "NEW_MINT".to_string(),
+                ui_amount: 100.0,
+                symbol: None,
+            }],
+        };
+        let diff = current.diff_received(&baseline);
+        assert_eq!(diff.tokens.len(), 1);
+        assert!((diff.tokens[0].ui_amount - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn diff_received_no_change() {
+        let balances = AccountBalances {
+            sol_lamports: 1_000_000,
+            tokens: vec![TokenBalance {
+                mint: "USDC".to_string(),
+                ui_amount: 50.0,
+                symbol: Some("USDC"),
+            }],
+        };
+        let diff = balances.diff_received(&balances);
+        assert_eq!(diff.sol_lamports, 0);
+        assert!(diff.tokens.is_empty());
+    }
+
+    #[test]
+    fn parse_token_accounts_empty_value() {
+        let result = serde_json::json!({"value": []});
+        let mut tokens = vec![];
+        parse_token_accounts(&result, &mut tokens);
+        assert!(tokens.is_empty());
+    }
+
+    #[test]
+    fn parse_token_accounts_null_value() {
+        let result = serde_json::json!({"value": null});
+        let mut tokens = vec![];
+        parse_token_accounts(&result, &mut tokens);
+        assert!(tokens.is_empty());
+    }
+
+    #[test]
+    fn parse_token_accounts_with_data() {
+        let result = serde_json::json!({
+            "value": [{
+                "account": {
+                    "data": {
+                        "parsed": {
+                            "info": {
+                                "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                                "tokenAmount": {
+                                    "uiAmount": 100.5,
+                                    "amount": "100500000"
+                                }
+                            }
+                        }
+                    }
+                }
+            }]
+        });
+        let mut tokens = vec![];
+        parse_token_accounts(&result, &mut tokens);
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].symbol, Some("USDC"));
+        assert!((tokens[0].ui_amount - 100.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn parse_token_accounts_skips_zero_balance() {
+        let result = serde_json::json!({
+            "value": [{
+                "account": {
+                    "data": {
+                        "parsed": {
+                            "info": {
+                                "mint": "SomeMint",
+                                "tokenAmount": {
+                                    "uiAmount": 0.0,
+                                    "amount": "0"
+                                }
+                            }
+                        }
+                    }
+                }
+            }]
+        });
+        let mut tokens = vec![];
+        parse_token_accounts(&result, &mut tokens);
+        assert!(tokens.is_empty());
+    }
+
+    #[test]
+    fn parse_token_accounts_missing_mint() {
+        let result = serde_json::json!({
+            "value": [{
+                "account": {
+                    "data": {
+                        "parsed": {
+                            "info": {
+                                "tokenAmount": {
+                                    "uiAmount": 10.0,
+                                    "amount": "10000000"
+                                }
+                            }
+                        }
+                    }
+                }
+            }]
+        });
+        let mut tokens = vec![];
+        parse_token_accounts(&result, &mut tokens);
+        assert!(tokens.is_empty());
+    }
+}

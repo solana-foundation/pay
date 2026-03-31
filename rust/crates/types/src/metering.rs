@@ -301,3 +301,299 @@ pub struct Service {
     pub protocol: PaymentProtocol,
     pub facilitator: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn http_method_serde_roundtrip() {
+        for method in [
+            HttpMethod::Get,
+            HttpMethod::Post,
+            HttpMethod::Put,
+            HttpMethod::Patch,
+            HttpMethod::Delete,
+        ] {
+            let json = serde_json::to_string(&method).unwrap();
+            let back: HttpMethod = serde_json::from_str(&json).unwrap();
+            assert_eq!(format!("{:?}", back), format!("{:?}", method));
+        }
+    }
+
+    #[test]
+    fn compare_op_serde() {
+        let json = serde_json::to_string(&CompareOp::Lte).unwrap();
+        assert_eq!(json, r#""<=""#);
+        let json = serde_json::to_string(&CompareOp::Lt).unwrap();
+        assert_eq!(json, r#""<""#);
+        let json = serde_json::to_string(&CompareOp::Gte).unwrap();
+        assert_eq!(json, r#"">=""#);
+        let json = serde_json::to_string(&CompareOp::Gt).unwrap();
+        assert_eq!(json, r#"">""#);
+        let json = serde_json::to_string(&CompareOp::Eq).unwrap();
+        assert_eq!(json, r#""==""#);
+    }
+
+    #[test]
+    fn compare_op_deserialize() {
+        let lte: CompareOp = serde_json::from_str(r#""<=""#).unwrap();
+        assert!(matches!(lte, CompareOp::Lte));
+        let gt: CompareOp = serde_json::from_str(r#"">""#).unwrap();
+        assert!(matches!(gt, CompareOp::Gt));
+    }
+
+    #[test]
+    fn api_category_serde() {
+        for cat in [
+            ApiCategory::AiMl,
+            ApiCategory::Search,
+            ApiCategory::Maps,
+            ApiCategory::Data,
+            ApiCategory::Compute,
+            ApiCategory::Productivity,
+        ] {
+            let json = serde_json::to_string(&cat).unwrap();
+            let back: ApiCategory = serde_json::from_str(&json).unwrap();
+            assert_eq!(format!("{:?}", back), format!("{:?}", cat));
+        }
+    }
+
+    #[test]
+    fn accounting_mode_default_is_pooled() {
+        let mode = AccountingMode::default();
+        assert!(matches!(mode, AccountingMode::Pooled));
+    }
+
+    #[test]
+    fn accounting_mode_serde() {
+        let pooled = serde_json::to_string(&AccountingMode::Pooled).unwrap();
+        assert_eq!(pooled, r#""pooled""#);
+        let per_agent = serde_json::to_string(&AccountingMode::PerAgent).unwrap();
+        assert_eq!(per_agent, r#""per_agent""#);
+    }
+
+    #[test]
+    fn meter_direction_serde() {
+        for dir in [
+            MeterDirection::Input,
+            MeterDirection::Output,
+            MeterDirection::Usage,
+            MeterDirection::Storage,
+        ] {
+            let json = serde_json::to_string(&dir).unwrap();
+            let back: MeterDirection = serde_json::from_str(&json).unwrap();
+            assert_eq!(format!("{:?}", back), format!("{:?}", dir));
+        }
+    }
+
+    #[test]
+    fn billing_unit_serde() {
+        for unit in [
+            BillingUnit::Tokens,
+            BillingUnit::Characters,
+            BillingUnit::Requests,
+            BillingUnit::Minutes,
+            BillingUnit::Hours,
+            BillingUnit::Seconds,
+            BillingUnit::Pages,
+            BillingUnit::Documents,
+            BillingUnit::Invocations,
+            BillingUnit::Bytes,
+            BillingUnit::Gibibytes,
+            BillingUnit::Tebibytes,
+            BillingUnit::Vcpu,
+            BillingUnit::QuotaUnits,
+            BillingUnit::Instances,
+        ] {
+            let json = serde_json::to_string(&unit).unwrap();
+            let back: BillingUnit = serde_json::from_str(&json).unwrap();
+            assert_eq!(format!("{:?}", back), format!("{:?}", unit));
+        }
+    }
+
+    #[test]
+    fn billing_period_serde() {
+        for period in [
+            BillingPeriod::PerSecond,
+            BillingPeriod::PerHour,
+            BillingPeriod::PerDay,
+            BillingPeriod::PerMonth,
+        ] {
+            let json = serde_json::to_string(&period).unwrap();
+            let back: BillingPeriod = serde_json::from_str(&json).unwrap();
+            assert_eq!(format!("{:?}", back), format!("{:?}", period));
+        }
+    }
+
+    #[test]
+    fn sku_level_serde() {
+        for level in [
+            SkuLevel::Essentials,
+            SkuLevel::Pro,
+            SkuLevel::Enterprise,
+        ] {
+            let json = serde_json::to_string(&level).unwrap();
+            let back: SkuLevel = serde_json::from_str(&json).unwrap();
+            assert_eq!(format!("{:?}", back), format!("{:?}", level));
+        }
+    }
+
+    #[test]
+    fn payment_protocol_serde() {
+        let x402 = serde_json::to_string(&PaymentProtocol::X402).unwrap();
+        assert_eq!(x402, r#""x402""#);
+        let mpp = serde_json::to_string(&PaymentProtocol::Mpp).unwrap();
+        assert_eq!(mpp, r#""mpp""#);
+    }
+
+    #[test]
+    fn meter_condition_tagged_serde() {
+        let cond = MeterCondition::InputTokens {
+            op: CompareOp::Lte,
+            value: 1000,
+        };
+        let json = serde_json::to_string(&cond).unwrap();
+        assert!(json.contains(r#""field":"input_tokens""#));
+        let back: MeterCondition = serde_json::from_str(&json).unwrap();
+        match back {
+            MeterCondition::InputTokens { op, value } => {
+                assert!(matches!(op, CompareOp::Lte));
+                assert_eq!(value, 1000);
+            }
+            _ => panic!("Wrong variant"),
+        }
+    }
+
+    #[test]
+    fn price_tier_optional_fields() {
+        let tier = PriceTier {
+            up_to: None,
+            price_usd: 0.01,
+            condition: None,
+            notes: None,
+        };
+        let json = serde_json::to_string(&tier).unwrap();
+        assert!(!json.contains("up_to"));
+        assert!(!json.contains("condition"));
+        assert!(!json.contains("notes"));
+    }
+
+    #[test]
+    fn endpoint_minimal() {
+        let ep = Endpoint {
+            method: HttpMethod::Get,
+            path: "v1/test".to_string(),
+            description: None,
+            resource: None,
+            metering: None,
+        };
+        let json = serde_json::to_string(&ep).unwrap();
+        let back: Endpoint = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.path, "v1/test");
+        assert!(back.metering.is_none());
+    }
+
+    #[test]
+    fn metering_with_variants() {
+        let metering = Metering {
+            dimensions: vec![],
+            variants: vec![MeterVariant {
+                param: "model".to_string(),
+                value: "gpt-4".to_string(),
+                dimensions: vec![MeterDimension {
+                    direction: MeterDirection::Input,
+                    unit: BillingUnit::Tokens,
+                    scale: 1_000_000,
+                    period: None,
+                    tiers: vec![PriceTier {
+                        up_to: None,
+                        price_usd: 0.03,
+                        condition: None,
+                        notes: None,
+                    }],
+                }],
+            }],
+            sku_tiers: vec![],
+        };
+        let json = serde_json::to_string(&metering).unwrap();
+        let back: Metering = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.variants.len(), 1);
+        assert_eq!(back.variants[0].value, "gpt-4");
+    }
+
+    #[test]
+    fn service_serde_roundtrip() {
+        let svc = Service {
+            id: "svc-1".to_string(),
+            name: "Test Service".to_string(),
+            description: "A test".to_string(),
+            endpoint_url: "https://api.example.com".to_string(),
+            category: "ai".to_string(),
+            protocol: PaymentProtocol::Mpp,
+            facilitator: "solana".to_string(),
+        };
+        let json = serde_json::to_string(&svc).unwrap();
+        let back: Service = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.id, svc.id);
+        assert_eq!(back.name, svc.name);
+    }
+
+    #[test]
+    fn full_api_spec_roundtrip() {
+        let spec = ApiSpec {
+            name: "vision".to_string(),
+            subdomain: "vision".to_string(),
+            title: "Cloud Vision".to_string(),
+            description: "Image analysis".to_string(),
+            category: ApiCategory::AiMl,
+            version: "v1".to_string(),
+            base_url: "https://vision.googleapis.com".to_string(),
+            accounting: AccountingMode::PerAgent,
+            endpoints: vec![Endpoint {
+                method: HttpMethod::Post,
+                path: "v1/images:annotate".to_string(),
+                description: Some("Annotate images".to_string()),
+                resource: Some("images".to_string()),
+                metering: Some(Metering {
+                    dimensions: vec![MeterDimension {
+                        direction: MeterDirection::Usage,
+                        unit: BillingUnit::Requests,
+                        scale: 1,
+                        period: None,
+                        tiers: vec![PriceTier {
+                            up_to: Some(1000),
+                            price_usd: 0.0,
+                            condition: None,
+                            notes: Some("Free tier".to_string()),
+                        }],
+                    }],
+                    variants: vec![],
+                    sku_tiers: vec![],
+                }),
+            }],
+            free_tier: Some(FreeTier {
+                amount: Some(1000),
+                unit: Some(BillingUnit::Requests),
+                period: Some(BillingPeriod::PerMonth),
+                notes: None,
+            }),
+            quotas: Some(QuotaSpec {
+                requests_per_minute: Some(600),
+                requests_per_day: None,
+                requests_per_100_seconds: None,
+                per_user_requests_per_second: None,
+                quota_units_per_day: None,
+                notes: None,
+            }),
+            notes: None,
+        };
+        let json = serde_json::to_string(&spec).unwrap();
+        let back: ApiSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.name, "vision");
+        assert_eq!(back.endpoints.len(), 1);
+        assert!(back.endpoints[0].metering.is_some());
+        assert!(back.free_tier.is_some());
+        assert_eq!(back.free_tier.unwrap().amount, Some(1000));
+    }
+}

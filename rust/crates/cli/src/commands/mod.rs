@@ -1,10 +1,8 @@
+pub mod account;
 pub mod claude;
 pub mod codex;
 pub mod curl;
-pub mod destroy;
-pub mod export;
 pub mod fetch;
-pub mod httpie;
 pub mod send;
 pub mod setup;
 pub mod topup;
@@ -16,7 +14,7 @@ use pay_core::mpp;
 use pay_core::runner::RunOutcome;
 use pay_core::x402;
 use pay_core::x402::Challenge as X402Challenge;
-use pay_core::{Config, run_curl_with_headers, run_httpie_with_headers, run_wget_with_headers};
+use pay_core::{Config, run_curl_with_headers, run_wget_with_headers};
 use solana_mpp::ChargeRequest;
 
 use crate::no_dna;
@@ -28,22 +26,21 @@ pub enum Command {
     Curl(curl::CurlCommand),
     /// Download a resource via wget, handling 402 Payment Required flows.
     Wget(wget::WgetCommand),
-    /// Make an HTTP request via httpie, handling 402 Payment Required flows.
-    #[command(name = "http")]
-    Httpie(httpie::HttpieCommand),
     /// Fetch a URL using the built-in HTTP client (no external tool required).
     Fetch(fetch::FetchCommand),
     /// Run Claude Code with 402 payment support.
     Claude(claude::ClaudeCommand),
     /// Run Codex with 402 payment support.
     Codex(codex::CodexCommand),
-    /// Permanently delete an account and its secret key.
-    Destroy(destroy::DestroyCommand),
-    /// Export your keypair to a JSON file (Solana CLI format).
-    Export(export::ExportCommand),
+    /// Manage accounts (new, import, list, destroy, export).
+    #[command(alias = "accounts")]
+    Account {
+        #[command(subcommand)]
+        command: account::AccountCommand,
+    },
     /// Send SOL to a recipient address.
     Send(send::SendCommand),
-    /// Generate a keypair and store it securely (Touch ID on macOS).
+    /// Generate a keypair, store it, and fund your account.
     Setup(setup::SetupCommand),
     /// Fund your account on localnet via Surfpool.
     Topup(topup::TopupCommand),
@@ -56,7 +53,6 @@ pub enum Command {
 pub enum ToolKind {
     Curl,
     Wget,
-    Httpie,
     Fetch,
     Claude,
     Codex,
@@ -69,17 +65,13 @@ impl Command {
         match self {
             Command::Curl(_) => ToolKind::Curl,
             Command::Wget(_) => ToolKind::Wget,
-            Command::Httpie(_) => ToolKind::Httpie,
             Command::Fetch(_) => ToolKind::Fetch,
             Command::Claude(_) => ToolKind::Claude,
             Command::Codex(_) => ToolKind::Codex,
-            Command::Destroy(_)
-            | Command::Export(_)
+            Command::Account { .. }
             | Command::Send(_)
             | Command::Setup(_)
-            | Command::Topup(_) => {
-                ToolKind::Mcp // handled early
-            }
+            | Command::Topup(_) => ToolKind::Mcp,
             Command::Mcp => ToolKind::Mcp,
         }
     }
@@ -89,7 +81,6 @@ impl Command {
 enum Tool<'a> {
     Curl(&'a [String]),
     Wget(&'a [String]),
-    Httpie(&'a [String]),
     Fetch { url: &'a str },
 }
 
@@ -101,14 +92,12 @@ impl Command {
         keypair_override: Option<&str>,
         verbose: bool,
     ) -> pay_core::Result<()> {
-        // Handle commands that don't go through the 402 flow
         let pay_bin = std::env::current_exe()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| "pay".to_string());
 
         match self {
-            Command::Destroy(cmd) => return cmd.run(),
-            Command::Export(cmd) => return cmd.run(keypair_override),
+            Command::Account { command } => return command.run(keypair_override),
             Command::Send(cmd) => return cmd.run(keypair_override, verbose),
             Command::Setup(cmd) => return cmd.run(),
             Command::Topup(cmd) => return cmd.run(keypair_override),
@@ -131,7 +120,6 @@ impl Command {
         let (outcome, tool) = match &self {
             Command::Curl(cmd) => (pay_core::run_curl(&cmd.args)?, Tool::Curl(&cmd.args)),
             Command::Wget(cmd) => (pay_core::run_wget(&cmd.args)?, Tool::Wget(&cmd.args)),
-            Command::Httpie(cmd) => (pay_core::run_httpie(&cmd.args)?, Tool::Httpie(&cmd.args)),
             Command::Fetch(cmd) => {
                 let parsed_headers = parse_header_args(&cmd.headers);
                 let outcome = pay_core::fetch::fetch(&cmd.url, &parsed_headers)?;
@@ -199,7 +187,6 @@ fn handle_outcome(
                 );
             }
 
-            // Not auto-paying — always show challenge info (user needs to see it)
             if is_json {
                 let network = req
                     .method_details
@@ -388,10 +375,6 @@ fn retry_with_header(
             let extra = vec![format!("{header_name}: {header_value}")];
             run_wget_with_headers(args, &extra)
         }
-        Tool::Httpie(args) => {
-            let extra = vec![format!("{header_name}:{header_value}")];
-            run_httpie_with_headers(args, &extra)
-        }
         Tool::Fetch { url, .. } => {
             let mut headers = fetch_headers.unwrap_or_default();
             headers.push((header_name.to_string(), header_value.to_string()));
@@ -430,4 +413,75 @@ fn parse_header_args(args: &[String]) -> Vec<(String, String)> {
             Some((key.trim().to_string(), value.trim().to_string()))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_header_args_basic() {
+        let args: Vec<String> = vec![
+            "Content-Type: application/json".to_string(),
+            "Authorization: Bearer token123".to_string(),
+        ];
+        let headers = parse_header_args(&args);
+        assert_eq!(headers.len(), 2);
+        assert_eq!(headers[0].0, "Content-Type");
+        assert_eq!(headers[0].1, "application/json");
+        assert_eq!(headers[1].0, "Authorization");
+        assert_eq!(headers[1].1, "Bearer token123");
+    }
+
+    #[test]
+    fn parse_header_args_empty() {
+        let headers = parse_header_args(&[]);
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn parse_header_args_no_colon() {
+        let args: Vec<String> = vec!["no-colon-here".to_string()];
+        let headers = parse_header_args(&args);
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn parse_header_args_trims_whitespace() {
+        let args: Vec<String> = vec!["  Key  :  Value  ".to_string()];
+        let headers = parse_header_args(&args);
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].0, "Key");
+        assert_eq!(headers[0].1, "Value");
+    }
+
+    #[test]
+    fn parse_header_args_value_with_colon() {
+        let args: Vec<String> = vec!["Location: https://example.com:8080/path".to_string()];
+        let headers = parse_header_args(&args);
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].0, "Location");
+        assert_eq!(headers[0].1, "https://example.com:8080/path");
+    }
+
+    #[test]
+    fn tool_kind_curl() {
+        let cmd = Command::Curl(curl::CurlCommand {
+            args: vec!["https://example.com".to_string()],
+        });
+        assert!(matches!(cmd.tool_kind(), ToolKind::Curl));
+    }
+
+    #[test]
+    fn tool_kind_wget() {
+        let cmd = Command::Wget(wget::WgetCommand {
+            args: vec!["https://example.com".to_string()],
+        });
+        assert!(matches!(cmd.tool_kind(), ToolKind::Wget));
+    }
+
+    #[test]
+    fn tool_kind_mcp() {
+        assert!(matches!(Command::Mcp.tool_kind(), ToolKind::Mcp));
+    }
 }

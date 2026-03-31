@@ -188,3 +188,71 @@ fn extract_variant_hint(path: &str) -> Option<String> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_variant_hint_models() {
+        assert_eq!(
+            extract_variant_hint("v1/models/gemini-2.0-flash:generateContent"),
+            Some("gemini-2.0-flash".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_variant_hint_voices() {
+        assert_eq!(
+            extract_variant_hint("v1/voices/chirp-3-hd:synthesize"),
+            Some("chirp-3-hd".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_variant_hint_no_colon() {
+        assert_eq!(
+            extract_variant_hint("v1/models/gpt-4"),
+            Some("gpt-4".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_variant_hint_no_match() {
+        assert_eq!(extract_variant_hint("v1/images/generate"), None);
+    }
+
+    #[test]
+    fn extract_variant_hint_empty() {
+        assert_eq!(extract_variant_hint(""), None);
+    }
+
+    #[test]
+    fn extract_variant_hint_models_at_end() {
+        // "models" is the last segment — no next segment
+        assert_eq!(extract_variant_hint("v1/models"), None);
+    }
+
+    #[test]
+    fn extract_request_properties_with_content_length() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-length", "12345".parse().unwrap());
+        let props = extract_request_properties(&headers, "/v1/test");
+        assert_eq!(props.body_size, Some(12345));
+    }
+
+    #[test]
+    fn extract_request_properties_no_content_length() {
+        let headers = HeaderMap::new();
+        let props = extract_request_properties(&headers, "/v1/test");
+        assert_eq!(props.body_size, None);
+    }
+
+    #[test]
+    fn extract_request_properties_invalid_content_length() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-length", "not-a-number".parse().unwrap());
+        let props = extract_request_properties(&headers, "/v1/test");
+        assert_eq!(props.body_size, None);
+    }
+}

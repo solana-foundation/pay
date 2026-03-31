@@ -224,3 +224,57 @@ fn do_paid_fetch(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmcp::ServerHandler;
+
+    #[test]
+    fn server_info_has_instructions() {
+        let mcp = PayMcp::new();
+        let info = mcp.get_info();
+        assert!(info.instructions.is_some());
+        assert!(info.instructions.unwrap().contains("402"));
+    }
+
+    #[test]
+    fn server_info_protocol_version() {
+        let mcp = PayMcp::new();
+        let info = mcp.get_info();
+        assert_eq!(info.protocol_version, ProtocolVersion::V_2025_06_18);
+    }
+
+    #[test]
+    fn curl_params_deserialize() {
+        let json = r#"{"url": "https://example.com"}"#;
+        let params: CurlParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.url, "https://example.com");
+        assert!(params.method.is_none());
+        assert!(params.headers.is_none());
+        assert!(params.body.is_none());
+        assert!(params.keypair.is_none());
+    }
+
+    #[test]
+    fn curl_params_with_headers() {
+        let json = r#"{"url": "https://example.com", "headers": {"Authorization": "Bearer tok"}}"#;
+        let params: CurlParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.headers.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn wget_params_deserialize() {
+        let json = r#"{"url": "https://example.com/file.zip"}"#;
+        let params: WgetParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.url, "https://example.com/file.zip");
+        assert!(params.output.is_none());
+        assert!(params.keypair.is_none());
+    }
+
+    #[test]
+    fn do_paid_fetch_returns_error_for_invalid_url() {
+        let result = do_paid_fetch("not-a-url", &[], "");
+        assert!(result.is_err());
+    }
+}

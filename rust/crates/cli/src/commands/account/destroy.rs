@@ -2,8 +2,8 @@
 
 use dialoguer::Confirm;
 use owo_colors::OwoColorize;
-use pay_core::accounts::{Account, AccountsFile, Keystore};
-use pay_core::keystore::KeystoreBackend;
+use pay_core::accounts::{Account, AccountsFile, Keystore as KeystoreKind};
+use pay_core::keystore::Keystore;
 
 /// Permanently delete an account and its secret key.
 ///
@@ -51,7 +51,7 @@ impl DestroyCommand {
             .pubkey
             .clone()
             .unwrap_or_else(|| "unknown".to_string());
-        let keystore = entry.keystore.clone();
+        let keystore_kind = entry.keystore.clone();
 
         eprintln!();
         eprintln!(
@@ -72,7 +72,7 @@ impl DestroyCommand {
             )
             .dimmed()
         );
-        eprintln!("{}", format!("  Keystore: {keystore}").dimmed());
+        eprintln!("{}", format!("  Keystore: {keystore_kind}").dimmed());
         eprintln!();
 
         // Suggest export
@@ -103,60 +103,16 @@ impl DestroyCommand {
         }
 
         // Delete from keystore backend
-        match keystore {
-            #[cfg(target_os = "macos")]
-            Keystore::AppleKeychain => {
-                use pay_core::keystore::AppleKeychain;
-                AppleKeychain
-                    .delete(&self.account)
-                    .map_err(|e| pay_core::Error::Config(format!("Keychain delete: {e}")))?;
-            }
-            #[cfg(not(target_os = "macos"))]
-            Keystore::AppleKeychain => {
-                return Err(pay_core::Error::Config(
-                    "Cannot delete Keychain entries on this platform".to_string(),
-                ));
-            }
-            #[cfg(target_os = "linux")]
-            Keystore::GnomeKeyring => {
-                use pay_core::keystore::GnomeKeyring;
-                GnomeKeyring
-                    .delete(&self.account)
-                    .map_err(|e| pay_core::Error::Config(format!("GNOME Keyring delete: {e}")))?;
-            }
-            #[cfg(not(target_os = "linux"))]
-            Keystore::GnomeKeyring => {
-                return Err(pay_core::Error::Config(
-                    "Cannot delete GNOME Keyring entries on this platform".to_string(),
-                ));
-            }
-            #[cfg(target_os = "windows")]
-            Keystore::WindowsHello => {
-                use pay_core::keystore::WindowsHello;
-                WindowsHello::new()
-                    .delete(&self.account)
-                    .map_err(|e| pay_core::Error::Config(format!("Windows Hello delete: {e}")))?;
-            }
-            #[cfg(not(target_os = "windows"))]
-            Keystore::WindowsHello => {
-                return Err(pay_core::Error::Config(
-                    "Cannot delete Windows Hello entries on this platform".to_string(),
-                ));
-            }
-            Keystore::OnePassword => {
-                use pay_core::keystore::OnePassword;
-                let backend = OnePassword::new();
-                backend
-                    .delete(&self.account)
-                    .map_err(|e| pay_core::Error::Config(format!("1Password delete: {e}")))?;
-            }
-            Keystore::File => {
-                // Don't delete user-managed files — just remove from accounts.yml
-                eprintln!(
-                    "{}",
-                    "  File-based keypair left on disk (remove it manually if needed).".dimmed()
-                );
-            }
+        let ks = keystore_for_kind(&keystore_kind)?;
+        if let Some(ks) = ks {
+            ks.delete(&self.account)
+                .map_err(|e| pay_core::Error::Config(format!("{keystore_kind} delete: {e}")))?;
+        } else {
+            // File-based — don't delete user-managed files
+            eprintln!(
+                "{}",
+                "  File-based keypair left on disk (remove it manually if needed).".dimmed()
+            );
         }
 
         // Remove from accounts.yml
@@ -186,17 +142,44 @@ impl DestroyCommand {
     }
 }
 
+/// Build a Keystore for the given kind, or None for File-based.
+fn keystore_for_kind(kind: &KeystoreKind) -> pay_core::Result<Option<Keystore>> {
+    match kind {
+        #[cfg(target_os = "macos")]
+        KeystoreKind::AppleKeychain => Ok(Some(Keystore::apple_keychain())),
+        #[cfg(not(target_os = "macos"))]
+        KeystoreKind::AppleKeychain => Err(pay_core::Error::Config(
+            "Cannot delete Keychain entries on this platform".to_string(),
+        )),
+
+        #[cfg(target_os = "linux")]
+        KeystoreKind::GnomeKeyring => Ok(Some(Keystore::gnome_keyring())),
+        #[cfg(not(target_os = "linux"))]
+        KeystoreKind::GnomeKeyring => Err(pay_core::Error::Config(
+            "Cannot delete GNOME Keyring entries on this platform".to_string(),
+        )),
+
+        #[cfg(target_os = "windows")]
+        KeystoreKind::WindowsHello => Ok(Some(Keystore::windows_hello())),
+        #[cfg(not(target_os = "windows"))]
+        KeystoreKind::WindowsHello => Err(pay_core::Error::Config(
+            "Cannot delete Windows Hello entries on this platform".to_string(),
+        )),
+
+        KeystoreKind::OnePassword => Ok(Some(Keystore::onepassword())),
+        KeystoreKind::File => Ok(None),
+    }
+}
+
 /// Probe keystores for a legacy account that predates accounts.yml.
 fn discover_legacy_account(name: &str) -> Option<Account> {
-    // Try macOS Keychain
     #[cfg(target_os = "macos")]
     {
-        use pay_core::keystore::AppleKeychain;
-        let kc = AppleKeychain;
-        if kc.exists(name) {
-            let pubkey = kc.pubkey(name).ok().map(|b| bs58::encode(&b).into_string());
+        let ks = Keystore::apple_keychain();
+        if ks.exists(name) {
+            let pubkey = ks.pubkey(name).ok().map(|b| bs58::encode(&b).into_string());
             return Some(Account {
-                keystore: Keystore::AppleKeychain,
+                keystore: KeystoreKind::AppleKeychain,
                 pubkey,
                 vault: None,
                 path: None,
@@ -204,15 +187,13 @@ fn discover_legacy_account(name: &str) -> Option<Account> {
         }
     }
 
-    // Try GNOME Keyring (Linux)
     #[cfg(target_os = "linux")]
     {
-        use pay_core::keystore::GnomeKeyring;
-        let kr = GnomeKeyring;
-        if kr.exists(name) {
-            let pubkey = kr.pubkey(name).ok().map(|b| bs58::encode(&b).into_string());
+        let ks = Keystore::gnome_keyring();
+        if ks.exists(name) {
+            let pubkey = ks.pubkey(name).ok().map(|b| bs58::encode(&b).into_string());
             return Some(Account {
-                keystore: Keystore::GnomeKeyring,
+                keystore: KeystoreKind::GnomeKeyring,
                 pubkey,
                 vault: None,
                 path: None,
@@ -220,14 +201,12 @@ fn discover_legacy_account(name: &str) -> Option<Account> {
         }
     }
 
-    // Try 1Password
     {
-        use pay_core::keystore::OnePassword;
-        let op = OnePassword::new();
-        if op.exists(name) {
-            let pubkey = op.pubkey(name).ok().map(|b| bs58::encode(&b).into_string());
+        let ks = Keystore::onepassword();
+        if ks.exists(name) {
+            let pubkey = ks.pubkey(name).ok().map(|b| bs58::encode(&b).into_string());
             return Some(Account {
-                keystore: Keystore::OnePassword,
+                keystore: KeystoreKind::OnePassword,
                 pubkey,
                 vault: None,
                 path: None,

@@ -122,3 +122,57 @@ fn parse_sol_amount(s: &str) -> Result<u64> {
     }
     Ok((sol * 1_000_000_000.0) as u64)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_sol_amount_one_sol() {
+        assert_eq!(parse_sol_amount("1.0").unwrap(), 1_000_000_000);
+    }
+
+    #[test]
+    fn parse_sol_amount_fractional() {
+        assert_eq!(parse_sol_amount("0.5").unwrap(), 500_000_000);
+    }
+
+    #[test]
+    fn parse_sol_amount_small() {
+        assert_eq!(parse_sol_amount("0.001").unwrap(), 1_000_000);
+    }
+
+    #[test]
+    fn parse_sol_amount_zero() {
+        assert_eq!(parse_sol_amount("0").unwrap(), 0);
+    }
+
+    #[test]
+    fn parse_sol_amount_integer() {
+        assert_eq!(parse_sol_amount("10").unwrap(), 10_000_000_000);
+    }
+
+    #[test]
+    fn parse_sol_amount_negative() {
+        assert!(parse_sol_amount("-1.0").is_err());
+    }
+
+    #[test]
+    fn parse_sol_amount_invalid() {
+        assert!(parse_sol_amount("abc").is_err());
+    }
+
+    #[test]
+    fn send_result_fields() {
+        let result = SendResult {
+            signature: "sig123".to_string(),
+            lamports: 1_000_000_000,
+            from: "from_pubkey".to_string(),
+            to: "to_pubkey".to_string(),
+        };
+        assert_eq!(result.signature, "sig123");
+        assert_eq!(result.lamports, 1_000_000_000);
+        assert_eq!(result.from, "from_pubkey");
+        assert_eq!(result.to, "to_pubkey");
+    }
+}

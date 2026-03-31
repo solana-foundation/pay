@@ -173,3 +173,363 @@ fn write_private(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
     #[cfg(not(unix))]
     std::fs::write(path, data)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keystore_display() {
+        assert_eq!(Keystore::AppleKeychain.to_string(), "apple-keychain");
+        assert_eq!(Keystore::GnomeKeyring.to_string(), "gnome-keyring");
+        assert_eq!(Keystore::WindowsHello.to_string(), "windows-hello");
+        assert_eq!(Keystore::OnePassword.to_string(), "1password");
+        assert_eq!(Keystore::File.to_string(), "file");
+    }
+
+    #[test]
+    fn keystore_serde_roundtrip() {
+        for ks in [
+            Keystore::AppleKeychain,
+            Keystore::GnomeKeyring,
+            Keystore::WindowsHello,
+            Keystore::OnePassword,
+            Keystore::File,
+        ] {
+            let json = serde_json::to_string(&ks).unwrap();
+            let back: Keystore = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, ks);
+        }
+    }
+
+    #[test]
+    fn signer_source_keychain() {
+        let account = Account {
+            keystore: Keystore::AppleKeychain,
+            pubkey: None,
+            vault: None,
+            path: None,
+        };
+        assert_eq!(account.signer_source("default"), "keychain:default");
+    }
+
+    #[test]
+    fn signer_source_gnome_keyring() {
+        let account = Account {
+            keystore: Keystore::GnomeKeyring,
+            pubkey: None,
+            vault: None,
+            path: None,
+        };
+        assert_eq!(account.signer_source("mykey"), "gnome-keyring:mykey");
+    }
+
+    #[test]
+    fn signer_source_windows_hello() {
+        let account = Account {
+            keystore: Keystore::WindowsHello,
+            pubkey: None,
+            vault: None,
+            path: None,
+        };
+        assert_eq!(account.signer_source("work"), "windows-hello:work");
+    }
+
+    #[test]
+    fn signer_source_onepassword() {
+        let account = Account {
+            keystore: Keystore::OnePassword,
+            pubkey: None,
+            vault: Some("Work".to_string()),
+            path: None,
+        };
+        assert_eq!(account.signer_source("work"), "1password:work");
+    }
+
+    #[test]
+    fn signer_source_file_with_path() {
+        let account = Account {
+            keystore: Keystore::File,
+            pubkey: None,
+            vault: None,
+            path: Some("/home/user/.config/solana/id.json".to_string()),
+        };
+        assert_eq!(
+            account.signer_source("legacy"),
+            "/home/user/.config/solana/id.json"
+        );
+    }
+
+    #[test]
+    fn signer_source_file_default_path() {
+        let account = Account {
+            keystore: Keystore::File,
+            pubkey: None,
+            vault: None,
+            path: None,
+        };
+        assert_eq!(
+            account.signer_source("myaccount"),
+            "~/.config/pay/myaccount.json"
+        );
+    }
+
+    #[test]
+    fn accounts_file_default_is_empty() {
+        let af = AccountsFile::default();
+        assert!(af.accounts.is_empty());
+        assert!(af.default_account.is_none());
+    }
+
+    #[test]
+    fn default_account_returns_none_when_empty() {
+        let af = AccountsFile::default();
+        // "default" key doesn't exist, so returns None
+        assert!(af.default_account().is_none());
+    }
+
+    #[test]
+    fn default_account_returns_explicit_default() {
+        let mut af = AccountsFile {
+            default_account: Some("work".to_string()),
+            ..Default::default()
+        };
+        af.accounts.insert(
+            "work".to_string(),
+            Account {
+                keystore: Keystore::OnePassword,
+                pubkey: None,
+                vault: None,
+                path: None,
+            },
+        );
+        let (name, _acct) = af.default_account().unwrap();
+        assert_eq!(name, "work");
+    }
+
+    #[test]
+    fn default_account_falls_back_to_default_name() {
+        let mut af = AccountsFile::default();
+        // No explicit default_account set, falls back to "default"
+        af.accounts.insert(
+            "default".to_string(),
+            Account {
+                keystore: Keystore::AppleKeychain,
+                pubkey: Some("abc123".to_string()),
+                vault: None,
+                path: None,
+            },
+        );
+        let (name, acct) = af.default_account().unwrap();
+        assert_eq!(name, "default");
+        assert_eq!(acct.pubkey.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn upsert_sets_default_on_first_insert() {
+        let mut af = AccountsFile::default();
+        af.upsert(
+            "first",
+            Account {
+                keystore: Keystore::File,
+                pubkey: None,
+                vault: None,
+                path: None,
+            },
+        );
+        assert_eq!(af.default_account.as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn upsert_does_not_change_existing_default() {
+        let mut af = AccountsFile::default();
+        af.upsert(
+            "first",
+            Account {
+                keystore: Keystore::File,
+                pubkey: None,
+                vault: None,
+                path: None,
+            },
+        );
+        af.upsert(
+            "second",
+            Account {
+                keystore: Keystore::File,
+                pubkey: None,
+                vault: None,
+                path: None,
+            },
+        );
+        assert_eq!(af.default_account.as_deref(), Some("first"));
+        assert_eq!(af.accounts.len(), 2);
+    }
+
+    #[test]
+    fn remove_clears_default_and_picks_next() {
+        let mut af = AccountsFile::default();
+        af.upsert(
+            "alpha",
+            Account {
+                keystore: Keystore::File,
+                pubkey: None,
+                vault: None,
+                path: None,
+            },
+        );
+        af.upsert(
+            "beta",
+            Account {
+                keystore: Keystore::File,
+                pubkey: None,
+                vault: None,
+                path: None,
+            },
+        );
+        assert_eq!(af.default_account.as_deref(), Some("alpha"));
+
+        let removed = af.remove("alpha");
+        assert!(removed.is_some());
+        // Should pick next available
+        assert_eq!(af.default_account.as_deref(), Some("beta"));
+    }
+
+    #[test]
+    fn remove_nonexistent_returns_none() {
+        let mut af = AccountsFile::default();
+        assert!(af.remove("nonexistent").is_none());
+    }
+
+    #[test]
+    fn remove_last_account_clears_default() {
+        let mut af = AccountsFile::default();
+        af.upsert(
+            "only",
+            Account {
+                keystore: Keystore::File,
+                pubkey: None,
+                vault: None,
+                path: None,
+            },
+        );
+        af.remove("only");
+        assert!(af.default_account.is_none());
+    }
+
+    #[test]
+    fn save_and_load_roundtrip() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("accounts.yml");
+
+        let mut af = AccountsFile::default();
+        af.upsert(
+            "test",
+            Account {
+                keystore: Keystore::File,
+                pubkey: Some("pubkey123".to_string()),
+                vault: None,
+                path: Some("/tmp/key.json".to_string()),
+            },
+        );
+
+        let yaml = serde_yml::to_string(&af).unwrap();
+        std::fs::write(&path, &yaml).unwrap();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let loaded: AccountsFile = serde_yml::from_str(&contents).unwrap();
+
+        assert_eq!(loaded.default_account.as_deref(), Some("test"));
+        assert_eq!(loaded.accounts.len(), 1);
+        let acct = loaded.accounts.get("test").unwrap();
+        assert_eq!(acct.keystore, Keystore::File);
+        assert_eq!(acct.pubkey.as_deref(), Some("pubkey123"));
+    }
+
+    #[test]
+    fn yaml_skip_serializing_none_fields() {
+        let account = Account {
+            keystore: Keystore::AppleKeychain,
+            pubkey: None,
+            vault: None,
+            path: None,
+        };
+        let yaml = serde_yml::to_string(&account).unwrap();
+        // None fields should be omitted
+        assert!(!yaml.contains("pubkey"));
+        assert!(!yaml.contains("vault"));
+        assert!(!yaml.contains("path"));
+    }
+
+    #[test]
+    fn yaml_includes_present_fields() {
+        let account = Account {
+            keystore: Keystore::OnePassword,
+            pubkey: Some("abc123".to_string()),
+            vault: Some("Work".to_string()),
+            path: None,
+        };
+        let yaml = serde_yml::to_string(&account).unwrap();
+        assert!(yaml.contains("pubkey"));
+        assert!(yaml.contains("vault"));
+        assert!(!yaml.contains("path"));
+    }
+
+    #[test]
+    fn accounts_file_multi_account_yaml() {
+        let mut af = AccountsFile::default();
+        af.upsert(
+            "default",
+            Account {
+                keystore: Keystore::AppleKeychain,
+                pubkey: Some("pk1".to_string()),
+                vault: None,
+                path: None,
+            },
+        );
+        af.upsert(
+            "work",
+            Account {
+                keystore: Keystore::OnePassword,
+                pubkey: Some("pk2".to_string()),
+                vault: Some("Work".to_string()),
+                path: None,
+            },
+        );
+
+        let yaml = serde_yml::to_string(&af).unwrap();
+        let loaded: AccountsFile = serde_yml::from_str(&yaml).unwrap();
+
+        assert_eq!(loaded.accounts.len(), 2);
+        assert_eq!(loaded.default_account.as_deref(), Some("default"));
+        assert_eq!(
+            loaded.accounts["work"].vault.as_deref(),
+            Some("Work")
+        );
+    }
+
+    #[test]
+    fn upsert_overwrites_existing() {
+        let mut af = AccountsFile::default();
+        af.upsert(
+            "test",
+            Account {
+                keystore: Keystore::File,
+                pubkey: Some("old".to_string()),
+                vault: None,
+                path: None,
+            },
+        );
+        af.upsert(
+            "test",
+            Account {
+                keystore: Keystore::AppleKeychain,
+                pubkey: Some("new".to_string()),
+                vault: None,
+                path: None,
+            },
+        );
+        assert_eq!(af.accounts.len(), 1);
+        assert_eq!(af.accounts["test"].pubkey.as_deref(), Some("new"));
+        assert_eq!(af.accounts["test"].keystore, Keystore::AppleKeychain);
+    }
+}
