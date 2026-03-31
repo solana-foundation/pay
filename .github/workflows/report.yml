@@ -6,19 +6,26 @@ on:
     types: [completed]
 
 permissions:
-  contents: read
+  contents: write
   pull-requests: write
   actions: read
 
 jobs:
   report:
-    name: Coverage Report
+    name: Coverage & Report
     if: github.event.workflow_run.event == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      # Download coverage artifacts from CI
+      # Download all artifacts from the CI run
+      - uses: actions/download-artifact@v4
+        with:
+          name: ts-coverage
+          path: ts-cov
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
       - uses: actions/download-artifact@v4
         with:
           name: rust-coverage
@@ -26,11 +33,10 @@ jobs:
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
         continue-on-error: true
-
       - uses: actions/download-artifact@v4
         with:
-          name: ts-coverage
-          path: ts-cov
+          name: surfpool-reports-rust
+          path: surfpool-reports
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
         continue-on-error: true
@@ -47,16 +53,20 @@ jobs:
       - name: Get PR number
         id: pr
         run: |
-          PR=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}" --jq '.pull_requests[0].number' 2>/dev/null || true)
+          PR=$(gh api repos/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}/artifacts 2>/dev/null | jq -r '.artifacts[0].workflow_run.pull_requests[0].number // empty' 2>/dev/null || true)
+          if [ -z "$PR" ]; then
+            PR=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}" --jq '.pull_requests[0].number' 2>/dev/null || true)
+          fi
           echo "number=$PR" >> "$GITHUB_OUTPUT"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # Post coverage comment
+      # Post unified coverage + surfpool report comment
       - name: Post test report
         if: steps.pr.outputs.number != ''
         uses: ./_surfpool/.github/actions/test-report
         with:
-          rust-coverage-json: rust-cov/coverage.json
           ts-coverage-json: ts-cov/coverage-summary.json
+          rust-coverage-json: rust-cov/coverage.json
           comment-header: coverage
+          pages-path: pr/${{ steps.pr.outputs.number }}

@@ -69,10 +69,19 @@ jobs:
         with:
           workspaces: rust
       - name: Run tests with coverage
-        run: cargo llvm-cov --workspace --features server --exclude pay --json --output-path coverage.json
+        env:
+          SURFPOOL_REPORT: "1"
+        run: cargo llvm-cov --workspace --features server --exclude pay --ignore-filename-regex 'crates/cli/' --json --output-path coverage.json
       - name: Upload Rust coverage
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: rust-coverage
           path: rust/coverage.json
+      - name: Upload Rust surfpool report data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surfpool-reports-rust
+          path: rust/target/surfpool-reports/
+          if-no-files-found: ignore
