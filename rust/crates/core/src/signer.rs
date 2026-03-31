@@ -44,7 +44,7 @@ fn load_from_keystore_backend(backend: &str, account: &str, reason: &str) -> Res
         "keychain" => {
             return Err(Error::Config(
                 "Keychain not available on this platform".to_string(),
-            ))
+            ));
         }
 
         #[cfg(target_os = "linux")]
@@ -53,7 +53,7 @@ fn load_from_keystore_backend(backend: &str, account: &str, reason: &str) -> Res
         "gnome-keyring" => {
             return Err(Error::Config(
                 "GNOME Keyring not available on this platform".to_string(),
-            ))
+            ));
         }
 
         #[cfg(target_os = "windows")]
@@ -62,7 +62,7 @@ fn load_from_keystore_backend(backend: &str, account: &str, reason: &str) -> Res
         "windows-hello" => {
             return Err(Error::Config(
                 "Windows Hello not available on this platform".to_string(),
-            ))
+            ));
         }
 
         "1password" => crate::keystore::Keystore::onepassword(),
@@ -70,7 +70,7 @@ fn load_from_keystore_backend(backend: &str, account: &str, reason: &str) -> Res
         _ => {
             return Err(Error::Config(format!(
                 "Unknown keystore backend: {backend}"
-            )))
+            )));
         }
     };
 
@@ -134,10 +134,12 @@ mod tests {
         {
             let result = load_signer("windows-hello:default");
             assert!(result.is_err());
-            assert!(result
-                .unwrap_err()
-                .to_string()
-                .contains("not available on this platform"));
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("not available on this platform")
+            );
         }
     }
 }

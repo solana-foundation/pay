@@ -501,10 +501,7 @@ mod tests {
 
         assert_eq!(loaded.accounts.len(), 2);
         assert_eq!(loaded.default_account.as_deref(), Some("default"));
-        assert_eq!(
-            loaded.accounts["work"].vault.as_deref(),
-            Some("Work")
-        );
+        assert_eq!(loaded.accounts["work"].vault.as_deref(), Some("Work"));
     }
 
     #[test]

@@ -68,10 +68,9 @@ impl Command {
             Command::Fetch(_) => ToolKind::Fetch,
             Command::Claude(_) => ToolKind::Claude,
             Command::Codex(_) => ToolKind::Codex,
-            Command::Account { .. }
-            | Command::Send(_)
-            | Command::Setup(_)
-            | Command::Topup(_) => ToolKind::Mcp,
+            Command::Account { .. } | Command::Send(_) | Command::Setup(_) | Command::Topup(_) => {
+                ToolKind::Mcp
+            }
             Command::Mcp => ToolKind::Mcp,
         }
     }

@@ -1068,9 +1068,33 @@ fn render_card_panel(
 
 fn solana_logo(prefix: &'static str) -> Vec<Line<'static>> {
     vec![
-        solana_logo_line(prefix, "⣠⣶", SOLANA_BLUE, "⣶⣶", SOLANA_GREEN, "⣶⣶⠖", SOLANA_GREEN),
-        solana_logo_line(prefix, "⠲⣶", SOLANA_PURPLE, "⣶⣶", SOLANA_BLUE, "⣶⣶⣄", SOLANA_GREEN),
-        solana_logo_line(prefix, "⣠⣶", SOLANA_PURPLE, "⣶⣶", SOLANA_PURPLE, "⣶⣶⠖", SOLANA_BLUE),
+        solana_logo_line(
+            prefix,
+            "⣠⣶",
+            SOLANA_BLUE,
+            "⣶⣶",
+            SOLANA_GREEN,
+            "⣶⣶⠖",
+            SOLANA_GREEN,
+        ),
+        solana_logo_line(
+            prefix,
+            "⠲⣶",
+            SOLANA_PURPLE,
+            "⣶⣶",
+            SOLANA_BLUE,
+            "⣶⣶⣄",
+            SOLANA_GREEN,
+        ),
+        solana_logo_line(
+            prefix,
+            "⣠⣶",
+            SOLANA_PURPLE,
+            "⣶⣶",
+            SOLANA_PURPLE,
+            "⣶⣶⠖",
+            SOLANA_BLUE,
+        ),
     ]
 }
 

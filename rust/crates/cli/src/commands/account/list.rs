@@ -11,7 +11,10 @@ impl ListCommand {
         let accounts = pay_core::accounts::AccountsFile::load()?;
 
         if accounts.accounts.is_empty() {
-            eprintln!("{}", "No accounts found. Run `pay account new` to create one.".dimmed());
+            eprintln!(
+                "{}",
+                "No accounts found. Run `pay account new` to create one.".dimmed()
+            );
             return Ok(());
         }
 
@@ -69,9 +72,7 @@ impl ListCommand {
                 "—".to_string()
             };
 
-            eprintln!(
-                "  {marker} {name:<12} {pubkey_display:<14} {backend:<16} {balance_str}",
-            );
+            eprintln!("  {marker} {name:<12} {pubkey_display:<14} {backend:<16} {balance_str}",);
         }
 
         eprintln!();

@@ -92,9 +92,7 @@ fn process_start_time() -> Result<u64> {
     fields
         .get(19)
         .and_then(|s| s.parse::<u64>().ok())
-        .ok_or_else(|| {
-            Error::Backend("parse /proc/self/stat: starttime field missing".to_string())
-        })
+        .ok_or_else(|| Error::Backend("parse /proc/self/stat: starttime field missing".to_string()))
 }
 
 // ── Secret Service store ────────────────────────────────────────────────────
@@ -235,11 +233,7 @@ async fn ensure_unlocked(col: &secret_service::Collection<'_>) -> Result<()> {
     Ok(())
 }
 
-async fn store_item(
-    col: &secret_service::Collection<'_>,
-    key: &str,
-    secret: &[u8],
-) -> Result<()> {
+async fn store_item(col: &secret_service::Collection<'_>, key: &str, secret: &[u8]) -> Result<()> {
     col.create_item(
         &format!("pay/{key}"),
         attrs(key),

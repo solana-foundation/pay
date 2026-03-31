@@ -108,9 +108,7 @@ fn keystore_for_backend(backend: &str) -> pay_core::Result<Keystore> {
 
         "1password" => Ok(Keystore::onepassword()),
 
-        other => Err(pay_core::Error::Config(format!(
-            "Unknown backend: {other}"
-        ))),
+        other => Err(pay_core::Error::Config(format!("Unknown backend: {other}"))),
     }
 }
 

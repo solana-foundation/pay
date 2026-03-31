@@ -39,7 +39,12 @@ impl AuthGate for TouchId {
     fn is_available(&self) -> bool {
         helper_path()
             .ok()
-            .and_then(|binary| Command::new(&binary).args(["check-biometrics"]).output().ok())
+            .and_then(|binary| {
+                Command::new(&binary)
+                    .args(["check-biometrics"])
+                    .output()
+                    .ok()
+            })
             .map(|out| String::from_utf8_lossy(&out.stdout).trim() == "yes")
             .unwrap_or(false)
     }

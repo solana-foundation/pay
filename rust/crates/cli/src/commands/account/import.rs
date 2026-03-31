@@ -55,13 +55,7 @@ impl ImportCommand {
         ks.import(&self.name, &keypair_bytes, sync)
             .map_err(|e| pay_core::Error::Config(format!("{e}")))?;
 
-        super::new::save_account(
-            &self.name,
-            keystore_kind,
-            &pubkey_b58,
-            self.vault,
-            None,
-        )?;
+        super::new::save_account(&self.name, keystore_kind, &pubkey_b58, self.vault, None)?;
 
         eprintln!();
         eprintln!("  {} {pubkey_b58}", "Imported:".dimmed());
@@ -84,7 +78,9 @@ fn build_keystore(
             "Stored in macOS Keychain.",
         )),
         #[cfg(not(target_os = "macos"))]
-        "keychain" => Err(pay_core::Error::Config("Keychain is only available on macOS".into())),
+        "keychain" => Err(pay_core::Error::Config(
+            "Keychain is only available on macOS".into(),
+        )),
 
         #[cfg(target_os = "linux")]
         "gnome-keyring" => Ok((
@@ -93,7 +89,9 @@ fn build_keystore(
             "Stored in GNOME Keyring.",
         )),
         #[cfg(not(target_os = "linux"))]
-        "gnome-keyring" => Err(pay_core::Error::Config("GNOME Keyring is only available on Linux".into())),
+        "gnome-keyring" => Err(pay_core::Error::Config(
+            "GNOME Keyring is only available on Linux".into(),
+        )),
 
         #[cfg(target_os = "windows")]
         "windows-hello" => Ok((
@@ -102,14 +100,20 @@ fn build_keystore(
             "Stored in Windows Credential Manager.",
         )),
         #[cfg(not(target_os = "windows"))]
-        "windows-hello" => Err(pay_core::Error::Config("Windows Hello is only available on Windows".into())),
+        "windows-hello" => Err(pay_core::Error::Config(
+            "Windows Hello is only available on Windows".into(),
+        )),
 
         "1password" => {
             let ks = match vault {
                 Some(v) => Keystore::onepassword_with_vault(v),
                 None => Keystore::onepassword(),
             };
-            Ok((ks, pay_core::accounts::Keystore::OnePassword, "Stored in 1Password."))
+            Ok((
+                ks,
+                pay_core::accounts::Keystore::OnePassword,
+                "Stored in 1Password.",
+            ))
         }
 
         other => Err(pay_core::Error::Config(format!("Unknown backend: {other}"))),

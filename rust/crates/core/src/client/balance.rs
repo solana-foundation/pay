@@ -201,7 +201,10 @@ mod tests {
 
     #[test]
     fn mint_symbol_unknown() {
-        assert_eq!(mint_symbol("SomeRandomMint1111111111111111111111111111"), None);
+        assert_eq!(
+            mint_symbol("SomeRandomMint1111111111111111111111111111"),
+            None
+        );
     }
 
     #[test]

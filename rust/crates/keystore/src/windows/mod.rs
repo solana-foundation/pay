@@ -67,9 +67,9 @@ impl AuthGate for WindowsHelloAuth {
             UserConsentVerificationResult::RetriesExhausted => {
                 Err(Error::AuthDenied("Windows Hello: too many attempts".into()))
             }
-            UserConsentVerificationResult::DisabledByPolicy => {
-                Err(Error::AuthDenied("Windows Hello: disabled by policy".into()))
-            }
+            UserConsentVerificationResult::DisabledByPolicy => Err(Error::AuthDenied(
+                "Windows Hello: disabled by policy".into(),
+            )),
             UserConsentVerificationResult::NotConfiguredForUser => Err(Error::AuthDenied(
                 "Windows Hello: not configured — set up in Settings first".into(),
             )),
@@ -120,8 +120,7 @@ fn cred_write(target: &[u16], blob: &[u8]) -> Result<()> {
         Persist: CRED_PERSIST_LOCAL_MACHINE,
         ..Default::default()
     };
-    unsafe { CredWriteW(&cred, 0) }
-        .map_err(|e| Error::Backend(format!("CredWriteW failed: {e}")))
+    unsafe { CredWriteW(&cred, 0) }.map_err(|e| Error::Backend(format!("CredWriteW failed: {e}")))
 }
 
 fn cred_read(target: &[u16]) -> Result<Zeroizing<Vec<u8>>> {

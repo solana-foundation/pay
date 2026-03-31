@@ -27,7 +27,12 @@ pub struct NewCommand {
 
 impl NewCommand {
     pub fn run(self) -> pay_core::Result<()> {
-        let pubkey = create_account(&self.name, self.backend.as_deref(), self.vault.as_deref(), self.force)?;
+        let pubkey = create_account(
+            &self.name,
+            self.backend.as_deref(),
+            self.vault.as_deref(),
+            self.force,
+        )?;
         eprintln!();
         eprintln!("  {} {pubkey}", "Your account:".dimmed());
         eprintln!();
@@ -51,12 +56,17 @@ pub fn create_account(
     let (ks, keystore_kind, backend_msg) = build_keystore(&backend_id, vault)?;
 
     if ks.exists(name) && !force {
-        let pubkey = ks.pubkey(name).map_err(|e| pay_core::Error::Config(format!("{e}")))?;
+        let pubkey = ks
+            .pubkey(name)
+            .map_err(|e| pay_core::Error::Config(format!("{e}")))?;
         let pubkey_b58 = bs58::encode(&pubkey).into_string();
         eprintln!();
         eprintln!("  {} {pubkey_b58}", "Your account:".dimmed());
         eprintln!();
-        eprintln!("{}", "  Account already exists. Use --force to replace it.".dimmed());
+        eprintln!(
+            "{}",
+            "  Account already exists. Use --force to replace it.".dimmed()
+        );
         eprintln!();
         return Ok(pubkey_b58);
     }
@@ -80,7 +90,13 @@ pub fn create_account(
 
     eprintln!("{}", format!("  {backend_msg}").dimmed());
 
-    save_account(name, keystore_kind, &pubkey_b58, vault.map(|v| v.to_string()), None)?;
+    save_account(
+        name,
+        keystore_kind,
+        &pubkey_b58,
+        vault.map(|v| v.to_string()),
+        None,
+    )?;
 
     Ok(pubkey_b58)
 }
@@ -194,8 +210,11 @@ pub fn pick_backend() -> pay_core::Result<String> {
         let gnome_available = Keystore::gnome_keyring_available();
         options.push(Opt {
             id: "gnome-keyring",
-            label: if gnome_available { "GNOME Keyring (password prompt)".into() }
-                   else { "GNOME Keyring — not available (desktop session required)".into() },
+            label: if gnome_available {
+                "GNOME Keyring (password prompt)".into()
+            } else {
+                "GNOME Keyring — not available (desktop session required)".into()
+            },
             available: gnome_available,
         });
     }
@@ -205,22 +224,35 @@ pub fn pick_backend() -> pay_core::Result<String> {
         let wh_available = Keystore::windows_hello_available();
         options.push(Opt {
             id: "windows-hello",
-            label: if wh_available { "Windows Hello (fingerprint / face / PIN)".into() }
-                   else { "Windows Hello — not configured".into() },
+            label: if wh_available {
+                "Windows Hello (fingerprint / face / PIN)".into()
+            } else {
+                "Windows Hello — not configured".into()
+            },
             available: wh_available,
         });
     }
 
     options.push(Opt {
         id: "1password",
-        label: if op_available { "1Password".into() }
-               else { "1Password — `op` CLI not found".into() },
+        label: if op_available {
+            "1Password".into()
+        } else {
+            "1Password — `op` CLI not found".into()
+        },
         available: op_available,
     });
 
-    let items: Vec<String> = options.iter().map(|o| {
-        if o.available { o.label.clone() } else { format!("{}", o.label.dimmed()) }
-    }).collect();
+    let items: Vec<String> = options
+        .iter()
+        .map(|o| {
+            if o.available {
+                o.label.clone()
+            } else {
+                format!("{}", o.label.dimmed())
+            }
+        })
+        .collect();
 
     let default = options.iter().position(|o| o.available).unwrap_or(0);
 
@@ -234,7 +266,9 @@ pub fn pick_backend() -> pay_core::Result<String> {
 
     let chosen = &options[selection];
     if !chosen.available {
-        return Err(pay_core::Error::Config("Selected backend is not available.".to_string()));
+        return Err(pay_core::Error::Config(
+            "Selected backend is not available.".to_string(),
+        ));
     }
 
     Ok(chosen.id.to_string())

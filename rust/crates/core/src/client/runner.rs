@@ -404,7 +404,8 @@ HTTP request sent, awaiting response...
 
     #[test]
     fn parse_headers_lowercase_keys() {
-        let raw = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Custom-Header: value\r\n\r\n";
+        let raw =
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Custom-Header: value\r\n\r\n";
         let (_, headers) = parse_http_headers(raw);
         // Keys should be lowercased
         assert!(headers.iter().any(|(k, _)| k == "content-type"));

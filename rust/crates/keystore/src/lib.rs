@@ -10,10 +10,10 @@ pub mod auth;
 mod error;
 pub mod store;
 
-#[cfg(target_os = "macos")]
-pub mod macos;
 #[cfg(target_os = "linux")]
 pub mod linux;
+#[cfg(target_os = "macos")]
+pub mod macos;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
@@ -259,7 +259,12 @@ mod tests {
         let ks = Keystore::in_memory();
         let result = ks.import("test", &[0u8; 32], SyncMode::ThisDeviceOnly);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("expected 64 bytes"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("expected 64 bytes")
+        );
     }
 
     #[test]
@@ -302,8 +307,8 @@ mod tests {
 
     #[test]
     fn auth_on_write() {
-        use std::sync::atomic::{AtomicU32, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
 
         struct CountingAuth(Arc<AtomicU32>);
         impl AuthGate for CountingAuth {
@@ -336,8 +341,8 @@ mod tests {
 
     #[test]
     fn no_auth_on_write() {
-        use std::sync::atomic::{AtomicU32, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
 
         struct CountingAuth(Arc<AtomicU32>);
         impl AuthGate for CountingAuth {

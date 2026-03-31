@@ -428,11 +428,7 @@ mod tests {
 
     #[test]
     fn sku_level_serde() {
-        for level in [
-            SkuLevel::Essentials,
-            SkuLevel::Pro,
-            SkuLevel::Enterprise,
-        ] {
+        for level in [SkuLevel::Essentials, SkuLevel::Pro, SkuLevel::Enterprise] {
             let json = serde_json::to_string(&level).unwrap();
             let back: SkuLevel = serde_json::from_str(&json).unwrap();
             assert_eq!(format!("{:?}", back), format!("{:?}", level));
