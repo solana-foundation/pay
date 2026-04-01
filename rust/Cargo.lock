@@ -5482,7 +5482,7 @@ checksum = "b867cad97c0791bbd3aaa6472142568c6c9e8f71937e98379f584cfb0cf35bec"
 
 [[package]]
 name = "pay"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "bs58",
@@ -5513,7 +5513,7 @@ dependencies = [
 
 [[package]]
 name = "pay-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -5549,7 +5549,7 @@ dependencies = [
 
 [[package]]
 name = "pay-integration"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pay-core",
  "pay-types",
@@ -5558,7 +5558,7 @@ dependencies = [
 
 [[package]]
 name = "pay-keystore"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "secret-service",
  "serde",
@@ -5573,7 +5573,7 @@ dependencies = [
 
 [[package]]
 name = "pay-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pay-core",
  "pay-keystore",
@@ -5588,7 +5588,7 @@ dependencies = [
 
 [[package]]
 name = "pay-types"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "schemars 0.8.22",
  "serde",
