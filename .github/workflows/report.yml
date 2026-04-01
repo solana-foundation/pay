@@ -59,12 +59,24 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # Post unified coverage + surfpool report comment
-      - name: Post test report
+      # Build coverage comment (reuse surfpool action for the body)
+      - name: Build coverage body
         if: steps.pr.outputs.number != ''
+        id: cov
         uses: ./_surfpool/.github/actions/test-report
         with:
           ts-coverage-json: ts-cov/coverage-summary.json
           rust-coverage-json: rust-cov/coverage.json
           comment-header: coverage
           pages-path: pr/${{ steps.pr.outputs.number }}
+
+      # The surfpool action skips posting because event_name != 'pull_request'.
+      # Post it ourselves with the explicit PR number.
+      - name: Post comment
+        if: steps.pr.outputs.number != '' && steps.cov.outputs.body != ''
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: coverage
+          number: ${{ steps.pr.outputs.number }}
+          message: ${{ steps.cov.outputs.body }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
