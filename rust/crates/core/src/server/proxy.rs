@@ -3,11 +3,14 @@
 //! Resolves the upstream from `ApiSpec.forward_url`, forwards headers and body,
 //! returns the upstream response. Strips hop-by-hop and payment headers.
 
+use std::sync::Arc;
+
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::response::Response;
 use pay_types::metering::{ApiSpec, AuthConfig};
 use serde_json::json;
+use tokio::sync::RwLock;
 
 /// Headers to strip when forwarding to upstream.
 const STRIP_HEADERS: &[&str] = &[
@@ -37,27 +40,18 @@ pub async fn forward_request(
         .map(|pq| pq.as_str())
         .unwrap_or(uri.path());
 
-    // Build upstream URL, injecting query param auth if configured.
-    let upstream_url = match &api.forward.auth {
-        Some(AuthConfig::QueryParam { key, env }) => {
-            let secret = std::env::var(env).unwrap_or_default();
-            let separator = if path_and_query.contains('?') {
-                "&"
-            } else {
-                "?"
-            };
-            format!(
-                "{}{}{separator}{key}={secret}",
-                api.forward.url.trim_end_matches('/'),
-                path_and_query,
-            )
-        }
-        _ => format!(
-            "{}{}",
-            api.forward.url.trim_end_matches('/'),
-            path_and_query,
-        ),
-    };
+    // Build upstream URL (with path rewrites), then inject query param auth if configured.
+    let mut upstream_url = api.forward.upstream_url(path_and_query);
+
+    if let Some(AuthConfig::QueryParam {
+        key,
+        value_from_env,
+    }) = &api.forward.auth
+    {
+        let secret = std::env::var(value_from_env).unwrap_or_default();
+        let separator = if upstream_url.contains('?') { "&" } else { "?" };
+        upstream_url = format!("{upstream_url}{separator}{key}={secret}");
+    }
 
     tracing::debug!(
         subdomain = %api.subdomain,
@@ -82,14 +76,53 @@ pub async fn forward_request(
         }
     }
 
-    // Inject header-based auth if configured.
-    if let Some(AuthConfig::Header { key, prefix, env }) = &api.forward.auth {
-        let secret = std::env::var(env).unwrap_or_default();
-        let value = match prefix {
-            Some(p) => format!("{p}{secret}"),
-            None => secret,
-        };
-        upstream_req = upstream_req.header(key.as_str(), value);
+    // Inject auth header if configured.
+    match &api.forward.auth {
+        Some(AuthConfig::Header {
+            key,
+            prefix,
+            value_from_env,
+        }) => {
+            let secret = std::env::var(value_from_env).unwrap_or_default();
+            let value = match prefix {
+                Some(p) => format!("{p}{secret}"),
+                None => secret,
+            };
+            upstream_req = upstream_req.header(key.as_str(), value);
+        }
+        Some(AuthConfig::Oauth2 {
+            token_url,
+            scopes,
+            client_id_from_env,
+            client_secret_from_env,
+            headers,
+        }) => {
+            match oauth2_token(
+                token_url,
+                scopes,
+                client_id_from_env.as_deref(),
+                client_secret_from_env.as_deref(),
+            )
+            .await
+            {
+                Ok(token) => {
+                    upstream_req = upstream_req.header("authorization", format!("Bearer {token}"));
+                    for (header_name, env_ref) in headers {
+                        if let Ok(val) = std::env::var(&env_ref.from_env) {
+                            upstream_req = upstream_req.header(header_name.as_str(), val);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to fetch OAuth2 token");
+                    return Err(error_response(
+                        StatusCode::BAD_GATEWAY,
+                        &format!("OAuth2 token error: {e}"),
+                    ));
+                }
+            }
+        }
+        _ => {}
     }
 
     // Forward body.
@@ -106,7 +139,13 @@ pub async fn forward_request(
     let status = StatusCode::from_u16(upstream_resp.status().as_u16())
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let mut response_headers = HeaderMap::new();
+    // Skip headers that reqwest handles (it auto-decompresses gzip).
+    let skip_response_headers = ["content-encoding", "content-length", "transfer-encoding"];
     for (name, value) in upstream_resp.headers() {
+        let name_lower = name.as_str();
+        if skip_response_headers.contains(&name_lower) {
+            continue;
+        }
         if let (Ok(n), Ok(v)) = (
             axum::http::header::HeaderName::from_bytes(name.as_str().as_bytes()),
             HeaderValue::from_bytes(value.as_bytes()),
@@ -149,6 +188,170 @@ pub fn error_response(status: StatusCode, message: &str) -> Response {
         .unwrap()
 }
 
+// =============================================================================
+// GCP OAuth2 token cache
+// =============================================================================
+
+/// Cached OAuth2 token with expiry.
+struct CachedToken {
+    access_token: String,
+    expires_at: std::time::Instant,
+}
+
+static OAUTH2_TOKEN_CACHE: std::sync::OnceLock<Arc<RwLock<Option<CachedToken>>>> =
+    std::sync::OnceLock::new();
+
+fn token_cache() -> &'static Arc<RwLock<Option<CachedToken>>> {
+    OAUTH2_TOKEN_CACHE.get_or_init(|| Arc::new(RwLock::new(None)))
+}
+
+/// Fetch an OAuth2 access token, using a cached value if still valid.
+async fn oauth2_token(
+    token_url: &str,
+    scopes: &[String],
+    client_id_env: Option<&str>,
+    client_secret_env: Option<&str>,
+) -> Result<String, String> {
+    // Check cache.
+    {
+        let cache = token_cache().read().await;
+        if let Some(ref cached) = *cache
+            && cached.expires_at > std::time::Instant::now() + std::time::Duration::from_secs(30)
+        {
+            return Ok(cached.access_token.clone());
+        }
+    }
+
+    let token = fetch_oauth2_token(token_url, scopes, client_id_env, client_secret_env).await?;
+
+    // Cache (assume ~1h validity, refresh 5min early).
+    {
+        let mut cache = token_cache().write().await;
+        *cache = Some(CachedToken {
+            access_token: token.clone(),
+            expires_at: std::time::Instant::now() + std::time::Duration::from_secs(3300),
+        });
+    }
+
+    Ok(token)
+}
+
+async fn fetch_oauth2_token(
+    token_url: &str,
+    scopes: &[String],
+    client_id_env: Option<&str>,
+    client_secret_env: Option<&str>,
+) -> Result<String, String> {
+    let client = reqwest::Client::new();
+
+    // Special: GCP metadata server.
+    if token_url == "gcp_metadata" {
+        return fetch_gcp_metadata_token(&client, scopes).await;
+    }
+
+    // Standard OAuth2 client_credentials grant.
+    let client_id = client_id_env
+        .and_then(|e| std::env::var(e).ok())
+        .ok_or("OAuth2 client_id env var not set")?;
+    let client_secret = client_secret_env
+        .and_then(|e| std::env::var(e).ok())
+        .ok_or("OAuth2 client_secret env var not set")?;
+
+    let mut params = vec![
+        ("grant_type", "client_credentials".to_string()),
+        ("client_id", client_id),
+        ("client_secret", client_secret),
+    ];
+    if !scopes.is_empty() {
+        params.push(("scope", scopes.join(" ")));
+    }
+
+    let resp = client
+        .post(token_url)
+        .form(&params)
+        .send()
+        .await
+        .map_err(|e| format!("OAuth2 token request failed: {e}"))?;
+
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Invalid OAuth2 response: {e}"))?;
+
+    body["access_token"]
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| format!("No access_token in response: {body}"))
+}
+
+/// Fetch token from GCP metadata server (Cloud Run / GCE).
+/// Falls back to Application Default Credentials for local dev.
+async fn fetch_gcp_metadata_token(
+    client: &reqwest::Client,
+    scopes: &[String],
+) -> Result<String, String> {
+    let scopes_param = scopes.join(",");
+
+    // 1. Metadata server.
+    let url = format!(
+        "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token?scopes={scopes_param}"
+    );
+    if let Ok(resp) = client
+        .get(&url)
+        .header("Metadata-Flavor", "Google")
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await
+        && resp.status().is_success()
+        && let Ok(body) = resp.json::<serde_json::Value>().await
+        && let Some(token) = body["access_token"].as_str()
+    {
+        tracing::debug!("OAuth2 token from GCP metadata server");
+        return Ok(token.to_string());
+    }
+
+    // 2. Application Default Credentials (local dev).
+    let adc_path = std::env::var("GOOGLE_APPLICATION_CREDENTIALS").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_default();
+        format!("{home}/.config/gcloud/application_default_credentials.json")
+    });
+    let adc_content = std::fs::read_to_string(&adc_path)
+        .map_err(|e| format!("No metadata server and can't read ADC at {adc_path}: {e}"))?;
+    let adc: serde_json::Value =
+        serde_json::from_str(&adc_content).map_err(|e| format!("Invalid ADC: {e}"))?;
+
+    let resp = client
+        .post("https://oauth2.googleapis.com/token")
+        .form(&[
+            ("client_id", adc["client_id"].as_str().unwrap_or_default()),
+            (
+                "client_secret",
+                adc["client_secret"].as_str().unwrap_or_default(),
+            ),
+            (
+                "refresh_token",
+                adc["refresh_token"].as_str().unwrap_or_default(),
+            ),
+            ("grant_type", "refresh_token"),
+        ])
+        .send()
+        .await
+        .map_err(|e| format!("ADC token refresh failed: {e}"))?;
+
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Invalid token response: {e}"))?;
+
+    body["access_token"]
+        .as_str()
+        .map(|s| {
+            tracing::debug!("OAuth2 token from ADC");
+            s.to_string()
+        })
+        .ok_or_else(|| format!("No access_token: {body}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,8 +365,10 @@ mod tests {
             description: "".to_string(),
             category: pay_types::metering::ApiCategory::AiMl,
             version: "1.0".to_string(),
+            env: std::collections::HashMap::new(),
             forward: ForwardConfig {
                 url: "https://api.example.com".to_string(),
+                path_rewrites: vec![],
                 auth: None,
             },
             accounting: pay_types::metering::AccountingMode::Pooled,
@@ -240,6 +445,7 @@ mod tests {
         let api = ApiSpec {
             forward: ForwardConfig {
                 url: base_url.clone(),
+                path_rewrites: vec![],
                 auth: None,
             },
             ..make_api("test")
@@ -267,6 +473,7 @@ mod tests {
         let api = ApiSpec {
             forward: ForwardConfig {
                 url: base_url.clone(),
+                path_rewrites: vec![],
                 auth: None,
             },
             ..make_api("test")
@@ -306,6 +513,7 @@ mod tests {
         let api = ApiSpec {
             forward: ForwardConfig {
                 url: base_url.clone(),
+                path_rewrites: vec![],
                 auth: None,
             },
             ..make_api("test")
@@ -335,6 +543,7 @@ mod tests {
         let api = ApiSpec {
             forward: ForwardConfig {
                 url: base_url.clone(),
+                path_rewrites: vec![],
                 auth: None,
             },
             ..make_api("test")
@@ -352,6 +561,7 @@ mod tests {
         let api = ApiSpec {
             forward: ForwardConfig {
                 url: "http://127.0.0.1:1".to_string(),
+                path_rewrites: vec![],
                 auth: None,
             }, // nothing listening
             ..make_api("test")
@@ -379,6 +589,7 @@ mod tests {
         let api = ApiSpec {
             forward: ForwardConfig {
                 url: base_url.clone(),
+                path_rewrites: vec![],
                 auth: None,
             },
             ..make_api("test")
@@ -395,5 +606,45 @@ mod tests {
         let qs = String::from_utf8(body.to_vec()).unwrap();
         assert!(qs.contains("q=hello"));
         assert!(qs.contains("limit=10"));
+    }
+
+    #[tokio::test]
+    async fn forward_request_with_path_rewrite() {
+        use pay_types::metering::PathRewrite;
+
+        // Upstream expects the operator's project ID in the path.
+        let app = axum::Router::new().route(
+            "/v3/projects/operator-proj/translate",
+            axum::routing::post(|| async { "translated" }),
+        );
+        let (base_url, _handle) = spawn_upstream(app).await;
+
+        // SAFETY: test-only, single-threaded
+        unsafe { std::env::set_var("_TEST_FWD_PROJECT", "operator-proj") };
+        let api = ApiSpec {
+            forward: ForwardConfig {
+                url: base_url.clone(),
+                path_rewrites: vec![PathRewrite {
+                    prefix: "v3/projects/{projectId}".to_string(),
+                    env: "_TEST_FWD_PROJECT".to_string(),
+                }],
+                auth: None,
+            },
+            ..make_api("test")
+        };
+
+        // Client sends their own project ID — rewrite substitutes it.
+        let uri: Uri = format!("{base_url}/v3/projects/client-proj/translate")
+            .parse()
+            .unwrap();
+        let result =
+            forward_request(&api, Method::POST, &uri, &HeaderMap::new(), Bytes::new()).await;
+
+        let resp = result.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(&body[..], b"translated");
+
+        unsafe { std::env::remove_var("_TEST_FWD_PROJECT") };
     }
 }

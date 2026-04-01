@@ -517,8 +517,10 @@ mod tests {
             description: "".to_string(),
             category: pay_types::metering::ApiCategory::AiMl,
             version: "1.0".to_string(),
+            env: std::collections::HashMap::new(),
             forward: pay_types::metering::ForwardConfig {
                 url: "https://api.example.com".to_string(),
+                path_rewrites: vec![],
                 auth: None,
             },
             accounting: AccountingMode::Pooled,
