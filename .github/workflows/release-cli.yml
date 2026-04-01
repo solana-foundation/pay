@@ -207,23 +207,19 @@ jobs:
           snap: ${{ steps.build.outputs.snap }}
           release: stable
 
-  # ── Update Homebrew tap ──────────────────────────────────────────────────
-  # Disabled: the first Homebrew submission must be manual.
-  # Uncomment after solana-foundation/homebrew-tap has the pay formula.
-  # homebrew:
-  #   name: Update Homebrew formula
-  #   needs: [preflight, release]
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - name: Update Homebrew tap
-  #       uses: mislav/bump-homebrew-formula-action@v3
-  #       with:
-  #         formula-name: pay
-  #         homebrew-tap: solana-foundation/homebrew-tap
-  #         tag-name: ${{ needs.preflight.outputs.tag }}
-  #         download-url: https://github.com/solana-foundation/pay/archive/refs/tags/${{ needs.preflight.outputs.tag }}.tar.gz
-  #       env:
-  #         COMMITTER_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+  # ── Update Homebrew core ─────────────────────────────────────────────────
+  homebrew:
+    name: Update Homebrew formula
+    needs: [preflight, release]
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry-run) }}
+    runs-on: macos-latest
+    steps:
+      - name: Bump homebrew-core formula
+        uses: dawidd6/action-homebrew-bump-formula@v4
+        with:
+          formula: pay
+          tag: ${{ needs.preflight.outputs.tag }}
+          token: ${{ secrets.HOMEBREW_GITHUB_API_TOKEN }}
 
   # ── Update winget manifest ───────────────────────────────────────────────
   # Disabled: the first winget submission must be manual.
