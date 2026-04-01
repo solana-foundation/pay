@@ -127,13 +127,15 @@ async fn fund_sol(rpc_url: &str, pubkey: &str) -> Result<()> {
     .await
 }
 
+const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+
 async fn fund_usdc(rpc_url: &str, pubkey: &str) -> Result<()> {
     rpc_call(
         rpc_url,
         "surfnet_setTokenAccount",
         serde_json::json!([pubkey, USDC_MINT, {
             "amount": 1_000_000_000_u64,
-        }]),
+        }, TOKEN_PROGRAM]),
     )
     .await
 }

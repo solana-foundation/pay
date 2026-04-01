@@ -160,14 +160,13 @@ impl StartCommand {
             let secret_key = std::env::var("PAY_MPP_CHALLENGE_SECRET")
                 .unwrap_or_else(|_| bs58::encode(rand::random::<[u8; 32]>()).into_string());
 
+            // Resolve currency label to mint address for the challenge.
+            let (mpp_currency, decimals) = resolve_currency(&currency, &network);
+
             let mpp = Mpp::new(solana_mpp::server::Config {
                 recipient: recipient.clone(),
-                currency: currency.clone(),
-                decimals: if currency.to_uppercase() == "SOL" {
-                    9
-                } else {
-                    6
-                },
+                currency: mpp_currency,
+                decimals,
                 network: network.clone(),
                 rpc_url: Some(rpc_url.clone()),
                 secret_key: Some(secret_key),
@@ -335,6 +334,22 @@ fn build_endpoints_json(api: &ApiSpec) -> serde_json::Value {
         },
         "endpoints": endpoints,
     })
+}
+
+/// Resolve a currency label to the value used in the MPP challenge.
+/// SPL tokens use their mint address; SOL uses "sol".
+fn resolve_currency(currency: &str, network: &str) -> (String, u8) {
+    match currency.to_uppercase().as_str() {
+        "SOL" => ("sol".to_string(), 9),
+        "USDC" => {
+            let mint = match network {
+                "devnet" => "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU",
+                _ => "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            };
+            (mint.to_string(), 6)
+        }
+        other => (other.to_string(), 6),
+    }
 }
 
 /// Create a SolanaSigner from the operator.signer config.
