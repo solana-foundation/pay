@@ -53,10 +53,8 @@ jobs:
       - name: Get PR number
         id: pr
         run: |
-          PR=$(gh api repos/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}/artifacts 2>/dev/null | jq -r '.artifacts[0].workflow_run.pull_requests[0].number // empty' 2>/dev/null || true)
-          if [ -z "$PR" ]; then
-            PR=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}" --jq '.pull_requests[0].number' 2>/dev/null || true)
-          fi
+          PR=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}" --jq '.pull_requests[0].number // empty' 2>/dev/null || true)
+          echo "PR number: ${PR:-<empty>}"
           echo "number=$PR" >> "$GITHUB_OUTPUT"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

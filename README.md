@@ -12,10 +12,10 @@ Wrap `curl` or `wget` — when an API returns 402, `pay` detects the payment pro
 
 ```sh
 # Without pay — you get a 402
-curl https://402-demo-api.vercel.app/mpp/quote/AAPL
+curl https://402-inspector.vercel.app/mpp/quote/AAPL
 
 # With pay — it handles the 402 and you get the response
-pay --dev curl https://402-demo-api.vercel.app/mpp/quote/AAPL
+pay --dev curl https://402-inspector.vercel.app/mpp/quote/AAPL
 ```
 
 ## Key Features
@@ -70,7 +70,7 @@ Get started instantly with an ephemeral keypair auto-funded via [Surfpool](https
 
 ```sh
 # Uses public devnet (402.surfnet.dev) by default
-pay --dev curl https://402-demo-api.vercel.app/mpp/quote/AAPL
+pay --dev curl https://402-inspector.vercel.app/mpp/quote/AAPL
 
 # Or use a local Surfpool instance
 pay --dev --local curl http://localhost:3402/mpp/quote/AAPL
@@ -105,7 +105,7 @@ pay --version
 pay setup
 
 # 2. Make a paid API call (--dev uses an ephemeral funded keypair)
-pay --dev curl https://402-demo-api.vercel.app/
+pay --dev curl https://402-inspector.vercel.app/
 
 # 3. Or let your AI agent handle it
 pay --dev claude
