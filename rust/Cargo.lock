@@ -5226,7 +5226,7 @@ version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "680998035259dcfcafe653688bf2aa6d3e2dc05e98be6ab46afb089dc84f1df8"
 dependencies = [
- "proc-macro-crate 3.5.0",
+ "proc-macro-crate 1.3.1",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -8883,7 +8883,7 @@ dependencies = [
 [[package]]
 name = "solana-mpp"
 version = "0.2.0"
-source = "git+https://github.com/solana-foundation/mpp-sdk?branch=main#57dc56d9ecc9b80c5f0a74052ac51ff1f9c650e3"
+source = "git+https://github.com/solana-foundation/mpp-sdk?branch=main#0961afb0445931958b7d67d7cc16e321a07b0d23"
 dependencies = [
  "base64 0.22.1",
  "bincode",
@@ -12817,7 +12817,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

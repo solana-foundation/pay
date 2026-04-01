@@ -40,12 +40,13 @@ pub fn build_credential(challenge: &Challenge, keypair_source: &str) -> Result<S
         .unwrap_or("mainnet-beta");
     let rpc_url =
         std::env::var("PAY_RPC_URL").unwrap_or_else(|_| default_rpc_url(network).to_string());
-    let rpc = RpcClient::new(rpc_url);
+    let rpc = RpcClient::new(rpc_url.clone());
 
     info!(
         amount = %request.amount,
         currency = %request.currency,
         network,
+        %rpc_url,
         signer = %signer.pubkey(),
         "Building MPP credential"
     );
