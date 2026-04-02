@@ -11,6 +11,7 @@ package-lock.json
 yarn.lock
 pnpm-lock.yaml
 !typescript/pnpm-lock.yaml
+!pdb/pnpm-lock.yaml
 bun.lock
 bun.lockb
 tsconfig.tsbuildinfo
