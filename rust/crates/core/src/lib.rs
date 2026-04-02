@@ -10,11 +10,11 @@ pub mod client;
 
 // Flat re-exports so callers can use `pay_core::mpp`, `pay_core::runner`, etc.
 pub use client::balance;
-pub use client::dev;
 pub use client::fetch;
 pub use client::mpp;
 pub use client::runner;
 pub use client::runner::{run_curl, run_curl_with_headers, run_wget, run_wget_with_headers};
+pub use client::sandbox;
 pub use client::send;
 pub use client::x402;
 

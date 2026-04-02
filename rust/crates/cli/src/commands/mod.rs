@@ -102,7 +102,7 @@ impl Command {
         output_fmt: Option<OutputFormat>,
         keypair_override: Option<&str>,
         verbose: bool,
-        dev: bool,
+        sandbox: bool,
     ) -> pay_core::Result<()> {
         let pay_bin = std::env::current_exe()
             .map(|p| p.to_string_lossy().to_string())
@@ -114,7 +114,7 @@ impl Command {
             Command::Send(cmd) => return cmd.run(keypair_override, verbose),
             Command::Setup(cmd) => return cmd.run(),
             Command::Topup(cmd) => return cmd.run(keypair_override),
-            Command::Server { command } => return command.run(keypair_override, dev),
+            Command::Server { command } => return command.run(keypair_override, sandbox),
             Command::Mcp => {
                 let rt = tokio::runtime::Builder::new_multi_thread()
                     .enable_all()

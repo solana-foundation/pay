@@ -1,4 +1,4 @@
-//! Dev mode: generate a funded keypair on localnet via surfpool cheatcodes.
+//! Sandbox mode: generate a funded keypair via surfpool cheatcodes.
 
 use std::io::Write;
 
@@ -9,8 +9,8 @@ use crate::{Error, Result};
 
 const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
-/// A dev keypair with its temp file (kept alive for the process lifetime).
-pub struct DevKeypair {
+/// A sandbox keypair with its temp file (kept alive for the process lifetime).
+pub struct SandboxKeypair {
     /// Path to the JSON keypair file.
     pub path: String,
     /// Base58 public key.
@@ -24,7 +24,7 @@ pub struct DevKeypair {
 /// Uses surfpool cheatcodes:
 /// - `surfnet_setAccount` for 100 SOL
 /// - `surfnet_setTokenAccount` for 1000 USDC
-pub async fn setup_dev_keypair(rpc_url: &str) -> Result<DevKeypair> {
+pub async fn setup_sandbox_keypair(rpc_url: &str) -> Result<SandboxKeypair> {
     // Generate 64 random bytes (32 secret + 32 public via ed25519)
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
     let verifying_key = signing_key.verifying_key();
@@ -43,7 +43,7 @@ pub async fn setup_dev_keypair(rpc_url: &str) -> Result<DevKeypair> {
     // Derive pubkey (base58)
     let pubkey = bs58::encode(&verifying_key.to_bytes()).into_string();
 
-    info!(pubkey = %pubkey, "Generated dev keypair");
+    info!(pubkey = %pubkey, "Generated sandbox keypair");
 
     // Check surfpool is reachable before attempting to fund
     check_surfpool(rpc_url).await?;
@@ -52,9 +52,9 @@ pub async fn setup_dev_keypair(rpc_url: &str) -> Result<DevKeypair> {
     fund_sol(rpc_url, &pubkey).await?;
     fund_usdc(rpc_url, &pubkey).await?;
 
-    info!(pubkey = %pubkey, "Dev keypair funded (100 SOL + 1000 USDC)");
+    info!(pubkey = %pubkey, "Sandbox keypair funded (100 SOL + 1000 USDC)");
 
-    Ok(DevKeypair {
+    Ok(SandboxKeypair {
         path,
         pubkey,
         _file: file,

@@ -12,9 +12,9 @@ pub enum ServerCommand {
 }
 
 impl ServerCommand {
-    pub fn run(self, keypair_source: Option<&str>, dev: bool) -> pay_core::Result<()> {
+    pub fn run(self, keypair_source: Option<&str>, sandbox: bool) -> pay_core::Result<()> {
         match self {
-            Self::Start(cmd) => cmd.run(keypair_source, dev),
+            Self::Start(cmd) => cmd.run(keypair_source, sandbox),
             Self::Scaffold(cmd) => cmd.run(),
         }
     }

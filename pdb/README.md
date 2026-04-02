@@ -13,6 +13,7 @@ Runs against the [Solana Payment Sandbox](https://402.surfnet.dev) — no real f
 
 - **Backend** — Express API (`api/index.ts`) with payment-gated demo endpoints, an embedded x402 facilitator, and a correlation engine that groups raw HTTP requests into payment flows streamed over SSE.
 - **Frontend** — React SPA (`src/`) with Vite. Compact flow list with protocol badge, resource path, status, and latency. Expanded view shows a step-by-step sequence diagram alongside a timestamped event log.
+- **Embedded mode** — The frontend and backend are also compiled into the `pay` Rust binary (`crates/pdb`). Run `pay --sandbox server start --debugger spec.yml` to get the debugger alongside any gateway proxy.
 
 ## Quick start
 
@@ -28,7 +29,7 @@ Open `http://localhost:5173`, then in another terminal:
 curl -i http://localhost:3000/mpp/quote/GOOG
 
 # Or let the CLI handle the full payment flow
-pay --dev curl http://localhost:3000/mpp/quote/GOOG
+pay --sandbox curl http://localhost:3000/mpp/quote/GOOG
 ```
 
 ## Deploy
@@ -61,6 +62,6 @@ Set these in your Vercel project settings (all optional):
 | `GET /x402/joke` | x402 | $0.001 |
 | `GET /x402/fact` | x402 | $0.001 |
 | `GET /health` | — | free |
-| `GET /logs/stream` | — | SSE stream of payment flows |
+| `GET /__debugger/logs/stream` | — | SSE stream of payment flows |
 
 The embedded x402 facilitator is mounted at `/facilitator/*`.

@@ -69,8 +69,8 @@ impl PaymentState for AppState {
 }
 
 impl StartCommand {
-    pub fn run(self, keypair_source: Option<&str>, dev: bool) -> pay_core::Result<()> {
-        let debugger = self.debugger || dev;
+    pub fn run(self, keypair_source: Option<&str>, sandbox: bool) -> pay_core::Result<()> {
+        let debugger = self.debugger || sandbox;
         let expanded = shellexpand::tilde(&self.spec);
         let contents = std::fs::read_to_string(expanded.as_ref())
             .map_err(|e| pay_core::Error::Config(format!("Failed to read {}: {e}", self.spec)))?;
@@ -112,8 +112,8 @@ impl StartCommand {
             .or(self.rpc_url.clone())
             .or_else(|| std::env::var("PAY_RPC_URL").ok())
             .unwrap_or_else(|| {
-                if dev {
-                    pay_core::config::DEV_RPC_URL.to_string()
+                if sandbox {
+                    pay_core::config::SANDBOX_RPC_URL.to_string()
                 } else {
                     pay_core::config::LOCAL_RPC_URL.to_string()
                 }
@@ -137,7 +137,7 @@ impl StartCommand {
 
         rt.block_on(async {
             // ── Resolve signer (async — needs the runtime) ──
-            let use_local = self.local_signer || dev;
+            let use_local = self.local_signer || sandbox;
 
             let fee_payer_signer: Option<Arc<dyn SolanaSigner>> = if use_local {
                 if let Some(source) = keypair_source_owned.as_deref() {

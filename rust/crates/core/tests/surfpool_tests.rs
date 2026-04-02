@@ -201,20 +201,20 @@ async fn send_sol_insufficient_funds() {
 // =============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn dev_setup_keypair() {
+async fn sandbox_setup_keypair() {
     let surfnet = start_surfnet().await;
 
     let rpc = surfnet.rpc_url().to_string();
-    let dev = client::dev::setup_dev_keypair(&rpc).await;
-    assert!(dev.is_ok(), "setup_dev_keypair failed: {:?}", dev.err());
+    let kp = client::sandbox::setup_sandbox_keypair(&rpc).await;
+    assert!(kp.is_ok(), "setup_sandbox_keypair failed: {:?}", kp.err());
 
-    let dev = dev.unwrap();
-    assert!(!dev.pubkey.is_empty());
-    assert!(!dev.path.is_empty());
+    let kp = kp.unwrap();
+    assert!(!kp.pubkey.is_empty());
+    assert!(!kp.path.is_empty());
 
     // Verify the keypair is funded
     let rpc2 = surfnet.rpc_url().to_string();
-    let dpk = dev.pubkey.clone();
+    let dpk = kp.pubkey.clone();
     let balance = client::balance::get_balances(&rpc2, &dpk).await.unwrap();
     assert!(
         balance.sol_lamports >= 100_000_000_000,

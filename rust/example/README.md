@@ -14,7 +14,7 @@ pnpm dev      # watch mode — restarts on file changes
 pnpm start    # single run
 ```
 
-By default the server connects to the public Surfpool devnet at `402.surfnet.dev:8899`. No local setup needed.
+By default the server connects to the public Surfpool sandbox at `402.surfnet.dev:8899`. No local setup needed.
 
 ## Using a local Surfpool instead
 
@@ -29,10 +29,10 @@ surfpool start
 RPC_URL=http://localhost:8899 pnpm dev
 ```
 
-Then use `--dev --local` with `pay`:
+Then use `--local` with `pay`:
 
 ```bash
-pay --dev --local curl http://localhost:3402/mpp/quote/SOL
+pay --local curl http://localhost:3402/mpp/quote/SOL
 ```
 
 ## Endpoints
@@ -40,15 +40,15 @@ pay --dev --local curl http://localhost:3402/mpp/quote/SOL
 ### MPP (www-authenticate header)
 
 ```bash
-pay --dev curl http://localhost:3402/mpp/quote/AAPL
-pay --dev curl http://localhost:3402/mpp/weather/paris
+pay --sandbox curl http://localhost:3402/mpp/quote/AAPL
+pay --sandbox curl http://localhost:3402/mpp/weather/paris
 ```
 
 ### x402 (X-PAYMENT-REQUIRED header)
 
 ```bash
-pay --dev curl http://localhost:3402/x402/joke
-pay --dev curl http://localhost:3402/x402/fact
+pay --sandbox curl http://localhost:3402/x402/joke
+pay --sandbox curl http://localhost:3402/x402/fact
 ```
 
 ### Free

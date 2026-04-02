@@ -51,7 +51,7 @@ export function Sidebar() {
       .catch(() => {});
   }, []);
 
-  const baseUrl = `http://${window.location.host}`;
+  const baseUrl = `${window.location.protocol}//${window.location.host}`;
   const firstMetered =
     config?.endpoints.mpp[0] || config?.endpoints.x402[0] || null;
 
@@ -153,8 +153,9 @@ export function Sidebar() {
               <div className="code-block">
                 {(() => {
                   const methodFlag = firstMetered.method !== "GET" ? `-X ${firstMetered.method} ` : "";
-                  const cmd = `pay --dev curl ${methodFlag}${baseUrl}/${firstMetered.path}`;
-                  const display = `pay --dev curl ${methodFlag}\\\n  ${baseUrl}/${firstMetered.path}`;
+                  const path = firstMetered.path.startsWith("/") ? firstMetered.path : `/${firstMetered.path}`;
+                  const cmd = `pay --sandbox curl ${methodFlag}${baseUrl}${path}`;
+                  const display = `pay --sandbox curl ${methodFlag}\\\n  ${baseUrl}${path}`;
                   return (
                     <>
                       <pre>{display}</pre>

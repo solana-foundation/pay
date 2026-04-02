@@ -26,12 +26,15 @@ struct Opts {
     #[arg(long, global = true)]
     yolo: bool,
 
-    /// Dev mode: generate a fresh ephemeral keypair funded via Surfpool.
-    /// Uses 402.surfnet.dev by default; combine with --local for localhost:8899.
+    /// Sandbox mode: ephemeral keypair funded on Surfpool (402.surfnet.dev).
     #[arg(long, global = true)]
+    sandbox: bool,
+
+    /// Alias for --sandbox (hidden).
+    #[arg(long, global = true, hide = true)]
     dev: bool,
 
-    /// Use local Surfpool (localhost:8899) instead of the public devnet.
+    /// Local sandbox: ephemeral keypair funded on local Surfpool (localhost:8899).
     #[arg(long, global = true)]
     local: bool,
 
@@ -68,40 +71,41 @@ fn main() {
     init_logging(config.log_format, opts.verbose);
 
     // Resolve the keypair source:
-    // 1. --dev → ephemeral keypair funded on localnet
+    // 1. --sandbox / --local → ephemeral keypair funded via Surfpool
     // 2. Keychain (from `pay setup`) → Touch ID protected
     // 3. ~/.config/solana/id.json → file-based fallback
     // 4. None → tell user to run `pay setup`
+    let sandbox_mode = opts.sandbox || opts.local || opts.dev;
     let keypair_override: Option<String>;
 
-    if opts.dev {
+    if sandbox_mode {
         let rpc_url = if opts.local {
             pay_core::config::LOCAL_RPC_URL.to_string()
-        } else if let Ok(url) = std::env::var("PAY_DEV_RPC_URL") {
+        } else if let Ok(url) = std::env::var("PAY_RPC_URL") {
             url
         } else {
-            pay_core::config::DEV_RPC_URL.to_string()
+            pay_core::config::SANDBOX_RPC_URL.to_string()
         };
         let rt = tokio::runtime::Runtime::new().unwrap();
-        match rt.block_on(pay_core::client::dev::setup_dev_keypair(&rpc_url)) {
+        match rt.block_on(pay_core::sandbox::setup_sandbox_keypair(&rpc_url)) {
             Ok(kp) => {
                 if opts.verbose {
                     eprintln!(
                         "{}",
-                        format!("Dev mode: ephemeral account {} ({})", kp.pubkey, rpc_url).dimmed()
+                        format!("Sandbox: ephemeral account {} ({})", kp.pubkey, rpc_url).dimmed()
                     );
                 }
                 keypair_override = Some(kp.path.clone());
-                // Make the dev RPC URL available to payment signing and MCP subprocesses
+                // Make the RPC URL available to payment signing and MCP subprocesses
                 // SAFETY: called before any threads are spawned
                 unsafe { std::env::set_var("PAY_RPC_URL", &rpc_url) };
-                // Keep the DevKeypair alive (owns the temp file)
+                // Keep the SandboxKeypair alive (owns the temp file)
                 std::mem::forget(kp);
             }
             Err(err) => {
                 eprintln!(
                     "{}",
-                    format!("Error setting up dev keypair: {err}").dimmed()
+                    format!("Error setting up sandbox keypair: {err}").dimmed()
                 );
                 std::process::exit(1);
             }
@@ -124,7 +128,7 @@ fn main() {
         Command::Curl(_) | Command::Wget(_) | Command::Fetch(_)
     );
     // HTTP tools always auto-pay (Touch ID is the approval gate, not the TUI)
-    let auto_pay = opts.yolo || opts.dev || is_agent || is_http_tool || config.auto_pay;
+    let auto_pay = opts.yolo || sandbox_mode || is_agent || is_http_tool || config.auto_pay;
 
     // If not auto-paying and stderr is a TTY, show the session setup TUI
     let has_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
@@ -162,7 +166,7 @@ fn main() {
         output_fmt,
         keypair_override.as_deref(),
         verbose,
-        opts.dev,
+        sandbox_mode,
     ) {
         if no_dna::should_json(output_fmt) {
             output::error_json(&err.to_string());
@@ -210,7 +214,7 @@ fn resolve_keypair(config: &Config) -> Option<String> {
     );
     eprintln!(
         "{}",
-        "  pay --dev ...          Ephemeral keypair on localnet".dimmed()
+        "  pay --sandbox ...      Ephemeral keypair on Surfpool sandbox".dimmed()
     );
     std::process::exit(1);
 }

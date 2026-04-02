@@ -15,7 +15,7 @@ Wrap `curl` or `wget` — when an API returns 402, `pay` detects the payment pro
 curl https://payment-debugger.vercel.app/mpp/quote/AAPL
 
 # With pay — it handles the 402 and you get the response
-pay --dev curl https://payment-debugger.vercel.app/mpp/quote/AAPL
+pay --sandbox curl https://payment-debugger.vercel.app/mpp/quote/AAPL
 ```
 
 ## Key Features
@@ -60,20 +60,20 @@ Set a spending cap and expiration before making requests. The interactive TUI le
 
 ```sh
 # Run Claude Code or Codex with pay injected automatically
-pay --dev claude
-pay --dev codex
+pay --sandbox claude
+pay --sandbox codex
 ```
 
-### Dev Mode
+### Sandbox Mode
 
 Get started instantly with an ephemeral keypair auto-funded via [Surfpool](https://github.com/txtx/surfpool). No setup, no mainnet tokens needed.
 
 ```sh
-# Uses public devnet (402.surfnet.dev) by default
-pay --dev curl https://payment-debugger.vercel.app/mpp/quote/AAPL
+# Uses public sandbox (402.surfnet.dev)
+pay --sandbox curl https://payment-debugger.vercel.app/mpp/quote/AAPL
 
-# Or use a local Surfpool instance
-pay --dev --local curl http://localhost:3402/mpp/quote/AAPL
+# Or use a local Surfpool instance (localhost:8899)
+pay --local curl http://localhost:3402/mpp/quote/AAPL
 ```
 
 ## Installation
@@ -104,11 +104,11 @@ pay --version
 # 1. Generate a keypair (Touch ID protected on macOS)
 pay setup
 
-# 2. Make a paid API call (--dev uses an ephemeral funded keypair)
-pay --dev curl https://payment-debugger.vercel.app/
+# 2. Make a paid API call (--sandbox uses an ephemeral funded keypair)
+pay --sandbox curl https://payment-debugger.vercel.app/mpp/quote/AAPL
 
 # 3. Or let your AI agent handle it
-pay --dev claude
+pay --sandbox claude
 ```
 
 ## Contributing
