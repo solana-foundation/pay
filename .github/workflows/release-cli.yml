@@ -60,6 +60,15 @@ jobs:
             exit 1
           fi
 
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+      - name: Build PDB frontend
+        run: cd ../pdb && pnpm install --frozen-lockfile && pnpm build
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -110,6 +119,15 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.preflight.outputs.tag }}
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+      - name: Build PDB frontend
+        run: cd pdb && pnpm install --frozen-lockfile && pnpm build
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -183,29 +201,27 @@ jobs:
             artifacts/sha256sums.txt
 
   # ── Publish to Snap Store ────────────────────────────────────────────────
-  snap:
-    name: Snap
-    needs: [preflight, release]
-    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry-run) }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.preflight.outputs.tag }}
-
-      - name: Set snap version
-        run: |
-          sed -i "s/^version:.*/version: \"${{ needs.preflight.outputs.version }}\"/" snap/snapcraft.yaml
-
-      - uses: snapcore/action-build@v1
-        id: build
-
-      - uses: snapcore/action-publish@v1
-        env:
-          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
-        with:
-          snap: ${{ steps.build.outputs.snap }}
-          release: stable
+  # Disabled: snap build needs PDB frontend + snapcraft config updates.
+  # snap:
+  #   name: Snap
+  #   needs: [preflight, release]
+  #   if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry-run) }}
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #       with:
+  #         ref: ${{ needs.preflight.outputs.tag }}
+  #     - name: Set snap version
+  #       run: |
+  #         sed -i "s/^version:.*/version: \"${{ needs.preflight.outputs.version }}\"/" snap/snapcraft.yaml
+  #     - uses: snapcore/action-build@v1
+  #       id: build
+  #     - uses: snapcore/action-publish@v1
+  #       env:
+  #         SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+  #       with:
+  #         snap: ${{ steps.build.outputs.snap }}
+  #         release: stable
 
 
   # ── Update winget manifest ───────────────────────────────────────────────

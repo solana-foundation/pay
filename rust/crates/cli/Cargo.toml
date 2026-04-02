@@ -39,3 +39,4 @@ dialoguer = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 qrcode = { workspace = true }
+pay-pdb = { workspace = true }

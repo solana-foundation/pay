@@ -43,6 +43,14 @@ jobs:
         working-directory: ./rust
     steps:
       - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+      - name: Build PDB frontend
+        run: cd ../pdb && pnpm install --frozen-lockfile && pnpm build
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -61,6 +69,14 @@ jobs:
         working-directory: ./rust
     steps:
       - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+      - name: Build PDB frontend
+        run: cd ../pdb && pnpm install --frozen-lockfile && pnpm build
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview

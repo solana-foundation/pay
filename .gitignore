@@ -15,6 +15,7 @@ bun.lock
 bun.lockb
 tsconfig.tsbuildinfo
 dist/
+.vercel
 
 # Rust
 rust/target

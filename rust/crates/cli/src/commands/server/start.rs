@@ -47,6 +47,10 @@ pub struct StartCommand {
     /// Use the local wallet as fee-payer signer instead of the operator.signer backend (e.g. GCP KMS).
     #[arg(long)]
     pub local_signer: bool,
+
+    /// Launch the Payment Debugger UI alongside the gateway.
+    #[arg(long)]
+    pub debugger: bool,
 }
 
 #[derive(Clone)]
@@ -66,6 +70,7 @@ impl PaymentState for AppState {
 
 impl StartCommand {
     pub fn run(self, keypair_source: Option<&str>, dev: bool) -> pay_core::Result<()> {
+        let debugger = self.debugger || dev;
         let expanded = shellexpand::tilde(&self.spec);
         let contents = std::fs::read_to_string(expanded.as_ref())
             .map_err(|e| pay_core::Error::Config(format!("Failed to read {}: {e}", self.spec)))?;
@@ -244,15 +249,28 @@ impl StartCommand {
             );
             eprintln!();
 
+            let max_path_len = api
+                .endpoints
+                .iter()
+                .map(|e| e.path.len())
+                .max()
+                .unwrap_or(20);
+
+            let rule = format!(
+                "  {}{}{}", "─".repeat(9), "─".repeat(max_path_len + 2), "─".repeat(10)
+            );
+            eprintln!("{}", rule.dimmed());
+
             for ep in &api.endpoints {
                 let method = format!("{:?}", ep.method).to_uppercase();
+                let method_padded = format!("{:<7}", method);
                 let method_colored = match method.as_str() {
-                    "GET" => method.green().to_string(),
-                    "POST" => method.blue().to_string(),
-                    "PUT" => method.yellow().to_string(),
-                    "DELETE" => method.red().to_string(),
-                    "PATCH" => method.cyan().to_string(),
-                    _ => method.dimmed().to_string(),
+                    "GET" => method_padded.green().to_string(),
+                    "POST" => method_padded.blue().to_string(),
+                    "PUT" => method_padded.yellow().to_string(),
+                    "DELETE" => method_padded.red().to_string(),
+                    "PATCH" => method_padded.cyan().to_string(),
+                    _ => method_padded.dimmed().to_string(),
                 };
                 let price_tag = if let Some(ref m) = ep.metering {
                     let price = m
@@ -267,17 +285,24 @@ impl StartCommand {
                                 .map(|t| t.price_usd)
                         })
                         .unwrap_or(0.0);
-                    format!("${:.4}", price).yellow().to_string()
+                    format!("{:>8}", format!("${:.4}", price))
+                        .yellow()
+                        .to_string()
                 } else {
-                    "free".green().to_string()
+                    format!("{:>8}", "free").green().to_string()
                 };
 
-                eprintln!("  {:<7} {:<40} {}", method_colored, ep.path, price_tag,);
+                eprintln!(
+                    "  {} {:<width$} {}",
+                    method_colored,
+                    ep.path,
+                    price_tag,
+                    width = max_path_len,
+                );
             }
 
-            eprintln!();
-            eprintln!("  {}  /__gateway/health", "GET".green());
-            eprintln!("  {}  /__gateway/endpoints", "GET".green());
+            eprintln!("{}", rule.dimmed());
+
             eprintln!();
 
             // ── Build router ──
@@ -288,12 +313,46 @@ impl StartCommand {
                 mpp: Some(mpp),
             };
 
-            let app = axum::Router::new()
+            let mut app = axum::Router::new()
                 .route("/__gateway/health", get(|| async { "ok" }))
                 .route(
                     "/__gateway/endpoints",
                     get(move || async move { axum::Json(endpoints_json).into_response() }),
-                )
+                );
+
+            let pdb_state = if debugger {
+                let pdb_config = build_pdb_config(&api, &recipient, &network, &rpc_url);
+                let pdb = pay_pdb::PdbState::new(pdb_config);
+                pdb.spawn_cleanup();
+                Some(pdb)
+            } else {
+                None
+            };
+
+            if let Some(ref pdb) = pdb_state {
+                app = app
+                    .route(
+                        "/",
+                        get(|headers: axum::http::HeaderMap| async move {
+                            let accepts_html = headers
+                                .get("accept")
+                                .and_then(|v| v.to_str().ok())
+                                .is_some_and(|v| v.contains("text/html"));
+                            if accepts_html {
+                                axum::response::Redirect::temporary("/__debugger/")
+                                    .into_response()
+                            } else {
+                                axum::Json(serde_json::json!({"status": "ok"})).into_response()
+                            }
+                        }),
+                    )
+                    .nest_service(
+                        "/__debugger",
+                    pay_pdb::debugger_router(pdb.clone()),
+                );
+            }
+
+            let app = app
                 .fallback(any(move |req: axum::http::Request<axum::body::Body>| {
                     let api = api.clone();
                     async move {
@@ -316,18 +375,31 @@ impl StartCommand {
                     state.clone(),
                     pay_core::server::payment::payment_middleware::<AppState>,
                 ))
-                .with_state(state);
+                .with_state(state)
+                // Logging layer (outermost — executes first).
+                // Extension must be added AFTER the middleware layer (LIFO order)
+                // so the extension is available when the middleware runs.
+                .layer(middleware::from_fn(pay_pdb::logging::logging_middleware))
+                .layer(axum::Extension(pdb_state));
 
             let listener = tokio::net::TcpListener::bind(&self.bind)
                 .await
                 .map_err(|e| {
                     pay_core::Error::Config(format!("Failed to bind {}: {e}", self.bind))
                 })?;
-            eprintln!(
-                "  {} {}",
-                "listening".green().bold(),
-                format!("http://{}", self.bind).bold()
-            );
+            if debugger {
+                eprintln!(
+                    "  {} {}",
+                    "debugger".green().bold(),
+                    format!("http://{}", self.bind).bold()
+                );
+            } else {
+                eprintln!(
+                    "  {} {}",
+                    "listening".green().bold(),
+                    format!("http://{}", self.bind).bold()
+                );
+            }
             eprintln!();
             axum::serve(listener, app)
                 .await
@@ -368,6 +440,60 @@ fn build_endpoints_json(api: &ApiSpec) -> serde_json::Value {
             "url": api.forward.display_url(),
         },
         "endpoints": endpoints,
+    })
+}
+
+/// Build the sidebar config for the PDB frontend.
+fn build_pdb_config(
+    api: &ApiSpec,
+    recipient: &str,
+    network: &str,
+    rpc_url: &str,
+) -> serde_json::Value {
+    let metered: Vec<serde_json::Value> = api
+        .endpoints
+        .iter()
+        .filter(|e| e.metering.is_some())
+        .map(|e| {
+            let price = e
+                .metering
+                .as_ref()
+                .and_then(|m| m.dimensions.first())
+                .and_then(|d| d.tiers.first())
+                .map(|t| format!("${:.4}", t.price_usd))
+                .unwrap_or_else(|| "metered".into());
+            serde_json::json!({
+                "method": format!("{:?}", e.method).to_uppercase(),
+                "path": e.path,
+                "price": price,
+                "description": e.description.as_deref().unwrap_or(""),
+            })
+        })
+        .collect();
+
+    let free: Vec<serde_json::Value> = api
+        .endpoints
+        .iter()
+        .filter(|e| e.metering.is_none())
+        .map(|e| {
+            serde_json::json!({
+                "method": format!("{:?}", e.method).to_uppercase(),
+                "path": e.path,
+                "price": "free",
+                "description": e.description.as_deref().unwrap_or(""),
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "recipient": recipient,
+        "network": network,
+        "rpcUrl": rpc_url,
+        "endpoints": {
+            "mpp": metered,
+            "x402": [],
+            "oauth": free,
+        }
     })
 }
 
