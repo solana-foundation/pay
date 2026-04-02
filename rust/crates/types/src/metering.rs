@@ -21,6 +21,10 @@ pub struct ApiSpec {
     pub description: String,
     pub category: ApiCategory,
     pub version: String,
+    /// Environment variables to set when the spec is loaded.
+    /// Static values are set directly; `${VAR}` references the runtime environment.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub env: std::collections::HashMap<String, String>,
     /// Forwarding config — upstream URL and optional auth injection.
     pub forward: ForwardConfig,
     /// How volume tiers are tracked: pooled (shared counter) or per_agent (per wallet).
@@ -43,9 +47,108 @@ pub struct ApiSpec {
 pub struct ForwardConfig {
     /// Upstream base URL (e.g. `https://generativelanguage.googleapis.com/`).
     pub url: String,
+    /// Optional path segments prepended to the request path.
+    /// Each segment's value is resolved from an environment variable.
+    ///
+    /// ```yaml
+    /// forward:
+    ///   url: https://translation.googleapis.com
+    ///   path_rewrites:
+    ///     - prefix: "v3/projects/{projectId}"
+    ///       env: GOOGLE_PROJECT_ID
+    /// ```
+    ///
+    /// Given `GOOGLE_PROJECT_ID=my-proj`, a request to
+    /// `/v3/projects/any-value/locations/global:translateText` is rewritten to
+    /// `https://translation.googleapis.com/v3/projects/my-proj/locations/global:translateText`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path_rewrites: Vec<PathRewrite>,
     /// How the proxy injects upstream API credentials after payment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<AuthConfig>,
+}
+
+/// A path rewrite rule — matches a prefix pattern in the request path and
+/// substitutes `{placeholder}` segments with an env var value.
+///
+/// Example: prefix `v3/projects/{projectId}` with env `GCP_PROJECT=gateway-402`
+/// rewrites `/v3/projects/any-value/locations/global:translateText`
+/// to      `/v3/projects/gateway-402/locations/global:translateText`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PathRewrite {
+    /// Path prefix template with a `{placeholder}` (e.g. `v3/projects/{projectId}`).
+    pub prefix: String,
+    /// Environment variable whose value replaces the placeholder.
+    pub env: String,
+}
+
+impl ForwardConfig {
+    /// Build the full upstream URL for a given request path+query.
+    ///
+    /// For each path rewrite rule, matches the prefix pattern against the
+    /// request path segments and substitutes `{placeholder}` segments with
+    /// the env var value. Unmatched paths are forwarded as-is.
+    pub fn upstream_url(&self, path_and_query: &str) -> String {
+        let base = self.url.trim_end_matches('/');
+
+        if self.path_rewrites.is_empty() {
+            return format!("{base}{path_and_query}");
+        }
+
+        // Split path from query string.
+        let (path, query) = match path_and_query.find('?') {
+            Some(i) => (&path_and_query[..i], &path_and_query[i..]),
+            None => (path_and_query, ""),
+        };
+
+        let rewritten = rewrite_path(path, &self.path_rewrites);
+        format!("{base}{rewritten}{query}")
+    }
+
+    /// The base URL for display purposes.
+    pub fn display_url(&self) -> &str {
+        &self.url
+    }
+}
+
+/// Apply path rewrite rules to an incoming path.
+///
+/// Each rule's prefix is split into segments. Literal segments must match
+/// exactly; `{placeholder}` segments match any value and are replaced with
+/// the env var. The rest of the path is preserved.
+fn rewrite_path(path: &str, rewrites: &[PathRewrite]) -> String {
+    let path_trimmed = path.strip_prefix('/').unwrap_or(path);
+    let mut segments: Vec<String> = path_trimmed.split('/').map(String::from).collect();
+
+    for rewrite in rewrites {
+        let value = std::env::var(&rewrite.env).unwrap_or_default();
+        let prefix_parts: Vec<&str> = rewrite.prefix.split('/').collect();
+
+        if prefix_parts.len() > segments.len() {
+            continue;
+        }
+
+        let mut matched = true;
+        for (i, pat) in prefix_parts.iter().enumerate() {
+            if pat.starts_with('{') && pat.ends_with('}') {
+                continue;
+            }
+            if *pat != segments[i] {
+                matched = false;
+                break;
+            }
+        }
+
+        if matched {
+            for (i, pat) in prefix_parts.iter().enumerate() {
+                if pat.starts_with('{') && pat.ends_with('}') {
+                    segments[i] = value.clone();
+                }
+            }
+        }
+    }
+
+    format!("/{}", segments.join("/"))
 }
 
 // =============================================================================
@@ -53,6 +156,7 @@ pub struct ForwardConfig {
 // =============================================================================
 
 /// How the proxy injects upstream API credentials after payment succeeds.
+/// All secret values are resolved from environment variables at runtime.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum AuthConfig {
@@ -60,8 +164,8 @@ pub enum AuthConfig {
     QueryParam {
         /// Query parameter name (e.g. "key").
         key: String,
-        /// Environment variable holding the secret value.
-        env: String,
+        /// Environment variable holding the value.
+        value_from_env: String,
     },
     /// Inject as an HTTP header (e.g. `Authorization: Bearer TOKEN`).
     Header {
@@ -70,9 +174,33 @@ pub enum AuthConfig {
         /// Optional prefix (e.g. "Bearer ").
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prefix: Option<String>,
-        /// Environment variable holding the secret value.
-        env: String,
+        /// Environment variable holding the value.
+        value_from_env: String,
     },
+    /// OAuth2 — fetch access token and inject as `Authorization: Bearer`.
+    Oauth2 {
+        /// Token endpoint URL (e.g. `https://oauth2.googleapis.com/token`).
+        /// Special value `"gcp_metadata"` uses the GCP metadata server.
+        token_url: String,
+        /// OAuth2 scopes to request.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        scopes: Vec<String>,
+        /// Env var for client_id (for client_credentials grant).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_id_from_env: Option<String>,
+        /// Env var for client_secret (for client_credentials grant).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_secret_from_env: Option<String>,
+        /// Extra headers to inject, each value resolved from an env var.
+        #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+        headers: std::collections::HashMap<String, EnvRef>,
+    },
+}
+
+/// A value resolved from an environment variable.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct EnvRef {
+    pub from_env: String,
 }
 
 /// Operator-level configuration for a proxy instance.
@@ -626,8 +754,10 @@ mod tests {
             description: "Image analysis".to_string(),
             category: ApiCategory::AiMl,
             version: "v1".to_string(),
+            env: std::collections::HashMap::new(),
             forward: ForwardConfig {
                 url: "https://vision.googleapis.com".to_string(),
+                path_rewrites: vec![],
                 auth: None,
             },
             accounting: AccountingMode::PerAgent,
@@ -677,5 +807,172 @@ mod tests {
         assert!(back.endpoints[0].metering.is_some());
         assert!(back.free_tier.is_some());
         assert_eq!(back.free_tier.unwrap().amount, Some(1000));
+    }
+
+    // ── ForwardConfig / path rewrites ────────────────────────────────────
+
+    // ── rewrite_path ─────────────────────────────────────────────────────
+
+    #[test]
+    fn rewrite_path_substitutes_placeholder() {
+        // SAFETY: test-only, single-threaded
+        unsafe { std::env::set_var("_TEST_PROJ_1", "gateway-402") };
+        let rewrites = vec![PathRewrite {
+            prefix: "v3/projects/{projectId}".to_string(),
+            env: "_TEST_PROJ_1".to_string(),
+        }];
+        assert_eq!(
+            super::rewrite_path(
+                "/v3/projects/user-proj/locations/global:translateText",
+                &rewrites
+            ),
+            "/v3/projects/gateway-402/locations/global:translateText"
+        );
+        unsafe { std::env::remove_var("_TEST_PROJ_1") };
+    }
+
+    #[test]
+    fn rewrite_path_no_match_passes_through() {
+        // SAFETY: test-only, single-threaded
+        unsafe { std::env::set_var("_TEST_PROJ_2", "gateway-402") };
+        let rewrites = vec![PathRewrite {
+            prefix: "v3/projects/{projectId}".to_string(),
+            env: "_TEST_PROJ_2".to_string(),
+        }];
+        // Path doesn't start with v3/projects/...
+        assert_eq!(
+            super::rewrite_path("/v1/translate", &rewrites),
+            "/v1/translate"
+        );
+        unsafe { std::env::remove_var("_TEST_PROJ_2") };
+    }
+
+    #[test]
+    fn rewrite_path_missing_env_substitutes_empty() {
+        // SAFETY: test-only, single-threaded
+        unsafe { std::env::remove_var("_TEST_MISSING_2") };
+        let rewrites = vec![PathRewrite {
+            prefix: "v3/projects/{projectId}".to_string(),
+            env: "_TEST_MISSING_2".to_string(),
+        }];
+        assert_eq!(
+            super::rewrite_path("/v3/projects/user-proj/translate", &rewrites),
+            "/v3/projects//translate"
+        );
+    }
+
+    #[test]
+    fn rewrite_path_no_match_short_path() {
+        // Path is shorter than the prefix — rule is skipped.
+        // SAFETY: test-only, single-threaded
+        unsafe { std::env::set_var("_TEST_PROJ_3", "my-proj") };
+        let rewrites = vec![PathRewrite {
+            prefix: "v3/projects/{projectId}".to_string(),
+            env: "_TEST_PROJ_3".to_string(),
+        }];
+        assert_eq!(super::rewrite_path("/v3", &rewrites), "/v3");
+        unsafe { std::env::remove_var("_TEST_PROJ_3") };
+    }
+
+    // ── upstream_url ────────────────────────────────────────────────────
+
+    #[test]
+    fn upstream_url_no_rewrites() {
+        let fwd = ForwardConfig {
+            url: "https://api.example.com".to_string(),
+            path_rewrites: vec![],
+            auth: None,
+        };
+        assert_eq!(
+            fwd.upstream_url("/v1/translate?q=hello"),
+            "https://api.example.com/v1/translate?q=hello"
+        );
+    }
+
+    #[test]
+    fn upstream_url_trailing_slash_on_base() {
+        let fwd = ForwardConfig {
+            url: "https://api.example.com/".to_string(),
+            path_rewrites: vec![],
+            auth: None,
+        };
+        assert_eq!(
+            fwd.upstream_url("/v1/test"),
+            "https://api.example.com/v1/test"
+        );
+    }
+
+    #[test]
+    fn upstream_url_with_rewrite() {
+        // SAFETY: test-only, single-threaded
+        unsafe { std::env::set_var("_TEST_PROJECT_ID", "my-project-123") };
+        let fwd = ForwardConfig {
+            url: "https://translation.googleapis.com".to_string(),
+            path_rewrites: vec![PathRewrite {
+                prefix: "v3/projects/{projectId}".to_string(),
+                env: "_TEST_PROJECT_ID".to_string(),
+            }],
+            auth: None,
+        };
+        assert_eq!(
+            fwd.upstream_url("/v3/projects/any-value/locations/global:translateText"),
+            "https://translation.googleapis.com/v3/projects/my-project-123/locations/global:translateText"
+        );
+        unsafe { std::env::remove_var("_TEST_PROJECT_ID") };
+    }
+
+    #[test]
+    fn upstream_url_preserves_query_string() {
+        // SAFETY: test-only, single-threaded
+        unsafe { std::env::set_var("_TEST_PROJ_QS", "gateway-402") };
+        let fwd = ForwardConfig {
+            url: "https://api.example.com".to_string(),
+            path_rewrites: vec![PathRewrite {
+                prefix: "v3/projects/{projectId}".to_string(),
+                env: "_TEST_PROJ_QS".to_string(),
+            }],
+            auth: None,
+        };
+        assert_eq!(
+            fwd.upstream_url("/v3/projects/user-proj/translate?lang=fr"),
+            "https://api.example.com/v3/projects/gateway-402/translate?lang=fr"
+        );
+        unsafe { std::env::remove_var("_TEST_PROJ_QS") };
+    }
+
+    #[test]
+    fn forward_config_json_plain_url() {
+        let json = r#"{"url":"https://api.example.com"}"#;
+        let fwd: ForwardConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(fwd.url, "https://api.example.com");
+        assert!(fwd.path_rewrites.is_empty());
+    }
+
+    #[test]
+    fn forward_config_json_with_path_rewrites() {
+        let json = r#"{
+            "url": "https://translation.googleapis.com",
+            "path_rewrites": [
+                {"prefix": "v3/projects/{projectId}", "env": "GOOGLE_PROJECT_ID"}
+            ]
+        }"#;
+        let fwd: ForwardConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(fwd.url, "https://translation.googleapis.com");
+        assert_eq!(fwd.path_rewrites.len(), 1);
+        assert_eq!(fwd.path_rewrites[0].prefix, "v3/projects/{projectId}");
+        assert_eq!(fwd.path_rewrites[0].env, "GOOGLE_PROJECT_ID");
+    }
+
+    #[test]
+    fn forward_config_roundtrip_no_rewrites() {
+        let fwd = ForwardConfig {
+            url: "https://api.example.com".to_string(),
+            path_rewrites: vec![],
+            auth: None,
+        };
+        let json = serde_json::to_string(&fwd).unwrap();
+        assert!(!json.contains("path_rewrites"));
+        let back: ForwardConfig = serde_json::from_str(&json).unwrap();
+        assert!(back.path_rewrites.is_empty());
     }
 }

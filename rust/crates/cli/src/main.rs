@@ -106,11 +106,10 @@ fn main() {
                 std::process::exit(1);
             }
         }
-    } else if matches!(
-        opts.command,
-        Command::Setup(_) | Command::Account { .. } | Command::Server { .. }
-    ) {
+    } else if matches!(opts.command, Command::Setup(_) | Command::Account { .. }) {
         keypair_override = None;
+    } else if matches!(opts.command, Command::Server { .. }) {
+        keypair_override = config.default_keypair_source();
     } else if matches!(opts.command, Command::Topup(_)) {
         // Topup tries to resolve but doesn't exit if missing (--account fallback)
         keypair_override = config.default_keypair_source();
@@ -158,10 +157,13 @@ fn main() {
     let output_fmt = opts.output;
 
     let verbose = opts.verbose;
-    if let Err(err) =
-        opts.command
-            .execute(auto_pay, output_fmt, keypair_override.as_deref(), verbose)
-    {
+    if let Err(err) = opts.command.execute(
+        auto_pay,
+        output_fmt,
+        keypair_override.as_deref(),
+        verbose,
+        opts.dev,
+    ) {
         if no_dna::should_json(output_fmt) {
             output::error_json(&err.to_string());
         } else {

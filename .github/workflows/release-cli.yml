@@ -207,19 +207,6 @@ jobs:
           snap: ${{ steps.build.outputs.snap }}
           release: stable
 
-  # ── Update Homebrew core ─────────────────────────────────────────────────
-  homebrew:
-    name: Update Homebrew formula
-    needs: [preflight, release]
-    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry-run) }}
-    runs-on: macos-latest
-    steps:
-      - name: Bump homebrew-core formula
-        uses: dawidd6/action-homebrew-bump-formula@v4
-        with:
-          formula: pay
-          tag: ${{ needs.preflight.outputs.tag }}
-          token: ${{ secrets.HOMEBREW_GITHUB_API_TOKEN }}
 
   # ── Update winget manifest ───────────────────────────────────────────────
   # Disabled: the first winget submission must be manual.

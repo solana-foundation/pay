@@ -43,6 +43,10 @@ pub struct StartCommand {
     /// Sandbox mode — auto-airdrop SOL to the operator's fee payer wallet.
     #[arg(long)]
     pub sandbox: bool,
+
+    /// Use the local wallet as fee-payer signer instead of the operator.signer backend (e.g. GCP KMS).
+    #[arg(long)]
+    pub local_signer: bool,
 }
 
 #[derive(Clone)]
@@ -61,7 +65,7 @@ impl PaymentState for AppState {
 }
 
 impl StartCommand {
-    pub fn run(self, keypair_source: Option<&str>) -> pay_core::Result<()> {
+    pub fn run(self, keypair_source: Option<&str>, dev: bool) -> pay_core::Result<()> {
         let expanded = shellexpand::tilde(&self.spec);
         let contents = std::fs::read_to_string(expanded.as_ref())
             .map_err(|e| pay_core::Error::Config(format!("Failed to read {}: {e}", self.spec)))?;
@@ -69,13 +73,26 @@ impl StartCommand {
         let api: ApiSpec = serde_yml::from_str(&contents)
             .map_err(|e| pay_core::Error::Config(format!("Invalid spec: {e}")))?;
 
+        // Apply env vars from spec (static values or ${VAR} passthrough).
+        // SAFETY: called before any threads are spawned.
+        for (key, value) in &api.env {
+            if value.starts_with("${") && value.ends_with('}') {
+                let var_name = &value[2..value.len() - 1];
+                if let Ok(v) = std::env::var(var_name) {
+                    unsafe { std::env::set_var(key, v) };
+                }
+            } else {
+                unsafe { std::env::set_var(key, value) };
+            }
+        }
+
         let op = api.operator.clone();
         let op = op.as_ref();
 
         #[cfg(not(feature = "gcp_kms"))]
-        if op.and_then(|o| o.signer.as_ref()).is_some() {
+        if !self.local_signer && op.and_then(|o| o.signer.as_ref()).is_some() {
             return Err(pay_core::Error::Config(
-                "operator.signer requires the `gcp_kms` feature. Rebuild with `--features gcp_kms`."
+                "operator.signer requires the `gcp_kms` feature. Rebuild with `--features gcp_kms`, or use --local-signer."
                     .to_string(),
             ));
         }
@@ -89,7 +106,13 @@ impl StartCommand {
             .and_then(|o| o.rpc_url.clone())
             .or(self.rpc_url.clone())
             .or_else(|| std::env::var("PAY_RPC_URL").ok())
-            .unwrap_or_else(|| pay_core::config::LOCAL_RPC_URL.to_string());
+            .unwrap_or_else(|| {
+                if dev {
+                    pay_core::config::DEV_RPC_URL.to_string()
+                } else {
+                    pay_core::config::LOCAL_RPC_URL.to_string()
+                }
+            });
 
         let network = op
             .and_then(|o| o.network.clone())
@@ -109,15 +132,27 @@ impl StartCommand {
 
         rt.block_on(async {
             // ── Resolve signer (async — needs the runtime) ──
-            #[cfg(feature = "gcp_kms")]
-            let fee_payer_signer: Option<Arc<dyn SolanaSigner>> =
-                if let Some(ref cfg) = signer_cfg {
-                    Some(resolve_signer(cfg).await?)
+            let use_local = self.local_signer || dev;
+
+            let fee_payer_signer: Option<Arc<dyn SolanaSigner>> = if use_local {
+                if let Some(source) = keypair_source_owned.as_deref() {
+                    let signer = pay_core::signer::load_signer(source)?;
+                    Some(Arc::new(signer) as Arc<dyn SolanaSigner>)
                 } else {
                     None
-                };
-            #[cfg(not(feature = "gcp_kms"))]
-            let fee_payer_signer: Option<Arc<dyn SolanaSigner>> = None;
+                }
+            } else {
+                #[cfg(feature = "gcp_kms")]
+                {
+                    if let Some(ref cfg) = signer_cfg {
+                        Some(resolve_signer(cfg).await?)
+                    } else {
+                        None
+                    }
+                }
+                #[cfg(not(feature = "gcp_kms"))]
+                { None }
+            };
 
             // ── Resolve recipient ──
             let recipient = if let Some(r) = op.and_then(|o| o.recipient.as_ref()) {
@@ -187,7 +222,7 @@ impl StartCommand {
             eprintln!();
             eprintln!("  {} {}", "pay server".bold(), api.title.bold());
             eprintln!();
-            eprintln!("  {}  {}", "upstream".dimmed(), api.forward.url);
+            eprintln!("  {}  {}", "upstream".dimmed(), api.forward.display_url());
             eprintln!(
                 "  {}  {}",
                 "wallet  ".dimmed(),
@@ -330,7 +365,7 @@ fn build_endpoints_json(api: &ApiSpec) -> serde_json::Value {
         "name": api.name,
         "title": api.title,
         "forward": {
-            "url": api.forward.url,
+            "url": api.forward.display_url(),
         },
         "endpoints": endpoints,
     })
