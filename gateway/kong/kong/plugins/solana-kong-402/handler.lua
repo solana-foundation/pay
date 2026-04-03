@@ -186,24 +186,24 @@ local function path_matches(pattern, path)
   for i = 1, #pattern_parts do
     local pat = pattern_parts[i]
     local actual = path_parts[i]
+    local matches = false
+
     if pat:match("^%b{}$") then
-      goto continue
-    end
-    if pat:find("{", 1, true) then
+      matches = true
+    elseif pat:find("{", 1, true) then
       local close = pat:find("}", 1, true)
       if not close then
         return false
       end
       local suffix = pat:sub(close + 1)
-      if suffix ~= "" and actual:sub(-#suffix) ~= suffix then
-        return false
-      end
-      goto continue
+      matches = suffix == "" or actual:sub(-#suffix) == suffix
+    else
+      matches = pat == actual
     end
-    if pat ~= actual then
+
+    if not matches then
       return false
     end
-    ::continue::
   end
   return true
 end
