@@ -1,0 +1,32 @@
+_format_version: "3.0"
+
+services:
+  - name: protected-upstream
+    url: http://upstream:5678
+    routes:
+      - name: protected-route
+        paths:
+          - /paid
+        strip_path: true
+    plugins:
+      - name: solana-kong-402
+        config:
+          recipient: "3yGpUKnU5HSVSMxye83YuseTeSQykiS5N4eh6iQn1d2h"
+          currency: "USDC"
+          decimals: 6
+          network: "localnet"
+          rpc_url: "https://402.surfnet.dev:8899"
+          secret_key: "local-dev-secret"
+          external_id: "kong-local-demo-lua"
+          inject_upstream_headers: true
+          endpoints:
+            - method: GET
+              path: /paid
+              description: "Local Kong MPP demo (Lua)"
+              metering:
+                dimensions:
+                  - direction: usage
+                    unit: requests
+                    scale: 1
+                    tiers:
+                      - price_usd: 0.001

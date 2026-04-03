@@ -1,0 +1,21 @@
+services:
+  upstream:
+    image: hashicorp/http-echo:1.0.0
+    command:
+      - -listen=:5678
+      - -text={"ok":true,"service":"protected-upstream"}
+    ports:
+      - "5678:5678"
+
+  kong:
+    build:
+      context: ../../../..
+      dockerfile: solana-pay/gateway/kong/Dockerfile
+    depends_on:
+      - upstream
+    environment:
+      KONG_LOG_LEVEL: notice
+      MPP_SECRET_KEY: local-dev-secret
+    ports:
+      - "8000:8000"
+      - "8001:8001"

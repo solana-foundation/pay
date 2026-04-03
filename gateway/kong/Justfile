@@ -1,0 +1,34 @@
+default:
+    @just --list
+
+# Start local Kong Lua dev stack
+dev-up:
+    docker compose -f dev/docker-compose.yml up --build
+
+# Start local Kong Lua dev stack in detached mode
+dev-start:
+    docker compose -f dev/docker-compose.yml up --build -d
+
+# Stop local Kong Lua dev stack
+dev-down:
+    docker compose -f dev/docker-compose.yml down -v
+
+# Tail local Kong Lua dev stack logs
+dev-logs:
+    docker compose -f dev/docker-compose.yml logs -f
+
+# Start local Kong Go dev stack
+go-dev-up:
+    cd ../kong-go && docker compose -f dev/docker-compose.yml up --build
+
+# Start local Kong Go dev stack in detached mode
+go-dev-start:
+    cd ../kong-go && docker compose -f dev/docker-compose.yml up --build -d
+
+# Stop local Kong Go dev stack
+go-dev-down:
+    cd ../kong-go && docker compose -f dev/docker-compose.yml down -v
+
+# Tail local Kong Go dev stack logs
+go-dev-logs:
+    cd ../kong-go && docker compose -f dev/docker-compose.yml logs -f
