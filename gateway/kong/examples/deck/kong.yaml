@@ -1,0 +1,32 @@
+_format_version: "3.0"
+
+services:
+  - name: paid-api
+    url: http://example-upstream.internal
+    routes:
+      - name: paid-api-route
+        paths:
+          - /paid
+        strip_path: true
+    plugins:
+      - name: solana-kong-402
+        config:
+          recipient: "3yGpUKnU5HSVSMxye83YuseTeSQykiS5N4eh6iQn1d2h"
+          currency: "USDC"
+          decimals: 6
+          network: "localnet"
+          rpc_url: "https://402.surfnet.dev:8899"
+          secret_key: "replace-me"
+          external_id: "deck-example"
+          inject_upstream_headers: true
+          endpoints:
+            - method: GET
+              path: /paid
+              description: "Paid API call"
+              metering:
+                dimensions:
+                  - direction: usage
+                    unit: requests
+                    scale: 1
+                    tiers:
+                      - price_usd: 0.001

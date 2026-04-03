@@ -9,6 +9,18 @@ permissions:
   pull-requests: write
 
 jobs:
+  # ── Kong Lua plugin ──
+  kong-lua-test:
+    name: Kong Lua plugin test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: leafo/gh-actions-lua@v11
+        with:
+          luaVersion: "5.1"
+      - name: Run native Kong Lua plugin test
+        run: lua gateway/kong/kong/plugins/solana-kong-402/handler_test.lua
+
   # ── TypeScript SDK ──
   core-test:
     name: TypeScript tests + coverage

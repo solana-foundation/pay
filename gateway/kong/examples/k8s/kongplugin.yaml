@@ -1,0 +1,30 @@
+apiVersion: configuration.konghq.com/v1
+kind: KongPlugin
+metadata:
+  name: solana-kong-402
+plugin: solana-kong-402
+config:
+  recipient: "3yGpUKnU5HSVSMxye83YuseTeSQykiS5N4eh6iQn1d2h"
+  currency: "USDC"
+  decimals: 6
+  network: "localnet"
+  rpc_url: "https://402.surfnet.dev:8899"
+  external_id: "k8s-example"
+  inject_upstream_headers: true
+  endpoints:
+    - method: GET
+      path: /paid
+      description: "Paid API call"
+      metering:
+        dimensions:
+          - direction: usage
+            unit: requests
+            scale: 1
+            tiers:
+              - price_usd: 0.001
+configPatches:
+  - path: /secret_key
+    valueFrom:
+      secretKeyRef:
+        name: solana-kong-402-secret
+        key: secret_key

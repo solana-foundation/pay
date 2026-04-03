@@ -1,0 +1,83 @@
+local typedefs = require "kong.db.schema.typedefs"
+
+local condition = {
+  type = "record",
+  fields = {
+    { field = { type = "string", required = true, one_of = { "body_size" } } },
+    { op = { type = "string", required = true, one_of = { "<=", "<", ">=", ">", "==" } } },
+    { value = { type = "integer", required = true } },
+  },
+}
+
+local price_tier = {
+  type = "record",
+  fields = {
+    { up_to = { type = "integer", required = false } },
+    { price_usd = { type = "number", required = true } },
+    { notes = { type = "string", required = false } },
+    { condition = { required = false, type = "record", fields = condition.fields } },
+  },
+}
+
+local meter_dimension = {
+  type = "record",
+  fields = {
+    { direction = { type = "string", required = true } },
+    { unit = { type = "string", required = true } },
+    { scale = { type = "integer", required = false, default = 1 } },
+    { tiers = { type = "array", required = true, len_min = 1, elements = price_tier } },
+  },
+}
+
+local meter_variant = {
+  type = "record",
+  fields = {
+    { param = { type = "string", required = true } },
+    { value = { type = "string", required = true } },
+    { dimensions = { type = "array", required = true, len_min = 1, elements = meter_dimension } },
+  },
+}
+
+local metering = {
+  type = "record",
+  fields = {
+    { dimensions = { type = "array", required = false, elements = meter_dimension } },
+    { variants = { type = "array", required = false, elements = meter_variant } },
+  },
+}
+
+local endpoint = {
+  type = "record",
+  fields = {
+    { method = { type = "string", required = true, one_of = { "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS" } } },
+    { path = { type = "string", required = true } },
+    { description = { type = "string", required = false } },
+    { metering = { required = false, type = "record", fields = metering.fields } },
+  },
+}
+
+return {
+  name = "solana-kong-402",
+  fields = {
+    { consumer = typedefs.no_consumer },
+    { protocols = typedefs.protocols_http },
+    { config = {
+        type = "record",
+        fields = {
+          { recipient = { type = "string", required = true } },
+          { currency = { type = "string", required = false, default = "USDC" } },
+          { decimals = { type = "integer", required = false, default = 6 } },
+          { network = { type = "string", required = false, default = "mainnet-beta" } },
+          { rpc_url = { type = "string", required = false } },
+          { secret_key = { type = "string", required = false } },
+          { realm = { type = "string", required = false } },
+          { description = { type = "string", required = false } },
+          { external_id = { type = "string", required = false } },
+          { fee_payer = { type = "boolean", required = false, default = false } },
+          { inject_upstream_headers = { type = "boolean", required = false, default = true } },
+          { endpoints = { type = "array", required = true, len_min = 1, elements = endpoint } },
+        },
+      },
+    },
+  },
+}

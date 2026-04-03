@@ -1,0 +1,6 @@
+gateway:
+  image:
+    repository: ghcr.io/solana-foundation/pay-kong
+    tag: 0.1.0
+  env:
+    plugins: bundled,solana-kong-402
