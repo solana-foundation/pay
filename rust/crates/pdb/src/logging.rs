@@ -56,9 +56,10 @@ pub async fn logging_middleware(
     let status = response.status().as_u16();
     let res_headers = extract_headers(response.headers());
 
-    // Consume body to capture it, then re-wrap (capped at 16KB).
+    // Consume body to capture it, then re-wrap.
+    // Use 256KB limit to handle HTML payment pages (~50KB).
     let (parts, body) = response.into_parts();
-    let bytes = axum::body::to_bytes(body, 16 * 1024)
+    let bytes = axum::body::to_bytes(body, 256 * 1024)
         .await
         .unwrap_or_default();
 

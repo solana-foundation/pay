@@ -48,6 +48,14 @@ pub fn find_endpoint<'a>(api: &'a ApiSpec, method: &str, path: &str) -> Option<&
         .find(|e| format!("{:?}", e.method).to_uppercase() == method && path_matches(&e.path, path))
 }
 
+/// Find an endpoint by path only (ignoring HTTP method).
+/// Used for browser payment links where the browser sends GET to a POST endpoint.
+pub fn find_endpoint_by_path<'a>(api: &'a ApiSpec, path: &str) -> Option<&'a Endpoint> {
+    api.endpoints
+        .iter()
+        .find(|e| e.path == path || path_matches(&e.path, path))
+}
+
 /// Match a path pattern like "v1beta/models/{modelsId}:generateContent"
 /// against a concrete path like "v1beta/models/gemini-2.0-flash:generateContent".
 fn path_matches(pattern: &str, path: &str) -> bool {
@@ -127,6 +135,24 @@ pub fn resolve_price(
     }
 
     None
+}
+
+/// Resolve the effective split rules for a metering config.
+/// Per-tier splits override the metering-level splits.
+pub fn resolve_split_rules(metering: &Metering) -> &[pay_types::metering::SplitRule] {
+    // Check first tier for per-tier splits
+    let tier_splits = metering
+        .dimensions
+        .first()
+        .and_then(|d| d.tiers.first())
+        .map(|t| t.splits.as_slice())
+        .unwrap_or(&[]);
+
+    if !tier_splits.is_empty() {
+        return tier_splits;
+    }
+
+    &metering.splits
 }
 
 /// After a request is forwarded, record the usage and return the actual price charged.
@@ -453,18 +479,21 @@ mod tests {
                 price_usd: 0.0,
                 condition: None,
                 notes: None,
+                splits: vec![],
             },
             PriceTier {
                 up_to: Some(1000),
                 price_usd: 0.01,
                 condition: None,
                 notes: None,
+                splits: vec![],
             },
             PriceTier {
                 up_to: None,
                 price_usd: 0.005,
                 condition: None,
                 notes: None,
+                splits: vec![],
             },
         ];
 
@@ -487,12 +516,14 @@ mod tests {
                 price_usd: 0.0,
                 condition: None,
                 notes: None,
+                splits: vec![],
             },
             PriceTier {
                 up_to: None,
                 price_usd: 0.05,
                 condition: None,
                 notes: None,
+                splits: vec![],
             },
         ];
         assert_eq!(first_non_free_price(&tiers), 0.05);
@@ -505,6 +536,7 @@ mod tests {
             price_usd: 0.0,
             condition: None,
             notes: None,
+            splits: vec![],
         }];
         assert_eq!(first_non_free_price(&tiers), 0.0);
     }
@@ -518,7 +550,7 @@ mod tests {
             category: pay_types::metering::ApiCategory::AiMl,
             version: "1.0".to_string(),
             env: std::collections::HashMap::new(),
-            forward: pay_types::metering::ForwardConfig {
+            routing: pay_types::metering::RoutingConfig::Proxy {
                 url: "https://api.example.com".to_string(),
                 path_rewrites: vec![],
                 auth: None,
@@ -529,6 +561,7 @@ mod tests {
             quotas: None,
             notes: None,
             operator: None,
+            recipients: std::collections::HashMap::new(),
         }
     }
 
@@ -541,6 +574,7 @@ mod tests {
                 path: "v1/models".to_string(),
                 description: None,
                 resource: None,
+                routing: None,
                 metering: None,
             }],
         );
@@ -558,6 +592,7 @@ mod tests {
                 path: "v1/models/{modelId}:generate".to_string(),
                 description: None,
                 resource: None,
+                routing: None,
                 metering: None,
             }],
         );
@@ -574,6 +609,7 @@ mod tests {
                 path: "v1/models".to_string(),
                 description: None,
                 resource: None,
+                routing: None,
                 metering: None,
             }],
         );
@@ -587,6 +623,7 @@ mod tests {
             dimensions: vec![],
             variants: vec![],
             sku_tiers: vec![],
+            splits: vec![],
         };
         assert!(resolve_price(&metering, &RequestProperties::default(), None, None).is_none());
     }
@@ -604,10 +641,12 @@ mod tests {
                     price_usd: 0.01,
                     condition: None,
                     notes: None,
+                    splits: vec![],
                 }],
             }],
             variants: vec![],
             sku_tiers: vec![],
+            splits: vec![],
         };
         let price = resolve_price(&metering, &RequestProperties::default(), None, None);
         assert!(price.is_some());
@@ -625,6 +664,7 @@ mod tests {
                 sku: "essentials".to_string(),
                 level: pay_types::metering::SkuLevel::Essentials,
             }],
+            splits: vec![],
         };
         let price = resolve_price(&metering, &RequestProperties::default(), None, None);
         assert!(price.is_some());
@@ -649,6 +689,7 @@ mod tests {
                             price_usd: 0.05,
                             condition: None,
                             notes: None,
+                            splits: vec![],
                         }],
                     }],
                 },
@@ -665,11 +706,13 @@ mod tests {
                             price_usd: 0.01,
                             condition: None,
                             notes: None,
+                            splits: vec![],
                         }],
                     }],
                 },
             ],
             sku_tiers: vec![],
+            splits: vec![],
         };
         // Match second variant
         let price = resolve_price(
@@ -699,10 +742,12 @@ mod tests {
                         price_usd: 0.05,
                         condition: None,
                         notes: None,
+                        splits: vec![],
                     }],
                 }],
             }],
             sku_tiers: vec![],
+            splits: vec![],
         };
         // No variant hint match → uses first variant as default
         let price = resolve_price(
@@ -732,17 +777,20 @@ mod tests {
                             value: 128_000,
                         }),
                         notes: None,
+                        splits: vec![],
                     },
                     PriceTier {
                         up_to: None,
                         price_usd: 0.02,
                         condition: None,
                         notes: None,
+                        splits: vec![],
                     },
                 ],
             }],
             variants: vec![],
             sku_tiers: vec![],
+            splits: vec![],
         };
 
         // Within condition
@@ -779,17 +827,20 @@ mod tests {
                         price_usd: 0.0,
                         condition: None,
                         notes: None,
+                        splits: vec![],
                     },
                     PriceTier {
                         up_to: None,
                         price_usd: 0.01,
                         condition: None,
                         notes: None,
+                        splits: vec![],
                     },
                 ],
             }],
             variants: vec![],
             sku_tiers: vec![],
+            splits: vec![],
         };
 
         let ctx = MeteringContext {

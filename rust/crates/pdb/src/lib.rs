@@ -75,6 +75,7 @@ pub fn debugger_router(state: PdbState) -> Router {
         .route("/logs/stream", get(handlers::sse_stream))
         .route("/logs", get(handlers::logs_snapshot))
         .route("/api/config", get(handlers::config_handler))
+        // .route("/debug/fake-flow", axum::routing::post(handlers::inject_fake_flow))
         .fallback(get(serve_pdb))
         .with_state(state)
 }

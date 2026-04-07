@@ -40,3 +40,4 @@ ratatui = { workspace = true }
 crossterm = { workspace = true }
 qrcode = { workspace = true }
 pay-pdb = { workspace = true }
+urlencoding = "2.1.3"

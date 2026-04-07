@@ -5,13 +5,14 @@
 //! - Payment header → verify with solana-mpp, then forward upstream
 
 use axum::body::Body;
-use axum::http::{HeaderMap, Request, StatusCode};
+use axum::http::{HeaderMap, Method, Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 use solana_mpp::{
     AUTHORIZATION_HEADER, PAYMENT_RECEIPT_HEADER, WWW_AUTHENTICATE_HEADER, format_receipt,
     format_www_authenticate, parse_authorization,
+    server::html as mpp_html,
 };
 
 use crate::PaymentState;
@@ -38,6 +39,11 @@ pub async fn payment_middleware<S: PaymentState>(
         .unwrap_or("");
     let subdomain = host.split('.').next().unwrap_or("");
 
+    let accepts_html = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| mpp_html::accepts_html(v));
+
     let apis = state.apis();
     let api = match apis.iter().find(|a| a.subdomain == subdomain) {
         Some(api) => api,
@@ -46,7 +52,31 @@ pub async fn payment_middleware<S: PaymentState>(
         None => return next.run(req).await,
     };
 
-    let endpoint = metering::find_endpoint(api, method.as_str(), &path);
+    // Service worker for HTML payment link UI — must run before metering
+    // lookup so it works for any endpoint path regardless of method.
+    let query = uri.query().unwrap_or("");
+    if query.contains(mpp_html::SERVICE_WORKER_PARAM) {
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(axum::http::header::CONTENT_TYPE, "application/javascript")
+            .header("service-worker-allowed", "/")
+            .body(Body::from(mpp_html::service_worker_js()))
+            .unwrap();
+    }
+
+    // HEAD should be gated the same as GET.
+    let match_method = if method == Method::HEAD { "GET" } else { method.as_str() };
+
+    let endpoint = metering::find_endpoint(api, match_method, &path)
+        .or_else(|| {
+            // Browser payment link: GET request to a POST endpoint.
+            // Fall back to path-only match so the payment page renders.
+            if accepts_html {
+                metering::find_endpoint_by_path(api, &path)
+            } else {
+                None
+            }
+        });
     let metering_config = endpoint.and_then(|ep| ep.metering.as_ref());
 
     if metering_config.is_none() {
@@ -79,7 +109,57 @@ pub async fn payment_middleware<S: PaymentState>(
                 .map(|d| format!("{}", d.price_usd))
                 .unwrap_or_else(|| "0.01".to_string());
 
-            match mpp.charge(&amount) {
+            let description = endpoint.and_then(|ep| ep.description.as_deref());
+
+            // Resolve payment splits from metering config.
+            let split_rules = metering::resolve_split_rules(meter);
+            let amount_f64: f64 = amount.parse().unwrap_or(0.0);
+            let decimals = mpp.decimals() as u8;
+            let splits = if !split_rules.is_empty() {
+                let query_params: std::collections::HashMap<String, String> = uri
+                    .query()
+                    .map(|q| {
+                        q.split('&')
+                            .filter_map(|pair| {
+                                let mut parts = pair.splitn(2, '=');
+                                Some((parts.next()?.to_string(), parts.next().unwrap_or("").to_string()))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                match pay_types::splits::resolve_splits(
+                    split_rules,
+                    &api.recipients,
+                    amount_f64,
+                    decimals,
+                    &query_params,
+                ) {
+                    Ok(resolved) => resolved
+                        .into_iter()
+                        .map(|s| solana_mpp::protocol::solana::Split {
+                            recipient: s.recipient,
+                            amount: s.amount.to_string(),
+                            label: s.label,
+                            memo: s.memo,
+                        })
+                        .collect(),
+                    Err(e) => {
+                        tracing::debug!(error = %e, "Splits not resolved — omitting from challenge");
+                        vec![]
+                    }
+                }
+            } else {
+                vec![]
+            };
+
+            match mpp.charge_with_options(
+                &amount,
+                solana_mpp::server::ChargeOptions {
+                    description,
+                    splits,
+                    ..Default::default()
+                },
+            ) {
                 Ok(challenge) => {
                     let www_auth = match format_www_authenticate(&challenge) {
                         Ok(v) => v,
@@ -102,6 +182,27 @@ pub async fn payment_middleware<S: PaymentState>(
 
                     tracing::info!(subdomain = %subdomain, path = %path, amount = %amount, "402 Payment Required");
 
+                    if accepts_html {
+                        // Browser — render HTML payment link page.
+                        let page = mpp_html::challenge_to_html(
+                            &challenge,
+                            mpp.rpc_url(),
+                            mpp.network(),
+                        );
+                        tracing::info!(html_len = page.len(), "Generated HTML payment page");
+                        let mut resp = Response::builder()
+                            .status(StatusCode::PAYMENT_REQUIRED)
+                            .header(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")
+                            .header("content-security-policy", "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src *; worker-src 'self'")
+                            .body(Body::from(page))
+                            .unwrap();
+                        if let Ok(v) = axum::http::HeaderValue::from_str(&www_auth) {
+                            resp.headers_mut().insert(WWW_AUTHENTICATE_HEADER, v);
+                        }
+                        return resp;
+                    }
+
+                    // API client — JSON 402.
                     let mut resp = (StatusCode::PAYMENT_REQUIRED, axum::Json(body)).into_response();
                     if let Ok(v) = axum::http::HeaderValue::from_str(&www_auth) {
                         resp.headers_mut().insert(WWW_AUTHENTICATE_HEADER, v);

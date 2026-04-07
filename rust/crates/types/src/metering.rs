@@ -25,8 +25,8 @@ pub struct ApiSpec {
     /// Static values are set directly; `${VAR}` references the runtime environment.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub env: std::collections::HashMap<String, String>,
-    /// Forwarding config — upstream URL and optional auth injection.
-    pub forward: ForwardConfig,
+    /// Routing — how requests are handled (proxied upstream or responded to directly).
+    pub routing: RoutingConfig,
     /// How volume tiers are tracked: pooled (shared counter) or per_agent (per wallet).
     #[serde(default)]
     pub accounting: AccountingMode,
@@ -40,32 +40,58 @@ pub struct ApiSpec {
     /// Operator config — how this proxy instance runs (signer, recipient, currency).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator: Option<OperatorConfig>,
+    /// Named recipient aliases for use in payment splits.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub recipients: std::collections::HashMap<String, RecipientAlias>,
 }
 
-/// Upstream forwarding configuration.
+/// How a request is handled after payment verification.
+///
+/// ```yaml
+/// # Proxy — forward to an upstream API
+/// routing:
+///   type: proxy
+///   url: https://generativelanguage.googleapis.com/
+///   auth:
+///     method: query_param
+///     key: "key"
+///     value_from_env: GOOGLE_API_KEY
+///
+/// # Respond — return 200 with verified signature (no upstream)
+/// routing:
+///   type: respond
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct ForwardConfig {
-    /// Upstream base URL (e.g. `https://generativelanguage.googleapis.com/`).
-    pub url: String,
-    /// Optional path segments prepended to the request path.
-    /// Each segment's value is resolved from an environment variable.
-    ///
-    /// ```yaml
-    /// forward:
-    ///   url: https://translation.googleapis.com
-    ///   path_rewrites:
-    ///     - prefix: "v3/projects/{projectId}"
-    ///       env: GOOGLE_PROJECT_ID
-    /// ```
-    ///
-    /// Given `GOOGLE_PROJECT_ID=my-proj`, a request to
-    /// `/v3/projects/any-value/locations/global:translateText` is rewritten to
-    /// `https://translation.googleapis.com/v3/projects/my-proj/locations/global:translateText`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub path_rewrites: Vec<PathRewrite>,
-    /// How the proxy injects upstream API credentials after payment.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auth: Option<AuthConfig>,
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RoutingConfig {
+    /// Forward request to an upstream API.
+    Proxy {
+        /// Upstream base URL (e.g. `https://generativelanguage.googleapis.com/`).
+        url: String,
+        /// Optional path segments prepended to the request path.
+        /// Each segment's value is resolved from an environment variable.
+        ///
+        /// ```yaml
+        /// routing:
+        ///   type: proxy
+        ///   url: https://translation.googleapis.com
+        ///   path_rewrites:
+        ///     - prefix: "v3/projects/{projectId}"
+        ///       env: GOOGLE_PROJECT_ID
+        /// ```
+        ///
+        /// Given `GOOGLE_PROJECT_ID=my-proj`, a request to
+        /// `/v3/projects/any-value/locations/global:translateText` is rewritten to
+        /// `https://translation.googleapis.com/v3/projects/my-proj/locations/global:translateText`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        path_rewrites: Vec<PathRewrite>,
+        /// How the proxy injects upstream API credentials after payment.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth: Option<AuthConfig>,
+    },
+    /// Respond directly — return 200 with the verified payment signature,
+    /// or 401 if the request was denied. No upstream call.
+    Respond {},
 }
 
 /// A path rewrite rule — matches a prefix pattern in the request path and
@@ -82,32 +108,56 @@ pub struct PathRewrite {
     pub env: String,
 }
 
-impl ForwardConfig {
+impl RoutingConfig {
     /// Build the full upstream URL for a given request path+query.
-    ///
-    /// For each path rewrite rule, matches the prefix pattern against the
-    /// request path segments and substitutes `{placeholder}` segments with
-    /// the env var value. Unmatched paths are forwarded as-is.
-    pub fn upstream_url(&self, path_and_query: &str) -> String {
-        let base = self.url.trim_end_matches('/');
-
-        if self.path_rewrites.is_empty() {
-            return format!("{base}{path_and_query}");
+    /// Returns `None` for the `Respond` variant.
+    pub fn upstream_url(&self, path_and_query: &str) -> Option<String> {
+        match self {
+            Self::Proxy {
+                url,
+                path_rewrites,
+                ..
+            } => {
+                let base = url.trim_end_matches('/');
+                if path_rewrites.is_empty() {
+                    return Some(format!("{base}{path_and_query}"));
+                }
+                let (path, query) = match path_and_query.find('?') {
+                    Some(i) => (&path_and_query[..i], &path_and_query[i..]),
+                    None => (path_and_query, ""),
+                };
+                let rewritten = rewrite_path(path, path_rewrites);
+                Some(format!("{base}{rewritten}{query}"))
+            }
+            Self::Respond {} => None,
         }
-
-        // Split path from query string.
-        let (path, query) = match path_and_query.find('?') {
-            Some(i) => (&path_and_query[..i], &path_and_query[i..]),
-            None => (path_and_query, ""),
-        };
-
-        let rewritten = rewrite_path(path, &self.path_rewrites);
-        format!("{base}{rewritten}{query}")
     }
 
     /// The base URL for display purposes.
+    /// Returns `"respond"` for the `Respond` variant.
     pub fn display_url(&self) -> &str {
-        &self.url
+        match self {
+            Self::Proxy { url, .. } => url,
+            Self::Respond {} => "respond",
+        }
+    }
+
+    /// The auth config, if this is a proxy route.
+    pub fn auth(&self) -> Option<&AuthConfig> {
+        match self {
+            Self::Proxy { auth, .. } => auth.as_ref(),
+            Self::Respond {} => None,
+        }
+    }
+
+    /// Returns `true` if this is a proxy route.
+    pub fn is_proxy(&self) -> bool {
+        matches!(self, Self::Proxy { .. })
+    }
+
+    /// Returns `true` if this is a respond route.
+    pub fn is_respond(&self) -> bool {
+        matches!(self, Self::Respond { .. })
     }
 }
 
@@ -244,6 +294,52 @@ pub enum SignerConfig {
     },
 }
 
+// =============================================================================
+// Recipients & Splits
+// =============================================================================
+
+/// Named recipient alias declared at the API spec level.
+/// Used in split rules to reference wallet accounts by name.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct RecipientAlias {
+    /// Wallet account — literal base58 pubkey or `${VAR}` for runtime resolution.
+    /// Runtime variables are resolved from request query parameters.
+    pub account: String,
+    /// Human-readable label (shown in debugger UI and receipts).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// A single split directive — either a fixed USD amount or a percentage of the total.
+///
+/// Exactly one of `amount` or `percent` must be set.
+///
+/// **Semantics:**
+/// - `amount`: fixed USD value deducted from the charge.
+/// - `percent`: percentage of the **original total charge** (not the remaining balance).
+///
+/// This means reordering splits does not change anyone's payout — both fixed and
+/// percentage splits reference the same original total, following the standard
+/// payment processing model (Stripe, Adyen).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SplitRule {
+    /// Reference to a named recipient alias (key in `ApiSpec.recipients`).
+    pub recipient: String,
+    /// Fixed USD amount to send to this recipient.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amount: Option<f64>,
+    /// Percentage of the original total charge to send to this recipient.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub percent: Option<f64>,
+    /// Human-readable memo (shown in debugger + on-chain).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memo: Option<String>,
+}
+
+// =============================================================================
+// API Categories
+// =============================================================================
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ApiCategory {
@@ -268,6 +364,10 @@ pub struct Endpoint {
     /// Resource group (e.g. "models", "tunedModels", "files").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource: Option<String>,
+    /// Per-endpoint routing override. If set, takes precedence over the
+    /// top-level `routing` config for this endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<RoutingConfig>,
     /// Billing config for this endpoint. None = free / not billed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metering: Option<Metering>,
@@ -285,6 +385,10 @@ pub struct Metering {
     /// Maps Platform SKU tiers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sku_tiers: Vec<SkuTier>,
+    /// Payment splits — how the charge is distributed to named recipients.
+    /// Applied to all tiers unless overridden at the tier level.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub splits: Vec<SplitRule>,
 }
 
 /// A variant represents a pricing path selected by a request parameter.
@@ -324,6 +428,9 @@ pub struct PriceTier {
     pub condition: Option<MeterCondition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
+    /// Per-tier split overrides. If present, these replace the metering-level splits.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub splits: Vec<SplitRule>,
 }
 
 /// A condition the proxy can evaluate against request properties.
@@ -678,6 +785,7 @@ mod tests {
             price_usd: 0.01,
             condition: None,
             notes: None,
+            splits: vec![],
         };
         let json = serde_json::to_string(&tier).unwrap();
         assert!(!json.contains("up_to"));
@@ -692,6 +800,7 @@ mod tests {
             path: "v1/test".to_string(),
             description: None,
             resource: None,
+            routing: None,
             metering: None,
         };
         let json = serde_json::to_string(&ep).unwrap();
@@ -717,10 +826,12 @@ mod tests {
                         price_usd: 0.03,
                         condition: None,
                         notes: None,
+                        splits: vec![],
                     }],
                 }],
             }],
             sku_tiers: vec![],
+            splits: vec![],
         };
         let json = serde_json::to_string(&metering).unwrap();
         let back: Metering = serde_json::from_str(&json).unwrap();
@@ -755,7 +866,7 @@ mod tests {
             category: ApiCategory::AiMl,
             version: "v1".to_string(),
             env: std::collections::HashMap::new(),
-            forward: ForwardConfig {
+            routing: RoutingConfig::Proxy {
                 url: "https://vision.googleapis.com".to_string(),
                 path_rewrites: vec![],
                 auth: None,
@@ -766,6 +877,7 @@ mod tests {
                 path: "v1/images:annotate".to_string(),
                 description: Some("Annotate images".to_string()),
                 resource: Some("images".to_string()),
+                routing: None,
                 metering: Some(Metering {
                     dimensions: vec![MeterDimension {
                         direction: MeterDirection::Usage,
@@ -777,10 +889,12 @@ mod tests {
                             price_usd: 0.0,
                             condition: None,
                             notes: Some("Free tier".to_string()),
+                            splits: vec![],
                         }],
                     }],
                     variants: vec![],
                     sku_tiers: vec![],
+                    splits: vec![],
                 }),
             }],
             free_tier: Some(FreeTier {
@@ -799,6 +913,7 @@ mod tests {
             }),
             notes: None,
             operator: None,
+            recipients: std::collections::HashMap::new(),
         };
         let json = serde_json::to_string(&spec).unwrap();
         let back: ApiSpec = serde_json::from_str(&json).unwrap();
@@ -809,7 +924,7 @@ mod tests {
         assert_eq!(back.free_tier.unwrap().amount, Some(1000));
     }
 
-    // ── ForwardConfig / path rewrites ────────────────────────────────────
+    // ── RoutingConfig / path rewrites ────────────────────────────────────
 
     // ── rewrite_path ─────────────────────────────────────────────────────
 
@@ -878,26 +993,26 @@ mod tests {
 
     #[test]
     fn upstream_url_no_rewrites() {
-        let fwd = ForwardConfig {
+        let fwd = RoutingConfig::Proxy {
             url: "https://api.example.com".to_string(),
             path_rewrites: vec![],
             auth: None,
         };
         assert_eq!(
-            fwd.upstream_url("/v1/translate?q=hello"),
+            fwd.upstream_url("/v1/translate?q=hello").unwrap(),
             "https://api.example.com/v1/translate?q=hello"
         );
     }
 
     #[test]
     fn upstream_url_trailing_slash_on_base() {
-        let fwd = ForwardConfig {
+        let fwd = RoutingConfig::Proxy {
             url: "https://api.example.com/".to_string(),
             path_rewrites: vec![],
             auth: None,
         };
         assert_eq!(
-            fwd.upstream_url("/v1/test"),
+            fwd.upstream_url("/v1/test").unwrap(),
             "https://api.example.com/v1/test"
         );
     }
@@ -906,7 +1021,7 @@ mod tests {
     fn upstream_url_with_rewrite() {
         // SAFETY: test-only, single-threaded
         unsafe { std::env::set_var("_TEST_PROJECT_ID", "my-project-123") };
-        let fwd = ForwardConfig {
+        let fwd = RoutingConfig::Proxy {
             url: "https://translation.googleapis.com".to_string(),
             path_rewrites: vec![PathRewrite {
                 prefix: "v3/projects/{projectId}".to_string(),
@@ -915,7 +1030,7 @@ mod tests {
             auth: None,
         };
         assert_eq!(
-            fwd.upstream_url("/v3/projects/any-value/locations/global:translateText"),
+            fwd.upstream_url("/v3/projects/any-value/locations/global:translateText").unwrap(),
             "https://translation.googleapis.com/v3/projects/my-project-123/locations/global:translateText"
         );
         unsafe { std::env::remove_var("_TEST_PROJECT_ID") };
@@ -925,7 +1040,7 @@ mod tests {
     fn upstream_url_preserves_query_string() {
         // SAFETY: test-only, single-threaded
         unsafe { std::env::set_var("_TEST_PROJ_QS", "gateway-402") };
-        let fwd = ForwardConfig {
+        let fwd = RoutingConfig::Proxy {
             url: "https://api.example.com".to_string(),
             path_rewrites: vec![PathRewrite {
                 prefix: "v3/projects/{projectId}".to_string(),
@@ -934,45 +1049,89 @@ mod tests {
             auth: None,
         };
         assert_eq!(
-            fwd.upstream_url("/v3/projects/user-proj/translate?lang=fr"),
+            fwd.upstream_url("/v3/projects/user-proj/translate?lang=fr").unwrap(),
             "https://api.example.com/v3/projects/gateway-402/translate?lang=fr"
         );
         unsafe { std::env::remove_var("_TEST_PROJ_QS") };
     }
 
     #[test]
-    fn forward_config_json_plain_url() {
-        let json = r#"{"url":"https://api.example.com"}"#;
-        let fwd: ForwardConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(fwd.url, "https://api.example.com");
-        assert!(fwd.path_rewrites.is_empty());
+    fn routing_config_json_proxy() {
+        let json = r#"{"type":"proxy","url":"https://api.example.com"}"#;
+        let rc: RoutingConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(rc.display_url(), "https://api.example.com");
+        assert!(rc.is_proxy());
     }
 
     #[test]
-    fn forward_config_json_with_path_rewrites() {
+    fn routing_config_json_proxy_with_path_rewrites() {
         let json = r#"{
+            "type": "proxy",
             "url": "https://translation.googleapis.com",
             "path_rewrites": [
                 {"prefix": "v3/projects/{projectId}", "env": "GOOGLE_PROJECT_ID"}
             ]
         }"#;
-        let fwd: ForwardConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(fwd.url, "https://translation.googleapis.com");
-        assert_eq!(fwd.path_rewrites.len(), 1);
-        assert_eq!(fwd.path_rewrites[0].prefix, "v3/projects/{projectId}");
-        assert_eq!(fwd.path_rewrites[0].env, "GOOGLE_PROJECT_ID");
+        let rc: RoutingConfig = serde_json::from_str(json).unwrap();
+        assert!(rc.is_proxy());
+        if let RoutingConfig::Proxy { url, path_rewrites, .. } = &rc {
+            assert_eq!(url, "https://translation.googleapis.com");
+            assert_eq!(path_rewrites.len(), 1);
+            assert_eq!(path_rewrites[0].prefix, "v3/projects/{projectId}");
+            assert_eq!(path_rewrites[0].env, "GOOGLE_PROJECT_ID");
+        } else {
+            panic!("expected Proxy");
+        }
     }
 
     #[test]
-    fn forward_config_roundtrip_no_rewrites() {
-        let fwd = ForwardConfig {
+    fn routing_config_json_respond() {
+        let json = r#"{"type":"respond"}"#;
+        let rc: RoutingConfig = serde_json::from_str(json).unwrap();
+        assert!(rc.is_respond());
+        assert_eq!(rc.display_url(), "respond");
+        assert!(rc.upstream_url("/test").is_none());
+    }
+
+    #[test]
+    fn routing_config_roundtrip_proxy() {
+        let rc = RoutingConfig::Proxy {
             url: "https://api.example.com".to_string(),
             path_rewrites: vec![],
             auth: None,
         };
-        let json = serde_json::to_string(&fwd).unwrap();
+        let json = serde_json::to_string(&rc).unwrap();
+        assert!(json.contains(r#""type":"proxy""#));
         assert!(!json.contains("path_rewrites"));
-        let back: ForwardConfig = serde_json::from_str(&json).unwrap();
-        assert!(back.path_rewrites.is_empty());
+        let back: RoutingConfig = serde_json::from_str(&json).unwrap();
+        assert!(back.is_proxy());
+    }
+
+    #[test]
+    fn routing_config_roundtrip_respond() {
+        let rc = RoutingConfig::Respond {};
+        let json = serde_json::to_string(&rc).unwrap();
+        assert!(json.contains(r#""type":"respond""#));
+        let back: RoutingConfig = serde_json::from_str(&json).unwrap();
+        assert!(back.is_respond());
+    }
+
+    #[test]
+    fn endpoint_routing_override_serde() {
+        let json = r#"{
+            "method": "POST",
+            "path": "v1/test",
+            "routing": {"type": "respond"}
+        }"#;
+        let ep: Endpoint = serde_json::from_str(json).unwrap();
+        assert!(ep.routing.is_some());
+        assert!(ep.routing.unwrap().is_respond());
+    }
+
+    #[test]
+    fn endpoint_no_routing_override() {
+        let json = r#"{"method": "GET", "path": "v1/health"}"#;
+        let ep: Endpoint = serde_json::from_str(json).unwrap();
+        assert!(ep.routing.is_none());
     }
 }

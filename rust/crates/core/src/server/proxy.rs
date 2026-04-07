@@ -1,14 +1,16 @@
 //! HTTP reverse proxy — forwards requests to upstream APIs.
 //!
-//! Resolves the upstream from `ApiSpec.forward_url`, forwards headers and body,
+//! Resolves the upstream from `ApiSpec.routing`, forwards headers and body,
 //! returns the upstream response. Strips hop-by-hop and payment headers.
+//!
+//! For `Respond` routing, returns 200 directly (no upstream call).
 
 use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::response::Response;
-use pay_types::metering::{ApiSpec, AuthConfig};
+use pay_types::metering::{ApiSpec, AuthConfig, RoutingConfig};
 use serde_json::json;
 use tokio::sync::RwLock;
 
@@ -22,12 +24,30 @@ const STRIP_HEADERS: &[&str] = &[
     "payment-required",
 ];
 
+/// Resolve the effective routing for a request path.
+///
+/// Checks if the matched endpoint has a routing override; falls back to the
+/// API-level routing config.
+pub fn resolve_routing<'a>(api: &'a ApiSpec, path: &str) -> &'a RoutingConfig {
+    let trimmed = path.trim_start_matches('/');
+    for ep in &api.endpoints {
+        if ep.path == trimmed {
+            if let Some(ref r) = ep.routing {
+                return r;
+            }
+        }
+    }
+    &api.routing
+}
+
 /// Forward a request to the upstream API defined in the spec.
 ///
-/// - Builds the upstream URL from `api.forward.url` + request path
+/// - Builds the upstream URL from `api.routing` + request path
 /// - Forwards all headers except hop-by-hop and payment headers
 /// - Forwards the request body as-is
 /// - Returns the upstream response (status, headers, body)
+///
+/// For `Respond` routing, returns 200 with `{"status":"ok"}`.
 pub async fn forward_request(
     api: &ApiSpec,
     method: Method,
@@ -40,13 +60,27 @@ pub async fn forward_request(
         .map(|pq| pq.as_str())
         .unwrap_or(uri.path());
 
+    let routing = resolve_routing(api, uri.path());
+
+    // Respond mode — no upstream call.
+    if routing.is_respond() {
+        tracing::info!(subdomain = %api.subdomain, path = %uri.path(), "Respond mode — returning 200");
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"status":"ok"}"#))
+            .unwrap());
+    }
+
     // Build upstream URL (with path rewrites), then inject query param auth if configured.
-    let mut upstream_url = api.forward.upstream_url(path_and_query);
+    let mut upstream_url = routing
+        .upstream_url(path_and_query)
+        .expect("Proxy routing must have a URL");
 
     if let Some(AuthConfig::QueryParam {
         key,
         value_from_env,
-    }) = &api.forward.auth
+    }) = routing.auth()
     {
         let secret = std::env::var(value_from_env).unwrap_or_default();
         let separator = if upstream_url.contains('?') { "&" } else { "?" };
@@ -77,7 +111,7 @@ pub async fn forward_request(
     }
 
     // Inject auth header if configured.
-    match &api.forward.auth {
+    match routing.auth() {
         Some(AuthConfig::Header {
             key,
             prefix,
@@ -355,7 +389,7 @@ async fn fetch_gcp_metadata_token(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pay_types::metering::ForwardConfig;
+    use pay_types::metering::RoutingConfig;
 
     fn make_api(subdomain: &str) -> ApiSpec {
         ApiSpec {
@@ -366,7 +400,7 @@ mod tests {
             category: pay_types::metering::ApiCategory::AiMl,
             version: "1.0".to_string(),
             env: std::collections::HashMap::new(),
-            forward: ForwardConfig {
+            routing: RoutingConfig::Proxy {
                 url: "https://api.example.com".to_string(),
                 path_rewrites: vec![],
                 auth: None,
@@ -377,6 +411,7 @@ mod tests {
             quotas: None,
             notes: None,
             operator: None,
+            recipients: std::collections::HashMap::new(),
         }
     }
 
@@ -443,7 +478,7 @@ mod tests {
         let (base_url, _handle) = spawn_upstream(app).await;
 
         let api = ApiSpec {
-            forward: ForwardConfig {
+            routing: RoutingConfig::Proxy {
                 url: base_url.clone(),
                 path_rewrites: vec![],
                 auth: None,
@@ -471,7 +506,7 @@ mod tests {
         let (base_url, _handle) = spawn_upstream(app).await;
 
         let api = ApiSpec {
-            forward: ForwardConfig {
+            routing: RoutingConfig::Proxy {
                 url: base_url.clone(),
                 path_rewrites: vec![],
                 auth: None,
@@ -511,7 +546,7 @@ mod tests {
         let (base_url, _handle) = spawn_upstream(app).await;
 
         let api = ApiSpec {
-            forward: ForwardConfig {
+            routing: RoutingConfig::Proxy {
                 url: base_url.clone(),
                 path_rewrites: vec![],
                 auth: None,
@@ -541,7 +576,7 @@ mod tests {
         let (base_url, _handle) = spawn_upstream(app).await;
 
         let api = ApiSpec {
-            forward: ForwardConfig {
+            routing: RoutingConfig::Proxy {
                 url: base_url.clone(),
                 path_rewrites: vec![],
                 auth: None,
@@ -559,7 +594,7 @@ mod tests {
     #[tokio::test]
     async fn forward_request_upstream_down() {
         let api = ApiSpec {
-            forward: ForwardConfig {
+            routing: RoutingConfig::Proxy {
                 url: "http://127.0.0.1:1".to_string(),
                 path_rewrites: vec![],
                 auth: None,
@@ -587,7 +622,7 @@ mod tests {
         let (base_url, _handle) = spawn_upstream(app).await;
 
         let api = ApiSpec {
-            forward: ForwardConfig {
+            routing: RoutingConfig::Proxy {
                 url: base_url.clone(),
                 path_rewrites: vec![],
                 auth: None,
@@ -622,7 +657,7 @@ mod tests {
         // SAFETY: test-only, single-threaded
         unsafe { std::env::set_var("_TEST_FWD_PROJECT", "operator-proj") };
         let api = ApiSpec {
-            forward: ForwardConfig {
+            routing: RoutingConfig::Proxy {
                 url: base_url.clone(),
                 path_rewrites: vec![PathRewrite {
                     prefix: "v3/projects/{projectId}".to_string(),
@@ -646,5 +681,113 @@ mod tests {
         assert_eq!(&body[..], b"translated");
 
         unsafe { std::env::remove_var("_TEST_FWD_PROJECT") };
+    }
+
+    // ── resolve_routing ──────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_routing_uses_api_default() {
+        let api = make_api("test");
+        let r = resolve_routing(&api, "/v1/test");
+        assert!(r.is_proxy());
+    }
+
+    #[test]
+    fn resolve_routing_endpoint_override() {
+        let mut api = make_api("test");
+        api.endpoints.push(pay_types::metering::Endpoint {
+            method: pay_types::metering::HttpMethod::Post,
+            path: "v1/pay".to_string(),
+            description: None,
+            resource: None,
+            routing: Some(RoutingConfig::Respond {}),
+            metering: None,
+        });
+        // Endpoint with override → Respond
+        let r = resolve_routing(&api, "/v1/pay");
+        assert!(r.is_respond());
+        // Other path → falls back to API default (Proxy)
+        let r2 = resolve_routing(&api, "/v1/other");
+        assert!(r2.is_proxy());
+    }
+
+    #[test]
+    fn resolve_routing_endpoint_no_override_uses_default() {
+        let mut api = make_api("test");
+        api.endpoints.push(pay_types::metering::Endpoint {
+            method: pay_types::metering::HttpMethod::Get,
+            path: "v1/health".to_string(),
+            description: None,
+            resource: None,
+            routing: None, // no override
+            metering: None,
+        });
+        let r = resolve_routing(&api, "/v1/health");
+        assert!(r.is_proxy());
+    }
+
+    // ── forward_request with Respond routing ─────────────────────────────
+
+    #[tokio::test]
+    async fn forward_request_respond_mode() {
+        let mut api = make_api("test");
+        api.routing = RoutingConfig::Respond {};
+
+        let uri: Uri = "/v1/test".parse().unwrap();
+        let result =
+            forward_request(&api, Method::GET, &uri, &HeaderMap::new(), Bytes::new()).await;
+
+        let resp = result.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert!(body.starts_with(b"{"));
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn forward_request_respond_endpoint_override() {
+        let app = axum::Router::new().route(
+            "/v1/proxy-me",
+            axum::routing::get(|| async { "from upstream" }),
+        );
+        let (base_url, _handle) = spawn_upstream(app).await;
+
+        let mut api = make_api("test");
+        api.routing = RoutingConfig::Proxy {
+            url: base_url,
+            path_rewrites: vec![],
+            auth: None,
+        };
+        // Add an endpoint that overrides to Respond
+        api.endpoints.push(pay_types::metering::Endpoint {
+            method: pay_types::metering::HttpMethod::Post,
+            path: "v1/respond-only".to_string(),
+            description: None,
+            resource: None,
+            routing: Some(RoutingConfig::Respond {}),
+            metering: None,
+        });
+
+        // Respond endpoint returns 200 directly
+        let uri: Uri = "/v1/respond-only".parse().unwrap();
+        let result =
+            forward_request(&api, Method::POST, &uri, &HeaderMap::new(), Bytes::new()).await;
+        let resp = result.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "ok");
+
+        // Proxy endpoint still forwards upstream
+        let uri2: Uri = "/v1/proxy-me".parse().unwrap();
+        let result2 =
+            forward_request(&api, Method::GET, &uri2, &HeaderMap::new(), Bytes::new()).await;
+        let resp2 = result2.unwrap();
+        assert_eq!(resp2.status(), StatusCode::OK);
+        let body2 = axum::body::to_bytes(resp2.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(&body2[..], b"from upstream");
     }
 }
