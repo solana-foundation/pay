@@ -1,4 +1,5 @@
 import type { PaymentFlow } from "../types";
+import { Amount } from "./Amount";
 import { ProtocolBadge } from "./ProtocolBadge";
 import { StatusIndicator } from "./StatusIndicator";
 
@@ -31,7 +32,9 @@ export function FlowRow({ flow, selected, onClick }: Props) {
       <ProtocolBadge protocol={flow.protocol} />
       <span className="resource">{flow.resource}</span>
       <StatusIndicator status={flow.status} />
-      {flow.amount && <span className="amount">{flow.amount}</span>}
+      <span className="amount-slot">
+        {flow.amount && <Amount value={parseFloat(flow.amount)} />}
+      </span>
       <span className="duration">{fmtDuration(flow.durationMs)}</span>
       <span className="timestamp">{fmtTime(flow.startedAt)}</span>
     </div>

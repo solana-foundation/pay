@@ -1,0 +1,56 @@
+name: google-bigquery
+subdomain: google-bigquery
+title: "Google BigQuery API"
+description: "Run SQL queries on petabyte-scale datasets."
+category: data
+version: v2
+env:
+  GCP_PROJECT: gateway-402
+routing:
+  type: proxy
+  url: https://bigquery.googleapis.com/
+  auth:
+    method: oauth2
+    token_url: gcp_metadata
+    scopes:
+      - "https://www.googleapis.com/auth/bigquery"
+    headers:
+      x-goog-user-project:
+        from_env: GCP_PROJECT
+operator:
+  currency: "USDC"
+  network: "localnet"
+  fee_payer: true
+
+endpoints:
+  - method: POST
+    path: "bigquery/v2/projects/{projectsId}/queries"
+    resource: "jobs"
+    description: "Runs a SQL query and returns results."
+    metering:
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 0.15
+              notes: "Per-query fee (~$0.05 avg Google cost at ~9 GB/query + 3x margin)"
+  - method: GET
+    path: "bigquery/v2/projects/{projectsId}/queries/{jobId}"
+    resource: "jobs"
+    description: "Gets the results of a query job."
+  - method: POST
+    path: "bigquery/v2/projects/{projectsId}/jobs"
+    resource: "jobs"
+    description: "Starts an async query job."
+    metering:
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 0.15
+  - method: GET
+    path: "bigquery/v2/projects/{projectsId}/jobs/{jobId}"
+    resource: "jobs"
+    description: "Gets job status and metadata."

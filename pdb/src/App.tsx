@@ -1,6 +1,7 @@
 import { useState, useMemo } from "react";
 import { useFlows } from "./hooks/useFlows";
 import { useTheme } from "./hooks/useTheme";
+import { ConfigProvider } from "./hooks/useConfig";
 import { Header } from "./components/Header";
 import { Toolbar, type FilterMode } from "./components/Toolbar";
 import { FlowList } from "./components/FlowList";
@@ -12,7 +13,10 @@ export function App() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [mode, setMode] = useState<FilterMode>("all");
   const [search, setSearch] = useState("");
-  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [sidebarOpen, setSidebarOpen] = useState(() => {
+    const stored = localStorage.getItem("sidebarOpen");
+    return stored === null ? true : stored === "true";
+  });
 
   const filtered = useMemo(() => {
     return flows.filter((f) => {
@@ -31,13 +35,18 @@ export function App() {
   }, [flows, mode, viewerIp, search]);
 
   return (
+    <ConfigProvider>
     <div className="app">
       <div className="main">
         <Header
           theme={theme}
           onToggleTheme={toggleTheme}
           sidebarOpen={sidebarOpen}
-          onToggleSidebar={() => setSidebarOpen(!sidebarOpen)}
+          onToggleSidebar={() => {
+            const next = !sidebarOpen;
+            setSidebarOpen(next);
+            localStorage.setItem("sidebarOpen", String(next));
+          }}
         />
         <Toolbar
           mode={mode}
@@ -59,5 +68,6 @@ export function App() {
         <Sidebar />
       </div>
     </div>
+    </ConfigProvider>
   );
 }

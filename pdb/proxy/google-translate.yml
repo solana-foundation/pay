@@ -1,0 +1,58 @@
+name: google-translate
+subdomain: google-translate
+title: "Google Cloud Translation API"
+description: "Translate text between 100+ languages via Google Cloud Translation API."
+category: ai_ml
+version: v3
+env:
+  GCP_PROJECT: gateway-402
+routing:
+  type: proxy
+  url: https://translation.googleapis.com/
+  path_rewrites:
+    - prefix: "v3/projects/{projectId}"
+      env: GCP_PROJECT
+  auth:
+    method: oauth2
+    token_url: gcp_metadata
+    scopes:
+      - "https://www.googleapis.com/auth/cloud-translation"
+    headers:
+      x-goog-user-project:
+        from_env: GCP_PROJECT
+operator:
+  currency: "USDC"
+  network: "localnet"
+  fee_payer: true
+
+endpoints:
+  - method: POST
+    path: "v3/projects/{projectsId}/locations/{locationsId}:translateText"
+    resource: "projects.locations"
+    description: "Translates input text and returns translated text."
+    metering:
+      dimensions:
+        - direction: usage
+          unit: characters
+          scale: 1000000
+          tiers:
+            - up_to: 500000
+              price_usd: 0
+            - price_usd: 20
+  - method: POST
+    path: "v3/projects/{projectsId}/locations/{locationsId}:detectLanguage"
+    resource: "projects.locations"
+    description: "Detects the language of text within a request."
+    metering:
+      dimensions:
+        - direction: usage
+          unit: characters
+          scale: 1000000
+          tiers:
+            - up_to: 500000
+              price_usd: 0
+            - price_usd: 20
+  - method: GET
+    path: "v3/projects/{projectsId}/locations/{locationsId}/supportedLanguages"
+    resource: "projects.locations"
+    description: "Returns a list of supported languages for translation."
