@@ -87,10 +87,48 @@ async fn start_test_server(with_mpp: bool) -> (String, tokio::task::JoinHandle<(
     (url, handle)
 }
 
+fn load_respond_api() -> ApiSpec {
+    let content = std::fs::read_to_string("tests/fixtures/test-respond.yml").unwrap();
+    serde_yml::from_str(&content).unwrap()
+}
+
 fn client_with_host(subdomain: &str) -> reqwest::header::HeaderMap {
     let mut h = reqwest::header::HeaderMap::new();
     h.insert("host", format!("{subdomain}.localhost").parse().unwrap());
     h
+}
+
+async fn start_respond_server() -> (String, tokio::task::JoinHandle<()>) {
+    let api = load_respond_api();
+    let mpp = Mpp::new(solana_mpp::server::Config {
+        recipient: "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY".to_string(),
+        currency: "USDC".to_string(),
+        decimals: 6,
+        network: "localnet".to_string(),
+        rpc_url: Some("http://localhost:8899".to_string()),
+        secret_key: Some("test-secret".to_string()),
+        ..Default::default()
+    })
+    .ok();
+
+    let state = TestState {
+        apis: Arc::new(vec![api]),
+        mpp,
+    };
+
+    let app = Router::new()
+        .fallback(any(echo_handler))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            pay_core::server::payment::payment_middleware::<TestState>,
+        ))
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let handle = tokio::spawn(async { axum::serve(listener, app).await.unwrap() });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    (url, handle)
 }
 
 // =============================================================================
@@ -338,4 +376,148 @@ fn accounting_many_scopes() {
         scope: "wallet_50".into(),
     };
     assert_eq!(store.get_usage(&key), 50);
+}
+
+// =============================================================================
+// Method gating — prevent bypass by switching HTTP methods
+// =============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_on_post_endpoint_returns_402_with_html_accept() {
+    let (url, _h) = start_test_server(true).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{url}/v1/simple/echo"))
+        .headers(client_with_host("testapi"))
+        .header("accept", "text/html,*/*")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 402, "GET with Accept:text/html on POST endpoint should return 402 payment link");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_on_post_endpoint_without_html_passes_through() {
+    // With proxy routing, unknown method falls through to upstream (echo handler)
+    let (url, _h) = start_test_server(true).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{url}/v1/simple/echo"))
+        .headers(client_with_host("testapi"))
+        .send()
+        .await
+        .unwrap();
+    // Proxy routing: passes through to fallback (echo handler returns 200)
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn head_on_get_endpoint_returns_402() {
+    // Uses respond server which has a metered GET endpoint
+    let (url, _h) = start_respond_server().await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .head(format!("{url}/v1/data"))
+        .send()
+        .await
+        .unwrap();
+    // HEAD should be gated same as GET
+    assert_eq!(resp.status(), 402);
+}
+
+// =============================================================================
+// Respond routing — method gating and 404 behavior
+// =============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn respond_get_metered_returns_402() {
+    let (url, _h) = start_respond_server().await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{url}/v1/data"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 402, "GET on metered respond endpoint should return 402");
+    assert!(resp.headers().get("www-authenticate").is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn respond_post_metered_returns_402() {
+    let (url, _h) = start_respond_server().await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{url}/v1/submit"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 402, "POST on metered respond endpoint should return 402");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn respond_free_endpoint_passes_through() {
+    let (url, _h) = start_respond_server().await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{url}/v1/health"))
+        .send()
+        .await
+        .unwrap();
+    // Free endpoint with respond routing: passes to fallback (echo)
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn respond_unknown_path_returns_404() {
+    let (url, _h) = start_respond_server().await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{url}/v1/nonexistent"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "Unknown path on respond routing should return 404");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn respond_wrong_method_returns_404() {
+    let (url, _h) = start_respond_server().await;
+    let client = reqwest::Client::new();
+    // GET on a POST-only endpoint without Accept:text/html
+    let resp = client
+        .get(format!("{url}/v1/submit"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "GET on POST endpoint with respond routing should return 404");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn respond_wrong_method_with_html_returns_402() {
+    let (url, _h) = start_respond_server().await;
+    let client = reqwest::Client::new();
+    // GET on POST endpoint with Accept:text/html → payment link page
+    let resp = client
+        .get(format!("{url}/v1/submit"))
+        .header("accept", "text/html,*/*")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 402, "GET with Accept:text/html on POST endpoint should return 402 payment link");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn respond_service_worker_always_served() {
+    let (url, _h) = start_respond_server().await;
+    let client = reqwest::Client::new();
+    // Service worker request on a POST endpoint path
+    let resp = client
+        .get(format!("{url}/v1/submit?__mpp_worker=1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+    assert!(ct.contains("javascript"), "Service worker should return JS");
 }

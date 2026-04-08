@@ -14,9 +14,10 @@
   },
   "dependencies": {
     "@solana/kit": "^6.5.0",
-    "@solana/mpp": "^0.1.0",
+    "@solana/mpp": "^0.5.1",
     "cors": "^2.8.5",
     "express": "^4.21.0",
+    "mppx": "^0.5.8",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "x402": "^1.1.0",

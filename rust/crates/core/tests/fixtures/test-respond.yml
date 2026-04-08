@@ -1,0 +1,35 @@
+name: respondapi
+subdomain: respondapi
+title: "Respond API"
+description: "Test fixture for respond routing mode."
+category: ai_ml
+version: v1
+routing:
+  type: respond
+
+endpoints:
+  - method: GET
+    path: "v1/health"
+    description: "Health check — free"
+
+  - method: GET
+    path: "v1/data"
+    description: "Metered GET endpoint"
+    metering:
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 0.01
+
+  - method: POST
+    path: "v1/submit"
+    description: "Metered POST endpoint"
+    metering:
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 0.05

@@ -69,8 +69,8 @@ pub async fn payment_middleware<S: PaymentState>(
 
     let endpoint = metering::find_endpoint(api, match_method, &path)
         .or_else(|| {
-            // Browser payment link: GET request to a POST endpoint.
-            // Fall back to path-only match so the payment page renders.
+            // Browser payment link: GET/HEAD request to a metered endpoint.
+            // Render the HTML payment page so users can pay in the browser.
             if accepts_html {
                 metering::find_endpoint_by_path(api, &path)
             } else {
@@ -80,6 +80,15 @@ pub async fn payment_middleware<S: PaymentState>(
     let metering_config = endpoint.and_then(|ep| ep.metering.as_ref());
 
     if metering_config.is_none() {
+        // For respond routing, unknown/unmetered paths should 404
+        // (there's no upstream to forward to).
+        if api.routing.is_respond() && endpoint.is_none() {
+            return Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"error":"not_found"}"#))
+                .unwrap();
+        }
         return next.run(req).await;
     }
 
