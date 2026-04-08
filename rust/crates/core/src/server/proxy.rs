@@ -31,7 +31,9 @@ const STRIP_HEADERS: &[&str] = &[
 pub fn resolve_routing<'a>(api: &'a ApiSpec, path: &str) -> &'a RoutingConfig {
     let trimmed = path.trim_start_matches('/');
     for ep in &api.endpoints {
-        if ep.path == trimmed && let Some(ref r) = ep.routing {
+        if ep.path == trimmed
+            && let Some(ref r) = ep.routing
+        {
             return r;
         }
     }
@@ -62,11 +64,19 @@ pub async fn forward_request(
 
     // Respond mode — no upstream call.
     if routing.is_respond() {
-        tracing::info!(subdomain = %api.subdomain, path = %uri.path(), "Respond mode — returning 200");
+        use crate::server::metering::find_endpoint_by_path;
+        let path_trimmed = uri.path().trim_start_matches('/');
+        if find_endpoint_by_path(api, path_trimmed).is_some() {
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"status":"ok"}"#))
+                .unwrap());
+        }
         return Ok(Response::builder()
-            .status(StatusCode::OK)
+            .status(StatusCode::NOT_FOUND)
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"status":"ok"}"#))
+            .body(Body::from(r#"{"error":"not_found"}"#))
             .unwrap());
     }
 
@@ -783,9 +793,7 @@ mod tests {
             forward_request(&api, Method::GET, &uri2, &HeaderMap::new(), Bytes::new()).await;
         let resp2 = result2.unwrap();
         assert_eq!(resp2.status(), StatusCode::OK);
-        let body2 = axum::body::to_bytes(resp2.into_body(), 1024)
-            .await
-            .unwrap();
+        let body2 = axum::body::to_bytes(resp2.into_body(), 1024).await.unwrap();
         assert_eq!(&body2[..], b"from upstream");
     }
 }

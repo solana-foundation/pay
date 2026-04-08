@@ -11,8 +11,7 @@ use axum::response::{IntoResponse, Response};
 use serde_json::json;
 use solana_mpp::{
     AUTHORIZATION_HEADER, PAYMENT_RECEIPT_HEADER, WWW_AUTHENTICATE_HEADER, format_receipt,
-    format_www_authenticate, parse_authorization,
-    server::html as mpp_html,
+    format_www_authenticate, parse_authorization, server::html as mpp_html,
 };
 
 use crate::PaymentState;
@@ -65,28 +64,38 @@ pub async fn payment_middleware<S: PaymentState>(
     }
 
     // HEAD should be gated the same as GET.
-    let match_method = if method == Method::HEAD { "GET" } else { method.as_str() };
+    let match_method = if method == Method::HEAD {
+        "GET"
+    } else {
+        method.as_str()
+    };
 
-    let endpoint = metering::find_endpoint(api, match_method, &path)
-        .or_else(|| {
-            // Browser payment link: GET/HEAD request to a metered endpoint.
-            // Render the HTML payment page so users can pay in the browser.
-            if accepts_html {
-                metering::find_endpoint_by_path(api, &path)
-            } else {
-                None
-            }
-        });
+    let exact_match = metering::find_endpoint(api, match_method, &path);
+    let endpoint = exact_match.or_else(|| {
+        // Browser payment link: GET/HEAD request to a metered endpoint.
+        // Render the HTML payment page so users can pay in the browser.
+        if accepts_html {
+            metering::find_endpoint_by_path(api, &path)
+        } else {
+            None
+        }
+    });
     let metering_config = endpoint.and_then(|ep| ep.metering.as_ref());
 
     if metering_config.is_none() {
-        // For respond routing, unknown/unmetered paths should 404
-        // (there's no upstream to forward to).
-        if api.routing.is_respond() && endpoint.is_none() {
+        // For respond routing with no method match: if the path exists but
+        // the method is wrong, return 404 (not pass-through, since there's
+        // no upstream to handle it).
+        if api.routing.is_respond()
+            && exact_match.is_none()
+            && metering::find_endpoint_by_path(api, &path).is_some()
+        {
             return Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{"error":"not_found"}"#))
+                .body(Body::from(
+                    r#"{"error":"not_found","message":"method not allowed"}"#,
+                ))
                 .unwrap();
         }
         return next.run(req).await;
@@ -131,7 +140,10 @@ pub async fn payment_middleware<S: PaymentState>(
                         q.split('&')
                             .filter_map(|pair| {
                                 let mut parts = pair.splitn(2, '=');
-                                Some((parts.next()?.to_string(), parts.next().unwrap_or("").to_string()))
+                                Some((
+                                    parts.next()?.to_string(),
+                                    parts.next().unwrap_or("").to_string(),
+                                ))
                             })
                             .collect()
                     })
@@ -193,11 +205,8 @@ pub async fn payment_middleware<S: PaymentState>(
 
                     if accepts_html {
                         // Browser — render HTML payment link page.
-                        let page = mpp_html::challenge_to_html(
-                            &challenge,
-                            mpp.rpc_url(),
-                            mpp.network(),
-                        );
+                        let page =
+                            mpp_html::challenge_to_html(&challenge, mpp.rpc_url(), mpp.network());
                         tracing::info!(html_len = page.len(), "Generated HTML payment page");
                         let mut resp = Response::builder()
                             .status(StatusCode::PAYMENT_REQUIRED)

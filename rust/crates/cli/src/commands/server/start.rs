@@ -655,7 +655,6 @@ async fn sandbox_bootstrap_recipient(rpc_url: &str, recipient: &str, currency: &
         }))
         .send()
         .await;
-
 }
 
 fn format_price(price: f64) -> String {
@@ -810,10 +809,14 @@ async fn gateway_verify(
                     // Log successful payment to PDB
                     if let Some(pdb) = pdb {
                         let mut req_headers = std::collections::HashMap::new();
-                        req_headers.insert("authorization".to_string(), format!("Payment {}", auth_value));
+                        req_headers.insert(
+                            "authorization".to_string(),
+                            format!("Payment {}", auth_value),
+                        );
                         let entry = pay_pdb::types::LogEntry {
                             id: pdb.next_log_id(),
-                            ts: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                            ts: chrono::Utc::now()
+                                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                             method: req.method.clone(),
                             path: req.path.clone(),
                             status: 200,

@@ -114,9 +114,7 @@ impl RoutingConfig {
     pub fn upstream_url(&self, path_and_query: &str) -> Option<String> {
         match self {
             Self::Proxy {
-                url,
-                path_rewrites,
-                ..
+                url, path_rewrites, ..
             } => {
                 let base = url.trim_end_matches('/');
                 if path_rewrites.is_empty() {
@@ -1030,7 +1028,8 @@ mod tests {
             auth: None,
         };
         assert_eq!(
-            fwd.upstream_url("/v3/projects/any-value/locations/global:translateText").unwrap(),
+            fwd.upstream_url("/v3/projects/any-value/locations/global:translateText")
+                .unwrap(),
             "https://translation.googleapis.com/v3/projects/my-project-123/locations/global:translateText"
         );
         unsafe { std::env::remove_var("_TEST_PROJECT_ID") };
@@ -1049,7 +1048,8 @@ mod tests {
             auth: None,
         };
         assert_eq!(
-            fwd.upstream_url("/v3/projects/user-proj/translate?lang=fr").unwrap(),
+            fwd.upstream_url("/v3/projects/user-proj/translate?lang=fr")
+                .unwrap(),
             "https://api.example.com/v3/projects/gateway-402/translate?lang=fr"
         );
         unsafe { std::env::remove_var("_TEST_PROJ_QS") };
@@ -1074,7 +1074,10 @@ mod tests {
         }"#;
         let rc: RoutingConfig = serde_json::from_str(json).unwrap();
         assert!(rc.is_proxy());
-        if let RoutingConfig::Proxy { url, path_rewrites, .. } = &rc {
+        if let RoutingConfig::Proxy {
+            url, path_rewrites, ..
+        } = &rc
+        {
             assert_eq!(url, "https://translation.googleapis.com");
             assert_eq!(path_rewrites.len(), 1);
             assert_eq!(path_rewrites[0].prefix, "v3/projects/{projectId}");
