@@ -737,9 +737,17 @@ mod tests {
     // ── forward_request with Respond routing ─────────────────────────────
 
     #[tokio::test]
-    async fn forward_request_respond_mode() {
+    async fn forward_request_respond_mode_known_endpoint() {
         let mut api = make_api("test");
         api.routing = RoutingConfig::Respond {};
+        api.endpoints.push(pay_types::metering::Endpoint {
+            method: pay_types::metering::HttpMethod::Get,
+            path: "v1/test".to_string(),
+            description: None,
+            resource: None,
+            routing: None,
+            metering: None,
+        });
 
         let uri: Uri = "/v1/test".parse().unwrap();
         let result =
@@ -748,9 +756,21 @@ mod tests {
         let resp = result.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
-        assert!(body.starts_with(b"{"));
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn forward_request_respond_mode_unknown_path() {
+        let mut api = make_api("test");
+        api.routing = RoutingConfig::Respond {};
+
+        let uri: Uri = "/v1/unknown".parse().unwrap();
+        let result =
+            forward_request(&api, Method::GET, &uri, &HeaderMap::new(), Bytes::new()).await;
+
+        let resp = result.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
