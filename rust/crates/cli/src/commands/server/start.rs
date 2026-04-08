@@ -340,18 +340,6 @@ impl StartCommand {
                 apis: Arc::new(vec![api.clone()]),
                 mpp: Some(mpp),
             };
-            let mut app = axum::Router::new()
-                .route("/__402/health", get(|| async { "ok" }))
-                .route(
-                    "/__402/endpoints",
-                    get(move || async move { axum::Json(endpoints_json).into_response() }),
-                )
-                .route(
-                    "/__402/verify",
-                    post(move |body: axum::Json<GatewayVerifyRequest>| async move {
-                        gateway_verify(verify_mpp, body.0).await
-                    }),
-                );
 
             let pdb_state = if debugger {
                 let pdb_config = build_pdb_config(&api, &recipient, &network, &rpc_url);
@@ -361,6 +349,20 @@ impl StartCommand {
             } else {
                 None
             };
+
+            let verify_pdb = pdb_state.clone();
+            let mut app = axum::Router::new()
+                .route("/__402/health", get(|| async { "ok" }))
+                .route(
+                    "/__402/endpoints",
+                    get(move || async move { axum::Json(endpoints_json).into_response() }),
+                )
+                .route(
+                    "/__402/verify",
+                    post(move |body: axum::Json<GatewayVerifyRequest>| async move {
+                        gateway_verify(verify_mpp, body.0, verify_pdb.as_ref()).await
+                    }),
+                );
 
             if let Some(ref pdb) = pdb_state {
                 app = app
@@ -714,6 +716,7 @@ struct GatewayVerifyResponse {
 async fn gateway_verify(
     mpp: Mpp,
     req: GatewayVerifyRequest,
+    pdb: Option<&pay_pdb::PdbState>,
 ) -> axum::response::Response {
     use axum::http::StatusCode;
     use solana_mpp::{format_receipt, format_www_authenticate, parse_authorization};
@@ -753,6 +756,26 @@ async fn gateway_verify(
                 }
             };
             let www_auth = format_www_authenticate(&challenge).unwrap_or_default();
+
+            // Log 402 challenge to PDB
+            if let Some(pdb) = pdb {
+                let mut res_headers = std::collections::HashMap::new();
+                res_headers.insert("www-authenticate".to_string(), www_auth.clone());
+                let entry = pay_pdb::types::LogEntry {
+                    id: pdb.next_log_id(),
+                    ts: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                    method: req.method.clone(),
+                    path: req.path.clone(),
+                    status: 402,
+                    ms: 0,
+                    req_headers: std::collections::HashMap::new(),
+                    res_headers,
+                    res_body: None,
+                    client_ip: "gateway".to_string(),
+                };
+                pdb.correlation.lock().unwrap().ingest(entry);
+            }
+
             axum::Json(GatewayVerifyResponse {
                 decision: "payment_required".to_string(),
                 status_code: 402,
@@ -783,6 +806,26 @@ async fn gateway_verify(
             match mpp.verify_credential(&credential).await {
                 Ok(receipt) => {
                     let encoded = format_receipt(&receipt).unwrap_or_default();
+
+                    // Log successful payment to PDB
+                    if let Some(pdb) = pdb {
+                        let mut req_headers = std::collections::HashMap::new();
+                        req_headers.insert("authorization".to_string(), format!("Payment {}", auth_value));
+                        let entry = pay_pdb::types::LogEntry {
+                            id: pdb.next_log_id(),
+                            ts: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                            method: req.method.clone(),
+                            path: req.path.clone(),
+                            status: 200,
+                            ms: 0,
+                            req_headers,
+                            res_headers: std::collections::HashMap::new(),
+                            res_body: None,
+                            client_ip: "gateway".to_string(),
+                        };
+                        pdb.correlation.lock().unwrap().ingest(entry);
+                    }
+
                     axum::Json(GatewayVerifyResponse {
                         decision: "allow".to_string(),
                         status_code: 200,
