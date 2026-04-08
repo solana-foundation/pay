@@ -119,7 +119,7 @@ async function createApp() {
 
   // ── Request logging middleware ──
   app.use((req, res, next) => {
-    if (req.path === "/" || req.path.startsWith("/__debugger"))
+    if (req.path === "/" || req.path.startsWith("/__402/pdb"))
       return next();
     const start = Date.now();
 
@@ -185,7 +185,7 @@ async function createApp() {
   });
 
   // ── SSE stream (flow events) ──
-  app.get("/__debugger/logs/stream", (req, res) => {
+  app.get("/__402/pdb/logs/stream", (req, res) => {
     const viewerIp =
       (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() ||
       req.socket.remoteAddress ||
@@ -210,10 +210,10 @@ async function createApp() {
     req.on("close", () => sseClients.delete(client));
   });
 
-  app.get("/__debugger/logs", (_req, res) => res.json(correlation.snapshot()));
+  app.get("/__402/pdb/logs", (_req, res) => res.json(correlation.snapshot()));
 
   // ── Config endpoint (for React frontend) ──
-  app.get("/__debugger/api/config", (_req, res) => {
+  app.get("/__402/pdb/api/config", (_req, res) => {
     res.json({
       recipient,
       network: NETWORK,

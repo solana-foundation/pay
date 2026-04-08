@@ -7,7 +7,7 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      "/__debugger": "http://localhost:3000",
+      "/__402": "http://localhost:3000",
       "/mpp": "http://localhost:3000",
       "/x402": "http://localhost:3000",
       "/facilitator": "http://localhost:3000",

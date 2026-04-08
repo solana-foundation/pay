@@ -3,7 +3,7 @@
   "buildCommand": "pnpm run build",
   "outputDirectory": "dist",
   "rewrites": [
-    { "source": "/__debugger/:path*", "destination": "/api" },
+    { "source": "/__402/pdb/:path*", "destination": "/api" },
     { "source": "/mpp/:path*", "destination": "/api" },
     { "source": "/x402/:path*", "destination": "/api" },
     { "source": "/facilitator/:path*", "destination": "/api" },

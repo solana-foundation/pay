@@ -327,7 +327,7 @@ export class FlowCorrelation {
     return (
       path === "/" ||
       path === "/health" ||
-      path.startsWith("/__debugger")
+      path.startsWith("/__402")
     );
   }
 
