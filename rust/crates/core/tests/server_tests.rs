@@ -70,7 +70,7 @@ async fn start_test_server(with_mpp: bool) -> (String, tokio::task::JoinHandle<(
 
     let app = Router::new()
         .route(
-            "/__gateway/health",
+            "/__402/health",
             get(|| async { axum::Json(json!({"ok": true})) }),
         )
         .fallback(any(echo_handler))
@@ -143,7 +143,7 @@ fn error_response_bad_gateway() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn middleware_skips_gateway_routes() {
     let (url, _h) = start_test_server(true).await;
-    let resp = reqwest::get(format!("{url}/__gateway/health"))
+    let resp = reqwest::get(format!("{url}/__402/health"))
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);

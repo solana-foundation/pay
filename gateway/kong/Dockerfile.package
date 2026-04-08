@@ -1,0 +1,14 @@
+FROM kong:3.9.1
+
+USER root
+WORKDIR /tmp/pay
+
+COPY pay-0.1.0-1.rockspec ./pay-0.1.0-1.rockspec
+COPY gateway/kong ./gateway/kong
+
+RUN luarocks make pay-0.1.0-1.rockspec
+
+COPY gateway/kong/dev/kong.conf /etc/kong/kong.conf
+COPY gateway/kong/dev/kong.yml /etc/kong/kong.yml
+
+USER kong

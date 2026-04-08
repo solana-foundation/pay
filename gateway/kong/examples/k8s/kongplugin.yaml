@@ -11,6 +11,8 @@ config:
   rpc_url: "https://402.surfnet.dev:8899"
   external_id: "k8s-example"
   inject_upstream_headers: true
+  observability:
+    mode: log
   endpoints:
     - method: GET
       path: /paid

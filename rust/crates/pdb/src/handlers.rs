@@ -13,7 +13,7 @@ use tokio::sync::broadcast;
 use crate::PdbState;
 use crate::types::{LogEntry, SseMessage};
 
-/// SSE stream of flow events (`/__debugger/logs/stream`).
+/// SSE stream of flow events (`/__402/pdb/logs/stream`).
 pub async fn sse_stream(State(state): State<PdbState>) -> Response {
     let mut rx = state.tx.subscribe();
 
@@ -53,19 +53,19 @@ pub async fn sse_stream(State(state): State<PdbState>) -> Response {
         .unwrap()
 }
 
-/// JSON snapshot of all flows (`/__debugger/logs`).
+/// JSON snapshot of all flows (`/__402/pdb/logs`).
 pub async fn logs_snapshot(State(state): State<PdbState>) -> impl IntoResponse {
     let engine = state.correlation.lock().unwrap();
     Json(engine.snapshot())
 }
 
-/// Sidebar config (`/__debugger/api/config`).
+/// Sidebar config (`/__402/pdb/api/config`).
 pub async fn config_handler(State(state): State<PdbState>) -> impl IntoResponse {
     Json(state.config.clone())
 }
 
 /// Debug: inject a fake MPP flow with splits, for UI testing.
-/// `POST /__debugger/debug/fake-flow`
+/// `POST /__402/pdb/debug/fake-flow`
 pub async fn inject_fake_flow(State(state): State<PdbState>) -> impl IntoResponse {
     let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 

@@ -1,5 +1,5 @@
 package = "pay"
-version = "0.1.0-1"
+version = "0.1.1-1"
 source = {
   url = "git+https://github.com/solana-foundation/pay",
 }
@@ -28,6 +28,8 @@ build = {
     ["mpp.protocol.core.types"] = "gateway/kong/mpp/protocol/core/types.lua",
     ["mpp.protocol.intents.charge"] = "gateway/kong/mpp/protocol/intents/charge.lua",
     ["mpp.server"] = "gateway/kong/mpp/server/init.lua",
+    ["mpp.server.html"] = "gateway/kong/mpp/server/html.lua",
+    ["mpp.server.html_assets"] = "gateway/kong/mpp/server/html_assets/gen.lua",
     ["mpp.server.solana_verify"] = "gateway/kong/mpp/server/solana_verify.lua",
     ["mpp.util.base64url"] = "gateway/kong/mpp/util/base64url.lua",
     ["mpp.util.bit"] = "gateway/kong/mpp/util/bit.lua",

@@ -57,6 +57,17 @@ luarocks make pay-0.1.0-1.rockspec
 
 This rock is intended to be published as `solana/pay`.
 
+Important naming split:
+
+- LuaRocks package name: `pay`
+- Kong plugin name: `solana-kong-402`
+
+For Konnect specifically:
+
+- Konnect stores the plugin schema and plugin config
+- the data plane must still have the `pay` package installed locally
+- the Konnect data plane must use Kong Enterprise, not OSS Kong
+
 That installs:
 
 - `kong.plugins.solana-kong-402.handler`

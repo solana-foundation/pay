@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use axum::middleware;
 use axum::response::IntoResponse;
-use axum::routing::{any, get};
+use axum::routing::{any, get, post};
 use owo_colors::OwoColorize;
 use pay_core::PaymentState;
 use pay_types::metering::ApiSpec;
@@ -179,12 +179,10 @@ impl StartCommand {
             };
 
             // ── Sandbox: bootstrap operator wallet (SOL + token account) ──
-            if self.sandbox {
-                if let Some(ref signer) = fee_payer_signer {
-                    let pubkey = signer.pubkey().to_string();
-                    sandbox_airdrop(&rpc_url, &pubkey).await;
-                    sandbox_bootstrap_recipient(&rpc_url, &recipient, &currency).await;
-                }
+            if self.sandbox && let Some(ref signer) = fee_payer_signer {
+                let pubkey = signer.pubkey().to_string();
+                sandbox_airdrop(&rpc_url, &pubkey).await;
+                sandbox_bootstrap_recipient(&rpc_url, &recipient, &currency).await;
             }
 
             // ── Create MPP server ──
@@ -219,7 +217,7 @@ impl StartCommand {
             eprintln!();
             eprintln!("  {}   {}", "╔═╗ ╔═╗ ╦ ╦".bold(), "╔═╗ ╦ ╦".dimmed());
             eprintln!("  {}   {}", "╠═╝ ╠═╣ ╚╦╝".bold(), "╚═╗ ╠═╣".dimmed());
-            eprintln!("  {}  {}", "╩   ╩ ╩  ╩".bold(), format!("{} {}", "○".dimmed(), "╚═╝ ╩ ╩".dimmed()));
+            eprintln!("  {}  {} {}", "╩   ╩ ╩  ╩".bold(), "○".dimmed(), "╚═╝ ╩ ╩".dimmed());
             eprintln!("  {}", "Developer Tools for Programmable Payments".dimmed());
             eprintln!();
 
@@ -336,16 +334,23 @@ impl StartCommand {
             // ── Build router ──
             let endpoints_json = build_endpoints_json(&api);
 
+            let verify_mpp = mpp.clone();
+
             let state = AppState {
                 apis: Arc::new(vec![api.clone()]),
                 mpp: Some(mpp),
             };
-
             let mut app = axum::Router::new()
-                .route("/__gateway/health", get(|| async { "ok" }))
+                .route("/__402/health", get(|| async { "ok" }))
                 .route(
-                    "/__gateway/endpoints",
+                    "/__402/endpoints",
                     get(move || async move { axum::Json(endpoints_json).into_response() }),
+                )
+                .route(
+                    "/__402/verify",
+                    post(move |body: axum::Json<GatewayVerifyRequest>| async move {
+                        gateway_verify(verify_mpp, body.0).await
+                    }),
                 );
 
             let pdb_state = if debugger {
@@ -367,7 +372,7 @@ impl StartCommand {
                                 .and_then(|v| v.to_str().ok())
                                 .is_some_and(|v| v.contains("text/html"));
                             if accepts_html {
-                                axum::response::Redirect::temporary("/__debugger/")
+                                axum::response::Redirect::temporary("/__402/pdb/")
                                     .into_response()
                             } else {
                                 axum::Json(serde_json::json!({"status": "ok"})).into_response()
@@ -375,7 +380,7 @@ impl StartCommand {
                         }),
                     )
                     .nest_service(
-                        "/__debugger",
+                        "/__402/pdb",
                     pay_pdb::debugger_router(pdb.clone()),
                 );
             }
@@ -663,4 +668,168 @@ fn format_price(price: f64) -> String {
 /// Emit an OSC 8 clickable hyperlink for terminals that support it.
 fn terminal_link(text: &str, url: &str) -> String {
     format!("\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\", url, text)
+}
+
+// ── Gateway verify endpoint ──
+
+#[derive(serde::Deserialize)]
+struct GatewayVerifyRequest {
+    method: String,
+    path: String,
+    price: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    authorization: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    request_id: Option<String>,
+    #[serde(default)]
+    external_id: Option<String>,
+    /// JSON-encoded splits array from the gateway (assembled by JS policy).
+    #[serde(default)]
+    splits_json: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct GatewayVerifyResponse {
+    decision: String,
+    status_code: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    www_authenticate: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receipt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receipt_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receipt_reference: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    challenge_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    external_id: Option<String>,
+}
+
+async fn gateway_verify(
+    mpp: Mpp,
+    req: GatewayVerifyRequest,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use solana_mpp::{format_receipt, format_www_authenticate, parse_authorization};
+
+    let auth = req
+        .authorization
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+
+    // Parse splits from JSON string (assembled by Apigee JS policy).
+    let splits: Vec<solana_mpp::protocol::solana::Split> = req
+        .splits_json
+        .as_deref()
+        .filter(|s| !s.is_empty() && *s != "[]")
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+
+    match auth {
+        None => {
+            let challenge = match mpp.charge_with_options(
+                &req.price,
+                solana_mpp::server::ChargeOptions {
+                    description: req.description.as_deref(),
+                    external_id: req.external_id.as_deref(),
+                    splits: splits.clone(),
+                    ..Default::default()
+                },
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        axum::Json(serde_json::json!({"error": e.to_string()})),
+                    )
+                        .into_response();
+                }
+            };
+            let www_auth = format_www_authenticate(&challenge).unwrap_or_default();
+            axum::Json(GatewayVerifyResponse {
+                decision: "payment_required".to_string(),
+                status_code: 402,
+                www_authenticate: Some(www_auth),
+                body: Some(serde_json::json!({
+                    "error": "payment_required",
+                    "endpoint": { "method": req.method, "path": req.path },
+                })),
+                challenge_id: Some(challenge.id),
+                external_id: req.external_id,
+                receipt: None,
+                receipt_status: None,
+                receipt_reference: None,
+            })
+            .into_response()
+        }
+        Some(auth_value) => {
+            let credential = match parse_authorization(auth_value) {
+                Ok(c) => c,
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        axum::Json(serde_json::json!({"error": e.to_string()})),
+                    )
+                        .into_response();
+                }
+            };
+            match mpp.verify_credential(&credential).await {
+                Ok(receipt) => {
+                    let encoded = format_receipt(&receipt).unwrap_or_default();
+                    axum::Json(GatewayVerifyResponse {
+                        decision: "allow".to_string(),
+                        status_code: 200,
+                        receipt: Some(encoded),
+                        receipt_status: Some(receipt.status.to_string()),
+                        receipt_reference: Some(receipt.reference),
+                        challenge_id: Some(receipt.challenge_id),
+                        external_id: req.external_id,
+                        www_authenticate: None,
+                        body: None,
+                    })
+                    .into_response()
+                }
+                Err(error) => {
+                    // Re-issue challenge on failure
+                    let challenge = mpp
+                        .charge_with_options(
+                            &req.price,
+                            solana_mpp::server::ChargeOptions {
+                                description: req.description.as_deref(),
+                                external_id: req.external_id.as_deref(),
+                                splits,
+                                ..Default::default()
+                            },
+                        )
+                        .ok();
+                    let www_auth = challenge
+                        .as_ref()
+                        .and_then(|c| format_www_authenticate(c).ok());
+                    axum::Json(GatewayVerifyResponse {
+                        decision: "payment_required".to_string(),
+                        status_code: 402,
+                        www_authenticate: www_auth,
+                        body: Some(serde_json::json!({
+                            "error": "verification_failed",
+                            "message": error.to_string(),
+                            "retryable": error.retryable,
+                        })),
+                        challenge_id: challenge.map(|c| c.id),
+                        external_id: req.external_id,
+                        receipt: None,
+                        receipt_status: Some("failed".to_string()),
+                        receipt_reference: None,
+                    })
+                    .into_response()
+                }
+            }
+        }
+    }
 }

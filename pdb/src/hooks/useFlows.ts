@@ -44,10 +44,10 @@ export function useFlows() {
   const esRef = useRef<EventSource | null>(null);
 
   useEffect(() => {
-    const es = new EventSource("/__debugger/logs/stream");
+    const es = new EventSource("/__402/pdb/logs/stream");
     esRef.current = es;
 
-    console.log("[PDB] Connecting SSE: /__debugger/logs/stream");
+    console.log("[PDB] Connecting SSE: /__402/pdb/logs/stream");
     es.onopen = () => {
       console.log("[PDB] SSE connected");
       dispatch({ type: "connected", value: true });

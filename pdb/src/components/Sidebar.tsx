@@ -42,7 +42,7 @@ export function Sidebar() {
   const [config, setConfig] = useState<Config | null>(null);
 
   useEffect(() => {
-    fetch("/__debugger/api/config")
+    fetch("/__402/pdb/api/config")
       .then((r) => {
         if (!r.ok) throw new Error("not found");
         return r.json();

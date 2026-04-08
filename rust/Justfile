@@ -42,3 +42,7 @@ docker-run *ARGS:
 # Start a payment gateway server
 serve SPEC *ARGS:
     cargo run -- server start {{SPEC}} {{ARGS}}
+
+# Start the payment verifier service (for Apigee / external gateways)
+apigee-serve *ARGS:
+    cargo run -p pay -- server verify {{ARGS}}

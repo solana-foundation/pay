@@ -5258,7 +5258,7 @@ version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "680998035259dcfcafe653688bf2aa6d3e2dc05e98be6ab46afb089dc84f1df8"
 dependencies = [
- "proc-macro-crate 3.5.0",
+ "proc-macro-crate 1.3.1",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -5514,7 +5514,7 @@ checksum = "b867cad97c0791bbd3aaa6472142568c6c9e8f71937e98379f584cfb0cf35bec"
 
 [[package]]
 name = "pay"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "axum",
  "bs58",
@@ -5547,7 +5547,7 @@ dependencies = [
 
 [[package]]
 name = "pay-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -5583,7 +5583,7 @@ dependencies = [
 
 [[package]]
 name = "pay-integration"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "pay-core",
  "pay-types",
@@ -5592,7 +5592,7 @@ dependencies = [
 
 [[package]]
 name = "pay-keystore"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "secret-service",
  "serde",
@@ -5607,7 +5607,7 @@ dependencies = [
 
 [[package]]
 name = "pay-mcp"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "pay-core",
  "pay-keystore",
@@ -5622,7 +5622,7 @@ dependencies = [
 
 [[package]]
 name = "pay-pdb"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -5637,7 +5637,7 @@ dependencies = [
 
 [[package]]
 name = "pay-types"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "schemars 0.8.22",
  "serde",
@@ -8933,7 +8933,7 @@ dependencies = [
 [[package]]
 name = "solana-mpp"
 version = "0.2.0"
-source = "git+https://github.com/solana-foundation/mpp-sdk?branch=main#c3059dbbfc328db00f710fe56a2552909c00c87c"
+source = "git+https://github.com/solana-foundation/mpp-sdk?branch=feat%2Flabel-splits#3000a807cb9a45a5b3f6e47d5f8adda41dcbed3e"
 dependencies = [
  "base64 0.22.1",
  "bincode",
@@ -12875,7 +12875,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

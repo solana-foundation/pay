@@ -31,10 +31,8 @@ const STRIP_HEADERS: &[&str] = &[
 pub fn resolve_routing<'a>(api: &'a ApiSpec, path: &str) -> &'a RoutingConfig {
     let trimmed = path.trim_start_matches('/');
     for ep in &api.endpoints {
-        if ep.path == trimmed {
-            if let Some(ref r) = ep.routing {
-                return r;
-            }
+        if ep.path == trimmed && let Some(ref r) = ep.routing {
+            return r;
         }
     }
     &api.routing

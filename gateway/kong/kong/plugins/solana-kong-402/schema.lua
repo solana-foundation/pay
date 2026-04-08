@@ -46,6 +46,13 @@ local metering = {
   },
 }
 
+local observability = {
+  type = "record",
+  fields = {
+    { mode = { type = "string", required = false, default = "off", one_of = { "off", "log" } } },
+  },
+}
+
 local endpoint = {
   type = "record",
   fields = {
@@ -75,6 +82,7 @@ return {
           { external_id = { type = "string", required = false } },
           { fee_payer = { type = "boolean", required = false, default = false } },
           { inject_upstream_headers = { type = "boolean", required = false, default = true } },
+          { observability = { required = false, type = "record", fields = observability.fields } },
           { endpoints = { type = "array", required = true, len_min = 1, elements = endpoint } },
         },
       },

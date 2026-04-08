@@ -15,6 +15,7 @@ local upstream_status_header = "X-MPP-Receipt-Status"
 local upstream_reference_header = "X-MPP-Receipt-Reference"
 local upstream_challenge_id_header = "X-MPP-Challenge-ID"
 local upstream_external_id_header = "X-MPP-External-ID"
+local plugin_name = "solana-kong-402"
 
 local function trim(value)
   return (tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", ""))
@@ -319,6 +320,16 @@ local function amount_from_price(price, decimals)
   return amount
 end
 
+local function atomic_amount_from_display(amount, decimals)
+  local precision = tonumber(decimals) or 0
+  local numeric = tonumber(amount)
+  if not numeric then
+    return amount
+  end
+  local scaled = math.floor((numeric * (10 ^ precision)) + 0.5)
+  return tostring(scaled)
+end
+
 local function exit_json(status, body, headers)
   for name, value in pairs(headers or {}) do
     kong.response.set_header(name, value)
@@ -369,6 +380,100 @@ local function apply_receipt(config, receipt)
   end
 end
 
+local function safe_call(fn)
+  local ok, value = pcall(fn)
+  if not ok then
+    return nil
+  end
+  return value
+end
+
+local function get_route_id()
+  if not kong.router or not kong.router.get_route then
+    return nil
+  end
+  local route = safe_call(kong.router.get_route)
+  return route and route.id or nil
+end
+
+local function get_service_id()
+  if not kong.router or not kong.router.get_service then
+    return nil
+  end
+  local service = safe_call(kong.router.get_service)
+  return service and service.id or nil
+end
+
+local function get_request_id()
+  if not kong.request or not kong.request.get_id then
+    return nil
+  end
+  return safe_call(kong.request.get_id)
+end
+
+local function build_observability_event(config, endpoint, path)
+  local price = resolve_price(endpoint.metering, request_properties(), extract_variant_hint(path))
+  local amount_display = amount_from_price(price, config.decimals) or ""
+  return {
+    plugin = plugin_name,
+    payment_network = config.network,
+    payment_currency = config.currency,
+    payment_decimals = config.decimals,
+    payment_amount_atomic = atomic_amount_from_display(amount_display, config.decimals),
+    payment_amount_display = amount_display,
+    recipient = config.recipient,
+    endpoint_method = endpoint.method,
+    endpoint_path = endpoint.path,
+    route_id = get_route_id(),
+    service_id = get_service_id(),
+    request_id = get_request_id(),
+  }
+end
+
+local function emit_event(config, event)
+  local observability = config.observability or {}
+  if observability.mode ~= "log" then
+    return
+  end
+  if not kong.log or not kong.log.notice then
+    return
+  end
+  kong.log.notice(json.encode(event))
+end
+
+local function emit_payment_verified(config, endpoint, receipt, path)
+  local event = build_observability_event(config, endpoint, path)
+  event.event_name = "solana_pay.payment_verified"
+  event.challenge_id = receipt.challengeId
+  event.external_id = receipt.externalId
+  event.receipt_reference = receipt.reference
+  event.receipt_status = receipt.status
+  event.payment_method = receipt.method
+
+  emit_event(config, event)
+end
+
+local function emit_payment_failed(config, endpoint, path, reason, details)
+  local event = build_observability_event(config, endpoint, path)
+  event.event_name = "solana_pay.payment_failed"
+  event.failure_reason = reason
+  event.failure_details = details
+  event.receipt_status = "failed"
+
+  emit_event(config, event)
+end
+
+local function emit_payment_requested(config, endpoint, challenge, path)
+  local event = build_observability_event(config, endpoint, path)
+  event.event_name = "solana_pay.payment_requested"
+  event.challenge_id = challenge.id
+  event.external_id = challenge.externalId
+  event.payment_method = challenge.method
+  event.receipt_status = "pending"
+
+  emit_event(config, event)
+end
+
 local function payment_required(config, endpoint, method, path, reason, details)
   local price = resolve_price(endpoint.metering, request_properties(), extract_variant_hint(path))
   local amount, err = amount_from_price(price, config.decimals)
@@ -397,6 +502,7 @@ local function payment_required(config, endpoint, method, path, reason, details)
     external_id = config.external_id,
     fee_payer = config.fee_payer,
   })
+  emit_payment_requested(config, endpoint, challenge, path)
   local header = mpp.FormatWWWAuthenticate(challenge)
 
   local body = {
@@ -462,10 +568,12 @@ function plugin:access(config)
         message = details,
       })
     end
+    emit_payment_failed(config, endpoint, path, reason, details)
     return payment_required(config, endpoint, method, path, reason, details)
   end
 
   apply_receipt(config, receipt)
+  emit_payment_verified(config, endpoint, receipt, path)
 end
 
 function plugin:response()

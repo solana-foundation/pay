@@ -29,7 +29,7 @@ pub async fn payment_middleware<S: PaymentState>(
     let headers = req.headers().clone();
     let path = uri.path().trim_start_matches('/').to_string();
 
-    if path.starts_with("__gateway/") {
+    if path.starts_with("__402/") {
         return next.run(req).await;
     }
 
@@ -42,7 +42,7 @@ pub async fn payment_middleware<S: PaymentState>(
     let accepts_html = headers
         .get(axum::http::header::ACCEPT)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| mpp_html::accepts_html(v));
+        .is_some_and(mpp_html::accepts_html);
 
     let apis = state.apis();
     let api = match apis.iter().find(|a| a.subdomain == subdomain) {

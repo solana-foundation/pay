@@ -333,7 +333,7 @@ fn flow_key(client_ip: &str, path: &str) -> String {
 }
 
 fn is_internal_path(path: &str) -> bool {
-    path.starts_with("/__debugger") || path.starts_with("/__gateway")
+    path.starts_with("/__402")
 }
 
 fn is_x402_body(body: &Option<String>) -> bool {
@@ -509,8 +509,8 @@ mod tests {
         let (tx, _rx) = broadcast::channel(16);
         let mut engine = FlowCorrelation::new(tx);
 
-        engine.ingest(make_entry("GET", "/__debugger/logs", 200));
-        engine.ingest(make_entry("GET", "/__gateway/health", 200));
+        engine.ingest(make_entry("GET", "/__402/pdb/logs", 200));
+        engine.ingest(make_entry("GET", "/__402/health", 200));
 
         assert!(engine.snapshot().is_empty());
     }

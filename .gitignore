@@ -26,3 +26,5 @@ rust/target
 # Example
 rust/example/node_modules
 rust/example/pnpm-lock.yaml
+*.log
+coverage*.json

@@ -19,6 +19,8 @@ services:
           secret_key: "replace-me"
           external_id: "deck-example"
           inject_upstream_headers: true
+          observability:
+            mode: log
           endpoints:
             - method: GET
               path: /paid
