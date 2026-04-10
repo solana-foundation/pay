@@ -167,9 +167,12 @@ pub async fn forward_request(
         _ => {}
     }
 
-    // Forward body.
+    // Forward body. Always set content-length for POST/PUT/PATCH
+    // (some upstreams like Google APIs require it even when empty).
     if !body.is_empty() {
         upstream_req = upstream_req.body(body.to_vec());
+    } else if matches!(method.as_str(), "POST" | "PUT" | "PATCH") {
+        upstream_req = upstream_req.header("content-length", "0");
     }
 
     let upstream_resp = upstream_req.send().await.map_err(|e| {

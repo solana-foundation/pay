@@ -75,11 +75,15 @@ impl Config {
     /// 3. Config file `keypair` field
     /// 4. Legacy: probe Keychain / 1Password directly
     pub fn default_keypair_source(&self) -> Option<String> {
-        // 1. accounts.yml
+        // 1. accounts.yml — only return a source string for keystore-backed
+        //    accounts. Ephemeral accounts have no signer source string and
+        //    must be loaded via the network-aware path instead, so they're
+        //    intentionally invisible to this fallback.
         if let Ok(accounts) = crate::accounts::AccountsFile::load()
             && let Some((name, account)) = accounts.default_account()
+            && let Some(source) = account.signer_source(name)
         {
-            return Some(account.signer_source(name));
+            return Some(source);
         }
 
         // 2. PAY_SECRET_KEY env var

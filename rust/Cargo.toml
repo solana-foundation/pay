@@ -5,7 +5,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2024"
-version = "0.4.0"
+version = "0.5.0"
 license = "Apache-2.0"
 
 [workspace.dependencies]
@@ -81,13 +81,13 @@ bs58 = "0.5"
 qrcode = { version = "0.14", default-features = false }
 
 # Solana MPP (includes keypair loading + charge building)
-solana-mpp = { git = "https://github.com/solana-foundation/mpp-sdk", branch = "feat/label-splits", default-features = false, features = [
+solana-mpp = { git = "https://github.com/solana-foundation/mpp-sdk", branch = "main", default-features = false, features = [
     "client",
     "server",
 ] }
 
 # Solana x402
-solana-x402 = { git = "https://github.com/txtx/moneymq", rev = "c63b77a", default-features = false, features = [
+solana-x402 = { git = "https://github.com/txtx/moneymq", branch = "main", default-features = false, features = [
     "client",
 ] }
 
@@ -100,3 +100,9 @@ solana-pubkey = "3.0"
 solana-signature = "3.2"
 solana-system-interface = "2.0"
 solana-transaction = "3.1"
+
+# [patch."https://github.com/solana-foundation/mpp-sdk"]
+# solana-mpp = { path = "../../solana-mpp-sdk/rust" }
+
+# [patch."https://github.com/txtx/moneymq"]
+# solana-x402 = { path = "../../moneymq/crates/x402-sdk" }

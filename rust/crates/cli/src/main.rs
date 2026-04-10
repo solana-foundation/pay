@@ -1,4 +1,5 @@
 mod commands;
+pub mod components;
 mod no_dna;
 mod output;
 pub mod tui;
@@ -23,28 +24,37 @@ struct Opts {
 
     /// Automatically pay 402 challenges without prompting (no cap).
     /// Implied when NO_DNA is set.
-    #[arg(long, global = true)]
+    #[arg(long)]
     yolo: bool,
 
-    /// Sandbox mode: ephemeral keypair funded on Surfpool (402.surfnet.dev).
-    #[arg(long, global = true)]
+    /// Sandbox mode: force network=localnet and route to the hosted
+    /// Surfpool RPC (https://402.surfnet.dev:8899). Ephemeral wallets
+    /// are auto-generated and funded on first use.
+    #[arg(short = 's', long, conflicts_with = "mainnet")]
     sandbox: bool,
 
+    /// Mainnet mode: force network=mainnet, use the wallet bound to
+    /// `mainnet` in ~/.config/pay/accounts.yml. Overrides whatever the
+    /// challenge advertises — useful when you know what you want.
+    #[arg(long, conflicts_with = "sandbox")]
+    mainnet: bool,
+
     /// Alias for --sandbox (hidden).
-    #[arg(long, global = true, hide = true)]
+    #[arg(long, hide = true)]
     dev: bool,
 
-    /// Local sandbox: ephemeral keypair funded on local Surfpool (localhost:8899).
-    #[arg(long, global = true)]
+    /// Local sandbox: force network=localnet but route to a localhost
+    /// Surfpool (http://localhost:8899) instead of the hosted one.
+    #[arg(long, conflicts_with = "mainnet")]
     local: bool,
 
     /// Output format for status messages (text or json).
     /// Defaults to json when NO_DNA is set or stdout is piped.
-    #[arg(long, global = true)]
+    #[arg(long)]
     output: Option<OutputFormat>,
 
     /// Show verbose output (tracing logs, payment details).
-    #[arg(short, long, global = true)]
+    #[arg(short, long)]
     verbose: bool,
 }
 
@@ -70,15 +80,19 @@ fn main() {
 
     init_logging(config.log_format, opts.verbose);
 
-    // Resolve the keypair source:
-    // 1. --sandbox / --local → ephemeral keypair funded via Surfpool
-    // 2. Keychain (from `pay setup`) → Touch ID protected
-    // 3. ~/.config/solana/id.json → file-based fallback
-    // 4. None → tell user to run `pay setup`
+    // ── Network override + RPC URL ─────────────────────────────────────────
+    //
+    // The `--sandbox` / `--local` / `--mainnet` flags FORCE a specific
+    // Solana network slug for wallet routing, regardless of what the 402
+    // challenge advertises. With no flag, the network is read from the
+    // challenge.
+    //
+    // For sandbox flavors, also pin the RPC URL via `PAY_RPC_URL` so the
+    // mpp/x402 client talks to the right Surfpool instance. The wallet
+    // itself is generated lazily on first use by the network-aware
+    // `load_signer_for_network` path — no eager bootstrap, no Touch ID.
     let sandbox_mode = opts.sandbox || opts.local || opts.dev;
-    let keypair_override: Option<String>;
-
-    if sandbox_mode {
+    let network_override: Option<String> = if sandbox_mode {
         let rpc_url = if opts.local {
             pay_core::config::LOCAL_RPC_URL.to_string()
         } else if let Ok(url) = std::env::var("PAY_RPC_URL") {
@@ -86,41 +100,40 @@ fn main() {
         } else {
             pay_core::config::SANDBOX_RPC_URL.to_string()
         };
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        match rt.block_on(pay_core::sandbox::setup_sandbox_keypair(&rpc_url)) {
-            Ok(kp) => {
-                if opts.verbose {
-                    eprintln!(
-                        "{}",
-                        format!("Sandbox: ephemeral account {} ({})", kp.pubkey, rpc_url).dimmed()
-                    );
-                }
-                keypair_override = Some(kp.path.clone());
-                // Make the RPC URL available to payment signing and MCP subprocesses
-                // SAFETY: called before any threads are spawned
-                unsafe { std::env::set_var("PAY_RPC_URL", &rpc_url) };
-                // Keep the SandboxKeypair alive (owns the temp file)
-                std::mem::forget(kp);
-            }
-            Err(err) => {
-                eprintln!(
-                    "{}",
-                    format!("Error setting up sandbox keypair: {err}").dimmed()
-                );
-                std::process::exit(1);
-            }
-        }
-    } else if matches!(opts.command, Command::Setup(_) | Command::Account { .. }) {
-        keypair_override = None;
-    } else if matches!(opts.command, Command::Server { .. }) {
-        keypair_override = config.default_keypair_source();
-    } else if matches!(opts.command, Command::Topup(_)) {
-        // Topup tries to resolve but doesn't exit if missing (--account fallback)
-        keypair_override = config.default_keypair_source();
+        // SAFETY: called before any threads are spawned.
+        unsafe { std::env::set_var("PAY_RPC_URL", &rpc_url) };
+        Some("localnet".to_string())
+    } else if opts.mainnet {
+        Some("mainnet".to_string())
     } else {
-        // All other commands require a keypair
-        keypair_override = resolve_keypair(&config);
-    }
+        None
+    };
+
+    // ── Legacy keypair source for non-payment commands ─────────────────────
+    //
+    // `pay account`, `pay send`, `pay solana`, `pay topup`, `pay claude`
+    // and friends still use the original keystore-source-string flow.
+    // Payment commands (`pay curl`/`wget`/`fetch`) don't read this — they
+    // resolve the wallet via `network_override` + `accounts.yml` instead.
+    //
+    // In sandbox mode, NO command should probe the keychain — that would
+    // defeat the whole point of `--sandbox`. The server start path
+    // resolves its own ephemeral via the network-aware loader instead.
+    let keypair_override: Option<String> = if sandbox_mode
+        || matches!(
+            opts.command,
+            Command::Setup(_)
+                | Command::Account { .. }
+                | Command::Curl(_)
+                | Command::Wget(_)
+                | Command::Fetch(_)
+        ) {
+        None
+    } else if matches!(opts.command, Command::Server { .. } | Command::Topup(_)) {
+        config.default_keypair_source()
+    } else {
+        resolve_keypair(&config)
+    };
 
     let is_agent = no_dna::is_agent();
     let is_http_tool = matches!(
@@ -165,11 +178,17 @@ fn main() {
         auto_pay,
         output_fmt,
         keypair_override.as_deref(),
+        network_override.as_deref(),
         verbose,
         sandbox_mode,
     ) {
         if no_dna::should_json(output_fmt) {
             output::error_json(&err.to_string());
+        } else if let pay_core::Error::PaymentRejected(detail) = &err {
+            eprintln!(
+                "{}",
+                components::notice(components::NoticeLevel::Warning, "Payment rejected", detail,)
+            );
         } else {
             eprintln!("{}", format!("Error: {err}").dimmed());
         }

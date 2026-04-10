@@ -9,6 +9,9 @@ env:
 routing:
   type: proxy
   url: https://bigquery.googleapis.com/
+  path_rewrites:
+    - prefix: "bigquery/v2/projects/{projectsId}"
+      env: GCP_PROJECT
   auth:
     method: oauth2
     token_url: gcp_metadata
@@ -21,6 +24,11 @@ operator:
   currency: "USDC"
   network: "localnet"
   fee_payer: true
+
+recipients:
+  gateway:
+    account: "DxyXRSjEgHzRwXiaDpkPRJwZizpFk4g15eJVDh1ea2M8"
+    label: "Gateway"
 
 endpoints:
   - method: POST
@@ -35,6 +43,10 @@ endpoints:
           tiers:
             - price_usd: 0.15
               notes: "Per-query fee (~$0.05 avg Google cost at ~9 GB/query + 3x margin)"
+      splits:
+        - recipient: gateway
+          amount: 0.0001
+          memo: "Agentic gateway fee"
   - method: GET
     path: "bigquery/v2/projects/{projectsId}/queries/{jobId}"
     resource: "jobs"

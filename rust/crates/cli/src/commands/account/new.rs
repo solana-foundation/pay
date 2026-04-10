@@ -289,6 +289,8 @@ pub fn save_account(
             pubkey: Some(pubkey.to_string()),
             vault,
             path,
+            secret_key_b58: None,
+            created_at: None,
         },
     );
     accounts.save()

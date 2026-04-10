@@ -45,20 +45,29 @@ pub async fn setup_sandbox_keypair(rpc_url: &str) -> Result<SandboxKeypair> {
 
     info!(pubkey = %pubkey, "Generated sandbox keypair");
 
-    // Check surfpool is reachable before attempting to fund
-    check_surfpool(rpc_url).await?;
-
-    // Fund via surfpool cheatcodes
-    fund_sol(rpc_url, &pubkey).await?;
-    fund_usdc(rpc_url, &pubkey).await?;
-
-    info!(pubkey = %pubkey, "Sandbox keypair funded (100 SOL + 1000 USDC)");
+    fund_via_surfpool(rpc_url, &pubkey).await?;
 
     Ok(SandboxKeypair {
         path,
         pubkey,
         _file: file,
     })
+}
+
+/// Fund an existing pubkey on a Surfpool RPC. Used by the network-aware
+/// account routing path: when an ephemeral wallet is lazy-created for
+/// `localnet` and the configured RPC is a Surfpool sandbox, we top it up
+/// with SOL + USDC so the next payment broadcast doesn't fail with
+/// "insufficient funds".
+///
+/// No-ops gracefully if the RPC isn't a Surfpool — caller decides
+/// whether to ignore that or surface it.
+pub async fn fund_via_surfpool(rpc_url: &str, pubkey: &str) -> Result<()> {
+    check_surfpool(rpc_url).await?;
+    fund_sol(rpc_url, pubkey).await?;
+    fund_usdc(rpc_url, pubkey).await?;
+    info!(pubkey = %pubkey, "Sandbox wallet funded (100 SOL + 1000 USDC)");
+    Ok(())
 }
 
 async fn check_surfpool(rpc_url: &str) -> Result<()> {

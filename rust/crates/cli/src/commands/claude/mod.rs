@@ -48,16 +48,14 @@ impl ClaudeCommand {
             .arg("mcp__pay__curl")
             .arg("mcp__pay__wget")
             .arg("--append-system-prompt")
-            .arg("IMPORTANT: When you encounter HTTP 402 Payment Required responses, retry the same request using the pay MCP curl or wget tool — they handle payment automatically. Permission is handled by mcp.")
+            .arg(include_str!("agentic-gateway.md"))
             .args(&self.args)
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .status()
             .map_err(|e| {
-                pay_core::Error::Config(format!(
-                    "Failed to launch claude: {e}. Is it installed?"
-                ))
+                pay_core::Error::Config(format!("Failed to launch claude: {e}. Is it installed?"))
             })?;
 
         Ok(status.code().unwrap_or(1))

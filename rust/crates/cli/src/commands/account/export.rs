@@ -29,7 +29,16 @@ impl ExportCommand {
                 .iter()
                 .find(|(n, _)| *n == name)
                 .ok_or_else(|| pay_core::Error::Config(format!("Account '{name}' not found")))?;
-            account.signer_source(name)
+            // Ephemeral accounts can't be exported through this path —
+            // they have no external signer source. Tell the user to read
+            // the secret_key_b58 directly from accounts.yml.
+            account.signer_source(name).ok_or_else(|| {
+                pay_core::Error::Config(format!(
+                    "Account '{name}' is an ephemeral wallet — its secret key is \
+                     stored inline in ~/.config/pay/accounts.yml under the \
+                     `secret_key_b58` field"
+                ))
+            })?
         } else {
             let config = pay_core::Config::load().unwrap_or_default();
             keypair_source

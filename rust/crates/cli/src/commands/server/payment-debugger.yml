@@ -1,0 +1,204 @@
+name: payment-debugger
+subdomain: payment-debugger
+title: "Payment Debugger"
+description: "Demo API showcasing payment splits, tiered pricing, and referral flows."
+category: ai_ml
+version: v1
+routing:
+  type: respond
+operator:
+  currency: "USDC"
+  network: "localnet"
+  fee_payer: true
+
+# ── Named recipients ──
+# Aliases for wallet addresses used in splits.
+# `address` can be a literal base58 pubkey or `${ENV_VAR}` resolved at runtime.
+recipients:
+  vendor:
+    account: "CNR1b172rotbSG6kCpfR76KB2ios2y7X4p8yEEc7pjLu"
+    label: "Vendor"
+  tax_authority:
+    account: "EX8jprpePHt4byKfBJoUJGJQXA3TuDjtnScfQHAzGph5"
+    label: "Tax Authority"
+  payment_processor:
+    account: "DZwGzbZaqqaBsUPLJTvGqhhQjoi6PcTQ42HnZLYm4ici"
+    label: "Payment Processor"
+  escrow:
+    account: "HjaQR9kZSSizkcNeiKWeQkHNzeB3oJeW2Nxe7usuTbHx"
+    label: "Escrow"
+  affiliate:
+    account: "${AFFILIATE_WALLET}"
+    label: "Affiliate"
+
+endpoints:
+  # ── Simple: no splits (100% to operator) ──
+  - method: GET
+    path: "api/v1/reports/usage"
+    resource: "reports"
+    description: "Usage report — flat fee, no splits."
+    metering:
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 0.01
+
+  # ── Fixed-amount splits ──
+  - method: POST
+    path: "api/v1/invoices/pay"
+    resource: "invoices"
+    description: "Pay invoice — fixed splits to vendor + processor."
+    metering:
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 100.00
+      splits:
+        - recipient: vendor
+          amount: 85.00
+          memo: "Vendor payout"
+        - recipient: payment_processor
+          amount: 2.90
+          memo: "Processing fee"
+        - recipient: tax_authority
+          amount: 7.00
+          memo: "Withholding tax"
+
+  # ── Percentage splits ──
+  - method: POST
+    path: "api/v1/subscriptions/charge"
+    resource: "subscriptions"
+    description: "Subscription charge — percentage-based revenue share."
+    metering:
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 49.99
+      splits:
+        - recipient: payment_processor
+          percent: 2.9
+          memo: "Processing fee"
+        - recipient: tax_authority
+          percent: 7
+          memo: "Sales tax"
+
+  # ── Mixed: fixed + percentage ──
+  - method: POST
+    path: "api/v1/orders/checkout"
+    resource: "orders"
+    description: "Order checkout — fixed processing fee + percentage tax."
+    metering:
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 250.00
+      splits:
+        - recipient: payment_processor
+          amount: 0.30
+          memo: "Fixed processing fee"
+        - recipient: payment_processor
+          percent: 2.9
+          memo: "Variable processing fee"
+        - recipient: tax_authority
+          percent: 8.25
+          memo: "Sales tax"
+
+  # ── Dynamic recipient (affiliate resolved at runtime) ──
+  - method: POST
+    path: "api/v1/referrals/purchase"
+    resource: "referrals"
+    description: "Referred purchase — affiliate commission to dynamic wallet."
+    metering:
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 199.00
+      splits:
+        - recipient: vendor
+          percent: 70
+          memo: "Vendor payout"
+        - recipient: affiliate
+          percent: 10
+          memo: "Affiliate commission"
+        - recipient: payment_processor
+          percent: 2.9
+          memo: "Processing fee"
+
+  # ── Per-tier splits (different split config per pricing tier) ──
+  - method: POST
+    path: "api/v1/compute/run"
+    resource: "compute"
+    description: "Compute job — processing fees vary by volume tier."
+    metering:
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - up_to: 1000
+              price_usd: 0.10
+              splits:
+                - recipient: payment_processor
+                  percent: 3.5
+                  memo: "Processing (starter)"
+            - up_to: 100000
+              price_usd: 0.05
+              splits:
+                - recipient: payment_processor
+                  percent: 2.5
+                  memo: "Processing (growth)"
+            - price_usd: 0.02
+              splits:
+                - recipient: payment_processor
+                  percent: 1.5
+                  memo: "Processing (enterprise)"
+                - recipient: escrow
+                  percent: 2
+                  memo: "Escrow holdback"
+
+  # ── Many splits (disbursement) ──
+  - method: POST
+    path: "api/v1/settlements/disburse"
+    resource: "settlements"
+    description: "Settlement disbursement — revenue shared across multiple parties."
+    metering:
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 1000.00
+      splits:
+        - recipient: vendor
+          percent: 70
+          memo: "Vendor payout"
+        - recipient: payment_processor
+          amount: 0.30
+          memo: "Fixed processing fee"
+        - recipient: payment_processor
+          percent: 2.9
+          memo: "Variable processing fee"
+        - recipient: tax_authority
+          percent: 8.25
+          memo: "Sales tax"
+        - recipient: escrow
+          percent: 5
+          memo: "Escrow holdback"
+        - recipient: affiliate
+          percent: 3
+          memo: "Affiliate commission"
+
+  # ── Free endpoint (no metering, no splits) ──
+  - method: GET
+    path: "health"
+    description: "Health check — free, no payment required."

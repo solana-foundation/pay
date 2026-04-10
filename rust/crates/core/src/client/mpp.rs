@@ -7,8 +7,9 @@ use solana_mpp::protocol::solana::default_rpc_url;
 use solana_mpp::solana_keychain::SolanaSigner;
 use solana_mpp::solana_rpc_client::rpc_client::RpcClient;
 use solana_mpp::{ChargeRequest, parse_www_authenticate};
-use tracing::info;
+use tracing::{info, warn};
 
+use crate::accounts::{AccountsStore, ResolvedEphemeral};
 use crate::{Error, Result};
 
 // Re-export the challenge type for the runner/CLI.
@@ -19,8 +20,23 @@ pub fn parse(header_value: &str) -> Option<Challenge> {
     parse_www_authenticate(header_value).ok()
 }
 
-/// Build a signed credential and return the `Authorization` header value.
-pub fn build_credential(challenge: &Challenge, keypair_source: &str) -> Result<String> {
+/// Build a signed credential and return the `Authorization` header value
+/// alongside an optional `ResolvedEphemeral` notice that the caller should
+/// render if `Some` (signals "we just generated a fresh ephemeral wallet
+/// for this network — let the user know what its pubkey is").
+///
+/// Network resolution:
+///
+/// 1. `network_override` (if `Some`) — set by `--mainnet` / `--sandbox`
+///    CLI flags. Forces a specific network slug regardless of what the
+///    challenge advertises.
+/// 2. Otherwise, `challenge.method_details.network`.
+/// 3. Otherwise, `mainnet`.
+pub fn build_credential(
+    challenge: &Challenge,
+    store: &dyn AccountsStore,
+    network_override: Option<&str>,
+) -> Result<(String, Option<ResolvedEphemeral>)> {
     let request: ChargeRequest = challenge
         .request
         .decode()
@@ -28,24 +44,36 @@ pub fn build_credential(challenge: &Challenge, keypair_source: &str) -> Result<S
 
     let amount = format_amount(&request.amount, &request.currency);
     let desc = challenge.description.as_deref().unwrap_or("API access");
-    let reason = format!("pay {amount} for {desc}");
 
-    let signer = crate::signer::load_signer_with_reason(keypair_source, &reason)?;
-
-    let network = request
+    let challenge_network = request
         .method_details
         .as_ref()
         .and_then(|v| v.get("network"))
         .and_then(|v| v.as_str())
-        .unwrap_or("mainnet-beta");
+        .unwrap_or("mainnet")
+        .to_string();
+    // Auto-funding via Surfpool is gated on `network_override` being set —
+    // i.e. the user explicitly opted into sandbox mode via `--sandbox` or
+    // `--local`. Without that signal we don't know whether the localnet
+    // RPC is a Surfpool sandbox or just a real localhost validator, and
+    // probing it would either spam an irrelevant "install Surfpool"
+    // error or silently fund the wrong wallet.
+    let user_opted_into_sandbox = network_override.is_some();
+    let network = network_override
+        .map(str::to_string)
+        .unwrap_or(challenge_network);
+
+    let (signer, ephemeral_notice) =
+        crate::signer::load_signer_for_network_payment(&network, store, &amount, desc)?;
+
     let rpc_url =
-        std::env::var("PAY_RPC_URL").unwrap_or_else(|_| default_rpc_url(network).to_string());
+        std::env::var("PAY_RPC_URL").unwrap_or_else(|_| default_rpc_url(&network).to_string());
     let rpc = RpcClient::new(rpc_url.clone());
 
     info!(
         amount = %request.amount,
         currency = %request.currency,
-        network,
+        network = %network,
         %rpc_url,
         signer = %signer.pubkey(),
         "Building MPP credential"
@@ -56,8 +84,31 @@ pub fn build_credential(challenge: &Challenge, keypair_source: &str) -> Result<S
         .build()
         .map_err(|e| Error::Mpp(format!("Failed to create runtime: {e}")))?;
 
-    rt.block_on(build_credential_header(&signer, &rpc, challenge))
-        .map_err(|e| Error::Mpp(format!("Failed to build credential: {e}")))
+    // Only auto-fund when (a) the wallet was just lazy-created in this
+    // call AND (b) the user explicitly opted into sandbox mode. Without
+    // (b) we'd be probing arbitrary localnet RPCs and producing
+    // confusing "install Surfpool" errors for users who never asked for
+    // Surfpool in the first place.
+    if user_opted_into_sandbox
+        && ephemeral_notice
+            .as_ref()
+            .map(|e| e.created)
+            .unwrap_or(false)
+    {
+        let pubkey = signer.pubkey().to_string();
+        let fund_url = rpc_url.clone();
+        if let Err(e) = rt.block_on(crate::client::sandbox::fund_via_surfpool(
+            &fund_url, &pubkey,
+        )) {
+            warn!(error = %e, "Could not auto-fund ephemeral via Surfpool — broadcast may fail if wallet is empty");
+        }
+    }
+
+    let header = rt
+        .block_on(build_credential_header(&signer, &rpc, challenge))
+        .map_err(|e| Error::Mpp(format!("Failed to build credential: {e}")))?;
+
+    Ok((header, ephemeral_notice))
 }
 
 fn format_amount(amount: &str, currency: &str) -> String {

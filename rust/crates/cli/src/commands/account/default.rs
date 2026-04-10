@@ -29,7 +29,8 @@ impl DefaultCommand {
             )));
         }
 
-        accounts.default_account = Some(self.name.clone());
+        // "Default" now means "the account mapped to mainnet-beta".
+        accounts.set_network(pay_core::accounts::MAINNET_NETWORK, &self.name);
         accounts.save()?;
 
         super::list::print_account_list(&accounts, Some(super::list::Highlight::Green(&self.name)));

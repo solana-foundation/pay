@@ -288,6 +288,7 @@ async function createApp() {
         signer: feePayerSigner,
         currency: USDC_MINT,
         decimals: 6,
+        html: true,
       }),
     ],
   });

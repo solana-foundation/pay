@@ -28,7 +28,7 @@ impl AuthGate for TouchId {
             Ok(())
         } else {
             let err = extract_error(&output.stderr);
-            if err == "denied" {
+            if is_user_cancel(&err) {
                 Err(Error::AuthDenied(err))
             } else {
                 Err(Error::Backend(err))
@@ -181,12 +181,20 @@ fn helper_run(args: &[&str]) -> Result<String> {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     } else {
         let err = extract_error(&output.stderr);
-        if err == "denied" {
+        if is_user_cancel(&err) {
             Err(Error::AuthDenied(err))
         } else {
             Err(Error::Backend(err))
         }
     }
+}
+
+/// Detect Apple Keychain / LocalAuthentication "user cancelled" messages.
+/// Covers our own "denied" sentinel, Touch ID cancel, and SecItemCopyMatching
+/// cancel (errSecUserCanceled → "User canceled the operation.").
+fn is_user_cancel(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    m == "denied" || m.contains("cancel")
 }
 
 fn helper_store(key: &str, data: &[u8]) -> Result<()> {

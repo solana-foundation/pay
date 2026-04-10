@@ -113,25 +113,30 @@ impl DestroyCommand {
             );
         }
 
-        // Remove from accounts.yml
-        let was_default = accounts.default_account.as_deref() == Some(&self.account);
+        // Remove from accounts.yml — also clears any network mappings
+        // pointing at this account so we never end up with dangling refs.
+        let was_default = accounts
+            .default_account()
+            .map(|(name, _)| name == self.account)
+            .unwrap_or(false);
         accounts.remove(&self.account);
 
-        // If we deleted the default and there are remaining accounts, prompt for new default
-        if was_default && accounts.accounts.len() > 1 {
+        // If we deleted the mainnet-default and there are remaining
+        // accounts, prompt for a new mainnet account.
+        if was_default && !accounts.accounts.is_empty() {
             let names: Vec<String> = accounts.accounts.keys().cloned().collect();
             let has_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
             if has_tty {
                 let selection =
                     dialoguer::Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
-                        .with_prompt("Choose new default account")
+                        .with_prompt("Choose new default account (mainnet-beta)")
                         .items(&names)
                         .default(0)
                         .interact()
                         .ok();
 
                 if let Some(idx) = selection {
-                    accounts.default_account = Some(names[idx].clone());
+                    accounts.set_network(pay_core::accounts::MAINNET_NETWORK, &names[idx]);
                 }
             }
         }
@@ -179,6 +184,10 @@ fn keystore_for_kind(kind: &KeystoreKind) -> pay_core::Result<Option<Keystore>> 
 
         KeystoreKind::OnePassword => Ok(Some(Keystore::onepassword())),
         KeystoreKind::File => Ok(None),
+        // Ephemeral keypairs live entirely inside accounts.yml — there's
+        // no external keystore to delete from. The earlier `accounts.remove`
+        // call already wiped the entry, so we just no-op here.
+        KeystoreKind::Ephemeral => Ok(None),
     }
 }
 
@@ -194,6 +203,8 @@ fn discover_legacy_account(name: &str) -> Option<Account> {
                 pubkey,
                 vault: None,
                 path: None,
+                secret_key_b58: None,
+                created_at: None,
             });
         }
     }
@@ -208,6 +219,8 @@ fn discover_legacy_account(name: &str) -> Option<Account> {
                 pubkey,
                 vault: None,
                 path: None,
+                secret_key_b58: None,
+                created_at: None,
             });
         }
     }
@@ -221,6 +234,8 @@ fn discover_legacy_account(name: &str) -> Option<Account> {
                 pubkey,
                 vault: None,
                 path: None,
+                secret_key_b58: None,
+                created_at: None,
             });
         }
     }

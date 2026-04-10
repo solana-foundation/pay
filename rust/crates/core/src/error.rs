@@ -21,4 +21,7 @@ pub enum Error {
 
     #[error("MPP payment error: {0}")]
     Mpp(String),
+
+    #[error("Payment rejected: {0}")]
+    PaymentRejected(String),
 }

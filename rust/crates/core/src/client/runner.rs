@@ -27,6 +27,14 @@ pub enum RunOutcome {
         headers: Vec<(String, String)>,
         resource_url: String,
     },
+    /// The server returned 402 with a `verification_failed` body — this is a
+    /// retry response telling the client *why* the previously-submitted payment
+    /// was rejected (wrong network, expired, double-spend, etc.).
+    PaymentRejected {
+        reason: String,
+        retryable: bool,
+        resource_url: String,
+    },
     /// The command completed (any status other than 402).
     Completed {
         exit_code: i32,
@@ -137,7 +145,11 @@ fn run_wget_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunO
     debug!(?status_code, exit_code, "wget finished");
 
     if status_code == Some(402) {
-        // Swallow stderr on 402
+        // Swallow stderr on 402. NOTE: wget writes the body to a file in cwd
+        // by default, which we don't want to clobber by injecting -O. As a
+        // result, we can't surface server `verification_failed` reasons for
+        // wget retries (only curl/fetch). The retry path falls back to a
+        // generic "still 402" message.
         return Ok(classify_402(&headers, None, &url));
     }
 
@@ -155,6 +167,18 @@ pub(crate) fn classify_402(
     body: Option<&str>,
     resource_url: &str,
 ) -> RunOutcome {
+    // A `verification_failed` body wins over a fresh challenge: it means the
+    // server saw our payment header and rejected it. We must surface the
+    // reason instead of looping into a second pay-and-retry.
+    if let Some((reason, retryable)) = parse_verification_failure(body) {
+        info!(resource = resource_url, %reason, "Server rejected payment");
+        return RunOutcome::PaymentRejected {
+            reason,
+            retryable,
+            resource_url: resource_url.to_string(),
+        };
+    }
+
     // Check for MPP challenge in www-authenticate header
     if let Some(www_auth) = headers.iter().find(|(k, _)| k == "www-authenticate")
         && let Some(challenge) = mpp::parse(&www_auth.1)
@@ -179,6 +203,38 @@ pub(crate) fn classify_402(
         headers: headers.to_vec(),
         resource_url: resource_url.to_string(),
     }
+}
+
+/// Pure parser: pulls a `verification_failed` reason out of a 402 JSON body.
+///
+/// Returns `(message, retryable)` if the body matches the shape emitted by
+/// `crates/core/src/server/payment.rs` for verification failures:
+///
+/// ```json
+/// {"error": "verification_failed", "message": "...", "retryable": false}
+/// ```
+///
+/// Returns `None` for any other body shape (or absent body), so the caller
+/// can fall through to the normal challenge-detection path.
+pub(crate) fn parse_verification_failure(body: Option<&str>) -> Option<(String, bool)> {
+    let body = body?.trim();
+    if body.is_empty() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    if v.get("error")?.as_str()? != "verification_failed" {
+        return None;
+    }
+    let message = v
+        .get("message")
+        .and_then(|m| m.as_str())
+        .unwrap_or("payment verification failed")
+        .to_string();
+    let retryable = v
+        .get("retryable")
+        .and_then(|r| r.as_bool())
+        .unwrap_or(false);
+    Some((message, retryable))
 }
 
 fn check_command_exists(cmd: &str) -> Result<()> {
@@ -341,6 +397,130 @@ HTTP request sent, awaiting response...
         let headers = vec![("content-type".to_string(), "text/html".to_string())];
         let outcome = classify_402(&headers, None, "https://example.com/resource");
         assert!(matches!(outcome, RunOutcome::UnknownPaymentRequired { .. }));
+    }
+
+    // ── parse_verification_failure ──────────────────────────────────────────
+
+    #[test]
+    fn parse_verification_failure_full_payload() {
+        let body = r#"{"error":"verification_failed","message":"transaction not found on devnet","retryable":false}"#;
+        let parsed = parse_verification_failure(Some(body));
+        assert_eq!(
+            parsed,
+            Some(("transaction not found on devnet".to_string(), false))
+        );
+    }
+
+    #[test]
+    fn parse_verification_failure_retryable_true() {
+        let body = r#"{"error":"verification_failed","message":"rpc temporarily unavailable","retryable":true}"#;
+        let parsed = parse_verification_failure(Some(body));
+        assert_eq!(
+            parsed,
+            Some(("rpc temporarily unavailable".to_string(), true))
+        );
+    }
+
+    #[test]
+    fn parse_verification_failure_missing_message_uses_default() {
+        let body = r#"{"error":"verification_failed","retryable":false}"#;
+        let parsed = parse_verification_failure(Some(body));
+        assert_eq!(
+            parsed,
+            Some(("payment verification failed".to_string(), false))
+        );
+    }
+
+    #[test]
+    fn parse_verification_failure_missing_retryable_defaults_false() {
+        let body = r#"{"error":"verification_failed","message":"bad signature"}"#;
+        let parsed = parse_verification_failure(Some(body));
+        assert_eq!(parsed, Some(("bad signature".to_string(), false)));
+    }
+
+    #[test]
+    fn parse_verification_failure_wrong_error_field() {
+        // First-call 402 challenge body — must NOT be treated as a rejection.
+        let body = r#"{"error":"payment_required","message":"This endpoint requires payment."}"#;
+        assert_eq!(parse_verification_failure(Some(body)), None);
+    }
+
+    #[test]
+    fn parse_verification_failure_not_json() {
+        assert_eq!(parse_verification_failure(Some("not json at all")), None);
+    }
+
+    #[test]
+    fn parse_verification_failure_empty_string() {
+        assert_eq!(parse_verification_failure(Some("")), None);
+        assert_eq!(parse_verification_failure(Some("   ")), None);
+    }
+
+    #[test]
+    fn parse_verification_failure_none() {
+        assert_eq!(parse_verification_failure(None), None);
+    }
+
+    #[test]
+    fn classify_402_verification_failed_wins_over_challenge() {
+        // Even if a fresh www-authenticate challenge is present, a
+        // verification_failed body must take precedence — otherwise the
+        // client would loop into a second pay-and-retry instead of
+        // surfacing why the first payment was rejected.
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        let request_json = serde_json::json!({
+            "amount": "1000000",
+            "currency": "USDC",
+            "recipient": "So11111111111111111111111111111111111111112",
+            "methodDetails": { "network": "devnet" }
+        });
+        let b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&request_json).unwrap());
+        let headers = vec![(
+            "www-authenticate".to_string(),
+            format!(
+                "Payment id=\"test-id\", realm=\"test\", method=\"solana\", intent=\"charge\", request=\"{b64}\""
+            ),
+        )];
+        let body = r#"{"error":"verification_failed","message":"wrong network: expected localnet","retryable":false}"#;
+
+        let outcome = classify_402(&headers, Some(body), "https://example.com/resource");
+        match outcome {
+            RunOutcome::PaymentRejected {
+                reason, retryable, ..
+            } => {
+                assert_eq!(reason, "wrong network: expected localnet");
+                assert!(!retryable);
+            }
+            other => panic!("expected PaymentRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_402_unrelated_body_falls_through_to_challenge() {
+        // First-call 402 with a JSON body that isn't verification_failed —
+        // we still detect the MPP challenge from headers.
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        let request_json = serde_json::json!({
+            "amount": "1000000",
+            "currency": "USDC",
+            "recipient": "So11111111111111111111111111111111111111112",
+            "methodDetails": { "network": "devnet" }
+        });
+        let b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&request_json).unwrap());
+        let headers = vec![(
+            "www-authenticate".to_string(),
+            format!(
+                "Payment id=\"test-id\", realm=\"test\", method=\"solana\", intent=\"charge\", request=\"{b64}\""
+            ),
+        )];
+        let body = r#"{"error":"payment_required","message":"This endpoint requires payment."}"#;
+
+        let outcome = classify_402(&headers, Some(body), "https://example.com/resource");
+        assert!(matches!(outcome, RunOutcome::MppChallenge { .. }));
     }
 
     #[test]

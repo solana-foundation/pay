@@ -80,7 +80,7 @@ pub async fn inject_fake_flow(State(state): State<PdbState>) -> impl IntoRespons
             "decimals": 6,
             "feePayer": true,
             "feePayerKey": "4FEnLHBHFeePayerxxxxxxxxxxxxxxxxxxxxxxxxxx",
-            "network": "mainnet-beta",
+            "network": "mainnet",
             "recentBlockhash": "SURFNETxSAFEHASHxxxxxxxxxxxxxxxxxxxxx11x",
             "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
             "splits": [
@@ -157,7 +157,7 @@ pub async fn inject_fake_flow(State(state): State<PdbState>) -> impl IntoRespons
                 "decimals": 6,
                 "feePayer": true,
                 "feePayerKey": "4FEnLHBHFeePayerxxxxxxxxxxxxxxxxxxxxxxxxxx",
-                "network": "mainnet-beta",
+                "network": "mainnet",
                 "recentBlockhash": "SURFNETxSAFEHASHxxxxxxxxxxxxxxxxxxxxx11x",
                 "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
             }

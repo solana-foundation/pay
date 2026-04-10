@@ -7,8 +7,9 @@ use solana_x402::client::solana::{build_payment_header, parse_x402_challenge};
 use solana_x402::protocol::methods::solana::{PaymentRequirements, default_rpc_url};
 use solana_x402::solana_keychain::SolanaSigner;
 use solana_x402::solana_rpc_client::rpc_client::RpcClient;
-use tracing::info;
+use tracing::{info, warn};
 
+use crate::accounts::{AccountsStore, ResolvedEphemeral};
 use crate::{Error, Result};
 
 // Re-export for the runner/CLI.
@@ -19,23 +20,45 @@ pub fn parse(headers: &[(String, String)], body: Option<&str>) -> Option<Payment
     parse_x402_challenge(headers, body)
 }
 
-/// Build a signed payment and return the `X-PAYMENT` header value.
-pub fn build_payment(requirements: &PaymentRequirements, keypair_source: &str) -> Result<String> {
+/// Build a signed payment and return `(X-PAYMENT header, ephemeral_notice)`.
+///
+/// The `ephemeral_notice` is `Some` only when this call generated a fresh
+/// ephemeral wallet — the caller renders the "Generated <network> wallet"
+/// CLI notice with it.
+///
+/// Network resolution mirrors `mpp::build_credential`:
+/// 1. `network_override` (CLI flag) wins.
+/// 2. `requirements.cluster`.
+/// 3. `mainnet`.
+pub fn build_payment(
+    requirements: &PaymentRequirements,
+    store: &dyn AccountsStore,
+    network_override: Option<&str>,
+) -> Result<(String, Option<ResolvedEphemeral>)> {
     let amount = format_amount(&requirements.amount, &requirements.currency);
     let desc = requirements.description.as_deref().unwrap_or("API access");
-    let reason = format!("pay {amount} for {desc}");
 
-    let signer = crate::signer::load_signer_with_reason(keypair_source, &reason)?;
+    let cluster = requirements
+        .cluster
+        .as_deref()
+        .unwrap_or("mainnet")
+        .to_string();
+    // Same gating rationale as mpp::build_credential — only attempt
+    // auto-funding when the user explicitly opted into sandbox mode.
+    let user_opted_into_sandbox = network_override.is_some();
+    let network = network_override.map(str::to_string).unwrap_or(cluster);
 
-    let cluster = requirements.cluster.as_deref().unwrap_or("mainnet-beta");
+    let (signer, ephemeral_notice) =
+        crate::signer::load_signer_for_network_payment(&network, store, &amount, desc)?;
+
     let rpc_url =
-        std::env::var("PAY_RPC_URL").unwrap_or_else(|_| default_rpc_url(cluster).to_string());
+        std::env::var("PAY_RPC_URL").unwrap_or_else(|_| default_rpc_url(&network).to_string());
     let rpc = RpcClient::new(rpc_url.clone());
 
     info!(
         amount = %requirements.amount,
         currency = %requirements.currency,
-        cluster,
+        cluster = %network,
         signer = %signer.pubkey(),
         "Building x402 payment"
     );
@@ -45,8 +68,26 @@ pub fn build_payment(requirements: &PaymentRequirements, keypair_source: &str) -
         .build()
         .map_err(|e| Error::Mpp(format!("Failed to create runtime: {e}")))?;
 
-    rt.block_on(build_payment_header(&signer, &rpc, requirements))
-        .map_err(|e| Error::Mpp(format!("Failed to build x402 payment: {e}")))
+    if user_opted_into_sandbox
+        && ephemeral_notice
+            .as_ref()
+            .map(|e| e.created)
+            .unwrap_or(false)
+    {
+        let pubkey = signer.pubkey().to_string();
+        let fund_url = rpc_url.clone();
+        if let Err(e) = rt.block_on(crate::client::sandbox::fund_via_surfpool(
+            &fund_url, &pubkey,
+        )) {
+            warn!(error = %e, "Could not auto-fund ephemeral via Surfpool — broadcast may fail if wallet is empty");
+        }
+    }
+
+    let header = rt
+        .block_on(build_payment_header(&signer, &rpc, requirements))
+        .map_err(|e| Error::Mpp(format!("Failed to build x402 payment: {e}")))?;
+
+    Ok((header, ephemeral_notice))
 }
 
 fn format_amount(amount: &str, currency: &str) -> String {

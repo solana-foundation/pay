@@ -179,49 +179,59 @@ impl ServerHandler for PayMcp {
 
 /// Make a paid HTTP request using pay-core's built-in fetch.
 /// Handles 402 detection, payment, and retry.
+///
+/// Routes wallet selection through the network-aware accounts file
+/// (`~/.config/pay/accounts.yml`). The legacy `keypair_path` argument is
+/// no longer used — kept on the function signature for now to avoid
+/// touching the MCP tool layer.
 fn do_paid_fetch(
     url: &str,
     extra_headers: &[(String, String)],
-    keypair_path: &str,
+    _keypair_path: &str,
 ) -> Result<String, pay_core::Error> {
     use pay_core::client::runner::RunOutcome;
 
     let outcome = pay_core::client::fetch::fetch(url, extra_headers)?;
+    let store = pay_core::accounts::FileAccountsStore::default_path();
 
     match outcome {
         RunOutcome::MppChallenge { challenge, .. } => {
-            let auth_header = pay_core::client::mpp::build_credential(&challenge, keypair_path)?;
+            let (auth_header, _ephemeral) =
+                pay_core::client::mpp::build_credential(&challenge, &store, None)?;
             let mut headers = extra_headers.to_vec();
             headers.push(("Authorization".to_string(), auth_header));
-            match pay_core::client::fetch::fetch(url, &headers)? {
-                RunOutcome::Completed { body, .. } => {
-                    Ok(body.unwrap_or_else(|| "Payment successful.".to_string()))
-                }
-                _ => Err(pay_core::Error::Mpp(
-                    "Server returned 402 again after payment".to_string(),
-                )),
-            }
+            interpret_retry(pay_core::client::fetch::fetch(url, &headers)?)
         }
         RunOutcome::X402Challenge { requirements, .. } => {
-            let payment_header =
-                pay_core::client::x402::build_payment(&requirements, keypair_path)?;
+            let (payment_header, _ephemeral) =
+                pay_core::client::x402::build_payment(&requirements, &store, None)?;
             let mut headers = extra_headers.to_vec();
             headers.push(("X-PAYMENT".to_string(), payment_header));
-            match pay_core::client::fetch::fetch(url, &headers)? {
-                RunOutcome::Completed { body, .. } => {
-                    Ok(body.unwrap_or_else(|| "Payment successful.".to_string()))
-                }
-                _ => Err(pay_core::Error::Mpp(
-                    "Server returned 402 again after payment".to_string(),
-                )),
-            }
+            interpret_retry(pay_core::client::fetch::fetch(url, &headers)?)
         }
+        RunOutcome::PaymentRejected { reason, .. } => Err(pay_core::Error::PaymentRejected(reason)),
         RunOutcome::UnknownPaymentRequired { .. } => Err(pay_core::Error::Mpp(
             "402 Payment Required but no recognized protocol".to_string(),
         )),
         RunOutcome::Completed { body, .. } => {
             Ok(body.unwrap_or_else(|| "Request completed.".to_string()))
         }
+    }
+}
+
+/// Map a retry-fetch outcome to a string body or a structured error.
+fn interpret_retry(
+    outcome: pay_core::client::runner::RunOutcome,
+) -> Result<String, pay_core::Error> {
+    use pay_core::client::runner::RunOutcome;
+    match outcome {
+        RunOutcome::Completed { body, .. } => {
+            Ok(body.unwrap_or_else(|| "Payment successful.".to_string()))
+        }
+        RunOutcome::PaymentRejected { reason, .. } => Err(pay_core::Error::PaymentRejected(reason)),
+        _ => Err(pay_core::Error::Mpp(
+            "Server returned 402 again after payment".to_string(),
+        )),
     }
 }
 

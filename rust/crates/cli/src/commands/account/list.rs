@@ -65,8 +65,9 @@ pub fn print_account_list(
 
     eprintln!();
 
+    let default_name = accounts.default_account().map(|(n, _)| n.to_string());
     for (name, account) in &accounts.accounts {
-        let is_default = accounts.default_account.as_deref() == Some(name.as_str());
+        let is_default = default_name.as_deref() == Some(name.as_str());
         let is_highlighted = match &highlight {
             Some(Highlight::Green(n)) | Some(Highlight::Red(n)) => *n == name.as_str(),
             None => false,

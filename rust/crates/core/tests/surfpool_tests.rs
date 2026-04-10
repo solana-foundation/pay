@@ -267,6 +267,10 @@ async fn full_payment_flow_with_surfnet() {
         recipient: recipient.pubkey().to_string(),
         currency: "SOL".to_string(),
         decimals: 9,
+        // Surfpool is a localnet implementation. Its prefixed blockhash
+        // is acceptable for `network: localnet` per the SDK's
+        // asymmetric check (the only place SURFNET-prefixed hashes
+        // are valid).
         network: "localnet".to_string(),
         rpc_url: Some(surfnet.rpc_url().to_string()),
         secret_key: Some("test-secret".to_string()),
@@ -384,6 +388,10 @@ async fn mpp_build_credential_with_surfnet() {
         recipient: recipient.pubkey().to_string(),
         currency: "SOL".to_string(),
         decimals: 9,
+        // Surfpool is a localnet implementation. Its prefixed blockhash
+        // is acceptable for `network: localnet` per the SDK's
+        // asymmetric check (the only place SURFNET-prefixed hashes
+        // are valid).
         network: "localnet".to_string(),
         rpc_url: Some(surfnet.rpc_url().to_string()),
         secret_key: Some("test-secret".to_string()),
@@ -439,15 +447,40 @@ async fn mpp_build_credential_with_surfnet() {
     let kp_file = keypair_to_file(&payer);
     let kp_path = kp_file.path().to_string_lossy().to_string();
 
-    // Step 3: Build credential using pay_core (sets PAY_RPC_URL for the signer)
-    // build_credential creates its own tokio runtime, so run it from a blocking thread
+    // Step 3: Build credential using pay_core's network-aware path.
+    //
+    // Inject the test payer into a MemoryAccountsStore as an ephemeral
+    // account mapped to `localnet` — that's how the new
+    // `build_credential(challenge, store, network_override)` API
+    // resolves the wallet (no more `keypair_source: &str`).
+    //
+    // build_credential creates its own tokio runtime, so we drive it
+    // from a blocking thread.
     let rpc_url = surfnet.rpc_url().to_string();
     let challenge_clone = challenge.clone();
-    let kp = kp_path.clone();
+    let payer_bytes = payer.to_bytes().to_vec();
+    let payer_pubkey = payer.pubkey().to_string();
     let auth = tokio::task::spawn_blocking(move || {
-        // SAFETY: test-only env manipulation
+        // SAFETY: test-only env manipulation, runs before any other
+        // threads in this closure.
         unsafe { std::env::set_var("PAY_RPC_URL", &rpc_url) };
-        let result = client::mpp::build_credential(&challenge_clone, &kp);
+
+        let mut file = pay_core::accounts::AccountsFile::default();
+        file.upsert(
+            "localnet",
+            pay_core::accounts::Account {
+                keystore: pay_core::accounts::Keystore::Ephemeral,
+                pubkey: Some(payer_pubkey),
+                vault: None,
+                path: None,
+                secret_key_b58: Some(bs58::encode(&payer_bytes).into_string()),
+                created_at: Some("2026-04-10T00:00:00Z".to_string()),
+            },
+        );
+        file.set_network("localnet", "localnet");
+        let store = pay_core::accounts::MemoryAccountsStore::with_file(file);
+
+        let result = client::mpp::build_credential(&challenge_clone, &store, Some("localnet"));
         unsafe { std::env::remove_var("PAY_RPC_URL") };
         result
     })
@@ -455,8 +488,12 @@ async fn mpp_build_credential_with_surfnet() {
     .unwrap();
 
     assert!(auth.is_ok(), "build_credential failed: {:?}", auth.err());
-    let auth = auth.unwrap();
+    let (auth, ephemeral) = auth.unwrap();
     assert!(!auth.is_empty());
+    assert!(
+        ephemeral.is_none(),
+        "should be a cache hit (we pre-populated the store)"
+    );
 
     // Step 4: Use the credential — should get 200
     let resp = http

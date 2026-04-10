@@ -269,7 +269,7 @@ pub struct OperatorConfig {
     /// Solana RPC URL. Overrides --rpc-url CLI flag.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rpc_url: Option<String>,
-    /// Solana network (mainnet-beta, devnet, localnet).
+    /// Solana network (mainnet, devnet, localnet).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<String>,
     /// Whether the operator sponsors transaction fees.
@@ -278,17 +278,38 @@ pub struct OperatorConfig {
 }
 
 /// Signing backend configuration.
-/// When specified in the YAML, the proxy uses this signer directly —
-/// bypassing the keystore. For production use GCP KMS; for dev use file.
+///
+/// Tells the server how to load the wallet that co-signs as `fee_payer`.
+/// When `operator.fee_payer: true` is set in the YAML, exactly one of
+/// these variants must be configured (or the server must be started in
+/// `--sandbox` mode, which auto-loads a localnet ephemeral).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "backend", rename_all = "kebab-case")]
 pub enum SignerConfig {
     /// GCP Cloud KMS — Ed25519 HSM key. Private key never leaves the HSM.
+    /// Recommended for production. Requires the `gcp_kms` build feature.
     GcpKms {
         /// Full KMS key version resource name.
         key_name: String,
         /// Solana public key (base58) derived from the KMS key.
         pubkey: String,
+    },
+    /// Named account from `~/.config/pay/accounts.yml`. Loaded via the
+    /// regular keystore path — for `apple-keychain`/`gnome-keyring`/
+    /// `windows-hello`/`1password` entries this triggers the OS auth
+    /// prompt **once at server startup** (not per-payment). For
+    /// `ephemeral` entries no prompt fires.
+    Account {
+        /// Account name as it appears under `accounts:` in accounts.yml.
+        name: String,
+    },
+    /// Inline keypair file on disk (Solana CLI's standard JSON format
+    /// — a 64-byte u8 array). Bypasses the keystore entirely. Useful
+    /// for dev/CI machines where the wallet doesn't need OS-level
+    /// protection.
+    File {
+        /// Path to the keypair JSON file. `~` is expanded.
+        path: String,
     },
 }
 

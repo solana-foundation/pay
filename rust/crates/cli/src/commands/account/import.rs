@@ -80,11 +80,15 @@ impl ImportCommand {
                 pubkey: Some(pubkey_b58),
                 vault: self.vault,
                 path: None,
+                secret_key_b58: None,
+                created_at: None,
             },
         );
 
-        // 6. Prompt for default if not the only account
-        if !is_first && accounts.default_account.as_deref() != Some(&name) {
+        // 6. Prompt for default (= mainnet-beta mapping) if not the
+        //    only account.
+        let current_mainnet = accounts.default_account().map(|(n, _)| n.to_string());
+        if !is_first && current_mainnet.as_deref() != Some(name.as_str()) {
             let make_default = Confirm::with_theme(&theme)
                 .with_prompt(format!("Set '{}' as the default account?", name.green()))
                 .default(false)
@@ -92,7 +96,7 @@ impl ImportCommand {
                 .unwrap_or(false);
 
             if make_default {
-                accounts.default_account = Some(name.clone());
+                accounts.set_network(pay_core::accounts::MAINNET_NETWORK, &name);
             }
         }
 

@@ -16,7 +16,7 @@ use pay_core::mpp;
 use pay_core::runner::RunOutcome;
 use pay_core::x402;
 use pay_core::x402::Challenge as X402Challenge;
-use pay_core::{Config, run_curl_with_headers, run_wget_with_headers};
+use pay_core::{run_curl_with_headers, run_wget_with_headers};
 use solana_mpp::ChargeRequest;
 
 use crate::no_dna;
@@ -101,6 +101,7 @@ impl Command {
         auto_pay: bool,
         output_fmt: Option<OutputFormat>,
         keypair_override: Option<&str>,
+        network_override: Option<&str>,
         verbose: bool,
         sandbox: bool,
     ) -> pay_core::Result<()> {
@@ -144,7 +145,7 @@ impl Command {
                     auto_pay,
                     output_fmt,
                     Some(parsed_headers),
-                    keypair_override,
+                    network_override,
                     verbose,
                 );
             }
@@ -157,7 +158,7 @@ impl Command {
             auto_pay,
             output_fmt,
             None,
-            keypair_override,
+            network_override,
             verbose,
         )
     }
@@ -169,7 +170,7 @@ fn handle_outcome(
     auto_pay: bool,
     output_fmt: Option<OutputFormat>,
     fetch_headers: Option<Vec<(String, String)>>,
-    keypair_override: Option<&str>,
+    network_override: Option<&str>,
     verbose: bool,
 ) -> pay_core::Result<()> {
     let is_json = no_dna::should_json(output_fmt);
@@ -196,7 +197,7 @@ fn handle_outcome(
                     tool,
                     output_fmt,
                     fetch_headers,
-                    keypair_override,
+                    network_override,
                     verbose,
                 );
             }
@@ -251,7 +252,7 @@ fn handle_outcome(
                     tool,
                     output_fmt,
                     fetch_headers,
-                    keypair_override,
+                    network_override,
                     verbose,
                 );
             }
@@ -301,6 +302,38 @@ fn handle_outcome(
             }
         }
 
+        RunOutcome::PaymentRejected {
+            reason, retryable, ..
+        } => {
+            // First-call rejection: the request already carried an Authorization
+            // header (e.g. cached from a previous run) and the server rejected
+            // it. There's no point retrying with the same header — surface the
+            // reason and exit.
+            if is_json {
+                output::print_json(&serde_json::json!({
+                    "status": 402,
+                    "error": "payment_rejected",
+                    "reason": reason,
+                    "retryable": retryable,
+                }))?;
+            } else {
+                let body = if retryable {
+                    format!("{reason}\n(retryable — try again)")
+                } else {
+                    reason
+                };
+                eprintln!(
+                    "{}",
+                    crate::components::notice(
+                        crate::components::NoticeLevel::Error,
+                        "Payment rejected by verifier",
+                        &body,
+                    )
+                );
+            }
+            std::process::exit(1);
+        }
+
         RunOutcome::Completed { exit_code, body } => {
             if let Some(body) = body {
                 print!("{body}");
@@ -317,23 +350,22 @@ fn pay_mpp_and_retry(
     tool: &Tool,
     output_fmt: Option<OutputFormat>,
     fetch_headers: Option<Vec<(String, String)>>,
-    keypair_override: Option<&str>,
+    network_override: Option<&str>,
     verbose: bool,
 ) -> pay_core::Result<()> {
     let is_json = no_dna::should_json(output_fmt);
-    let config = Config::load()?;
-    let keypair_path = keypair_override
-        .map(std::borrow::ToOwned::to_owned)
-        .or_else(|| config.default_keypair_source())
-        .ok_or_else(|| {
-            pay_core::Error::Config("No keypair configured. Run `pay setup`.".to_string())
-        })?;
 
     if verbose && !is_json {
         eprintln!("{}", "Paying...".dimmed());
     }
 
-    let auth_header = mpp::build_credential(challenge, &keypair_path)?;
+    let store = pay_core::accounts::FileAccountsStore::default_path();
+    let (auth_header, ephemeral_notice) =
+        mpp::build_credential(challenge, &store, network_override)?;
+
+    if let Some(resolved) = ephemeral_notice {
+        render_generated_wallet_notice(&resolved, is_json)?;
+    }
 
     if verbose && !is_json {
         eprintln!("{}", "Payment signed, retrying...\n".dimmed());
@@ -348,23 +380,22 @@ fn pay_x402_and_retry(
     tool: &Tool,
     output_fmt: Option<OutputFormat>,
     fetch_headers: Option<Vec<(String, String)>>,
-    keypair_override: Option<&str>,
+    network_override: Option<&str>,
     verbose: bool,
 ) -> pay_core::Result<()> {
     let is_json = no_dna::should_json(output_fmt);
-    let config = Config::load()?;
-    let keypair_path = keypair_override
-        .map(std::borrow::ToOwned::to_owned)
-        .or_else(|| config.default_keypair_source())
-        .ok_or_else(|| {
-            pay_core::Error::Config("No keypair configured. Run `pay setup`.".to_string())
-        })?;
 
     if verbose && !is_json {
         eprintln!("{}", "Paying...".dimmed());
     }
 
-    let payment_json = x402::build_payment(requirements, &keypair_path)?;
+    let store = pay_core::accounts::FileAccountsStore::default_path();
+    let (payment_json, ephemeral_notice) =
+        x402::build_payment(requirements, &store, network_override)?;
+
+    if let Some(resolved) = ephemeral_notice {
+        render_generated_wallet_notice(&resolved, is_json)?;
+    }
 
     if verbose && !is_json {
         eprintln!("{}", "Payment signed, retrying...\n".dimmed());
@@ -372,6 +403,42 @@ fn pay_x402_and_retry(
 
     let retry_outcome = retry_with_header(tool, "X-PAYMENT", &payment_json, fetch_headers)?;
     handle_retry_outcome(retry_outcome, is_json)
+}
+
+/// Render the "Generated <network> wallet" notice when an ephemeral
+/// wallet was just lazy-created. Visible only in text mode — JSON output
+/// gets the same info as a structured side-channel field via stderr so
+/// pipelines don't break.
+fn render_generated_wallet_notice(
+    resolved: &pay_core::accounts::ResolvedEphemeral,
+    is_json: bool,
+) -> pay_core::Result<()> {
+    if is_json {
+        // Print to stderr so the program's primary stdout (the API
+        // response body) stays clean for piping.
+        let payload = serde_json::json!({
+            "event": "ephemeral_wallet_created",
+            "network": resolved.network,
+            "account": resolved.account_name,
+            "pubkey": resolved.account.pubkey,
+        });
+        eprintln!("{payload}");
+        return Ok(());
+    }
+    let pubkey = resolved.account.pubkey.as_deref().unwrap_or("(unknown)");
+    let body = format!(
+        "{}\nStored at ~/.config/pay/accounts.yml — reused on subsequent runs.",
+        pubkey
+    );
+    eprintln!(
+        "{}",
+        crate::components::notice(
+            crate::components::NoticeLevel::Info,
+            &format!("Generated {} wallet", resolved.network),
+            &body,
+        )
+    );
+    Ok(())
 }
 
 fn retry_with_header(
@@ -404,6 +471,28 @@ fn handle_retry_outcome(outcome: RunOutcome, is_json: bool) -> pay_core::Result<
                 print!("{body}");
             }
             std::process::exit(exit_code);
+        }
+        RunOutcome::PaymentRejected {
+            reason, retryable, ..
+        } => {
+            if is_json {
+                output::error_json(&format!("Payment rejected by verifier: {reason}"));
+            } else {
+                let body = if retryable {
+                    format!("{reason}\n(retryable — try again)")
+                } else {
+                    reason
+                };
+                eprintln!(
+                    "{}",
+                    crate::components::notice(
+                        crate::components::NoticeLevel::Error,
+                        "Payment rejected by verifier",
+                        &body,
+                    )
+                );
+            }
+            std::process::exit(1);
         }
         _ => {
             if is_json {

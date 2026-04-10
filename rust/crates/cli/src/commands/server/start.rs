@@ -7,9 +7,8 @@ use axum::response::IntoResponse;
 use axum::routing::{any, get, post};
 use owo_colors::OwoColorize;
 use pay_core::PaymentState;
-use pay_types::metering::ApiSpec;
-#[cfg(feature = "gcp_kms")]
-use pay_types::metering::SignerConfig;
+use pay_core::accounts::AccountsStore;
+use pay_types::metering::{ApiSpec, SignerConfig};
 use solana_mpp::server::Mpp;
 use solana_mpp::solana_keychain::SolanaSigner;
 
@@ -25,7 +24,7 @@ pub struct StartCommand {
     pub spec: String,
 
     /// Address to bind to.
-    #[arg(long, default_value = "0.0.0.0:8402")]
+    #[arg(long, default_value = "0.0.0.0:1402")]
     pub bind: String,
 
     /// Recipient wallet address for payments.
@@ -40,15 +39,8 @@ pub struct StartCommand {
     #[arg(long)]
     pub rpc_url: Option<String>,
 
-    /// Sandbox mode — auto-airdrop SOL to the operator's fee payer wallet.
-    #[arg(long)]
-    pub sandbox: bool,
-
-    /// Use the local wallet as fee-payer signer instead of the operator.signer backend (e.g. GCP KMS).
-    #[arg(long)]
-    pub local_signer: bool,
-
     /// Launch the Payment Debugger UI alongside the gateway.
+    /// Automatically enabled in sandbox mode (`pay --sandbox server start`).
     #[arg(long)]
     pub debugger: bool,
 }
@@ -94,13 +86,11 @@ impl StartCommand {
         let op = api.operator.clone();
         let op = op.as_ref();
 
-        #[cfg(not(feature = "gcp_kms"))]
-        if !self.local_signer && op.and_then(|o| o.signer.as_ref()).is_some() {
-            return Err(pay_core::Error::Config(
-                "operator.signer requires the `gcp_kms` feature. Rebuild with `--features gcp_kms`, or use --local-signer."
-                    .to_string(),
-            ));
-        }
+        // Note: we used to refuse any `operator.signer` block unless the
+        // `gcp_kms` feature was built. That was over-broad — the new
+        // `Account` and `File` variants need no extra build features and
+        // are the recommended path for local dev. The per-variant gate
+        // now lives inside `resolve_signer` itself.
 
         // Resolve config that doesn't need async.
         let currency = op
@@ -121,7 +111,7 @@ impl StartCommand {
 
         let network = op
             .and_then(|o| o.network.clone())
-            .unwrap_or_else(|| "mainnet-beta".to_string());
+            .unwrap_or_else(|| "mainnet".to_string());
 
         let fee_payer = op.map(|o| o.fee_payer).unwrap_or(false);
         #[allow(unused_variables)]
@@ -137,37 +127,60 @@ impl StartCommand {
 
         rt.block_on(async {
             // ── Resolve signer (async — needs the runtime) ──
-            let use_local = self.local_signer || sandbox;
-
-            let fee_payer_signer: Option<Arc<dyn SolanaSigner>> = if use_local {
-                if let Some(source) = keypair_source_owned.as_deref() {
-                    let signer = pay_core::signer::load_signer(source)?;
-                    Some(Arc::new(signer) as Arc<dyn SolanaSigner>)
-                } else {
-                    None
+            //
+            // In sandbox mode, route through the network-aware accounts
+            // file: lazy-create a localnet ephemeral if one doesn't
+            // already exist. NEVER touch the keychain in sandbox mode —
+            // that's the whole point of `--sandbox`.
+            //
+            // In normal mode, only the GCP KMS path produces a signer
+            // here; the legacy keypair_source path stays opt-in via
+            // operator.signer in the YAML.
+            let fee_payer_signer: Option<Arc<dyn SolanaSigner>> = if sandbox {
+                let store = pay_core::accounts::FileAccountsStore::default_path();
+                let (signer, ephemeral_notice) =
+                    pay_core::signer::load_signer_for_network("localnet", &store)?;
+                if let Some(resolved) = ephemeral_notice {
+                    eprintln!(
+                        "  {} {} {}",
+                        "Generated".green(),
+                        resolved.network.bold(),
+                        format!(
+                            "wallet ({})",
+                            resolved.account.pubkey.as_deref().unwrap_or("?")
+                        )
+                        .dimmed()
+                    );
                 }
+                Some(Arc::new(signer) as Arc<dyn SolanaSigner>)
+            } else if let Some(ref cfg) = signer_cfg {
+                // Non-sandbox mode with `operator.signer` set in YAML.
+                // Handles GcpKms (gated on the gcp_kms build feature),
+                // Account (named entry in accounts.yml), and File
+                // (raw JSON keypair on disk).
+                Some(resolve_signer(cfg).await?)
             } else {
-                #[cfg(feature = "gcp_kms")]
-                {
-                    if let Some(ref cfg) = signer_cfg {
-                        Some(resolve_signer(cfg).await?)
-                    } else {
-                        None
-                    }
-                }
-                #[cfg(not(feature = "gcp_kms"))]
-                { None }
+                None
             };
 
             // ── Resolve recipient ──
+            //
+            // Lookup order (first match wins):
+            //   1. operator.recipient in YAML
+            //   2. --recipient flag
+            //   3. PAY_PAYMENT_RECIPIENT env var
+            //   4. fee_payer_signer's pubkey (sandbox always has one;
+            //      production has one when operator.signer is set)
+            //   5. legacy keypair source (would prompt — only reachable
+            //      in non-sandbox mode without a configured signer)
             let recipient = if let Some(r) = op.and_then(|o| o.recipient.as_ref()) {
                 r.clone()
             } else if let Some(r) = &self.recipient {
                 r.clone()
-            } else if let Some(ref signer) = fee_payer_signer {
-                signer.pubkey().to_string()
             } else if let Ok(r) = std::env::var("PAY_PAYMENT_RECIPIENT") {
                 r
+            } else if let Some(ref signer) = fee_payer_signer {
+                signer.pubkey().to_string()
             } else if let Some(ref source) = keypair_source_owned {
                 let signer = pay_core::signer::load_signer(source)?;
                 signer.pubkey().to_string()
@@ -178,11 +191,48 @@ impl StartCommand {
                 ));
             };
 
-            // ── Sandbox: bootstrap operator wallet (SOL + token account) ──
-            if self.sandbox && let Some(ref signer) = fee_payer_signer {
+            // ── Validate fee_payer / signer consistency ──
+            //
+            // If the operator YAML demands `fee_payer: true` (the
+            // server co-signs to sponsor transaction fees) but no
+            // signer is available, the server would start happily and
+            // then fail every single payment at verify time with the
+            // unhelpful "Fee payer enabled but no signer configured"
+            // error. Catch it at startup instead so the user knows
+            // immediately what to fix.
+            if fee_payer && fee_payer_signer.is_none() {
+                return Err(pay_core::Error::Config(
+                    "operator.fee_payer is `true` but no fee payer signer is configured.\n\n\
+                     In sandbox mode, start the server with `pay --sandbox server start ...` \
+                     (or use `pay -s server demo`).\n\
+                     In production, set `operator.signer` in the YAML (requires the \
+                     `gcp_kms` build feature) or set `operator.fee_payer: false` \
+                     so clients pay their own fees."
+                        .to_string(),
+                ));
+            }
+
+            // ── Sandbox: fund the operator wallet ──
+            //
+            // Always re-fund on every sandbox server start, NOT gated on
+            // "just created" — Surfpool's cheatcode-set balances don't
+            // survive a Surfpool restart, so an `accounts.yml` cache hit
+            // doesn't imply the wallet still has SOL/USDC on the RPC.
+            // `fund_via_surfpool` sets fixed values (100 SOL + 1000 USDC)
+            // so calling it unconditionally is idempotent and safe — it
+            // can't clobber a meaningful state because the values are
+            // always the same.
+            if sandbox && let Some(ref signer) = fee_payer_signer {
                 let pubkey = signer.pubkey().to_string();
-                sandbox_airdrop(&rpc_url, &pubkey).await;
-                sandbox_bootstrap_recipient(&rpc_url, &recipient, &currency).await;
+                if let Err(e) =
+                    pay_core::client::sandbox::fund_via_surfpool(&rpc_url, &pubkey).await
+                {
+                    eprintln!(
+                        "  {} {}",
+                        "Sandbox funding failed:".red(),
+                        e.to_string().dimmed()
+                    );
+                }
             }
 
             // ── Create MPP server ──
@@ -232,20 +282,24 @@ impl StartCommand {
             } else {
                 "https://explorer.solana.com".to_string()
             };
-            let network_link = terminal_link(network_label, &network_url);
+            let network_link = crate::components::link::link_with_arrow(network_label, &network_url);
 
-            // Operator link (explorer token page)
+            // Operator link (explorer token page). The cluster query
+            // segment depends on the network:
+            //   - mainnet → no param (mainnet is the explorer default)
+            //   - devnet  → ?cluster=devnet
+            //   - localnet/sandbox → ?cluster=custom&customUrl=<rpc>
             let short_recipient = if recipient.len() > 8 {
                 format!("{}...{}", &recipient[..4], &recipient[recipient.len() - 4..])
             } else {
                 recipient.clone()
             };
-            let encoded_rpc = urlencoding::encode(&rpc_url);
+            let cluster_query = explorer_cluster_query(&network, &rpc_url);
             let operator_url = format!(
-                "https://explorer.solana.com/address/{}/tokens?cluster=custom&customUrl={}",
-                recipient, encoded_rpc
+                "https://explorer.solana.com/address/{}/tokens{}",
+                recipient, cluster_query
             );
-            let operator_link = terminal_link(&short_recipient, &operator_url);
+            let operator_link = crate::components::link::link_with_arrow(&short_recipient, &operator_url);
 
             eprintln!("  {}\t{}", "network".dimmed(), network_link);
             eprintln!(
@@ -254,14 +308,52 @@ impl StartCommand {
                 "$".green(),
                 currency.green()
             );
-            let balance_suffix = if sandbox {
-                let bal = fetch_sol_balance(&rpc_url, &recipient).await;
-                format!(" ({} SOL)", format_price(bal))
+
+            // Fetch the operator wallet's SOL balance for the banner.
+            // We do this in BOTH sandbox and mainnet modes — in sandbox
+            // it confirms the auto-fund worked; on mainnet it's a quick
+            // sanity check that the wallet actually exists on chain so
+            // the user doesn't waste time hitting the gateway with a
+            // wallet that has zero SOL.
+            //
+            // Color thresholds (covers all networks):
+            //   ≥ 0.10 SOL  → green   (comfortable runway)
+            //   ≥ 0.05 SOL  → yellow  (top up soon)
+            //    < 0.05 SOL → red     (next tx may fail)
+            let operator_sol = fetch_sol_balance(&rpc_url, &recipient).await;
+            let balance_text = format!(" ({} SOL)", format_price(operator_sol));
+            let balance_colored = if operator_sol >= 0.10 {
+                balance_text.green().to_string()
+            } else if operator_sol >= 0.05 {
+                balance_text.yellow().to_string()
             } else {
-                String::new()
+                balance_text.red().to_string()
             };
-            eprintln!("  {}\t{}{}", "operator".dimmed(), operator_link, balance_suffix.dimmed());
+            eprintln!("  {}\t{}{}", "operator".dimmed(), operator_link, balance_colored);
             eprintln!();
+
+            // Loud warning when the wallet is empty. The most common
+            // first-run failure mode on mainnet is "Attempt to debit an
+            // account but found no record of a prior credit" — a Solana
+            // runtime error that means the wallet has zero SOL on the
+            // configured cluster. Tell the user upfront instead of
+            // letting every payment fail at simulation time.
+            if operator_sol == 0.0 {
+                eprintln!(
+                    "{}",
+                    crate::components::notice(
+                        crate::components::NoticeLevel::Warning,
+                        "Operator wallet has 0 SOL",
+                        &format!(
+                            "{recipient}\non `{network}` via {rpc_url}\n\n\
+                             Even with operator.fee_payer = true, the wallet must \
+                             exist on chain (any prior credit) for SPL token \
+                             transfers to derive an ATA. Send a small amount of \
+                             SOL to the address above and restart the server."
+                        ),
+                    )
+                );
+            }
 
             eprintln!(
                 "  {}",
@@ -318,12 +410,16 @@ impl StartCommand {
                     format!("{:>8}", "free").green().to_string()
                 };
 
+                let path_url = format!("http://{}/{}", self.bind.replace("0.0.0.0", "127.0.0.1"), ep.path.trim_start_matches('/'));
+                let path_linked = crate::components::link::link_with_arrow(&ep.path, &path_url);
+                // Pad after the link (padding itself is not clickable)
+                let padding = " ".repeat(max_path_len.saturating_sub(ep.path.len()));
                 eprintln!(
-                    "  {} {:<width$} {}",
+                    "  {} {}{} {}",
                     method_colored,
-                    ep.path,
+                    path_linked,
+                    padding,
                     price_tag,
-                    width = max_path_len,
                 );
             }
 
@@ -423,17 +519,18 @@ impl StartCommand {
                     pay_core::Error::Config(format!("Failed to bind {}: {e}", self.bind))
                 })?;
             let display_addr = self.bind.replace("0.0.0.0", "127.0.0.1");
+            let url = format!("http://{}", display_addr);
             if debugger {
                 eprintln!(
                     "  {} {}",
-                    "debugger".green().bold(),
-                    format!("http://{}", display_addr).bold()
+                    "Running Payment debugger".green().bold(),
+                    crate::components::link::link_with_arrow(&url, &url),
                 );
             } else {
                 eprintln!(
                     "  {} {}",
                     "listening".green().bold(),
-                    format!("http://{}", display_addr).bold()
+                    crate::components::link::link_with_arrow(&url, &url),
                 );
             }
             eprintln!();
@@ -550,11 +647,30 @@ fn resolve_currency(currency: &str, network: &str) -> (String, u8) {
 }
 
 /// Create a SolanaSigner from the operator.signer config.
+///
+/// Production wrapper around [`resolve_signer_with_store`] that uses the
+/// real on-disk accounts file. Tests use the lower-level function with a
+/// `MemoryAccountsStore` so they don't touch `~/.config/pay/accounts.yml`.
+///
 /// Must be called from within the main async runtime so the GCP auth
 /// token cache's background refresh tasks stay alive.
-#[cfg(feature = "gcp_kms")]
 async fn resolve_signer(config: &SignerConfig) -> pay_core::Result<Arc<dyn SolanaSigner>> {
+    let store = pay_core::accounts::FileAccountsStore::default_path();
+    resolve_signer_with_store(config, &store).await
+}
+
+/// Testable core: same as [`resolve_signer`] but takes the accounts
+/// store as a parameter.
+///
+/// Handles all `SignerConfig` variants. The GCP KMS branch is feature-
+/// gated because it pulls in the gcp-auth crate; the Account and File
+/// branches need no extra build features.
+async fn resolve_signer_with_store(
+    config: &SignerConfig,
+    store: &dyn AccountsStore,
+) -> pay_core::Result<Arc<dyn SolanaSigner>> {
     match config {
+        #[cfg(feature = "gcp_kms")]
         SignerConfig::GcpKms { key_name, pubkey } => {
             let signer =
                 solana_mpp::solana_keychain::GcpKmsSigner::new(key_name.clone(), pubkey.clone())
@@ -562,31 +678,87 @@ async fn resolve_signer(config: &SignerConfig) -> pay_core::Result<Arc<dyn Solan
                     .map_err(|e| {
                         pay_core::Error::Config(format!("Failed to create GCP KMS signer: {e}"))
                     })?;
-
+            Ok(Arc::new(signer))
+        }
+        #[cfg(not(feature = "gcp_kms"))]
+        SignerConfig::GcpKms { .. } => Err(pay_core::Error::Config(
+            "operator.signer.backend = gcp-kms requires the `gcp_kms` build feature. \
+             Rebuild pay with `cargo build --features gcp_kms`, or use \
+             `backend: account` / `backend: file` instead."
+                .to_string(),
+        )),
+        SignerConfig::Account { name } => {
+            // Resolve through the accounts file. For keychain-backed
+            // accounts this triggers the OS auth prompt ONCE here (at
+            // server startup), then the loaded signer is reused for
+            // every payment — no per-request prompt.
+            let file = store.load()?;
+            let account = file.accounts.get(name).ok_or_else(|| {
+                pay_core::Error::Config(format!(
+                    "operator.signer.name = `{name}` does not exist in \
+                     ~/.config/pay/accounts.yml. Run `pay account ls` to see \
+                     available accounts, or `pay setup` to create one."
+                ))
+            })?;
+            // Use the Account's load path so ephemeral entries work too.
+            let signer = if account.keystore == pay_core::accounts::Keystore::Ephemeral {
+                let bytes = account.ephemeral_keypair_bytes().ok_or_else(|| {
+                    pay_core::Error::Config(format!(
+                        "Account `{name}` is ephemeral but has no inline secret_key_b58"
+                    ))
+                })?;
+                solana_mpp::solana_keychain::MemorySigner::from_bytes(&bytes).map_err(|e| {
+                    pay_core::Error::Config(format!("Invalid keypair bytes for `{name}`: {e}"))
+                })?
+            } else {
+                let source = account.signer_source(name).ok_or_else(|| {
+                    pay_core::Error::Config(format!("Account `{name}` has no signer source string"))
+                })?;
+                pay_core::signer::load_signer_with_reason(
+                    &source,
+                    "authorize as fee payer for the gateway",
+                )?
+            };
+            Ok(Arc::new(signer))
+        }
+        SignerConfig::File { path } => {
+            let expanded = shellexpand::tilde(path).into_owned();
+            let signer = pay_core::signer::load_signer_with_reason(
+                &expanded,
+                "authorize as fee payer for the gateway",
+            )
+            .map_err(|e| {
+                pay_core::Error::Config(format!(
+                    "operator.signer.path = `{path}` could not be loaded: {e}.\n\n\
+                     Expected a Solana CLI keypair file (a JSON array of exactly \
+                     64 bytes: 32 bytes secret + 32 bytes public key).\n\n\
+                     Generate one with `solana-keygen new -o {path}`."
+                ))
+            })?;
             Ok(Arc::new(signer))
         }
     }
 }
 
-/// Check SOL balance and request airdrop if below 1 SOL.
-async fn sandbox_airdrop(rpc_url: &str, pubkey: &str) {
-    let client = reqwest::Client::new();
-    let balance_lamports = fetch_lamports(&client, rpc_url, pubkey).await;
-
-    if balance_lamports < 1_000_000_000 {
-        let _ = client
-            .post(rpc_url)
-            .json(&serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "requestAirdrop",
-                "params": [pubkey, 2_000_000_000u64]
-            }))
-            .send()
-            .await;
+/// Build the `?cluster=...` query suffix for a Solana Explorer URL.
+///
+/// - `mainnet`            → empty string (mainnet is the explorer default)
+/// - `devnet`             → `?cluster=devnet`
+/// - `localnet` (any RPC) → `?cluster=custom&customUrl=<rpc>` so the
+///   explorer talks to the local validator (Surfpool sandbox or real
+///   localhost) instead of guessing.
+/// - anything else        → empty string (let the explorer decide)
+fn explorer_cluster_query(network: &str, rpc_url: &str) -> String {
+    match network {
+        "mainnet" => String::new(),
+        "devnet" => "?cluster=devnet".to_string(),
+        "localnet" => format!("?cluster=custom&customUrl={}", urlencoding::encode(rpc_url)),
+        _ => String::new(),
     }
 }
 
+/// Fetch a wallet's lamport balance via JSON-RPC. Returns 0 on any error
+/// — used by the banner only, where a missing balance is harmless.
 async fn fetch_lamports(client: &reqwest::Client, rpc_url: &str, pubkey: &str) -> u64 {
     let resp = client
         .post(rpc_url)
@@ -614,49 +786,6 @@ async fn fetch_sol_balance(rpc_url: &str, pubkey: &str) -> f64 {
     fetch_lamports(&client, rpc_url, pubkey).await as f64 / 1_000_000_000.0
 }
 
-/// Bootstrap the recipient's token account on the sandbox so SPL transfers succeed.
-async fn sandbox_bootstrap_recipient(rpc_url: &str, recipient: &str, currency: &str) {
-    let (mint, token_program) = match currency.to_uppercase().as_str() {
-        "SOL" => return, // Native SOL doesn't need a token account
-        "USDC" => (
-            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-            "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
-        ),
-        _ => return,
-    };
-
-    let client = reqwest::Client::new();
-
-    // Set SOL balance so the account exists
-    let _ = client
-        .post(rpc_url)
-        .json(&serde_json::json!({
-            "jsonrpc": "2.0", "id": 1,
-            "method": "surfnet_setAccount",
-            "params": [recipient, {
-                "lamports": 1_000_000_000_u64,
-                "data": "",
-                "executable": false,
-                "owner": "11111111111111111111111111111111",
-            }]
-        }))
-        .send()
-        .await;
-
-    // Create token account with zero balance
-    let _ = client
-        .post(rpc_url)
-        .json(&serde_json::json!({
-            "jsonrpc": "2.0", "id": 1,
-            "method": "surfnet_setTokenAccount",
-            "params": [recipient, mint, {
-                "amount": 0,
-            }, token_program]
-        }))
-        .send()
-        .await;
-}
-
 fn format_price(price: f64) -> String {
     if price.fract() == 0.0 {
         format!("{}", price as u64)
@@ -667,9 +796,6 @@ fn format_price(price: f64) -> String {
 }
 
 /// Emit an OSC 8 clickable hyperlink for terminals that support it.
-fn terminal_link(text: &str, url: &str) -> String {
-    format!("\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\", url, text)
-}
 
 // ── Gateway verify endpoint ──
 
@@ -838,7 +964,7 @@ async fn gateway_verify(
                         challenge_id: Some(receipt.challenge_id),
                         external_id: req.external_id,
                         www_authenticate: None,
-                        body: None,
+                        body: Some(serde_json::json!({"pdb_active": pdb.is_some()})),
                     })
                     .into_response()
                 }
@@ -877,5 +1003,257 @@ async fn gateway_verify(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::explorer_cluster_query;
+
+    #[test]
+    fn explorer_cluster_query_mainnet_is_empty() {
+        // Mainnet is the explorer's default — appending `?cluster=mainnet`
+        // would just add noise. The user's expected URL was bare.
+        assert_eq!(
+            explorer_cluster_query("mainnet", "https://api.mainnet-beta.solana.com"),
+            ""
+        );
+    }
+
+    #[test]
+    fn explorer_cluster_query_devnet_picks_devnet() {
+        assert_eq!(
+            explorer_cluster_query("devnet", "https://api.devnet.solana.com"),
+            "?cluster=devnet"
+        );
+    }
+
+    #[test]
+    fn explorer_cluster_query_localnet_uses_custom_with_url_encoding() {
+        // The RPC URL must be URL-encoded so the explorer parses it as
+        // a single query value.
+        assert_eq!(
+            explorer_cluster_query("localnet", "https://402.surfnet.dev:8899"),
+            "?cluster=custom&customUrl=https%3A%2F%2F402.surfnet.dev%3A8899"
+        );
+    }
+
+    #[test]
+    fn explorer_cluster_query_localnet_with_localhost_rpc() {
+        assert_eq!(
+            explorer_cluster_query("localnet", "http://localhost:8899"),
+            "?cluster=custom&customUrl=http%3A%2F%2Flocalhost%3A8899"
+        );
+    }
+
+    #[test]
+    fn explorer_cluster_query_unknown_network_falls_back_to_empty() {
+        // Anything we don't recognize gets the bare URL — let the
+        // explorer apply its own default rather than guessing.
+        assert_eq!(explorer_cluster_query("foonet", "http://example/"), "");
+    }
+
+    // ── resolve_signer (operator.signer in YAML) ───────────────────────────
+    //
+    // Tests for the SignerConfig variants exposed via `operator.signer` in
+    // a provider YAML. Each variant is exercised through
+    // `resolve_signer_with_store` so we can inject a `MemoryAccountsStore`
+    // and never touch `~/.config/pay/accounts.yml`.
+
+    use super::resolve_signer_with_store;
+    use pay_core::accounts::{
+        Account, AccountsFile, Keystore as AcctKeystore, MemoryAccountsStore,
+    };
+    use pay_types::metering::SignerConfig;
+    // SolanaSigner trait is brought into scope by the parent module's
+    // `use solana_mpp::solana_keychain::SolanaSigner;` so calls like
+    // `signer.pubkey()` resolve through the trait method.
+
+    /// A real ed25519 keypair (sk[32] || pk[32]) lifted from the
+    /// solana-keychain crate's test fixtures. Stable across runs so
+    /// pubkey assertions can pin a known value.
+    const VALID_TEST_KEYPAIR_BYTES: [u8; 64] = [
+        41, 99, 180, 88, 51, 57, 48, 80, 61, 63, 219, 75, 176, 49, 116, 254, 227, 176, 196, 204,
+        122, 47, 166, 133, 155, 252, 217, 0, 253, 17, 49, 143, 47, 94, 121, 167, 195, 136, 72, 22,
+        157, 48, 77, 88, 63, 96, 57, 122, 181, 243, 236, 188, 241, 134, 174, 224, 100, 246, 17,
+        170, 104, 17, 151, 48,
+    ];
+
+    /// Pubkey base58 derived from `VALID_TEST_KEYPAIR_BYTES[32..]` —
+    /// pinned so the tests catch unintended drift in the keypair format.
+    const VALID_TEST_KEYPAIR_PUBKEY: &str = "4BuiY9QUUfPoAGNJBja3JapAuVWMc9c7in6UCgyC2zPR";
+
+    fn write_test_keypair_file(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("test-key.json");
+        let json: Vec<i64> = VALID_TEST_KEYPAIR_BYTES.iter().map(|&b| b as i64).collect();
+        std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+        path
+    }
+
+    fn ephemeral_account_with_known_pubkey() -> (Account, String) {
+        let pubkey = bs58::encode(&VALID_TEST_KEYPAIR_BYTES[32..]).into_string();
+        let acct = Account {
+            keystore: AcctKeystore::Ephemeral,
+            pubkey: Some(pubkey.clone()),
+            vault: None,
+            path: None,
+            secret_key_b58: Some(bs58::encode(&VALID_TEST_KEYPAIR_BYTES[..]).into_string()),
+            created_at: Some("2026-04-10T00:00:00Z".to_string()),
+        };
+        (acct, pubkey)
+    }
+
+    // ── File backend ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn resolve_signer_file_loads_valid_keypair() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_keypair_file(dir.path());
+        let cfg = SignerConfig::File {
+            path: path.to_string_lossy().into_owned(),
+        };
+        let store = MemoryAccountsStore::new();
+
+        let signer = resolve_signer_with_store(&cfg, &store).await.unwrap();
+        assert_eq!(
+            signer.pubkey().to_string(),
+            VALID_TEST_KEYPAIR_PUBKEY,
+            "loaded signer's pubkey must match the keypair we wrote"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_signer_file_errors_on_missing_path() {
+        let cfg = SignerConfig::File {
+            path: "/var/folders/sr/this-path-definitely-does-not-exist.json".to_string(),
+        };
+        let store = MemoryAccountsStore::new();
+
+        let err = match resolve_signer_with_store(&cfg, &store).await {
+            Ok(_) => panic!("expected error, got Ok"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        // The wrapped error should mention the offending path AND the
+        // keygen hint so the user knows what to do next.
+        assert!(
+            msg.contains("does-not-exist.json"),
+            "missing path in error: {msg}"
+        );
+        assert!(
+            msg.contains("solana-keygen new"),
+            "missing remediation hint: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_signer_file_errors_on_garbage_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("garbage.json");
+        std::fs::write(&path, "this is not a keypair").unwrap();
+        let cfg = SignerConfig::File {
+            path: path.to_string_lossy().into_owned(),
+        };
+        let store = MemoryAccountsStore::new();
+
+        let err = match resolve_signer_with_store(&cfg, &store).await {
+            Ok(_) => panic!("expected error, got Ok"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("64 bytes"), "missing length hint: {msg}");
+    }
+
+    // ── Account backend ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn resolve_signer_account_loads_ephemeral_entry() {
+        // The most common dev path: a named ephemeral account in
+        // accounts.yml. No OS auth prompt fires because the secret is
+        // stored inline.
+        let mut file = AccountsFile::default();
+        let (account, expected_pubkey) = ephemeral_account_with_known_pubkey();
+        file.upsert("test-payer", account);
+        let store = MemoryAccountsStore::with_file(file);
+
+        let cfg = SignerConfig::Account {
+            name: "test-payer".to_string(),
+        };
+        let signer = resolve_signer_with_store(&cfg, &store).await.unwrap();
+        assert_eq!(signer.pubkey().to_string(), expected_pubkey);
+    }
+
+    #[tokio::test]
+    async fn resolve_signer_account_errors_on_unknown_name() {
+        let store = MemoryAccountsStore::new();
+        let cfg = SignerConfig::Account {
+            name: "ghost-account".to_string(),
+        };
+
+        let err = match resolve_signer_with_store(&cfg, &store).await {
+            Ok(_) => panic!("expected error, got Ok"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("ghost-account"), "missing account name: {msg}");
+        assert!(
+            msg.contains("pay account ls"),
+            "missing remediation hint: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_signer_account_errors_on_corrupt_ephemeral_secret() {
+        // Account is marked ephemeral but secret_key_b58 isn't valid
+        // base58. Should fail with a helpful message naming the account.
+        let mut file = AccountsFile::default();
+        let bad = Account {
+            keystore: AcctKeystore::Ephemeral,
+            pubkey: Some("4BuiY9QUUfPoAGNJBja3JapAuVWMc9c7in6UCgyC2zPR".to_string()),
+            vault: None,
+            path: None,
+            // Valid base58 but wrong length (decodes to <64 bytes).
+            secret_key_b58: Some("abc".to_string()),
+            created_at: Some("2026-04-10T00:00:00Z".to_string()),
+        };
+        file.upsert("broken", bad);
+        let store = MemoryAccountsStore::with_file(file);
+
+        let cfg = SignerConfig::Account {
+            name: "broken".to_string(),
+        };
+        let err = match resolve_signer_with_store(&cfg, &store).await {
+            Ok(_) => panic!("expected error, got Ok"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("broken"), "missing account name: {msg}");
+    }
+
+    // ── GcpKms backend (build-feature gated) ──────────────────────────────
+
+    #[tokio::test]
+    #[cfg(not(feature = "gcp_kms"))]
+    async fn resolve_signer_gcp_kms_errors_when_feature_missing() {
+        // Without the gcp_kms feature, the GcpKms variant must error
+        // with a clear "rebuild with --features gcp_kms" hint AND
+        // mention the alternative backends so the user has options.
+        let cfg = SignerConfig::GcpKms {
+            key_name: "projects/x/locations/y/keyRings/z/cryptoKeys/a/cryptoKeyVersions/1"
+                .to_string(),
+            pubkey: "4BuiY9QUUfPoAGNJBja3JapAuVWMc9c7in6UCgyC2zPR".to_string(),
+        };
+        let store = MemoryAccountsStore::new();
+
+        let err = match resolve_signer_with_store(&cfg, &store).await {
+            Ok(_) => panic!("expected error, got Ok"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("gcp_kms"), "missing feature name: {msg}");
+        assert!(
+            msg.contains("backend: account"),
+            "missing alt-backend hint: {msg}"
+        );
     }
 }
