@@ -16,7 +16,7 @@ jobs:
     if: github.event.workflow_run.event == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Download all artifacts from the CI run
       - uses: actions/download-artifact@v4
@@ -42,7 +42,7 @@ jobs:
         continue-on-error: true
 
       # Fetch the reusable test-report action from surfpool
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           repository: solana-foundation/surfpool
           ref: feat/sdk
