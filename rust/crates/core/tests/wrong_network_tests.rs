@@ -158,20 +158,6 @@ fn fresh_payer() -> SigningKey {
     SigningKey::generate(&mut rand::rngs::OsRng)
 }
 
-/// Hand-crafted "real cluster" blockhash: 32 random-looking bytes whose
-/// base58 encoding does NOT start with the sandbox prefix.
-fn real_cluster_blockhash() -> Hash {
-    // Specific bytes chosen so the base58 encoding is stable and clearly
-    // not a SURFNETxSAFEHASH match. (Hash::default() = all zeros encodes
-    // as "11111111…" which also works, but using non-trivial bytes makes
-    // it obvious in test failure output.)
-    Hash::new_from_array([
-        0x9f, 0x12, 0xab, 0x33, 0xcd, 0x44, 0xef, 0x55, 0x6a, 0x77, 0x8b, 0x99, 0xa0, 0xb1, 0xc2,
-        0xd3, 0xe4, 0xf5, 0x06, 0x17, 0x28, 0x39, 0x4a, 0x5b, 0x6c, 0x7d, 0x8e, 0x9f, 0xaf, 0xbf,
-        0xcf, 0xdf,
-    ])
-}
-
 /// A blockhash whose first base58 characters START with the Surfpool
 /// prefix. Constructed by base58-decoding the literal Surfpool-shaped
 /// string into 32 raw bytes (right-padded with zeros if needed) — that's

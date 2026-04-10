@@ -438,14 +438,13 @@ async fn mpp_build_credential_with_surfnet() {
         .to_string();
     let challenge = client::mpp::parse(&www_auth).unwrap();
 
-    // Step 2: Create a funded payer keypair file
+    // Step 2: Create a funded payer (the new network-aware path takes
+    // raw secret bytes via a MemoryAccountsStore, no temp file needed).
     let payer = Keypair::new();
     surfnet
         .cheatcodes()
         .fund_sol(&payer.pubkey(), 2_000_000_000)
         .unwrap();
-    let kp_file = keypair_to_file(&payer);
-    let kp_path = kp_file.path().to_string_lossy().to_string();
 
     // Step 3: Build credential using pay_core's network-aware path.
     //
