@@ -35,9 +35,28 @@ fn fetch_request_with_method(
         .build()
         .map_err(|e| Error::Mpp(format!("Failed to create HTTP client: {e}")))?;
 
-    debug!(%method, %url, has_body = body.is_some(), "Fetching");
+    // When the debugger proxy is active, route through it so PDB captures
+    // the traffic. The original URL is passed in X-Pay-Forward-To.
+    let (actual_url, forward_header) = if let Ok(proxy) = std::env::var("PAY_DEBUGGER_PROXY") {
+        // Rewrite: https://gateway/path → http://127.0.0.1:1402/path
+        let path = url
+            .find("://")
+            .and_then(|i| url[i + 3..].find('/'))
+            .map(|i| &url[url.find("://").unwrap() + 3 + i..])
+            .unwrap_or("/");
+        let proxy_url = format!("{}{}", proxy.trim_end_matches('/'), path);
+        debug!(%url, %proxy_url, "Routing through debugger proxy");
+        (proxy_url, Some(url.to_string()))
+    } else {
+        (url.to_string(), None)
+    };
 
-    let mut req = client.request(method, url);
+    debug!(%method, url = %actual_url, has_body = body.is_some(), "Fetching");
+
+    let mut req = client.request(method, &actual_url);
+    if let Some(dest) = &forward_header {
+        req = req.header("x-pay-forward-to", dest.as_str());
+    }
     for (key, value) in extra_headers {
         req = req.header(key.as_str(), value.as_str());
     }

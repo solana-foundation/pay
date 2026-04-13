@@ -29,6 +29,9 @@ impl CodexCommand {
         if let Ok(url) = std::env::var("PAY_RPC_URL") {
             env_parts.push(format!("PAY_RPC_URL=\"{url}\""));
         }
+        if let Ok(proxy) = std::env::var("PAY_DEBUGGER_PROXY") {
+            env_parts.push(format!("PAY_DEBUGGER_PROXY=\"{proxy}\""));
+        }
         if !env_parts.is_empty() {
             cmd.arg("-c")
                 .arg(format!("mcp_servers.pay.env={{{}}}", env_parts.join(",")));
