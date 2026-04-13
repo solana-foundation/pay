@@ -5,6 +5,7 @@
 //!
 //! For `Respond` routing, returns 200 directly (no upstream call).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
@@ -243,11 +244,28 @@ struct CachedToken {
     expires_at: std::time::Instant,
 }
 
-static OAUTH2_TOKEN_CACHE: std::sync::OnceLock<Arc<RwLock<Option<CachedToken>>>> =
+/// A freshly-fetched token with the provider-reported lifetime.
+struct FetchedToken {
+    access_token: String,
+    expires_in_secs: u64,
+}
+
+/// Cache key: one entry per distinct (token_url, scopes, client_id) tuple.
+/// The metadata server returns different tokens for different scope sets,
+/// and standard OAuth2 providers key tokens by client. Caching them all under
+/// a single slot would cause one upstream's token to evict another's.
+#[derive(PartialEq, Eq, Hash)]
+struct TokenKey {
+    token_url: String,
+    scopes: Vec<String>,
+    client_id: Option<String>,
+}
+
+static OAUTH2_TOKEN_CACHE: std::sync::OnceLock<Arc<RwLock<HashMap<TokenKey, CachedToken>>>> =
     std::sync::OnceLock::new();
 
-fn token_cache() -> &'static Arc<RwLock<Option<CachedToken>>> {
-    OAUTH2_TOKEN_CACHE.get_or_init(|| Arc::new(RwLock::new(None)))
+fn token_cache() -> &'static Arc<RwLock<HashMap<TokenKey, CachedToken>>> {
+    OAUTH2_TOKEN_CACHE.get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
 }
 
 /// Fetch an OAuth2 access token, using a cached value if still valid.
@@ -257,28 +275,44 @@ async fn oauth2_token(
     client_id_env: Option<&str>,
     client_secret_env: Option<&str>,
 ) -> Result<String, String> {
-    // Check cache.
+    let key = TokenKey {
+        token_url: token_url.to_string(),
+        scopes: scopes.to_vec(),
+        client_id: client_id_env.and_then(|e| std::env::var(e).ok()),
+    };
+
+    // Check cache — require at least 30s of remaining life to avoid races
+    // with in-flight upstream requests.
     {
         let cache = token_cache().read().await;
-        if let Some(ref cached) = *cache
+        if let Some(cached) = cache.get(&key)
             && cached.expires_at > std::time::Instant::now() + std::time::Duration::from_secs(30)
         {
             return Ok(cached.access_token.clone());
         }
     }
 
-    let token = fetch_oauth2_token(token_url, scopes, client_id_env, client_secret_env).await?;
+    let fetched = fetch_oauth2_token(token_url, scopes, client_id_env, client_secret_env).await?;
 
-    // Cache (assume ~1h validity, refresh 5min early).
+    // Refresh 60s before the provider-reported expiry. Providers (especially
+    // the GCP metadata server) may return a token that's already partially
+    // used, so NEVER assume a fixed ~1h lifetime — always honour `expires_in`.
+    let refresh_margin = 60;
+    let ttl = fetched.expires_in_secs.saturating_sub(refresh_margin);
+    let expires_at = std::time::Instant::now() + std::time::Duration::from_secs(ttl);
+
     {
         let mut cache = token_cache().write().await;
-        *cache = Some(CachedToken {
-            access_token: token.clone(),
-            expires_at: std::time::Instant::now() + std::time::Duration::from_secs(3300),
-        });
+        cache.insert(
+            key,
+            CachedToken {
+                access_token: fetched.access_token.clone(),
+                expires_at,
+            },
+        );
     }
 
-    Ok(token)
+    Ok(fetched.access_token)
 }
 
 async fn fetch_oauth2_token(
@@ -286,7 +320,7 @@ async fn fetch_oauth2_token(
     scopes: &[String],
     client_id_env: Option<&str>,
     client_secret_env: Option<&str>,
-) -> Result<String, String> {
+) -> Result<FetchedToken, String> {
     let client = reqwest::Client::new();
 
     // Special: GCP metadata server.
@@ -323,10 +357,16 @@ async fn fetch_oauth2_token(
         .await
         .map_err(|e| format!("Invalid OAuth2 response: {e}"))?;
 
-    body["access_token"]
+    let access_token = body["access_token"]
         .as_str()
         .map(|s| s.to_string())
-        .ok_or_else(|| format!("No access_token in response: {body}"))
+        .ok_or_else(|| format!("No access_token in response: {body}"))?;
+    let expires_in_secs = body["expires_in"].as_u64().unwrap_or(3600);
+
+    Ok(FetchedToken {
+        access_token,
+        expires_in_secs,
+    })
 }
 
 /// Fetch token from GCP metadata server (Cloud Run / GCE).
@@ -334,7 +374,7 @@ async fn fetch_oauth2_token(
 async fn fetch_gcp_metadata_token(
     client: &reqwest::Client,
     scopes: &[String],
-) -> Result<String, String> {
+) -> Result<FetchedToken, String> {
     let scopes_param = scopes.join(",");
 
     // 1. Metadata server.
@@ -352,7 +392,14 @@ async fn fetch_gcp_metadata_token(
         && let Some(token) = body["access_token"].as_str()
     {
         tracing::debug!("OAuth2 token from GCP metadata server");
-        return Ok(token.to_string());
+        // The metadata server returns its own cached token and only mints a
+        // fresh one shortly before expiry, so `expires_in` is the remaining
+        // lifetime of that shared token — not a fresh 1h window.
+        let expires_in_secs = body["expires_in"].as_u64().unwrap_or(3600);
+        return Ok(FetchedToken {
+            access_token: token.to_string(),
+            expires_in_secs,
+        });
     }
 
     // 2. Application Default Credentials (local dev).
@@ -388,13 +435,17 @@ async fn fetch_gcp_metadata_token(
         .await
         .map_err(|e| format!("Invalid token response: {e}"))?;
 
-    body["access_token"]
+    let access_token = body["access_token"]
         .as_str()
-        .map(|s| {
-            tracing::debug!("OAuth2 token from ADC");
-            s.to_string()
-        })
-        .ok_or_else(|| format!("No access_token: {body}"))
+        .map(|s| s.to_string())
+        .ok_or_else(|| format!("No access_token: {body}"))?;
+    let expires_in_secs = body["expires_in"].as_u64().unwrap_or(3600);
+
+    tracing::debug!("OAuth2 token from ADC");
+    Ok(FetchedToken {
+        access_token,
+        expires_in_secs,
+    })
 }
 
 #[cfg(test)]

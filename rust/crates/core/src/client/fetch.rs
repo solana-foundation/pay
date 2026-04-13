@@ -1,23 +1,48 @@
 //! Built-in HTTP client using reqwest. No external binary needed.
 
+use reqwest::Method;
 use reqwest::blocking::Client;
 use tracing::debug;
 
 use crate::client::runner::{self, RunOutcome};
 use crate::{Error, Result};
 
+/// Fetch a URL with an explicit HTTP method/body, detecting 402 + MPP challenges.
+pub fn fetch_request(
+    method: &str,
+    url: &str,
+    extra_headers: &[(String, String)],
+    body: Option<&str>,
+) -> Result<RunOutcome> {
+    let method = Method::from_bytes(method.as_bytes())
+        .map_err(|e| Error::Mpp(format!("Invalid HTTP method `{method}`: {e}")))?;
+    fetch_request_with_method(method, url, extra_headers, body)
+}
+
 /// Fetch a URL, detecting 402 + MPP challenges.
 pub fn fetch(url: &str, extra_headers: &[(String, String)]) -> Result<RunOutcome> {
+    fetch_request_with_method(Method::GET, url, extra_headers, None)
+}
+
+fn fetch_request_with_method(
+    method: Method,
+    url: &str,
+    extra_headers: &[(String, String)],
+    body: Option<&str>,
+) -> Result<RunOutcome> {
     let client = Client::builder()
         .user_agent(format!("pay/{}", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|e| Error::Mpp(format!("Failed to create HTTP client: {e}")))?;
 
-    debug!(%url, "Fetching");
+    debug!(%method, %url, has_body = body.is_some(), "Fetching");
 
-    let mut req = client.get(url);
+    let mut req = client.request(method, url);
     for (key, value) in extra_headers {
         req = req.header(key.as_str(), value.as_str());
+    }
+    if let Some(body) = body {
+        req = req.body(body.to_owned());
     }
 
     let resp = req
@@ -146,6 +171,37 @@ mod tests {
             }
             _ => panic!("Expected Completed"),
         }
+    }
+
+    #[test]
+    fn fetch_request_sends_post_body() {
+        let app = axum::Router::new().route(
+            "/echo-body",
+            axum::routing::post(|body: String| async move { body }),
+        );
+        let base_url = start_server(app);
+
+        let result = fetch_request(
+            "POST",
+            &format!("{base_url}/echo-body"),
+            &[("content-type".to_string(), "application/json".to_string())],
+            Some("{\"query\":\"SELECT 1\"}"),
+        )
+        .unwrap();
+
+        match result {
+            RunOutcome::Completed { exit_code, body } => {
+                assert_eq!(exit_code, 0);
+                assert_eq!(body.unwrap(), "{\"query\":\"SELECT 1\"}");
+            }
+            _ => panic!("Expected Completed"),
+        }
+    }
+
+    #[test]
+    fn fetch_request_rejects_invalid_method() {
+        let result = fetch_request("BAD METHOD", "https://example.com", &[], None);
+        assert!(result.is_err());
     }
 
     #[test]
