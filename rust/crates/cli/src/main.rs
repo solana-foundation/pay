@@ -124,6 +124,8 @@ fn main() {
             opts.command,
             Command::Setup(_)
                 | Command::Account { .. }
+                | Command::Bazaar { .. }
+                | Command::Install(_)
                 | Command::Curl(_)
                 | Command::Wget(_)
                 | Command::Fetch(_)

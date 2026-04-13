@@ -36,16 +36,18 @@ impl CodexCommand {
 
         let status = cmd
             .arg("-c")
-            .arg("instructions=\"For ANY HTTP request, use the pay MCP curl tool (pay.curl) instead of Bash curl/wget. The pay curl tool handles 402 Payment Required responses automatically.\"")
+            .arg(format!(
+                "instructions=\"{}\"",
+                pay_core::instructions::INSTRUCTIONS.replace('\n', " ")
+            ))
+            .arg("--full-auto")
             .args(&self.args)
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .status()
             .map_err(|e| {
-                pay_core::Error::Config(format!(
-                    "Failed to launch codex: {e}. Is it installed?"
-                ))
+                pay_core::Error::Config(format!("Failed to launch codex: {e}. Is it installed?"))
             })?;
 
         Ok(status.code().unwrap_or(1))

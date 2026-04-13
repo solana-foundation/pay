@@ -42,23 +42,6 @@ pub struct CurlParams {
     pub keypair: Option<String>,
 }
 
-/// Parameters for the `wget` tool.
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct WgetParams {
-    /// The URL to download.
-    #[schemars(description = "The URL to download")]
-    pub url: String,
-
-    /// Output file path. Defaults to the filename from the URL.
-    #[schemars(description = "Output file path. Defaults to filename from URL.")]
-    #[allow(dead_code)]
-    pub output: Option<String>,
-
-    /// Path to a Solana keypair file for paying 402 challenges.
-    #[schemars(description = "Path to Solana keypair file. Defaults to ~/.config/solana/id.json.")]
-    pub keypair: Option<String>,
-}
-
 impl Default for PayMcp {
     fn default() -> Self {
         Self::new()
@@ -77,6 +60,7 @@ impl PayMcp {
         description = r#"Make an HTTP request with automatic 402 Payment Required handling.
 
 If you receive HTTP 402 status codes when using the Bash tool with curl/wget,
+If you receive HTTP 402 status codes when using another HTTP client,
 retry the exact same request using this tool instead — it will handle the
 payment automatically.
 
@@ -109,53 +93,151 @@ Payments are made on Solana (SOL and SPL tokens like USDC).
             }
         }
 
+        let method = params.method.clone().unwrap_or_else(|| "GET".to_string());
+        let body = params.body.clone();
+
+        // Always request JSON responses — without this, many APIs
+        // return HTML error pages that waste the agent's context.
+        if !headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("accept"))
+        {
+            headers.push(("Accept".to_string(), "application/json".to_string()));
+        }
+        // Auto-set Content-Type for requests with a body.
+        if body.is_some()
+            && !headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        {
+            headers.push(("Content-Type".to_string(), "application/json".to_string()));
+        }
         let url = params.url.clone();
         let kp = keypair_path.to_string();
-        let response = tokio::task::spawn_blocking(move || do_paid_fetch(&url, &headers, &kp))
-            .await
-            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
-            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        let response =
+            tokio::task::spawn_blocking(move || do_paid_fetch(&method, &url, &headers, body, &kp))
+                .await
+                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
+                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(response)]))
     }
+
+    // ── Bazaar tools (progressive disclosure) ──────────────────────────────
 
     #[tool(
-        description = r#"Download a resource with automatic 402 Payment Required handling.
+        description = r#"Search for available paid API services and their endpoints.
 
-If you receive HTTP 402 status codes when using the Bash tool with wget,
-retry the exact same request using this tool instead — it will handle the
-payment automatically.
+Returns matching services with their endpoints. Each endpoint has a
+complete `url` field — paste it directly into the `curl` tool.
+For BigQuery, the project ID in URLs is `gateway-402`.
 
-Example: if `wget https://api.example.com/file` returns 402, call this tool
-with url="https://api.example.com/file" and the payment + download is handled
-for you.
+Shows top 5 metered + 3 free endpoints per service. Use
+`bazaar_endpoints` for the full list if needed.
 
-Supports both MPP (www-authenticate header) and x402 (X-PAYMENT-REQUIRED) protocols.
-Payments are made on Solana (SOL and SPL tokens like USDC).
+Categories: ai_ml, data, compute, maps, search, translation, productivity
 "#
     )]
-    async fn wget(
+    async fn bazaar_search(
         &self,
-        Parameters(params): Parameters<WgetParams>,
+        Parameters(params): Parameters<BazaarSearchParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let config = pay_core::Config::load()
-            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
-        let keypair_path = params
-            .keypair
-            .clone()
-            .or_else(|| config.default_keypair_source())
-            .unwrap_or_default()
-            .to_string();
-
-        let url = params.url.clone();
-        let kp = keypair_path.to_string();
-        let response = tokio::task::spawn_blocking(move || do_paid_fetch(&url, &[], &kp))
+        let catalog = tokio::task::spawn_blocking(pay_core::bazaar::load_bazaar)
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
 
-        Ok(CallToolResult::success(vec![Content::text(response)]))
+        let hits = pay_core::bazaar::search(
+            &catalog,
+            params.query.as_deref(),
+            params.category.as_deref(),
+        );
+
+        // Group and cap per service (same condensed logic as the CLI).
+        let grouped = pay_core::bazaar::group_search_results(&hits);
+        let condensed: Vec<_> = grouped
+            .into_iter()
+            .map(|mut g| {
+                // Cap: 5 metered + 3 free per service
+                let metered: Vec<_> = g.endpoints.iter().filter(|e| e.metered).cloned().collect();
+                let free: Vec<_> = g.endpoints.iter().filter(|e| !e.metered).cloned().collect();
+                let mut capped: Vec<_> = metered.into_iter().take(5).collect();
+                capped.extend(free.into_iter().take(3));
+                g.endpoints = capped;
+                g
+            })
+            .collect();
+
+        let json = serde_json::to_string_pretty(&condensed)
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
     }
+
+    #[tool(description = r#"List all endpoints for a specific API service.
+
+Each endpoint includes a complete `url` field — paste it directly into
+the `curl` tool. No URL assembly needed. Use after `bazaar_search` to
+get the exact endpoints you need.
+"#)]
+    async fn bazaar_endpoints(
+        &self,
+        Parameters(params): Parameters<BazaarEndpointsParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let catalog = tokio::task::spawn_blocking(pay_core::bazaar::load_bazaar)
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+
+        let svc = catalog
+            .services
+            .iter()
+            .find(|s| s.name.eq_ignore_ascii_case(&params.service))
+            .ok_or_else(|| {
+                rmcp::ErrorData::invalid_params(
+                    format!("Service `{}` not found", params.service),
+                    None,
+                )
+            })?;
+
+        let clean = pay_core::bazaar::SearchResultGroup {
+            service: svc.name.clone(),
+            title: svc.title.clone(),
+            url: svc.service_url.clone(),
+            endpoints: svc
+                .endpoints
+                .iter()
+                .map(|ep| pay_core::bazaar::endpoint_to_hit(&svc.service_url, ep))
+                .collect(),
+        };
+
+        let json = serde_json::to_string_pretty(&clean)
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+}
+
+/// Parameters for `bazaar_search`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct BazaarSearchParams {
+    /// Keyword to search for (matches service name, title, description).
+    #[schemars(description = "Search keyword (e.g. 'bigquery', 'translate', 'vision')")]
+    pub query: Option<String>,
+
+    /// Filter by category.
+    #[schemars(
+        description = "Filter by category: ai_ml, data, compute, maps, search, translation, productivity"
+    )]
+    pub category: Option<String>,
+}
+
+/// Parameters for `bazaar_endpoints`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct BazaarEndpointsParams {
+    /// Service name from bazaar_search results.
+    #[schemars(description = "Service name (e.g. 'bigquery', 'translate', 'vision')")]
+    pub service: String,
 }
 
 #[tool_handler]
@@ -165,14 +247,7 @@ impl ServerHandler for PayMcp {
             protocol_version: ProtocolVersion::V_2025_06_18,
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             server_info: rmcp::model::Implementation::from_build_env(),
-            instructions: Some(
-                "Pay MCP server — HTTP tools with automatic Solana payment for 402-gated APIs.\n\
-                 When you encounter HTTP 402 Payment Required responses from curl or wget in the \
-                 Bash tool, retry the same request using the pay `curl` or `wget` tools instead. \
-                 They will automatically detect the payment protocol (MPP or x402), sign a Solana \
-                 transaction, and retry with the payment credential."
-                    .to_string(),
-            ),
+            instructions: Some(pay_core::instructions::INSTRUCTIONS.to_string()),
         }
     }
 }
@@ -185,13 +260,16 @@ impl ServerHandler for PayMcp {
 /// no longer used — kept on the function signature for now to avoid
 /// touching the MCP tool layer.
 fn do_paid_fetch(
+    method: &str,
     url: &str,
     extra_headers: &[(String, String)],
+    body: Option<String>,
     _keypair_path: &str,
 ) -> Result<String, pay_core::Error> {
     use pay_core::client::runner::RunOutcome;
 
-    let outcome = pay_core::client::fetch::fetch(url, extra_headers)?;
+    let outcome =
+        pay_core::client::fetch::fetch_request(method, url, extra_headers, body.as_deref())?;
     let store = pay_core::accounts::FileAccountsStore::default_path();
 
     match outcome {
@@ -200,14 +278,24 @@ fn do_paid_fetch(
                 pay_core::client::mpp::build_credential(&challenge, &store, None)?;
             let mut headers = extra_headers.to_vec();
             headers.push(("Authorization".to_string(), auth_header));
-            interpret_retry(pay_core::client::fetch::fetch(url, &headers)?)
+            interpret_retry(pay_core::client::fetch::fetch_request(
+                method,
+                url,
+                &headers,
+                body.as_deref(),
+            )?)
         }
         RunOutcome::X402Challenge { requirements, .. } => {
             let (payment_header, _ephemeral) =
                 pay_core::client::x402::build_payment(&requirements, &store, None)?;
             let mut headers = extra_headers.to_vec();
             headers.push(("X-PAYMENT".to_string(), payment_header));
-            interpret_retry(pay_core::client::fetch::fetch(url, &headers)?)
+            interpret_retry(pay_core::client::fetch::fetch_request(
+                method,
+                url,
+                &headers,
+                body.as_deref(),
+            )?)
         }
         RunOutcome::PaymentRejected { reason, .. } => Err(pay_core::Error::PaymentRejected(reason)),
         RunOutcome::UnknownPaymentRequired { .. } => Err(pay_core::Error::Mpp(
@@ -274,17 +362,44 @@ mod tests {
     }
 
     #[test]
-    fn wget_params_deserialize() {
-        let json = r#"{"url": "https://example.com/file.zip"}"#;
-        let params: WgetParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.url, "https://example.com/file.zip");
-        assert!(params.output.is_none());
-        assert!(params.keypair.is_none());
+    fn content_type_defaults_to_json_for_body_requests() {
+        let mut headers = Vec::new();
+        let body = Some("{\"query\":\"SELECT 1\"}".to_string());
+
+        if body.is_some()
+            && !headers
+                .iter()
+                .any(|(k, _): &(String, String)| k.eq_ignore_ascii_case("content-type"))
+        {
+            headers.push(("Content-Type".to_string(), "application/json".to_string()));
+        }
+
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].0, "Content-Type");
+        assert_eq!(headers[0].1, "application/json");
+    }
+
+    #[test]
+    fn explicit_content_type_is_preserved() {
+        let mut headers = vec![("content-type".to_string(), "text/plain".to_string())];
+        let body = Some("hello".to_string());
+
+        if body.is_some()
+            && !headers
+                .iter()
+                .any(|(k, _): &(String, String)| k.eq_ignore_ascii_case("content-type"))
+        {
+            headers.push(("Content-Type".to_string(), "application/json".to_string()));
+        }
+
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].0, "content-type");
+        assert_eq!(headers[0].1, "text/plain");
     }
 
     #[test]
     fn do_paid_fetch_returns_error_for_invalid_url() {
-        let result = do_paid_fetch("not-a-url", &[], "");
+        let result = do_paid_fetch("GET", "not-a-url", &[], None, "");
         assert!(result.is_err());
     }
 }

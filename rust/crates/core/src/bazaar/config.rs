@@ -1,0 +1,326 @@
+//! Local bazaar configuration — `~/.config/pay/bazaar.yaml`.
+//!
+//! Tracks provider sources (catalog URLs or GitHub repos) and cache
+//! settings. `pay install` / `pay bazaar add` / `pay bazaar remove`
+//! mutate this file.
+
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+
+use crate::{Error, Result};
+
+const BAZAAR_CONFIG_FILE: &str = "~/.config/pay/bazaar.yaml";
+const BAZAAR_CACHE_DIR: &str = "~/.config/pay/bazaar";
+
+/// Default cache TTL in minutes.
+const DEFAULT_TTL_MINUTES: u32 = 30;
+
+/// The default catalog shipped with pay — always present even if the
+/// user hasn't added any sources.
+pub const DEFAULT_SOURCE: &str =
+    "https://storage.googleapis.com/gateway-402-public-assets-sandbox/catalog/google/sandbox.json";
+
+/// A provider source in the bazaar config.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Source {
+    /// Display name (e.g. "google", "company/apis").
+    pub name: String,
+    /// Resolved URL to the catalog JSON.
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BazaarConfig {
+    /// Cache time-to-live in minutes.
+    #[serde(default = "default_ttl")]
+    pub ttl_minutes: u32,
+    #[serde(default)]
+    pub sources: Vec<Source>,
+}
+
+fn default_ttl() -> u32 {
+    DEFAULT_TTL_MINUTES
+}
+
+impl Default for BazaarConfig {
+    fn default() -> Self {
+        Self {
+            ttl_minutes: DEFAULT_TTL_MINUTES,
+            sources: vec![Source {
+                name: "google".to_string(),
+                url: DEFAULT_SOURCE.to_string(),
+            }],
+        }
+    }
+}
+
+impl BazaarConfig {
+    pub fn load() -> Result<Self> {
+        let path = config_path();
+        if !path.exists()
+            || std::fs::read_to_string(&path)
+                .map(|r| r.trim().is_empty())
+                .unwrap_or(true)
+        {
+            let cfg = Self::default();
+            let _ = cfg.save(); // persist so the user can see/edit it
+            return Ok(cfg);
+        }
+        let raw = std::fs::read_to_string(&path)
+            .map_err(|e| Error::Config(format!("read {}: {e}", path.display())))?;
+        serde_yml::from_str(&raw)
+            .map_err(|e| Error::Config(format!("parse {}: {e}", path.display())))
+    }
+
+    pub fn save(&self) -> Result<()> {
+        let path = config_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| Error::Config(format!("mkdir: {e}")))?;
+        }
+        let yaml =
+            serde_yml::to_string(self).map_err(|e| Error::Config(format!("serialize: {e}")))?;
+        std::fs::write(&path, yaml)
+            .map_err(|e| Error::Config(format!("write {}: {e}", path.display())))
+    }
+
+    /// Add a source. Returns true if it was new.
+    pub fn add_source(&mut self, source: &str) -> bool {
+        let url = resolve_source_url(source);
+        if self.sources.iter().any(|s| s.url == url) {
+            return false;
+        }
+        self.sources.push(Source {
+            name: derive_name(source),
+            url,
+        });
+        true
+    }
+
+    /// Remove a source by name or URL. Returns true if it existed.
+    pub fn remove_source(&mut self, source: &str) -> bool {
+        let url = resolve_source_url(source);
+        let before = self.sources.len();
+        self.sources.retain(|s| s.url != url && s.name != source);
+        self.sources.len() < before
+    }
+
+    /// Deterministic 8-hex-char hash of the sorted source URLs.
+    /// Changes when sources are added/removed, invalidating the cache.
+    pub fn sources_hash(&self) -> String {
+        let mut sorted: Vec<_> = self.sources.iter().map(|s| &s.url).collect();
+        sorted.sort();
+        let mut hasher = DefaultHasher::new();
+        sorted.hash(&mut hasher);
+        format!("{:016x}", hasher.finish())[..8].to_string()
+    }
+
+    /// Get source URLs for fetching.
+    pub fn source_urls(&self) -> Vec<&str> {
+        self.sources.iter().map(|s| s.url.as_str()).collect()
+    }
+
+    /// Path to the current valid cache file, or None if stale/missing.
+    pub fn valid_cache_path(&self) -> Option<PathBuf> {
+        let dir = cache_dir();
+        let hash = self.sources_hash();
+        // Look for a cache file matching this hash
+        let entries = std::fs::read_dir(&dir).ok()?;
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("bazaar-") && name.contains(&hash) && name.ends_with(".json") {
+                // Check TTL
+                if let Ok(meta) = entry.metadata()
+                    && let Ok(modified) = meta.modified()
+                {
+                    let age = modified
+                        .elapsed()
+                        .unwrap_or(std::time::Duration::from_secs(u64::MAX));
+                    if age.as_secs() < (self.ttl_minutes as u64) * 60 {
+                        return Some(entry.path());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Generate a new cache file path for the current source list.
+    pub fn new_cache_path(&self) -> PathBuf {
+        let dir = cache_dir();
+        let hash = self.sources_hash();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        dir.join(format!("bazaar-{ts}-{hash}.json"))
+    }
+
+    /// Clean up old cache files that don't match the current hash.
+    pub fn clean_stale_caches(&self) {
+        let dir = cache_dir();
+        let hash = self.sources_hash();
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with("bazaar-") && name.ends_with(".json") && !name.contains(&hash) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+}
+
+/// Resolve a source shorthand to a URL.
+fn resolve_source_url(source: &str) -> String {
+    if source.starts_with("http://") || source.starts_with("https://") {
+        return source.to_string();
+    }
+    if source.contains('/') && !source.contains(' ') {
+        return format!(
+            "https://raw.githubusercontent.com/{}/main/catalog.json",
+            source
+        );
+    }
+    source.to_string()
+}
+
+/// Derive a short display name from a source string.
+/// - `company/apis` → `company/apis`
+/// - `https://storage.googleapis.com/.../google/sandbox.json` → `google`
+/// - `https://example.com/catalog.json` → `example.com`
+fn derive_name(source: &str) -> String {
+    // GitHub shorthand — keep as-is, it's already a good name.
+    if !source.starts_with("http://") && !source.starts_with("https://") {
+        return source.to_string();
+    }
+    // Try to extract a meaningful segment from the URL path.
+    if let Some(path) = source.split("//").nth(1) {
+        let segments: Vec<&str> = path
+            .split('/')
+            .filter(|s| !s.is_empty() && *s != "catalog.json" && *s != "sandbox.json")
+            .collect();
+        // Use the last meaningful path segment before the filename.
+        if let Some(last) = segments.last()
+            && (!last.contains('.') || segments.len() <= 2)
+        {
+            return last.to_string();
+        }
+        // Fall back to the hostname.
+        if let Some(host) = segments.first() {
+            return host.to_string();
+        }
+    }
+    source.to_string()
+}
+
+fn config_path() -> PathBuf {
+    PathBuf::from(shellexpand::tilde(BAZAAR_CONFIG_FILE).into_owned())
+}
+
+fn cache_dir() -> PathBuf {
+    PathBuf::from(shellexpand::tilde(BAZAAR_CACHE_DIR).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_has_default_source() {
+        let cfg = BazaarConfig::default();
+        assert_eq!(cfg.sources.len(), 1);
+        assert_eq!(cfg.sources[0].name, "google");
+        assert!(cfg.sources[0].url.contains("gateway-402"));
+    }
+
+    #[test]
+    fn add_source_deduplicates() {
+        let mut cfg = BazaarConfig::default();
+        assert!(cfg.add_source("https://example.com/catalog.json"));
+        assert!(!cfg.add_source("https://example.com/catalog.json"));
+        assert_eq!(cfg.sources.len(), 2);
+    }
+
+    #[test]
+    fn add_source_resolves_github_shorthand() {
+        let mut cfg = BazaarConfig::default();
+        cfg.add_source("company/apis");
+        let last = cfg.sources.last().unwrap();
+        assert_eq!(last.name, "company/apis");
+        assert!(last.url.contains("raw.githubusercontent.com"));
+    }
+
+    #[test]
+    fn remove_source_by_url() {
+        let mut cfg = BazaarConfig::default();
+        cfg.add_source("https://example.com/catalog.json");
+        assert!(cfg.remove_source("https://example.com/catalog.json"));
+        assert!(!cfg.remove_source("https://example.com/catalog.json"));
+    }
+
+    #[test]
+    fn remove_source_by_name() {
+        let mut cfg = BazaarConfig::default();
+        cfg.add_source("company/apis");
+        assert!(cfg.remove_source("company/apis"));
+        assert_eq!(cfg.sources.len(), 1); // only default left
+    }
+
+    #[test]
+    fn sources_hash_is_deterministic() {
+        let mut cfg = BazaarConfig::default();
+        cfg.add_source("https://a.com");
+        cfg.add_source("https://b.com");
+        let h1 = cfg.sources_hash();
+        cfg.sources.reverse();
+        let h2 = cfg.sources_hash();
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn sources_hash_changes_on_add() {
+        let cfg1 = BazaarConfig::default();
+        let mut cfg2 = BazaarConfig::default();
+        cfg2.add_source("https://new.com");
+        assert_ne!(cfg1.sources_hash(), cfg2.sources_hash());
+    }
+
+    #[test]
+    fn resolve_source_github_shorthand() {
+        let url = resolve_source_url("company/my-apis");
+        assert_eq!(
+            url,
+            "https://raw.githubusercontent.com/company/my-apis/main/catalog.json"
+        );
+    }
+
+    #[test]
+    fn resolve_source_full_url_passthrough() {
+        let url = resolve_source_url("https://example.com/foo.json");
+        assert_eq!(url, "https://example.com/foo.json");
+    }
+
+    #[test]
+    fn derive_name_github_shorthand() {
+        assert_eq!(derive_name("company/apis"), "company/apis");
+    }
+
+    #[test]
+    fn derive_name_gcs_url() {
+        assert_eq!(
+            derive_name("https://storage.googleapis.com/bucket/catalog/google/sandbox.json"),
+            "google"
+        );
+    }
+
+    #[test]
+    fn derive_name_simple_url() {
+        assert_eq!(
+            derive_name("https://example.com/catalog.json"),
+            "example.com"
+        );
+    }
+}

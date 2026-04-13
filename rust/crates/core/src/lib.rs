@@ -1,7 +1,9 @@
 // Shared modules
 pub mod accounts;
+pub mod bazaar;
 pub mod config;
 pub mod error;
+pub mod instructions;
 pub mod keystore;
 pub mod signer;
 

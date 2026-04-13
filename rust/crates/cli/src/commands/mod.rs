@@ -1,4 +1,5 @@
 pub mod account;
+pub mod bazaar;
 pub mod claude;
 pub mod codex;
 pub mod curl;
@@ -53,6 +54,14 @@ pub enum Command {
         #[command(subcommand)]
         command: server::ServerCommand,
     },
+    /// Browse, search, and inspect API providers from the bazaar.
+    Bazaar {
+        #[command(subcommand)]
+        command: bazaar::BazaarCommand,
+    },
+    /// Add a provider source (shorthand for `bazaar add`).
+    #[command(alias = "add", short_flag = 'i')]
+    Install(bazaar::install::InstallCommand),
     /// Start the MCP server (for Claude Code, Cursor, etc.)
     Mcp,
 }
@@ -78,6 +87,8 @@ impl Command {
             Command::Claude(_) => ToolKind::Claude,
             Command::Codex(_) => ToolKind::Codex,
             Command::Account { .. }
+            | Command::Bazaar { .. }
+            | Command::Install(_)
             | Command::Send(_)
             | Command::Setup(_)
             | Command::Topup(_)
@@ -111,6 +122,8 @@ impl Command {
 
         match self {
             Command::Account { command } => return command.run(keypair_override),
+            Command::Bazaar { command } => return command.run(),
+            Command::Install(cmd) => return cmd.run(),
             Command::Solana(cmd) => std::process::exit(cmd.run(keypair_override)?),
             Command::Send(cmd) => return cmd.run(keypair_override, verbose),
             Command::Setup(cmd) => return cmd.run(),
