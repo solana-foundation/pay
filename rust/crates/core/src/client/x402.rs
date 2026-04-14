@@ -75,12 +75,7 @@ pub fn build_payment(
         .build()
         .map_err(|e| Error::Mpp(format!("Failed to create runtime: {e}")))?;
 
-    if user_opted_into_sandbox
-        && ephemeral_notice
-            .as_ref()
-            .map(|e| e.created)
-            .unwrap_or(false)
-    {
+    if user_opted_into_sandbox && ephemeral_notice.is_some() {
         let pubkey = signer.pubkey().to_string();
         let fund_url = rpc_url.clone();
         if let Err(e) = rt.block_on(crate::client::sandbox::fund_via_surfpool(

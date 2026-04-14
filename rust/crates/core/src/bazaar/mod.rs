@@ -943,4 +943,136 @@ mod tests {
         collect_prices(&None, &mut prices);
         assert!(prices.is_empty());
     }
+
+    // ── group_search_results ─────────────────────────────────────────────
+
+    #[test]
+    fn group_search_results_groups_by_service() {
+        let cat = test_catalog();
+        let hits = search(&cat, None, None);
+        let groups = group_search_results(&hits);
+        assert_eq!(groups.len(), 2);
+        let bq = groups.iter().find(|g| g.service == "bigquery").unwrap();
+        assert_eq!(bq.title, "BigQuery API");
+        assert_eq!(bq.endpoints.len(), 3);
+    }
+
+    #[test]
+    fn group_search_results_empty() {
+        let groups = group_search_results(&[]);
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn group_search_results_endpoints_have_urls() {
+        let cat = test_catalog();
+        let hits = search(&cat, Some("annotate"), None);
+        let groups = group_search_results(&hits);
+        assert_eq!(groups.len(), 1);
+        let ep = &groups[0].endpoints[0];
+        assert!(ep.url.starts_with("https://"));
+        assert!(ep.url.contains("annotate"));
+        assert!(ep.metered);
+    }
+
+    // ── build_endpoint_url ───────────────────────────────────────────────
+
+    #[test]
+    fn build_endpoint_url_basic() {
+        let url = build_endpoint_url("https://gw.example.com", "v2/projects/foo/queries");
+        assert_eq!(url, "https://gw.example.com/v2/projects/foo/queries");
+    }
+
+    #[test]
+    fn build_endpoint_url_resolves_placeholders() {
+        let url = build_endpoint_url("https://gw.example.com", "v2/projects/{projectsId}/queries");
+        assert_eq!(
+            url,
+            "https://gw.example.com/v2/projects/gateway-402/queries"
+        );
+    }
+
+    #[test]
+    fn build_endpoint_url_resolves_project_placeholder() {
+        let url = build_endpoint_url("https://gw.example.com", "v1/{project}/datasets");
+        assert_eq!(url, "https://gw.example.com/v1/gateway-402/datasets");
+    }
+
+    #[test]
+    fn build_endpoint_url_empty_path() {
+        let url = build_endpoint_url("https://gw.example.com/", "");
+        assert_eq!(url, "https://gw.example.com");
+    }
+
+    #[test]
+    fn build_endpoint_url_strips_extra_slashes() {
+        let url = build_endpoint_url("https://gw.example.com/", "/v2/foo");
+        assert_eq!(url, "https://gw.example.com/v2/foo");
+    }
+
+    // ── endpoint_to_hit ──────────────────────────────────────────────────
+
+    #[test]
+    fn endpoint_to_hit_builds_correct_hit() {
+        let ep = Endpoint {
+            method: "POST".to_string(),
+            path: "v1/images:annotate".to_string(),
+            full_path: "/vision/v1/images:annotate".to_string(),
+            resource: "images".to_string(),
+            description: "Annotate images".to_string(),
+            pricing: Some(serde_json::json!({"price_usd": 1.50})),
+        };
+        let hit = endpoint_to_hit("https://gw.example.com", &ep);
+        assert_eq!(hit.method, "POST");
+        assert_eq!(hit.url, "https://gw.example.com/v1/images:annotate");
+        assert_eq!(hit.resource, "images");
+        assert!(hit.metered);
+    }
+
+    #[test]
+    fn endpoint_to_hit_free_endpoint() {
+        let ep = Endpoint {
+            method: "GET".to_string(),
+            path: "v2/datasets".to_string(),
+            full_path: "/bq/v2/datasets".to_string(),
+            resource: "datasets".to_string(),
+            description: "List datasets".to_string(),
+            pricing: None,
+        };
+        let hit = endpoint_to_hit("https://gw.example.com", &ep);
+        assert!(!hit.metered);
+    }
+
+    // ── summarize_service ────────────────────────────────────────────────
+
+    #[test]
+    fn summarize_service_counts_correct() {
+        let cat = test_catalog();
+        let svc = cat.services.iter().find(|s| s.name == "bigquery").unwrap();
+        let summary = summarize_service(svc);
+        assert_eq!(summary.name, "bigquery");
+        assert_eq!(summary.metered_endpoints, 1);
+        assert_eq!(summary.free_endpoints, 2);
+        assert_eq!(summary.endpoint_count, 3);
+        assert!(summary.min_price_usd <= summary.max_price_usd);
+    }
+
+    #[test]
+    fn summarize_service_extracts_prices() {
+        let cat = test_catalog();
+        let svc = cat.services.iter().find(|s| s.name == "bigquery").unwrap();
+        let summary = summarize_service(svc);
+        // bigquery has tiers with price_usd: 0 and 6.25
+        assert!((summary.min_price_usd - 0.0).abs() < f64::EPSILON);
+        assert!((summary.max_price_usd - 6.25).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn summarize_service_all_metered() {
+        let cat = test_catalog();
+        let svc = cat.services.iter().find(|s| s.name == "vision").unwrap();
+        let summary = summarize_service(svc);
+        assert_eq!(summary.metered_endpoints, 1);
+        assert_eq!(summary.free_endpoints, 0);
+    }
 }

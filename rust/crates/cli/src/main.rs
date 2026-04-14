@@ -93,7 +93,7 @@ fn main() {
     // BEFORE launching the agent. The MCP curl tool will route through it
     // (via PAY_DEBUGGER_PROXY env var), capturing all traffic for the PDB UI.
     if opts.debugger {
-        match debugger_proxy::start_background(debugger_proxy::DEFAULT_BIND) {
+        match debugger_proxy::start_background() {
             Ok(proxy_url) => {
                 // SAFETY: called before any threads that read this var.
                 unsafe { std::env::set_var("PAY_DEBUGGER_PROXY", &proxy_url) };

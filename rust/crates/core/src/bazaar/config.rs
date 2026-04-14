@@ -323,4 +323,50 @@ mod tests {
             "example.com"
         );
     }
+
+    #[test]
+    fn source_urls_returns_all_urls() {
+        let mut cfg = BazaarConfig::default();
+        cfg.add_source("https://a.com/catalog.json");
+        cfg.add_source("https://b.com/catalog.json");
+        let urls = cfg.source_urls();
+        assert_eq!(urls.len(), 3); // default + 2
+        assert!(urls.contains(&"https://a.com/catalog.json"));
+        assert!(urls.contains(&"https://b.com/catalog.json"));
+    }
+
+    #[test]
+    fn new_cache_path_contains_hash() {
+        let cfg = BazaarConfig::default();
+        let hash = cfg.sources_hash();
+        let path = cfg.new_cache_path();
+        let filename = path.file_name().unwrap().to_string_lossy();
+        assert!(filename.starts_with("bazaar-"));
+        assert!(filename.contains(&hash));
+        assert!(filename.ends_with(".json"));
+    }
+
+    #[test]
+    fn valid_cache_path_returns_none_when_no_cache() {
+        // With no cache dir, should return None
+        let mut cfg = BazaarConfig::default();
+        // Add a unique source so hash won't match any existing cache
+        cfg.add_source("https://unique-test-source-12345.example.com/catalog.json");
+        // valid_cache_path scans the cache dir — with a unique hash it won't find anything
+        // (unless the dir doesn't exist, which also returns None)
+        assert!(cfg.valid_cache_path().is_none());
+    }
+
+    #[test]
+    fn clean_stale_caches_is_safe_when_dir_missing() {
+        // Should not panic when cache dir doesn't exist
+        let mut cfg = BazaarConfig::default();
+        cfg.add_source("https://nonexistent-test-12345.example.com/catalog.json");
+        cfg.clean_stale_caches(); // no-op, no panic
+    }
+
+    #[test]
+    fn default_ttl_value() {
+        assert_eq!(default_ttl(), 30);
+    }
 }

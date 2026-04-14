@@ -509,7 +509,9 @@ impl StartCommand {
                                 .and_then(|v| v.to_str().ok())
                                 .is_some_and(|v| v.contains("text/html"));
                             if accepts_html {
-                                axum::response::Redirect::temporary("/__402/pdb/")
+                                axum::response::Redirect::temporary(
+                                        &format!("{}/", pay_pdb::PDB_PATH),
+                                    )
                                     .into_response()
                             } else {
                                 axum::Json(serde_json::json!({"status": "ok"})).into_response()
@@ -517,7 +519,7 @@ impl StartCommand {
                         }),
                     )
                     .nest_service(
-                        "/__402/pdb",
+                        pay_pdb::PDB_PATH,
                     pay_pdb::debugger_router(pdb.clone()),
                 );
             }

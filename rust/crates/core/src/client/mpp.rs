@@ -98,17 +98,10 @@ pub fn build_credential(
         .build()
         .map_err(|e| Error::Mpp(format!("Failed to create runtime: {e}")))?;
 
-    // Only auto-fund when (a) the wallet was just lazy-created in this
-    // call AND (b) the user explicitly opted into sandbox mode. Without
-    // (b) we'd be probing arbitrary localnet RPCs and producing
-    // confusing "install Surfpool" errors for users who never asked for
-    // Surfpool in the first place.
-    if user_opted_into_sandbox
-        && ephemeral_notice
-            .as_ref()
-            .map(|e| e.created)
-            .unwrap_or(false)
-    {
+    // Auto-fund when the user opted into sandbox mode and the wallet is
+    // ephemeral. We fund on every call (idempotent) rather than only on
+    // first creation, because Surfpool restarts wipe token balances.
+    if user_opted_into_sandbox && ephemeral_notice.is_some() {
         let pubkey = signer.pubkey().to_string();
         let fund_url = rpc_url.clone();
         if let Err(e) = rt.block_on(crate::client::sandbox::fund_via_surfpool(

@@ -25,6 +25,9 @@ use tokio::sync::broadcast;
 use correlation::FlowCorrelation;
 use types::SseMessage;
 
+/// Mount path for the PDB debugger UI (no trailing slash).
+pub const PDB_PATH: &str = "/__402/pdb";
+
 static ASSETS: Dir<'_> = include_dir!("$OUT_DIR/pdb-dist");
 
 /// Shared state for the PDB debugger.
@@ -75,9 +78,31 @@ pub fn debugger_router(state: PdbState) -> Router {
         .route("/logs/stream", get(handlers::sse_stream))
         .route("/logs", get(handlers::logs_snapshot))
         .route("/api/config", get(handlers::config_handler))
+        // Explicit `/` route so axum matches `/__402/pdb/` (with trailing
+        // slash) inside the nest.  Without this, `/__402/pdb/` falls through
+        // to the outer router's fallback, and relative `./assets/…` paths in
+        // index.html break because the browser resolves them against the
+        // wrong base.
+        .route("/", get(serve_index))
         // .route("/debug/fake-flow", axum::routing::post(handlers::inject_fake_flow))
         .fallback(get(serve_pdb))
         .with_state(state)
+}
+
+/// Serve index.html directly (used for the explicit `/` route).
+async fn serve_index() -> Response<Body> {
+    match ASSETS.get_file("index.html") {
+        Some(file) => Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/html")
+            .header("Cache-Control", "no-cache")
+            .body(Body::from(file.contents().to_vec()))
+            .unwrap(),
+        None => Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::empty())
+            .unwrap(),
+    }
 }
 
 /// Axum handler that serves the embedded PDB static files.

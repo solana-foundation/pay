@@ -8,10 +8,11 @@ interface Props {
 }
 
 export function FlowDetail({ flow }: Props) {
+  const success = flow.status === "resource-delivered";
   return (
     <div className="flow-detail">
-      <SequenceDiagram steps={flow.steps} failed={flow.status === "failed"} />
-      <PaymentSplits flow={flow} />
+      <SequenceDiagram steps={flow.steps} failed={flow.status === "failed"} success={success} />
+      <PaymentSplits flow={flow} success={success} />
       <EventLog events={flow.events} />
     </div>
   );

@@ -1,4 +1,4 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect, useRef } from "react";
 import { useFlows } from "./hooks/useFlows";
 import { useTheme } from "./hooks/useTheme";
 import { ConfigProvider } from "./hooks/useConfig";
@@ -17,6 +17,23 @@ export function App() {
     const stored = localStorage.getItem("sidebarOpen");
     return stored === null ? true : stored === "true";
   });
+
+  // Track whether the user has manually clicked a flow row.
+  // Until they do, auto-expand the latest flow as it arrives.
+  const userClicked = useRef(false);
+  const prevFlowCount = useRef(0);
+
+  const handleSelect = (id: string | null) => {
+    userClicked.current = true;
+    setSelectedId(id);
+  };
+
+  useEffect(() => {
+    if (!userClicked.current && flows.length > prevFlowCount.current && flows.length > 0) {
+      setSelectedId(flows[flows.length - 1].id);
+    }
+    prevFlowCount.current = flows.length;
+  }, [flows]);
 
   const filtered = useMemo(() => {
     return flows.filter((f) => {
@@ -61,7 +78,7 @@ export function App() {
         <FlowList
           flows={filtered}
           selectedId={selectedId}
-          onSelect={setSelectedId}
+          onSelect={handleSelect}
         />
       </div>
       <div className={`sidebar${sidebarOpen ? "" : " collapsed"}`}>

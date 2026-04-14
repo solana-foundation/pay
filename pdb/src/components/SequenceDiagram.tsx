@@ -12,13 +12,14 @@ function fmtTime(iso: string): string {
 interface Props {
   steps: FlowStep[];
   failed?: boolean;
+  success?: boolean;
 }
 
 const ROW_H = 52;
 const R = 7;
 const CX = 10;
 
-export function SequenceDiagram({ steps, failed }: Props) {
+export function SequenceDiagram({ steps, failed, success }: Props) {
   const totalH = steps.length * ROW_H;
 
   // Find the first non-completed step index (where failure icon goes)
@@ -39,13 +40,19 @@ export function SequenceDiagram({ steps, failed }: Props) {
 
             const color = isFailed
               ? "var(--red)"
-              : completed
-                ? "var(--green)"
-                : step.status === "in-progress"
-                  ? "var(--yellow)"
-                  : "var(--fg-muted)";
+              : !success && !failed
+                ? completed
+                  ? "var(--fg-muted)"
+                  : "var(--border)"
+                : completed
+                  ? "var(--green)"
+                  : step.status === "in-progress"
+                    ? "var(--yellow)"
+                    : "var(--fg-muted)";
 
-            const lineColor = completed ? "var(--green)" : "var(--border)";
+            const lineColor = !success && !failed
+              ? (completed ? "var(--fg-muted)" : "var(--border)")
+              : (completed ? "var(--green)" : "var(--border)");
             const showCheck = isLast && completed && !failed;
 
             return (

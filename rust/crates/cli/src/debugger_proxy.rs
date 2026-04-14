@@ -19,16 +19,41 @@ use axum::routing::any;
 /// Header carrying the original destination URL.
 pub const FORWARD_HEADER: &str = "x-pay-forward-to";
 
-/// Default bind address for the debugger proxy.
-pub const DEFAULT_BIND: &str = "127.0.0.1:1402";
+/// Default starting port for the debugger proxy.
+pub const DEFAULT_PORT: u16 = 1402;
+
+/// Port increment when the previous port is busy.
+const PORT_STEP: u16 = 1000;
+
+/// Maximum number of ports to try before giving up.
+const MAX_PORT_ATTEMPTS: u16 = 10;
+
+/// Find an available port starting from `DEFAULT_PORT`, stepping by
+/// `PORT_STEP` (1402 → 2402 → 3402 → …).
+fn find_available_port() -> pay_core::Result<u16> {
+    let mut port = DEFAULT_PORT;
+    for _ in 0..MAX_PORT_ATTEMPTS {
+        match std::net::TcpListener::bind(("127.0.0.1", port)) {
+            Ok(_listener) => return Ok(port), // port is free (listener drops immediately)
+            Err(_) => port += PORT_STEP,
+        }
+    }
+    Err(pay_core::Error::Config(format!(
+        "no available debugger port (tried {DEFAULT_PORT}–{port})"
+    )))
+}
 
 /// Start the debugger proxy in the background. Returns the bind address
 /// so the caller can set `PAY_DEBUGGER_PROXY` for the MCP server.
 ///
+/// Automatically picks the first available port starting from 1402,
+/// stepping by 1000 (1402 → 2402 → 3402 → …) if the port is busy.
+///
 /// The proxy runs on a dedicated tokio runtime in a background thread
 /// so it doesn't interfere with the CLI's sync main function.
-pub fn start_background(bind: &str) -> pay_core::Result<String> {
-    let bind = bind.to_string();
+pub fn start_background() -> pay_core::Result<String> {
+    let port = find_available_port()?;
+    let bind = format!("127.0.0.1:{port}");
     let bind_clone = bind.clone();
 
     std::thread::spawn(move || {
@@ -52,7 +77,7 @@ pub fn start_background(bind: &str) -> pay_core::Result<String> {
 
             let pdb_state = pdb.clone();
             let app = Router::new()
-                .nest("/__402/pdb", pay_pdb::debugger_router(pdb.clone()))
+                .nest_service(pay_pdb::PDB_PATH, pay_pdb::debugger_router(pdb.clone()))
                 .fallback(any(move |req: Request<Body>| {
                     let pdb = pdb_state.clone();
                     forward_and_log(req, pdb)
@@ -64,7 +89,8 @@ pub fn start_background(bind: &str) -> pay_core::Result<String> {
                 .unwrap_or_else(|e| panic!("debugger proxy bind {bind_clone}: {e}"));
 
             eprintln!(
-                "  {} http://{bind_clone}/__402/pdb/",
+                "  {} http://{bind_clone}{}/",
+                pay_pdb::PDB_PATH,
                 owo_colors::OwoColorize::green(&"Debugger"),
             );
 
@@ -90,7 +116,8 @@ async fn forward_and_log(req: Request<Body>, pdb: pay_pdb::PdbState) -> Response
     let Some(dest_url) = forward_to else {
         // No forward header → this is a browser request, not an MCP
         // curl call. Redirect to the PDB dashboard.
-        return axum::response::Redirect::temporary("/__402/pdb").into_response();
+        return axum::response::Redirect::temporary(&format!("{}/", pay_pdb::PDB_PATH))
+            .into_response();
     };
 
     let method = req.method().clone();
@@ -204,12 +231,7 @@ fn reqwest_headers(src: &HeaderMap) -> reqwest::header::HeaderMap {
 }
 
 fn chrono_now() -> String {
-    // Lightweight UTC timestamp without pulling in chrono.
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format!("{secs}")
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 #[cfg(test)]
@@ -232,7 +254,7 @@ mod tests {
                 }));
                 let pdb_state = pdb.clone();
                 let app = Router::new()
-                    .nest("/__402/pdb", pay_pdb::debugger_router(pdb.clone()))
+                    .nest_service(pay_pdb::PDB_PATH, pay_pdb::debugger_router(pdb.clone()))
                     .fallback(any(move |req: Request<Body>| {
                         let pdb = pdb_state.clone();
                         forward_and_log(req, pdb)
@@ -249,14 +271,34 @@ mod tests {
     }
 
     #[test]
-    fn pdb_html_served_with_correct_assets() {
+    fn pdb_served_with_trailing_slash() {
         let addr = start_test_proxy();
         let client = reqwest::blocking::Client::builder()
             .redirect(reqwest::redirect::Policy::limited(5))
             .build()
             .unwrap();
 
-        // PDB index (axum serves at /__402/pdb, redirects /__402/pdb/ there)
+        // /__402/pdb/ (trailing slash) must serve index.html directly
+        let resp = client
+            .get(format!("http://{addr}/__402/pdb/"))
+            .send()
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let html = resp.text().unwrap();
+        assert!(html.contains("Payment Debugger"));
+        // Relative asset paths — browser resolves ./assets/ against /__402/pdb/
+        assert!(html.contains("./assets/"));
+    }
+
+    #[test]
+    fn pdb_served_without_trailing_slash() {
+        let addr = start_test_proxy();
+        let client = reqwest::blocking::Client::builder()
+            .redirect(reqwest::redirect::Policy::limited(5))
+            .build()
+            .unwrap();
+
+        // /__402/pdb (no slash) also works
         let resp = client
             .get(format!("http://{addr}/__402/pdb"))
             .send()
@@ -264,8 +306,6 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let html = resp.text().unwrap();
         assert!(html.contains("Payment Debugger"));
-        // Asset paths must be absolute so they work regardless of trailing slash
-        assert!(html.contains("/__402/pdb/assets/"));
     }
 
     #[test]
@@ -282,12 +322,24 @@ mod tests {
         let config: serde_json::Value = resp.json().unwrap();
         assert_eq!(config["network"], "proxy");
 
-        // JS asset
+        // CSS asset (resolve like the browser would from /__402/pdb/)
         let resp = client
-            .get(format!("http://{addr}/__402/pdb/assets/index-2XdDUhE2.js"))
+            .get(format!("http://{addr}/__402/pdb/"))
             .send()
             .unwrap();
-        assert_eq!(resp.status(), 200);
+        let html = resp.text().unwrap();
+        // Extract actual asset filename from the HTML
+        if let Some(start) = html.find("src=\"./assets/") {
+            let rest = &html[start + 6..]; // skip src="./
+            if let Some(end) = rest.find('"') {
+                let asset_path = &rest[..end]; // assets/index-XXX.js
+                let resp = client
+                    .get(format!("http://{addr}/__402/pdb/{asset_path}"))
+                    .send()
+                    .unwrap();
+                assert_eq!(resp.status(), 200, "asset at {asset_path} should serve");
+            }
+        }
     }
 
     #[test]
@@ -300,6 +352,16 @@ mod tests {
         let resp = no_redirect.get(format!("http://{addr}/")).send().unwrap();
         assert_eq!(resp.status(), 307);
         let loc = resp.headers().get("location").unwrap().to_str().unwrap();
-        assert_eq!(loc, "/__402/pdb");
+        assert_eq!(loc, "/__402/pdb/");
+    }
+
+    #[test]
+    fn find_available_port_skips_busy() {
+        // Occupy DEFAULT_PORT
+        let _blocker = std::net::TcpListener::bind(("127.0.0.1", DEFAULT_PORT)).ok();
+        let port = find_available_port().unwrap();
+        // Should be DEFAULT_PORT if it was free, or DEFAULT_PORT + PORT_STEP if occupied
+        assert!(port >= DEFAULT_PORT);
+        assert_eq!((port - DEFAULT_PORT) % PORT_STEP, 0);
     }
 }
