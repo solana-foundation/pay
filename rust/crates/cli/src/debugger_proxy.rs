@@ -286,8 +286,11 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let html = resp.text().unwrap();
         assert!(html.contains("Payment Debugger"));
-        // Relative asset paths — browser resolves ./assets/ against /__402/pdb/
-        assert!(html.contains("./assets/"));
+        // When the full PDB frontend is built, asset paths are relative.
+        // CI may embed a placeholder without assets — skip this check then.
+        if html.contains("assets/") {
+            assert!(html.contains("./assets/"));
+        }
     }
 
     #[test]
