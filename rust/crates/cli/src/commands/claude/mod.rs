@@ -31,6 +31,12 @@ impl ClaudeCommand {
         if let Ok(url) = std::env::var("PAY_RPC_URL") {
             env.insert("PAY_RPC_URL".to_string(), serde_json::Value::String(url));
         }
+        if let Ok(proxy) = std::env::var("PAY_DEBUGGER_PROXY") {
+            env.insert(
+                "PAY_DEBUGGER_PROXY".to_string(),
+                serde_json::Value::String(proxy),
+            );
+        }
         if !env.is_empty() {
             mcp_server["env"] = serde_json::Value::Object(env);
         }
@@ -45,10 +51,9 @@ impl ClaudeCommand {
             .arg("--mcp-config")
             .arg(mcp_config.to_string())
             .arg("--allowedTools")
-            .arg("mcp__pay__curl")
-            .arg("mcp__pay__wget")
+            .arg("mcp__pay__curl,mcp__pay__bazaar_search,mcp__pay__bazaar_endpoints")
             .arg("--append-system-prompt")
-            .arg(include_str!("agentic-gateway.md"))
+            .arg(pay_core::instructions::INSTRUCTIONS)
             .args(&self.args)
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())

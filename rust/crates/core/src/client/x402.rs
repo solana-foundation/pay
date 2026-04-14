@@ -43,6 +43,13 @@ pub fn build_payment(
         .as_deref()
         .unwrap_or("mainnet")
         .to_string();
+
+    // Client-side network intent check (same shape as mpp.rs). x402's
+    // PaymentRequirements doesn't carry a `recentBlockhash` field, so
+    // only the slug-mismatch branch can fire here — but we route
+    // through the same helper for consistency.
+    crate::client::mpp::check_client_network_intent(network_override, &cluster, None)?;
+
     // Same gating rationale as mpp::build_credential — only attempt
     // auto-funding when the user explicitly opted into sandbox mode.
     let user_opted_into_sandbox = network_override.is_some();
@@ -68,12 +75,7 @@ pub fn build_payment(
         .build()
         .map_err(|e| Error::Mpp(format!("Failed to create runtime: {e}")))?;
 
-    if user_opted_into_sandbox
-        && ephemeral_notice
-            .as_ref()
-            .map(|e| e.created)
-            .unwrap_or(false)
-    {
+    if user_opted_into_sandbox && ephemeral_notice.is_some() {
         let pubkey = signer.pubkey().to_string();
         let fund_url = rpc_url.clone();
         if let Err(e) = rt.block_on(crate::client::sandbox::fund_via_surfpool(

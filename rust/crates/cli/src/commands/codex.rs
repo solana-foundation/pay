@@ -29,6 +29,9 @@ impl CodexCommand {
         if let Ok(url) = std::env::var("PAY_RPC_URL") {
             env_parts.push(format!("PAY_RPC_URL=\"{url}\""));
         }
+        if let Ok(proxy) = std::env::var("PAY_DEBUGGER_PROXY") {
+            env_parts.push(format!("PAY_DEBUGGER_PROXY=\"{proxy}\""));
+        }
         if !env_parts.is_empty() {
             cmd.arg("-c")
                 .arg(format!("mcp_servers.pay.env={{{}}}", env_parts.join(",")));
@@ -36,16 +39,18 @@ impl CodexCommand {
 
         let status = cmd
             .arg("-c")
-            .arg("instructions=\"For ANY HTTP request, use the pay MCP curl tool (pay.curl) instead of Bash curl/wget. The pay curl tool handles 402 Payment Required responses automatically.\"")
+            .arg(format!(
+                "instructions=\"{}\"",
+                pay_core::instructions::INSTRUCTIONS.replace('\n', " ")
+            ))
+            .arg("--full-auto")
             .args(&self.args)
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .status()
             .map_err(|e| {
-                pay_core::Error::Config(format!(
-                    "Failed to launch codex: {e}. Is it installed?"
-                ))
+                pay_core::Error::Config(format!("Failed to launch codex: {e}. Is it installed?"))
             })?;
 
         Ok(status.code().unwrap_or(1))

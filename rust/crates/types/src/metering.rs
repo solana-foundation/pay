@@ -163,7 +163,9 @@ impl RoutingConfig {
 ///
 /// Each rule's prefix is split into segments. Literal segments must match
 /// exactly; `{placeholder}` segments match any value and are replaced with
-/// the env var. The rest of the path is preserved.
+/// the env var. The prefix is matched at ANY position in the path — not
+/// just the start — so `projects/{projectId}` matches both
+/// `/projects/foo/bar` and `/bigquery/v2/projects/foo/bar`.
 fn rewrite_path(path: &str, rewrites: &[PathRewrite]) -> String {
     let path_trimmed = path.strip_prefix('/').unwrap_or(path);
     let mut segments: Vec<String> = path_trimmed.split('/').map(String::from).collect();
@@ -176,22 +178,26 @@ fn rewrite_path(path: &str, rewrites: &[PathRewrite]) -> String {
             continue;
         }
 
-        let mut matched = true;
-        for (i, pat) in prefix_parts.iter().enumerate() {
-            if pat.starts_with('{') && pat.ends_with('}') {
-                continue;
-            }
-            if *pat != segments[i] {
-                matched = false;
-                break;
-            }
-        }
-
-        if matched {
-            for (i, pat) in prefix_parts.iter().enumerate() {
+        // Scan for the prefix at every possible offset in the path.
+        let max_start = segments.len() - prefix_parts.len();
+        for start in 0..=max_start {
+            let mut matched = true;
+            for (j, pat) in prefix_parts.iter().enumerate() {
                 if pat.starts_with('{') && pat.ends_with('}') {
-                    segments[i] = value.clone();
+                    continue;
                 }
+                if *pat != segments[start + j] {
+                    matched = false;
+                    break;
+                }
+            }
+            if matched {
+                for (j, pat) in prefix_parts.iter().enumerate() {
+                    if pat.starts_with('{') && pat.ends_with('}') {
+                        segments[start + j] = value.clone();
+                    }
+                }
+                break; // Apply the first match only.
             }
         }
     }
@@ -1074,6 +1080,37 @@ mod tests {
             "https://api.example.com/v3/projects/gateway-402/translate?lang=fr"
         );
         unsafe { std::env::remove_var("_TEST_PROJ_QS") };
+    }
+
+    #[test]
+    fn upstream_url_rewrite_prefix_not_at_start() {
+        // BigQuery case: prefix is `projects/{projectId}` but the path
+        // starts with `bigquery/v2/projects/...`. The rewrite must find
+        // the prefix at offset 2 in the segment list, not fail because
+        // segment[0] != "projects".
+        unsafe { std::env::set_var("_TEST_BQ_PROJECT", "gateway-402") };
+        let fwd = RoutingConfig::Proxy {
+            url: "https://bigquery.googleapis.com".to_string(),
+            path_rewrites: vec![PathRewrite {
+                prefix: "projects/{projectId}".to_string(),
+                env: "_TEST_BQ_PROJECT".to_string(),
+            }],
+            auth: None,
+        };
+        assert_eq!(
+            fwd.upstream_url("/bigquery/v2/projects/any-user-value/queries")
+                .unwrap(),
+            "https://bigquery.googleapis.com/bigquery/v2/projects/gateway-402/queries"
+        );
+        // Also works for nested paths after the project
+        assert_eq!(
+            fwd.upstream_url(
+                "/bigquery/v2/projects/bigquery-public-data/datasets/my_dataset/tables"
+            )
+            .unwrap(),
+            "https://bigquery.googleapis.com/bigquery/v2/projects/gateway-402/datasets/my_dataset/tables"
+        );
+        unsafe { std::env::remove_var("_TEST_BQ_PROJECT") };
     }
 
     #[test]

@@ -1,5 +1,6 @@
 mod commands;
 pub mod components;
+pub mod debugger_proxy;
 mod no_dna;
 mod output;
 pub mod tui;
@@ -56,6 +57,12 @@ struct Opts {
     /// Show verbose output (tracing logs, payment details).
     #[arg(short, long)]
     verbose: bool,
+
+    /// Launch the Payment Debugger proxy on port 1402. All MCP curl
+    /// requests are routed through it, and the PDB UI is served at
+    /// http://127.0.0.1:1402/__402/pdb/
+    #[arg(long)]
+    debugger: bool,
 }
 
 fn main() {
@@ -79,6 +86,23 @@ fn main() {
     }
 
     init_logging(config.log_format, opts.verbose);
+
+    // ── Debugger proxy ─────────────────────────────────────────────────────
+    //
+    // When `--debugger` is set, spin up a forward proxy + PDB on port 1402
+    // BEFORE launching the agent. The MCP curl tool will route through it
+    // (via PAY_DEBUGGER_PROXY env var), capturing all traffic for the PDB UI.
+    if opts.debugger {
+        match debugger_proxy::start_background() {
+            Ok(proxy_url) => {
+                // SAFETY: called before any threads that read this var.
+                unsafe { std::env::set_var("PAY_DEBUGGER_PROXY", &proxy_url) };
+            }
+            Err(e) => {
+                eprintln!("{}", format!("Debugger proxy failed: {e}").dimmed());
+            }
+        }
+    }
 
     // ── Network override + RPC URL ─────────────────────────────────────────
     //
@@ -124,6 +148,8 @@ fn main() {
             opts.command,
             Command::Setup(_)
                 | Command::Account { .. }
+                | Command::Bazaar { .. }
+                | Command::Install(_)
                 | Command::Curl(_)
                 | Command::Wget(_)
                 | Command::Fetch(_)

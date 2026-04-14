@@ -1,3 +1,4 @@
+import { useRef, useEffect, useState } from "react";
 import type { PaymentFlow } from "../types";
 import { Amount, formatUsd } from "./Amount";
 import { useConfig, explorerTokenUrl } from "../hooks/useConfig";
@@ -89,7 +90,82 @@ const COLORS = [
   "#f85149",
 ];
 
-export function PaymentSplits({ flow }: { flow: PaymentFlow }) {
+const GRAYS = [
+  "#6e7681",
+  "#848d97",
+  "#8b949e",
+  "#6e7681",
+  "#848d97",
+  "#8b949e",
+  "#6e7681",
+];
+
+type RibbonData = {
+  recipient: Recipient;
+  thickness: number;
+  srcTop: number;
+  srcBottom: number;
+  destTop: number;
+  destBottom: number;
+  color: string;
+};
+
+function renderSplitsSvg(
+  ribbons: RibbonData[],
+  recipBars: { top: number; center: number }[],
+  palette: string[],
+  BAR_W: number,
+  SVG_W: number,
+  SENDER_BAR_H: number,
+  RECIP_BAR_H: number,
+  TOTAL_H: number,
+  BRANCH_X_FRAC: number,
+  prefix: string,
+) {
+  return (
+    <svg className="splits-svg" width={SVG_W} height={TOTAL_H} viewBox={`0 0 ${SVG_W} ${TOTAL_H}`}>
+      <defs>
+        {ribbons.map((_, i) => (
+          <linearGradient key={i} id={`rib-${prefix}-${i}`} x1="0" x2="1">
+            <stop offset="0%" stopColor={palette[i % palette.length]} stopOpacity={prefix === "gray" ? "0.35" : "0.45"} />
+            <stop offset="50%" stopColor={palette[i % palette.length]} stopOpacity={prefix === "gray" ? "0.18" : "0.25"} />
+            <stop offset="100%" stopColor={palette[i % palette.length]} stopOpacity={prefix === "gray" ? "0.35" : "0.45"} />
+          </linearGradient>
+        ))}
+      </defs>
+      {ribbons.map((rib, i) => {
+        const x0 = BAR_W;
+        const x1 = SVG_W - BAR_W;
+        const branchX = x0 + (x1 - x0) * BRANCH_X_FRAC;
+        const cx = branchX + (x1 - branchX) * 0.5;
+        const d = `M ${x0} ${rib.srcTop} L ${branchX} ${rib.srcTop} C ${cx} ${rib.srcTop}, ${cx} ${rib.destTop}, ${x1} ${rib.destTop} L ${x1} ${rib.destBottom} C ${cx} ${rib.destBottom}, ${cx} ${rib.srcBottom}, ${branchX} ${rib.srcBottom} L ${x0} ${rib.srcBottom} Z`;
+        return <path key={i} d={d} fill={`url(#rib-${prefix}-${i})`} className="splits-ribbon" />;
+      })}
+      <rect x={0} y={0} width={BAR_W} height={SENDER_BAR_H} fill={prefix === "gray" ? "var(--fg-muted)" : "var(--accent)"} />
+      {recipBars.map((bar, i) => (
+        <rect key={i} x={SVG_W - BAR_W} y={bar.top} width={BAR_W} height={RECIP_BAR_H} fill={palette[i % palette.length]} />
+      ))}
+    </svg>
+  );
+}
+
+export function PaymentSplits({ flow, success }: { flow: PaymentFlow; success: boolean }) {
+  // Track transition from non-success → success to trigger animation
+  const prevSuccess = useRef(success);
+  const [animating, setAnimating] = useState(false);
+  // Bump key to force SVG re-mount (restarts CSS animation)
+  const [animKey, setAnimKey] = useState(0);
+
+  useEffect(() => {
+    if (success && !prevSuccess.current) {
+      setAnimating(true);
+      setAnimKey((k) => k + 1);
+      const timer = setTimeout(() => setAnimating(false), 600);
+      prevSuccess.current = true;
+      return () => clearTimeout(timer);
+    }
+    prevSuccess.current = success;
+  }, [success]);
   const config = useConfig();
   const parsed = parseChallenge(flow);
 
@@ -132,13 +208,14 @@ export function PaymentSplits({ flow }: { flow: PaymentFlow }) {
     const destTop = i * (RECIP_BAR_H + 2);
     const destBottom = destTop + RECIP_BAR_H;
 
+    const palette = success || animating ? COLORS : GRAYS;
     return {
       ...f,
       srcTop,
       srcBottom,
       destTop,
       destBottom,
-      color: COLORS[i % COLORS.length],
+      color: palette[i % palette.length],
     };
   });
 
@@ -164,52 +241,18 @@ export function PaymentSplits({ flow }: { flow: PaymentFlow }) {
           </div>
         </div>
 
-        {/* SVG */}
-        <svg className="splits-svg" width={SVG_W} height={TOTAL_H} viewBox={`0 0 ${SVG_W} ${TOTAL_H}`}>
-          <defs>
-            {ribbons.map((rib, i) => (
-              <linearGradient key={i} id={`rib-${i}`} x1="0" x2="1">
-                <stop offset="0%" stopColor={rib.color} stopOpacity="0.45" />
-                <stop offset="50%" stopColor={rib.color} stopOpacity="0.25" />
-                <stop offset="100%" stopColor={rib.color} stopOpacity="0.45" />
-              </linearGradient>
-            ))}
-          </defs>
-
-          {ribbons.map((rib, i) => {
-            const x0 = BAR_W;
-            const x1 = SVG_W - BAR_W;
-            const branchX = x0 + (x1 - x0) * BRANCH_X_FRAC;
-            const cx1 = branchX + (x1 - branchX) * 0.5;
-            const cx2 = branchX + (x1 - branchX) * 0.5;
-            const d = `
-              M ${x0} ${rib.srcTop}
-              L ${branchX} ${rib.srcTop}
-              C ${cx1} ${rib.srcTop}, ${cx2} ${rib.destTop}, ${x1} ${rib.destTop}
-              L ${x1} ${rib.destBottom}
-              C ${cx2} ${rib.destBottom}, ${cx1} ${rib.srcBottom}, ${branchX} ${rib.srcBottom}
-              L ${x0} ${rib.srcBottom}
-              Z
-            `;
-            return <path key={i} d={d} fill={`url(#rib-${i})`} className="splits-ribbon" />;
-          })}
-
-          {/* Sender bar */}
-          <rect x={0} y={0} width={BAR_W} height={SENDER_BAR_H} rx={0} fill="var(--accent)" />
-
-          {/* Recipient bars */}
-          {recipBars.map((bar, i) => (
-            <rect
-              key={i}
-              x={SVG_W - BAR_W}
-              y={bar.top}
-              width={BAR_W}
-              height={RECIP_BAR_H}
-              rx={0}
-              fill={COLORS[i % COLORS.length]}
-            />
-          ))}
-        </svg>
+        {/* SVG stack — gray base + colored overlay with CSS clip-path reveal */}
+        <div className="splits-svg-stack" style={{ width: SVG_W, height: TOTAL_H, position: "relative" }}>
+          {renderSplitsSvg(ribbons, recipBars, GRAYS, BAR_W, SVG_W, SENDER_BAR_H, RECIP_BAR_H, TOTAL_H, BRANCH_X_FRAC, "gray")}
+          {(success || animating) && (
+            <div
+              key={animKey}
+              className={`splits-color-overlay${animating ? " splits-sweeping" : ""}`}
+            >
+              {renderSplitsSvg(ribbons, recipBars, COLORS, BAR_W, SVG_W, SENDER_BAR_H, RECIP_BAR_H, TOTAL_H, BRANCH_X_FRAC, "color")}
+            </div>
+          )}
+        </div>
 
         {/* Right labels */}
         <div className="splits-right-info" style={{ height: TOTAL_H }}>

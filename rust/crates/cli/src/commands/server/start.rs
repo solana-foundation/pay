@@ -97,24 +97,36 @@ impl StartCommand {
             .and_then(|o| o.currency.clone())
             .unwrap_or_else(|| self.currency.clone());
 
-        let rpc_url = op
-            .and_then(|o| o.rpc_url.clone())
-            .or(self.rpc_url.clone())
-            .or_else(|| std::env::var("PAY_RPC_URL").ok())
-            .unwrap_or_else(|| {
-                if sandbox {
-                    pay_core::config::SANDBOX_RPC_URL.to_string()
-                } else {
-                    pay_core::config::LOCAL_RPC_URL.to_string()
-                }
-            });
-
         let network = op
             .and_then(|o| o.network.clone())
             .unwrap_or_else(|| "mainnet".to_string());
 
+        // RPC URL fallback chain. Network-aware so that `localnet`
+        // defaults to the hosted Surfpool sandbox (where ephemeral
+        // wallets can be auto-created and auto-funded). Users running
+        // a real `solana-test-validator` should set `operator.rpc_url`
+        // explicitly or pass `--rpc-url`.
+        let rpc_url = op
+            .and_then(|o| o.rpc_url.clone())
+            .or(self.rpc_url.clone())
+            .or_else(|| std::env::var("PAY_RPC_URL").ok())
+            .unwrap_or_else(|| match network.as_str() {
+                // localnet → Surfpool sandbox (lets the smart-default
+                // auto-create + auto-fund the ephemeral on first run).
+                "localnet" => pay_core::config::SANDBOX_RPC_URL.to_string(),
+                "devnet" => "https://api.devnet.solana.com".to_string(),
+                "mainnet" => "https://api.mainnet-beta.solana.com".to_string(),
+                // Unknown network → fall through to the old default.
+                _ => {
+                    if sandbox {
+                        pay_core::config::SANDBOX_RPC_URL.to_string()
+                    } else {
+                        pay_core::config::LOCAL_RPC_URL.to_string()
+                    }
+                }
+            });
+
         let fee_payer = op.map(|o| o.fee_payer).unwrap_or(false);
-        #[allow(unused_variables)]
         let signer_cfg = op.and_then(|o| o.signer.clone());
         let keypair_source_owned = keypair_source.map(|s| s.to_string());
 
@@ -126,20 +138,35 @@ impl StartCommand {
             .map_err(|e| pay_core::Error::Config(format!("Failed to create runtime: {e}")))?;
 
         rt.block_on(async {
-            // ── Resolve signer (async — needs the runtime) ──
+            // ── Resolve fee-payer signer (async — needs the runtime) ──
             //
-            // In sandbox mode, route through the network-aware accounts
-            // file: lazy-create a localnet ephemeral if one doesn't
-            // already exist. NEVER touch the keychain in sandbox mode —
-            // that's the whole point of `--sandbox`.
+            // Lookup order, first match wins:
             //
-            // In normal mode, only the GCP KMS path produces a signer
-            // here; the legacy keypair_source path stays opt-in via
-            // operator.signer in the YAML.
-            let fee_payer_signer: Option<Arc<dyn SolanaSigner>> = if sandbox {
+            //   1. **Explicit `operator.signer` in YAML** — user said
+            //      what they want, honor it. Handles GcpKms (build-
+            //      feature gated), Account (named entry in
+            //      accounts.yml), and File (JSON keypair on disk).
+            //
+            //   2. **`--sandbox` flag** — forces the localnet ephemeral
+            //      from accounts.yml regardless of network. Lazy-creates
+            //      on first use. Never touches the keychain.
+            //
+            //   3. **Throwaway network slug** (`localnet` / `devnet`) —
+            //      smart default: route through the network-aware
+            //      loader so users running `pay server start` against
+            //      a localnet/devnet spec don't have to think about
+            //      signers. Same code path as the sandbox flag.
+            //
+            //   4. **None** — leaves fee_payer_signer empty. Caught by
+            //      the early-validation guard below if `fee_payer: true`.
+            let fee_payer_signer: Option<Arc<dyn SolanaSigner>> = if let Some(ref cfg) = signer_cfg
+            {
+                Some(resolve_signer(cfg).await?)
+            } else if sandbox || matches!(network.as_str(), "localnet" | "devnet") {
+                let auto_network = if sandbox { "localnet" } else { network.as_str() };
                 let store = pay_core::accounts::FileAccountsStore::default_path();
                 let (signer, ephemeral_notice) =
-                    pay_core::signer::load_signer_for_network("localnet", &store)?;
+                    pay_core::signer::load_signer_for_network(auto_network, &store)?;
                 if let Some(resolved) = ephemeral_notice {
                     eprintln!(
                         "  {} {} {}",
@@ -153,12 +180,19 @@ impl StartCommand {
                     );
                 }
                 Some(Arc::new(signer) as Arc<dyn SolanaSigner>)
-            } else if let Some(ref cfg) = signer_cfg {
-                // Non-sandbox mode with `operator.signer` set in YAML.
-                // Handles GcpKms (gated on the gcp_kms build feature),
-                // Account (named entry in accounts.yml), and File
-                // (raw JSON keypair on disk).
-                Some(resolve_signer(cfg).await?)
+            } else if let Some(ref source) = keypair_source_owned {
+                // Mainnet (or unknown network) with no `operator.signer`
+                // block but a default keypair from `pay setup` —
+                // typically `keychain:default`. Load it once at startup
+                // with a meaningful reason string so the OS auth prompt
+                // tells the user *why* it's being asked. The same
+                // signer is then used as both the fee-payer and the
+                // recipient-pubkey source (no second load).
+                let signer = pay_core::signer::load_signer_with_reason(
+                    source,
+                    "authorize as fee payer for the gateway",
+                )?;
+                Some(Arc::new(signer) as Arc<dyn SolanaSigner>)
             } else {
                 None
             };
@@ -169,10 +203,10 @@ impl StartCommand {
             //   1. operator.recipient in YAML
             //   2. --recipient flag
             //   3. PAY_PAYMENT_RECIPIENT env var
-            //   4. fee_payer_signer's pubkey (sandbox always has one;
-            //      production has one when operator.signer is set)
-            //   5. legacy keypair source (would prompt — only reachable
-            //      in non-sandbox mode without a configured signer)
+            //   4. fee_payer_signer's pubkey — covers sandbox, throwaway-
+            //      network smart default, explicit operator.signer block,
+            //      and the legacy keypair_source fallback (all four set
+            //      fee_payer_signer above).
             let recipient = if let Some(r) = op.and_then(|o| o.recipient.as_ref()) {
                 r.clone()
             } else if let Some(r) = &self.recipient {
@@ -180,9 +214,6 @@ impl StartCommand {
             } else if let Ok(r) = std::env::var("PAY_PAYMENT_RECIPIENT") {
                 r
             } else if let Some(ref signer) = fee_payer_signer {
-                signer.pubkey().to_string()
-            } else if let Some(ref source) = keypair_source_owned {
-                let signer = pay_core::signer::load_signer(source)?;
                 signer.pubkey().to_string()
             } else {
                 return Err(pay_core::Error::Config(
@@ -212,17 +243,25 @@ impl StartCommand {
                 ));
             }
 
-            // ── Sandbox: fund the operator wallet ──
+            // ── Auto-fund the operator wallet on Surfpool ──
             //
-            // Always re-fund on every sandbox server start, NOT gated on
-            // "just created" — Surfpool's cheatcode-set balances don't
-            // survive a Surfpool restart, so an `accounts.yml` cache hit
-            // doesn't imply the wallet still has SOL/USDC on the RPC.
-            // `fund_via_surfpool` sets fixed values (100 SOL + 1000 USDC)
-            // so calling it unconditionally is idempotent and safe — it
-            // can't clobber a meaningful state because the values are
-            // always the same.
-            if sandbox && let Some(ref signer) = fee_payer_signer {
+            // Trigger when EITHER:
+            //   - the user passed `--sandbox` (explicit opt-in), or
+            //   - the resolved RPC URL points at Surfpool (the smart-
+            //     default `network: localnet` path lands here).
+            //
+            // `fund_via_surfpool` deposits a fixed amount (100 SOL +
+            // 1000 USDC) so calling it on every server start is
+            // idempotent and survives Surfpool restarts (which would
+            // otherwise wipe the cheatcode-set balances).
+            //
+            // When the RPC is a real cluster (mainnet/devnet/local
+            // validator), funding is skipped silently — the operator
+            // is responsible for funding their own wallet.
+            let looks_like_surfpool =
+                rpc_url.contains("surfnet") || rpc_url.contains("surfpool");
+            let should_fund = sandbox || looks_like_surfpool;
+            if should_fund && let Some(ref signer) = fee_payer_signer {
                 let pubkey = signer.pubkey().to_string();
                 if let Err(e) =
                     pay_core::client::sandbox::fund_via_surfpool(&rpc_url, &pubkey).await
@@ -470,7 +509,9 @@ impl StartCommand {
                                 .and_then(|v| v.to_str().ok())
                                 .is_some_and(|v| v.contains("text/html"));
                             if accepts_html {
-                                axum::response::Redirect::temporary("/__402/pdb/")
+                                axum::response::Redirect::temporary(
+                                        &format!("{}/", pay_pdb::PDB_PATH),
+                                    )
                                     .into_response()
                             } else {
                                 axum::Json(serde_json::json!({"status": "ok"})).into_response()
@@ -478,7 +519,7 @@ impl StartCommand {
                         }),
                     )
                     .nest_service(
-                        "/__402/pdb",
+                        pay_pdb::PDB_PATH,
                     pay_pdb::debugger_router(pdb.clone()),
                 );
             }

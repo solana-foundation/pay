@@ -1,4 +1,4 @@
-//! MCP server for pay — exposes curl and wget as tools with 402 payment support.
+//! MCP server for pay — exposes HTTP tools with 402 payment support.
 
 mod server;
 

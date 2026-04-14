@@ -405,6 +405,11 @@ body {
   flex-shrink: 0;
 }
 
+.seq-track circle,
+.seq-track line {
+  transition: fill 0.6s ease, stroke 0.6s ease;
+}
+
 .seq-labels {
   flex: 1;
 }
@@ -574,6 +579,28 @@ body {
   margin-bottom: 3px;
 }
 
+.splits-svg-stack {
+  flex-shrink: 0;
+}
+
+.splits-svg-stack > svg {
+  display: block;
+}
+
+.splits-color-overlay {
+  position: absolute;
+  inset: 0;
+}
+
+.splits-color-overlay.splits-sweeping {
+  animation: splits-sweep 0.6s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+
+@keyframes splits-sweep {
+  from { clip-path: inset(0 100% 0 0); }
+  to   { clip-path: inset(0 0 0 0); }
+}
+
 .splits-svg {
   flex-shrink: 0;
   display: block;
@@ -586,6 +613,7 @@ body {
 .splits-ribbon:hover {
   opacity: 0.9;
 }
+
 
 .splits-label-name {
   font-size: 12px;
