@@ -78,14 +78,13 @@ impl ReceivedFunds {
     }
 }
 
-/// Fetch SOL and all token balances via individual RPC requests.
+/// Fetch SOL and all token balances for a single pubkey.
 pub async fn get_balances(rpc_url: &str, pubkey: &str) -> crate::Result<AccountBalances> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .map_err(|e| crate::Error::Config(e.to_string()))?;
 
-    // Get SOL balance
     let sol_resp = rpc_call(
         &client,
         rpc_url,
@@ -95,18 +94,16 @@ pub async fn get_balances(rpc_url: &str, pubkey: &str) -> crate::Result<AccountB
     .await?;
     let sol_lamports = sol_resp["result"]["value"].as_u64().unwrap_or(0);
 
-    // Get token accounts from both token programs
     let mut tokens = Vec::new();
     for program_id in TOKEN_PROGRAMS {
-        let resp = rpc_call(
+        if let Ok(resp) = rpc_call(
             &client,
             rpc_url,
             "getTokenAccountsByOwner",
             serde_json::json!([pubkey, { "programId": program_id }, { "encoding": "jsonParsed", "commitment": "confirmed" }]),
         )
-        .await;
-
-        if let Ok(resp) = resp {
+        .await
+        {
             parse_token_accounts(&resp["result"], &mut tokens);
         }
     }
@@ -115,6 +112,82 @@ pub async fn get_balances(rpc_url: &str, pubkey: &str) -> crate::Result<AccountB
         sol_lamports,
         tokens,
     })
+}
+
+/// Fetch SOL and token balances for multiple pubkeys efficiently.
+///
+/// SOL balances: one `getMultipleAccounts` call for all pubkeys.
+/// Token balances: concurrent `getTokenAccountsByOwner` per pubkey.
+///
+/// Returns a map of pubkey → balances; entries absent from the map failed.
+pub async fn get_balances_batch(
+    rpc_url: &str,
+    pubkeys: &[String],
+) -> std::collections::HashMap<String, AccountBalances> {
+    if pubkeys.is_empty() {
+        return std::collections::HashMap::new();
+    }
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return std::collections::HashMap::new(),
+    };
+
+    // Initialise map with zeroed balances so every pubkey has an entry.
+    let mut balances: std::collections::HashMap<String, AccountBalances> = pubkeys
+        .iter()
+        .map(|pk| (pk.clone(), AccountBalances::default()))
+        .collect();
+
+    // ── SOL balances: one getMultipleAccounts call ────────────────────────
+    if let Ok(resp) = rpc_call(
+        &client,
+        rpc_url,
+        "getMultipleAccounts",
+        serde_json::json!([pubkeys, { "commitment": "confirmed" }]),
+    )
+    .await
+        && let Some(accounts) = resp["result"]["value"].as_array()
+    {
+        for (pk, account) in pubkeys.iter().zip(accounts.iter()) {
+            // account is null when the address has never been funded
+            let lamports = account["lamports"].as_u64().unwrap_or(0);
+            if let Some(entry) = balances.get_mut(pk) {
+                entry.sol_lamports = lamports;
+            }
+        }
+    }
+
+    // ── Token balances: concurrent getTokenAccountsByOwner ────────────────
+    let mut set = tokio::task::JoinSet::new();
+    for pk in pubkeys {
+        for program_id in TOKEN_PROGRAMS {
+            let client = client.clone();
+            let rpc = rpc_url.to_string();
+            let pk = pk.clone();
+            let program_id = *program_id;
+            set.spawn(async move {
+                let resp = rpc_call(
+                    &client,
+                    &rpc,
+                    "getTokenAccountsByOwner",
+                    serde_json::json!([pk, { "programId": program_id }, { "encoding": "jsonParsed", "commitment": "confirmed" }]),
+                )
+                .await;
+                (pk, resp)
+            });
+        }
+    }
+
+    while let Some(Ok((pk, Ok(resp)))) = set.join_next().await {
+        let entry = balances.entry(pk).or_default();
+        parse_token_accounts(&resp["result"], &mut entry.tokens);
+    }
+
+    balances
 }
 
 async fn rpc_call(
@@ -130,36 +203,27 @@ async fn rpc_call(
         "params": params,
     });
 
-    let mut last_err = None;
-    for attempt in 0..3 {
-        if attempt > 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
-        }
-        let resp = client
-            .post(rpc_url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| crate::Error::Config(format!("RPC error: {e}")))?;
+    let resp = client
+        .post(rpc_url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| crate::Error::Config(format!("RPC error: {e}")))?;
 
-        if resp.status() == 429 {
-            last_err = Some(crate::Error::Config("RPC rate limited (429)".to_string()));
-            continue;
-        }
-
-        let result: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| crate::Error::Config(format!("RPC parse error: {e}")))?;
-
-        if let Some(err) = result.get("error") {
-            return Err(crate::Error::Config(format!("RPC error: {err}")));
-        }
-
-        return Ok(result);
+    if resp.status() == 429 {
+        return Err(crate::Error::Config("RPC rate limited (429)".to_string()));
     }
 
-    Err(last_err.unwrap_or_else(|| crate::Error::Config("RPC failed".to_string())))
+    let result: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| crate::Error::Config(format!("RPC parse error: {e}")))?;
+
+    if let Some(err) = result.get("error") {
+        return Err(crate::Error::Config(format!("RPC error: {err}")));
+    }
+
+    Ok(result)
 }
 
 fn parse_token_accounts(result: &serde_json::Value, tokens: &mut Vec<TokenBalance>) {

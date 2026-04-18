@@ -16,7 +16,7 @@ use crate::commands::ToolKind;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
-use pay_core::client::balance::{AccountBalances, ReceivedFunds};
+use pay_core::client::balance::ReceivedFunds;
 use qrcode::QrCode;
 use qrcode::render::unicode;
 use ratatui::Terminal;
@@ -32,7 +32,6 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// Result from the polling thread: what changed + current totals.
 struct TopupDetected {
     received: ReceivedFunds,
-    current: AccountBalances,
 }
 
 /// What the status line should show.
@@ -48,6 +47,11 @@ enum PollStatus {
 /// Slider range: $0.00 to $15.00 in $0.50 increments = 30 steps, + 1 YOLO step = 31
 const MAX_STEPS: usize = 31;
 const STEP_AMOUNT: u64 = 500_000; // 0.50 USDC in base units (6 decimals)
+
+/// Topup amount slider: 0 = any amount, 1-25 = $1 to $25 in $1 steps
+const TOPUP_MAX_STEPS: usize = 25;
+const TOPUP_STEP_USDC: f64 = 1.0;
+const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
 const CARD_WIDTH: u16 = 36;
 const CARD_BG: Color = Color::Rgb(35, 40, 50);
@@ -108,12 +112,12 @@ fn with_terminal<T>(
 }
 
 /// Show the session setup TUI. Returns the user's session config.
-pub fn setup_session(tool: ToolKind) -> io::Result<SessionSetup> {
+pub fn setup_session(tool: ToolKind, account_name: &str) -> io::Result<SessionSetup> {
     if !std::io::IsTerminal::is_terminal(&std::io::stderr()) {
         return Ok(SessionSetup::Cancelled);
     }
 
-    with_terminal(|terminal| run(terminal, tool))
+    with_terminal(|terminal| run(terminal, tool, account_name))
 }
 
 const DEFAULT_ONRAMP_URL: &str = "https://www.coinbase.com/";
@@ -131,14 +135,14 @@ impl TopupOption {
 
     fn title(self) -> &'static str {
         match self {
-            Self::TransferFromExistingAccount => "Top-up from existing account",
+            Self::TransferFromExistingAccount => "Top-up from Mobile wallet",
             Self::BuyStablecoins => "Buy stablecoins",
         }
     }
 
     fn subtitle(self) -> &'static str {
         match self {
-            Self::TransferFromExistingAccount => "Scan or copy this Solana address",
+            Self::TransferFromExistingAccount => "Scan with any Solana wallet",
             Self::BuyStablecoins => "Choose an onramp provider",
         }
     }
@@ -187,33 +191,34 @@ impl BuyProvider {
     }
 }
 
-pub fn run_topup_flow(pubkey: &str, rpc_url: &str) -> pay_core::Result<()> {
+/// Returns `true` if funds were detected, `false` if the user dismissed.
+pub fn run_topup_flow(
+    pubkey: &str,
+    rpc_url: &str,
+    account_name: &str,
+) -> pay_core::Result<Option<ReceivedFunds>> {
     if !std::io::IsTerminal::is_terminal(&std::io::stderr()) {
         print_topup_instructions(pubkey);
-        return Ok(());
+        return Ok(None);
     }
 
-    let result = with_terminal(|terminal| run_topup(terminal, pubkey, rpc_url))?;
+    let result = with_terminal(|terminal| run_topup(terminal, pubkey, rpc_url, account_name))?;
 
-    match result {
-        Some(detected) => {
-            print_received(&detected.received, &detected.current);
-            Ok(())
-        }
-        None => Ok(()),
-    }
+    Ok(result.map(|d| d.received))
 }
 
 fn run_topup(
     terminal: &mut Terminal<CrosstermBackend<io::Stderr>>,
     pubkey: &str,
     rpc_url: &str,
+    account_name: &str,
 ) -> io::Result<Option<TopupDetected>> {
     let options = TopupOption::all();
     let providers = BuyProvider::all();
     let mut selected = 0usize;
     let mut provider_selected = 0usize;
     let mut focus = TopupFocus::Methods;
+    let mut amount_pos: usize = 10; // default $10
     let started_at = Instant::now();
 
     // Fetch initial balances (best-effort; skip polling if RPC is unreachable)
@@ -256,7 +261,7 @@ fn run_topup(
                     {
                         let received = current.diff_received(&initial);
                         if received.has_any() {
-                            let _ = tx.send(TopupDetected { received, current });
+                            let _ = tx.send(TopupDetected { received });
                             return;
                         }
                     }
@@ -286,12 +291,14 @@ fn run_topup(
                 frame,
                 area,
                 pubkey,
+                account_name,
                 &options,
                 selected,
                 &providers,
                 provider_selected,
                 focus,
                 &status,
+                amount_pos,
             );
         })?;
 
@@ -319,10 +326,21 @@ fn run_topup(
                     provider_selected += 1
                 }
                 KeyCode::Down => {}
-                KeyCode::Left => focus = TopupFocus::Methods,
-                KeyCode::Right if options[selected] == TopupOption::BuyStablecoins => {
-                    focus = TopupFocus::Providers;
+                KeyCode::Left => {
+                    if options[selected] == TopupOption::TransferFromExistingAccount {
+                        amount_pos = amount_pos.saturating_sub(1);
+                    } else {
+                        focus = TopupFocus::Methods;
+                    }
                 }
+                KeyCode::Right => match options[selected] {
+                    TopupOption::TransferFromExistingAccount => {
+                        if amount_pos < TOPUP_MAX_STEPS {
+                            amount_pos += 1;
+                        }
+                    }
+                    TopupOption::BuyStablecoins => focus = TopupFocus::Providers,
+                },
                 KeyCode::Enter => {
                     if options[selected] == TopupOption::BuyStablecoins
                         && focus == TopupFocus::Providers
@@ -351,12 +369,14 @@ fn render_topup_selector(
     frame: &mut ratatui::Frame,
     area: Rect,
     pubkey: &str,
+    account_name: &str,
     options: &[TopupOption],
     selected: usize,
     providers: &[BuyProvider],
     provider_selected: usize,
     focus: TopupFocus,
     status: &PollStatus,
+    amount_pos: usize,
 ) {
     frame.render_widget(
         Block::default().style(Style::default().bg(TOPUP_MAIN_BG)),
@@ -461,42 +481,83 @@ fn render_topup_selector(
 
     let active = options[selected];
     match active {
-        TopupOption::TransferFromExistingAccount => render_qr_detail(frame, right[1], pubkey),
+        TopupOption::TransferFromExistingAccount => {
+            render_qr_detail(frame, right[1], pubkey, account_name, amount_pos)
+        }
         TopupOption::BuyStablecoins => {
             render_provider_list(frame, right[1], providers, provider_selected, focus)
         }
     }
 
-    render_topup_controls(frame, chunks[1], false, status);
+    render_topup_controls(frame, chunks[1], active, status);
 }
 
-fn render_qr_detail(frame: &mut ratatui::Frame, area: Rect, pubkey: &str) {
-    let qr_lines = render_qr(pubkey).unwrap_or_else(|_| {
+fn render_qr_detail(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    pubkey: &str,
+    account_name: &str,
+    amount_pos: usize,
+) {
+    // Reserve slider space first so the QR gets whatever remains.
+    let split = Layout::vertical([Constraint::Min(0), Constraint::Length(5)]).split(area);
+
+    let url = solana_pay_url(pubkey, amount_pos);
+    let qr_lines = render_qr(&url).unwrap_or_else(|_| {
         vec![Line::from(Span::styled(
             "QR unavailable",
             Style::default().fg(Color::DarkGray),
         ))]
     });
-    let content = Layout::vertical([
+    let qr_area = Layout::vertical([
         Constraint::Min(0),
         Constraint::Length(qr_lines.len() as u16),
-        Constraint::Length(1),
-        Constraint::Length(1),
         Constraint::Min(0),
     ])
-    .split(area);
+    .split(split[0]);
 
-    let qr = Paragraph::new(qr_lines).centered();
-    frame.render_widget(qr, content[1]);
+    frame.render_widget(Paragraph::new(qr_lines).centered(), qr_area[1]);
 
-    let pubkey_line = Paragraph::new(Line::from(Span::styled(
-        pubkey,
-        Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::DIM),
-    )))
-    .centered();
-    frame.render_widget(pubkey_line, content[3]);
+    let amount_str = if amount_pos == 0 {
+        "any".to_string()
+    } else {
+        format!("${:.0}", amount_pos as f64 * TOPUP_STEP_USDC)
+    };
+    let title = Line::from(vec![
+        Span::raw(" Send "),
+        Span::styled(
+            amount_str,
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" to account "),
+        Span::styled(
+            format!("@{account_name}"),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+    ]);
+    render_slider_box(
+        frame,
+        split[1],
+        title,
+        amount_pos,
+        TOPUP_MAX_STEPS,
+        &["any", "$5", "$10", "$25"],
+        false,
+    );
+}
+
+fn solana_pay_url(pubkey: &str, amount_pos: usize) -> String {
+    if amount_pos > 0 {
+        let amount = (amount_pos as f64) * TOPUP_STEP_USDC;
+        format!("solana:{pubkey}?amount={amount}&spl-token={USDC_MINT}")
+    } else {
+        format!("solana:{pubkey}?spl-token={USDC_MINT}")
+    }
 }
 
 fn render_provider_list(
@@ -556,7 +617,7 @@ fn render_provider_list(
 }
 
 fn render_qr(data: &str) -> Result<Vec<Line<'static>>, qrcode::types::QrError> {
-    let code = QrCode::new(data.as_bytes())?;
+    let code = QrCode::with_error_correction_level(data.as_bytes(), qrcode::EcLevel::L)?;
     let rendered = code
         .render::<unicode::Dense1x2>()
         .dark_color(unicode::Dense1x2::Dark)
@@ -578,27 +639,28 @@ fn render_qr(data: &str) -> Result<Vec<Line<'static>>, qrcode::types::QrError> {
 fn render_topup_controls(
     frame: &mut ratatui::Frame,
     area: Rect,
-    in_detail: bool,
+    active: TopupOption,
     status: &PollStatus,
 ) {
-    let mut spans = if in_detail {
-        vec![
-            Span::styled("Enter", Style::default().fg(Color::Green).bold()),
-            Span::styled(" done  │  ", Style::default().dim()),
+    let mut spans = match active {
+        TopupOption::TransferFromExistingAccount => vec![
+            Span::styled("↑ ↓", Style::default().fg(Color::Cyan).bold()),
+            Span::styled(" move  │  ", Style::default().dim()),
+            Span::styled("← →", Style::default().fg(Color::Cyan).bold()),
+            Span::styled(" amount  │  ", Style::default().dim()),
             Span::styled("Esc", Style::default().fg(Color::Red).bold()),
-            Span::styled(" back", Style::default().dim()),
-        ]
-    } else {
-        vec![
+            Span::styled(" skip", Style::default().dim()),
+        ],
+        TopupOption::BuyStablecoins => vec![
             Span::styled("↑ ↓", Style::default().fg(Color::Cyan).bold()),
             Span::styled(" move  │  ", Style::default().dim()),
             Span::styled("← →", Style::default().fg(Color::Cyan).bold()),
             Span::styled(" switch pane  │  ", Style::default().dim()),
             Span::styled("Enter", Style::default().fg(Color::Green).bold()),
-            Span::styled(" confirm/open  │  ", Style::default().dim()),
+            Span::styled(" open  │  ", Style::default().dim()),
             Span::styled("Esc", Style::default().fg(Color::Red).bold()),
             Span::styled(" skip", Style::default().dim()),
-        ]
+        ],
     };
 
     let status_spans = match status {
@@ -647,58 +709,6 @@ fn print_topup_instructions(pubkey: &str) {
     eprintln!("  2. Buy funds using an onramp such as Coinbase: {DEFAULT_ONRAMP_URL}");
 }
 
-fn format_balance(sol_lamports: u64, tokens: &[impl AsTokenDisplay]) -> String {
-    let mut parts = Vec::new();
-    if sol_lamports > 0 {
-        let sol = sol_lamports as f64 / 1_000_000_000.0;
-        parts.push(format!("{sol:.4} SOL"));
-    }
-    for token in tokens {
-        let label = token.display_symbol();
-        parts.push(format!("{:.2} {label}", token.display_amount()));
-    }
-    parts.join(", ")
-}
-
-trait AsTokenDisplay {
-    fn display_symbol(&self) -> &str;
-    fn display_amount(&self) -> f64;
-}
-
-impl AsTokenDisplay for pay_core::client::balance::TokenBalance {
-    fn display_symbol(&self) -> &str {
-        self.symbol.unwrap_or(&self.mint[..8])
-    }
-    fn display_amount(&self) -> f64 {
-        self.ui_amount
-    }
-}
-
-impl AsTokenDisplay for pay_core::client::balance::ReceivedToken {
-    fn display_symbol(&self) -> &str {
-        self.symbol.unwrap_or(&self.mint[..8])
-    }
-    fn display_amount(&self) -> f64 {
-        self.ui_amount
-    }
-}
-
-fn print_received(received: &ReceivedFunds, current: &AccountBalances) {
-    use owo_colors::OwoColorize;
-
-    let received_str = format_balance(received.sol_lamports, &received.tokens);
-    if !received_str.is_empty() {
-        eprint!("Received ");
-        eprintln!("{}", received_str.green());
-    }
-
-    let balance_str = format_balance(current.sol_lamports, &current.tokens);
-    if !balance_str.is_empty() {
-        eprint!("{}", "Balance: ".dimmed());
-        eprintln!("{}", balance_str.green());
-    }
-}
-
 fn open_url(url: &str) -> io::Result<()> {
     #[cfg(target_os = "macos")]
     {
@@ -719,6 +729,7 @@ fn open_url(url: &str) -> io::Result<()> {
 fn run(
     terminal: &mut Terminal<CrosstermBackend<io::Stderr>>,
     tool: ToolKind,
+    account_name: &str,
 ) -> io::Result<SessionSetup> {
     let mut budget_pos: usize = 2; // $1.00
     let mut expiry_pos: usize = 3; // 1h
@@ -727,7 +738,15 @@ fn run(
     loop {
         terminal.draw(|frame| {
             let area = frame.area();
-            render_session_setup(frame, area, budget_pos, expiry_pos, &focus, tool);
+            render_session_setup(
+                frame,
+                area,
+                budget_pos,
+                expiry_pos,
+                &focus,
+                tool,
+                account_name,
+            );
         })?;
 
         if event::poll(std::time::Duration::from_millis(50))?
@@ -797,6 +816,7 @@ fn render_session_setup(
     expiry_pos: usize,
     focus: &Focus,
     tool: ToolKind,
+    account_name: &str,
 ) {
     frame.render_widget(
         Block::default().style(Style::default().bg(TOPUP_MAIN_BG)),
@@ -812,7 +832,14 @@ fn render_session_setup(
     let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
     let columns = Layout::horizontal([Constraint::Min(0), Constraint::Length(44)]).split(chunks[0]);
 
-    render_left_panel(frame, columns[0], budget_pos, expiry_pos, focus);
+    render_left_panel(
+        frame,
+        columns[0],
+        budget_pos,
+        expiry_pos,
+        focus,
+        account_name,
+    );
     render_card_panel(frame, columns[1], budget_pos, expiry_pos, tool);
     render_controls(frame, chunks[1]);
 }
@@ -823,6 +850,7 @@ fn render_left_panel(
     budget_pos: usize,
     expiry_pos: usize,
     focus: &Focus,
+    account_name: &str,
 ) {
     let sidebar = Layout::horizontal([
         Constraint::Length(2),
@@ -854,7 +882,14 @@ fn render_left_panel(
         h[1]
     };
 
-    render_budget_box(frame, center(content[3]), budget_pos, max_w, focus);
+    render_budget_box(
+        frame,
+        center(content[3]),
+        budget_pos,
+        max_w,
+        focus,
+        account_name,
+    );
     render_expiry_box(frame, center(content[5]), expiry_pos, focus);
 }
 
@@ -862,44 +897,42 @@ fn render_budget_box(
     frame: &mut ratatui::Frame,
     area: Rect,
     position: usize,
-    box_width: u16,
+    _box_width: u16,
     focus: &Focus,
+    account_name: &str,
 ) {
-    let border_color = if *focus == Focus::Budget {
-        Color::Green
+    let is_yolo = position >= MAX_STEPS;
+    let amount_str = if is_yolo {
+        "YOLO".to_string()
     } else {
-        Color::DarkGray
+        format!("${:.0}", position as f64 * 0.5)
     };
-
-    let block = Block::default()
-        .title(" Budget ")
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border_color));
-
-    let bar_width = (box_width as usize).saturating_sub(4);
-    let num_bars = bar_width;
-    let cursor_pos = (position * num_bars).checked_div(MAX_STEPS).unwrap_or(0);
-
-    let mut bar_spans = vec![Span::raw(" ")];
-    for i in 0..num_bars {
-        let color = if i == cursor_pos {
-            bar_color(i, num_bars, true)
-        } else if i < cursor_pos {
-            bar_color(i, num_bars, false)
-        } else {
-            Color::Rgb(50, 55, 60)
-        };
-        bar_spans.push(Span::styled("▐", Style::default().fg(color)));
-    }
-
-    let lines = vec![
-        Line::default(),
-        Line::from(bar_spans),
-        Line::from(render_scale_spans(box_width)),
-    ];
-
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    let title = Line::from(vec![
+        Span::raw(" Send "),
+        Span::styled(
+            amount_str,
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" to account "),
+        Span::styled(
+            format!("@{account_name}"),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+    ]);
+    render_slider_box(
+        frame,
+        area,
+        title,
+        position,
+        MAX_STEPS,
+        &["$0", "$5", "$10", "$15", "YOLO"],
+        *focus == Focus::Budget,
+    );
 }
 
 fn render_expiry_box(frame: &mut ratatui::Frame, area: Rect, position: usize, focus: &Focus) {
@@ -1142,9 +1175,8 @@ fn bar_color(index: usize, total: usize, bright: bool) -> Color {
     }
 }
 
-fn render_scale_spans(box_width: u16) -> Vec<Span<'static>> {
+fn render_scale_spans(box_width: u16, labels: &[&str]) -> Vec<Span<'static>> {
     let bar_width = (box_width as usize).saturating_sub(4);
-    let labels = ["$0", "$5", "$10", "$15", "YOLO"];
 
     let mut spans = vec![Span::raw(" ")];
     for (i, label) in labels.iter().enumerate() {
@@ -1166,6 +1198,53 @@ fn render_scale_spans(box_width: u16) -> Vec<Span<'static>> {
     }
 
     spans
+}
+
+/// Generic slider bar used by both the session budget box and the topup amount box.
+fn render_slider_box<'a>(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    title: impl Into<ratatui::widgets::block::Title<'a>>,
+    position: usize,
+    max_steps: usize,
+    scale_labels: &[&str],
+    focused: bool,
+) {
+    let border_color = if focused {
+        Color::Green
+    } else {
+        Color::DarkGray
+    };
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color));
+
+    let box_width = area.width;
+    let bar_width = (box_width as usize).saturating_sub(4);
+    let cursor_pos = (position * bar_width).checked_div(max_steps).unwrap_or(0);
+
+    let mut bar_spans = vec![Span::raw(" ")];
+    for i in 0..bar_width {
+        let color = if i == cursor_pos {
+            bar_color(i, bar_width, true)
+        } else if i < cursor_pos {
+            bar_color(i, bar_width, false)
+        } else {
+            Color::Rgb(50, 55, 60)
+        };
+        bar_spans.push(Span::styled("▐", Style::default().fg(color)));
+    }
+
+    let lines = vec![
+        Line::default(),
+        Line::from(bar_spans),
+        Line::from(render_scale_spans(box_width, scale_labels)),
+    ];
+
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn render_controls(frame: &mut ratatui::Frame, area: Rect) {

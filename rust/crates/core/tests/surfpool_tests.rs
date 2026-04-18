@@ -467,8 +467,10 @@ async fn mpp_build_credential_with_surfnet() {
         let mut file = pay_core::accounts::AccountsFile::default();
         file.upsert(
             "localnet",
+            "default",
             pay_core::accounts::Account {
                 keystore: pay_core::accounts::Keystore::Ephemeral,
+                active: false,
                 pubkey: Some(payer_pubkey),
                 vault: None,
                 path: None,
@@ -476,7 +478,6 @@ async fn mpp_build_credential_with_surfnet() {
                 created_at: Some("2026-04-10T00:00:00Z".to_string()),
             },
         );
-        file.set_network("localnet", "localnet");
         let store = pay_core::accounts::MemoryAccountsStore::with_file(file);
 
         let result = client::mpp::build_credential(&challenge_clone, &store, Some("localnet"));

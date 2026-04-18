@@ -127,7 +127,7 @@ impl Command {
             Command::Solana(cmd) => std::process::exit(cmd.run(keypair_override)?),
             Command::Send(cmd) => return cmd.run(keypair_override, verbose),
             Command::Setup(cmd) => return cmd.run(),
-            Command::Topup(cmd) => return cmd.run(keypair_override),
+            Command::Topup(cmd) => return cmd.run(),
             Command::Server { command } => return command.run(keypair_override, sandbox),
             Command::Mcp => {
                 let rt = tokio::runtime::Builder::new_multi_thread()

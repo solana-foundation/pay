@@ -72,11 +72,6 @@ pub fn load_signer_for_network_with_reason(
             let signer = signer_from_account(&account, &name, reason)?;
             Ok((signer, None))
         }
-        AccountChoice::Dangling { network, name } => Err(Error::Config(format!(
-            "Network `{network}` is mapped to account `{name}` which doesn't \
-             exist in ~/.config/pay/accounts.yml. Edit the file or remove the \
-             mapping."
-        ))),
         AccountChoice::Missing => {
             if is_lazy_ephemeral_network(network) {
                 let resolved = load_or_create_ephemeral_for_network(network, store)?;
@@ -84,9 +79,8 @@ pub fn load_signer_for_network_with_reason(
                 Ok((signer, Some(resolved)))
             } else {
                 Err(Error::Config(format!(
-                    "No wallet configured for network `{network}`.\n\n\
-                     Run `pay setup` to create a wallet, or add a mapping to \
-                     ~/.config/pay/accounts.yml under `networks:`."
+                    "No account configured for network `{network}`.\n\n\
+                     Run `pay setup` to create an account."
                 )))
             }
         }
@@ -303,6 +297,7 @@ mod tests {
         full.extend_from_slice(&verifying_key.to_bytes());
         Account {
             keystore: Keystore::Ephemeral,
+            active: false,
             pubkey: Some(bs58::encode(verifying_key.to_bytes()).into_string()),
             vault: None,
             path: None,
@@ -316,8 +311,7 @@ mod tests {
         let mut file = AccountsFile::default();
         let acct = fresh_ephemeral_account();
         let expected_pubkey = acct.pubkey.clone().unwrap();
-        file.upsert("localnet", acct);
-        file.set_network("localnet", "localnet");
+        file.upsert("localnet", "default", acct);
         let store = MemoryAccountsStore::with_file(file);
 
         let (signer, ephemeral) = load_signer_for_network("localnet", &store).unwrap();
@@ -367,7 +361,7 @@ mod tests {
         let err = load_signer_for_network(MAINNET_NETWORK, &store).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("No wallet configured"),
+            msg.contains("No account configured"),
             "missing setup hint: {msg}"
         );
         assert!(msg.contains("pay setup"), "missing setup command: {msg}");
@@ -379,18 +373,14 @@ mod tests {
     }
 
     #[test]
-    fn load_signer_for_network_errors_on_dangling_mapping() {
-        // Networks map points at an account that doesn't exist.
-        let mut file = AccountsFile::default();
-        file.networks
-            .insert("localnet".to_string(), "deleted".to_string());
-        let store = MemoryAccountsStore::with_file(file);
-
-        let err = load_signer_for_network("localnet", &store).unwrap_err();
-        assert!(err.to_string().contains("doesn't exist"));
-        // Crucially, must NOT auto-create — that would silently mask
-        // the user's broken config.
-        assert_eq!(store.save_count(), 0);
+    fn load_signer_for_network_lazy_creates_when_missing() {
+        // No account for localnet → auto-create an ephemeral.
+        let store = MemoryAccountsStore::new();
+        let (_, ephemeral) = load_signer_for_network("localnet", &store).unwrap();
+        let resolved = ephemeral.expect("ephemeral creation must be reported");
+        assert!(resolved.created);
+        assert_eq!(resolved.network, "localnet");
+        assert_eq!(store.save_count(), 1);
     }
 
     #[test]

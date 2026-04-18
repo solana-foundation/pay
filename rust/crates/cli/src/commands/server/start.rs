@@ -733,14 +733,22 @@ async fn resolve_signer_with_store(
             // accounts this triggers the OS auth prompt ONCE here (at
             // server startup), then the loaded signer is reused for
             // every payment — no per-request prompt.
+            //
+            // Search mainnet first, then any other network, for the
+            // named account.
             let file = store.load()?;
-            let account = file.accounts.get(name).ok_or_else(|| {
-                pay_core::Error::Config(format!(
-                    "operator.signer.name = `{name}` does not exist in \
-                     ~/.config/pay/accounts.yml. Run `pay account ls` to see \
-                     available accounts, or `pay setup` to create one."
-                ))
-            })?;
+            let account = file
+                .accounts
+                .get(pay_core::accounts::MAINNET_NETWORK)
+                .and_then(|net| net.get(name))
+                .or_else(|| file.accounts.values().find_map(|net| net.get(name)))
+                .ok_or_else(|| {
+                    pay_core::Error::Config(format!(
+                        "operator.signer.name = `{name}` does not exist in \
+                         ~/.config/pay/accounts.yml. Run `pay account ls` to see \
+                         available accounts, or `pay setup` to create one."
+                    ))
+                })?;
             // Use the Account's load path so ephemeral entries work too.
             let signer = if account.keystore == pay_core::accounts::Keystore::Ephemeral {
                 let bytes = account.ephemeral_keypair_bytes().ok_or_else(|| {
@@ -1135,6 +1143,7 @@ mod tests {
         let pubkey = bs58::encode(&VALID_TEST_KEYPAIR_BYTES[32..]).into_string();
         let acct = Account {
             keystore: AcctKeystore::Ephemeral,
+            active: false,
             pubkey: Some(pubkey.clone()),
             vault: None,
             path: None,
@@ -1214,7 +1223,7 @@ mod tests {
         // stored inline.
         let mut file = AccountsFile::default();
         let (account, expected_pubkey) = ephemeral_account_with_known_pubkey();
-        file.upsert("test-payer", account);
+        file.upsert(pay_core::accounts::MAINNET_NETWORK, "test-payer", account);
         let store = MemoryAccountsStore::with_file(file);
 
         let cfg = SignerConfig::Account {
@@ -1250,6 +1259,7 @@ mod tests {
         let mut file = AccountsFile::default();
         let bad = Account {
             keystore: AcctKeystore::Ephemeral,
+            active: false,
             pubkey: Some("4BuiY9QUUfPoAGNJBja3JapAuVWMc9c7in6UCgyC2zPR".to_string()),
             vault: None,
             path: None,
@@ -1257,7 +1267,7 @@ mod tests {
             secret_key_b58: Some("abc".to_string()),
             created_at: Some("2026-04-10T00:00:00Z".to_string()),
         };
-        file.upsert("broken", bad);
+        file.upsert(pay_core::accounts::MAINNET_NETWORK, "broken", bad);
         let store = MemoryAccountsStore::with_file(file);
 
         let cfg = SignerConfig::Account {

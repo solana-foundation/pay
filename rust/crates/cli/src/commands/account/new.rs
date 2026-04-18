@@ -27,33 +27,40 @@ pub struct NewCommand {
 
 impl NewCommand {
     pub fn run(self) -> pay_core::Result<()> {
-        let pubkey = create_account(
+        let (pubkey, backend_name) = create_account(
             &self.name,
             self.backend.as_deref(),
             self.vault.as_deref(),
             self.force,
         )?;
         eprintln!();
-        eprintln!("  {} {pubkey}", "Your account:".dimmed());
-        eprintln!();
+
+        let config = pay_core::Config::load().unwrap_or_default();
+        let rpc_url = config
+            .rpc_url
+            .clone()
+            .unwrap_or_else(pay_core::balance::mainnet_rpc_url);
+        let received = crate::tui::run_topup_flow(&pubkey, &rpc_url, &self.name)?;
+        print_next_steps(&self.name, backend_name, received.as_ref());
         Ok(())
     }
 }
 
 /// Core account creation logic. Returns the base58 pubkey on success.
 /// Shared by `pay account new` and `pay setup`.
+/// Returns `(pubkey_b58, backend_display_name)`.
 pub fn create_account(
     name: &str,
     backend: Option<&str>,
     vault: Option<&str>,
     force: bool,
-) -> pay_core::Result<String> {
+) -> pay_core::Result<(String, &'static str)> {
     let backend_id = match backend {
         Some(b) => b.to_string(),
         None => pick_backend()?,
     };
 
-    let (ks, keystore_kind, backend_msg) = build_keystore(&backend_id, vault)?;
+    let (ks, keystore_kind, backend_display) = build_keystore(&backend_id, vault)?;
 
     if ks.exists(name) && !force {
         let pubkey = ks
@@ -61,20 +68,12 @@ pub fn create_account(
             .map_err(|e| pay_core::Error::Config(format!("{e}")))?;
         let pubkey_b58 = bs58::encode(&pubkey).into_string();
         eprintln!();
-        eprintln!("  {} {pubkey_b58}", "Your account:".dimmed());
-        eprintln!();
         eprintln!(
             "{}",
             "  Account already exists. Use --force to replace it.".dimmed()
         );
         eprintln!();
-        return Ok(pubkey_b58);
-    }
-
-    // Authenticate before generating (for backends like Apple Keychain)
-    if backend_id == "keychain" {
-        ks.authenticate("set up your payment account")
-            .map_err(|e| pay_core::Error::Config(format!("{e}")))?;
+        return Ok((pubkey_b58, backend_display));
     }
 
     let (keypair_bytes, pubkey_b58) = generate_keypair();
@@ -85,10 +84,9 @@ pub fn create_account(
         pay_core::keystore::SyncMode::ThisDeviceOnly
     };
 
-    ks.import(name, &keypair_bytes, sync)
+    let reason = format!("set up \"{}\" payment account", name);
+    ks.import_with_reason(name, &keypair_bytes, sync, &reason)
         .map_err(|e| pay_core::Error::Config(format!("{e}")))?;
-
-    eprintln!("{}", format!("  {backend_msg}").dimmed());
 
     save_account(
         name,
@@ -98,7 +96,7 @@ pub fn create_account(
         None,
     )?;
 
-    Ok(pubkey_b58)
+    Ok((pubkey_b58, backend_display))
 }
 
 fn build_keystore(
@@ -110,7 +108,7 @@ fn build_keystore(
         "keychain" => Ok((
             Keystore::apple_keychain(),
             pay_core::accounts::Keystore::AppleKeychain,
-            "Stored in macOS Keychain — Touch ID required to pay.",
+            "Apple Keychain",
         )),
         #[cfg(not(target_os = "macos"))]
         "keychain" => Err(pay_core::Error::Config(
@@ -127,7 +125,7 @@ fn build_keystore(
             Ok((
                 Keystore::gnome_keyring(),
                 pay_core::accounts::Keystore::GnomeKeyring,
-                "Stored in GNOME Keyring — password prompt required to pay.",
+                "GNOME Keyring",
             ))
         }
         #[cfg(not(target_os = "linux"))]
@@ -145,7 +143,7 @@ fn build_keystore(
             Ok((
                 Keystore::windows_hello(),
                 pay_core::accounts::Keystore::WindowsHello,
-                "Stored in Windows Credential Manager — Windows Hello required to pay.",
+                "Windows Hello",
             ))
         }
         #[cfg(not(target_os = "windows"))]
@@ -163,11 +161,7 @@ fn build_keystore(
                 Some(v) => Keystore::onepassword_with_vault(v),
                 None => Keystore::onepassword(),
             };
-            Ok((
-                ks,
-                pay_core::accounts::Keystore::OnePassword,
-                "Stored in 1Password.",
-            ))
+            Ok((ks, pay_core::accounts::Keystore::OnePassword, "1Password"))
         }
 
         other => Err(pay_core::Error::Config(format!(
@@ -190,10 +184,7 @@ pub fn pick_backend() -> pay_core::Result<String> {
     struct Opt {
         id: &'static str,
         label: String,
-        available: bool,
     }
-
-    let op_available = Keystore::onepassword_available();
 
     let mut options = Vec::new();
 
@@ -202,76 +193,58 @@ pub fn pick_backend() -> pay_core::Result<String> {
     options.push(Opt {
         id: "keychain",
         label: "macOS Keychain (Touch ID)".into(),
-        available: true,
     });
 
     #[cfg(target_os = "linux")]
     {
         let gnome_available = Keystore::gnome_keyring_available();
-        options.push(Opt {
-            id: "gnome-keyring",
-            label: if gnome_available {
-                "GNOME Keyring (password prompt)".into()
-            } else {
-                "GNOME Keyring — not available (desktop session required)".into()
-            },
-            available: gnome_available,
-        });
+        if gnome_available {
+            options.push(Opt {
+                id: "gnome-keyring",
+                label: "GNOME Keyring (password prompt)".into(),
+            });
+        }
     }
 
     #[cfg(target_os = "windows")]
     {
         let wh_available = Keystore::windows_hello_available();
+        if wh_available {
+            options.push(Opt {
+                id: "windows-hello",
+                label: "Windows Hello (fingerprint / face / PIN)".into(),
+            });
+        }
+    }
+
+    if Keystore::onepassword_available() {
         options.push(Opt {
-            id: "windows-hello",
-            label: if wh_available {
-                "Windows Hello (fingerprint / face / PIN)".into()
-            } else {
-                "Windows Hello — not configured".into()
-            },
-            available: wh_available,
+            id: "1password",
+            label: "1Password".into(),
         });
     }
 
-    options.push(Opt {
-        id: "1password",
-        label: if op_available {
-            "1Password".into()
-        } else {
-            "1Password — `op` CLI not found".into()
-        },
-        available: op_available,
-    });
-
-    let items: Vec<String> = options
-        .iter()
-        .map(|o| {
-            if o.available {
-                o.label.clone()
-            } else {
-                format!("{}", o.label.dimmed())
-            }
-        })
-        .collect();
-
-    let default = options.iter().position(|o| o.available).unwrap_or(0);
-
-    eprintln!();
-    let selection = Select::new()
-        .with_prompt("Where should pay store your keypair?")
-        .items(&items)
-        .default(default)
-        .interact()
-        .map_err(|e| pay_core::Error::Config(format!("Selection cancelled: {e}")))?;
-
-    let chosen = &options[selection];
-    if !chosen.available {
+    if options.is_empty() {
         return Err(pay_core::Error::Config(
-            "Selected backend is not available.".to_string(),
+            "No supported keystore backend is available on this system.".to_string(),
         ));
     }
 
-    Ok(chosen.id.to_string())
+    if options.len() == 1 {
+        return Ok(options.remove(0).id.to_string());
+    }
+
+    let items: Vec<String> = options.iter().map(|o| o.label.clone()).collect();
+
+    eprintln!();
+    let selection = Select::new()
+        .with_prompt("Where should pay store your secret key?")
+        .items(&items)
+        .default(0)
+        .interact()
+        .map_err(|e| pay_core::Error::Config(format!("Selection cancelled: {e}")))?;
+
+    Ok(options[selection].id.to_string())
 }
 
 pub fn save_account(
@@ -283,9 +256,11 @@ pub fn save_account(
 ) -> pay_core::Result<()> {
     let mut accounts = pay_core::accounts::AccountsFile::load()?;
     accounts.upsert(
+        pay_core::accounts::MAINNET_NETWORK,
         name,
         pay_core::accounts::Account {
             keystore,
+            active: false,
             pubkey: Some(pubkey.to_string()),
             vault,
             path,
@@ -294,6 +269,64 @@ pub fn save_account(
         },
     );
     accounts.save()
+}
+
+/// Print the post-setup summary and next-step hints.
+///
+/// Shows `✔` confirmation lines for keystore and (if funded) the received
+/// amount. Skips the topup hint when the user already funded during setup.
+pub fn print_next_steps(
+    name: &str,
+    backend_name: &str,
+    received: Option<&pay_core::client::balance::ReceivedFunds>,
+) {
+    eprintln!();
+    eprintln!(
+        "  {} Account secured in {}",
+        "✔".green(),
+        backend_name.green()
+    );
+
+    if let Some(r) = received {
+        let amount = format_received(r);
+        if !amount.is_empty() {
+            eprintln!(
+                "  {} Account initialized with {}",
+                "✔".green(),
+                amount.green()
+            );
+        }
+        eprintln!();
+        eprintln!("  {}", "Explore available APIs:".dimmed());
+        eprintln!("  {}", "$ pay bazaar ls".bold());
+    } else {
+        let topup_cmd = if name == "default" {
+            "pay topup".to_string()
+        } else {
+            format!("pay topup --account {name}")
+        };
+        eprintln!();
+        eprintln!("  {}", "Fund your account:".dimmed());
+        eprintln!("  {}", format!("$ {topup_cmd}").bold());
+        eprintln!();
+        eprintln!("  {}", "Explore available APIs:".dimmed());
+        eprintln!("  {}", "$ pay bazaar ls".bold());
+    }
+    eprintln!();
+}
+
+pub fn format_received(r: &pay_core::client::balance::ReceivedFunds) -> String {
+    if let Some(usdc) = r.tokens.iter().find(|t| t.symbol == Some("USDC")) {
+        return format!("${:.2}", usdc.ui_amount);
+    }
+    if let Some(token) = r.tokens.first() {
+        let sym = token.symbol.unwrap_or("tokens");
+        return format!("{:.2} {sym}", token.ui_amount);
+    }
+    if r.sol_lamports > 0 {
+        return format!("{:.4} SOL", r.sol_lamports as f64 / 1_000_000_000.0);
+    }
+    String::new()
 }
 
 pub fn generate_keypair() -> (Vec<u8>, String) {
