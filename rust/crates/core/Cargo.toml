@@ -67,3 +67,7 @@ required-features = ["server"]
 [[test]]
 name = "surfpool_tests"
 required-features = ["server"]
+
+[[test]]
+name = "session_surfpool_sdk_tests"
+required-features = ["server"]
