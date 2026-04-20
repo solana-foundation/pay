@@ -695,6 +695,15 @@ impl StartCommand {
                     let api = api.clone();
                     async move {
                         let (parts, body) = req.into_parts();
+                        // 404 for paths not listed in the spec — prevents OAuth2
+                        // token fetches for browser auto-requests like /favicon.ico.
+                        let path = parts.uri.path().trim_start_matches('/');
+                        if pay_core::server::metering::find_endpoint_by_path(&api, path).is_none() {
+                            return axum::response::IntoResponse::into_response((
+                                axum::http::StatusCode::NOT_FOUND,
+                                axum::Json(serde_json::json!({"error": "not_found"})),
+                            ));
+                        }
                         let bytes = axum::body::to_bytes(body, 10 * 1024 * 1024)
                             .await
                             .unwrap_or_default();

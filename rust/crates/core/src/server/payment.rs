@@ -104,22 +104,13 @@ pub async fn payment_middleware<S: PaymentState>(
     let metering_config = endpoint.and_then(|ep| ep.metering.as_ref());
 
     if metering_config.is_none() {
-        // Unknown path — not listed in the spec at all.
-        // Return 404 rather than forwarding to upstream; this prevents
-        // spurious OAuth2 token fetches (and proxy errors) for paths like
-        // /favicon.ico that browsers request automatically when opening the
-        // Payment Debugger UI.
-        if metering::find_endpoint_by_path(api, &path).is_none() {
-            return Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"error":"not_found"}"#))
-                .unwrap();
-        }
-
-        // Known path, wrong HTTP method on a respond-routed API → 404
-        // (there is no upstream to handle a method the spec doesn't define).
-        if api.routing.is_respond() && exact_match.is_none() {
+        // For respond routing with no method match: if the path exists but
+        // the method is wrong, return 404 (not pass-through, since there's
+        // no upstream to handle it).
+        if api.routing.is_respond()
+            && exact_match.is_none()
+            && metering::find_endpoint_by_path(api, &path).is_some()
+        {
             return Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .header("content-type", "application/json")

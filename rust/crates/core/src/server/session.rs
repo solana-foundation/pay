@@ -48,6 +48,12 @@ use crate::{Error, Result};
 const INTENT: &str = "session";
 const METHOD: &str = "solana";
 const DEFAULT_REALM: &str = "MPP Session";
+const FIXED_DELEGATION_CAP_OFFSET: usize = 107;
+const FIXED_DELEGATION_CAP_LEN: usize = 8;
+const FIBER_CHANNEL_DATA_SIZE: u64 = 42;
+const FIBER_CHANNEL_DEPOSIT_OFFSET: usize = 0;
+const FIBER_CHANNEL_STATUS_OFFSET: usize = 40;
+const FIBER_CHANNEL_STATUS_OPEN: u8 = 0;
 
 // ── Multi-delegate chain interface ─────────────────────────────────────────
 
@@ -182,6 +188,43 @@ fn normalize_pull_setup_reason(reason: &str) -> String {
     reason.replace("initMultiDelegateTx", "initDelegationTx")
 }
 
+fn parse_fixed_delegation_cap(data: &[u8]) -> Option<u64> {
+    let bytes =
+        data.get(FIXED_DELEGATION_CAP_OFFSET..FIXED_DELEGATION_CAP_OFFSET + FIXED_DELEGATION_CAP_LEN)?;
+    let bytes: [u8; FIXED_DELEGATION_CAP_LEN] = bytes.try_into().ok()?;
+    Some(u64::from_le_bytes(bytes))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FiberChannelAccountState {
+    account_already_exists: bool,
+    existing_deposit: Option<u64>,
+    existing_status: Option<u8>,
+    already_open: bool,
+}
+
+fn inspect_existing_fiber_channel(data: Option<&[u8]>) -> FiberChannelAccountState {
+    let account_already_exists =
+        data.is_some_and(|bytes| bytes.len() == FIBER_CHANNEL_DATA_SIZE as usize);
+    let existing_deposit = data.and_then(|bytes| {
+        let bytes = bytes.get(FIBER_CHANNEL_DEPOSIT_OFFSET..FIBER_CHANNEL_DEPOSIT_OFFSET + 8)?;
+        let mut amount = [0u8; 8];
+        amount.copy_from_slice(bytes);
+        Some(u64::from_le_bytes(amount))
+    });
+    let existing_status = data.and_then(|bytes| bytes.get(FIBER_CHANNEL_STATUS_OFFSET).copied());
+    let already_open = account_already_exists
+        && existing_deposit.unwrap_or(0) > 0
+        && existing_status == Some(FIBER_CHANNEL_STATUS_OPEN);
+
+    FiberChannelAccountState {
+        account_already_exists,
+        existing_deposit,
+        existing_status,
+        already_open,
+    }
+}
+
 // ── RPC-backed multi-delegate chain ───────────────────────────────────────────
 
 /// [`MultiDelegateChain`] implementation backed by a live Solana RPC endpoint.
@@ -246,12 +289,13 @@ impl MultiDelegateChain for RpcMultiDelegateChain {
                 let multi_delegate_exists = accounts[0].is_some();
 
                 // FixedDelegation account layout:
-                //   [0..107]  Header (disc + version + bump + delegator[32] + delegatee[32] + payer[32] + init_id[8])
-                //   [107..115] amount: u64
-                let existing_delegation_cap = accounts[1].as_ref().and_then(|acct| {
-                    let bytes: [u8; 8] = acct.data[107..115].try_into().ok()?;
-                    Some(u64::from_le_bytes(bytes))
-                });
+                //   [0..107]   header
+                //   [107..115] delegated amount: u64
+                // RPC account data is untrusted here, so malformed or short
+                // accounts must not panic the gateway.
+                let existing_delegation_cap = accounts[1]
+                    .as_ref()
+                    .and_then(|acct| parse_fixed_delegation_cap(&acct.data));
 
                 tracing::info!(
                     %owner_str,
@@ -462,11 +506,7 @@ async fn submit_channel_opens(
     use solana_system_interface::instruction as system_instruction;
     use solana_transaction::Transaction;
 
-    const FIBER_CHANNEL_DATA_SIZE: u64 = 42;
     const IX_OPEN: u8 = 0;
-    const CHANNEL_DEPOSIT_OFFSET: usize = 0;
-    const CHANNEL_STATUS_OFFSET: usize = 40;
-    const STATUS_OPEN: u8 = 0;
 
     if batch.is_empty() {
         return Ok(());
@@ -486,40 +526,25 @@ async fn submit_channel_opens(
             .map_err(|e| Error::Mpp(format!("failed to derive Fiber channel address: {e}")))?;
 
         let existing_account = rpc.get_account(&channel).ok();
-        let account_already_exists = existing_account
-            .as_ref()
-            .is_some_and(|account| account.data.len() == FIBER_CHANNEL_DATA_SIZE as usize);
-        let existing_deposit = existing_account.as_ref().and_then(|account| {
-            (account.data.len() > CHANNEL_DEPOSIT_OFFSET + 8).then(|| {
-                let mut bytes = [0u8; 8];
-                bytes.copy_from_slice(
-                    &account.data[CHANNEL_DEPOSIT_OFFSET..CHANNEL_DEPOSIT_OFFSET + 8],
-                );
-                u64::from_le_bytes(bytes)
-            })
-        });
-        let existing_status = existing_account
-            .as_ref()
-            .and_then(|account| account.data.get(CHANNEL_STATUS_OFFSET).copied());
-        let already_open = account_already_exists
-            && existing_deposit.unwrap_or(0) > 0
-            && existing_status == Some(STATUS_OPEN);
+        let existing_state = inspect_existing_fiber_channel(
+            existing_account.as_ref().map(|account| account.data.as_slice()),
+        );
 
         tracing::info!(
             owner = %item.owner,
             token_account = %item.token_account,
             %channel,
             seed,
-            create_account = !account_already_exists,
-            already_open,
+            create_account = !existing_state.account_already_exists,
+            already_open = existing_state.already_open,
             existing_owner = ?existing_account.as_ref().map(|account| account.owner.to_string()),
             existing_lamports = ?existing_account.as_ref().map(|account| account.lamports),
-            existing_deposit,
-            existing_status,
+            existing_deposit = existing_state.existing_deposit,
+            existing_status = existing_state.existing_status,
             "prepared Fiber channel-open item"
         );
 
-        if already_open {
+        if existing_state.already_open {
             tracing::info!(
                 owner = %item.owner,
                 token_account = %item.token_account,
@@ -529,7 +554,7 @@ async fn submit_channel_opens(
             continue;
         }
 
-        if !account_already_exists {
+        if !existing_state.account_already_exists {
             instructions.push(system_instruction::create_account_with_seed(
                 &operator,
                 &channel,
@@ -1257,6 +1282,92 @@ mod tests {
         assert_ne!(init, update);
     }
 
+    #[test]
+    fn normalize_pull_setup_reason_renames_init_payload() {
+        assert_eq!(
+            normalize_pull_setup_reason("missing initMultiDelegateTx"),
+            "missing initDelegationTx"
+        );
+    }
+
+    #[test]
+    fn parse_fixed_delegation_cap_reads_expected_offset() {
+        let mut data = vec![0u8; FIXED_DELEGATION_CAP_OFFSET + FIXED_DELEGATION_CAP_LEN];
+        data[FIXED_DELEGATION_CAP_OFFSET..FIXED_DELEGATION_CAP_OFFSET + FIXED_DELEGATION_CAP_LEN]
+            .copy_from_slice(&CAP.to_le_bytes());
+        assert_eq!(parse_fixed_delegation_cap(&data), Some(CAP));
+    }
+
+    #[test]
+    fn parse_fixed_delegation_cap_rejects_short_data() {
+        let data = vec![0u8; FIXED_DELEGATION_CAP_OFFSET + FIXED_DELEGATION_CAP_LEN - 1];
+        assert_eq!(parse_fixed_delegation_cap(&data), None);
+    }
+
+    #[test]
+    fn inspect_existing_fiber_channel_detects_open_channel() {
+        let mut data = vec![0u8; FIBER_CHANNEL_DATA_SIZE as usize];
+        data[FIBER_CHANNEL_DEPOSIT_OFFSET..FIBER_CHANNEL_DEPOSIT_OFFSET + 8]
+            .copy_from_slice(&123u64.to_le_bytes());
+        data[FIBER_CHANNEL_STATUS_OFFSET] = FIBER_CHANNEL_STATUS_OPEN;
+
+        assert_eq!(
+            inspect_existing_fiber_channel(Some(&data)),
+            FiberChannelAccountState {
+                account_already_exists: true,
+                existing_deposit: Some(123),
+                existing_status: Some(FIBER_CHANNEL_STATUS_OPEN),
+                already_open: true,
+            }
+        );
+    }
+
+    #[test]
+    fn inspect_existing_fiber_channel_rejects_short_or_closed_accounts() {
+        let short = vec![0u8; 4];
+        assert_eq!(
+            inspect_existing_fiber_channel(Some(&short)),
+            FiberChannelAccountState {
+                account_already_exists: false,
+                existing_deposit: None,
+                existing_status: None,
+                already_open: false,
+            }
+        );
+
+        let mut closed = vec![0u8; FIBER_CHANNEL_DATA_SIZE as usize];
+        closed[FIBER_CHANNEL_DEPOSIT_OFFSET..FIBER_CHANNEL_DEPOSIT_OFFSET + 8]
+            .copy_from_slice(&123u64.to_le_bytes());
+        closed[FIBER_CHANNEL_STATUS_OFFSET] = 9;
+        let state = inspect_existing_fiber_channel(Some(&closed));
+        assert!(state.account_already_exists);
+        assert_eq!(state.existing_deposit, Some(123));
+        assert_eq!(state.existing_status, Some(9));
+        assert!(!state.already_open);
+    }
+
+    #[test]
+    fn fiber_channel_seed_is_deterministic_and_input_sensitive() {
+        let first = fiber_channel_seed("owner-a", "token-a");
+        let second = fiber_channel_seed("owner-a", "token-a");
+        let different = fiber_channel_seed("owner-a", "token-b");
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 32);
+        assert_ne!(first, different);
+    }
+
+    #[test]
+    fn with_realm_updates_challenge_realm() {
+        let session = test_session_mpp().with_realm("Custom Realm");
+        let challenge = session.challenge(CAP).unwrap();
+        assert_eq!(challenge.realm, "Custom Realm");
+    }
+
+    #[test]
+    fn fetch_recent_blockhash_without_rpc_returns_none() {
+        assert_eq!(test_session_mpp().fetch_recent_blockhash(), None);
+    }
+
     #[tokio::test]
     async fn process_rejects_non_session_intent() {
         let session = test_session_mpp();
@@ -1359,9 +1470,184 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn challenge_header_formats_session_challenge() {
+        let header = test_session_mpp().challenge_header(CAP).unwrap();
+        let challenge = solana_mpp::parse_www_authenticate(&header).unwrap();
+        assert_eq!(challenge.intent.as_str(), INTENT);
+        assert_eq!(challenge.method.as_str(), METHOD);
+    }
+
+    #[tokio::test]
+    async fn finalize_params_returns_error_for_unknown_channel() {
+        let err = test_session_mpp()
+            .finalize_params("missing-channel")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Failed to get finalize params"));
+    }
+
+    #[tokio::test]
     async fn run_pull_setup_skips_when_chain_not_configured() {
         let session = test_session_mpp();
         session.run_pull_setup(&no_tx_payload(CAP)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_pull_setup_rejects_invalid_pull_deposit() {
+        let session = test_session_mpp().with_multi_delegate_chain(Box::new(chain_no_pda()));
+        let mut payload = init_tx_payload(CAP);
+        payload.approved_amount = Some("not-a-number".to_string());
+        let err = session.run_pull_setup(&payload).await.unwrap_err();
+        assert!(err.to_string().contains("pull open"));
+    }
+
+    #[tokio::test]
+    async fn enqueue_channel_open_requires_batcher_and_fields() {
+        let session = test_session_mpp();
+        let state = ChannelState {
+            channel_id: "chan-1".to_string(),
+            authorized_signer: "auth-1".to_string(),
+            deposit: CAP,
+            cumulative: 0,
+            finalized: false,
+            highest_voucher_signature: None,
+            close_requested_at: None,
+            operator: Some("walletABC".to_string()),
+        };
+        session.enqueue_channel_open(&no_tx_payload(CAP), &state);
+
+        let submitted: Arc<Mutex<Vec<Vec<(String, String, u64)>>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&submitted);
+        let session = test_session_mpp().with_test_open_channel_batcher_interval(20, move |batch| {
+            let sink = Arc::clone(&sink);
+            async move {
+                sink.lock().unwrap().push(batch);
+                Ok(())
+            }
+        });
+        let mut payload = no_tx_payload(CAP);
+        payload.token_account = None;
+        session.enqueue_channel_open(&payload, &state);
+
+        sleep(Duration::from_millis(40)).await;
+        assert!(submitted.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn batcher_flushes_on_interval() {
+        let submitted: Arc<Mutex<Vec<Vec<(String, String, u64)>>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&submitted);
+        let session = test_session_mpp().with_test_open_channel_batcher_interval(20, move |batch| {
+            let sink = Arc::clone(&sink);
+            async move {
+                sink.lock().unwrap().push(batch);
+                Ok(())
+            }
+        });
+        let state = ChannelState {
+            channel_id: "chan-interval".to_string(),
+            authorized_signer: "auth-interval".to_string(),
+            deposit: CAP,
+            cumulative: 0,
+            finalized: false,
+            highest_voucher_signature: None,
+            close_requested_at: None,
+            operator: Some("walletABC".to_string()),
+        };
+
+        session.enqueue_channel_open(&no_tx_payload(CAP), &state);
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if !submitted.lock().unwrap().is_empty() {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("batch flush on interval");
+
+        let batches = submitted.lock().unwrap().clone();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            batches[0],
+            vec![("walletABC".to_string(), "tokacct111".to_string(), CAP)]
+        );
+    }
+
+    #[tokio::test]
+    async fn batcher_continues_after_submit_error() {
+        let attempts = Arc::new(Mutex::new(0usize));
+        let sink = Arc::clone(&attempts);
+        let batcher = spawn_open_channel_batcher_with_submitter(
+            Arc::new(move |_batch: Vec<ChannelOpenItem>| {
+                let sink = Arc::clone(&sink);
+                Box::pin(async move {
+                    *sink.lock().unwrap() += 1;
+                    Err(Error::Mpp("simulated batch failure".to_string()))
+                })
+            }),
+            20,
+        );
+
+        batcher.enqueue(ChannelOpenItem {
+            owner: "owner-1".to_string(),
+            token_account: "token-1".to_string(),
+            deposit: 11,
+            distribution_hash: [1; 16],
+        });
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if *attempts.lock().unwrap() >= 1 {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("first batch attempt should happen");
+
+        batcher.enqueue(ChannelOpenItem {
+            owner: "owner-2".to_string(),
+            token_account: "token-2".to_string(),
+            deposit: 22,
+            distribution_hash: [2; 16],
+        });
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if *attempts.lock().unwrap() >= 2 {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("batcher should accept later batches after an error");
+    }
+
+    #[tokio::test]
+    async fn spawn_open_channel_batcher_can_start_and_stop_without_work() {
+        use ed25519_dalek::SigningKey;
+
+        let sk = SigningKey::generate(&mut rand::thread_rng());
+        let vk = sk.verifying_key();
+        let mut kp = [0u8; 64];
+        kp[..32].copy_from_slice(sk.as_bytes());
+        kp[32..].copy_from_slice(vk.as_bytes());
+        let signer: Arc<dyn SolanaSigner> = Arc::new(MemorySigner::from_bytes(&kp).unwrap());
+        let batcher = spawn_open_channel_batcher(
+            signer,
+            "http://127.0.0.1:8899".to_string(),
+            solana_pubkey::Pubkey::new_unique(),
+            50,
+        );
+        drop(batcher);
+        sleep(Duration::from_millis(20)).await;
     }
 
     #[tokio::test]

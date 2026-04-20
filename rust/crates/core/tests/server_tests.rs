@@ -596,10 +596,11 @@ fn accounting_many_scopes() {
 // Root redirect to PDB (when debugger is active)
 // =============================================================================
 
-#[ignore = "redirect behavior depends on localhost client/runtime behavior"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn root_redirects_to_pdb_with_html_accept() {
-    // Simulates `pay server start` with debugger: root with Accept:text/html → redirect
+    // Simulates `pay server start`: root with Accept:text/html → redirect to pdb.
+    // Unlisted paths (e.g. /favicon.ico) must return 404, not forward to upstream
+    // (which would trigger spurious OAuth2 fetches).
     let api = load_respond_api();
     let mpp = Mpp::new(solana_mpp::server::Config {
         recipient: "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY".to_string(),
@@ -636,6 +637,15 @@ async fn root_redirects_to_pdb_with_html_accept() {
             let api = api.clone();
             async move {
                 let (parts, body) = req.into_parts();
+                // 404 for paths not in the spec (matches production fallback in start.rs).
+                let path = parts.uri.path().trim_start_matches('/');
+                if pay_core::server::metering::find_endpoint_by_path(&api, path).is_none() {
+                    return (
+                        axum::http::StatusCode::NOT_FOUND,
+                        axum::Json(json!({"error": "not_found"})),
+                    )
+                        .into_response();
+                }
                 let bytes = axum::body::to_bytes(body, 10 * 1024 * 1024)
                     .await
                     .unwrap_or_default();
@@ -660,7 +670,7 @@ async fn root_redirects_to_pdb_with_html_accept() {
         .build()
         .unwrap();
 
-    // HTML accept → redirect to PDB
+    // HTML accept → redirect to PDB.
     let resp = client
         .get(&url)
         .header("accept", "text/html,*/*")
@@ -670,9 +680,13 @@ async fn root_redirects_to_pdb_with_html_accept() {
     assert_eq!(resp.status(), 307);
     assert_eq!(resp.headers().get("location").unwrap(), "/__402/pdb/");
 
-    // JSON accept → 200 status
+    // JSON accept → 200 status ok.
     let resp = client.get(&url).send().await.unwrap();
     assert_eq!(resp.status(), 200);
+
+    // Unlisted path → 404, not a proxy attempt.
+    let resp = client.get(format!("{url}/favicon.ico")).send().await.unwrap();
+    assert_eq!(resp.status(), 404);
 }
 
 // =============================================================================
