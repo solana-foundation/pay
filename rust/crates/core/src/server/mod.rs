@@ -9,4 +9,7 @@ pub mod payment;
 #[cfg(feature = "server")]
 pub mod proxy;
 
+#[cfg(feature = "server")]
+pub mod session;
+
 pub use accounting::{AccountingKey, AccountingStore, InMemoryStore, current_period};

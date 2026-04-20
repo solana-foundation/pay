@@ -22,41 +22,56 @@ pub struct ExportCommand {
 
 impl ExportCommand {
     pub fn run(self, keypair_source: Option<&str>) -> pay_core::Result<()> {
-        let source = if let Some(name) = &self.name {
+        let (keypair_bytes, pubkey) = if let Some(name) = &self.name {
             let accounts = pay_core::accounts::AccountsFile::load()?;
-            let (_, account) = accounts
+            let account = accounts
                 .accounts
-                .iter()
-                .find(|(n, _)| *n == name)
+                .get(pay_core::accounts::MAINNET_NETWORK)
+                .and_then(|net| net.iter().find(|(n, _)| *n == name))
+                .map(|(_, a)| a)
                 .ok_or_else(|| pay_core::Error::Config(format!("Account '{name}' not found")))?;
-            // Ephemeral accounts can't be exported through this path —
-            // they have no external signer source. Tell the user to read
-            // the secret_key_b58 directly from accounts.yml.
-            account.signer_source(name).ok_or_else(|| {
-                pay_core::Error::Config(format!(
-                    "Account '{name}' is an ephemeral wallet — its secret key is \
-                     stored inline in ~/.config/pay/accounts.yml under the \
-                     `secret_key_b58` field"
-                ))
-            })?
+            let bytes = pay_core::signer::load_keypair_bytes_from_account_with_reason(
+                account,
+                name,
+                pay_core::accounts::MAINNET_NETWORK,
+                &format!("export {} account", name),
+            )?;
+            let pubkey = bs58::encode(&bytes[32..64]).into_string();
+            (bytes, pubkey)
         } else {
             let config = pay_core::Config::load().unwrap_or_default();
-            keypair_source
-                .map(|s| s.to_string())
-                .or_else(|| config.default_keypair_source())
-                .ok_or_else(|| {
-                    pay_core::Error::Config(
-                        "No wallet configured. Run `pay setup` first.".to_string(),
-                    )
-                })?
+            if keypair_source.is_none()
+                && let Ok(accounts) = pay_core::accounts::AccountsFile::load()
+                && let Some((name, account)) = accounts.default_account()
+            {
+                let bytes = pay_core::signer::load_keypair_bytes_from_account_with_reason(
+                    account,
+                    name,
+                    pay_core::accounts::MAINNET_NETWORK,
+                    &format!("export {} account", name),
+                )?;
+                let pubkey = bs58::encode(&bytes[32..64]).into_string();
+                (bytes, pubkey)
+            } else {
+                let src = keypair_source
+                    .map(|s| s.to_string())
+                    .or_else(|| config.default_keypair_source())
+                    .ok_or_else(|| {
+                        pay_core::Error::Config(
+                            "No account configured. Run `pay setup` first.".to_string(),
+                        )
+                    })?;
+                let bytes = reload_raw_bytes(
+                    &src,
+                    &format!(
+                        "export {} account",
+                        self.name.as_deref().unwrap_or("default")
+                    ),
+                )?;
+                let pubkey = bs58::encode(&bytes[32..64]).into_string();
+                (bytes, pubkey)
+            }
         };
-
-        let signer = pay_core::signer::load_signer(&source)?;
-
-        use solana_mpp::solana_keychain::SolanaSigner;
-        let pubkey = signer.pubkey();
-
-        let keypair_bytes = reload_raw_bytes(&source)?;
 
         let json = serde_json::to_string(&*keypair_bytes)
             .map_err(|e| pay_core::Error::Config(format!("JSON error: {e}")))?;
@@ -81,14 +96,17 @@ impl ExportCommand {
                     pay_core::Error::Config(format!("Failed to write {}: {e}", self.path))
                 })?;
             }
-            eprintln!("Exported to {} (pubkey: {})", self.path, pubkey);
+            eprintln!("Exported to {} (pubkey: {})", self.path, &pubkey);
         }
 
         Ok(())
     }
 }
 
-fn reload_raw_bytes(source: &str) -> pay_core::Result<pay_core::keystore::Zeroizing<Vec<u8>>> {
+fn reload_raw_bytes(
+    source: &str,
+    reason: &str,
+) -> pay_core::Result<pay_core::keystore::Zeroizing<Vec<u8>>> {
     // Try keystore backends
     let (backend_name, account) = if let Some(account) = source.strip_prefix("keychain:") {
         ("keychain", account)
@@ -104,7 +122,7 @@ fn reload_raw_bytes(source: &str) -> pay_core::Result<pay_core::keystore::Zeroiz
     };
 
     let ks = keystore_for_backend(backend_name)?;
-    ks.load_keypair(account, "export keypair")
+    ks.load_keypair(account, reason)
         .map_err(|e| pay_core::Error::Config(format!("{backend_name}: {e}")))
 }
 

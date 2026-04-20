@@ -12,8 +12,14 @@ use crate::{Error, Result};
 /// The outcome of running a wrapped command.
 #[derive(Debug)]
 pub enum RunOutcome {
-    /// The server returned 402 with an MPP challenge.
+    /// The server returned 402 with an MPP charge challenge.
     MppChallenge {
+        challenge: Box<mpp::Challenge>,
+        resource_url: String,
+    },
+    /// The server returned 402 with an MPP session challenge (intent="session").
+    /// Session payments require a stateful client with a Fiber channel.
+    SessionChallenge {
         challenge: Box<mpp::Challenge>,
         resource_url: String,
     },
@@ -183,6 +189,13 @@ pub(crate) fn classify_402(
     if let Some(www_auth) = headers.iter().find(|(k, _)| k == "www-authenticate")
         && let Some(challenge) = mpp::parse(&www_auth.1)
     {
+        if challenge.intent.as_str() == "session" {
+            info!(resource = resource_url, "Detected MPP session challenge");
+            return RunOutcome::SessionChallenge {
+                challenge: Box::new(challenge),
+                resource_url: resource_url.to_string(),
+            };
+        }
         info!(resource = resource_url, "Detected MPP challenge");
         return RunOutcome::MppChallenge {
             challenge: Box::new(challenge),
@@ -393,6 +406,47 @@ HTTP request sent, awaiting response...
     }
 
     #[test]
+    fn classify_402_with_session_mpp() {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        let request_json = serde_json::json!({
+            "cap": "1000000",
+            "currency": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            "network": "localnet",
+            "operator": "So11111111111111111111111111111111111111112",
+            "recipient": "So11111111111111111111111111111111111111112",
+            "modes": ["pull"]
+        });
+        let b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&request_json).unwrap());
+        let headers = vec![(
+            "www-authenticate".to_string(),
+            format!(
+                "Payment id=\"test-id\", realm=\"test\", method=\"solana\", intent=\"session\", request=\"{b64}\""
+            ),
+        )];
+
+        let outcome = classify_402(&headers, None, "https://example.com/resource");
+        assert!(matches!(outcome, RunOutcome::SessionChallenge { .. }));
+    }
+
+    #[test]
+    fn classify_402_with_x402_header() {
+        let requirements = serde_json::json!({
+            "network": "solana",
+            "cluster": "devnet",
+            "recipient": "So11111111111111111111111111111111111111112",
+            "amount": "1000000",
+            "currency": "USDC",
+            "resource": "https://example.com/resource"
+        });
+        let headers = vec![("x-payment-required".to_string(), requirements.to_string())];
+
+        let outcome = classify_402(&headers, None, "https://example.com/resource");
+        assert!(matches!(outcome, RunOutcome::X402Challenge { .. }));
+    }
+
+    #[test]
     fn classify_402_without_mpp() {
         let headers = vec![("content-type".to_string(), "text/html".to_string())];
         let outcome = classify_402(&headers, None, "https://example.com/resource");
@@ -560,6 +614,18 @@ HTTP request sent, awaiting response...
     }
 
     #[test]
+    fn find_url_returns_first_url_when_multiple_present() {
+        let args = vec![
+            "https://first.example.com".to_string(),
+            "https://second.example.com".to_string(),
+        ];
+        assert_eq!(
+            find_url_in_args(&args),
+            Some("https://first.example.com".to_string())
+        );
+    }
+
+    #[test]
     fn parse_empty_headers() {
         let (status, headers) = parse_http_headers("");
         assert_eq!(status, None);
@@ -593,6 +659,24 @@ HTTP request sent, awaiting response...
     }
 
     #[test]
+    fn parse_headers_preserves_colons_in_values() {
+        let raw = "HTTP/1.1 200 OK\r\nLocation: https://example.com/a:b\r\n\r\n";
+        let (_, headers) = parse_http_headers(raw);
+        assert_eq!(
+            headers.iter().find(|(k, _)| k == "location").unwrap().1,
+            "https://example.com/a:b"
+        );
+    }
+
+    #[test]
+    fn parse_http_headers_skips_lines_without_colon() {
+        let raw = "HTTP/1.1 200 OK\r\nnot-a-header\r\nContent-Type: text/plain\r\n\r\n";
+        let (_, headers) = parse_http_headers(raw);
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].0, "content-type");
+    }
+
+    #[test]
     fn parse_wget_empty() {
         let (status, headers) = parse_wget_headers("");
         assert_eq!(status, None);
@@ -623,6 +707,14 @@ HTTP request sent, awaiting response...
         assert_eq!(status, Some(200));
         // "not a header line" has spaces in key, should be skipped
         assert_eq!(headers.len(), 1);
+    }
+
+    #[test]
+    fn parse_wget_returns_none_when_no_http_status_seen() {
+        let stderr = "Resolving example.com... connected.";
+        let (status, headers) = parse_wget_headers(stderr);
+        assert_eq!(status, None);
+        assert!(headers.is_empty());
     }
 
     #[test]

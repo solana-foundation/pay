@@ -2,7 +2,7 @@
 
 use dialoguer::Confirm;
 use owo_colors::OwoColorize;
-use pay_core::accounts::{Account, AccountsFile, Keystore as KeystoreKind};
+use pay_core::accounts::{Account, AccountsFile, Keystore as KeystoreKind, MAINNET_NETWORK};
 use pay_core::keystore::Keystore;
 
 /// Permanently delete an account and its secret key.
@@ -11,9 +11,13 @@ use pay_core::keystore::Keystore;
 /// keystore backend and the entry from accounts.yml.
 #[derive(clap::Args)]
 pub struct DestroyCommand {
-    /// Account name to destroy. Defaults to your default account.
+    /// Account name to destroy. Defaults to "default".
     #[arg(default_value = "default")]
     pub account: String,
+
+    /// Remove from the sandbox (localnet) network instead of mainnet.
+    #[arg(long)]
+    pub sandbox: bool,
 
     /// Skip the confirmation prompt.
     #[arg(long)]
@@ -24,28 +28,46 @@ impl DestroyCommand {
     pub fn run(self) -> pay_core::Result<()> {
         let mut accounts = AccountsFile::load()?;
 
-        // If the account isn't in accounts.yml, probe keystores for legacy accounts
-        if !accounts.accounts.contains_key(&self.account)
+        let network = if self.sandbox {
+            "localnet"
+        } else {
+            MAINNET_NETWORK
+        };
+
+        // Fall back to legacy keystore probe for mainnet accounts not yet in accounts.yml.
+        let in_file = accounts
+            .accounts
+            .get(network)
+            .and_then(|net| net.get(&self.account))
+            .is_some();
+
+        if !in_file
+            && network == MAINNET_NETWORK
             && let Some(discovered) = discover_legacy_account(&self.account)
         {
-            accounts.upsert(&self.account, discovered);
+            accounts.upsert(MAINNET_NETWORK, &self.account, discovered);
         }
 
-        let entry = accounts.accounts.get(&self.account).ok_or_else(|| {
-            let available: Vec<_> = accounts.accounts.keys().map(|k| k.as_str()).collect();
-            if available.is_empty() {
-                pay_core::Error::Config(
-                    "No accounts found (checked accounts.yml, Keychain, and 1Password)."
-                        .to_string(),
-                )
-            } else {
-                pay_core::Error::Config(format!(
-                    "Account '{}' not found. Available: {}",
-                    self.account,
-                    available.join(", ")
-                ))
-            }
-        })?;
+        let entry = accounts
+            .accounts
+            .get(network)
+            .and_then(|net| net.get(&self.account))
+            .ok_or_else(|| {
+                let available: Vec<String> = accounts
+                    .accounts
+                    .get(network)
+                    .map(|net| net.keys().cloned().collect())
+                    .unwrap_or_default();
+                if available.is_empty() {
+                    pay_core::Error::Config(format!("No {network} accounts found."))
+                } else {
+                    pay_core::Error::Config(format!(
+                        "Account '{}' not found in {network}. Available: {}",
+                        self.account,
+                        available.join(", ")
+                    ))
+                }
+            })?;
 
         let _pubkey = entry
             .pubkey
@@ -56,7 +78,10 @@ impl DestroyCommand {
         // Show account list with the target in red
         super::list::print_account_list(
             &accounts,
-            Some(super::list::Highlight::Red(&self.account)),
+            Some(super::list::Highlight::Red {
+                network,
+                name: &self.account,
+            }),
         );
 
         if !self.yes {
@@ -103,47 +128,58 @@ impl DestroyCommand {
         // Delete from keystore backend
         let ks = keystore_for_kind(&keystore_kind)?;
         if let Some(ks) = ks {
-            ks.delete(&self.account)
+            let reason = format!("delete {} account", self.account);
+            ks.delete(&self.account, &reason)
                 .map_err(|e| pay_core::Error::Config(format!("{keystore_kind} delete: {e}")))?;
         } else {
-            // File-based — don't delete user-managed files
+            // File-based or ephemeral — don't delete user-managed files
             eprintln!(
                 "{}",
                 "  File-based keypair left on disk (remove it manually if needed).".dimmed()
             );
         }
 
-        // Remove from accounts.yml — also clears any network mappings
-        // pointing at this account so we never end up with dangling refs.
+        // Check if this was the active mainnet account before removing.
         let was_default = accounts
             .default_account()
             .map(|(name, _)| name == self.account)
             .unwrap_or(false);
-        accounts.remove(&self.account);
+
+        accounts.remove(MAINNET_NETWORK, &self.account);
 
         // If we deleted the mainnet-default and there are remaining
-        // accounts, prompt for a new mainnet account.
-        if was_default && !accounts.accounts.is_empty() {
-            let names: Vec<String> = accounts.accounts.keys().cloned().collect();
+        // accounts, prompt for a new active account.
+        let remaining: Vec<String> = accounts
+            .accounts
+            .get(MAINNET_NETWORK)
+            .map(|net| net.keys().cloned().collect())
+            .unwrap_or_default();
+
+        if was_default && !remaining.is_empty() {
             let has_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
             if has_tty {
                 let selection =
                     dialoguer::Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
-                        .with_prompt("Choose new default account (mainnet-beta)")
-                        .items(&names)
+                        .with_prompt("Choose new default account (mainnet)")
+                        .items(&remaining)
                         .default(0)
                         .interact()
                         .ok();
 
                 if let Some(idx) = selection {
-                    accounts.set_network(pay_core::accounts::MAINNET_NETWORK, &names[idx]);
+                    accounts.set_active(MAINNET_NETWORK, &remaining[idx]);
                 }
             }
         }
 
         accounts.save()?;
 
-        if accounts.accounts.is_empty() {
+        let mainnet_empty = accounts
+            .accounts
+            .get(MAINNET_NETWORK)
+            .is_none_or(|net| net.is_empty());
+
+        if mainnet_empty {
             eprintln!();
             eprintln!(
                 "{}",
@@ -158,7 +194,7 @@ impl DestroyCommand {
     }
 }
 
-/// Build a Keystore for the given kind, or None for File-based.
+/// Build a Keystore for the given kind, or None for File-based/Ephemeral.
 fn keystore_for_kind(kind: &KeystoreKind) -> pay_core::Result<Option<Keystore>> {
     match kind {
         #[cfg(target_os = "macos")]
@@ -200,6 +236,8 @@ fn discover_legacy_account(name: &str) -> Option<Account> {
             let pubkey = ks.pubkey(name).ok().map(|b| bs58::encode(&b).into_string());
             return Some(Account {
                 keystore: KeystoreKind::AppleKeychain,
+                active: false,
+                auth_required: Some(true),
                 pubkey,
                 vault: None,
                 path: None,
@@ -216,6 +254,8 @@ fn discover_legacy_account(name: &str) -> Option<Account> {
             let pubkey = ks.pubkey(name).ok().map(|b| bs58::encode(&b).into_string());
             return Some(Account {
                 keystore: KeystoreKind::GnomeKeyring,
+                active: false,
+                auth_required: Some(true),
                 pubkey,
                 vault: None,
                 path: None,
@@ -231,6 +271,8 @@ fn discover_legacy_account(name: &str) -> Option<Account> {
             let pubkey = ks.pubkey(name).ok().map(|b| bs58::encode(&b).into_string());
             return Some(Account {
                 keystore: KeystoreKind::OnePassword,
+                active: false,
+                auth_required: Some(true),
                 pubkey,
                 vault: None,
                 path: None,

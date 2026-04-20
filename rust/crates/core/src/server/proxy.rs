@@ -27,8 +27,11 @@ const STRIP_HEADERS: &[&str] = &[
 
 /// Resolve the effective routing for a request path.
 ///
-/// Checks if the matched endpoint has a routing override; falls back to the
-/// API-level routing config.
+/// This intentionally ignores the HTTP method. Metering/payment logic handles
+/// method-sensitive gating separately, while routing overrides remain path-based
+/// so browser payment-link and redirect flows can still inherit the endpoint's
+/// transport behavior even when the browser uses `GET` against a non-GET
+/// metered endpoint.
 pub fn resolve_routing<'a>(api: &'a ApiSpec, path: &str) -> &'a RoutingConfig {
     let trimmed = path.trim_start_matches('/');
     for ep in &api.endpoints {
@@ -473,6 +476,7 @@ mod tests {
             quotas: None,
             notes: None,
             operator: None,
+            session: None,
             recipients: std::collections::HashMap::new(),
         }
     }
@@ -745,6 +749,157 @@ mod tests {
         unsafe { std::env::remove_var("_TEST_FWD_PROJECT") };
     }
 
+    #[tokio::test]
+    async fn forward_request_injects_header_auth() {
+        use std::sync::{Arc, Mutex};
+
+        let auth_header: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let captured = Arc::clone(&auth_header);
+        let app = axum::Router::new().route(
+            "/v1/check",
+            axum::routing::get(move |headers: axum::http::HeaderMap| {
+                let captured = Arc::clone(&captured);
+                async move {
+                    *captured.lock().unwrap() = headers
+                        .get("x-api-key")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string);
+                    "ok"
+                }
+            }),
+        );
+        let (base_url, _handle) = spawn_upstream(app).await;
+
+        // SAFETY: test-only env mutation scoped to this test.
+        unsafe { std::env::set_var("_TEST_PROXY_AUTH", "secret-123") };
+        let api = ApiSpec {
+            routing: RoutingConfig::Proxy {
+                url: base_url,
+                path_rewrites: vec![],
+                auth: Some(AuthConfig::Header {
+                    key: "x-api-key".to_string(),
+                    prefix: Some("Bearer ".to_string()),
+                    value_from_env: "_TEST_PROXY_AUTH".to_string(),
+                }),
+            },
+            ..make_api("test")
+        };
+
+        let uri: Uri = "/v1/check".parse().unwrap();
+        let result =
+            forward_request(&api, Method::GET, &uri, &HeaderMap::new(), Bytes::new()).await;
+
+        unsafe { std::env::remove_var("_TEST_PROXY_AUTH") };
+
+        assert_eq!(result.unwrap().status(), StatusCode::OK);
+        assert_eq!(
+            auth_header.lock().unwrap().as_deref(),
+            Some("Bearer secret-123")
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_request_injects_query_param_auth() {
+        let app = axum::Router::new().route(
+            "/v1/check",
+            axum::routing::get(|uri: axum::http::Uri| async move {
+                uri.query().unwrap_or_default().to_string()
+            }),
+        );
+        let (base_url, _handle) = spawn_upstream(app).await;
+
+        // SAFETY: test-only env mutation scoped to this test.
+        unsafe { std::env::set_var("_TEST_PROXY_QUERY_AUTH", "qp-secret") };
+        let api = ApiSpec {
+            routing: RoutingConfig::Proxy {
+                url: base_url,
+                path_rewrites: vec![],
+                auth: Some(AuthConfig::QueryParam {
+                    key: "api_key".to_string(),
+                    value_from_env: "_TEST_PROXY_QUERY_AUTH".to_string(),
+                }),
+            },
+            ..make_api("test")
+        };
+
+        let uri: Uri = "/v1/check?existing=1".parse().unwrap();
+        let result =
+            forward_request(&api, Method::GET, &uri, &HeaderMap::new(), Bytes::new()).await;
+
+        unsafe { std::env::remove_var("_TEST_PROXY_QUERY_AUTH") };
+
+        let resp = result.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        let query = String::from_utf8(body.to_vec()).unwrap();
+        assert!(query.contains("existing=1"));
+        assert!(query.contains("api_key=qp-secret"));
+    }
+
+    #[tokio::test]
+    async fn forward_request_sets_content_length_for_empty_post() {
+        let app = axum::Router::new().route(
+            "/v1/empty",
+            axum::routing::post(|headers: axum::http::HeaderMap| async move {
+                headers
+                    .get("content-length")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string()
+            }),
+        );
+        let (base_url, _handle) = spawn_upstream(app).await;
+
+        let api = ApiSpec {
+            routing: RoutingConfig::Proxy {
+                url: base_url,
+                path_rewrites: vec![],
+                auth: None,
+            },
+            ..make_api("test")
+        };
+
+        let uri: Uri = "/v1/empty".parse().unwrap();
+        let result =
+            forward_request(&api, Method::POST, &uri, &HeaderMap::new(), Bytes::new()).await;
+
+        let resp = result.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(&body[..], b"0");
+    }
+
+    #[tokio::test]
+    async fn forward_request_oauth2_missing_env_returns_bad_gateway() {
+        let api = ApiSpec {
+            routing: RoutingConfig::Proxy {
+                url: "https://api.example.com".to_string(),
+                path_rewrites: vec![],
+                auth: Some(AuthConfig::Oauth2 {
+                    token_url: "https://oauth.example.com/token".to_string(),
+                    scopes: vec!["scope-a".to_string()],
+                    client_id_from_env: Some("_TEST_MISSING_CLIENT_ID".to_string()),
+                    client_secret_from_env: Some("_TEST_MISSING_CLIENT_SECRET".to_string()),
+                    headers: HashMap::new(),
+                }),
+            },
+            ..make_api("test")
+        };
+
+        let uri: Uri = "/v1/protected".parse().unwrap();
+        let result =
+            forward_request(&api, Method::GET, &uri, &HeaderMap::new(), Bytes::new()).await;
+
+        let err = result.unwrap_err();
+        assert_eq!(err.status(), StatusCode::BAD_GATEWAY);
+        let body = axum::body::to_bytes(err.into_body(), 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["message"]
+                .as_str()
+                .unwrap()
+                .contains("client_id env var not set")
+        );
+    }
+
     // ── resolve_routing ──────────────────────────────────────────────────
 
     #[test]
@@ -786,6 +941,29 @@ mod tests {
         });
         let r = resolve_routing(&api, "/v1/health");
         assert!(r.is_proxy());
+    }
+
+    #[test]
+    fn resolve_routing_keeps_endpoint_override_for_browser_get_on_post_path() {
+        let mut api = make_api("test");
+        api.endpoints.push(pay_types::metering::Endpoint {
+            method: pay_types::metering::HttpMethod::Post,
+            path: "v1/shared".to_string(),
+            description: None,
+            resource: None,
+            routing: Some(RoutingConfig::Respond {}),
+            metering: None,
+        });
+        api.endpoints.push(pay_types::metering::Endpoint {
+            method: pay_types::metering::HttpMethod::Get,
+            path: "v1/shared".to_string(),
+            description: None,
+            resource: None,
+            routing: None,
+            metering: None,
+        });
+
+        assert!(resolve_routing(&api, "/v1/shared").is_respond());
     }
 
     // ── forward_request with Respond routing ─────────────────────────────

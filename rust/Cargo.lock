@@ -5602,6 +5602,7 @@ dependencies = [
  "serde_yml",
  "shellexpand",
  "solana-mpp",
+ "solana-pubkey 3.0.0",
  "tempfile",
  "tokio",
  "tracing",
@@ -5616,6 +5617,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "bincode",
+ "blake3",
  "bs58",
  "ed25519-dalek 2.2.0",
  "figment",
@@ -5627,7 +5629,9 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yml",
+ "serial_test",
  "shellexpand",
+ "solana-client",
  "solana-hash 3.1.0",
  "solana-instruction 3.4.0",
  "solana-message 3.1.0",
@@ -5642,6 +5646,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "toml 0.8.23",
+ "tower",
  "tracing",
 ]
 
@@ -6934,6 +6939,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "scc"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46e6f046b7fef48e2660c57ed794263155d713de679057f2d0c169bfc6e756cc"
+dependencies = [
+ "sdd",
+]
+
+[[package]]
 name = "schannel"
 version = "0.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7028,6 +7042,12 @@ dependencies = [
  "ring",
  "untrusted 0.9.0",
 ]
+
+[[package]]
+name = "sdd"
+version = "3.0.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "490dcfcbfef26be6800d11870ff2df8774fa6e86d047e3e8c8a76b25655e41ca"
 
 [[package]]
 name = "sec1"
@@ -7302,6 +7322,32 @@ dependencies = [
  "ryu",
  "serde",
  "version_check",
+]
+
+[[package]]
+name = "serial_test"
+version = "3.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "911bd979bf1070a3f3aa7b691a3b3e9968f339ceeec89e08c280a8a22207a32f"
+dependencies = [
+ "futures-executor",
+ "futures-util",
+ "log",
+ "once_cell",
+ "parking_lot 0.12.5",
+ "scc",
+ "serial_test_derive",
+]
+
+[[package]]
+name = "serial_test_derive"
+version = "3.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0a7d91949b85b0d2fb687445e448b40d322b6b3e4af6b44a29b21d9a5f33e6d9"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -9003,11 +9049,13 @@ dependencies = [
 [[package]]
 name = "solana-mpp"
 version = "0.2.0"
-source = "git+https://github.com/solana-foundation/mpp-sdk?branch=main#edf77468ed904b6c549651c45445ad321cf13a9c"
+source = "git+https://github.com/solana-foundation/mpp-sdk?branch=main#73daceba15df61fcae9b0aee664dd9d7e01ca5c2"
 dependencies = [
  "base64 0.22.1",
  "bincode",
+ "blake3",
  "bs58",
+ "ed25519-dalek 2.2.0",
  "hmac 0.12.1",
  "reqwest 0.12.28",
  "serde",

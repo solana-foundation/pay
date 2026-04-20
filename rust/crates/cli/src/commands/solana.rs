@@ -26,18 +26,30 @@ pub struct SolanaCommand {
 
 impl SolanaCommand {
     pub fn run(self, keypair_source: Option<&str>) -> pay_core::Result<i32> {
-        let source = keypair_source
-            .map(|s| s.to_string())
-            .or_else(|| {
-                let config = pay_core::Config::load().unwrap_or_default();
-                config.default_keypair_source()
-            })
-            .ok_or_else(|| {
-                pay_core::Error::Config("No wallet configured. Run `pay setup` first.".to_string())
-            })?;
-
-        // Load the keypair bytes from whichever backend
-        let keypair_bytes = load_keypair_bytes(&source)?;
+        let keypair_bytes = if keypair_source.is_none()
+            && let Ok(accounts) = pay_core::accounts::AccountsFile::load()
+            && let Some((name, account)) = accounts.default_account()
+        {
+            pay_core::signer::load_keypair_bytes_from_account_with_reason(
+                account,
+                name,
+                pay_core::accounts::MAINNET_NETWORK,
+                "solana CLI access",
+            )?
+        } else {
+            let source = keypair_source
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    let config = pay_core::Config::load().unwrap_or_default();
+                    config.default_keypair_source()
+                })
+                .ok_or_else(|| {
+                    pay_core::Error::Config(
+                        "No account configured. Run `pay setup` first.".to_string(),
+                    )
+                })?;
+            load_keypair_bytes(&source)?
+        };
 
         // Write to a secure temp file (auto-deleted on drop)
         let dir = tempfile::tempdir()?;

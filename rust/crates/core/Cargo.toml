@@ -27,10 +27,11 @@ figment = { workspace = true }
 toml = { workspace = true }
 tempfile = { workspace = true }
 shellexpand = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["time", "sync"] }
 ed25519-dalek = { workspace = true }
 rand = { workspace = true }
 bs58 = { workspace = true }
+blake3 = { workspace = true }
 reqwest = { workspace = true }
 pay-keystore = { workspace = true }
 solana-mpp = { workspace = true }
@@ -51,6 +52,9 @@ reqwest = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 surfpool-sdk = { git = "https://github.com/solana-foundation/surfpool", branch = "feat/sdk" }
 serde_json = { workspace = true }
+tower = "0.5"
+serial_test = "3"
+solana-client = "3.1"
 
 [[test]]
 name = "metering_tests"
@@ -62,4 +66,8 @@ required-features = ["server"]
 
 [[test]]
 name = "surfpool_tests"
+required-features = ["server"]
+
+[[test]]
+name = "session_surfpool_sdk_tests"
 required-features = ["server"]

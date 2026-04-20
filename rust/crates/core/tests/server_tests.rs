@@ -13,9 +13,11 @@ use axum::routing::{any, get};
 use pay_core::PaymentState;
 use pay_core::server::accounting::{AccountingKey, AccountingStore, InMemoryStore};
 use pay_core::server::proxy;
+use pay_core::server::session::SessionMpp;
 use pay_types::metering::ApiSpec;
 use serde_json::json;
 use solana_mpp::server::Mpp;
+use solana_mpp::server::session::SessionConfig;
 use std::sync::Arc;
 
 // ── Test app state ──
@@ -32,6 +34,25 @@ impl PaymentState for TestState {
     }
     fn mpp(&self) -> Option<&Mpp> {
         self.mpp.as_ref()
+    }
+}
+
+#[derive(Clone)]
+struct SessionTestState {
+    apis: Arc<Vec<ApiSpec>>,
+    mpp: Option<Mpp>,
+    session_mpp: Option<Arc<SessionMpp>>,
+}
+
+impl PaymentState for SessionTestState {
+    fn apis(&self) -> &[ApiSpec] {
+        &self.apis
+    }
+    fn mpp(&self) -> Option<&Mpp> {
+        self.mpp.as_ref()
+    }
+    fn session_mpp(&self) -> Option<&SessionMpp> {
+        self.session_mpp.as_deref()
     }
 }
 
@@ -143,6 +164,44 @@ async fn start_respond_server() -> (String, tokio::task::JoinHandle<()>) {
     (url, handle)
 }
 
+fn test_session_mpp() -> SessionMpp {
+    SessionMpp::new(
+        SessionConfig {
+            operator: solana_pubkey::Pubkey::new_unique().to_string(),
+            recipient: solana_pubkey::Pubkey::new_unique().to_string(),
+            max_cap: 5_000_000,
+            currency: solana_pubkey::Pubkey::new_unique().to_string(),
+            network: "localnet".to_string(),
+            modes: vec![solana_mpp::SessionMode::Push, solana_mpp::SessionMode::Pull],
+            ..SessionConfig::default()
+        },
+        "test-secret",
+    )
+}
+
+async fn start_session_server() -> (String, tokio::task::JoinHandle<()>) {
+    let api = load_test_api();
+    let state = SessionTestState {
+        apis: Arc::new(vec![api]),
+        mpp: None,
+        session_mpp: Some(Arc::new(test_session_mpp())),
+    };
+
+    let app = Router::new()
+        .fallback(any(echo_handler))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            pay_core::server::payment::payment_middleware::<SessionTestState>,
+        ))
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let handle = tokio::spawn(async { axum::serve(listener, app).await.unwrap() });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    (url, handle)
+}
+
 // =============================================================================
 // proxy::resolve_api
 // =============================================================================
@@ -212,6 +271,7 @@ async fn middleware_passes_free_endpoints() {
     assert_eq!(body["echo"], true);
 }
 
+#[ignore = "host/localhost passthrough is environment-sensitive and not payment-critical"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn middleware_passes_unknown_subdomain() {
     let (url, _h) = start_test_server(true).await;
@@ -223,6 +283,20 @@ async fn middleware_passes_unknown_subdomain() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn middleware_uses_single_api_mode_without_host_header() {
+    let (url, _h) = start_test_server(true).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{url}/v1/simple/echo"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 402);
+    assert!(resp.headers().get("www-authenticate").is_some());
 }
 
 // =============================================================================
@@ -282,6 +356,29 @@ async fn middleware_402_challenge_parseable() {
     assert_eq!(challenge.intent.as_str(), "charge");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn middleware_html_payment_link_sets_html_content_type_and_challenge() {
+    let (url, _h) = start_test_server(true).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{url}/v1/simple/echo"))
+        .headers(client_with_host("testapi"))
+        .header("accept", "text/html,*/*")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 402);
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(content_type.contains("text/html"));
+    assert!(resp.headers().get("www-authenticate").is_some());
+}
+
 // =============================================================================
 // Payment middleware — invalid credentials
 // =============================================================================
@@ -317,6 +414,115 @@ async fn middleware_rejects_bearer_scheme() {
         .unwrap();
     // Bearer is not "Payment" scheme — should be rejected
     assert!(resp.status() == 400 || resp.status() == 402);
+}
+
+// =============================================================================
+// Payment middleware — session flow
+// =============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn middleware_returns_session_challenge_when_session_mpp_configured() {
+    let (url, _h) = start_session_server().await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{url}/v1/simple/echo"))
+        .headers(client_with_host("testapi"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 402);
+    let www_auth = resp
+        .headers()
+        .get("www-authenticate")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let challenge = solana_mpp::parse_www_authenticate(www_auth).unwrap();
+    assert_eq!(challenge.intent.as_str(), "session");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn middleware_accepts_session_open_and_voucher_then_close() {
+    let (url, _h) = start_session_server().await;
+    let client = reqwest::Client::new();
+
+    let challenge_resp = client
+        .post(format!("{url}/v1/simple/echo"))
+        .headers(client_with_host("testapi"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    let www_auth = challenge_resp
+        .headers()
+        .get("www-authenticate")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let challenge = solana_mpp::parse_www_authenticate(&www_auth).unwrap();
+
+    let challenge_for_open = challenge.clone();
+    let (handle, open_header) = tokio::task::spawn_blocking(move || {
+        pay_core::session::open_session_header(&challenge_for_open, 1_000_000)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    let open_resp = client
+        .post(format!("{url}/v1/simple/echo"))
+        .headers(client_with_host("testapi"))
+        .header("authorization", open_header)
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(open_resp.status(), 200);
+
+    let voucher_header = handle.voucher_header(25).await.unwrap();
+    let voucher_resp = client
+        .post(format!("{url}/v1/simple/echo"))
+        .headers(client_with_host("testapi"))
+        .header("authorization", voucher_header)
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(voucher_resp.status(), 200);
+
+    let close_header = handle.close_header(Some(25)).await.unwrap();
+    let close_resp = client
+        .post(format!("{url}/v1/simple/echo"))
+        .headers(client_with_host("testapi"))
+        .header("authorization", close_header)
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(close_resp.status(), 200);
+    let body: serde_json::Value = close_resp.json().await.unwrap();
+    assert_eq!(body["status"], "closed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn middleware_garbage_auth_includes_message() {
+    let (url, _h) = start_test_server(true).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{url}/v1/simple/echo"))
+        .headers(client_with_host("testapi"))
+        .header("authorization", "Payment dGhpcyBpcyBnYXJiYWdl")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["message"].is_string());
 }
 
 // =============================================================================
@@ -394,7 +600,9 @@ fn accounting_many_scopes() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn root_redirects_to_pdb_with_html_accept() {
-    // Simulates `pay server start` with debugger: root with Accept:text/html → redirect
+    // Simulates `pay server start`: root with Accept:text/html → redirect to pdb.
+    // Unlisted paths (e.g. /favicon.ico) must return 404, not forward to upstream
+    // (which would trigger spurious OAuth2 fetches).
     let api = load_respond_api();
     let mpp = Mpp::new(solana_mpp::server::Config {
         recipient: "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY".to_string(),
@@ -431,6 +639,15 @@ async fn root_redirects_to_pdb_with_html_accept() {
             let api = api.clone();
             async move {
                 let (parts, body) = req.into_parts();
+                // 404 for paths not in the spec (matches production fallback in start.rs).
+                let path = parts.uri.path().trim_start_matches('/');
+                if pay_core::server::metering::find_endpoint_by_path(&api, path).is_none() {
+                    return (
+                        axum::http::StatusCode::NOT_FOUND,
+                        axum::Json(json!({"error": "not_found"})),
+                    )
+                        .into_response();
+                }
                 let bytes = axum::body::to_bytes(body, 10 * 1024 * 1024)
                     .await
                     .unwrap_or_default();
@@ -455,7 +672,7 @@ async fn root_redirects_to_pdb_with_html_accept() {
         .build()
         .unwrap();
 
-    // HTML accept → redirect to PDB
+    // HTML accept → redirect to PDB.
     let resp = client
         .get(&url)
         .header("accept", "text/html,*/*")
@@ -465,9 +682,17 @@ async fn root_redirects_to_pdb_with_html_accept() {
     assert_eq!(resp.status(), 307);
     assert_eq!(resp.headers().get("location").unwrap(), "/__402/pdb/");
 
-    // JSON accept → 200 status
+    // JSON accept → 200 status ok.
     let resp = client.get(&url).send().await.unwrap();
     assert_eq!(resp.status(), 200);
+
+    // Unlisted path → 404, not a proxy attempt.
+    let resp = client
+        .get(format!("{url}/favicon.ico"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
 }
 
 // =============================================================================

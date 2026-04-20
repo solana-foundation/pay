@@ -1,39 +1,62 @@
-/// Choose how to fund your pay account.
+/// Fund your pay account.
 #[derive(clap::Args)]
 pub struct TopupCommand {
-    /// Account address to fund. Defaults to your pay account.
+    /// Account address to fund. Defaults to your mainnet account.
     #[arg(long)]
     pub account: Option<String>,
+
+    /// Fund the sandbox (localnet) account instead of mainnet.
+    #[arg(long)]
+    pub sandbox: bool,
 }
 
 impl TopupCommand {
-    pub fn run(self, keypair_source: Option<&str>) -> pay_core::Result<()> {
+    pub fn run(self) -> pay_core::Result<()> {
         let config = pay_core::Config::load().unwrap_or_default();
-        // Default to mainnet for topup — that's where real funds arrive.
-        // Respect explicit config override for dev/localnet use.
-        let rpc_url = config
-            .rpc_url
-            .clone()
-            .unwrap_or_else(pay_core::balance::mainnet_rpc_url);
 
-        let pubkey = if let Some(addr) = &self.account {
-            addr.clone()
+        let (network, rpc_url) = if self.sandbox {
+            let url = config
+                .rpc_url
+                .clone()
+                .unwrap_or_else(|| pay_core::config::SANDBOX_RPC_URL.to_string());
+            ("localnet", url)
         } else {
-            match keypair_source {
-                Some(source) => {
-                    use solana_mpp::solana_keychain::SolanaSigner;
-                    let signer = pay_core::signer::load_signer(source)?;
-                    signer.pubkey().to_string()
-                }
+            let url = config
+                .rpc_url
+                .clone()
+                .unwrap_or_else(pay_core::balance::mainnet_rpc_url);
+            (pay_core::accounts::MAINNET_NETWORK, url)
+        };
+
+        let (pubkey, account_name) = if let Some(addr) = &self.account {
+            (addr.clone(), addr.clone())
+        } else {
+            let accounts = pay_core::accounts::AccountsFile::load()?;
+            match accounts.account_for_network(network) {
+                Some((name, account)) => (
+                    account.pubkey.clone().ok_or_else(|| {
+                        pay_core::Error::Config("Account has no pubkey".to_string())
+                    })?,
+                    name.to_string(),
+                ),
                 None => {
-                    return Err(pay_core::Error::Config(
-                        "No account found. Run `pay setup` first, or use --account <address>."
-                            .to_string(),
-                    ));
+                    return Err(pay_core::Error::Config(format!(
+                        "No {network} account found. Run `pay setup` first."
+                    )));
                 }
             }
         };
 
-        crate::tui::run_topup_flow(&pubkey, &rpc_url)
+        if let Some(received) = crate::tui::run_topup_flow(&pubkey, &rpc_url, &account_name)? {
+            use owo_colors::OwoColorize;
+            eprintln!();
+            eprintln!("  {}", "Funded!".green().bold());
+            let amount = crate::commands::account::new::format_received(&received);
+            if !amount.is_empty() {
+                eprintln!("  {} {}", "✔".green(), amount.green());
+            }
+            eprintln!();
+        }
+        Ok(())
     }
 }
