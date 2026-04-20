@@ -58,6 +58,11 @@ struct Opts {
     #[arg(short, long)]
     verbose: bool,
 
+    /// Use a specific named account from `~/.config/pay/accounts.yml`.
+    /// For `--local` / `--sandbox`, this selects a wallet within `localnet`.
+    #[arg(long)]
+    account: Option<String>,
+
     /// Launch the Payment Debugger proxy on port 1402. All MCP curl
     /// requests are routed through it, and the PDB UI is served at
     /// http://127.0.0.1:1402/__402/pdb/
@@ -209,6 +214,7 @@ fn main() {
         output_fmt,
         keypair_override.as_deref(),
         network_override.as_deref(),
+        opts.account.as_deref(),
         verbose,
         sandbox_mode,
     ) {

@@ -34,6 +34,7 @@ pub fn build_payment(
     requirements: &PaymentRequirements,
     store: &dyn AccountsStore,
     network_override: Option<&str>,
+    account_override: Option<&str>,
 ) -> Result<(String, Option<ResolvedEphemeral>)> {
     let amount = format_amount(&requirements.amount, &requirements.currency);
     let desc = requirements.description.as_deref().unwrap_or("API access");
@@ -56,7 +57,13 @@ pub fn build_payment(
     let network = network_override.map(str::to_string).unwrap_or(cluster);
 
     let (signer, ephemeral_notice) =
-        crate::signer::load_signer_for_network_payment(&network, store, &amount, desc)?;
+        crate::signer::load_signer_for_network_payment(
+            &network,
+            store,
+            account_override,
+            &amount,
+            desc,
+        )?;
 
     let rpc_url =
         std::env::var("PAY_RPC_URL").unwrap_or_else(|_| default_rpc_url(&network).to_string());

@@ -43,6 +43,11 @@ pub struct ApiSpec {
     /// Named recipient aliases for use in payment splits.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub recipients: std::collections::HashMap<String, RecipientAlias>,
+    /// Session channel parameters. When set, the middleware issues a 402
+    /// with `intent="session"` and accepts signed vouchers instead of
+    /// per-request charges.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionSpec>,
 }
 
 /// How a request is handled after payment verification.
@@ -322,6 +327,43 @@ pub enum SignerConfig {
 // =============================================================================
 // Recipients & Splits
 // =============================================================================
+
+/// Session channel parameters — emitted by the server when the API
+/// is configured for MPP session payments (off-chain vouchers).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SessionSpec {
+    /// Default channel cap offered to clients (USDC, human-readable).
+    /// Clients may request a lower cap; the server will not exceed this.
+    pub cap_usdc: f64,
+    /// Minimum voucher increment (base units = µUSDC).
+    /// Prevents spam vouchers smaller than one API call's cost.
+    #[serde(default)]
+    pub min_voucher_delta: u64,
+    /// Session modes this server accepts.
+    ///
+    /// Allowed values: `"push"` (Fiber channel, client-funded) and/or
+    /// `"pull"` (SPL token delegation, operator fee-pays the approve tx).
+    ///
+    /// Defaults to `["push"]` when omitted.
+    ///
+    /// Example YAML:
+    /// ```yaml
+    /// session:
+    ///   cap_usdc: 10.0
+    ///   modes: [push, pull]
+    /// ```
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub modes: Vec<String>,
+    /// Fiber channel-open batch flush interval in milliseconds.
+    ///
+    /// Defaults to `400` when omitted.
+    #[serde(default = "default_session_batch_open_interval_ms")]
+    pub batch_open_interval_ms: u64,
+}
+
+fn default_session_batch_open_interval_ms() -> u64 {
+    400
+}
 
 /// Named recipient alias declared at the API spec level.
 /// Used in split rules to reference wallet accounts by name.
@@ -939,6 +981,7 @@ mod tests {
             notes: None,
             operator: None,
             recipients: std::collections::HashMap::new(),
+            session: None,
         };
         let json = serde_json::to_string(&spec).unwrap();
         let back: ApiSpec = serde_json::from_str(&json).unwrap();

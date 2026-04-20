@@ -4,7 +4,8 @@ use solana_mpp::solana_keychain::MemorySigner;
 
 use crate::accounts::{
     Account, AccountChoice, AccountsStore, Keystore, ResolvedEphemeral,
-    load_or_create_ephemeral_for_network, resolve_account_for_network,
+    load_or_create_ephemeral_for_network, load_or_create_ephemeral_for_network_as,
+    resolve_account_for_network,
 };
 use crate::{Error, Result};
 
@@ -56,7 +57,7 @@ pub fn load_signer_for_network(
     network: &str,
     store: &dyn AccountsStore,
 ) -> Result<(MemorySigner, Option<ResolvedEphemeral>)> {
-    load_signer_for_network_with_reason(network, store, "authorize payment")
+    load_signer_for_network_with_reason(network, store, None, "authorize payment")
 }
 
 /// Variant of [`load_signer_for_network`] that takes an explicit reason
@@ -64,9 +65,24 @@ pub fn load_signer_for_network(
 pub fn load_signer_for_network_with_reason(
     network: &str,
     store: &dyn AccountsStore,
+    account_override: Option<&str>,
     reason: &str,
 ) -> Result<(MemorySigner, Option<ResolvedEphemeral>)> {
     let file = store.load()?;
+    if let Some(name) = account_override {
+        if let Some(account) = file.named_account_for_network(network, name).cloned() {
+            let signer = signer_from_account(&account, name, reason)?;
+            return Ok((signer, None));
+        }
+        if is_lazy_ephemeral_network(network) {
+            let resolved = load_or_create_ephemeral_for_network_as(network, name, store)?;
+            let signer = signer_from_ephemeral(&resolved.account)?;
+            return Ok((signer, Some(resolved)));
+        }
+        return Err(Error::Config(format!(
+            "No account named `{name}` configured for network `{network}`."
+        )));
+    }
     match resolve_account_for_network(network, &file) {
         AccountChoice::Resolved { name, account } => {
             let signer = signer_from_account(&account, &name, reason)?;
@@ -92,11 +108,12 @@ pub fn load_signer_for_network_with_reason(
 pub fn load_signer_for_network_payment(
     network: &str,
     store: &dyn AccountsStore,
+    account_override: Option<&str>,
     amount: &str,
     desc: &str,
 ) -> Result<(MemorySigner, Option<ResolvedEphemeral>)> {
     let reason = format!("pay {amount} for {desc}");
-    load_signer_for_network_with_reason(network, store, &reason).map_err(|e| match e {
+    load_signer_for_network_with_reason(network, store, account_override, &reason).map_err(|e| match e {
         Error::PaymentRejected(where_) => {
             Error::PaymentRejected(format!("{amount} payment authorization was {where_}"))
         }

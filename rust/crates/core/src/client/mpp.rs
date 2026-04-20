@@ -36,6 +36,7 @@ pub fn build_credential(
     challenge: &Challenge,
     store: &dyn AccountsStore,
     network_override: Option<&str>,
+    account_override: Option<&str>,
 ) -> Result<(String, Option<ResolvedEphemeral>)> {
     let request: ChargeRequest = challenge
         .request
@@ -78,7 +79,13 @@ pub fn build_credential(
         .unwrap_or(challenge_network);
 
     let (signer, ephemeral_notice) =
-        crate::signer::load_signer_for_network_payment(&network, store, &amount, desc)?;
+        crate::signer::load_signer_for_network_payment(
+            &network,
+            store,
+            account_override,
+            &amount,
+            desc,
+        )?;
 
     let rpc_url =
         std::env::var("PAY_RPC_URL").unwrap_or_else(|_| default_rpc_url(&network).to_string());

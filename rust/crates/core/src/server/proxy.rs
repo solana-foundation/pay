@@ -473,6 +473,7 @@ mod tests {
             quotas: None,
             notes: None,
             operator: None,
+            session: None,
             recipients: std::collections::HashMap::new(),
         }
     }

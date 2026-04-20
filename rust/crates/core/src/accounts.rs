@@ -216,6 +216,11 @@ impl AccountsFile {
         network_accounts.iter().next().map(|(n, a)| (n.as_str(), a))
     }
 
+    /// Look up a specific named account within a network.
+    pub fn named_account_for_network(&self, network: &str, name: &str) -> Option<&Account> {
+        self.accounts.get(network)?.get(name)
+    }
+
     /// Convenience: the account mapped to mainnet — i.e. the user's
     /// "default" wallet for real-money flows. Returns `None` if no
     /// mainnet account has been configured (e.g. user hasn't run
@@ -411,41 +416,68 @@ pub fn load_or_create_ephemeral_for_network(
     network: &str,
     store: &dyn AccountsStore,
 ) -> Result<ResolvedEphemeral> {
+    load_or_create_ephemeral_for_network_as(network, DEFAULT_ACCOUNT_NAME, store)
+}
+
+/// Named variant of [`load_or_create_ephemeral_for_network`].
+pub fn load_or_create_ephemeral_for_network_as(
+    network: &str,
+    account_name: &str,
+    store: &dyn AccountsStore,
+) -> Result<ResolvedEphemeral> {
     let mut file = store.load()?;
 
-    match resolve_account_for_network(network, &file) {
-        AccountChoice::Resolved { name, account } => {
-            if account.keystore != Keystore::Ephemeral {
-                return Err(Error::Config(format!(
-                    "Network `{network}` is mapped to account `{name}` which is \
-                     `{}`-backed, not ephemeral. Resolve via the keystore loader \
-                     instead of generating a fresh wallet.",
-                    account.keystore
-                )));
-            }
-            Ok(ResolvedEphemeral {
-                network: network.to_string(),
-                account_name: name,
-                account,
-                created: false,
-            })
+    if let Some(account) = file.named_account_for_network(network, account_name).cloned() {
+        if account.keystore != Keystore::Ephemeral {
+            return Err(Error::Config(format!(
+                "Network `{network}` account `{account_name}` is \
+                 `{}`-backed, not ephemeral. Resolve via the keystore loader \
+                 instead of generating a fresh wallet.",
+                account.keystore
+            )));
         }
-        AccountChoice::Missing => {
-            let account = generate_ephemeral_account();
-            let account_name = DEFAULT_ACCOUNT_NAME.to_string();
-            file.accounts
-                .entry(network.to_string())
-                .or_default()
-                .insert(account_name.clone(), account.clone());
-            store.save(&file)?;
-            Ok(ResolvedEphemeral {
-                network: network.to_string(),
-                account_name,
-                account,
-                created: true,
-            })
+        return Ok(ResolvedEphemeral {
+            network: network.to_string(),
+            account_name: account_name.to_string(),
+            account,
+            created: false,
+        });
+    }
+
+    if account_name == DEFAULT_ACCOUNT_NAME {
+        match resolve_account_for_network(network, &file) {
+            AccountChoice::Resolved { name, account } => {
+                if account.keystore != Keystore::Ephemeral {
+                    return Err(Error::Config(format!(
+                        "Network `{network}` is mapped to account `{name}` which is \
+                         `{}`-backed, not ephemeral. Resolve via the keystore loader \
+                         instead of generating a fresh wallet.",
+                        account.keystore
+                    )));
+                }
+                return Ok(ResolvedEphemeral {
+                    network: network.to_string(),
+                    account_name: name,
+                    account,
+                    created: false,
+                });
+            }
+            AccountChoice::Missing => {}
         }
     }
+
+    let account = generate_ephemeral_account();
+    file.accounts
+        .entry(network.to_string())
+        .or_default()
+        .insert(account_name.to_string(), account.clone());
+    store.save(&file)?;
+    Ok(ResolvedEphemeral {
+        network: network.to_string(),
+        account_name: account_name.to_string(),
+        account,
+        created: true,
+    })
 }
 
 fn generate_ephemeral_account() -> Account {

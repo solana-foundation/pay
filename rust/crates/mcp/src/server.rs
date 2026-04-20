@@ -275,7 +275,7 @@ fn do_paid_fetch(
     match outcome {
         RunOutcome::MppChallenge { challenge, .. } => {
             let (auth_header, _ephemeral) =
-                pay_core::client::mpp::build_credential(&challenge, &store, None)?;
+                pay_core::client::mpp::build_credential(&challenge, &store, None, None)?;
             let mut headers = extra_headers.to_vec();
             headers.push(("Authorization".to_string(), auth_header));
             interpret_retry(pay_core::client::fetch::fetch_request(
@@ -287,7 +287,7 @@ fn do_paid_fetch(
         }
         RunOutcome::X402Challenge { requirements, .. } => {
             let (payment_header, _ephemeral) =
-                pay_core::client::x402::build_payment(&requirements, &store, None)?;
+                pay_core::client::x402::build_payment(&requirements, &store, None, None)?;
             let mut headers = extra_headers.to_vec();
             headers.push(("X-PAYMENT".to_string(), payment_header));
             interpret_retry(pay_core::client::fetch::fetch_request(
@@ -297,6 +297,9 @@ fn do_paid_fetch(
                 body.as_deref(),
             )?)
         }
+        RunOutcome::SessionChallenge { .. } => Err(pay_core::Error::Mpp(
+            "402 Payment Required (MPP session) — session payments require a stateful client with a Fiber channel".to_string(),
+        )),
         RunOutcome::PaymentRejected { reason, .. } => Err(pay_core::Error::PaymentRejected(reason)),
         RunOutcome::UnknownPaymentRequired { .. } => Err(pay_core::Error::Mpp(
             "402 Payment Required but no recognized protocol".to_string(),

@@ -78,6 +78,7 @@ zeroize = "1"
 ed25519-dalek = { version = "2", default-features = false }
 rand = "0.8"
 bs58 = "0.5"
+blake3 = "1"
 qrcode = { version = "0.14", default-features = false }
 
 # Solana MPP (includes keypair loading + charge building)
@@ -101,8 +102,8 @@ solana-signature = "3.2"
 solana-system-interface = "2.0"
 solana-transaction = "3.1"
 
-# [patch."https://github.com/solana-foundation/mpp-sdk"]
-# solana-mpp = { path = "../../solana-mpp-sdk/rust" }
+[patch."https://github.com/solana-foundation/mpp-sdk"]
+solana-mpp = { path = "../../mpp-sdk/rust" }
 
 # [patch."https://github.com/txtx/moneymq"]
 # solana-x402 = { path = "../../moneymq/crates/x402-sdk" }

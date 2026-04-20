@@ -5602,6 +5602,7 @@ dependencies = [
  "serde_yml",
  "shellexpand",
  "solana-mpp",
+ "solana-pubkey 3.0.0",
  "tempfile",
  "tokio",
  "tracing",
@@ -5616,6 +5617,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "bincode",
+ "blake3",
  "bs58",
  "ed25519-dalek 2.2.0",
  "figment",
@@ -5642,6 +5644,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "toml 0.8.23",
+ "tower",
  "tracing",
 ]
 
@@ -9003,11 +9006,12 @@ dependencies = [
 [[package]]
 name = "solana-mpp"
 version = "0.2.0"
-source = "git+https://github.com/solana-foundation/mpp-sdk?branch=main#edf77468ed904b6c549651c45445ad321cf13a9c"
 dependencies = [
  "base64 0.22.1",
  "bincode",
+ "blake3",
  "bs58",
+ "ed25519-dalek 2.2.0",
  "hmac 0.12.1",
  "reqwest 0.12.28",
  "serde",

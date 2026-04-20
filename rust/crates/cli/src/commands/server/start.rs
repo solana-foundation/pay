@@ -1,5 +1,6 @@
 //! `pay server start` — start a payment gateway proxy.
 
+use std::process::Command as ProcessCommand;
 use std::sync::Arc;
 
 use axum::middleware;
@@ -8,8 +9,10 @@ use axum::routing::{any, get, post};
 use owo_colors::OwoColorize;
 use pay_core::PaymentState;
 use pay_core::accounts::AccountsStore;
+use pay_core::server::session::SessionMpp;
 use pay_types::metering::{ApiSpec, SignerConfig};
 use solana_mpp::server::Mpp;
+use solana_mpp::solana_keychain::memory::MemorySigner;
 use solana_mpp::solana_keychain::SolanaSigner;
 
 /// Start the payment gateway proxy.
@@ -49,6 +52,7 @@ pub struct StartCommand {
 struct AppState {
     apis: Arc<Vec<ApiSpec>>,
     mpp: Option<Mpp>,
+    session_mpp: Option<Arc<SessionMpp>>,
 }
 
 impl PaymentState for AppState {
@@ -57,6 +61,9 @@ impl PaymentState for AppState {
     }
     fn mpp(&self) -> Option<&Mpp> {
         self.mpp.as_ref()
+    }
+    fn session_mpp(&self) -> Option<&SessionMpp> {
+        self.session_mpp.as_deref()
     }
 }
 
@@ -283,17 +290,175 @@ impl StartCommand {
 
             let mpp = Mpp::new(solana_mpp::server::Config {
                 recipient: recipient.clone(),
-                currency: mpp_currency,
+                currency: mpp_currency.clone(),
                 decimals,
                 network: network.clone(),
                 rpc_url: Some(rpc_url.clone()),
-                secret_key: Some(secret_key),
+                secret_key: Some(secret_key.clone()),
                 fee_payer,
-                fee_payer_signer,
+                fee_payer_signer: fee_payer_signer.clone(),
                 html: true,
                 ..Default::default()
             })
             .map_err(|e| pay_core::Error::Config(format!("Failed to create MPP server: {e}")))?;
+
+            // ── Create session MPP server (if session config present) ──
+            let session_mpp: Option<Arc<SessionMpp>> = if let Some(ref sess) = api.session {
+                use pay_core::server::session::RpcMultiDelegateChain;
+                use solana_mpp::program::multi_delegator::MULTI_DELEGATOR_PROGRAM_ID;
+                use solana_mpp::server::session::SessionConfig;
+                use solana_mpp::SessionMode;
+                use std::str::FromStr;
+
+                let cap_base = (sess.cap_usdc * 10f64.powi(decimals as i32)).round() as u64;
+                let session_secret = std::env::var("PAY_SESSION_SECRET")
+                    .unwrap_or_else(|_| secret_key.clone());
+                let modes: Vec<SessionMode> = if sess.modes.is_empty() {
+                    vec![SessionMode::Push]
+                } else {
+                    sess.modes
+                        .iter()
+                        .map(|m| match m.as_str() {
+                            "pull" => SessionMode::Pull,
+                            _ => SessionMode::Push,
+                        })
+                        .collect()
+                };
+                let using_local_rpc = rpc_url.contains("localhost") || rpc_url.contains("127.0.0.1");
+                let fiber_program_id = if using_local_rpc {
+                    Some(ensure_local_fiber_program(&rpc_url)?)
+                } else {
+                    std::env::var("PAY_FIBER_PROGRAM_ID")
+                        .ok()
+                        .and_then(|value| solana_pubkey::Pubkey::from_str(&value).ok())
+                };
+
+                let config = SessionConfig {
+                    recipient: recipient.clone(),
+                    operator: recipient.clone(),
+                    currency: mpp_currency.clone(),
+                    decimals: decimals as u8,
+                    network: network.clone(),
+                    max_cap: cap_base,
+                    min_voucher_delta: sess.min_voucher_delta,
+                    modes: modes.clone(),
+                    rpc_url: Some(rpc_url.clone()),
+                    program_id: fiber_program_id,
+                    ..Default::default()
+                };
+
+                let mut smpp = SessionMpp::new(config, session_secret)
+                    .with_realm(api.title.clone());
+
+                // Wire up the multi-delegate chain when pull mode is enabled.
+                if modes.contains(&SessionMode::Pull) {
+                    let program_id = solana_pubkey::Pubkey::from_str(MULTI_DELEGATOR_PROGRAM_ID)
+                        .expect("valid multi-delegator program ID");
+                    let mint = solana_pubkey::Pubkey::from_str(&mpp_currency)
+                        .unwrap_or_else(|_| {
+                            // fallback: mainnet USDC
+                            solana_pubkey::Pubkey::from_str(
+                                "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                            )
+                            .unwrap()
+                        });
+                    let operator_pk = solana_pubkey::Pubkey::from_str(&recipient)
+                        .unwrap_or_else(|_| solana_pubkey::Pubkey::default());
+
+                    if using_local_rpc {
+                        ensure_local_multi_delegator_program(&rpc_url, MULTI_DELEGATOR_PROGRAM_ID)?;
+                    }
+
+                    if sandbox && !using_local_rpc {
+                        // Sandbox: record submitted txs and return a stub sig so
+                        // the full HTTP flow works without a live multi-delegator
+                        // program on Surfpool.
+                        use pay_core::server::session::MultiDelegateChain;
+                        use solana_mpp::program::multi_delegator::MultiDelegateOnChainState;
+                        use std::future::Future;
+                        use std::pin::Pin;
+
+                        struct SandboxChain;
+
+                        impl MultiDelegateChain for SandboxChain {
+                            fn fetch_state<'a>(
+                                &'a self,
+                                owner: &'a str,
+                            ) -> Pin<
+                                Box<
+                                    dyn Future<
+                                            Output = pay_core::Result<
+                                                MultiDelegateOnChainState,
+                                            >,
+                                        > + Send
+                                        + 'a,
+                                >,
+                            > {
+                                let _ = owner;
+                                Box::pin(async {
+                                    Ok(MultiDelegateOnChainState {
+                                        multi_delegate_exists: false,
+                                        existing_delegation_cap: None,
+                                    })
+                                })
+                            }
+
+                            fn submit_tx<'a>(
+                                &'a self,
+                                tx_base64: &'a str,
+                            ) -> Pin<
+                                Box<
+                                    dyn Future<Output = pay_core::Result<String>>
+                                        + Send
+                                        + 'a,
+                                >,
+                            > {
+                                let preview = &tx_base64[..40.min(tx_base64.len())];
+                                eprintln!("  {} {preview}…", "[sandbox] submit_tx".dimmed());
+                                Box::pin(async { Ok("sandbox_stub_sig".to_string()) })
+                            }
+                        }
+
+                        smpp = smpp.with_multi_delegate_chain(Box::new(SandboxChain));
+                    } else {
+                        smpp = smpp.with_multi_delegate_chain(Box::new(RpcMultiDelegateChain {
+                            rpc_url: rpc_url.clone(),
+                            program_id,
+                            mint,
+                            operator: operator_pk,
+                            delegation_nonce: 0,
+                        }));
+                    }
+
+                    let operator_signer = fee_payer_signer.clone().ok_or_else(|| {
+                        pay_core::Error::Config(
+                            "pull-mode sessions require an operator signer".to_string(),
+                        )
+                    })?;
+                    let fiber_program_id = fiber_program_id.ok_or_else(|| {
+                        pay_core::Error::Config(
+                            "pull-mode sessions require a Fiber program ID; set PAY_FIBER_PROGRAM_ID or use local RPC"
+                                .to_string(),
+                        )
+                    })?;
+
+                    smpp = smpp.with_open_channel_batcher(
+                        operator_signer,
+                        rpc_url.clone(),
+                        fiber_program_id,
+                        sess.batch_open_interval_ms,
+                    );
+                    tracing::info!(
+                        interval_ms = sess.batch_open_interval_ms,
+                        fiber_program_id = %fiber_program_id,
+                        "enabled pull-mode Fiber batcher"
+                    );
+                }
+
+                Some(Arc::new(smpp))
+            } else {
+                None
+            };
 
             // ── Banner ──
             let metered_count = api
@@ -474,6 +639,7 @@ impl StartCommand {
             let state = AppState {
                 apis: Arc::new(vec![api.clone()]),
                 mpp: Some(mpp),
+                session_mpp,
             };
 
             let pdb_state = if debugger {
@@ -842,6 +1008,215 @@ fn format_price(price: f64) -> String {
         let s = format!("{:.4}", price);
         s.trim_end_matches('0').to_string()
     }
+}
+
+fn ensure_local_multi_delegator_program(rpc_url: &str, program_id: &str) -> pay_core::Result<()> {
+    if local_program_is_executable(rpc_url, program_id) {
+        eprintln!("  {}", "multi-delegator program already deployed locally".dimmed());
+        return Ok(());
+    }
+
+    let repo = std::env::var("PAY_MULTI_DELEGATOR_REPO")
+        .unwrap_or_else(|_| "/Users/ludo/Coding/solana-program/multi-delegator".to_string());
+    let repo_path = std::path::Path::new(&repo);
+    let keypair_path = repo_path.join("keys/multi_delegator-keypair.json");
+    let deploy_dir = repo_path.join("target/deploy");
+    let deploy_keypair_path = deploy_dir.join("multi_delegator-keypair.json");
+    let program_so_path = deploy_dir.join("multi_delegator.so");
+
+    if !keypair_path.exists() {
+        return Err(pay_core::Error::Config(format!(
+            "multi-delegator keypair not found at {}",
+            keypair_path.display()
+        )));
+    }
+
+    std::fs::create_dir_all(&deploy_dir).map_err(|e| {
+        pay_core::Error::Config(format!(
+            "failed to create {}: {e}",
+            deploy_dir.display()
+        ))
+    })?;
+    std::fs::copy(&keypair_path, &deploy_keypair_path).map_err(|e| {
+        pay_core::Error::Config(format!(
+            "failed to copy deploy keypair to {}: {e}",
+            deploy_keypair_path.display()
+        ))
+    })?;
+
+    if !program_so_path.exists() {
+        eprintln!("  {}", "building local multi-delegator program...".dimmed());
+        let status = ProcessCommand::new("cargo")
+            .arg("build-sbf")
+            .current_dir(repo_path.join("programs/multi_delegator"))
+            .status()
+            .map_err(|e| {
+                pay_core::Error::Config(format!(
+                    "failed to invoke cargo build-sbf for multi-delegator: {e}"
+                ))
+            })?;
+        if !status.success() {
+            return Err(pay_core::Error::Config(
+                "cargo build-sbf for multi-delegator failed".to_string(),
+            ));
+        }
+    }
+
+    let payer_keypair = localnet_fee_payer_keypair_file()?;
+    eprintln!("  {}", "deploying multi-delegator program to local Surfpool...".dimmed());
+    let status = ProcessCommand::new("solana")
+        .arg("program")
+        .arg("deploy")
+        .arg("--url")
+        .arg(rpc_url)
+        .arg("--keypair")
+        .arg(payer_keypair.path())
+        .arg("--fee-payer")
+        .arg(payer_keypair.path())
+        .arg("--program-id")
+        .arg(&deploy_keypair_path)
+        .arg(&program_so_path)
+        .status()
+        .map_err(|e| {
+            pay_core::Error::Config(format!(
+                "failed to invoke solana program deploy for multi-delegator: {e}"
+            ))
+        })?;
+    if !status.success() {
+        return Err(pay_core::Error::Config(
+            "solana program deploy for multi-delegator failed".to_string(),
+        ));
+    }
+
+    if !local_program_is_executable(rpc_url, program_id) {
+        return Err(pay_core::Error::Config(format!(
+            "multi-delegator program {program_id} still not executable after deploy"
+        )));
+    }
+
+    eprintln!("  {}", "multi-delegator program deployed locally".green());
+    Ok(())
+}
+
+fn ensure_local_fiber_program(rpc_url: &str) -> pay_core::Result<solana_pubkey::Pubkey> {
+    use std::str::FromStr;
+
+    let repo = std::env::var("PAY_FIBER_REPO")
+        .unwrap_or_else(|_| "/Users/ludo/Coding/fiber".to_string());
+    let repo_path = std::path::Path::new(&repo);
+    let deploy_dir = repo_path.join("target/deploy");
+    let keypair_path = deploy_dir.join("fiber_native-keypair.json");
+    let program_so_path = deploy_dir.join("fiber_native.so");
+
+    if !keypair_path.exists() {
+        return Err(pay_core::Error::Config(format!(
+            "Fiber program keypair not found at {}",
+            keypair_path.display()
+        )));
+    }
+
+    let keypair_path_str = keypair_path.to_string_lossy();
+    let signer = MemorySigner::from_private_key_file(&keypair_path_str).map_err(|e| {
+        pay_core::Error::Config(format!("failed to load Fiber program keypair: {e}"))
+    })?;
+    let program_id = solana_pubkey::Pubkey::from_str(&signer.pubkey().to_string()).map_err(|e| {
+        pay_core::Error::Config(format!("invalid Fiber program ID from keypair: {e}"))
+    })?;
+
+    if local_program_is_executable(rpc_url, &program_id.to_string()) {
+        eprintln!("  {}", "Fiber program already deployed locally".dimmed());
+        return Ok(program_id);
+    }
+
+    if !program_so_path.exists() {
+        eprintln!("  {}", "building local Fiber program...".dimmed());
+        let status = ProcessCommand::new("cargo")
+            .arg("build-sbf")
+            .current_dir(repo_path.join("native"))
+            .status()
+            .map_err(|e| {
+                pay_core::Error::Config(format!("failed to invoke cargo build-sbf for Fiber: {e}"))
+            })?;
+        if !status.success() {
+            return Err(pay_core::Error::Config(
+                "cargo build-sbf for Fiber failed".to_string(),
+            ));
+        }
+    }
+
+    eprintln!("  {}", "deploying Fiber program to local Surfpool...".dimmed());
+    let status = ProcessCommand::new("surfpool")
+        .arg("run")
+        .arg("deployment")
+        .arg("--env")
+        .arg("localnet")
+        .arg("--unsupervised")
+        .current_dir(repo_path)
+        .status()
+        .map_err(|e| {
+            pay_core::Error::Config(format!(
+                "failed to invoke surfpool deployment runbook for Fiber: {e}"
+            ))
+        })?;
+    if !status.success() {
+        return Err(pay_core::Error::Config(
+            "surfpool deployment runbook for Fiber failed".to_string(),
+        ));
+    }
+
+    if !local_program_is_executable(rpc_url, &program_id.to_string()) {
+        return Err(pay_core::Error::Config(format!(
+            "Fiber program {program_id} still not executable after deploy"
+        )));
+    }
+
+    eprintln!("  {}", "Fiber program deployed locally".green());
+    Ok(program_id)
+}
+
+fn local_program_is_executable(rpc_url: &str, program_id: &str) -> bool {
+    let output = ProcessCommand::new("curl")
+        .arg("-s")
+        .arg("-X")
+        .arg("POST")
+        .arg(rpc_url)
+        .arg("-H")
+        .arg("Content-Type: application/json")
+        .arg("-d")
+        .arg(format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getAccountInfo\",\"params\":[\"{program_id}\",{{\"encoding\":\"base64\"}}]}}"
+        ))
+        .output();
+
+    let Ok(output) = output else {
+        return false;
+    };
+    let body = String::from_utf8_lossy(&output.stdout);
+    body.contains("\"executable\":true")
+}
+
+fn localnet_fee_payer_keypair_file() -> pay_core::Result<tempfile::NamedTempFile> {
+    use std::io::Write;
+
+    let accounts = pay_core::accounts::AccountsFile::load()?;
+    let (_, account) = accounts.account_for_network("localnet").ok_or_else(|| {
+        pay_core::Error::Config(
+            "no localnet account configured in ~/.config/pay/accounts.yml".to_string(),
+        )
+    })?;
+    let bytes = account.ephemeral_keypair_bytes().ok_or_else(|| {
+        pay_core::Error::Config(
+            "localnet account is not ephemeral or missing secret_key_b58".to_string(),
+        )
+    })?;
+
+    let mut file = tempfile::NamedTempFile::new().map_err(|e| {
+        pay_core::Error::Config(format!("failed to create temp fee payer keypair file: {e}"))
+    })?;
+    write!(file, "{}", serde_json::to_string(&bytes).unwrap()).map_err(|e| {
+        pay_core::Error::Config(format!("failed to write temp fee payer keypair file: {e}"))
+    })?;
+    Ok(file)
 }
 
 /// Emit an OSC 8 clickable hyperlink for terminals that support it.

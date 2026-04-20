@@ -12,8 +12,14 @@ use crate::{Error, Result};
 /// The outcome of running a wrapped command.
 #[derive(Debug)]
 pub enum RunOutcome {
-    /// The server returned 402 with an MPP challenge.
+    /// The server returned 402 with an MPP charge challenge.
     MppChallenge {
+        challenge: Box<mpp::Challenge>,
+        resource_url: String,
+    },
+    /// The server returned 402 with an MPP session challenge (intent="session").
+    /// Session payments require a stateful client with a Fiber channel.
+    SessionChallenge {
         challenge: Box<mpp::Challenge>,
         resource_url: String,
     },
@@ -183,6 +189,13 @@ pub(crate) fn classify_402(
     if let Some(www_auth) = headers.iter().find(|(k, _)| k == "www-authenticate")
         && let Some(challenge) = mpp::parse(&www_auth.1)
     {
+        if challenge.intent.as_str() == "session" {
+            info!(resource = resource_url, "Detected MPP session challenge");
+            return RunOutcome::SessionChallenge {
+                challenge: Box::new(challenge),
+                resource_url: resource_url.to_string(),
+            };
+        }
         info!(resource = resource_url, "Detected MPP challenge");
         return RunOutcome::MppChallenge {
             challenge: Box::new(challenge),
