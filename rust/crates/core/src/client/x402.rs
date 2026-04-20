@@ -217,7 +217,11 @@ mod tests {
 
         assert!(msg.contains("you forced network `localnet`"));
         assert!(msg.contains("server expects `mainnet`"));
-        assert_eq!(store.save_count(), 0, "mismatch must fail before any wallet mutation");
+        assert_eq!(
+            store.save_count(),
+            0,
+            "mismatch must fail before any wallet mutation"
+        );
     }
 
     #[test]
@@ -241,7 +245,10 @@ mod tests {
         let msg = err.to_string();
 
         assert!(msg.contains("No account named `alice` configured for network `mainnet`"));
-        assert_eq!(store.save_count(), 0, "named-account miss must not lazily create");
+        assert_eq!(
+            store.save_count(),
+            0,
+            "named-account miss must not lazily create"
+        );
     }
-
 }

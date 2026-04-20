@@ -82,7 +82,7 @@ blake3 = "1"
 qrcode = { version = "0.14", default-features = false }
 
 # Solana MPP (includes keypair loading + charge building)
-solana-mpp = { git = "https://github.com/solana-foundation/mpp-sdk", branch = "chore/update-workflows", default-features = false, features = [
+solana-mpp = { git = "https://github.com/solana-foundation/mpp-sdk", branch = "main", default-features = false, features = [
     "client",
     "server",
 ] }

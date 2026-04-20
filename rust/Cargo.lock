@@ -9049,6 +9049,7 @@ dependencies = [
 [[package]]
 name = "solana-mpp"
 version = "0.2.0"
+source = "git+https://github.com/solana-foundation/mpp-sdk?branch=main#73daceba15df61fcae9b0aee664dd9d7e01ca5c2"
 dependencies = [
  "base64 0.22.1",
  "bincode",

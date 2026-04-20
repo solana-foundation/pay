@@ -71,7 +71,7 @@ pub fn load_signer_for_network_with_reason(
     let file = store.load()?;
     if let Some(name) = account_override {
         if let Some(account) = file.named_account_for_network(network, name).cloned() {
-            let signer = signer_from_account(&account, name, reason)?;
+            let signer = load_signer_from_account_with_reason(&account, name, network, reason)?;
             return Ok((signer, None));
         }
         if is_lazy_ephemeral_network(network) {
@@ -85,7 +85,7 @@ pub fn load_signer_for_network_with_reason(
     }
     match resolve_account_for_network(network, &file) {
         AccountChoice::Resolved { name, account } => {
-            let signer = signer_from_account(&account, &name, reason)?;
+            let signer = load_signer_from_account_with_reason(&account, &name, network, reason)?;
             Ok((signer, None))
         }
         AccountChoice::Missing => {
@@ -130,16 +130,111 @@ fn is_lazy_ephemeral_network(network: &str) -> bool {
     matches!(network, "localnet" | "devnet")
 }
 
-fn signer_from_account(account: &Account, name: &str, reason: &str) -> Result<MemorySigner> {
+pub fn load_keypair_bytes_from_account_with_reason(
+    account: &Account,
+    name: &str,
+    network: &str,
+    reason: &str,
+) -> Result<crate::keystore::Zeroizing<Vec<u8>>> {
     if account.keystore == Keystore::Ephemeral {
-        signer_from_ephemeral(account)
-    } else {
-        // Non-ephemeral accounts always resolve to an external signer source.
-        let source = account
-            .signer_source(name)
-            .expect("non-ephemeral accounts must provide a signer source");
-        load_signer_with_reason(&source, reason)
+        maybe_authenticate_ephemeral_account(account, network, reason)?;
+        return account
+            .ephemeral_keypair_bytes()
+            .map(crate::keystore::Zeroizing::new)
+            .ok_or_else(|| {
+                Error::Config(
+                    "Ephemeral account is missing its inline `secret_key_b58` field".to_string(),
+                )
+            });
     }
+
+    let source = account
+        .signer_source(name)
+        .expect("non-ephemeral accounts must provide a signer source");
+
+    match account.keystore {
+        Keystore::AppleKeychain => {
+            #[cfg(target_os = "macos")]
+            {
+                let ks = if account.auth_required_for_network(network) {
+                    crate::keystore::Keystore::apple_keychain()
+                } else {
+                    crate::keystore::Keystore::new(
+                        crate::keystore::auth::NoAuth,
+                        crate::keystore::macos::AppleKeychainStore,
+                        false,
+                    )
+                };
+                ks.load_keypair(name, reason)
+                    .map_err(|e| Error::Config(format!("keychain: {e}")))
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                Err(Error::Config(
+                    "Keychain not available on this platform".to_string(),
+                ))
+            }
+        }
+        Keystore::GnomeKeyring => {
+            #[cfg(target_os = "linux")]
+            {
+                let ks = if account.auth_required_for_network(network) {
+                    crate::keystore::Keystore::gnome_keyring()
+                } else {
+                    crate::keystore::Keystore::new(
+                        crate::keystore::auth::NoAuth,
+                        crate::keystore::linux::SecretServiceStore,
+                        false,
+                    )
+                };
+                ks.load_keypair(name, reason)
+                    .map_err(|e| Error::Config(format!("gnome-keyring: {e}")))
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = source;
+                Err(Error::Config(
+                    "GNOME Keyring not available on this platform".to_string(),
+                ))
+            }
+        }
+        Keystore::WindowsHello => {
+            #[cfg(target_os = "windows")]
+            {
+                let ks = if account.auth_required_for_network(network) {
+                    crate::keystore::Keystore::windows_hello()
+                } else {
+                    crate::keystore::Keystore::new(
+                        crate::keystore::auth::NoAuth,
+                        crate::keystore::windows::WindowsCredentialStore,
+                        false,
+                    )
+                };
+                ks.load_keypair(name, reason)
+                    .map_err(|e| Error::Config(format!("windows-hello: {e}")))
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let _ = source;
+                Err(Error::Config(
+                    "Windows Hello not available on this platform".to_string(),
+                ))
+            }
+        }
+        Keystore::OnePassword => load_signer_keypair_bytes_with_reason(&source, reason),
+        Keystore::File => load_signer_keypair_bytes_with_reason(&source, reason),
+        Keystore::Ephemeral => unreachable!("handled above"),
+    }
+}
+
+pub fn load_signer_from_account_with_reason(
+    account: &Account,
+    name: &str,
+    network: &str,
+    reason: &str,
+) -> Result<MemorySigner> {
+    let bytes = load_keypair_bytes_from_account_with_reason(account, name, network, reason)?;
+    MemorySigner::from_bytes(&bytes).map_err(|e| Error::Config(format!("Invalid keypair: {e}")))
 }
 
 fn signer_from_ephemeral(account: &Account) -> Result<MemorySigner> {
@@ -150,8 +245,63 @@ fn signer_from_ephemeral(account: &Account) -> Result<MemorySigner> {
         .map_err(|e| Error::Config(format!("Invalid ephemeral keypair bytes: {e}")))
 }
 
+fn maybe_authenticate_ephemeral_account(
+    account: &Account,
+    network: &str,
+    reason: &str,
+) -> Result<()> {
+    if !account.auth_required_for_network(network) {
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        crate::keystore::Keystore::apple_keychain()
+            .authenticate(reason)
+            .map_err(map_ephemeral_auth_error)
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        crate::keystore::Keystore::gnome_keyring()
+            .authenticate(reason)
+            .map_err(map_ephemeral_auth_error)
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        crate::keystore::Keystore::windows_hello()
+            .authenticate(reason)
+            .map_err(map_ephemeral_auth_error)
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = reason;
+        Err(Error::Config(
+            "Ephemeral account auth gating is not available on this platform".to_string(),
+        ))
+    }
+}
+
+fn map_ephemeral_auth_error(e: crate::keystore::Error) -> Error {
+    if matches!(e, crate::keystore::Error::AuthDenied(_)) {
+        Error::PaymentRejected("rejected by user at authentication prompt".to_string())
+    } else {
+        Error::Config(format!("ephemeral auth gate: {e}"))
+    }
+}
+
 /// Load a `MemorySigner` with a custom reason string.
 pub fn load_signer_with_reason(source: &str, reason: &str) -> Result<MemorySigner> {
+    let bytes = load_signer_keypair_bytes_with_reason(source, reason)?;
+    MemorySigner::from_bytes(&bytes).map_err(|e| Error::Config(format!("Invalid keypair: {e}")))
+}
+
+pub fn load_signer_keypair_bytes_with_reason(
+    source: &str,
+    reason: &str,
+) -> Result<crate::keystore::Zeroizing<Vec<u8>>> {
     if let Some(account) = source.strip_prefix("keychain:") {
         load_from_keystore_backend("keychain", account, reason)
     } else if let Some(account) = source.strip_prefix("gnome-keyring:") {
@@ -177,22 +327,51 @@ fn rejection_source(backend: &str) -> &'static str {
     }
 }
 
-fn load_from_file(path: &str) -> Result<MemorySigner> {
+fn load_from_file(path: &str) -> Result<crate::keystore::Zeroizing<Vec<u8>>> {
     let expanded = shellexpand::tilde(path);
     // Newer solana-keychain split file vs inline-string parsing into two
     // separate constructors. Prefer the file path when the argument exists
     // on disk; otherwise fall back to treating the source as an inline
     // private key (base58 or u8-array literal).
     if std::path::Path::new(expanded.as_ref()).exists() {
-        MemorySigner::from_private_key_file(&expanded)
+        let data = std::fs::read_to_string(expanded.as_ref())
+            .map_err(|e| Error::Config(format!("Failed to load keypair from {path}: {e}")))?;
+        parse_private_key_string(&data)
+            .map(crate::keystore::Zeroizing::new)
             .map_err(|e| Error::Config(format!("Failed to load keypair from {path}: {e}")))
     } else {
-        MemorySigner::from_private_key_string(&expanded)
+        parse_private_key_string(expanded.as_ref())
+            .map(crate::keystore::Zeroizing::new)
             .map_err(|e| Error::Config(format!("Failed to load keypair from {path}: {e}")))
     }
 }
 
-fn load_from_keystore_backend(backend: &str, account: &str, reason: &str) -> Result<MemorySigner> {
+fn parse_private_key_string(input: &str) -> std::result::Result<Vec<u8>, String> {
+    let trimmed = input.trim();
+
+    if trimmed.starts_with('[') {
+        let bytes: Vec<u8> =
+            serde_json::from_str(trimmed).map_err(|e| format!("Invalid keypair JSON: {e}"))?;
+        if bytes.len() != 64 {
+            return Err(format!("Expected 64 bytes, got {}", bytes.len()));
+        }
+        return Ok(bytes);
+    }
+
+    let bytes = bs58::decode(trimmed)
+        .into_vec()
+        .map_err(|e| format!("Invalid base58 private key: {e}"))?;
+    if bytes.len() != 64 {
+        return Err(format!("Expected 64 bytes, got {}", bytes.len()));
+    }
+    Ok(bytes)
+}
+
+fn load_from_keystore_backend(
+    backend: &str,
+    account: &str,
+    reason: &str,
+) -> Result<crate::keystore::Zeroizing<Vec<u8>>> {
     let keystore = match backend {
         #[cfg(target_os = "macos")]
         "keychain" => crate::keystore::Keystore::apple_keychain(),
@@ -238,8 +417,7 @@ fn load_from_keystore_backend(backend: &str, account: &str, reason: &str) -> Res
         }
     })?;
 
-    MemorySigner::from_bytes(&bytes)
-        .map_err(|e| Error::Config(format!("Invalid keypair from {backend}: {e}")))
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -334,6 +512,7 @@ mod tests {
         Account {
             keystore: Keystore::Ephemeral,
             active: false,
+            auth_required: Some(false),
             pubkey: Some(bs58::encode(verifying_key.to_bytes()).into_string()),
             vault: None,
             path: None,
@@ -447,8 +626,15 @@ mod tests {
 
         use solana_mpp::solana_keychain::SolanaSigner;
         assert_eq!(signer.pubkey().to_string(), expected_pubkey);
-        assert!(ephemeral.is_none(), "existing named account must not report creation");
-        assert_eq!(store.save_count(), 0, "existing named account must not write");
+        assert!(
+            ephemeral.is_none(),
+            "existing named account must not report creation"
+        );
+        assert_eq!(
+            store.save_count(),
+            0,
+            "existing named account must not write"
+        );
     }
 
     #[test]
@@ -468,20 +654,20 @@ mod tests {
         );
 
         let snapshot = store.snapshot();
-        assert!(snapshot.named_account_for_network("localnet", "alice").is_some());
+        assert!(
+            snapshot
+                .named_account_for_network("localnet", "alice")
+                .is_some()
+        );
         assert_eq!(store.save_count(), 1);
     }
 
     #[test]
     fn load_signer_for_network_rejects_missing_named_mainnet_account() {
         let store = MemoryAccountsStore::new();
-        let err = load_signer_for_network_with_reason(
-            MAINNET_NETWORK,
-            &store,
-            Some("alice"),
-            "test",
-        )
-        .unwrap_err();
+        let err =
+            load_signer_for_network_with_reason(MAINNET_NETWORK, &store, Some("alice"), "test")
+                .unwrap_err();
 
         assert!(
             err.to_string()
@@ -495,6 +681,7 @@ mod tests {
         let account = Account {
             keystore: Keystore::Ephemeral,
             active: false,
+            auth_required: Some(false),
             pubkey: None,
             vault: None,
             path: None,
@@ -503,9 +690,10 @@ mod tests {
         };
 
         let err = signer_from_ephemeral(&account).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("Ephemeral account is missing its inline `secret_key_b58` field"));
+        assert!(
+            err.to_string()
+                .contains("Ephemeral account is missing its inline `secret_key_b58` field")
+        );
     }
 
     #[test]

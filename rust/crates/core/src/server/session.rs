@@ -189,8 +189,8 @@ fn normalize_pull_setup_reason(reason: &str) -> String {
 }
 
 fn parse_fixed_delegation_cap(data: &[u8]) -> Option<u64> {
-    let bytes =
-        data.get(FIXED_DELEGATION_CAP_OFFSET..FIXED_DELEGATION_CAP_OFFSET + FIXED_DELEGATION_CAP_LEN)?;
+    let bytes = data
+        .get(FIXED_DELEGATION_CAP_OFFSET..FIXED_DELEGATION_CAP_OFFSET + FIXED_DELEGATION_CAP_LEN)?;
     let bytes: [u8; FIXED_DELEGATION_CAP_LEN] = bytes.try_into().ok()?;
     Some(u64::from_le_bytes(bytes))
 }
@@ -527,7 +527,9 @@ async fn submit_channel_opens(
 
         let existing_account = rpc.get_account(&channel).ok();
         let existing_state = inspect_existing_fiber_channel(
-            existing_account.as_ref().map(|account| account.data.as_slice()),
+            existing_account
+                .as_ref()
+                .map(|account| account.data.as_slice()),
         );
 
         tracing::info!(
@@ -880,18 +882,17 @@ impl SessionMpp {
 
     /// Enqueue a Fiber channel open in the batch processor (if configured).
     fn enqueue_channel_open(&self, payload: &OpenPayload, state: &ChannelState) {
-        if let Some(batcher) = &self.open_channel_batcher {
-            if let (Some(token_account), Some(owner)) =
+        if let Some(batcher) = &self.open_channel_batcher
+            && let (Some(token_account), Some(owner)) =
                 (payload.token_account.as_deref(), payload.owner.as_deref())
-            {
-                batcher.enqueue(ChannelOpenItem {
-                    owner: owner.to_string(),
-                    token_account: token_account.to_string(),
-                    deposit: state.deposit,
-                    distribution_hash: self.distribution_hash,
-                });
-                tracing::info!(owner, deposit = state.deposit, "Fiber channel open queued");
-            }
+        {
+            batcher.enqueue(ChannelOpenItem {
+                owner: owner.to_string(),
+                token_account: token_account.to_string(),
+                deposit: state.deposit,
+                distribution_hash: self.distribution_hash,
+            });
+            tracing::info!(owner, deposit = state.deposit, "Fiber channel open queued");
         }
     }
 
@@ -924,6 +925,8 @@ mod tests {
     use solana_mpp::{PaymentCredential, format_authorization};
     use std::sync::{Arc, Mutex};
     use tokio::time::{sleep, timeout};
+
+    type BatchLog = Arc<Mutex<Vec<Vec<(String, String, u64)>>>>;
 
     // ── Mock MultiDelegateChain ───────────────────────────────────────────────
 
@@ -1516,16 +1519,16 @@ mod tests {
         };
         session.enqueue_channel_open(&no_tx_payload(CAP), &state);
 
-        let submitted: Arc<Mutex<Vec<Vec<(String, String, u64)>>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let submitted: BatchLog = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&submitted);
-        let session = test_session_mpp().with_test_open_channel_batcher_interval(20, move |batch| {
-            let sink = Arc::clone(&sink);
-            async move {
-                sink.lock().unwrap().push(batch);
-                Ok(())
-            }
-        });
+        let session =
+            test_session_mpp().with_test_open_channel_batcher_interval(20, move |batch| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    sink.lock().unwrap().push(batch);
+                    Ok(())
+                }
+            });
         let mut payload = no_tx_payload(CAP);
         payload.token_account = None;
         session.enqueue_channel_open(&payload, &state);
@@ -1536,16 +1539,16 @@ mod tests {
 
     #[tokio::test]
     async fn batcher_flushes_on_interval() {
-        let submitted: Arc<Mutex<Vec<Vec<(String, String, u64)>>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let submitted: BatchLog = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&submitted);
-        let session = test_session_mpp().with_test_open_channel_batcher_interval(20, move |batch| {
-            let sink = Arc::clone(&sink);
-            async move {
-                sink.lock().unwrap().push(batch);
-                Ok(())
-            }
-        });
+        let session =
+            test_session_mpp().with_test_open_channel_batcher_interval(20, move |batch| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    sink.lock().unwrap().push(batch);
+                    Ok(())
+                }
+            });
         let state = ChannelState {
             channel_id: "chan-interval".to_string(),
             authorized_signer: "auth-interval".to_string(),
@@ -1652,8 +1655,7 @@ mod tests {
 
     #[tokio::test]
     async fn batcher_flushes_pending_items_on_shutdown() {
-        let submitted: Arc<Mutex<Vec<Vec<(String, String, u64)>>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let submitted: BatchLog = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&submitted);
         let submitter: BatchSubmitter = Arc::new(move |batch: Vec<ChannelOpenItem>| {
             let sink = Arc::clone(&sink);

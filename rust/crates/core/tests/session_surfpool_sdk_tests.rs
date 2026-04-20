@@ -34,6 +34,8 @@ use surfpool_sdk::{Keypair, Signer};
 use tokio::time::{Duration, sleep};
 use tower::util::ServiceExt;
 
+type BatchLog = Arc<Mutex<Vec<Vec<(String, String, u64)>>>>;
+
 const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const SPL_TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const TEST_DEPOSIT: u64 = 1_000_000;
@@ -269,6 +271,7 @@ fn memory_store_for_keypair(keypair: &Keypair) -> MemoryAccountsStore {
         Account {
             keystore: Keystore::Ephemeral,
             active: false,
+            auth_required: Some(false),
             pubkey: Some(keypair.pubkey().to_string()),
             vault: None,
             path: None,
@@ -493,7 +496,7 @@ fn sorted_batch(batch: &[(String, String, u64)]) -> Vec<(String, String, u64)> {
 
 async fn make_session_app(
     chain: Box<dyn MultiDelegateChain>,
-    batches: Arc<Mutex<Vec<Vec<(String, String, u64)>>>>,
+    batches: BatchLog,
     operator: &Keypair,
     recipient: &Keypair,
     rpc_url: &str,
@@ -552,7 +555,7 @@ async fn pull_session_surfpool_init_path_submits_init_and_batches_open() {
     fund_participant(&surfpool, &recipient, 0);
     fund_participant(&surfpool, &user, 5_000_000);
 
-    let batches: Arc<Mutex<Vec<Vec<(String, String, u64)>>>> = Arc::new(Mutex::new(Vec::new()));
+    let batches: BatchLog = Arc::new(Mutex::new(Vec::new()));
     let chain = new_recording_chain(&rpc_url, &operator);
     let app = make_session_app(
         Box::new(chain.clone()),
@@ -600,7 +603,7 @@ async fn pull_session_surfpool_update_path_submits_update_and_batches_open() {
     fund_participant(&surfpool, &operator, 0);
     fund_participant(&surfpool, &recipient, 0);
     fund_participant(&surfpool, &user, 5_000_000);
-    let batches: Arc<Mutex<Vec<Vec<(String, String, u64)>>>> = Arc::new(Mutex::new(Vec::new()));
+    let batches: BatchLog = Arc::new(Mutex::new(Vec::new()));
     let chain = StaticRecordingChain::new(MultiDelegateOnChainState {
         multi_delegate_exists: true,
         existing_delegation_cap: Some(250_000),
@@ -648,7 +651,7 @@ async fn pull_session_surfpool_sufficient_path_submits_no_setup_tx_and_batches_o
     let expected_token_account =
         seed_delegation_cap(&surfpool, &rpc_url, &user, &operator, TEST_DEPOSIT).await;
 
-    let batches: Arc<Mutex<Vec<Vec<(String, String, u64)>>>> = Arc::new(Mutex::new(Vec::new()));
+    let batches: BatchLog = Arc::new(Mutex::new(Vec::new()));
     let chain = new_recording_chain(&rpc_url, &operator);
     let app = make_session_app(
         Box::new(chain.clone()),
@@ -705,7 +708,7 @@ async fn pull_session_surfpool_multi_account_opens_share_one_batch() {
     seed_delegation_cap(&surfpool, &rpc_url, &alice, &operator, TEST_DEPOSIT).await;
     seed_delegation_cap(&surfpool, &rpc_url, &bob, &operator, TEST_DEPOSIT).await;
 
-    let batches: Arc<Mutex<Vec<Vec<(String, String, u64)>>>> = Arc::new(Mutex::new(Vec::new()));
+    let batches: BatchLog = Arc::new(Mutex::new(Vec::new()));
     let chain = new_recording_chain(&rpc_url, &operator);
     let app = make_session_app(
         Box::new(chain.clone()),

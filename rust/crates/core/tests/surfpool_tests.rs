@@ -9,7 +9,10 @@
 #![cfg(feature = "server")]
 
 use pay_core::client;
+use std::sync::{Arc, Mutex};
 use surfpool_sdk::{Keypair, Signer, Surfnet};
+
+type BatchLog = Arc<Mutex<Vec<Vec<(String, String, u64)>>>>;
 
 // =============================================================================
 // Helpers
@@ -660,8 +663,7 @@ async fn pull_session_submits_required_setup_and_batches_channel_opens() {
 
     let owner_init = Keypair::new();
     let owner_update = Keypair::new();
-    let batch_submissions: Arc<Mutex<Vec<Vec<(String, String, u64)>>>> =
-        Arc::new(Mutex::new(vec![]));
+    let batch_submissions: BatchLog = Arc::new(Mutex::new(vec![]));
 
     let chain = MockChain::new(HashMap::from([
         (
@@ -990,8 +992,7 @@ async fn pull_session_full_flow() {
     // ── [3] Build SessionMpp with capturing chain ──────────────────────────
     println!("\n[3] Building SessionMpp with CapturingChain...");
 
-    let channel_opens: Arc<std::sync::Mutex<Vec<Vec<(String, String, u64)>>>> =
-        Arc::new(std::sync::Mutex::new(vec![]));
+    let channel_opens: BatchLog = Arc::new(Mutex::new(vec![]));
 
     let chain = CapturingChain::new();
 
@@ -1374,6 +1375,7 @@ async fn mpp_build_credential_with_surfnet() {
             pay_core::accounts::Account {
                 keystore: pay_core::accounts::Keystore::Ephemeral,
                 active: false,
+                auth_required: Some(false),
                 pubkey: Some(payer_pubkey),
                 vault: None,
                 path: None,

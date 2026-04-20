@@ -440,10 +440,7 @@ HTTP request sent, awaiting response...
             "currency": "USDC",
             "resource": "https://example.com/resource"
         });
-        let headers = vec![(
-            "x-payment-required".to_string(),
-            requirements.to_string(),
-        )];
+        let headers = vec![("x-payment-required".to_string(), requirements.to_string())];
 
         let outcome = classify_402(&headers, None, "https://example.com/resource");
         assert!(matches!(outcome, RunOutcome::X402Challenge { .. }));

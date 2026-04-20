@@ -9,6 +9,7 @@
 //!   mainnet:
 //!     default:
 //!       keystore: apple-keychain
+//!       auth_required: true
 //!       pubkey: 7xKX...abc
 //!     work:
 //!       keystore: 1password
@@ -17,6 +18,7 @@
 //!   localnet:
 //!     default:
 //!       keystore: ephemeral
+//!       auth_required: false
 //!       pubkey: ABc...
 //!       secret_key_b58: 5Kj...
 //!       created_at: 2026-04-10T12:34:56Z
@@ -52,6 +54,11 @@ pub const DEFAULT_ACCOUNT_NAME: &str = "default";
 /// Solana mainnet network slug — used as the lookup key for "the user's
 /// real-money wallet" throughout the rest of the codebase.
 pub const MAINNET_NETWORK: &str = "mainnet";
+
+/// Default auth-gate policy for a network.
+pub fn default_auth_required_for_network(network: &str) -> bool {
+    network == MAINNET_NETWORK
+}
 
 // ── Keystore + Account ──────────────────────────────────────────────────────
 
@@ -98,6 +105,12 @@ pub struct Account {
     #[serde(default, skip_serializing_if = "is_false")]
     pub active: bool,
 
+    /// Whether loading the secret key should pass through the backend's
+    /// auth gate (Touch ID, Windows Hello, polkit, etc.). When omitted,
+    /// defaults to `true` for `mainnet` and `false` for other networks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_required: Option<bool>,
+
     /// Base-58 public key (cached for display without auth).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pubkey: Option<String>,
@@ -124,6 +137,12 @@ pub struct Account {
 }
 
 impl Account {
+    /// Whether this account should require backend auth on secret-key access.
+    pub fn auth_required_for_network(&self, network: &str) -> bool {
+        self.auth_required
+            .unwrap_or_else(|| default_auth_required_for_network(network))
+    }
+
     /// Build the signer source string used by `pay_core::signer::load_signer`
     /// for keystore-backed accounts. Returns `None` for ephemeral accounts
     /// — those must be loaded via [`Account::pubkey`] + the inline secret
@@ -492,6 +511,7 @@ fn generate_ephemeral_account() -> Account {
     Account {
         keystore: Keystore::Ephemeral,
         active: false,
+        auth_required: Some(false),
         pubkey: Some(bs58::encode(verifying_key.to_bytes()).into_string()),
         vault: None,
         path: None,
@@ -562,6 +582,7 @@ mod tests {
         Account {
             keystore: Keystore::AppleKeychain,
             active: false,
+            auth_required: None,
             pubkey: Some(pubkey.to_string()),
             vault: None,
             path: None,
@@ -574,6 +595,7 @@ mod tests {
         Account {
             keystore: Keystore::Ephemeral,
             active: false,
+            auth_required: Some(false),
             pubkey: Some(pubkey.to_string()),
             vault: None,
             path: None,
@@ -626,6 +648,7 @@ mod tests {
         let acct = Account {
             keystore: Keystore::File,
             active: false,
+            auth_required: None,
             pubkey: None,
             vault: None,
             path: Some("/home/me/.config/solana/id.json".to_string()),
@@ -643,6 +666,7 @@ mod tests {
         let acct = Account {
             keystore: Keystore::File,
             active: false,
+            auth_required: None,
             pubkey: None,
             vault: None,
             path: None,
@@ -661,6 +685,7 @@ mod tests {
         let acct = Account {
             keystore: Keystore::Ephemeral,
             active: false,
+            auth_required: Some(false),
             pubkey: Some("pk".to_string()),
             vault: None,
             path: None,
@@ -673,6 +698,25 @@ mod tests {
     #[test]
     fn ephemeral_keypair_bytes_none_for_keychain_account() {
         assert!(keychain_account("pk").ephemeral_keypair_bytes().is_none());
+    }
+
+    #[test]
+    fn auth_required_defaults_to_true_on_mainnet() {
+        let acct = keychain_account("pk");
+        assert!(acct.auth_required_for_network(MAINNET_NETWORK));
+    }
+
+    #[test]
+    fn auth_required_defaults_to_false_off_mainnet() {
+        let acct = keychain_account("pk");
+        assert!(!acct.auth_required_for_network("devnet"));
+    }
+
+    #[test]
+    fn auth_required_explicit_override_wins() {
+        let mut acct = keychain_account("pk");
+        acct.auth_required = Some(false);
+        assert!(!acct.auth_required_for_network(MAINNET_NETWORK));
     }
 
     // ── AccountsFile mutation ─────────────────────────────────────────────
@@ -984,6 +1028,7 @@ mod tests {
     fn yaml_skips_none_fields() {
         let acct = keychain_account("pk");
         let yaml = serde_yml::to_string(&acct).unwrap();
+        assert!(!yaml.contains("auth_required"));
         assert!(!yaml.contains("vault"));
         assert!(!yaml.contains("path"));
         assert!(!yaml.contains("secret_key_b58"));
@@ -1003,6 +1048,14 @@ mod tests {
         acct.active = true;
         let yaml = serde_yml::to_string(&acct).unwrap();
         assert!(yaml.contains("active: true"));
+    }
+
+    #[test]
+    fn yaml_includes_auth_required_when_set() {
+        let mut acct = keychain_account("pk");
+        acct.auth_required = Some(false);
+        let yaml = serde_yml::to_string(&acct).unwrap();
+        assert!(yaml.contains("auth_required: false"));
     }
 
     #[test]

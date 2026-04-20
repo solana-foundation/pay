@@ -76,6 +76,11 @@ jobs:
   rust-test:
     name: Rust tests + coverage
     runs-on: ubuntu-latest
+    services:
+      surfpool:
+        image: surfpool/surfpool
+        ports:
+          - 8899:8899
     defaults:
       run:
         working-directory: ./rust

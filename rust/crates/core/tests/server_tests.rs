@@ -16,8 +16,8 @@ use pay_core::server::proxy;
 use pay_core::server::session::SessionMpp;
 use pay_types::metering::ApiSpec;
 use serde_json::json;
-use solana_mpp::server::session::SessionConfig;
 use solana_mpp::server::Mpp;
+use solana_mpp::server::session::SessionConfig;
 use std::sync::Arc;
 
 // ── Test app state ──
@@ -172,10 +172,7 @@ fn test_session_mpp() -> SessionMpp {
             max_cap: 5_000_000,
             currency: solana_pubkey::Pubkey::new_unique().to_string(),
             network: "localnet".to_string(),
-            modes: vec![
-                solana_mpp::SessionMode::Push,
-                solana_mpp::SessionMode::Pull,
-            ],
+            modes: vec![solana_mpp::SessionMode::Push, solana_mpp::SessionMode::Pull],
             ..SessionConfig::default()
         },
         "test-secret",
@@ -372,7 +369,12 @@ async fn middleware_html_payment_link_sets_html_content_type_and_challenge() {
         .unwrap();
 
     assert_eq!(resp.status(), 402);
-    let content_type = resp.headers().get("content-type").unwrap().to_str().unwrap();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
     assert!(content_type.contains("text/html"));
     assert!(resp.headers().get("www-authenticate").is_some());
 }
@@ -685,7 +687,11 @@ async fn root_redirects_to_pdb_with_html_accept() {
     assert_eq!(resp.status(), 200);
 
     // Unlisted path → 404, not a proxy attempt.
-    let resp = client.get(format!("{url}/favicon.ico")).send().await.unwrap();
+    let resp = client
+        .get(format!("{url}/favicon.ico"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 404);
 }
 

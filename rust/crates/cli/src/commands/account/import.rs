@@ -84,6 +84,7 @@ impl ImportCommand {
             pay_core::accounts::Account {
                 keystore: keystore_kind,
                 active: false,
+                auth_required: Some(true),
                 pubkey: Some(pubkey_b58),
                 vault: self.vault,
                 path: None,

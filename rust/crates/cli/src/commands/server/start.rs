@@ -337,7 +337,7 @@ impl StartCommand {
                     recipient: recipient.clone(),
                     operator: recipient.clone(),
                     currency: mpp_currency.clone(),
-                    decimals: decimals as u8,
+                    decimals,
                     network: network.clone(),
                     max_cap: cap_base,
                     min_voucher_delta: sess.min_voucher_delta,
@@ -912,11 +912,18 @@ async fn resolve_signer_with_store(
             // Search mainnet first, then any other network, for the
             // named account.
             let file = store.load()?;
-            let account = file
+            let (network, account) = file
                 .accounts
                 .get(pay_core::accounts::MAINNET_NETWORK)
-                .and_then(|net| net.get(name))
-                .or_else(|| file.accounts.values().find_map(|net| net.get(name)))
+                .and_then(|net| {
+                    net.get(name)
+                        .map(|account| (pay_core::accounts::MAINNET_NETWORK, account))
+                })
+                .or_else(|| {
+                    file.accounts.iter().find_map(|(network, net)| {
+                        net.get(name).map(|account| (network.as_str(), account))
+                    })
+                })
                 .ok_or_else(|| {
                     pay_core::Error::Config(format!(
                         "operator.signer.name = `{name}` does not exist in \
@@ -935,11 +942,10 @@ async fn resolve_signer_with_store(
                     pay_core::Error::Config(format!("Invalid keypair bytes for `{name}`: {e}"))
                 })?
             } else {
-                let source = account.signer_source(name).ok_or_else(|| {
-                    pay_core::Error::Config(format!("Account `{name}` has no signer source string"))
-                })?;
-                pay_core::signer::load_signer_with_reason(
-                    &source,
+                pay_core::signer::load_signer_from_account_with_reason(
+                    account,
+                    name,
+                    network,
                     "authorize as fee payer for the gateway",
                 )?
             };
@@ -1535,6 +1541,7 @@ mod tests {
         let acct = Account {
             keystore: AcctKeystore::Ephemeral,
             active: false,
+            auth_required: Some(false),
             pubkey: Some(pubkey.clone()),
             vault: None,
             path: None,
@@ -1651,6 +1658,7 @@ mod tests {
         let bad = Account {
             keystore: AcctKeystore::Ephemeral,
             active: false,
+            auth_required: Some(false),
             pubkey: Some("4BuiY9QUUfPoAGNJBja3JapAuVWMc9c7in6UCgyC2zPR".to_string()),
             vault: None,
             path: None,

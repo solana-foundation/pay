@@ -469,6 +469,7 @@ mod tests {
             Account {
                 keystore: Keystore::Ephemeral,
                 active: false,
+                auth_required: Some(false),
                 pubkey: Some(keypair.pubkey().to_string()),
                 vault: None,
                 path: None,

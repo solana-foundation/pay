@@ -134,12 +134,17 @@ pub async fn payment_middleware<S: PaymentState>(
     if let Some(session_mpp) = state.session_mpp() {
         if auth_header.is_none() {
             let price = metering::resolve_price(meter, &props, variant_hint.as_deref(), None);
-            return session_challenge_response(session_mpp, &method, &path, &subdomain, price);
+            return session_challenge_response(session_mpp, &method, &path, subdomain, price);
         }
 
         if let Some(auth_value) = auth_header.filter(|value| is_session_authorization(value)) {
             return handle_session_authorization(
-                session_mpp, auth_value, subdomain, &path, req, next,
+                session_mpp,
+                auth_value,
+                subdomain,
+                &path,
+                req,
+                next,
             )
             .await;
         }
@@ -154,23 +159,21 @@ pub async fn payment_middleware<S: PaymentState>(
     };
 
     match auth_header {
-        None => {
-            charge_challenge_response(
-                mpp,
-                meter,
-                api,
-                &props,
-                variant_hint.as_deref(),
-                ChargeRequestContext {
-                    method: &method,
-                    path: &path,
-                    uri: &uri,
-                    subdomain,
-                    accepts_html,
-                },
-                endpoint.and_then(|ep| ep.description.as_deref()),
-            )
-        }
+        None => charge_challenge_response(
+            mpp,
+            meter,
+            api,
+            &props,
+            variant_hint.as_deref(),
+            ChargeRequestContext {
+                method: &method,
+                path: &path,
+                uri: &uri,
+                subdomain,
+                accepts_html,
+            },
+            endpoint.and_then(|ep| ep.description.as_deref()),
+        ),
         Some(auth_value) => {
             handle_charge_authorization(mpp, auth_value, subdomain, &path, req, next).await
         }
@@ -420,7 +423,9 @@ fn verification_failed_response(
 fn challenge_json_response(body: serde_json::Value, www_auth: &str) -> Response {
     let mut response = (StatusCode::PAYMENT_REQUIRED, axum::Json(body)).into_response();
     if let Ok(value) = axum::http::HeaderValue::from_str(www_auth) {
-        response.headers_mut().insert(WWW_AUTHENTICATE_HEADER, value);
+        response
+            .headers_mut()
+            .insert(WWW_AUTHENTICATE_HEADER, value);
     }
     response
 }
@@ -439,7 +444,9 @@ fn html_challenge_response(
         .body(Body::from(page))
         .unwrap();
     if let Ok(value) = axum::http::HeaderValue::from_str(www_auth) {
-        response.headers_mut().insert(WWW_AUTHENTICATE_HEADER, value);
+        response
+            .headers_mut()
+            .insert(WWW_AUTHENTICATE_HEADER, value);
     }
     response
 }

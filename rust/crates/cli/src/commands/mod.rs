@@ -107,6 +107,7 @@ enum Tool<'a> {
 }
 
 impl Command {
+    #[allow(clippy::too_many_arguments)]
     pub fn execute(
         self,
         auto_pay: bool,
@@ -182,6 +183,7 @@ impl Command {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_outcome(
     outcome: RunOutcome,
     tool: &Tool,
@@ -484,6 +486,7 @@ fn pay_x402_and_retry(
     handle_retry_outcome(retry_outcome, is_json)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn pay_session_and_retry(
     challenge: &mpp::Challenge,
     req: Option<&SessionRequest>,

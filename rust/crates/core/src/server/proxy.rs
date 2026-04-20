@@ -35,7 +35,9 @@ const STRIP_HEADERS: &[&str] = &[
 pub fn resolve_routing<'a>(api: &'a ApiSpec, path: &str) -> &'a RoutingConfig {
     let trimmed = path.trim_start_matches('/');
     for ep in &api.endpoints {
-        if ep.path == trimmed && let Some(ref r) = ep.routing {
+        if ep.path == trimmed
+            && let Some(ref r) = ep.routing
+        {
             return r;
         }
     }
@@ -890,7 +892,12 @@ mod tests {
         assert_eq!(err.status(), StatusCode::BAD_GATEWAY);
         let body = axum::body::to_bytes(err.into_body(), 1024).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json["message"].as_str().unwrap().contains("client_id env var not set"));
+        assert!(
+            json["message"]
+                .as_str()
+                .unwrap()
+                .contains("client_id env var not set")
+        );
     }
 
     // ── resolve_routing ──────────────────────────────────────────────────

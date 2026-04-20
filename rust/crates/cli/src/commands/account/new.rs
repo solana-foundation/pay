@@ -261,6 +261,7 @@ pub fn save_account(
         pay_core::accounts::Account {
             keystore,
             active: false,
+            auth_required: Some(true),
             pubkey: Some(pubkey.to_string()),
             vault,
             path,

@@ -161,6 +161,7 @@ fn expand_path(path: &str) -> std::borrow::Cow<'_, str> {
 #[cfg(test)]
 mod tests {
     use super::{Config, LogFormat};
+    use serial_test::serial;
     use std::io::Write;
 
     #[test]
@@ -181,6 +182,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn load_from_path_reads_config_file() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let config_path = temp_dir.path().join("pay.toml");
@@ -200,6 +202,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn load_from_path_with_none_uses_defaults() {
         let config = Config::load_from_path(None).expect("load default config");
         assert!(!config.auto_pay);
@@ -272,6 +275,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn load_partial_config() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let config_path = temp_dir.path().join("pay.toml");

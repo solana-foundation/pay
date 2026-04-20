@@ -237,6 +237,7 @@ fn discover_legacy_account(name: &str) -> Option<Account> {
             return Some(Account {
                 keystore: KeystoreKind::AppleKeychain,
                 active: false,
+                auth_required: Some(true),
                 pubkey,
                 vault: None,
                 path: None,
@@ -254,6 +255,7 @@ fn discover_legacy_account(name: &str) -> Option<Account> {
             return Some(Account {
                 keystore: KeystoreKind::GnomeKeyring,
                 active: false,
+                auth_required: Some(true),
                 pubkey,
                 vault: None,
                 path: None,
@@ -270,6 +272,7 @@ fn discover_legacy_account(name: &str) -> Option<Account> {
             return Some(Account {
                 keystore: KeystoreKind::OnePassword,
                 active: false,
+                auth_required: Some(true),
                 pubkey,
                 vault: None,
                 path: None,
