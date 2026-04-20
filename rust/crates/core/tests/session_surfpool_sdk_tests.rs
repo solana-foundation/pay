@@ -528,6 +528,7 @@ fn fund_participant(cheatcodes: &Cheatcodes, keypair: &Keypair, usdc_amount: u64
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
+#[ignore = "requires mainnet RPC for JIT program fetch"]
 async fn pull_session_surfpool_init_path_submits_init_and_batches_open() {
     let surfnet = start_surfnet().await;
     let rpc_url = surfnet.rpc_url().to_string();
@@ -578,6 +579,7 @@ async fn pull_session_surfpool_init_path_submits_init_and_batches_open() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
+#[ignore = "requires mainnet RPC for JIT program fetch"]
 async fn pull_session_surfpool_update_path_submits_update_and_batches_open() {
     let surfnet = start_surfnet().await;
     let rpc_url = surfnet.rpc_url().to_string();
@@ -624,6 +626,7 @@ async fn pull_session_surfpool_update_path_submits_update_and_batches_open() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
+#[ignore = "requires mainnet RPC for JIT program fetch"]
 async fn pull_session_surfpool_sufficient_path_submits_no_setup_tx_and_batches_open() {
     let surfnet = start_surfnet().await;
     let rpc_url = surfnet.rpc_url().to_string();
@@ -680,6 +683,7 @@ async fn pull_session_surfpool_sufficient_path_submits_no_setup_tx_and_batches_o
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
+#[ignore = "requires mainnet RPC for JIT program fetch"]
 async fn pull_session_surfpool_multi_account_opens_share_one_batch() {
     let surfnet = start_surfnet().await;
     let rpc_url = surfnet.rpc_url().to_string();
