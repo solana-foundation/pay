@@ -76,13 +76,6 @@ jobs:
   rust-test:
     name: Rust tests + coverage
     runs-on: ubuntu-latest
-    services:
-      surfpool:
-        image: surfpool/surfpool
-        env:
-          SURFPOOL_DATASOURCE_RPC_URL: https://api.mainnet-beta.solana.com
-        ports:
-          - 8899:8899
     defaults:
       run:
         working-directory: ./rust

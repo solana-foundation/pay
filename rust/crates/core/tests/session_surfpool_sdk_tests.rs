@@ -187,42 +187,26 @@ impl Drop for EnvVarGuard {
     }
 }
 
-struct LocalSurfpool {
+async fn start_surfnet() -> surfpool_sdk::Surfnet {
+    surfpool_sdk::Surfnet::builder()
+        .remote_rpc_url("https://api.mainnet-beta.solana.com")
+        .airdrop_sol(10_000_000_000)
+        .start()
+        .await
+        .expect("Failed to start Surfnet")
+}
+
+struct Cheatcodes {
     rpc_url: String,
 }
 
-impl LocalSurfpool {
-    fn try_connect() -> Option<Self> {
-        use solana_mpp::solana_rpc_client::rpc_client::RpcClient;
-
-        let rpc_url =
-            std::env::var("PAY_RPC_URL").unwrap_or_else(|_| "http://127.0.0.1:8899".to_string());
-        if RpcClient::new(rpc_url.clone())
-            .get_latest_blockhash()
-            .is_err()
-        {
-            eprintln!("Surfpool RPC not reachable at {rpc_url} — skipping test");
-            return None;
-        }
-        Some(Self { rpc_url })
-    }
-
-    fn rpc_url(&self) -> &str {
-        &self.rpc_url
-    }
-
-    fn cheatcodes(&self) -> LocalCheatcodes<'_> {
-        LocalCheatcodes {
-            rpc_url: &self.rpc_url,
+impl Cheatcodes {
+    fn new(rpc_url: &str) -> Self {
+        Self {
+            rpc_url: rpc_url.to_string(),
         }
     }
-}
 
-struct LocalCheatcodes<'a> {
-    rpc_url: &'a str,
-}
-
-impl<'a> LocalCheatcodes<'a> {
     fn fund_sol(&self, address: &Pubkey, lamports: u64) {
         let params = serde_json::json!([address.to_string(), { "lamports": lamports }]);
         self.call("surfnet_setAccount", params);
@@ -448,7 +432,7 @@ async fn submit_base64_transaction(rpc_url: &str, tx_base64: &str) -> String {
 }
 
 async fn seed_delegation_cap(
-    surfpool: &LocalSurfpool,
+    cheatcodes: &Cheatcodes,
     rpc_url: &str,
     user: &Keypair,
     operator: &Keypair,
@@ -460,10 +444,7 @@ async fn seed_delegation_cap(
     let recent_blockhash = RpcClient::new(rpc_url.to_string())
         .get_latest_blockhash()
         .expect("latest blockhash");
-    let user_ata =
-        surfpool
-            .cheatcodes()
-            .get_ata(&user.pubkey(), &usdc_mint(), Some(&default_token_program()));
+    let user_ata = cheatcodes.get_ata(&user.pubkey(), &usdc_mint(), Some(&default_token_program()));
     let tx = build_init_multi_delegate_tx(
         &user_signer,
         &usdc_mint(),
@@ -535,11 +516,9 @@ async fn make_session_app(
     build_app(session_mpp)
 }
 
-fn fund_participant(surfpool: &LocalSurfpool, keypair: &Keypair, usdc_amount: u64) {
-    surfpool
-        .cheatcodes()
-        .fund_sol(&keypair.pubkey(), 2_000_000_000);
-    surfpool.cheatcodes().fund_token(
+fn fund_participant(cheatcodes: &Cheatcodes, keypair: &Keypair, usdc_amount: u64) {
+    cheatcodes.fund_sol(&keypair.pubkey(), 2_000_000_000);
+    cheatcodes.fund_token(
         &keypair.pubkey(),
         &usdc_mint(),
         usdc_amount,
@@ -550,16 +529,15 @@ fn fund_participant(surfpool: &LocalSurfpool, keypair: &Keypair, usdc_amount: u6
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn pull_session_surfpool_init_path_submits_init_and_batches_open() {
-    let Some(surfpool) = LocalSurfpool::try_connect() else {
-        return;
-    };
-    let rpc_url = surfpool.rpc_url().to_string();
+    let surfnet = start_surfnet().await;
+    let rpc_url = surfnet.rpc_url().to_string();
+    let cheatcodes = Cheatcodes::new(&rpc_url);
     let operator = Keypair::new();
     let recipient = Keypair::new();
     let user = Keypair::new();
-    fund_participant(&surfpool, &operator, 0);
-    fund_participant(&surfpool, &recipient, 0);
-    fund_participant(&surfpool, &user, 5_000_000);
+    fund_participant(&cheatcodes, &operator, 0);
+    fund_participant(&cheatcodes, &recipient, 0);
+    fund_participant(&cheatcodes, &user, 5_000_000);
 
     let batches: BatchLog = Arc::new(Mutex::new(Vec::new()));
     let chain = new_recording_chain(&rpc_url, &operator);
@@ -601,16 +579,15 @@ async fn pull_session_surfpool_init_path_submits_init_and_batches_open() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn pull_session_surfpool_update_path_submits_update_and_batches_open() {
-    let Some(surfpool) = LocalSurfpool::try_connect() else {
-        return;
-    };
-    let rpc_url = surfpool.rpc_url().to_string();
+    let surfnet = start_surfnet().await;
+    let rpc_url = surfnet.rpc_url().to_string();
+    let cheatcodes = Cheatcodes::new(&rpc_url);
     let operator = Keypair::new();
     let recipient = Keypair::new();
     let user = Keypair::new();
-    fund_participant(&surfpool, &operator, 0);
-    fund_participant(&surfpool, &recipient, 0);
-    fund_participant(&surfpool, &user, 5_000_000);
+    fund_participant(&cheatcodes, &operator, 0);
+    fund_participant(&cheatcodes, &recipient, 0);
+    fund_participant(&cheatcodes, &user, 5_000_000);
     let batches: BatchLog = Arc::new(Mutex::new(Vec::new()));
     let chain = StaticRecordingChain::new(MultiDelegateOnChainState {
         multi_delegate_exists: true,
@@ -648,18 +625,17 @@ async fn pull_session_surfpool_update_path_submits_update_and_batches_open() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn pull_session_surfpool_sufficient_path_submits_no_setup_tx_and_batches_open() {
-    let Some(surfpool) = LocalSurfpool::try_connect() else {
-        return;
-    };
-    let rpc_url = surfpool.rpc_url().to_string();
+    let surfnet = start_surfnet().await;
+    let rpc_url = surfnet.rpc_url().to_string();
+    let cheatcodes = Cheatcodes::new(&rpc_url);
     let operator = Keypair::new();
     let recipient = Keypair::new();
     let user = Keypair::new();
-    fund_participant(&surfpool, &operator, 0);
-    fund_participant(&surfpool, &recipient, 0);
-    fund_participant(&surfpool, &user, 5_000_000);
+    fund_participant(&cheatcodes, &operator, 0);
+    fund_participant(&cheatcodes, &recipient, 0);
+    fund_participant(&cheatcodes, &user, 5_000_000);
     let expected_token_account =
-        seed_delegation_cap(&surfpool, &rpc_url, &user, &operator, TEST_DEPOSIT).await;
+        seed_delegation_cap(&cheatcodes, &rpc_url, &user, &operator, TEST_DEPOSIT).await;
 
     let batches: BatchLog = Arc::new(Mutex::new(Vec::new()));
     let chain = new_recording_chain(&rpc_url, &operator);
@@ -705,20 +681,19 @@ async fn pull_session_surfpool_sufficient_path_submits_no_setup_tx_and_batches_o
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn pull_session_surfpool_multi_account_opens_share_one_batch() {
-    let Some(surfpool) = LocalSurfpool::try_connect() else {
-        return;
-    };
-    let rpc_url = surfpool.rpc_url().to_string();
+    let surfnet = start_surfnet().await;
+    let rpc_url = surfnet.rpc_url().to_string();
+    let cheatcodes = Cheatcodes::new(&rpc_url);
     let operator = Keypair::new();
     let recipient = Keypair::new();
     let alice = Keypair::new();
     let bob = Keypair::new();
-    fund_participant(&surfpool, &operator, 0);
-    fund_participant(&surfpool, &recipient, 0);
-    fund_participant(&surfpool, &alice, 5_000_000);
-    fund_participant(&surfpool, &bob, 5_000_000);
-    seed_delegation_cap(&surfpool, &rpc_url, &alice, &operator, TEST_DEPOSIT).await;
-    seed_delegation_cap(&surfpool, &rpc_url, &bob, &operator, TEST_DEPOSIT).await;
+    fund_participant(&cheatcodes, &operator, 0);
+    fund_participant(&cheatcodes, &recipient, 0);
+    fund_participant(&cheatcodes, &alice, 5_000_000);
+    fund_participant(&cheatcodes, &bob, 5_000_000);
+    seed_delegation_cap(&cheatcodes, &rpc_url, &alice, &operator, TEST_DEPOSIT).await;
+    seed_delegation_cap(&cheatcodes, &rpc_url, &bob, &operator, TEST_DEPOSIT).await;
 
     let batches: BatchLog = Arc::new(Mutex::new(Vec::new()));
     let chain = new_recording_chain(&rpc_url, &operator);
