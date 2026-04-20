@@ -192,15 +192,19 @@ struct LocalSurfpool {
 }
 
 impl LocalSurfpool {
-    fn connect() -> Self {
+    fn try_connect() -> Option<Self> {
         use solana_mpp::solana_rpc_client::rpc_client::RpcClient;
 
         let rpc_url =
             std::env::var("PAY_RPC_URL").unwrap_or_else(|_| "http://127.0.0.1:8899".to_string());
-        RpcClient::new(rpc_url.clone())
+        if RpcClient::new(rpc_url.clone())
             .get_latest_blockhash()
-            .unwrap_or_else(|e| panic!("Surfpool RPC not reachable at {rpc_url}: {e}"));
-        Self { rpc_url }
+            .is_err()
+        {
+            eprintln!("Surfpool RPC not reachable at {rpc_url} — skipping test");
+            return None;
+        }
+        Some(Self { rpc_url })
     }
 
     fn rpc_url(&self) -> &str {
@@ -546,7 +550,9 @@ fn fund_participant(surfpool: &LocalSurfpool, keypair: &Keypair, usdc_amount: u6
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn pull_session_surfpool_init_path_submits_init_and_batches_open() {
-    let surfpool = LocalSurfpool::connect();
+    let Some(surfpool) = LocalSurfpool::try_connect() else {
+        return;
+    };
     let rpc_url = surfpool.rpc_url().to_string();
     let operator = Keypair::new();
     let recipient = Keypair::new();
@@ -595,7 +601,9 @@ async fn pull_session_surfpool_init_path_submits_init_and_batches_open() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn pull_session_surfpool_update_path_submits_update_and_batches_open() {
-    let surfpool = LocalSurfpool::connect();
+    let Some(surfpool) = LocalSurfpool::try_connect() else {
+        return;
+    };
     let rpc_url = surfpool.rpc_url().to_string();
     let operator = Keypair::new();
     let recipient = Keypair::new();
@@ -640,7 +648,9 @@ async fn pull_session_surfpool_update_path_submits_update_and_batches_open() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn pull_session_surfpool_sufficient_path_submits_no_setup_tx_and_batches_open() {
-    let surfpool = LocalSurfpool::connect();
+    let Some(surfpool) = LocalSurfpool::try_connect() else {
+        return;
+    };
     let rpc_url = surfpool.rpc_url().to_string();
     let operator = Keypair::new();
     let recipient = Keypair::new();
@@ -695,7 +705,9 @@ async fn pull_session_surfpool_sufficient_path_submits_no_setup_tx_and_batches_o
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn pull_session_surfpool_multi_account_opens_share_one_batch() {
-    let surfpool = LocalSurfpool::connect();
+    let Some(surfpool) = LocalSurfpool::try_connect() else {
+        return;
+    };
     let rpc_url = surfpool.rpc_url().to_string();
     let operator = Keypair::new();
     let recipient = Keypair::new();
