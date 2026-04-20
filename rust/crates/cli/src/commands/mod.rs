@@ -18,7 +18,7 @@ use pay_core::runner::RunOutcome;
 use pay_core::x402;
 use pay_core::x402::Challenge as X402Challenge;
 use pay_core::{run_curl_with_headers, run_wget_with_headers};
-use solana_mpp::ChargeRequest;
+use solana_mpp::{ChargeRequest, SessionRequest};
 
 use crate::no_dna;
 use crate::output::{self, OutputFormat};
@@ -113,6 +113,7 @@ impl Command {
         output_fmt: Option<OutputFormat>,
         keypair_override: Option<&str>,
         network_override: Option<&str>,
+        account_override: Option<&str>,
         verbose: bool,
         sandbox: bool,
     ) -> pay_core::Result<()> {
@@ -127,7 +128,7 @@ impl Command {
             Command::Solana(cmd) => std::process::exit(cmd.run(keypair_override)?),
             Command::Send(cmd) => return cmd.run(keypair_override, verbose),
             Command::Setup(cmd) => return cmd.run(),
-            Command::Topup(cmd) => return cmd.run(keypair_override),
+            Command::Topup(cmd) => return cmd.run(),
             Command::Server { command } => return command.run(keypair_override, sandbox),
             Command::Mcp => {
                 let rt = tokio::runtime::Builder::new_multi_thread()
@@ -159,6 +160,8 @@ impl Command {
                     output_fmt,
                     Some(parsed_headers),
                     network_override,
+                    account_override,
+                    sandbox,
                     verbose,
                 );
             }
@@ -172,6 +175,8 @@ impl Command {
             output_fmt,
             None,
             network_override,
+            account_override,
+            sandbox,
             verbose,
         )
     }
@@ -184,6 +189,8 @@ fn handle_outcome(
     output_fmt: Option<OutputFormat>,
     fetch_headers: Option<Vec<(String, String)>>,
     network_override: Option<&str>,
+    account_override: Option<&str>,
+    sandbox: bool,
     verbose: bool,
 ) -> pay_core::Result<()> {
     let is_json = no_dna::should_json(output_fmt);
@@ -211,6 +218,7 @@ fn handle_outcome(
                     output_fmt,
                     fetch_headers,
                     network_override,
+                    account_override,
                     verbose,
                 );
             }
@@ -245,6 +253,57 @@ fn handle_outcome(
             }
         }
 
+        RunOutcome::SessionChallenge {
+            challenge,
+            resource_url,
+        } => {
+            let req: Option<SessionRequest> = challenge.request.decode().ok();
+            let cap_usdc = req.as_ref().and_then(|r| r.cap.parse::<u64>().ok()).unwrap_or(0) as f64 / 1_000_000.0;
+
+            if auto_pay {
+                if verbose && !is_json {
+                    eprintln!(
+                        "{}",
+                        format!("402 Payment Required (MPP session) — cap ${cap_usdc:.2} USDC — opening session…").dimmed()
+                    );
+                }
+                return pay_session_and_retry(
+                    &challenge,
+                    req.as_ref(),
+                    tool,
+                    output_fmt,
+                    fetch_headers,
+                    network_override,
+                    account_override,
+                    sandbox,
+                    verbose,
+                );
+            }
+
+            if is_json {
+                output::print_json(&serde_json::json!({
+                    "status": 402,
+                    "protocol": "mpp-session",
+                    "challenge": {
+                        "cap_usdc": cap_usdc,
+                        "currency": req.as_ref().map(|r| &r.currency),
+                        "network": req.as_ref().and_then(|r| r.network.as_deref()),
+                        "min_voucher_delta": req.as_ref().and_then(|r| r.min_voucher_delta.as_deref()),
+                        "recipient": req.as_ref().map(|r| &r.recipient),
+                    },
+                    "resource": resource_url,
+                }))?;
+            } else {
+                eprintln!(
+                    "{}",
+                    format!(
+                        "402 Payment Required (MPP session) — cap ${cap_usdc:.2} USDC — use --yolo to open a session automatically",
+                    )
+                    .dimmed()
+                );
+            }
+        }
+
         RunOutcome::X402Challenge {
             requirements,
             resource_url,
@@ -266,6 +325,7 @@ fn handle_outcome(
                     output_fmt,
                     fetch_headers,
                     network_override,
+                    account_override,
                     verbose,
                 );
             }
@@ -364,6 +424,7 @@ fn pay_mpp_and_retry(
     output_fmt: Option<OutputFormat>,
     fetch_headers: Option<Vec<(String, String)>>,
     network_override: Option<&str>,
+    account_override: Option<&str>,
     verbose: bool,
 ) -> pay_core::Result<()> {
     let is_json = no_dna::should_json(output_fmt);
@@ -374,7 +435,7 @@ fn pay_mpp_and_retry(
 
     let store = pay_core::accounts::FileAccountsStore::default_path();
     let (auth_header, ephemeral_notice) =
-        mpp::build_credential(challenge, &store, network_override)?;
+        mpp::build_credential(challenge, &store, network_override, account_override)?;
 
     if let Some(resolved) = ephemeral_notice {
         render_generated_wallet_notice(&resolved, is_json)?;
@@ -394,6 +455,7 @@ fn pay_x402_and_retry(
     output_fmt: Option<OutputFormat>,
     fetch_headers: Option<Vec<(String, String)>>,
     network_override: Option<&str>,
+    account_override: Option<&str>,
     verbose: bool,
 ) -> pay_core::Result<()> {
     let is_json = no_dna::should_json(output_fmt);
@@ -404,7 +466,7 @@ fn pay_x402_and_retry(
 
     let store = pay_core::accounts::FileAccountsStore::default_path();
     let (payment_json, ephemeral_notice) =
-        x402::build_payment(requirements, &store, network_override)?;
+        x402::build_payment(requirements, &store, network_override, account_override)?;
 
     if let Some(resolved) = ephemeral_notice {
         render_generated_wallet_notice(&resolved, is_json)?;
@@ -415,6 +477,95 @@ fn pay_x402_and_retry(
     }
 
     let retry_outcome = retry_with_header(tool, "X-PAYMENT", &payment_json, fetch_headers)?;
+    handle_retry_outcome(retry_outcome, is_json)
+}
+
+fn pay_session_and_retry(
+    challenge: &mpp::Challenge,
+    req: Option<&SessionRequest>,
+    tool: &Tool,
+    output_fmt: Option<OutputFormat>,
+    fetch_headers: Option<Vec<(String, String)>>,
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+    sandbox: bool,
+    verbose: bool,
+) -> pay_core::Result<()> {
+    use solana_mpp::SessionMode;
+
+    let is_json = no_dna::should_json(output_fmt);
+
+    // Deposit = min_voucher_delta * 1000, clamped to [1 USDC, cap].
+    let min_delta = req
+        .and_then(|r| r.min_voucher_delta.as_deref())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(1_000);
+    let cap = req
+        .and_then(|r| r.cap.parse::<u64>().ok())
+        .unwrap_or(1_000_000);
+    let deposit = (min_delta * 1_000).max(1_000_000).min(cap);
+
+    // Prefer pull mode if advertised — it doesn't require an on-chain Fiber channel.
+    let use_pull = req
+        .map(|r| r.modes.contains(&SessionMode::Pull))
+        .unwrap_or(false);
+
+    let auth_header = if use_pull {
+        let Some(request) = req else {
+            return Err(pay_core::Error::Mpp(
+                "pull-mode session requires a decoded SessionRequest".to_string(),
+            ));
+        };
+
+        if verbose && !is_json {
+            eprintln!(
+                "{}",
+                format!(
+                    "Opening pull-mode session (deposit {} µUSDC, operator {})…",
+                    deposit,
+                    &request.operator[..8.min(request.operator.len())]
+                )
+                .dimmed()
+            );
+        }
+
+        let store = pay_core::accounts::FileAccountsStore::default_path();
+        let (_handle, header) = pay_core::session::open_pull_session_header(
+            challenge,
+            request,
+            &store,
+            network_override,
+            account_override,
+            deposit,
+            sandbox,
+        )?;
+
+        if verbose && !is_json {
+            eprintln!(
+                "{}",
+                "Pull session ready — delegation txs built, sending request…\n".dimmed()
+            );
+        }
+
+        header
+    } else {
+        if verbose && !is_json {
+            eprintln!(
+                "{}",
+                format!("Opening push session (deposit {} µUSDC)…", deposit).dimmed()
+            );
+        }
+
+        let (_handle, header) = pay_core::session::open_session_header(challenge, deposit)?;
+
+        if verbose && !is_json {
+            eprintln!("{}", "Push session opened — sending request…\n".dimmed());
+        }
+
+        header
+    };
+
+    let retry_outcome = retry_with_header(tool, "Authorization", &auth_header, fetch_headers)?;
     handle_retry_outcome(retry_outcome, is_json)
 }
 

@@ -23,7 +23,27 @@ pub struct SetupCommand {
 
 impl SetupCommand {
     pub fn run(self) -> pay_core::Result<()> {
-        let pubkey = super::account::new::create_account(
+        // Abort before any prompts if the default account already exists.
+        if !self.force
+            && let Ok(accounts) = pay_core::accounts::AccountsFile::load()
+            && accounts
+                .accounts
+                .get(pay_core::accounts::MAINNET_NETWORK)
+                .is_some_and(|net| net.contains_key("default"))
+        {
+            super::account::list::print_account_list(
+                &accounts,
+                None::<super::account::list::Highlight>,
+            );
+            eprintln!(
+                "{}",
+                "  A default account already exists. Use --force to replace it, or `pay account new --name <name>` to add another.".dimmed()
+            );
+            eprintln!();
+            return Ok(());
+        }
+
+        let (pubkey, backend_name) = super::account::new::create_account(
             "default",
             self.backend.as_deref(),
             self.vault.as_deref(),
@@ -31,19 +51,14 @@ impl SetupCommand {
         )?;
 
         eprintln!();
-        eprintln!("  {} {pubkey}", "Your account:".dimmed());
-        eprintln!();
-        eprintln!(
-            "{}",
-            "  Next: fund your account, then run `pay curl <url>` to access paid APIs.".dimmed()
-        );
-        eprintln!();
 
         let config = pay_core::Config::load().unwrap_or_default();
         let rpc_url = config
             .rpc_url
             .clone()
             .unwrap_or_else(pay_core::balance::mainnet_rpc_url);
-        crate::tui::run_topup_flow(&pubkey, &rpc_url)
+        let received = crate::tui::run_topup_flow(&pubkey, &rpc_url, "default")?;
+        super::account::new::print_next_steps("default", backend_name, received.as_ref());
+        Ok(())
     }
 }

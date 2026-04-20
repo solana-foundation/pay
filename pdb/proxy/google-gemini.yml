@@ -1,0 +1,100 @@
+name: gemini
+subdomain: gemini
+title: "Gemini AI (Session)"
+description: >
+  Generate content with Gemini models using a pre-funded Solana session channel.
+  Open one channel per session and pay per request with signed vouchers —
+  no on-chain transaction per call.
+category: ai_ml
+version: v1beta
+routing:
+  type: proxy
+  url: https://generativelanguage.googleapis.com/
+  auth:
+    method: query_param
+    key: "key"
+    value_from_env: GOOGLE_API_KEY
+operator:
+  currency: "USDC"
+  network: "localnet"
+  fee_payer: true
+
+# Session channel parameters.
+# The middleware issues a 402 with intent="session" instead of intent="charge".
+# Clients send signed vouchers on each call; no on-chain tx per request.
+session:
+  # Default channel cap offered to clients (USDC, human-readable).
+  # Clients may request a lower cap; the server will not accept higher.
+  cap_usdc: 10.0
+  # Minimum voucher increment (base units = µUSDC).
+  # Prevents spam vouchers smaller than one API call's cost.
+  min_voucher_delta: 1000   # 0.001 USDC
+  # Supported session modes (push = Fiber channel, pull = SPL delegation).
+  modes: [push, pull]
+
+endpoints:
+  # ── Free ──────────────────────────────────────────────────────────────────
+
+  - method: GET
+    path: "v1beta/models"
+    resource: "models"
+    description: "List available Gemini models. Free — no payment required."
+
+  - method: GET
+    path: "v1beta/models/{modelsId}"
+    resource: "models"
+    description: "Get model metadata. Free — no payment required."
+
+  # ── Metered (session voucher per call) ────────────────────────────────────
+
+  - method: POST
+    path: "v1beta/models/{modelsId}:generateContent"
+    resource: "models"
+    description: >
+      Generate content with a Gemini model. Requires a session voucher
+      incrementing by at least the per-request cost below.
+    metering:
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 0.001   # 0.001 USDC per request (= 1000 µUSDC)
+
+  - method: POST
+    path: "v1beta/models/{modelsId}:streamGenerateContent"
+    resource: "models"
+    description: >
+      Stream generated content with a Gemini model. Same per-request cost
+      as generateContent.
+    metering:
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 0.001
+
+  - method: POST
+    path: "v1beta/models/{modelsId}:countTokens"
+    resource: "models"
+    description: "Count tokens in a prompt. Flat fee."
+    metering:
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 0.0001  # 0.0001 USDC per count call
+
+  - method: POST
+    path: "v1beta/models/{modelsId}:embedContent"
+    resource: "models"
+    description: "Generate text embeddings. Flat fee per call."
+    metering:
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 0.0001

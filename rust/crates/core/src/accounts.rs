@@ -1,38 +1,30 @@
 //! Account registry + per-network routing — `~/.config/pay/accounts.yml`.
 //!
-//! Single source of truth for two related things:
-//!
-//! 1. **Named wallets** (`accounts:`) — one entry per wallet the user has
-//!    set up, each backed by a keystore (Apple Keychain, 1Password, GNOME
-//!    Keyring, Windows Hello, a file path) or stored inline as an
-//!    `ephemeral` keypair (cached test wallets generated lazily for
-//!    sandbox/devnet/localnet).
-//!
-//! 2. **Network routing** (`networks:`) — a map from Solana network slug
-//!    (`mainnet`, `devnet`, `localnet`, `sandbox`) to the name of the
-//!    account to use when paying a challenge that advertises that network.
+//! Single source of truth for named wallets, organised by network.
 //!
 //! ```yaml
-//! version: 1
+//! version: 2
 //!
 //! accounts:
-//!   default:
-//!     keystore: apple-keychain
-//!     pubkey: 7xKX...abc
-//!   work:
-//!     keystore: 1password
-//!     vault: Work
-//!     pubkey: 9yLM...def
-//!   sandbox:
-//!     keystore: ephemeral
-//!     pubkey: ABc...
-//!     secret_key_b58: 5Kj...
-//!     created_at: 2026-04-10T12:34:56Z
-//!
-//! networks:
-//!   mainnet: default
-//!   sandbox: sandbox
+//!   mainnet:
+//!     default:
+//!       keystore: apple-keychain
+//!       pubkey: 7xKX...abc
+//!     work:
+//!       keystore: 1password
+//!       vault: Work
+//!       pubkey: 9yLM...def
+//!   localnet:
+//!     default:
+//!       keystore: ephemeral
+//!       pubkey: ABc...
+//!       secret_key_b58: 5Kj...
+//!       created_at: 2026-04-10T12:34:56Z
 //! ```
+//!
+//! When a network has multiple accounts, the "active" one (used for
+//! payments) is the one with `active: true`, or else the first one
+//! alphabetically (BTreeMap ordering).
 //!
 //! ## Testability
 //!
@@ -41,9 +33,6 @@
 //! permissions; tests use [`MemoryAccountsStore`] which holds the config
 //! in memory and counts save calls so we can assert "we resolved an
 //! ephemeral but forgot to persist it" never happens.
-//!
-//! Pure functions like [`resolve_account_for_network`] take an
-//! `&AccountsFile` value and have no I/O — they're trivially unit-testable.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -55,14 +44,13 @@ use crate::{Error, Result};
 const ACCOUNTS_FILE: &str = "~/.config/pay/accounts.yml";
 
 /// Current schema version. Bumped on incompatible changes.
-pub const ACCOUNTS_SCHEMA_VERSION: u32 = 1;
+pub const ACCOUNTS_SCHEMA_VERSION: u32 = 2;
 
 /// Default account name created by `pay setup`.
 pub const DEFAULT_ACCOUNT_NAME: &str = "default";
 
 /// Solana mainnet network slug — used as the lookup key for "the user's
-/// real-money wallet" throughout the rest of the codebase. Matches the
-/// slug used by `solana-mpp::protocol::solana::default_rpc_url("mainnet")`.
+/// real-money wallet" throughout the rest of the codebase.
 pub const MAINNET_NETWORK: &str = "mainnet";
 
 // ── Keystore + Account ──────────────────────────────────────────────────────
@@ -94,11 +82,21 @@ impl std::fmt::Display for Keystore {
     }
 }
 
+fn is_false(b: &bool) -> bool {
+    !b
+}
+
 /// A single account entry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Account {
     /// Which keystore backend stores the secret key.
     pub keystore: Keystore,
+
+    /// Whether this account is the active one for its network. Only one
+    /// account per network should have this set. If none is set, the first
+    /// one alphabetically is used. Omitted from YAML when false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub active: bool,
 
     /// Base-58 public key (cached for display without auth).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -160,22 +158,16 @@ impl Account {
 
 // ── AccountsFile ────────────────────────────────────────────────────────────
 
-/// The top-level accounts file — named wallets + per-network routing.
+/// The top-level accounts file — wallets nested by network.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AccountsFile {
     /// Schema version. Bumped on incompatible changes.
     #[serde(default = "default_version")]
     pub version: u32,
 
-    /// All registered accounts, keyed by user-chosen name.
+    /// All registered accounts, keyed by network slug → account name.
     #[serde(default)]
-    pub accounts: BTreeMap<String, Account>,
-
-    /// Network slug → account name. When the client receives a 402
-    /// challenge that advertises a network, this map decides which
-    /// wallet to sign with.
-    #[serde(default)]
-    pub networks: BTreeMap<String, String>,
+    pub accounts: BTreeMap<String, BTreeMap<String, Account>>,
 }
 
 impl Default for AccountsFile {
@@ -183,7 +175,6 @@ impl Default for AccountsFile {
         Self {
             version: ACCOUNTS_SCHEMA_VERSION,
             accounts: BTreeMap::new(),
-            networks: BTreeMap::new(),
         }
     }
 }
@@ -205,11 +196,29 @@ impl AccountsFile {
     }
 
     /// Look up the account that should be used for the given network.
+    ///
+    /// Selection rule:
+    /// 1. Account with `active: true` (if any).
+    /// 2. Otherwise the first account alphabetically (BTreeMap order).
+    ///
     /// Returns `(account_name, account)` or `None` if the network has no
-    /// mapping or the mapping points at a non-existent account.
+    /// accounts configured.
     pub fn account_for_network(&self, network: &str) -> Option<(&str, &Account)> {
-        let name = self.networks.get(network)?;
-        self.accounts.get(name).map(|a| (name.as_str(), a))
+        let network_accounts = self.accounts.get(network)?;
+        if network_accounts.is_empty() {
+            return None;
+        }
+        // Prefer explicitly active account.
+        if let Some((name, acct)) = network_accounts.iter().find(|(_, a)| a.active) {
+            return Some((name.as_str(), acct));
+        }
+        // Fall back to first alphabetically.
+        network_accounts.iter().next().map(|(n, a)| (n.as_str(), a))
+    }
+
+    /// Look up a specific named account within a network.
+    pub fn named_account_for_network(&self, network: &str, name: &str) -> Option<&Account> {
+        self.accounts.get(network)?.get(name)
     }
 
     /// Convenience: the account mapped to mainnet — i.e. the user's
@@ -220,49 +229,44 @@ impl AccountsFile {
         self.account_for_network(MAINNET_NETWORK)
     }
 
-    /// Add or update an account. The first account inserted into a fresh
-    /// file is also wired up as the `mainnet` default — keeps
-    /// `pay setup` from needing two writes.
-    pub fn upsert(&mut self, name: &str, account: Account) {
-        let is_first = self.accounts.is_empty();
-        self.accounts.insert(name.to_string(), account);
-        if is_first && !self.networks.contains_key(MAINNET_NETWORK) {
-            self.networks
-                .insert(MAINNET_NETWORK.to_string(), name.to_string());
-        }
+    /// Add or update an account within a network.
+    pub fn upsert(&mut self, network: &str, name: &str, account: Account) {
+        self.accounts
+            .entry(network.to_string())
+            .or_default()
+            .insert(name.to_string(), account);
     }
 
-    /// Remove an account. Also clears any network mappings that pointed
-    /// at it (otherwise we'd be left with dangling network → account
-    /// references that resolve to `Missing`).
-    pub fn remove(&mut self, name: &str) -> Option<Account> {
-        let removed = self.accounts.remove(name);
-        if removed.is_some() {
-            self.networks.retain(|_, v| v != name);
+    /// Remove an account from a network. Also removes the network entry
+    /// if it becomes empty. Returns the removed account, or `None`.
+    pub fn remove(&mut self, network: &str, name: &str) -> Option<Account> {
+        let network_accounts = self.accounts.get_mut(network)?;
+        let removed = network_accounts.remove(name);
+        if network_accounts.is_empty() {
+            self.accounts.remove(network);
         }
         removed
     }
 
-    /// Set (or replace) the account that backs a given network slug.
-    pub fn set_network(&mut self, network: &str, account_name: &str) {
-        self.networks
-            .insert(network.to_string(), account_name.to_string());
+    /// Set `active: true` on the named account in a network, clearing it
+    /// from all other accounts in the same network.
+    pub fn set_active(&mut self, network: &str, name: &str) {
+        if let Some(network_accounts) = self.accounts.get_mut(network) {
+            for (acct_name, acct) in network_accounts.iter_mut() {
+                acct.active = acct_name == name;
+            }
+        }
     }
 }
 
 // ── Resolution ──────────────────────────────────────────────────────────────
 
-/// Result of looking up an account for a network. Distinguishes the
-/// "no mapping" case from the "mapping points at a deleted account"
-/// case so callers can give precise error messages.
+/// Result of looking up an account for a network.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccountChoice {
-    /// Network is mapped to an existing account.
+    /// Network has an account configured.
     Resolved { name: String, account: Account },
-    /// Network is mapped to an account name that doesn't exist in
-    /// `accounts:`. Always a config bug — surface it loudly.
-    Dangling { network: String, name: String },
-    /// Network has no entry in the `networks:` map at all. Caller may
+    /// Network has no entry in the accounts map at all. Caller may
     /// choose to lazily create one (for ephemeral networks like
     /// sandbox/devnet/localnet) or surface "no wallet configured".
     Missing,
@@ -271,18 +275,12 @@ pub enum AccountChoice {
 /// Pure resolver: given a config snapshot and a network slug, return
 /// the account choice for it. Does no I/O.
 pub fn resolve_account_for_network(network: &str, file: &AccountsFile) -> AccountChoice {
-    let Some(name) = file.networks.get(network) else {
-        return AccountChoice::Missing;
-    };
-    match file.accounts.get(name) {
-        Some(account) => AccountChoice::Resolved {
-            name: name.clone(),
+    match file.account_for_network(network) {
+        Some((name, account)) => AccountChoice::Resolved {
+            name: name.to_string(),
             account: account.clone(),
         },
-        None => AccountChoice::Dangling {
-            network: network.to_string(),
-            name: name.clone(),
-        },
+        None => AccountChoice::Missing,
     }
 }
 
@@ -407,79 +405,79 @@ pub struct ResolvedEphemeral {
 /// one if no entry exists.
 ///
 /// Behavior:
-/// - **No mapping for the network** → generate a fresh ephemeral, name
-///   the account after the network slug, wire it into the `networks:`
-///   map, persist, return with `created = true`.
-/// - **Mapping points at an ephemeral account** → return cache hit with
-///   `created = false`.
-/// - **Mapping points at a non-ephemeral account** → error. The caller
-///   should resolve through `signer::load_signer` instead so the
-///   user's real wallet is used.
-/// - **Mapping points at a non-existent account** (dangling) → error.
+/// - **No account for the network** → generate a fresh ephemeral named
+///   "default", insert under `accounts[network]["default"]`, persist,
+///   return with `created = true`.
+/// - **Account is ephemeral** → return cache hit with `created = false`.
+/// - **Account is non-ephemeral** → error. The caller should resolve
+///   through `signer::load_signer` instead so the user's real wallet
+///   is used.
 pub fn load_or_create_ephemeral_for_network(
     network: &str,
     store: &dyn AccountsStore,
 ) -> Result<ResolvedEphemeral> {
-    let mut file = store.load()?;
-
-    match resolve_account_for_network(network, &file) {
-        AccountChoice::Resolved { name, account } => {
-            if account.keystore != Keystore::Ephemeral {
-                return Err(Error::Config(format!(
-                    "Network `{network}` is mapped to account `{name}` which is \
-                     `{}`-backed, not ephemeral. Resolve via the keystore loader \
-                     instead of generating a fresh wallet.",
-                    account.keystore
-                )));
-            }
-            Ok(ResolvedEphemeral {
-                network: network.to_string(),
-                account_name: name,
-                account,
-                created: false,
-            })
-        }
-        AccountChoice::Dangling { name, .. } => Err(Error::Config(format!(
-            "Network `{network}` is mapped to account `{name}` which doesn't exist \
-             in the accounts file. Edit ~/.config/pay/accounts.yml to fix the mapping."
-        ))),
-        AccountChoice::Missing => {
-            let account = generate_ephemeral_account();
-            // Use the network slug as the account name. Power users can
-            // rename or remap later via `set_network`.
-            let account_name = network.to_string();
-            file.accounts.insert(account_name.clone(), account.clone());
-            file.networks
-                .insert(network.to_string(), account_name.clone());
-            store.save(&file)?;
-            Ok(ResolvedEphemeral {
-                network: network.to_string(),
-                account_name,
-                account,
-                created: true,
-            })
-        }
-    }
+    load_or_create_ephemeral_for_network_as(network, DEFAULT_ACCOUNT_NAME, store)
 }
 
-/// Set (or replace) a network → account mapping. Used by `pay setup` to
-/// wire `mainnet → default` after the user creates their main
-/// wallet, and by `pay account set-default` for explicit user
-/// reassignments.
-pub fn set_account_for_network(
+/// Named variant of [`load_or_create_ephemeral_for_network`].
+pub fn load_or_create_ephemeral_for_network_as(
     network: &str,
     account_name: &str,
     store: &dyn AccountsStore,
-) -> Result<()> {
+) -> Result<ResolvedEphemeral> {
     let mut file = store.load()?;
-    if !file.accounts.contains_key(account_name) {
-        return Err(Error::Config(format!(
-            "Cannot map network `{network}` → account `{account_name}`: no such account"
-        )));
+
+    if let Some(account) = file.named_account_for_network(network, account_name).cloned() {
+        if account.keystore != Keystore::Ephemeral {
+            return Err(Error::Config(format!(
+                "Network `{network}` account `{account_name}` is \
+                 `{}`-backed, not ephemeral. Resolve via the keystore loader \
+                 instead of generating a fresh wallet.",
+                account.keystore
+            )));
+        }
+        return Ok(ResolvedEphemeral {
+            network: network.to_string(),
+            account_name: account_name.to_string(),
+            account,
+            created: false,
+        });
     }
-    file.networks
-        .insert(network.to_string(), account_name.to_string());
-    store.save(&file)
+
+    if account_name == DEFAULT_ACCOUNT_NAME {
+        match resolve_account_for_network(network, &file) {
+            AccountChoice::Resolved { name, account } => {
+                if account.keystore != Keystore::Ephemeral {
+                    return Err(Error::Config(format!(
+                        "Network `{network}` is mapped to account `{name}` which is \
+                         `{}`-backed, not ephemeral. Resolve via the keystore loader \
+                         instead of generating a fresh wallet.",
+                        account.keystore
+                    )));
+                }
+                return Ok(ResolvedEphemeral {
+                    network: network.to_string(),
+                    account_name: name,
+                    account,
+                    created: false,
+                });
+            }
+            AccountChoice::Missing => {}
+        }
+    }
+
+    let account = generate_ephemeral_account();
+    file.accounts
+        .entry(network.to_string())
+        .or_default()
+        .insert(account_name.to_string(), account.clone());
+    store.save(&file)?;
+    Ok(ResolvedEphemeral {
+        network: network.to_string(),
+        account_name: account_name.to_string(),
+        account,
+        created: true,
+    })
 }
 
 fn generate_ephemeral_account() -> Account {
@@ -490,6 +488,7 @@ fn generate_ephemeral_account() -> Account {
     full.extend_from_slice(&verifying_key.to_bytes());
     Account {
         keystore: Keystore::Ephemeral,
+        active: false,
         pubkey: Some(bs58::encode(verifying_key.to_bytes()).into_string()),
         vault: None,
         path: None,
@@ -559,6 +558,7 @@ mod tests {
     fn keychain_account(pubkey: &str) -> Account {
         Account {
             keystore: Keystore::AppleKeychain,
+            active: false,
             pubkey: Some(pubkey.to_string()),
             vault: None,
             path: None,
@@ -570,6 +570,7 @@ mod tests {
     fn fake_ephemeral(pubkey: &str) -> Account {
         Account {
             keystore: Keystore::Ephemeral,
+            active: false,
             pubkey: Some(pubkey.to_string()),
             vault: None,
             path: None,
@@ -614,8 +615,6 @@ mod tests {
 
     #[test]
     fn signer_source_ephemeral_returns_none() {
-        // Ephemeral accounts must NOT be loaded through the external
-        // `load_signer` path — they have no source string.
         assert_eq!(fake_ephemeral("pk").signer_source("sandbox"), None);
     }
 
@@ -623,6 +622,7 @@ mod tests {
     fn signer_source_file_uses_path_when_set() {
         let acct = Account {
             keystore: Keystore::File,
+            active: false,
             pubkey: None,
             vault: None,
             path: Some("/home/me/.config/solana/id.json".to_string()),
@@ -639,6 +639,7 @@ mod tests {
     fn signer_source_file_falls_back_to_default_path() {
         let acct = Account {
             keystore: Keystore::File,
+            active: false,
             pubkey: None,
             vault: None,
             path: None,
@@ -656,6 +657,7 @@ mod tests {
         let raw_bytes: Vec<u8> = (0u8..64).collect();
         let acct = Account {
             keystore: Keystore::Ephemeral,
+            active: false,
             pubkey: Some("pk".to_string()),
             vault: None,
             path: None,
@@ -673,76 +675,114 @@ mod tests {
     // ── AccountsFile mutation ─────────────────────────────────────────────
 
     #[test]
-    fn upsert_first_account_wires_mainnet_default() {
-        // First insert should auto-wire `mainnet → <name>` so a
-        // brand-new `pay setup` works without an explicit set_network.
+    fn upsert_inserts_under_network() {
         let mut f = AccountsFile::default();
-        f.upsert("default", keychain_account("pk1"));
-        assert_eq!(
-            f.networks.get(MAINNET_NETWORK).map(String::as_str),
-            Some("default")
+        f.upsert(MAINNET_NETWORK, "default", keychain_account("pk1"));
+        assert!(
+            f.accounts
+                .get(MAINNET_NETWORK)
+                .unwrap()
+                .contains_key("default")
         );
     }
 
     #[test]
-    fn upsert_second_account_does_not_clobber_mainnet_default() {
-        // Adding a second account shouldn't repoint mainnet — that's a
-        // user-driven decision via set_network.
+    fn upsert_second_account_in_same_network() {
         let mut f = AccountsFile::default();
-        f.upsert("default", keychain_account("pk1"));
-        f.upsert("work", keychain_account("pk2"));
-        assert_eq!(
-            f.networks.get(MAINNET_NETWORK).map(String::as_str),
-            Some("default")
-        );
-        assert_eq!(f.accounts.len(), 2);
+        f.upsert(MAINNET_NETWORK, "default", keychain_account("pk1"));
+        f.upsert(MAINNET_NETWORK, "work", keychain_account("pk2"));
+        let net = f.accounts.get(MAINNET_NETWORK).unwrap();
+        assert_eq!(net.len(), 2);
     }
 
     #[test]
     fn upsert_overwrites_existing_account() {
         let mut f = AccountsFile::default();
-        f.upsert("default", keychain_account("old"));
-        f.upsert("default", keychain_account("new"));
-        assert_eq!(f.accounts.len(), 1);
-        assert_eq!(f.accounts["default"].pubkey.as_deref(), Some("new"));
+        f.upsert(MAINNET_NETWORK, "default", keychain_account("old"));
+        f.upsert(MAINNET_NETWORK, "default", keychain_account("new"));
+        let net = f.accounts.get(MAINNET_NETWORK).unwrap();
+        assert_eq!(net.len(), 1);
+        assert_eq!(net["default"].pubkey.as_deref(), Some("new"));
     }
 
     #[test]
-    fn remove_account_clears_dangling_network_mappings() {
-        // If `mainnet → default` and we delete `default`, the
-        // mapping must be removed too — otherwise resolution would
-        // return `Dangling` forever.
+    fn remove_account_removes_network_when_empty() {
         let mut f = AccountsFile::default();
-        f.upsert("default", keychain_account("pk"));
-        assert!(f.networks.contains_key(MAINNET_NETWORK));
-        f.remove("default");
-        assert!(!f.networks.contains_key(MAINNET_NETWORK));
+        f.upsert(MAINNET_NETWORK, "default", keychain_account("pk"));
+        f.remove(MAINNET_NETWORK, "default");
+        assert!(!f.accounts.contains_key(MAINNET_NETWORK));
     }
 
     #[test]
-    fn remove_nonexistent_returns_none_and_leaves_networks_alone() {
+    fn remove_account_leaves_network_with_remaining_accounts() {
         let mut f = AccountsFile::default();
-        f.upsert("default", keychain_account("pk"));
-        assert!(f.remove("ghost").is_none());
-        assert!(f.networks.contains_key(MAINNET_NETWORK));
+        f.upsert(MAINNET_NETWORK, "default", keychain_account("pk1"));
+        f.upsert(MAINNET_NETWORK, "work", keychain_account("pk2"));
+        f.remove(MAINNET_NETWORK, "default");
+        let net = f.accounts.get(MAINNET_NETWORK).unwrap();
+        assert_eq!(net.len(), 1);
+        assert!(net.contains_key("work"));
     }
 
     #[test]
-    fn set_network_writes_mapping() {
+    fn remove_nonexistent_returns_none() {
         let mut f = AccountsFile::default();
-        f.upsert("work", keychain_account("pk"));
-        f.set_network("devnet", "work");
-        assert_eq!(f.networks.get("devnet").map(String::as_str), Some("work"));
+        f.upsert(MAINNET_NETWORK, "default", keychain_account("pk"));
+        assert!(f.remove(MAINNET_NETWORK, "ghost").is_none());
+        assert!(f.accounts.contains_key(MAINNET_NETWORK));
+    }
+
+    #[test]
+    fn set_active_marks_correct_account() {
+        let mut f = AccountsFile::default();
+        f.upsert(MAINNET_NETWORK, "default", keychain_account("pk1"));
+        f.upsert(MAINNET_NETWORK, "work", keychain_account("pk2"));
+        f.set_active(MAINNET_NETWORK, "work");
+        let net = f.accounts.get(MAINNET_NETWORK).unwrap();
+        assert!(net["work"].active);
+        assert!(!net["default"].active);
+    }
+
+    #[test]
+    fn set_active_clears_previous_active() {
+        let mut f = AccountsFile::default();
+        f.upsert(MAINNET_NETWORK, "default", keychain_account("pk1"));
+        f.upsert(MAINNET_NETWORK, "work", keychain_account("pk2"));
+        f.set_active(MAINNET_NETWORK, "default");
+        f.set_active(MAINNET_NETWORK, "work");
+        let net = f.accounts.get(MAINNET_NETWORK).unwrap();
+        assert!(!net["default"].active);
+        assert!(net["work"].active);
     }
 
     // ── Lookups ───────────────────────────────────────────────────────────
 
     #[test]
-    fn account_for_network_returns_resolved() {
+    fn account_for_network_returns_first_when_no_active() {
         let mut f = AccountsFile::default();
-        f.upsert("work", keychain_account("WorkPubkey"));
-        f.set_network("mainnet", "work");
-        let (name, acct) = f.account_for_network("mainnet").unwrap();
+        // BTreeMap is sorted: "default" < "work"
+        f.upsert(
+            MAINNET_NETWORK,
+            "default",
+            keychain_account("DefaultPubkey"),
+        );
+        f.upsert(MAINNET_NETWORK, "work", keychain_account("WorkPubkey"));
+        let (name, acct) = f.account_for_network(MAINNET_NETWORK).unwrap();
+        assert_eq!(name, "default");
+        assert_eq!(acct.pubkey.as_deref(), Some("DefaultPubkey"));
+    }
+
+    #[test]
+    fn account_for_network_prefers_active() {
+        let mut f = AccountsFile::default();
+        f.upsert(
+            MAINNET_NETWORK,
+            "default",
+            keychain_account("DefaultPubkey"),
+        );
+        f.upsert(MAINNET_NETWORK, "work", keychain_account("WorkPubkey"));
+        f.set_active(MAINNET_NETWORK, "work");
+        let (name, acct) = f.account_for_network(MAINNET_NETWORK).unwrap();
         assert_eq!(name, "work");
         assert_eq!(acct.pubkey.as_deref(), Some("WorkPubkey"));
     }
@@ -750,15 +790,18 @@ mod tests {
     #[test]
     fn default_account_is_shim_for_mainnet_lookup() {
         let mut f = AccountsFile::default();
-        f.upsert("default", keychain_account("DefaultPubkey"));
-        // upsert auto-wires mainnet → "default" on first insert.
+        f.upsert(
+            MAINNET_NETWORK,
+            "default",
+            keychain_account("DefaultPubkey"),
+        );
         let (name, acct) = f.default_account().unwrap();
         assert_eq!(name, "default");
         assert_eq!(acct.pubkey.as_deref(), Some("DefaultPubkey"));
     }
 
     #[test]
-    fn default_account_returns_none_when_no_mainnet_mapping() {
+    fn default_account_returns_none_when_no_mainnet() {
         let f = AccountsFile::default();
         assert!(f.default_account().is_none());
     }
@@ -766,13 +809,12 @@ mod tests {
     // ── resolve_account_for_network (pure) ────────────────────────────────
 
     #[test]
-    fn resolve_returns_resolved_for_existing_mapping() {
+    fn resolve_returns_resolved_for_existing_account() {
         let mut f = AccountsFile::default();
-        f.upsert("work", keychain_account("pk"));
-        f.set_network("mainnet", "work");
-        match resolve_account_for_network("mainnet", &f) {
+        f.upsert(MAINNET_NETWORK, "default", keychain_account("pk"));
+        match resolve_account_for_network(MAINNET_NETWORK, &f) {
             AccountChoice::Resolved { name, account } => {
-                assert_eq!(name, "work");
+                assert_eq!(name, "default");
                 assert_eq!(account.pubkey.as_deref(), Some("pk"));
             }
             other => panic!("expected Resolved, got {other:?}"),
@@ -789,28 +831,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_returns_dangling_for_orphan_mapping() {
-        // Networks map references an account that doesn't exist.
-        // Caller must surface this as a config error, not silently
-        // create a new wallet.
-        let mut f = AccountsFile::default();
-        f.networks
-            .insert("mainnet".to_string(), "deleted-acct".to_string());
-        match resolve_account_for_network("mainnet", &f) {
-            AccountChoice::Dangling { network, name } => {
-                assert_eq!(network, "mainnet");
-                assert_eq!(name, "deleted-acct");
-            }
-            other => panic!("expected Dangling, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn resolve_does_not_cross_networks() {
         let mut f = AccountsFile::default();
-        f.upsert("dev-cache", fake_ephemeral("DevPk"));
-        f.set_network("devnet", "dev-cache");
-        // localnet has no mapping — must NOT fall back to devnet.
+        f.upsert("devnet", "default", fake_ephemeral("DevPk"));
+        // localnet has no account — must NOT fall back to devnet.
         assert_eq!(
             resolve_account_for_network("localnet", &f),
             AccountChoice::Missing
@@ -826,7 +850,7 @@ mod tests {
 
         assert!(resolved.created, "should report creation");
         assert_eq!(resolved.network, "devnet");
-        assert_eq!(resolved.account_name, "devnet");
+        assert_eq!(resolved.account_name, DEFAULT_ACCOUNT_NAME);
         assert_eq!(resolved.account.keystore, Keystore::Ephemeral);
         assert!(resolved.account.pubkey.is_some());
         assert!(resolved.account.secret_key_b58.is_some());
@@ -839,21 +863,21 @@ mod tests {
                 .starts_with("20")
         );
 
-        // Persisted: account + networks mapping both written.
+        // Persisted: account stored under accounts[devnet][default]
         assert_eq!(store.save_count(), 1);
         let snap = store.snapshot();
-        assert!(snap.accounts.contains_key("devnet"));
-        assert_eq!(
-            snap.networks.get("devnet").map(String::as_str),
-            Some("devnet")
+        assert!(
+            snap.accounts
+                .get("devnet")
+                .unwrap()
+                .contains_key(DEFAULT_ACCOUNT_NAME)
         );
     }
 
     #[test]
     fn load_or_create_reuses_existing_ephemeral() {
         let mut f = AccountsFile::default();
-        f.upsert("sandbox", fake_ephemeral("ReusedPk"));
-        f.set_network("sandbox", "sandbox");
+        f.upsert("sandbox", DEFAULT_ACCOUNT_NAME, fake_ephemeral("ReusedPk"));
         let store = MemoryAccountsStore::with_file(f);
 
         let resolved = load_or_create_ephemeral_for_network("sandbox", &store).unwrap();
@@ -865,30 +889,15 @@ mod tests {
     #[test]
     fn load_or_create_errors_when_mapped_to_keychain_account() {
         // mainnet points at the user's real keychain wallet.
-        // Asking for an ephemeral for it would silently bypass the real
-        // wallet — refuse and let the caller route via signer::load_signer.
         let mut f = AccountsFile::default();
-        f.upsert("default", keychain_account("Real"));
-        f.set_network("mainnet", "default");
+        f.upsert(MAINNET_NETWORK, "default", keychain_account("Real"));
         let store = MemoryAccountsStore::with_file(f);
 
-        let err = load_or_create_ephemeral_for_network("mainnet", &store).unwrap_err();
+        let err = load_or_create_ephemeral_for_network(MAINNET_NETWORK, &store).unwrap_err();
         assert!(
             err.to_string().contains("not ephemeral"),
             "error should mention non-ephemeral keystore: {err}"
         );
-        assert_eq!(store.save_count(), 0);
-    }
-
-    #[test]
-    fn load_or_create_errors_on_dangling_mapping() {
-        let mut f = AccountsFile::default();
-        f.networks
-            .insert("devnet".to_string(), "deleted".to_string());
-        let store = MemoryAccountsStore::with_file(f);
-
-        let err = load_or_create_ephemeral_for_network("devnet", &store).unwrap_err();
-        assert!(err.to_string().contains("doesn't exist"));
         assert_eq!(store.save_count(), 0);
     }
 
@@ -908,45 +917,6 @@ mod tests {
         assert_eq!(store.save_count(), 2);
     }
 
-    // ── set_account_for_network ───────────────────────────────────────────
-
-    #[test]
-    fn set_account_for_network_writes_mapping() {
-        let mut f = AccountsFile::default();
-        f.upsert("work", keychain_account("pk"));
-        let store = MemoryAccountsStore::with_file(f);
-
-        set_account_for_network("mainnet", "work", &store).unwrap();
-        let snap = store.snapshot();
-        assert_eq!(
-            snap.networks.get("mainnet").map(String::as_str),
-            Some("work")
-        );
-    }
-
-    #[test]
-    fn set_account_for_network_errors_on_unknown_account() {
-        let store = MemoryAccountsStore::new();
-        let err = set_account_for_network("mainnet", "ghost", &store).unwrap_err();
-        assert!(err.to_string().contains("no such account"));
-        assert_eq!(store.save_count(), 0);
-    }
-
-    #[test]
-    fn set_account_for_network_overwrites_existing_mapping() {
-        let mut f = AccountsFile::default();
-        f.upsert("default", keychain_account("pk1"));
-        f.upsert("work", keychain_account("pk2"));
-        f.set_network("mainnet", "default");
-        let store = MemoryAccountsStore::with_file(f);
-
-        set_account_for_network("mainnet", "work", &store).unwrap();
-        assert_eq!(
-            store.snapshot().networks.get("mainnet").map(String::as_str),
-            Some("work")
-        );
-    }
-
     // ── FileAccountsStore round-trip ──────────────────────────────────────
 
     #[test]
@@ -957,11 +927,10 @@ mod tests {
 
         // Empty file → empty AccountsFile.
         let empty = store.load().unwrap();
-        assert_eq!(empty.version, 1);
+        assert_eq!(empty.version, 2);
         assert!(empty.accounts.is_empty());
-        assert!(empty.networks.is_empty());
 
-        // Lazy-create writes both account + network mapping.
+        // Lazy-create writes account under accounts[sandbox][default].
         let resolved = load_or_create_ephemeral_for_network("sandbox", &store).unwrap();
         assert!(resolved.created);
         assert!(path.exists());
@@ -978,9 +947,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = FileAccountsStore::at(dir.path().join("does-not-exist.yml"));
         let f = store.load().unwrap();
-        assert_eq!(f.version, 1);
+        assert_eq!(f.version, 2);
         assert!(f.accounts.is_empty());
-        assert!(f.networks.is_empty());
     }
 
     #[test]
@@ -996,15 +964,17 @@ mod tests {
     // ── YAML shape ────────────────────────────────────────────────────────
 
     #[test]
-    fn yaml_shape_has_version_accounts_networks() {
+    fn yaml_shape_has_version_and_accounts_nested() {
         let mut f = AccountsFile::default();
-        f.upsert("default", keychain_account("pk1"));
+        f.upsert(MAINNET_NETWORK, "default", keychain_account("pk1"));
         let yaml = serde_yml::to_string(&f).unwrap();
         assert!(yaml.contains("version:"));
         assert!(yaml.contains("accounts:"));
-        assert!(yaml.contains("networks:"));
-        assert!(yaml.contains("mainnet: default"));
+        assert!(yaml.contains("mainnet:"));
+        assert!(yaml.contains("default:"));
         assert!(yaml.contains("apple-keychain"));
+        // No top-level 'networks:' key
+        assert!(!yaml.contains("\nnetworks:"));
     }
 
     #[test]
@@ -1015,6 +985,21 @@ mod tests {
         assert!(!yaml.contains("path"));
         assert!(!yaml.contains("secret_key_b58"));
         assert!(!yaml.contains("created_at"));
+    }
+
+    #[test]
+    fn yaml_skips_active_when_false() {
+        let acct = keychain_account("pk");
+        let yaml = serde_yml::to_string(&acct).unwrap();
+        assert!(!yaml.contains("active"));
+    }
+
+    #[test]
+    fn yaml_includes_active_when_true() {
+        let mut acct = keychain_account("pk");
+        acct.active = true;
+        let yaml = serde_yml::to_string(&acct).unwrap();
+        assert!(yaml.contains("active: true"));
     }
 
     #[test]

@@ -18,6 +18,7 @@ pub use client::runner;
 pub use client::runner::{run_curl, run_curl_with_headers, run_wget, run_wget_with_headers};
 pub use client::sandbox;
 pub use client::send;
+pub use client::session;
 pub use client::x402;
 
 // Server modules (gateway proxy)
@@ -39,4 +40,7 @@ use solana_mpp::server::Mpp;
 pub trait PaymentState: Clone + Send + Sync + 'static {
     fn apis(&self) -> &[ApiSpec];
     fn mpp(&self) -> Option<&Mpp>;
+    fn session_mpp(&self) -> Option<&server::session::SessionMpp> {
+        None
+    }
 }

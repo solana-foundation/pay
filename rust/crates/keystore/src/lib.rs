@@ -121,10 +121,21 @@ impl Keystore {
 
     /// Import a 64-byte keypair (32 secret + 32 public).
     pub fn import(&self, account: &str, keypair_bytes: &[u8], _sync: SyncMode) -> Result<()> {
+        self.import_with_reason(account, keypair_bytes, _sync, "store keypair")
+    }
+
+    /// Import with a custom auth prompt reason shown to the user.
+    pub fn import_with_reason(
+        &self,
+        account: &str,
+        keypair_bytes: &[u8],
+        _sync: SyncMode,
+        reason: &str,
+    ) -> Result<()> {
         validate_keypair(keypair_bytes)?;
 
         if self.auth_on_write {
-            self.auth.authenticate("store keypair")?;
+            self.auth.authenticate(reason)?;
         }
 
         self.store.store(&keypair_key(account), keypair_bytes)?;
@@ -138,10 +149,10 @@ impl Keystore {
         self.store.exists(&keypair_key(account))
     }
 
-    /// Delete a keypair.
-    pub fn delete(&self, account: &str) -> Result<()> {
+    /// Delete a keypair. `reason` is shown in the OS auth prompt (Touch ID, etc.).
+    pub fn delete(&self, account: &str, reason: &str) -> Result<()> {
         if self.auth_on_write {
-            self.auth.authenticate("delete keypair")?;
+            self.auth.authenticate(reason)?;
         }
 
         self.store.delete(&keypair_key(account))?;
@@ -238,7 +249,7 @@ mod tests {
         ks.import("test", &test_keypair(), SyncMode::ThisDeviceOnly)
             .unwrap();
         assert!(ks.exists("test"));
-        ks.delete("test").unwrap();
+        ks.delete("test", "test").unwrap();
         assert!(!ks.exists("test"));
     }
 
@@ -287,7 +298,7 @@ mod tests {
         assert_eq!(ks.pubkey("acct1").unwrap(), vec![0x22; 32]);
         assert_eq!(ks.pubkey("acct2").unwrap(), vec![0x44; 32]);
 
-        ks.delete("acct1").unwrap();
+        ks.delete("acct1", "test").unwrap();
         assert!(!ks.exists("acct1"));
         assert!(ks.exists("acct2"));
     }
@@ -335,7 +346,7 @@ mod tests {
         ks.load_keypair("test", "test").unwrap();
         assert_eq!(counter.load(Ordering::SeqCst), 2); // load_keypair calls auth
 
-        ks.delete("test").unwrap();
+        ks.delete("test", "test").unwrap();
         assert_eq!(counter.load(Ordering::SeqCst), 3); // delete calls auth
     }
 
@@ -369,7 +380,7 @@ mod tests {
         ks.load_keypair("test", "test").unwrap();
         assert_eq!(counter.load(Ordering::SeqCst), 1); // load_keypair calls auth
 
-        ks.delete("test").unwrap();
+        ks.delete("test", "test").unwrap();
         assert_eq!(counter.load(Ordering::SeqCst), 1); // delete does NOT call auth
     }
 
@@ -388,7 +399,7 @@ mod tests {
     #[test]
     fn delete_nonexistent_succeeds() {
         let ks = Keystore::in_memory();
-        ks.delete("nonexistent").unwrap();
+        ks.delete("nonexistent", "test").unwrap();
     }
 
     #[test]
@@ -487,7 +498,7 @@ mod tests {
         ks.store.store("test", &test_keypair()).unwrap();
         ks.store.store("test.pubkey", &[0xBB; 32]).unwrap();
 
-        let result = ks.delete("test");
+        let result = ks.delete("test", "test");
         assert!(result.is_err());
         // Key should still exist
         assert!(ks.exists("test"));
@@ -535,7 +546,7 @@ mod tests {
         assert_eq!(&loaded[32..], &public);
 
         // Delete
-        ks.delete("alice").unwrap();
+        ks.delete("alice", "test").unwrap();
         assert!(!ks.exists("alice"));
         assert!(ks.pubkey("alice").is_err());
         assert!(ks.load_keypair("alice", "test").is_err());

@@ -27,6 +27,7 @@ tracing-subscriber = { workspace = true }
 pay-mcp = { workspace = true }
 reqwest = { workspace = true }
 solana-mpp = { workspace = true }
+solana-pubkey = { workspace = true }
 tokio = { workspace = true }
 owo-colors = { workspace = true }
 shellexpand = { workspace = true }

@@ -33,7 +33,7 @@ impl SolanaCommand {
                 config.default_keypair_source()
             })
             .ok_or_else(|| {
-                pay_core::Error::Config("No wallet configured. Run `pay setup` first.".to_string())
+                pay_core::Error::Config("No account configured. Run `pay setup` first.".to_string())
             })?;
 
         // Load the keypair bytes from whichever backend

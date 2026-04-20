@@ -4,4 +4,5 @@ pub mod mpp;
 pub mod runner;
 pub mod sandbox;
 pub mod send;
+pub mod session;
 pub mod x402;

@@ -8,6 +8,9 @@ fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let pdb_dist = manifest_dir.join("../../../pdb/dist");
 
+    // Re-run if dist contents change (emit unconditionally so cargo detects when dist is created).
+    println!("cargo:rerun-if-changed={}", pdb_dist.display());
+
     if !pdb_dist.exists() {
         println!(
             "cargo:warning=pdb/dist not found at {}, embedding empty placeholder",
@@ -20,9 +23,6 @@ fn main() {
         ).unwrap();
         return;
     }
-
-    // Re-run if dist contents change.
-    println!("cargo:rerun-if-changed={}", pdb_dist.display());
 
     if asset_dir.exists() {
         fs::remove_dir_all(&asset_dir).unwrap();

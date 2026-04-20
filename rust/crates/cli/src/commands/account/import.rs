@@ -68,15 +68,22 @@ impl ImportCommand {
             pay_core::keystore::SyncMode::ThisDeviceOnly
         };
 
-        ks.import(&name, &keypair_bytes, sync)
+        let reason = format!("import \"{}\" account", name);
+        ks.import_with_reason(&name, &keypair_bytes, sync, &reason)
             .map_err(|e| pay_core::Error::Config(format!("{e}")))?;
 
-        // 5. Save to accounts.yml
-        let is_first = accounts.accounts.is_empty();
+        // 5. Save to accounts.yml under mainnet
+        let is_first = accounts
+            .accounts
+            .get(pay_core::accounts::MAINNET_NETWORK)
+            .is_none_or(|net| net.is_empty());
+
         accounts.upsert(
+            pay_core::accounts::MAINNET_NETWORK,
             &name,
             pay_core::accounts::Account {
                 keystore: keystore_kind,
+                active: false,
                 pubkey: Some(pubkey_b58),
                 vault: self.vault,
                 path: None,
@@ -85,8 +92,7 @@ impl ImportCommand {
             },
         );
 
-        // 6. Prompt for default (= mainnet-beta mapping) if not the
-        //    only account.
+        // 6. Prompt for active (= mainnet default) if not the only account.
         let current_mainnet = accounts.default_account().map(|(n, _)| n.to_string());
         if !is_first && current_mainnet.as_deref() != Some(name.as_str()) {
             let make_default = Confirm::with_theme(&theme)
@@ -96,22 +102,33 @@ impl ImportCommand {
                 .unwrap_or(false);
 
             if make_default {
-                accounts.set_network(pay_core::accounts::MAINNET_NETWORK, &name);
+                accounts.set_active(pay_core::accounts::MAINNET_NETWORK, &name);
             }
         }
 
         accounts.save()?;
 
         // 7. Show the account list with the new entry highlighted
-        super::list::print_account_list(&accounts, Some(super::list::Highlight::Green(&name)));
+        super::list::print_account_list(
+            &accounts,
+            Some(super::list::Highlight::Green {
+                network: pay_core::accounts::MAINNET_NETWORK,
+                name: &name,
+            }),
+        );
 
         Ok(())
     }
 }
 
 fn display_balance(pubkey: &str) {
+    let config = pay_core::Config::load().unwrap_or_default();
+    let rpc_url = config
+        .rpc_url
+        .clone()
+        .unwrap_or_else(pay_core::balance::mainnet_rpc_url);
     let bal = super::list::fetch_balance(pubkey);
-    let display = super::list::format_balance_display(bal.as_ref(), Some(pubkey));
+    let display = super::list::format_balance_display(bal.as_ref(), Some(pubkey), &rpc_url);
     eprintln!("  {}  {}", "Balance:".dimmed(), display);
 }
 
@@ -122,8 +139,15 @@ fn resolve_name(
 ) -> pay_core::Result<String> {
     let has_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
 
+    let mainnet_has = |name: &str| {
+        accounts
+            .accounts
+            .get(pay_core::accounts::MAINNET_NETWORK)
+            .is_some_and(|net| net.contains_key(name))
+    };
+
     if let Some(name) = explicit {
-        if accounts.accounts.contains_key(name) && has_tty {
+        if mainnet_has(name) && has_tty {
             let overwrite = Confirm::with_theme(theme)
                 .with_prompt(format!(
                     "Account '{}' already exists. Overwrite?",
@@ -140,7 +164,7 @@ fn resolve_name(
         return Ok(name.to_string());
     }
 
-    if accounts.accounts.contains_key("default") && has_tty {
+    if mainnet_has("default") && has_tty {
         let choice = dialoguer::Select::with_theme(theme)
             .with_prompt(format!("Account '{}' already exists", "default".yellow()))
             .items(["Overwrite 'default'", "Create with a different name"])

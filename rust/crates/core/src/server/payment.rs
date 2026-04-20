@@ -102,13 +102,6 @@ pub async fn payment_middleware<S: PaymentState>(
     }
 
     let meter = metering_config.unwrap();
-    let mpp = match state.mpp() {
-        Some(mpp) => mpp,
-        None => {
-            tracing::warn!("Metered endpoint hit but MPP not configured — passing through");
-            return next.run(req).await;
-        }
-    };
 
     let props = extract_request_properties(&headers, &path);
     let variant_hint = extract_variant_hint(&path);
@@ -116,6 +109,91 @@ pub async fn payment_middleware<S: PaymentState>(
     let auth_header = headers
         .get(AUTHORIZATION_HEADER)
         .and_then(|v| v.to_str().ok());
+
+    // ── Session intent path ────────────────────────────────────────────────
+    // If a session MPP is configured and the client sent a session credential,
+    // route to the session handler. If no credential and session is configured,
+    // issue a session 402 challenge.
+    if let Some(session_mpp) = state.session_mpp() {
+        match auth_header {
+            None => {
+                // No auth → issue session challenge at max_cap.
+                let price = metering::resolve_price(meter, &props, variant_hint.as_deref(), None);
+                let body = json!({
+                    "error": "payment_required",
+                    "message": "This endpoint requires a session payment.",
+                    "endpoint": { "method": method.as_str(), "path": path },
+                    "pricing": price,
+                });
+                let www_auth = match session_mpp.challenge_header(u64::MAX) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        tracing::error!(error = %e, "Failed to generate session challenge");
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            axum::Json(json!({"error": "challenge_generation_failed"})),
+                        )
+                            .into_response();
+                    }
+                };
+                tracing::info!(subdomain = %subdomain, path = %path, "402 Session Required");
+                let mut resp = (StatusCode::PAYMENT_REQUIRED, axum::Json(body)).into_response();
+                if let Ok(v) = axum::http::HeaderValue::from_str(&www_auth) {
+                    resp.headers_mut().insert(WWW_AUTHENTICATE_HEADER, v);
+                }
+                return resp;
+            }
+            Some(auth_value) => {
+                // Check if this is a session credential (intent = "session").
+                let is_session = parse_authorization(auth_value)
+                    .ok()
+                    .map(|c| c.challenge.intent.as_str() == "session")
+                    .unwrap_or(false);
+
+                if is_session {
+                    return match session_mpp.process(auth_value).await {
+                        Ok(outcome) => {
+                            use crate::server::session::SessionOutcome;
+                            match outcome {
+                                SessionOutcome::Active(_state) => {
+                                    tracing::info!(subdomain = %subdomain, path = %path, "Session action accepted — forwarding");
+                                    next.run(req).await
+                                }
+                                SessionOutcome::Voucher(_cumulative) => {
+                                    tracing::info!(subdomain = %subdomain, path = %path, "Voucher accepted — forwarding");
+                                    next.run(req).await
+                                }
+                                SessionOutcome::Closed(_params) => {
+                                    tracing::info!(subdomain = %subdomain, path = %path, "Session closed");
+                                    (StatusCode::OK, axum::Json(json!({"status": "closed"}))).into_response()
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(subdomain = %subdomain, path = %path, error = %e, "Session action failed");
+                            (
+                                StatusCode::PAYMENT_REQUIRED,
+                                axum::Json(json!({
+                                    "error": "session_failed",
+                                    "message": e.to_string(),
+                                })),
+                            )
+                                .into_response()
+                        }
+                    };
+                }
+                // Fall through to the charge path if intent is not session.
+            }
+        }
+    }
+
+    let mpp = match state.mpp() {
+        Some(mpp) => mpp,
+        None => {
+            tracing::warn!("Metered endpoint hit but MPP not configured — passing through");
+            return next.run(req).await;
+        }
+    };
 
     match auth_header {
         None => {

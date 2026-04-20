@@ -11,8 +11,17 @@ impl DefaultCommand {
     pub fn run(self) -> pay_core::Result<()> {
         let mut accounts = pay_core::accounts::AccountsFile::load()?;
 
-        if !accounts.accounts.contains_key(&self.name) {
-            let available: Vec<_> = accounts.accounts.keys().collect();
+        let exists = accounts
+            .accounts
+            .get(pay_core::accounts::MAINNET_NETWORK)
+            .is_some_and(|net| net.contains_key(&self.name));
+
+        if !exists {
+            let available: Vec<String> = accounts
+                .accounts
+                .get(pay_core::accounts::MAINNET_NETWORK)
+                .map(|net| net.keys().cloned().collect())
+                .unwrap_or_default();
             if available.is_empty() {
                 return Err(pay_core::Error::Config(
                     "No accounts found. Run `pay account new` first.".to_string(),
@@ -21,19 +30,20 @@ impl DefaultCommand {
             return Err(pay_core::Error::Config(format!(
                 "Account '{}' not found. Available: {}",
                 self.name,
-                available
-                    .iter()
-                    .map(|k| k.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                available.join(", ")
             )));
         }
 
-        // "Default" now means "the account mapped to mainnet-beta".
-        accounts.set_network(pay_core::accounts::MAINNET_NETWORK, &self.name);
+        accounts.set_active(pay_core::accounts::MAINNET_NETWORK, &self.name);
         accounts.save()?;
 
-        super::list::print_account_list(&accounts, Some(super::list::Highlight::Green(&self.name)));
+        super::list::print_account_list(
+            &accounts,
+            Some(super::list::Highlight::Green {
+                network: pay_core::accounts::MAINNET_NETWORK,
+                name: &self.name,
+            }),
+        );
 
         Ok(())
     }
