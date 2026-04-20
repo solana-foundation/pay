@@ -258,7 +258,11 @@ fn handle_outcome(
             resource_url,
         } => {
             let req: Option<SessionRequest> = challenge.request.decode().ok();
-            let cap_usdc = req.as_ref().and_then(|r| r.cap.parse::<u64>().ok()).unwrap_or(0) as f64 / 1_000_000.0;
+            let cap_usdc = req
+                .as_ref()
+                .and_then(|r| r.cap.parse::<u64>().ok())
+                .unwrap_or(0) as f64
+                / 1_000_000.0;
 
             if auto_pay {
                 if verbose && !is_json {

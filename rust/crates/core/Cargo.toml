@@ -53,6 +53,8 @@ tokio = { workspace = true, features = ["full"] }
 surfpool-sdk = { git = "https://github.com/solana-foundation/surfpool", branch = "feat/sdk" }
 serde_json = { workspace = true }
 tower = "0.5"
+serial_test = "3"
+solana-client = "3.1"
 
 [[test]]
 name = "metering_tests"

@@ -12,8 +12,8 @@ use pay_core::accounts::AccountsStore;
 use pay_core::server::session::SessionMpp;
 use pay_types::metering::{ApiSpec, SignerConfig};
 use solana_mpp::server::Mpp;
-use solana_mpp::solana_keychain::memory::MemorySigner;
 use solana_mpp::solana_keychain::SolanaSigner;
+use solana_mpp::solana_keychain::memory::MemorySigner;
 
 /// Start the payment gateway proxy.
 ///
@@ -1012,7 +1012,10 @@ fn format_price(price: f64) -> String {
 
 fn ensure_local_multi_delegator_program(rpc_url: &str, program_id: &str) -> pay_core::Result<()> {
     if local_program_is_executable(rpc_url, program_id) {
-        eprintln!("  {}", "multi-delegator program already deployed locally".dimmed());
+        eprintln!(
+            "  {}",
+            "multi-delegator program already deployed locally".dimmed()
+        );
         return Ok(());
     }
 
@@ -1032,10 +1035,7 @@ fn ensure_local_multi_delegator_program(rpc_url: &str, program_id: &str) -> pay_
     }
 
     std::fs::create_dir_all(&deploy_dir).map_err(|e| {
-        pay_core::Error::Config(format!(
-            "failed to create {}: {e}",
-            deploy_dir.display()
-        ))
+        pay_core::Error::Config(format!("failed to create {}: {e}", deploy_dir.display()))
     })?;
     std::fs::copy(&keypair_path, &deploy_keypair_path).map_err(|e| {
         pay_core::Error::Config(format!(
@@ -1063,7 +1063,10 @@ fn ensure_local_multi_delegator_program(rpc_url: &str, program_id: &str) -> pay_
     }
 
     let payer_keypair = localnet_fee_payer_keypair_file()?;
-    eprintln!("  {}", "deploying multi-delegator program to local Surfpool...".dimmed());
+    eprintln!(
+        "  {}",
+        "deploying multi-delegator program to local Surfpool...".dimmed()
+    );
     let status = ProcessCommand::new("solana")
         .arg("program")
         .arg("deploy")
@@ -1101,8 +1104,8 @@ fn ensure_local_multi_delegator_program(rpc_url: &str, program_id: &str) -> pay_
 fn ensure_local_fiber_program(rpc_url: &str) -> pay_core::Result<solana_pubkey::Pubkey> {
     use std::str::FromStr;
 
-    let repo = std::env::var("PAY_FIBER_REPO")
-        .unwrap_or_else(|_| "/Users/ludo/Coding/fiber".to_string());
+    let repo =
+        std::env::var("PAY_FIBER_REPO").unwrap_or_else(|_| "/Users/ludo/Coding/fiber".to_string());
     let repo_path = std::path::Path::new(&repo);
     let deploy_dir = repo_path.join("target/deploy");
     let keypair_path = deploy_dir.join("fiber_native-keypair.json");
@@ -1119,9 +1122,10 @@ fn ensure_local_fiber_program(rpc_url: &str) -> pay_core::Result<solana_pubkey::
     let signer = MemorySigner::from_private_key_file(&keypair_path_str).map_err(|e| {
         pay_core::Error::Config(format!("failed to load Fiber program keypair: {e}"))
     })?;
-    let program_id = solana_pubkey::Pubkey::from_str(&signer.pubkey().to_string()).map_err(|e| {
-        pay_core::Error::Config(format!("invalid Fiber program ID from keypair: {e}"))
-    })?;
+    let program_id =
+        solana_pubkey::Pubkey::from_str(&signer.pubkey().to_string()).map_err(|e| {
+            pay_core::Error::Config(format!("invalid Fiber program ID from keypair: {e}"))
+        })?;
 
     if local_program_is_executable(rpc_url, &program_id.to_string()) {
         eprintln!("  {}", "Fiber program already deployed locally".dimmed());
@@ -1144,7 +1148,10 @@ fn ensure_local_fiber_program(rpc_url: &str) -> pay_core::Result<solana_pubkey::
         }
     }
 
-    eprintln!("  {}", "deploying Fiber program to local Surfpool...".dimmed());
+    eprintln!(
+        "  {}",
+        "deploying Fiber program to local Surfpool...".dimmed()
+    );
     let status = ProcessCommand::new("surfpool")
         .arg("run")
         .arg("deployment")

@@ -113,11 +113,13 @@ pub fn load_signer_for_network_payment(
     desc: &str,
 ) -> Result<(MemorySigner, Option<ResolvedEphemeral>)> {
     let reason = format!("pay {amount} for {desc}");
-    load_signer_for_network_with_reason(network, store, account_override, &reason).map_err(|e| match e {
-        Error::PaymentRejected(where_) => {
-            Error::PaymentRejected(format!("{amount} payment authorization was {where_}"))
+    load_signer_for_network_with_reason(network, store, account_override, &reason).map_err(|e| {
+        match e {
+            Error::PaymentRejected(where_) => {
+                Error::PaymentRejected(format!("{amount} payment authorization was {where_}"))
+            }
+            other => other,
         }
-        other => other,
     })
 }
 
@@ -132,9 +134,10 @@ fn signer_from_account(account: &Account, name: &str, reason: &str) -> Result<Me
     if account.keystore == Keystore::Ephemeral {
         signer_from_ephemeral(account)
     } else {
-        let source = account.signer_source(name).ok_or_else(|| {
-            Error::Config(format!("Account `{name}` has no signer source string"))
-        })?;
+        // Non-ephemeral accounts always resolve to an external signer source.
+        let source = account
+            .signer_source(name)
+            .expect("non-ephemeral accounts must provide a signer source");
         load_signer_with_reason(&source, reason)
     }
 }
@@ -286,6 +289,22 @@ mod tests {
     }
 
     #[test]
+    fn load_signer_accepts_inline_private_key_string() {
+        use solana_mpp::solana_keychain::SolanaSigner;
+
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let verifying_key = signing_key.verifying_key();
+        let mut keypair_bytes = Vec::with_capacity(64);
+        keypair_bytes.extend_from_slice(&signing_key.to_bytes());
+        keypair_bytes.extend_from_slice(&verifying_key.to_bytes());
+        let inline = bs58::encode(keypair_bytes).into_string();
+
+        let signer = load_signer(&inline).unwrap();
+        let expected_pubkey = bs58::encode(verifying_key.to_bytes()).into_string();
+        assert_eq!(signer.pubkey().to_string(), expected_pubkey);
+    }
+
+    #[test]
     fn load_signer_windows_hello_unavailable() {
         #[cfg(not(target_os = "windows"))]
         {
@@ -413,5 +432,103 @@ mod tests {
         assert!(e1.is_some(), "first call should report creation");
         assert!(e2.is_none(), "second call must be a cache hit");
         assert_eq!(store.save_count(), 1, "exactly one write across both calls");
+    }
+
+    #[test]
+    fn load_signer_for_network_resolves_named_existing_ephemeral() {
+        let mut file = AccountsFile::default();
+        let acct = fresh_ephemeral_account();
+        let expected_pubkey = acct.pubkey.clone().unwrap();
+        file.upsert("localnet", "alice", acct);
+        let store = MemoryAccountsStore::with_file(file);
+
+        let (signer, ephemeral) =
+            load_signer_for_network_with_reason("localnet", &store, Some("alice"), "test").unwrap();
+
+        use solana_mpp::solana_keychain::SolanaSigner;
+        assert_eq!(signer.pubkey().to_string(), expected_pubkey);
+        assert!(ephemeral.is_none(), "existing named account must not report creation");
+        assert_eq!(store.save_count(), 0, "existing named account must not write");
+    }
+
+    #[test]
+    fn load_signer_for_network_lazy_creates_named_localnet_account() {
+        let store = MemoryAccountsStore::new();
+        let (signer, ephemeral) =
+            load_signer_for_network_with_reason("localnet", &store, Some("alice"), "test").unwrap();
+
+        use solana_mpp::solana_keychain::SolanaSigner;
+        let resolved = ephemeral.expect("named localnet miss must create");
+        assert!(resolved.created);
+        assert_eq!(resolved.account_name, "alice");
+        assert_eq!(resolved.network, "localnet");
+        assert_eq!(
+            resolved.account.pubkey.as_deref(),
+            Some(signer.pubkey().to_string().as_str())
+        );
+
+        let snapshot = store.snapshot();
+        assert!(snapshot.named_account_for_network("localnet", "alice").is_some());
+        assert_eq!(store.save_count(), 1);
+    }
+
+    #[test]
+    fn load_signer_for_network_rejects_missing_named_mainnet_account() {
+        let store = MemoryAccountsStore::new();
+        let err = load_signer_for_network_with_reason(
+            MAINNET_NETWORK,
+            &store,
+            Some("alice"),
+            "test",
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("No account named `alice` configured for network `mainnet`.")
+        );
+        assert_eq!(store.save_count(), 0);
+    }
+
+    #[test]
+    fn signer_from_ephemeral_rejects_missing_inline_secret() {
+        let account = Account {
+            keystore: Keystore::Ephemeral,
+            active: false,
+            pubkey: None,
+            vault: None,
+            path: None,
+            secret_key_b58: None,
+            created_at: None,
+        };
+
+        let err = signer_from_ephemeral(&account).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Ephemeral account is missing its inline `secret_key_b58` field"));
+    }
+
+    #[test]
+    fn rejection_source_maps_known_backends() {
+        assert_eq!(
+            rejection_source("keychain"),
+            "rejected by user at Apple Keychain"
+        );
+        assert_eq!(
+            rejection_source("windows-hello"),
+            "rejected by user at Windows Hello"
+        );
+        assert_eq!(
+            rejection_source("gnome-keyring"),
+            "rejected by user at GNOME Keyring"
+        );
+        assert_eq!(
+            rejection_source("1password"),
+            "rejected by user at 1Password"
+        );
+        assert_eq!(
+            rejection_source("unknown"),
+            "rejected by user at authentication prompt"
+        );
     }
 }

@@ -20,7 +20,7 @@
 //! process_open() records channel state
 //!   │
 //!   ▼
-//! Enqueue Fiber channel open in 400 ms batch processor
+//! Enqueue Fiber channel open in the configured batch processor interval
 //! ```
 //!
 //! Multi-delegator accounts are **long-lived**: most returning clients take the
@@ -34,13 +34,13 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use solana_mpp::program::multi_delegator::{
-    assess_multi_delegate_setup, MultiDelegateOnChainState, MultiDelegateSetupAction,
+    MultiDelegateOnChainState, MultiDelegateSetupAction, assess_multi_delegate_setup,
 };
-use solana_mpp::solana_keychain::SolanaSigner;
 use solana_mpp::server::session::{FinalizeParams, SessionConfig, SessionServer};
+use solana_mpp::solana_keychain::SolanaSigner;
 use solana_mpp::store::{ChannelState, MemoryChannelStore};
 use solana_mpp::{
-    parse_authorization, Base64UrlJson, OpenPayload, PaymentChallenge, SessionAction, SessionMode,
+    Base64UrlJson, OpenPayload, PaymentChallenge, SessionAction, SessionMode, parse_authorization,
 };
 
 use crate::{Error, Result};
@@ -169,12 +169,17 @@ pub async fn handle_pull_setup(
         }
 
         MultiDelegateSetupAction::MissingPayload(reason) => {
+            let reason = normalize_pull_setup_reason(&reason.to_string());
             tracing::warn!(owner, %reason, "pull open rejected: missing tx payload");
             Err(Error::Mpp(format!(
                 "pull open requires on-chain setup: {reason}"
             )))
         }
     }
+}
+
+fn normalize_pull_setup_reason(reason: &str) -> String {
+    reason.replace("initMultiDelegateTx", "initDelegationTx")
 }
 
 // ── RPC-backed multi-delegate chain ───────────────────────────────────────────
@@ -234,7 +239,9 @@ impl MultiDelegateChain for RpcMultiDelegateChain {
                 let rpc = RpcClient::new(rpc_url);
                 let accounts = rpc
                     .get_multiple_accounts(&[multi_delegate_pda, delegation_pda])
-                    .map_err(|e| Error::Mpp(format!("RPC error fetching delegation accounts: {e}")))?;
+                    .map_err(|e| {
+                        Error::Mpp(format!("RPC error fetching delegation accounts: {e}"))
+                    })?;
 
                 let multi_delegate_exists = accounts[0].is_some();
 
@@ -253,7 +260,10 @@ impl MultiDelegateChain for RpcMultiDelegateChain {
                     "RPC multi-delegate state fetched"
                 );
 
-                Ok(MultiDelegateOnChainState { multi_delegate_exists, existing_delegation_cap })
+                Ok(MultiDelegateOnChainState {
+                    multi_delegate_exists,
+                    existing_delegation_cap,
+                })
             })
             .await
             .map_err(|e| Error::Mpp(format!("spawn_blocking join error: {e}")))?
@@ -298,14 +308,14 @@ impl MultiDelegateChain for RpcMultiDelegateChain {
 // Pull-mode session open flow:
 //
 //   1. Multi-delegator setup (per-session, NOT batched):
-//      Each client's `InitMultiDelegate` + `CreateFixedDelegation` requires a
+//      Each client's delegation setup requires a
 //      dedicated transaction and must be confirmed before proceeding.
 //
 //   2. Fiber channel open (queued after delegation confirms, BATCHED):
 //      Once the delegation is confirmed the operator opens a Fiber payment
 //      channel on the client's behalf.  Multiple `InitChannel` instructions
 //      can be packed into one Solana transaction, so the runloop accumulates
-//      them and flushes every 400 ms.
+//      them and flushes on the configured interval.
 
 /// A queued Fiber channel open waiting to be included in the next batch tx.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -337,8 +347,9 @@ impl OpenChannelBatcher {
 
 /// Spawn the Fiber-channel-open batch runloop and return a [`OpenChannelBatcher`] handle.
 ///
-/// Every 400 ms the runloop drains pending [`ChannelOpenItem`]s and submits a
-/// single transaction containing one Fiber `InitChannel` instruction per item.
+/// On each configured tick the runloop drains pending [`ChannelOpenItem`]s and
+/// submits a single transaction containing one Fiber `InitChannel` instruction
+/// per item.
 /// Must be called from within a running Tokio runtime.
 pub fn spawn_open_channel_batcher(
     operator_signer: Arc<dyn SolanaSigner>,
@@ -356,8 +367,13 @@ pub fn spawn_open_channel_batcher(
         let operator_signer = Arc::clone(&operator_signer);
         let rpc_url = rpc_url.clone();
         Box::pin(async move {
-            submit_channel_opens(&batch, Arc::clone(&operator_signer), &rpc_url, fiber_program_id)
-                .await
+            submit_channel_opens(
+                &batch,
+                Arc::clone(&operator_signer),
+                &rpc_url,
+                fiber_program_id,
+            )
+            .await
         })
     });
     spawn_open_channel_batcher_with_submitter(submitter, interval_ms)
@@ -476,7 +492,9 @@ async fn submit_channel_opens(
         let existing_deposit = existing_account.as_ref().and_then(|account| {
             (account.data.len() > CHANNEL_DEPOSIT_OFFSET + 8).then(|| {
                 let mut bytes = [0u8; 8];
-                bytes.copy_from_slice(&account.data[CHANNEL_DEPOSIT_OFFSET..CHANNEL_DEPOSIT_OFFSET + 8]);
+                bytes.copy_from_slice(
+                    &account.data[CHANNEL_DEPOSIT_OFFSET..CHANNEL_DEPOSIT_OFFSET + 8],
+                );
                 u64::from_le_bytes(bytes)
             })
         });
@@ -539,7 +557,10 @@ async fn submit_channel_opens(
     }
 
     if instructions.is_empty() {
-        tracing::info!(count = batch.len(), "no Fiber channel-open instructions needed");
+        tracing::info!(
+            count = batch.len(),
+            "no Fiber channel-open instructions needed"
+        );
         return Ok(());
     }
 
@@ -603,12 +624,13 @@ pub enum SessionOutcome {
 ///
 /// Pull-mode sessions go through a two-step on-chain process:
 /// 1. Multi-delegator setup (individual, confirmed via [`MultiDelegateChain`])
-/// 2. Fiber channel open (batched every 400 ms via [`OpenChannelBatcher`])
+/// 2. Fiber channel open (batched via [`OpenChannelBatcher`])
 pub struct SessionMpp {
     server: SessionServer<MemoryChannelStore>,
     secret_key: String,
     realm: String,
     distribution_hash: [u8; 16],
+    rpc_url: Option<String>,
     /// Interface to on-chain multi-delegate state (optional; pull-mode setup
     /// is skipped when absent).
     multi_delegate_chain: Option<Box<dyn MultiDelegateChain>>,
@@ -619,8 +641,8 @@ pub struct SessionMpp {
 impl SessionMpp {
     /// Create from a [`SessionConfig`] and an HMAC secret key.
     pub fn new(config: SessionConfig, secret_key: impl Into<String>) -> Self {
-        let recipient = solana_pubkey::Pubkey::try_from(config.recipient.as_str())
-            .unwrap_or_default();
+        let recipient =
+            solana_pubkey::Pubkey::try_from(config.recipient.as_str()).unwrap_or_default();
         let splits = config
             .splits
             .iter()
@@ -630,6 +652,7 @@ impl SessionMpp {
             distribution_hash: solana_mpp::server::session::compute_distribution_hash(
                 &recipient, &splits,
             ),
+            rpc_url: config.rpc_url.clone(),
             server: SessionServer::new(config, MemoryChannelStore::new()),
             secret_key: secret_key.into(),
             realm: DEFAULT_REALM.to_string(),
@@ -656,7 +679,8 @@ impl SessionMpp {
     /// Enable the Fiber channel-open batch processor for pull-mode sessions.
     ///
     /// Spawns a Tokio task that collects opens and submits a batched
-    /// transaction every 400 ms.  Must be called from within a Tokio runtime.
+    /// transaction on the configured interval. Must be called from within a
+    /// Tokio runtime.
     pub fn with_open_channel_batcher(
         mut self,
         operator_signer: Arc<dyn SolanaSigner>,
@@ -674,7 +698,20 @@ impl SessionMpp {
     }
 
     #[doc(hidden)]
-    pub fn with_test_open_channel_batcher<F, Fut>(mut self, submitter: F) -> Self
+    pub fn with_test_open_channel_batcher<F, Fut>(self, submitter: F) -> Self
+    where
+        F: Fn(Vec<(String, String, u64)>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        self.with_test_open_channel_batcher_interval(400, submitter)
+    }
+
+    #[doc(hidden)]
+    pub fn with_test_open_channel_batcher_interval<F, Fut>(
+        mut self,
+        interval_ms: u64,
+        submitter: F,
+    ) -> Self
     where
         F: Fn(Vec<(String, String, u64)>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<()>> + Send + 'static,
@@ -688,13 +725,17 @@ impl SessionMpp {
                 .collect();
             Box::pin(async move { submitter(mapped).await })
         });
-        self.open_channel_batcher = Some(spawn_open_channel_batcher_with_submitter(adapter, 400));
+        self.open_channel_batcher = Some(spawn_open_channel_batcher_with_submitter(
+            adapter,
+            interval_ms,
+        ));
         self
     }
 
     /// Build a [`PaymentChallenge`] for a new session with the given cap.
     pub fn challenge(&self, cap: u64) -> Result<PaymentChallenge> {
-        let request = self.server.build_challenge_request(cap);
+        let mut request = self.server.build_challenge_request(cap);
+        request.recent_blockhash = self.fetch_recent_blockhash();
         let encoded = Base64UrlJson::from_typed(&request)
             .map_err(|e| Error::Mpp(format!("Failed to encode session request: {e}")))?;
         Ok(PaymentChallenge::with_secret_key(
@@ -726,8 +767,7 @@ impl SessionMpp {
         if credential.challenge.intent.as_str() != INTENT {
             return Err(Error::Mpp(format!(
                 "Expected '{}' intent, got '{}'",
-                INTENT,
-                credential.challenge.intent
+                INTENT, credential.challenge.intent
             )));
         }
 
@@ -829,6 +869,23 @@ impl SessionMpp {
             }
         }
     }
+
+    /// Best-effort blockhash prefetch for session challenges.
+    ///
+    /// The challenge remains valid without this field, so RPC failures are
+    /// logged and ignored instead of failing challenge generation.
+    fn fetch_recent_blockhash(&self) -> Option<String> {
+        use solana_mpp::solana_rpc_client::rpc_client::RpcClient;
+
+        let rpc_url = self.rpc_url.as_ref()?;
+        match RpcClient::new(rpc_url.clone()).get_latest_blockhash() {
+            Ok(blockhash) => Some(blockhash.to_string()),
+            Err(error) => {
+                tracing::debug!(rpc_url, %error, "failed to prefetch session recent blockhash");
+                None
+            }
+        }
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -836,8 +893,12 @@ impl SessionMpp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::session::SessionHandle;
     use solana_mpp::program::multi_delegator::MultiDelegateOnChainState;
+    use solana_mpp::solana_keychain::{SolanaSigner, memory::MemorySigner};
+    use solana_mpp::{PaymentCredential, format_authorization};
     use std::sync::{Arc, Mutex};
+    use tokio::time::{sleep, timeout};
 
     // ── Mock MultiDelegateChain ───────────────────────────────────────────────
 
@@ -870,8 +931,7 @@ mod tests {
         fn fetch_state<'a>(
             &'a self,
             _owner: &'a str,
-        ) -> Pin<Box<dyn Future<Output = Result<MultiDelegateOnChainState>> + Send + 'a>>
-        {
+        ) -> Pin<Box<dyn Future<Output = Result<MultiDelegateOnChainState>> + Send + 'a>> {
             let state = self.state.clone();
             Box::pin(async move { Ok(state) })
         }
@@ -879,8 +939,7 @@ mod tests {
         fn submit_tx<'a>(
             &'a self,
             tx_base64: &'a str,
-        ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>>
-        {
+        ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
             if let Some(ref err) = self.submit_error {
                 let e = err.clone();
                 return Box::pin(async move { Err(Error::Mpp(e)) });
@@ -950,29 +1009,68 @@ mod tests {
 
     const CAP: u64 = 1_000_000;
 
+    fn test_session_config() -> SessionConfig {
+        SessionConfig {
+            operator: solana_pubkey::Pubkey::new_unique().to_string(),
+            recipient: solana_pubkey::Pubkey::new_unique().to_string(),
+            max_cap: 5 * CAP,
+            currency: solana_pubkey::Pubkey::new_unique().to_string(),
+            network: "localnet".to_string(),
+            modes: vec![SessionMode::Push, SessionMode::Pull],
+            ..SessionConfig::default()
+        }
+    }
+
+    fn test_session_mpp() -> SessionMpp {
+        SessionMpp::new(test_session_config(), "test-secret")
+    }
+
+    fn test_session_signer() -> Box<dyn SolanaSigner> {
+        use ed25519_dalek::SigningKey;
+
+        let sk = SigningKey::generate(&mut rand::thread_rng());
+        let vk = sk.verifying_key();
+        let mut kp = [0u8; 64];
+        kp[..32].copy_from_slice(sk.as_bytes());
+        kp[32..].copy_from_slice(vk.as_bytes());
+        Box::new(MemorySigner::from_bytes(&kp).unwrap())
+    }
+
     // ── handle_pull_setup: AlreadySufficient path ─────────────────────────────
 
     #[tokio::test]
     async fn already_sufficient_returns_ok_no_tx_submitted() {
         let chain = chain_sufficient(5 * CAP);
-        let outcome = handle_pull_setup(&no_tx_payload(CAP), CAP, &chain).await.unwrap();
+        let outcome = handle_pull_setup(&no_tx_payload(CAP), CAP, &chain)
+            .await
+            .unwrap();
         assert_eq!(outcome, PullSetupOutcome::AlreadySufficient);
-        assert!(chain.submitted_txs().is_empty(), "no tx should be submitted");
+        assert!(
+            chain.submitted_txs().is_empty(),
+            "no tx should be submitted"
+        );
     }
 
     #[tokio::test]
     async fn exact_cap_returns_already_sufficient() {
         let chain = chain_sufficient(CAP);
-        let outcome = handle_pull_setup(&no_tx_payload(CAP), CAP, &chain).await.unwrap();
+        let outcome = handle_pull_setup(&no_tx_payload(CAP), CAP, &chain)
+            .await
+            .unwrap();
         assert_eq!(outcome, PullSetupOutcome::AlreadySufficient);
     }
 
     #[tokio::test]
     async fn already_sufficient_ignores_provided_update_tx() {
         let chain = chain_sufficient(5 * CAP);
-        let outcome = handle_pull_setup(&update_tx_payload(CAP), CAP, &chain).await.unwrap();
+        let outcome = handle_pull_setup(&update_tx_payload(CAP), CAP, &chain)
+            .await
+            .unwrap();
         assert_eq!(outcome, PullSetupOutcome::AlreadySufficient);
-        assert!(chain.submitted_txs().is_empty(), "update tx must not be submitted when cap sufficient");
+        assert!(
+            chain.submitted_txs().is_empty(),
+            "update tx must not be submitted when cap sufficient"
+        );
     }
 
     // ── handle_pull_setup: SubmitInit path ────────────────────────────────────
@@ -980,10 +1078,14 @@ mod tests {
     #[tokio::test]
     async fn no_multi_delegate_with_init_tx_submits_init() {
         let chain = chain_no_pda();
-        let outcome = handle_pull_setup(&init_tx_payload(CAP), CAP, &chain).await.unwrap();
+        let outcome = handle_pull_setup(&init_tx_payload(CAP), CAP, &chain)
+            .await
+            .unwrap();
         assert_eq!(
             outcome,
-            PullSetupOutcome::InitSubmitted { signature: "mock_sig_abc123".to_string() }
+            PullSetupOutcome::InitSubmitted {
+                signature: "mock_sig_abc123".to_string()
+            }
         );
         assert_eq!(chain.submitted_txs(), vec!["init_tx_base64"]);
     }
@@ -991,10 +1093,14 @@ mod tests {
     #[tokio::test]
     async fn no_multi_delegate_with_both_txs_submits_only_init() {
         let chain = chain_no_pda();
-        let outcome = handle_pull_setup(&both_tx_payload(CAP), CAP, &chain).await.unwrap();
+        let outcome = handle_pull_setup(&both_tx_payload(CAP), CAP, &chain)
+            .await
+            .unwrap();
         assert_eq!(
             outcome,
-            PullSetupOutcome::InitSubmitted { signature: "mock_sig_abc123".to_string() }
+            PullSetupOutcome::InitSubmitted {
+                signature: "mock_sig_abc123".to_string()
+            }
         );
         // Only init_tx was submitted, not update_tx
         assert_eq!(chain.submitted_txs(), vec!["init_tx_base64"]);
@@ -1005,10 +1111,14 @@ mod tests {
     #[tokio::test]
     async fn pda_exists_no_delegation_with_update_tx_submits_update() {
         let chain = chain_pda_no_delegation();
-        let outcome = handle_pull_setup(&update_tx_payload(CAP), CAP, &chain).await.unwrap();
+        let outcome = handle_pull_setup(&update_tx_payload(CAP), CAP, &chain)
+            .await
+            .unwrap();
         assert_eq!(
             outcome,
-            PullSetupOutcome::UpdateSubmitted { signature: "mock_sig_abc123".to_string() }
+            PullSetupOutcome::UpdateSubmitted {
+                signature: "mock_sig_abc123".to_string()
+            }
         );
         assert_eq!(chain.submitted_txs(), vec!["update_tx_base64"]);
     }
@@ -1016,10 +1126,14 @@ mod tests {
     #[tokio::test]
     async fn pda_exists_insufficient_cap_with_update_tx_submits_update() {
         let chain = chain_insufficient(CAP / 2);
-        let outcome = handle_pull_setup(&update_tx_payload(CAP), CAP, &chain).await.unwrap();
+        let outcome = handle_pull_setup(&update_tx_payload(CAP), CAP, &chain)
+            .await
+            .unwrap();
         assert_eq!(
             outcome,
-            PullSetupOutcome::UpdateSubmitted { signature: "mock_sig_abc123".to_string() }
+            PullSetupOutcome::UpdateSubmitted {
+                signature: "mock_sig_abc123".to_string()
+            }
         );
         assert_eq!(chain.submitted_txs(), vec!["update_tx_base64"]);
     }
@@ -1027,10 +1141,14 @@ mod tests {
     #[tokio::test]
     async fn pda_exists_insufficient_with_both_txs_submits_only_update() {
         let chain = chain_insufficient(CAP / 2);
-        let outcome = handle_pull_setup(&both_tx_payload(CAP), CAP, &chain).await.unwrap();
+        let outcome = handle_pull_setup(&both_tx_payload(CAP), CAP, &chain)
+            .await
+            .unwrap();
         assert_eq!(
             outcome,
-            PullSetupOutcome::UpdateSubmitted { signature: "mock_sig_abc123".to_string() }
+            PullSetupOutcome::UpdateSubmitted {
+                signature: "mock_sig_abc123".to_string()
+            }
         );
         // Only update_tx was submitted, not init_tx
         assert_eq!(chain.submitted_txs(), vec!["update_tx_base64"]);
@@ -1041,18 +1159,28 @@ mod tests {
     #[tokio::test]
     async fn no_multi_delegate_without_init_tx_returns_error() {
         let chain = chain_no_pda();
-        let err = handle_pull_setup(&no_tx_payload(CAP), CAP, &chain).await.unwrap_err();
+        let err = handle_pull_setup(&no_tx_payload(CAP), CAP, &chain)
+            .await
+            .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("initMultiDelegateTx"), "expected init tx mention, got: {msg}");
+        assert!(
+            msg.contains("initDelegationTx"),
+            "expected init tx mention, got: {msg}"
+        );
         assert!(chain.submitted_txs().is_empty());
     }
 
     #[tokio::test]
     async fn pda_exists_no_delegation_without_update_tx_returns_error() {
         let chain = chain_pda_no_delegation();
-        let err = handle_pull_setup(&no_tx_payload(CAP), CAP, &chain).await.unwrap_err();
+        let err = handle_pull_setup(&no_tx_payload(CAP), CAP, &chain)
+            .await
+            .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("updateDelegationTx"), "expected update tx mention, got: {msg}");
+        assert!(
+            msg.contains("updateDelegationTx"),
+            "expected update tx mention, got: {msg}"
+        );
         assert!(chain.submitted_txs().is_empty());
     }
 
@@ -1060,9 +1188,14 @@ mod tests {
     async fn no_multi_delegate_with_update_tx_only_returns_error() {
         // update_tx alone is not enough when MultiDelegate doesn't exist yet.
         let chain = chain_no_pda();
-        let err = handle_pull_setup(&update_tx_payload(CAP), CAP, &chain).await.unwrap_err();
+        let err = handle_pull_setup(&update_tx_payload(CAP), CAP, &chain)
+            .await
+            .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("initMultiDelegateTx"), "expected init tx mention, got: {msg}");
+        assert!(
+            msg.contains("initDelegationTx"),
+            "expected init tx mention, got: {msg}"
+        );
         assert!(chain.submitted_txs().is_empty());
     }
 
@@ -1071,14 +1204,18 @@ mod tests {
     #[tokio::test]
     async fn init_tx_submission_failure_propagates_error() {
         let chain = chain_no_pda().with_submit_error("RPC timeout");
-        let err = handle_pull_setup(&init_tx_payload(CAP), CAP, &chain).await.unwrap_err();
+        let err = handle_pull_setup(&init_tx_payload(CAP), CAP, &chain)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("RPC timeout"), "got: {err}");
     }
 
     #[tokio::test]
     async fn update_tx_submission_failure_propagates_error() {
         let chain = chain_pda_no_delegation().with_submit_error("network error");
-        let err = handle_pull_setup(&update_tx_payload(CAP), CAP, &chain).await.unwrap_err();
+        let err = handle_pull_setup(&update_tx_payload(CAP), CAP, &chain)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("network error"), "got: {err}");
     }
 
@@ -1109,10 +1246,177 @@ mod tests {
     #[test]
     fn pull_setup_outcomes_are_distinguishable() {
         let already = PullSetupOutcome::AlreadySufficient;
-        let init = PullSetupOutcome::InitSubmitted { signature: "sig1".to_string() };
-        let update = PullSetupOutcome::UpdateSubmitted { signature: "sig2".to_string() };
+        let init = PullSetupOutcome::InitSubmitted {
+            signature: "sig1".to_string(),
+        };
+        let update = PullSetupOutcome::UpdateSubmitted {
+            signature: "sig2".to_string(),
+        };
         assert_ne!(already, init);
         assert_ne!(already, update);
         assert_ne!(init, update);
+    }
+
+    #[tokio::test]
+    async fn process_rejects_non_session_intent() {
+        let session = test_session_mpp();
+        let challenge = PaymentChallenge::with_secret_key(
+            "test-secret",
+            "test-realm",
+            METHOD,
+            "charge",
+            Base64UrlJson::from_typed(&session.server.build_challenge_request(CAP)).unwrap(),
+        );
+        let handle = SessionHandle::new(
+            solana_pubkey::Pubkey::new_unique(),
+            test_session_signer(),
+            challenge,
+        );
+        let auth_header = handle.open_header(CAP, "open_sig").await.unwrap();
+
+        let err = session
+            .process(&auth_header)
+            .await
+            .err()
+            .expect("non-session intent should error");
+        assert!(
+            err.to_string().contains("Expected 'session' intent"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_rejects_invalid_authorization_header() {
+        let session = test_session_mpp();
+        let err = session
+            .process("Bearer definitely-not-mpp")
+            .await
+            .err()
+            .expect("invalid auth should error");
+        assert!(
+            err.to_string().contains("Invalid authorization header"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_rejects_unknown_session_action_payload() {
+        let session = test_session_mpp();
+        let challenge = session.challenge(CAP).unwrap();
+        let credential = PaymentCredential::new(
+            challenge.to_echo(),
+            serde_json::json!({ "action": "mystery" }),
+        );
+        let auth_header = format_authorization(&credential).unwrap();
+
+        let err = session
+            .process(&auth_header)
+            .await
+            .err()
+            .expect("unknown action should error");
+        assert!(
+            err.to_string()
+                .contains("Unrecognized session action payload"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_supports_open_voucher_topup_and_close() {
+        let session = test_session_mpp();
+        let challenge = session.challenge(CAP).unwrap();
+        let handle = SessionHandle::new(
+            solana_pubkey::Pubkey::new_unique(),
+            test_session_signer(),
+            challenge,
+        );
+        let open_header = handle.open_header(CAP, "open_sig").await.unwrap();
+
+        let SessionOutcome::Active(opened) = session.process(&open_header).await.unwrap() else {
+            panic!("expected open to return active session");
+        };
+        assert_eq!(opened.deposit, CAP);
+
+        let voucher_header = handle.voucher_header(75).await.unwrap();
+        let SessionOutcome::Voucher(cumulative) = session.process(&voucher_header).await.unwrap()
+        else {
+            panic!("expected voucher outcome");
+        };
+        assert_eq!(cumulative, 75);
+
+        let topup_header = handle.topup_header(CAP + 500, "topup_sig").await.unwrap();
+        let SessionOutcome::Active(topped_up) = session.process(&topup_header).await.unwrap()
+        else {
+            panic!("expected topup outcome");
+        };
+        assert_eq!(topped_up.deposit, CAP + 500);
+
+        let close_header = handle.close_header(Some(25)).await.unwrap();
+        let SessionOutcome::Closed(params) = session.process(&close_header).await.unwrap() else {
+            panic!("expected close outcome");
+        };
+        assert_eq!(params.settled, 100);
+    }
+
+    #[tokio::test]
+    async fn run_pull_setup_skips_when_chain_not_configured() {
+        let session = test_session_mpp();
+        session.run_pull_setup(&no_tx_payload(CAP)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn batcher_flushes_pending_items_on_shutdown() {
+        let submitted: Arc<Mutex<Vec<Vec<(String, String, u64)>>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&submitted);
+        let submitter: BatchSubmitter = Arc::new(move |batch: Vec<ChannelOpenItem>| {
+            let sink = Arc::clone(&sink);
+            Box::pin(async move {
+                sink.lock().unwrap().push(
+                    batch
+                        .into_iter()
+                        .map(|item| (item.owner, item.token_account, item.deposit))
+                        .collect(),
+                );
+                Ok(())
+            })
+        });
+
+        let batcher = spawn_open_channel_batcher_with_submitter(submitter, 10_000);
+        batcher.enqueue(ChannelOpenItem {
+            owner: "owner-1".to_string(),
+            token_account: "token-1".to_string(),
+            deposit: 11,
+            distribution_hash: [1; 16],
+        });
+        batcher.enqueue(ChannelOpenItem {
+            owner: "owner-2".to_string(),
+            token_account: "token-2".to_string(),
+            deposit: 22,
+            distribution_hash: [2; 16],
+        });
+
+        drop(batcher);
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if submitted.lock().unwrap().len() == 1 {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("batch flush on shutdown");
+
+        let batches = submitted.lock().unwrap().clone();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            batches[0],
+            vec![
+                ("owner-1".to_string(), "token-1".to_string(), 11),
+                ("owner-2".to_string(), "token-2".to_string(), 22),
+            ]
+        );
     }
 }

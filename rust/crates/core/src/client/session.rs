@@ -19,8 +19,8 @@ use std::sync::Arc;
 use solana_mpp::client::session::ActiveSession;
 use solana_mpp::solana_keychain::SolanaSigner;
 use solana_mpp::{
-    format_authorization, parse_www_authenticate, PaymentChallenge, PaymentCredential,
-    SessionAction, SessionRequest,
+    PaymentChallenge, PaymentCredential, SessionAction, SessionRequest, format_authorization,
+    parse_www_authenticate,
 };
 use solana_pubkey::Pubkey;
 use tokio::sync::Mutex;
@@ -229,6 +229,7 @@ pub fn open_pull_session_header(
     deposit: u64,
     sandbox: bool,
 ) -> Result<(SessionHandle, String)> {
+    use solana_hash::Hash;
     use solana_mpp::client::multi_delegate::{
         build_init_multi_delegate_tx, build_update_delegation_tx,
     };
@@ -238,33 +239,38 @@ pub fn open_pull_session_header(
     use solana_pubkey::Pubkey;
     use std::str::FromStr;
 
-    let network = network_override
-        .map(str::to_string)
-        .unwrap_or_else(|| request.network.clone().unwrap_or_else(|| "mainnet".to_string()));
+    let network = network_override.map(str::to_string).unwrap_or_else(|| {
+        request
+            .network
+            .clone()
+            .unwrap_or_else(|| "mainnet".to_string())
+    });
 
     // Load the user's wallet keypair
-    let (signer, ephemeral_notice) =
-        crate::signer::load_signer_for_network_with_reason(
-            &network,
-            store,
-            account_override,
-            "authorize payment",
-        )?;
+    let (signer, ephemeral_notice) = crate::signer::load_signer_for_network_with_reason(
+        &network,
+        store,
+        account_override,
+        "authorize payment",
+    )?;
     let user_pubkey = signer.pubkey();
 
     // Resolve RPC endpoint
-    let rpc_url = std::env::var("PAY_RPC_URL")
-        .unwrap_or_else(|_| default_rpc_url(&network).to_string());
+    let rpc_url =
+        std::env::var("PAY_RPC_URL").unwrap_or_else(|_| default_rpc_url(&network).to_string());
 
     // Operator pubkey (delegatee in every FixedDelegation)
     let operator_pk = Pubkey::from_str(&request.operator)
         .map_err(|_| Error::Mpp(format!("invalid operator pubkey: {}", request.operator)))?;
 
     // Mint and token program (currency field carries the resolved mint address)
-    let mint_pk = Pubkey::from_str(&request.currency)
-        .map_err(|_| Error::Mpp(format!("invalid mint address in challenge: {}", request.currency)))?;
-    let token_program_pk =
-        Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap();
+    let mint_pk = Pubkey::from_str(&request.currency).map_err(|_| {
+        Error::Mpp(format!(
+            "invalid mint address in challenge: {}",
+            request.currency
+        ))
+    })?;
+    let token_program_pk = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap();
 
     // Derive the user's ATA: find_program_address([owner, token_program, mint], ata_program)
     let ata_program_pk = Pubkey::from_str(programs::ASSOCIATED_TOKEN_PROGRAM).unwrap();
@@ -298,15 +304,17 @@ pub fn open_pull_session_header(
     if sandbox && ephemeral_notice.is_some() {
         let pubkey = user_pubkey.to_string();
         let rpc = rpc_url.clone();
-        if let Err(e) =
-            rt.block_on(crate::client::sandbox::fund_via_surfpool(&rpc, &pubkey))
-        {
+        if let Err(e) = rt.block_on(crate::client::sandbox::fund_via_surfpool(&rpc, &pubkey)) {
             tracing::warn!(error = %e, "Surfpool auto-fund failed — USDC balance may be 0");
         }
     }
 
-    // Step 2: get a recent blockhash (sync RpcClient, fine in a sync context)
-    let recent_blockhash = {
+    // Prefer the server-provided blockhash to avoid a redundant client-side
+    // RPC call. Fall back to the cluster only when the challenge omitted it.
+    let recent_blockhash = if let Some(blockhash) = request.recent_blockhash.as_deref() {
+        Hash::from_str(blockhash)
+            .map_err(|e| Error::Mpp(format!("invalid recentBlockhash in challenge: {e}")))?
+    } else {
         use solana_mpp::solana_rpc_client::rpc_client::RpcClient;
         RpcClient::new(rpc_url.clone())
             .get_latest_blockhash()
@@ -400,4 +408,300 @@ fn build_header(challenge: &PaymentChallenge, action: &SessionAction) -> Result<
     let credential = PaymentCredential::new(challenge.to_echo(), action);
     format_authorization(&credential)
         .map_err(|e| Error::Mpp(format!("Failed to format authorization header: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::accounts::{Account, AccountsFile, Keystore, MemoryAccountsStore};
+    use serial_test::serial;
+    use solana_mpp::{Base64UrlJson, SessionMode, SessionSplit, parse_authorization};
+    use surfpool_sdk::{Keypair, Signer};
+
+    fn test_request() -> SessionRequest {
+        SessionRequest {
+            cap: "1000000".to_string(),
+            currency: solana_pubkey::Pubkey::new_unique().to_string(),
+            decimals: Some(6),
+            network: Some("localnet".to_string()),
+            operator: solana_pubkey::Pubkey::new_unique().to_string(),
+            recipient: solana_pubkey::Pubkey::new_unique().to_string(),
+            splits: vec![SessionSplit {
+                recipient: solana_pubkey::Pubkey::new_unique().to_string(),
+                amount: "100".to_string(),
+            }],
+            program_id: Some(solana_pubkey::Pubkey::new_unique().to_string()),
+            description: Some("test session".to_string()),
+            external_id: Some("ext-123".to_string()),
+            min_voucher_delta: Some("25".to_string()),
+            modes: vec![SessionMode::Push, SessionMode::Pull],
+            recent_blockhash: None,
+        }
+    }
+
+    fn test_challenge(intent: &str) -> PaymentChallenge {
+        let request = Base64UrlJson::from_typed(&test_request()).unwrap();
+        PaymentChallenge::with_secret_key("test-secret", "test-realm", "solana", intent, request)
+    }
+
+    fn test_signer() -> Box<dyn SolanaSigner> {
+        use ed25519_dalek::SigningKey;
+        use solana_mpp::solana_keychain::MemorySigner;
+
+        let sk = SigningKey::generate(&mut rand::thread_rng());
+        let vk = sk.verifying_key();
+        let mut kp = [0u8; 64];
+        kp[..32].copy_from_slice(sk.as_bytes());
+        kp[32..].copy_from_slice(vk.as_bytes());
+        Box::new(MemorySigner::from_bytes(&kp).unwrap())
+    }
+
+    fn parse_action(header: &str) -> SessionAction {
+        let credential = parse_authorization(header).expect("parse authorization");
+        serde_json::from_value(credential.payload).expect("decode session action")
+    }
+
+    fn memory_store_for_keypair(keypair: &Keypair) -> MemoryAccountsStore {
+        let mut file = AccountsFile::default();
+        file.upsert(
+            "localnet",
+            "default",
+            Account {
+                keystore: Keystore::Ephemeral,
+                active: false,
+                pubkey: Some(keypair.pubkey().to_string()),
+                vault: None,
+                path: None,
+                secret_key_b58: Some(bs58::encode(keypair.to_bytes()).into_string()),
+                created_at: Some("2026-04-19T00:00:00Z".to_string()),
+            },
+        );
+        MemoryAccountsStore::with_file(file)
+    }
+
+    #[test]
+    fn parse_challenge_only_accepts_session_headers() {
+        let challenge = test_challenge("session");
+        let header = challenge.to_header().unwrap();
+
+        let Some((parsed_challenge, request)) = SessionHandle::parse_challenge(&header) else {
+            panic!("expected a session challenge");
+        };
+        assert_eq!(parsed_challenge.intent.as_str(), "session");
+        assert_eq!(request.cap, "1000000");
+
+        let non_session = test_challenge("charge").to_header().unwrap();
+        assert!(SessionHandle::parse_challenge(&non_session).is_none());
+        assert!(SessionHandle::parse_challenge("not a challenge").is_none());
+    }
+
+    #[tokio::test]
+    async fn session_handle_builds_expected_headers() {
+        let channel_id = Pubkey::new_unique();
+        let channel_id_str = channel_id.to_string();
+        let challenge = test_challenge("session");
+        let handle = SessionHandle::new(channel_id, test_signer(), challenge.clone());
+
+        let open = parse_action(&handle.open_header(1_000_000, "open_sig").await.unwrap());
+        match open {
+            SessionAction::Open(payload) => {
+                assert_eq!(payload.mode, SessionMode::Push);
+                assert_eq!(payload.channel_id.as_deref(), Some(channel_id_str.as_str()));
+                assert_eq!(payload.deposit.as_deref(), Some("1000000"));
+                assert_eq!(payload.signature, "open_sig");
+            }
+            _ => panic!("expected open action"),
+        }
+
+        let voucher = parse_action(&handle.voucher_header(125).await.unwrap());
+        match voucher {
+            SessionAction::Voucher(payload) => {
+                assert_eq!(payload.voucher.data.channel_id, channel_id_str);
+                assert_eq!(payload.voucher.data.cumulative, "125");
+            }
+            _ => panic!("expected voucher action"),
+        }
+        assert_eq!(handle.cumulative().await, 125);
+        assert_eq!(handle.channel_id().await, channel_id.to_string());
+        assert_eq!(handle.challenge().intent, challenge.intent);
+
+        let topup = parse_action(&handle.topup_header(2_000_000, "topup_sig").await.unwrap());
+        match topup {
+            SessionAction::TopUp(payload) => {
+                assert_eq!(payload.channel_id, channel_id.to_string());
+                assert_eq!(payload.new_deposit, "2000000");
+                assert_eq!(payload.signature, "topup_sig");
+            }
+            _ => panic!("expected topup action"),
+        }
+
+        let close = parse_action(&handle.close_header(Some(25)).await.unwrap());
+        match close {
+            SessionAction::Close(payload) => {
+                let voucher = payload.voucher.expect("final voucher");
+                assert_eq!(voucher.data.cumulative, "150");
+            }
+            _ => panic!("expected close action"),
+        }
+    }
+
+    #[tokio::test]
+    async fn open_pull_header_attaches_both_delegation_payloads() {
+        let token_account = Pubkey::new_unique();
+        let token_account_str = token_account.to_string();
+        let owner = Pubkey::new_unique().to_string();
+        let handle = SessionHandle::new(token_account, test_signer(), test_challenge("session"));
+
+        let action = parse_action(
+            &handle
+                .open_pull_header(
+                    1_000_000,
+                    &owner,
+                    "approve_sig",
+                    "init_tx_b64".to_string(),
+                    "update_tx_b64".to_string(),
+                )
+                .await
+                .unwrap(),
+        );
+        match action {
+            SessionAction::Open(payload) => {
+                assert_eq!(payload.mode, SessionMode::Pull);
+                assert_eq!(
+                    payload.token_account.as_deref(),
+                    Some(token_account_str.as_str())
+                );
+                assert_eq!(payload.approved_amount.as_deref(), Some("1000000"));
+                assert_eq!(payload.owner.as_deref(), Some(owner.as_str()));
+                assert_eq!(
+                    payload.init_multi_delegate_tx.as_deref(),
+                    Some("init_tx_b64")
+                );
+                assert_eq!(
+                    payload.update_delegation_tx.as_deref(),
+                    Some("update_tx_b64")
+                );
+            }
+            _ => panic!("expected pull open action"),
+        }
+    }
+
+    #[test]
+    fn open_session_header_returns_parseable_header() {
+        let challenge = test_challenge("session");
+        let (handle, header) = open_session_header(&challenge, 1_000_000).unwrap();
+        let action = parse_action(&header);
+        match action {
+            SessionAction::Open(payload) => {
+                assert_eq!(payload.mode, SessionMode::Push);
+                assert_eq!(payload.deposit.as_deref(), Some("1000000"));
+            }
+            _ => panic!("expected open action"),
+        }
+        let parsed = SessionHandle::parse_challenge(&challenge.to_header().unwrap()).unwrap();
+        assert_eq!(parsed.0.intent, handle.challenge().intent);
+    }
+
+    #[test]
+    fn voucher_header_sync_matches_async_builder() {
+        let handle = SessionHandle::new(
+            Pubkey::new_unique(),
+            test_signer(),
+            test_challenge("session"),
+        );
+        let sync = voucher_header_sync(&handle, 42).unwrap();
+        let action = parse_action(&sync);
+        match action {
+            SessionAction::Voucher(payload) => {
+                assert_eq!(payload.voucher.data.cumulative, "42");
+            }
+            _ => panic!("expected voucher action"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn open_pull_session_header_rejects_invalid_operator() {
+        let user = Keypair::new();
+        let store = memory_store_for_keypair(&user);
+        let mut request = test_request();
+        request.operator = "not-a-pubkey".to_string();
+
+        let err = open_pull_session_header(
+            &test_challenge("session"),
+            &request,
+            &store,
+            Some("localnet"),
+            None,
+            1_000_000,
+            false,
+        )
+        .err()
+        .expect("invalid operator should error");
+
+        assert!(
+            err.to_string().contains("invalid operator pubkey"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn open_pull_session_header_rejects_invalid_mint() {
+        let user = Keypair::new();
+        let store = memory_store_for_keypair(&user);
+        let mut request = test_request();
+        request.currency = "not-a-mint".to_string();
+
+        let err = open_pull_session_header(
+            &test_challenge("session"),
+            &request,
+            &store,
+            Some("localnet"),
+            None,
+            1_000_000,
+            false,
+        )
+        .err()
+        .expect("invalid mint should error");
+
+        assert!(
+            err.to_string().contains("invalid mint address"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn open_pull_session_header_reports_rpc_failures() {
+        let user = Keypair::new();
+        let store = memory_store_for_keypair(&user);
+        let original = std::env::var("PAY_RPC_URL").ok();
+        // SAFETY: this test is `serial`, so no concurrent env access occurs.
+        unsafe { std::env::set_var("PAY_RPC_URL", "http://127.0.0.1:1") };
+
+        let err = open_pull_session_header(
+            &test_challenge("session"),
+            &test_request(),
+            &store,
+            Some("localnet"),
+            None,
+            1_000_000,
+            false,
+        )
+        .err()
+        .expect("rpc lookup should fail");
+
+        match original {
+            // SAFETY: this test is `serial`, so no concurrent env access occurs.
+            Some(value) => unsafe { std::env::set_var("PAY_RPC_URL", value) },
+            // SAFETY: this test is `serial`, so no concurrent env access occurs.
+            None => unsafe { std::env::remove_var("PAY_RPC_URL") },
+        }
+
+        assert!(
+            err.to_string().contains("failed to get recent blockhash"),
+            "got: {err}"
+        );
+    }
 }

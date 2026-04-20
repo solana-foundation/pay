@@ -427,7 +427,10 @@ pub fn load_or_create_ephemeral_for_network_as(
 ) -> Result<ResolvedEphemeral> {
     let mut file = store.load()?;
 
-    if let Some(account) = file.named_account_for_network(network, account_name).cloned() {
+    if let Some(account) = file
+        .named_account_for_network(network, account_name)
+        .cloned()
+    {
         if account.keystore != Keystore::Ephemeral {
             return Err(Error::Config(format!(
                 "Network `{network}` account `{account_name}` is \

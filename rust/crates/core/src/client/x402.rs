@@ -56,14 +56,13 @@ pub fn build_payment(
     let user_opted_into_sandbox = network_override.is_some();
     let network = network_override.map(str::to_string).unwrap_or(cluster);
 
-    let (signer, ephemeral_notice) =
-        crate::signer::load_signer_for_network_payment(
-            &network,
-            store,
-            account_override,
-            &amount,
-            desc,
-        )?;
+    let (signer, ephemeral_notice) = crate::signer::load_signer_for_network_payment(
+        &network,
+        store,
+        account_override,
+        &amount,
+        desc,
+    )?;
 
     let rpc_url =
         std::env::var("PAY_RPC_URL").unwrap_or_else(|_| default_rpc_url(&network).to_string());
@@ -126,6 +125,26 @@ fn format_value(v: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::accounts::MemoryAccountsStore;
+
+    fn sample_requirements() -> PaymentRequirements {
+        PaymentRequirements {
+            network: "solana".to_string(),
+            cluster: Some("mainnet".to_string()),
+            recipient: "11111111111111111111111111111111".to_string(),
+            amount: "1000000".to_string(),
+            currency: "USDC".to_string(),
+            decimals: Some(6),
+            token_program: None,
+            resource: "https://api.example.com/v1/test".to_string(),
+            description: Some("API access".to_string()),
+            max_age: Some(60),
+            recent_blockhash: None,
+            fee_payer: None,
+            fee_payer_key: None,
+            extra: None,
+        }
+    }
 
     #[test]
     fn format_value_zero() {
@@ -187,4 +206,42 @@ mod tests {
         let headers = vec![("content-type".to_string(), "text/html".to_string())];
         assert!(parse(&headers, None).is_none());
     }
+
+    #[test]
+    fn build_payment_rejects_network_intent_mismatch_before_signer_lookup() {
+        let store = MemoryAccountsStore::new();
+        let requirements = sample_requirements();
+
+        let err = build_payment(&requirements, &store, Some("localnet"), None).unwrap_err();
+        let msg = err.to_string();
+
+        assert!(msg.contains("you forced network `localnet`"));
+        assert!(msg.contains("server expects `mainnet`"));
+        assert_eq!(store.save_count(), 0, "mismatch must fail before any wallet mutation");
+    }
+
+    #[test]
+    fn build_payment_requires_mainnet_wallet_when_no_override_is_set() {
+        let store = MemoryAccountsStore::new();
+        let requirements = sample_requirements();
+
+        let err = build_payment(&requirements, &store, None, None).unwrap_err();
+        let msg = err.to_string();
+
+        assert!(msg.contains("No account configured for network `mainnet`"));
+        assert!(msg.contains("pay setup"));
+    }
+
+    #[test]
+    fn build_payment_reports_named_account_miss_for_network() {
+        let store = MemoryAccountsStore::new();
+        let requirements = sample_requirements();
+
+        let err = build_payment(&requirements, &store, None, Some("alice")).unwrap_err();
+        let msg = err.to_string();
+
+        assert!(msg.contains("No account named `alice` configured for network `mainnet`"));
+        assert_eq!(store.save_count(), 0, "named-account miss must not lazily create");
+    }
+
 }

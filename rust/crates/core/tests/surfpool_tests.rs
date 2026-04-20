@@ -422,7 +422,9 @@ async fn push_session_full_flow() {
     };
 
     let app = Router::new()
-        .fallback(any(|| async { axum::Json(serde_json::json!({"ok": true})) }))
+        .fallback(any(|| async {
+            axum::Json(serde_json::json!({"ok": true}))
+        }))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             pay_core::server::payment::payment_middleware::<S>,
@@ -455,7 +457,11 @@ async fn push_session_full_flow() {
         .to_string();
 
     let challenge = parse_www_authenticate(&www_auth).unwrap();
-    assert_eq!(challenge.intent.as_str(), "session", "expected session intent");
+    assert_eq!(
+        challenge.intent.as_str(),
+        "session",
+        "expected session intent"
+    );
     assert_eq!(challenge.method.as_str(), "solana");
 
     // ── Step 2: Open session ───────────────────────────────────────────────
@@ -485,11 +491,8 @@ async fn push_session_full_flow() {
 
     let deposit = 1_000_000u64; // 1 USDC
     let open_action = active.open_action(deposit, &open_tx_sig);
-    let auth = format_authorization(&PaymentCredential::new(
-        challenge.to_echo(),
-        open_action,
-    ))
-    .unwrap();
+    let auth =
+        format_authorization(&PaymentCredential::new(challenge.to_echo(), open_action)).unwrap();
 
     let resp = http
         .post(format!("{url}/v1/simple/echo"))
@@ -499,15 +502,18 @@ async fn push_session_full_flow() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200, "open should return 200, got {}: {}", resp.status(), resp.text().await.unwrap());
+    assert_eq!(
+        resp.status(),
+        200,
+        "open should return 200, got {}: {}",
+        resp.status(),
+        resp.text().await.unwrap()
+    );
 
     // ── Step 3: Voucher (subsequent API call) ──────────────────────────────
     let voucher_action = active.voucher_action(1_000).await.unwrap(); // 0.001 USDC
-    let auth = format_authorization(&PaymentCredential::new(
-        challenge.to_echo(),
-        voucher_action,
-    ))
-    .unwrap();
+    let auth =
+        format_authorization(&PaymentCredential::new(challenge.to_echo(), voucher_action)).unwrap();
 
     let resp = http
         .post(format!("{url}/v1/simple/echo"))
@@ -517,15 +523,17 @@ async fn push_session_full_flow() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200, "voucher should return 200, got {}", resp.status());
+    assert_eq!(
+        resp.status(),
+        200,
+        "voucher should return 200, got {}",
+        resp.status()
+    );
 
     // Second voucher — watermark advances
     let voucher_action = active.voucher_action(1_000).await.unwrap();
-    let auth = format_authorization(&PaymentCredential::new(
-        challenge.to_echo(),
-        voucher_action,
-    ))
-    .unwrap();
+    let auth =
+        format_authorization(&PaymentCredential::new(challenge.to_echo(), voucher_action)).unwrap();
 
     let resp = http
         .post(format!("{url}/v1/simple/echo"))
@@ -539,11 +547,8 @@ async fn push_session_full_flow() {
 
     // ── Step 4: Close session ──────────────────────────────────────────────
     let close_action = active.close_action(None).await.unwrap();
-    let auth = format_authorization(&PaymentCredential::new(
-        challenge.to_echo(),
-        close_action,
-    ))
-    .unwrap();
+    let auth =
+        format_authorization(&PaymentCredential::new(challenge.to_echo(), close_action)).unwrap();
 
     let resp = http
         .post(format!("{url}/v1/simple/echo"))
@@ -553,9 +558,17 @@ async fn push_session_full_flow() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200, "close should return 200, got {}", resp.status());
+    assert_eq!(
+        resp.status(),
+        200,
+        "close should return 200, got {}",
+        resp.status()
+    );
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["status"], "closed", "expected closed status, got {body}");
+    assert_eq!(
+        body["status"], "closed",
+        "expected closed status, got {body}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -569,9 +582,7 @@ async fn pull_session_submits_required_setup_and_batches_channel_opens() {
     use solana_mpp::program::multi_delegator::MultiDelegateOnChainState;
     use solana_mpp::server::session::SessionConfig;
     use solana_mpp::solana_keychain::memory::MemorySigner;
-    use solana_mpp::{
-        SessionAction, SessionMode, format_authorization, parse_www_authenticate,
-    };
+    use solana_mpp::{SessionAction, SessionMode, format_authorization, parse_www_authenticate};
     use std::collections::HashMap;
     use std::future::Future;
     use std::pin::Pin;
@@ -619,10 +630,14 @@ async fn pull_session_submits_required_setup_and_batches_channel_opens() {
             owner: &'a str,
         ) -> Pin<Box<dyn Future<Output = pay_core::Result<MultiDelegateOnChainState>> + Send + 'a>>
         {
-            let state = self.states.get(owner).cloned().unwrap_or(MultiDelegateOnChainState {
-                multi_delegate_exists: false,
-                existing_delegation_cap: None,
-            });
+            let state = self
+                .states
+                .get(owner)
+                .cloned()
+                .unwrap_or(MultiDelegateOnChainState {
+                    multi_delegate_exists: false,
+                    existing_delegation_cap: None,
+                });
             Box::pin(async move { Ok(state) })
         }
 
@@ -645,7 +660,8 @@ async fn pull_session_submits_required_setup_and_batches_channel_opens() {
 
     let owner_init = Keypair::new();
     let owner_update = Keypair::new();
-    let batch_submissions: Arc<Mutex<Vec<Vec<(String, String, u64)>>>> = Arc::new(Mutex::new(vec![]));
+    let batch_submissions: Arc<Mutex<Vec<Vec<(String, String, u64)>>>> =
+        Arc::new(Mutex::new(vec![]));
 
     let chain = MockChain::new(HashMap::from([
         (
@@ -751,18 +767,13 @@ async fn pull_session_submits_required_setup_and_batches_channel_opens() {
         let session_kp = Keypair::new();
         let session_signer: Box<dyn solana_mpp::solana_keychain::SolanaSigner> =
             Box::new(MemorySigner::from_bytes(&session_kp.to_bytes()).unwrap());
-        let active = solana_mpp::client::session::ActiveSession::new(
-            token_account.pubkey(),
-            session_signer,
-        );
-        let payload = match active.open_pull_action(
-            1_000_000,
-            &owner.pubkey().to_string(),
-            approve_tx_sig,
-        ) {
-            SessionAction::Open(payload) => payload,
-            _ => unreachable!("open_pull_action must return SessionAction::Open"),
-        };
+        let active =
+            solana_mpp::client::session::ActiveSession::new(token_account.pubkey(), session_signer);
+        let payload =
+            match active.open_pull_action(1_000_000, &owner.pubkey().to_string(), approve_tx_sig) {
+                SessionAction::Open(payload) => payload,
+                _ => unreachable!("open_pull_action must return SessionAction::Open"),
+            };
         let payload = match init_tx {
             Some(tx) => payload.with_init_tx(tx.to_string()),
             None => payload,
@@ -848,13 +859,12 @@ async fn pull_session_full_flow() {
     };
     use solana_mpp::client::session::ActiveSession;
     use solana_mpp::program::multi_delegator::{
-        MultiDelegateOnChainState, MULTI_DELEGATOR_PROGRAM_ID,
+        MULTI_DELEGATOR_PROGRAM_ID, MultiDelegateOnChainState,
     };
     use solana_mpp::server::session::SessionConfig;
     use solana_mpp::solana_keychain::memory::MemorySigner;
     use solana_mpp::{
-        PaymentCredential, SessionAction, SessionMode, format_authorization,
-        parse_www_authenticate,
+        PaymentCredential, SessionAction, SessionMode, format_authorization, parse_www_authenticate,
     };
     use solana_pubkey::Pubkey;
     use std::future::Future;
@@ -875,7 +885,9 @@ async fn pull_session_full_flow() {
 
     impl CapturingChain {
         fn new() -> Self {
-            Self { submitted: Arc::new(std::sync::Mutex::new(vec![])) }
+            Self {
+                submitted: Arc::new(std::sync::Mutex::new(vec![])),
+            }
         }
         fn take_submitted(&self) -> Vec<String> {
             self.submitted.lock().unwrap().clone()
@@ -1025,7 +1037,9 @@ async fn pull_session_full_flow() {
     // ── [4] Start HTTP server ──────────────────────────────────────────────
     println!("\n[4] Starting HTTP server...");
     let app = Router::new()
-        .fallback(any(|| async { axum::Json(serde_json::json!({"ok": true})) }))
+        .fallback(any(|| async {
+            axum::Json(serde_json::json!({"ok": true}))
+        }))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             pay_core::server::payment::payment_middleware::<S>,
@@ -1059,7 +1073,10 @@ async fn pull_session_full_flow() {
         .unwrap()
         .to_string();
     let challenge = parse_www_authenticate(&www_auth).unwrap();
-    println!("    challenge intent={} method={}", challenge.intent, challenge.method);
+    println!(
+        "    challenge intent={} method={}",
+        challenge.intent, challenge.method
+    );
 
     // ── [6] Build initMultiDelegateTx + updateDelegationTx ────────────────
     println!("\n[6] Building multi-delegator transactions...");
@@ -1089,7 +1106,7 @@ async fn pull_session_full_flow() {
         &operator_kp.pubkey(),
         &program_id_pk,
         &token_program_pk,
-        0,        // nonce
+        0, // nonce
         cap,
         expiry_ts,
         recent_blockhash,
@@ -1102,8 +1119,8 @@ async fn pull_session_full_flow() {
         &mint_pk,
         &operator_kp.pubkey(),
         &program_id_pk,
-        0,        // nonce
-        cap * 2,  // higher cap for update path
+        0,       // nonce
+        cap * 2, // higher cap for update path
         expiry_ts,
         recent_blockhash,
     )
@@ -1148,7 +1165,10 @@ async fn pull_session_full_flow() {
         .unwrap();
     let status = resp.status();
     let body_text = resp.text().await.unwrap();
-    assert_eq!(status, 200, "open should return 200, got {status}: {body_text}");
+    assert_eq!(
+        status, 200,
+        "open should return 200, got {status}: {body_text}"
+    );
     println!("    ✓ open accepted (200)");
 
     // Give the batcher a moment to flush
@@ -1158,11 +1178,9 @@ async fn pull_session_full_flow() {
     println!("\n[8] Sending vouchers...");
     for i in 1..=2 {
         let voucher_action = active.voucher_action(1_000).await.unwrap();
-        let auth = format_authorization(&PaymentCredential::new(
-            challenge.to_echo(),
-            voucher_action,
-        ))
-        .unwrap();
+        let auth =
+            format_authorization(&PaymentCredential::new(challenge.to_echo(), voucher_action))
+                .unwrap();
         let resp = http
             .post(format!("{url}/v1/simple/echo"))
             .header("host", "testapi.localhost")
@@ -1178,11 +1196,8 @@ async fn pull_session_full_flow() {
     // ── [9] Close ──────────────────────────────────────────────────────────
     println!("\n[9] Closing session...");
     let close_action = active.close_action(None).await.unwrap();
-    let auth = format_authorization(&PaymentCredential::new(
-        challenge.to_echo(),
-        close_action,
-    ))
-    .unwrap();
+    let auth =
+        format_authorization(&PaymentCredential::new(challenge.to_echo(), close_action)).unwrap();
     let resp = http
         .post(format!("{url}/v1/simple/echo"))
         .header("host", "testapi.localhost")
@@ -1198,7 +1213,12 @@ async fn pull_session_full_flow() {
 
     // ── Verify server submitted the correct tx ────────────────────────────
     let submitted = chain.take_submitted();
-    assert_eq!(submitted.len(), 1, "expected one tx submitted, got {}", submitted.len());
+    assert_eq!(
+        submitted.len(),
+        1,
+        "expected one tx submitted, got {}",
+        submitted.len()
+    );
     assert_eq!(
         submitted[0], init_tx_b64,
         "server should have submitted initMultiDelegateTx (not updateDelegationTx)"
@@ -1207,12 +1227,20 @@ async fn pull_session_full_flow() {
 
     // ── Verify batcher received the channel open ───────────────────────────
     let opens = channel_opens.lock().unwrap().clone();
-    assert_eq!(opens.len(), 1, "expected one batch flush, got {}", opens.len());
+    assert_eq!(
+        opens.len(),
+        1,
+        "expected one batch flush, got {}",
+        opens.len()
+    );
     assert_eq!(opens[0].len(), 1, "expected one channel open in the batch");
     assert_eq!(opens[0][0].0, user_kp.pubkey().to_string());
     assert_eq!(opens[0][0].1, user_ata.to_string());
     assert_eq!(opens[0][0].2, cap);
-    println!("    ✓ batcher received channel open for owner={}", opens[0][0].0);
+    println!(
+        "    ✓ batcher received channel open for owner={}",
+        opens[0][0].0
+    );
 
     println!("\n╔══════════════════════════════════════════════════════╗");
     println!("║   ALL STEPS PASSED ✓                                 ║");
