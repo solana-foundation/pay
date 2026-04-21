@@ -101,7 +101,11 @@ impl SyncCommand {
 
             let md = convert_to_registry_md(&spec, &name);
 
-            let out_path = self.out.join(&self.operator).join(&origin).join(format!("{name}.md"));
+            let out_path = self
+                .out
+                .join(&self.operator)
+                .join(&origin)
+                .join(format!("{name}.md"));
             if let Some(parent) = out_path.parent() {
                 fs::create_dir_all(parent).map_err(|e| {
                     pay_core::Error::Config(format!("mkdir {}: {e}", parent.display()))
@@ -163,10 +167,7 @@ fn expand_paths(patterns: &[String]) -> pay_core::Result<Vec<PathBuf>> {
 fn convert_to_registry_md(spec: &serde_json::Value, name: &str) -> String {
     let obj = spec.as_object().expect("spec must be an object");
 
-    let title = obj
-        .get("title")
-        .and_then(|v| v.as_str())
-        .unwrap_or(name);
+    let title = obj.get("title").and_then(|v| v.as_str()).unwrap_or(name);
     let description = obj
         .get("description")
         .and_then(|v| v.as_str())
@@ -175,10 +176,7 @@ fn convert_to_registry_md(spec: &serde_json::Value, name: &str) -> String {
         .get("category")
         .and_then(|v| v.as_str())
         .unwrap_or("other");
-    let version = obj
-        .get("version")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let version = obj.get("version").and_then(|v| v.as_str()).unwrap_or("");
 
     let service_url = obj
         .get("routing")

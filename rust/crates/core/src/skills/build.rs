@@ -338,7 +338,14 @@ fn collect_providers(
                 let name = path.file_stem().unwrap().to_string_lossy().to_string();
                 let fqn = format!("{operator_name}/{name}");
                 process_provider_md(
-                    &path, &fqn, &name, &operator_name, &operator_name, root, errors, &mut results,
+                    &path,
+                    &fqn,
+                    &name,
+                    &operator_name,
+                    &operator_name,
+                    root,
+                    errors,
+                    &mut results,
                 );
             } else if path.is_dir() {
                 // 3-level: operator/origin/*.md (proxied APIs)
@@ -351,7 +358,13 @@ fn collect_providers(
                     let name = md_path.file_stem().unwrap().to_string_lossy().to_string();
                     let fqn = format!("{operator_name}/{origin}/{name}");
                     process_provider_md(
-                        &md_path, &fqn, &name, &operator_name, &origin, root, errors,
+                        &md_path,
+                        &fqn,
+                        &name,
+                        &operator_name,
+                        &origin,
+                        root,
+                        errors,
                         &mut results,
                     );
                 }
@@ -422,7 +435,10 @@ fn process_provider_md(
     };
 
     if spec.name != name {
-        errors.push(format!("{fqn}: name=`{}` but filename is `{name}`", spec.name));
+        errors.push(format!(
+            "{fqn}: name=`{}` but filename is `{name}`",
+            spec.name
+        ));
         return;
     }
 
@@ -476,8 +492,7 @@ fn process_provider_md(
         endpoints: spec.endpoints,
     };
 
-    let detail_json =
-        serde_json::to_string_pretty(&detail).expect("detail serialization failed");
+    let detail_json = serde_json::to_string_pretty(&detail).expect("detail serialization failed");
     let sha = content_sha(&detail_json);
 
     let index_entry = ProviderIndexEntry {

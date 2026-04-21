@@ -14,7 +14,10 @@ pub struct BuildCommand {
     pub path: PathBuf,
 
     /// CDN base URL for detail file references in the index.
-    #[arg(long, default_value = "https://storage.googleapis.com/pay-skills-cdn/v2")]
+    #[arg(
+        long,
+        default_value = "https://storage.googleapis.com/pay-skills-cdn/v2"
+    )]
     pub base_url: String,
 
     /// Output directory (default: <path>/dist).
@@ -28,9 +31,7 @@ impl BuildCommand {
             pay_core::Error::Config(format!("invalid path `{}`: {e}", self.path.display()))
         })?;
 
-        let dist = self
-            .output
-            .unwrap_or_else(|| root.join("dist"));
+        let dist = self.output.unwrap_or_else(|| root.join("dist"));
 
         eprintln!(
             "Building skills index from {}",
@@ -84,12 +85,10 @@ impl BuildCommand {
         let index_json = serde_json::to_string_pretty(&result.index)
             .map_err(|e| pay_core::Error::Config(format!("json: {e}")))?;
         let index_path = dist.join("skills.json");
-        fs::create_dir_all(&dist).map_err(|e| {
-            pay_core::Error::Config(format!("mkdir {}: {e}", dist.display()))
-        })?;
-        fs::write(&index_path, format!("{index_json}\n")).map_err(|e| {
-            pay_core::Error::Config(format!("write {}: {e}", index_path.display()))
-        })?;
+        fs::create_dir_all(&dist)
+            .map_err(|e| pay_core::Error::Config(format!("mkdir {}: {e}", dist.display())))?;
+        fs::write(&index_path, format!("{index_json}\n"))
+            .map_err(|e| pay_core::Error::Config(format!("write {}: {e}", index_path.display())))?;
 
         // Summary
         eprintln!(
@@ -109,7 +108,9 @@ impl BuildCommand {
             eprintln!();
             eprintln!(
                 "{}",
-                format!("{} error(s) found", result.errors.len()).red().bold()
+                format!("{} error(s) found", result.errors.len())
+                    .red()
+                    .bold()
             );
             std::process::exit(1);
         }
