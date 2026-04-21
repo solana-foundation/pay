@@ -36,7 +36,11 @@ pub fn run() -> pay_core::Result<()> {
         format!(
             "{} providers, {} total endpoints",
             catalog.providers.len(),
-            catalog.providers.iter().map(|s| s.endpoint_count).sum::<u32>()
+            catalog
+                .providers
+                .iter()
+                .map(|s| s.endpoint_count)
+                .sum::<u32>()
         )
         .dimmed()
     );

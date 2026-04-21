@@ -174,6 +174,37 @@ Categories: ai_ml, data, compute, maps, search, translation, productivity
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
+    #[tool(
+        description = r#"List all available paid API services with their top endpoints in a single call.
+
+Returns every service with up to 3 metered endpoints each. Use this
+instead of multiple `skills_search` calls when you want a broad overview
+of what's available. Drill into a specific service with `skills_endpoints`.
+"#
+    )]
+    async fn skills_list(&self) -> Result<CallToolResult, rmcp::ErrorData> {
+        let catalog = tokio::task::spawn_blocking(pay_core::skills::load_skills)
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+
+        let hits = pay_core::skills::search(&catalog, None, None);
+        let grouped = pay_core::skills::group_search_results(&hits);
+        let condensed: Vec<_> = grouped
+            .into_iter()
+            .map(|mut g| {
+                let metered: Vec<_> = g.endpoints.iter().filter(|e| e.metered).cloned().collect();
+                g.endpoints = metered.into_iter().take(3).collect();
+                g
+            })
+            .collect();
+
+        let json = serde_json::to_string_pretty(&condensed)
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
     #[tool(description = r#"List all endpoints for a specific API service.
 
 Each endpoint includes a complete `url` field — paste it directly into
@@ -192,8 +223,7 @@ get the exact endpoints you need.
 
         // Lazy-fetch endpoints if not loaded
         tokio::task::spawn_blocking(move || {
-            pay_core::skills::ensure_endpoints(&mut catalog, &service_name)
-                .map(|()| catalog)
+            pay_core::skills::ensure_endpoints(&mut catalog, &service_name).map(|()| catalog)
         })
         .await
         .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
@@ -202,8 +232,10 @@ get the exact endpoints you need.
             let svc = catalog
                 .providers
                 .iter()
-                .find(|s| s.fqn.eq_ignore_ascii_case(&params.service)
-                    || s.name().eq_ignore_ascii_case(&params.service))
+                .find(|s| {
+                    s.fqn.eq_ignore_ascii_case(&params.service)
+                        || s.name().eq_ignore_ascii_case(&params.service)
+                })
                 .ok_or_else(|| {
                     rmcp::ErrorData::invalid_params(
                         format!("Service `{}` not found", params.service),

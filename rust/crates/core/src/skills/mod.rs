@@ -451,9 +451,8 @@ fn find_service<'a>(catalog: &'a Catalog, name: &str) -> Option<&'a Service> {
 /// Downloads `{base_url}/providers/{fqn}.json`, caches locally in
 /// `~/.config/pay/skills/detail/`, uses `sha` for invalidation.
 pub fn load_service_endpoints(catalog: &Catalog, service_name: &str) -> Result<Vec<Endpoint>> {
-    let svc = find_service(catalog, service_name).ok_or_else(|| {
-        Error::Config(format!("service `{service_name}` not found"))
-    })?;
+    let svc = find_service(catalog, service_name)
+        .ok_or_else(|| Error::Config(format!("service `{service_name}` not found")))?;
 
     // Already loaded?
     if svc.endpoints_loaded() {
@@ -473,12 +472,11 @@ pub fn load_service_endpoints(catalog: &Catalog, service_name: &str) -> Result<V
         std::path::PathBuf::from(shellexpand::tilde("~/.config/pay/skills/detail").into_owned());
     let cache_file = cache_dir.join(format!("{}.json", svc.sha));
 
-    if cache_file.exists() {
-        if let Ok(raw) = std::fs::read_to_string(&cache_file) {
-            if let Ok(detail) = parse_detail(&raw) {
-                return Ok(detail.endpoints);
-            }
-        }
+    if cache_file.exists()
+        && let Ok(raw) = std::fs::read_to_string(&cache_file)
+        && let Ok(detail) = parse_detail(&raw)
+    {
+        return Ok(detail.endpoints);
     }
 
     // Fetch from CDN
@@ -545,13 +543,12 @@ pub fn ensure_endpoints(catalog: &mut Catalog, service_name: &str) -> Result<()>
         std::path::PathBuf::from(shellexpand::tilde("~/.config/pay/skills/detail").into_owned());
     let cache_file = cache_dir.join(format!("{}.json", svc.sha));
 
-    if cache_file.exists() {
-        if let Ok(raw) = std::fs::read_to_string(&cache_file) {
-            if let Ok(detail) = parse_detail(&raw) {
-                svc.endpoints = detail.endpoints;
-                return Ok(());
-            }
-        }
+    if cache_file.exists()
+        && let Ok(raw) = std::fs::read_to_string(&cache_file)
+        && let Ok(detail) = parse_detail(&raw)
+    {
+        svc.endpoints = detail.endpoints;
+        return Ok(());
     }
 
     let client = reqwest::blocking::Client::builder()
@@ -808,7 +805,11 @@ fn summarize_service(svc: &Service) -> ServiceSummary {
             category: svc.category.clone(),
             service_url: svc.service_url.clone(),
             endpoint_count: svc.endpoint_count,
-            metered_endpoints: if svc.has_metering { svc.endpoint_count } else { 0 },
+            metered_endpoints: if svc.has_metering {
+                svc.endpoint_count
+            } else {
+                0
+            },
             free_endpoints: if svc.has_free_tier { 1 } else { 0 },
             min_price_usd: svc.min_price_usd,
             max_price_usd: svc.max_price_usd,
@@ -1048,7 +1049,10 @@ mod tests {
         let cat = catalog_with_endpoints();
         let hits = search(&cat, Some("queries"), None);
         assert_eq!(hits.len(), 2);
-        assert!(hits.iter().all(|h| h.service == "solana-foundation/google/bigquery"));
+        assert!(
+            hits.iter()
+                .all(|h| h.service == "solana-foundation/google/bigquery")
+        );
     }
 
     #[test]
@@ -1072,7 +1076,10 @@ mod tests {
         let cat = catalog_with_endpoints();
         let hits = search(&cat, None, None);
         // Within bigquery, metered POST should come before free GETs
-        let bq: Vec<_> = hits.iter().filter(|h| h.service.contains("bigquery")).collect();
+        let bq: Vec<_> = hits
+            .iter()
+            .filter(|h| h.service.contains("bigquery"))
+            .collect();
         assert!(bq[0].metered);
     }
 
@@ -1134,7 +1141,11 @@ mod tests {
         assert_eq!(jobs.endpoint_count, 2);
         assert_eq!(jobs.metered_count, 1);
 
-        let datasets = detail.resources.iter().find(|r| r.name == "datasets").unwrap();
+        let datasets = detail
+            .resources
+            .iter()
+            .find(|r| r.name == "datasets")
+            .unwrap();
         assert_eq!(datasets.endpoint_count, 1);
         assert_eq!(datasets.metered_count, 0);
     }
@@ -1169,7 +1180,10 @@ mod tests {
         let hits = search(&cat, None, None);
         let groups = group_search_results(&hits);
         assert_eq!(groups.len(), 2);
-        let bq = groups.iter().find(|g| g.service.contains("bigquery")).unwrap();
+        let bq = groups
+            .iter()
+            .find(|g| g.service.contains("bigquery"))
+            .unwrap();
         assert_eq!(bq.endpoints.len(), 3);
     }
 
@@ -1178,7 +1192,10 @@ mod tests {
         let cat = catalog_with_endpoints();
         let hits = search(&cat, Some("annotate"), None);
         let groups = group_search_results(&hits);
-        assert_eq!(groups[0].endpoints[0].url, "https://gw.example.com/v1/images:annotate");
+        assert_eq!(
+            groups[0].endpoints[0].url,
+            "https://gw.example.com/v1/images:annotate"
+        );
         assert!(groups[0].endpoints[0].metered);
     }
 
@@ -1187,12 +1204,18 @@ mod tests {
     #[test]
     fn build_endpoint_url_resolves_placeholders() {
         let url = build_endpoint_url("https://gw.example.com", "v2/projects/{projectsId}/queries");
-        assert_eq!(url, "https://gw.example.com/v2/projects/gateway-402/queries");
+        assert_eq!(
+            url,
+            "https://gw.example.com/v2/projects/gateway-402/queries"
+        );
     }
 
     #[test]
     fn build_endpoint_url_empty_path() {
-        assert_eq!(build_endpoint_url("https://gw.example.com/", ""), "https://gw.example.com");
+        assert_eq!(
+            build_endpoint_url("https://gw.example.com/", ""),
+            "https://gw.example.com"
+        );
     }
 
     // ── collect_prices ──────────────────────────────────────────────────────

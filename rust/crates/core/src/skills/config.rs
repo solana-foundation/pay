@@ -20,8 +20,7 @@ const DEFAULT_TTL_MINUTES: u32 = 30;
 
 /// The default catalog shipped with pay — always present even if the
 /// user hasn't added any sources.
-pub const DEFAULT_SOURCE: &str =
-    "https://storage.googleapis.com/pay-skills/v1/skills.json";
+pub const DEFAULT_SOURCE: &str = "https://storage.googleapis.com/pay-skills/v1/skills.json";
 
 /// A provider source in the skills catalog config.
 #[derive(Debug, Clone, Serialize, Deserialize)]
