@@ -2,6 +2,7 @@ name: Docker
 on:
   push:
     tags: ["pay-v*"]
+  pull_request: {}
   workflow_dispatch: {}
 
 env:
