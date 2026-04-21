@@ -3,7 +3,7 @@ use owo_colors::OwoColorize;
 /// List endpoints for a resource within a service.
 #[derive(clap::Args)]
 pub struct EndpointsCommand {
-    /// Service name (e.g. "bigquery").
+    /// Service name or FQN (e.g. "bigquery" or "solana-foundation/google/bigquery").
     pub service: String,
 
     /// Resource name (e.g. "jobs", "datasets").
@@ -16,13 +16,16 @@ pub struct EndpointsCommand {
 
 impl EndpointsCommand {
     pub fn run(self) -> pay_core::Result<()> {
-        let catalog = pay_core::skills::load_skills()?;
+        let mut catalog = pay_core::skills::load_skills()?;
+
+        // Lazy-fetch endpoints from CDN if needed
+        pay_core::skills::ensure_endpoints(&mut catalog, &self.service)?;
+
         let result = pay_core::skills::resource_endpoints(&catalog, &self.service, &self.resource)
             .ok_or_else(|| {
                 pay_core::Error::Config(format!(
-                    "No endpoints found for resource `{}` in service `{}`. \
-                         Try `pay skills service {}` to see available resources.",
-                    self.resource, self.service, self.service
+                    "No endpoints found for resource `{}` in service `{}`.",
+                    self.resource, self.service
                 ))
             })?;
 
@@ -60,7 +63,6 @@ impl EndpointsCommand {
             );
 
             if !ep.description.is_empty() {
-                // Truncate long descriptions to one line
                 let desc = if ep.description.len() > 80 {
                     format!("{}...", &ep.description[..77])
                 } else {

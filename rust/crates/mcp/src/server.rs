@@ -184,37 +184,49 @@ get the exact endpoints you need.
         &self,
         Parameters(params): Parameters<SkillsEndpointsParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let catalog = tokio::task::spawn_blocking(pay_core::skills::load_skills)
+        let service_name = params.service.clone();
+        let mut catalog = tokio::task::spawn_blocking(pay_core::skills::load_skills)
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
 
-        let svc = catalog
-            .services
-            .iter()
-            .find(|s| s.name.eq_ignore_ascii_case(&params.service))
-            .ok_or_else(|| {
-                rmcp::ErrorData::invalid_params(
-                    format!("Service `{}` not found", params.service),
-                    None,
-                )
-            })?;
-
-        let clean = pay_core::skills::SearchResultGroup {
-            service: svc.name.clone(),
-            title: svc.title.clone(),
-            url: svc.service_url.clone(),
-            endpoints: svc
-                .endpoints
+        // Lazy-fetch endpoints if not loaded
+        tokio::task::spawn_blocking(move || {
+            pay_core::skills::ensure_endpoints(&mut catalog, &service_name)
+                .map(|()| catalog)
+        })
+        .await
+        .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
+        .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))
+        .and_then(|catalog| {
+            let svc = catalog
+                .providers
                 .iter()
-                .map(|ep| pay_core::skills::endpoint_to_hit(&svc.service_url, ep))
-                .collect(),
-        };
+                .find(|s| s.fqn.eq_ignore_ascii_case(&params.service)
+                    || s.name().eq_ignore_ascii_case(&params.service))
+                .ok_or_else(|| {
+                    rmcp::ErrorData::invalid_params(
+                        format!("Service `{}` not found", params.service),
+                        None,
+                    )
+                })?;
 
-        let json = serde_json::to_string_pretty(&clean)
-            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+            let clean = pay_core::skills::SearchResultGroup {
+                service: svc.fqn.clone(),
+                title: svc.title.clone(),
+                url: svc.service_url.clone(),
+                endpoints: svc
+                    .endpoints
+                    .iter()
+                    .map(|ep| pay_core::skills::endpoint_to_hit(&svc.service_url, ep))
+                    .collect(),
+            };
 
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+            let json = serde_json::to_string_pretty(&clean)
+                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+
+            Ok(CallToolResult::success(vec![Content::text(json)]))
+        })
     }
 }
 

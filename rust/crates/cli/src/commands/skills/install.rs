@@ -18,14 +18,9 @@ impl InstallCommand {
             eprintln!("{}", "  Updating cache...".dimmed());
             let catalog = pay_core::skills::update_skills()?;
             eprintln!(
-                "  {} {} services, {} endpoints",
+                "  {} {} providers",
                 "Ready:".green(),
-                catalog.services.len(),
-                catalog
-                    .services
-                    .iter()
-                    .map(|s| s.endpoints.len())
-                    .sum::<usize>()
+                catalog.providers.len(),
             );
         } else {
             eprintln!("{}", "  Already installed.".dimmed());

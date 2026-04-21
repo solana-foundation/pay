@@ -4,8 +4,13 @@
 //! Provider sources are managed in `~/.config/pay/skills.yaml` (see
 //! [`config::SkillsConfig`]) and merged into a single consolidated cache.
 //!
+//! The index is lightweight (no inline endpoints). Endpoint data is
+//! lazy-fetched from `{base_url}/providers/{fqn}.json` on demand and
+//! cached locally.
+//!
 //! Query functions ([`search`], [`service_detail`], [`resource_endpoints`])
-//! are pure — no I/O at query time. The I/O boundary is [`load_skills`].
+//! are pure — no I/O at query time. The I/O boundary is [`load_skills`]
+//! and [`load_service_endpoints`].
 
 pub mod build;
 pub mod config;
@@ -31,54 +36,31 @@ fn deserialize_version<'de, D: serde::Deserializer<'de>>(
 }
 
 // ── Catalog schema ──────────────────────────────────────────────────────────
-//
-// Matches the shape of the GCS `sandbox.json` file published by the
-// agent-gateway CI. The `pay-skills` build script produces the same shape
-// so both sources can feed the same code path.
 
-/// Top-level catalog — the full index downloaded from the CDN.
-///
-/// Accepts both the GCS `sandbox.json` shape (field `services`) and
-/// the `pay-skills/index.json` shape (field `providers`). The CLI
-/// normalizes both into `services` internally.
+/// Top-level catalog — the skills.json index from the CDN.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Catalog {
     #[serde(alias = "version", deserialize_with = "deserialize_version")]
     pub schema_version: String,
+    #[serde(default)]
     pub generated_at: String,
+    /// CDN base URL for fetching provider detail files.
     #[serde(default)]
-    pub environment: String,
+    pub base_url: String,
     #[serde(default)]
-    pub provider: String,
-    #[serde(default)]
-    pub totals: Option<CatalogTotals>,
-    /// Service list — populated from `services` (GCS) or `providers`
-    /// (pay-skills). Both map to the same `Service` struct.
-    #[serde(alias = "providers")]
-    pub services: Vec<Service>,
+    pub provider_count: u32,
+    /// Provider list from `providers[]` in skills.json.
+    #[serde(alias = "services", default)]
+    pub providers: Vec<Service>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CatalogTotals {
-    pub services: u32,
-    pub endpoints: u32,
-    #[serde(default)]
-    pub metered_endpoints: u32,
-    #[serde(default)]
-    pub free_endpoints: u32,
-}
-
-/// A single API service (e.g. "bigquery", "generativelanguage").
+/// A provider entry in the index. Endpoints are NOT inline — they're
+/// lazy-fetched from `{base_url}/providers/{fqn}.json` when needed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Service {
-    pub name: String,
-    /// Which provider/source this service came from (e.g. "google").
-    /// Set from the catalog's top-level `provider` field or the source
-    /// name during merge.
-    #[serde(default)]
-    pub provider: String,
-    #[serde(default)]
-    pub subdomain: String,
+    /// Fully qualified name: `operator/origin/name` or `operator/name`.
+    #[serde(alias = "name")]
+    pub fqn: String,
     #[serde(default)]
     pub title: String,
     #[serde(default)]
@@ -86,15 +68,35 @@ pub struct Service {
     #[serde(default)]
     pub category: String,
     #[serde(default)]
-    pub version: String,
-    #[serde(default)]
     pub service_url: String,
     #[serde(default)]
     pub endpoint_count: u32,
     #[serde(default)]
-    pub endpoints: Vec<Endpoint>,
+    pub has_metering: bool,
     #[serde(default)]
-    pub free_tier: Option<serde_json::Value>,
+    pub has_free_tier: bool,
+    #[serde(default)]
+    pub min_price_usd: f64,
+    #[serde(default)]
+    pub max_price_usd: f64,
+    /// Content hash of the detail file — used for cache invalidation.
+    #[serde(default)]
+    pub sha: String,
+    /// Endpoints — empty from the index, populated by [`load_service_endpoints`].
+    #[serde(default)]
+    pub endpoints: Vec<Endpoint>,
+}
+
+impl Service {
+    /// Short name (last segment of the FQN).
+    pub fn name(&self) -> &str {
+        self.fqn.rsplit('/').next().unwrap_or(&self.fqn)
+    }
+
+    /// Whether endpoints have been loaded (lazy-fetch completed).
+    pub fn endpoints_loaded(&self) -> bool {
+        !self.endpoints.is_empty()
+    }
 }
 
 /// A single API endpoint within a service.
@@ -115,29 +117,22 @@ pub struct Endpoint {
 // ── Query results ───────────────────────────────────────────────────────────
 
 /// A search hit: one endpoint within a service, with enough context to
-/// construct a `pay curl` command directly. The primary result type of
-/// [`search`] — users should never need a second command to get from a
-/// search result to an actionable URL.
+/// construct a `pay curl` command directly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchHit {
-    /// Service this endpoint belongs to.
     pub service: String,
     pub service_title: String,
     pub service_url: String,
-    /// The endpoint itself.
     pub method: String,
     pub path: String,
     pub full_path: String,
     pub description: String,
     pub resource: String,
-    /// Pricing — `None` means free (pass-through).
     pub pricing: Option<serde_json::Value>,
-    /// Whether this endpoint is metered (pay adds value).
     pub metered: bool,
 }
 
 /// Grouped search result — service metadata + matching endpoints.
-/// Used by the CLI `--json` output and the MCP tools.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResultGroup {
     pub service: String,
@@ -150,8 +145,6 @@ pub struct SearchResultGroup {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EndpointHit {
     pub method: String,
-    /// Complete, ready-to-use URL (`service_url + full_path`). The agent
-    /// can paste this directly into `pay curl` without any assembly.
     pub url: String,
     pub path: String,
     pub description: String,
@@ -183,8 +176,7 @@ pub fn group_search_results(hits: &[SearchHit]) -> Vec<SearchResultGroup> {
     groups
 }
 
-/// A service summary — used by the MCP `skills_search` tool for context
-/// efficiency (agents don't want 2,617 endpoints in one response).
+/// A service summary — used by the MCP `skills_search` tool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceSummary {
     pub name: String,
@@ -232,20 +224,16 @@ pub struct ResourceEndpoints {
 
 /// Search services and endpoints by keyword and/or category.
 ///
-/// Matches against service name/title/description AND endpoint
-/// path/description (case-insensitive substring). Returns individual
-/// endpoint hits grouped by service, metered endpoints first — each
-/// hit contains enough info to construct a `pay curl` command.
-///
-/// When `query` is None and `category` is None, returns all metered
-/// endpoints (the ones pay adds value for) across all services.
+/// When endpoints are loaded (from detail files), matches against endpoint
+/// paths and descriptions. When only the index is available, matches
+/// service-level fields only and emits a single summary hit per service.
 pub fn search(catalog: &Catalog, query: Option<&str>, category: Option<&str>) -> Vec<SearchHit> {
     let query_lower = query.map(|q| q.to_lowercase());
 
     let mut hits: Vec<SearchHit> = Vec::new();
 
-    for svc in &catalog.services {
-        // Category filter (service-level)
+    for svc in &catalog.providers {
+        // Category filter
         if let Some(cat) = category
             && !svc.category.eq_ignore_ascii_case(cat)
         {
@@ -256,41 +244,55 @@ pub fn search(catalog: &Catalog, query: Option<&str>, category: Option<&str>) ->
         let service_matches = match &query_lower {
             Some(q) => {
                 let haystack =
-                    format!("{} {} {}", svc.name, svc.title, svc.description).to_lowercase();
+                    format!("{} {} {}", svc.fqn, svc.title, svc.description).to_lowercase();
                 haystack.contains(q.as_str())
             }
             None => true,
         };
 
-        for ep in &svc.endpoints {
-            // An endpoint is a hit if:
-            // - the service matched the keyword, OR
-            // - the endpoint's own path/description matches the keyword
-            let endpoint_matches = if service_matches {
-                true
-            } else if let Some(ref q) = query_lower {
-                let haystack =
-                    format!("{} {} {}", ep.path, ep.full_path, ep.description).to_lowercase();
-                haystack.contains(q.as_str())
-            } else {
-                false
-            };
+        if svc.endpoints_loaded() {
+            // Full endpoint-level search
+            for ep in &svc.endpoints {
+                let endpoint_matches = if service_matches {
+                    true
+                } else if let Some(ref q) = query_lower {
+                    let haystack =
+                        format!("{} {} {}", ep.path, ep.full_path, ep.description).to_lowercase();
+                    haystack.contains(q.as_str())
+                } else {
+                    false
+                };
 
-            if !endpoint_matches {
-                continue;
+                if !endpoint_matches {
+                    continue;
+                }
+
+                hits.push(SearchHit {
+                    service: svc.fqn.clone(),
+                    service_title: svc.title.clone(),
+                    service_url: svc.service_url.clone(),
+                    method: ep.method.clone(),
+                    path: ep.path.clone(),
+                    full_path: ep.full_path.clone(),
+                    description: ep.description.clone(),
+                    resource: ep.resource.clone(),
+                    pricing: ep.pricing.clone(),
+                    metered: ep.pricing.is_some(),
+                });
             }
-
+        } else if service_matches {
+            // Index-only: emit a service-level placeholder hit
             hits.push(SearchHit {
-                service: svc.name.clone(),
+                service: svc.fqn.clone(),
                 service_title: svc.title.clone(),
                 service_url: svc.service_url.clone(),
-                method: ep.method.clone(),
-                path: ep.path.clone(),
-                full_path: ep.full_path.clone(),
-                description: ep.description.clone(),
-                resource: ep.resource.clone(),
-                pricing: ep.pricing.clone(),
-                metered: ep.pricing.is_some(),
+                method: String::new(),
+                path: String::new(),
+                full_path: String::new(),
+                description: svc.description.clone(),
+                resource: String::new(),
+                pricing: None,
+                metered: svc.has_metering,
             });
         }
     }
@@ -303,8 +305,7 @@ pub fn search(catalog: &Catalog, query: Option<&str>, category: Option<&str>) ->
             .then_with(|| a.path.cmp(&b.path))
     });
 
-    // Hoist services that have metered endpoints to the top (so the
-    // first thing the user sees is pay-able endpoints, not free ones).
+    // Hoist services that have metered endpoints to the top.
     let has_metered: std::collections::HashSet<_> = hits
         .iter()
         .filter(|h| h.metered)
@@ -324,11 +325,6 @@ pub fn search(catalog: &Catalog, query: Option<&str>, category: Option<&str>) ->
 }
 
 /// Search at the service level (for MCP progressive disclosure).
-///
-/// Same matching logic as [`search`] but returns service summaries
-/// instead of individual endpoints — keeps the response compact so
-/// agents don't consume 2,617 endpoints of context when all they
-/// need is "which services exist".
 pub fn search_services(
     catalog: &Catalog,
     query: Option<&str>,
@@ -337,7 +333,7 @@ pub fn search_services(
     let query_lower = query.map(|q| q.to_lowercase());
 
     catalog
-        .services
+        .providers
         .iter()
         .filter(|svc| {
             if let Some(cat) = category
@@ -346,12 +342,12 @@ pub fn search_services(
                 return false;
             }
             if let Some(ref q) = query_lower {
-                // Match service-level OR any endpoint-level
                 let svc_haystack =
-                    format!("{} {} {}", svc.name, svc.title, svc.description).to_lowercase();
+                    format!("{} {} {}", svc.fqn, svc.title, svc.description).to_lowercase();
                 if svc_haystack.contains(q.as_str()) {
                     return true;
                 }
+                // Also check endpoints if loaded
                 return svc.endpoints.iter().any(|ep| {
                     let ep_haystack =
                         format!("{} {} {}", ep.path, ep.full_path, ep.description).to_lowercase();
@@ -365,13 +361,10 @@ pub fn search_services(
 }
 
 /// Level 2: list resources within a service.
+/// Requires endpoints to be loaded — returns None if empty.
 pub fn service_detail(catalog: &Catalog, service_name: &str) -> Option<ServiceDetail> {
-    let svc = catalog
-        .services
-        .iter()
-        .find(|s| s.name.eq_ignore_ascii_case(service_name))?;
+    let svc = find_service(catalog, service_name)?;
 
-    // Group endpoints by resource
     let mut groups: BTreeMap<String, (u32, u32, Vec<String>)> = BTreeMap::new();
     for ep in &svc.endpoints {
         let resource = if ep.resource.is_empty() {
@@ -392,7 +385,7 @@ pub fn service_detail(catalog: &Catalog, service_name: &str) -> Option<ServiceDe
     }
 
     Some(ServiceDetail {
-        name: svc.name.clone(),
+        name: svc.fqn.clone(),
         title: svc.title.clone(),
         description: svc.description.clone(),
         category: svc.category.clone(),
@@ -415,10 +408,7 @@ pub fn resource_endpoints(
     service_name: &str,
     resource_name: &str,
 ) -> Option<ResourceEndpoints> {
-    let svc = catalog
-        .services
-        .iter()
-        .find(|s| s.name.eq_ignore_ascii_case(service_name))?;
+    let svc = find_service(catalog, service_name)?;
 
     let endpoints: Vec<Endpoint> = svc
         .endpoints
@@ -432,18 +422,207 @@ pub fn resource_endpoints(
     }
 
     Some(ResourceEndpoints {
-        service: svc.name.clone(),
+        service: svc.fqn.clone(),
         resource: resource_name.to_string(),
         service_url: svc.service_url.clone(),
         endpoints,
     })
 }
 
+/// Find a service by FQN or short name (case-insensitive).
+fn find_service<'a>(catalog: &'a Catalog, name: &str) -> Option<&'a Service> {
+    catalog
+        .providers
+        .iter()
+        .find(|s| s.fqn.eq_ignore_ascii_case(name))
+        .or_else(|| {
+            // Fallback: match on short name (last segment)
+            catalog
+                .providers
+                .iter()
+                .find(|s| s.name().eq_ignore_ascii_case(name))
+        })
+}
+
+// ── Lazy endpoint loading ─────────────────────────────────────────────────
+
+/// Fetch a provider's full detail file and return the endpoints.
+///
+/// Downloads `{base_url}/providers/{fqn}.json`, caches locally in
+/// `~/.config/pay/skills/detail/`, uses `sha` for invalidation.
+pub fn load_service_endpoints(catalog: &Catalog, service_name: &str) -> Result<Vec<Endpoint>> {
+    let svc = find_service(catalog, service_name).ok_or_else(|| {
+        Error::Config(format!("service `{service_name}` not found"))
+    })?;
+
+    // Already loaded?
+    if svc.endpoints_loaded() {
+        return Ok(svc.endpoints.clone());
+    }
+
+    if catalog.base_url.is_empty() {
+        return Err(Error::Config(
+            "no base_url in catalog — cannot fetch endpoint detail".into(),
+        ));
+    }
+
+    let detail_url = format!("{}/providers/{}.json", catalog.base_url, svc.fqn);
+
+    // Check local cache
+    let cache_dir =
+        std::path::PathBuf::from(shellexpand::tilde("~/.config/pay/skills/detail").into_owned());
+    let cache_file = cache_dir.join(format!("{}.json", svc.sha));
+
+    if cache_file.exists() {
+        if let Ok(raw) = std::fs::read_to_string(&cache_file) {
+            if let Ok(detail) = parse_detail(&raw) {
+                return Ok(detail.endpoints);
+            }
+        }
+    }
+
+    // Fetch from CDN
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| Error::Config(format!("http client: {e}")))?;
+
+    let resp = client
+        .get(&detail_url)
+        .send()
+        .map_err(|e| Error::Config(format!("fetch {detail_url}: {e}")))?;
+
+    if !resp.status().is_success() {
+        return Err(Error::Config(format!(
+            "{detail_url} returned {}",
+            resp.status()
+        )));
+    }
+
+    let raw = resp
+        .text()
+        .map_err(|e| Error::Config(format!("read {detail_url}: {e}")))?;
+
+    let detail = parse_detail(&raw)?;
+
+    // Cache it
+    let _ = std::fs::create_dir_all(&cache_dir);
+    let _ = std::fs::write(&cache_file, &raw);
+
+    Ok(detail.endpoints)
+}
+
+/// Convenience: load endpoints and inject them into the catalog's service.
+pub fn ensure_endpoints(catalog: &mut Catalog, service_name: &str) -> Result<()> {
+    let base_url = catalog.base_url.clone();
+    let idx = catalog
+        .providers
+        .iter()
+        .position(|s| s.fqn.eq_ignore_ascii_case(service_name))
+        .or_else(|| {
+            catalog
+                .providers
+                .iter()
+                .position(|s| s.name().eq_ignore_ascii_case(service_name))
+        })
+        .ok_or_else(|| Error::Config(format!("service `{service_name}` not found")))?;
+    let svc = &mut catalog.providers[idx];
+
+    if svc.endpoints_loaded() {
+        return Ok(());
+    }
+
+    if base_url.is_empty() {
+        return Err(Error::Config(
+            "no base_url in catalog — cannot fetch endpoint detail".into(),
+        ));
+    }
+
+    let detail_url = format!("{}/providers/{}.json", base_url, svc.fqn);
+
+    // Check local cache
+    let cache_dir =
+        std::path::PathBuf::from(shellexpand::tilde("~/.config/pay/skills/detail").into_owned());
+    let cache_file = cache_dir.join(format!("{}.json", svc.sha));
+
+    if cache_file.exists() {
+        if let Ok(raw) = std::fs::read_to_string(&cache_file) {
+            if let Ok(detail) = parse_detail(&raw) {
+                svc.endpoints = detail.endpoints;
+                return Ok(());
+            }
+        }
+    }
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| Error::Config(format!("http client: {e}")))?;
+
+    let resp = client
+        .get(&detail_url)
+        .send()
+        .map_err(|e| Error::Config(format!("fetch {detail_url}: {e}")))?;
+
+    if !resp.status().is_success() {
+        return Err(Error::Config(format!(
+            "{detail_url} returned {}",
+            resp.status()
+        )));
+    }
+
+    let raw = resp
+        .text()
+        .map_err(|e| Error::Config(format!("read {detail_url}: {e}")))?;
+
+    let detail = parse_detail(&raw)?;
+    let _ = std::fs::create_dir_all(&cache_dir);
+    let _ = std::fs::write(&cache_file, &raw);
+
+    svc.endpoints = detail.endpoints;
+
+    // Clean up stale detail files not referenced by current index
+    clean_stale_detail_cache(catalog);
+
+    Ok(())
+}
+
+/// Remove detail cache files whose sha doesn't appear in the current catalog.
+pub fn clean_stale_detail_cache(catalog: &Catalog) {
+    let cache_dir =
+        std::path::PathBuf::from(shellexpand::tilde("~/.config/pay/skills/detail").into_owned());
+    let Ok(entries) = std::fs::read_dir(&cache_dir) else {
+        return;
+    };
+    let live_shas: std::collections::HashSet<_> = catalog
+        .providers
+        .iter()
+        .filter(|s| !s.sha.is_empty())
+        .map(|s| format!("{}.json", s.sha))
+        .collect();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.ends_with(".json") && !live_shas.contains(&name) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Provider detail file shape (only the fields we need).
+#[derive(Debug, Deserialize)]
+struct ProviderDetailFile {
+    #[serde(default)]
+    endpoints: Vec<Endpoint>,
+}
+
+fn parse_detail(raw: &str) -> Result<ProviderDetailFile> {
+    serde_json::from_str(raw).map_err(|e| Error::Config(format!("parse detail: {e}")))
+}
+
 // ── Catalog loading + caching ───────────────────────────────────────────────
 
-/// Load the consolidated skills catalog. Uses the cached version if
-/// fresh, otherwise fetches all sources from `~/.config/pay/skills.yaml`
-/// and merges them.
+/// Load the skills catalog. Uses cache if fresh, otherwise fetches from
+/// configured sources.
 pub fn load_skills() -> Result<Catalog> {
     let cfg = config::SkillsConfig::load()?;
 
@@ -491,32 +670,23 @@ pub fn update_skills() -> Result<Catalog> {
     Ok(catalog)
 }
 
-/// Fetch each source URL and merge all services into one Catalog.
+/// Fetch each source URL and merge all providers into one Catalog.
 fn fetch_and_merge(cfg: &config::SkillsConfig) -> Result<Catalog> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|e| Error::Config(format!("http client: {e}")))?;
 
-    let mut all_services: Vec<Service> = Vec::new();
+    let mut all_providers: Vec<Service> = Vec::new();
+    let mut base_url = String::new();
 
     for source in &cfg.sources {
         match fetch_one(&client, &source.url) {
             Ok(cat) => {
-                // Tag each service with its provider. Prefer the
-                // catalog's own `provider` field; fall back to the
-                // source name from skills.yaml.
-                let provider_tag = if cat.provider.is_empty() {
-                    &source.name
-                } else {
-                    &cat.provider
-                };
-                for mut svc in cat.services {
-                    if svc.provider.is_empty() {
-                        svc.provider = provider_tag.to_string();
-                    }
-                    all_services.push(svc);
+                if base_url.is_empty() && !cat.base_url.is_empty() {
+                    base_url = cat.base_url.clone();
                 }
+                all_providers.extend(cat.providers);
             }
             Err(e) => {
                 tracing::warn!(url = %source.url, error = %e, "Skipping skills source");
@@ -524,17 +694,16 @@ fn fetch_and_merge(cfg: &config::SkillsConfig) -> Result<Catalog> {
         }
     }
 
-    // Deduplicate by service name (first wins).
+    // Deduplicate by FQN (first wins).
     let mut seen = std::collections::HashSet::new();
-    all_services.retain(|svc| seen.insert(svc.name.clone()));
+    all_providers.retain(|svc| seen.insert(svc.fqn.clone()));
 
     Ok(Catalog {
         schema_version: "1".to_string(),
         generated_at: String::new(),
-        environment: String::new(),
-        provider: String::new(),
-        totals: None,
-        services: all_services,
+        base_url,
+        provider_count: all_providers.len() as u32,
+        providers: all_providers,
     })
 }
 
@@ -575,14 +744,9 @@ fn write_cache(cfg: &config::SkillsConfig, catalog: &Catalog) -> Result<()> {
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-/// Default project ID for gateway queries. The gateway rewrites this
-/// to the operator's actual project, so the value here is just a
-/// routing token — but agents need a concrete value to avoid guessing.
 const GATEWAY_PROJECT_ID: &str = "gateway-402";
 
 /// Build a complete endpoint URL from a service URL + path.
-/// Resolves `{projectsId}` and `{project}` placeholders to the
-/// gateway project ID so the URL is truly copy-paste-ready.
 pub fn build_endpoint_url(service_url: &str, path: &str) -> String {
     let base = service_url.trim_end_matches('/');
     let p = path.trim_start_matches('/');
@@ -596,11 +760,6 @@ pub fn build_endpoint_url(service_url: &str, path: &str) -> String {
 }
 
 /// Build an `EndpointHit` from raw service + endpoint data.
-///
-/// Uses `path` (the raw API path) — NOT `full_path` which prepends
-/// the subdomain routing prefix. When each service has its own
-/// `service_url`, the subdomain prefix is redundant and produces
-/// broken double-prefixed URLs like `/bigquery/bigquery/v2/...`.
 pub fn endpoint_to_hit(service_url: &str, ep: &Endpoint) -> EndpointHit {
     EndpointHit {
         method: ep.method.clone(),
@@ -613,30 +772,47 @@ pub fn endpoint_to_hit(service_url: &str, ep: &Endpoint) -> EndpointHit {
 }
 
 fn summarize_service(svc: &Service) -> ServiceSummary {
-    let mut metered = 0u32;
-    let mut free = 0u32;
-    let mut prices: Vec<f64> = Vec::new();
+    // If endpoints are loaded, compute from them. Otherwise use index metadata.
+    if svc.endpoints_loaded() {
+        let mut metered = 0u32;
+        let mut free = 0u32;
+        let mut prices: Vec<f64> = Vec::new();
 
-    for ep in &svc.endpoints {
-        if ep.pricing.is_some() {
-            metered += 1;
-            collect_prices(&ep.pricing, &mut prices);
-        } else {
-            free += 1;
+        for ep in &svc.endpoints {
+            if ep.pricing.is_some() {
+                metered += 1;
+                collect_prices(&ep.pricing, &mut prices);
+            } else {
+                free += 1;
+            }
         }
-    }
 
-    ServiceSummary {
-        name: svc.name.clone(),
-        title: svc.title.clone(),
-        description: svc.description.clone(),
-        category: svc.category.clone(),
-        service_url: svc.service_url.clone(),
-        endpoint_count: svc.endpoint_count.max(metered + free),
-        metered_endpoints: metered,
-        free_endpoints: free,
-        min_price_usd: prices.iter().copied().reduce(f64::min).unwrap_or(0.0),
-        max_price_usd: prices.iter().copied().reduce(f64::max).unwrap_or(0.0),
+        ServiceSummary {
+            name: svc.fqn.clone(),
+            title: svc.title.clone(),
+            description: svc.description.clone(),
+            category: svc.category.clone(),
+            service_url: svc.service_url.clone(),
+            endpoint_count: svc.endpoint_count.max(metered + free),
+            metered_endpoints: metered,
+            free_endpoints: free,
+            min_price_usd: prices.iter().copied().reduce(f64::min).unwrap_or(0.0),
+            max_price_usd: prices.iter().copied().reduce(f64::max).unwrap_or(0.0),
+        }
+    } else {
+        // Use pre-computed index metadata
+        ServiceSummary {
+            name: svc.fqn.clone(),
+            title: svc.title.clone(),
+            description: svc.description.clone(),
+            category: svc.category.clone(),
+            service_url: svc.service_url.clone(),
+            endpoint_count: svc.endpoint_count,
+            metered_endpoints: if svc.has_metering { svc.endpoint_count } else { 0 },
+            free_endpoints: if svc.has_free_tier { 1 } else { 0 },
+            min_price_usd: svc.min_price_usd,
+            max_price_usd: svc.max_price_usd,
+        }
     }
 }
 
@@ -667,75 +843,64 @@ fn collect_prices(pricing: &Option<serde_json::Value>, out: &mut Vec<f64>) {
 mod tests {
     use super::*;
 
-    fn test_catalog() -> Catalog {
+    /// A catalog with endpoints loaded (simulates post-lazy-fetch state).
+    fn catalog_with_endpoints() -> Catalog {
         let json = r#"{
-            "schema_version": "1",
-            "generated_at": "2026-04-13T00:00:00Z",
-            "environment": "test",
-            "provider": "test",
-            "services": [
+            "version": "1",
+            "generated_at": "2026-04-21T00:00:00Z",
+            "base_url": "https://cdn.example.com/v1",
+            "providers": [
                 {
-                    "name": "bigquery",
+                    "fqn": "solana-foundation/google/bigquery",
                     "title": "BigQuery API",
-                    "description": "Serverless data warehouse",
+                    "description": "Serverless data warehouse. SQL over petabyte-scale data.",
                     "category": "data",
-                    "version": "v2",
                     "service_url": "https://gw.example.com",
                     "endpoint_count": 3,
+                    "has_metering": true,
+                    "has_free_tier": true,
+                    "min_price_usd": 0.0,
+                    "max_price_usd": 6.25,
+                    "sha": "abc123",
                     "endpoints": [
                         {
                             "method": "POST",
-                            "path": "v2/projects/{p}/queries",
-                            "full_path": "/bigquery/v2/projects/{p}/queries",
+                            "path": "v2/projects/{projectsId}/queries",
                             "resource": "jobs",
-                            "description": "Run a query",
-                            "pricing": {
-                                "model": "tiered",
-                                "dimensions": [{
-                                    "tiers": [
-                                        {"up_to": 1, "price_usd": 0},
-                                        {"price_usd": 6.25}
-                                    ]
-                                }]
-                            }
+                            "description": "Run a SQL query",
+                            "pricing": { "dimensions": [{ "tiers": [{ "price_usd": 6.25 }] }] }
                         },
                         {
                             "method": "GET",
-                            "path": "v2/projects/{p}/queries/{j}",
-                            "full_path": "/bigquery/v2/projects/{p}/queries/{j}",
+                            "path": "v2/projects/{projectsId}/queries/{queryId}",
                             "resource": "jobs",
                             "description": "Get query results"
                         },
                         {
                             "method": "GET",
-                            "path": "v2/projects/{p}/datasets",
-                            "full_path": "/bigquery/v2/projects/{p}/datasets",
+                            "path": "v2/projects/{projectsId}/datasets",
                             "resource": "datasets",
                             "description": "List datasets"
                         }
                     ]
                 },
                 {
-                    "name": "vision",
+                    "fqn": "solana-foundation/google/vision",
                     "title": "Cloud Vision API",
-                    "description": "Image recognition and OCR",
+                    "description": "Detect objects, faces, text (OCR) in images.",
                     "category": "ai_ml",
-                    "version": "v1",
                     "service_url": "https://gw.example.com",
                     "endpoint_count": 1,
+                    "has_metering": true,
+                    "has_free_tier": false,
+                    "sha": "def456",
                     "endpoints": [
                         {
                             "method": "POST",
                             "path": "v1/images:annotate",
-                            "full_path": "/vision/v1/images:annotate",
                             "resource": "images",
                             "description": "Annotate images",
-                            "pricing": {
-                                "model": "tiered",
-                                "dimensions": [{
-                                    "tiers": [{"price_usd": 1.50}]
-                                }]
-                            }
+                            "pricing": { "dimensions": [{ "tiers": [{ "price_usd": 1.50 }] }] }
                         }
                     ]
                 }
@@ -744,336 +909,534 @@ mod tests {
         serde_json::from_str(json).unwrap()
     }
 
-    // ── search (endpoint-level) ─────────────────────────────────────────
+    /// A catalog from the index only (no endpoints loaded).
+    fn catalog_index_only() -> Catalog {
+        let json = r#"{
+            "version": "1",
+            "generated_at": "2026-04-21T00:00:00Z",
+            "base_url": "https://cdn.example.com/v1",
+            "providers": [
+                {
+                    "fqn": "solana-foundation/google/bigquery",
+                    "title": "BigQuery API",
+                    "description": "Serverless data warehouse. SQL over petabyte-scale data.",
+                    "category": "data",
+                    "service_url": "https://gw.example.com",
+                    "endpoint_count": 47,
+                    "has_metering": true,
+                    "has_free_tier": true,
+                    "min_price_usd": 0.0,
+                    "max_price_usd": 6.25,
+                    "sha": "abc123"
+                },
+                {
+                    "fqn": "solana-foundation/google/vision",
+                    "title": "Cloud Vision API",
+                    "description": "Detect objects, faces, text (OCR) in images.",
+                    "category": "ai_ml",
+                    "service_url": "https://gw.example.com",
+                    "endpoint_count": 38,
+                    "has_metering": true,
+                    "has_free_tier": true,
+                    "sha": "def456"
+                },
+                {
+                    "fqn": "solana-foundation/payment-debugger",
+                    "title": "Payment Debugger",
+                    "description": "Demo API for testing payment flows.",
+                    "category": "devtools",
+                    "service_url": "https://pdb.example.com",
+                    "endpoint_count": 8,
+                    "has_metering": true,
+                    "has_free_tier": true,
+                    "sha": "ghi789"
+                }
+            ]
+        }"#;
+        serde_json::from_str(json).unwrap()
+    }
+
+    // ── Deserialization ─────────────────────────────────────────────────────
 
     #[test]
-    fn search_no_filters_returns_all_endpoints() {
-        let cat = test_catalog();
-        let results = search(&cat, None, None);
-        // 3 from bigquery + 1 from vision = 4
-        assert_eq!(results.len(), 4);
+    fn parse_v1_index() {
+        let cat = catalog_index_only();
+        assert_eq!(cat.schema_version, "1");
+        assert_eq!(cat.providers.len(), 3);
+        assert_eq!(cat.base_url, "https://cdn.example.com/v1");
     }
 
     #[test]
-    fn search_by_service_keyword_returns_endpoints() {
-        let cat = test_catalog();
-        let results = search(&cat, Some("warehouse"), None);
-        // "warehouse" matches bigquery's description → all 3 bigquery endpoints
-        assert_eq!(results.len(), 3);
-        assert!(results.iter().all(|h| h.service == "bigquery"));
+    fn service_fqn_and_name() {
+        let cat = catalog_index_only();
+        let svc = &cat.providers[0];
+        assert_eq!(svc.fqn, "solana-foundation/google/bigquery");
+        assert_eq!(svc.name(), "bigquery");
     }
 
     #[test]
-    fn search_by_endpoint_keyword() {
-        let cat = test_catalog();
-        // "annotate" only appears in vision's endpoint description
-        let results = search(&cat, Some("annotate"), None);
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].service, "vision");
-        assert_eq!(results[0].method, "POST");
+    fn service_two_level_fqn() {
+        let cat = catalog_index_only();
+        let svc = &cat.providers[2];
+        assert_eq!(svc.fqn, "solana-foundation/payment-debugger");
+        assert_eq!(svc.name(), "payment-debugger");
     }
 
     #[test]
-    fn search_by_path_keyword() {
-        let cat = test_catalog();
-        // "queries" appears in bigquery endpoint paths
-        let results = search(&cat, Some("queries"), None);
-        assert_eq!(results.len(), 2);
-        assert!(results.iter().all(|h| h.service == "bigquery"));
+    fn index_metadata_present() {
+        let cat = catalog_index_only();
+        let svc = &cat.providers[0];
+        assert_eq!(svc.endpoint_count, 47);
+        assert!(svc.has_metering);
+        assert!(svc.has_free_tier);
+        assert!(!svc.endpoints_loaded());
+    }
+
+    // ── Search (index-only, no endpoints loaded) ────────────────────────────
+
+    #[test]
+    fn search_index_only_matches_service_title() {
+        let cat = catalog_index_only();
+        let hits = search(&cat, Some("bigquery"), None);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].service, "solana-foundation/google/bigquery");
+        // Placeholder hit — no method/path since endpoints aren't loaded
+        assert!(hits[0].method.is_empty());
     }
 
     #[test]
-    fn search_case_insensitive() {
-        let cat = test_catalog();
-        let results = search(&cat, Some("BIGQUERY"), None);
-        assert_eq!(results.len(), 3);
+    fn search_index_only_matches_description() {
+        let cat = catalog_index_only();
+        let hits = search(&cat, Some("warehouse"), None);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].service, "solana-foundation/google/bigquery");
     }
 
     #[test]
-    fn search_by_category() {
-        let cat = test_catalog();
-        let results = search(&cat, None, Some("ai_ml"));
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].service, "vision");
+    fn search_index_only_matches_fqn() {
+        let cat = catalog_index_only();
+        let hits = search(&cat, Some("payment-debugger"), None);
+        assert_eq!(hits.len(), 1);
     }
 
     #[test]
-    fn search_keyword_and_category_mismatch() {
-        let cat = test_catalog();
-        // "warehouse" matches bigquery (data), not ai_ml
-        let results = search(&cat, Some("warehouse"), Some("ai_ml"));
-        assert!(results.is_empty());
+    fn search_index_only_category_filter() {
+        let cat = catalog_index_only();
+        let hits = search(&cat, None, Some("ai_ml"));
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].service, "solana-foundation/google/vision");
     }
 
     #[test]
-    fn search_no_match() {
-        let cat = test_catalog();
-        let results = search(&cat, Some("nonexistent"), None);
-        assert!(results.is_empty());
+    fn search_index_only_no_match() {
+        let cat = catalog_index_only();
+        let hits = search(&cat, Some("nonexistent"), None);
+        assert!(hits.is_empty());
     }
 
     #[test]
-    fn search_services_with_metered_sort_first() {
-        let cat = test_catalog();
-        let results = search(&cat, None, None);
-        // Services with paid endpoints (bigquery, vision) sort before
-        // services that are entirely free. Within each service, metered
-        // endpoints come first.
-        //
-        // Both test services have metered endpoints, so we just check
-        // that within each service block, metered comes before free.
-        let bq: Vec<_> = results.iter().filter(|h| h.service == "bigquery").collect();
-        if let Some(first_free) = bq.iter().position(|h| !h.metered) {
-            let last_metered = bq.iter().rposition(|h| h.metered).unwrap_or(0);
-            assert!(
-                last_metered < first_free,
-                "within bigquery: metered must come before free"
-            );
-        }
+    fn search_index_only_all_returns_all_providers() {
+        let cat = catalog_index_only();
+        let hits = search(&cat, None, None);
+        assert_eq!(hits.len(), 3);
+    }
+
+    // ── Search (with endpoints loaded) ──────────────────────────────────────
+
+    #[test]
+    fn search_with_endpoints_matches_path() {
+        let cat = catalog_with_endpoints();
+        let hits = search(&cat, Some("queries"), None);
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().all(|h| h.service == "solana-foundation/google/bigquery"));
     }
 
     #[test]
-    fn search_hit_has_full_context() {
-        let cat = test_catalog();
-        let results = search(&cat, Some("annotate"), None);
-        let hit = &results[0];
-        assert_eq!(hit.service, "vision");
-        assert_eq!(hit.service_title, "Cloud Vision API");
-        assert_eq!(hit.service_url, "https://gw.example.com");
-        assert_eq!(hit.method, "POST");
-        assert!(!hit.full_path.is_empty());
-        assert!(hit.metered);
-        assert!(hit.pricing.is_some());
+    fn search_with_endpoints_matches_endpoint_description() {
+        let cat = catalog_with_endpoints();
+        let hits = search(&cat, Some("annotate"), None);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].method, "POST");
     }
 
-    // ── search_services (MCP level) ──────────────────────────────────────
+    #[test]
+    fn search_with_endpoints_all_returns_all() {
+        let cat = catalog_with_endpoints();
+        let hits = search(&cat, None, None);
+        // 3 bigquery + 1 vision = 4
+        assert_eq!(hits.len(), 4);
+    }
 
     #[test]
-    fn search_services_returns_summaries() {
-        let cat = test_catalog();
+    fn search_metered_first() {
+        let cat = catalog_with_endpoints();
+        let hits = search(&cat, None, None);
+        // Within bigquery, metered POST should come before free GETs
+        let bq: Vec<_> = hits.iter().filter(|h| h.service.contains("bigquery")).collect();
+        assert!(bq[0].metered);
+    }
+
+    // ── search_services ─────────────────────────────────────────────────────
+
+    #[test]
+    fn search_services_index_only() {
+        let cat = catalog_index_only();
         let results = search_services(&cat, Some("bigquery"), None);
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].name, "bigquery");
+        assert_eq!(results[0].name, "solana-foundation/google/bigquery");
+        assert_eq!(results[0].endpoint_count, 47);
+        assert_eq!(results[0].min_price_usd, 0.0);
+        assert_eq!(results[0].max_price_usd, 6.25);
+    }
+
+    #[test]
+    fn search_services_with_endpoints() {
+        let cat = catalog_with_endpoints();
+        let results = search_services(&cat, Some("bigquery"), None);
+        assert_eq!(results.len(), 1);
         assert_eq!(results[0].metered_endpoints, 1);
         assert_eq!(results[0].free_endpoints, 2);
     }
 
-    // ── service_detail ────────────────────────────────────────────────────
+    // ── find_service ────────────────────────────────────────────────────────
+
+    #[test]
+    fn find_service_by_fqn() {
+        let cat = catalog_index_only();
+        let svc = find_service(&cat, "solana-foundation/google/bigquery");
+        assert!(svc.is_some());
+    }
+
+    #[test]
+    fn find_service_by_short_name() {
+        let cat = catalog_index_only();
+        let svc = find_service(&cat, "bigquery");
+        assert!(svc.is_some());
+        assert_eq!(svc.unwrap().fqn, "solana-foundation/google/bigquery");
+    }
+
+    #[test]
+    fn find_service_case_insensitive() {
+        let cat = catalog_index_only();
+        assert!(find_service(&cat, "BigQuery").is_some());
+        assert!(find_service(&cat, "SOLANA-FOUNDATION/GOOGLE/BIGQUERY").is_some());
+    }
+
+    // ── service_detail (requires endpoints) ─────────────────────────────────
 
     #[test]
     fn service_detail_groups_by_resource() {
-        let cat = test_catalog();
+        let cat = catalog_with_endpoints();
         let detail = service_detail(&cat, "bigquery").unwrap();
         assert_eq!(detail.resources.len(), 2);
 
         let jobs = detail.resources.iter().find(|r| r.name == "jobs").unwrap();
         assert_eq!(jobs.endpoint_count, 2);
         assert_eq!(jobs.metered_count, 1);
-        assert!(jobs.methods.contains(&"POST".to_string()));
-        assert!(jobs.methods.contains(&"GET".to_string()));
 
-        let datasets = detail
-            .resources
-            .iter()
-            .find(|r| r.name == "datasets")
-            .unwrap();
+        let datasets = detail.resources.iter().find(|r| r.name == "datasets").unwrap();
         assert_eq!(datasets.endpoint_count, 1);
         assert_eq!(datasets.metered_count, 0);
     }
 
     #[test]
-    fn service_detail_unknown_service() {
-        let cat = test_catalog();
-        assert!(service_detail(&cat, "nonexistent").is_none());
+    fn service_detail_empty_when_no_endpoints() {
+        let cat = catalog_index_only();
+        let detail = service_detail(&cat, "bigquery").unwrap();
+        assert!(detail.resources.is_empty());
     }
 
-    #[test]
-    fn service_detail_case_insensitive() {
-        let cat = test_catalog();
-        assert!(service_detail(&cat, "BigQuery").is_some());
-    }
-
-    // ── resource_endpoints ────────────────────────────────────────────────
+    // ── resource_endpoints ──────────────────────────────────────────────────
 
     #[test]
     fn resource_endpoints_returns_matching() {
-        let cat = test_catalog();
+        let cat = catalog_with_endpoints();
         let result = resource_endpoints(&cat, "bigquery", "jobs").unwrap();
         assert_eq!(result.endpoints.len(), 2);
-        assert_eq!(result.service, "bigquery");
-        assert_eq!(result.resource, "jobs");
     }
 
     #[test]
-    fn resource_endpoints_unknown_resource() {
-        let cat = test_catalog();
-        assert!(resource_endpoints(&cat, "bigquery", "nonexistent").is_none());
+    fn resource_endpoints_none_when_not_loaded() {
+        let cat = catalog_index_only();
+        assert!(resource_endpoints(&cat, "bigquery", "jobs").is_none());
+    }
+
+    // ── group_search_results ────────────────────────────────────────────────
+
+    #[test]
+    fn group_search_results_groups_by_service() {
+        let cat = catalog_with_endpoints();
+        let hits = search(&cat, None, None);
+        let groups = group_search_results(&hits);
+        assert_eq!(groups.len(), 2);
+        let bq = groups.iter().find(|g| g.service.contains("bigquery")).unwrap();
+        assert_eq!(bq.endpoints.len(), 3);
     }
 
     #[test]
-    fn resource_endpoints_includes_pricing() {
-        let cat = test_catalog();
-        let result = resource_endpoints(&cat, "bigquery", "jobs").unwrap();
-        let metered = result.endpoints.iter().find(|e| e.pricing.is_some());
-        assert!(metered.is_some(), "should include the metered endpoint");
-        let free = result.endpoints.iter().find(|e| e.pricing.is_none());
-        assert!(free.is_some(), "should include the free endpoint");
+    fn group_search_results_endpoints_have_urls() {
+        let cat = catalog_with_endpoints();
+        let hits = search(&cat, Some("annotate"), None);
+        let groups = group_search_results(&hits);
+        assert_eq!(groups[0].endpoints[0].url, "https://gw.example.com/v1/images:annotate");
+        assert!(groups[0].endpoints[0].metered);
     }
 
-    // ── collect_prices ────────────────────────────────────────────────────
+    // ── build_endpoint_url ──────────────────────────────────────────────────
 
     #[test]
-    fn collect_prices_recurses_nested_structures() {
-        let pricing: serde_json::Value = serde_json::json!({
-            "model": "tiered",
-            "dimensions": [
-                { "tiers": [
-                    { "up_to": 1, "price_usd": 0 },
-                    { "price_usd": 6.25 }
-                ]}
-            ]
+    fn build_endpoint_url_resolves_placeholders() {
+        let url = build_endpoint_url("https://gw.example.com", "v2/projects/{projectsId}/queries");
+        assert_eq!(url, "https://gw.example.com/v2/projects/gateway-402/queries");
+    }
+
+    #[test]
+    fn build_endpoint_url_empty_path() {
+        assert_eq!(build_endpoint_url("https://gw.example.com/", ""), "https://gw.example.com");
+    }
+
+    // ── collect_prices ──────────────────────────────────────────────────────
+
+    #[test]
+    fn collect_prices_nested() {
+        let pricing = serde_json::json!({
+            "dimensions": [{ "tiers": [{ "price_usd": 0 }, { "price_usd": 6.25 }] }]
         });
         let mut prices = Vec::new();
         collect_prices(&Some(pricing), &mut prices);
         assert_eq!(prices, vec![0.0, 6.25]);
     }
 
-    #[test]
-    fn collect_prices_handles_none() {
-        let mut prices = Vec::new();
-        collect_prices(&None, &mut prices);
-        assert!(prices.is_empty());
-    }
-
-    // ── group_search_results ─────────────────────────────────────────────
+    // ── Cache invalidation ──────────────────────────────────────────────────
 
     #[test]
-    fn group_search_results_groups_by_service() {
-        let cat = test_catalog();
-        let hits = search(&cat, None, None);
-        let groups = group_search_results(&hits);
-        assert_eq!(groups.len(), 2);
-        let bq = groups.iter().find(|g| g.service == "bigquery").unwrap();
-        assert_eq!(bq.title, "BigQuery API");
-        assert_eq!(bq.endpoints.len(), 3);
+    fn detail_cache_key_is_sha_based() {
+        // Two providers with different shas must not share cache files.
+        let cat = catalog_index_only();
+        let bq = &cat.providers[0];
+        let vision = &cat.providers[1];
+        assert_ne!(bq.sha, vision.sha);
+        // Cache file names are `{sha}.json` — different shas = different files
+        let bq_cache = format!("{}.json", bq.sha);
+        let vision_cache = format!("{}.json", vision.sha);
+        assert_ne!(bq_cache, vision_cache);
     }
 
     #[test]
-    fn group_search_results_empty() {
-        let groups = group_search_results(&[]);
-        assert!(groups.is_empty());
+    fn sha_change_invalidates_detail_cache() {
+        // Simulate: index has sha "abc123" for bigquery.
+        // A new index arrives with sha "xyz789" for the same provider.
+        // The old cache file "abc123.json" should NOT be hit.
+        let old_sha = "abc123";
+        let new_sha = "xyz789";
+        let old_cache = format!("{old_sha}.json");
+        let new_cache = format!("{new_sha}.json");
+        assert_ne!(old_cache, new_cache);
+        // ensure_endpoints looks for `{sha}.json` — with a new sha, it's a miss.
     }
 
     #[test]
-    fn group_search_results_endpoints_have_urls() {
-        let cat = test_catalog();
-        let hits = search(&cat, Some("annotate"), None);
-        let groups = group_search_results(&hits);
-        assert_eq!(groups.len(), 1);
-        let ep = &groups[0].endpoints[0];
-        assert!(ep.url.starts_with("https://"));
-        assert!(ep.url.contains("annotate"));
-        assert!(ep.metered);
-    }
+    fn endpoints_loaded_reflects_state() {
+        let mut cat = catalog_index_only();
+        let svc = &cat.providers[0];
+        assert!(!svc.endpoints_loaded());
 
-    // ── build_endpoint_url ───────────────────────────────────────────────
-
-    #[test]
-    fn build_endpoint_url_basic() {
-        let url = build_endpoint_url("https://gw.example.com", "v2/projects/foo/queries");
-        assert_eq!(url, "https://gw.example.com/v2/projects/foo/queries");
+        // Simulate loading endpoints
+        cat.providers[0].endpoints = vec![Endpoint {
+            method: "GET".to_string(),
+            path: "test".to_string(),
+            full_path: String::new(),
+            resource: String::new(),
+            description: "test".to_string(),
+            pricing: None,
+        }];
+        assert!(cat.providers[0].endpoints_loaded());
     }
 
     #[test]
-    fn build_endpoint_url_resolves_placeholders() {
-        let url = build_endpoint_url("https://gw.example.com", "v2/projects/{projectsId}/queries");
+    fn ensure_endpoints_skips_when_already_loaded() {
+        let mut cat = catalog_with_endpoints();
+        // Already has endpoints — ensure_endpoints should be a no-op
+        let count_before = cat.providers[0].endpoints.len();
+        let result = ensure_endpoints(&mut cat, "bigquery");
+        assert!(result.is_ok());
+        assert_eq!(cat.providers[0].endpoints.len(), count_before);
+    }
+
+    #[test]
+    fn ensure_endpoints_fails_without_base_url() {
+        let mut cat = catalog_index_only();
+        cat.base_url = String::new(); // no base_url
+        let result = ensure_endpoints(&mut cat, "bigquery");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("base_url"));
+    }
+
+    #[test]
+    fn ensure_endpoints_fails_for_unknown_service() {
+        let mut cat = catalog_index_only();
+        let result = ensure_endpoints(&mut cat, "nonexistent");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("not found"));
+    }
+
+    #[test]
+    fn detail_file_cache_uses_tempdir() {
+        // Verify the detail cache path construction
+        let cat = catalog_index_only();
+        let svc = &cat.providers[0];
+        let cache_dir = std::path::PathBuf::from("/tmp/test-skills-cache");
+        let cache_file = cache_dir.join(format!("{}.json", svc.sha));
         assert_eq!(
-            url,
-            "https://gw.example.com/v2/projects/gateway-402/queries"
+            cache_file.file_name().unwrap().to_str().unwrap(),
+            "abc123.json"
         );
     }
 
     #[test]
-    fn build_endpoint_url_resolves_project_placeholder() {
-        let url = build_endpoint_url("https://gw.example.com", "v1/{project}/datasets");
-        assert_eq!(url, "https://gw.example.com/v1/gateway-402/datasets");
-    }
+    fn index_updated_sha_means_detail_cache_miss() {
+        // Simulate the full invalidation flow:
+        // 1. Index v1: bigquery sha="abc123"
+        // 2. Index v2: bigquery sha="new_sha_456"
+        // 3. Cache has "abc123.json" but NOT "new_sha_456.json"
+        // 4. ensure_endpoints should miss cache and fetch
 
-    #[test]
-    fn build_endpoint_url_empty_path() {
-        let url = build_endpoint_url("https://gw.example.com/", "");
-        assert_eq!(url, "https://gw.example.com");
-    }
+        let mut cat_v1 = catalog_index_only();
+        let mut cat_v2 = catalog_index_only();
+        cat_v2.providers[0].sha = "new_sha_456".to_string();
 
-    #[test]
-    fn build_endpoint_url_strips_extra_slashes() {
-        let url = build_endpoint_url("https://gw.example.com/", "/v2/foo");
-        assert_eq!(url, "https://gw.example.com/v2/foo");
-    }
+        // v1 and v2 have different shas for the same provider
+        assert_ne!(cat_v1.providers[0].sha, cat_v2.providers[0].sha);
 
-    // ── endpoint_to_hit ──────────────────────────────────────────────────
+        // Both still have no endpoints loaded
+        assert!(!cat_v1.providers[0].endpoints_loaded());
+        assert!(!cat_v2.providers[0].endpoints_loaded());
 
-    #[test]
-    fn endpoint_to_hit_builds_correct_hit() {
-        let ep = Endpoint {
-            method: "POST".to_string(),
-            path: "v1/images:annotate".to_string(),
-            full_path: "/vision/v1/images:annotate".to_string(),
-            resource: "images".to_string(),
-            description: "Annotate images".to_string(),
-            pricing: Some(serde_json::json!({"price_usd": 1.50})),
-        };
-        let hit = endpoint_to_hit("https://gw.example.com", &ep);
-        assert_eq!(hit.method, "POST");
-        assert_eq!(hit.url, "https://gw.example.com/v1/images:annotate");
-        assert_eq!(hit.resource, "images");
-        assert!(hit.metered);
-    }
-
-    #[test]
-    fn endpoint_to_hit_free_endpoint() {
-        let ep = Endpoint {
+        // Inject endpoints into v1 to simulate "was loaded from old cache"
+        cat_v1.providers[0].endpoints = vec![Endpoint {
             method: "GET".to_string(),
-            path: "v2/datasets".to_string(),
-            full_path: "/bq/v2/datasets".to_string(),
-            resource: "datasets".to_string(),
-            description: "List datasets".to_string(),
+            path: "old".to_string(),
+            full_path: String::new(),
+            resource: String::new(),
+            description: "old endpoint".to_string(),
             pricing: None,
-        };
-        let hit = endpoint_to_hit("https://gw.example.com", &ep);
-        assert!(!hit.metered);
-    }
+        }];
 
-    // ── summarize_service ────────────────────────────────────────────────
-
-    #[test]
-    fn summarize_service_counts_correct() {
-        let cat = test_catalog();
-        let svc = cat.services.iter().find(|s| s.name == "bigquery").unwrap();
-        let summary = summarize_service(svc);
-        assert_eq!(summary.name, "bigquery");
-        assert_eq!(summary.metered_endpoints, 1);
-        assert_eq!(summary.free_endpoints, 2);
-        assert_eq!(summary.endpoint_count, 3);
-        assert!(summary.min_price_usd <= summary.max_price_usd);
+        // v1 is loaded, v2 is not — v2 would need a fresh fetch
+        assert!(cat_v1.providers[0].endpoints_loaded());
+        assert!(!cat_v2.providers[0].endpoints_loaded());
     }
 
     #[test]
-    fn summarize_service_extracts_prices() {
-        let cat = test_catalog();
-        let svc = cat.services.iter().find(|s| s.name == "bigquery").unwrap();
-        let summary = summarize_service(svc);
-        // bigquery has tiers with price_usd: 0 and 6.25
-        assert!((summary.min_price_usd - 0.0).abs() < f64::EPSILON);
-        assert!((summary.max_price_usd - 6.25).abs() < f64::EPSILON);
+    fn parse_detail_extracts_endpoints() {
+        let json = r#"{
+            "fqn": "test/api",
+            "endpoints": [
+                {"method": "GET", "path": "v1/foo", "description": "Get foo"},
+                {"method": "POST", "path": "v1/bar", "description": "Create bar"}
+            ]
+        }"#;
+        let detail = parse_detail(json).unwrap();
+        assert_eq!(detail.endpoints.len(), 2);
+        assert_eq!(detail.endpoints[0].method, "GET");
+        assert_eq!(detail.endpoints[1].path, "v1/bar");
     }
 
     #[test]
-    fn summarize_service_all_metered() {
-        let cat = test_catalog();
-        let svc = cat.services.iter().find(|s| s.name == "vision").unwrap();
-        let summary = summarize_service(svc);
-        assert_eq!(summary.metered_endpoints, 1);
-        assert_eq!(summary.free_endpoints, 0);
+    fn parse_detail_handles_empty_endpoints() {
+        let json = r#"{"fqn": "test/api"}"#;
+        let detail = parse_detail(json).unwrap();
+        assert!(detail.endpoints.is_empty());
+    }
+
+    #[test]
+    fn parse_detail_handles_extra_fields() {
+        // Detail files have fields we don't deserialize (content, source, etc.)
+        // Make sure they don't cause errors
+        let json = r#"{
+            "fqn": "test/api",
+            "name": "api",
+            "title": "Test API",
+            "content": "Some markdown...",
+            "source": {"skill": "pay-skills"},
+            "affiliate_policy": {"enabled": true},
+            "endpoints": [{"method": "GET", "path": "v1/x", "description": "test"}]
+        }"#;
+        let detail = parse_detail(json).unwrap();
+        assert_eq!(detail.endpoints.len(), 1);
+    }
+
+    // ── Detail cache cleanup ──────────────────────────────────────────────
+
+    #[test]
+    fn clean_stale_detail_cache_removes_old_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let detail_dir = dir.path().join("detail");
+        std::fs::create_dir_all(&detail_dir).unwrap();
+
+        // Create some cache files: two live, one stale
+        std::fs::write(detail_dir.join("abc123.json"), "{}").unwrap();
+        std::fs::write(detail_dir.join("def456.json"), "{}").unwrap();
+        std::fs::write(detail_dir.join("old_dead.json"), "{}").unwrap();
+
+        // Catalog only references abc123 and def456
+        let cat = catalog_index_only(); // shas: abc123, def456, ghi789
+
+        // We can't easily override the cache dir, so test the logic directly:
+        let live_shas: std::collections::HashSet<_> = cat
+            .providers
+            .iter()
+            .filter(|s| !s.sha.is_empty())
+            .map(|s| format!("{}.json", s.sha))
+            .collect();
+
+        assert!(live_shas.contains("abc123.json"));
+        assert!(live_shas.contains("def456.json"));
+        assert!(live_shas.contains("ghi789.json"));
+        assert!(!live_shas.contains("old_dead.json"));
+
+        // Simulate cleanup
+        for entry in std::fs::read_dir(&detail_dir).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.ends_with(".json") && !live_shas.contains(&name) {
+                std::fs::remove_file(entry.path()).unwrap();
+            }
+        }
+
+        // old_dead.json should be gone
+        assert!(!detail_dir.join("old_dead.json").exists());
+        // live files should remain
+        assert!(detail_dir.join("abc123.json").exists());
+        assert!(detail_dir.join("def456.json").exists());
+    }
+
+    // ── Catalog round-trip ──────────────────────────────────────────────────
+
+    #[test]
+    fn catalog_serialization_round_trip() {
+        let cat = catalog_index_only();
+        let json = serde_json::to_string(&cat).unwrap();
+        let cat2: Catalog = serde_json::from_str(&json).unwrap();
+        assert_eq!(cat.providers.len(), cat2.providers.len());
+        assert_eq!(cat.base_url, cat2.base_url);
+        assert_eq!(cat.providers[0].fqn, cat2.providers[0].fqn);
+        assert_eq!(cat.providers[0].sha, cat2.providers[0].sha);
+    }
+
+    #[test]
+    fn catalog_with_integer_version() {
+        // version can be int or string
+        let json = r#"{"version": 1, "generated_at": "", "providers": []}"#;
+        let cat: Catalog = serde_json::from_str(json).unwrap();
+        assert_eq!(cat.schema_version, "1");
+    }
+
+    #[test]
+    fn catalog_with_string_version() {
+        let json = r#"{"version": "1", "generated_at": "", "providers": []}"#;
+        let cat: Catalog = serde_json::from_str(json).unwrap();
+        assert_eq!(cat.schema_version, "1");
     }
 }

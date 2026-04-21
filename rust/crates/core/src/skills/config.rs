@@ -21,7 +21,7 @@ const DEFAULT_TTL_MINUTES: u32 = 30;
 /// The default catalog shipped with pay — always present even if the
 /// user hasn't added any sources.
 pub const DEFAULT_SOURCE: &str =
-    "https://storage.googleapis.com/gateway-402-public-assets-sandbox/catalog/google/sandbox.json";
+    "https://storage.googleapis.com/pay-skills/v1/skills.json";
 
 /// A provider source in the skills catalog config.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,7 +50,7 @@ impl Default for SkillsConfig {
         Self {
             ttl_minutes: DEFAULT_TTL_MINUTES,
             sources: vec![Source {
-                name: "google".to_string(),
+                name: "pay-skills".to_string(),
                 url: DEFAULT_SOURCE.to_string(),
             }],
         }
@@ -232,8 +232,8 @@ mod tests {
     fn default_has_default_source() {
         let cfg = SkillsConfig::default();
         assert_eq!(cfg.sources.len(), 1);
-        assert_eq!(cfg.sources[0].name, "google");
-        assert!(cfg.sources[0].url.contains("gateway-402"));
+        assert_eq!(cfg.sources[0].name, "pay-skills");
+        assert!(cfg.sources[0].url.contains("pay-skills"));
     }
 
     #[test]
