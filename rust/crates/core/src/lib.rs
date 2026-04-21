@@ -1,11 +1,11 @@
 // Shared modules
 pub mod accounts;
-pub mod bazaar;
 pub mod config;
 pub mod error;
 pub mod instructions;
 pub mod keystore;
 pub mod signer;
+pub mod skills;
 
 // Client modules (CLI)
 pub mod client;

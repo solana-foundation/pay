@@ -1,11 +1,11 @@
-//! Bazaar — service discovery for paid APIs.
+//! Skills — service discovery for paid APIs.
 //!
-//! The bazaar is a cached index of API providers and their endpoints.
-//! Provider sources are managed in `~/.config/pay/bazaar.yaml` (see
-//! [`config::BazaarConfig`]) and merged into a single consolidated cache.
+//! The skills catalog is a cached index of API providers and their endpoints.
+//! Provider sources are managed in `~/.config/pay/skills.yaml` (see
+//! [`config::SkillsConfig`]) and merged into a single consolidated cache.
 //!
 //! Query functions ([`search`], [`service_detail`], [`resource_endpoints`])
-//! are pure — no I/O at query time. The I/O boundary is [`load_bazaar`].
+//! are pure — no I/O at query time. The I/O boundary is [`load_skills`].
 
 pub mod config;
 
@@ -32,13 +32,13 @@ fn deserialize_version<'de, D: serde::Deserializer<'de>>(
 // ── Catalog schema ──────────────────────────────────────────────────────────
 //
 // Matches the shape of the GCS `sandbox.json` file published by the
-// agent-gateway CI. The `pay-bazaar` build script produces the same shape
+// agent-gateway CI. The `pay-skills` build script produces the same shape
 // so both sources can feed the same code path.
 
 /// Top-level catalog — the full index downloaded from the CDN.
 ///
 /// Accepts both the GCS `sandbox.json` shape (field `services`) and
-/// the `pay-bazaar/index.json` shape (field `providers`). The CLI
+/// the `pay-skills/index.json` shape (field `providers`). The CLI
 /// normalizes both into `services` internally.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Catalog {
@@ -52,7 +52,7 @@ pub struct Catalog {
     #[serde(default)]
     pub totals: Option<CatalogTotals>,
     /// Service list — populated from `services` (GCS) or `providers`
-    /// (pay-bazaar). Both map to the same `Service` struct.
+    /// (pay-skills). Both map to the same `Service` struct.
     #[serde(alias = "providers")]
     pub services: Vec<Service>,
 }
@@ -182,7 +182,7 @@ pub fn group_search_results(hits: &[SearchHit]) -> Vec<SearchResultGroup> {
     groups
 }
 
-/// A service summary — used by the MCP `bazaar_search` tool for context
+/// A service summary — used by the MCP `skills_search` tool for context
 /// efficiency (agents don't want 2,617 endpoints in one response).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceSummary {
@@ -440,11 +440,11 @@ pub fn resource_endpoints(
 
 // ── Catalog loading + caching ───────────────────────────────────────────────
 
-/// Load the consolidated bazaar catalog. Uses the cached version if
-/// fresh, otherwise fetches all sources from `~/.config/pay/bazaar.yaml`
+/// Load the consolidated skills catalog. Uses the cached version if
+/// fresh, otherwise fetches all sources from `~/.config/pay/skills.yaml`
 /// and merges them.
-pub fn load_bazaar() -> Result<Catalog> {
-    let cfg = config::BazaarConfig::load()?;
+pub fn load_skills() -> Result<Catalog> {
+    let cfg = config::SkillsConfig::load()?;
 
     // Cache hit?
     if let Some(path) = cfg.valid_cache_path() {
@@ -463,11 +463,11 @@ pub fn load_bazaar() -> Result<Catalog> {
         Err(fetch_err) => {
             // Try ANY existing cache file as a fallback (even stale).
             let dir =
-                std::path::PathBuf::from(shellexpand::tilde("~/.config/pay/bazaar").into_owned());
+                std::path::PathBuf::from(shellexpand::tilde("~/.config/pay/skills").into_owned());
             if let Ok(entries) = std::fs::read_dir(&dir) {
                 for entry in entries.flatten() {
                     let name = entry.file_name().to_string_lossy().to_string();
-                    if name.starts_with("bazaar-")
+                    if name.starts_with("skills-")
                         && name.ends_with(".json")
                         && let Ok(raw) = std::fs::read_to_string(entry.path())
                         && let Ok(cat) = parse_catalog(&raw)
@@ -482,8 +482,8 @@ pub fn load_bazaar() -> Result<Catalog> {
 }
 
 /// Force-refresh: fetch all sources, merge, write cache.
-pub fn update_bazaar() -> Result<Catalog> {
-    let cfg = config::BazaarConfig::load()?;
+pub fn update_skills() -> Result<Catalog> {
+    let cfg = config::SkillsConfig::load()?;
     let catalog = fetch_and_merge(&cfg)?;
     write_cache(&cfg, &catalog)?;
     cfg.clean_stale_caches();
@@ -491,7 +491,7 @@ pub fn update_bazaar() -> Result<Catalog> {
 }
 
 /// Fetch each source URL and merge all services into one Catalog.
-fn fetch_and_merge(cfg: &config::BazaarConfig) -> Result<Catalog> {
+fn fetch_and_merge(cfg: &config::SkillsConfig) -> Result<Catalog> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
@@ -504,7 +504,7 @@ fn fetch_and_merge(cfg: &config::BazaarConfig) -> Result<Catalog> {
             Ok(cat) => {
                 // Tag each service with its provider. Prefer the
                 // catalog's own `provider` field; fall back to the
-                // source name from bazaar.yaml.
+                // source name from skills.yaml.
                 let provider_tag = if cat.provider.is_empty() {
                     &source.name
                 } else {
@@ -518,7 +518,7 @@ fn fetch_and_merge(cfg: &config::BazaarConfig) -> Result<Catalog> {
                 }
             }
             Err(e) => {
-                tracing::warn!(url = %source.url, error = %e, "Skipping bazaar source");
+                tracing::warn!(url = %source.url, error = %e, "Skipping skills source");
             }
         }
     }
@@ -545,7 +545,7 @@ fn fetch_one(client: &reqwest::blocking::Client, url: &str) -> Result<Catalog> {
 
     if !resp.status().is_success() {
         return Err(Error::Config(format!(
-            "bazaar source {url} returned {}",
+            "skills source {url} returned {}",
             resp.status()
         )));
     }
@@ -560,7 +560,7 @@ fn parse_catalog(raw: &str) -> Result<Catalog> {
     serde_json::from_str(raw).map_err(|e| Error::Config(format!("parse catalog: {e}")))
 }
 
-fn write_cache(cfg: &config::BazaarConfig, catalog: &Catalog) -> Result<()> {
+fn write_cache(cfg: &config::SkillsConfig, catalog: &Catalog) -> Result<()> {
     let path = cfg.new_cache_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)

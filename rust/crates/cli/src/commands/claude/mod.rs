@@ -51,7 +51,7 @@ impl ClaudeCommand {
             .arg("--mcp-config")
             .arg(mcp_config.to_string())
             .arg("--allowedTools")
-            .arg("mcp__pay__curl,mcp__pay__bazaar_search,mcp__pay__bazaar_endpoints")
+            .arg("mcp__pay__curl,mcp__pay__skills_search,mcp__pay__skills_endpoints")
             .arg("--append-system-prompt")
             .arg(pay_core::instructions::INSTRUCTIONS)
             .args(&self.args)

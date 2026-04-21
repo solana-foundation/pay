@@ -1,5 +1,4 @@
 pub mod account;
-pub mod bazaar;
 pub mod claude;
 pub mod codex;
 pub mod curl;
@@ -7,6 +6,7 @@ pub mod fetch;
 pub mod send;
 pub mod server;
 pub mod setup;
+pub mod skills;
 pub mod solana;
 pub mod topup;
 pub mod wget;
@@ -54,14 +54,14 @@ pub enum Command {
         #[command(subcommand)]
         command: server::ServerCommand,
     },
-    /// Browse, search, and inspect API providers from the bazaar.
-    Bazaar {
+    /// Browse, search, and inspect API providers from the skills catalog.
+    Skills {
         #[command(subcommand)]
-        command: bazaar::BazaarCommand,
+        command: skills::SkillsCommand,
     },
-    /// Add a provider source (shorthand for `bazaar add`).
+    /// Add a provider source (shorthand for `skills add`).
     #[command(alias = "add", short_flag = 'i')]
-    Install(bazaar::install::InstallCommand),
+    Install(skills::install::InstallCommand),
     /// Start the MCP server (for Claude Code, Cursor, etc.)
     Mcp,
 }
@@ -87,7 +87,7 @@ impl Command {
             Command::Claude(_) => ToolKind::Claude,
             Command::Codex(_) => ToolKind::Codex,
             Command::Account { .. }
-            | Command::Bazaar { .. }
+            | Command::Skills { .. }
             | Command::Install(_)
             | Command::Send(_)
             | Command::Setup(_)
@@ -124,7 +124,7 @@ impl Command {
 
         match self {
             Command::Account { command } => return command.run(keypair_override),
-            Command::Bazaar { command } => return command.run(),
+            Command::Skills { command } => return command.run(),
             Command::Install(cmd) => return cmd.run(),
             Command::Solana(cmd) => std::process::exit(cmd.run(keypair_override)?),
             Command::Send(cmd) => return cmd.run(keypair_override, verbose),

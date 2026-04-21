@@ -16,12 +16,12 @@ pub struct EndpointsCommand {
 
 impl EndpointsCommand {
     pub fn run(self) -> pay_core::Result<()> {
-        let catalog = pay_core::bazaar::load_bazaar()?;
-        let result = pay_core::bazaar::resource_endpoints(&catalog, &self.service, &self.resource)
+        let catalog = pay_core::skills::load_skills()?;
+        let result = pay_core::skills::resource_endpoints(&catalog, &self.service, &self.resource)
             .ok_or_else(|| {
                 pay_core::Error::Config(format!(
                     "No endpoints found for resource `{}` in service `{}`. \
-                         Try `pay bazaar service {}` to see available resources.",
+                         Try `pay skills service {}` to see available resources.",
                     self.resource, self.service, self.service
                 ))
             })?;

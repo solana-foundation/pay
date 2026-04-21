@@ -1,6 +1,6 @@
 use owo_colors::OwoColorize;
 
-/// Add a provider source to the bazaar.
+/// Add a provider source to the skills catalog.
 ///
 /// Accepts a GitHub `org/repo` shorthand or a full URL to a catalog JSON.
 #[derive(clap::Args)]
@@ -11,12 +11,12 @@ pub struct InstallCommand {
 
 impl InstallCommand {
     pub fn run(self) -> pay_core::Result<()> {
-        let mut cfg = pay_core::bazaar::config::BazaarConfig::load()?;
+        let mut cfg = pay_core::skills::config::SkillsConfig::load()?;
         if cfg.add_source(&self.source) {
             cfg.save()?;
             eprintln!("  {} {}", "Added:".green(), self.source);
             eprintln!("{}", "  Updating cache...".dimmed());
-            let catalog = pay_core::bazaar::update_bazaar()?;
+            let catalog = pay_core::skills::update_skills()?;
             eprintln!(
                 "  {} {} services, {} endpoints",
                 "Ready:".green(),

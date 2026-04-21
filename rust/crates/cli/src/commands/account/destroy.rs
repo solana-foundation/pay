@@ -100,7 +100,7 @@ impl DestroyCommand {
             if export {
                 let export_path = format!("backup-{}.json", self.account);
                 let export_cmd = super::export::ExportCommand {
-                    path: export_path.clone(),
+                    path: Some(export_path.clone()),
                     name: Some(self.account.clone()),
                 };
                 // Try exporting, but don't fail the whole remove if it errors

@@ -1,7 +1,7 @@
 use owo_colors::OwoColorize;
 
 pub fn run() -> pay_core::Result<()> {
-    let catalog = pay_core::bazaar::load_bazaar()?;
+    let catalog = pay_core::skills::load_skills()?;
 
     if catalog.services.is_empty() {
         eprintln!(
@@ -12,7 +12,7 @@ pub fn run() -> pay_core::Result<()> {
     }
 
     // Group by provider
-    let mut by_provider: std::collections::BTreeMap<String, Vec<&pay_core::bazaar::Service>> =
+    let mut by_provider: std::collections::BTreeMap<String, Vec<&pay_core::skills::Service>> =
         std::collections::BTreeMap::new();
     for svc in &catalog.services {
         let key = if svc.provider.is_empty() {
@@ -66,7 +66,7 @@ pub fn run() -> pay_core::Result<()> {
     Ok(())
 }
 
-fn format_stats(svc: &pay_core::bazaar::Service) -> String {
+fn format_stats(svc: &pay_core::skills::Service) -> String {
     let metered = svc.endpoints.iter().filter(|e| e.pricing.is_some()).count();
     let total = svc.endpoints.len();
     if metered > 0 {

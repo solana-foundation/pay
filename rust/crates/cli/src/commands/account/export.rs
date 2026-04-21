@@ -1,4 +1,4 @@
-//! `pay export` — export keypair in Solana CLI format.
+//! `pay account export` — export keypair in Solana CLI format.
 
 use pay_core::keystore::Keystore;
 
@@ -8,12 +8,13 @@ use pay_core::keystore::Keystore;
 /// `solana-keygen` and expected by `--keypair` in the Solana CLI.
 ///
 /// Examples:
-///   pay export key.json
-///   pay export -                # print to stdout
+///   pay account export              # exports default account to ./<name>.json
+///   pay account export my-key.json  # exports to a specific path
+///   pay account export -            # print to stdout
 #[derive(clap::Args)]
 pub struct ExportCommand {
-    /// Output file path, or "-" for stdout.
-    pub path: String,
+    /// Output file path, or "-" for stdout. Defaults to ./<account-name>.json.
+    pub path: Option<String>,
 
     /// Account name to export. Defaults to the default account.
     #[arg(long)]
@@ -22,7 +23,7 @@ pub struct ExportCommand {
 
 impl ExportCommand {
     pub fn run(self, keypair_source: Option<&str>) -> pay_core::Result<()> {
-        let (keypair_bytes, pubkey) = if let Some(name) = &self.name {
+        let (keypair_bytes, pubkey, account_name) = if let Some(name) = &self.name {
             let accounts = pay_core::accounts::AccountsFile::load()?;
             let account = accounts
                 .accounts
@@ -30,28 +31,30 @@ impl ExportCommand {
                 .and_then(|net| net.iter().find(|(n, _)| *n == name))
                 .map(|(_, a)| a)
                 .ok_or_else(|| pay_core::Error::Config(format!("Account '{name}' not found")))?;
+            let reason = format!("read your \"{name}\" account");
             let bytes = pay_core::signer::load_keypair_bytes_from_account_with_reason(
                 account,
                 name,
                 pay_core::accounts::MAINNET_NETWORK,
-                &format!("export {} account", name),
+                &reason,
             )?;
             let pubkey = bs58::encode(&bytes[32..64]).into_string();
-            (bytes, pubkey)
+            (bytes, pubkey, name.clone())
         } else {
             let config = pay_core::Config::load().unwrap_or_default();
             if keypair_source.is_none()
                 && let Ok(accounts) = pay_core::accounts::AccountsFile::load()
                 && let Some((name, account)) = accounts.default_account()
             {
+                let reason = format!("read your \"{name}\" account");
                 let bytes = pay_core::signer::load_keypair_bytes_from_account_with_reason(
                     account,
                     name,
                     pay_core::accounts::MAINNET_NETWORK,
-                    &format!("export {} account", name),
+                    &reason,
                 )?;
                 let pubkey = bs58::encode(&bytes[32..64]).into_string();
-                (bytes, pubkey)
+                (bytes, pubkey, name.to_string())
             } else {
                 let src = keypair_source
                     .map(|s| s.to_string())
@@ -61,22 +64,24 @@ impl ExportCommand {
                             "No account configured. Run `pay setup` first.".to_string(),
                         )
                     })?;
-                let bytes = reload_raw_bytes(
-                    &src,
-                    &format!(
-                        "export {} account",
-                        self.name.as_deref().unwrap_or("default")
-                    ),
-                )?;
+                let fallback_name = self.name.as_deref().unwrap_or("default");
+                let reason = format!("read your \"{fallback_name}\" account");
+                let bytes = reload_raw_bytes(&src, &reason)?;
                 let pubkey = bs58::encode(&bytes[32..64]).into_string();
-                (bytes, pubkey)
+                let name = self.name.clone().unwrap_or_else(|| "default".to_string());
+                (bytes, pubkey, name)
             }
         };
+
+        let short_pubkey = &pubkey[..8.min(pubkey.len())];
+        let path = self
+            .path
+            .unwrap_or_else(|| format!("pay-account-{account_name}-{short_pubkey}.json"));
 
         let json = serde_json::to_string(&*keypair_bytes)
             .map_err(|e| pay_core::Error::Config(format!("JSON error: {e}")))?;
 
-        if self.path == "-" {
+        if path == "-" {
             println!("{json}");
         } else {
             {
@@ -89,14 +94,33 @@ impl ExportCommand {
                 #[cfg(unix)]
                 opts.mode(0o600);
 
-                let mut file = opts.open(&self.path).map_err(|e| {
-                    pay_core::Error::Config(format!("Failed to create {}: {e}", self.path))
+                let mut file = opts.open(&path).map_err(|e| {
+                    pay_core::Error::Config(format!("Failed to create {}: {e}", path))
                 })?;
                 writeln!(file, "{json}").map_err(|e| {
-                    pay_core::Error::Config(format!("Failed to write {}: {e}", self.path))
+                    pay_core::Error::Config(format!("Failed to write {}: {e}", path))
                 })?;
             }
-            eprintln!("Exported to {} (pubkey: {})", self.path, &pubkey);
+            eprintln!("Exported to {} (pubkey: {})", path, &pubkey);
+
+            let delete =
+                dialoguer::Confirm::with_theme(&dialoguer::theme::ColorfulTheme::default())
+                    .with_prompt(format!(
+                        "Delete the \"{}\" account from the keystore?",
+                        account_name
+                    ))
+                    .default(false)
+                    .interact()
+                    .unwrap_or(false);
+
+            if delete {
+                let destroy_cmd = super::destroy::DestroyCommand {
+                    account: account_name,
+                    sandbox: false,
+                    yes: true,
+                };
+                destroy_cmd.run()?;
+            }
         }
 
         Ok(())

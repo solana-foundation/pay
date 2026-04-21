@@ -22,6 +22,7 @@ pub enum AccountCommand {
     #[command(alias = "rm", alias = "destroy")]
     Remove(destroy::DestroyCommand),
     /// Export a keypair to a JSON file (Solana CLI format).
+    #[command(alias = "backup")]
     Export(export::ExportCommand),
 }
 

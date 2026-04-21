@@ -1,5 +1,5 @@
 use owo_colors::OwoColorize;
-use pay_core::bazaar::SearchHit;
+use pay_core::skills::SearchHit;
 
 /// Max metered endpoints to show per service in condensed mode.
 const CONDENSED_METERED_LIMIT: usize = 5;
@@ -9,9 +9,9 @@ const CONDENSED_TOTAL_LIMIT: usize = 8;
 /// Search for API providers and endpoints.
 ///
 /// Adaptive output:
-/// - **Single service match**: shows all endpoints (like `bazaar endpoints`)
+/// - **Single service match**: shows all endpoints (like `skills endpoints`)
 /// - **Multiple services**: condensed view — metered endpoints first, capped,
-///   with a hint to drill down via `pay bazaar endpoints <service>`
+///   with a hint to drill down via `pay skills endpoints <service>`
 #[derive(clap::Args)]
 pub struct SearchCommand {
     /// Keyword to search for (matches service names, endpoint paths, descriptions).
@@ -28,12 +28,12 @@ pub struct SearchCommand {
 
 impl SearchCommand {
     pub fn run(self) -> pay_core::Result<()> {
-        let catalog = pay_core::bazaar::load_bazaar()?;
+        let catalog = pay_core::skills::load_skills()?;
         let hits =
-            pay_core::bazaar::search(&catalog, self.query.as_deref(), self.category.as_deref());
+            pay_core::skills::search(&catalog, self.query.as_deref(), self.category.as_deref());
 
         if self.json {
-            let grouped = pay_core::bazaar::group_search_results(&hits);
+            let grouped = pay_core::skills::group_search_results(&hits);
             let json = serde_json::to_string_pretty(&grouped)
                 .map_err(|e| pay_core::Error::Config(format!("json: {e}")))?;
             println!("{json}");
@@ -43,7 +43,7 @@ impl SearchCommand {
         if hits.is_empty() {
             eprintln!(
                 "{}",
-                "No results. Try a broader search or `pay bazaar search` to list all.".dimmed()
+                "No results. Try a broader search or `pay skills search` to list all.".dimmed()
             );
             return Ok(());
         }
@@ -60,7 +60,7 @@ impl SearchCommand {
         };
 
         if services.len() == 1 {
-            // Single service — show everything (like `bazaar endpoints`)
+            // Single service — show everything (like `skills endpoints`)
             print_full_service(&hits);
         } else {
             // Multiple services — condensed per service
@@ -140,7 +140,7 @@ fn print_condensed(hits: &[SearchHit], services: &[String]) {
             eprintln!(
                 "    {}",
                 format!(
-                    "... {} more — `pay bazaar endpoints {}`",
+                    "... {} more — `pay skills endpoints {}`",
                     total - shown,
                     svc_name
                 )

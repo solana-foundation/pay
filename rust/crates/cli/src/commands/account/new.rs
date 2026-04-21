@@ -299,7 +299,7 @@ pub fn print_next_steps(
         }
         eprintln!();
         eprintln!("  {}", "Explore available APIs:".dimmed());
-        eprintln!("  {}", "$ pay bazaar ls".bold());
+        eprintln!("  {}", "$ pay skills ls".bold());
     } else {
         let topup_cmd = if name == "default" {
             "pay topup".to_string()
@@ -311,7 +311,7 @@ pub fn print_next_steps(
         eprintln!("  {}", format!("$ {topup_cmd}").bold());
         eprintln!();
         eprintln!("  {}", "Explore available APIs:".dimmed());
-        eprintln!("  {}", "$ pay bazaar ls".bold());
+        eprintln!("  {}", "$ pay skills ls".bold());
     }
     eprintln!();
 }

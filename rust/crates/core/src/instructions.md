@@ -4,20 +4,20 @@ Most cloud APIs (BigQuery, Vertex AI, Cloud Vision, Translate, etc.) require acc
 
 # MCP tools
 
-- `bazaar_search("bigquery")` — discover APIs. Returns endpoints with complete, ready-to-use URLs.
-- `bazaar_endpoints("bigquery")` — list ALL endpoints for a service.
+- `skills_search("bigquery")` — discover APIs. Returns endpoints with complete, ready-to-use URLs.
+- `skills_endpoints("bigquery")` — list ALL endpoints for a service.
 - `curl({url, method, headers, body})` — make requests. Handles 402 payment automatically.
 
 # How to use
 
-1. Search: `bazaar_search("translate")`
+1. Search: `skills_search("translate")`
 2. The `url` field in results is complete — use it directly
 3. Call: `curl({url: "...", method: "POST", headers: {"Content-Type": "application/json"}, body: "..."})`
 
 # BigQuery example
 
 ```
-bazaar_search("bigquery")
+skills_search("bigquery")
 → POST https://.../bigquery/v2/projects/gateway-402/queries
 
 curl({
@@ -28,9 +28,9 @@ curl({
 })
 ```
 
-# Beyond the bazaar
+# Beyond the skills catalog
 
-`pay curl` works with ANY API that returns HTTP 402 — not just the ones listed in the bazaar. If you encounter a 402 Payment Required response from any URL, use `curl` and it will handle the payment and retry automatically. The bazaar is a discovery tool, not a limit.
+`pay curl` works with ANY API that returns HTTP 402 — not just the ones listed in the skills catalog. If you encounter a 402 Payment Required response from any URL, use `curl` and it will handle the payment and retry automatically. The skills catalog is a discovery tool, not a limit.
 
 # Notes
 

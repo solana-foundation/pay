@@ -1,8 +1,8 @@
 use owo_colors::OwoColorize;
 
 pub fn run() -> pay_core::Result<()> {
-    eprintln!("{}", "Updating bazaar catalog...".dimmed());
-    let catalog = pay_core::bazaar::update_bazaar()?;
+    eprintln!("{}", "Updating skills catalog...".dimmed());
+    let catalog = pay_core::skills::update_skills()?;
     eprintln!(
         "  {} {} services, {} endpoints",
         "Updated:".green(),

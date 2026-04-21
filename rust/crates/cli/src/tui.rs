@@ -7,8 +7,7 @@
 use std::io;
 #[cfg(target_os = "macos")]
 use std::process::Command as ProcessCommand;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crate::commands::ToolKind;
@@ -16,7 +15,7 @@ use crate::commands::ToolKind;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
-use pay_core::client::balance::ReceivedFunds;
+use pay_core::client::balance::{AccountBalances, ReceivedFunds};
 use qrcode::QrCode;
 use qrcode::render::unicode;
 use ratatui::Terminal;
@@ -27,7 +26,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
 const POLL_DELAY: Duration = Duration::from_secs(10);
-const POLL_INTERVAL: Duration = Duration::from_secs(1);
+const POLL_COUNTDOWN: Duration = Duration::from_secs(15);
 
 /// Result from the polling thread: what changed + current totals.
 struct TopupDetected {
@@ -38,10 +37,12 @@ struct TopupDetected {
 enum PollStatus {
     /// Initial balance fetch failed — no polling possible.
     RpcUnavailable,
-    /// Waiting for the 10s delay before polling starts.
+    /// Waiting for the initial delay before first check.
     Waiting { secs_left: u64 },
-    /// Actively polling for incoming funds.
-    Polling { spinner_idx: usize },
+    /// Currently fetching balances from RPC.
+    Checking { spinner_idx: usize },
+    /// Countdown until the next automatic refresh.
+    Countdown { secs_left: u64 },
 }
 
 /// Slider range: $0.00 to $15.00 in $0.50 increments = 30 steps, + 1 YOLO step = 31
@@ -227,62 +228,73 @@ fn run_topup(
         .block_on(pay_core::client::balance::get_balances(rpc_url, pubkey))
         .ok();
 
-    // Channel for the polling thread to report received funds
+    // Channel for background balance checks
     let (tx, rx) = mpsc::channel::<TopupDetected>();
-    let stop = Arc::new(AtomicBool::new(false));
-    let mut polling_spawned = false;
+    let mut last_check_at: Option<Instant> = None;
+    let mut checking = false;
 
-    let cleanup = |stop: &Arc<AtomicBool>| {
-        stop.store(true, Ordering::Relaxed);
+    // Trigger a balance check on the background thread.
+    let trigger_check = |tx: &mpsc::Sender<TopupDetected>,
+                         initial: &AccountBalances,
+                         rpc_url: &str,
+                         pubkey: &str| {
+        let rpc = rpc_url.to_string();
+        let pk = pubkey.to_string();
+        let initial = initial.clone();
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            if let Ok(current) = rt.block_on(pay_core::client::balance::get_balances(&rpc, &pk)) {
+                let received = current.diff_received(&initial);
+                if received.has_any() {
+                    let _ = tx.send(TopupDetected { received });
+                }
+            }
+            // Send a sentinel None to signal "check finished, nothing found"
+        });
     };
 
     loop {
         let elapsed = started_at.elapsed();
         let has_baseline = initial_balances.is_some();
-        let polling_active = elapsed >= POLL_DELAY && has_baseline;
+        let past_delay = elapsed >= POLL_DELAY;
 
-        // Spawn the polling thread once after the delay
-        if polling_active && !polling_spawned {
-            polling_spawned = true;
-            let rpc = rpc_url.to_string();
-            let pk = pubkey.to_string();
-            let initial = initial_balances.clone().unwrap();
-            let tx = tx.clone();
-            let stop_flag = stop.clone();
-            std::thread::spawn(move || {
-                while !stop_flag.load(Ordering::Relaxed) {
-                    std::thread::sleep(POLL_INTERVAL);
-                    if stop_flag.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    if let Ok(current) = tokio::runtime::Runtime::new()
-                        .unwrap()
-                        .block_on(pay_core::client::balance::get_balances(&rpc, &pk))
-                    {
-                        let received = current.diff_received(&initial);
-                        if received.has_any() {
-                            let _ = tx.send(TopupDetected { received });
-                            return;
-                        }
-                    }
-                }
-            });
+        // Auto-trigger first check after POLL_DELAY, then every POLL_COUNTDOWN
+        if has_baseline && past_delay && !checking {
+            let should_check = match last_check_at {
+                None => true,
+                Some(t) => t.elapsed() >= POLL_COUNTDOWN,
+            };
+            if should_check {
+                checking = true;
+                last_check_at = Some(Instant::now());
+                trigger_check(&tx, initial_balances.as_ref().unwrap(), rpc_url, pubkey);
+            }
         }
 
-        // Check if the polling thread detected incoming funds
+        // Check if a background check detected incoming funds
         if let Ok(received) = rx.try_recv() {
-            cleanup(&stop);
             return Ok(Some(received));
+        }
+        // If we were checking and the thread finished (channel empty), mark done
+        if checking && last_check_at.is_some_and(|t| t.elapsed() >= Duration::from_secs(6)) {
+            checking = false; // RPC timed out or returned no change
         }
 
         let status = if !has_baseline {
             PollStatus::RpcUnavailable
-        } else if !polling_active {
+        } else if !past_delay {
             let secs_left = POLL_DELAY.as_secs().saturating_sub(elapsed.as_secs());
             PollStatus::Waiting { secs_left }
-        } else {
+        } else if checking {
             let spinner_idx = (elapsed.as_millis() / 80) as usize;
-            PollStatus::Polling { spinner_idx }
+            PollStatus::Checking { spinner_idx }
+        } else {
+            let since_last = last_check_at.map(|t| t.elapsed()).unwrap_or_default();
+            let secs_left = POLL_COUNTDOWN
+                .as_secs()
+                .saturating_sub(since_last.as_secs());
+            PollStatus::Countdown { secs_left }
         };
 
         terminal.draw(|frame| {
@@ -347,15 +359,19 @@ fn run_topup(
                     {
                         open_url(providers[provider_selected].url())?;
                     }
-                    cleanup(&stop);
                     return Ok(None);
                 }
+                KeyCode::Char('r') | KeyCode::Char('R')
+                    if has_baseline && past_delay && !checking =>
+                {
+                    checking = true;
+                    last_check_at = Some(Instant::now());
+                    trigger_check(&tx, initial_balances.as_ref().unwrap(), rpc_url, pubkey);
+                }
                 KeyCode::Char('q') | KeyCode::Esc => {
-                    cleanup(&stop);
                     return Ok(None);
                 }
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    cleanup(&stop);
                     return Ok(None);
                 }
                 _ => {}
@@ -675,16 +691,25 @@ fn render_topup_controls(
                 Style::default().fg(Color::Yellow).bold(),
             ),
         ],
-        PollStatus::Polling { spinner_idx } => {
+        PollStatus::Checking { spinner_idx } => {
             const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
             vec![
                 Span::styled(
                     SPINNER[spinner_idx % SPINNER.len()],
                     Style::default().fg(Color::Green).bold(),
                 ),
-                Span::styled(" online", Style::default().fg(Color::Green).bold()),
+                Span::styled(" checking…", Style::default().fg(Color::Green).bold()),
             ]
         }
+        PollStatus::Countdown { secs_left } => vec![
+            Span::styled(
+                format!("{secs_left}s"),
+                Style::default().fg(Color::DarkGray).bold(),
+            ),
+            Span::styled("  ", Style::default()),
+            Span::styled("R", Style::default().fg(Color::Cyan).bold()),
+            Span::styled(" refresh", Style::default().dim()),
+        ],
     };
 
     let controls_width: usize = spans.iter().map(|span| span.content.len()).sum();

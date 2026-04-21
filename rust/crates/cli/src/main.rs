@@ -17,7 +17,7 @@ use pay_core::{Config, LogFormat};
 #[command(
     name = "pay",
     version,
-    about = "HTTP client with 402 Payment Required support"
+    about = "The missing payment layer for HTTP. pay auto-signs stablecoin transactions when APIs charge per request (x402, MPP)"
 )]
 struct Opts {
     #[clap(subcommand)]
@@ -65,7 +65,7 @@ struct Opts {
 
     /// Launch the Payment Debugger proxy on port 1402. All MCP curl
     /// requests are routed through it, and the PDB UI is served at
-    /// http://127.0.0.1:1402/__402/pdb/
+    /// http://127.0.0.1:1402/
     #[arg(long)]
     debugger: bool,
 }
@@ -153,7 +153,7 @@ fn main() {
             opts.command,
             Command::Setup(_)
                 | Command::Account { .. }
-                | Command::Bazaar { .. }
+                | Command::Skills { .. }
                 | Command::Install(_)
                 | Command::Curl(_)
                 | Command::Wget(_)

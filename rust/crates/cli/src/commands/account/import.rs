@@ -49,8 +49,26 @@ impl ImportCommand {
         display_balance(&pubkey_b58);
         eprintln!();
 
-        // 3. Resolve account name — check for conflicts
+        // 3. Check if this pubkey is already registered
         let mut accounts = pay_core::accounts::AccountsFile::load()?;
+        if let Some((network, existing_name)) = find_account_by_pubkey(&accounts, &pubkey_b58) {
+            let proceed = Confirm::with_theme(&theme)
+                .with_prompt(format!(
+                    "This key is already registered as \"{}\" on {}. Import anyway?",
+                    existing_name.yellow(),
+                    network.yellow(),
+                ))
+                .default(false)
+                .interact()
+                .unwrap_or(false);
+
+            if !proceed {
+                eprintln!("Import cancelled.");
+                return Ok(());
+            }
+        }
+
+        // 4. Resolve account name — check for conflicts
         let name = resolve_name(&theme, self.name.as_deref(), &accounts)?;
 
         // 4. Pick backend and import
@@ -120,6 +138,20 @@ impl ImportCommand {
 
         Ok(())
     }
+}
+
+fn find_account_by_pubkey<'a>(
+    accounts: &'a pay_core::accounts::AccountsFile,
+    pubkey: &str,
+) -> Option<(&'a str, &'a str)> {
+    for (network, net_accounts) in &accounts.accounts {
+        for (name, account) in net_accounts {
+            if account.pubkey.as_deref() == Some(pubkey) {
+                return Some((network, name));
+            }
+        }
+    }
+    None
 }
 
 fn display_balance(pubkey: &str) {
