@@ -7,6 +7,7 @@
 //! Query functions ([`search`], [`service_detail`], [`resource_endpoints`])
 //! are pure — no I/O at query time. The I/O boundary is [`load_skills`].
 
+pub mod build;
 pub mod config;
 
 use std::collections::BTreeMap;

@@ -19,6 +19,7 @@ pay-core = { workspace = true, features = ["server"] }
 pay-keystore = { workspace = true }
 pay-types = { workspace = true }
 clap = { workspace = true }
+glob = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yml = { workspace = true }

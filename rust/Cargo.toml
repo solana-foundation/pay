@@ -18,6 +18,7 @@ pay-pdb = { path = "crates/pdb" }
 
 # CLI
 clap = { version = "4", features = ["derive"] }
+glob = "0.3"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

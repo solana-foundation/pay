@@ -1,6 +1,8 @@
+pub mod build;
 pub mod endpoints;
 pub mod install;
 pub mod list;
+pub mod provider;
 pub mod remove;
 pub mod search;
 pub mod update;
@@ -23,6 +25,13 @@ pub enum SkillsCommand {
     List,
     /// Refresh the local skills cache from all sources.
     Update,
+    /// Build the skills index from a pay-skills registry directory.
+    Build(build::BuildCommand),
+    /// Manage providers in the registry.
+    Provider {
+        #[command(subcommand)]
+        command: provider::ProviderCommand,
+    },
 }
 
 impl SkillsCommand {
@@ -34,6 +43,8 @@ impl SkillsCommand {
             Self::Remove(cmd) => cmd.run(),
             Self::List => list::run(),
             Self::Update => update::run(),
+            Self::Build(cmd) => cmd.run(),
+            Self::Provider { command } => command.run(),
         }
     }
 }

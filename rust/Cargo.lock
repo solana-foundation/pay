@@ -5587,6 +5587,7 @@ dependencies = [
  "crossterm",
  "dialoguer",
  "ed25519-dalek 2.2.0",
+ "glob",
  "owo-colors",
  "pay-core",
  "pay-keystore",
