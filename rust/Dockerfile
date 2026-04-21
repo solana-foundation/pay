@@ -36,4 +36,4 @@ WORKDIR /app
 
 USER pay
 
-ENTRYPOINT ["pay", "server", "start"]
+ENTRYPOINT ["pay"]
