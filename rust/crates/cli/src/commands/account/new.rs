@@ -320,7 +320,7 @@ pub fn pick_backend() -> pay_core::Result<String> {
 
     eprintln!();
     let selection = Select::new()
-        .with_prompt("Where should pay store your secret key?")
+        .with_prompt("Where should pay store your account?")
         .items(&items)
         .default(0)
         .interact()
