@@ -9,9 +9,9 @@ use clap::Subcommand;
 
 #[derive(Subcommand)]
 pub enum AccountCommand {
-    /// Generate a new keypair and store it securely.
+    /// Create a new account and store it securely.
     New(new::NewCommand),
-    /// Import an existing keypair from a Solana CLI JSON file.
+    /// Import an account from a JSON key file.
     Import(import::ImportCommand),
     /// List all registered accounts with balances.
     #[command(alias = "ls")]
@@ -21,7 +21,7 @@ pub enum AccountCommand {
     /// Permanently delete an account and its secret key.
     #[command(alias = "rm", alias = "destroy")]
     Remove(destroy::DestroyCommand),
-    /// Export a keypair to a JSON file (Solana CLI format).
+    /// Export an account to a JSON key file.
     #[command(alias = "backup")]
     Export(export::ExportCommand),
 }

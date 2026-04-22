@@ -1,11 +1,10 @@
-//! `pay account export` — export keypair in Solana CLI format.
+//! `pay account export` — export an account to a JSON key file.
 
 use pay_core::keystore::Keystore;
 
-/// Export your keypair to a JSON file (Solana CLI format).
+/// Export an account to a JSON key file.
 ///
-/// The output is a JSON array of 64 bytes — the same format used by
-/// `solana-keygen` and expected by `--keypair` in the Solana CLI.
+/// The output is compatible with the Solana CLI (`--keypair`).
 ///
 /// Examples:
 ///   pay account export              # exports default account to ./<name>.json
