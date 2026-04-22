@@ -116,18 +116,18 @@ pub fn validate(content: &str) -> Result<ValidatedProvider, Vec<String>> {
         return Err(validation_errors);
     }
 
-    if spec.description.len() > 120 {
+    if spec.meta.description.len() > 120 {
         errors.push(format!(
             "description is {} chars (max 120): \"{}\"",
-            spec.description.len(),
-            spec.description
+            spec.meta.description.len(),
+            spec.meta.description
         ));
     }
 
-    if !spec.service_url.starts_with("https://") {
+    if !spec.meta.service_url.starts_with("https://") {
         errors.push(format!(
             "service_url must start with https:// (got \"{}\")",
-            spec.service_url
+            spec.meta.service_url
         ));
     }
 
@@ -174,7 +174,8 @@ mod tests {
         let result = validate("---\nname: x\n---\n");
         assert!(result.is_err());
         let errs = result.unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("YAML parse error")));
+        // Fields default to empty strings, caught by validate_provider
+        assert!(!errs.is_empty());
     }
 
     #[test]

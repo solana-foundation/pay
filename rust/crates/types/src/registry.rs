@@ -31,21 +31,38 @@ pub const KNOWN_CATEGORIES: &[&str] = &[
 
 pub const AFFILIATE_TYPES: &[&str] = &["agent", "cli", "platform"];
 
+/// Common metadata shared across all service representations (frontmatter,
+/// index entries, runtime catalog, search results, detail views).
+///
+/// Embed with `#[serde(flatten)]` to avoid repeating these fields.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ServiceMeta {
+    /// Human-readable title.
+    #[serde(default)]
+    pub title: String,
+    /// One-sentence description (max 120 chars). Powers search.
+    #[serde(default)]
+    pub description: String,
+    /// Category. One of: ai_ml, data, compute, maps, search, translation,
+    /// productivity, finance, identity, storage, messaging, media, iot,
+    /// security, analytics, devtools, cloud, other.
+    #[serde(default)]
+    pub category: String,
+    /// Live URL where the API is reachable (production).
+    #[serde(default)]
+    pub service_url: String,
+    /// Optional sandbox/testnet URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_service_url: Option<String>,
+}
+
 /// Provider frontmatter — the YAML block in a provider `.md` file.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ProviderFrontmatter {
     /// API name — must match the filename (without `.md`).
     pub name: String,
-    /// Human-readable title.
-    pub title: String,
-    /// One-sentence description (max 120 chars). Powers search.
-    pub description: String,
-    /// Category. One of: ai_ml, data, compute, maps, search, translation,
-    /// productivity, finance, identity, storage, messaging, media, iot,
-    /// security, analytics, devtools, cloud, other.
-    pub category: String,
-    /// Live URL where the API is reachable.
-    pub service_url: String,
+    #[serde(flatten)]
+    pub meta: ServiceMeta,
     /// API version (e.g. "v1", "v2").
     #[serde(default)]
     pub version: String,
@@ -143,24 +160,25 @@ fn valid_base58(s: &str) -> bool {
 
 pub fn validate_provider(spec: &ProviderFrontmatter, fqn: &str) -> Vec<String> {
     let mut errs = Vec::new();
+    let m = &spec.meta;
 
-    if !KNOWN_CATEGORIES.contains(&spec.category.as_str()) {
+    if !KNOWN_CATEGORIES.contains(&m.category.as_str()) {
         errs.push(format!(
             "{fqn}: unknown category `{}` (valid: {})",
-            spec.category,
+            m.category,
             KNOWN_CATEGORIES.join(", ")
         ));
     }
-    if spec.description.len() > 120 {
+    if m.description.len() > 120 {
         errs.push(format!(
             "{fqn}: description is {} chars (max 120)",
-            spec.description.len()
+            m.description.len()
         ));
     }
-    if !spec.service_url.starts_with("https://") && !spec.service_url.starts_with("http://") {
+    if !m.service_url.starts_with("https://") && !m.service_url.starts_with("http://") {
         errs.push(format!(
             "{fqn}: service_url must start with https:// (got `{}`)",
-            spec.service_url
+            m.service_url
         ));
     }
     if spec.endpoints.is_empty() {

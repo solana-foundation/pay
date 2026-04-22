@@ -39,12 +39,12 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
 
         let clean = pay_core::skills::SearchResultGroup {
             service: svc.fqn.clone(),
-            title: svc.title.clone(),
-            url: svc.service_url.clone(),
+            title: svc.meta.title.clone(),
+            url: svc.meta.service_url.clone(),
             endpoints: svc
                 .endpoints
                 .iter()
-                .map(|ep| pay_core::skills::endpoint_to_hit(&svc.service_url, ep))
+                .map(|ep| pay_core::skills::endpoint_to_hit(&svc.meta.service_url, ep))
                 .collect(),
         };
 

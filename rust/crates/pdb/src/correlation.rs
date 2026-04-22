@@ -251,7 +251,7 @@ impl FlowCorrelation {
                 detail: entry
                     .res_body
                     .as_deref()
-                    .map(|b| truncate(b, 200).to_string()),
+                    .map(|b| truncate(b, 2000).to_string()),
             });
         } else {
             flow.status = FlowStatus::Failed;
@@ -261,7 +261,7 @@ impl FlowCorrelation {
                 detail: entry
                     .res_body
                     .as_deref()
-                    .map(|b| truncate(b, 200).to_string()),
+                    .map(|b| truncate(b, 2000).to_string()),
             });
         }
 
