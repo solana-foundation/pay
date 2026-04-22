@@ -34,7 +34,7 @@ pub struct DemoCommand {
 }
 
 impl DemoCommand {
-    pub fn run(self, keypair_source: Option<&str>, sandbox: bool) -> pay_core::Result<()> {
+    pub fn run(self, active_account_name: Option<&str>, sandbox: bool) -> pay_core::Result<()> {
         // Demo mode always uses sandbox — require top-level --sandbox so
         // main.rs has already set up an ephemeral keypair (avoids Touch ID).
         if !sandbox {
@@ -64,6 +64,6 @@ impl DemoCommand {
             rpc_url,
             debugger: true,
         };
-        cmd.run(keypair_source, true)
+        cmd.run(active_account_name, true)
     }
 }

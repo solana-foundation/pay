@@ -68,7 +68,7 @@ impl PaymentState for AppState {
 }
 
 impl StartCommand {
-    pub fn run(self, keypair_source: Option<&str>, sandbox: bool) -> pay_core::Result<()> {
+    pub fn run(self, active_account_name: Option<&str>, sandbox: bool) -> pay_core::Result<()> {
         let debugger = self.debugger || sandbox;
         let expanded = shellexpand::tilde(&self.spec);
         let contents = std::fs::read_to_string(expanded.as_ref())
@@ -135,7 +135,7 @@ impl StartCommand {
 
         let fee_payer = op.map(|o| o.fee_payer).unwrap_or(false);
         let signer_cfg = op.and_then(|o| o.signer.clone());
-        let keypair_source_owned = keypair_source.map(|s| s.to_string());
+        let active_account_name_owned = active_account_name.map(|s| s.to_string());
 
         // Create the runtime first — everything async runs inside it so
         // background tasks (like GCP auth token refresh) stay alive.
@@ -187,7 +187,7 @@ impl StartCommand {
                     );
                 }
                 Some(Arc::new(signer) as Arc<dyn SolanaSigner>)
-            } else if let Some(ref source) = keypair_source_owned {
+            } else if let Some(ref source) = active_account_name_owned {
                 // Mainnet (or unknown network) with no `operator.signer`
                 // block but a default keypair from `pay setup` —
                 // typically `keychain:default`. Load it once at startup
@@ -212,7 +212,7 @@ impl StartCommand {
             //   3. PAY_PAYMENT_RECIPIENT env var
             //   4. fee_payer_signer's pubkey — covers sandbox, throwaway-
             //      network smart default, explicit operator.signer block,
-            //      and the legacy keypair_source fallback (all four set
+            //      and the legacy active_account_name fallback (all four set
             //      fee_payer_signer above).
             let recipient = if let Some(r) = op.and_then(|o| o.recipient.as_ref()) {
                 r.clone()

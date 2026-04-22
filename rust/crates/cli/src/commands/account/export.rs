@@ -21,7 +21,7 @@ pub struct ExportCommand {
 }
 
 impl ExportCommand {
-    pub fn run(self, keypair_source: Option<&str>) -> pay_core::Result<()> {
+    pub fn run(self, active_account_name: Option<&str>) -> pay_core::Result<()> {
         let (keypair_bytes, pubkey, account_name) = if let Some(name) = &self.name {
             let accounts = pay_core::accounts::AccountsFile::load()?;
             let account = accounts
@@ -41,7 +41,7 @@ impl ExportCommand {
             (bytes, pubkey, name.clone())
         } else {
             let config = pay_core::Config::load().unwrap_or_default();
-            if keypair_source.is_none()
+            if active_account_name.is_none()
                 && let Ok(accounts) = pay_core::accounts::AccountsFile::load()
                 && let Some((name, account)) = accounts.default_account()
             {
@@ -55,9 +55,9 @@ impl ExportCommand {
                 let pubkey = bs58::encode(&bytes[32..64]).into_string();
                 (bytes, pubkey, name.to_string())
             } else {
-                let src = keypair_source
+                let src = active_account_name
                     .map(|s| s.to_string())
-                    .or_else(|| config.default_keypair_source())
+                    .or_else(|| config.default_active_account_name())
                     .ok_or_else(|| {
                         pay_core::Error::Config(
                             "No account configured. Run `pay setup` first.".to_string(),

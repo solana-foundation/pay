@@ -161,7 +161,7 @@ fn main() {
         ) {
         None
     } else if matches!(opts.command, Command::Server { .. } | Command::Topup(_)) {
-        config.default_keypair_source()
+        config.default_active_account_name()
     } else {
         resolve_keypair(&config)
     };
@@ -252,7 +252,7 @@ fn init_logging(log_format: LogFormat, verbose: bool) {
 
 /// Find a usable keypair, or tell the user to run `pay setup`.
 fn resolve_keypair(config: &Config) -> Option<String> {
-    if let Some(source) = config.default_keypair_source() {
+    if let Some(source) = config.default_active_account_name() {
         return Some(source);
     }
 
@@ -265,7 +265,7 @@ fn resolve_keypair(config: &Config) -> Option<String> {
     );
     eprintln!(
         "{}",
-        "  PAY_SECRET_KEY=<path>     Use an existing keypair file".dimmed()
+        "  PAY_ACTIVE_ACCOUNT=<name>     Use a specific account from accounts.yml".dimmed()
     );
     eprintln!(
         "{}",

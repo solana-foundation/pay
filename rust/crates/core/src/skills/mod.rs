@@ -176,7 +176,7 @@ pub fn group_search_results(hits: &[SearchHit]) -> Vec<SearchResultGroup> {
     groups
 }
 
-/// A service summary — used by the MCP `skills_search` tool.
+/// A service summary — used by the MCP `search_skills` tool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceSummary {
     pub name: String,

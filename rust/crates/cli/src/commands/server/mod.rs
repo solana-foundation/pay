@@ -15,10 +15,10 @@ pub enum ServerCommand {
 }
 
 impl ServerCommand {
-    pub fn run(self, keypair_source: Option<&str>, sandbox: bool) -> pay_core::Result<()> {
+    pub fn run(self, active_account_name: Option<&str>, sandbox: bool) -> pay_core::Result<()> {
         match self {
-            Self::Start(cmd) => cmd.run(keypair_source, sandbox),
-            Self::Demo(cmd) => cmd.run(keypair_source, sandbox),
+            Self::Start(cmd) => cmd.run(active_account_name, sandbox),
+            Self::Demo(cmd) => cmd.run(active_account_name, sandbox),
             Self::Scaffold(cmd) => cmd.run(),
         }
     }

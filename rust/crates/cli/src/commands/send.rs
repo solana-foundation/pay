@@ -17,13 +17,13 @@ pub struct SendCommand {
 }
 
 impl SendCommand {
-    pub fn run(self, keypair_source: Option<&str>, verbose: bool) -> pay_core::Result<()> {
+    pub fn run(self, active_account_name: Option<&str>, verbose: bool) -> pay_core::Result<()> {
         let config = pay_core::Config::load().unwrap_or_default();
         let rpc_url = config.rpc_url().to_string();
 
-        let keypair = keypair_source
+        let keypair = active_account_name
             .map(|s| s.to_string())
-            .or_else(|| config.default_keypair_source())
+            .or_else(|| config.default_active_account_name())
             .ok_or_else(|| {
                 pay_core::Error::Config("No account configured. Run `pay setup` first.".to_string())
             })?;

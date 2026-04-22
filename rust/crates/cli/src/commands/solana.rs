@@ -25,8 +25,8 @@ pub struct SolanaCommand {
 }
 
 impl SolanaCommand {
-    pub fn run(self, keypair_source: Option<&str>) -> pay_core::Result<i32> {
-        let keypair_bytes = if keypair_source.is_none()
+    pub fn run(self, active_account_name: Option<&str>) -> pay_core::Result<i32> {
+        let keypair_bytes = if active_account_name.is_none()
             && let Ok(accounts) = pay_core::accounts::AccountsFile::load()
             && let Some((name, account)) = accounts.default_account()
         {
@@ -37,11 +37,11 @@ impl SolanaCommand {
                 "solana CLI access",
             )?
         } else {
-            let source = keypair_source
+            let source = active_account_name
                 .map(|s| s.to_string())
                 .or_else(|| {
                     let config = pay_core::Config::load().unwrap_or_default();
-                    config.default_keypair_source()
+                    config.default_active_account_name()
                 })
                 .ok_or_else(|| {
                     pay_core::Error::Config(
