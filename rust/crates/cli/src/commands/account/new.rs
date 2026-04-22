@@ -375,15 +375,8 @@ pub fn print_next_steps(
     if let Some(r) = received {
         let amount = format_received(r);
         if !amount.is_empty() {
-            eprintln!(
-                "  {} Account initialized with {}",
-                "✔".green(),
-                amount.green()
-            );
+            eprintln!("  {} Account funded with {}", "✔".green(), amount.green());
         }
-        eprintln!();
-        eprintln!("  {}", "Explore available APIs:".dimmed());
-        eprintln!("  {}", "$ pay skills ls".bold());
     } else {
         let topup_cmd = if name == "default" {
             "pay topup".to_string()
@@ -393,10 +386,15 @@ pub fn print_next_steps(
         eprintln!();
         eprintln!("  {}", "Fund your account:".dimmed());
         eprintln!("  {}", format!("$ {topup_cmd}").bold());
-        eprintln!();
-        eprintln!("  {}", "Explore available APIs:".dimmed());
-        eprintln!("  {}", "$ pay skills ls".bold());
     }
+    eprintln!();
+    eprintln!(
+        "  {}",
+        "Ready to go. Time to make HTTP pay for itself.".dimmed()
+    );
+    eprintln!();
+    eprintln!("  {}", "$ pay claude".bold());
+    eprintln!("  {}", "$ pay codex".bold());
     eprintln!();
 }
 
