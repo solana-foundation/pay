@@ -2,6 +2,7 @@
 //!
 //! Convenience command that combines `pay account new` + `pay topup`.
 
+use dialoguer::Confirm;
 use owo_colors::OwoColorize;
 
 /// Generate a keypair, store it securely, and fund your account.
@@ -43,6 +44,9 @@ impl SetupCommand {
             return Ok(());
         }
 
+        // Offer to install the agent skill if npx is available.
+        maybe_install_skill();
+
         let (pubkey, backend_name) = super::account::new::create_account(
             "default",
             self.backend.as_deref(),
@@ -61,4 +65,60 @@ impl SetupCommand {
         super::account::new::print_next_steps("default", backend_name, received.as_ref());
         Ok(())
     }
+}
+
+/// If `npx` is on PATH, offer to install the pay agent skill for coding agents.
+fn maybe_install_skill() {
+    let has_npx = std::process::Command::new("npx")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+
+    if !has_npx {
+        return;
+    }
+
+    eprintln!();
+    let install = Confirm::with_theme(&dialoguer::theme::ColorfulTheme::default())
+        .with_prompt("Install pay skill for your coding agents? (Claude Code, Cursor, …)")
+        .default(true)
+        .interact()
+        .unwrap_or(false);
+
+    if !install {
+        return;
+    }
+
+    eprintln!();
+    let status = std::process::Command::new("npx")
+        .args([
+            "-y",
+            "skills",
+            "add",
+            "https://github.com/solana-foundation/pay",
+            "--skill",
+            "pay",
+            "-y",
+        ])
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {
+            eprintln!("  {} Skill installed", "✔".green());
+        }
+        _ => {
+            eprintln!(
+                "{}",
+                "  Skill install failed — you can retry later with:".dimmed()
+            );
+            eprintln!(
+                "{}",
+                "  npx -y skills add https://github.com/solana-foundation/pay --skill pay -y"
+                    .dimmed()
+            );
+        }
+    }
+    eprintln!();
 }

@@ -1,0 +1,70 @@
+{
+  "name": "@solana/pay",
+  "version": "0.7.0",
+  "description": "Solana Pay CLI — accept and send payments on Solana",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/solana-foundation/pay.git",
+    "directory": "npm"
+  },
+  "homepage": "https://github.com/solana-foundation/pay",
+  "bugs": {
+    "url": "https://github.com/solana-foundation/pay/issues"
+  },
+  "keywords": [
+    "solana",
+    "pay",
+    "payments",
+    "crypto",
+    "usdc",
+    "cli"
+  ],
+  "bin": {
+    "pay": "run.js"
+  },
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "preferUnplugged": true,
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "run.js",
+    "install.js",
+    "platform.js",
+    "LICENSE",
+    "README.md"
+  ],
+  "supportedPlatforms": {
+    "aarch64-apple-darwin": {
+      "artifact": "pay-aarch64-apple-darwin.tar.gz",
+      "binary": "pay"
+    },
+    "x86_64-apple-darwin": {
+      "artifact": "pay-x86_64-apple-darwin.tar.gz",
+      "binary": "pay"
+    },
+    "aarch64-unknown-linux-gnu": {
+      "artifact": "pay-aarch64-unknown-linux-gnu.tar.gz",
+      "binary": "pay"
+    },
+    "aarch64-unknown-linux-musl": {
+      "artifact": "pay-aarch64-unknown-linux-musl.tar.gz",
+      "binary": "pay"
+    },
+    "x86_64-unknown-linux-gnu": {
+      "artifact": "pay-x86_64-unknown-linux-gnu.tar.gz",
+      "binary": "pay"
+    },
+    "x86_64-unknown-linux-musl": {
+      "artifact": "pay-x86_64-unknown-linux-musl.tar.gz",
+      "binary": "pay"
+    },
+    "x86_64-pc-windows-msvc": {
+      "artifact": "pay-x86_64-pc-windows-msvc.zip",
+      "binary": "pay.exe"
+    }
+  }
+}
