@@ -274,6 +274,17 @@ fn run_topup(
 
         // Check if a background check detected incoming funds
         if let Ok(received) = rx.try_recv() {
+            blink_checkmark(
+                terminal,
+                pubkey,
+                account_name,
+                &options,
+                selected,
+                &providers,
+                provider_selected,
+                focus,
+                amount_pos,
+            )?;
             return Ok(Some(received));
         }
         // If we were checking and the thread finished (channel empty), mark done
@@ -311,6 +322,7 @@ fn run_topup(
                 focus,
                 &status,
                 amount_pos,
+                None,
             );
         })?;
 
@@ -369,7 +381,23 @@ fn run_topup(
                     trigger_check(&tx, initial_balances.as_ref().unwrap(), rpc_url, pubkey);
                 }
                 KeyCode::Char('q') | KeyCode::Esc => {
-                    return Ok(None);
+                    blink_checkmark(
+                        terminal,
+                        pubkey,
+                        account_name,
+                        &options,
+                        selected,
+                        &providers,
+                        provider_selected,
+                        focus,
+                        amount_pos,
+                    )?;
+                    return Ok(Some(TopupDetected {
+                        received: ReceivedFunds {
+                            sol_lamports: 0,
+                            tokens: vec![],
+                        },
+                    }));
                 }
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     return Ok(None);
@@ -378,6 +406,97 @@ fn run_topup(
             }
         }
     }
+}
+
+/// Blink state passed into the normal render to replace the QR with a checkmark.
+struct BlinkState {
+    visible: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn blink_checkmark(
+    terminal: &mut Terminal<CrosstermBackend<io::Stderr>>,
+    pubkey: &str,
+    account_name: &str,
+    options: &[TopupOption],
+    selected: usize,
+    providers: &[BuyProvider],
+    provider_selected: usize,
+    focus: TopupFocus,
+    amount_pos: usize,
+) -> io::Result<()> {
+    for i in 0..5 {
+        let visible = i % 2 == 0;
+        let blink = Some(BlinkState { visible });
+        terminal.draw(|frame| {
+            let area = frame.area();
+            render_topup_selector(
+                frame,
+                area,
+                pubkey,
+                account_name,
+                options,
+                selected,
+                providers,
+                provider_selected,
+                focus,
+                &PollStatus::RpcUnavailable, // status bar doesn't matter during blink
+                amount_pos,
+                blink.as_ref(),
+            );
+        })?;
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    Ok(())
+}
+
+fn render_success_checkmark(frame: &mut ratatui::Frame, area: Rect, visible: bool) {
+    frame.render_widget(Clear, area);
+
+    let g = Style::default().fg(Color::Green).bold();
+
+    let checkmark: Vec<Line> = if visible {
+        vec![
+            Line::raw(""),
+            Line::styled("                              ████", g),
+            Line::styled("                            ██████", g),
+            Line::styled("                          ████████", g),
+            Line::styled("                        ████████  ", g),
+            Line::styled("                      ████████    ", g),
+            Line::styled("                    ████████      ", g),
+            Line::styled("                  ████████        ", g),
+            Line::styled("                ████████          ", g),
+            Line::styled("  ████        ████████            ", g),
+            Line::styled("  ██████    ████████              ", g),
+            Line::styled("  ████████████████                ", g),
+            Line::styled("    ████████████                  ", g),
+            Line::styled("      ████████                    ", g),
+            Line::styled("        ████                      ", g),
+            Line::raw(""),
+        ]
+    } else {
+        vec![Line::raw(""); 16]
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Green));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let top_pad = inner.height.saturating_sub(checkmark.len() as u16) / 2;
+    let text_area = Rect {
+        x: inner.x,
+        y: inner.y + top_pad,
+        width: inner.width,
+        height: inner.height.saturating_sub(top_pad),
+    };
+    frame.render_widget(
+        Paragraph::new(checkmark).alignment(ratatui::layout::Alignment::Center),
+        text_area,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -393,6 +512,7 @@ fn render_topup_selector(
     focus: TopupFocus,
     status: &PollStatus,
     amount_pos: usize,
+    blink: Option<&BlinkState>,
 ) {
     frame.render_widget(
         Block::default().style(Style::default().bg(TOPUP_MAIN_BG)),
@@ -498,7 +618,7 @@ fn render_topup_selector(
     let active = options[selected];
     match active {
         TopupOption::TransferFromExistingAccount => {
-            render_qr_detail(frame, right[1], pubkey, account_name, amount_pos)
+            render_qr_detail(frame, right[1], pubkey, account_name, amount_pos, blink)
         }
         TopupOption::BuyStablecoins => {
             render_provider_list(frame, right[1], providers, provider_selected, focus)
@@ -514,10 +634,12 @@ fn render_qr_detail(
     pubkey: &str,
     account_name: &str,
     amount_pos: usize,
+    blink: Option<&BlinkState>,
 ) {
     // Reserve slider space first so the QR gets whatever remains.
     let split = Layout::vertical([Constraint::Min(0), Constraint::Length(5)]).split(area);
 
+    // Compute QR size to get the exact area it occupies, even during blink.
     let url = solana_pay_url(pubkey, amount_pos);
     let qr_lines = render_qr(&url).unwrap_or_else(|_| {
         vec![Line::from(Span::styled(
@@ -532,7 +654,22 @@ fn render_qr_detail(
     ])
     .split(split[0]);
 
-    frame.render_widget(Paragraph::new(qr_lines).centered(), qr_area[1]);
+    // Compute the QR pixel width so the checkmark matches it.
+    let qr_width = qr_lines.first().map(|l| l.width()).unwrap_or(0) as u16;
+
+    if let Some(b) = blink {
+        // Center-constrain to QR width
+        let pad = qr_area[1].width.saturating_sub(qr_width) / 2;
+        let centered = Rect {
+            x: qr_area[1].x + pad,
+            y: qr_area[1].y,
+            width: qr_width.min(qr_area[1].width),
+            height: qr_area[1].height,
+        };
+        render_success_checkmark(frame, centered, b.visible);
+    } else {
+        frame.render_widget(Paragraph::new(qr_lines).centered(), qr_area[1]);
+    }
 
     let amount_str = if amount_pos == 0 {
         "any".to_string()
@@ -1249,19 +1386,22 @@ fn render_slider_box<'a>(
 
     let box_width = area.width;
     let bar_width = (box_width as usize).saturating_sub(4);
-    let cursor_pos = (position * bar_width).checked_div(max_steps).unwrap_or(0);
+    let track_width = bar_width.saturating_sub(6); // account for arrows
+    let cursor_pos = (position * track_width).checked_div(max_steps).unwrap_or(0);
 
-    let mut bar_spans = vec![Span::raw(" ")];
-    for i in 0..bar_width {
+    let arrow_style = Style::default().fg(Color::Cyan).bold();
+    let mut bar_spans = vec![Span::styled(" ◀ ", arrow_style)];
+    for i in 0..bar_width.saturating_sub(6) {
         let color = if i == cursor_pos {
-            bar_color(i, bar_width, true)
+            bar_color(i, bar_width.saturating_sub(6), true)
         } else if i < cursor_pos {
-            bar_color(i, bar_width, false)
+            bar_color(i, bar_width.saturating_sub(6), false)
         } else {
             Color::Rgb(50, 55, 60)
         };
         bar_spans.push(Span::styled("▐", Style::default().fg(color)));
     }
+    bar_spans.push(Span::styled(" ▶ ", arrow_style));
 
     let lines = vec![
         Line::default(),

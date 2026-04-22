@@ -86,11 +86,14 @@ impl SecretStore for AppleKeychainStore {
 // this. A future improvement could hash-pin the binary against the embedded
 // HELPER_SOURCE to detect tampering.
 
+/// Pre-compiled Swift helper binary embedded at build time.
+/// Empty if swiftc was not available during `cargo build`.
+const EMBEDDED_HELPER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pay-helper"));
+
 fn helper_path() -> Result<PathBuf> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     let cache_dir = PathBuf::from(home).join(".cache").join("pay");
     let binary = cache_dir.join("pay.sh");
-    let source = cache_dir.join("pay.sh.swift");
     let entitlements = cache_dir.join("pay.sh.entitlements");
 
     if binary.exists() {
@@ -106,6 +109,23 @@ fn helper_path() -> Result<PathBuf> {
         std::fs::set_permissions(&cache_dir, std::fs::Permissions::from_mode(0o700)).ok();
     }
 
+    // Use the pre-compiled binary if available (no swiftc needed on user's machine).
+    if !EMBEDDED_HELPER.is_empty() {
+        std::fs::write(&binary, EMBEDDED_HELPER)
+            .map_err(|e| Error::Backend(format!("Failed to extract helper binary: {e}")))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).ok();
+        }
+        std::fs::write(&entitlements, ENTITLEMENTS_PLIST)
+            .map_err(|e| Error::Backend(format!("Failed to write entitlements: {e}")))?;
+        codesign_binary(&binary, &entitlements)?;
+        return Ok(binary);
+    }
+
+    // Fallback: compile from source at runtime (requires swiftc / Xcode CLT).
+    let source = cache_dir.join("pay.sh.swift");
     std::fs::write(&source, HELPER_SOURCE)
         .map_err(|e| Error::Backend(format!("Failed to write helper source: {e}")))?;
     std::fs::write(&entitlements, ENTITLEMENTS_PLIST)
@@ -116,18 +136,27 @@ fn helper_path() -> Result<PathBuf> {
         .arg(&binary)
         .arg(&source)
         .output()
-        .map_err(|e| Error::Backend(format!("swiftc: {e}")))?;
+        .map_err(|e| {
+            Error::Backend(format!(
+                "swiftc not found: {e}. Install Xcode Command Line Tools: xcode-select --install"
+            ))
+        })?;
 
     if !compile.status.success() {
         let stderr = String::from_utf8_lossy(&compile.stderr);
         return Err(Error::Backend(format!("swiftc failed: {stderr}")));
     }
 
+    codesign_binary(&binary, &entitlements)?;
+    Ok(binary)
+}
+
+fn codesign_binary(binary: &PathBuf, entitlements: &PathBuf) -> Result<()> {
     let identity = find_signing_identity().unwrap_or_else(|| "-".to_string());
     let sign = Command::new("codesign")
         .args(["-s", &identity, "-f", "--entitlements"])
-        .arg(&entitlements)
-        .arg(&binary)
+        .arg(entitlements)
+        .arg(binary)
         .output()
         .map_err(|e| Error::Backend(format!("codesign: {e}")))?;
 
@@ -135,8 +164,7 @@ fn helper_path() -> Result<PathBuf> {
         let stderr = String::from_utf8_lossy(&sign.stderr);
         return Err(Error::Backend(format!("codesign failed: {stderr}")));
     }
-
-    Ok(binary)
+    Ok(())
 }
 
 fn verify_codesign(binary: &PathBuf) -> Result<()> {
