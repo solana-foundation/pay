@@ -51,9 +51,9 @@ pub fn build_payment(
     // through the same helper for consistency.
     crate::client::mpp::check_client_network_intent(network_override, &cluster, None)?;
 
-    // Same gating rationale as mpp::build_credential — only attempt
-    // auto-funding when the user explicitly opted into sandbox mode.
-    let user_opted_into_sandbox = network_override.is_some();
+    // Auto-fund when the user opted into sandbox or the challenge
+    // advertises localnet (likely a sandbox gateway without --sandbox).
+    let user_opted_into_sandbox = network_override.is_some() || cluster == "localnet";
     let network = network_override.map(str::to_string).unwrap_or(cluster);
 
     let (signer, ephemeral_notice) = crate::signer::load_signer_for_network_payment(
@@ -81,7 +81,7 @@ pub fn build_payment(
         .build()
         .map_err(|e| Error::Mpp(format!("Failed to create runtime: {e}")))?;
 
-    if user_opted_into_sandbox && ephemeral_notice.is_some() {
+    if user_opted_into_sandbox {
         let pubkey = signer.pubkey().to_string();
         let fund_url = rpc_url.clone();
         if let Err(e) = rt.block_on(crate::client::sandbox::fund_via_surfpool(

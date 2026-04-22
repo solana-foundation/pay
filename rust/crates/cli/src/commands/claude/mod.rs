@@ -31,6 +31,12 @@ impl ClaudeCommand {
         if let Ok(url) = std::env::var("PAY_RPC_URL") {
             env.insert("PAY_RPC_URL".to_string(), serde_json::Value::String(url));
         }
+        if let Ok(network) = std::env::var("PAY_NETWORK_ENFORCED") {
+            env.insert(
+                "PAY_NETWORK_ENFORCED".to_string(),
+                serde_json::Value::String(network),
+            );
+        }
         if let Ok(proxy) = std::env::var("PAY_DEBUGGER_PROXY") {
             env.insert(
                 "PAY_DEBUGGER_PROXY".to_string(),

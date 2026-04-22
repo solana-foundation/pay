@@ -1544,6 +1544,7 @@ mod tests {
             auth_required: Some(false),
             pubkey: Some(pubkey.clone()),
             vault: None,
+            account: None,
             path: None,
             secret_key_b58: Some(bs58::encode(&VALID_TEST_KEYPAIR_BYTES[..]).into_string()),
             created_at: Some("2026-04-10T00:00:00Z".to_string()),
@@ -1661,6 +1662,7 @@ mod tests {
             auth_required: Some(false),
             pubkey: Some("4BuiY9QUUfPoAGNJBja3JapAuVWMc9c7in6UCgyC2zPR".to_string()),
             vault: None,
+            account: None,
             path: None,
             // Valid base58 but wrong length (decodes to <64 bytes).
             secret_key_b58: Some("abc".to_string()),

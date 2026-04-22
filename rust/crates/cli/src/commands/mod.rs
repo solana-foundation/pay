@@ -79,6 +79,7 @@ pub enum ToolKind {
 
 impl Command {
     /// Which tool this command wraps.
+    #[allow(dead_code)] // used by session budget TUI (currently disabled)
     pub fn tool_kind(&self) -> ToolKind {
         match self {
             Command::Curl(_) => ToolKind::Curl,

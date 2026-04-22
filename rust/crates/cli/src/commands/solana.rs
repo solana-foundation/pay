@@ -135,7 +135,7 @@ fn load_keypair_bytes(source: &str) -> pay_core::Result<pay_core::keystore::Zero
                     "Windows Hello not available on this platform".into(),
                 ));
             }
-            "1password" => Keystore::onepassword(),
+            "1password" => Keystore::onepassword(None),
             _ => unreachable!(),
         };
         return ks

@@ -472,6 +472,7 @@ mod tests {
                 auth_required: Some(false),
                 pubkey: Some(keypair.pubkey().to_string()),
                 vault: None,
+                account: None,
                 path: None,
                 secret_key_b58: Some(bs58::encode(keypair.to_bytes()).into_string()),
                 created_at: Some("2026-04-19T00:00:00Z".to_string()),

@@ -72,11 +72,17 @@ fn do_paid_fetch(
     let outcome =
         pay_core::client::fetch::fetch_request(method, url, extra_headers, body.as_deref())?;
     let store = pay_core::accounts::FileAccountsStore::default_path();
+    let network_override = std::env::var("PAY_NETWORK_ENFORCED").ok();
+    let account_override = std::env::var("PAY_ACTIVE_ACCOUNT").ok();
 
     match outcome {
         RunOutcome::MppChallenge { challenge, .. } => {
-            let (auth_header, _ephemeral) =
-                pay_core::client::mpp::build_credential(&challenge, &store, None, None)?;
+            let (auth_header, _ephemeral) = pay_core::client::mpp::build_credential(
+                &challenge,
+                &store,
+                network_override.as_deref(),
+                account_override.as_deref(),
+            )?;
             let mut headers = extra_headers.to_vec();
             headers.push(("Authorization".to_string(), auth_header));
             interpret_retry(pay_core::client::fetch::fetch_request(
@@ -87,8 +93,12 @@ fn do_paid_fetch(
             )?)
         }
         RunOutcome::X402Challenge { requirements, .. } => {
-            let (payment_header, _ephemeral) =
-                pay_core::client::x402::build_payment(&requirements, &store, None, None)?;
+            let (payment_header, _ephemeral) = pay_core::client::x402::build_payment(
+                &requirements,
+                &store,
+                network_override.as_deref(),
+                account_override.as_deref(),
+            )?;
             let mut headers = extra_headers.to_vec();
             headers.push(("X-PAYMENT".to_string(), payment_header));
             interpret_retry(pay_core::client::fetch::fetch_request(
@@ -220,5 +230,28 @@ mod tests {
     fn do_paid_fetch_returns_error_for_invalid_url() {
         let result = do_paid_fetch("GET", "not-a-url", &[], None);
         assert!(result.is_err());
+    }
+
+    // ── Env var propagation for network/account overrides ─────────────
+
+    #[test]
+    fn network_override_reads_from_env() {
+        // Simulate what main.rs sets when --sandbox is used
+        unsafe { std::env::set_var("PAY_NETWORK_ENFORCED", "localnet") };
+        let val = std::env::var("PAY_NETWORK_ENFORCED").ok();
+        assert_eq!(val.as_deref(), Some("localnet"));
+        unsafe { std::env::remove_var("PAY_NETWORK_ENFORCED") };
+
+        // Without the env var, returns None
+        let val = std::env::var("PAY_NETWORK_ENFORCED").ok();
+        assert!(val.is_none());
+    }
+
+    #[test]
+    fn account_override_reads_from_env() {
+        unsafe { std::env::set_var("PAY_ACTIVE_ACCOUNT", "my-wallet") };
+        let val = std::env::var("PAY_ACTIVE_ACCOUNT").ok();
+        assert_eq!(val.as_deref(), Some("my-wallet"));
+        unsafe { std::env::remove_var("PAY_ACTIVE_ACCOUNT") };
     }
 }

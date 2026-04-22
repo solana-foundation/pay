@@ -67,13 +67,15 @@ pub fn build_credential(
     // succeeds against the wrong cluster.
     check_client_network_intent(network_override, &challenge_network, embedded_blockhash)?;
 
-    // Auto-funding via Surfpool is gated on `network_override` being set —
-    // i.e. the user explicitly opted into sandbox mode via `--sandbox` or
-    // `--local`. Without that signal we don't know whether the localnet
-    // RPC is a Surfpool sandbox or just a real localhost validator, and
-    // probing it would either spam an irrelevant "install Surfpool"
-    // error or silently fund the wrong wallet.
-    let user_opted_into_sandbox = network_override.is_some();
+    // Auto-funding via Surfpool runs when the user explicitly opted into
+    // sandbox (`--sandbox`/`--local`) OR when the challenge embeds a
+    // Surfpool blockhash — meaning we hit a sandbox gateway without a flag.
+    // The `surfnet_setTokenAccount` cheatcode is required to properly
+    // initialize token accounts in surfpool's local state; JIT-fetched
+    // accounts from mainnet are read-only and fail simulation.
+    let is_surfpool_challenge =
+        embedded_blockhash.is_some_and(|h| h.starts_with(SURFPOOL_BLOCKHASH_PREFIX));
+    let user_opted_into_sandbox = network_override.is_some() || is_surfpool_challenge;
     let network = network_override
         .map(str::to_string)
         .unwrap_or(challenge_network);
@@ -86,8 +88,15 @@ pub fn build_credential(
         desc,
     )?;
 
-    let rpc_url =
-        std::env::var("PAY_RPC_URL").unwrap_or_else(|_| default_rpc_url(&network).to_string());
+    let rpc_url = std::env::var("PAY_RPC_URL").unwrap_or_else(|_| {
+        if network == "localnet"
+            && embedded_blockhash.is_some_and(|h| h.starts_with(SURFPOOL_BLOCKHASH_PREFIX))
+        {
+            crate::config::SANDBOX_RPC_URL.to_string()
+        } else {
+            default_rpc_url(&network).to_string()
+        }
+    });
     let rpc = RpcClient::new(rpc_url.clone());
 
     info!(
@@ -104,10 +113,11 @@ pub fn build_credential(
         .build()
         .map_err(|e| Error::Mpp(format!("Failed to create runtime: {e}")))?;
 
-    // Auto-fund when the user opted into sandbox mode and the wallet is
-    // ephemeral. We fund on every call (idempotent) rather than only on
-    // first creation, because Surfpool restarts wipe token balances.
-    if user_opted_into_sandbox && ephemeral_notice.is_some() {
+    // Auto-fund when in sandbox mode. We fund on every call (idempotent)
+    // because Surfpool requires `surfnet_setTokenAccount` to properly
+    // initialize token accounts — JIT-fetched accounts from mainnet
+    // fail simulation without it.
+    if user_opted_into_sandbox {
         let pubkey = signer.pubkey().to_string();
         let fund_url = rpc_url.clone();
         if let Err(e) = rt.block_on(crate::client::sandbox::fund_via_surfpool(
@@ -393,5 +403,129 @@ mod tests {
             Some("SURFNETxNotARealHash"),
         ));
         assert!(msg.contains(SURFPOOL_BLOCKHASH_PREFIX));
+    }
+
+    // ── Surfpool detection & RPC fallback ─────────────────────────────────
+    //
+    // Tests for the auto-detection of sandbox challenges via the embedded
+    // Surfpool blockhash prefix. Covers:
+    // - `user_opted_into_sandbox` derivation
+    // - RPC URL fallback to SANDBOX_RPC_URL
+    // - Behavior with and without `--sandbox` flag
+
+    fn surfpool_hash() -> &'static str {
+        "SURFNETxSAFEHASHxxxxxxxxxxxxxxxxxxx18b8dc98"
+    }
+
+    fn mainnet_hash() -> &'static str {
+        "9zrUHnA1nCByPksy3aL8tQ47vqdaG2vnFs4HrxgcZj4F"
+    }
+
+    /// Helper: compute `user_opted_into_sandbox` using the same logic as
+    /// `build_credential`.
+    fn is_sandbox(network_override: Option<&str>, embedded_blockhash: Option<&str>) -> bool {
+        let is_surfpool_challenge =
+            embedded_blockhash.is_some_and(|h| h.starts_with(SURFPOOL_BLOCKHASH_PREFIX));
+        network_override.is_some() || is_surfpool_challenge
+    }
+
+    /// Helper: compute RPC URL using the same logic as `build_credential`.
+    fn resolve_rpc(
+        network: &str,
+        embedded_blockhash: Option<&str>,
+        pay_rpc_url: Option<&str>,
+    ) -> String {
+        if let Some(url) = pay_rpc_url {
+            url.to_string()
+        } else if network == "localnet"
+            && embedded_blockhash.is_some_and(|h| h.starts_with(SURFPOOL_BLOCKHASH_PREFIX))
+        {
+            crate::config::SANDBOX_RPC_URL.to_string()
+        } else {
+            default_rpc_url(network).to_string()
+        }
+    }
+
+    // ── user_opted_into_sandbox detection ──
+
+    #[test]
+    fn sandbox_detected_with_explicit_flag() {
+        // --sandbox sets network_override = Some("localnet")
+        assert!(is_sandbox(Some("localnet"), None));
+        assert!(is_sandbox(Some("localnet"), Some(surfpool_hash())));
+    }
+
+    #[test]
+    fn sandbox_detected_with_mainnet_flag() {
+        // --mainnet also sets network_override
+        assert!(is_sandbox(Some("mainnet"), None));
+    }
+
+    #[test]
+    fn sandbox_detected_via_surfpool_blockhash_without_flag() {
+        // No flag but challenge has surfpool blockhash → sandbox
+        assert!(is_sandbox(None, Some(surfpool_hash())));
+    }
+
+    #[test]
+    fn sandbox_not_detected_without_flag_or_surfpool() {
+        // No flag, mainnet blockhash → not sandbox
+        assert!(!is_sandbox(None, None));
+        assert!(!is_sandbox(None, Some(mainnet_hash())));
+    }
+
+    #[test]
+    fn sandbox_not_detected_with_partial_surfpool_prefix() {
+        // Partial prefix doesn't count
+        assert!(!is_sandbox(None, Some("SURFNETxNotTheRealPrefix")));
+    }
+
+    // ── RPC URL resolution ──
+
+    #[test]
+    fn rpc_uses_env_var_when_set() {
+        let url = resolve_rpc(
+            "localnet",
+            Some(surfpool_hash()),
+            Some("http://custom:8899"),
+        );
+        assert_eq!(url, "http://custom:8899");
+    }
+
+    #[test]
+    fn rpc_falls_back_to_sandbox_for_surfpool_challenge() {
+        let url = resolve_rpc("localnet", Some(surfpool_hash()), None);
+        assert_eq!(url, crate::config::SANDBOX_RPC_URL);
+    }
+
+    #[test]
+    fn rpc_falls_back_to_localhost_for_non_surfpool_localnet() {
+        let url = resolve_rpc("localnet", Some(mainnet_hash()), None);
+        assert_eq!(url, "http://localhost:8899");
+    }
+
+    #[test]
+    fn rpc_falls_back_to_localhost_for_localnet_no_blockhash() {
+        let url = resolve_rpc("localnet", None, None);
+        assert_eq!(url, "http://localhost:8899");
+    }
+
+    #[test]
+    fn rpc_falls_back_to_mainnet_for_mainnet_network() {
+        let url = resolve_rpc("mainnet", None, None);
+        assert_eq!(url, "https://api.mainnet-beta.solana.com");
+    }
+
+    #[test]
+    fn rpc_falls_back_to_devnet_for_devnet_network() {
+        let url = resolve_rpc("devnet", None, None);
+        assert_eq!(url, "https://api.devnet.solana.com");
+    }
+
+    #[test]
+    fn rpc_ignores_surfpool_blockhash_for_non_localnet() {
+        // Even if blockhash looks like surfpool, non-localnet uses default
+        let url = resolve_rpc("mainnet", Some(surfpool_hash()), None);
+        assert_eq!(url, "https://api.mainnet-beta.solana.com");
     }
 }

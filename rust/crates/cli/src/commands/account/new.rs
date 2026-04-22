@@ -60,7 +60,7 @@ pub fn create_account(
         None => pick_backend()?,
     };
 
-    let (ks, keystore_kind, backend_display) = build_keystore(&backend_id, vault)?;
+    let (ks, keystore_kind, backend_display, op_info) = build_keystore(&backend_id, vault)?;
 
     if ks.exists(name) && !force {
         let pubkey = ks
@@ -92,23 +92,39 @@ pub fn create_account(
         name,
         keystore_kind,
         &pubkey_b58,
-        vault.map(|v| v.to_string()),
+        op_info
+            .as_ref()
+            .and_then(|i| i.vault.clone())
+            .or(vault.map(|v| v.to_string())),
         None,
+        op_info.as_ref().and_then(|i| i.account.clone()),
     )?;
 
     Ok((pubkey_b58, backend_display))
 }
 
+/// Resolved 1Password account info for storing in accounts.yml.
+pub struct OpAccountInfo {
+    pub vault: Option<String>,
+    pub account: Option<String>,
+}
+
 fn build_keystore(
     backend_id: &str,
     vault: Option<&str>,
-) -> pay_core::Result<(Keystore, pay_core::accounts::Keystore, &'static str)> {
+) -> pay_core::Result<(
+    Keystore,
+    pay_core::accounts::Keystore,
+    &'static str,
+    Option<OpAccountInfo>,
+)> {
     match backend_id {
         #[cfg(target_os = "macos")]
         "keychain" => Ok((
             Keystore::apple_keychain(),
             pay_core::accounts::Keystore::AppleKeychain,
             "Apple Keychain",
+            None,
         )),
         #[cfg(not(target_os = "macos"))]
         "keychain" => Err(pay_core::Error::Config(
@@ -126,6 +142,7 @@ fn build_keystore(
                 Keystore::gnome_keyring(),
                 pay_core::accounts::Keystore::GnomeKeyring,
                 "GNOME Keyring",
+                None,
             ))
         }
         #[cfg(not(target_os = "linux"))]
@@ -144,6 +161,7 @@ fn build_keystore(
                 Keystore::windows_hello(),
                 pay_core::accounts::Keystore::WindowsHello,
                 "Windows Hello",
+                None,
             ))
         }
         #[cfg(not(target_os = "windows"))]
@@ -157,16 +175,68 @@ fn build_keystore(
                     "1Password CLI (`op`) is not installed or not signed in.".to_string(),
                 ));
             }
+            let op_account = resolve_op_account()?;
             let ks = match vault {
-                Some(v) => Keystore::onepassword_with_vault(v),
-                None => Keystore::onepassword(),
+                Some(v) => Keystore::onepassword_with_vault(v, op_account.clone()),
+                None => Keystore::onepassword(op_account.clone()),
             };
-            Ok((ks, pay_core::accounts::Keystore::OnePassword, "1Password"))
+            Ok((
+                ks,
+                pay_core::accounts::Keystore::OnePassword,
+                "1Password",
+                Some(OpAccountInfo {
+                    vault: vault.map(|v| v.to_string()),
+                    account: op_account,
+                }),
+            ))
         }
 
         other => Err(pay_core::Error::Config(format!(
             "Unknown backend: {other}. Use 'keychain', 'gnome-keyring', 'windows-hello', or '1password'."
         ))),
+    }
+}
+
+/// Resolve which 1Password account to use. If only one account is
+/// configured, use it automatically. If multiple, prompt the user.
+pub fn resolve_op_account() -> pay_core::Result<Option<String>> {
+    let output = std::process::Command::new("op")
+        .args(["account", "list", "--format=json"])
+        .output()
+        .map_err(|e| pay_core::Error::Config(format!("op account list: {e}")))?;
+
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    #[derive(serde::Deserialize)]
+    struct OpAccount {
+        account_uuid: String,
+        email: String,
+        url: String,
+    }
+
+    let accounts: Vec<OpAccount> = serde_json::from_slice(&output.stdout).unwrap_or_default();
+
+    match accounts.len() {
+        0 => Ok(None),
+        1 => Ok(Some(accounts[0].account_uuid.clone())),
+        _ => {
+            let labels: Vec<String> = accounts
+                .iter()
+                .map(|a| format!("{} ({})", a.email, a.url))
+                .collect();
+
+            let selection =
+                dialoguer::Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
+                    .with_prompt("Which 1Password account?")
+                    .items(&labels)
+                    .default(0)
+                    .interact()
+                    .map_err(|e| pay_core::Error::Config(format!("Prompt error: {e}")))?;
+
+            Ok(Some(accounts[selection].account_uuid.clone()))
+        }
     }
 }
 
@@ -253,6 +323,7 @@ pub fn save_account(
     pubkey: &str,
     vault: Option<String>,
     path: Option<String>,
+    account: Option<String>,
 ) -> pay_core::Result<()> {
     let mut accounts = pay_core::accounts::AccountsFile::load()?;
     accounts.upsert(
@@ -264,6 +335,7 @@ pub fn save_account(
             auth_required: Some(true),
             pubkey: Some(pubkey.to_string()),
             vault,
+            account,
             path,
             secret_key_b58: None,
             created_at: None,

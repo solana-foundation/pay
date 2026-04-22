@@ -5665,6 +5665,7 @@ dependencies = [
 name = "pay-keystore"
 version = "0.7.0"
 dependencies = [
+ "bs58",
  "secret-service",
  "serde",
  "serde_json",
@@ -5700,11 +5701,18 @@ dependencies = [
  "async-stream",
  "axum",
  "base64 0.22.1",
+ "bincode",
  "chrono",
  "include_dir",
  "mime_guess",
  "serde",
  "serde_json",
+ "solana-hash 3.1.0",
+ "solana-instruction 3.4.0",
+ "solana-message 3.1.0",
+ "solana-pubkey 3.0.0",
+ "solana-signature",
+ "solana-transaction",
  "tokio",
 ]
 

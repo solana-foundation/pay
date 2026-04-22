@@ -116,7 +116,7 @@ impl Config {
         }
 
         {
-            let ks = crate::keystore::Keystore::onepassword();
+            let ks = crate::keystore::Keystore::onepassword(None);
             if ks.exists("default") {
                 return Some("1password:default".to_string());
             }

@@ -117,6 +117,10 @@ fn cred_write(target: &[u16], blob: &[u8]) -> Result<()> {
             .try_into()
             .map_err(|_| Error::Backend("credential blob too large".into()))?,
         CredentialBlob: blob.as_ptr().cast_mut(),
+        // CRED_PERSIST_LOCAL_MACHINE: credential is per-user, persists across
+        // reboots, and is protected by DPAPI (user-scoped encryption).
+        // It does NOT grant access to other users on the machine despite
+        // the misleading name.
         Persist: CRED_PERSIST_LOCAL_MACHINE,
         ..Default::default()
     };

@@ -106,6 +106,7 @@ impl ImportCommand {
                 pubkey: Some(pubkey_b58),
                 vault: self.vault,
                 path: None,
+                account: None,
                 secret_key_b58: None,
                 created_at: None,
             },
@@ -256,9 +257,10 @@ pub(super) fn build_keystore(
         )),
 
         "1password" => {
+            let op_account = super::new::resolve_op_account()?;
             let ks = match vault {
-                Some(v) => Keystore::onepassword_with_vault(v),
-                None => Keystore::onepassword(),
+                Some(v) => Keystore::onepassword_with_vault(v, op_account),
+                None => Keystore::onepassword(op_account),
             };
             Ok((
                 ks,

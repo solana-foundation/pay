@@ -101,25 +101,6 @@ impl ExportCommand {
                 })?;
             }
             eprintln!("Exported to {} (pubkey: {})", path, &pubkey);
-
-            let delete =
-                dialoguer::Confirm::with_theme(&dialoguer::theme::ColorfulTheme::default())
-                    .with_prompt(format!(
-                        "Delete the \"{}\" account from the keystore?",
-                        account_name
-                    ))
-                    .default(false)
-                    .interact()
-                    .unwrap_or(false);
-
-            if delete {
-                let destroy_cmd = super::destroy::DestroyCommand {
-                    account: account_name,
-                    sandbox: false,
-                    yes: true,
-                };
-                destroy_cmd.run()?;
-            }
         }
 
         Ok(())
@@ -172,7 +153,7 @@ fn keystore_for_backend(backend: &str) -> pay_core::Result<Keystore> {
             "Windows Hello not available on this platform".to_string(),
         )),
 
-        "1password" => Ok(Keystore::onepassword()),
+        "1password" => Ok(Keystore::onepassword(None)),
 
         other => Err(pay_core::Error::Config(format!("Unknown backend: {other}"))),
     }

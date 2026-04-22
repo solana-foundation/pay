@@ -72,6 +72,8 @@ pub struct PaymentFlow {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub challenge_headers: Option<HashMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub payer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub payment_headers: Option<HashMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_headers: Option<HashMap<String, String>>,

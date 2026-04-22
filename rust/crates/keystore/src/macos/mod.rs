@@ -60,7 +60,7 @@ impl SecretStore for AppleKeychainStore {
     }
 
     fn load(&self, key: &str) -> Result<Zeroizing<Vec<u8>>> {
-        let hex = helper_run(&["read", key])?;
+        let hex = Zeroizing::new(helper_run(&["read", key])?);
         crate::store::hex_decode(hex.trim()).map(Zeroizing::new)
     }
 
@@ -77,6 +77,14 @@ impl SecretStore for AppleKeychainStore {
 }
 
 // ── Swift helper management ─────────────────────────────────────────────────
+//
+// The compiled Swift helper at `~/.cache/pay/pay.sh` is verified via
+// `codesign --verify --strict` on each use. This confirms the binary has a
+// valid signature but does NOT pin to a specific signing identity — an
+// attacker who can write to the cache dir could replace it with any validly
+// signed binary. The cache dir is created with 0o700 permissions to limit
+// this. A future improvement could hash-pin the binary against the embedded
+// HELPER_SOURCE to detect tampering.
 
 fn helper_path() -> Result<PathBuf> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());

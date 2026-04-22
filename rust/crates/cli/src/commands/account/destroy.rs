@@ -74,6 +74,7 @@ impl DestroyCommand {
             .clone()
             .unwrap_or_else(|| "unknown".to_string());
         let keystore_kind = entry.keystore.clone();
+        let op_account = entry.account.clone();
 
         // Show account list with the target in red
         super::list::print_account_list(
@@ -126,7 +127,7 @@ impl DestroyCommand {
         }
 
         // Delete from keystore backend
-        let ks = keystore_for_kind(&keystore_kind)?;
+        let ks = keystore_for_kind(&keystore_kind, op_account)?;
         if let Some(ks) = ks {
             let reason = format!("delete {} account", self.account);
             ks.delete(&self.account, &reason)
@@ -195,7 +196,10 @@ impl DestroyCommand {
 }
 
 /// Build a Keystore for the given kind, or None for File-based/Ephemeral.
-fn keystore_for_kind(kind: &KeystoreKind) -> pay_core::Result<Option<Keystore>> {
+fn keystore_for_kind(
+    kind: &KeystoreKind,
+    op_account: Option<String>,
+) -> pay_core::Result<Option<Keystore>> {
     match kind {
         #[cfg(target_os = "macos")]
         KeystoreKind::AppleKeychain => Ok(Some(Keystore::apple_keychain())),
@@ -218,7 +222,7 @@ fn keystore_for_kind(kind: &KeystoreKind) -> pay_core::Result<Option<Keystore>> 
             "Cannot delete Windows Hello entries on this platform".to_string(),
         )),
 
-        KeystoreKind::OnePassword => Ok(Some(Keystore::onepassword())),
+        KeystoreKind::OnePassword => Ok(Some(Keystore::onepassword(op_account))),
         KeystoreKind::File => Ok(None),
         // Ephemeral keypairs live entirely inside accounts.yml — there's
         // no external keystore to delete from. The earlier `accounts.remove`
@@ -240,6 +244,7 @@ fn discover_legacy_account(name: &str) -> Option<Account> {
                 auth_required: Some(true),
                 pubkey,
                 vault: None,
+                account: None,
                 path: None,
                 secret_key_b58: None,
                 created_at: None,
@@ -266,7 +271,7 @@ fn discover_legacy_account(name: &str) -> Option<Account> {
     }
 
     {
-        let ks = Keystore::onepassword();
+        let ks = Keystore::onepassword(None);
         if ks.exists(name) {
             let pubkey = ks.pubkey(name).ok().map(|b| bs58::encode(&b).into_string());
             return Some(Account {
@@ -275,6 +280,7 @@ fn discover_legacy_account(name: &str) -> Option<Account> {
                 auth_required: Some(true),
                 pubkey,
                 vault: None,
+                account: None,
                 path: None,
                 secret_key_b58: None,
                 created_at: None,

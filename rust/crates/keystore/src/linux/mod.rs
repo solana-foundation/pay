@@ -111,14 +111,14 @@ impl SecretServiceStore {
 impl SecretStore for SecretServiceStore {
     fn store(&self, key: &str, data: &[u8]) -> Result<()> {
         let key = key.to_owned();
-        let data = data.to_owned();
+        let data = Zeroizing::new(data.to_owned());
         run(async move {
             let ss = connect().await?;
             let col = get_or_create_collection(&ss).await?;
             ensure_unlocked(&col).await?;
-            store_item(&col, &key, &data).await?;
+            let result = store_item(&col, &key, &data).await;
             col.lock().await.map_err(ss_err)?;
-            Ok(())
+            result
         })
     }
 
@@ -131,13 +131,16 @@ impl SecretStore for SecretServiceStore {
             })?;
             ensure_unlocked(&col).await?;
 
-            let items = col.search_items(attrs(&key)).await.map_err(ss_err)?;
-            let item = items
-                .first()
-                .ok_or_else(|| Error::Backend(format!("key not found: {key}")))?;
-            let secret = Zeroizing::new(item.get_secret().await.map_err(ss_err)?);
+            let result = async {
+                let items = col.search_items(attrs(&key)).await.map_err(ss_err)?;
+                let item = items
+                    .first()
+                    .ok_or_else(|| Error::Backend(format!("key not found: {key}")))?;
+                Ok(Zeroizing::new(item.get_secret().await.map_err(ss_err)?))
+            }
+            .await;
             col.lock().await.map_err(ss_err)?;
-            Ok(secret)
+            result
         })
     }
 

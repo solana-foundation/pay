@@ -39,6 +39,7 @@ export interface PaymentFlow {
   updatedAt: string; // ISO
   durationMs: number;
   amount?: string;
+  payer?: string;
   steps: FlowStep[];
   events: FlowEvent[];
   // Raw data for detail inspection

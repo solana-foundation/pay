@@ -112,8 +112,15 @@ func doCheckBiometrics() {
 }
 
 func hexToData(_ hex: String) -> Data {
-    var d = Data(); var i = hex.startIndex
-    while i < hex.endIndex { let n = hex.index(i, offsetBy: 2); if let b = UInt8(hex[i..<n], radix: 16) { d.append(b) }; i = n }
+    guard hex.count % 2 == 0 else { fail("hex string has odd length") }
+    var d = Data()
+    var i = hex.startIndex
+    while i < hex.endIndex {
+        let n = hex.index(i, offsetBy: 2)
+        guard let b = UInt8(hex[i..<n], radix: 16) else { fail("invalid hex at offset \(hex.distance(from: hex.startIndex, to: i))") }
+        d.append(b)
+        i = n
+    }
     return d
 }
 
