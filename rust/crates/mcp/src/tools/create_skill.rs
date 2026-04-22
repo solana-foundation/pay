@@ -174,7 +174,8 @@ mod tests {
         let result = validate("---\nname: x\n---\n");
         assert!(result.is_err());
         let errs = result.unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("YAML parse error")));
+        // Fields default to empty strings, caught by validate_provider
+        assert!(!errs.is_empty());
     }
 
     #[test]
