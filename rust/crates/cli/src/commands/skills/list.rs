@@ -25,7 +25,7 @@ pub fn run() -> pay_core::Result<()> {
         eprintln!(
             "  {:<45} {:<38} {}",
             svc.fqn.bold(),
-            svc.title.dimmed(),
+            svc.meta.title.dimmed(),
             stats,
         );
     }

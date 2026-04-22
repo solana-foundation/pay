@@ -73,6 +73,18 @@ pub fn create_account(
             "  Account already exists. Use --force to replace it.".dimmed()
         );
         eprintln!();
+
+        // Ensure the account is registered in accounts.yml even if the
+        // keypair already exists in the keystore (e.g. after a reset).
+        save_account(
+            name,
+            keystore_kind,
+            &pubkey_b58,
+            op_info.as_ref().and_then(|i| i.vault.clone()),
+            None,
+            op_info.as_ref().and_then(|i| i.account.clone()),
+        )?;
+
         return Ok((pubkey_b58, backend_display));
     }
 

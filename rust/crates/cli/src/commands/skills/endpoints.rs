@@ -72,13 +72,13 @@ impl EndpointsCommand {
             }
         }
 
-        if !result.service_url.is_empty() {
+        if !result.meta.service_url.is_empty() {
             eprintln!();
             eprintln!(
                 "  {}",
                 format!(
                     "Gateway: {}\nUse `pay curl <gateway><path>` to make requests.",
-                    result.service_url
+                    result.meta.service_url
                 )
                 .dimmed()
             );

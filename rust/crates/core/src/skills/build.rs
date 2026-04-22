@@ -41,10 +41,8 @@ pub struct SkillsIndex {
 #[derive(Debug, Serialize)]
 pub struct ProviderIndexEntry {
     pub fqn: String,
-    pub title: String,
-    pub description: String,
-    pub category: String,
-    pub service_url: String,
+    #[serde(flatten)]
+    pub meta: pay_types::registry::ServiceMeta,
     pub endpoint_count: usize,
     pub has_metering: bool,
     pub has_free_tier: bool,
@@ -62,11 +60,9 @@ pub struct ProviderDetail {
     pub operator: String,
     /// The origin org whose API is being proxied. Same as operator for native APIs.
     pub origin: String,
-    pub title: String,
-    pub description: String,
-    pub category: String,
+    #[serde(flatten)]
+    pub meta: pay_types::registry::ServiceMeta,
     pub version: String,
-    pub service_url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub openapi_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -332,11 +328,8 @@ fn process_provider_md(
         name: spec.name.clone(),
         operator: operator.to_string(),
         origin: origin.to_string(),
-        title: spec.title.clone(),
-        description: spec.description.clone(),
-        category: spec.category.clone(),
+        meta: spec.meta.clone(),
         version: spec.version.clone(),
-        service_url: spec.service_url.clone(),
         openapi_url: spec.openapi_url.clone(),
         affiliate_policy: spec.affiliate_policy.clone(),
         source: ProviderSource {
@@ -357,10 +350,7 @@ fn process_provider_md(
 
     let index_entry = ProviderIndexEntry {
         fqn: fqn.to_string(),
-        title: spec.title,
-        description: spec.description,
-        category: spec.category,
-        service_url: spec.service_url,
+        meta: spec.meta,
         endpoint_count: detail.endpoints.len(),
         has_metering,
         has_free_tier,

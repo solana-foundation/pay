@@ -61,14 +61,8 @@ pub struct Service {
     /// Fully qualified name: `operator/origin/name` or `operator/name`.
     #[serde(alias = "name")]
     pub fqn: String,
-    #[serde(default)]
-    pub title: String,
-    #[serde(default)]
-    pub description: String,
-    #[serde(default)]
-    pub category: String,
-    #[serde(default)]
-    pub service_url: String,
+    #[serde(flatten)]
+    pub meta: pay_types::registry::ServiceMeta,
     #[serde(default)]
     pub endpoint_count: u32,
     #[serde(default)]
@@ -180,10 +174,8 @@ pub fn group_search_results(hits: &[SearchHit]) -> Vec<SearchResultGroup> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceSummary {
     pub name: String,
-    pub title: String,
-    pub description: String,
-    pub category: String,
-    pub service_url: String,
+    #[serde(flatten)]
+    pub meta: pay_types::registry::ServiceMeta,
     pub endpoint_count: u32,
     pub metered_endpoints: u32,
     pub free_endpoints: u32,
@@ -204,10 +196,8 @@ pub struct ResourceGroup {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceDetail {
     pub name: String,
-    pub title: String,
-    pub description: String,
-    pub category: String,
-    pub service_url: String,
+    #[serde(flatten)]
+    pub meta: pay_types::registry::ServiceMeta,
     pub resources: Vec<ResourceGroup>,
 }
 
@@ -216,7 +206,8 @@ pub struct ServiceDetail {
 pub struct ResourceEndpoints {
     pub service: String,
     pub resource: String,
-    pub service_url: String,
+    #[serde(flatten)]
+    pub meta: pay_types::registry::ServiceMeta,
     pub endpoints: Vec<Endpoint>,
 }
 
@@ -235,7 +226,7 @@ pub fn search(catalog: &Catalog, query: Option<&str>, category: Option<&str>) ->
     for svc in &catalog.providers {
         // Category filter
         if let Some(cat) = category
-            && !svc.category.eq_ignore_ascii_case(cat)
+            && !svc.meta.category.eq_ignore_ascii_case(cat)
         {
             continue;
         }
@@ -243,8 +234,8 @@ pub fn search(catalog: &Catalog, query: Option<&str>, category: Option<&str>) ->
         // Check if the service itself matches the keyword
         let service_matches = match &query_lower {
             Some(q) => {
-                let haystack =
-                    format!("{} {} {}", svc.fqn, svc.title, svc.description).to_lowercase();
+                let haystack = format!("{} {} {}", svc.fqn, svc.meta.title, svc.meta.description)
+                    .to_lowercase();
                 haystack.contains(q.as_str())
             }
             None => true,
@@ -269,8 +260,8 @@ pub fn search(catalog: &Catalog, query: Option<&str>, category: Option<&str>) ->
 
                 hits.push(SearchHit {
                     service: svc.fqn.clone(),
-                    service_title: svc.title.clone(),
-                    service_url: svc.service_url.clone(),
+                    service_title: svc.meta.title.clone(),
+                    service_url: svc.meta.service_url.clone(),
                     method: ep.method.clone(),
                     path: ep.path.clone(),
                     full_path: ep.full_path.clone(),
@@ -284,12 +275,12 @@ pub fn search(catalog: &Catalog, query: Option<&str>, category: Option<&str>) ->
             // Index-only: emit a service-level placeholder hit
             hits.push(SearchHit {
                 service: svc.fqn.clone(),
-                service_title: svc.title.clone(),
-                service_url: svc.service_url.clone(),
+                service_title: svc.meta.title.clone(),
+                service_url: svc.meta.service_url.clone(),
                 method: String::new(),
                 path: String::new(),
                 full_path: String::new(),
-                description: svc.description.clone(),
+                description: svc.meta.description.clone(),
                 resource: String::new(),
                 pricing: None,
                 metered: svc.has_metering,
@@ -337,13 +328,14 @@ pub fn search_services(
         .iter()
         .filter(|svc| {
             if let Some(cat) = category
-                && !svc.category.eq_ignore_ascii_case(cat)
+                && !svc.meta.category.eq_ignore_ascii_case(cat)
             {
                 return false;
             }
             if let Some(ref q) = query_lower {
                 let svc_haystack =
-                    format!("{} {} {}", svc.fqn, svc.title, svc.description).to_lowercase();
+                    format!("{} {} {}", svc.fqn, svc.meta.title, svc.meta.description)
+                        .to_lowercase();
                 if svc_haystack.contains(q.as_str()) {
                     return true;
                 }
@@ -386,10 +378,7 @@ pub fn service_detail(catalog: &Catalog, service_name: &str) -> Option<ServiceDe
 
     Some(ServiceDetail {
         name: svc.fqn.clone(),
-        title: svc.title.clone(),
-        description: svc.description.clone(),
-        category: svc.category.clone(),
-        service_url: svc.service_url.clone(),
+        meta: svc.meta.clone(),
         resources: groups
             .into_iter()
             .map(|(name, (count, metered, methods))| ResourceGroup {
@@ -424,7 +413,7 @@ pub fn resource_endpoints(
     Some(ResourceEndpoints {
         service: svc.fqn.clone(),
         resource: resource_name.to_string(),
-        service_url: svc.service_url.clone(),
+        meta: svc.meta.clone(),
         endpoints,
     })
 }
@@ -786,10 +775,7 @@ fn summarize_service(svc: &Service) -> ServiceSummary {
 
         ServiceSummary {
             name: svc.fqn.clone(),
-            title: svc.title.clone(),
-            description: svc.description.clone(),
-            category: svc.category.clone(),
-            service_url: svc.service_url.clone(),
+            meta: svc.meta.clone(),
             endpoint_count: svc.endpoint_count.max(metered + free),
             metered_endpoints: metered,
             free_endpoints: free,
@@ -800,10 +786,7 @@ fn summarize_service(svc: &Service) -> ServiceSummary {
         // Use pre-computed index metadata
         ServiceSummary {
             name: svc.fqn.clone(),
-            title: svc.title.clone(),
-            description: svc.description.clone(),
-            category: svc.category.clone(),
-            service_url: svc.service_url.clone(),
+            meta: svc.meta.clone(),
             endpoint_count: svc.endpoint_count,
             metered_endpoints: if svc.has_metering {
                 svc.endpoint_count
