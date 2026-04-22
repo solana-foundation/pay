@@ -741,18 +741,48 @@ a.splits-label-name.splits-addr-link:hover {
 }
 
 .event-detail {
+  position: relative;
   color: var(--fg-muted);
   font-size: 12px;
-  font-family: var(--font-mono);
   margin-top: 4px;
   background: var(--bg);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
   padding: 6px 8px;
-  white-space: pre-wrap;
-  word-break: break-all;
-  max-height: 120px;
+  max-height: 150px;
+  overflow: hidden;
+  transition: max-height 0.2s ease;
+}
+
+.event-detail-expanded {
+  max-height: none;
   overflow-y: auto;
+}
+
+.event-detail-pre {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--fg-muted);
+}
+
+.event-detail-fade {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 36px;
+  background: linear-gradient(transparent, var(--bg));
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  padding-bottom: 4px;
+  font-size: 11px;
+  color: var(--fg-secondary);
+  font-family: var(--font-mono);
+  letter-spacing: 0.02em;
 }
 
 /* ── Sidebar ── */
