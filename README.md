@@ -85,12 +85,18 @@ pay setup    # Touch ID on macOS, Windows Hello on Windows, GNOME Keyring on Lin
 
 ## Installation
 
+### Prebuilt Binaries
+
+```sh
+brew install pay
+```
+
 ### From Source
 
 ```sh
 git clone https://github.com/solana-foundation/pay.git
-cd pay/rust
-cargo cli-install
+cd pay
+just install-pay
 ```
 
 ### Verify

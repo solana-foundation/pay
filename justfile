@@ -77,6 +77,11 @@ fmt:
     cd typescript && pnpm --filter @solana/pay fmt
     cd rust && cargo fmt --check
 
+# Install the pay CLI binary
+install-pay:
+    cd pdb && pnpm install --frozen-lockfile && pnpm build
+    cd rust && cargo cli-install
+
 # Full CI — lint, typecheck, test, build
 ci: lint test build
     cd typescript && pnpm --filter @solana/pay typecheck
