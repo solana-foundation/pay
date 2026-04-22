@@ -42,6 +42,12 @@ pub struct SyncCommand {
     /// of each input file.
     #[arg(long)]
     pub origin: Option<String>,
+
+    /// Template for service_url. Use `{name}` as placeholder for the spec name.
+    /// If omitted, falls back to the routing.url from the YAML spec.
+    /// Example: `https://sandbox-pay-google-{name}-v2c65mhlba-uc.a.run.app`
+    #[arg(long)]
+    pub service_url: Option<String>,
 }
 
 impl SyncCommand {
@@ -99,7 +105,7 @@ impl SyncCommand {
                 }
             };
 
-            let md = convert_to_registry_md(&spec, &name);
+            let md = convert_to_registry_md(&spec, &name, self.service_url.as_deref());
 
             let out_path = self
                 .out
@@ -164,7 +170,11 @@ fn expand_paths(patterns: &[String]) -> pay_core::Result<Vec<PathBuf>> {
 }
 
 /// Convert a runtime provider YAML (serde_json::Value) to a registry .md string.
-fn convert_to_registry_md(spec: &serde_json::Value, name: &str) -> String {
+fn convert_to_registry_md(
+    spec: &serde_json::Value,
+    name: &str,
+    service_url_template: Option<&str>,
+) -> String {
     let obj = spec.as_object().expect("spec must be an object");
 
     let title = obj.get("title").and_then(|v| v.as_str()).unwrap_or(name);
@@ -178,11 +188,15 @@ fn convert_to_registry_md(spec: &serde_json::Value, name: &str) -> String {
         .unwrap_or("other");
     let version = obj.get("version").and_then(|v| v.as_str()).unwrap_or("");
 
-    let service_url = obj
-        .get("routing")
-        .and_then(|r| r.get("url"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let service_url = match service_url_template {
+        Some(tpl) => tpl.replace("{name}", name),
+        None => obj
+            .get("routing")
+            .and_then(|r| r.get("url"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+    };
 
     let endpoints = obj
         .get("endpoints")
@@ -231,10 +245,7 @@ fn convert_to_registry_md(spec: &serde_json::Value, name: &str) -> String {
         "category".into(),
         serde_json::Value::String(category.into()),
     );
-    fm.insert(
-        "service_url".into(),
-        serde_json::Value::String(service_url.into()),
-    );
+    fm.insert("service_url".into(), serde_json::Value::String(service_url));
     if !version.is_empty() {
         fm.insert("version".into(), serde_json::Value::String(version.into()));
     }

@@ -11,109 +11,15 @@ use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::{Error, Result};
 
-// ── Known values ───────────────────────────────────────────────────────────
-
-const KNOWN_CATEGORIES: &[&str] = &[
-    "ai_ml",
-    "analytics",
-    "cloud",
-    "compute",
-    "data",
-    "devtools",
-    "finance",
-    "identity",
-    "iot",
-    "maps",
-    "media",
-    "messaging",
-    "other",
-    "productivity",
-    "search",
-    "security",
-    "storage",
-    "translation",
-];
-
-const AFFILIATE_TYPES: &[&str] = &["agent", "cli", "platform"];
-
-// Base58 alphabet for Solana pubkey validation.
-const BASE58_ALPHABET: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-
-// ── Frontmatter types ──────────────────────────────────────────────────────
-
-/// Provider frontmatter — the YAML block in a provider `.md` file.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ProviderFrontmatter {
-    pub name: String,
-    pub title: String,
-    pub description: String,
-    pub category: String,
-    pub service_url: String,
-    #[serde(default)]
-    pub version: String,
-    #[serde(default)]
-    pub openapi_url: Option<String>,
-    #[serde(default)]
-    pub affiliate_policy: Option<AffiliatePolicy>,
-    #[serde(default)]
-    pub endpoints: Vec<EndpointSpec>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AffiliatePolicy {
-    pub enabled: bool,
-    #[serde(default)]
-    pub default_percent: Option<f64>,
-    #[serde(default)]
-    pub allow: Option<Vec<String>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EndpointSpec {
-    pub method: String,
-    pub path: String,
-    pub description: String,
-    #[serde(default)]
-    pub resource: Option<String>,
-    #[serde(default)]
-    pub pricing: Option<serde_json::Value>,
-}
-
-/// Affiliate frontmatter.
-#[derive(Debug, Clone, Deserialize)]
-pub struct AffiliateFrontmatter {
-    pub name: String,
-    pub title: String,
-    #[serde(rename = "type")]
-    pub affiliate_type: String,
-    pub account: String,
-    pub contact: String,
-    #[serde(default)]
-    pub url: Option<String>,
-    #[serde(default = "default_network")]
-    pub network: String,
-}
-
-fn default_network() -> String {
-    "mainnet".to_string()
-}
-
-/// Aggregator frontmatter.
-#[derive(Debug, Clone, Deserialize)]
-pub struct AggregatorFrontmatter {
-    pub name: String,
-    pub title: String,
-    pub url: String,
-    pub contact: String,
-    #[serde(default)]
-    pub description: Option<String>,
-    #[serde(default)]
-    pub catalog_url: Option<String>,
-}
+// Re-export types from pay-types so callers can use `pay_core::skills::build::*`.
+pub use pay_types::registry::{
+    AffiliateFrontmatter, AffiliatePolicy, AggregatorFrontmatter, EndpointSpec, KNOWN_CATEGORIES,
+    ProviderFrontmatter, validate_affiliate, validate_provider,
+};
 
 // ── Output types ───────────────────────────────────────────────────────────
 
@@ -234,52 +140,6 @@ pub fn parse_frontmatter(text: &str) -> Result<(String, String)> {
     let yaml = rest[..end].trim().to_string();
     let content = rest[end + 4..].trim().to_string();
     Ok((yaml, content))
-}
-
-// ── Validation ─────────────────────────────────────────────────────────────
-
-fn valid_base58(s: &str) -> bool {
-    (32..=44).contains(&s.len()) && s.bytes().all(|b| BASE58_ALPHABET.contains(&b))
-}
-
-fn validate_provider(spec: &ProviderFrontmatter, fqn: &str) -> Vec<String> {
-    let mut errs = Vec::new();
-
-    if !KNOWN_CATEGORIES.contains(&spec.category.as_str()) {
-        errs.push(format!("{fqn}: unknown category `{}`", spec.category));
-    }
-    if spec.endpoints.is_empty() {
-        errs.push(format!("{fqn}: must have at least one endpoint"));
-    }
-    for (i, ep) in spec.endpoints.iter().enumerate() {
-        if ep.method.is_empty() {
-            errs.push(format!("{fqn}: endpoint[{i}] missing `method`"));
-        }
-        if ep.path.is_empty() {
-            errs.push(format!("{fqn}: endpoint[{i}] missing `path`"));
-        }
-        if ep.description.is_empty() {
-            errs.push(format!("{fqn}: endpoint[{i}] missing `description`"));
-        }
-    }
-    errs
-}
-
-fn validate_affiliate(spec: &AffiliateFrontmatter, name: &str) -> Vec<String> {
-    let mut errs = Vec::new();
-    if !valid_base58(&spec.account) {
-        errs.push(format!(
-            "affiliate/{name}: invalid account `{}` (must be base58 Solana pubkey)",
-            spec.account
-        ));
-    }
-    if !AFFILIATE_TYPES.contains(&spec.affiliate_type.as_str()) {
-        errs.push(format!(
-            "affiliate/{name}: unknown type `{}`",
-            spec.affiliate_type
-        ));
-    }
-    errs
 }
 
 // ── Price helpers ──────────────────────────────────────────────────────────

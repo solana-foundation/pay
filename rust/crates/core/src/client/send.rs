@@ -28,16 +28,16 @@ pub struct SendResult {
 /// - `amount_str`: either a decimal SOL amount (e.g. `"0.1"`) or `"*"` to drain the account
 ///   (leaving enough for the transaction fee).
 /// - `recipient`: base-58 public key of the recipient.
-/// - `keypair_source`: keypair source string (file path or `keychain:default`).
+/// - `active_account_name`: keypair source string (file path or `keychain:default`).
 /// - `rpc_url`: Solana RPC endpoint.
 pub async fn send_sol(
     amount_str: &str,
     recipient: &str,
-    keypair_source: &str,
+    active_account_name: &str,
     rpc_url: &str,
 ) -> Result<SendResult> {
     let reason = format!("send SOL to {recipient}");
-    let signer = crate::signer::load_signer_with_reason(keypair_source, &reason)?;
+    let signer = crate::signer::load_signer_with_reason(active_account_name, &reason)?;
     let rpc = RpcClient::new(rpc_url.to_string());
 
     let sender_pubkey = signer.pubkey();

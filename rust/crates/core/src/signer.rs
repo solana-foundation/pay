@@ -221,7 +221,21 @@ pub fn load_keypair_bytes_from_account_with_reason(
                 ))
             }
         }
-        Keystore::OnePassword => load_signer_keypair_bytes_with_reason(&source, reason),
+        Keystore::OnePassword => {
+            let op_account = account.account.clone();
+            let ks = if let Some(vault) = &account.vault {
+                crate::keystore::Keystore::onepassword_with_vault(vault.clone(), op_account)
+            } else {
+                crate::keystore::Keystore::onepassword(op_account)
+            };
+            ks.load_keypair(name, reason).map_err(|e| {
+                if matches!(e, crate::keystore::Error::AuthDenied(_)) {
+                    Error::PaymentRejected("rejected by user at 1Password".to_string())
+                } else {
+                    Error::Config(format!("1password: {e}"))
+                }
+            })
+        }
         Keystore::File => load_signer_keypair_bytes_with_reason(&source, reason),
         Keystore::Ephemeral => unreachable!("handled above"),
     }
@@ -400,7 +414,7 @@ fn load_from_keystore_backend(
             ));
         }
 
-        "1password" => crate::keystore::Keystore::onepassword(),
+        "1password" => crate::keystore::Keystore::onepassword(None),
 
         _ => {
             return Err(Error::Config(format!(
@@ -515,6 +529,7 @@ mod tests {
             auth_required: Some(false),
             pubkey: Some(bs58::encode(verifying_key.to_bytes()).into_string()),
             vault: None,
+            account: None,
             path: None,
             secret_key_b58: Some(bs58::encode(&full).into_string()),
             created_at: Some("2026-04-10T00:00:00Z".to_string()),
@@ -685,6 +700,7 @@ mod tests {
             pubkey: None,
             vault: None,
             path: None,
+            account: None,
             secret_key_b58: None,
             created_at: None,
         };

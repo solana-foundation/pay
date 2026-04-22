@@ -119,6 +119,11 @@ pub struct Account {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vault: Option<String>,
 
+    /// 1Password account identifier (UUID or shorthand) used to sign in/out
+    /// of the correct `op` session. Only for `keystore: 1password`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+
     /// File path (only for `keystore: file`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
@@ -514,6 +519,7 @@ fn generate_ephemeral_account() -> Account {
         auth_required: Some(false),
         pubkey: Some(bs58::encode(verifying_key.to_bytes()).into_string()),
         vault: None,
+        account: None,
         path: None,
         secret_key_b58: Some(bs58::encode(&full).into_string()),
         created_at: Some(now_rfc3339()),
@@ -586,6 +592,7 @@ mod tests {
             pubkey: Some(pubkey.to_string()),
             vault: None,
             path: None,
+            account: None,
             secret_key_b58: None,
             created_at: None,
         }
@@ -598,6 +605,7 @@ mod tests {
             auth_required: Some(false),
             pubkey: Some(pubkey.to_string()),
             vault: None,
+            account: None,
             path: None,
             secret_key_b58: Some("test-secret-bytes-base58".to_string()),
             created_at: Some("2026-04-10T00:00:00Z".to_string()),
@@ -652,6 +660,7 @@ mod tests {
             pubkey: None,
             vault: None,
             path: Some("/home/me/.config/solana/id.json".to_string()),
+            account: None,
             secret_key_b58: None,
             created_at: None,
         };
@@ -670,6 +679,7 @@ mod tests {
             pubkey: None,
             vault: None,
             path: None,
+            account: None,
             secret_key_b58: None,
             created_at: None,
         };
@@ -688,6 +698,7 @@ mod tests {
             auth_required: Some(false),
             pubkey: Some("pk".to_string()),
             vault: None,
+            account: None,
             path: None,
             secret_key_b58: Some(bs58::encode(&raw_bytes).into_string()),
             created_at: Some("2026-04-10T00:00:00Z".to_string()),

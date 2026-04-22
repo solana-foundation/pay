@@ -6,9 +6,11 @@ license.workspace = true
 
 [dependencies]
 pay-core = { workspace = true }
+pay-types = { workspace = true }
 pay-keystore = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yml = { workspace = true }
 rmcp = { workspace = true }
 schemars = { workspace = true }
 tokio = { workspace = true }

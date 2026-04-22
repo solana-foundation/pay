@@ -30,6 +30,7 @@ interface ParsedChallenge {
   totalAmount: number;
   recipients: Recipient[];
   feePayerKey?: string;
+  payerAddress?: string;
 }
 
 function parseChallenge(flow: PaymentFlow): ParsedChallenge | null {
@@ -74,6 +75,7 @@ function parseChallenge(flow: PaymentFlow): ParsedChallenge | null {
       totalAmount: rawTotal / divisor,
       recipients,
       feePayerKey: req.methodDetails?.feePayerKey,
+      payerAddress: flow.payer,
     };
   } catch {
     return null;
@@ -234,7 +236,19 @@ export function PaymentSplits({ flow, success }: { flow: PaymentFlow; success: b
         {/* Left labels */}
         <div className="splits-left-info" style={{ height: TOTAL_H, display: 'flex', alignItems: 'flex-start', justifyContent: 'flex-end' }}>
           <div className="splits-sender-label" style={{ marginTop: Math.max(0, SENDER_BAR_H / 2 - 20) }}>
-            <div className="splits-label-name">Payer</div>
+            {parsed.payerAddress ? (
+              <a
+                className="splits-label-name splits-addr-link"
+                href={explorerTokenUrl(parsed.payerAddress, config)}
+                target="_blank"
+                rel="noopener"
+                title={parsed.payerAddress}
+              >
+                Payer
+              </a>
+            ) : (
+              <div className="splits-label-name">Payer</div>
+            )}
             <div className="splits-label-amount">
               <Amount value={total} />
             </div>

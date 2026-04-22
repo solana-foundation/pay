@@ -1355,7 +1355,7 @@ async fn mpp_build_credential_with_surfnet() {
     // Inject the test payer into a MemoryAccountsStore as an ephemeral
     // account mapped to `localnet` — that's how the new
     // `build_credential(challenge, store, network_override, account_override)` API
-    // resolves the wallet (no more `keypair_source: &str`).
+    // resolves the wallet (no more `active_account_name: &str`).
     //
     // build_credential creates its own tokio runtime, so we drive it
     // from a blocking thread.
@@ -1378,6 +1378,7 @@ async fn mpp_build_credential_with_surfnet() {
                 auth_required: Some(false),
                 pubkey: Some(payer_pubkey),
                 vault: None,
+                account: None,
                 path: None,
                 secret_key_b58: Some(bs58::encode(&payer_bytes).into_string()),
                 created_at: Some("2026-04-10T00:00:00Z".to_string()),

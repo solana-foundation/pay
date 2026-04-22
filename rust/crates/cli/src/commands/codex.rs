@@ -14,7 +14,7 @@ pub struct CodexCommand {
 }
 
 impl CodexCommand {
-    pub fn run(self, pay_bin: &str, keypair_source: Option<&str>) -> pay_core::Result<i32> {
+    pub fn run(self, pay_bin: &str, active_account_name: Option<&str>) -> pay_core::Result<i32> {
         let mut cmd = Command::new("codex");
         cmd.arg("-c")
             .arg(format!("mcp_servers.pay.command=\"{pay_bin}\""))
@@ -23,8 +23,8 @@ impl CodexCommand {
 
         // Pass config to MCP server via env
         let mut env_parts = Vec::new();
-        if let Some(source) = keypair_source {
-            env_parts.push(format!("PAY_SECRET_KEY=\"{source}\""));
+        if let Some(source) = active_account_name {
+            env_parts.push(format!("PAY_ACTIVE_ACCOUNT=\"{source}\""));
         }
         if let Ok(url) = std::env::var("PAY_RPC_URL") {
             env_parts.push(format!("PAY_RPC_URL=\"{url}\""));

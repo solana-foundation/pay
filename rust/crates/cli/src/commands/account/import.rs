@@ -1,13 +1,13 @@
-//! `pay account import` — import an existing keypair from a Solana CLI JSON file.
+//! `pay account import` — import an account from a JSON key file.
 
 use dialoguer::{Confirm, Input, theme::ColorfulTheme};
 use owo_colors::OwoColorize;
 use pay_core::keystore::Keystore;
 
-/// Import a keypair from a Solana CLI JSON file into a keystore backend.
+/// Import an account from a JSON key file into a secure keystore.
 #[derive(clap::Args)]
 pub struct ImportCommand {
-    /// Path to the Solana CLI keypair JSON file (64-byte array).
+    /// Path to the JSON key file.
     pub file: String,
 
     /// Account name. Defaults to "default".
@@ -106,6 +106,7 @@ impl ImportCommand {
                 pubkey: Some(pubkey_b58),
                 vault: self.vault,
                 path: None,
+                account: None,
                 secret_key_b58: None,
                 created_at: None,
             },
@@ -256,9 +257,10 @@ pub(super) fn build_keystore(
         )),
 
         "1password" => {
+            let op_account = super::new::resolve_op_account()?;
             let ks = match vault {
-                Some(v) => Keystore::onepassword_with_vault(v),
-                None => Keystore::onepassword(),
+                Some(v) => Keystore::onepassword_with_vault(v, op_account),
+                None => Keystore::onepassword(op_account),
             };
             Ok((
                 ks,

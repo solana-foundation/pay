@@ -71,10 +71,10 @@ impl Config {
     ///
     /// Resolution order:
     /// 1. `accounts.yml` default account
-    /// 2. `PAY_SECRET_KEY` env var
+    /// 2. `PAY_ACTIVE_ACCOUNT` env var
     /// 3. Config file `keypair` field
     /// 4. Legacy: probe Keychain / 1Password directly
-    pub fn default_keypair_source(&self) -> Option<String> {
+    pub fn default_active_account_name(&self) -> Option<String> {
         // 1. accounts.yml — only return a source string for keystore-backed
         //    accounts. Ephemeral accounts have no signer source string and
         //    must be loaded via the network-aware path instead, so they're
@@ -86,8 +86,8 @@ impl Config {
             return Some(source);
         }
 
-        // 2. PAY_SECRET_KEY env var
-        if let Ok(path) = std::env::var("PAY_SECRET_KEY") {
+        // 2. PAY_ACTIVE_ACCOUNT env var
+        if let Ok(path) = std::env::var("PAY_ACTIVE_ACCOUNT") {
             let trimmed = path.trim();
             if !trimmed.is_empty() {
                 return Some(trimmed.to_string());
@@ -116,7 +116,7 @@ impl Config {
         }
 
         {
-            let ks = crate::keystore::Keystore::onepassword();
+            let ks = crate::keystore::Keystore::onepassword(None);
             if ks.exists("default") {
                 return Some("1password:default".to_string());
             }
@@ -289,15 +289,15 @@ mod tests {
         assert_eq!(config.rpc_url(), super::LOCAL_RPC_URL);
     }
 
-    // Note: find_config_path() and default_keypair_source() depend on env vars
-    // (PAY_CONFIG, PAY_SECRET_KEY) and machine state (accounts.yml, keystores).
+    // Note: find_config_path() and default_active_account_name() depend on env vars
+    // (PAY_CONFIG, PAY_ACTIVE_ACCOUNT) and machine state (accounts.yml, keystores).
     // Env-based tests are flaky under parallel execution, so we test the
     // deterministic parts and trust the integration tests for the rest.
 
     #[test]
-    fn default_keypair_source_returns_some_or_none() {
+    fn default_active_account_name_returns_some_or_none() {
         let config = Config::default();
-        let _ = config.default_keypair_source();
+        let _ = config.default_active_account_name();
     }
 
     #[test]

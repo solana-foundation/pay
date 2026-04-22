@@ -166,6 +166,7 @@ impl FlowCorrelation {
             updated_at: now.clone(),
             duration_ms: 0,
             amount,
+            payer: None,
             steps,
             events: vec![
                 FlowEvent {
@@ -217,6 +218,7 @@ impl FlowCorrelation {
 
         let now = &entry.ts;
         flow.payment_headers = Some(entry.req_headers.clone());
+        flow.payer = extract_payer(&entry.req_headers);
         flow.response_headers = Some(entry.res_headers.clone());
         flow.response_body = entry.res_body.clone();
         flow.updated_at = now.clone();
@@ -290,6 +292,7 @@ impl FlowCorrelation {
             updated_at: now.clone(),
             duration_ms: entry.ms,
             amount: None,
+            payer: extract_payer(&entry.req_headers),
             steps,
             events: vec![FlowEvent {
                 ts: now.clone(),
@@ -442,6 +445,61 @@ fn extract_amount(entry: &LogEntry) -> Option<String> {
     None
 }
 
+/// Extract the payer's pubkey from the payment authorization header.
+///
+/// MPP format: `Payment <base64url-json>` where JSON contains a
+/// `payload.transaction` (base64 Solana tx — first signer is the payer).
+fn extract_payer(headers: &HashMap<String, String>) -> Option<String> {
+    let auth = headers.get("authorization")?;
+    let token = auth
+        .strip_prefix("Payment ")
+        .or_else(|| {
+            // Also try case-insensitive match
+            let lower = auth.to_lowercase();
+            if lower.starts_with("payment ") {
+                Some(&auth[8..])
+            } else {
+                None
+            }
+        })?
+        .trim();
+
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(token)
+        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(token))
+        .ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+
+    // Try payload.transaction (base64 Solana tx).
+    // When feePayer is true, account_keys[0] is the server's fee payer.
+    // The actual client/payer is the second signer (the one who signed
+    // the token transfer). We find them by looking at which signatures
+    // are non-zero (the client signs, the fee payer slot is zeroed out
+    // for the server to fill in later).
+    if let Some(tx_b64) = json["payload"]["transaction"].as_str() {
+        let tx_bytes = base64::engine::general_purpose::STANDARD
+            .decode(tx_b64)
+            .ok()?;
+        let tx: solana_transaction::Transaction = bincode::deserialize(&tx_bytes).ok()?;
+
+        // Find the first account key whose signature is non-zero
+        // (the client-signed key). The fee payer signature is typically
+        // all zeros because the server fills it in after verification.
+        let zero_sig = [0u8; 64];
+        for (i, sig) in tx.signatures.iter().enumerate() {
+            if sig.as_ref() != zero_sig && i < tx.message.account_keys.len() {
+                return Some(tx.message.account_keys[i].to_string());
+            }
+        }
+        // Fallback: first account key
+        let pubkey = tx.message.account_keys.first()?;
+        return Some(pubkey.to_string());
+    }
+
+    // Try source field (if the SDK sets it)
+    json["source"].as_str().map(|s| s.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -560,5 +618,158 @@ mod tests {
         }
 
         assert_eq!(engine.snapshot().len(), MAX_FLOWS);
+    }
+
+    // ── extract_payer ────────────────────────────────────────────────────
+
+    #[test]
+    fn extract_payer_returns_none_for_empty_headers() {
+        let headers = HashMap::new();
+        assert!(extract_payer(&headers).is_none());
+    }
+
+    #[test]
+    fn extract_payer_returns_none_for_non_payment_auth() {
+        let mut headers = HashMap::new();
+        headers.insert("authorization".to_string(), "Bearer some-token".to_string());
+        assert!(extract_payer(&headers).is_none());
+    }
+
+    #[test]
+    fn extract_payer_returns_none_for_invalid_base64() {
+        let mut headers = HashMap::new();
+        headers.insert(
+            "authorization".to_string(),
+            "Payment !!!not-base64!!!".to_string(),
+        );
+        assert!(extract_payer(&headers).is_none());
+    }
+
+    #[test]
+    fn extract_payer_returns_none_for_invalid_json() {
+        let mut headers = HashMap::new();
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"not json at all");
+        headers.insert("authorization".to_string(), format!("Payment {b64}"));
+        assert!(extract_payer(&headers).is_none());
+    }
+
+    #[test]
+    fn extract_payer_returns_none_when_no_transaction_in_payload() {
+        let mut headers = HashMap::new();
+        let json = serde_json::json!({
+            "challenge": {"id": "test"},
+            "payload": {"signature": "abc123"}
+        });
+        let b64 =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json.to_string().as_bytes());
+        headers.insert("authorization".to_string(), format!("Payment {b64}"));
+        // Falls through to source field check, which is also absent
+        assert!(extract_payer(&headers).is_none());
+    }
+
+    #[test]
+    fn extract_payer_uses_source_field_as_fallback() {
+        let mut headers = HashMap::new();
+        let json = serde_json::json!({
+            "challenge": {"id": "test"},
+            "source": "MyWalletPubkey123",
+            "payload": {"signature": "abc123"}
+        });
+        let b64 =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json.to_string().as_bytes());
+        headers.insert("authorization".to_string(), format!("Payment {b64}"));
+        assert_eq!(
+            extract_payer(&headers).as_deref(),
+            Some("MyWalletPubkey123")
+        );
+    }
+
+    #[test]
+    fn extract_payer_from_real_transaction() {
+        // Build a minimal valid Solana transaction with a known signer.
+        use solana_transaction::Transaction;
+
+        let fee_payer = solana_pubkey::Pubkey::new_unique();
+        let user_key = solana_pubkey::Pubkey::new_unique();
+
+        // Build a message with fee_payer first, user_key second
+        let instruction = solana_instruction::Instruction::new_with_bytes(
+            solana_pubkey::Pubkey::new_unique(), // program
+            &[],
+            vec![
+                solana_instruction::AccountMeta::new(fee_payer, true),
+                solana_instruction::AccountMeta::new(user_key, true),
+            ],
+        );
+        let blockhash = solana_hash::Hash::default();
+        let message = solana_message::Message::new_with_blockhash(
+            &[instruction],
+            Some(&fee_payer),
+            &blockhash,
+        );
+
+        // Create tx with placeholder signatures (fee_payer=zero, user=nonzero)
+        let tx = Transaction {
+            signatures: vec![
+                solana_signature::Signature::default(), // fee payer: all zeros
+                solana_signature::Signature::new_unique(), // user: non-zero
+            ],
+            message,
+        };
+
+        let tx_bytes = bincode::serialize(&tx).unwrap();
+        let tx_b64 = base64::engine::general_purpose::STANDARD.encode(&tx_bytes);
+
+        let json = serde_json::json!({
+            "challenge": {"id": "test"},
+            "payload": {"type": "transaction", "transaction": tx_b64}
+        });
+        let b64 =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json.to_string().as_bytes());
+
+        let mut headers = HashMap::new();
+        headers.insert("authorization".to_string(), format!("Payment {b64}"));
+
+        let payer = extract_payer(&headers);
+        // Should return user_key (non-zero sig), not fee_payer (zero sig)
+        assert_eq!(payer.as_deref(), Some(user_key.to_string().as_str()));
+    }
+
+    #[test]
+    fn extract_payer_fallback_when_all_sigs_zero() {
+        // If all signatures are zero, fallback to first account key
+        use solana_transaction::Transaction;
+
+        let key = solana_pubkey::Pubkey::new_unique();
+        let instruction = solana_instruction::Instruction::new_with_bytes(
+            solana_pubkey::Pubkey::new_unique(),
+            &[],
+            vec![solana_instruction::AccountMeta::new(key, true)],
+        );
+        let message = solana_message::Message::new_with_blockhash(
+            &[instruction],
+            Some(&key),
+            &solana_hash::Hash::default(),
+        );
+        let tx = Transaction {
+            signatures: vec![solana_signature::Signature::default()],
+            message,
+        };
+
+        let tx_bytes = bincode::serialize(&tx).unwrap();
+        let tx_b64 = base64::engine::general_purpose::STANDARD.encode(&tx_bytes);
+
+        let json = serde_json::json!({
+            "challenge": {"id": "test"},
+            "payload": {"type": "transaction", "transaction": tx_b64}
+        });
+        let b64 =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json.to_string().as_bytes());
+
+        let mut headers = HashMap::new();
+        headers.insert("authorization".to_string(), format!("Payment {b64}"));
+
+        let payer = extract_payer(&headers);
+        assert_eq!(payer.as_deref(), Some(key.to_string().as_str()));
     }
 }

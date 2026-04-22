@@ -89,9 +89,8 @@ pub fn start_background() -> pay_core::Result<String> {
                 .unwrap_or_else(|e| panic!("debugger proxy bind {bind_clone}: {e}"));
 
             eprintln!(
-                "  {} http://{bind_clone}{}/",
-                pay_pdb::PDB_PATH,
-                owo_colors::OwoColorize::green(&"Debugger"),
+                "{} http://{bind_clone}/",
+                owo_colors::OwoColorize::green(&"Payment Debugger"),
             );
 
             axum::serve(listener, app).await.ok();

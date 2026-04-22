@@ -33,6 +33,15 @@ pub enum SyncMode {
 }
 
 /// Composed keystore: auth gate + secret store + shared logic.
+///
+/// # Security note
+///
+/// The auth gate is an **advisory** layer — callers can construct a
+/// `Keystore` with [`NoAuth`](auth::NoAuth) paired with any platform
+/// store. The real security boundary is the OS credential store itself
+/// (Keychain ACLs, DPAPI, Secret Service encryption). The auth gate
+/// provides UX-level protection (biometric prompts) but does not prevent
+/// programmatic access by code running in the same process.
 pub struct Keystore {
     auth: Box<dyn AuthGate>,
     store: Box<dyn SecretStore>,
@@ -58,17 +67,21 @@ impl Keystore {
         Self::new(auth::NoAuth, store::InMemoryStore::new(), false)
     }
 
-    /// 1Password via `op` CLI. Auth handled by `op` internally.
-    pub fn onepassword() -> Self {
-        Self::new(auth::NoAuth, store::OnePasswordStore::new(), false)
+    /// 1Password via `op` CLI with signout/signin auth cycle.
+    pub fn onepassword(account: Option<String>) -> Self {
+        Self::new(
+            store::OnePasswordAuth::new(account.clone()),
+            store::OnePasswordStore::new(account),
+            true,
+        )
     }
 
     /// 1Password targeting a specific vault.
-    pub fn onepassword_with_vault(vault: impl Into<String>) -> Self {
+    pub fn onepassword_with_vault(vault: impl Into<String>, account: Option<String>) -> Self {
         Self::new(
-            auth::NoAuth,
-            store::OnePasswordStore::with_vault(vault),
-            false,
+            store::OnePasswordAuth::new(account.clone()),
+            store::OnePasswordStore::with_vault(vault, account),
+            true,
         )
     }
 
@@ -132,6 +145,7 @@ impl Keystore {
         _sync: SyncMode,
         reason: &str,
     ) -> Result<()> {
+        validate_account_name(account)?;
         validate_keypair(keypair_bytes)?;
 
         if self.auth_on_write {
@@ -151,6 +165,7 @@ impl Keystore {
 
     /// Delete a keypair. `reason` is shown in the OS auth prompt (Touch ID, etc.).
     pub fn delete(&self, account: &str, reason: &str) -> Result<()> {
+        validate_account_name(account)?;
         if self.auth_on_write {
             self.auth.authenticate(reason)?;
         }
@@ -162,11 +177,13 @@ impl Keystore {
 
     /// Get the 32-byte public key without requiring auth.
     pub fn pubkey(&self, account: &str) -> Result<Vec<u8>> {
+        validate_account_name(account)?;
         self.store.load(&pubkey_key(account)).map(|z| z.to_vec())
     }
 
     /// Load the full 64-byte keypair. Triggers auth prompt.
     pub fn load_keypair(&self, account: &str, reason: &str) -> Result<Zeroizing<Vec<u8>>> {
+        validate_account_name(account)?;
         self.auth.authenticate(reason)?;
         self.store.load(&keypair_key(account))
     }
@@ -183,6 +200,23 @@ impl Keystore {
 }
 
 // ── Shared helpers ──────────────────────────────────────────────────────────
+
+fn validate_account_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(Error::InvalidKeypair(
+            "account name cannot be empty".to_string(),
+        ));
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
+    {
+        return Err(Error::InvalidKeypair(format!(
+            "account name contains invalid characters: {name:?} (allowed: a-z, 0-9, '.', '_', '-')"
+        )));
+    }
+    Ok(())
+}
 
 fn validate_keypair(bytes: &[u8]) -> Result<()> {
     if bytes.len() != 64 {
@@ -417,7 +451,7 @@ mod tests {
     fn hex_roundtrip() {
         let data = vec![0xDE, 0xAD, 0xBE, 0xEF];
         let hex = store::hex_encode(&data);
-        assert_eq!(hex, "deadbeef");
+        assert_eq!(&*hex, "deadbeef");
         let decoded = store::hex_decode(&hex).unwrap();
         assert_eq!(decoded, data);
     }

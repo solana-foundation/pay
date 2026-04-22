@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod metering;
+pub mod registry;
 pub mod splits;
 
 /// Represents an HTTP 402 payment challenge returned by a server.

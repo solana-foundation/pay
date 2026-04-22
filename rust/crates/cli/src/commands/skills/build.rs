@@ -14,10 +14,7 @@ pub struct BuildCommand {
     pub path: PathBuf,
 
     /// CDN base URL for detail file references in the index.
-    #[arg(
-        long,
-        default_value = "https://storage.googleapis.com/pay-skills-cdn/v2"
-    )]
+    #[arg(long, default_value = "https://storage.googleapis.com/pay-skills/v2")]
     pub base_url: String,
 
     /// Output directory (default: <path>/dist).

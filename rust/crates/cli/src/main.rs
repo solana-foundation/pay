@@ -121,6 +121,28 @@ fn main() {
     // itself is generated lazily on first use by the network-aware
     // `load_signer_for_network` path — no eager bootstrap, no Touch ID.
     let sandbox_mode = opts.sandbox || opts.local || opts.dev;
+
+    if let Some(ref name) = opts.account {
+        let accounts = pay_core::accounts::AccountsFile::load().unwrap_or_default();
+        let enforced_network = if sandbox_mode {
+            Some("localnet")
+        } else if opts.mainnet {
+            Some("mainnet")
+        } else {
+            None
+        };
+        if let Some(network) = enforced_network {
+            let exists = accounts
+                .accounts
+                .get(network)
+                .is_some_and(|net| net.contains_key(name.as_str()));
+            if !exists {
+                eprintln!("Error: account '{name}' not found in {network}.");
+                std::process::exit(1);
+            }
+        }
+    }
+
     let network_override: Option<String> = if sandbox_mode {
         let rpc_url = if opts.local {
             pay_core::config::LOCAL_RPC_URL.to_string()
@@ -131,8 +153,11 @@ fn main() {
         };
         // SAFETY: called before any threads are spawned.
         unsafe { std::env::set_var("PAY_RPC_URL", &rpc_url) };
+        unsafe { std::env::set_var("PAY_NETWORK_ENFORCED", "localnet") };
         Some("localnet".to_string())
     } else if opts.mainnet {
+        // SAFETY: called before any threads are spawned.
+        unsafe { std::env::set_var("PAY_NETWORK_ENFORCED", "mainnet") };
         Some("mainnet".to_string())
     } else {
         None
@@ -161,7 +186,7 @@ fn main() {
         ) {
         None
     } else if matches!(opts.command, Command::Server { .. } | Command::Topup(_)) {
-        config.default_keypair_source()
+        config.default_active_account_name()
     } else {
         resolve_keypair(&config)
     };
@@ -174,37 +199,8 @@ fn main() {
     // HTTP tools always auto-pay (Touch ID is the approval gate, not the TUI)
     let auto_pay = opts.yolo || sandbox_mode || is_agent || is_http_tool || config.auto_pay;
 
-    // If not auto-paying and stderr is a TTY, show the session setup TUI
-    let has_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
-    let auto_pay =
-        if !auto_pay && has_tty && matches!(opts.command, Command::Claude(_) | Command::Codex(_)) {
-            let tool_kind = opts.command.tool_kind();
-            let account_name = pay_core::accounts::AccountsFile::load()
-                .ok()
-                .and_then(|a| a.default_account().map(|(n, _)| n.to_string()))
-                .unwrap_or_else(|| "default".to_string());
-            match tui::setup_session(tool_kind, &account_name) {
-                Ok(tui::SessionSetup::Approved { cap, expires_in }) => {
-                    eprintln!(
-                        "{}",
-                        format!(
-                            "Session started (cap: {} USDC, expires: {})",
-                            format_cap(cap),
-                            format_duration(expires_in)
-                        )
-                        .dimmed()
-                    );
-                    true
-                }
-                Ok(tui::SessionSetup::Cancelled) => {
-                    eprintln!("{}", "Session cancelled.".dimmed());
-                    std::process::exit(0);
-                }
-                Err(_) => false,
-            }
-        } else {
-            auto_pay
-        };
+    // TODO: session budget TUI — skipped for now, not ready.
+    let _has_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
 
     let output_fmt = opts.output;
 
@@ -252,7 +248,7 @@ fn init_logging(log_format: LogFormat, verbose: bool) {
 
 /// Find a usable keypair, or tell the user to run `pay setup`.
 fn resolve_keypair(config: &Config) -> Option<String> {
-    if let Some(source) = config.default_keypair_source() {
+    if let Some(source) = config.default_active_account_name() {
         return Some(source);
     }
 
@@ -265,7 +261,7 @@ fn resolve_keypair(config: &Config) -> Option<String> {
     );
     eprintln!(
         "{}",
-        "  PAY_SECRET_KEY=<path>     Use an existing keypair file".dimmed()
+        "  PAY_ACTIVE_ACCOUNT=<name>     Use a specific account from accounts.yml".dimmed()
     );
     eprintln!(
         "{}",
@@ -274,6 +270,7 @@ fn resolve_keypair(config: &Config) -> Option<String> {
     std::process::exit(1);
 }
 
+#[allow(dead_code)] // used by session budget TUI (currently disabled)
 fn format_cap(cap: u64) -> String {
     let usdc = cap as f64 / 1_000_000.0;
     if usdc < 1.0 {
@@ -283,6 +280,7 @@ fn format_cap(cap: u64) -> String {
     }
 }
 
+#[allow(dead_code)] // used by session budget TUI (currently disabled)
 fn format_duration(secs: u64) -> String {
     match secs {
         s if s < 60 => format!("{s}s"),
