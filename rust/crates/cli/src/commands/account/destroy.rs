@@ -263,6 +263,7 @@ fn discover_legacy_account(name: &str) -> Option<Account> {
                 auth_required: Some(true),
                 pubkey,
                 vault: None,
+                account: None,
                 path: None,
                 secret_key_b58: None,
                 created_at: None,
