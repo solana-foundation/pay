@@ -18,6 +18,9 @@ tsconfig.tsbuildinfo
 dist/
 .vercel
 
+# CLI binary (downloaded at runtime by run.js)
+typescript/packages/solana-pay/core/bin/
+
 # Rust
 rust/target
 *.swp
