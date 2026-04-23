@@ -381,23 +381,7 @@ fn run_topup(
                     trigger_check(&tx, initial_balances.as_ref().unwrap(), rpc_url, pubkey);
                 }
                 KeyCode::Char('q') | KeyCode::Esc => {
-                    blink_checkmark(
-                        terminal,
-                        pubkey,
-                        account_name,
-                        &options,
-                        selected,
-                        &providers,
-                        provider_selected,
-                        focus,
-                        amount_pos,
-                    )?;
-                    return Ok(Some(TopupDetected {
-                        received: ReceivedFunds {
-                            sol_lamports: 0,
-                            tokens: vec![],
-                        },
-                    }));
+                    return Ok(None);
                 }
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     return Ok(None);
