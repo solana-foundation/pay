@@ -98,6 +98,19 @@ get the exact endpoints you need.
         tools::get_skill_endpoints::run(params).await
     }
 
+    #[tool(description = r#"Get the balance of the active pay account.
+
+Returns the SOL balance and all SPL token balances (USDC, USDT, etc.)
+for the currently configured account. Use this to check available funds
+before making paid API calls.
+"#)]
+    async fn get_balance(
+        &self,
+        Parameters(params): Parameters<tools::get_balance::Params>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        tools::get_balance::run(params).await
+    }
+
     #[tool(description = r#"Create or validate a pay-skills provider listing.
 
 Use this tool when a developer wants to list their API in the pay-skills

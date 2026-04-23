@@ -509,6 +509,10 @@ fn render_topup_selector(
         Block::default().style(Style::default().bg(TOPUP_SIDEBAR_BG)),
         full_columns[0],
     );
+    frame.render_widget(
+        Block::default().style(Style::default().bg(TOPUP_MAIN_BG)),
+        full_columns[1],
+    );
 
     let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
     let columns =
