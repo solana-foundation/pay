@@ -29,9 +29,9 @@ function main() {
   }
 
   const version = pkg.version;
-  const baseUrl = `https://github.com/solana-foundation/pay/releases/download/v${version}`;
+  const baseUrl = `https://github.com/solana-foundation/pay/releases/download/pay-v${version}`;
   const artifactUrl = `${baseUrl}/${meta.artifact}`;
-  const shaUrl = `${artifactUrl}.sha256`;
+  const shaUrl = `${baseUrl}/sha256sums.txt`;
 
   fs.mkdirSync(BIN_DIR, { recursive: true });
 
@@ -44,16 +44,20 @@ function main() {
 
   // Verify checksum
   try {
-    const expectedSha = downloadToString(shaUrl).trim().split(/\s+/)[0];
-    const actualSha = sha256File(artifactPath);
-    if (actualSha !== expectedSha) {
-      console.error(
-        `Checksum mismatch!\n  Expected: ${expectedSha}\n  Actual:   ${actualSha}`,
-      );
-      fs.unlinkSync(artifactPath);
-      process.exit(1);
+    const sums = downloadToString(shaUrl);
+    const line = sums.split("\n").find((l) => l.includes(meta.artifact));
+    if (line) {
+      const expectedSha = line.trim().split(/\s+/)[0];
+      const actualSha = sha256File(artifactPath);
+      if (actualSha !== expectedSha) {
+        console.error(
+          `Checksum mismatch!\n  Expected: ${expectedSha}\n  Actual:   ${actualSha}`,
+        );
+        fs.unlinkSync(artifactPath);
+        process.exit(1);
+      }
+      console.log("Checksum verified.");
     }
-    console.log("Checksum verified.");
   } catch (err) {
     console.warn(`Checksum file not available, skipping verification: ${err.message}`);
   }

@@ -83,6 +83,9 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pnpm-store-
 
+      - name: Copy skills into package
+        run: cp -r skills typescript/packages/solana-pay/core/skills
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
