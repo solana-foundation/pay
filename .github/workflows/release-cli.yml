@@ -1,4 +1,4 @@
-name: Release CLI
+name: Publish pay to GitHub Releases
 
 on:
   workflow_dispatch:
