@@ -5,7 +5,7 @@
 const path = require('path');
 const fs = require('fs');
 const { spawnSync } = require('child_process');
-const { getPlatform } = require('./platform');
+const { getPlatform } = require('./platform.cjs');
 
 const pkg = require('./package.json');
 const platform = getPlatform();
@@ -21,7 +21,7 @@ const binPath = path.join(__dirname, 'bin', meta.binary);
 // Auto-install if binary is missing
 if (!fs.existsSync(binPath)) {
     console.error('pay binary not found. Running install...');
-    const install = spawnSync(process.execPath, [path.join(__dirname, 'install.js')], {
+    const install = spawnSync(process.execPath, [path.join(__dirname, 'install.cjs')], {
         stdio: 'inherit',
     });
     if (install.status !== 0) {

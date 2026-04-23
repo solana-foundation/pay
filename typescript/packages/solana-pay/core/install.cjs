@@ -6,7 +6,7 @@ const path = require('path');
 const https = require('https');
 const { createHash } = require('crypto');
 const { execSync } = require('child_process');
-const { getPlatform } = require('./platform');
+const { getPlatform } = require('./platform.cjs');
 
 const pkg = require('./package.json');
 const BIN_DIR = path.join(__dirname, 'bin');
