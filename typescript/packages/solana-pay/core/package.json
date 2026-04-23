@@ -1,6 +1,6 @@
 {
     "name": "@solana/pay",
-    "version": "1.0.0-beta.0",
+    "version": "1.0.0-beta.1",
     "author": "Solana Maintainers <maintainers@solana.foundation>",
     "repository": "https://github.com/solana-foundation/pay",
     "license": "Apache-2.0",
@@ -9,9 +9,16 @@
     "engines": {
         "node": ">=20"
     },
+    "bin": {
+        "pay": "./run.js"
+    },
     "files": [
         "dist",
         "src",
+        "run.js",
+        "install.js",
+        "platform.js",
+        "skills",
         "LICENSE",
         "README.md"
     ],
@@ -60,6 +67,37 @@
         "@solana/kit-plugin-rpc": "^0.8.0",
         "@solana/rpc-subscriptions-api": "^6.5.0",
         "@solana/rpc-subscriptions-spec": "^6.5.0"
+    },
+    "preferUnplugged": true,
+    "supportedPlatforms": {
+        "aarch64-apple-darwin": {
+            "artifact": "pay-aarch64-apple-darwin.tar.gz",
+            "binary": "pay"
+        },
+        "x86_64-apple-darwin": {
+            "artifact": "pay-x86_64-apple-darwin.tar.gz",
+            "binary": "pay"
+        },
+        "aarch64-unknown-linux-gnu": {
+            "artifact": "pay-aarch64-unknown-linux-gnu.tar.gz",
+            "binary": "pay"
+        },
+        "aarch64-unknown-linux-musl": {
+            "artifact": "pay-aarch64-unknown-linux-musl.tar.gz",
+            "binary": "pay"
+        },
+        "x86_64-unknown-linux-gnu": {
+            "artifact": "pay-x86_64-unknown-linux-gnu.tar.gz",
+            "binary": "pay"
+        },
+        "x86_64-unknown-linux-musl": {
+            "artifact": "pay-x86_64-unknown-linux-musl.tar.gz",
+            "binary": "pay"
+        },
+        "x86_64-pc-windows-msvc": {
+            "artifact": "pay-x86_64-pc-windows-msvc.zip",
+            "binary": "pay.exe"
+        }
     },
     "devDependencies": {
         "@eslint/js": "^9.39.1",
