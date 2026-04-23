@@ -312,10 +312,6 @@ pub fn pick_backend() -> pay_core::Result<String> {
         ));
     }
 
-    if options.len() == 1 {
-        return Ok(options.remove(0).id.to_string());
-    }
-
     let items: Vec<String> = options.iter().map(|o| o.label.clone()).collect();
 
     eprintln!();
@@ -377,6 +373,14 @@ pub fn print_next_steps(
         if !amount.is_empty() {
             eprintln!("  {} Account funded with {}", "✔".green(), amount.green());
         }
+        eprintln!();
+        eprintln!(
+            "  {}",
+            "Ready to go. Time to make HTTP pay for itself.".dimmed()
+        );
+        eprintln!();
+        eprintln!("  {}", "$ pay claude".bold());
+        eprintln!("  {}", "$ pay codex".bold());
     } else {
         let topup_cmd = if name == "default" {
             "pay topup".to_string()
@@ -384,17 +388,13 @@ pub fn print_next_steps(
             format!("pay topup --account {name}")
         };
         eprintln!();
-        eprintln!("  {}", "Fund your account:".dimmed());
-        eprintln!("  {}", format!("$ {topup_cmd}").bold());
+        eprintln!(
+            "  {}",
+            "A top-up is required before making paid requests.".dimmed()
+        );
+        eprintln!("  {}", format!("When ready, run: $ {topup_cmd}").dimmed());
     }
-    eprintln!();
-    eprintln!(
-        "  {}",
-        "Ready to go. Time to make HTTP pay for itself.".dimmed()
-    );
-    eprintln!();
-    eprintln!("  {}", "$ pay claude".bold());
-    eprintln!("  {}", "$ pay codex".bold());
+
     eprintln!();
 }
 

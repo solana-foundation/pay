@@ -121,7 +121,10 @@ pub fn build_payment(
             let payload = rt
                 .block_on(build_payment_payload(&signer, &rpc, requirements))
                 .map_err(|e| Error::Mpp(format!("Failed to build x402 payment: {e}")))?;
-            (X402_V1_PAYMENT_HEADER, encode_v1_payment_header(&payload, requirements)?)
+            (
+                X402_V1_PAYMENT_HEADER,
+                encode_v1_payment_header(&payload, requirements)?,
+            )
         }
         _ => {
             let header = rt
@@ -186,12 +189,11 @@ fn detect_x402_version(headers: &[(String, String)], body: Option<&str>) -> u8 {
         return 2;
     }
 
-    if let Some(body) = body {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
-            if let Some(version) = json.get("x402Version").and_then(|v| v.as_u64()) {
-                return version as u8;
-            }
-        }
+    if let Some(body) = body
+        && let Ok(json) = serde_json::from_str::<serde_json::Value>(body)
+        && let Some(version) = json.get("x402Version").and_then(|v| v.as_u64())
+    {
+        return version as u8;
     }
 
     if headers.iter().any(|(k, _)| k == "x-payment-required") {
@@ -217,8 +219,7 @@ fn normalize_x402_headers(headers: &[(String, String)]) -> Vec<(String, String)>
 
 fn decoded_payment_required_body(headers: &[(String, String)]) -> Option<String> {
     let (_, value) = headers.iter().find(|(k, _)| k == "payment-required")?;
-    let decoded =
-        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, value).ok()?;
+    let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, value).ok()?;
     String::from_utf8(decoded).ok()
 }
 
@@ -236,9 +237,9 @@ fn encode_v1_payment_header(
     };
 
     let network = match requirements.cluster.as_deref() {
-        Some("devnet") | Some("solana-devnet") | Some("solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1") => {
-            "solana-devnet"
-        }
+        Some("devnet")
+        | Some("solana-devnet")
+        | Some("solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1") => "solana-devnet",
         _ => "solana",
     };
 
@@ -305,7 +306,9 @@ async fn build_payment_header_v2_with_context(
         base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
             serde_json::to_string(&envelope)
-                .map_err(|e| solana_x402::error::Error::Other(format!("JSON serialization failed: {e}")))?
+                .map_err(|e| {
+                    solana_x402::error::Error::Other(format!("JSON serialization failed: {e}"))
+                })?
                 .as_bytes(),
         )
     };

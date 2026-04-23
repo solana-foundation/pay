@@ -228,21 +228,21 @@ pub(crate) fn classify_402(
 
     // Session MPP: the method field ("solana") indicates chain support.
     // Session requests don't use ChargeRequest so mpp_is_solana doesn't apply.
-    if let Some(challenge) = &mpp_challenge {
-        if challenge.intent.as_str() == "session" {
-            let is_solana_method = challenge.method.as_str() == "solana";
-            if is_solana_method {
-                info!(
-                    resource = resource_url,
-                    "Detected MPP session challenge (Solana)"
-                );
-                return RunOutcome::SessionChallenge {
-                    challenge: Box::new(challenge.clone()),
-                    resource_url: resource_url.to_string(),
-                };
-            }
-            // Non-Solana session — fall through to x402 or error.
+    if let Some(challenge) = &mpp_challenge
+        && challenge.intent.as_str() == "session"
+    {
+        let is_solana_method = challenge.method.as_str() == "solana";
+        if is_solana_method {
+            info!(
+                resource = resource_url,
+                "Detected MPP session challenge (Solana)"
+            );
+            return RunOutcome::SessionChallenge {
+                challenge: Box::new(challenge.clone()),
+                resource_url: resource_url.to_string(),
+            };
         }
+        // Non-Solana session — fall through to x402 or error.
     }
 
     // Prefer MPP for one-shot Solana payments (native protocol).

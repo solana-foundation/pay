@@ -483,8 +483,7 @@ fn pay_x402_and_retry(
         eprintln!("{}", "Payment signed, retrying...\n".dimmed());
     }
 
-    let retry_outcome =
-        retry_with_header(tool, payment_header_name, &payment_json, fetch_headers)?;
+    let retry_outcome = retry_with_header(tool, payment_header_name, &payment_json, fetch_headers)?;
     handle_retry_outcome(retry_outcome, is_json)
 }
 
