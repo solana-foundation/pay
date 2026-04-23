@@ -1,4 +1,4 @@
-name: Docker
+name: Publish pay to GHCR
 on:
   push:
     tags: ["pay-v*"]
