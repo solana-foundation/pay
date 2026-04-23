@@ -13,8 +13,10 @@ const BIN_DIR = path.join(__dirname, 'bin');
 const VERSION_FILE = path.join(BIN_DIR, '.version');
 
 function main() {
+    const version = pkg.cliVersion || resolveLatestCliVersion();
+
     // Skip if already installed at the correct version
-    if (fs.existsSync(VERSION_FILE) && fs.readFileSync(VERSION_FILE, 'utf-8').trim() === pkg.version) {
+    if (fs.existsSync(VERSION_FILE) && fs.readFileSync(VERSION_FILE, 'utf-8').trim() === version) {
         return;
     }
 
@@ -25,7 +27,6 @@ function main() {
         process.exit(1);
     }
 
-    const version = pkg.version;
     const baseUrl = `https://github.com/solana-foundation/pay/releases/download/pay-v${version}`;
     const artifactUrl = `${baseUrl}/${meta.artifact}`;
     const shaUrl = `${baseUrl}/sha256sums.txt`;
@@ -77,6 +78,20 @@ function main() {
     fs.writeFileSync(VERSION_FILE, version);
 
     console.log(`pay v${version} installed successfully.`);
+}
+
+/**
+ * Query the GitHub API for the latest pay-v* release tag.
+ * @returns {string}
+ */
+function resolveLatestCliVersion() {
+    const json = downloadToString('https://api.github.com/repos/solana-foundation/pay/releases?per_page=20');
+    const releases = JSON.parse(json);
+    const release = releases.find(r => r.tag_name && r.tag_name.startsWith('pay-v') && !r.draft);
+    if (!release) {
+        throw new Error('No CLI release found on GitHub');
+    }
+    return release.tag_name.replace('pay-v', '');
 }
 
 /**
