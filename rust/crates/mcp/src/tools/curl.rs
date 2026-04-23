@@ -92,15 +92,15 @@ fn do_paid_fetch(
                 body.as_deref(),
             )?)
         }
-        RunOutcome::X402Challenge { requirements, .. } => {
-            let (payment_header, _ephemeral) = pay_core::client::x402::build_payment(
-                &requirements,
+        RunOutcome::X402Challenge { challenge, .. } => {
+            let (payment_header_name, payment_header, _ephemeral) = pay_core::client::x402::build_payment(
+                &challenge,
                 &store,
                 network_override.as_deref(),
                 account_override.as_deref(),
             )?;
             let mut headers = extra_headers.to_vec();
-            headers.push(("X-PAYMENT".to_string(), payment_header));
+            headers.push((payment_header_name.to_string(), payment_header));
             interpret_retry(pay_core::client::fetch::fetch_request(
                 method,
                 url,
@@ -253,5 +253,11 @@ mod tests {
         let val = std::env::var("PAY_ACTIVE_ACCOUNT").ok();
         assert_eq!(val.as_deref(), Some("my-wallet"));
         unsafe { std::env::remove_var("PAY_ACTIVE_ACCOUNT") };
+    }
+
+    #[test]
+    fn x402_paid_fetch_supports_v1_and_v2_header_names() {
+        assert_eq!(pay_core::x402::X402_V1_PAYMENT_HEADER, "X-PAYMENT");
+        assert_eq!(pay_core::x402::X402_V2_PAYMENT_HEADER, "PAYMENT-SIGNATURE");
     }
 }

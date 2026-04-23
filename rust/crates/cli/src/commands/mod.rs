@@ -312,7 +312,7 @@ fn handle_outcome(
         }
 
         RunOutcome::X402Challenge {
-            requirements,
+            challenge,
             resource_url,
         } => {
             if auto_pay {
@@ -321,13 +321,13 @@ fn handle_outcome(
                         "{}",
                         format!(
                             "402 Payment Required (x402) — {} {}",
-                            requirements.amount, requirements.currency
+                            challenge.requirements.amount, challenge.requirements.currency
                         )
                         .dimmed()
                     );
                 }
                 return pay_x402_and_retry(
-                    &requirements,
+                    &challenge,
                     tool,
                     output_fmt,
                     fetch_headers,
@@ -342,11 +342,11 @@ fn handle_outcome(
                     "status": 402,
                     "protocol": "x402",
                     "challenge": {
-                        "amount": requirements.amount,
-                        "currency": requirements.currency,
-                        "recipient": requirements.recipient,
-                        "description": requirements.description,
-                        "cluster": requirements.cluster,
+                        "amount": challenge.requirements.amount,
+                        "currency": challenge.requirements.currency,
+                        "recipient": challenge.requirements.recipient,
+                        "description": challenge.requirements.description,
+                        "cluster": challenge.requirements.cluster,
                     },
                     "resource": resource_url,
                 }))?;
@@ -355,7 +355,7 @@ fn handle_outcome(
                     "{}",
                     format!(
                         "402 Payment Required (x402) — {} {} — use --yolo to pay automatically",
-                        requirements.amount, requirements.currency
+                        challenge.requirements.amount, challenge.requirements.currency
                     )
                     .dimmed()
                 );
@@ -457,7 +457,7 @@ fn pay_mpp_and_retry(
 }
 
 fn pay_x402_and_retry(
-    requirements: &X402Challenge,
+    challenge: &X402Challenge,
     tool: &Tool,
     output_fmt: Option<OutputFormat>,
     fetch_headers: Option<Vec<(String, String)>>,
@@ -472,8 +472,8 @@ fn pay_x402_and_retry(
     }
 
     let store = pay_core::accounts::FileAccountsStore::default_path();
-    let (payment_json, ephemeral_notice) =
-        x402::build_payment(requirements, &store, network_override, account_override)?;
+    let (payment_header_name, payment_json, ephemeral_notice) =
+        x402::build_payment(challenge, &store, network_override, account_override)?;
 
     if let Some(resolved) = ephemeral_notice {
         render_generated_wallet_notice(&resolved, is_json)?;
@@ -483,7 +483,8 @@ fn pay_x402_and_retry(
         eprintln!("{}", "Payment signed, retrying...\n".dimmed());
     }
 
-    let retry_outcome = retry_with_header(tool, "X-PAYMENT", &payment_json, fetch_headers)?;
+    let retry_outcome =
+        retry_with_header(tool, payment_header_name, &payment_json, fetch_headers)?;
     handle_retry_outcome(retry_outcome, is_json)
 }
 
@@ -758,5 +759,11 @@ mod tests {
     #[test]
     fn tool_kind_mcp() {
         assert!(matches!(Command::Mcp.tool_kind(), ToolKind::Mcp));
+    }
+
+    #[test]
+    fn x402_retry_supports_v1_and_v2_header_names() {
+        assert_eq!(pay_core::x402::X402_V1_PAYMENT_HEADER, "X-PAYMENT");
+        assert_eq!(pay_core::x402::X402_V2_PAYMENT_HEADER, "PAYMENT-SIGNATURE");
     }
 }

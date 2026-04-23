@@ -3,8 +3,6 @@ use std::process::{Command, Stdio};
 use tempfile::NamedTempFile;
 use tracing::{debug, info};
 
-use solana_x402::protocol::methods::solana::PaymentRequirements;
-
 use crate::client::mpp;
 use crate::client::x402;
 use crate::{Error, Result};
@@ -25,7 +23,7 @@ pub enum RunOutcome {
     },
     /// The server returned 402 with an x402 challenge.
     X402Challenge {
-        requirements: Box<PaymentRequirements>,
+        challenge: Box<x402::Challenge>,
         resource_url: String,
     },
     /// The server returned 402 but without a recognized payment protocol.
@@ -185,29 +183,95 @@ pub(crate) fn classify_402(
         };
     }
 
-    // Check for MPP challenge in www-authenticate header
-    if let Some(www_auth) = headers.iter().find(|(k, _)| k == "www-authenticate")
-        && let Some(challenge) = mpp::parse(&www_auth.1)
-    {
+    // Parse both protocols — multi-chain endpoints may advertise both
+    // x402 (Solana + Base) and Tempo/MPP (EVM-only).
+    //
+    // Some servers use `payment-required` instead of `x-payment-required`
+    // for x402. If the standard parse fails, try decoding `payment-required`
+    // as base64 JSON and re-parse.
+    let x402_challenge = x402::parse(headers, body).or_else(|| {
+        headers
+            .iter()
+            .find(|(k, _)| k == "payment-required")
+            .and_then(|(_, v)| {
+                use base64::Engine;
+                let decoded = base64::engine::general_purpose::STANDARD.decode(v).ok()?;
+                let json_str = String::from_utf8(decoded).ok()?;
+                // Re-parse with the decoded JSON as the body
+                let synthetic_headers: Vec<(String, String)> =
+                    vec![("x-payment-required".to_string(), json_str.clone())];
+                x402::parse(&synthetic_headers, Some(&json_str))
+            })
+    });
+    let mpp_challenge = headers
+        .iter()
+        .find(|(k, _)| k == "www-authenticate")
+        .and_then(|(_, v)| mpp::parse(v));
+
+    // x402::parse (from solana_x402) only returns Some when a Solana-
+    // compatible `accepts` entry exists — it's already a Solana filter.
+    // MPP is chain-agnostic at the parse level, so we need to validate
+    // the recipient is a valid Solana pubkey.
+    let mpp_is_solana = mpp_challenge.as_ref().is_some_and(|c| {
+        c.request
+            .decode()
+            .ok()
+            .map(|r: solana_mpp::ChargeRequest| {
+                // Solana recipients are 32-44 char Base58 strings.
+                // EVM addresses start with "0x" — quick reject.
+                r.recipient
+                    .as_deref()
+                    .is_some_and(|s| !s.starts_with("0x") && s.len() >= 32 && s.len() <= 44)
+            })
+            .unwrap_or(false)
+    });
+
+    // Session MPP: the method field ("solana") indicates chain support.
+    // Session requests don't use ChargeRequest so mpp_is_solana doesn't apply.
+    if let Some(challenge) = &mpp_challenge {
         if challenge.intent.as_str() == "session" {
-            info!(resource = resource_url, "Detected MPP session challenge");
-            return RunOutcome::SessionChallenge {
-                challenge: Box::new(challenge),
-                resource_url: resource_url.to_string(),
-            };
+            let is_solana_method = challenge.method.as_str() == "solana";
+            if is_solana_method {
+                info!(
+                    resource = resource_url,
+                    "Detected MPP session challenge (Solana)"
+                );
+                return RunOutcome::SessionChallenge {
+                    challenge: Box::new(challenge.clone()),
+                    resource_url: resource_url.to_string(),
+                };
+            }
+            // Non-Solana session — fall through to x402 or error.
         }
-        info!(resource = resource_url, "Detected MPP challenge");
+    }
+
+    // Prefer MPP for one-shot Solana payments (native protocol).
+    if mpp_is_solana {
+        let challenge = mpp_challenge.unwrap();
+        info!(resource = resource_url, "Detected MPP challenge (Solana)");
         return RunOutcome::MppChallenge {
             challenge: Box::new(challenge),
             resource_url: resource_url.to_string(),
         };
     }
 
-    // Check for x402 challenge (header or body)
-    if let Some(requirements) = x402::parse(headers, body) {
-        info!(resource = resource_url, "Detected x402 challenge");
+    // Fall back to x402 if it has a Solana path.
+    if let Some(challenge) = x402_challenge {
+        info!(resource = resource_url, "Detected x402 challenge (Solana)");
         return RunOutcome::X402Challenge {
-            requirements: Box::new(requirements),
+            challenge: Box::new(challenge),
+            resource_url: resource_url.to_string(),
+        };
+    }
+
+    // Neither protocol supports Solana — tell the user clearly.
+    if mpp_challenge.is_some() {
+        return RunOutcome::PaymentRejected {
+            reason: "Server requires payment but only accepts non-Solana chains \
+                     (e.g. Base/EVM). This endpoint is not compatible with `pay`. \
+                     Check if the provider supports Solana USDC."
+                .to_string(),
+            retryable: false,
             resource_url: resource_url.to_string(),
         };
     }
@@ -444,6 +508,39 @@ HTTP request sent, awaiting response...
 
         let outcome = classify_402(&headers, None, "https://example.com/resource");
         assert!(matches!(outcome, RunOutcome::X402Challenge { .. }));
+    }
+
+    #[test]
+    fn classify_402_rejects_evm_only_mpp_with_clear_error() {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        // MPP challenge with EVM-style Tempo recipient (not Solana)
+        let request_json = serde_json::json!({
+            "amount": "10000",
+            "currency": "0x20c00000000000000000000b9537d11c60e8b50",
+            "methodDetails": { "chainId": 4217 },
+            "recipient": "0x325bdF6F7efAB24a2210c48c1b64cAb2eAe1d430"
+        });
+        let b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&request_json).unwrap());
+        let headers = vec![(
+            "www-authenticate".to_string(),
+            format!(
+                "Payment id=\"test\", realm=\"test\", method=\"tempo\", intent=\"charge\", request=\"{b64}\""
+            ),
+        )];
+
+        // EVM-only MPP with no x402 fallback → clear rejection
+        let outcome = classify_402(&headers, None, "https://evm-only.example.com/api");
+        match outcome {
+            RunOutcome::PaymentRejected { reason, .. } => {
+                assert!(
+                    reason.contains("non-Solana"),
+                    "Expected non-Solana message, got: {reason}"
+                );
+            }
+            other => panic!("Expected PaymentRejected, got: {other:?}"),
+        }
     }
 
     #[test]
