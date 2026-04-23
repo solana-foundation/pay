@@ -99,10 +99,14 @@ pub async fn send_sol(
         .ok_or_else(|| Error::Config("Signer not found in transaction".to_string()))?;
     tx.signatures[signer_index] = sig;
 
-    // Send and confirm
+    // Send TX
     let signature = rpc
-        .send_and_confirm_transaction(&tx)
+        .send_transaction(&tx)
         .map_err(|e| Error::Config(format!("Transaction failed: {e}")))?;
+
+    // Confirm TX
+    rpc.confirm_transaction(&signature)
+        .map_err(|e| Error::Config(format!("Confirmation failed: {e}")))?;
 
     Ok(SendResult {
         signature: signature.to_string(),
