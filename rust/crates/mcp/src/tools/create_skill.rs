@@ -116,9 +116,9 @@ pub fn validate(content: &str) -> Result<ValidatedProvider, Vec<String>> {
         return Err(validation_errors);
     }
 
-    if spec.meta.description.len() > 120 {
+    if spec.meta.description.len() > 255 {
         errors.push(format!(
-            "description is {} chars (max 120): \"{}\"",
+            "description is {} chars (max 255): \"{}\"",
             spec.meta.description.len(),
             spec.meta.description
         ));
@@ -198,14 +198,14 @@ mod tests {
 
     #[test]
     fn validate_long_description() {
-        let long_desc = "A".repeat(121);
+        let long_desc = "A".repeat(256);
         let md = format!(
             "---\nname: x\ntitle: X\ndescription: \"{long_desc}\"\ncategory: data\nservice_url: https://x.com\nendpoints:\n  - method: GET\n    path: v1\n    description: Do thing\n---\n"
         );
         let result = validate(&md);
         assert!(result.is_err());
         let errs = result.unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("120")));
+        assert!(errs.iter().any(|e| e.contains("255")));
     }
 
     #[test]

@@ -686,6 +686,177 @@ pub struct Service {
     pub facilitator: String,
 }
 
+// =============================================================================
+// Validation
+// =============================================================================
+
+/// Validate an API spec's metering and split configuration.
+///
+/// Catches configuration errors that would only surface at runtime as
+/// `SplitsExceedTotal` or `UnknownRecipient` errors. Run this during
+/// `pay skills provider sync` and `pay skills build` to fail fast.
+pub fn validate_api_spec(spec: &ApiSpec) -> Vec<String> {
+    let mut errs = Vec::new();
+
+    for ep in &spec.endpoints {
+        let Some(metering) = &ep.metering else {
+            continue;
+        };
+        let path = &ep.path;
+
+        validate_splits_have_pricing(metering, path, &mut errs);
+        validate_splits_within_price(metering, path, &mut errs);
+        validate_split_recipients(metering, &spec.recipients, path, &mut errs);
+        validate_split_rules(metering, path, &mut errs);
+        validate_tier_splits(metering, &spec.recipients, path, &mut errs);
+    }
+
+    errs
+}
+
+/// Splits require explicit pricing dimensions — `sku_tiers` alone resolves
+/// to `price_usd: 0.0`, which always triggers `SplitsExceedTotal`.
+fn validate_splits_have_pricing(metering: &Metering, path: &str, errs: &mut Vec<String>) {
+    if !metering.splits.is_empty() && metering.dimensions.is_empty() && metering.variants.is_empty()
+    {
+        errs.push(format!(
+            "endpoint `{path}`: has splits but no pricing dimensions — \
+             sku_tiers alone resolve to $0.00, causing 'Splits consume the entire amount' at runtime"
+        ));
+    }
+}
+
+/// The sum of all splits must be strictly less than the minimum non-zero
+/// per-unit price across all tiers (i.e. `price_usd / scale`).
+fn validate_splits_within_price(metering: &Metering, path: &str, errs: &mut Vec<String>) {
+    if metering.splits.is_empty() {
+        return;
+    }
+
+    let min_price = min_nonzero_per_unit_price(&metering.dimensions);
+    if min_price == 0.0 {
+        return; // No priced tiers — covered by validate_splits_have_pricing.
+    }
+
+    let fixed_total: f64 = metering.splits.iter().filter_map(|s| s.amount).sum();
+    let percent_total: f64 = metering
+        .splits
+        .iter()
+        .filter_map(|s| s.percent)
+        .sum::<f64>()
+        / 100.0
+        * min_price;
+    let splits_total = fixed_total + percent_total;
+
+    if splits_total >= min_price {
+        errs.push(format!(
+            "endpoint `{path}`: splits total (${splits_total:.6}) >= \
+             minimum per-unit price (${min_price:.6}) — primary recipient would receive nothing"
+        ));
+    }
+}
+
+/// Every split recipient alias must exist in the spec-level `recipients` map.
+fn validate_split_recipients(
+    metering: &Metering,
+    recipients: &std::collections::HashMap<String, RecipientAlias>,
+    path: &str,
+    errs: &mut Vec<String>,
+) {
+    for split in &metering.splits {
+        if !recipients.contains_key(&split.recipient) {
+            errs.push(format!(
+                "endpoint `{path}`: split references unknown recipient `{}`",
+                split.recipient
+            ));
+        }
+    }
+}
+
+/// Each split must have exactly one of `amount` or `percent`.
+fn validate_split_rules(metering: &Metering, path: &str, errs: &mut Vec<String>) {
+    for split in &metering.splits {
+        match (split.amount, split.percent) {
+            (Some(_), Some(_)) => errs.push(format!(
+                "endpoint `{path}`: split for `{}` has both amount and percent — pick one",
+                split.recipient
+            )),
+            (None, None) => errs.push(format!(
+                "endpoint `{path}`: split for `{}` has neither amount nor percent",
+                split.recipient
+            )),
+            _ => {}
+        }
+    }
+}
+
+/// Validate per-tier split overrides against their tier's per-unit price.
+fn validate_tier_splits(
+    metering: &Metering,
+    recipients: &std::collections::HashMap<String, RecipientAlias>,
+    path: &str,
+    errs: &mut Vec<String>,
+) {
+    for dim in &metering.dimensions {
+        let scale = dim.scale.max(1) as f64;
+        for tier in &dim.tiers {
+            if tier.splits.is_empty() {
+                continue;
+            }
+
+            let per_unit = tier.price_usd / scale;
+
+            // Recipient existence check.
+            for split in &tier.splits {
+                if !recipients.contains_key(&split.recipient) {
+                    errs.push(format!(
+                        "endpoint `{path}` (tier ${per_unit:.6}/unit): split references unknown recipient `{}`",
+                        split.recipient
+                    ));
+                }
+                match (split.amount, split.percent) {
+                    (Some(_), Some(_)) => errs.push(format!(
+                        "endpoint `{path}` (tier ${per_unit:.6}/unit): split for `{}` has both amount and percent",
+                        split.recipient
+                    )),
+                    (None, None) => errs.push(format!(
+                        "endpoint `{path}` (tier ${per_unit:.6}/unit): split for `{}` has neither amount nor percent",
+                        split.recipient
+                    )),
+                    _ => {}
+                }
+            }
+
+            // Splits must be less than the per-unit price.
+            if per_unit > 0.0 {
+                let fixed: f64 = tier.splits.iter().filter_map(|s| s.amount).sum();
+                let pct: f64 =
+                    tier.splits.iter().filter_map(|s| s.percent).sum::<f64>() / 100.0 * per_unit;
+                let total = fixed + pct;
+                if total >= per_unit {
+                    errs.push(format!(
+                        "endpoint `{path}` (tier ${per_unit:.6}/unit): tier splits total (${total:.6}) >= \
+                         per-unit price (${per_unit:.6})"
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// Smallest non-zero per-unit price (`price_usd / scale`) across all tiers.
+fn min_nonzero_per_unit_price(dimensions: &[MeterDimension]) -> f64 {
+    dimensions
+        .iter()
+        .flat_map(|d| {
+            let scale = d.scale.max(1) as f64;
+            d.tiers.iter().map(move |t| t.price_usd / scale)
+        })
+        .filter(|p| *p > 0.0)
+        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .unwrap_or(0.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1237,5 +1408,276 @@ mod tests {
         let json = r#"{"method": "GET", "path": "v1/health"}"#;
         let ep: Endpoint = serde_json::from_str(json).unwrap();
         assert!(ep.routing.is_none());
+    }
+
+    // ── validate_api_spec ───────────────────────────────────────────────
+
+    fn test_spec(endpoints: Vec<Endpoint>) -> ApiSpec {
+        let mut recipients = std::collections::HashMap::new();
+        recipients.insert(
+            "operator".into(),
+            RecipientAlias {
+                account: "OperatorWaLLetxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".into(),
+                label: Some("Operator".into()),
+            },
+        );
+        recipients.insert(
+            "platform".into(),
+            RecipientAlias {
+                account: "PlatformWaLLetxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx".into(),
+                label: Some("Platform".into()),
+            },
+        );
+        ApiSpec {
+            name: "test".into(),
+            subdomain: "test".into(),
+            title: "Test".into(),
+            description: "Test".into(),
+            category: ApiCategory::Maps,
+            version: "v1".into(),
+            env: Default::default(),
+            routing: RoutingConfig::Respond {},
+            accounting: AccountingMode::default(),
+            endpoints,
+            free_tier: None,
+            quotas: None,
+            notes: None,
+            operator: None,
+            recipients,
+            session: None,
+        }
+    }
+
+    #[test]
+    fn validate_splits_without_dimensions() {
+        let spec = test_spec(vec![Endpoint {
+            method: HttpMethod::Post,
+            path: "v1/search".into(),
+            description: None,
+            resource: None,
+            routing: None,
+            metering: Some(Metering {
+                dimensions: vec![],
+                variants: vec![],
+                sku_tiers: vec![SkuTier {
+                    sku: "search-basic".into(),
+                    level: SkuLevel::Essentials,
+                }],
+                splits: vec![SplitRule {
+                    recipient: "operator".into(),
+                    amount: Some(0.00025),
+                    percent: None,
+                    memo: None,
+                }],
+            }),
+        }]);
+        let errs = validate_api_spec(&spec);
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].contains("no pricing dimensions"));
+    }
+
+    #[test]
+    fn validate_splits_exceed_price() {
+        let spec = test_spec(vec![Endpoint {
+            method: HttpMethod::Post,
+            path: "v1/search".into(),
+            description: None,
+            resource: None,
+            routing: None,
+            metering: Some(Metering {
+                dimensions: vec![MeterDimension {
+                    direction: MeterDirection::Usage,
+                    unit: BillingUnit::Requests,
+                    scale: 1,
+                    period: None,
+                    tiers: vec![PriceTier {
+                        up_to: None,
+                        price_usd: 0.0002,
+                        condition: None,
+                        notes: None,
+                        splits: vec![],
+                    }],
+                }],
+                variants: vec![],
+                sku_tiers: vec![],
+                splits: vec![SplitRule {
+                    recipient: "operator".into(),
+                    amount: Some(0.00025),
+                    percent: None,
+                    memo: None,
+                }],
+            }),
+        }]);
+        let errs = validate_api_spec(&spec);
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].contains("primary recipient would receive nothing"));
+    }
+
+    #[test]
+    fn validate_unknown_recipient() {
+        let spec = test_spec(vec![Endpoint {
+            method: HttpMethod::Post,
+            path: "v1/search".into(),
+            description: None,
+            resource: None,
+            routing: None,
+            metering: Some(Metering {
+                dimensions: vec![MeterDimension {
+                    direction: MeterDirection::Usage,
+                    unit: BillingUnit::Requests,
+                    scale: 1,
+                    period: None,
+                    tiers: vec![PriceTier {
+                        up_to: None,
+                        price_usd: 0.01,
+                        condition: None,
+                        notes: None,
+                        splits: vec![],
+                    }],
+                }],
+                variants: vec![],
+                sku_tiers: vec![],
+                splits: vec![SplitRule {
+                    recipient: "nonexistent".into(),
+                    amount: Some(0.001),
+                    percent: None,
+                    memo: None,
+                }],
+            }),
+        }]);
+        let errs = validate_api_spec(&spec);
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].contains("unknown recipient `nonexistent`"));
+    }
+
+    #[test]
+    fn validate_split_both_amount_and_percent() {
+        let spec = test_spec(vec![Endpoint {
+            method: HttpMethod::Post,
+            path: "v1/search".into(),
+            description: None,
+            resource: None,
+            routing: None,
+            metering: Some(Metering {
+                dimensions: vec![MeterDimension {
+                    direction: MeterDirection::Usage,
+                    unit: BillingUnit::Requests,
+                    scale: 1,
+                    period: None,
+                    tiers: vec![PriceTier {
+                        up_to: None,
+                        price_usd: 0.01,
+                        condition: None,
+                        notes: None,
+                        splits: vec![],
+                    }],
+                }],
+                variants: vec![],
+                sku_tiers: vec![],
+                splits: vec![SplitRule {
+                    recipient: "operator".into(),
+                    amount: Some(0.001),
+                    percent: Some(5.0),
+                    memo: None,
+                }],
+            }),
+        }]);
+        let errs = validate_api_spec(&spec);
+        assert!(errs.iter().any(|e| e.contains("both amount and percent")));
+    }
+
+    #[test]
+    fn validate_valid_spec_no_errors() {
+        let spec = test_spec(vec![Endpoint {
+            method: HttpMethod::Post,
+            path: "v1/search".into(),
+            description: None,
+            resource: None,
+            routing: None,
+            metering: Some(Metering {
+                dimensions: vec![MeterDimension {
+                    direction: MeterDirection::Usage,
+                    unit: BillingUnit::Requests,
+                    scale: 1,
+                    period: None,
+                    tiers: vec![PriceTier {
+                        up_to: None,
+                        price_usd: 0.001,
+                        condition: None,
+                        notes: None,
+                        splits: vec![],
+                    }],
+                }],
+                variants: vec![],
+                sku_tiers: vec![],
+                splits: vec![
+                    SplitRule {
+                        recipient: "operator".into(),
+                        amount: Some(0.00025),
+                        percent: None,
+                        memo: None,
+                    },
+                    SplitRule {
+                        recipient: "platform".into(),
+                        amount: None,
+                        percent: Some(0.05),
+                        memo: None,
+                    },
+                ],
+            }),
+        }]);
+        let errs = validate_api_spec(&spec);
+        assert!(errs.is_empty(), "expected no errors, got: {errs:?}");
+    }
+
+    #[test]
+    fn validate_free_endpoint_no_errors() {
+        let spec = test_spec(vec![Endpoint {
+            method: HttpMethod::Get,
+            path: "v1/health".into(),
+            description: None,
+            resource: None,
+            routing: None,
+            metering: None,
+        }]);
+        let errs = validate_api_spec(&spec);
+        assert!(errs.is_empty());
+    }
+
+    #[test]
+    fn validate_tier_splits_exceed_tier_price() {
+        let spec = test_spec(vec![Endpoint {
+            method: HttpMethod::Post,
+            path: "v1/compute".into(),
+            description: None,
+            resource: None,
+            routing: None,
+            metering: Some(Metering {
+                dimensions: vec![MeterDimension {
+                    direction: MeterDirection::Usage,
+                    unit: BillingUnit::Requests,
+                    scale: 1,
+                    period: None,
+                    tiers: vec![PriceTier {
+                        up_to: None,
+                        price_usd: 0.01,
+                        condition: None,
+                        notes: None,
+                        splits: vec![SplitRule {
+                            recipient: "operator".into(),
+                            amount: Some(0.01),
+                            percent: None,
+                            memo: None,
+                        }],
+                    }],
+                }],
+                variants: vec![],
+                sku_tiers: vec![],
+                splits: vec![],
+            }),
+        }]);
+        let errs = validate_api_spec(&spec);
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].contains("tier splits total"));
     }
 }

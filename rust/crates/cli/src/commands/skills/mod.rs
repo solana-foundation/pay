@@ -24,7 +24,7 @@ pub enum SkillsCommand {
     #[command(alias = "ls")]
     List,
     /// Refresh the local skills cache from all sources.
-    Update,
+    Update(update::UpdateCommand),
     /// Build the skills index from a pay-skills registry directory.
     Build(build::BuildCommand),
     /// Manage providers in the registry.
@@ -42,7 +42,7 @@ impl SkillsCommand {
             Self::Add(cmd) => cmd.run(),
             Self::Remove(cmd) => cmd.run(),
             Self::List => list::run(),
-            Self::Update => update::run(),
+            Self::Update(cmd) => cmd.run(),
             Self::Build(cmd) => cmd.run(),
             Self::Provider { command } => command.run(),
         }

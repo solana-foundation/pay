@@ -109,6 +109,18 @@ impl SyncCommand {
                 }
             };
 
+            // Validate metering/splits config against the typed ApiSpec.
+            if let Ok(api_spec) = serde_yml::from_str::<pay_types::metering::ApiSpec>(&text) {
+                let validation_errs = pay_types::metering::validate_api_spec(&api_spec);
+                if !validation_errs.is_empty() {
+                    for err in &validation_errs {
+                        eprintln!("  {} {}: {err}", "✗".red(), name);
+                    }
+                    skipped += 1;
+                    continue;
+                }
+            }
+
             let md = convert_to_registry_md(
                 &spec,
                 &name,
@@ -196,6 +208,7 @@ fn convert_to_registry_md(
         .get("category")
         .and_then(|v| v.as_str())
         .unwrap_or("other");
+    let use_case = obj.get("use_case").and_then(|v| v.as_str());
     let version = obj.get("version").and_then(|v| v.as_str()).unwrap_or("");
 
     let service_url = match service_url_template {
@@ -256,6 +269,9 @@ fn convert_to_registry_md(
         serde_json::Value::String(category.into()),
     );
     fm.insert("service_url".into(), serde_json::Value::String(service_url));
+    if let Some(uc) = use_case {
+        fm.insert("use_case".into(), serde_json::Value::String(uc.to_string()));
+    }
     if let Some(tpl) = sandbox_service_url_template {
         fm.insert(
             "sandbox_service_url".into(),

@@ -50,34 +50,13 @@ Payments are made on Solana (SOL and SPL tokens like USDC).
         tools::curl::run(params).await
     }
 
-    #[tool(
-        description = r#"Search for available paid API services and their endpoints.
+    #[tool(description = r#"List all available paid API services.
 
-Returns matching services with their endpoints. Each endpoint has a
-complete `url` field — paste it directly into the `curl` tool.
-For BigQuery, the project ID in URLs is `gateway-402`.
-
-Shows top 5 metered + 3 free endpoints per service. Use
-`get_skill_endpoints` for the full list if needed.
-
-Categories: ai_ml, data, compute, maps, search, translation, productivity
-"#
-    )]
-    async fn search_skills(
-        &self,
-        Parameters(params): Parameters<tools::search_skills::Params>,
-    ) -> Result<CallToolResult, rmcp::ErrorData> {
-        tools::search_skills::run(params).await
-    }
-
-    #[tool(
-        description = r#"List all available paid API services with their top endpoints in a single call.
-
-Returns every service with up to 3 metered endpoints each. Use this
-instead of multiple `search_skills` calls when you want a broad overview
-of what's available. Drill into a specific service with `get_skill_endpoints`.
-"#
-    )]
+Returns every service with fqn, description, category, and use_case.
+Browse the list and pick the best match for your task, then call
+`get_skill_endpoints` with the chosen `fqn` to get endpoints and
+usage instructions.
+"#)]
     async fn list_skills(
         &self,
         Parameters(params): Parameters<tools::list_skills::Params>,
@@ -85,17 +64,32 @@ of what's available. Drill into a specific service with `get_skill_endpoints`.
         tools::list_skills::run(params).await
     }
 
-    #[tool(description = r#"List all endpoints for a specific API service.
+    #[tool(
+        description = r#"Get full details for a specific API service by its fqn.
 
-Each endpoint includes a complete `url` field — paste it directly into
-the `curl` tool. No URL assembly needed. Use after `search_skills` to
-get the exact endpoints you need.
-"#)]
+Returns endpoints (each with a complete `url` for the `curl` tool),
+usage notes, pricing info, and sandbox/production URLs. Call this
+after picking a service from `search_skills` or `list_skills`.
+"#
+    )]
     async fn get_skill_endpoints(
         &self,
         Parameters(params): Parameters<tools::get_skill_endpoints::Params>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         tools::get_skill_endpoints::run(params).await
+    }
+
+    #[tool(description = r#"Get the balance of the active pay account.
+
+Returns the SOL balance and all SPL token balances (USDC, USDT, etc.)
+for the currently configured account. Use this to check available funds
+before making paid API calls.
+"#)]
+    async fn get_balance(
+        &self,
+        Parameters(params): Parameters<tools::get_balance::Params>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        tools::get_balance::run(params).await
     }
 
     #[tool(description = r#"Create or validate a pay-skills provider listing.

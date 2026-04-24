@@ -1,6 +1,5 @@
 mod rs 'rust/Justfile'
 mod ts 'typescript/Justfile'
-mod kong 'gateway/kong/Justfile'
 
 default:
     @just help
@@ -18,14 +17,6 @@ help:
     @echo "    just build             Build everything"
     @echo "    just fmt               Format everything"
     @echo "    just ci                Full CI — lint, typecheck, test, build"
-    @echo "    just kong dev-up       Start local Kong Lua plugin + mock upstream"
-    @echo "    just kong dev-start    Start local Kong Lua plugin in detached mode"
-    @echo "    just kong dev-down     Stop local Kong Lua stack"
-    @echo "    just kong dev-logs     Tail local Kong Lua logs"
-    @echo "    just kong go-dev-up    Start local Kong Go pluginserver + mock upstream"
-    @echo "    just kong go-dev-start Start local Kong Go pluginserver in detached mode"
-    @echo "    just kong go-dev-down  Stop local Kong Go stack"
-    @echo "    just kong go-dev-logs  Tail local Kong Go logs"
     @echo ""
     @echo "  Rust CLI (just rs <cmd>)"
     @echo "    just rs build          Build release binary"
