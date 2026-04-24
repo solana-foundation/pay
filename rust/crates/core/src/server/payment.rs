@@ -268,7 +268,10 @@ fn charge_challenge_response(
     let amount = price
         .as_ref()
         .and_then(|p| p.dimensions.first())
-        .map(|d| format!("{}", d.price_usd))
+        .map(|d| {
+            let per_unit = d.price_usd / d.scale.max(1) as f64;
+            format!("{}", per_unit)
+        })
         .unwrap_or_else(|| "0.01".to_string());
     let splits = resolve_charge_splits(mpp, meter, api, request.uri, &amount);
 

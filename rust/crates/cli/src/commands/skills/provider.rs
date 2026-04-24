@@ -109,6 +109,18 @@ impl SyncCommand {
                 }
             };
 
+            // Validate metering/splits config against the typed ApiSpec.
+            if let Ok(api_spec) = serde_yml::from_str::<pay_types::metering::ApiSpec>(&text) {
+                let validation_errs = pay_types::metering::validate_api_spec(&api_spec);
+                if !validation_errs.is_empty() {
+                    for err in &validation_errs {
+                        eprintln!("  {} {}: {err}", "✗".red(), name);
+                    }
+                    skipped += 1;
+                    continue;
+                }
+            }
+
             let md = convert_to_registry_md(
                 &spec,
                 &name,

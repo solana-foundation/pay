@@ -79,6 +79,10 @@ pub struct Service {
     /// Endpoints — empty from the index, populated by [`load_service_endpoints`].
     #[serde(default)]
     pub endpoints: Vec<Endpoint>,
+    /// Markdown body from the provider detail file — empty from the index,
+    /// populated alongside endpoints by [`ensure_endpoints`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
 }
 
 impl Service {
@@ -537,6 +541,7 @@ pub fn ensure_endpoints(catalog: &mut Catalog, service_name: &str) -> Result<()>
         && let Ok(detail) = parse_detail(&raw)
     {
         svc.endpoints = detail.endpoints;
+        svc.content = detail.content;
         return Ok(());
     }
 
@@ -566,6 +571,7 @@ pub fn ensure_endpoints(catalog: &mut Catalog, service_name: &str) -> Result<()>
     let _ = std::fs::write(&cache_file, &raw);
 
     svc.endpoints = detail.endpoints;
+    svc.content = detail.content;
 
     // Clean up stale detail files not referenced by current index
     clean_stale_detail_cache(catalog);
@@ -594,7 +600,7 @@ pub fn clean_stale_detail_cache(catalog: &Catalog) {
     }
 }
 
-/// Provider detail file shape (only the fields we need).
+/// Provider detail file shape.
 #[derive(Debug, Deserialize)]
 struct ProviderDetailFile {
     #[serde(default)]
@@ -622,7 +628,7 @@ pub fn load_skills() -> Result<Catalog> {
     }
 
     // Cache miss — fetch, merge, cache.
-    match fetch_and_merge(&cfg) {
+    match fetch_and_merge(&cfg, false) {
         Ok(catalog) => {
             let _ = write_cache(&cfg, &catalog);
             cfg.clean_stale_caches();
@@ -650,16 +656,22 @@ pub fn load_skills() -> Result<Catalog> {
 }
 
 /// Force-refresh: fetch all sources, merge, write cache.
-pub fn update_skills() -> Result<Catalog> {
+/// When `cache_bust` is true, append `?v=<timestamp>` to source URLs
+/// to bypass CDN edge caches, and purge all local detail caches.
+pub fn update_skills(cache_bust: bool) -> Result<Catalog> {
     let cfg = config::SkillsConfig::load()?;
-    let catalog = fetch_and_merge(&cfg)?;
+    let catalog = fetch_and_merge(&cfg, cache_bust)?;
     write_cache(&cfg, &catalog)?;
     cfg.clean_stale_caches();
+    if cache_bust {
+        // Purge all detail caches so endpoints are re-fetched with fresh shas.
+        clean_stale_detail_cache(&catalog);
+    }
     Ok(catalog)
 }
 
 /// Fetch each source URL and merge all providers into one Catalog.
-fn fetch_and_merge(cfg: &config::SkillsConfig) -> Result<Catalog> {
+fn fetch_and_merge(cfg: &config::SkillsConfig, cache_bust: bool) -> Result<Catalog> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
@@ -669,7 +681,17 @@ fn fetch_and_merge(cfg: &config::SkillsConfig) -> Result<Catalog> {
     let mut base_url = String::new();
 
     for source in &cfg.sources {
-        match fetch_one(&client, &source.url) {
+        let url = if cache_bust {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let sep = if source.url.contains('?') { '&' } else { '?' };
+            format!("{}{sep}v={ts}", source.url)
+        } else {
+            source.url.clone()
+        };
+        match fetch_one(&client, &url) {
             Ok(cat) => {
                 if base_url.is_empty() && !cat.base_url.is_empty() {
                     base_url = cat.base_url.clone();

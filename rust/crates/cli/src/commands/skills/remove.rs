@@ -14,7 +14,7 @@ impl RemoveCommand {
             cfg.save()?;
             eprintln!("  {} {}", "Removed:".green(), self.source);
             eprintln!("{}", "  Updating cache...".dimmed());
-            let catalog = pay_core::skills::update_skills()?;
+            let catalog = pay_core::skills::update_skills(false)?;
             eprintln!(
                 "  {} {} providers",
                 "Ready:".green(),

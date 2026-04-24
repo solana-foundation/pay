@@ -37,13 +37,6 @@ struct EndpointEntry {
     metered: bool,
 }
 
-/// Minimal shape to extract `content` from the raw detail JSON.
-#[derive(Debug, Deserialize)]
-struct DetailContent {
-    #[serde(default)]
-    content: Option<String>,
-}
-
 pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
     let fqn = params.fqn.clone();
     let mut catalog = tokio::task::spawn_blocking(pay_core::skills::load_skills)
@@ -68,8 +61,7 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
             rmcp::ErrorData::invalid_params(format!("Service `{}` not found", fqn), None)
         })?;
 
-    // Read content from the cached detail file (not in the Service struct by design)
-    let content = read_detail_content(&svc.sha);
+    let content = svc.content.clone();
 
     let base_url = &svc.meta.service_url;
     let detail = SkillDetail {
@@ -99,20 +91,6 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
     Ok(CallToolResult::success(vec![rmcp::model::Content::text(
         json,
     )]))
-}
-
-/// Read `content` from the cached detail JSON file on disk.
-fn read_detail_content(sha: &str) -> Option<String> {
-    if sha.is_empty() {
-        return None;
-    }
-    let home = std::env::var("HOME").ok()?;
-    let cache_file = std::path::PathBuf::from(home)
-        .join(".config/pay/skills/detail")
-        .join(format!("{sha}.json"));
-    let raw = std::fs::read_to_string(cache_file).ok()?;
-    let detail: DetailContent = serde_json::from_str(&raw).ok()?;
-    detail.content
 }
 
 #[cfg(test)]

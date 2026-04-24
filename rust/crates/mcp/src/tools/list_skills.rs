@@ -9,6 +9,10 @@ pub struct Params {
     #[schemars(description = "Set to true to force-refresh the catalog from CDN before listing")]
     #[serde(default)]
     pub refresh: bool,
+    /// Bypass CDN cache by appending a cache-buster query parameter.
+    #[schemars(description = "Set to true to bypass CDN edge cache (appends ?v=<timestamp>)")]
+    #[serde(default)]
+    pub cache_bust: bool,
 }
 
 /// Lightweight entry returned to the LLM for skill selection.
@@ -24,8 +28,9 @@ struct SkillEntry {
 }
 
 pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
-    let catalog = if params.refresh {
-        tokio::task::spawn_blocking(pay_core::skills::update_skills)
+    let cache_bust = params.cache_bust;
+    let catalog = if params.refresh || cache_bust {
+        tokio::task::spawn_blocking(move || pay_core::skills::update_skills(cache_bust))
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
