@@ -198,7 +198,7 @@ mod tests {
 
     #[test]
     fn validate_long_description() {
-        let long_desc = "A".repeat(121);
+        let long_desc = "A".repeat(256);
         let md = format!(
             "---\nname: x\ntitle: X\ndescription: \"{long_desc}\"\ncategory: data\nservice_url: https://x.com\nendpoints:\n  - method: GET\n    path: v1\n    description: Do thing\n---\n"
         );
