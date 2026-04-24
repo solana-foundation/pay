@@ -25,8 +25,8 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
-const POLL_DELAY: Duration = Duration::from_secs(10);
-const POLL_COUNTDOWN: Duration = Duration::from_secs(15);
+const POLL_DELAY: Duration = Duration::from_secs(4);
+const POLL_COUNTDOWN: Duration = Duration::from_secs(4);
 
 /// Result from the polling thread: what changed + current totals.
 struct TopupDetected {
@@ -533,6 +533,11 @@ fn render_topup_selector(
         Constraint::Min(0),
     ])
     .split(sidebar[1]);
+    // Ensure right column has dark background before content.
+    frame.render_widget(
+        Block::default().style(Style::default().bg(TOPUP_MAIN_BG)),
+        columns[1],
+    );
     let right = Layout::vertical([Constraint::Length(1), Constraint::Min(8)])
         .margin(2)
         .split(columns[1]);
@@ -624,6 +629,12 @@ fn render_qr_detail(
     amount_pos: usize,
     blink: Option<&BlinkState>,
 ) {
+    // Ensure the entire detail area has a dark background.
+    frame.render_widget(
+        Block::default().style(Style::default().bg(TOPUP_MAIN_BG)),
+        area,
+    );
+
     // Reserve slider space first so the QR gets whatever remains.
     let split = Layout::vertical([Constraint::Min(0), Constraint::Length(5)]).split(area);
 
@@ -642,21 +653,25 @@ fn render_qr_detail(
     ])
     .split(split[0]);
 
-    // Compute the QR pixel width so the checkmark matches it.
+    // Constrain to a square area centered in the available space.
     let qr_width = qr_lines.first().map(|l| l.width()).unwrap_or(0) as u16;
+    let qr_height = qr_lines.len() as u16;
+    let h_pad = qr_area[1].width.saturating_sub(qr_width) / 2;
+    let v_pad = qr_area[1].height.saturating_sub(qr_height) / 2;
+    let qr_rect = Rect {
+        x: qr_area[1].x + h_pad,
+        y: qr_area[1].y + v_pad,
+        width: qr_width.min(qr_area[1].width),
+        height: qr_height.min(qr_area[1].height),
+    };
 
     if let Some(b) = blink {
-        // Center-constrain to QR width
-        let pad = qr_area[1].width.saturating_sub(qr_width) / 2;
-        let centered = Rect {
-            x: qr_area[1].x + pad,
-            y: qr_area[1].y,
-            width: qr_width.min(qr_area[1].width),
-            height: qr_area[1].height,
-        };
-        render_success_checkmark(frame, centered, b.visible);
+        render_success_checkmark(frame, qr_rect, b.visible);
     } else {
-        frame.render_widget(Paragraph::new(qr_lines).centered(), qr_area[1]);
+        frame.render_widget(
+            Paragraph::new(qr_lines).style(Style::default().bg(TOPUP_MAIN_BG).fg(Color::White)),
+            qr_rect,
+        );
     }
 
     let amount_str = if amount_pos == 0 {
@@ -754,7 +769,10 @@ fn render_provider_list(
         })
         .collect::<Vec<_>>();
 
-    frame.render_widget(Paragraph::new(lines), area);
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(TOPUP_MAIN_BG)),
+        area,
+    );
 }
 
 fn render_qr(data: &str) -> Result<Vec<Line<'static>>, qrcode::types::QrError> {

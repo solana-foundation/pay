@@ -4,10 +4,9 @@ Most cloud APIs require account setup, billing, API keys, and CLI authentication
 
 # MCP tools
 
-- `search_skills("bigquery")` — discover APIs by keyword or category. Returns services with ready-to-use endpoint URLs.
-- `list_skills()` — browse all available APIs. Pass `{"refresh": true}` to force-refresh from CDN.
-- `get_skill_endpoints("bigquery")` — list ALL endpoints for a specific service.
-- `curl({url, method, headers, body})` — make requests. Handles 402 payment automatically.
+- `list_skills()` — Retrieve a local and instant registry 100+ high quality API and datasources.
+- `get_skill_endpoints(fqn)` — list all the available endpoints for a specific service.
+- `curl({url, method, headers, body})` — Perform requests. Handles 402/MPP payment automatically using USDC/USDT/CASH/stablecoins.
 - `create_skill({content})` — validate a provider listing for the pay-skills registry.
 
 # How to use

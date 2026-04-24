@@ -196,6 +196,7 @@ fn convert_to_registry_md(
         .get("category")
         .and_then(|v| v.as_str())
         .unwrap_or("other");
+    let use_case = obj.get("use_case").and_then(|v| v.as_str());
     let version = obj.get("version").and_then(|v| v.as_str()).unwrap_or("");
 
     let service_url = match service_url_template {
@@ -256,6 +257,9 @@ fn convert_to_registry_md(
         serde_json::Value::String(category.into()),
     );
     fm.insert("service_url".into(), serde_json::Value::String(service_url));
+    if let Some(uc) = use_case {
+        fm.insert("use_case".into(), serde_json::Value::String(uc.to_string()));
+    }
     if let Some(tpl) = sandbox_service_url_template {
         fm.insert(
             "sandbox_service_url".into(),

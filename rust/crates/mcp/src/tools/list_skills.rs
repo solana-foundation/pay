@@ -1,7 +1,7 @@
 use rmcp::model::CallToolResult;
 use rmcp::schemars;
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct Params {
@@ -9,6 +9,18 @@ pub struct Params {
     #[schemars(description = "Set to true to force-refresh the catalog from CDN before listing")]
     #[serde(default)]
     pub refresh: bool,
+}
+
+/// Lightweight entry returned to the LLM for skill selection.
+#[derive(Debug, Serialize)]
+struct SkillEntry {
+    fqn: String,
+    description: String,
+    category: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    use_case: Option<String>,
+    endpoint_count: u32,
+    has_metering: bool,
 }
 
 pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
@@ -24,18 +36,20 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
     };
 
-    let hits = pay_core::skills::search(&catalog, None, None);
-    let grouped = pay_core::skills::group_search_results(&hits);
-    let condensed: Vec<_> = grouped
-        .into_iter()
-        .map(|mut g| {
-            let metered: Vec<_> = g.endpoints.iter().filter(|e| e.metered).cloned().collect();
-            g.endpoints = metered.into_iter().take(3).collect();
-            g
+    let entries: Vec<SkillEntry> = catalog
+        .providers
+        .iter()
+        .map(|svc| SkillEntry {
+            fqn: svc.fqn.clone(),
+            description: svc.meta.description.clone(),
+            category: svc.meta.category.clone(),
+            use_case: svc.meta.use_case.clone(),
+            endpoint_count: svc.endpoint_count,
+            has_metering: svc.has_metering,
         })
         .collect();
 
-    let json = serde_json::to_string_pretty(&condensed)
+    let json = serde_json::to_string_pretty(&entries)
         .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
 
     Ok(CallToolResult::success(vec![rmcp::model::Content::text(

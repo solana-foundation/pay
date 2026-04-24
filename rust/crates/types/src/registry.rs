@@ -40,9 +40,12 @@ pub struct ServiceMeta {
     /// Human-readable title.
     #[serde(default)]
     pub title: String,
-    /// One-sentence description (max 120 chars). Powers search.
+    /// One-sentence description (max 255 chars). Powers search.
     #[serde(default)]
     pub description: String,
+    /// Hint for LLMs: when should this skill be used? (e.g. "looking for data analytics, market research")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_case: Option<String>,
     /// Category. One of: ai_ml, data, compute, maps, search, translation,
     /// productivity, finance, identity, storage, messaging, media, iot,
     /// security, analytics, devtools, cloud, other.
@@ -169,9 +172,9 @@ pub fn validate_provider(spec: &ProviderFrontmatter, fqn: &str) -> Vec<String> {
             KNOWN_CATEGORIES.join(", ")
         ));
     }
-    if m.description.len() > 120 {
+    if m.description.len() > 255 {
         errs.push(format!(
-            "{fqn}: description is {} chars (max 120)",
+            "{fqn}: description is {} chars (max 255)",
             m.description.len()
         ));
     }

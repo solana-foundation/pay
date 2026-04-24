@@ -599,6 +599,8 @@ pub fn clean_stale_detail_cache(catalog: &Catalog) {
 struct ProviderDetailFile {
     #[serde(default)]
     endpoints: Vec<Endpoint>,
+    #[serde(default)]
+    content: Option<String>,
 }
 
 fn parse_detail(raw: &str) -> Result<ProviderDetailFile> {
