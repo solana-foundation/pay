@@ -14,6 +14,7 @@
 
 pub mod build;
 pub mod config;
+pub mod probe;
 
 use std::collections::BTreeMap;
 

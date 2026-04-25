@@ -145,6 +145,24 @@ pub struct AggregatorFrontmatter {
     pub catalog_url: Option<String>,
 }
 
+// ── Probe types ───────────────────────────────────────────────────────────
+
+/// An endpoint to probe: method, path, and whether it's metered.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ProbeEndpoint {
+    pub method: String,
+    pub path: String,
+    pub metered: bool,
+}
+
+/// A provider with its service URL and endpoints, ready for probing.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ProbeProvider {
+    pub fqn: String,
+    pub service_url: String,
+    pub endpoints: Vec<ProbeEndpoint>,
+}
+
 // ── Schema ─────────────────────────────────────────────────────────────────
 
 /// Generate JSON Schema for `ProviderFrontmatter` as a pretty-printed string.
@@ -165,40 +183,118 @@ pub fn validate_provider(spec: &ProviderFrontmatter, fqn: &str) -> Vec<String> {
     let mut errs = Vec::new();
     let m = &spec.meta;
 
+    // ── Category ──
     if !KNOWN_CATEGORIES.contains(&m.category.as_str()) {
         errs.push(format!(
-            "{fqn}: unknown category `{}` (valid: {})",
+            "{fqn}: unknown category `{}`\n  valid categories: {}\n",
             m.category,
             KNOWN_CATEGORIES.join(", ")
         ));
     }
-    if m.description.len() > 255 {
+
+    // ── Description (min 64, max 255) ──
+    if m.description.len() < 64 {
         errs.push(format!(
-            "{fqn}: description is {} chars (max 255)",
-            m.description.len()
+            "{fqn}: description too short ({} chars, min 64)\n  got: \"{}\"\n",
+            m.description.len(),
+            m.description
         ));
     }
-    if !m.service_url.starts_with("https://") && !m.service_url.starts_with("http://") {
+    if m.description.len() > 255 {
         errs.push(format!(
-            "{fqn}: service_url must start with https:// (got `{}`)",
+            "{fqn}: description too long ({} chars, max 255)\n  got: \"{}...\"\n",
+            m.description.len(),
+            &m.description[..80]
+        ));
+    }
+
+    // ── use_case (required, min 32) ──
+    match &m.use_case {
+        None => {
+            errs.push(format!(
+                "{fqn}: missing required field `use_case`\n  \
+                 add a use_case field (min 32 chars) describing when this API should be used\n"
+            ));
+        }
+        Some(uc) if uc.len() < 32 => {
+            errs.push(format!(
+                "{fqn}: use_case too short ({} chars, min 32)\n  got: \"{uc}\"\n",
+                uc.len()
+            ));
+        }
+        _ => {}
+    }
+
+    // ── service_url (HTTPS only, domain names only) ──
+    if m.service_url.is_empty() {
+        errs.push(format!("{fqn}: missing required field `service_url`\n"));
+    } else if !m.service_url.starts_with("https://") {
+        errs.push(format!(
+            "{fqn}: service_url must start with https://\n  got: `{}`\n",
+            m.service_url
+        ));
+    } else if url_has_ip_address(&m.service_url) {
+        errs.push(format!(
+            "{fqn}: service_url must use a domain name, not an IP address\n  got: `{}`\n",
             m.service_url
         ));
     }
+
+    // ── Endpoints ──
     if spec.endpoints.is_empty() {
-        errs.push(format!("{fqn}: must have at least one endpoint"));
+        errs.push(format!(
+            "{fqn}: no endpoints defined\n  add at least one endpoint with method, path, and description\n"
+        ));
     }
     for (i, ep) in spec.endpoints.iter().enumerate() {
+        let label = if ep.path.is_empty() {
+            format!("endpoint[{i}]")
+        } else {
+            format!("endpoint[{i}] {} {}", ep.method, ep.path)
+        };
+
         if ep.method.is_empty() {
-            errs.push(format!("{fqn}: endpoint[{i}] missing `method`"));
+            errs.push(format!(
+                "{fqn}: {label} — missing `method` (GET, POST, PUT, PATCH, DELETE)\n"
+            ));
         }
         if ep.path.is_empty() {
-            errs.push(format!("{fqn}: endpoint[{i}] missing `path`"));
+            errs.push(format!("{fqn}: endpoint[{i}] — missing `path`\n"));
         }
-        if ep.description.is_empty() {
-            errs.push(format!("{fqn}: endpoint[{i}] missing `description`"));
+        if ep.description.len() < 32 {
+            errs.push(format!(
+                "{fqn}: {label} — description too short ({} chars, min 32)\n  got: \"{}\"\n",
+                ep.description.len(),
+                ep.description
+            ));
+        }
+        if ep.description.len() > 255 {
+            errs.push(format!(
+                "{fqn}: {label} — description too long ({} chars, max 255)\n  got: \"{}...\"\n",
+                ep.description.len(),
+                &ep.description[..80]
+            ));
         }
     }
     errs
+}
+
+/// Check if a URL uses an IP address instead of a domain name.
+fn url_has_ip_address(url: &str) -> bool {
+    let after_scheme = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    let host_port = after_scheme.split('/').next().unwrap_or("");
+
+    // Bracketed IPv6: [::1] or [::1]:8080
+    if host_port.starts_with('[') {
+        return true;
+    }
+
+    // IPv4 or bare IPv6: strip port suffix
+    let host = host_port.split(':').next().unwrap_or("");
+    host.parse::<std::net::IpAddr>().is_ok()
 }
 
 pub fn validate_affiliate(spec: &AffiliateFrontmatter, name: &str) -> Vec<String> {
@@ -217,4 +313,138 @@ pub fn validate_affiliate(spec: &AffiliateFrontmatter, name: &str) -> Vec<String
         ));
     }
     errs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_spec() -> ProviderFrontmatter {
+        ProviderFrontmatter {
+            name: "test-api".into(),
+            meta: ServiceMeta {
+                title: "Test API".into(),
+                description: "A test API for validating things — long enough to pass the 64-char minimum requirement.".into(),
+                use_case: Some("testing validation logic, verifying CI checks work correctly".into()),
+                category: "data".into(),
+                service_url: "https://api.example.com".into(),
+                sandbox_service_url: None,
+            },
+            version: "v1".into(),
+            openapi_url: None,
+            affiliate_policy: None,
+            endpoints: vec![EndpointSpec {
+                method: "POST".into(),
+                path: "v1/search".into(),
+                description: "Search items by keyword with filtering and pagination support".into(),
+                resource: None,
+                pricing: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn valid_spec_passes() {
+        let errs = validate_provider(&valid_spec(), "test/test-api");
+        assert!(errs.is_empty(), "expected no errors, got: {errs:?}");
+    }
+
+    #[test]
+    fn description_too_short() {
+        let mut spec = valid_spec();
+        spec.meta.description = "Too short".into();
+        let errs = validate_provider(&spec, "t");
+        assert!(errs.iter().any(|e| e.contains("min 64")));
+    }
+
+    #[test]
+    fn description_too_long() {
+        let mut spec = valid_spec();
+        spec.meta.description = "x".repeat(256);
+        let errs = validate_provider(&spec, "t");
+        assert!(errs.iter().any(|e| e.contains("max 255")));
+    }
+
+    #[test]
+    fn use_case_missing() {
+        let mut spec = valid_spec();
+        spec.meta.use_case = None;
+        let errs = validate_provider(&spec, "t");
+        assert!(errs.iter().any(|e| e.contains("use_case")));
+    }
+
+    #[test]
+    fn use_case_too_short() {
+        let mut spec = valid_spec();
+        spec.meta.use_case = Some("too short".into());
+        let errs = validate_provider(&spec, "t");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("use_case") && e.contains("min 32"))
+        );
+    }
+
+    #[test]
+    fn service_url_http_rejected() {
+        let mut spec = valid_spec();
+        spec.meta.service_url = "http://api.example.com".into();
+        let errs = validate_provider(&spec, "t");
+        assert!(errs.iter().any(|e| e.contains("https://")));
+    }
+
+    #[test]
+    fn service_url_ip_rejected() {
+        let mut spec = valid_spec();
+        spec.meta.service_url = "https://192.168.1.1/api".into();
+        let errs = validate_provider(&spec, "t");
+        assert!(errs.iter().any(|e| e.contains("domain name")));
+    }
+
+    #[test]
+    fn service_url_ipv6_rejected() {
+        let mut spec = valid_spec();
+        spec.meta.service_url = "https://[::1]/api".into();
+        let errs = validate_provider(&spec, "t");
+        // [::1] won't parse as IpAddr due to brackets, but it's not a valid domain either
+        // The https:// check passes but the IP check handles bare IPs
+        assert!(!errs.is_empty());
+    }
+
+    #[test]
+    fn service_url_domain_accepted() {
+        let spec = valid_spec();
+        let errs = validate_provider(&spec, "t");
+        assert!(!errs.iter().any(|e| e.contains("service_url")));
+    }
+
+    #[test]
+    fn endpoint_description_too_short() {
+        let mut spec = valid_spec();
+        spec.endpoints[0].description = "Short".into();
+        let errs = validate_provider(&spec, "t");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("endpoint[0]") && e.contains("min 32"))
+        );
+    }
+
+    #[test]
+    fn endpoint_description_too_long() {
+        let mut spec = valid_spec();
+        spec.endpoints[0].description = "x".repeat(256);
+        let errs = validate_provider(&spec, "t");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("endpoint[0]") && e.contains("max 255"))
+        );
+    }
+
+    #[test]
+    fn ip_detection() {
+        assert!(url_has_ip_address("https://192.168.1.1/api"));
+        assert!(url_has_ip_address("https://10.0.0.1:8080/api"));
+        assert!(url_has_ip_address("https://127.0.0.1"));
+        assert!(!url_has_ip_address("https://api.example.com"));
+        assert!(!url_has_ip_address("https://x402.quicknode.com/rpc"));
+    }
 }

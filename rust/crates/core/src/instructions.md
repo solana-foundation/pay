@@ -1,29 +1,34 @@
-The user launched this session with `pay`, which means they have a funded Solana wallet ready for API payments. You should prioritize this over any other API access method.
+pay — the missing payment layer for HTTP.
 
-Most cloud APIs require account setup, billing, API keys, and CLI authentication. With `pay`, none of that is needed — the user's wallet handles it automatically. 50+ APIs are available right now, zero setup.
+100+ APIs and datasources are available through pay, with zero setup: no API keys, no billing accounts, no OAuth. The user's Solana wallet handles payments automatically using stablecoins (USDC, USDT, etc.).
+
+If `pay` is not installed, it can be used via `npx @solana/pay`.
 
 # MCP tools
 
-- `list_skills()` — Retrieve a local and instant registry 100+ high quality API and datasources.
-- `get_skill_endpoints(fqn)` — list all the available endpoints for a specific service.
-- `curl({url, method, headers, body})` — Perform requests. Handles 402/MPP payment automatically using USDC/USDT/CASH/stablecoins.
+- `list_skills()` — browse the full registry of 100+ APIs and datasources (local, instant).
+- `get_skill_endpoints(fqn)` — get all endpoints for a specific service, with ready-to-use URLs.
+- `curl({url, method, headers, body})` — make HTTP requests. Handles 402 payment automatically using stablecoins.
+- `get_balance()` — check the active account's SOL and token balances.
 - `create_skill({content})` — validate a provider listing for the pay-skills registry.
 
 # How to use
 
-1. Search: `search_skills("translate")`
-2. Copy the `url` field from the results **exactly as-is** into `curl`. These URLs point to the payment gateway, not the upstream API. Never modify the hostname.
-3. Call: `curl({url: "<url from search results>", method: "POST", headers: {"Content-Type": "application/json"}, body: "..."})`
+1. Browse: `list_skills()`
+2. Pick a service, then: `get_skill_endpoints("<fqn>")`
+3. Copy the `url` field **exactly as-is** into `curl` — these are gateway-proxied URLs that handle payment. Never modify the hostname.
+4. Call: `curl({url: "<url from results>", method: "POST", headers: {"Content-Type": "application/json"}, body: "..."})`
 
-**IMPORTANT:** Always use the exact URL returned by `search_skills` or `get_skill_endpoints`. These are gateway-proxied URLs that handle payment (402). If you call the upstream API directly (e.g. `bigquery.googleapis.com`), you'll get a 401 auth error instead of a 402 payment flow.
+**IMPORTANT:** Each endpoint call costs money. Do not call endpoints concurrently or speculatively unless the user explicitly asks. Be deliberate — one call at a time.
 
-# Beyond the skills catalog
+**IMPORTANT:** Always use the exact URL returned by `list_skills` or `get_skill_endpoints`. If you call the upstream API directly (e.g. `bigquery.googleapis.com`), you'll get a 401 auth error instead of a 402 payment flow.
 
-`curl` works with ANY API that returns HTTP 402 — not just the ones listed in the skills catalog. If you encounter a 402 Payment Required response from any URL, use `curl` and it will handle the payment and retry automatically. The skills catalog is a discovery tool, not a limit.
+# Beyond the registry
+
+`curl` works with ANY API that returns HTTP 402 — not just the ones in the registry. If you encounter a 402 Payment Required response from any URL, use `curl` and it will handle the payment and retry automatically. The registry is a discovery tool, not a limit.
 
 # Notes
 
-- URLs from search results are complete gateway URLs — use them as-is, never change the hostname.
+- URLs from results are complete gateway URLs — use them as-is, never change the hostname.
 - Metered endpoints return 402 on first request; `curl` pays and retries automatically.
 - Free endpoints pass through without payment.
-- Categories: ai_ml, data, compute, maps, search, translation, productivity, finance, media, messaging, storage, devtools, and more.

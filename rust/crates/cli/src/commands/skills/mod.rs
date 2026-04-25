@@ -2,6 +2,7 @@ pub mod build;
 pub mod endpoints;
 pub mod install;
 pub mod list;
+pub mod probe;
 pub mod provider;
 pub mod remove;
 pub mod search;
@@ -27,6 +28,8 @@ pub enum SkillsCommand {
     Update(update::UpdateCommand),
     /// Build the skills index from a pay-skills registry directory.
     Build(build::BuildCommand),
+    /// Probe endpoints to verify they return valid Solana 402 challenges.
+    Probe(probe::ProbeCommand),
     /// Manage providers in the registry.
     Provider {
         #[command(subcommand)]
@@ -44,6 +47,7 @@ impl SkillsCommand {
             Self::List => list::run(),
             Self::Update(cmd) => cmd.run(),
             Self::Build(cmd) => cmd.run(),
+            Self::Probe(cmd) => cmd.run(),
             Self::Provider { command } => command.run(),
         }
     }

@@ -143,7 +143,7 @@ mod tests {
     use super::*;
 
     fn valid_md() -> &'static str {
-        "---\nname: test-api\ntitle: \"Test API\"\ndescription: \"A test API for unit tests\"\ncategory: devtools\nservice_url: https://test.example.com\nendpoints:\n  - method: POST\n    path: \"v1/run\"\n    description: \"Run a test\"\n---\n\nSome markdown body.\n"
+        "---\nname: test-api\ntitle: \"Test API\"\ndescription: \"A test API for unit tests — validates that the create_skill tool works correctly end to end\"\nuse_case: \"testing validation logic, verifying CI checks work correctly\"\ncategory: devtools\nservice_url: https://test.example.com\nendpoints:\n  - method: POST\n    path: \"v1/run\"\n    description: \"Run a test suite against the target service and return results\"\n---\n\nSome markdown body.\n"
     }
 
     #[test]
@@ -236,7 +236,7 @@ mod tests {
 
     #[test]
     fn validate_with_pricing() {
-        let md = "---\nname: x\ntitle: X\ndescription: X\ncategory: data\nservice_url: https://x.com\nendpoints:\n  - method: POST\n    path: v1/search\n    description: Search\n    pricing:\n      dimensions:\n        - direction: usage\n          unit: requests\n          scale: 1\n          tiers:\n            - price_usd: 0.01\n---\n";
+        let md = "---\nname: x\ntitle: X\ndescription: \"A data service that provides search capabilities across structured datasets and indexes\"\nuse_case: \"searching structured data, querying indexed datasets\"\ncategory: data\nservice_url: https://x.com\nendpoints:\n  - method: POST\n    path: v1/search\n    description: \"Search datasets by keyword with filtering and pagination support\"\n    pricing:\n      dimensions:\n        - direction: usage\n          unit: requests\n          scale: 1\n          tiers:\n            - price_usd: 0.01\n---\n";
         let result = validate(md);
         assert!(result.is_ok());
         let v = result.unwrap();
@@ -245,7 +245,7 @@ mod tests {
 
     #[test]
     fn validate_with_optional_fields() {
-        let md = "---\nname: x\ntitle: X\ndescription: X\ncategory: data\nservice_url: https://x.com\nversion: v2\nopenapi_url: https://x.com/openapi.json\naffiliate_policy:\n  enabled: true\n  default_percent: 10\nendpoints:\n  - method: GET\n    path: v1\n    description: Do thing\n    resource: things\n---\n";
+        let md = "---\nname: x\ntitle: X\ndescription: \"A data service with optional fields configured for versioning and affiliate support\"\nuse_case: \"testing optional field handling, verifying affiliate config\"\ncategory: data\nservice_url: https://x.com\nversion: v2\nopenapi_url: https://x.com/openapi.json\naffiliate_policy:\n  enabled: true\n  default_percent: 10\nendpoints:\n  - method: GET\n    path: v1\n    description: \"Retrieve all available things with optional filtering\"\n    resource: things\n---\n";
         let result = validate(md);
         assert!(result.is_ok());
         let v = result.unwrap();
