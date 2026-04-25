@@ -17,7 +17,8 @@ use pay_core::{Config, LogFormat};
 #[command(
     name = "pay",
     version,
-    about = "The missing payment layer for HTTP. pay auto-signs stablecoin transactions when APIs charge per request (x402, MPP)"
+    about = "The missing payment layer for HTTP.",
+    long_about = pay_core::instructions::INSTRUCTIONS,
 )]
 struct Opts {
     #[clap(subcommand)]
