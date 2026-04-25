@@ -110,8 +110,8 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
             }
             response.push_str(
                 "\n## Common fixes\n\n\
-                 - Add `use_case` with at least 32 characters.\n\
-                 - Keep provider `description` between 64 and 255 characters.\n\
+                 - Add `use_case` with 32-255 characters; start with `Use for` or `Use when` and list concrete agent trigger tasks.\n\
+                 - Keep provider `description` between 64 and 255 characters; summarize capabilities and result shapes, not use cases.\n\
                  - Keep endpoint `description` between 32 and 255 characters.\n\
                  - Use a valid category from the schema.\n\
                  - Use an HTTPS `service_url` with a domain name, not localhost or an IP address.\n\

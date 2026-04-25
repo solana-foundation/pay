@@ -1,8 +1,8 @@
 # pay
 
-**The missing payment layer for HTTP. `pay` auto-signs stablecoin transactions when APIs charge per request (x402, MPP).**
+**The missing payment layer for HTTP. `pay` handles x402 and MPP payment challenges with user-authorized stablecoin signing.**
 
-Wrap your CLI (`curl`, `claude`, `codex`, etc.) — when a stablecoin gated API returns 402, `pay` detects the payment protocol, signs a stablecoin transaction, and retries. The response lands on stdout as if nothing happened.
+Wrap your CLI (`curl`, `claude`, `codex`, etc.) -- when a stablecoin-gated API returns 402, `pay` detects the payment protocol, prepares the stablecoin transaction, asks the local wallet to authorize and sign it, then retries with the payment proof.
 
 [Install](#installation) · [Quick Start](#quick-start) · [Docs](https://docs.solanapay.com)
 
@@ -14,7 +14,7 @@ Wrap your CLI (`curl`, `claude`, `codex`, etc.) — when a stablecoin gated API 
 # Without pay — you get a 402
 curl https://payment-debugger.vercel.app/mpp/quote/AAPL
 
-# With pay — it handles the 402 and you get the response
+# With pay -- it handles the 402 challenge and returns the response
 pay --sandbox curl https://payment-debugger.vercel.app/mpp/quote/AAPL
 ```
 
@@ -22,7 +22,7 @@ pay --sandbox curl https://payment-debugger.vercel.app/mpp/quote/AAPL
 
 ### 💵 Transparent 402 Handling
 
-Wrap your CLI (`curl`, `claude`, `codex`, etc.) — when an API returns 402, `pay` detects the payment protocol, signs a stablecoin transaction, and retries. You get the response body. That's it.
+Wrap your CLI (`curl`, `claude`, `codex`, etc.) -- when an API returns 402, `pay` detects the payment protocol, prepares the stablecoin transaction, asks the local wallet to authorize and sign it, then retries with the payment proof.
 
 Supports both live payment standards on Solana:
 - **[MPP](https://paymentauth.org/draft-solana-charge-00.html/)** — Machine Payments Protocol
@@ -43,10 +43,10 @@ pay skills update                   # refresh the local cache
 
 ### 🤖 AI-Native with MCP
 
-`pay` ships with a built-in [MCP](https://modelcontextprotocol.io/) server, giving AI assistants the ability to make paid API calls on your behalf.
+`pay` ships with a built-in [MCP](https://modelcontextprotocol.io/) server, letting AI assistants request paid API calls through the same local wallet-approval flow.
 
 ```sh
-# Run Claude Code or Codex with pay injected automatically
+# Run Claude Code or Codex with pay injected into the agent session
 pay --sandbox claude
 pay --sandbox codex
 ```
@@ -69,7 +69,7 @@ A [public debugger](https://payment-debugger.vercel.app) is also available.
 
 ### 🔐 Secure Key Storage
 
-Your keys never touch disk in plaintext. `pay` stores keypairs in:
+Your keys never touch disk in plaintext. `pay` stores keypairs in secure local credential stores:
 
 - **macOS Keychain** with optional Touch ID biometric prompt (macOS)
 - **Windows Credential Manager** with optional Windows Hello prompt (Windows)
@@ -77,7 +77,7 @@ Your keys never touch disk in plaintext. `pay` stores keypairs in:
 - **1Password** vault via `op` CLI — auth handled by 1Password itself (cross-platform)
 - **File-based** keypair for CI and scripting
 
-The biometric/password prompt is controlled per-account by the `auth_required` setting — defaults to `true` on mainnet, `false` elsewhere.
+For protected accounts, payment signing requires local user approval, such as Touch ID on macOS. The biometric/password prompt is controlled per-account by the `auth_required` setting -- defaults to `true` on mainnet, `false` elsewhere.
 
 ```sh
 pay setup    # Touch ID on macOS, Windows Hello on Windows, GNOME Keyring on Linux, or choose 1Password

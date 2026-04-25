@@ -114,14 +114,27 @@ provider `.md` file: YAML frontmatter followed by optional markdown body.
   `providers/<operator>/<origin>/<name>.md` for proxied APIs.
 - `name`: lowercase URL-safe API name; must match the filename without `.md`.
 - `title`: human-readable API name.
-- `description`: 64-255 chars, one concrete sentence that powers search.
-- `use_case`: required, min 32 chars; describe when an agent should choose it.
+- `description`: 64-255 chars; summarize what the API is, major capabilities,
+  and result shapes. Do not start with "Use for".
+- `use_case`: 32-255 chars; start with "Use for" or "Use when" and list
+  concrete agent trigger tasks, synonyms, and adjacent workflows.
 - `category`: one of `ai_ml`, `analytics`, `cloud`, `compute`, `data`,
   `devtools`, `finance`, `identity`, `iot`, `maps`, `media`, `messaging`,
   `other`, `productivity`, `search`, `security`, `storage`, `translation`.
 - `service_url`: production HTTPS URL with a domain name, not localhost or an IP.
 - `endpoints`: at least one `{method, path, description, resource?, pricing?}`.
 - Endpoint descriptions: 32-255 chars, start with a verb and name the object.
+
+## Root metadata guidance
+
+- Use the 255-character budget deliberately; 180-255 chars is a good target for
+  broad APIs.
+- `description` is catalog/search copy: what the service does and what callers
+  get back.
+- `use_case` is routing copy: when an agent should pick the service for a user
+  task.
+- Keep both truthful to the listed endpoints. Do not include unsupported
+  workflows just to attract traffic.
 
 ## Pricing and probing rules
 
@@ -151,8 +164,8 @@ pay skills probe . --files providers/<operator>/<name>.md --currencies USDC,USDT
 ---
 name: fraud-check
 title: "Fraud Check"
-description: "Score payment transactions for fraud risk using device, behavioral, and merchant signals."
-use_case: "checking payment fraud risk, scoring transactions, and enriching risk review workflows"
+description: "Score payment transactions for fraud risk using device, behavioral, merchant, card, wallet, and checkout signals. Returns risk scores, review signals, decision reasons, and structured metadata for payment protection workflows."
+use_case: "Use for payment fraud scoring, checkout risk review, transaction monitoring, merchant risk signals, chargeback prevention, wallet or card payment review, suspicious behavior detection, and enriching trust and safety workflows."
 category: finance
 service_url: https://api.mycompany.com
 endpoints:

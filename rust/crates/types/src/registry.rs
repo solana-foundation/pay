@@ -43,7 +43,7 @@ pub struct ServiceMeta {
     /// One-sentence description (max 255 chars). Powers search.
     #[serde(default)]
     pub description: String,
-    /// Hint for LLMs: when should this skill be used? (e.g. "looking for data analytics, market research")
+    /// Hint for LLMs: when should this skill be used? (max 255 chars).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub use_case: Option<String>,
     /// Category. One of: ai_ml, data, compute, maps, search, translation,
@@ -208,18 +208,25 @@ pub fn validate_provider(spec: &ProviderFrontmatter, fqn: &str) -> Vec<String> {
         ));
     }
 
-    // ── use_case (required, min 32) ──
+    // ── use_case (required, 32-255 chars) ──
     match &m.use_case {
         None => {
             errs.push(format!(
                 "{fqn}: missing required field `use_case`\n  \
-                 add a use_case field (min 32 chars) describing when this API should be used\n"
+                 add a use_case field (32-255 chars) describing when this API should be used\n"
             ));
         }
         Some(uc) if uc.len() < 32 => {
             errs.push(format!(
                 "{fqn}: use_case too short ({} chars, min 32)\n  got: \"{uc}\"\n",
                 uc.len()
+            ));
+        }
+        Some(uc) if uc.len() > 255 => {
+            errs.push(format!(
+                "{fqn}: use_case too long ({} chars, max 255)\n  got: \"{}...\"\n",
+                uc.len(),
+                &uc[..80]
             ));
         }
         _ => {}
@@ -594,6 +601,17 @@ contact: ops@example.com
         assert!(
             errs.iter()
                 .any(|e| e.contains("use_case") && e.contains("min 32"))
+        );
+    }
+
+    #[test]
+    fn use_case_too_long() {
+        let mut spec = valid_spec();
+        spec.meta.use_case = Some("x".repeat(256));
+        let errs = validate_provider(&spec, "t");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("use_case") && e.contains("max 255"))
         );
     }
 
