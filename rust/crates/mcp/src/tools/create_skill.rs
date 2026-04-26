@@ -2,6 +2,7 @@ use rmcp::model::CallToolResult;
 use rmcp::schemars;
 use schemars::JsonSchema;
 use serde::Deserialize;
+use std::path::{Component, Path};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct Params {
@@ -13,7 +14,7 @@ pub struct Params {
 
     /// Optional path to write the validated file to disk.
     #[schemars(
-        description = "Optional: file path to write the validated .md file (e.g. providers/myorg/my-api.md)"
+        description = "Optional: pay-skills provider path to write after validation. Use providers/<operator>/<name>.md for native APIs or providers/<operator>/<origin>/<name>.md for proxied APIs; filename must match the frontmatter name."
     )]
     pub output_path: Option<String>,
 }
@@ -34,32 +35,66 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
     match result {
         Ok(validated) => {
             let spec_json = serde_json::to_string_pretty(&validated.spec).unwrap_or_default();
+            let (metered, free) = endpoint_counts(&validated.spec);
             let mut response = format!(
-                "Provider spec is valid ({} endpoints).\n\n```json\n{spec_json}\n```\n",
+                "Provider spec is valid.\n\n\
+                 - endpoints: {} total ({metered} metered, {free} free)\n\
+                 - category: {}\n\
+                 - service_url: {}\n\n\
+                 ```json\n{spec_json}\n```\n",
                 validated.spec.endpoints.len(),
+                validated.spec.meta.category,
+                validated.spec.meta.service_url,
             );
 
-            if let Some(path) = output_path {
-                match std::fs::create_dir_all(
-                    std::path::Path::new(&path)
-                        .parent()
-                        .unwrap_or(std::path::Path::new(".")),
-                )
-                .and_then(|_| std::fs::write(&path, &params.content))
-                {
-                    Ok(_) => {
-                        response.push_str(&format!("\nWrote to: {path}\n"));
+            if let Some(path) = output_path.as_deref() {
+                let path_errors = validate_output_path(path, &validated.spec.name);
+                if !path_errors.is_empty() {
+                    response.push_str("\n## Output path needs attention\n\n");
+                    response.push_str("The provider content was valid, but I did not write it because the requested path is not contributor-ready:\n\n");
+                    for err in &path_errors {
+                        response.push_str(&format!("- {err}\n"));
                     }
-                    Err(e) => {
-                        response.push_str(&format!("\nFailed to write to {path}: {e}\n"));
+                    response.push_str(&format!(
+                        "\nUse one of:\n\n```text\n{}\n```\n",
+                        recommended_paths(&validated.spec.name)
+                    ));
+                } else {
+                    match std::fs::create_dir_all(
+                        std::path::Path::new(path)
+                            .parent()
+                            .unwrap_or(std::path::Path::new(".")),
+                    )
+                    .and_then(|_| std::fs::write(path, &params.content))
+                    {
+                        Ok(_) => {
+                            response.push_str(&format!("\nWrote to: {path}\n"));
+                            response.push_str(&format!(
+                            "\n## Validate before PR\n\n\
+                             ```bash\n\
+                             pay skills build . --output /tmp/pay-skills-dist\n\
+                             pay skills probe . --files {path} --currencies USDC,USDT --timeout 15 --concurrency 5\n\
+                             ```\n"
+                        ));
+                        }
+                        Err(e) => {
+                            response.push_str(&format!("\nFailed to write to {path}: {e}\n"));
+                        }
                     }
                 }
             } else {
                 response.push_str(&format!(
                     "\n## Next steps\n\n\
                      1. Fork https://github.com/solana-foundation/pay-skills\n\
-                     2. Add this file as `providers/<org>/{}.md`\n\
-                     3. Open a PR — CI will validate automatically\n",
+                     2. Add this file at one of:\n\n\
+                     ```text\n{}\n```\n\n\
+                     3. Run:\n\n\
+                     ```bash\n\
+                     pay skills build . --output /tmp/pay-skills-dist\n\
+                     pay skills probe . --files providers/<operator>/{}.md --currencies USDC,USDT --timeout 15 --concurrency 5\n\
+                     ```\n\n\
+                     4. Open a PR. CI will validate the YAML and probe changed paid endpoints.\n",
+                    recommended_paths(&validated.spec.name),
                     validated.spec.name
                 ));
             }
@@ -73,6 +108,16 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
             for err in &errors {
                 response.push_str(&format!("- {err}\n"));
             }
+            response.push_str(
+                "\n## Common fixes\n\n\
+                 - Add `use_case` with 32-255 characters; start with `Use for` or `Use when` and list concrete agent trigger tasks.\n\
+                 - Keep provider `description` between 64 and 255 characters; summarize capabilities and result shapes, not use cases.\n\
+                 - Keep endpoint `description` between 32 and 255 characters.\n\
+                 - Use a valid category from the schema.\n\
+                 - Use an HTTPS `service_url` with a domain name, not localhost or an IP address.\n\
+                 - Omit `pricing` for free endpoints; if `pricing` is present the endpoint must return HTTP 402.\n\
+                 - For non-zero prices, make sure `price_usd / scale >= 0.000001`.\n",
+            );
             let schema_json = pay_types::registry::provider_json_schema();
             response.push_str(&format!(
                 "\n## JSON Schema for provider frontmatter\n\n```json\n{schema_json}\n```\n"
@@ -136,6 +181,62 @@ pub fn validate(content: &str) -> Result<ValidatedProvider, Vec<String>> {
     }
 
     Ok(ValidatedProvider { spec })
+}
+
+fn endpoint_counts(spec: &pay_types::registry::ProviderFrontmatter) -> (usize, usize) {
+    let metered = spec
+        .endpoints
+        .iter()
+        .filter(|ep| ep.pricing.is_some())
+        .count();
+    let free = spec.endpoints.len().saturating_sub(metered);
+    (metered, free)
+}
+
+fn recommended_paths(name: &str) -> String {
+    format!("providers/<operator>/{name}.md\nproviders/<operator>/<origin>/{name}.md")
+}
+
+fn validate_output_path(path: &str, name: &str) -> Vec<String> {
+    let mut errors = Vec::new();
+    let path_ref = Path::new(path);
+
+    if path_ref.extension().and_then(|e| e.to_str()) != Some("md") {
+        errors.push("output_path must end in `.md`".to_string());
+    }
+
+    match path_ref.file_stem().and_then(|s| s.to_str()) {
+        Some(stem) if stem == name => {}
+        Some(stem) => errors.push(format!(
+            "filename `{stem}.md` must match frontmatter name `{name}`"
+        )),
+        None => errors.push("output_path must include a filename".to_string()),
+    }
+
+    let components = normal_components(path_ref);
+    match components.iter().position(|c| c == "providers") {
+        Some(idx) => {
+            let tail_len = components.len().saturating_sub(idx + 1);
+            if tail_len < 2 {
+                errors.push(
+                    "output_path must be providers/<operator>/<name>.md or providers/<operator>/<origin>/<name>.md"
+                        .to_string(),
+                );
+            }
+        }
+        None => errors.push("output_path must be under `providers/`".to_string()),
+    }
+
+    errors
+}
+
+fn normal_components(path: &Path) -> Vec<String> {
+    path.components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => value.to_str().map(str::to_string),
+            _ => None,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -244,6 +345,15 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_pricing_below_stablecoin_precision() {
+        let md = "---\nname: x\ntitle: X\ndescription: \"A data service that validates tiny prices are rejected before publishing\"\nuse_case: \"testing pricing precision validation for tiny metered endpoint prices\"\ncategory: data\nservice_url: https://x.com\nendpoints:\n  - method: POST\n    path: v1/search\n    description: \"Search datasets by keyword with filtering and pagination support\"\n    pricing:\n      dimensions:\n        - direction: usage\n          unit: requests\n          scale: 2000000\n          tiers:\n            - price_usd: 1.0\n---\n";
+        let result = validate(md);
+        assert!(result.is_err());
+        let errs = result.unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("below minimum $0.000001")));
+    }
+
+    #[test]
     fn validate_with_optional_fields() {
         let md = "---\nname: x\ntitle: X\ndescription: \"A data service with optional fields configured for versioning and affiliate support\"\nuse_case: \"testing optional field handling, verifying affiliate config\"\ncategory: data\nservice_url: https://x.com\nversion: v2\nopenapi_url: https://x.com/openapi.json\naffiliate_policy:\n  enabled: true\n  default_percent: 10\nendpoints:\n  - method: GET\n    path: v1\n    description: \"Retrieve all available things with optional filtering\"\n    resource: things\n---\n";
         let result = validate(md);
@@ -268,5 +378,41 @@ mod tests {
         let json = r#"{"content": "---\n---\n", "output_path": "/tmp/test.md"}"#;
         let params: Params = serde_json::from_str(json).unwrap();
         assert_eq!(params.output_path.unwrap(), "/tmp/test.md");
+    }
+
+    #[test]
+    fn output_path_accepts_native_and_proxied_provider_paths() {
+        assert!(validate_output_path("providers/acme/search.md", "search").is_empty());
+        assert!(validate_output_path("providers/acme/google/search.md", "search").is_empty());
+    }
+
+    #[test]
+    fn output_path_reports_contributor_path_issues() {
+        let errs = validate_output_path("tmp/search.yml", "search");
+        assert!(errs.iter().any(|e| e.contains("`.md`")));
+        assert!(errs.iter().any(|e| e.contains("providers/")));
+
+        let errs = validate_output_path("providers/acme/wrong.md", "search");
+        assert!(errs.iter().any(|e| e.contains("must match")));
+
+        let errs = validate_output_path("providers/search.md", "search");
+        assert!(errs.iter().any(|e| e.contains("providers/<operator>")));
+    }
+
+    #[test]
+    fn endpoint_counts_separates_metered_and_free_endpoints() {
+        let mut spec = validate(valid_md()).unwrap().spec;
+        spec.endpoints.push(pay_types::registry::EndpointSpec {
+            method: "GET".into(),
+            path: "v1/free".into(),
+            description: "Fetch a free health check response from the service".into(),
+            resource: None,
+            pricing: None,
+        });
+        spec.endpoints[0].pricing = Some(serde_json::json!({
+            "dimensions": [{"scale": 1, "tiers": [{"price_usd": 0.01}]}]
+        }));
+
+        assert_eq!(endpoint_counts(&spec), (1, 1));
     }
 }

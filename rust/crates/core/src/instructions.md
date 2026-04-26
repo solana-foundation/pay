@@ -1,34 +1,38 @@
-pay — the missing payment layer for HTTP.
+pay gives agents paid HTTP access without API keys. It detects 402 payment
+challenges and prepares the required stablecoin transaction, but spending is
+authorized locally by the user.
 
-100+ APIs and datasources are available through pay, with zero setup: no API keys, no billing accounts, no OAuth. The user's Solana wallet handles payments automatically using stablecoins (USDC, USDT, etc.).
+# Tools
 
-If `pay` is not installed, it can be used via `npx @solana/pay`.
+- `list_skills()` - search or browse available API providers.
+- `get_skill_endpoints(fqn)` - return ready-to-call endpoint URLs for one provider.
+- `curl({url, method, headers, body})` - make HTTP requests and handle 402 payment challenges.
+- `get_balance()` - check wallet balances before paid work or when asked.
+- `create_skill({content})` - validate a pay-skills provider listing.
 
-# MCP tools
+# Agent workflow
 
-- `list_skills()` — browse the full registry of 100+ APIs and datasources (local, instant).
-- `get_skill_endpoints(fqn)` — get all endpoints for a specific service, with ready-to-use URLs.
-- `curl({url, method, headers, body})` — make HTTP requests. Handles 402 payment automatically using stablecoins.
-- `get_balance()` — check the active account's SOL and token balances.
-- `create_skill({content})` — validate a provider listing for the pay-skills registry.
+1. Use `list_skills()` only when you need to choose a provider.
+2. Call `get_skill_endpoints("<fqn>")` for the selected provider.
+3. Copy the returned `url` exactly into `curl`; do not change the hostname.
+4. Make the smallest useful request first. Paid calls should be deliberate and
+   sequential unless the user explicitly asks for batching or parallel calls.
+   Real payments still require local wallet approval.
 
-# How to use
+Security model:
 
-1. Browse: `list_skills()`
-2. Pick a service, then: `get_skill_endpoints("<fqn>")`
-3. Copy the `url` field **exactly as-is** into `curl` — these are gateway-proxied URLs that handle payment. Never modify the hostname.
-4. Call: `curl({url: "<url from results>", method: "POST", headers: {"Content-Type": "application/json"}, body: "..."})`
+- The skill does not contain or request private keys, seed phrases, API keys, or
+  custodial credentials.
+- Wallet keys are stored by `pay` in the operating system's secure credential
+  store, such as macOS Keychain.
+- Real payment transactions require local user authorization through the wallet
+  unlock flow, such as Touch ID on macOS.
+- Agents can request a paid call, but they cannot bypass the user's local
+  signing approval.
 
-**IMPORTANT:** Each endpoint call costs money. Do not call endpoints concurrently or speculatively unless the user explicitly asks. Be deliberate — one call at a time.
+Use gateway URLs from pay results, not upstream URLs such as
+`bigquery.googleapis.com`; upstream calls usually require provider-specific auth
+and bypass the payment flow.
 
-**IMPORTANT:** Always use the exact URL returned by `list_skills` or `get_skill_endpoints`. If you call the upstream API directly (e.g. `bigquery.googleapis.com`), you'll get a 401 auth error instead of a 402 payment flow.
-
-# Beyond the registry
-
-`curl` works with ANY API that returns HTTP 402 — not just the ones in the registry. If you encounter a 402 Payment Required response from any URL, use `curl` and it will handle the payment and retry automatically. The registry is a discovery tool, not a limit.
-
-# Notes
-
-- URLs from results are complete gateway URLs — use them as-is, never change the hostname.
-- Metered endpoints return 402 on first request; `curl` pays and retries automatically.
-- Free endpoints pass through without payment.
+`curl` also works with any non-registry URL that returns HTTP 402. Treat the
+registry as discovery, not as the only supported surface.

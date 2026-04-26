@@ -43,7 +43,7 @@ pub struct ServiceMeta {
     /// One-sentence description (max 255 chars). Powers search.
     #[serde(default)]
     pub description: String,
-    /// Hint for LLMs: when should this skill be used? (e.g. "looking for data analytics, market research")
+    /// Hint for LLMs: when should this skill be used? (max 255 chars).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub use_case: Option<String>,
     /// Category. One of: ai_ml, data, compute, maps, search, translation,
@@ -208,18 +208,25 @@ pub fn validate_provider(spec: &ProviderFrontmatter, fqn: &str) -> Vec<String> {
         ));
     }
 
-    // ── use_case (required, min 32) ──
+    // ── use_case (required, 32-255 chars) ──
     match &m.use_case {
         None => {
             errs.push(format!(
                 "{fqn}: missing required field `use_case`\n  \
-                 add a use_case field (min 32 chars) describing when this API should be used\n"
+                 add a use_case field (32-255 chars) describing when this API should be used\n"
             ));
         }
         Some(uc) if uc.len() < 32 => {
             errs.push(format!(
                 "{fqn}: use_case too short ({} chars, min 32)\n  got: \"{uc}\"\n",
                 uc.len()
+            ));
+        }
+        Some(uc) if uc.len() > 255 => {
+            errs.push(format!(
+                "{fqn}: use_case too long ({} chars, max 255)\n  got: \"{}...\"\n",
+                uc.len(),
+                &uc[..80]
             ));
         }
         _ => {}
@@ -275,8 +282,54 @@ pub fn validate_provider(spec: &ProviderFrontmatter, fqn: &str) -> Vec<String> {
                 &ep.description[..80]
             ));
         }
+
+        // ── Pricing precision ──
+        if let Some(pricing) = &ep.pricing {
+            validate_pricing_precision(pricing, fqn, &label, &mut errs);
+        }
     }
     errs
+}
+
+/// Check that `price_usd / scale` doesn't produce more decimals than
+/// stablecoin tokens support (6 for USDC/USDT).
+fn validate_pricing_precision(
+    pricing: &serde_json::Value,
+    fqn: &str,
+    label: &str,
+    errs: &mut Vec<String>,
+) {
+    const MIN_REPRESENTABLE: f64 = 0.000001; // 10^-6
+
+    let Some(dims) = pricing.get("dimensions").and_then(|v| v.as_array()) else {
+        return;
+    };
+    for dim in dims {
+        let scale = dim
+            .get("scale")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1)
+            .max(1);
+        let Some(tiers) = dim.get("tiers").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for tier in tiers {
+            let price = tier
+                .get("price_usd")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            if price == 0.0 {
+                continue;
+            }
+            let per_unit = price / scale as f64;
+            if per_unit > 0.0 && per_unit < MIN_REPRESENTABLE {
+                errs.push(format!(
+                    "{fqn}: {label} — price_usd ${price} / scale {scale} = ${per_unit:.12}/unit, \
+                     below minimum ${MIN_REPRESENTABLE} for 6-decimal tokens. Reduce scale or increase price_usd.\n"
+                ));
+            }
+        }
+    }
 }
 
 /// Check if a URL uses an IP address instead of a domain name.
@@ -350,6 +403,173 @@ mod tests {
     }
 
     #[test]
+    fn provider_json_schema_contains_provider_shape() {
+        let schema = provider_json_schema();
+        let value: serde_json::Value = serde_json::from_str(&schema).unwrap();
+        assert!(value["definitions"]["EndpointSpec"].is_object());
+        assert!(schema.contains("ProviderFrontmatter"));
+    }
+
+    #[test]
+    fn provider_yaml_pricing_precision_rejected() {
+        let yaml = r#"
+name: tiny-api
+title: Tiny API
+description: Tiny prices that exercise provider YAML validation and registry checks.
+use_case: validating provider registry YAML pricing precision before publishing
+category: data
+service_url: https://api.example.com
+endpoints:
+  - method: POST
+    path: v1/tiny
+    description: Search datasets by keyword with filtering and pagination support
+    pricing:
+      dimensions:
+        - scale: 2000000
+          tiers:
+            - price_usd: 1.0
+"#;
+        let spec: ProviderFrontmatter = serde_yml::from_str(yaml).unwrap();
+        let errs = validate_provider(&spec, "test/tiny-api");
+        assert!(
+            errs.iter().any(|e| e.contains("below minimum $0.000001")),
+            "expected pricing precision error, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn provider_pricing_precision_allows_unpriced_and_exact_micro_prices() {
+        let mut spec = valid_spec();
+        spec.endpoints = vec![
+            EndpointSpec {
+                method: "GET".into(),
+                path: "v1/free".into(),
+                description: "Fetch free metadata without charging the caller for usage".into(),
+                resource: None,
+                pricing: Some(serde_json::json!({})),
+            },
+            EndpointSpec {
+                method: "POST".into(),
+                path: "v1/exact".into(),
+                description: "Create a priced request at the minimum token precision boundary"
+                    .into(),
+                resource: None,
+                pricing: Some(serde_json::json!({
+                    "dimensions": [
+                        {
+                            "scale": 0,
+                            "tiers": [
+                                { "price_usd": 0.0 },
+                                { "price_usd": 0.000001 }
+                            ]
+                        },
+                        {
+                            "scale": 1
+                        }
+                    ]
+                })),
+            },
+        ];
+        let errs = validate_provider(&spec, "test/test-api");
+        assert!(errs.is_empty(), "expected no errors, got: {errs:?}");
+    }
+
+    #[test]
+    fn category_service_url_and_endpoint_presence_are_required() {
+        let mut spec = valid_spec();
+        spec.meta.category = "unknown".into();
+        spec.meta.service_url = String::new();
+        spec.endpoints = vec![];
+
+        let errs = validate_provider(&spec, "test/test-api");
+        assert!(
+            errs.iter().any(|e| e.contains("unknown category")),
+            "expected category error, got: {errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("missing required field `service_url`")),
+            "expected service_url error, got: {errs:?}"
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("no endpoints defined")),
+            "expected endpoint presence error, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn endpoint_method_and_path_are_required() {
+        let mut spec = valid_spec();
+        spec.endpoints[0].method = String::new();
+        spec.endpoints[0].path = String::new();
+
+        let errs = validate_provider(&spec, "test/test-api");
+        assert!(
+            errs.iter().any(|e| e.contains("missing `method`")),
+            "expected method error, got: {errs:?}"
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("missing `path`")),
+            "expected path error, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn affiliate_yaml_defaults_network_and_validates_fields() {
+        let yaml = r#"
+name: partner
+title: Partner
+type: agent
+account: "11111111111111111111111111111111"
+contact: ops@example.com
+"#;
+        let spec: AffiliateFrontmatter = serde_yml::from_str(yaml).unwrap();
+        assert_eq!(spec.network, "mainnet");
+        assert!(validate_affiliate(&spec, "partner").is_empty());
+
+        let mut invalid = spec;
+        invalid.account = "0".into();
+        invalid.affiliate_type = "vendor".into();
+        let errs = validate_affiliate(&invalid, "partner");
+        assert!(
+            errs.iter().any(|e| e.contains("invalid account")),
+            "expected account error, got: {errs:?}"
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("unknown type")),
+            "expected type error, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn aggregator_and_probe_types_roundtrip() {
+        let aggregator = AggregatorFrontmatter {
+            name: "agg".into(),
+            title: "Aggregator".into(),
+            url: "https://agg.example.com".into(),
+            contact: "ops@example.com".into(),
+            description: Some("Catalog operator".into()),
+            catalog_url: Some("https://agg.example.com/skills.json".into()),
+        };
+        let yaml = serde_yml::to_string(&aggregator).unwrap();
+        let parsed: AggregatorFrontmatter = serde_yml::from_str(&yaml).unwrap();
+        assert_eq!(parsed.catalog_url, aggregator.catalog_url);
+
+        let provider = ProbeProvider {
+            fqn: "test/test-api".into(),
+            service_url: "https://api.example.com".into(),
+            endpoints: vec![ProbeEndpoint {
+                method: "POST".into(),
+                path: "v1/search".into(),
+                metered: true,
+            }],
+        };
+        let json = serde_json::to_string(&provider).unwrap();
+        let parsed: ProbeProvider = serde_json::from_str(&json).unwrap();
+        assert!(parsed.endpoints[0].metered);
+    }
+
+    #[test]
     fn description_too_short() {
         let mut spec = valid_spec();
         spec.meta.description = "Too short".into();
@@ -381,6 +601,17 @@ mod tests {
         assert!(
             errs.iter()
                 .any(|e| e.contains("use_case") && e.contains("min 32"))
+        );
+    }
+
+    #[test]
+    fn use_case_too_long() {
+        let mut spec = valid_spec();
+        spec.meta.use_case = Some("x".repeat(256));
+        let errs = validate_provider(&spec, "t");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("use_case") && e.contains("max 255"))
         );
     }
 

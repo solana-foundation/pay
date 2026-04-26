@@ -94,50 +94,85 @@ before making paid API calls.
 
     #[tool(description = r#"Create or validate a pay-skills provider listing.
 
-Use this tool when a developer wants to list their API in the pay-skills
-registry. It validates a provider `.md` file (YAML frontmatter + markdown body)
-and returns detailed feedback.
+Use this when a developer wants to publish a payment-gated API in
+https://github.com/solana-foundation/pay-skills. The tool validates a complete
+provider `.md` file: YAML frontmatter followed by optional markdown body.
+
+## What to inspect before calling
+
+1. Find real payment-gated endpoints. Look for HTTP 402 handling, x402 headers,
+   MPP challenges, `pay server start` YAML, pricing config, or metering config.
+2. Prefer facts from code, OpenAPI specs, existing routing tables, and deployed
+   URLs. Do not invent endpoints or prices.
+3. If the project has runtime `pay server start` YAML, consider using
+   `pay skills provider sync` first, then validate the generated `.md` content
+   with this tool.
+
+## Required provider rules
+
+- File path: `providers/<operator>/<name>.md` for native APIs or
+  `providers/<operator>/<origin>/<name>.md` for proxied APIs.
+- `name`: lowercase URL-safe API name; must match the filename without `.md`.
+- `title`: human-readable API name.
+- `description`: 64-255 chars; summarize what the API is, major capabilities,
+  and result shapes. Do not start with "Use for".
+- `use_case`: 32-255 chars; start with "Use for" or "Use when" and list
+  concrete agent trigger tasks, synonyms, and adjacent workflows.
+- `category`: one of `ai_ml`, `analytics`, `cloud`, `compute`, `data`,
+  `devtools`, `finance`, `identity`, `iot`, `maps`, `media`, `messaging`,
+  `other`, `productivity`, `search`, `security`, `storage`, `translation`.
+- `service_url`: production HTTPS URL with a domain name, not localhost or an IP.
+- `endpoints`: at least one `{method, path, description, resource?, pricing?}`.
+- Endpoint descriptions: 32-255 chars, start with a verb and name the object.
+
+## Root metadata guidance
+
+- Use the 255-character budget deliberately; 180-255 chars is a good target for
+  broad APIs.
+- `description` is catalog/search copy: what the service does and what callers
+  get back.
+- `use_case` is routing copy: when an agent should pick the service for a user
+  task.
+- Keep both truthful to the listed endpoints. Do not include unsupported
+  workflows just to attract traffic.
+
+## Pricing and probing rules
+
+- Omit `pricing` for free endpoints.
+- If `pricing` is present, CI treats the endpoint as paid and probes for HTTP 402.
+- Paid endpoints must return a valid MPP, MPP session, or x402 challenge.
+- Paid endpoints must accept Solana mainnet USDC or USDT.
+- Non-zero per-unit prices must satisfy `price_usd / scale >= 0.000001` because
+  USDC and USDT have 6 decimal places.
 
 ## Workflow
 
-1. Analyse the developer's codebase to find x402 or MPP payment-gated endpoints.
-   Look for: 402 response handling, x-payment headers, pricing/metering config,
-   `pay server start` YAML specs, or endpoint pricing declarations.
+1. Build the full markdown content.
+2. Call this tool with `content`.
+3. If validation fails, fix every reported issue and retry.
+4. When valid, either pass `output_path` or tell the developer to add the file
+   to pay-skills and run:
 
-2. Infer the provider name from the git remote origin (e.g. `myorg/myrepo` → org is `myorg`).
-
-3. Build the `.md` file content with YAML frontmatter containing:
-   - name: API name (lowercase, matches filename)
-   - title: Human-readable title
-   - description: One sentence, max 120 chars
-   - category: one of [ai_ml, data, compute, maps, search, translation, productivity,
-     finance, identity, storage, messaging, media, iot, security, analytics, devtools, other]
-   - service_url: live URL where the API is reachable
-   - endpoints: array of {method, path, description, resource?, pricing?}
-
-4. Call this tool with the full `.md` content to validate it.
-
-5. If validation fails, the tool returns detailed errors and the JSON Schema. Fix and retry.
-
-6. When valid, either:
-   - Pass `output_path` to write the file to disk, OR
-   - Tell the developer to fork https://github.com/solana-foundation/pay-skills,
-     add the file at `providers/<org>/<name>.md`, and open a PR.
+```bash
+pay skills build . --output /tmp/pay-skills-dist
+pay skills probe . --files providers/<operator>/<name>.md --currencies USDC,USDT --timeout 15 --concurrency 5
+```
 
 ## Example input
 
 ```
 ---
-name: my-api
-title: "My API"
-description: "Real-time fraud detection for payment transactions"
+name: fraud-check
+title: "Fraud Check"
+description: "Score payment transactions for fraud risk using device, behavioral, merchant, card, wallet, and checkout signals. Returns risk scores, review signals, decision reasons, and structured metadata for payment protection workflows."
+use_case: "Use for payment fraud scoring, checkout risk review, transaction monitoring, merchant risk signals, chargeback prevention, wallet or card payment review, suspicious behavior detection, and enriching trust and safety workflows."
 category: finance
 service_url: https://api.mycompany.com
 endpoints:
   - method: POST
-    path: "v1/check"
-    resource: "fraud"
-    description: "Check a transaction for fraud signals"
+    path: v1/check
+    resource: fraud
+    description: "Score a payment transaction for fraud risk signals"
     pricing:
       dimensions:
         - direction: usage
@@ -147,7 +182,7 @@ endpoints:
             - price_usd: 0.05
 ---
 
-Longer description with usage examples, pricing notes, etc.
+Use this API to score card, wallet, and bank payment attempts before fulfillment.
 ```
 "#)]
     async fn create_skill(

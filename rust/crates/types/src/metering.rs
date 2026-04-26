@@ -709,6 +709,7 @@ pub fn validate_api_spec(spec: &ApiSpec) -> Vec<String> {
         validate_split_recipients(metering, &spec.recipients, path, &mut errs);
         validate_split_rules(metering, path, &mut errs);
         validate_tier_splits(metering, &spec.recipients, path, &mut errs);
+        validate_price_precision(metering, path, &mut errs);
     }
 
     errs
@@ -837,6 +838,51 @@ fn validate_tier_splits(
                     errs.push(format!(
                         "endpoint `{path}` (tier ${per_unit:.6}/unit): tier splits total (${total:.6}) >= \
                          per-unit price (${per_unit:.6})"
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// Per-unit price must be representable with 6 decimal places (USDC/USDT).
+/// `price_usd / scale` values like `0.005 / 1099511627776` produce ~30
+/// decimals, which overflows the token's precision and crashes at runtime.
+fn validate_price_precision(metering: &Metering, path: &str, errs: &mut Vec<String>) {
+    const MAX_DECIMALS: u32 = 6; // USDC/USDT = 6 decimals
+    let threshold = 10f64.powi(-(MAX_DECIMALS as i32)); // 0.000001
+
+    for dim in &metering.dimensions {
+        let scale = dim.scale.max(1) as f64;
+        for tier in &dim.tiers {
+            if tier.price_usd == 0.0 {
+                continue;
+            }
+            let per_unit = tier.price_usd / scale;
+            if per_unit < threshold && per_unit > 0.0 {
+                errs.push(format!(
+                    "endpoint `{path}`: price ${:.6}/unit (${} / scale {}) is below the \
+                     minimum representable amount for 6-decimal tokens (${threshold}) — \
+                     reduce scale or increase price_usd",
+                    per_unit, tier.price_usd, dim.scale
+                ));
+            }
+        }
+    }
+
+    for variant in &metering.variants {
+        for dim in &variant.dimensions {
+            let scale = dim.scale.max(1) as f64;
+            for tier in &dim.tiers {
+                if tier.price_usd == 0.0 {
+                    continue;
+                }
+                let per_unit = tier.price_usd / scale;
+                if per_unit < threshold && per_unit > 0.0 {
+                    errs.push(format!(
+                        "endpoint `{path}` (variant {}={}): price ${:.6}/unit (${} / scale {}) \
+                         is below the minimum representable amount for 6-decimal tokens",
+                        variant.param, variant.value, per_unit, tier.price_usd, dim.scale
                     ));
                 }
             }
@@ -1587,6 +1633,45 @@ mod tests {
     }
 
     #[test]
+    fn validate_split_neither_amount_nor_percent() {
+        let spec = test_spec(vec![Endpoint {
+            method: HttpMethod::Post,
+            path: "v1/search".into(),
+            description: None,
+            resource: None,
+            routing: None,
+            metering: Some(Metering {
+                dimensions: vec![MeterDimension {
+                    direction: MeterDirection::Usage,
+                    unit: BillingUnit::Requests,
+                    scale: 1,
+                    period: None,
+                    tiers: vec![PriceTier {
+                        up_to: None,
+                        price_usd: 0.01,
+                        condition: None,
+                        notes: None,
+                        splits: vec![],
+                    }],
+                }],
+                variants: vec![],
+                sku_tiers: vec![],
+                splits: vec![SplitRule {
+                    recipient: "operator".into(),
+                    amount: None,
+                    percent: None,
+                    memo: None,
+                }],
+            }),
+        }]);
+        let errs = validate_api_spec(&spec);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("neither amount nor percent"))
+        );
+    }
+
+    #[test]
     fn validate_valid_spec_no_errors() {
         let spec = test_spec(vec![Endpoint {
             method: HttpMethod::Post,
@@ -1679,5 +1764,160 @@ mod tests {
         let errs = validate_api_spec(&spec);
         assert_eq!(errs.len(), 1);
         assert!(errs[0].contains("tier splits total"));
+    }
+
+    #[test]
+    fn validate_tier_split_unknown_recipient_and_bad_rules() {
+        let spec = test_spec(vec![Endpoint {
+            method: HttpMethod::Post,
+            path: "v1/compute".into(),
+            description: None,
+            resource: None,
+            routing: None,
+            metering: Some(Metering {
+                dimensions: vec![MeterDimension {
+                    direction: MeterDirection::Usage,
+                    unit: BillingUnit::Requests,
+                    scale: 1,
+                    period: None,
+                    tiers: vec![PriceTier {
+                        up_to: None,
+                        price_usd: 0.01,
+                        condition: None,
+                        notes: None,
+                        splits: vec![
+                            SplitRule {
+                                recipient: "missing".into(),
+                                amount: Some(0.001),
+                                percent: None,
+                                memo: None,
+                            },
+                            SplitRule {
+                                recipient: "operator".into(),
+                                amount: Some(0.001),
+                                percent: Some(10.0),
+                                memo: None,
+                            },
+                            SplitRule {
+                                recipient: "platform".into(),
+                                amount: None,
+                                percent: None,
+                                memo: None,
+                            },
+                        ],
+                    }],
+                }],
+                variants: vec![],
+                sku_tiers: vec![],
+                splits: vec![],
+            }),
+        }]);
+        let errs = validate_api_spec(&spec);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("unknown recipient `missing`")),
+            "expected unknown recipient error, got: {errs:?}"
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("both amount and percent")),
+            "expected both amount and percent error, got: {errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("neither amount nor percent")),
+            "expected neither amount nor percent error, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_price_precision_rejects_dimension_below_token_precision() {
+        let yaml = r#"
+name: tiny
+subdomain: tiny
+title: Tiny Prices
+description: Tiny prices
+category: data
+version: v1
+routing:
+  type: respond
+endpoints:
+  - method: POST
+    path: v1/tiny
+    metering:
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 2000000
+          tiers:
+            - price_usd: 1.0
+"#;
+        let spec: ApiSpec = serde_yml::from_str(yaml).unwrap();
+        let errs = validate_api_spec(&spec);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("below the minimum representable amount")),
+            "expected precision error, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_price_precision_rejects_variant_below_token_precision() {
+        let yaml = r#"
+name: variants
+subdomain: variants
+title: Variant Prices
+description: Variant prices
+category: data
+version: v1
+routing:
+  type: respond
+endpoints:
+  - method: POST
+    path: v1/models
+    metering:
+      variants:
+        - param: model
+          value: tiny-model
+          dimensions:
+            - direction: input
+              unit: tokens
+              scale: 10000000
+              tiers:
+                - price_usd: 1.0
+"#;
+        let spec: ApiSpec = serde_yml::from_str(yaml).unwrap();
+        let errs = validate_api_spec(&spec);
+        assert!(
+            errs.iter().any(|e| e.contains("variant model=tiny-model")),
+            "expected variant precision error, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_price_precision_allows_zero_and_minimum_prices() {
+        let yaml = r#"
+name: exact
+subdomain: exact
+title: Exact Prices
+description: Exact prices
+category: data
+version: v1
+routing:
+  type: respond
+endpoints:
+  - method: POST
+    path: v1/exact
+    metering:
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 0.0
+            - price_usd: 0.000001
+"#;
+        let spec: ApiSpec = serde_yml::from_str(yaml).unwrap();
+        let errs = validate_api_spec(&spec);
+        assert!(errs.is_empty(), "expected no errors, got: {errs:?}");
     }
 }

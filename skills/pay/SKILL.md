@@ -1,15 +1,26 @@
 ---
 name: pay
-description: The missing payment layer for HTTP. 100+ APIs and datasources, zero setup — your Solana wallet handles payments automatically using stablecoins.
+description: User-authorized paid HTTP access for agents without API keys. Use when a task needs x402/402 APIs, pay-skills providers, secure wallet-approved API calls, or provider listings for pay-skills.
 ---
 
-pay — the missing payment layer for HTTP.
+pay gives agents paid HTTP access without API keys. It detects 402 payment
+challenges and prepares the required stablecoin transaction, but spending is
+authorized locally by the user.
 
-100+ APIs and datasources are available through pay, with zero setup: no API keys, no billing accounts, no OAuth. Your Solana wallet handles payments automatically using stablecoins (USDC, USDT, etc.).
+# Security model
 
-If `pay` is not installed, it can be used via `npx @solana/pay`.
+- The skill does not contain or request private keys, seed phrases, API keys, or
+  custodial credentials.
+- Wallet keys are stored by `pay` in the operating system's secure credential
+  store, such as macOS Keychain.
+- Real payment transactions require local user authorization through the wallet
+  unlock flow, such as Touch ID on macOS.
+- Agents can request a paid call, but they cannot bypass the user's local
+  signing approval.
+- Use sandbox mode for tests; it uses an ephemeral devnet wallet instead of real
+  funds.
 
-# MCP server
+# Setup
 
 Add to your MCP config to give AI agents direct access to paid APIs:
 
@@ -24,54 +35,60 @@ Add to your MCP config to give AI agents direct access to paid APIs:
 }
 ```
 
-Or launch Claude Code / Codex with pay injected automatically:
+Or launch Claude Code / Codex with pay injected into the agent session:
 
 ```sh
 pay claude
 pay codex
 ```
 
+If `pay` is not installed, use `npx @solana/pay`.
+
 # MCP tools
 
-- `list_skills()` — browse the full registry of 100+ APIs and datasources (local, instant).
-- `get_skill_endpoints(fqn)` — get all endpoints for a specific service, with ready-to-use URLs.
-- `curl({url, method, headers, body})` — make HTTP requests. Handles 402 payment automatically using stablecoins.
-- `get_balance()` — check the active account's SOL and token balances.
-- `create_skill({content})` — validate a provider listing for the pay-skills registry.
+- `list_skills()` - search or browse available API providers.
+- `get_skill_endpoints(fqn)` - return ready-to-call endpoint URLs for one provider.
+- `curl({url, method, headers, body})` - make HTTP requests and handle 402 payment challenges.
+- `get_balance()` - check wallet balances before paid work or when asked.
+- `create_skill({content})` - validate a pay-skills provider listing.
 
-# How to use
+# Agent workflow
 
-1. Browse: `list_skills()`
-2. Pick a service, then: `get_skill_endpoints("<fqn>")`
-3. Copy the `url` field **exactly as-is** into `curl` — these are gateway-proxied URLs that handle payment. Never modify the hostname.
-4. Call: `curl({url: "<url from results>", method: "POST", headers: {"Content-Type": "application/json"}, body: "..."})`
+1. Use `list_skills()` only when you need to choose a provider.
+2. Call `get_skill_endpoints("<fqn>")` for the selected provider.
+3. Copy the returned `url` exactly into `curl`; do not change the hostname.
+4. Make the smallest useful request first. Paid calls should be deliberate and
+   sequential unless the user explicitly asks for batching or parallel calls.
+   Real payments still require local wallet approval.
 
-**IMPORTANT:** Each endpoint call costs money. Do not call endpoints concurrently or speculatively unless the user explicitly asks. Be deliberate — one call at a time.
-
-**IMPORTANT:** Always use the exact URL returned by `list_skills` or `get_skill_endpoints`. If you call the upstream API directly (e.g. `bigquery.googleapis.com`), you'll get a 401 auth error instead of a 402 payment flow.
+Use gateway URLs from pay results, not upstream URLs such as
+`bigquery.googleapis.com`; upstream calls usually require provider-specific auth
+and bypass the payment flow.
 
 # Beyond the registry
 
-`curl` works with ANY API that returns HTTP 402 — not just the ones in the registry. If you encounter a 402 Payment Required response from any URL, use `curl` and it will handle the payment and retry automatically. The registry is a discovery tool, not a limit.
+`curl` works with any API that returns HTTP 402. The registry is discovery, not a
+limit.
 
 # CLI usage
 
 ```sh
-pay setup                                  # generate a wallet
-pay claude                                 # launch Claude Code with pay
-pay codex                                  # launch Codex with pay
-pay curl https://payment-debugger.vercel.app/mpp/quote/AAPL   # HTTP request with 402 handling
-pay --sandbox curl https://payment-debugger.vercel.app/mpp/quote/AAPL  # ephemeral devnet wallet
-pay skills list                            # browse the API registry
-pay skills endpoints <provider>            # list endpoints for a provider
-pay account list                           # list accounts
-pay topup                                  # fund account
-pay server start                           # run a payment gateway for your API
+pay setup                         # create a wallet
+pay claude                        # launch Claude Code with pay
+pay codex                         # launch Codex with pay
+pay curl <url>                    # HTTP request with user-authorized 402 handling
+pay --sandbox curl <url>          # use an ephemeral devnet wallet
+pay skills list                   # browse the API registry
+pay skills endpoints <provider>   # list provider endpoints
+pay account list                  # list accounts
+pay topup                         # fund account
+pay server start                  # run a payment gateway for your API
 ```
 
 # Notes
 
-- URLs from results are complete gateway URLs — use them as-is, never change the hostname.
-- Metered endpoints return 402 on first request; `curl` pays and retries automatically.
+- URLs from results are complete gateway URLs; use them as-is.
+- Metered endpoints return 402 first; `curl` prepares the payment, gets local
+  signing approval, then retries with the payment proof.
 - Free endpoints pass through without payment.
-- Public Payment Debugger: https://payment-debugger.vercel.app
+- Use `create_skill` only when creating or reviewing a pay-skills provider file.
