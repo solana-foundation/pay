@@ -431,8 +431,8 @@ fn handle_outcome(
     Ok(())
 }
 
-struct PaymentRetryContext<'a> {
-    tool: &'a Tool,
+struct PaymentRetryContext<'a, 'tool> {
+    tool: &'a Tool<'tool>,
     output_fmt: Option<OutputFormat>,
     fetch_headers: Option<Vec<(String, String)>>,
     network_override: Option<&'a str>,
@@ -443,7 +443,7 @@ struct PaymentRetryContext<'a> {
 fn pay_mpp_and_retry(
     challenge: &mpp::Challenge,
     resource_url: &str,
-    ctx: PaymentRetryContext<'_>,
+    ctx: PaymentRetryContext<'_, '_>,
 ) -> pay_core::Result<()> {
     let is_json = no_dna::should_json(ctx.output_fmt);
 
@@ -476,7 +476,7 @@ fn pay_mpp_and_retry(
 fn pay_x402_and_retry(
     challenge: &X402Challenge,
     resource_url: &str,
-    ctx: PaymentRetryContext<'_>,
+    ctx: PaymentRetryContext<'_, '_>,
 ) -> pay_core::Result<()> {
     let is_json = no_dna::should_json(ctx.output_fmt);
 

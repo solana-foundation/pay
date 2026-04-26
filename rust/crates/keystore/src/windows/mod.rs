@@ -60,7 +60,7 @@ impl AuthGate for WindowsHelloAuth {
     fn authenticate(&self, intent: &AuthIntent) -> Result<()> {
         ensure_com_init();
 
-        let message = intent.prompt_message();
+        let message = windows_hello_reason_wrapper(&intent.prompt_message());
         let result = request_verification(&message)
             .map_err(|e| Error::Backend(format!("Windows Hello request failed: {e}")))?;
 
@@ -246,40 +246,56 @@ fn cred_delete(target: &[u16]) -> Result<()> {
         .map_err(|e| Error::Backend(format!("CredDeleteW failed: {e}")))
 }
 
+/// The canonical prompt message is a sentence fragment so macOS can render it
+/// after "<app> is trying to ". Windows Hello shows the reason verbatim, so
+/// wrap the fragment with the same "pay.sh is trying to" prefix and a trailing
+/// period to keep the wording aligned across platforms.
+fn windows_hello_reason_wrapper(message: &str) -> String {
+    let trimmed = message.trim_end_matches('.').trim();
+    if trimmed.is_empty() {
+        return "pay.sh is trying to authenticate.".to_string();
+    }
+    format!("pay.sh is trying to {trimmed}.")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn prompt_message_preserves_user_facing_reason() {
+    fn wrapper_prefixes_default_reason() {
         assert_eq!(
-            AuthIntent::default_payment().prompt_message(),
-            "Authorize a payment with pay."
+            windows_hello_reason_wrapper(&AuthIntent::default_payment().prompt_message()),
+            "pay.sh is trying to authorize a payment with pay."
         );
     }
 
     #[test]
-    fn prompt_message_preserves_specific_payment_reason() {
+    fn wrapper_prefixes_specific_payment_reason() {
         assert_eq!(
-            AuthIntent::authorize_payment("$0.05", "accessing API api.example.com")
-                .prompt_message(),
-            "Authorize payment of $0.05 for accessing API api.example.com."
+            windows_hello_reason_wrapper(
+                &AuthIntent::authorize_payment("$0.05", "accessing API api.example.com")
+                    .prompt_message()
+            ),
+            "pay.sh is trying to authorize payment of $0.05 for accessing API api.example.com."
         );
     }
 
     #[test]
-    fn prompt_message_trims_whitespace_and_punctuation() {
+    fn wrapper_trims_whitespace_and_terminates() {
         assert_eq!(
-            AuthIntent::from_reason("  delete default account.  ").prompt_message(),
-            "delete default account."
+            windows_hello_reason_wrapper(
+                &AuthIntent::from_reason("  delete default account  ").prompt_message()
+            ),
+            "pay.sh is trying to delete default account."
         );
     }
 
     #[test]
-    fn prompt_message_falls_back_for_empty_reason() {
+    fn wrapper_falls_back_for_empty_reason() {
         assert_eq!(
-            AuthIntent::from_reason("   ").prompt_message(),
-            "Authorize pay to use your payment account."
+            windows_hello_reason_wrapper(&AuthIntent::from_reason("   ").prompt_message()),
+            "pay.sh is trying to authorize pay to use your payment account."
         );
     }
 

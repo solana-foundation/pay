@@ -2,7 +2,7 @@
 
 use crate::Result;
 
-pub(crate) const DEFAULT_AUTH_REASON: &str = "Authorize pay to use your payment account.";
+pub(crate) const DEFAULT_AUTH_REASON: &str = "authorize pay to use your payment account";
 
 /// Why the keystore is asking the user to authenticate.
 ///
@@ -121,47 +121,47 @@ impl PaymentLimit {
 impl AuthIntent {
     pub fn authorize_payment(amount: &str, description: &str) -> Self {
         Self::AuthorizePayment {
-            message: format!("Authorize payment of {amount} for {description}."),
+            message: format!("authorize payment of {amount} for {description}"),
             limit: PaymentLimit::from_amount(amount),
         }
     }
 
     pub fn default_payment() -> Self {
         Self::AuthorizePayment {
-            message: "Authorize a payment with pay.".to_string(),
+            message: "authorize a payment with pay".to_string(),
             limit: None,
         }
     }
 
     pub fn send_sol(recipient: &str) -> Self {
         Self::AuthorizePayment {
-            message: format!("Authorize sending SOL to {recipient}."),
+            message: format!("authorize sending SOL to {recipient}"),
             limit: None,
         }
     }
 
     pub fn create_account(account: &str) -> Self {
-        Self::CreateAccount(format!("Set up the \"{account}\" payment account."))
+        Self::CreateAccount(format!("set up the \"{account}\" payment account"))
     }
 
     pub fn import_account(account: &str) -> Self {
-        Self::ImportAccount(format!("Import the \"{account}\" payment account."))
+        Self::ImportAccount(format!("import the \"{account}\" payment account"))
     }
 
     pub fn export_account(account: &str) -> Self {
-        Self::ExportAccount(format!("Export the \"{account}\" payment account."))
+        Self::ExportAccount(format!("export the \"{account}\" payment account"))
     }
 
     pub fn delete_account(account: &str) -> Self {
-        Self::DeleteAccount(format!("Delete the \"{account}\" payment account."))
+        Self::DeleteAccount(format!("delete the \"{account}\" payment account"))
     }
 
     pub fn open_session() -> Self {
-        Self::OpenSession("Authorize opening a pay session.".to_string())
+        Self::OpenSession("authorize opening a pay session".to_string())
     }
 
     pub fn use_gateway_fee_payer() -> Self {
-        Self::UseGatewayFeePayer("Use your pay account as the gateway fee payer.".to_string())
+        Self::UseGatewayFeePayer("use your pay account as the gateway fee payer".to_string())
     }
 
     pub fn use_account(message: impl Into<String>) -> Self {
@@ -318,8 +318,8 @@ mod tests {
     #[test]
     fn prompt_message_preserves_user_facing_reason() {
         assert_eq!(
-            AuthIntent::from_reason("Authorize a payment with pay.").prompt_message(),
-            "Authorize a payment with pay."
+            AuthIntent::from_reason("authorize a payment with pay").prompt_message(),
+            "authorize a payment with pay"
         );
     }
 
@@ -328,15 +328,15 @@ mod tests {
         assert_eq!(
             AuthIntent::authorize_payment("$0.05", "accessing API api.example.com")
                 .prompt_message(),
-            "Authorize payment of $0.05 for accessing API api.example.com."
+            "authorize payment of $0.05 for accessing API api.example.com"
         );
     }
 
     #[test]
     fn prompt_message_trims_whitespace_and_punctuation() {
         assert_eq!(
-            AuthIntent::from_reason("  delete default account.  ").prompt_message(),
-            "delete default account."
+            AuthIntent::from_reason("  delete default account  ").prompt_message(),
+            "delete default account"
         );
     }
 
@@ -360,31 +360,31 @@ mod tests {
     #[test]
     fn from_reason_maps_known_reason_shapes_to_variants() {
         assert!(matches!(
-            AuthIntent::from_reason("Authorize sending SOL to recipient."),
+            AuthIntent::from_reason("authorize sending SOL to recipient"),
             AuthIntent::AuthorizePayment { .. }
         ));
         assert!(matches!(
-            AuthIntent::from_reason("Set up the \"default\" payment account."),
+            AuthIntent::from_reason("set up the \"default\" payment account"),
             AuthIntent::CreateAccount(_)
         ));
         assert!(matches!(
-            AuthIntent::from_reason("Import the \"default\" payment account."),
+            AuthIntent::from_reason("import the \"default\" payment account"),
             AuthIntent::ImportAccount(_)
         ));
         assert!(matches!(
-            AuthIntent::from_reason("Export the \"default\" payment account."),
+            AuthIntent::from_reason("export the \"default\" payment account"),
             AuthIntent::ExportAccount(_)
         ));
         assert!(matches!(
-            AuthIntent::from_reason("Delete the \"default\" payment account."),
+            AuthIntent::from_reason("delete the \"default\" payment account"),
             AuthIntent::DeleteAccount(_)
         ));
         assert!(matches!(
-            AuthIntent::from_reason("Authorize opening a pay session."),
+            AuthIntent::from_reason("authorize opening a pay session"),
             AuthIntent::OpenSession(_)
         ));
         assert!(matches!(
-            AuthIntent::from_reason("Use your pay account as the gateway fee payer."),
+            AuthIntent::from_reason("use your pay account as the gateway fee payer"),
             AuthIntent::UseGatewayFeePayer(_)
         ));
     }
@@ -425,7 +425,7 @@ mod tests {
             Some(PaymentLimit::Usd005)
         );
         assert_eq!(
-            AuthIntent::from_reason("Authorize payment of $0.0501 for accessing API.")
+            AuthIntent::from_reason("authorize payment of $0.0501 for accessing API")
                 .payment_limit(),
             Some(PaymentLimit::Usd01)
         );

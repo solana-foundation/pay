@@ -63,7 +63,7 @@ pub fn load_signer_for_network(
 
 /// Variant of [`load_signer_for_network`] that takes an explicit reason
 /// string for the keystore auth prompt (e.g.
-/// "Authorize payment of $0.10 for accessing API api.example.com.").
+/// "authorize payment of $0.10 for accessing API api.example.com").
 pub fn load_signer_for_network_with_reason(
     network: &str,
     store: &dyn AccountsStore,
