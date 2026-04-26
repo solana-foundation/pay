@@ -5,6 +5,12 @@
 use dialoguer::Confirm;
 use owo_colors::OwoColorize;
 
+#[cfg(target_os = "linux")]
+const POLKIT_POLICY_PATH: &str = "/usr/share/polkit-1/actions/sh.pay.unlock-keypair.policy";
+
+#[cfg(target_os = "linux")]
+const POLKIT_POLICY: &str = include_str!("../../../../config/polkit/sh.pay.unlock-keypair.policy");
+
 /// Generate a keypair, store it securely, and fund your account.
 #[derive(clap::Args)]
 pub struct SetupCommand {
@@ -69,7 +75,8 @@ impl SetupCommand {
 
 /// If `npx` is on PATH, offer to install the pay agent skill for coding agents.
 fn maybe_install_skill() {
-    let has_npx = std::process::Command::new("npx")
+    let npx_bin = if cfg!(windows) { "npx.cmd" } else { "npx" };
+    let has_npx = std::process::Command::new(npx_bin)
         .arg("--version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -92,7 +99,7 @@ fn maybe_install_skill() {
     }
 
     eprintln!();
-    let status = std::process::Command::new("npx")
+    let status = std::process::Command::new(npx_bin)
         .args([
             "-y",
             "skills",
@@ -121,4 +128,57 @@ fn maybe_install_skill() {
         }
     }
     eprintln!();
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn install_linux_polkit_policy_if_needed() -> pay_core::Result<()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    if std::fs::read_to_string(POLKIT_POLICY_PATH).is_ok_and(|installed| installed == POLKIT_POLICY)
+    {
+        return Ok(());
+    }
+
+    eprintln!();
+    eprintln!(
+        "{}",
+        "  Installing Linux authentication prompts for pay (polkit policy)...".dimmed()
+    );
+
+    let mut child = Command::new("pkexec")
+        .args(["tee", POLKIT_POLICY_PATH])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .map_err(|e| {
+            pay_core::Error::Config(format!(
+                "Failed to launch pkexec to install the pay polkit policy: {e}.\n\n\
+                 Install it manually with:\n\
+                 \x20 sudo tee {POLKIT_POLICY_PATH} >/dev/null <<'EOF'\n\
+                 {POLKIT_POLICY}EOF"
+            ))
+        })?;
+
+    {
+        let mut stdin = child.stdin.take().expect("pkexec stdin");
+        stdin
+            .write_all(POLKIT_POLICY.as_bytes())
+            .map_err(|e| pay_core::Error::Config(format!("Failed to write polkit policy: {e}")))?;
+    }
+
+    let status = child
+        .wait()
+        .map_err(|e| pay_core::Error::Config(format!("pkexec failed: {e}")))?;
+
+    if status.success() {
+        eprintln!("  {} Linux authentication prompts installed", "✔".green());
+        Ok(())
+    } else {
+        Err(pay_core::Error::Config(format!(
+            "Failed to install the pay polkit policy (pkexec exited with {status}).\n\n\
+             Install it manually with:\n\
+             \x20 sudo cp rust/config/polkit/sh.pay.unlock-keypair.policy {POLKIT_POLICY_PATH}"
+        )))
+    }
 }

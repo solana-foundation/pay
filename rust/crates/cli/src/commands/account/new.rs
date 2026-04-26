@@ -96,8 +96,8 @@ pub fn create_account(
         pay_core::keystore::SyncMode::ThisDeviceOnly
     };
 
-    let reason = format!("set up \"{}\" payment account", name);
-    ks.import_with_reason(name, &keypair_bytes, sync, &reason)
+    let intent = pay_core::keystore::AuthIntent::create_account(name);
+    ks.import_with_intent(name, &keypair_bytes, sync, &intent)
         .map_err(|e| pay_core::Error::Config(format!("{e}")))?;
 
     save_account(
@@ -150,6 +150,7 @@ fn build_keystore(
                     "GNOME Keyring is not available.".to_string(),
                 ));
             }
+            crate::commands::setup::install_linux_polkit_policy_if_needed()?;
             Ok((
                 Keystore::gnome_keyring(),
                 pay_core::accounts::Keystore::GnomeKeyring,

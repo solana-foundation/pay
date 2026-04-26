@@ -1,6 +1,6 @@
 //! macOS: Touch ID authentication + Apple Keychain storage.
 
-use crate::{AuthGate, Error, Result, SecretStore, Zeroizing};
+use crate::{AuthGate, AuthIntent, Error, Result, SecretStore, Zeroizing};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -17,10 +17,11 @@ const ENTITLEMENTS_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 pub struct TouchId;
 
 impl AuthGate for TouchId {
-    fn authenticate(&self, reason: &str) -> Result<()> {
+    fn authenticate(&self, intent: &AuthIntent) -> Result<()> {
         let binary = helper_path()?;
+        let message = intent.prompt_message();
         let output = Command::new(&binary)
-            .args(["authenticate", reason])
+            .args(["authenticate", &message])
             .output()
             .map_err(|e| Error::Backend(format!("pay.sh: {e}")))?;
 

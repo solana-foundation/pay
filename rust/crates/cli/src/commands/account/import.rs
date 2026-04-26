@@ -86,8 +86,8 @@ impl ImportCommand {
             pay_core::keystore::SyncMode::ThisDeviceOnly
         };
 
-        let reason = format!("import \"{}\" account", name);
-        ks.import_with_reason(&name, &keypair_bytes, sync, &reason)
+        let intent = pay_core::keystore::AuthIntent::import_account(&name);
+        ks.import_with_intent(&name, &keypair_bytes, sync, &intent)
             .map_err(|e| pay_core::Error::Config(format!("{e}")))?;
 
         // 5. Save to accounts.yml under mainnet
@@ -235,11 +235,14 @@ pub(super) fn build_keystore(
         )),
 
         #[cfg(target_os = "linux")]
-        "gnome-keyring" => Ok((
-            Keystore::gnome_keyring(),
-            pay_core::accounts::Keystore::GnomeKeyring,
-            "Stored in GNOME Keyring.",
-        )),
+        "gnome-keyring" => {
+            crate::commands::setup::install_linux_polkit_policy_if_needed()?;
+            Ok((
+                Keystore::gnome_keyring(),
+                pay_core::accounts::Keystore::GnomeKeyring,
+                "Stored in GNOME Keyring.",
+            ))
+        }
         #[cfg(not(target_os = "linux"))]
         "gnome-keyring" => Err(pay_core::Error::Config(
             "GNOME Keyring is only available on Linux".into(),

@@ -5,12 +5,164 @@
 <policyconfig>
   <vendor>Solana Foundation</vendor>
   <vendor_url>https://solana.org</vendor_url>
-  <action id="sh.pay.unlock-keypair">
-    <description>Authorize payment with your Solana keypair</description>
+  <action id="sh.pay.authorize-payment">
+    <description>Authorize Solana payment</description>
     <message>Authentication is required to authorize a Solana payment</message>
     <defaults>
       <!-- auth_self: requires the user's own credentials (password or fingerprint),
            not admin/root. Applies in all contexts. -->
+      <allow_any>auth_self</allow_any>
+      <allow_inactive>auth_self</allow_inactive>
+      <allow_active>auth_self</allow_active>
+    </defaults>
+  </action>
+  <action id="sh.pay.authorize-payment-up-to-usd-00001">
+    <description>Authorize payment up to $0.0001</description>
+    <message>Authentication is required to authorize a payment up to $0.0001</message>
+    <defaults><allow_any>auth_self</allow_any><allow_inactive>auth_self</allow_inactive><allow_active>auth_self</allow_active></defaults>
+  </action>
+  <action id="sh.pay.authorize-payment-up-to-usd-0001">
+    <description>Authorize payment up to $0.001</description>
+    <message>Authentication is required to authorize a payment up to $0.001</message>
+    <defaults><allow_any>auth_self</allow_any><allow_inactive>auth_self</allow_inactive><allow_active>auth_self</allow_active></defaults>
+  </action>
+  <action id="sh.pay.authorize-payment-up-to-usd-0005">
+    <description>Authorize payment up to $0.005</description>
+    <message>Authentication is required to authorize a payment up to $0.005</message>
+    <defaults><allow_any>auth_self</allow_any><allow_inactive>auth_self</allow_inactive><allow_active>auth_self</allow_active></defaults>
+  </action>
+  <action id="sh.pay.authorize-payment-up-to-usd-001">
+    <description>Authorize payment up to $0.01</description>
+    <message>Authentication is required to authorize a payment up to $0.01</message>
+    <defaults><allow_any>auth_self</allow_any><allow_inactive>auth_self</allow_inactive><allow_active>auth_self</allow_active></defaults>
+  </action>
+  <action id="sh.pay.authorize-payment-up-to-usd-005">
+    <description>Authorize payment up to $0.05</description>
+    <message>Authentication is required to authorize a payment up to $0.05</message>
+    <defaults><allow_any>auth_self</allow_any><allow_inactive>auth_self</allow_inactive><allow_active>auth_self</allow_active></defaults>
+  </action>
+  <action id="sh.pay.authorize-payment-up-to-usd-01">
+    <description>Authorize payment up to $0.10</description>
+    <message>Authentication is required to authorize a payment up to $0.10</message>
+    <defaults><allow_any>auth_self</allow_any><allow_inactive>auth_self</allow_inactive><allow_active>auth_self</allow_active></defaults>
+  </action>
+  <action id="sh.pay.authorize-payment-up-to-usd-05">
+    <description>Authorize payment up to $0.50</description>
+    <message>Authentication is required to authorize a payment up to $0.50</message>
+    <defaults><allow_any>auth_self</allow_any><allow_inactive>auth_self</allow_inactive><allow_active>auth_self</allow_active></defaults>
+  </action>
+  <action id="sh.pay.authorize-payment-up-to-usd-1">
+    <description>Authorize payment up to $1</description>
+    <message>Authentication is required to authorize a payment up to $1</message>
+    <defaults><allow_any>auth_self</allow_any><allow_inactive>auth_self</allow_inactive><allow_active>auth_self</allow_active></defaults>
+  </action>
+  <action id="sh.pay.authorize-payment-up-to-usd-2">
+    <description>Authorize payment up to $2</description>
+    <message>Authentication is required to authorize a payment up to $2</message>
+    <defaults><allow_any>auth_self</allow_any><allow_inactive>auth_self</allow_inactive><allow_active>auth_self</allow_active></defaults>
+  </action>
+  <action id="sh.pay.authorize-payment-up-to-usd-5">
+    <description>Authorize payment up to $5</description>
+    <message>Authentication is required to authorize a payment up to $5</message>
+    <defaults><allow_any>auth_self</allow_any><allow_inactive>auth_self</allow_inactive><allow_active>auth_self</allow_active></defaults>
+  </action>
+  <action id="sh.pay.authorize-payment-up-to-usd-10">
+    <description>Authorize payment up to $10</description>
+    <message>Authentication is required to authorize a payment up to $10</message>
+    <defaults><allow_any>auth_self</allow_any><allow_inactive>auth_self</allow_inactive><allow_active>auth_self</allow_active></defaults>
+  </action>
+  <action id="sh.pay.authorize-payment-up-to-usd-15">
+    <description>Authorize payment up to $15</description>
+    <message>Authentication is required to authorize a payment up to $15</message>
+    <defaults><allow_any>auth_self</allow_any><allow_inactive>auth_self</allow_inactive><allow_active>auth_self</allow_active></defaults>
+  </action>
+  <action id="sh.pay.authorize-payment-up-to-usd-20">
+    <description>Authorize payment up to $20</description>
+    <message>Authentication is required to authorize a payment up to $20</message>
+    <defaults><allow_any>auth_self</allow_any><allow_inactive>auth_self</allow_inactive><allow_active>auth_self</allow_active></defaults>
+  </action>
+  <action id="sh.pay.authorize-payment-up-to-usd-25">
+    <description>Authorize payment up to $25</description>
+    <message>Authentication is required to authorize a payment up to $25</message>
+    <defaults><allow_any>auth_self</allow_any><allow_inactive>auth_self</allow_inactive><allow_active>auth_self</allow_active></defaults>
+  </action>
+  <action id="sh.pay.authorize-payment-up-to-usd-50">
+    <description>Authorize payment up to $50</description>
+    <message>Authentication is required to authorize a payment up to $50</message>
+    <defaults><allow_any>auth_self</allow_any><allow_inactive>auth_self</allow_inactive><allow_active>auth_self</allow_active></defaults>
+  </action>
+  <action id="sh.pay.authorize-payment-above-usd-50">
+    <description>Authorize payment above $50</description>
+    <message>Authentication is required to authorize a payment above $50</message>
+    <defaults><allow_any>auth_self</allow_any><allow_inactive>auth_self</allow_inactive><allow_active>auth_self</allow_active></defaults>
+  </action>
+  <action id="sh.pay.create-keypair">
+    <description>Create Solana payment account</description>
+    <message>Authentication is required to create a Solana payment account</message>
+    <defaults>
+      <allow_any>auth_self</allow_any>
+      <allow_inactive>auth_self</allow_inactive>
+      <allow_active>auth_self</allow_active>
+    </defaults>
+  </action>
+  <action id="sh.pay.import-keypair">
+    <description>Import Solana payment account</description>
+    <message>Authentication is required to import a Solana payment account</message>
+    <defaults>
+      <allow_any>auth_self</allow_any>
+      <allow_inactive>auth_self</allow_inactive>
+      <allow_active>auth_self</allow_active>
+    </defaults>
+  </action>
+  <action id="sh.pay.export-keypair">
+    <description>Export Solana payment account</description>
+    <message>Authentication is required to export a Solana payment account</message>
+    <defaults>
+      <allow_any>auth_self</allow_any>
+      <allow_inactive>auth_self</allow_inactive>
+      <allow_active>auth_self</allow_active>
+    </defaults>
+  </action>
+  <action id="sh.pay.delete-keypair">
+    <description>Delete Solana payment account</description>
+    <message>Authentication is required to delete a Solana payment account</message>
+    <defaults>
+      <allow_any>auth_self</allow_any>
+      <allow_inactive>auth_self</allow_inactive>
+      <allow_active>auth_self</allow_active>
+    </defaults>
+  </action>
+  <action id="sh.pay.open-session">
+    <description>Open pay session</description>
+    <message>Authentication is required to open a pay session</message>
+    <defaults>
+      <allow_any>auth_self</allow_any>
+      <allow_inactive>auth_self</allow_inactive>
+      <allow_active>auth_self</allow_active>
+    </defaults>
+  </action>
+  <action id="sh.pay.use-gateway-fee-payer">
+    <description>Use gateway fee payer account</description>
+    <message>Authentication is required to use your Solana payment account as the gateway fee payer</message>
+    <defaults>
+      <allow_any>auth_self</allow_any>
+      <allow_inactive>auth_self</allow_inactive>
+      <allow_active>auth_self</allow_active>
+    </defaults>
+  </action>
+  <action id="sh.pay.use-keypair">
+    <description>Use Solana payment account</description>
+    <message>Authentication is required to use your Solana payment account</message>
+    <defaults>
+      <allow_any>auth_self</allow_any>
+      <allow_inactive>auth_self</allow_inactive>
+      <allow_active>auth_self</allow_active>
+    </defaults>
+  </action>
+  <action id="sh.pay.unlock-keypair">
+    <description>Use Solana payment account</description>
+    <message>Authentication is required to use your Solana payment account</message>
+    <defaults>
       <allow_any>auth_self</allow_any>
       <allow_inactive>auth_self</allow_inactive>
       <allow_active>auth_self</allow_active>

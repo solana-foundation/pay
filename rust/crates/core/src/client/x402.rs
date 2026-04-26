@@ -61,10 +61,14 @@ pub fn build_payment(
     store: &dyn AccountsStore,
     network_override: Option<&str>,
     account_override: Option<&str>,
+    resource_url: Option<&str>,
 ) -> Result<(&'static str, String, Option<ResolvedEphemeral>)> {
     let requirements = &challenge.requirements;
     let amount = format_amount(&requirements.amount, &requirements.currency);
-    let desc = requirements.description.as_deref().unwrap_or("API access");
+    let desc = crate::client::prompt::payment_description(
+        requirements.description.as_deref(),
+        &[Some(requirements.resource.as_str()), resource_url],
+    );
 
     let cluster = normalize_network(requirements.cluster.as_deref().unwrap_or("mainnet"));
 
@@ -84,7 +88,7 @@ pub fn build_payment(
         store,
         account_override,
         &amount,
-        desc,
+        &desc,
     )?;
 
     let rpc_url =
@@ -500,7 +504,7 @@ mod tests {
             resource: None,
         };
 
-        let err = build_payment(&challenge, &store, Some("localnet"), None).unwrap_err();
+        let err = build_payment(&challenge, &store, Some("localnet"), None, None).unwrap_err();
         let msg = err.to_string();
 
         assert!(msg.contains("you forced network `localnet`"));
@@ -522,7 +526,7 @@ mod tests {
             resource: None,
         };
 
-        let err = build_payment(&challenge, &store, None, None).unwrap_err();
+        let err = build_payment(&challenge, &store, None, None, None).unwrap_err();
         let msg = err.to_string();
 
         assert!(msg.contains("No account configured for network `mainnet`"));
@@ -540,7 +544,7 @@ mod tests {
             accepted: None,
             resource: None,
         };
-        let err = build_payment(&challenge, &store, None, Some("alice")).unwrap_err();
+        let err = build_payment(&challenge, &store, None, Some("alice"), None).unwrap_err();
         let msg = err.to_string();
 
         assert!(msg.contains("No account named `alice` configured for network `mainnet`"));

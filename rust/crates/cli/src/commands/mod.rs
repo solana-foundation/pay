@@ -217,12 +217,15 @@ fn handle_outcome(
                 }
                 return pay_mpp_and_retry(
                     &challenge,
-                    tool,
-                    output_fmt,
-                    fetch_headers,
-                    network_override,
-                    account_override,
-                    verbose,
+                    &resource_url,
+                    PaymentRetryContext {
+                        tool,
+                        output_fmt,
+                        fetch_headers,
+                        network_override,
+                        account_override,
+                        verbose,
+                    },
                 );
             }
 
@@ -328,12 +331,15 @@ fn handle_outcome(
                 }
                 return pay_x402_and_retry(
                     &challenge,
-                    tool,
-                    output_fmt,
-                    fetch_headers,
-                    network_override,
-                    account_override,
-                    verbose,
+                    &resource_url,
+                    PaymentRetryContext {
+                        tool,
+                        output_fmt,
+                        fetch_headers,
+                        network_override,
+                        account_override,
+                        verbose,
+                    },
                 );
             }
 
@@ -425,65 +431,82 @@ fn handle_outcome(
     Ok(())
 }
 
-fn pay_mpp_and_retry(
-    challenge: &mpp::Challenge,
-    tool: &Tool,
+struct PaymentRetryContext<'a, 'tool> {
+    tool: &'a Tool<'tool>,
     output_fmt: Option<OutputFormat>,
     fetch_headers: Option<Vec<(String, String)>>,
-    network_override: Option<&str>,
-    account_override: Option<&str>,
+    network_override: Option<&'a str>,
+    account_override: Option<&'a str>,
     verbose: bool,
-) -> pay_core::Result<()> {
-    let is_json = no_dna::should_json(output_fmt);
+}
 
-    if verbose && !is_json {
+fn pay_mpp_and_retry(
+    challenge: &mpp::Challenge,
+    resource_url: &str,
+    ctx: PaymentRetryContext<'_, '_>,
+) -> pay_core::Result<()> {
+    let is_json = no_dna::should_json(ctx.output_fmt);
+
+    if ctx.verbose && !is_json {
         eprintln!("{}", "Paying...".dimmed());
     }
 
     let store = pay_core::accounts::FileAccountsStore::default_path();
-    let (auth_header, ephemeral_notice) =
-        mpp::build_credential(challenge, &store, network_override, account_override)?;
+    let (auth_header, ephemeral_notice) = mpp::build_credential(
+        challenge,
+        &store,
+        ctx.network_override,
+        ctx.account_override,
+        Some(resource_url),
+    )?;
 
     if let Some(resolved) = ephemeral_notice {
         render_generated_wallet_notice(&resolved, is_json)?;
     }
 
-    if verbose && !is_json {
+    if ctx.verbose && !is_json {
         eprintln!("{}", "Payment signed, retrying...\n".dimmed());
     }
 
-    let retry_outcome = retry_with_header(tool, "Authorization", &auth_header, fetch_headers)?;
+    let retry_outcome =
+        retry_with_header(ctx.tool, "Authorization", &auth_header, ctx.fetch_headers)?;
     handle_retry_outcome(retry_outcome, is_json)
 }
 
 fn pay_x402_and_retry(
     challenge: &X402Challenge,
-    tool: &Tool,
-    output_fmt: Option<OutputFormat>,
-    fetch_headers: Option<Vec<(String, String)>>,
-    network_override: Option<&str>,
-    account_override: Option<&str>,
-    verbose: bool,
+    resource_url: &str,
+    ctx: PaymentRetryContext<'_, '_>,
 ) -> pay_core::Result<()> {
-    let is_json = no_dna::should_json(output_fmt);
+    let is_json = no_dna::should_json(ctx.output_fmt);
 
-    if verbose && !is_json {
+    if ctx.verbose && !is_json {
         eprintln!("{}", "Paying...".dimmed());
     }
 
     let store = pay_core::accounts::FileAccountsStore::default_path();
-    let (payment_header_name, payment_json, ephemeral_notice) =
-        x402::build_payment(challenge, &store, network_override, account_override)?;
+    let (payment_header_name, payment_json, ephemeral_notice) = x402::build_payment(
+        challenge,
+        &store,
+        ctx.network_override,
+        ctx.account_override,
+        Some(resource_url),
+    )?;
 
     if let Some(resolved) = ephemeral_notice {
         render_generated_wallet_notice(&resolved, is_json)?;
     }
 
-    if verbose && !is_json {
+    if ctx.verbose && !is_json {
         eprintln!("{}", "Payment signed, retrying...\n".dimmed());
     }
 
-    let retry_outcome = retry_with_header(tool, payment_header_name, &payment_json, fetch_headers)?;
+    let retry_outcome = retry_with_header(
+        ctx.tool,
+        payment_header_name,
+        &payment_json,
+        ctx.fetch_headers,
+    )?;
     handle_retry_outcome(retry_outcome, is_json)
 }
 

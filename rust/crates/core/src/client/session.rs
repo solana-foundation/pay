@@ -247,11 +247,12 @@ pub fn open_pull_session_header(
     });
 
     // Load the user's wallet keypair
-    let (signer, ephemeral_notice) = crate::signer::load_signer_for_network_with_reason(
+    let intent = crate::keystore::AuthIntent::open_session();
+    let (signer, ephemeral_notice) = crate::signer::load_signer_for_network_with_intent(
         &network,
         store,
         account_override,
-        "authorize payment",
+        &intent,
     )?;
     let user_pubkey = signer.pubkey();
 

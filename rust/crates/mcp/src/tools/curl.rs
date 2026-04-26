@@ -82,6 +82,7 @@ fn do_paid_fetch(
                 &store,
                 network_override.as_deref(),
                 account_override.as_deref(),
+                Some(url),
             )?;
             let mut headers = extra_headers.to_vec();
             headers.push(("Authorization".to_string(), auth_header));
@@ -98,6 +99,7 @@ fn do_paid_fetch(
                 &store,
                 network_override.as_deref(),
                 account_override.as_deref(),
+                Some(url),
             )?;
             let mut headers = extra_headers.to_vec();
             headers.push((payment_header_name.to_string(), payment_header));

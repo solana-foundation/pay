@@ -1354,7 +1354,7 @@ async fn mpp_build_credential_with_surfnet() {
     //
     // Inject the test payer into a MemoryAccountsStore as an ephemeral
     // account mapped to `localnet` — that's how the new
-    // `build_credential(challenge, store, network_override, account_override)` API
+    // `build_credential(challenge, store, network_override, account_override, resource_url)` API
     // resolves the wallet (no more `active_account_name: &str`).
     //
     // build_credential creates its own tokio runtime, so we drive it
@@ -1387,7 +1387,7 @@ async fn mpp_build_credential_with_surfnet() {
         let store = pay_core::accounts::MemoryAccountsStore::with_file(file);
 
         let result =
-            client::mpp::build_credential(&challenge_clone, &store, Some("localnet"), None);
+            client::mpp::build_credential(&challenge_clone, &store, Some("localnet"), None, None);
         unsafe { std::env::remove_var("PAY_RPC_URL") };
         result
     })

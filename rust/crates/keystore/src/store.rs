@@ -138,7 +138,7 @@ impl OnePasswordAuth {
 }
 
 impl crate::AuthGate for OnePasswordAuth {
-    fn authenticate(&self, _reason: &str) -> crate::Result<()> {
+    fn authenticate(&self, _intent: &crate::AuthIntent) -> crate::Result<()> {
         self.signout();
         self.signin()
     }

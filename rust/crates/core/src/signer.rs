@@ -7,6 +7,7 @@ use crate::accounts::{
     load_or_create_ephemeral_for_network, load_or_create_ephemeral_for_network_as,
     resolve_account_for_network,
 };
+use crate::keystore::AuthIntent;
 use crate::{Error, Result};
 
 /// Load a `MemorySigner` from the given source.
@@ -17,14 +18,14 @@ use crate::{Error, Result};
 /// - `1password:<account>` — load from 1Password (triggers `op` CLI auth)
 /// - anything else — treat as a file path
 pub fn load_signer(source: &str) -> Result<MemorySigner> {
-    load_signer_with_reason(source, "authorize payment")
+    load_signer_with_intent(source, &AuthIntent::default_payment())
 }
 
 /// Load a signer for a payment, prefixing rejection errors with the amount
 /// (e.g. "$0.10 payment authorization was rejected by user at Apple Keychain").
 pub fn load_signer_for_payment(source: &str, amount: &str, desc: &str) -> Result<MemorySigner> {
-    let reason = format!("pay {amount} for {desc}");
-    load_signer_with_reason(source, &reason).map_err(|e| match e {
+    let intent = AuthIntent::authorize_payment(amount, desc);
+    load_signer_with_intent(source, &intent).map_err(|e| match e {
         Error::PaymentRejected(where_) => {
             Error::PaymentRejected(format!("{amount} payment authorization was {where_}"))
         }
@@ -57,21 +58,38 @@ pub fn load_signer_for_network(
     network: &str,
     store: &dyn AccountsStore,
 ) -> Result<(MemorySigner, Option<ResolvedEphemeral>)> {
-    load_signer_for_network_with_reason(network, store, None, "authorize payment")
+    load_signer_for_network_with_intent(network, store, None, &AuthIntent::default_payment())
 }
 
 /// Variant of [`load_signer_for_network`] that takes an explicit reason
-/// string for the keystore auth prompt (e.g. "pay $0.10 for API access").
+/// string for the keystore auth prompt (e.g.
+/// "authorize payment of $0.10 for accessing API api.example.com").
 pub fn load_signer_for_network_with_reason(
     network: &str,
     store: &dyn AccountsStore,
     account_override: Option<&str>,
     reason: &str,
 ) -> Result<(MemorySigner, Option<ResolvedEphemeral>)> {
+    load_signer_for_network_with_intent(
+        network,
+        store,
+        account_override,
+        &AuthIntent::from_reason(reason),
+    )
+}
+
+/// Variant of [`load_signer_for_network`] that takes a typed keystore auth
+/// intent.
+pub fn load_signer_for_network_with_intent(
+    network: &str,
+    store: &dyn AccountsStore,
+    account_override: Option<&str>,
+    intent: &AuthIntent,
+) -> Result<(MemorySigner, Option<ResolvedEphemeral>)> {
     let file = store.load()?;
     if let Some(name) = account_override {
         if let Some(account) = file.named_account_for_network(network, name).cloned() {
-            let signer = load_signer_from_account_with_reason(&account, name, network, reason)?;
+            let signer = load_signer_from_account_with_intent(&account, name, network, intent)?;
             return Ok((signer, None));
         }
         if is_lazy_ephemeral_network(network) {
@@ -85,7 +103,7 @@ pub fn load_signer_for_network_with_reason(
     }
     match resolve_account_for_network(network, &file) {
         AccountChoice::Resolved { name, account } => {
-            let signer = load_signer_from_account_with_reason(&account, &name, network, reason)?;
+            let signer = load_signer_from_account_with_intent(&account, &name, network, intent)?;
             Ok((signer, None))
         }
         AccountChoice::Missing => {
@@ -112,8 +130,8 @@ pub fn load_signer_for_network_payment(
     amount: &str,
     desc: &str,
 ) -> Result<(MemorySigner, Option<ResolvedEphemeral>)> {
-    let reason = format!("pay {amount} for {desc}");
-    load_signer_for_network_with_reason(network, store, account_override, &reason).map_err(|e| {
+    let intent = AuthIntent::authorize_payment(amount, desc);
+    load_signer_for_network_with_intent(network, store, account_override, &intent).map_err(|e| {
         match e {
             Error::PaymentRejected(where_) => {
                 Error::PaymentRejected(format!("{amount} payment authorization was {where_}"))
@@ -136,8 +154,22 @@ pub fn load_keypair_bytes_from_account_with_reason(
     network: &str,
     reason: &str,
 ) -> Result<crate::keystore::Zeroizing<Vec<u8>>> {
+    load_keypair_bytes_from_account_with_intent(
+        account,
+        name,
+        network,
+        &AuthIntent::from_reason(reason),
+    )
+}
+
+pub fn load_keypair_bytes_from_account_with_intent(
+    account: &Account,
+    name: &str,
+    network: &str,
+    intent: &AuthIntent,
+) -> Result<crate::keystore::Zeroizing<Vec<u8>>> {
     if account.keystore == Keystore::Ephemeral {
-        maybe_authenticate_ephemeral_account(account, network, reason)?;
+        maybe_authenticate_ephemeral_account(account, network, intent)?;
         return account
             .ephemeral_keypair_bytes()
             .map(crate::keystore::Zeroizing::new)
@@ -165,7 +197,7 @@ pub fn load_keypair_bytes_from_account_with_reason(
                         false,
                     )
                 };
-                ks.load_keypair(name, reason)
+                ks.load_keypair_with_intent(name, intent)
                     .map_err(|e| Error::Config(format!("keychain: {e}")))
             }
             #[cfg(not(target_os = "macos"))]
@@ -187,7 +219,7 @@ pub fn load_keypair_bytes_from_account_with_reason(
                         false,
                     )
                 };
-                ks.load_keypair(name, reason)
+                ks.load_keypair_with_intent(name, intent)
                     .map_err(|e| Error::Config(format!("gnome-keyring: {e}")))
             }
             #[cfg(not(target_os = "linux"))]
@@ -210,7 +242,7 @@ pub fn load_keypair_bytes_from_account_with_reason(
                         false,
                     )
                 };
-                ks.load_keypair(name, reason)
+                ks.load_keypair_with_intent(name, intent)
                     .map_err(|e| Error::Config(format!("windows-hello: {e}")))
             }
             #[cfg(not(target_os = "windows"))]
@@ -228,7 +260,7 @@ pub fn load_keypair_bytes_from_account_with_reason(
             } else {
                 crate::keystore::Keystore::onepassword(op_account)
             };
-            ks.load_keypair(name, reason).map_err(|e| {
+            ks.load_keypair_with_intent(name, intent).map_err(|e| {
                 if matches!(e, crate::keystore::Error::AuthDenied(_)) {
                     Error::PaymentRejected("rejected by user at 1Password".to_string())
                 } else {
@@ -236,7 +268,7 @@ pub fn load_keypair_bytes_from_account_with_reason(
                 }
             })
         }
-        Keystore::File => load_signer_keypair_bytes_with_reason(&source, reason),
+        Keystore::File => load_signer_keypair_bytes_with_intent(&source, intent),
         Keystore::Ephemeral => unreachable!("handled above"),
     }
 }
@@ -247,7 +279,22 @@ pub fn load_signer_from_account_with_reason(
     network: &str,
     reason: &str,
 ) -> Result<MemorySigner> {
-    let bytes = load_keypair_bytes_from_account_with_reason(account, name, network, reason)?;
+    let bytes = load_keypair_bytes_from_account_with_intent(
+        account,
+        name,
+        network,
+        &AuthIntent::from_reason(reason),
+    )?;
+    MemorySigner::from_bytes(&bytes).map_err(|e| Error::Config(format!("Invalid keypair: {e}")))
+}
+
+pub fn load_signer_from_account_with_intent(
+    account: &Account,
+    name: &str,
+    network: &str,
+    intent: &AuthIntent,
+) -> Result<MemorySigner> {
+    let bytes = load_keypair_bytes_from_account_with_intent(account, name, network, intent)?;
     MemorySigner::from_bytes(&bytes).map_err(|e| Error::Config(format!("Invalid keypair: {e}")))
 }
 
@@ -262,7 +309,7 @@ fn signer_from_ephemeral(account: &Account) -> Result<MemorySigner> {
 fn maybe_authenticate_ephemeral_account(
     account: &Account,
     network: &str,
-    reason: &str,
+    intent: &AuthIntent,
 ) -> Result<()> {
     if !account.auth_required_for_network(network) {
         return Ok(());
@@ -271,27 +318,27 @@ fn maybe_authenticate_ephemeral_account(
     #[cfg(target_os = "macos")]
     {
         crate::keystore::Keystore::apple_keychain()
-            .authenticate(reason)
+            .authenticate_intent(intent)
             .map_err(map_ephemeral_auth_error)
     }
 
     #[cfg(target_os = "linux")]
     {
         crate::keystore::Keystore::gnome_keyring()
-            .authenticate(reason)
+            .authenticate_intent(intent)
             .map_err(map_ephemeral_auth_error)
     }
 
     #[cfg(target_os = "windows")]
     {
         crate::keystore::Keystore::windows_hello()
-            .authenticate(reason)
+            .authenticate_intent(intent)
             .map_err(map_ephemeral_auth_error)
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
-        let _ = reason;
+        let _ = intent;
         Err(Error::Config(
             "Ephemeral account auth gating is not available on this platform".to_string(),
         ))
@@ -308,7 +355,12 @@ fn map_ephemeral_auth_error(e: crate::keystore::Error) -> Error {
 
 /// Load a `MemorySigner` with a custom reason string.
 pub fn load_signer_with_reason(source: &str, reason: &str) -> Result<MemorySigner> {
-    let bytes = load_signer_keypair_bytes_with_reason(source, reason)?;
+    load_signer_with_intent(source, &AuthIntent::from_reason(reason))
+}
+
+/// Load a `MemorySigner` with a typed auth intent.
+pub fn load_signer_with_intent(source: &str, intent: &AuthIntent) -> Result<MemorySigner> {
+    let bytes = load_signer_keypair_bytes_with_intent(source, intent)?;
     MemorySigner::from_bytes(&bytes).map_err(|e| Error::Config(format!("Invalid keypair: {e}")))
 }
 
@@ -316,14 +368,21 @@ pub fn load_signer_keypair_bytes_with_reason(
     source: &str,
     reason: &str,
 ) -> Result<crate::keystore::Zeroizing<Vec<u8>>> {
+    load_signer_keypair_bytes_with_intent(source, &AuthIntent::from_reason(reason))
+}
+
+pub fn load_signer_keypair_bytes_with_intent(
+    source: &str,
+    intent: &AuthIntent,
+) -> Result<crate::keystore::Zeroizing<Vec<u8>>> {
     if let Some(account) = source.strip_prefix("keychain:") {
-        load_from_keystore_backend("keychain", account, reason)
+        load_from_keystore_backend("keychain", account, intent)
     } else if let Some(account) = source.strip_prefix("gnome-keyring:") {
-        load_from_keystore_backend("gnome-keyring", account, reason)
+        load_from_keystore_backend("gnome-keyring", account, intent)
     } else if let Some(account) = source.strip_prefix("windows-hello:") {
-        load_from_keystore_backend("windows-hello", account, reason)
+        load_from_keystore_backend("windows-hello", account, intent)
     } else if let Some(account) = source.strip_prefix("1password:") {
-        load_from_keystore_backend("1password", account, reason)
+        load_from_keystore_backend("1password", account, intent)
     } else {
         load_from_file(source)
     }
@@ -384,7 +443,7 @@ fn parse_private_key_string(input: &str) -> std::result::Result<Vec<u8>, String>
 fn load_from_keystore_backend(
     backend: &str,
     account: &str,
-    reason: &str,
+    intent: &AuthIntent,
 ) -> Result<crate::keystore::Zeroizing<Vec<u8>>> {
     let keystore = match backend {
         #[cfg(target_os = "macos")]
@@ -423,13 +482,15 @@ fn load_from_keystore_backend(
         }
     };
 
-    let bytes = keystore.load_keypair(account, reason).map_err(|e| {
-        if matches!(e, crate::keystore::Error::AuthDenied(_)) {
-            Error::PaymentRejected(rejection_source(backend).to_string())
-        } else {
-            Error::Config(format!("{backend}: {e}"))
-        }
-    })?;
+    let bytes = keystore
+        .load_keypair_with_intent(account, intent)
+        .map_err(|e| {
+            if matches!(e, crate::keystore::Error::AuthDenied(_)) {
+                Error::PaymentRejected(rejection_source(backend).to_string())
+            } else {
+                Error::Config(format!("{backend}: {e}"))
+            }
+        })?;
 
     Ok(bytes)
 }

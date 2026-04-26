@@ -782,6 +782,273 @@ pub fn endpoint_to_hit(service_url: &str, ep: &Endpoint) -> EndpointHit {
     }
 }
 
+/// Resolve a request URL to a skills FQN using only local cache state.
+///
+/// This intentionally never refreshes the skills catalog: auth prompts need a
+/// best-effort label without adding network latency before the OS prompt.
+pub fn service_fqn_for_resource_url(resource_url: &str) -> Option<String> {
+    cached_catalogs().into_iter().find_map(|catalog| {
+        service_fqn_for_url_in_catalog(&catalog, resource_url, cached_service_endpoints)
+    })
+}
+
+fn cached_catalogs() -> Vec<Catalog> {
+    let dir = std::path::PathBuf::from(shellexpand::tilde("~/.config/pay/skills").into_owned());
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+
+    let mut entries: Vec<_> = entries
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            name.starts_with("skills-") && name.ends_with(".json")
+        })
+        .collect();
+
+    entries.sort_by_key(|entry| {
+        std::cmp::Reverse(
+            entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+        )
+    });
+
+    entries
+        .into_iter()
+        .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+        .filter_map(|raw| parse_catalog(&raw).ok())
+        .collect()
+}
+
+fn cached_service_endpoints(svc: &Service) -> Option<Vec<Endpoint>> {
+    if svc.endpoints_loaded() {
+        return Some(svc.endpoints.clone());
+    }
+    if svc.sha.is_empty() {
+        return None;
+    }
+
+    let cache_file = detail_cache_dir().join(format!("{}.json", svc.sha));
+    std::fs::read_to_string(cache_file)
+        .ok()
+        .and_then(|raw| parse_detail(&raw).ok())
+        .map(|detail| detail.endpoints)
+}
+
+fn detail_cache_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(shellexpand::tilde("~/.config/pay/skills/detail").into_owned())
+}
+
+fn service_fqn_for_url_in_catalog<F>(
+    catalog: &Catalog,
+    resource_url: &str,
+    mut detail_lookup: F,
+) -> Option<String>
+where
+    F: FnMut(&Service) -> Option<Vec<Endpoint>>,
+{
+    let target = ParsedUrl::parse(resource_url)?;
+    let mut endpoint_matches = Vec::new();
+    let mut base_matches = Vec::new();
+
+    for svc in &catalog.providers {
+        let endpoints = if svc.endpoints_loaded() {
+            Some(svc.endpoints.clone())
+        } else {
+            detail_lookup(svc)
+        };
+
+        for base_url in service_base_urls(svc) {
+            let Some(base_match) = base_url_match(&target, base_url) else {
+                continue;
+            };
+
+            if endpoints.as_ref().is_some_and(|endpoints| {
+                endpoints
+                    .iter()
+                    .any(|endpoint| endpoint_path_matches(&base_match.relative_path, endpoint))
+            }) {
+                endpoint_matches.push((base_match.prefix_len, svc.fqn.clone()));
+            }
+            base_matches.push((base_match.prefix_len, svc.fqn.clone()));
+        }
+    }
+
+    choose_unique_best_match(endpoint_matches).or_else(|| choose_unique_best_match(base_matches))
+}
+
+fn service_base_urls(svc: &Service) -> Vec<&str> {
+    let mut urls = Vec::new();
+    if !svc.meta.service_url.trim().is_empty() {
+        urls.push(svc.meta.service_url.as_str());
+    }
+    if let Some(sandbox_url) = svc.meta.sandbox_service_url.as_deref()
+        && !sandbox_url.trim().is_empty()
+    {
+        urls.push(sandbox_url);
+    }
+    urls
+}
+
+fn choose_unique_best_match(matches: Vec<(usize, String)>) -> Option<String> {
+    let best_prefix_len = matches.iter().map(|(prefix_len, _)| *prefix_len).max()?;
+    let mut fqns: Vec<_> = matches
+        .into_iter()
+        .filter(|(prefix_len, _)| *prefix_len == best_prefix_len)
+        .map(|(_, fqn)| fqn)
+        .collect();
+    fqns.sort();
+    fqns.dedup();
+    if fqns.len() == 1 { fqns.pop() } else { None }
+}
+
+#[derive(Debug)]
+struct ParsedUrl {
+    scheme: String,
+    host: String,
+    port: Option<u16>,
+    path: String,
+}
+
+impl ParsedUrl {
+    fn parse(raw: &str) -> Option<Self> {
+        let url = reqwest::Url::parse(raw).ok()?;
+        Some(Self {
+            scheme: url.scheme().to_ascii_lowercase(),
+            host: url.host_str()?.to_ascii_lowercase(),
+            port: url.port_or_known_default(),
+            path: normalize_url_path(url.path()),
+        })
+    }
+}
+
+struct BaseUrlMatch {
+    prefix_len: usize,
+    relative_path: String,
+}
+
+fn base_url_match(target: &ParsedUrl, base_url: &str) -> Option<BaseUrlMatch> {
+    let base = ParsedUrl::parse(base_url)?;
+    if target.scheme != base.scheme || target.host != base.host || target.port != base.port {
+        return None;
+    }
+
+    let relative_path = relative_path(&target.path, &base.path)?;
+    Some(BaseUrlMatch {
+        prefix_len: base.path.len(),
+        relative_path,
+    })
+}
+
+fn normalize_url_path(path: &str) -> String {
+    let path = path.trim_end_matches('/');
+    if path.is_empty() {
+        "/".to_string()
+    } else {
+        path.to_string()
+    }
+}
+
+fn relative_path(target_path: &str, base_path: &str) -> Option<String> {
+    if base_path == "/" {
+        return Some(target_path.trim_start_matches('/').to_string());
+    }
+    if target_path == base_path {
+        return Some(String::new());
+    }
+    target_path
+        .strip_prefix(base_path)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .map(str::to_string)
+}
+
+fn endpoint_path_matches(relative_path: &str, endpoint: &Endpoint) -> bool {
+    [endpoint.path.as_str(), endpoint.full_path.as_str()]
+        .into_iter()
+        .filter(|path| !path.trim().is_empty())
+        .any(|path| path_template_matches(path, relative_path))
+}
+
+fn path_template_matches(template: &str, target: &str) -> bool {
+    let template = template.trim_matches('/');
+    let target = target.trim_matches('/');
+    if template == target {
+        return true;
+    }
+
+    let template_parts: Vec<_> = if template.is_empty() {
+        Vec::new()
+    } else {
+        template.split('/').collect()
+    };
+    let target_parts: Vec<_> = if target.is_empty() {
+        Vec::new()
+    } else {
+        target.split('/').collect()
+    };
+    template_parts.len() == target_parts.len()
+        && template_parts
+            .iter()
+            .zip(target_parts.iter())
+            .all(|(template, target)| path_segment_matches(template, target))
+}
+
+fn path_segment_matches(template: &str, target: &str) -> bool {
+    if template.starts_with('{') && template.ends_with('}') {
+        return !target.is_empty();
+    }
+    if !template.contains('{') {
+        return template == target;
+    }
+
+    segment_template_matches(template, target)
+}
+
+fn segment_template_matches(template: &str, target: &str) -> bool {
+    let mut template_rest = template;
+    let mut target_rest = target;
+
+    loop {
+        let Some(open) = template_rest.find('{') else {
+            return target_rest == template_rest;
+        };
+        let literal = &template_rest[..open];
+        if !target_rest.starts_with(literal) {
+            return false;
+        }
+        target_rest = &target_rest[literal.len()..];
+
+        let after_open = &template_rest[open + 1..];
+        let Some(close) = after_open.find('}') else {
+            return false;
+        };
+        let after_placeholder = &after_open[close + 1..];
+        if after_placeholder.is_empty() {
+            return !target_rest.is_empty();
+        }
+
+        let next_literal_end = after_placeholder
+            .find('{')
+            .unwrap_or(after_placeholder.len());
+        let next_literal = &after_placeholder[..next_literal_end];
+        if next_literal.is_empty() {
+            template_rest = after_placeholder;
+            continue;
+        }
+
+        let Some(next_literal_pos) = target_rest.find(next_literal) else {
+            return false;
+        };
+        if next_literal_pos == 0 {
+            return false;
+        }
+        target_rest = &target_rest[next_literal_pos..];
+        template_rest = after_placeholder;
+    }
+}
+
 fn summarize_service(svc: &Service) -> ServiceSummary {
     // If endpoints are loaded, compute from them. Otherwise use index metadata.
     if svc.endpoints_loaded() {
@@ -1224,6 +1491,61 @@ mod tests {
             build_endpoint_url("https://gw.example.com/", ""),
             "https://gw.example.com"
         );
+    }
+
+    // ── service_fqn_for_url_in_catalog ─────────────────────────────────────
+
+    #[test]
+    fn service_fqn_for_url_in_catalog_matches_loaded_endpoint_on_shared_gateway() {
+        let cat = catalog_with_endpoints();
+        let fqn = service_fqn_for_url_in_catalog(
+            &cat,
+            "https://gw.example.com/v1/images:annotate",
+            |_| None,
+        );
+        assert_eq!(fqn.as_deref(), Some("solana-foundation/google/vision"));
+    }
+
+    #[test]
+    fn service_fqn_for_url_in_catalog_matches_placeholder_endpoint() {
+        let cat = catalog_with_endpoints();
+        let fqn = service_fqn_for_url_in_catalog(
+            &cat,
+            "https://gw.example.com/v2/projects/my-project/queries",
+            |_| None,
+        );
+        assert_eq!(fqn.as_deref(), Some("solana-foundation/google/bigquery"));
+    }
+
+    #[test]
+    fn service_fqn_for_url_in_catalog_avoids_ambiguous_shared_gateway_without_endpoints() {
+        let cat = catalog_index_only();
+        let fqn =
+            service_fqn_for_url_in_catalog(&cat, "https://gw.example.com/v1/unknown", |_| None);
+        assert_eq!(fqn, None);
+    }
+
+    #[test]
+    fn service_fqn_for_url_in_catalog_uses_unique_service_domain() {
+        let cat = catalog_index_only();
+        let fqn = service_fqn_for_url_in_catalog(&cat, "https://pdb.example.com/reports", |_| None);
+        assert_eq!(fqn.as_deref(), Some("solana-foundation/payment-debugger"));
+    }
+
+    #[test]
+    fn path_template_matches_segment_placeholders() {
+        assert!(path_template_matches(
+            "v2/projects/{project}/queries",
+            "v2/projects/my-project/queries"
+        ));
+        assert!(path_template_matches(
+            "v1/models/{model}:generateContent",
+            "v1/models/gemini-2.0-flash:generateContent"
+        ));
+        assert!(!path_template_matches(
+            "v2/projects/{project}/queries",
+            "v2/projects/my-project/datasets"
+        ));
     }
 
     // ── collect_prices ──────────────────────────────────────────────────────

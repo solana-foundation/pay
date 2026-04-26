@@ -1,18 +1,34 @@
 //! Linux: Polkit authentication + GNOME Secret Service storage.
 
-use crate::{AuthGate, Error, Result, SecretStore, Zeroizing};
+use crate::{AuthGate, AuthIntent, Error, Result, SecretStore, Zeroizing};
 use secret_service::{EncryptionType, SecretService};
 use std::collections::HashMap;
 
 // ── Polkit auth gate ────────────────────────────────────────────────────────
 
-const POLKIT_ACTION: &str = "sh.pay.unlock-keypair";
+const POLKIT_ACTION_PAYMENT: &str = "sh.pay.authorize-payment";
+const POLKIT_ACTION_CREATE: &str = "sh.pay.create-keypair";
+const POLKIT_ACTION_IMPORT: &str = "sh.pay.import-keypair";
+const POLKIT_ACTION_EXPORT: &str = "sh.pay.export-keypair";
+const POLKIT_ACTION_DELETE: &str = "sh.pay.delete-keypair";
+const POLKIT_ACTION_SESSION: &str = "sh.pay.open-session";
+const POLKIT_ACTION_GATEWAY_FEE_PAYER: &str = "sh.pay.use-gateway-fee-payer";
+const POLKIT_ACTION_USE: &str = "sh.pay.use-keypair";
+const LEGACY_POLKIT_ACTION: &str = "sh.pay.unlock-keypair";
 
 pub struct Polkit;
 
 impl AuthGate for Polkit {
-    fn authenticate(&self, _reason: &str) -> Result<()> {
-        run(async { polkit_authenticate().await })
+    fn authenticate(&self, intent: &AuthIntent) -> Result<()> {
+        let action = polkit_action_for_intent(intent);
+        run(async move {
+            match polkit_authenticate(action).await {
+                Err(e) if action != LEGACY_POLKIT_ACTION && is_missing_action(&e) => {
+                    polkit_authenticate(LEGACY_POLKIT_ACTION).await
+                }
+                result => result,
+            }
+        })
     }
 
     fn is_available(&self) -> bool {
@@ -20,7 +36,7 @@ impl AuthGate for Polkit {
     }
 }
 
-async fn polkit_authenticate() -> Result<()> {
+async fn polkit_authenticate(action: &str) -> Result<()> {
     use zbus::zvariant::{OwnedValue, Value};
 
     let conn = zbus::Connection::system()
@@ -50,7 +66,7 @@ async fn polkit_authenticate() -> Result<()> {
             "CheckAuthorization",
             &(
                 ("unix-process", subject_details),
-                POLKIT_ACTION,
+                action,
                 details,
                 flags,
                 "",
@@ -60,12 +76,7 @@ async fn polkit_authenticate() -> Result<()> {
         .map_err(|e| {
             let msg = e.to_string();
             if msg.contains("No such action") || msg.contains("not registered") {
-                Error::Backend(format!(
-                    "polkit action '{POLKIT_ACTION}' is not installed.\n\
-                     Install it with:\n\
-                     \x20 sudo cp rust/config/polkit/sh.pay.unlock-keypair.policy \\\n\
-                     \x20      /usr/share/polkit-1/actions/"
-                ))
+                missing_action_error(action)
             } else {
                 Error::Backend(format!("polkit: {msg}"))
             }
@@ -80,6 +91,55 @@ async fn polkit_authenticate() -> Result<()> {
     } else {
         Err(Error::AuthDenied("authentication cancelled".to_string()))
     }
+}
+
+fn polkit_action_for_intent(intent: &AuthIntent) -> &'static str {
+    match intent {
+        AuthIntent::AuthorizePayment { limit, .. } => limit
+            .map(polkit_payment_limit_action)
+            .unwrap_or(POLKIT_ACTION_PAYMENT),
+        AuthIntent::CreateAccount(_) => POLKIT_ACTION_CREATE,
+        AuthIntent::ImportAccount(_) => POLKIT_ACTION_IMPORT,
+        AuthIntent::ExportAccount(_) => POLKIT_ACTION_EXPORT,
+        AuthIntent::DeleteAccount(_) => POLKIT_ACTION_DELETE,
+        AuthIntent::OpenSession(_) => POLKIT_ACTION_SESSION,
+        AuthIntent::UseGatewayFeePayer(_) => POLKIT_ACTION_GATEWAY_FEE_PAYER,
+        AuthIntent::UseAccount(_) => POLKIT_ACTION_USE,
+    }
+}
+
+fn polkit_payment_limit_action(limit: crate::PaymentLimit) -> &'static str {
+    match limit {
+        crate::PaymentLimit::Usd00001 => "sh.pay.authorize-payment-up-to-usd-00001",
+        crate::PaymentLimit::Usd0001 => "sh.pay.authorize-payment-up-to-usd-0001",
+        crate::PaymentLimit::Usd0005 => "sh.pay.authorize-payment-up-to-usd-0005",
+        crate::PaymentLimit::Usd001 => "sh.pay.authorize-payment-up-to-usd-001",
+        crate::PaymentLimit::Usd005 => "sh.pay.authorize-payment-up-to-usd-005",
+        crate::PaymentLimit::Usd01 => "sh.pay.authorize-payment-up-to-usd-01",
+        crate::PaymentLimit::Usd05 => "sh.pay.authorize-payment-up-to-usd-05",
+        crate::PaymentLimit::Usd1 => "sh.pay.authorize-payment-up-to-usd-1",
+        crate::PaymentLimit::Usd2 => "sh.pay.authorize-payment-up-to-usd-2",
+        crate::PaymentLimit::Usd5 => "sh.pay.authorize-payment-up-to-usd-5",
+        crate::PaymentLimit::Usd10 => "sh.pay.authorize-payment-up-to-usd-10",
+        crate::PaymentLimit::Usd15 => "sh.pay.authorize-payment-up-to-usd-15",
+        crate::PaymentLimit::Usd20 => "sh.pay.authorize-payment-up-to-usd-20",
+        crate::PaymentLimit::Usd25 => "sh.pay.authorize-payment-up-to-usd-25",
+        crate::PaymentLimit::Usd50 => "sh.pay.authorize-payment-up-to-usd-50",
+        crate::PaymentLimit::AboveUsd50 => "sh.pay.authorize-payment-above-usd-50",
+    }
+}
+
+fn missing_action_error(action: &str) -> Error {
+    Error::Backend(format!(
+        "polkit action '{action}' is not installed.\n\
+         Run `pay setup` to install the embedded policy, or install it manually with:\n\
+         \x20 sudo cp rust/config/polkit/sh.pay.unlock-keypair.policy \\\n\
+         \x20      /usr/share/polkit-1/actions/"
+    ))
+}
+
+fn is_missing_action(error: &Error) -> bool {
+    matches!(error, Error::Backend(msg) if msg.contains("is not installed"))
 }
 
 fn process_start_time() -> Result<u64> {
@@ -266,4 +326,74 @@ where
         .build()
         .expect("tokio runtime")
         .block_on(future)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn payment_intents_use_payment_action() {
+        assert_eq!(
+            polkit_action_for_intent(&AuthIntent::authorize_payment(
+                "$0.05",
+                "accessing API api.example.com"
+            )),
+            "sh.pay.authorize-payment-up-to-usd-005"
+        );
+        assert_eq!(
+            polkit_action_for_intent(&AuthIntent::default_payment()),
+            POLKIT_ACTION_PAYMENT
+        );
+        assert_eq!(
+            polkit_action_for_intent(&AuthIntent::send_sol("11111111111111111111111111111111")),
+            POLKIT_ACTION_PAYMENT
+        );
+        assert_eq!(
+            polkit_action_for_intent(&AuthIntent::authorize_payment("$0.0501", "accessing API")),
+            "sh.pay.authorize-payment-up-to-usd-01"
+        );
+        assert_eq!(
+            polkit_action_for_intent(&AuthIntent::authorize_payment("$50.01", "accessing API")),
+            "sh.pay.authorize-payment-above-usd-50"
+        );
+    }
+
+    #[test]
+    fn account_lifecycle_intents_use_specific_actions() {
+        assert_eq!(
+            polkit_action_for_intent(&AuthIntent::create_account("default")),
+            POLKIT_ACTION_CREATE
+        );
+        assert_eq!(
+            polkit_action_for_intent(&AuthIntent::import_account("default")),
+            POLKIT_ACTION_IMPORT
+        );
+        assert_eq!(
+            polkit_action_for_intent(&AuthIntent::export_account("default")),
+            POLKIT_ACTION_EXPORT
+        );
+        assert_eq!(
+            polkit_action_for_intent(&AuthIntent::delete_account("default")),
+            POLKIT_ACTION_DELETE
+        );
+        assert_eq!(
+            polkit_action_for_intent(&AuthIntent::open_session()),
+            POLKIT_ACTION_SESSION
+        );
+        assert_eq!(
+            polkit_action_for_intent(&AuthIntent::use_gateway_fee_payer()),
+            POLKIT_ACTION_GATEWAY_FEE_PAYER
+        );
+    }
+
+    #[test]
+    fn use_account_intent_uses_generic_action() {
+        assert_eq!(
+            polkit_action_for_intent(&AuthIntent::use_account(
+                "Use your pay account with the Solana CLI."
+            )),
+            POLKIT_ACTION_USE
+        );
+    }
 }

@@ -1,20 +1,30 @@
 //! Windows: Windows Hello authentication + Credential Manager storage.
 
-use crate::{AuthGate, Error, Result, SecretStore, Zeroizing};
+use crate::{AuthGate, AuthIntent, Error, Result, SecretStore, Zeroizing};
 use std::cell::Cell;
+use std::ffi::c_void;
+use std::mem::{MaybeUninit, transmute, transmute_copy};
 use std::slice;
 use windows::{
+    Foundation::IAsyncOperation,
     Security::Credentials::UI::{
         UserConsentVerificationResult, UserConsentVerifier, UserConsentVerifierAvailability,
     },
     Win32::{
+        Foundation::HWND,
         Security::Credentials::{
             CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC, CREDENTIALW, CredDeleteW, CredFree,
             CredReadW, CredWriteW,
         },
-        System::Com::{COINIT_MULTITHREADED, CoInitializeEx},
+        System::{
+            Com::{COINIT_MULTITHREADED, CoInitializeEx},
+            Console::GetConsoleWindow,
+        },
+        UI::WindowsAndMessaging::{GetForegroundWindow, IsWindowVisible},
     },
-    core::{HSTRING, PCWSTR, PWSTR},
+    core::{
+        GUID, HRESULT, HSTRING, IInspectable, IInspectable_Vtbl, Interface, PCWSTR, PWSTR, Type,
+    },
 };
 
 // ── COM initialization ──────────────────────────────────────────────────────
@@ -47,13 +57,11 @@ impl WindowsHelloAuth {
 }
 
 impl AuthGate for WindowsHelloAuth {
-    fn authenticate(&self, reason: &str) -> Result<()> {
+    fn authenticate(&self, intent: &AuthIntent) -> Result<()> {
         ensure_com_init();
 
-        let message = HSTRING::from(reason);
-        let result = UserConsentVerifier::RequestVerificationAsync(&message)
-            .map_err(|e| Error::Backend(format!("Windows Hello unavailable: {e}")))?
-            .get()
+        let message = windows_hello_reason_wrapper(&intent.prompt_message());
+        let result = request_verification(&message)
             .map_err(|e| Error::Backend(format!("Windows Hello request failed: {e}")))?;
 
         match result {
@@ -80,6 +88,89 @@ impl AuthGate for WindowsHelloAuth {
     fn is_available(&self) -> bool {
         Self::is_available()
     }
+}
+
+// Desktop apps need the HWND-based interop API for Windows Hello prompts. The
+// plain UserConsentVerifier::RequestVerificationAsync API is the UWP path.
+windows::core::imp::define_interface!(
+    IUserConsentVerifierInterop,
+    IUserConsentVerifierInteropVtbl,
+    0x39e050c3_4e74_441a_8dc0_b81104df949c
+);
+
+impl core::ops::Deref for IUserConsentVerifierInterop {
+    type Target = IInspectable;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { transmute(self) }
+    }
+}
+
+windows::core::imp::interface_hierarchy!(
+    IUserConsentVerifierInterop,
+    windows::core::IUnknown,
+    IInspectable
+);
+
+#[repr(C)]
+pub struct IUserConsentVerifierInteropVtbl {
+    pub base__: IInspectable_Vtbl,
+    pub request_verification_for_window_async: unsafe extern "system" fn(
+        *mut c_void,
+        HWND,
+        MaybeUninit<HSTRING>,
+        *const GUID,
+        *mut *mut c_void,
+    ) -> HRESULT,
+}
+
+fn request_verification(message: &str) -> windows::core::Result<UserConsentVerificationResult> {
+    let message = HSTRING::from(message);
+
+    if let Some(hwnd) = prompt_parent_window()
+        && let Ok(op) = request_verification_for_window_async(hwnd, &message)
+    {
+        return op.get();
+    }
+
+    UserConsentVerifier::RequestVerificationAsync(&message)?.get()
+}
+
+fn request_verification_for_window_async(
+    hwnd: HWND,
+    message: &HSTRING,
+) -> windows::core::Result<IAsyncOperation<UserConsentVerificationResult>> {
+    let interop = windows::core::factory::<UserConsentVerifier, IUserConsentVerifierInterop>()?;
+
+    unsafe {
+        let mut result__ = core::mem::zeroed();
+        (Interface::vtable(&interop).request_verification_for_window_async)(
+            Interface::as_raw(&interop),
+            hwnd,
+            transmute_copy(message),
+            &<IAsyncOperation<UserConsentVerificationResult> as Interface>::IID,
+            &mut result__,
+        )
+        .and_then(|| Type::from_abi(result__))
+    }
+}
+
+fn prompt_parent_window() -> Option<HWND> {
+    let console = unsafe { GetConsoleWindow() };
+    if !console.is_invalid() && unsafe { IsWindowVisible(console).0 != 0 } {
+        return Some(console);
+    }
+
+    let foreground = unsafe { GetForegroundWindow() };
+    if !foreground.is_invalid() {
+        return Some(foreground);
+    }
+
+    if !console.is_invalid() {
+        return Some(console);
+    }
+
+    None
 }
 
 // ── Windows Credential Manager store ────────────────────────────────────────
@@ -153,4 +244,67 @@ fn cred_exists(target: &[u16]) -> bool {
 fn cred_delete(target: &[u16]) -> Result<()> {
     unsafe { CredDeleteW(PCWSTR(target.as_ptr()), CRED_TYPE_GENERIC, 0) }
         .map_err(|e| Error::Backend(format!("CredDeleteW failed: {e}")))
+}
+
+/// The canonical prompt message is a sentence fragment so macOS can render it
+/// after "<app> is trying to ". Windows Hello shows the reason verbatim, so
+/// wrap the fragment with the same "pay.sh is trying to" prefix and a trailing
+/// period to keep the wording aligned across platforms.
+fn windows_hello_reason_wrapper(message: &str) -> String {
+    let trimmed = message.trim_end_matches('.').trim();
+    if trimmed.is_empty() {
+        return "pay.sh is trying to authenticate.".to_string();
+    }
+    format!("pay.sh is trying to {trimmed}.")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wrapper_prefixes_default_reason() {
+        assert_eq!(
+            windows_hello_reason_wrapper(&AuthIntent::default_payment().prompt_message()),
+            "pay.sh is trying to authorize a payment with pay."
+        );
+    }
+
+    #[test]
+    fn wrapper_prefixes_specific_payment_reason() {
+        assert_eq!(
+            windows_hello_reason_wrapper(
+                &AuthIntent::authorize_payment("$0.05", "accessing API api.example.com")
+                    .prompt_message()
+            ),
+            "pay.sh is trying to authorize payment of $0.05 for accessing API api.example.com."
+        );
+    }
+
+    #[test]
+    fn wrapper_trims_whitespace_and_terminates() {
+        assert_eq!(
+            windows_hello_reason_wrapper(
+                &AuthIntent::from_reason("  delete default account  ").prompt_message()
+            ),
+            "pay.sh is trying to delete default account."
+        );
+    }
+
+    #[test]
+    fn wrapper_falls_back_for_empty_reason() {
+        assert_eq!(
+            windows_hello_reason_wrapper(&AuthIntent::from_reason("   ").prompt_message()),
+            "pay.sh is trying to authorize pay to use your payment account."
+        );
+    }
+
+    #[test]
+    fn prompt_message_bounds_long_reasons() {
+        let long = "a".repeat(221);
+        let message = AuthIntent::from_reason(&long).prompt_message();
+
+        assert!(message.ends_with("..."));
+        assert!(message.len() < 230);
+    }
 }

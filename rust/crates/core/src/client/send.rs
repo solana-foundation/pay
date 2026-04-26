@@ -36,8 +36,8 @@ pub async fn send_sol(
     active_account_name: &str,
     rpc_url: &str,
 ) -> Result<SendResult> {
-    let reason = format!("send SOL to {recipient}");
-    let signer = crate::signer::load_signer_with_reason(active_account_name, &reason)?;
+    let intent = crate::keystore::AuthIntent::send_sol(recipient);
+    let signer = crate::signer::load_signer_with_intent(active_account_name, &intent)?;
     let rpc = RpcClient::new(rpc_url.to_string());
 
     let sender_pubkey = signer.pubkey();
