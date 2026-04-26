@@ -217,6 +217,7 @@ fn handle_outcome(
                 }
                 return pay_mpp_and_retry(
                     &challenge,
+                    &resource_url,
                     tool,
                     output_fmt,
                     fetch_headers,
@@ -328,6 +329,7 @@ fn handle_outcome(
                 }
                 return pay_x402_and_retry(
                     &challenge,
+                    &resource_url,
                     tool,
                     output_fmt,
                     fetch_headers,
@@ -427,6 +429,7 @@ fn handle_outcome(
 
 fn pay_mpp_and_retry(
     challenge: &mpp::Challenge,
+    resource_url: &str,
     tool: &Tool,
     output_fmt: Option<OutputFormat>,
     fetch_headers: Option<Vec<(String, String)>>,
@@ -441,8 +444,13 @@ fn pay_mpp_and_retry(
     }
 
     let store = pay_core::accounts::FileAccountsStore::default_path();
-    let (auth_header, ephemeral_notice) =
-        mpp::build_credential(challenge, &store, network_override, account_override)?;
+    let (auth_header, ephemeral_notice) = mpp::build_credential(
+        challenge,
+        &store,
+        network_override,
+        account_override,
+        Some(resource_url),
+    )?;
 
     if let Some(resolved) = ephemeral_notice {
         render_generated_wallet_notice(&resolved, is_json)?;
@@ -458,6 +466,7 @@ fn pay_mpp_and_retry(
 
 fn pay_x402_and_retry(
     challenge: &X402Challenge,
+    resource_url: &str,
     tool: &Tool,
     output_fmt: Option<OutputFormat>,
     fetch_headers: Option<Vec<(String, String)>>,
@@ -472,8 +481,13 @@ fn pay_x402_and_retry(
     }
 
     let store = pay_core::accounts::FileAccountsStore::default_path();
-    let (payment_header_name, payment_json, ephemeral_notice) =
-        x402::build_payment(challenge, &store, network_override, account_override)?;
+    let (payment_header_name, payment_json, ephemeral_notice) = x402::build_payment(
+        challenge,
+        &store,
+        network_override,
+        account_override,
+        Some(resource_url),
+    )?;
 
     if let Some(resolved) = ephemeral_notice {
         render_generated_wallet_notice(&resolved, is_json)?;

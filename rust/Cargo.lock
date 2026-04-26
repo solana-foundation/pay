@@ -5667,6 +5667,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "windows",
+ "windows-core",
  "zbus",
  "zeroize",
 ]

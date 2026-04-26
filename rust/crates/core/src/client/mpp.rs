@@ -37,6 +37,7 @@ pub fn build_credential(
     store: &dyn AccountsStore,
     network_override: Option<&str>,
     account_override: Option<&str>,
+    resource_url: Option<&str>,
 ) -> Result<(String, Option<ResolvedEphemeral>)> {
     let request: ChargeRequest = challenge
         .request
@@ -44,7 +45,10 @@ pub fn build_credential(
         .map_err(|e| Error::Mpp(format!("Failed to decode challenge request: {e}")))?;
 
     let amount = format_amount(&request.amount, &request.currency);
-    let desc = challenge.description.as_deref().unwrap_or("API access");
+    let desc = crate::client::prompt::payment_description(
+        challenge.description.as_deref(),
+        &[resource_url],
+    );
 
     let challenge_network = request
         .method_details
@@ -85,7 +89,7 @@ pub fn build_credential(
         store,
         account_override,
         &amount,
-        desc,
+        &desc,
     )?;
 
     let rpc_url = std::env::var("PAY_RPC_URL").unwrap_or_else(|_| {

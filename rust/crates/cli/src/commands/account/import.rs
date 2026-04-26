@@ -86,7 +86,7 @@ impl ImportCommand {
             pay_core::keystore::SyncMode::ThisDeviceOnly
         };
 
-        let reason = format!("import \"{}\" account", name);
+        let reason = format!("Import the \"{}\" payment account.", name);
         ks.import_with_reason(&name, &keypair_bytes, sync, &reason)
             .map_err(|e| pay_core::Error::Config(format!("{e}")))?;
 

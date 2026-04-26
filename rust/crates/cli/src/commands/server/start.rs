@@ -197,7 +197,7 @@ impl StartCommand {
                 // recipient-pubkey source (no second load).
                 let signer = pay_core::signer::load_signer_with_reason(
                     source,
-                    "authorize as fee payer for the gateway",
+                    "Use your pay account as the gateway fee payer.",
                 )?;
                 Some(Arc::new(signer) as Arc<dyn SolanaSigner>)
             } else {
@@ -946,7 +946,7 @@ async fn resolve_signer_with_store(
                     account,
                     name,
                     network,
-                    "authorize as fee payer for the gateway",
+                    "Use your pay account as the gateway fee payer.",
                 )?
             };
             Ok(Arc::new(signer))
@@ -955,7 +955,7 @@ async fn resolve_signer_with_store(
             let expanded = shellexpand::tilde(path).into_owned();
             let signer = pay_core::signer::load_signer_with_reason(
                 &expanded,
-                "authorize as fee payer for the gateway",
+                "Use your pay account as the gateway fee payer.",
             )
             .map_err(|e| {
                 pay_core::Error::Config(format!(

@@ -17,13 +17,13 @@ use crate::{Error, Result};
 /// - `1password:<account>` — load from 1Password (triggers `op` CLI auth)
 /// - anything else — treat as a file path
 pub fn load_signer(source: &str) -> Result<MemorySigner> {
-    load_signer_with_reason(source, "authorize payment")
+    load_signer_with_reason(source, "Authorize a payment with pay.")
 }
 
 /// Load a signer for a payment, prefixing rejection errors with the amount
 /// (e.g. "$0.10 payment authorization was rejected by user at Apple Keychain").
 pub fn load_signer_for_payment(source: &str, amount: &str, desc: &str) -> Result<MemorySigner> {
-    let reason = format!("pay {amount} for {desc}");
+    let reason = format!("Authorize payment of {amount} for {desc}.");
     load_signer_with_reason(source, &reason).map_err(|e| match e {
         Error::PaymentRejected(where_) => {
             Error::PaymentRejected(format!("{amount} payment authorization was {where_}"))
@@ -57,11 +57,12 @@ pub fn load_signer_for_network(
     network: &str,
     store: &dyn AccountsStore,
 ) -> Result<(MemorySigner, Option<ResolvedEphemeral>)> {
-    load_signer_for_network_with_reason(network, store, None, "authorize payment")
+    load_signer_for_network_with_reason(network, store, None, "Authorize a payment with pay.")
 }
 
 /// Variant of [`load_signer_for_network`] that takes an explicit reason
-/// string for the keystore auth prompt (e.g. "pay $0.10 for API access").
+/// string for the keystore auth prompt (e.g.
+/// "Authorize payment of $0.10 for accessing API api.example.com.").
 pub fn load_signer_for_network_with_reason(
     network: &str,
     store: &dyn AccountsStore,
@@ -112,7 +113,7 @@ pub fn load_signer_for_network_payment(
     amount: &str,
     desc: &str,
 ) -> Result<(MemorySigner, Option<ResolvedEphemeral>)> {
-    let reason = format!("pay {amount} for {desc}");
+    let reason = format!("Authorize payment of {amount} for {desc}.");
     load_signer_for_network_with_reason(network, store, account_override, &reason).map_err(|e| {
         match e {
             Error::PaymentRejected(where_) => {

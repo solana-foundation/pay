@@ -96,7 +96,7 @@ pub fn create_account(
         pay_core::keystore::SyncMode::ThisDeviceOnly
     };
 
-    let reason = format!("set up \"{}\" payment account", name);
+    let reason = format!("Set up the \"{}\" payment account.", name);
     ks.import_with_reason(name, &keypair_bytes, sync, &reason)
         .map_err(|e| pay_core::Error::Config(format!("{e}")))?;
 

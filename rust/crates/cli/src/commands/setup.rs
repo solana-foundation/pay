@@ -69,7 +69,8 @@ impl SetupCommand {
 
 /// If `npx` is on PATH, offer to install the pay agent skill for coding agents.
 fn maybe_install_skill() {
-    let has_npx = std::process::Command::new("npx")
+    let npx_bin = if cfg!(windows) { "npx.cmd" } else { "npx" };
+    let has_npx = std::process::Command::new(npx_bin)
         .arg("--version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -92,7 +93,7 @@ fn maybe_install_skill() {
     }
 
     eprintln!();
-    let status = std::process::Command::new("npx")
+    let status = std::process::Command::new(npx_bin)
         .args([
             "-y",
             "skills",

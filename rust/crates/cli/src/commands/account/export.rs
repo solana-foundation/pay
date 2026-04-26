@@ -30,7 +30,7 @@ impl ExportCommand {
                 .and_then(|net| net.iter().find(|(n, _)| *n == name))
                 .map(|(_, a)| a)
                 .ok_or_else(|| pay_core::Error::Config(format!("Account '{name}' not found")))?;
-            let reason = format!("read your \"{name}\" account");
+            let reason = format!("Export the \"{name}\" payment account.");
             let bytes = pay_core::signer::load_keypair_bytes_from_account_with_reason(
                 account,
                 name,
@@ -45,7 +45,7 @@ impl ExportCommand {
                 && let Ok(accounts) = pay_core::accounts::AccountsFile::load()
                 && let Some((name, account)) = accounts.default_account()
             {
-                let reason = format!("read your \"{name}\" account");
+                let reason = format!("Export the \"{name}\" payment account.");
                 let bytes = pay_core::signer::load_keypair_bytes_from_account_with_reason(
                     account,
                     name,
@@ -64,7 +64,7 @@ impl ExportCommand {
                         )
                     })?;
                 let fallback_name = self.name.as_deref().unwrap_or("default");
-                let reason = format!("read your \"{fallback_name}\" account");
+                let reason = format!("Export the \"{fallback_name}\" payment account.");
                 let bytes = reload_raw_bytes(&src, &reason)?;
                 let pubkey = bs58::encode(&bytes[32..64]).into_string();
                 let name = self.name.clone().unwrap_or_else(|| "default".to_string());

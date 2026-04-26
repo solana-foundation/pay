@@ -2,19 +2,29 @@
 
 use crate::{AuthGate, Error, Result, SecretStore, Zeroizing};
 use std::cell::Cell;
+use std::ffi::c_void;
+use std::mem::{MaybeUninit, transmute, transmute_copy};
 use std::slice;
 use windows::{
+    Foundation::IAsyncOperation,
     Security::Credentials::UI::{
         UserConsentVerificationResult, UserConsentVerifier, UserConsentVerifierAvailability,
     },
     Win32::{
+        Foundation::HWND,
         Security::Credentials::{
             CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC, CREDENTIALW, CredDeleteW, CredFree,
             CredReadW, CredWriteW,
         },
-        System::Com::{COINIT_MULTITHREADED, CoInitializeEx},
+        System::{
+            Com::{COINIT_MULTITHREADED, CoInitializeEx},
+            Console::GetConsoleWindow,
+        },
+        UI::WindowsAndMessaging::{GetForegroundWindow, IsWindowVisible},
     },
-    core::{HSTRING, PCWSTR, PWSTR},
+    core::{
+        GUID, HRESULT, HSTRING, IInspectable, IInspectable_Vtbl, Interface, PCWSTR, PWSTR, Type,
+    },
 };
 
 // ── COM initialization ──────────────────────────────────────────────────────
@@ -50,10 +60,8 @@ impl AuthGate for WindowsHelloAuth {
     fn authenticate(&self, reason: &str) -> Result<()> {
         ensure_com_init();
 
-        let message = HSTRING::from(reason);
-        let result = UserConsentVerifier::RequestVerificationAsync(&message)
-            .map_err(|e| Error::Backend(format!("Windows Hello unavailable: {e}")))?
-            .get()
+        let message = prompt_message(reason);
+        let result = request_verification(&message)
             .map_err(|e| Error::Backend(format!("Windows Hello request failed: {e}")))?;
 
         match result {
@@ -80,6 +88,111 @@ impl AuthGate for WindowsHelloAuth {
     fn is_available(&self) -> bool {
         Self::is_available()
     }
+}
+
+fn prompt_message(reason: &str) -> String {
+    let normalized = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    let normalized = normalized.trim();
+    let message = if normalized.is_empty() {
+        "Authorize pay to use your payment account."
+    } else {
+        normalized
+    };
+
+    truncate_for_prompt(message, 220)
+}
+
+fn truncate_for_prompt(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
+// Desktop apps need the HWND-based interop API for Windows Hello prompts. The
+// plain UserConsentVerifier::RequestVerificationAsync API is the UWP path.
+windows::core::imp::define_interface!(
+    IUserConsentVerifierInterop,
+    IUserConsentVerifierInteropVtbl,
+    0x39e050c3_4e74_441a_8dc0_b81104df949c
+);
+
+impl core::ops::Deref for IUserConsentVerifierInterop {
+    type Target = IInspectable;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { transmute(self) }
+    }
+}
+
+windows::core::imp::interface_hierarchy!(
+    IUserConsentVerifierInterop,
+    windows::core::IUnknown,
+    IInspectable
+);
+
+#[repr(C)]
+pub struct IUserConsentVerifierInteropVtbl {
+    pub base__: IInspectable_Vtbl,
+    pub request_verification_for_window_async: unsafe extern "system" fn(
+        *mut c_void,
+        HWND,
+        MaybeUninit<HSTRING>,
+        *const GUID,
+        *mut *mut c_void,
+    ) -> HRESULT,
+}
+
+fn request_verification(message: &str) -> windows::core::Result<UserConsentVerificationResult> {
+    let message = HSTRING::from(message);
+
+    if let Some(hwnd) = prompt_parent_window()
+        && let Ok(op) = request_verification_for_window_async(hwnd, &message)
+    {
+        return op.get();
+    }
+
+    UserConsentVerifier::RequestVerificationAsync(&message)?.get()
+}
+
+fn request_verification_for_window_async(
+    hwnd: HWND,
+    message: &HSTRING,
+) -> windows::core::Result<IAsyncOperation<UserConsentVerificationResult>> {
+    let interop = windows::core::factory::<UserConsentVerifier, IUserConsentVerifierInterop>()?;
+
+    unsafe {
+        let mut result__ = core::mem::zeroed();
+        (Interface::vtable(&interop).request_verification_for_window_async)(
+            Interface::as_raw(&interop),
+            hwnd,
+            transmute_copy(message),
+            &<IAsyncOperation<UserConsentVerificationResult> as Interface>::IID,
+            &mut result__,
+        )
+        .and_then(|| Type::from_abi(result__))
+    }
+}
+
+fn prompt_parent_window() -> Option<HWND> {
+    let console = unsafe { GetConsoleWindow() };
+    if !console.is_invalid() && unsafe { IsWindowVisible(console).0 != 0 } {
+        return Some(console);
+    }
+
+    let foreground = unsafe { GetForegroundWindow() };
+    if !foreground.is_invalid() {
+        return Some(foreground);
+    }
+
+    if !console.is_invalid() {
+        return Some(console);
+    }
+
+    None
 }
 
 // ── Windows Credential Manager store ────────────────────────────────────────
@@ -153,4 +266,50 @@ fn cred_exists(target: &[u16]) -> bool {
 fn cred_delete(target: &[u16]) -> Result<()> {
     unsafe { CredDeleteW(PCWSTR(target.as_ptr()), CRED_TYPE_GENERIC, 0) }
         .map_err(|e| Error::Backend(format!("CredDeleteW failed: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prompt_message_preserves_user_facing_reason() {
+        assert_eq!(
+            prompt_message("Authorize a payment with pay."),
+            "Authorize a payment with pay."
+        );
+    }
+
+    #[test]
+    fn prompt_message_preserves_specific_payment_reason() {
+        assert_eq!(
+            prompt_message("Authorize payment of $0.05 for accessing API api.example.com."),
+            "Authorize payment of $0.05 for accessing API api.example.com."
+        );
+    }
+
+    #[test]
+    fn prompt_message_trims_whitespace_and_punctuation() {
+        assert_eq!(
+            prompt_message("  delete default account.  "),
+            "delete default account."
+        );
+    }
+
+    #[test]
+    fn prompt_message_falls_back_for_empty_reason() {
+        assert_eq!(
+            prompt_message("   "),
+            "Authorize pay to use your payment account."
+        );
+    }
+
+    #[test]
+    fn prompt_message_bounds_long_reasons() {
+        let long = "a".repeat(220);
+        let message = prompt_message(&long);
+
+        assert!(message.ends_with("..."));
+        assert!(message.len() < 230);
+    }
 }

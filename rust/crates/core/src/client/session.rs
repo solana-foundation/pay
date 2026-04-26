@@ -251,7 +251,7 @@ pub fn open_pull_session_header(
         &network,
         store,
         account_override,
-        "authorize payment",
+        "Authorize opening a pay session.",
     )?;
     let user_pubkey = signer.pubkey();
 

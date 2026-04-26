@@ -129,7 +129,7 @@ impl DestroyCommand {
         // Delete from keystore backend
         let ks = keystore_for_kind(&keystore_kind, op_account)?;
         if let Some(ks) = ks {
-            let reason = format!("delete {} account", self.account);
+            let reason = format!("Delete the \"{}\" payment account.", self.account);
             ks.delete(&self.account, &reason)
                 .map_err(|e| pay_core::Error::Config(format!("{keystore_kind} delete: {e}")))?;
         } else {

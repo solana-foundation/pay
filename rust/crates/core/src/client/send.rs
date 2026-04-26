@@ -36,7 +36,7 @@ pub async fn send_sol(
     active_account_name: &str,
     rpc_url: &str,
 ) -> Result<SendResult> {
-    let reason = format!("send SOL to {recipient}");
+    let reason = format!("Authorize sending SOL to {recipient}.");
     let signer = crate::signer::load_signer_with_reason(active_account_name, &reason)?;
     let rpc = RpcClient::new(rpc_url.to_string());
 

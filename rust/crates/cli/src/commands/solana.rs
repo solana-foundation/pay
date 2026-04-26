@@ -34,7 +34,7 @@ impl SolanaCommand {
                 account,
                 name,
                 pay_core::accounts::MAINNET_NETWORK,
-                "solana CLI access",
+                "Use your pay account with the Solana CLI.",
             )?
         } else {
             let source = active_account_name
@@ -139,7 +139,7 @@ fn load_keypair_bytes(source: &str) -> pay_core::Result<pay_core::keystore::Zero
             _ => unreachable!(),
         };
         return ks
-            .load_keypair(account, "solana CLI access")
+            .load_keypair(account, "Use your pay account with the Solana CLI.")
             .map_err(|e| pay_core::Error::Config(format!("{backend_name}: {e}")));
     }
 

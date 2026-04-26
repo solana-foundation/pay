@@ -19,7 +19,11 @@ zbus = { version = "3", default-features = false, features = ["tokio"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.58", features = [
+    "Foundation",
     "Win32_Security_Credentials",
     "Win32_System_Com",
+    "Win32_System_Console",
+    "Win32_UI_WindowsAndMessaging",
     "Security_Credentials_UI",
 ] }
+windows-core = "0.58"
