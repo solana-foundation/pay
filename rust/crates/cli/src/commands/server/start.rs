@@ -195,10 +195,8 @@ impl StartCommand {
                 // tells the user *why* it's being asked. The same
                 // signer is then used as both the fee-payer and the
                 // recipient-pubkey source (no second load).
-                let signer = pay_core::signer::load_signer_with_reason(
-                    source,
-                    "Use your pay account as the gateway fee payer.",
-                )?;
+                let intent = pay_core::keystore::AuthIntent::use_gateway_fee_payer();
+                let signer = pay_core::signer::load_signer_with_intent(source, &intent)?;
                 Some(Arc::new(signer) as Arc<dyn SolanaSigner>)
             } else {
                 None
@@ -942,29 +940,25 @@ async fn resolve_signer_with_store(
                     pay_core::Error::Config(format!("Invalid keypair bytes for `{name}`: {e}"))
                 })?
             } else {
-                pay_core::signer::load_signer_from_account_with_reason(
-                    account,
-                    name,
-                    network,
-                    "Use your pay account as the gateway fee payer.",
+                let intent = pay_core::keystore::AuthIntent::use_gateway_fee_payer();
+                pay_core::signer::load_signer_from_account_with_intent(
+                    account, name, network, &intent,
                 )?
             };
             Ok(Arc::new(signer))
         }
         SignerConfig::File { path } => {
             let expanded = shellexpand::tilde(path).into_owned();
-            let signer = pay_core::signer::load_signer_with_reason(
-                &expanded,
-                "Use your pay account as the gateway fee payer.",
-            )
-            .map_err(|e| {
-                pay_core::Error::Config(format!(
-                    "operator.signer.path = `{path}` could not be loaded: {e}.\n\n\
+            let intent = pay_core::keystore::AuthIntent::use_gateway_fee_payer();
+            let signer =
+                pay_core::signer::load_signer_with_intent(&expanded, &intent).map_err(|e| {
+                    pay_core::Error::Config(format!(
+                        "operator.signer.path = `{path}` could not be loaded: {e}.\n\n\
                      Expected a Solana CLI keypair file (a JSON array of exactly \
                      64 bytes: 32 bytes secret + 32 bytes public key).\n\n\
                      Generate one with `solana-keygen new -o {path}`."
-                ))
-            })?;
+                    ))
+                })?;
             Ok(Arc::new(signer))
         }
     }

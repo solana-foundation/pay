@@ -17,7 +17,7 @@ pub mod macos;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
-pub use auth::AuthGate;
+pub use auth::{AuthGate, AuthIntent, PaymentLimit};
 pub use error::{Error, Result};
 pub use store::SecretStore;
 pub use zeroize::Zeroizing;
@@ -134,7 +134,12 @@ impl Keystore {
 
     /// Import a 64-byte keypair (32 secret + 32 public).
     pub fn import(&self, account: &str, keypair_bytes: &[u8], _sync: SyncMode) -> Result<()> {
-        self.import_with_reason(account, keypair_bytes, _sync, "store keypair")
+        self.import_with_intent(
+            account,
+            keypair_bytes,
+            _sync,
+            &AuthIntent::create_account(account),
+        )
     }
 
     /// Import with a custom auth prompt reason shown to the user.
@@ -145,11 +150,27 @@ impl Keystore {
         _sync: SyncMode,
         reason: &str,
     ) -> Result<()> {
+        self.import_with_intent(
+            account,
+            keypair_bytes,
+            _sync,
+            &AuthIntent::from_reason(reason),
+        )
+    }
+
+    /// Import with a typed auth intent shown to the user where supported.
+    pub fn import_with_intent(
+        &self,
+        account: &str,
+        keypair_bytes: &[u8],
+        _sync: SyncMode,
+        intent: &AuthIntent,
+    ) -> Result<()> {
         validate_account_name(account)?;
         validate_keypair(keypair_bytes)?;
 
         if self.auth_on_write {
-            self.auth.authenticate(reason)?;
+            self.auth.authenticate(intent)?;
         }
 
         self.store.store(&keypair_key(account), keypair_bytes)?;
@@ -165,9 +186,14 @@ impl Keystore {
 
     /// Delete a keypair. `reason` is shown in the OS auth prompt (Touch ID, etc.).
     pub fn delete(&self, account: &str, reason: &str) -> Result<()> {
+        self.delete_with_intent(account, &AuthIntent::from_reason(reason))
+    }
+
+    /// Delete a keypair with a typed auth intent.
+    pub fn delete_with_intent(&self, account: &str, intent: &AuthIntent) -> Result<()> {
         validate_account_name(account)?;
         if self.auth_on_write {
-            self.auth.authenticate(reason)?;
+            self.auth.authenticate(intent)?;
         }
 
         self.store.delete(&keypair_key(account))?;
@@ -183,14 +209,28 @@ impl Keystore {
 
     /// Load the full 64-byte keypair. Triggers auth prompt.
     pub fn load_keypair(&self, account: &str, reason: &str) -> Result<Zeroizing<Vec<u8>>> {
+        self.load_keypair_with_intent(account, &AuthIntent::from_reason(reason))
+    }
+
+    /// Load the full 64-byte keypair with a typed auth intent.
+    pub fn load_keypair_with_intent(
+        &self,
+        account: &str,
+        intent: &AuthIntent,
+    ) -> Result<Zeroizing<Vec<u8>>> {
         validate_account_name(account)?;
-        self.auth.authenticate(reason)?;
+        self.auth.authenticate(intent)?;
         self.store.load(&keypair_key(account))
     }
 
     /// Authenticate without loading anything (for standalone prompts).
     pub fn authenticate(&self, reason: &str) -> Result<()> {
-        self.auth.authenticate(reason)
+        self.authenticate_intent(&AuthIntent::from_reason(reason))
+    }
+
+    /// Authenticate without loading anything using a typed auth intent.
+    pub fn authenticate_intent(&self, intent: &AuthIntent) -> Result<()> {
+        self.auth.authenticate(intent)
     }
 
     /// Check if the auth mechanism is available.
@@ -357,7 +397,7 @@ mod tests {
 
         struct CountingAuth(Arc<AtomicU32>);
         impl AuthGate for CountingAuth {
-            fn authenticate(&self, _reason: &str) -> Result<()> {
+            fn authenticate(&self, _intent: &AuthIntent) -> Result<()> {
                 self.0.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             }
@@ -391,7 +431,7 @@ mod tests {
 
         struct CountingAuth(Arc<AtomicU32>);
         impl AuthGate for CountingAuth {
-            fn authenticate(&self, _reason: &str) -> Result<()> {
+            fn authenticate(&self, _intent: &AuthIntent) -> Result<()> {
                 self.0.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             }
@@ -470,7 +510,7 @@ mod tests {
 
     struct DenyAuth;
     impl AuthGate for DenyAuth {
-        fn authenticate(&self, _reason: &str) -> Result<()> {
+        fn authenticate(&self, _intent: &AuthIntent) -> Result<()> {
             Err(Error::AuthDenied("denied by test".to_string()))
         }
         fn is_available(&self) -> bool {

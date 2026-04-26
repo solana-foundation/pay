@@ -30,12 +30,12 @@ impl ExportCommand {
                 .and_then(|net| net.iter().find(|(n, _)| *n == name))
                 .map(|(_, a)| a)
                 .ok_or_else(|| pay_core::Error::Config(format!("Account '{name}' not found")))?;
-            let reason = format!("Export the \"{name}\" payment account.");
-            let bytes = pay_core::signer::load_keypair_bytes_from_account_with_reason(
+            let intent = pay_core::keystore::AuthIntent::export_account(name);
+            let bytes = pay_core::signer::load_keypair_bytes_from_account_with_intent(
                 account,
                 name,
                 pay_core::accounts::MAINNET_NETWORK,
-                &reason,
+                &intent,
             )?;
             let pubkey = bs58::encode(&bytes[32..64]).into_string();
             (bytes, pubkey, name.clone())
@@ -45,12 +45,12 @@ impl ExportCommand {
                 && let Ok(accounts) = pay_core::accounts::AccountsFile::load()
                 && let Some((name, account)) = accounts.default_account()
             {
-                let reason = format!("Export the \"{name}\" payment account.");
-                let bytes = pay_core::signer::load_keypair_bytes_from_account_with_reason(
+                let intent = pay_core::keystore::AuthIntent::export_account(name);
+                let bytes = pay_core::signer::load_keypair_bytes_from_account_with_intent(
                     account,
                     name,
                     pay_core::accounts::MAINNET_NETWORK,
-                    &reason,
+                    &intent,
                 )?;
                 let pubkey = bs58::encode(&bytes[32..64]).into_string();
                 (bytes, pubkey, name.to_string())
@@ -64,8 +64,8 @@ impl ExportCommand {
                         )
                     })?;
                 let fallback_name = self.name.as_deref().unwrap_or("default");
-                let reason = format!("Export the \"{fallback_name}\" payment account.");
-                let bytes = reload_raw_bytes(&src, &reason)?;
+                let intent = pay_core::keystore::AuthIntent::export_account(fallback_name);
+                let bytes = reload_raw_bytes(&src, &intent)?;
                 let pubkey = bs58::encode(&bytes[32..64]).into_string();
                 let name = self.name.clone().unwrap_or_else(|| "default".to_string());
                 (bytes, pubkey, name)
@@ -109,7 +109,7 @@ impl ExportCommand {
 
 fn reload_raw_bytes(
     source: &str,
-    reason: &str,
+    intent: &pay_core::keystore::AuthIntent,
 ) -> pay_core::Result<pay_core::keystore::Zeroizing<Vec<u8>>> {
     // Try keystore backends
     let (backend_name, account) = if let Some(account) = source.strip_prefix("keychain:") {
@@ -126,7 +126,7 @@ fn reload_raw_bytes(
     };
 
     let ks = keystore_for_backend(backend_name)?;
-    ks.load_keypair(account, reason)
+    ks.load_keypair_with_intent(account, intent)
         .map_err(|e| pay_core::Error::Config(format!("{backend_name}: {e}")))
 }
 

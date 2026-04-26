@@ -30,11 +30,14 @@ impl SolanaCommand {
             && let Ok(accounts) = pay_core::accounts::AccountsFile::load()
             && let Some((name, account)) = accounts.default_account()
         {
-            pay_core::signer::load_keypair_bytes_from_account_with_reason(
+            let intent = pay_core::keystore::AuthIntent::use_account(
+                "Use your pay account with the Solana CLI.",
+            );
+            pay_core::signer::load_keypair_bytes_from_account_with_intent(
                 account,
                 name,
                 pay_core::accounts::MAINNET_NETWORK,
-                "Use your pay account with the Solana CLI.",
+                &intent,
             )?
         } else {
             let source = active_account_name
@@ -138,8 +141,11 @@ fn load_keypair_bytes(source: &str) -> pay_core::Result<pay_core::keystore::Zero
             "1password" => Keystore::onepassword(None),
             _ => unreachable!(),
         };
+        let intent = pay_core::keystore::AuthIntent::use_account(
+            "Use your pay account with the Solana CLI.",
+        );
         return ks
-            .load_keypair(account, "Use your pay account with the Solana CLI.")
+            .load_keypair_with_intent(account, &intent)
             .map_err(|e| pay_core::Error::Config(format!("{backend_name}: {e}")));
     }
 

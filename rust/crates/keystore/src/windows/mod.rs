@@ -1,6 +1,6 @@
 //! Windows: Windows Hello authentication + Credential Manager storage.
 
-use crate::{AuthGate, Error, Result, SecretStore, Zeroizing};
+use crate::{AuthGate, AuthIntent, Error, Result, SecretStore, Zeroizing};
 use std::cell::Cell;
 use std::ffi::c_void;
 use std::mem::{MaybeUninit, transmute, transmute_copy};
@@ -57,10 +57,10 @@ impl WindowsHelloAuth {
 }
 
 impl AuthGate for WindowsHelloAuth {
-    fn authenticate(&self, reason: &str) -> Result<()> {
+    fn authenticate(&self, intent: &AuthIntent) -> Result<()> {
         ensure_com_init();
 
-        let message = prompt_message(reason);
+        let message = intent.prompt_message();
         let result = request_verification(&message)
             .map_err(|e| Error::Backend(format!("Windows Hello request failed: {e}")))?;
 
@@ -87,28 +87,6 @@ impl AuthGate for WindowsHelloAuth {
 
     fn is_available(&self) -> bool {
         Self::is_available()
-    }
-}
-
-fn prompt_message(reason: &str) -> String {
-    let normalized = reason.split_whitespace().collect::<Vec<_>>().join(" ");
-    let normalized = normalized.trim();
-    let message = if normalized.is_empty() {
-        "Authorize pay to use your payment account."
-    } else {
-        normalized
-    };
-
-    truncate_for_prompt(message, 220)
-}
-
-fn truncate_for_prompt(value: &str, max_chars: usize) -> String {
-    let mut chars = value.chars();
-    let truncated: String = chars.by_ref().take(max_chars).collect();
-    if chars.next().is_some() {
-        format!("{truncated}...")
-    } else {
-        truncated
     }
 }
 
@@ -275,7 +253,7 @@ mod tests {
     #[test]
     fn prompt_message_preserves_user_facing_reason() {
         assert_eq!(
-            prompt_message("Authorize a payment with pay."),
+            AuthIntent::default_payment().prompt_message(),
             "Authorize a payment with pay."
         );
     }
@@ -283,7 +261,8 @@ mod tests {
     #[test]
     fn prompt_message_preserves_specific_payment_reason() {
         assert_eq!(
-            prompt_message("Authorize payment of $0.05 for accessing API api.example.com."),
+            AuthIntent::authorize_payment("$0.05", "accessing API api.example.com")
+                .prompt_message(),
             "Authorize payment of $0.05 for accessing API api.example.com."
         );
     }
@@ -291,7 +270,7 @@ mod tests {
     #[test]
     fn prompt_message_trims_whitespace_and_punctuation() {
         assert_eq!(
-            prompt_message("  delete default account.  "),
+            AuthIntent::from_reason("  delete default account.  ").prompt_message(),
             "delete default account."
         );
     }
@@ -299,15 +278,15 @@ mod tests {
     #[test]
     fn prompt_message_falls_back_for_empty_reason() {
         assert_eq!(
-            prompt_message("   "),
+            AuthIntent::from_reason("   ").prompt_message(),
             "Authorize pay to use your payment account."
         );
     }
 
     #[test]
     fn prompt_message_bounds_long_reasons() {
-        let long = "a".repeat(220);
-        let message = prompt_message(&long);
+        let long = "a".repeat(221);
+        let message = AuthIntent::from_reason(&long).prompt_message();
 
         assert!(message.ends_with("..."));
         assert!(message.len() < 230);

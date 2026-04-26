@@ -5,6 +5,12 @@
 use dialoguer::Confirm;
 use owo_colors::OwoColorize;
 
+#[cfg(target_os = "linux")]
+const POLKIT_POLICY_PATH: &str = "/usr/share/polkit-1/actions/sh.pay.unlock-keypair.policy";
+
+#[cfg(target_os = "linux")]
+const POLKIT_POLICY: &str = include_str!("../../../../config/polkit/sh.pay.unlock-keypair.policy");
+
 /// Generate a keypair, store it securely, and fund your account.
 #[derive(clap::Args)]
 pub struct SetupCommand {
@@ -122,4 +128,57 @@ fn maybe_install_skill() {
         }
     }
     eprintln!();
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn install_linux_polkit_policy_if_needed() -> pay_core::Result<()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    if std::fs::read_to_string(POLKIT_POLICY_PATH).is_ok_and(|installed| installed == POLKIT_POLICY)
+    {
+        return Ok(());
+    }
+
+    eprintln!();
+    eprintln!(
+        "{}",
+        "  Installing Linux authentication prompts for pay (polkit policy)...".dimmed()
+    );
+
+    let mut child = Command::new("pkexec")
+        .args(["tee", POLKIT_POLICY_PATH])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .map_err(|e| {
+            pay_core::Error::Config(format!(
+                "Failed to launch pkexec to install the pay polkit policy: {e}.\n\n\
+                 Install it manually with:\n\
+                 \x20 sudo tee {POLKIT_POLICY_PATH} >/dev/null <<'EOF'\n\
+                 {POLKIT_POLICY}EOF"
+            ))
+        })?;
+
+    {
+        let mut stdin = child.stdin.take().expect("pkexec stdin");
+        stdin
+            .write_all(POLKIT_POLICY.as_bytes())
+            .map_err(|e| pay_core::Error::Config(format!("Failed to write polkit policy: {e}")))?;
+    }
+
+    let status = child
+        .wait()
+        .map_err(|e| pay_core::Error::Config(format!("pkexec failed: {e}")))?;
+
+    if status.success() {
+        eprintln!("  {} Linux authentication prompts installed", "✔".green());
+        Ok(())
+    } else {
+        Err(pay_core::Error::Config(format!(
+            "Failed to install the pay polkit policy (pkexec exited with {status}).\n\n\
+             Install it manually with:\n\
+             \x20 sudo cp rust/config/polkit/sh.pay.unlock-keypair.policy {POLKIT_POLICY_PATH}"
+        )))
+    }
 }
