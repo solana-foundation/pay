@@ -27,6 +27,11 @@ pub enum RunOutcome {
         challenge: Box<x402::Challenge>,
         resource_url: String,
     },
+    /// The server returned 402 with an auth-only x402 SIWX challenge.
+    X402SignInChallenge {
+        challenge: Box<x402::SiwxAuthChallenge>,
+        resource_url: String,
+    },
     /// The server returned 402 but without a recognized payment protocol.
     UnknownPaymentRequired {
         headers: Vec<(String, String)>,
@@ -193,18 +198,17 @@ pub(crate) fn classify_402(
     let x402_challenge = x402::parse(headers, body).or_else(|| {
         headers
             .iter()
-            .find(|(k, _)| k == "payment-required")
+            .find(|(k, _)| k.eq_ignore_ascii_case(solana_x402::PAYMENT_REQUIRED_HEADER))
             .and_then(|(_, v)| {
                 use base64::Engine;
                 let decoded = base64::engine::general_purpose::STANDARD.decode(v).ok()?;
                 let json_str = String::from_utf8(decoded).ok()?;
                 // Re-parse with the decoded JSON as the body
-                let synthetic_headers: Vec<(String, String)> =
-                    vec![("x-payment-required".to_string(), json_str.clone())];
-                x402::parse(&synthetic_headers, Some(&json_str))
+                x402::parse(&[], Some(&json_str))
             })
     });
     let mpp_challenges = mpp::parse_headers(headers);
+    let x402_siwx_challenge = x402::parse_siwx_auth(headers, body);
 
     // x402::parse (from solana_x402) only returns Some when a Solana-
     // compatible `accepts` entry exists — it's already a Solana filter.
@@ -250,6 +254,14 @@ pub(crate) fn classify_402(
     if let Some(challenge) = x402_challenge {
         info!(resource = resource_url, "Detected x402 challenge (Solana)");
         return RunOutcome::X402Challenge {
+            challenge: Box::new(challenge),
+            resource_url: resource_url.to_string(),
+        };
+    }
+
+    if let Some(challenge) = x402_siwx_challenge {
+        info!(resource = resource_url, "Detected x402 sign-in challenge");
+        return RunOutcome::X402SignInChallenge {
             challenge: Box::new(challenge),
             resource_url: resource_url.to_string(),
         };
@@ -532,10 +544,102 @@ HTTP request sent, awaiting response...
             "currency": "USDC",
             "resource": "https://example.com/resource"
         });
-        let headers = vec![("x-payment-required".to_string(), requirements.to_string())];
+        let headers = vec![(
+            solana_x402::X402_V1_PAYMENT_REQUIRED_HEADER.to_string(),
+            requirements.to_string(),
+        )];
 
         let outcome = classify_402(&headers, None, "https://example.com/resource");
         assert!(matches!(outcome, RunOutcome::X402Challenge { .. }));
+    }
+
+    #[test]
+    fn classify_402_with_x402_siwx_auth_only_header() {
+        use base64::Engine;
+
+        let payment_required = serde_json::json!({
+            solana_x402::X402_VERSION_FIELD: solana_x402::X402_VERSION_V2,
+            "resource": {
+                "url": "https://example.com/resource",
+                "description": "API access"
+            },
+            "accepts": [],
+            "extensions": {
+                "sign-in-with-x": {
+                    "domain": "example.com",
+                    "uri": "https://example.com",
+                    "version": "1",
+                    "nonce": "nonce-123",
+                    "issuedAt": "2026-04-27T00:00:00Z",
+                    "supportedChains": [{
+                        "chainId": solana_x402::exact::SOLANA_MAINNET,
+                        "type": "ed25519",
+                        "signatureScheme": "siws"
+                    }]
+                }
+            }
+        });
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(payment_required.to_string().as_bytes());
+        let headers = vec![(solana_x402::PAYMENT_REQUIRED_HEADER.to_string(), encoded)];
+
+        let outcome = classify_402(&headers, None, "https://example.com/resource");
+
+        match outcome {
+            RunOutcome::X402SignInChallenge {
+                challenge,
+                resource_url,
+            } => {
+                assert_eq!(challenge.extension.nonce, "nonce-123");
+                assert_eq!(resource_url, "https://example.com/resource");
+            }
+            other => panic!("expected X402SignInChallenge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_402_prefers_payment_when_siwx_extends_payment_challenge() {
+        use base64::Engine;
+
+        let selected = serde_json::json!({
+            "scheme": solana_x402::exact::EXACT_SCHEME,
+            "network": solana_x402::exact::SOLANA_MAINNET,
+            "amount": "10000",
+            "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            "payTo": "6cvgmdrsVxyiuPzqMCSBnS7fAmA5Mk2VG4BcfVhC8jdC",
+            "maxTimeoutSeconds": 300
+        });
+        let payment_required = serde_json::json!({
+            solana_x402::X402_VERSION_FIELD: solana_x402::X402_VERSION_V2,
+            "accepts": [selected],
+            "extensions": {
+                "sign-in-with-x": {
+                    "domain": "example.com",
+                    "uri": "https://example.com",
+                    "version": "1",
+                    "nonce": "nonce-123",
+                    "issuedAt": "2026-04-27T00:00:00Z",
+                    "supportedChains": [{
+                        "chainId": solana_x402::exact::SOLANA_MAINNET,
+                        "type": "ed25519",
+                        "signatureScheme": "siws"
+                    }]
+                }
+            }
+        });
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(payment_required.to_string().as_bytes());
+        let headers = vec![(solana_x402::PAYMENT_REQUIRED_HEADER.to_string(), encoded)];
+
+        let outcome = classify_402(&headers, None, "https://example.com/resource");
+
+        match outcome {
+            RunOutcome::X402Challenge { challenge, .. } => {
+                assert_eq!(challenge.requirements.amount, "10000");
+                assert!(challenge.siwx.is_some());
+            }
+            other => panic!("expected X402Challenge, got {other:?}"),
+        }
     }
 
     #[test]

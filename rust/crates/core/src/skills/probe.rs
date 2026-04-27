@@ -233,6 +233,13 @@ fn classify_outcome(outcome: RunOutcome, accepted: &[String]) -> ProbeStatus {
             }
         }
 
+        RunOutcome::X402SignInChallenge { .. } => ProbeStatus::Ok {
+            protocol: "x402-siwx".into(),
+            currency: "sign-in".into(),
+            network: "mainnet".into(),
+            recipient: String::new(),
+        },
+
         RunOutcome::PaymentRejected { reason, .. } => ProbeStatus::WrongChain { details: reason },
 
         RunOutcome::UnknownPaymentRequired { .. } => ProbeStatus::UnknownProtocol,

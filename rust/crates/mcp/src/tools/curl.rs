@@ -108,7 +108,7 @@ fn do_paid_fetch(
             )?)
         }
         RunOutcome::X402Challenge { challenge, .. } => {
-            let (payment_header_name, payment_header, _ephemeral) = pay_core::client::x402::build_payment(
+            let built_payment = pay_core::client::x402::build_payment(
                 &challenge,
                 &store,
                 network_override.as_deref(),
@@ -116,7 +116,34 @@ fn do_paid_fetch(
                 Some(url),
             )?;
             let mut headers = extra_headers.to_vec();
-            headers.push((payment_header_name.to_string(), payment_header));
+            headers.extend(
+                built_payment
+                    .headers
+                    .into_iter()
+                    .map(|(name, value)| (name.to_string(), value)),
+            );
+            interpret_retry(pay_core::client::fetch::fetch_request(
+                method,
+                url,
+                &headers,
+                body.as_deref(),
+            )?)
+        }
+        RunOutcome::X402SignInChallenge { challenge, .. } => {
+            let built_payment = pay_core::client::x402::build_siwx_auth_header(
+                &challenge,
+                &store,
+                network_override.as_deref(),
+                account_override.as_deref(),
+                Some(url),
+            )?;
+            let mut headers = extra_headers.to_vec();
+            headers.extend(
+                built_payment
+                    .headers
+                    .into_iter()
+                    .map(|(name, value)| (name.to_string(), value)),
+            );
             interpret_retry(pay_core::client::fetch::fetch_request(
                 method,
                 url,
@@ -275,5 +302,6 @@ mod tests {
     fn x402_paid_fetch_supports_v1_and_v2_header_names() {
         assert_eq!(pay_core::x402::X402_V1_PAYMENT_HEADER, "X-PAYMENT");
         assert_eq!(pay_core::x402::X402_V2_PAYMENT_HEADER, "PAYMENT-SIGNATURE");
+        assert_eq!(pay_core::x402::SIGN_IN_WITH_X_HEADER, "SIGN-IN-WITH-X");
     }
 }

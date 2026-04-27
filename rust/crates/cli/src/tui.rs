@@ -219,7 +219,7 @@ fn run_topup(
     let mut selected = 0usize;
     let mut provider_selected = 0usize;
     let mut focus = TopupFocus::Methods;
-    let mut amount_pos: usize = 10; // default $10
+    let mut amount_pos: usize = 5; // default $5
     let started_at = Instant::now();
 
     // Fetch initial balances (best-effort; skip polling if RPC is unreachable)
@@ -702,7 +702,7 @@ fn render_qr_detail(
         title,
         amount_pos,
         TOPUP_MAX_STEPS,
-        &["any", "$5", "$10", "$25"],
+        &[(0, "any"), (5, "$5"), (10, "$10"), (25, "$25")],
         false,
     );
 }
@@ -1098,7 +1098,13 @@ fn render_budget_box(
         title,
         position,
         MAX_STEPS,
-        &["$0", "$5", "$10", "$15", "YOLO"],
+        &[
+            (0, "$0"),
+            (10, "$5"),
+            (20, "$10"),
+            (30, "$15"),
+            (31, "YOLO"),
+        ],
         *focus == Focus::Budget,
     );
 }
@@ -1343,29 +1349,36 @@ fn bar_color(index: usize, total: usize, bright: bool) -> Color {
     }
 }
 
-fn render_scale_spans(box_width: u16, labels: &[&str]) -> Vec<Span<'static>> {
-    let bar_width = (box_width as usize).saturating_sub(4);
+fn render_scale_spans(
+    bar_width: usize,
+    max_steps: usize,
+    track_last: usize,
+    labels: &[(usize, &str)],
+) -> Vec<Span<'static>> {
+    let arrow_width = 3usize;
+    let mut chars = vec![' '; bar_width];
 
-    let mut spans = vec![Span::raw(" ")];
-    for (i, label) in labels.iter().enumerate() {
-        let pos = if i == labels.len() - 1 {
-            bar_width
-        } else {
-            (i * bar_width) / (labels.len() - 1)
-        };
+    for &(position, label) in labels {
+        let label_width = label.chars().count();
+        let track_pos = (position.min(max_steps) * track_last)
+            .checked_div(max_steps)
+            .unwrap_or(0);
+        let label_center = arrow_width + track_pos;
+        let label_start = label_center
+            .saturating_sub(label_width / 2)
+            .min(bar_width.saturating_sub(label_width));
 
-        let current_len: usize = spans.iter().map(|s| s.content.len()).sum();
-        let target = pos + 1;
-        if target > current_len {
-            spans.push(Span::raw(" ".repeat(target - current_len)));
+        for (idx, ch) in label.chars().enumerate() {
+            if let Some(slot) = chars.get_mut(label_start + idx) {
+                *slot = ch;
+            }
         }
-        spans.push(Span::styled(
-            label.to_string(),
-            Style::default().fg(Color::DarkGray),
-        ));
     }
 
-    spans
+    vec![Span::styled(
+        chars.into_iter().collect::<String>(),
+        Style::default().fg(Color::DarkGray),
+    )]
 }
 
 /// Generic slider bar used by both the session budget box and the topup amount box.
@@ -1375,7 +1388,7 @@ fn render_slider_box<'a>(
     title: impl Into<ratatui::widgets::block::Title<'a>>,
     position: usize,
     max_steps: usize,
-    scale_labels: &[&str],
+    scale_labels: &[(usize, &str)],
     focused: bool,
 ) {
     let border_color = if focused {
@@ -1393,7 +1406,10 @@ fn render_slider_box<'a>(
     let box_width = area.width;
     let bar_width = (box_width as usize).saturating_sub(4);
     let track_width = bar_width.saturating_sub(6); // account for arrows
-    let cursor_pos = (position * track_width).checked_div(max_steps).unwrap_or(0);
+    let track_last = track_width.saturating_sub(1);
+    let cursor_pos = (position.min(max_steps) * track_last)
+        .checked_div(max_steps)
+        .unwrap_or(0);
 
     let arrow_style = Style::default().fg(Color::Cyan).bold();
     let mut bar_spans = vec![Span::styled(" ◀ ", arrow_style)];
@@ -1412,7 +1428,12 @@ fn render_slider_box<'a>(
     let lines = vec![
         Line::default(),
         Line::from(bar_spans),
-        Line::from(render_scale_spans(box_width, scale_labels)),
+        Line::from(render_scale_spans(
+            bar_width,
+            max_steps,
+            track_last,
+            scale_labels,
+        )),
     ];
 
     frame.render_widget(Paragraph::new(lines).block(block), area);

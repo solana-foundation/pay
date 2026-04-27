@@ -379,6 +379,42 @@ fn handle_outcome(
             }
         }
 
+        RunOutcome::X402SignInChallenge {
+            challenge,
+            resource_url,
+        } => {
+            if auto_pay {
+                if verbose && !is_json {
+                    eprintln!("{}", "402 Sign-In Required (x402)".dimmed());
+                }
+                return pay_x402_siwx_and_retry(
+                    &challenge,
+                    &resource_url,
+                    PaymentRetryContext {
+                        tool,
+                        output_fmt,
+                        fetch_headers,
+                        network_override,
+                        account_override,
+                        verbose,
+                    },
+                );
+            }
+
+            if is_json {
+                output::print_json(&serde_json::json!({
+                    "status": 402,
+                    "protocol": "x402-siwx",
+                    "resource": resource_url,
+                }))?;
+            } else {
+                eprintln!(
+                    "{}",
+                    "402 Sign-In Required (x402) — use --yolo to sign automatically".dimmed()
+                );
+            }
+        }
+
         RunOutcome::UnknownPaymentRequired {
             headers: _,
             resource_url,
@@ -536,7 +572,7 @@ fn pay_x402_and_retry(
     }
 
     let store = pay_core::accounts::FileAccountsStore::default_path();
-    let (payment_header_name, payment_json, ephemeral_notice) = x402::build_payment(
+    let built_payment = x402::build_payment(
         challenge,
         &store,
         ctx.network_override,
@@ -544,7 +580,7 @@ fn pay_x402_and_retry(
         Some(resource_url),
     )?;
 
-    if let Some(resolved) = ephemeral_notice {
+    if let Some(resolved) = built_payment.ephemeral_notice {
         render_generated_wallet_notice(&resolved, is_json)?;
     }
 
@@ -552,12 +588,39 @@ fn pay_x402_and_retry(
         eprintln!("{}", "Payment signed, retrying...\n".dimmed());
     }
 
-    let retry_outcome = retry_with_header(
-        ctx.tool,
-        payment_header_name,
-        &payment_json,
-        ctx.fetch_headers,
+    let retry_outcome = retry_with_headers(ctx.tool, &built_payment.headers, ctx.fetch_headers)?;
+    handle_retry_outcome(retry_outcome, is_json)
+}
+
+fn pay_x402_siwx_and_retry(
+    challenge: &x402::SiwxAuthChallenge,
+    resource_url: &str,
+    ctx: PaymentRetryContext<'_, '_>,
+) -> pay_core::Result<()> {
+    let is_json = no_dna::should_json(ctx.output_fmt);
+
+    if ctx.verbose && !is_json {
+        eprintln!("{}", "Signing in...".dimmed());
+    }
+
+    let store = pay_core::accounts::FileAccountsStore::default_path();
+    let built_payment = x402::build_siwx_auth_header(
+        challenge,
+        &store,
+        ctx.network_override,
+        ctx.account_override,
+        Some(resource_url),
     )?;
+
+    if let Some(resolved) = built_payment.ephemeral_notice {
+        render_generated_wallet_notice(&resolved, is_json)?;
+    }
+
+    if ctx.verbose && !is_json {
+        eprintln!("{}", "Sign-in signed, retrying...\n".dimmed());
+    }
+
+    let retry_outcome = retry_with_headers(ctx.tool, &built_payment.headers, ctx.fetch_headers)?;
     handle_retry_outcome(retry_outcome, is_json)
 }
 
@@ -693,21 +756,44 @@ fn retry_with_header(
     header_value: &str,
     fetch_headers: Option<Vec<(String, String)>>,
 ) -> pay_core::Result<RunOutcome> {
+    retry_with_headers(
+        tool,
+        &[(header_name, header_value.to_string())],
+        fetch_headers,
+    )
+}
+
+fn retry_with_headers(
+    tool: &Tool,
+    headers_to_add: &[(&str, String)],
+    fetch_headers: Option<Vec<(String, String)>>,
+) -> pay_core::Result<RunOutcome> {
     match tool {
         Tool::Curl(args) => {
-            let extra = vec![format!("{header_name}: {header_value}")];
+            let extra = retry_header_args(headers_to_add);
             run_curl_with_headers(args, &extra)
         }
         Tool::Wget(args) => {
-            let extra = vec![format!("{header_name}: {header_value}")];
+            let extra = retry_header_args(headers_to_add);
             run_wget_with_headers(args, &extra)
         }
         Tool::Fetch { url, .. } => {
             let mut headers = fetch_headers.unwrap_or_default();
-            headers.push((header_name.to_string(), header_value.to_string()));
+            headers.extend(
+                headers_to_add
+                    .iter()
+                    .map(|(name, value)| (name.to_string(), value.clone())),
+            );
             pay_core::fetch::fetch(url, &headers)
         }
     }
+}
+
+fn retry_header_args(headers_to_add: &[(&str, String)]) -> Vec<String> {
+    headers_to_add
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}"))
+        .collect()
 }
 
 fn handle_retry_outcome(outcome: RunOutcome, is_json: bool) -> pay_core::Result<()> {
@@ -838,5 +924,25 @@ mod tests {
     fn x402_retry_supports_v1_and_v2_header_names() {
         assert_eq!(pay_core::x402::X402_V1_PAYMENT_HEADER, "X-PAYMENT");
         assert_eq!(pay_core::x402::X402_V2_PAYMENT_HEADER, "PAYMENT-SIGNATURE");
+        assert_eq!(pay_core::x402::SIGN_IN_WITH_X_HEADER, "SIGN-IN-WITH-X");
+    }
+
+    #[test]
+    fn retry_header_args_preserves_multiple_x402_headers() {
+        let headers = retry_header_args(&[
+            (
+                pay_core::x402::X402_V2_PAYMENT_HEADER,
+                "payment".to_string(),
+            ),
+            (pay_core::x402::SIGN_IN_WITH_X_HEADER, "sign-in".to_string()),
+        ]);
+
+        assert_eq!(
+            headers,
+            vec![
+                "PAYMENT-SIGNATURE: payment".to_string(),
+                "SIGN-IN-WITH-X: sign-in".to_string()
+            ]
+        );
     }
 }
