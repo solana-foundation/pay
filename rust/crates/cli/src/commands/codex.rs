@@ -5,6 +5,15 @@ use std::process::{Command, Stdio};
 
 use clap::Args;
 
+const PAY_MCP_ENABLED_TOOLS: &[&str] = &[
+    "curl",
+    "search_skills",
+    "list_skills",
+    "get_skill_endpoints",
+    "get_balance",
+    "create_skill",
+];
+
 /// Run Codex with 402 payment support.
 ///
 /// Launches Codex with the pay MCP server injected automatically.
@@ -59,6 +68,11 @@ fn build_codex_args(
         config_string("mcp_servers.pay.command", pay_bin),
         "-c".to_string(),
         "mcp_servers.pay.args=[\"mcp\"]".to_string(),
+        "-c".to_string(),
+        format!(
+            "mcp_servers.pay.enabled_tools={}",
+            toml_string_array(PAY_MCP_ENABLED_TOOLS)
+        ),
     ];
 
     // Pass config to MCP server via env.
@@ -108,6 +122,10 @@ fn config_string(key: &str, value: &str) -> String {
 
 fn toml_string(value: &str) -> String {
     serde_json::to_string(value).expect("serializing a string cannot fail")
+}
+
+fn toml_string_array(values: &[&str]) -> String {
+    serde_json::to_string(values).expect("serializing a string array cannot fail")
 }
 
 // On Windows, npm's codex.cmd wrapper forwards %* through cmd.exe. The pay
@@ -215,6 +233,9 @@ mod tests {
         );
 
         assert!(args.contains(&r#"mcp_servers.pay.command="C:\\Users\\me\\pay.exe""#.to_string()));
+        assert!(args.contains(
+            &r#"mcp_servers.pay.enabled_tools=["curl","search_skills","list_skills","get_skill_endpoints","get_balance","create_skill"]"#.to_string()
+        ));
         assert!(
             args.contains(&r#"mcp_servers.pay.env={PAY_ACTIVE_ACCOUNT="default"}"#.to_string())
         );

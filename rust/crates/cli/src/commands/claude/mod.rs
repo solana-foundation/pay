@@ -2,7 +2,7 @@ use std::process::{Command, Stdio};
 
 use clap::Args;
 
-const ALLOWED_TOOLS: &str = "mcp__pay__curl,mcp__pay__search_skills,mcp__pay__list_skills,mcp__pay__get_skill_endpoints,mcp__pay__create_skill";
+const ALLOWED_TOOLS: &str = "mcp__pay__curl,mcp__pay__search_skills,mcp__pay__list_skills,mcp__pay__get_skill_endpoints,mcp__pay__get_balance,mcp__pay__create_skill";
 
 /// Run Claude Code with 402 payment support.
 ///
@@ -63,6 +63,7 @@ impl ClaudeCommand {
             let status = Command::new("claude")
                 .arg("--mcp-config")
                 .arg(mcp_config.to_string())
+                .arg("--strict-mcp-config")
                 .arg("--allowedTools")
                 .arg(ALLOWED_TOOLS)
                 .arg("--append-system-prompt")
@@ -104,7 +105,7 @@ fn launch_windows(mcp_config: serde_json::Value, extra_args: &[String]) -> pay_c
     // PowerShell single-quoted here-string: content is 100% literal — backticks,
     // angle brackets, quotes, etc. all pass through without interpretation.
     let script = format!(
-        "& claude --mcp-config '{config_path_str}' --allowedTools '{ALLOWED_TOOLS}' --append-system-prompt @'\n{instructions}\n'@ @args\n",
+        "& claude --mcp-config '{config_path_str}' --strict-mcp-config --allowedTools '{ALLOWED_TOOLS}' --append-system-prompt @'\n{instructions}\n'@ @args\n",
         instructions = pay_core::instructions::INSTRUCTIONS,
     );
 
@@ -131,4 +132,23 @@ fn launch_windows(mcp_config: serde_json::Value, extra_args: &[String]) -> pay_c
         })?;
 
     Ok(status.code().unwrap_or(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allowed_tools_include_all_pay_mcp_tools() {
+        for tool in [
+            "mcp__pay__curl",
+            "mcp__pay__search_skills",
+            "mcp__pay__list_skills",
+            "mcp__pay__get_skill_endpoints",
+            "mcp__pay__get_balance",
+            "mcp__pay__create_skill",
+        ] {
+            assert!(ALLOWED_TOOLS.split(',').any(|allowed| allowed == tool));
+        }
+    }
 }

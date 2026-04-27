@@ -50,12 +50,29 @@ Payments are made on Solana (SOL and SPL tokens like USDC).
         tools::curl::run(params).await
     }
 
+    #[tool(
+        description = r#"Search paid API services for a user task and return ranked candidates with endpoint context.
+
+Use this for provider selection. Pass the user's actual task as `query`, such
+as "search Instagram influencers in Paris" or "run SQL over public crypto
+datasets". The response is ranked, includes reasons, and includes compact
+endpoint/pricing candidates for top providers. Pick the best provider and
+endpoint only when they clearly match the task. Call `get_skill_endpoints` only
+when you need full usage notes or more endpoint context.
+"#
+    )]
+    async fn search_skills(
+        &self,
+        Parameters(params): Parameters<tools::search_skills::Params>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        tools::search_skills::run(params).await
+    }
+
     #[tool(description = r#"List all available paid API services.
 
-Returns every service with fqn, description, category, and use_case.
-Browse the list and pick the best match for your task, then call
-`get_skill_endpoints` with the chosen `fqn` to get endpoints and
-usage instructions.
+Browse-only fallback. Do not use this for normal provider selection; call
+`search_skills` with the user's task instead. Returns every service with fqn,
+description, category, and use_case.
 "#)]
     async fn list_skills(
         &self,
@@ -69,7 +86,7 @@ usage instructions.
 
 Returns endpoints (each with a complete `url` for the `curl` tool),
 usage notes, pricing info, and sandbox/production URLs. Call this
-after picking a service from `search_skills` or `list_skills`.
+after picking a service from `search_skills`.
 "#
     )]
     async fn get_skill_endpoints(

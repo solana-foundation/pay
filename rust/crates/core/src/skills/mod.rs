@@ -188,6 +188,15 @@ pub struct ServiceSummary {
     pub max_price_usd: f64,
 }
 
+/// Ranked service candidate for agent provider selection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RankedServiceSummary {
+    #[serde(flatten)]
+    pub service: ServiceSummary,
+    pub score: u32,
+    pub reasons: Vec<String>,
+}
+
 /// Level 2 result: a resource group returned by [`service_detail`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceGroup {
@@ -239,8 +248,15 @@ pub fn search(catalog: &Catalog, query: Option<&str>, category: Option<&str>) ->
         // Check if the service itself matches the keyword
         let service_matches = match &query_lower {
             Some(q) => {
-                let haystack = format!("{} {} {}", svc.fqn, svc.meta.title, svc.meta.description)
-                    .to_lowercase();
+                let haystack = format!(
+                    "{} {} {} {} {}",
+                    svc.fqn,
+                    svc.meta.title,
+                    svc.meta.description,
+                    svc.meta.use_case.as_deref().unwrap_or_default(),
+                    svc.meta.aliases.join(" ")
+                )
+                .to_lowercase();
                 haystack.contains(q.as_str())
             }
             None => true,
@@ -338,9 +354,15 @@ pub fn search_services(
                 return false;
             }
             if let Some(ref q) = query_lower {
-                let svc_haystack =
-                    format!("{} {} {}", svc.fqn, svc.meta.title, svc.meta.description)
-                        .to_lowercase();
+                let svc_haystack = format!(
+                    "{} {} {} {} {}",
+                    svc.fqn,
+                    svc.meta.title,
+                    svc.meta.description,
+                    svc.meta.use_case.as_deref().unwrap_or_default(),
+                    svc.meta.aliases.join(" ")
+                )
+                .to_lowercase();
                 if svc_haystack.contains(q.as_str()) {
                     return true;
                 }
@@ -355,6 +377,307 @@ pub fn search_services(
         })
         .map(summarize_service)
         .collect()
+}
+
+/// Rank providers for a natural-language task.
+///
+/// This is intentionally simple and deterministic. The goal is not semantic
+/// search; it is to avoid dumping the full provider catalog into an agent and
+/// asking it to guess. Strong matches in `use_case`, title, FQN, and loaded
+/// endpoint descriptions outrank broad catalog entries.
+pub fn search_services_ranked(
+    catalog: &Catalog,
+    query: &str,
+    category: Option<&str>,
+    limit: usize,
+) -> Vec<RankedServiceSummary> {
+    let terms = tokenize_query(query);
+    let query_lower = query.trim().to_lowercase();
+    let limit = limit.clamp(1, 20);
+
+    let mut ranked: Vec<RankedServiceSummary> = catalog
+        .providers
+        .iter()
+        .filter(|svc| {
+            category
+                .map(|cat| svc.meta.category.eq_ignore_ascii_case(cat))
+                .unwrap_or(true)
+        })
+        .filter_map(|svc| {
+            let (score, reasons) = score_service_for_query(svc, &query_lower, &terms);
+            if score == 0 {
+                return None;
+            }
+            Some(RankedServiceSummary {
+                service: summarize_service(svc),
+                score,
+                reasons,
+            })
+        })
+        .collect();
+
+    ranked.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| a.service.endpoint_count.cmp(&b.service.endpoint_count))
+            .then_with(|| a.service.name.cmp(&b.service.name))
+    });
+    ranked.truncate(limit);
+    ranked
+}
+
+fn tokenize_query(query: &str) -> Vec<String> {
+    const STOPWORDS: &[&str] = &[
+        "a",
+        "ad",
+        "an",
+        "and",
+        "any",
+        "api",
+        "are",
+        "around",
+        "as",
+        "at",
+        "by",
+        "can",
+        "could",
+        "for",
+        "from",
+        "get",
+        "give",
+        "i",
+        "idk",
+        "in",
+        "into",
+        "is",
+        "it",
+        "kinda",
+        "like",
+        "me",
+        "maybe",
+        "my",
+        "need",
+        "of",
+        "on",
+        "one",
+        "or",
+        "our",
+        "please",
+        "pls",
+        "quick",
+        "rn",
+        "some",
+        "somewhere",
+        "stuff",
+        "that",
+        "the",
+        "there",
+        "these",
+        "they",
+        "thing",
+        "thingy",
+        "this",
+        "to",
+        "up",
+        "use",
+        "using",
+        "we",
+        "what",
+        "where",
+        "who",
+        "with",
+    ];
+
+    query
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .map(|term| term.trim().to_lowercase())
+        .filter(|term| term.len() > 1 && !STOPWORDS.contains(&term.as_str()))
+        .collect()
+}
+
+fn score_service_for_query(
+    svc: &Service,
+    query_lower: &str,
+    terms: &[String],
+) -> (u32, Vec<String>) {
+    let mut score = 0u32;
+    let mut reasons = Vec::new();
+
+    let fqn = svc.fqn.to_lowercase();
+    let short_name = svc.name().to_lowercase();
+    let title = svc.meta.title.to_lowercase();
+    let description = svc.meta.description.to_lowercase();
+    let use_case = svc.meta.use_case.clone().unwrap_or_default().to_lowercase();
+    let aliases = svc.meta.aliases.join(" ").to_lowercase();
+    let category = svc.meta.category.to_lowercase();
+
+    if !query_lower.is_empty() {
+        if fqn.contains(query_lower) || short_name.contains(query_lower) {
+            score += 90;
+            reasons.push("provider name matches the task".to_string());
+        }
+        if title.contains(query_lower) {
+            score += 80;
+            reasons.push("provider title matches the task".to_string());
+        }
+        if use_case.contains(query_lower) {
+            score += 70;
+            reasons.push("provider use case directly matches the task".to_string());
+        }
+        if aliases.contains(query_lower) {
+            score += 70;
+            reasons.push("provider aliases directly match the task".to_string());
+        }
+        if description.contains(query_lower) {
+            score += 55;
+            reasons.push("provider description matches the task".to_string());
+        }
+    }
+
+    let mut matched_terms = 0u32;
+    for term in terms {
+        let mut term_matched = false;
+        if contains_query_term(&fqn, term) || contains_query_term(&short_name, term) {
+            score += 24;
+            term_matched = true;
+        }
+        if contains_query_term(&title, term) {
+            score += 18;
+            term_matched = true;
+        }
+        if contains_query_term(&use_case, term) {
+            score += 14;
+            term_matched = true;
+        }
+        if contains_query_term(&aliases, term) {
+            score += 18;
+            term_matched = true;
+        }
+        if contains_query_term(&description, term) {
+            score += 10;
+            term_matched = true;
+        }
+        if contains_query_term(&category, term) {
+            score += 8;
+            term_matched = true;
+        }
+        if endpoint_term_matches(svc, term) {
+            score += 12;
+            term_matched = true;
+        }
+        if term_matched {
+            matched_terms += 1;
+        }
+    }
+
+    if !terms.is_empty() {
+        let coverage = matched_terms * 100 / terms.len() as u32;
+        score += coverage;
+        if coverage == 100 {
+            reasons.push("all important query terms match this provider".to_string());
+        } else if coverage >= 50 {
+            reasons.push("most important query terms match this provider".to_string());
+        }
+    }
+
+    if svc.endpoints_loaded()
+        && svc.endpoints.iter().any(|ep| {
+            let haystack = format!(
+                "{} {} {} {}",
+                ep.method, ep.path, ep.resource, ep.description
+            )
+            .to_lowercase();
+            !query_lower.is_empty() && haystack.contains(query_lower)
+        })
+    {
+        score += 45;
+        reasons.push("a specific endpoint matches the task".to_string());
+    }
+
+    if svc.endpoint_count <= 5 {
+        score += 12;
+    } else if svc.endpoint_count <= 20 {
+        score += 6;
+    } else if svc.endpoint_count >= 100 {
+        score = score.saturating_sub(8);
+    }
+
+    if is_demo_provider(&fqn, &description) && !query_mentions_demo(query_lower, terms) {
+        score = score.saturating_sub(40);
+    }
+
+    if score > 0 && reasons.is_empty() {
+        reasons.push("provider metadata partially matches the task".to_string());
+    }
+
+    (score, reasons)
+}
+
+fn endpoint_term_matches(svc: &Service, term: &str) -> bool {
+    svc.endpoints.iter().any(|ep| {
+        let haystack = format!("{} {} {}", ep.path, ep.resource, ep.description).to_lowercase();
+        contains_query_term(&haystack, term)
+    })
+}
+
+fn contains_query_term(haystack: &str, term: &str) -> bool {
+    if term.len() <= 3 {
+        return haystack
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|word| word == term);
+    }
+
+    if haystack.contains(term) {
+        return true;
+    }
+
+    if term.len() > 3 {
+        let plural = format!("{term}s");
+        if haystack.contains(&plural) {
+            return true;
+        }
+        if let Some(stem) = term.strip_suffix('y') {
+            let plural = format!("{stem}ies");
+            if haystack.contains(&plural) {
+                return true;
+            }
+        }
+        if let Some(stem) = term.strip_suffix("ies") {
+            let singular = format!("{stem}y");
+            if haystack.contains(&singular) {
+                return true;
+            }
+        }
+        if let Some(singular) = term.strip_suffix('s')
+            && singular.len() > 2
+            && haystack.contains(singular)
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn is_demo_provider(fqn: &str, description: &str) -> bool {
+    fqn.contains("payment-debugger") || description.contains("demo api")
+}
+
+fn query_mentions_demo(query_lower: &str, terms: &[String]) -> bool {
+    query_lower.contains("payment debugger")
+        || terms
+            .iter()
+            .any(|term| matches!(term.as_str(), "demo" | "debugger" | "test" | "testing"))
+}
+
+/// Extract the minimum and maximum USD prices from a registry pricing block.
+pub fn price_range_usd(pricing: &Option<serde_json::Value>) -> Option<(f64, f64)> {
+    let mut prices = Vec::new();
+    collect_prices(pricing, &mut prices);
+    Some((
+        prices.iter().copied().reduce(f64::min)?,
+        prices.iter().copied().reduce(f64::max)?,
+    ))
 }
 
 /// Level 2: list resources within a service.
@@ -1232,6 +1555,70 @@ mod tests {
         serde_json::from_str(json).unwrap()
     }
 
+    fn catalog_for_provider_routing() -> Catalog {
+        let json = r#"{
+            "version": "1",
+            "generated_at": "2026-04-21T00:00:00Z",
+            "base_url": "https://cdn.example.com/v1",
+            "providers": [
+                {
+                    "fqn": "merit-systems/stableenrich/enrichment",
+                    "title": "StableEnrich",
+                    "description": "Unified enrichment gateway for people, company, web search, scraping, maps, email verification, and property data.",
+                    "use_case": "Use for contact enrichment, company lookup, prospect search, web search, page scraping, local business discovery, email verification, and people search.",
+                    "category": "data",
+                    "service_url": "https://stableenrich.example.com",
+                    "endpoint_count": 30,
+                    "has_metering": true,
+                    "min_price_usd": 0.002,
+                    "max_price_usd": 0.44,
+                    "sha": "stableenrich"
+                },
+                {
+                    "fqn": "socialintel/influencer-search",
+                    "title": "Social Intel",
+                    "description": "Instagram influencer search by keyword, category, demographics, and location.",
+                    "use_case": "Use for Instagram influencer search, creator discovery, audience demographics, brand partnership prospecting, and location-based social media research.",
+                    "aliases": ["brand collab recs", "insta folks", "creator shortlist"],
+                    "category": "data",
+                    "service_url": "https://social.example.com",
+                    "endpoint_count": 1,
+                    "has_metering": true,
+                    "min_price_usd": 0.1,
+                    "max_price_usd": 0.1,
+                    "sha": "social"
+                },
+                {
+                    "fqn": "quicknode/rpc",
+                    "title": "QuickNode",
+                    "description": "Pay-per-request JSON-RPC access to blockchain networks including Solana.",
+                    "use_case": "Use for raw blockchain RPC methods, Solana getSlot, account reads, transaction submission, and chain data access.",
+                    "category": "compute",
+                    "service_url": "https://quicknode.example.com",
+                    "endpoint_count": 1,
+                    "has_metering": true,
+                    "min_price_usd": 0.01,
+                    "max_price_usd": 0.01,
+                    "sha": "quicknode"
+                },
+                {
+                    "fqn": "solana-foundation/payment-debugger",
+                    "title": "Payment Debugger",
+                    "description": "Demo API for testing payment flows.",
+                    "use_case": "Use for payment debugger demos and testing pay flows.",
+                    "category": "devtools",
+                    "service_url": "https://debugger.example.com",
+                    "endpoint_count": 8,
+                    "has_metering": true,
+                    "min_price_usd": 0.01,
+                    "max_price_usd": 1000.0,
+                    "sha": "debugger"
+                }
+            ]
+        }"#;
+        serde_json::from_str(json).unwrap()
+    }
+
     // ── Deserialization ─────────────────────────────────────────────────────
 
     #[test]
@@ -1378,6 +1765,70 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].metered_endpoints, 1);
         assert_eq!(results[0].free_endpoints, 2);
+    }
+
+    #[test]
+    fn search_services_matches_use_case() {
+        let cat = catalog_for_provider_routing();
+        let results = search_services(&cat, Some("creator discovery"), None);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "socialintel/influencer-search");
+    }
+
+    #[test]
+    fn ranked_search_prefers_narrow_provider_over_broad_match() {
+        let cat = catalog_for_provider_routing();
+        let results = search_services_ranked(&cat, "find instagram influencers in paris", None, 5);
+        assert_eq!(results[0].service.name, "socialintel/influencer-search");
+        assert!(results[0].score > results[1].score);
+    }
+
+    #[test]
+    fn ranked_search_uses_use_case_metadata() {
+        let cat = catalog_for_provider_routing();
+        let results =
+            search_services_ranked(&cat, "send a raw solana getSlot RPC request", None, 5);
+        assert_eq!(results[0].service.name, "quicknode/rpc");
+        assert!(
+            results[0]
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("important query terms"))
+        );
+    }
+
+    #[test]
+    fn ranked_search_uses_alias_metadata() {
+        let cat = catalog_for_provider_routing();
+        let results = search_services_ranked(&cat, "brand collab recs", None, 5);
+        assert_eq!(results[0].service.name, "socialintel/influencer-search");
+        assert!(
+            results[0]
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("aliases"))
+        );
+    }
+
+    #[test]
+    fn ranked_search_applies_category_filter() {
+        let cat = catalog_for_provider_routing();
+        let results = search_services_ranked(&cat, "solana rpc", Some("data"), 5);
+        assert!(
+            !results
+                .iter()
+                .any(|result| result.service.name == "quicknode/rpc")
+        );
+    }
+
+    #[test]
+    fn ranked_search_deprioritizes_demo_provider_for_real_tasks() {
+        let cat = catalog_for_provider_routing();
+        let results = search_services_ranked(&cat, "payment search", None, 5);
+        assert_ne!(
+            results[0].service.name,
+            "solana-foundation/payment-debugger"
+        );
     }
 
     // ── find_service ────────────────────────────────────────────────────────
@@ -1558,6 +2009,19 @@ mod tests {
         let mut prices = Vec::new();
         collect_prices(&Some(pricing), &mut prices);
         assert_eq!(prices, vec![0.0, 6.25]);
+    }
+
+    #[test]
+    fn price_range_usd_returns_min_and_max() {
+        let pricing = serde_json::json!({
+            "dimensions": [
+                { "tiers": [{ "price_usd": 0.01 }, { "price_usd": 0.04 }] },
+                { "price_usd": 0.02 }
+            ]
+        });
+
+        assert_eq!(price_range_usd(&Some(pricing)), Some((0.01, 0.04)));
+        assert_eq!(price_range_usd(&None), None);
     }
 
     // ── Cache invalidation ──────────────────────────────────────────────────
