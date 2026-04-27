@@ -38,6 +38,24 @@ impl PaymentState for TestState {
 }
 
 #[derive(Clone)]
+struct MultiCurrencyTestState {
+    apis: Arc<Vec<ApiSpec>>,
+    mpps: Vec<Mpp>,
+}
+
+impl PaymentState for MultiCurrencyTestState {
+    fn apis(&self) -> &[ApiSpec] {
+        &self.apis
+    }
+    fn mpp(&self) -> Option<&Mpp> {
+        self.mpps.first()
+    }
+    fn mpps(&self) -> Vec<&Mpp> {
+        self.mpps.iter().collect()
+    }
+}
+
+#[derive(Clone)]
 struct SessionTestState {
     apis: Arc<Vec<ApiSpec>>,
     mpp: Option<Mpp>,
@@ -98,6 +116,44 @@ async fn start_test_server(with_mpp: bool) -> (String, tokio::task::JoinHandle<(
         .layer(middleware::from_fn_with_state(
             state.clone(),
             pay_core::server::payment::payment_middleware::<TestState>,
+        ))
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let handle = tokio::spawn(async { axum::serve(listener, app).await.unwrap() });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    (url, handle)
+}
+
+async fn start_multi_currency_server() -> (String, tokio::task::JoinHandle<()>) {
+    let api = load_test_api();
+    let mpps = ["USDC", "CASH", "USDT"]
+        .into_iter()
+        .map(|currency| {
+            Mpp::new(solana_mpp::server::Config {
+                recipient: "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY".to_string(),
+                currency: currency.to_string(),
+                decimals: 6,
+                network: "localnet".to_string(),
+                rpc_url: Some("http://localhost:8899".to_string()),
+                secret_key: Some("test-secret".to_string()),
+                ..Default::default()
+            })
+            .unwrap()
+        })
+        .collect();
+
+    let state = MultiCurrencyTestState {
+        apis: Arc::new(vec![api]),
+        mpps,
+    };
+
+    let app = Router::new()
+        .fallback(any(echo_handler))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            pay_core::server::payment::payment_middleware::<MultiCurrencyTestState>,
         ))
         .with_state(state);
 
@@ -354,6 +410,39 @@ async fn middleware_402_challenge_parseable() {
     let challenge = solana_mpp::parse_www_authenticate(www_auth).unwrap();
     assert_eq!(challenge.method.as_str(), "solana");
     assert_eq!(challenge.intent.as_str(), "charge");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn middleware_returns_one_challenge_per_configured_currency() {
+    let (url, _h) = start_multi_currency_server().await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{url}/v1/simple/echo"))
+        .headers(client_with_host("testapi"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 402);
+    let headers: Vec<_> = resp
+        .headers()
+        .get_all("www-authenticate")
+        .iter()
+        .map(|value| value.to_str().unwrap())
+        .collect();
+    let challenges = solana_mpp::parse_www_authenticate_all(headers)
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let currencies: Vec<String> = challenges
+        .into_iter()
+        .map(|challenge| {
+            let request: solana_mpp::ChargeRequest = challenge.request.decode().unwrap();
+            request.currency
+        })
+        .collect();
+    assert_eq!(currencies, ["USDC", "CASH", "USDT"]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

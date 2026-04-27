@@ -4,16 +4,24 @@ use std::process::Command as ProcessCommand;
 use std::sync::Arc;
 
 use axum::middleware;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use owo_colors::OwoColorize;
 use pay_core::PaymentState;
 use pay_core::accounts::AccountsStore;
 use pay_core::server::session::SessionMpp;
-use pay_types::metering::{ApiSpec, SignerConfig};
+use pay_types::metering::{ApiSpec, OperatorConfig, SignerConfig};
 use solana_mpp::server::Mpp;
 use solana_mpp::solana_keychain::SolanaSigner;
 use solana_mpp::solana_keychain::memory::MemorySigner;
+
+const AUTO_OPERATOR_ACCOUNT_NAME: &str = "gateway";
+const BROWSER_RPC_PROXY_PATH: &str = "/__402/rpc";
+const BROWSER_RPC_ALLOWED_METHODS: &[&str] = &[
+    "getLatestBlockhash",
+    "surfnet_setAccount",
+    "surfnet_setTokenAccount",
+];
 
 /// Start the payment gateway proxy.
 ///
@@ -51,8 +59,9 @@ pub struct StartCommand {
 #[derive(Clone)]
 struct AppState {
     apis: Arc<Vec<ApiSpec>>,
-    mpp: Option<Mpp>,
+    mpps: Vec<Mpp>,
     session_mpp: Option<Arc<SessionMpp>>,
+    browser_rpc_url: Option<String>,
 }
 
 impl PaymentState for AppState {
@@ -60,7 +69,13 @@ impl PaymentState for AppState {
         &self.apis
     }
     fn mpp(&self) -> Option<&Mpp> {
-        self.mpp.as_ref()
+        self.mpps.first()
+    }
+    fn mpps(&self) -> Vec<&Mpp> {
+        self.mpps.iter().collect()
+    }
+    fn browser_rpc_url(&self) -> Option<&str> {
+        self.browser_rpc_url.as_deref()
     }
     fn session_mpp(&self) -> Option<&SessionMpp> {
         self.session_mpp.as_deref()
@@ -100,9 +115,7 @@ impl StartCommand {
         // now lives inside `resolve_signer` itself.
 
         // Resolve config that doesn't need async.
-        let currency = op
-            .and_then(|o| o.currency.clone())
-            .unwrap_or_else(|| self.currency.clone());
+        let currencies = resolve_operator_currencies(op, &self.currency);
 
         let network = op
             .and_then(|o| o.network.clone())
@@ -154,9 +167,10 @@ impl StartCommand {
             //      feature gated), Account (named entry in
             //      accounts.yml), and File (JSON keypair on disk).
             //
-            //   2. **`--sandbox` flag** — forces the localnet ephemeral
-            //      from accounts.yml regardless of network. Lazy-creates
-            //      on first use. Never touches the keychain.
+            //   2. **`--sandbox` flag** — forces a dedicated localnet
+            //      gateway ephemeral from accounts.yml regardless of
+            //      network. Lazy-creates on first use. Never touches the
+            //      keychain.
             //
             //   3. **Throwaway network slug** (`localnet` / `devnet`) —
             //      smart default: route through the network-aware
@@ -172,15 +186,26 @@ impl StartCommand {
             } else if sandbox || matches!(network.as_str(), "localnet" | "devnet") {
                 let auto_network = if sandbox { "localnet" } else { network.as_str() };
                 let store = pay_core::accounts::FileAccountsStore::default_path();
+                let _ = pay_core::accounts::load_or_create_exact_ephemeral_for_network_as(
+                    auto_network,
+                    pay_core::accounts::DEFAULT_ACCOUNT_NAME,
+                    &store,
+                )?;
                 let (signer, ephemeral_notice) =
-                    pay_core::signer::load_signer_for_network(auto_network, &store)?;
+                    pay_core::signer::load_signer_for_network_with_reason(
+                        auto_network,
+                        &store,
+                        Some(AUTO_OPERATOR_ACCOUNT_NAME),
+                        "use your pay account as the gateway fee payer",
+                    )?;
                 if let Some(resolved) = ephemeral_notice {
                     eprintln!(
                         "  {} {} {}",
                         "Generated".green(),
                         resolved.network.bold(),
                         format!(
-                            "wallet ({})",
+                            "{} wallet ({})",
+                            resolved.account_name,
                             resolved.account.pubkey.as_deref().unwrap_or("?")
                         )
                         .dimmed()
@@ -210,7 +235,7 @@ impl StartCommand {
             //   3. PAY_PAYMENT_RECIPIENT env var
             //   4. fee_payer_signer's pubkey — covers sandbox, throwaway-
             //      network smart default, explicit operator.signer block,
-            //      and the legacy active_account_name fallback (all four set
+            //      and the active_account_name fallback (all four set
             //      fee_payer_signer above).
             let recipient = if let Some(r) = op.and_then(|o| o.recipient.as_ref()) {
                 r.clone()
@@ -279,26 +304,41 @@ impl StartCommand {
                 }
             }
 
-            // ── Create MPP server ──
+            // ── Create MPP servers ──
             let secret_key = std::env::var("PAY_MPP_CHALLENGE_SECRET")
                 .unwrap_or_else(|_| bs58::encode(rand::random::<[u8; 32]>()).into_string());
 
-            // Resolve currency label to mint address for the challenge.
-            let (mpp_currency, decimals) = resolve_currency(&currency, &network);
-
-            let mpp = Mpp::new(solana_mpp::server::Config {
-                recipient: recipient.clone(),
-                currency: mpp_currency.clone(),
-                decimals,
-                network: network.clone(),
-                rpc_url: Some(rpc_url.clone()),
-                secret_key: Some(secret_key.clone()),
-                fee_payer,
-                fee_payer_signer: fee_payer_signer.clone(),
-                html: true,
-                ..Default::default()
-            })
-            .map_err(|e| pay_core::Error::Config(format!("Failed to create MPP server: {e}")))?;
+            let currency_configs: Vec<_> = currencies
+                .iter()
+                .map(|currency| {
+                    let (mpp_currency, decimals) = resolve_currency(currency, &network);
+                    (currency.clone(), mpp_currency, decimals)
+                })
+                .collect();
+            let mpps: Vec<Mpp> = currency_configs
+                .iter()
+                .map(|(_, mpp_currency, decimals)| {
+                    Mpp::new(solana_mpp::server::Config {
+                        recipient: recipient.clone(),
+                        currency: mpp_currency.clone(),
+                        decimals: *decimals,
+                        network: network.clone(),
+                        rpc_url: Some(rpc_url.clone()),
+                        secret_key: Some(secret_key.clone()),
+                        fee_payer,
+                        fee_payer_signer: fee_payer_signer.clone(),
+                        html: true,
+                        ..Default::default()
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| pay_core::Error::Config(format!("Failed to create MPP server: {e}")))?;
+            let (_session_currency, session_mpp_currency, session_decimals) =
+                currency_configs.first().cloned().ok_or_else(|| {
+                    pay_core::Error::Config(
+                        "At least one operator currency must be configured".to_string(),
+                    )
+                })?;
 
             // ── Create session MPP server (if session config present) ──
             let session_mpp: Option<Arc<SessionMpp>> = if let Some(ref sess) = api.session {
@@ -308,7 +348,7 @@ impl StartCommand {
                 use solana_mpp::SessionMode;
                 use std::str::FromStr;
 
-                let cap_base = (sess.cap_usdc * 10f64.powi(decimals as i32)).round() as u64;
+                let cap_base = (sess.cap_usdc * 10f64.powi(session_decimals as i32)).round() as u64;
                 let session_secret = std::env::var("PAY_SESSION_SECRET")
                     .unwrap_or_else(|_| secret_key.clone());
                 let modes: Vec<SessionMode> = if sess.modes.is_empty() {
@@ -334,8 +374,8 @@ impl StartCommand {
                 let config = SessionConfig {
                     recipient: recipient.clone(),
                     operator: recipient.clone(),
-                    currency: mpp_currency.clone(),
-                    decimals,
+                    currency: session_mpp_currency.clone(),
+                    decimals: session_decimals,
                     network: network.clone(),
                     max_cap: cap_base,
                     min_voucher_delta: sess.min_voucher_delta,
@@ -352,7 +392,7 @@ impl StartCommand {
                 if modes.contains(&SessionMode::Pull) {
                     let program_id = solana_pubkey::Pubkey::from_str(MULTI_DELEGATOR_PROGRAM_ID)
                         .expect("valid multi-delegator program ID");
-                    let mint = solana_pubkey::Pubkey::from_str(&mpp_currency)
+                    let mint = solana_pubkey::Pubkey::from_str(&session_mpp_currency)
                         .unwrap_or_else(|_| {
                             // fallback: mainnet USDC
                             solana_pubkey::Pubkey::from_str(
@@ -508,7 +548,7 @@ impl StartCommand {
                 "  {}\t{} via {}",
                 "currency".dimmed(),
                 "$".green(),
-                currency.green()
+                currencies.join(", ").green()
             );
 
             // Fetch the operator wallet's SOL balance for the banner.
@@ -632,12 +672,13 @@ impl StartCommand {
             // ── Build router ──
             let endpoints_json = build_endpoints_json(&api);
 
-            let verify_mpp = mpp.clone();
+            let verify_mpps = mpps.clone();
 
             let state = AppState {
                 apis: Arc::new(vec![api.clone()]),
-                mpp: Some(mpp),
+                mpps,
                 session_mpp,
+                browser_rpc_url: Some(BROWSER_RPC_PROXY_PATH.to_string()),
             };
 
             let pdb_state = if debugger {
@@ -650,8 +691,18 @@ impl StartCommand {
             };
 
             let verify_pdb = pdb_state.clone();
+            let rpc_proxy_url = rpc_url.clone();
+            let rpc_proxy_client = reqwest::Client::new();
             let mut app = axum::Router::new()
                 .route("/__402/health", get(|| async { "ok" }))
+                .route(
+                    BROWSER_RPC_PROXY_PATH,
+                    post(move |body: axum::body::Bytes| {
+                        let client = rpc_proxy_client.clone();
+                        let rpc_url = rpc_proxy_url.clone();
+                        async move { browser_rpc_proxy(client, rpc_url, body).await }
+                    }),
+                )
                 .route(
                     "/__402/endpoints",
                     get(move || async move { axum::Json(endpoints_json).into_response() }),
@@ -659,7 +710,7 @@ impl StartCommand {
                 .route(
                     "/__402/verify",
                     post(move |body: axum::Json<GatewayVerifyRequest>| async move {
-                        gateway_verify(verify_mpp, body.0, verify_pdb.as_ref()).await
+                        gateway_verify(verify_mpps.clone(), body.0, verify_pdb.as_ref()).await
                     }),
                 );
 
@@ -844,19 +895,133 @@ fn build_pdb_config(
     })
 }
 
+async fn browser_rpc_proxy(
+    client: reqwest::Client,
+    rpc_url: String,
+    body: axum::body::Bytes,
+) -> Response {
+    if let Err(message) = validate_browser_rpc_request(&body) {
+        return rpc_proxy_error(axum::http::StatusCode::BAD_REQUEST, message);
+    }
+
+    let upstream = match client
+        .post(&rpc_url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!(error = %error, "Browser RPC proxy request failed");
+            return rpc_proxy_error(
+                axum::http::StatusCode::BAD_GATEWAY,
+                "Payment RPC is unavailable.",
+            );
+        }
+    };
+
+    let status = axum::http::StatusCode::from_u16(upstream.status().as_u16())
+        .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+    let content_type = upstream
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+    let bytes = match upstream.bytes().await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::warn!(error = %error, "Browser RPC proxy response read failed");
+            return rpc_proxy_error(
+                axum::http::StatusCode::BAD_GATEWAY,
+                "Payment RPC response could not be read.",
+            );
+        }
+    };
+
+    Response::builder()
+        .status(status)
+        .header(axum::http::header::CONTENT_TYPE, content_type)
+        .header(axum::http::header::CACHE_CONTROL, "no-store")
+        .body(axum::body::Body::from(bytes))
+        .unwrap()
+}
+
+fn validate_browser_rpc_request(body: &[u8]) -> Result<(), &'static str> {
+    let value: serde_json::Value =
+        serde_json::from_slice(body).map_err(|_| "Payment RPC request must be valid JSON.")?;
+
+    let calls: Vec<&serde_json::Value> = match &value {
+        serde_json::Value::Object(_) => vec![&value],
+        serde_json::Value::Array(calls) if !calls.is_empty() => calls.iter().collect(),
+        _ => return Err("Payment RPC request must be a JSON-RPC object."),
+    };
+
+    for call in calls {
+        let method = call
+            .get("method")
+            .and_then(|method| method.as_str())
+            .ok_or("Payment RPC request is missing a method.")?;
+        if !BROWSER_RPC_ALLOWED_METHODS.contains(&method) {
+            return Err("Payment RPC method is not allowed.");
+        }
+    }
+
+    Ok(())
+}
+
+fn rpc_proxy_error(status: axum::http::StatusCode, message: &'static str) -> Response {
+    (
+        status,
+        axum::Json(serde_json::json!({
+            "error": "payment_rpc_failed",
+            "message": message,
+        })),
+    )
+        .into_response()
+}
+
 /// Resolve a currency label to the value used in the MPP challenge.
 /// SPL tokens use their mint address; SOL uses "sol".
 fn resolve_currency(currency: &str, network: &str) -> (String, u8) {
     match currency.to_uppercase().as_str() {
         "SOL" => ("sol".to_string(), 9),
-        "USDC" => {
-            let mint = match network {
-                "devnet" => "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU",
-                _ => "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-            };
-            (mint.to_string(), 6)
-        }
+        "USDC" | "USDT" | "PYUSD" | "CASH" => (
+            solana_mpp::protocol::solana::resolve_stablecoin_mint(currency, Some(network))
+                .unwrap_or(currency)
+                .to_string(),
+            6,
+        ),
         other => (other.to_string(), 6),
+    }
+}
+
+fn resolve_operator_currencies(op: Option<&OperatorConfig>, cli_currency: &str) -> Vec<String> {
+    let configured = op
+        .and_then(|operator| operator.currencies.get("usd"))
+        .filter(|currencies| !currencies.is_empty())
+        .cloned()
+        .unwrap_or_else(|| vec![cli_currency.to_string()]);
+
+    let mut deduped = Vec::new();
+    for currency in configured {
+        let currency = currency.trim();
+        if currency.is_empty() {
+            continue;
+        }
+        if !deduped
+            .iter()
+            .any(|existing: &String| existing.eq_ignore_ascii_case(currency))
+        {
+            deduped.push(currency.to_string());
+        }
+    }
+
+    if deduped.is_empty() {
+        vec![cli_currency.to_string()]
+    } else {
+        deduped
     }
 }
 
@@ -1265,6 +1430,8 @@ struct GatewayVerifyResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     www_authenticate: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    www_authenticate_headers: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     body: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     receipt: Option<String>,
@@ -1279,12 +1446,12 @@ struct GatewayVerifyResponse {
 }
 
 async fn gateway_verify(
-    mpp: Mpp,
+    mpps: Vec<Mpp>,
     req: GatewayVerifyRequest,
     pdb: Option<&pay_pdb::PdbState>,
 ) -> axum::response::Response {
     use axum::http::StatusCode;
-    use solana_mpp::{format_receipt, format_www_authenticate, parse_authorization};
+    use solana_mpp::{format_receipt, format_www_authenticate_many, parse_authorization};
 
     let auth = req
         .authorization
@@ -1302,16 +1469,8 @@ async fn gateway_verify(
 
     match auth {
         None => {
-            let challenge = match mpp.charge_with_options(
-                &req.price,
-                solana_mpp::server::ChargeOptions {
-                    description: req.description.as_deref(),
-                    external_id: req.external_id.as_deref(),
-                    splits: splits.clone(),
-                    ..Default::default()
-                },
-            ) {
-                Ok(c) => c,
+            let challenges = match gateway_charge_challenges(&mpps, &req, splits.clone()) {
+                Ok(challenges) => challenges,
                 Err(e) => {
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -1320,12 +1479,13 @@ async fn gateway_verify(
                         .into_response();
                 }
             };
-            let www_auth = format_www_authenticate(&challenge).unwrap_or_default();
+            let www_auths = format_www_authenticate_many(&challenges).unwrap_or_default();
+            let first_www_auth = www_auths.first().cloned().unwrap_or_default();
 
             // Log 402 challenge to PDB
             if let Some(pdb) = pdb {
                 let mut res_headers = std::collections::HashMap::new();
-                res_headers.insert("www-authenticate".to_string(), www_auth.clone());
+                res_headers.insert("www-authenticate".to_string(), www_auths.join("\n"));
                 let entry = pay_pdb::types::LogEntry {
                     id: pdb.next_log_id(),
                     ts: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
@@ -1344,12 +1504,13 @@ async fn gateway_verify(
             axum::Json(GatewayVerifyResponse {
                 decision: "payment_required".to_string(),
                 status_code: 402,
-                www_authenticate: Some(www_auth),
+                www_authenticate: Some(first_www_auth),
+                www_authenticate_headers: Some(www_auths),
                 body: Some(serde_json::json!({
                     "error": "payment_required",
                     "endpoint": { "method": req.method, "path": req.path },
                 })),
-                challenge_id: Some(challenge.id),
+                challenge_id: challenges.first().map(|challenge| challenge.id.clone()),
                 external_id: req.external_id,
                 receipt: None,
                 receipt_status: None,
@@ -1368,87 +1529,107 @@ async fn gateway_verify(
                         .into_response();
                 }
             };
-            match mpp.verify_credential(&credential).await {
-                Ok(receipt) => {
-                    let encoded = format_receipt(&receipt).unwrap_or_default();
+            let mut last_error = None;
+            for mpp in &mpps {
+                match mpp.verify_credential(&credential).await {
+                    Ok(receipt) => {
+                        let encoded = format_receipt(&receipt).unwrap_or_default();
 
-                    // Log successful payment to PDB
-                    if let Some(pdb) = pdb {
-                        let mut req_headers = std::collections::HashMap::new();
-                        req_headers.insert(
-                            "authorization".to_string(),
-                            format!("Payment {}", auth_value),
-                        );
-                        let entry = pay_pdb::types::LogEntry {
-                            id: pdb.next_log_id(),
-                            ts: chrono::Utc::now()
-                                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-                            method: req.method.clone(),
-                            path: req.path.clone(),
-                            status: 200,
-                            ms: 0,
-                            req_headers,
-                            res_headers: std::collections::HashMap::new(),
-                            res_body: None,
-                            client_ip: "gateway".to_string(),
-                        };
-                        pdb.correlation.lock().unwrap().ingest(entry);
+                        // Log successful payment to PDB
+                        if let Some(pdb) = pdb {
+                            let mut req_headers = std::collections::HashMap::new();
+                            req_headers.insert(
+                                "authorization".to_string(),
+                                format!("Payment {}", auth_value),
+                            );
+                            let entry = pay_pdb::types::LogEntry {
+                                id: pdb.next_log_id(),
+                                ts: chrono::Utc::now()
+                                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                                method: req.method.clone(),
+                                path: req.path.clone(),
+                                status: 200,
+                                ms: 0,
+                                req_headers,
+                                res_headers: std::collections::HashMap::new(),
+                                res_body: None,
+                                client_ip: "gateway".to_string(),
+                            };
+                            pdb.correlation.lock().unwrap().ingest(entry);
+                        }
+
+                        return axum::Json(GatewayVerifyResponse {
+                            decision: "allow".to_string(),
+                            status_code: 200,
+                            receipt: Some(encoded),
+                            receipt_status: Some(receipt.status.to_string()),
+                            receipt_reference: Some(receipt.reference),
+                            challenge_id: Some(receipt.challenge_id),
+                            external_id: req.external_id,
+                            www_authenticate: None,
+                            www_authenticate_headers: None,
+                            body: Some(serde_json::json!({"pdb_active": pdb.is_some()})),
+                        })
+                        .into_response();
                     }
-
-                    axum::Json(GatewayVerifyResponse {
-                        decision: "allow".to_string(),
-                        status_code: 200,
-                        receipt: Some(encoded),
-                        receipt_status: Some(receipt.status.to_string()),
-                        receipt_reference: Some(receipt.reference),
-                        challenge_id: Some(receipt.challenge_id),
-                        external_id: req.external_id,
-                        www_authenticate: None,
-                        body: Some(serde_json::json!({"pdb_active": pdb.is_some()})),
-                    })
-                    .into_response()
-                }
-                Err(error) => {
-                    // Re-issue challenge on failure
-                    let challenge = mpp
-                        .charge_with_options(
-                            &req.price,
-                            solana_mpp::server::ChargeOptions {
-                                description: req.description.as_deref(),
-                                external_id: req.external_id.as_deref(),
-                                splits,
-                                ..Default::default()
-                            },
-                        )
-                        .ok();
-                    let www_auth = challenge
-                        .as_ref()
-                        .and_then(|c| format_www_authenticate(c).ok());
-                    axum::Json(GatewayVerifyResponse {
-                        decision: "payment_required".to_string(),
-                        status_code: 402,
-                        www_authenticate: www_auth,
-                        body: Some(serde_json::json!({
-                            "error": "verification_failed",
-                            "message": error.to_string(),
-                            "retryable": error.retryable,
-                        })),
-                        challenge_id: challenge.map(|c| c.id),
-                        external_id: req.external_id,
-                        receipt: None,
-                        receipt_status: Some("failed".to_string()),
-                        receipt_reference: None,
-                    })
-                    .into_response()
+                    Err(error) => last_error = Some(error),
                 }
             }
+
+            let error = last_error.unwrap_or_else(|| {
+                solana_mpp::server::VerificationError::new("MPP not configured")
+            });
+            let message = pay_core::server::payment::readable_verification_message(&error);
+            // Re-issue challenge on failure
+            let challenges = gateway_charge_challenges(&mpps, &req, splits).unwrap_or_default();
+            let www_auths = format_www_authenticate_many(&challenges).unwrap_or_default();
+            axum::Json(GatewayVerifyResponse {
+                decision: "payment_required".to_string(),
+                status_code: 402,
+                www_authenticate: www_auths.first().cloned(),
+                www_authenticate_headers: Some(www_auths),
+                body: Some(serde_json::json!({
+                    "error": "verification_failed",
+                    "message": message,
+                    "retryable": error.retryable,
+                })),
+                challenge_id: challenges.first().map(|challenge| challenge.id.clone()),
+                external_id: req.external_id,
+                receipt: None,
+                receipt_status: Some("failed".to_string()),
+                receipt_reference: None,
+            })
+            .into_response()
         }
     }
 }
 
+fn gateway_charge_challenges(
+    mpps: &[Mpp],
+    req: &GatewayVerifyRequest,
+    splits: Vec<solana_mpp::protocol::solana::Split>,
+) -> Result<Vec<solana_mpp::PaymentChallenge>, solana_mpp::Error> {
+    mpps.iter()
+        .map(|mpp| {
+            mpp.charge_with_options(
+                &req.price,
+                solana_mpp::server::ChargeOptions {
+                    description: req.description.as_deref(),
+                    external_id: req.external_id.as_deref(),
+                    splits: splits.clone(),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::explorer_cluster_query;
+    use super::{
+        build_pdb_config, explorer_cluster_query, resolve_currency, resolve_operator_currencies,
+        validate_browser_rpc_request,
+    };
 
     #[test]
     fn explorer_cluster_query_mainnet_is_empty() {
@@ -1491,6 +1672,134 @@ mod tests {
         // Anything we don't recognize gets the bare URL — let the
         // explorer apply its own default rather than guessing.
         assert_eq!(explorer_cluster_query("foonet", "http://example/"), "");
+    }
+
+    #[test]
+    fn resolve_operator_currencies_prefers_usd_group() {
+        let op: pay_types::metering::OperatorConfig = serde_yml::from_str(
+            r#"
+currencies:
+  usd: ["USDC", "USDT", "CASH"]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_operator_currencies(Some(&op), "PYUSD"),
+            ["USDC", "USDT", "CASH"]
+        );
+    }
+
+    #[test]
+    fn resolve_operator_currencies_falls_back_to_cli_currency() {
+        let op: pay_types::metering::OperatorConfig =
+            serde_yml::from_str(r#"network: "devnet""#).unwrap();
+
+        assert_eq!(resolve_operator_currencies(Some(&op), "USDC"), ["USDC"]);
+    }
+
+    #[test]
+    fn operator_config_rejects_removed_currency_field() {
+        let err = serde_yml::from_str::<pay_types::metering::OperatorConfig>(r#"currency: "USDT""#)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn resolve_currency_uses_mpp_stablecoin_constants() {
+        assert_eq!(
+            resolve_currency("USDT", "mainnet").0,
+            solana_mpp::protocol::solana::mints::USDT_MAINNET
+        );
+        assert_eq!(
+            resolve_currency("CASH", "mainnet").0,
+            solana_mpp::protocol::solana::mints::CASH_MAINNET
+        );
+    }
+
+    #[test]
+    fn browser_rpc_proxy_accepts_payment_page_methods() {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getLatestBlockhash",
+            "params": [{"commitment": "confirmed"}],
+        });
+
+        validate_browser_rpc_request(request.to_string().as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn browser_rpc_proxy_accepts_surfpool_setup_batch() {
+        let request = serde_json::json!([
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "surfnet_setAccount",
+                "params": [],
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "surfnet_setTokenAccount",
+                "params": [],
+            }
+        ]);
+
+        validate_browser_rpc_request(request.to_string().as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn browser_rpc_proxy_rejects_unneeded_rpc_methods() {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sendTransaction",
+            "params": [],
+        });
+
+        let err = validate_browser_rpc_request(request.to_string().as_bytes()).unwrap_err();
+        assert_eq!(err, "Payment RPC method is not allowed.");
+    }
+
+    #[test]
+    fn pdb_config_uses_real_rpc_url_for_explorer_links() {
+        let api: pay_types::metering::ApiSpec = serde_yml::from_str(
+            r#"
+name: testapi
+subdomain: testapi
+title: Test API
+description: Test API
+category: ai_ml
+version: v1
+routing:
+  type: respond
+operator:
+  recipient: CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY
+endpoints:
+  - method: GET
+    path: v1/data
+    resource: data
+    metering:
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 0.01
+"#,
+        )
+        .unwrap();
+
+        let config = build_pdb_config(
+            &api,
+            "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY",
+            "localnet",
+            "https://402.surfnet.dev:8899",
+        );
+
+        assert_eq!(config["rpcUrl"], "https://402.surfnet.dev:8899");
     }
 
     // ── resolve_signer (operator.signer in YAML) ───────────────────────────

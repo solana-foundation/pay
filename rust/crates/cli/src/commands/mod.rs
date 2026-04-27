@@ -201,22 +201,32 @@ fn handle_outcome(
     match outcome {
         RunOutcome::MppChallenge {
             challenge,
+            alternatives,
             resource_url,
         } => {
             let req: ChargeRequest = challenge.request.decode().unwrap_or_default();
+            let mut challenges = Vec::with_capacity(1 + alternatives.len());
+            challenges.push((*challenge).clone());
+            challenges.extend(alternatives);
             if auto_pay {
                 if verbose && !is_json {
+                    let currencies = mpp_challenge_currencies(&challenges).join(", ");
                     eprintln!(
                         "{}",
                         format!(
                             "402 Payment Required (MPP) — {} {}",
-                            req.amount, req.currency
+                            req.amount,
+                            if currencies.is_empty() {
+                                req.currency.clone()
+                            } else {
+                                currencies
+                            }
                         )
                         .dimmed()
                     );
                 }
                 return pay_mpp_and_retry(
-                    &challenge,
+                    &challenges,
                     &resource_url,
                     PaymentRetryContext {
                         tool,
@@ -238,6 +248,7 @@ fn handle_outcome(
                 output::print_json(&serde_json::json!({
                     "status": 402,
                     "protocol": "mpp",
+                    "challenges": mpp_challenges_json(&challenges),
                     "challenge": {
                         "amount": req.amount,
                         "currency": req.currency,
@@ -441,7 +452,7 @@ struct PaymentRetryContext<'a, 'tool> {
 }
 
 fn pay_mpp_and_retry(
-    challenge: &mpp::Challenge,
+    challenges: &[mpp::Challenge],
     resource_url: &str,
     ctx: PaymentRetryContext<'_, '_>,
 ) -> pay_core::Result<()> {
@@ -452,6 +463,13 @@ fn pay_mpp_and_retry(
     }
 
     let store = pay_core::accounts::FileAccountsStore::default_path();
+    let challenge = mpp::select_challenge_by_balance(
+        challenges,
+        &store,
+        ctx.network_override,
+        ctx.account_override,
+    )?
+    .ok_or_else(|| pay_core::Error::Mpp("No compatible MPP challenge found".to_string()))?;
     let (auth_header, ephemeral_notice) = mpp::build_credential(
         challenge,
         &store,
@@ -471,6 +489,39 @@ fn pay_mpp_and_retry(
     let retry_outcome =
         retry_with_header(ctx.tool, "Authorization", &auth_header, ctx.fetch_headers)?;
     handle_retry_outcome(retry_outcome, is_json)
+}
+
+fn mpp_challenge_currencies(challenges: &[mpp::Challenge]) -> Vec<String> {
+    challenges
+        .iter()
+        .filter_map(|challenge| {
+            let request: ChargeRequest = challenge.request.decode().ok()?;
+            Some(request.currency)
+        })
+        .collect()
+}
+
+fn mpp_challenges_json(challenges: &[mpp::Challenge]) -> serde_json::Value {
+    let values: Vec<serde_json::Value> = challenges
+        .iter()
+        .filter_map(|challenge| {
+            let request: ChargeRequest = challenge.request.decode().ok()?;
+            let network = request
+                .method_details
+                .as_ref()
+                .and_then(|v| v.get("network"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            Some(serde_json::json!({
+                "amount": request.amount,
+                "currency": request.currency,
+                "recipient": request.recipient,
+                "description": request.description,
+                "network": network,
+            }))
+        })
+        .collect();
+    serde_json::Value::Array(values)
 }
 
 fn pay_x402_and_retry(

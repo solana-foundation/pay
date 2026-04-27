@@ -412,7 +412,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.2",
  "rustls 0.23.37",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -2326,7 +2326,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2630,7 +2630,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3694,7 +3694,7 @@ dependencies = [
  "httpdate",
  "itoa",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.4.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -3800,7 +3800,7 @@ dependencies = [
  "libc",
  "percent-encoding 2.3.2",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "system-configuration 0.7.0",
  "tokio",
  "tower-service",
@@ -5150,7 +5150,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5316,7 +5316,7 @@ version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "680998035259dcfcafe653688bf2aa6d3e2dc05e98be6ab46afb089dc84f1df8"
 dependencies = [
- "proc-macro-crate 1.3.1",
+ "proc-macro-crate 3.5.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -5572,7 +5572,7 @@ checksum = "b867cad97c0791bbd3aaa6472142568c6c9e8f71937e98379f584cfb0cf35bec"
 
 [[package]]
 name = "pay"
-version = "0.7.4"
+version = "0.8.0"
 dependencies = [
  "axum",
  "bs58",
@@ -5607,7 +5607,7 @@ dependencies = [
 
 [[package]]
 name = "pay-core"
-version = "0.7.4"
+version = "0.8.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -5648,7 +5648,7 @@ dependencies = [
 
 [[package]]
 name = "pay-integration"
-version = "0.7.4"
+version = "0.8.0"
 dependencies = [
  "pay-core",
  "pay-types",
@@ -5657,7 +5657,7 @@ dependencies = [
 
 [[package]]
 name = "pay-keystore"
-version = "0.7.4"
+version = "0.8.0"
 dependencies = [
  "bs58",
  "secret-service",
@@ -5674,7 +5674,7 @@ dependencies = [
 
 [[package]]
 name = "pay-mcp"
-version = "0.7.4"
+version = "0.8.0"
 dependencies = [
  "pay-core",
  "pay-keystore",
@@ -5691,7 +5691,7 @@ dependencies = [
 
 [[package]]
 name = "pay-pdb"
-version = "0.7.4"
+version = "0.8.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -5713,7 +5713,7 @@ dependencies = [
 
 [[package]]
 name = "pay-types"
-version = "0.7.4"
+version = "0.8.0"
 dependencies = [
  "schemars 0.8.22",
  "serde",
@@ -6162,7 +6162,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.2",
  "rustls 0.23.37",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -6200,7 +6200,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "tracing",
  "windows-sys 0.59.0",
 ]
@@ -6807,7 +6807,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6887,7 +6887,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7545,16 +7545,6 @@ checksum = "9f7916fc008ca5542385b89a3d3ce689953c143e9304a9bf8beec1de48994c0d"
 dependencies = [
  "libc",
  "winapi 0.3.9",
-]
-
-[[package]]
-name = "socket2"
-version = "0.5.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e22376abed350d73dd1cd119b57ffccad95b4e585a7cda43e286245ce23c0678"
-dependencies = [
- "libc",
- "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -9056,7 +9046,7 @@ dependencies = [
 [[package]]
 name = "solana-mpp"
 version = "0.2.0"
-source = "git+https://github.com/solana-foundation/mpp-sdk?branch=main#73daceba15df61fcae9b0aee664dd9d7e01ca5c2"
+source = "git+https://github.com/solana-foundation/mpp-sdk?branch=chore%2Fimprove-spec#26e1f57ba0c87fc6085c9e4051705759e4766732"
 dependencies = [
  "base64 0.22.1",
  "bincode",
@@ -11127,7 +11117,7 @@ dependencies = [
 [[package]]
 name = "solana-x402"
 version = "0.1.0"
-source = "git+https://github.com/txtx/moneymq?branch=main#fcaa6828caf14bb60ee6026211366814c01cdd60"
+source = "git+https://github.com/solana-foundation/x402-sdk?branch=main#0ed603495213a6b9a859ed30e21d4855f18cdea7"
 dependencies = [
  "base64 0.22.1",
  "bincode",
@@ -11887,7 +11877,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -13022,7 +13012,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

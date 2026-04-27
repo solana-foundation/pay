@@ -11,7 +11,7 @@ use axum::response::{IntoResponse, Response};
 use serde_json::json;
 use solana_mpp::{
     AUTHORIZATION_HEADER, PAYMENT_RECEIPT_HEADER, WWW_AUTHENTICATE_HEADER, format_receipt,
-    format_www_authenticate, parse_authorization, server::html as mpp_html,
+    format_www_authenticate_many, parse_authorization, server::html as mpp_html,
 };
 
 use crate::PaymentState;
@@ -26,7 +26,16 @@ struct ChargeRequestContext<'a> {
     uri: &'a axum::http::Uri,
     subdomain: &'a str,
     accepts_html: bool,
+    browser_rpc_url: Option<&'a str>,
 }
+
+const PAYMENT_PAGE_CONTENT_SECURITY_POLICY: &str = "\
+    default-src 'self'; \
+    script-src 'unsafe-inline'; \
+    style-src 'unsafe-inline'; \
+    img-src 'self' data: blob: https:; \
+    connect-src 'self' http://localhost:* http://127.0.0.1:* https:; \
+    worker-src 'self'";
 
 /// Axum middleware that gates metered endpoints behind MPP payment.
 pub async fn payment_middleware<S: PaymentState>(
@@ -150,17 +159,15 @@ pub async fn payment_middleware<S: PaymentState>(
         }
     }
 
-    let mpp = match state.mpp() {
-        Some(mpp) => mpp,
-        None => {
-            tracing::warn!("Metered endpoint hit but MPP not configured — passing through");
-            return next.run(req).await;
-        }
-    };
+    let mpps = state.mpps();
+    if mpps.is_empty() {
+        tracing::warn!("Metered endpoint hit but MPP not configured — passing through");
+        return next.run(req).await;
+    }
 
     match auth_header {
         None => charge_challenge_response(
-            mpp,
+            &mpps,
             meter,
             api,
             &props,
@@ -171,11 +178,12 @@ pub async fn payment_middleware<S: PaymentState>(
                 uri: &uri,
                 subdomain,
                 accepts_html,
+                browser_rpc_url: state.browser_rpc_url(),
             },
             endpoint.and_then(|ep| ep.description.as_deref()),
         ),
         Some(auth_value) => {
-            handle_charge_authorization(mpp, auth_value, subdomain, &path, req, next).await
+            handle_charge_authorization(&mpps, auth_value, subdomain, &path, req, next).await
         }
     }
 }
@@ -212,7 +220,7 @@ fn session_challenge_response(
         }
     };
     tracing::info!(subdomain = %subdomain, path = %path, "402 Session Required");
-    challenge_json_response(body, &www_auth)
+    challenge_json_response(body, &[www_auth])
 }
 
 async fn handle_session_authorization(
@@ -256,7 +264,7 @@ async fn handle_session_authorization(
 }
 
 fn charge_challenge_response(
-    mpp: &solana_mpp::server::Mpp,
+    mpps: &[&solana_mpp::server::Mpp],
     meter: &pay_types::metering::Metering,
     api: &pay_types::metering::ApiSpec,
     props: &RequestProperties,
@@ -273,55 +281,66 @@ fn charge_challenge_response(
             format!("{}", per_unit)
         })
         .unwrap_or_else(|| "0.01".to_string());
-    let splits = resolve_charge_splits(mpp, meter, api, request.uri, &amount);
-
-    match mpp.charge_with_options(
-        &amount,
-        solana_mpp::server::ChargeOptions {
-            description,
-            splits,
-            ..Default::default()
-        },
-    ) {
-        Ok(challenge) => {
-            let www_auth = match format_www_authenticate(&challenge) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to format challenge");
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        axum::Json(json!({"error": "internal_error"})),
-                    )
-                        .into_response();
-                }
-            };
-
-            let body = json!({
-                "error": "payment_required",
-                "message": "This endpoint requires payment.",
-                "endpoint": { "method": request.method.as_str(), "path": request.path },
-                "pricing": price,
-            });
-
-            tracing::info!(subdomain = %request.subdomain, path = %request.path, amount = %amount, "402 Payment Required");
-
-            if request.accepts_html {
-                return html_challenge_response(mpp, &challenge, &www_auth);
+    let mut challenges = Vec::with_capacity(mpps.len());
+    for mpp in mpps {
+        let splits = resolve_charge_splits(mpp, meter, api, request.uri, &amount);
+        match mpp.charge_with_options(
+            &amount,
+            solana_mpp::server::ChargeOptions {
+                description,
+                splits,
+                ..Default::default()
+            },
+        ) {
+            Ok(challenge) => challenges.push(challenge),
+            Err(e) => {
+                tracing::error!(error = %e, currency = %mpp.currency(), "Failed to generate challenge");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(
+                        json!({"error": "challenge_generation_failed", "message": e.to_string()}),
+                    ),
+                )
+                    .into_response();
             }
-
-            challenge_json_response(body, &www_auth)
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to generate challenge");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(
-                    json!({"error": "challenge_generation_failed", "message": e.to_string()}),
-                ),
-            )
-                .into_response()
         }
     }
+
+    let www_auths = match format_www_authenticate_many(&challenges) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to format challenges");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"error": "internal_error"})),
+            )
+                .into_response();
+        }
+    };
+
+    let body = json!({
+        "error": "payment_required",
+        "message": "This endpoint requires payment.",
+        "endpoint": { "method": request.method.as_str(), "path": request.path },
+        "pricing": price,
+        "payment": {
+            "protocol": "mpp",
+            "challenges": challenges.len(),
+        },
+    });
+
+    tracing::info!(subdomain = %request.subdomain, path = %request.path, amount = %amount, challenges = challenges.len(), "402 Payment Required");
+
+    if request.accepts_html {
+        return html_challenge_response(
+            mpps[0],
+            &challenges[0],
+            &www_auths,
+            request.browser_rpc_url,
+        );
+    }
+
+    challenge_json_response(body, &www_auths)
 }
 
 fn resolve_charge_splits(
@@ -352,6 +371,7 @@ fn resolve_charge_splits(
             .map(|split| solana_mpp::protocol::solana::Split {
                 recipient: split.recipient,
                 amount: split.amount.to_string(),
+                ata_creation_required: None,
                 label: split.label,
                 memo: split.memo,
             })
@@ -364,7 +384,7 @@ fn resolve_charge_splits(
 }
 
 async fn handle_charge_authorization(
-    mpp: &solana_mpp::server::Mpp,
+    mpps: &[&solana_mpp::server::Mpp],
     auth_value: &str,
     subdomain: &str,
     path: &str,
@@ -383,75 +403,102 @@ async fn handle_charge_authorization(
         }
     };
 
-    match mpp.verify_credential(&credential).await {
-        Ok(receipt) => {
-            tracing::info!(subdomain = %subdomain, path = %path, reference = %receipt.reference, "Payment verified — forwarding");
-            let mut response = next.run(req).await;
-            if let Ok(receipt_str) = format_receipt(&receipt)
-                && let Ok(v) = axum::http::HeaderValue::from_str(&receipt_str)
-            {
-                response.headers_mut().insert(PAYMENT_RECEIPT_HEADER, v);
+    let mut last_error = None;
+    for mpp in mpps {
+        match mpp.verify_credential(&credential).await {
+            Ok(receipt) => {
+                tracing::info!(subdomain = %subdomain, path = %path, reference = %receipt.reference, "Payment verified — forwarding");
+                let mut response = next.run(req).await;
+                if let Ok(receipt_str) = format_receipt(&receipt)
+                    && let Ok(v) = axum::http::HeaderValue::from_str(&receipt_str)
+                {
+                    response.headers_mut().insert(PAYMENT_RECEIPT_HEADER, v);
+                }
+                return response;
             }
-            response
-        }
-        Err(e) => {
-            tracing::warn!(subdomain = %subdomain, path = %path, error = %e, "Payment verification failed");
-            verification_failed_response(mpp, &e)
+            Err(e) => last_error = Some(e),
         }
     }
+
+    let error = last_error
+        .unwrap_or_else(|| solana_mpp::server::VerificationError::new("MPP not configured"));
+    let message = readable_verification_message(&error);
+    tracing::warn!(subdomain = %subdomain, path = %path, error = %message, "Payment verification failed");
+    verification_failed_response(mpps, &error)
 }
 
 fn verification_failed_response(
-    mpp: &solana_mpp::server::Mpp,
+    mpps: &[&solana_mpp::server::Mpp],
     error: &solana_mpp::server::VerificationError,
 ) -> Response {
+    let message = readable_verification_message(error);
     let mut response = (
         StatusCode::PAYMENT_REQUIRED,
         axum::Json(json!({
             "error": "verification_failed",
-            "message": error.to_string(),
+            "message": message,
             "retryable": error.retryable,
         })),
     )
         .into_response();
-    if let Ok(challenge) = mpp.charge("0.01")
-        && let Ok(www_auth) = format_www_authenticate(&challenge)
-        && let Ok(v) = axum::http::HeaderValue::from_str(&www_auth)
-    {
-        response.headers_mut().insert(WWW_AUTHENTICATE_HEADER, v);
+    let challenges: Vec<_> = mpps
+        .iter()
+        .filter_map(|mpp| mpp.charge("0.01").ok())
+        .collect();
+    if let Ok(www_auths) = format_www_authenticate_many(&challenges) {
+        append_www_authenticate_headers(response.headers_mut(), &www_auths);
     }
     response
 }
 
-fn challenge_json_response(body: serde_json::Value, www_auth: &str) -> Response {
-    let mut response = (StatusCode::PAYMENT_REQUIRED, axum::Json(body)).into_response();
-    if let Ok(value) = axum::http::HeaderValue::from_str(www_auth) {
-        response
-            .headers_mut()
-            .insert(WWW_AUTHENTICATE_HEADER, value);
+pub fn readable_verification_message(error: &solana_mpp::server::VerificationError) -> String {
+    let message = error.to_string();
+    if message.contains("Fee payer cannot authorize the SPL payment transfer") {
+        return "Payment used the same account for the server and client. Restart the demo server, then retry the request.".to_string();
     }
+    if message.contains("Fee payer token account cannot fund the SPL payment transfer") {
+        return "Payment used the server account instead of the client account. Restart the demo server, then retry the request.".to_string();
+    }
+    if message.contains("ATA creation owner is not authorized by the challenge") {
+        return "Payment tried to create a token account this charge did not allow.".to_string();
+    }
+    message
+}
+
+fn challenge_json_response(body: serde_json::Value, www_auths: &[String]) -> Response {
+    let mut response = (StatusCode::PAYMENT_REQUIRED, axum::Json(body)).into_response();
+    append_www_authenticate_headers(response.headers_mut(), www_auths);
     response
 }
 
 fn html_challenge_response(
     mpp: &solana_mpp::server::Mpp,
     challenge: &solana_mpp::PaymentChallenge,
-    www_auth: &str,
+    www_auths: &[String],
+    browser_rpc_url: Option<&str>,
 ) -> Response {
-    let page = mpp_html::challenge_to_html(challenge, mpp.rpc_url(), mpp.network());
+    let rpc_url = browser_rpc_url.unwrap_or_else(|| mpp.rpc_url());
+    let page = mpp_html::challenge_to_html(challenge, rpc_url, mpp.network());
     tracing::info!(html_len = page.len(), "Generated HTML payment page");
     let mut response = Response::builder()
         .status(StatusCode::PAYMENT_REQUIRED)
         .header(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")
-        .header("content-security-policy", "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src *; worker-src 'self'")
+        .header(
+            axum::http::header::CONTENT_SECURITY_POLICY,
+            PAYMENT_PAGE_CONTENT_SECURITY_POLICY,
+        )
         .body(Body::from(page))
         .unwrap();
-    if let Ok(value) = axum::http::HeaderValue::from_str(www_auth) {
-        response
-            .headers_mut()
-            .insert(WWW_AUTHENTICATE_HEADER, value);
-    }
+    append_www_authenticate_headers(response.headers_mut(), www_auths);
     response
+}
+
+fn append_www_authenticate_headers(headers: &mut HeaderMap, www_auths: &[String]) {
+    for www_auth in www_auths {
+        if let Ok(value) = axum::http::HeaderValue::from_str(www_auth) {
+            headers.append(WWW_AUTHENTICATE_HEADER, value);
+        }
+    }
 }
 
 fn parse_query_params(uri: &axum::http::Uri) -> std::collections::HashMap<String, String> {
@@ -606,6 +653,30 @@ mod tests {
         assert_eq!(params.get("baz"), Some(&"qux".to_string()));
     }
 
+    #[test]
+    fn readable_verification_message_explains_fee_payer_authority_conflict() {
+        let error = solana_mpp::server::VerificationError::invalid_payload(
+            "Fee payer cannot authorize the SPL payment transfer",
+        );
+        let message = readable_verification_message(&error);
+        assert_eq!(
+            message,
+            "Payment used the same account for the server and client. Restart the demo server, then retry the request."
+        );
+    }
+
+    #[test]
+    fn readable_verification_message_explains_disallowed_ata_creation() {
+        let error = solana_mpp::server::VerificationError::invalid_payload(
+            "ATA creation owner is not authorized by the challenge",
+        );
+        let message = readable_verification_message(&error);
+        assert_eq!(
+            message,
+            "Payment tried to create a token account this charge did not allow."
+        );
+    }
+
     #[tokio::test]
     async fn session_challenge_response_sets_session_header() {
         let response = session_challenge_response(
@@ -629,19 +700,27 @@ mod tests {
     async fn html_challenge_response_sets_html_content_type() {
         let mpp = test_mpp();
         let challenge = mpp.charge("0.01").expect("challenge should build");
-        let header = format_www_authenticate(&challenge).expect("header should format");
-        let response = html_challenge_response(&mpp, &challenge, &header);
+        let header = solana_mpp::format_www_authenticate(&challenge).expect("header should format");
+        let response = html_challenge_response(&mpp, &challenge, &[header], Some("/__402/rpc"));
 
         assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
         assert_eq!(
             response.headers().get(axum::http::header::CONTENT_TYPE),
             Some(&"text/html; charset=utf-8".parse().unwrap())
         );
+        let csp = response
+            .headers()
+            .get(axum::http::header::CONTENT_SECURITY_POLICY)
+            .and_then(|value| value.to_str().ok())
+            .unwrap();
+        assert!(csp.contains("img-src"));
+        assert!(csp.contains("connect-src"));
 
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert!(body.contains("<!doctype html>") || body.contains("<html"));
+        assert!(body.contains("\"rpcUrl\":\"/__402/rpc\""));
     }
 }

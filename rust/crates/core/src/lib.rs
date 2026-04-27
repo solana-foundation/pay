@@ -40,6 +40,12 @@ use solana_mpp::server::Mpp;
 pub trait PaymentState: Clone + Send + Sync + 'static {
     fn apis(&self) -> &[ApiSpec];
     fn mpp(&self) -> Option<&Mpp>;
+    fn mpps(&self) -> Vec<&Mpp> {
+        self.mpp().into_iter().collect()
+    }
+    fn browser_rpc_url(&self) -> Option<&str> {
+        None
+    }
     fn session_mpp(&self) -> Option<&server::session::SessionMpp> {
         None
     }

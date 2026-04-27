@@ -76,9 +76,23 @@ fn do_paid_fetch(
     let account_override = std::env::var("PAY_ACTIVE_ACCOUNT").ok();
 
     match outcome {
-        RunOutcome::MppChallenge { challenge, .. } => {
+        RunOutcome::MppChallenge {
+            challenge,
+            alternatives,
+            ..
+        } => {
+            let mut challenges = Vec::with_capacity(1 + alternatives.len());
+            challenges.push((*challenge).clone());
+            challenges.extend(alternatives);
+            let selected = pay_core::client::mpp::select_challenge_by_balance(
+                &challenges,
+                &store,
+                network_override.as_deref(),
+                account_override.as_deref(),
+            )?
+            .ok_or_else(|| pay_core::Error::Mpp("No compatible MPP challenge found".to_string()))?;
             let (auth_header, _ephemeral) = pay_core::client::mpp::build_credential(
-                &challenge,
+                selected,
                 &store,
                 network_override.as_deref(),
                 account_override.as_deref(),

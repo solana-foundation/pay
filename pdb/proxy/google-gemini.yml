@@ -15,7 +15,8 @@ routing:
     key: "key"
     value_from_env: GOOGLE_API_KEY
 operator:
-  currency: "USDC"
+  currencies:
+    usd: ["USDC", "USDT", "CASH"]
   network: "localnet"
   fee_payer: true
 

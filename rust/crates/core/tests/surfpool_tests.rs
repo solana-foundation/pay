@@ -9,22 +9,42 @@
 #![cfg(feature = "server")]
 
 use pay_core::client;
+use serial_test::serial;
 use std::sync::{Arc, Mutex};
 use surfpool_sdk::{Keypair, Signer, Surfnet};
 
 type BatchLog = Arc<Mutex<Vec<Vec<(String, String, u64)>>>>;
+static SURFNET: tokio::sync::OnceCell<Surfnet> = tokio::sync::OnceCell::const_new();
+static JIT_SURFNET: tokio::sync::OnceCell<Surfnet> = tokio::sync::OnceCell::const_new();
 
 // =============================================================================
 // Helpers
 // =============================================================================
 
-async fn start_surfnet() -> Surfnet {
-    Surfnet::builder()
-        .offline(true)
-        .airdrop_sol(10_000_000_000)
-        .start()
+async fn start_surfnet() -> &'static Surfnet {
+    SURFNET
+        .get_or_init(|| async {
+            Surfnet::builder()
+                .offline(true)
+                .airdrop_sol(10_000_000_000)
+                .start()
+                .await
+                .expect("Failed to start Surfnet")
+        })
         .await
-        .expect("Failed to start Surfnet")
+}
+
+async fn start_jit_surfnet() -> &'static Surfnet {
+    JIT_SURFNET
+        .get_or_init(|| async {
+            Surfnet::builder()
+                .remote_rpc_url("https://api.mainnet-beta.solana.com")
+                .airdrop_sol(10_000_000_000)
+                .start()
+                .await
+                .expect("Failed to start JIT surfnet")
+        })
+        .await
 }
 
 fn keypair_to_file(keypair: &Keypair) -> tempfile::NamedTempFile {
@@ -40,10 +60,15 @@ fn keypair_to_file(keypair: &Keypair) -> tempfile::NamedTempFile {
 // =============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn balance_funded_account() {
     let surfnet = start_surfnet().await;
-    let payer = surfnet.payer();
-    let pubkey = payer.pubkey().to_string();
+    let account = Keypair::new();
+    surfnet
+        .cheatcodes()
+        .fund_sol(&account.pubkey(), 10_000_000_000)
+        .unwrap();
+    let pubkey = account.pubkey().to_string();
 
     let rpc = surfnet.rpc_url().to_string();
     let pk = pubkey.clone();
@@ -56,6 +81,7 @@ async fn balance_funded_account() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn balance_empty_account() {
     let surfnet = start_surfnet().await;
     let empty = Keypair::new();
@@ -68,10 +94,15 @@ async fn balance_empty_account() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn balance_diff_received() {
     let surfnet = start_surfnet().await;
-    let payer = surfnet.payer();
-    let pubkey = payer.pubkey().to_string();
+    let account = Keypair::new();
+    surfnet
+        .cheatcodes()
+        .fund_sol(&account.pubkey(), 10_000_000_000)
+        .unwrap();
+    let pubkey = account.pubkey().to_string();
 
     let rpc = surfnet.rpc_url().to_string();
     let pk = pubkey.clone();
@@ -80,7 +111,7 @@ async fn balance_diff_received() {
     // Fund more SOL
     surfnet
         .cheatcodes()
-        .fund_sol(&payer.pubkey(), 15_000_000_000)
+        .fund_sol(&account.pubkey(), 15_000_000_000)
         .unwrap();
 
     let after = client::balance::get_balances(&rpc, &pk).await.unwrap();
@@ -89,6 +120,7 @@ async fn balance_diff_received() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn balance_invalid_pubkey() {
     let surfnet = start_surfnet().await;
     let rpc = surfnet.rpc_url().to_string();
@@ -101,13 +133,18 @@ async fn balance_invalid_pubkey() {
 // =============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn send_sol_basic() {
     let surfnet = start_surfnet().await;
-    let payer = surfnet.payer();
+    let payer = Keypair::new();
+    surfnet
+        .cheatcodes()
+        .fund_sol(&payer.pubkey(), 1_000_000_000)
+        .unwrap();
     let recipient = Keypair::new();
 
     // Write payer keypair to a temp file
-    let kp_file = keypair_to_file(payer);
+    let kp_file = keypair_to_file(&payer);
     let kp_path = kp_file.path().to_string_lossy().to_string();
 
     let rpc = surfnet.rpc_url().to_string();
@@ -128,12 +165,17 @@ async fn send_sol_basic() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn send_sol_drain() {
     let surfnet = start_surfnet().await;
-    let payer = surfnet.payer();
+    let payer = Keypair::new();
+    surfnet
+        .cheatcodes()
+        .fund_sol(&payer.pubkey(), 10_000_000_000)
+        .unwrap();
     let recipient = Keypair::new();
 
-    let kp_file = keypair_to_file(payer);
+    let kp_file = keypair_to_file(&payer);
     let kp_path = kp_file.path().to_string_lossy().to_string();
 
     // "*" means drain all (minus fees)
@@ -165,10 +207,15 @@ async fn send_sol_drain() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn send_sol_invalid_recipient() {
     let surfnet = start_surfnet().await;
-    let payer = surfnet.payer();
-    let kp_file = keypair_to_file(payer);
+    let payer = Keypair::new();
+    surfnet
+        .cheatcodes()
+        .fund_sol(&payer.pubkey(), 1_000_000_000)
+        .unwrap();
+    let kp_file = keypair_to_file(&payer);
     let kp_path = kp_file.path().to_string_lossy().to_string();
 
     let _rpc = surfnet.rpc_url().to_string();
@@ -179,6 +226,7 @@ async fn send_sol_invalid_recipient() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn send_sol_insufficient_funds() {
     let surfnet = start_surfnet().await;
     // Create a wallet with very little SOL
@@ -204,6 +252,7 @@ async fn send_sol_insufficient_funds() {
 // =============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn sandbox_setup_keypair() {
     let surfnet = start_surfnet().await;
 
@@ -231,6 +280,7 @@ async fn sandbox_setup_keypair() {
 // =============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn full_payment_flow_with_surfnet() {
     use axum::Router;
     use axum::middleware;
@@ -352,6 +402,7 @@ async fn full_payment_flow_with_surfnet() {
 // =============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn push_session_full_flow() {
     use axum::Router;
     use axum::middleware;
@@ -575,6 +626,7 @@ async fn push_session_full_flow() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn pull_session_submits_required_setup_and_batches_channel_opens() {
     use axum::Router;
     use axum::middleware;
@@ -849,6 +901,7 @@ async fn pull_session_submits_required_setup_and_batches_channel_opens() {
 // =============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
 async fn pull_session_full_flow() {
     use axum::Router;
     use axum::middleware;
@@ -947,12 +1000,7 @@ async fn pull_session_full_flow() {
     println!("╚══════════════════════════════════════════════════════╝");
 
     println!("\n[1] Starting surfnet with JIT mainnet fetching...");
-    let surfnet = Surfnet::builder()
-        .remote_rpc_url("https://api.mainnet-beta.solana.com")
-        .airdrop_sol(10_000_000_000)
-        .start()
-        .await
-        .expect("Failed to start JIT surfnet");
+    let surfnet = start_jit_surfnet().await;
     let rpc_url = surfnet.rpc_url().to_string();
     println!("    RPC: {rpc_url}");
 
@@ -1253,6 +1301,7 @@ async fn pull_session_full_flow() {
 // =============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn mpp_build_credential_with_surfnet() {
     use axum::Router;
     use axum::middleware;
