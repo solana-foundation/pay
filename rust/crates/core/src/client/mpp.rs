@@ -518,15 +518,16 @@ mod tests {
     }
 
     #[test]
-    fn parse_all_extracts_repeated_payment_challenges() {
-        let first = solana_mpp::format_www_authenticate(&challenge_for_currency("USDC", "1000000"))
+    fn parse_all_extracts_repeated_stablecoin_payment_challenges() {
+        let usdc = solana_mpp::format_www_authenticate(&challenge_for_currency("USDC", "1000000"))
             .unwrap();
-        let second =
-            solana_mpp::format_www_authenticate(&challenge_for_currency("USDT", "1000000"))
-                .unwrap();
+        let cash = solana_mpp::format_www_authenticate(&challenge_for_currency("CASH", "1000000"))
+            .unwrap();
+        let usdt = solana_mpp::format_www_authenticate(&challenge_for_currency("USDT", "1000000"))
+            .unwrap();
 
-        let parsed = parse_all([first.as_str(), second.as_str()]);
-        assert_eq!(parsed.len(), 2);
+        let parsed = parse_all([usdc.as_str(), cash.as_str(), usdt.as_str()]);
+        assert_eq!(parsed.len(), 3);
         let currencies: Vec<String> = parsed
             .into_iter()
             .map(|challenge| {
@@ -534,7 +535,20 @@ mod tests {
                 request.currency
             })
             .collect();
-        assert_eq!(currencies, ["USDC", "USDT"]);
+        assert_eq!(currencies, ["USDC", "CASH", "USDT"]);
+    }
+
+    fn token_balance(
+        mint: &str,
+        raw_amount: u64,
+        symbol: &'static str,
+    ) -> crate::client::balance::TokenBalance {
+        crate::client::balance::TokenBalance {
+            mint: mint.to_string(),
+            raw_amount,
+            ui_amount: raw_amount as f64 / 1_000_000.0,
+            symbol: Some(symbol),
+        }
     }
 
     #[test]
@@ -546,12 +560,77 @@ mod tests {
         let candidates = decoded_charge_candidates(&challenges, None).unwrap();
         let balances = crate::client::balance::AccountBalances {
             sol_lamports: 0,
-            tokens: vec![crate::client::balance::TokenBalance {
-                mint: solana_mpp::protocol::solana::mints::USDT_MAINNET.to_string(),
-                raw_amount: 2_000_000,
-                ui_amount: 2.0,
-                symbol: Some("USDT"),
-            }],
+            tokens: vec![token_balance(
+                solana_mpp::protocol::solana::mints::USDT_MAINNET,
+                2_000_000,
+                "USDT",
+            )],
+        };
+
+        let selected = select_candidate_index_for_balances(&candidates, &balances).unwrap();
+        assert_eq!(candidates[selected].currency, "USDT");
+    }
+
+    #[test]
+    fn balance_selector_picks_cash_from_usdc_cash_usdt_when_cash_is_first_funded() {
+        let challenges = vec![
+            challenge_for_currency("USDC", "1000000"),
+            challenge_for_currency("CASH", "1000000"),
+            challenge_for_currency("USDT", "1000000"),
+        ];
+        let candidates = decoded_charge_candidates(&challenges, None).unwrap();
+        let balances = crate::client::balance::AccountBalances {
+            sol_lamports: 0,
+            tokens: vec![
+                token_balance(
+                    solana_mpp::protocol::solana::mints::USDC_MAINNET,
+                    999_999,
+                    "USDC",
+                ),
+                token_balance(
+                    solana_mpp::protocol::solana::mints::CASH_MAINNET,
+                    1_000_000,
+                    "CASH",
+                ),
+                token_balance(
+                    solana_mpp::protocol::solana::mints::USDT_MAINNET,
+                    5_000_000,
+                    "USDT",
+                ),
+            ],
+        };
+
+        let selected = select_candidate_index_for_balances(&candidates, &balances).unwrap();
+        assert_eq!(candidates[selected].currency, "CASH");
+    }
+
+    #[test]
+    fn balance_selector_skips_underfunded_cash_and_picks_usdt() {
+        let challenges = vec![
+            challenge_for_currency("USDC", "1000000"),
+            challenge_for_currency("CASH", "1000000"),
+            challenge_for_currency("USDT", "1000000"),
+        ];
+        let candidates = decoded_charge_candidates(&challenges, None).unwrap();
+        let balances = crate::client::balance::AccountBalances {
+            sol_lamports: 0,
+            tokens: vec![
+                token_balance(
+                    solana_mpp::protocol::solana::mints::USDC_MAINNET,
+                    999_999,
+                    "USDC",
+                ),
+                token_balance(
+                    solana_mpp::protocol::solana::mints::CASH_MAINNET,
+                    999_999,
+                    "CASH",
+                ),
+                token_balance(
+                    solana_mpp::protocol::solana::mints::USDT_MAINNET,
+                    1_000_000,
+                    "USDT",
+                ),
+            ],
         };
 
         let selected = select_candidate_index_for_balances(&candidates, &balances).unwrap();
@@ -567,12 +646,11 @@ mod tests {
         let candidates = decoded_charge_candidates(&challenges, None).unwrap();
         let balances = crate::client::balance::AccountBalances {
             sol_lamports: 0,
-            tokens: vec![crate::client::balance::TokenBalance {
-                mint: solana_mpp::protocol::solana::mints::USDT_MAINNET.to_string(),
-                raw_amount: 999_999,
-                ui_amount: 0.999999,
-                symbol: Some("USDT"),
-            }],
+            tokens: vec![token_balance(
+                solana_mpp::protocol::solana::mints::USDT_MAINNET,
+                999_999,
+                "USDT",
+            )],
         };
 
         assert!(select_candidate_index_for_balances(&candidates, &balances).is_none());

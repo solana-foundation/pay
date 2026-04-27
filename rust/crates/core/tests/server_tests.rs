@@ -128,7 +128,7 @@ async fn start_test_server(with_mpp: bool) -> (String, tokio::task::JoinHandle<(
 
 async fn start_multi_currency_server() -> (String, tokio::task::JoinHandle<()>) {
     let api = load_test_api();
-    let mpps = ["USDC", "USDT", "CASH"]
+    let mpps = ["USDC", "CASH", "USDT"]
         .into_iter()
         .map(|currency| {
             Mpp::new(solana_mpp::server::Config {
@@ -442,7 +442,7 @@ async fn middleware_returns_one_challenge_per_configured_currency() {
             request.currency
         })
         .collect();
-    assert_eq!(currencies, ["USDC", "USDT", "CASH"]);
+    assert_eq!(currencies, ["USDC", "CASH", "USDT"]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
