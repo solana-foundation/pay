@@ -249,12 +249,11 @@ pub fn search(catalog: &Catalog, query: Option<&str>, category: Option<&str>) ->
         let service_matches = match &query_lower {
             Some(q) => {
                 let haystack = format!(
-                    "{} {} {} {} {}",
+                    "{} {} {} {}",
                     svc.fqn,
                     svc.meta.title,
                     svc.meta.description,
-                    svc.meta.use_case.as_deref().unwrap_or_default(),
-                    svc.meta.aliases.join(" ")
+                    svc.meta.use_case.as_deref().unwrap_or_default()
                 )
                 .to_lowercase();
                 haystack.contains(q.as_str())
@@ -355,12 +354,11 @@ pub fn search_services(
             }
             if let Some(ref q) = query_lower {
                 let svc_haystack = format!(
-                    "{} {} {} {} {}",
+                    "{} {} {} {}",
                     svc.fqn,
                     svc.meta.title,
                     svc.meta.description,
-                    svc.meta.use_case.as_deref().unwrap_or_default(),
-                    svc.meta.aliases.join(" ")
+                    svc.meta.use_case.as_deref().unwrap_or_default()
                 )
                 .to_lowercase();
                 if svc_haystack.contains(q.as_str()) {
@@ -508,7 +506,6 @@ fn score_service_for_query(
     let title = svc.meta.title.to_lowercase();
     let description = svc.meta.description.to_lowercase();
     let use_case = svc.meta.use_case.clone().unwrap_or_default().to_lowercase();
-    let aliases = svc.meta.aliases.join(" ").to_lowercase();
     let category = svc.meta.category.to_lowercase();
 
     if !query_lower.is_empty() {
@@ -523,10 +520,6 @@ fn score_service_for_query(
         if use_case.contains(query_lower) {
             score += 70;
             reasons.push("provider use case directly matches the task".to_string());
-        }
-        if aliases.contains(query_lower) {
-            score += 70;
-            reasons.push("provider aliases directly match the task".to_string());
         }
         if description.contains(query_lower) {
             score += 55;
@@ -547,10 +540,6 @@ fn score_service_for_query(
         }
         if contains_query_term(&use_case, term) {
             score += 14;
-            term_matched = true;
-        }
-        if contains_query_term(&aliases, term) {
-            score += 18;
             term_matched = true;
         }
         if contains_query_term(&description, term) {
@@ -1579,7 +1568,6 @@ mod tests {
                     "title": "Social Intel",
                     "description": "Instagram influencer search by keyword, category, demographics, and location.",
                     "use_case": "Use for Instagram influencer search, creator discovery, audience demographics, brand partnership prospecting, and location-based social media research.",
-                    "aliases": ["brand collab recs", "insta folks", "creator shortlist"],
                     "category": "data",
                     "service_url": "https://social.example.com",
                     "endpoint_count": 1,
@@ -1794,19 +1782,6 @@ mod tests {
                 .reasons
                 .iter()
                 .any(|reason| reason.contains("important query terms"))
-        );
-    }
-
-    #[test]
-    fn ranked_search_uses_alias_metadata() {
-        let cat = catalog_for_provider_routing();
-        let results = search_services_ranked(&cat, "brand collab recs", None, 5);
-        assert_eq!(results[0].service.name, "socialintel/influencer-search");
-        assert!(
-            results[0]
-                .reasons
-                .iter()
-                .any(|reason| reason.contains("aliases"))
         );
     }
 

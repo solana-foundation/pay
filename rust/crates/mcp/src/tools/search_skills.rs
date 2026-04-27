@@ -302,8 +302,8 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
-    const GLOBAL_CURRENT_BENCHMARK: f64 = 94.622;
-    const GLOBAL_CURRENT_TOP1_BENCHMARK: f64 = 89.889;
+    const GLOBAL_CURRENT_BENCHMARK: f64 = 83.722;
+    const GLOBAL_CURRENT_TOP1_BENCHMARK: f64 = 77.111;
     const BENCHMARK_EPSILON: f64 = 0.001;
 
     #[test]
@@ -1245,7 +1245,6 @@ mod tests {
                 title: title.to_string(),
                 description: description.to_string(),
                 use_case: Some(use_case.to_string()),
-                aliases: benchmark_aliases(fqn),
                 category: category.to_string(),
                 service_url: format!("https://{}.example.com", fqn.replace('/', "-")),
                 sandbox_service_url: None,
@@ -1259,92 +1258,6 @@ mod tests {
             endpoints,
             content: None,
         }
-    }
-
-    fn benchmark_aliases(fqn: &str) -> Vec<String> {
-        let aliases = match fqn {
-            "socialintel/influencer-search" => {
-                "creator creators influencer influencers insta instagram ig audience followers collab campaign sponsor promote micro who should talk who should promote pay to post"
-            }
-            "merit-systems/stableenrich/enrichment" => {
-                "business businesses company contact contacts domain email emails enrich founder lead leads markdown prospect scrape site url webpage website who works behind domain sales list pull text"
-            }
-            "minerva/identity" => {
-                "confidence contact email emails human identity lead linkedin name person profile resolve same person who dis who is this"
-            }
-            "perplexity/sonar" => {
-                "answer citations current internet latest links news recent research sonar sources today web look it up right now still true"
-            }
-            "quicknode/rpc" => {
-                "blockhash broadcast chain getaccountinfo getbalance getslot jsonrpc node rpc simulate slot solana submit transaction tx raw chain send tx send transaction"
-            }
-            "allium/blockchain-analytics" => {
-                "activity address assets balances history holders holdings mint portfolio pubkey token tokens transaction transfers wallet wallet has wallet do"
-            }
-            "merit-systems/stablecrypto/market-data" => {
-                "cap coin coingecko crypto defi defillama floor gas market nft price protocol token tvl volume gas fee market cap how much is"
-            }
-            "merit-systems/stablestudio/media-generation" => {
-                "animated avatar banner creative generate image mockup photo pic picture prompt thumbnail video visual visuals make pic make picture short clip"
-            }
-            "merit-systems/stablesocial/social-data" => {
-                "comments facebook fb followers hashtag ig insta instagram metrics posts reddit social tiktok people saying social chatter reddit vibe"
-            }
-            "solana-foundation/google/bigquery" => {
-                "bigquery bq data dataset datasets job public query rows schema sql table tables warehouse big data public data"
-            }
-            "solana-foundation/google/vision" => {
-                "faces image img landmark labels logo logos object objects ocr photo pic picture screenshot vision read menu read text"
-            }
-            "solana-foundation/google/documentai" => {
-                "contract doc document fields form invoice ocr paper paperwork parse pdf receipt scan scanned tables tax structured data multi page"
-            }
-            "solana-foundation/google/language" => {
-                "article categorize category classify companies copy entities entity mentioned mood names nlp orgs paragraph positive sentiment text tone words support ticket customer feedback"
-            }
-            "solana-foundation/google/translate" => {
-                "detect english french german japanese lang language localise localization localize spanish translatoin translate translation make it spanish make this french"
-            }
-            "solana-foundation/google/speech" => {
-                "audio caption captions diarize listen mp3 podcast recording speech spoken stt transcribe transcript transcription voice audio to text speech to text voice note"
-            }
-            "solana-foundation/google/texttospeech" => {
-                "audiobook loud narration pronounce read speak speech spoken ssml tts voice voiceover text to voice text 2 speech read aloud out loud"
-            }
-            "solana-foundation/google/places" => {
-                "bar business cafe coffee florist gym hotel maps near nearby pharmacy place restaurant restaurants reviews spot store sushi vegan around here around me gas station near me open now to eat"
-            }
-            "solana-foundation/google/addressvalidation" => {
-                "addr address addy city deliver deliverability geocode mailing postal residential shipping street usps validate zip package get there street city zip"
-            }
-            "solana-foundation/google/factchecktools" => {
-                "claim claimreview debunk debunked fact factcheck factchecked fake hoax misinfo misinformation rating rumor statement true viral fact check true or false"
-            }
-            "agentmail/email" => {
-                "email inbox mail mailbox mails messages note outbound replies reply check my mails did i get email"
-            }
-            "merit-systems/stablephone/calls" => {
-                "call caller dial phone picked telephony transcript voice phone call voice agent picked up"
-            }
-            "merit-systems/stableupload/hosting" => {
-                "asset cdn deploy file folder host hosted html link online pdf public publish site upload url put online shareable link"
-            }
-            "x402scan/search" => {
-                "402 endpoint endpoints gated mpp paid payment registry x402 x402scan payment required paid api paid apis"
-            }
-            "crushrewards/pricing" => {
-                "cheaper cheapest compare coupon deal deals discount offer offers overpriced price pricing retail sale best price good deal"
-            }
-            "purch/marketplace" => {
-                "amazon buy buyable catalog checkout ecom ecommerce item listing listings marketplace order product products purchase shop shopify shopping store buy this to buy"
-            }
-            _ => "",
-        };
-
-        aliases
-            .split_whitespace()
-            .map(ToString::to_string)
-            .collect()
     }
 
     fn endpoint(

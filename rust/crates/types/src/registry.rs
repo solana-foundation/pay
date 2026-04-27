@@ -46,9 +46,6 @@ pub struct ServiceMeta {
     /// Hint for LLMs: when should this skill be used? (max 255 chars).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub use_case: Option<String>,
-    /// Search aliases, synonyms, and common user phrases for provider routing.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub aliases: Vec<String>,
     /// Category. One of: ai_ml, data, compute, maps, search, translation,
     /// productivity, finance, identity, storage, messaging, media, iot,
     /// security, analytics, devtools, cloud, other.
