@@ -37,6 +37,10 @@ export function explorerTokenUrl(
   config: Config | null,
 ): string {
   const base = `https://explorer.solana.com/address/${address}/tokens`;
-  if (!config?.rpcUrl) return base;
-  return `${base}?cluster=custom&customUrl=${encodeURIComponent(config.rpcUrl)}`;
+  if (!config) return base;
+  if (config.network === "devnet") return `${base}?cluster=devnet`;
+  if (config.network === "localnet" && config.rpcUrl) {
+    return `${base}?cluster=custom&customUrl=${encodeURIComponent(config.rpcUrl)}`;
+  }
+  return base;
 }

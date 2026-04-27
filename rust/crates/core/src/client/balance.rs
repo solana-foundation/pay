@@ -15,6 +15,8 @@ fn mint_symbol(mint: &str) -> Option<&'static str> {
     match mint {
         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" => Some("USDC"),
         "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB" => Some("USDT"),
+        "2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo" => Some("PYUSD"),
+        "CASHx9KJUStyftLFWGvEVf59SGeG9sh5FfcnZMVPCASH" => Some("CASH"),
         _ => None,
     }
 }
@@ -22,6 +24,7 @@ fn mint_symbol(mint: &str) -> Option<&'static str> {
 #[derive(Debug, Clone)]
 pub struct TokenBalance {
     pub mint: String,
+    pub raw_amount: u64,
     pub ui_amount: f64,
     pub symbol: Option<&'static str>,
 }
@@ -245,6 +248,7 @@ fn parse_token_accounts(result: &serde_json::Value, tokens: &mut Vec<TokenBalanc
         if ui > 0.0 || raw != "0" {
             tokens.push(TokenBalance {
                 mint: mint.to_string(),
+                raw_amount: raw.parse().unwrap_or(0),
                 ui_amount: ui,
                 symbol: mint_symbol(mint),
             });
@@ -361,6 +365,7 @@ mod tests {
             sol_lamports: 0,
             tokens: vec![TokenBalance {
                 mint: "USDC_MINT".to_string(),
+                raw_amount: 10_000_000,
                 ui_amount: 10.0,
                 symbol: Some("USDC"),
             }],
@@ -369,6 +374,7 @@ mod tests {
             sol_lamports: 0,
             tokens: vec![TokenBalance {
                 mint: "USDC_MINT".to_string(),
+                raw_amount: 25_500_000,
                 ui_amount: 25.5,
                 symbol: Some("USDC"),
             }],
@@ -389,6 +395,7 @@ mod tests {
             sol_lamports: 0,
             tokens: vec![TokenBalance {
                 mint: "NEW_MINT".to_string(),
+                raw_amount: 100_000_000,
                 ui_amount: 100.0,
                 symbol: None,
             }],
@@ -404,6 +411,7 @@ mod tests {
             sol_lamports: 1_000_000,
             tokens: vec![TokenBalance {
                 mint: "USDC".to_string(),
+                raw_amount: 50_000_000,
                 ui_amount: 50.0,
                 symbol: Some("USDC"),
             }],

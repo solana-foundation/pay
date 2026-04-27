@@ -21,7 +21,8 @@ routing:
       x-goog-user-project:
         from_env: GCP_PROJECT
 operator:
-  currency: "USDC"
+  currencies:
+    usd: ["USDC", "USDT", "CASH"]
   network: "localnet"
   fee_payer: true
 

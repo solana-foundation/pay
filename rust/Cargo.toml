@@ -5,7 +5,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2024"
-version = "0.7.4"
+version = "0.8.0"
 license = "Apache-2.0"
 
 [workspace.dependencies]
@@ -83,7 +83,7 @@ blake3 = "1"
 qrcode = { version = "0.14", default-features = false }
 
 # Solana MPP (includes keypair loading + charge building)
-solana-mpp = { git = "https://github.com/solana-foundation/mpp-sdk", branch = "main", default-features = false, features = [
+solana-mpp = { git = "https://github.com/solana-foundation/mpp-sdk", branch = "chore/improve-spec", default-features = false, features = [
     "client",
     "server",
 ] }

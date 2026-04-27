@@ -265,6 +265,7 @@ pub struct EnvRef {
 /// Operator-level configuration for a proxy instance.
 /// Controls signing, payment recipient, and currency.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct OperatorConfig {
     /// Signing backend for fee sponsorship and settlement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -273,10 +274,10 @@ pub struct OperatorConfig {
     /// Overrides --recipient CLI flag.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recipient: Option<String>,
-    /// Payment currency (SOL, USDC, etc.).
-    /// Overrides --currency CLI flag.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub currency: Option<String>,
+    /// Payment currencies grouped by unit, e.g. `{ usd: [USDC, USDT, CASH] }`.
+    /// When present, charge endpoints advertise one challenge per listed currency.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub currencies: std::collections::BTreeMap<String, Vec<String>>,
     /// Solana RPC URL. Overrides --rpc-url CLI flag.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rpc_url: Option<String>,

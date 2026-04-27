@@ -5572,7 +5572,7 @@ checksum = "b867cad97c0791bbd3aaa6472142568c6c9e8f71937e98379f584cfb0cf35bec"
 
 [[package]]
 name = "pay"
-version = "0.7.4"
+version = "0.8.0"
 dependencies = [
  "axum",
  "bs58",
@@ -5607,7 +5607,7 @@ dependencies = [
 
 [[package]]
 name = "pay-core"
-version = "0.7.4"
+version = "0.8.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -5648,7 +5648,7 @@ dependencies = [
 
 [[package]]
 name = "pay-integration"
-version = "0.7.4"
+version = "0.8.0"
 dependencies = [
  "pay-core",
  "pay-types",
@@ -5657,7 +5657,7 @@ dependencies = [
 
 [[package]]
 name = "pay-keystore"
-version = "0.7.4"
+version = "0.8.0"
 dependencies = [
  "bs58",
  "secret-service",
@@ -5674,7 +5674,7 @@ dependencies = [
 
 [[package]]
 name = "pay-mcp"
-version = "0.7.4"
+version = "0.8.0"
 dependencies = [
  "pay-core",
  "pay-keystore",
@@ -5691,7 +5691,7 @@ dependencies = [
 
 [[package]]
 name = "pay-pdb"
-version = "0.7.4"
+version = "0.8.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -5713,7 +5713,7 @@ dependencies = [
 
 [[package]]
 name = "pay-types"
-version = "0.7.4"
+version = "0.8.0"
 dependencies = [
  "schemars 0.8.22",
  "serde",
@@ -9046,7 +9046,7 @@ dependencies = [
 [[package]]
 name = "solana-mpp"
 version = "0.2.0"
-source = "git+https://github.com/solana-foundation/mpp-sdk?branch=main#73daceba15df61fcae9b0aee664dd9d7e01ca5c2"
+source = "git+https://github.com/solana-foundation/mpp-sdk?branch=chore%2Fimprove-spec#26e1f57ba0c87fc6085c9e4051705759e4766732"
 dependencies = [
  "base64 0.22.1",
  "bincode",
@@ -11117,7 +11117,7 @@ dependencies = [
 [[package]]
 name = "solana-x402"
 version = "0.1.0"
-source = "git+https://github.com/solana-foundation/x402-sdk?branch=main#9859bc9edf1350dbcfffc729ab96bfe63419aad0"
+source = "git+https://github.com/solana-foundation/x402-sdk?branch=main#0ed603495213a6b9a859ed30e21d4855f18cdea7"
 dependencies = [
  "base64 0.22.1",
  "bincode",

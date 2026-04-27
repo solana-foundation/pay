@@ -507,6 +507,53 @@ pub fn load_or_create_ephemeral_for_network_as(
     })
 }
 
+/// Ensure an exact named ephemeral account exists for a network.
+///
+/// Unlike [`load_or_create_ephemeral_for_network_as`], this never falls back
+/// to another account when `account_name` is `default`. It is used when two
+/// local roles must remain distinct, such as a sandbox gateway fee payer and
+/// a sandbox client payer.
+pub fn load_or_create_exact_ephemeral_for_network_as(
+    network: &str,
+    account_name: &str,
+    store: &dyn AccountsStore,
+) -> Result<ResolvedEphemeral> {
+    let mut file = store.load()?;
+
+    if let Some(account) = file
+        .named_account_for_network(network, account_name)
+        .cloned()
+    {
+        if account.keystore != Keystore::Ephemeral {
+            return Err(Error::Config(format!(
+                "Network `{network}` account `{account_name}` is \
+                 `{}`-backed, not ephemeral. Resolve via the keystore loader \
+                 instead of generating a fresh wallet.",
+                account.keystore
+            )));
+        }
+        return Ok(ResolvedEphemeral {
+            network: network.to_string(),
+            account_name: account_name.to_string(),
+            account,
+            created: false,
+        });
+    }
+
+    let account = generate_ephemeral_account();
+    file.accounts
+        .entry(network.to_string())
+        .or_default()
+        .insert(account_name.to_string(), account.clone());
+    store.save(&file)?;
+    Ok(ResolvedEphemeral {
+        network: network.to_string(),
+        account_name: account_name.to_string(),
+        account,
+        created: true,
+    })
+}
+
 fn generate_ephemeral_account() -> Account {
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
     let verifying_key = signing_key.verifying_key();
@@ -942,6 +989,33 @@ mod tests {
         assert!(!resolved.created);
         assert_eq!(resolved.account.pubkey.as_deref(), Some("ReusedPk"));
         assert_eq!(store.save_count(), 0, "must not persist on cache hit");
+    }
+
+    #[test]
+    fn exact_load_or_create_default_does_not_reuse_other_named_account() {
+        let mut f = AccountsFile::default();
+        f.upsert("localnet", "gateway", fake_ephemeral("GatewayPk"));
+        let store = MemoryAccountsStore::with_file(f);
+
+        let resolved =
+            load_or_create_exact_ephemeral_for_network_as("localnet", DEFAULT_ACCOUNT_NAME, &store)
+                .unwrap();
+
+        assert!(resolved.created);
+        assert_eq!(resolved.account_name, DEFAULT_ACCOUNT_NAME);
+        assert_ne!(resolved.account.pubkey.as_deref(), Some("GatewayPk"));
+
+        let snapshot = store.snapshot();
+        assert!(
+            snapshot
+                .named_account_for_network("localnet", "gateway")
+                .is_some()
+        );
+        assert!(
+            snapshot
+                .named_account_for_network("localnet", DEFAULT_ACCOUNT_NAME)
+                .is_some()
+        );
     }
 
     #[test]

@@ -13,6 +13,7 @@ pub enum RunOutcome {
     /// The server returned 402 with an MPP charge challenge.
     MppChallenge {
         challenge: Box<mpp::Challenge>,
+        alternatives: Vec<mpp::Challenge>,
         resource_url: String,
     },
     /// The server returned 402 with an MPP session challenge (intent="session").
@@ -203,33 +204,17 @@ pub(crate) fn classify_402(
                 x402::parse(&synthetic_headers, Some(&json_str))
             })
     });
-    let mpp_challenge = headers
-        .iter()
-        .find(|(k, _)| k == "www-authenticate")
-        .and_then(|(_, v)| mpp::parse(v));
+    let mpp_challenges = mpp::parse_headers(headers);
 
     // x402::parse (from solana_x402) only returns Some when a Solana-
     // compatible `accepts` entry exists — it's already a Solana filter.
     // MPP is chain-agnostic at the parse level, so we need to validate
     // the recipient is a valid Solana pubkey.
-    let mpp_is_solana = mpp_challenge.as_ref().is_some_and(|c| {
-        c.request
-            .decode()
-            .ok()
-            .map(|r: solana_mpp::ChargeRequest| {
-                // Solana recipients are 32-44 char Base58 strings.
-                // EVM addresses start with "0x" — quick reject.
-                r.recipient
-                    .as_deref()
-                    .is_some_and(|s| !s.starts_with("0x") && s.len() >= 32 && s.len() <= 44)
-            })
-            .unwrap_or(false)
-    });
-
     // Session MPP: the method field ("solana") indicates chain support.
     // Session requests don't use ChargeRequest so mpp_is_solana doesn't apply.
-    if let Some(challenge) = &mpp_challenge
-        && challenge.intent.as_str() == "session"
+    if let Some(challenge) = mpp_challenges
+        .iter()
+        .find(|challenge| challenge.intent.as_str() == "session")
     {
         let is_solana_method = challenge.method.as_str() == "solana";
         if is_solana_method {
@@ -246,11 +231,17 @@ pub(crate) fn classify_402(
     }
 
     // Prefer MPP for one-shot Solana payments (native protocol).
-    if mpp_is_solana {
-        let challenge = mpp_challenge.unwrap();
+    let mut charge_challenges: Vec<mpp::Challenge> = mpp_challenges
+        .iter()
+        .filter(|challenge| solana_mpp::client::is_solana_charge_challenge(challenge))
+        .cloned()
+        .collect();
+    if !charge_challenges.is_empty() {
+        let challenge = charge_challenges.remove(0);
         info!(resource = resource_url, "Detected MPP challenge (Solana)");
         return RunOutcome::MppChallenge {
             challenge: Box::new(challenge),
+            alternatives: charge_challenges,
             resource_url: resource_url.to_string(),
         };
     }
@@ -265,7 +256,7 @@ pub(crate) fn classify_402(
     }
 
     // Neither protocol supports Solana — tell the user clearly.
-    if mpp_challenge.is_some() {
+    if !mpp_challenges.is_empty() {
         return RunOutcome::PaymentRejected {
             reason: "Server requires payment but only accepts non-Solana chains \
                      (e.g. Base/EVM). This endpoint is not compatible with `pay`. \
@@ -467,6 +458,43 @@ HTTP request sent, awaiting response...
 
         let outcome = classify_402(&headers, None, "https://example.com/resource");
         assert!(matches!(outcome, RunOutcome::MppChallenge { .. }));
+    }
+
+    #[test]
+    fn classify_402_preserves_multiple_mpp_charge_challenges() {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        let header_for = |currency: &str| {
+            let request_json = serde_json::json!({
+                "amount": "1000000",
+                "currency": currency,
+                "recipient": "So11111111111111111111111111111111111111112",
+                "methodDetails": { "network": "devnet" }
+            });
+            let b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&request_json).unwrap());
+            (
+                "www-authenticate".to_string(),
+                format!(
+                    "Payment id=\"{currency}\", realm=\"test\", method=\"solana\", intent=\"charge\", request=\"{b64}\""
+                ),
+            )
+        };
+        let headers = vec![header_for("USDC"), header_for("USDT"), header_for("CASH")];
+
+        let outcome = classify_402(&headers, None, "https://example.com/resource");
+        match outcome {
+            RunOutcome::MppChallenge {
+                challenge,
+                alternatives,
+                ..
+            } => {
+                let first: solana_mpp::ChargeRequest = challenge.request.decode().unwrap();
+                assert_eq!(first.currency, "USDC");
+                assert_eq!(alternatives.len(), 2);
+            }
+            other => panic!("expected MppChallenge, got {other:?}"),
+        }
     }
 
     #[test]

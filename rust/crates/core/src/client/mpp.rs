@@ -6,10 +6,12 @@ use solana_mpp::client::build_credential_header;
 use solana_mpp::protocol::solana::default_rpc_url;
 use solana_mpp::solana_keychain::SolanaSigner;
 use solana_mpp::solana_rpc_client::rpc_client::RpcClient;
-use solana_mpp::{ChargeRequest, parse_www_authenticate};
+use solana_mpp::{ChargeRequest, parse_www_authenticate_all};
 use tracing::{info, warn};
 
-use crate::accounts::{AccountsStore, ResolvedEphemeral};
+use crate::accounts::{
+    AccountChoice, AccountsStore, ResolvedEphemeral, resolve_account_for_network,
+};
 use crate::{Error, Result};
 
 // Re-export the challenge type for the runner/CLI.
@@ -17,7 +19,26 @@ pub use solana_mpp::PaymentChallenge as Challenge;
 
 /// Try to extract an MPP challenge from the `www-authenticate` header value.
 pub fn parse(header_value: &str) -> Option<Challenge> {
-    parse_www_authenticate(header_value).ok()
+    parse_all([header_value]).into_iter().next()
+}
+
+/// Extract every MPP challenge from repeated or combined `WWW-Authenticate`
+/// header values.
+pub fn parse_all<'a>(header_values: impl IntoIterator<Item = &'a str>) -> Vec<Challenge> {
+    parse_www_authenticate_all(header_values)
+        .into_iter()
+        .filter_map(|result| result.ok())
+        .collect()
+}
+
+/// Extract every MPP challenge from a lowercase header list.
+pub fn parse_headers(headers: &[(String, String)]) -> Vec<Challenge> {
+    parse_all(
+        headers
+            .iter()
+            .filter(|(name, _)| name == "www-authenticate")
+            .map(|(_, value)| value.as_str()),
+    )
 }
 
 /// Build a signed credential and return the `Authorization` header value
@@ -57,6 +78,7 @@ pub fn build_credential(
         .and_then(|v| v.as_str())
         .unwrap_or("mainnet")
         .to_string();
+    let challenge_network = normalize_network(&challenge_network).to_string();
     let embedded_blockhash = request
         .method_details
         .as_ref()
@@ -92,15 +114,7 @@ pub fn build_credential(
         &desc,
     )?;
 
-    let rpc_url = std::env::var("PAY_RPC_URL").unwrap_or_else(|_| {
-        if network == "localnet"
-            && embedded_blockhash.is_some_and(|h| h.starts_with(SURFPOOL_BLOCKHASH_PREFIX))
-        {
-            crate::config::SANDBOX_RPC_URL.to_string()
-        } else {
-            default_rpc_url(&network).to_string()
-        }
-    });
+    let rpc_url = resolve_rpc_url(&network, embedded_blockhash);
     let rpc = RpcClient::new(rpc_url.clone());
 
     info!(
@@ -136,6 +150,205 @@ pub fn build_credential(
         .map_err(|e| Error::Mpp(format!("Failed to build credential: {e}")))?;
 
     Ok((header, ephemeral_notice))
+}
+
+/// Select a charge challenge the configured wallet can actually pay.
+///
+/// If balances cannot be fetched, the first Solana charge challenge is
+/// returned so older payment paths continue to work. If balances are known and
+/// none of the advertised currencies is funded enough, payment is rejected
+/// before the client signs anything.
+pub fn select_challenge_by_balance<'a>(
+    challenges: &'a [Challenge],
+    store: &dyn AccountsStore,
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+) -> Result<Option<&'a Challenge>> {
+    let candidates = decoded_charge_candidates(challenges, network_override)?;
+    let Some(first) = candidates.first() else {
+        return Ok(None);
+    };
+
+    let network = normalize_network(&first.network);
+    let pubkey = match account_pubkey_for_network(store, network, account_override)? {
+        Some(pubkey) => pubkey,
+        None => return Ok(Some(&challenges[first.index])),
+    };
+
+    let rpc_url = resolve_rpc_url(&first.network, first.embedded_blockhash.as_deref());
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| Error::Mpp(format!("Failed to create runtime: {e}")))?;
+
+    if first.user_opted_into_sandbox
+        && let Err(e) = rt.block_on(crate::client::sandbox::fund_via_surfpool(&rpc_url, &pubkey))
+    {
+        warn!(error = %e, "Could not auto-fund wallet via Surfpool before challenge selection");
+    }
+
+    let balances = match rt.block_on(crate::client::balance::get_balances(&rpc_url, &pubkey)) {
+        Ok(balances) => balances,
+        Err(e) => {
+            warn!(error = %e, %rpc_url, %pubkey, "Could not fetch balances for MPP challenge selection");
+            return Ok(Some(&challenges[first.index]));
+        }
+    };
+
+    if let Some(index) = select_candidate_index_for_balances(&candidates, &balances) {
+        let selected = &candidates[index];
+        info!(
+            currency = %selected.currency,
+            amount = selected.amount,
+            network = %selected.network,
+            pubkey = %pubkey,
+            "Selected MPP challenge based on wallet balance"
+        );
+        return Ok(Some(&challenges[selected.index]));
+    }
+
+    Err(Error::PaymentRejected(format!(
+        "wallet `{pubkey}` does not have enough balance on `{network}` for any advertised MPP challenge"
+    )))
+}
+
+#[derive(Debug, Clone)]
+struct DecodedChargeCandidate {
+    index: usize,
+    amount: u64,
+    currency: String,
+    mint: Option<String>,
+    network: String,
+    embedded_blockhash: Option<String>,
+    user_opted_into_sandbox: bool,
+}
+
+fn decoded_charge_candidates(
+    challenges: &[Challenge],
+    network_override: Option<&str>,
+) -> Result<Vec<DecodedChargeCandidate>> {
+    let mut candidates = Vec::new();
+
+    for (index, challenge) in challenges.iter().enumerate() {
+        if !solana_mpp::client::is_solana_charge_challenge(challenge) {
+            continue;
+        }
+
+        let request: ChargeRequest = challenge
+            .request
+            .decode()
+            .map_err(|e| Error::Mpp(format!("Failed to decode challenge request: {e}")))?;
+        let details: solana_mpp::protocol::solana::MethodDetails = request
+            .method_details
+            .clone()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|e| Error::Mpp(format!("Failed to decode Solana method details: {e}")))?
+            .unwrap_or_default();
+
+        let challenge_network = details
+            .network
+            .clone()
+            .unwrap_or_else(|| "mainnet".to_string());
+        let challenge_network = normalize_network(&challenge_network).to_string();
+        if let Some(forced) = network_override {
+            if forced != challenge_network {
+                continue;
+            }
+            check_client_network_intent(
+                Some(forced),
+                &challenge_network,
+                details.recent_blockhash.as_deref(),
+            )?;
+        }
+
+        let network = network_override
+            .map(str::to_string)
+            .unwrap_or(challenge_network);
+        let is_surfpool_challenge = details
+            .recent_blockhash
+            .as_deref()
+            .is_some_and(|h| h.starts_with(SURFPOOL_BLOCKHASH_PREFIX));
+        let mint = solana_mpp::protocol::solana::resolve_stablecoin_mint(
+            &request.currency,
+            Some(&network),
+        )
+        .map(str::to_string);
+
+        candidates.push(DecodedChargeCandidate {
+            index,
+            amount: request
+                .amount
+                .parse()
+                .map_err(|_| Error::Mpp(format!("Invalid challenge amount: {}", request.amount)))?,
+            currency: request.currency,
+            mint,
+            network,
+            embedded_blockhash: details.recent_blockhash,
+            user_opted_into_sandbox: network_override.is_some() || is_surfpool_challenge,
+        });
+    }
+
+    Ok(candidates)
+}
+
+fn select_candidate_index_for_balances(
+    candidates: &[DecodedChargeCandidate],
+    balances: &crate::client::balance::AccountBalances,
+) -> Option<usize> {
+    candidates
+        .iter()
+        .position(|candidate| has_sufficient_balance(candidate, balances))
+}
+
+fn has_sufficient_balance(
+    candidate: &DecodedChargeCandidate,
+    balances: &crate::client::balance::AccountBalances,
+) -> bool {
+    match &candidate.mint {
+        None => balances.sol_lamports >= candidate.amount,
+        Some(mint) => balances
+            .tokens
+            .iter()
+            .any(|token| token.mint == *mint && token.raw_amount >= candidate.amount),
+    }
+}
+
+fn account_pubkey_for_network(
+    store: &dyn AccountsStore,
+    network: &str,
+    account_override: Option<&str>,
+) -> Result<Option<String>> {
+    let file = store.load()?;
+    if let Some(name) = account_override {
+        return Ok(file
+            .named_account_for_network(network, name)
+            .and_then(|account| account.pubkey.clone()));
+    }
+
+    match resolve_account_for_network(network, &file) {
+        AccountChoice::Resolved { account, .. } => Ok(account.pubkey),
+        AccountChoice::Missing => Ok(None),
+    }
+}
+
+fn resolve_rpc_url(network: &str, embedded_blockhash: Option<&str>) -> String {
+    std::env::var("PAY_RPC_URL").unwrap_or_else(|_| {
+        if network == "localnet"
+            && embedded_blockhash.is_some_and(|h| h.starts_with(SURFPOOL_BLOCKHASH_PREFIX))
+        {
+            crate::config::SANDBOX_RPC_URL.to_string()
+        } else {
+            default_rpc_url(network).to_string()
+        }
+    })
+}
+
+fn normalize_network(network: &str) -> &str {
+    match network {
+        "mainnet-beta" => "mainnet",
+        other => other,
+    }
 }
 
 /// Base58 prefix that the Surfpool sandbox embeds in every blockhash it
@@ -285,6 +498,84 @@ mod tests {
     #[test]
     fn parse_returns_none_for_invalid() {
         assert!(parse("not a valid header").is_none());
+    }
+
+    fn challenge_for_currency(currency: &str, amount: &str) -> Challenge {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        let request_json = serde_json::json!({
+            "amount": amount,
+            "currency": currency,
+            "recipient": "So11111111111111111111111111111111111111112",
+            "methodDetails": { "network": "mainnet" }
+        });
+        let b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&request_json).unwrap());
+        let header = format!(
+            "Payment id=\"{currency}\", realm=\"test\", method=\"solana\", intent=\"charge\", request=\"{b64}\""
+        );
+        parse(&header).unwrap()
+    }
+
+    #[test]
+    fn parse_all_extracts_repeated_payment_challenges() {
+        let first = solana_mpp::format_www_authenticate(&challenge_for_currency("USDC", "1000000"))
+            .unwrap();
+        let second =
+            solana_mpp::format_www_authenticate(&challenge_for_currency("USDT", "1000000"))
+                .unwrap();
+
+        let parsed = parse_all([first.as_str(), second.as_str()]);
+        assert_eq!(parsed.len(), 2);
+        let currencies: Vec<String> = parsed
+            .into_iter()
+            .map(|challenge| {
+                let request: ChargeRequest = challenge.request.decode().unwrap();
+                request.currency
+            })
+            .collect();
+        assert_eq!(currencies, ["USDC", "USDT"]);
+    }
+
+    #[test]
+    fn balance_selector_picks_first_funded_currency() {
+        let challenges = vec![
+            challenge_for_currency("USDC", "1000000"),
+            challenge_for_currency("USDT", "1000000"),
+        ];
+        let candidates = decoded_charge_candidates(&challenges, None).unwrap();
+        let balances = crate::client::balance::AccountBalances {
+            sol_lamports: 0,
+            tokens: vec![crate::client::balance::TokenBalance {
+                mint: solana_mpp::protocol::solana::mints::USDT_MAINNET.to_string(),
+                raw_amount: 2_000_000,
+                ui_amount: 2.0,
+                symbol: Some("USDT"),
+            }],
+        };
+
+        let selected = select_candidate_index_for_balances(&candidates, &balances).unwrap();
+        assert_eq!(candidates[selected].currency, "USDT");
+    }
+
+    #[test]
+    fn balance_selector_returns_none_when_no_currency_is_funded() {
+        let challenges = vec![
+            challenge_for_currency("USDC", "1000000"),
+            challenge_for_currency("USDT", "1000000"),
+        ];
+        let candidates = decoded_charge_candidates(&challenges, None).unwrap();
+        let balances = crate::client::balance::AccountBalances {
+            sol_lamports: 0,
+            tokens: vec![crate::client::balance::TokenBalance {
+                mint: solana_mpp::protocol::solana::mints::USDT_MAINNET.to_string(),
+                raw_amount: 999_999,
+                ui_amount: 0.999999,
+                symbol: Some("USDT"),
+            }],
+        };
+
+        assert!(select_candidate_index_for_balances(&candidates, &balances).is_none());
     }
 
     // ── check_client_network_intent ────────────────────────────────────────

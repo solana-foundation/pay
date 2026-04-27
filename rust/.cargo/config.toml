@@ -1,2 +1,5 @@
 [alias]
 cli-install = "install --path crates/cli --locked --force"
+
+[net]
+git-fetch-with-cli = true

@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { explorerTokenUrl } from "../hooks/useConfig";
 
 interface EndpointInfo {
   method: string;
@@ -127,7 +128,7 @@ export function Sidebar() {
           <div className="meta-row">
             <span className="meta-label">Recipient</span>
             <a
-              href={`https://explorer.solana.com/address/${config.recipient}/tokens?cluster=custom&customUrl=${encodeURIComponent(config.rpcUrl)}`}
+              href={explorerTokenUrl(config.recipient, config)}
               target="_blank"
               rel="noopener"
               className="meta-pill"
