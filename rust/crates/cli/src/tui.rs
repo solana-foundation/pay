@@ -16,8 +16,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use pay_core::client::balance::{AccountBalances, ReceivedFunds};
-use qrcode::QrCode;
-use qrcode::render::unicode;
+use qrcode::{Color as QrColor, QrCode};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -31,6 +30,12 @@ const POLL_COUNTDOWN: Duration = Duration::from_secs(4);
 /// Result from the polling thread: what changed + current totals.
 struct TopupDetected {
     received: ReceivedFunds,
+}
+
+struct RenderedQr {
+    lines: Vec<Line<'static>>,
+    width: u16,
+    height: u16,
 }
 
 /// What the status line should show.
@@ -61,7 +66,6 @@ const TOPUP_MAIN_BG: Color = Color::Rgb(9, 9, 11);
 const TOPUP_CARD_BG: Color = Color::Rgb(39, 39, 42);
 const TOPUP_CARD_ACTIVE_BG: Color = Color::Rgb(74, 222, 128);
 const TOPUP_CARD_INACTIVE_SELECTED_BG: Color = Color::Rgb(34, 84, 61);
-const TOPUP_CARD_ACTIVE_FG: Color = Color::Rgb(24, 24, 27);
 const SOLANA_PURPLE: Color = Color::Rgb(153, 69, 255);
 const SOLANA_BLUE: Color = Color::Rgb(80, 120, 255);
 const SOLANA_GREEN: Color = Color::Rgb(20, 241, 149);
@@ -498,6 +502,7 @@ fn render_topup_selector(
     amount_pos: usize,
     blink: Option<&BlinkState>,
 ) {
+    frame.render_widget(Clear, area);
     frame.render_widget(
         Block::default().style(Style::default().bg(TOPUP_MAIN_BG)),
         area,
@@ -563,45 +568,45 @@ fn render_topup_selector(
         let chunk_idx = idx * 2;
         let is_selected = idx == selected;
         let is_active = is_selected && focus == TopupFocus::Methods;
-        let card_bg = if is_active {
+        let border_color = if is_active {
             TOPUP_CARD_ACTIVE_BG
         } else if is_selected {
             TOPUP_CARD_INACTIVE_SELECTED_BG
+        } else {
+            Color::DarkGray
+        };
+        let title_color = if is_active {
+            TOPUP_CARD_ACTIVE_BG
+        } else {
+            Color::White
+        };
+        let subtitle_color = if is_selected {
+            Color::White
+        } else {
+            Color::Gray
+        };
+        let marker_color = if is_selected {
+            TOPUP_CARD_ACTIVE_BG
         } else {
             TOPUP_CARD_BG
         };
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(card_bg))
-            .style(Style::default().bg(card_bg));
+            .border_style(Style::default().fg(border_color))
+            .style(Style::default().bg(TOPUP_CARD_BG));
         let card = Paragraph::new(vec![
             Line::from(Span::styled(
                 option.title(),
                 Style::default()
-                    .fg(if is_selected {
-                        TOPUP_CARD_ACTIVE_FG
-                    } else {
-                        Color::White
-                    })
+                    .fg(title_color)
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(vec![
                 Span::styled(
                     if is_active { "● " } else { "  " },
-                    Style::default().fg(if is_selected {
-                        TOPUP_CARD_ACTIVE_FG
-                    } else {
-                        Color::DarkGray
-                    }),
+                    Style::default().fg(marker_color),
                 ),
-                Span::styled(
-                    option.subtitle(),
-                    Style::default().fg(if is_selected {
-                        TOPUP_CARD_ACTIVE_FG
-                    } else {
-                        Color::Gray
-                    }),
-                ),
+                Span::styled(option.subtitle(), Style::default().fg(subtitle_color)),
             ]),
         ])
         .block(block);
@@ -640,36 +645,31 @@ fn render_qr_detail(
 
     // Compute QR size to get the exact area it occupies, even during blink.
     let url = solana_pay_url(pubkey, amount_pos);
-    let qr_lines = render_qr(&url).unwrap_or_else(|_| {
-        vec![Line::from(Span::styled(
-            "QR unavailable",
-            Style::default().fg(Color::DarkGray),
-        ))]
-    });
+    let qr = render_qr(&url, split[0].width, split[0].height)
+        .ok()
+        .flatten()
+        .unwrap_or_else(unavailable_qr);
     let qr_area = Layout::vertical([
         Constraint::Min(0),
-        Constraint::Length(qr_lines.len() as u16),
+        Constraint::Length(qr.height),
         Constraint::Min(0),
     ])
     .split(split[0]);
 
-    // Constrain to a square area centered in the available space.
-    let qr_width = qr_lines.first().map(|l| l.width()).unwrap_or(0) as u16;
-    let qr_height = qr_lines.len() as u16;
-    let h_pad = qr_area[1].width.saturating_sub(qr_width) / 2;
-    let v_pad = qr_area[1].height.saturating_sub(qr_height) / 2;
+    let h_pad = qr_area[1].width.saturating_sub(qr.width) / 2;
+    let v_pad = qr_area[1].height.saturating_sub(qr.height) / 2;
     let qr_rect = Rect {
         x: qr_area[1].x + h_pad,
         y: qr_area[1].y + v_pad,
-        width: qr_width.min(qr_area[1].width),
-        height: qr_height.min(qr_area[1].height),
+        width: qr.width.min(qr_area[1].width),
+        height: qr.height.min(qr_area[1].height),
     };
 
     if let Some(b) = blink {
         render_success_checkmark(frame, qr_rect, b.visible);
     } else {
         frame.render_widget(
-            Paragraph::new(qr_lines).style(Style::default().bg(TOPUP_MAIN_BG).fg(Color::White)),
+            Paragraph::new(qr.lines).style(Style::default().bg(TOPUP_MAIN_BG).fg(Color::White)),
             qr_rect,
         );
     }
@@ -775,24 +775,85 @@ fn render_provider_list(
     );
 }
 
-fn render_qr(data: &str) -> Result<Vec<Line<'static>>, qrcode::types::QrError> {
-    let code = QrCode::with_error_correction_level(data.as_bytes(), qrcode::EcLevel::L)?;
-    let rendered = code
-        .render::<unicode::Dense1x2>()
-        .dark_color(unicode::Dense1x2::Dark)
-        .light_color(unicode::Dense1x2::Light)
-        .quiet_zone(false)
-        .build();
+fn unavailable_qr() -> RenderedQr {
+    let lines = vec![Line::from(Span::styled(
+        "QR unavailable",
+        Style::default().fg(Color::DarkGray),
+    ))];
+    RenderedQr {
+        width: lines.first().map(Line::width).unwrap_or(0) as u16,
+        height: lines.len() as u16,
+        lines,
+    }
+}
 
-    Ok(rendered
-        .lines()
-        .map(|line| {
-            Line::from(Span::styled(
-                line.to_string(),
-                Style::default().fg(Color::White),
-            ))
-        })
-        .collect())
+fn render_qr(
+    data: &str,
+    max_width: u16,
+    max_height: u16,
+) -> Result<Option<RenderedQr>, qrcode::types::QrError> {
+    let code = QrCode::with_error_correction_level(data.as_bytes(), qrcode::EcLevel::L)?;
+    let modules = code.width();
+    let Some((module_cols, module_subrows)) =
+        choose_qr_module_cells(modules, max_width, max_height)
+    else {
+        return Ok(None);
+    };
+
+    let scaled_rows = modules * module_subrows;
+    let mut lines = Vec::with_capacity(scaled_rows.div_ceil(2));
+    for top_subrow in (0..scaled_rows).step_by(2) {
+        let mut spans = Vec::with_capacity(modules);
+        for x in 0..modules {
+            let top_dark = qr_subrow_dark(&code, x, top_subrow, module_subrows);
+            let bottom_dark = qr_subrow_dark(&code, x, top_subrow + 1, module_subrows);
+            spans.push(render_qr_half_block(top_dark, bottom_dark, module_cols));
+        }
+
+        lines.push(Line::from(spans));
+    }
+    let width = lines.first().map(Line::width).unwrap_or(0) as u16;
+    let height = lines.len() as u16;
+
+    Ok(Some(RenderedQr {
+        lines,
+        width,
+        height,
+    }))
+}
+
+fn qr_subrow_dark(code: &QrCode, x: usize, subrow: usize, module_subrows: usize) -> bool {
+    let y = subrow / module_subrows;
+    y < code.width() && code[(x, y)] != QrColor::Light
+}
+
+fn render_qr_half_block(top_dark: bool, bottom_dark: bool, module_cols: usize) -> Span<'static> {
+    let cells = match (top_dark, bottom_dark) {
+        (true, true) => " ".repeat(module_cols),
+        (true, false) => "▀".repeat(module_cols),
+        (false, true) => "▄".repeat(module_cols),
+        (false, false) => " ".repeat(module_cols),
+    };
+
+    let style = match (top_dark, bottom_dark) {
+        (true, true) => Style::default().bg(Color::White),
+        (true, false) | (false, true) => Style::default().fg(Color::White).bg(TOPUP_MAIN_BG),
+        (false, false) => Style::default().bg(TOPUP_MAIN_BG),
+    };
+
+    Span::styled(cells, style)
+}
+
+fn choose_qr_module_cells(
+    modules: usize,
+    max_width: u16,
+    max_height: u16,
+) -> Option<(usize, usize)> {
+    let max_cols = (usize::from(max_width) / modules).min(8);
+    let max_subrows = ((usize::from(max_height) * 2) / modules).min(8);
+    let module_size = max_cols.min(max_subrows);
+
+    (module_size > 0).then_some((module_size, module_size))
 }
 
 fn render_topup_controls(
@@ -1454,4 +1515,54 @@ fn render_controls(frame: &mut ratatui::Frame, area: Rect) {
         Paragraph::new(line).style(Style::default().bg(TOPUP_SIDEBAR_BG)),
         area,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE_SOLANA_PAY_URL: &str = "solana:11111111111111111111111111111111?amount=5&spl-token=\
+         EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
+    #[test]
+    fn topup_qr_render_keeps_square_physical_geometry() {
+        let qr = render_qr(SAMPLE_SOLANA_PAY_URL, 120, 60)
+            .expect("QR should encode")
+            .expect("QR should fit");
+
+        assert!(qr.width <= 120);
+        assert!(qr.height <= 60);
+
+        let physical_width = usize::from(qr.width);
+        let physical_height = usize::from(qr.height) * 2;
+        assert!(physical_width.abs_diff(physical_height) <= 1);
+    }
+
+    #[test]
+    fn topup_qr_render_defaults_to_two_column_modules() {
+        let qr = render_qr(SAMPLE_SOLANA_PAY_URL, 120, 60)
+            .expect("QR should encode")
+            .expect("QR should fit");
+
+        let physical_width = usize::from(qr.width);
+        let physical_height = usize::from(qr.height) * 2;
+        assert!(physical_width.abs_diff(physical_height) <= 1);
+    }
+
+    #[test]
+    fn topup_qr_render_fits_compact_terminal_area() {
+        let qr = render_qr(SAMPLE_SOLANA_PAY_URL, 120, 30)
+            .expect("QR should encode")
+            .expect("QR should fit");
+
+        assert!(qr.width <= 120);
+        assert!(qr.height <= 30);
+    }
+
+    #[test]
+    fn topup_qr_render_refuses_to_clip() {
+        let qr = render_qr(SAMPLE_SOLANA_PAY_URL, 1, 1).expect("QR should encode");
+
+        assert!(qr.is_none());
+    }
 }
