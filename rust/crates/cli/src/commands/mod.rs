@@ -78,6 +78,13 @@ pub enum ToolKind {
 }
 
 impl Command {
+    pub fn otlp_sidecar(&self) -> Option<&str> {
+        match self {
+            Command::Server { command } => command.otlp_sidecar(),
+            _ => None,
+        }
+    }
+
     /// Which tool this command wraps.
     #[allow(dead_code)] // used by session budget TUI (currently disabled)
     pub fn tool_kind(&self) -> ToolKind {

@@ -15,6 +15,8 @@ use pay_types::metering::{ApiSpec, AuthConfig, RoutingConfig};
 use serde_json::json;
 use tokio::sync::RwLock;
 
+use crate::server::telemetry;
+
 /// Headers to strip when forwarding to upstream.
 const STRIP_HEADERS: &[&str] = &[
     "host",
@@ -52,6 +54,11 @@ pub fn resolve_routing<'a>(api: &'a ApiSpec, path: &str) -> &'a RoutingConfig {
 /// - Returns the upstream response (status, headers, body)
 ///
 /// For `Respond` routing, returns 200 with `{"status":"ok"}`.
+#[tracing::instrument(
+    name = "proxy_forward",
+    skip(api, headers, body),
+    fields(subdomain = %api.subdomain, method = %method, path = %uri.path())
+)]
 pub async fn forward_request(
     api: &ApiSpec,
     method: Method,
@@ -160,6 +167,12 @@ pub async fn forward_request(
                     }
                 }
                 Err(e) => {
+                    telemetry::record_upstream_error(
+                        &api.subdomain,
+                        uri.path(),
+                        &upstream_url,
+                        &format!("OAuth2 token error: {e}"),
+                    );
                     tracing::error!(error = %e, "Failed to fetch OAuth2 token");
                     return Err(error_response(
                         StatusCode::BAD_GATEWAY,
@@ -180,6 +193,7 @@ pub async fn forward_request(
     }
 
     let upstream_resp = upstream_req.send().await.map_err(|e| {
+        telemetry::record_upstream_error(&api.subdomain, uri.path(), &upstream_url, &e.to_string());
         tracing::error!(error = %e, upstream = %upstream_url, "Upstream request failed");
         error_response(StatusCode::BAD_GATEWAY, &format!("Upstream error: {e}"))
     })?;
@@ -187,6 +201,14 @@ pub async fn forward_request(
     // Build response.
     let status = StatusCode::from_u16(upstream_resp.status().as_u16())
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    if status.is_server_error() {
+        telemetry::record_upstream_error(
+            &api.subdomain,
+            uri.path(),
+            &upstream_url,
+            &format!("upstream returned {status}"),
+        );
+    }
     let mut response_headers = HeaderMap::new();
     // Skip headers that reqwest handles (it auto-decompresses gzip).
     let skip_response_headers = ["content-encoding", "content-length", "transfer-encoding"];
@@ -204,6 +226,12 @@ pub async fn forward_request(
     }
 
     let response_body = upstream_resp.bytes().await.map_err(|e| {
+        telemetry::record_upstream_error(
+            &api.subdomain,
+            uri.path(),
+            &upstream_url,
+            &format!("upstream body read error: {e}"),
+        );
         error_response(
             StatusCode::BAD_GATEWAY,
             &format!("Upstream body read error: {e}"),

@@ -10,6 +10,7 @@ use owo_colors::OwoColorize;
 use pay_core::PaymentState;
 use pay_core::accounts::AccountsStore;
 use pay_core::server::session::SessionMpp;
+use pay_core::server::telemetry::FeePayerWallet;
 use pay_types::metering::{ApiSpec, OperatorConfig, SignerConfig};
 use solana_mpp::server::Mpp;
 use solana_mpp::solana_keychain::SolanaSigner;
@@ -54,6 +55,10 @@ pub struct StartCommand {
     /// Automatically enabled in sandbox mode (`pay --sandbox server start`).
     #[arg(long)]
     pub debugger: bool,
+
+    /// Export traces and metrics to an OTLP HTTP sidecar at HOST:PORT.
+    #[arg(long, value_name = "HOST:PORT")]
+    pub otlp_sidecar: Option<String>,
 }
 
 #[derive(Clone)]
@@ -62,6 +67,7 @@ struct AppState {
     mpps: Vec<Mpp>,
     session_mpp: Option<Arc<SessionMpp>>,
     browser_rpc_url: Option<String>,
+    fee_payer_wallet: Option<FeePayerWallet>,
 }
 
 impl PaymentState for AppState {
@@ -79,6 +85,9 @@ impl PaymentState for AppState {
     }
     fn session_mpp(&self) -> Option<&SessionMpp> {
         self.session_mpp.as_deref()
+    }
+    fn fee_payer_wallet(&self) -> Option<&FeePayerWallet> {
+        self.fee_payer_wallet.as_ref()
     }
 }
 
@@ -597,6 +606,17 @@ impl StartCommand {
                 );
             }
 
+            let fee_payer_wallet = if fee_payer {
+                fee_payer_signer.as_ref().map(|signer| {
+                    FeePayerWallet::new(rpc_url.clone(), signer.pubkey().to_string())
+                })
+            } else {
+                None
+            };
+            if let Some(ref wallet) = fee_payer_wallet {
+                wallet.observe("startup", &api.subdomain, "__startup").await;
+            }
+
             eprintln!(
                 "  {}",
                 format!(
@@ -679,6 +699,7 @@ impl StartCommand {
                 mpps,
                 session_mpp,
                 browser_rpc_url: Some(BROWSER_RPC_PROXY_PATH.to_string()),
+                fee_payer_wallet,
             };
 
             let pdb_state = if debugger {

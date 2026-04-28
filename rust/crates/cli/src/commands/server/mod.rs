@@ -15,6 +15,14 @@ pub enum ServerCommand {
 }
 
 impl ServerCommand {
+    pub fn otlp_sidecar(&self) -> Option<&str> {
+        match self {
+            Self::Start(cmd) => cmd.otlp_sidecar.as_deref(),
+            Self::Demo(cmd) => cmd.otlp_sidecar.as_deref(),
+            Self::Scaffold(_) => None,
+        }
+    }
+
     pub fn run(self, active_account_name: Option<&str>, sandbox: bool) -> pay_core::Result<()> {
         match self {
             Self::Start(cmd) => cmd.run(active_account_name, sandbox),

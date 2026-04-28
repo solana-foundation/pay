@@ -31,6 +31,10 @@ pub struct DemoCommand {
     /// Use local Surfpool (http://localhost:8899) instead of hosted sandbox.
     #[arg(long)]
     pub local: bool,
+
+    /// Export traces and metrics to an OTLP HTTP sidecar at HOST:PORT.
+    #[arg(long, value_name = "HOST:PORT")]
+    pub otlp_sidecar: Option<String>,
 }
 
 impl DemoCommand {
@@ -63,6 +67,7 @@ impl DemoCommand {
             currency: self.currency,
             rpc_url,
             debugger: true,
+            otlp_sidecar: self.otlp_sidecar,
         };
         cmd.run(active_account_name, true)
     }

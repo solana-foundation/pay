@@ -49,4 +49,7 @@ pub trait PaymentState: Clone + Send + Sync + 'static {
     fn session_mpp(&self) -> Option<&server::session::SessionMpp> {
         None
     }
+    fn fee_payer_wallet(&self) -> Option<&server::telemetry::FeePayerWallet> {
+        None
+    }
 }

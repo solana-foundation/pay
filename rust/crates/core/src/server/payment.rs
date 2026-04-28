@@ -16,6 +16,7 @@ use solana_mpp::{
 
 use crate::PaymentState;
 use crate::server::metering::{self, RequestProperties};
+use crate::server::telemetry;
 
 /// Small non-generic helpers keep the middleware readable and, importantly for
 /// coverage tooling, avoid burying the critical payment branches inside one
@@ -183,7 +184,16 @@ pub async fn payment_middleware<S: PaymentState>(
             endpoint.and_then(|ep| ep.description.as_deref()),
         ),
         Some(auth_value) => {
-            handle_charge_authorization(&mpps, auth_value, subdomain, &path, req, next).await
+            handle_charge_authorization(
+                &mpps,
+                auth_value,
+                subdomain,
+                &path,
+                state.fee_payer_wallet().cloned(),
+                req,
+                next,
+            )
+            .await
         }
     }
 }
@@ -202,6 +212,10 @@ fn session_challenge_response(
     subdomain: &str,
     price: Option<metering::ResolvedPrice>,
 ) -> Response {
+    let amount_usd = price
+        .as_ref()
+        .and_then(|p| p.dimensions.first())
+        .map(|d| d.price_usd / d.scale.max(1) as f64);
     let body = json!({
         "error": "payment_required",
         "message": "This endpoint requires a session payment.",
@@ -219,10 +233,23 @@ fn session_challenge_response(
                 .into_response();
         }
     };
-    tracing::info!(subdomain = %subdomain, path = %path, "402 Session Required");
+    telemetry::record_402_challenge_sent(
+        "session",
+        subdomain,
+        path,
+        method.as_str(),
+        amount_usd,
+        "session",
+        1,
+    );
     challenge_json_response(body, &[www_auth])
 }
 
+#[tracing::instrument(
+    name = "session_authorization",
+    skip(session_mpp, auth_value, req, next),
+    fields(subdomain = %subdomain, path = %path)
+)]
 async fn handle_session_authorization(
     session_mpp: &crate::server::session::SessionMpp,
     auth_value: &str,
@@ -237,11 +264,27 @@ async fn handle_session_authorization(
             match outcome {
                 SessionOutcome::Active(_state) => {
                     tracing::info!(subdomain = %subdomain, path = %path, "Session action accepted — forwarding");
-                    next.run(req).await
+                    let response = next.run(req).await;
+                    telemetry::record_paid_request_completed(
+                        "session",
+                        subdomain,
+                        path,
+                        response.status(),
+                        None,
+                    );
+                    response
                 }
                 SessionOutcome::Voucher(_cumulative) => {
                     tracing::info!(subdomain = %subdomain, path = %path, "Voucher accepted — forwarding");
-                    next.run(req).await
+                    let response = next.run(req).await;
+                    telemetry::record_paid_request_completed(
+                        "session",
+                        subdomain,
+                        path,
+                        response.status(),
+                        None,
+                    );
+                    response
                 }
                 SessionOutcome::Closed(_params) => {
                     tracing::info!(subdomain = %subdomain, path = %path, "Session closed");
@@ -250,6 +293,7 @@ async fn handle_session_authorization(
             }
         }
         Err(e) => {
+            telemetry::record_settlement_error("session", subdomain, path, &e.to_string(), true);
             tracing::warn!(subdomain = %subdomain, path = %path, error = %e, "Session action failed");
             (
                 StatusCode::PAYMENT_REQUIRED,
@@ -294,6 +338,7 @@ fn charge_challenge_response(
         ) {
             Ok(challenge) => challenges.push(challenge),
             Err(e) => {
+                telemetry::record_challenge_error("mpp", mpp.currency(), &e.to_string());
                 tracing::error!(error = %e, currency = %mpp.currency(), "Failed to generate challenge");
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -329,7 +374,20 @@ fn charge_challenge_response(
         },
     });
 
-    tracing::info!(subdomain = %request.subdomain, path = %request.path, amount = %amount, challenges = challenges.len(), "402 Payment Required");
+    let currencies = mpps
+        .iter()
+        .map(|mpp| mpp.currency())
+        .collect::<Vec<_>>()
+        .join(",");
+    telemetry::record_402_challenge_sent(
+        "mpp",
+        request.subdomain,
+        request.path,
+        request.method.as_str(),
+        amount.parse::<f64>().ok(),
+        &currencies,
+        challenges.len(),
+    );
 
     if request.accepts_html {
         return html_challenge_response(
@@ -383,11 +441,17 @@ fn resolve_charge_splits(
     }
 }
 
+#[tracing::instrument(
+    name = "charge_authorization",
+    skip(mpps, auth_value, fee_payer_wallet, req, next),
+    fields(subdomain = %subdomain, path = %path)
+)]
 async fn handle_charge_authorization(
     mpps: &[&solana_mpp::server::Mpp],
     auth_value: &str,
     subdomain: &str,
     path: &str,
+    fee_payer_wallet: Option<telemetry::FeePayerWallet>,
     req: Request<Body>,
     next: Next,
 ) -> Response {
@@ -407,8 +471,31 @@ async fn handle_charge_authorization(
     for mpp in mpps {
         match mpp.verify_credential(&credential).await {
             Ok(receipt) => {
+                let payment = decode_payment_amount(&credential, mpp.decimals() as u8);
+                telemetry::record_payment_collected(
+                    "mpp",
+                    subdomain,
+                    path,
+                    payment.as_ref(),
+                    &receipt.reference,
+                );
                 tracing::info!(subdomain = %subdomain, path = %path, reference = %receipt.reference, "Payment verified — forwarding");
                 let mut response = next.run(req).await;
+                let status = response.status();
+                telemetry::record_paid_request_completed(
+                    "mpp",
+                    subdomain,
+                    path,
+                    status,
+                    payment.as_ref(),
+                );
+                if let Some(wallet) = fee_payer_wallet.clone() {
+                    let subdomain = subdomain.to_string();
+                    let path = path.to_string();
+                    tokio::spawn(async move {
+                        wallet.observe("payment_verified", &subdomain, &path).await;
+                    });
+                }
                 if let Ok(receipt_str) = format_receipt(&receipt)
                     && let Ok(v) = axum::http::HeaderValue::from_str(&receipt_str)
                 {
@@ -423,8 +510,17 @@ async fn handle_charge_authorization(
     let error = last_error
         .unwrap_or_else(|| solana_mpp::server::VerificationError::new("MPP not configured"));
     let message = readable_verification_message(&error);
+    telemetry::record_settlement_error("mpp", subdomain, path, &message, error.retryable);
     tracing::warn!(subdomain = %subdomain, path = %path, error = %message, "Payment verification failed");
     verification_failed_response(mpps, &error)
+}
+
+fn decode_payment_amount(
+    credential: &solana_mpp::PaymentCredential,
+    decimals: u8,
+) -> Option<telemetry::PaymentAmount> {
+    let request: solana_mpp::ChargeRequest = credential.challenge.request.decode().ok()?;
+    telemetry::payment_amount_from_raw(&request.amount, decimals, request.currency)
 }
 
 fn verification_failed_response(

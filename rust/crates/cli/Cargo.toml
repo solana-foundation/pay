@@ -25,6 +25,11 @@ serde_json = { workspace = true }
 serde_yml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+opentelemetry-semantic-conventions = { workspace = true }
+opentelemetry_sdk = { workspace = true }
 pay-mcp = { workspace = true }
 reqwest = { workspace = true }
 solana-mpp = { workspace = true }

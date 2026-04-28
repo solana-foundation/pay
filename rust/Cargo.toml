@@ -51,6 +51,16 @@ crossterm = { version = "0.28", default-features = false }
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-opentelemetry = "0.32"
+opentelemetry = "0.31"
+opentelemetry-otlp = { version = "0.31", default-features = false, features = [
+    "http-proto",
+    "metrics",
+    "reqwest-blocking-client",
+    "trace",
+] }
+opentelemetry-semantic-conventions = "0.31"
+opentelemetry_sdk = "0.31"
 
 # Configuration
 figment = { version = "0.10", features = ["toml", "env"] }

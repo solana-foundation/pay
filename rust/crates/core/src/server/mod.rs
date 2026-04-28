@@ -12,4 +12,7 @@ pub mod proxy;
 #[cfg(feature = "server")]
 pub mod session;
 
+#[cfg(feature = "server")]
+pub mod telemetry;
+
 pub use accounting::{AccountingKey, AccountingStore, InMemoryStore, current_period};
