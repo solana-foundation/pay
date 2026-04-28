@@ -269,7 +269,7 @@ fn handle_outcome(
                 eprintln!(
                     "{}",
                     format!(
-                        "402 Payment Required (MPP) — {} {} — use --yolo to pay automatically",
+                        "402 Payment Required (MPP) — {} {} — use --yolo for capped auto-pay",
                         req.amount, req.currency
                     )
                     .dimmed()
@@ -325,7 +325,7 @@ fn handle_outcome(
                 eprintln!(
                     "{}",
                     format!(
-                        "402 Payment Required (MPP session) — cap ${cap_usdc:.2} USDC — use --yolo to open a session automatically",
+                        "402 Payment Required (MPP session) — cap ${cap_usdc:.2} USDC — use --yolo for capped auto-pay",
                     )
                     .dimmed()
                 );
@@ -378,7 +378,7 @@ fn handle_outcome(
                 eprintln!(
                     "{}",
                     format!(
-                        "402 Payment Required (x402) — {} {} — use --yolo to pay automatically",
+                        "402 Payment Required (x402) — {} {} — use --yolo for capped auto-pay",
                         challenge.requirements.amount, challenge.requirements.currency
                     )
                     .dimmed()

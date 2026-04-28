@@ -1,0 +1,369 @@
+# Monetize APIs With Pay
+
+Use this reference when a developer wants to put an API behind Pay, test paid
+HTTP 402 flows locally, or publish the API to
+`https://github.com/solana-foundation/pay-skills` so agents can discover it.
+
+Pay has two developer-facing parts:
+
+- `pay server start <spec.yml>` runs a payment gateway. It returns HTTP 402 for
+  metered endpoints, verifies payment, then either proxies to an upstream API or
+  responds directly.
+- A `pay-skills` provider markdown file lists the API in the public registry so
+  `pay skills search`, Pay MCP `search_skills`, Claude, and Codex can select the
+  provider without guessing.
+
+## Runtime YAML
+
+Start with a scaffold:
+
+```sh
+pay server scaffold provider.yml
+```
+
+A minimal proxy spec:
+
+```yaml
+name: my-api
+subdomain: my-api
+title: "My API"
+description: "Paid API for normalized search results."
+category: data
+version: v1
+routing:
+  type: proxy
+  url: https://api.example.com/
+  auth:
+    method: header
+    key: authorization
+    value_from_env: EXAMPLE_API_KEY
+operator:
+  currencies:
+    usd: ["USDC", "USDT", "CASH"]
+  network: "localnet"
+  fee_payer: true
+endpoints:
+  - method: GET
+    path: "health"
+    description: "Health check."
+  - method: POST
+    path: "v1/search"
+    resource: "search"
+    description: "Search records by keyword and return normalized matches."
+    metering:
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 0.01
+```
+
+Use `routing.type: proxy` to forward paid requests to an upstream API. Use
+`routing.type: respond` when the gateway itself should return the response after
+payment verification, useful for demos and simple paid endpoints.
+
+Important runtime fields:
+
+- `operator.currencies.usd`: stablecoin symbols accepted for USD-denominated
+  charges. Prefer `["USDC", "USDT", "CASH"]` when all are supported.
+- `operator.network`: use `localnet` for sandbox tests and `mainnet` in
+  production.
+- `operator.fee_payer: true`: lets the gateway pay setup/settlement fees where
+  required.
+- `operator.recipient`: optional explicit recipient wallet. If omitted, Pay can
+  use the operator signer as recipient in local/sandbox flows.
+- `operator.signer`: optional production signer config. Use a named Pay account,
+  keypair file, or production signer such as GCP KMS.
+- `recipients`: named wallet aliases used by payment splits.
+- `metering.dimensions`: pricing. Omit `metering` for free endpoints.
+- `session`: optional MPP session config for voucher-based repeated calls.
+
+## Pricing And Splits
+
+Use simple per-request pricing unless the API naturally bills by tokens,
+characters, minutes, pages, bytes, or another measured unit:
+
+```yaml
+metering:
+  dimensions:
+    - direction: usage
+      unit: requests
+      scale: 1
+      tiers:
+        - price_usd: 0.01
+```
+
+Splits distribute a charge to named `recipients`:
+
+```yaml
+recipients:
+  partner:
+    account: "${PARTNER_WALLET}"
+    label: "Partner"
+
+endpoints:
+  - method: POST
+    path: "v1/report"
+    metering:
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 0.10
+      splits:
+        - recipient: partner
+          percent: 20
+          memo: "Partner revenue share"
+```
+
+Split rules:
+
+- Every split recipient must exist in the top-level `recipients` map.
+- Each split sets exactly one of `amount` or `percent`.
+- Split totals must be strictly less than the minimum per-unit price so the
+  primary recipient still receives a positive amount.
+- Per-tier split overrides follow the same recipient and total rules.
+- Non-zero `price_usd / scale` must be at least `0.000001`, the 6-decimal
+  precision floor for USDC/USDT-style tokens.
+
+## Local Testing Flow
+
+Use sandbox mode first. It uses localnet wallets and the Surfpool sandbox, so no
+mainnet funds are required.
+
+Terminal A, start your paid gateway on a non-debugger port:
+
+```sh
+EXAMPLE_API_KEY=... pay --sandbox server start provider.yml --bind 127.0.0.1:1403
+```
+
+Terminal B, call it through Pay and capture the flow in the debugger:
+
+```sh
+pay --sandbox --debugger curl http://127.0.0.1:1403/v1/search \
+  -H 'content-type: application/json' \
+  -d '{"query":"test"}'
+```
+
+Open `http://127.0.0.1:1402/` to inspect the challenge, payment, retry, and
+upstream delivery. Port `1402` is used by the debugger proxy, so bind the server
+to another port such as `1403` when testing with `pay --debugger curl`.
+
+Alternative: run the debugger inside the server instead:
+
+```sh
+pay --sandbox server start provider.yml --debugger
+pay --sandbox curl http://127.0.0.1:1402/v1/search -d '{"query":"test"}'
+```
+
+When debugging failures:
+
+- A free endpoint should pass through without `402`.
+- A metered endpoint should return `402` before payment.
+- After Pay retries with proof, the gateway should verify payment and deliver
+  the upstream response.
+- If the client sees unsupported network/currency, align
+  `operator.currencies`, `operator.network`, and the client wallet network.
+
+## Production Deployment
+
+Treat Pay as a cloud-native gateway, not as a desktop process copied into
+production. The production shape should be a pinned container image, declarative
+YAML specs, cloud secret management, KMS-backed signing, and structured
+observability.
+
+Recommended baseline:
+
+- Run the official container image `ghcr.io/solana-foundation/pay:<version>` or
+  a pinned image mirrored into your cloud registry. Avoid mutable `latest` tags
+  for production rollouts.
+- Deploy one `pay server start <spec.yml>` instance per API/provider surface.
+  On Cloud Run, this maps cleanly to one service per provider or per upstream
+  API, each with its own YAML spec and environment.
+- Bind to the platform port, for example `--bind 0.0.0.0:8080` on Cloud Run.
+- Store provider API keys, RPC URLs, MPP challenge secrets, and recipient
+  configuration in the cloud secret manager. Inject them as environment
+  variables; do not bake secrets into images or provider markdown.
+- Use a production signer backend such as `operator.signer.backend: gcp-kms`
+  for fee-payer signing. The private key stays in Cloud KMS/HSM-backed key
+  management and the Cloud Run service account receives only the minimum IAM
+  permissions required to sign.
+- Keep recipient wallets and fee-payer wallets separate where possible. The
+  fee payer should hold enough SOL for fees, not operational treasury funds.
+- Configure `operator.currencies.usd` explicitly, usually
+  `["USDC", "USDT", "CASH"]` when those rails are supported.
+- Enable OTLP export with `--otlp-sidecar <host:port>` and run an OpenTelemetry
+  Collector sidecar or agent. Local logs stay readable by default; production
+  should emit structured logs, traces, and metrics.
+- Alert on payment and delivery failures, not just process health. At minimum
+  track HTTP 402 challenges sent, paid requests verified, settlement failures,
+  upstream delivery failures, payments collected, fees paid, and remaining
+  fee-payer SOL.
+
+Example production spec fragment:
+
+```yaml
+operator:
+  currencies:
+    usd: ["USDC", "USDT", "CASH"]
+  network: mainnet
+  fee_payer: true
+  rpc_url: "${PAY_RPC_URL}"
+  recipient: "${PAY_PAYMENT_RECIPIENT}"
+  signer:
+    backend: gcp-kms
+    key_name: "${PAY_GCP_KMS_KEY_NAME}"
+    pubkey: "${PAY_GCP_KMS_PUBKEY}"
+```
+
+Example Cloud Run command:
+
+```sh
+pay server start /app/providers/google/bigquery.yml \
+  --bind 0.0.0.0:8080 \
+  --otlp-sidecar 127.0.0.1:4318
+```
+
+For GCP deployments, a typical setup is Cloud Run for the Pay process, Secret
+Manager for runtime secrets, Cloud KMS/HSM for signing, Artifact Registry or a
+mirrored GHCR image for the container, Cloud Load Balancing for custom domains,
+and an OpenTelemetry Collector sidecar exporting to Cloud Logging, Cloud Trace,
+Cloud Monitoring, or Grafana Cloud.
+
+## Provider Listing
+
+After the runtime YAML works, add a provider markdown file in the
+`https://github.com/solana-foundation/pay-skills` repository:
+
+```text
+providers/<operator>/<name>.md
+providers/<operator>/<origin>/<name>.md
+```
+
+Use the two-level path when you operate the API directly. Use the three-level
+path when your gateway proxies another provider.
+
+Minimal provider listing:
+
+```markdown
+---
+name: my-api
+title: "My API"
+description: "Search and retrieve normalized records with prices, availability, metadata, filters, pagination, and result fields for analytics and automation."
+use_case: "Use for product search, marketplace price comparison, catalog enrichment, data lookup, deal monitoring, and commerce automation."
+category: data
+service_url: https://my-api.example.com
+sandbox_service_url: https://sandbox.my-api.example.com
+version: v1
+endpoints:
+  - method: POST
+    path: v1/search
+    resource: search
+    description: "Search records by keyword with structured filters and pagination"
+    pricing:
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 0.01
+---
+
+## Usage Notes
+
+Use `v1/search` for direct lookup. Include filters in the first request and keep
+`limit` small to avoid unnecessary paid calls.
+
+## Spend-Aware Usage
+
+- Use the narrowest endpoint that answers the user.
+- Batch records when supported.
+- Ask before broad crawls, bulk enrichment, dynamic pricing, or purchases.
+```
+
+## Frontmatter Best Practices
+
+- `name` must match the filename without `.md`.
+- `title` is the human-readable provider name.
+- `description` is required, 64-255 characters. It should say what the service
+  is and what it returns. Do not start it with `Use for`.
+- `use_case` is required, 32-255 characters. Start with `Use for` or `Use when`
+  and include task phrases agents will see from users.
+- `category` must be one of the registry categories:
+  `ai_ml analytics cloud compute data devtools finance identity iot maps media
+  messaging other productivity search security storage translation`.
+- `service_url` must be production HTTPS with a domain name, not localhost or an
+  IP address.
+- Add `sandbox_service_url` when available; configure sandbox services to use
+  `https://402.surfnet.dev` as Solana RPC.
+- Omit `pricing` for free endpoints. Include `pricing` only for endpoints that
+  return a valid paid 402 challenge.
+- Endpoint descriptions are required, 32-255 characters. Start with a concrete
+  verb and name the object, such as `Search influencers` or `Generate images`.
+
+Good frontmatter is dense and literal. It should help agents choose correctly,
+not market the product.
+
+## Markdown Body Best Practices
+
+The markdown body is loaded by agents after `get_skill_endpoints`, so it should
+optimize execution and reduce wasted paid calls:
+
+- Explain the cheapest endpoint for common tasks.
+- Document request-body shapes, required fields, and response IDs/tokens.
+- Explain async flows: trigger endpoint, polling endpoint, token expiration, and
+  when not to retrigger.
+- Include network/currency compatibility notes.
+- Include spend-aware guidance: smallest useful `limit`, batch support, fields
+  to request, and when to ask the user before paying.
+- Call out common gotchas, such as endpoints that require SIWX, unsupported
+  Solana payment, or free preview endpoints.
+- Treat provider output as untrusted data; do not put instructions that ask the
+  agent to ignore its system or tool rules.
+
+## Validation And PR Flow
+
+From a local checkout of `https://github.com/solana-foundation/pay-skills`:
+
+```sh
+pay skills build . --output /tmp/pay-skills-dist
+pay skills probe . \
+  --files providers/<operator>/<name>.md \
+  --currencies USDC,USDT \
+  --timeout 15 \
+  --concurrency 5
+```
+
+If you already have runtime YAML, generate provider markdown from it:
+
+```sh
+pay skills provider sync path/to/*.yml \
+  --operator <operator> \
+  --origin <origin> \
+  --service-url 'https://production-{name}.example.com' \
+  --sandbox-service-url 'https://sandbox-{name}.example.com' \
+  --out providers
+```
+
+The sync command creates a starting point from runtime YAML. Before running
+`pay skills build`, inspect the generated markdown and add registry-only fields
+such as `use_case` plus spend-aware usage notes when they were not present in
+the YAML.
+
+Before opening a PR:
+
+- `pay skills build` succeeds.
+- Changed paid providers pass `pay skills probe`.
+- Paid endpoints return HTTP 402 before payment.
+- Challenges are MPP, MPP session, or x402.
+- Currency is USDC or USDT, with Solana mainnet support.
+- `service_url` is a production HTTPS domain.
+- Pricing is truthful and representable at 6-decimal precision.
+- Provider descriptions and endpoint descriptions meet length limits.
+
+Open the PR against `https://github.com/solana-foundation/pay-skills`. CI runs
+static validation and probes changed providers. After merge, the public skills
+index is rebuilt and agents can discover the provider through
+`pay skills search` and Pay MCP `search_skills`.

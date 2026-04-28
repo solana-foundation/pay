@@ -25,7 +25,8 @@ struct Opts {
     #[clap(subcommand)]
     command: Command,
 
-    /// Automatically pay 402 challenges without prompting (no cap).
+    /// Automatically satisfy 402 challenges after the user approves a spending
+    /// cap; Pay enforces the cap and stops before the budget can be exceeded.
     /// Implied when NO_DNA is set.
     #[arg(long)]
     yolo: bool,
