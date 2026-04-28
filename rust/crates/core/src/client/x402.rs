@@ -334,16 +334,22 @@ fn format_value(v: f64) -> String {
 }
 
 fn detect_x402_version(headers: &[(String, String)], body: Option<&str>) -> u64 {
+    // Mirror `parse_x402_challenge_for_network`'s selection order so the
+    // version we report is the one whose payload the parser actually consumed.
+    // If the parser took the v1 header but we reported V2 from the body, the
+    // build path would emit a v2 envelope from v1-parsed requirements — same
+    // struct shape today but a latent mismatch the moment the wire formats
+    // diverge.
     if header_value(headers, PAYMENT_REQUIRED_HEADER).is_some() {
         return X402_VERSION_V2;
     }
 
-    if let Some(version) = body.and_then(x402_version_from_json) {
-        return version;
-    }
-
     if let Some(value) = header_value(headers, X402_V1_PAYMENT_REQUIRED_HEADER) {
         return x402_version_from_json(value).unwrap_or(X402_VERSION_V1);
+    }
+
+    if let Some(version) = body.and_then(x402_version_from_json) {
+        return version;
     }
 
     X402_VERSION_V2
@@ -468,6 +474,34 @@ mod tests {
         let challenge = parse(&[], Some(&body)).unwrap();
         assert_eq!(challenge.x402_version, X402_VERSION_V1);
         assert_eq!(challenge.requirements.amount, "5000");
+    }
+
+    #[test]
+    fn parse_v1_header_with_v2_body_keeps_v1_version() {
+        // Mixed-config server: only the v1 header is present, but the body
+        // declares x402Version=2. The upstream parser consumes the v1 header,
+        // so we must report V1 to keep the build path aligned with what was
+        // parsed — otherwise we'd emit a v2 proof for a v1-only server.
+        let v1_requirements = serde_json::json!({
+            "scheme": EXACT_SCHEME,
+            "network": "solana-devnet",
+            "maxAmountRequired": "5000",
+            "payTo": "abc123",
+            "asset": "SOL",
+            "resource": "/test"
+        });
+        let body = serde_json::json!({
+            X402_VERSION_FIELD: X402_VERSION_V2,
+            "accepts": []
+        })
+        .to_string();
+        let headers = vec![(
+            X402_V1_PAYMENT_REQUIRED_HEADER.to_string(),
+            v1_requirements.to_string(),
+        )];
+
+        let challenge = parse(&headers, Some(&body)).unwrap();
+        assert_eq!(challenge.x402_version, X402_VERSION_V1);
     }
 
     #[test]

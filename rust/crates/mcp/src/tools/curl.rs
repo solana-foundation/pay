@@ -2,6 +2,7 @@ use rmcp::model::CallToolResult;
 use rmcp::schemars;
 use schemars::JsonSchema;
 use serde::Deserialize;
+use serde_json::Value;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct Params {
@@ -13,8 +14,26 @@ pub struct Params {
         description = "Request headers as key-value pairs (e.g. {\"Authorization\": \"Bearer token\"})"
     )]
     pub headers: Option<std::collections::HashMap<String, String>>,
-    #[schemars(description = "Request body string (for POST, PUT, etc.)")]
-    pub body: Option<String>,
+    #[schemars(
+        description = "Request body for POST/PUT/PATCH. Pass either a string or a JSON value; JSON values are serialized before sending."
+    )]
+    pub body: Option<BodyParam>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum BodyParam {
+    Text(String),
+    Json(Value),
+}
+
+impl BodyParam {
+    fn into_string(self) -> Result<String, serde_json::Error> {
+        match self {
+            Self::Text(body) => Ok(body),
+            Self::Json(value) => serde_json::to_string(&value),
+        }
+    }
 }
 
 /// Prepare request headers from params — auto-injects Accept and Content-Type.
@@ -47,7 +66,14 @@ pub fn prepare_headers(
 pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
     let headers = prepare_headers(&params.headers, params.body.is_some());
     let method = params.method.clone().unwrap_or_else(|| "GET".to_string());
-    let body = params.body.clone();
+    let body = params
+        .body
+        .clone()
+        .map(BodyParam::into_string)
+        .transpose()
+        .map_err(|e| {
+            rmcp::ErrorData::invalid_params(format!("Failed to serialize request body: {e}"), None)
+        })?;
     let url = params.url.clone();
 
     let response =
@@ -205,6 +231,33 @@ mod tests {
         assert_eq!(params.method.unwrap(), "POST");
         assert_eq!(params.headers.as_ref().unwrap().len(), 1);
         assert!(params.body.is_some());
+    }
+
+    #[test]
+    fn params_deserialize_json_object_body() {
+        let json = r#"{
+            "url": "https://example.com",
+            "method": "POST",
+            "body": {"q": 1, "limit": 2}
+        }"#;
+        let params: Params = serde_json::from_str(json).unwrap();
+        let body = params.body.unwrap().into_string().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap(),
+            serde_json::json!({"q": 1, "limit": 2})
+        );
+    }
+
+    #[test]
+    fn params_deserialize_json_array_body() {
+        let json = r#"{
+            "url": "https://example.com",
+            "method": "POST",
+            "body": ["a", "b"]
+        }"#;
+        let params: Params = serde_json::from_str(json).unwrap();
+        let body = params.body.unwrap().into_string().unwrap();
+        assert_eq!(body, r#"["a","b"]"#);
     }
 
     #[test]

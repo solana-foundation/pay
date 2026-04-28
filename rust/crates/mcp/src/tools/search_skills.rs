@@ -38,6 +38,8 @@ pub struct Params {
 struct SearchResponse {
     query: String,
     candidates: Vec<CandidateEntry>,
+    selection_guidance: Vec<String>,
+    call_plan_fields: Vec<String>,
     next_step: String,
 }
 
@@ -146,7 +148,7 @@ fn search_catalog(
         max_results,
     );
 
-    let candidates = ranked
+    let candidates: Vec<CandidateEntry> = ranked
         .into_iter()
         .map(|candidate| {
             let fqn = candidate.service.name;
@@ -174,12 +176,70 @@ fn search_catalog(
             }
         })
         .collect();
+    let next_step = next_step_for_candidates(&candidates);
 
     SearchResponse {
         query,
         candidates,
-        next_step: "Pick the best candidate and endpoint only if they clearly match the user task. If endpoint details are insufficient, call get_skill_endpoints with the chosen fqn before curl.".to_string(),
+        selection_guidance: selection_guidance(),
+        call_plan_fields: call_plan_fields(),
+        next_step,
     }
+}
+
+fn selection_guidance() -> Vec<String> {
+    [
+        "Use the top candidate only when its provider and endpoint clearly match the user's task.",
+        "Prefer exact endpoint fit over broad provider metadata.",
+        "Hard-reject wrong network/currency, unusable method/body shape, invalid 402 challenges, and prices above the user's stated limit.",
+        "For close candidates, compare endpoint fit, supported network/currency, usable request shape, freshness/result quality, and total estimated price in that order.",
+        "Call get_skill_endpoints once for the most likely provider when compact endpoint candidates are insufficient; do not browse every provider.",
+        "Ask the user before multi-call exploration, schema probing, broad crawls, unclear pricing, or a provider tie that remains unresolved.",
+    ]
+    .into_iter()
+    .map(ToString::to_string)
+    .collect()
+}
+
+fn call_plan_fields() -> Vec<String> {
+    [
+        "provider fqn",
+        "endpoint method and exact url",
+        "why this endpoint matches",
+        "expected paid calls",
+        "estimated total spend",
+        "smallest useful request body or query",
+    ]
+    .into_iter()
+    .map(ToString::to_string)
+    .collect()
+}
+
+fn next_step_for_candidates(candidates: &[CandidateEntry]) -> String {
+    let Some(top) = candidates.first() else {
+        return "No matching provider was found. Retry search_skills once with refresh=true if the catalog may be stale; otherwise ask the user before using a non-Pay fallback.".to_string();
+    };
+
+    if top.endpoint_lookup_error.is_some() || top.endpoints.is_empty() {
+        return format!(
+            "Inspect `{}` with get_skill_endpoints before paying; compact endpoint details were unavailable or incomplete.",
+            top.fqn
+        );
+    }
+
+    if let Some(second) = candidates.get(1)
+        && top.score <= second.score.saturating_add(10)
+    {
+        return format!(
+            "Top candidates are close: `{}` ({}) and `{}` ({}). Compare endpoint fit and total estimated price; ask the user if neither clearly wins.",
+            top.fqn, top.score, second.fqn, second.score
+        );
+    }
+
+    format!(
+        "If `{}` and one returned endpoint clearly match, make a compact call plan and call curl with the endpoint's exact url. If not, call get_skill_endpoints for `{}` before paying.",
+        top.fqn, top.fqn
+    )
 }
 
 fn endpoint_entries_for_query(
@@ -321,6 +381,50 @@ mod tests {
         .unwrap();
         assert_eq!(params.category.as_deref(), Some("media"));
         assert_eq!(params.max_results, 3);
+    }
+
+    #[test]
+    fn search_response_includes_provider_selection_guidance() {
+        let response = search_catalog(
+            bench_catalog(),
+            "what's the volume of USDC that moved on Solana the past week".to_string(),
+            None,
+            5,
+        );
+
+        assert!(!response.candidates.is_empty());
+        assert!(
+            response
+                .selection_guidance
+                .iter()
+                .any(|line| line.contains("endpoint fit"))
+        );
+        assert!(
+            response
+                .call_plan_fields
+                .iter()
+                .any(|field| field == "estimated total spend")
+        );
+        assert!(response.next_step.contains("call plan") || response.next_step.contains("Compare"));
+    }
+
+    #[test]
+    fn search_response_handles_empty_results_with_refresh_hint() {
+        let response = search_catalog(
+            pay_core::skills::Catalog {
+                schema_version: "1".to_string(),
+                generated_at: "test".to_string(),
+                base_url: String::new(),
+                provider_count: 0,
+                providers: Vec::new(),
+            },
+            "no matching service".to_string(),
+            None,
+            5,
+        );
+
+        assert!(response.candidates.is_empty());
+        assert!(response.next_step.contains("refresh=true"));
     }
 
     #[test]

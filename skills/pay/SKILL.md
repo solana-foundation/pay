@@ -11,7 +11,9 @@ access without API keys. The user experience is intentionally Apple Pay-like:
 when the Pay `curl` MCP tool needs to satisfy a paid 402 challenge, it prepares
 the payment and asks for local approval, such as Touch ID on macOS, before any
 funds move. Stablecoins are the settlement rail under the hood, not the primary
-agent-facing workflow.
+agent-facing workflow. The user's Pay account needs supported stablecoins such
+as USDC, USDT, or CASH; it does not need SOL for network fees because
+server-side fee payers handle transaction fees and setup costs.
 
 Use Pay for deliberate, user-directed API calls, not autonomous browsing or
 speculative provider exploration.
@@ -36,8 +38,9 @@ provider choice.
 - `get_skill_endpoints(fqn)` - return ready-to-call endpoint URLs and usage
   notes for one provider.
 - `curl({url, method, headers, body})` - make HTTP requests and handle 402
-  payment challenges with user-approved payment.
-- `get_balance()` - check wallet balances before paid work or when asked.
+  payment challenges with user-approved stablecoin payment. The account does
+  not need SOL for network fees.
+- `get_balance()` - check stablecoin balances before paid work or when asked.
 - `list_skills()` - browse all available API providers.
 - `create_skill({content})` - validate a pay-skills provider listing.
 

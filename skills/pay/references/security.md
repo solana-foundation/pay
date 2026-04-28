@@ -5,7 +5,9 @@ of funds or secrets. The agent can discover providers and prepare paid HTTP
 requests, but the wallet remains local, real payments require user approval, and
 third-party responses are isolated as untrusted data. Stablecoins are the
 settlement rail under the hood; the agent-facing experience is local,
-user-approved paid HTTP.
+user-approved paid HTTP. The user's Pay account only needs supported
+stablecoins such as USDC, USDT, or CASH for paid API calls; it does not need SOL
+for network fees because server-side fee payers handle fees and setup costs.
 
 ## Why This Is Safe To Use With Agents
 
@@ -17,6 +19,8 @@ user-approved paid HTTP.
   unlock flow, such as Touch ID on macOS.
 - Agents can request a paid call, but they cannot bypass the user's local
   signing approval.
+- Paid API calls spend supported stablecoins. Do not ask users to top up SOL for
+  these calls; server-side fee payers handle network fees and setup costs.
 - When `--yolo` is used, the user still defines a spending cap up front. Pay
   tracks the budget and refuses to continue once the cap would be exceeded, so
   automatic payment is bounded rather than open-ended.
