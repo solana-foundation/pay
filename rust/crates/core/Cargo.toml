@@ -8,6 +8,8 @@ license.workspace = true
 default = []
 # Payment middleware for axum-based servers (metering, accounting, 402 flow).
 server = ["dep:axum"]
+# Gate network-dependent integration tests (e.g. OpenAPI smoke tests).
+network_tests = []
 # Build OpenSSL from source for cross-compilation (no system libssl-dev needed).
 # Activates openssl-sys/vendored which is pulled in transitively by
 # solana-rpc-client → reqwest → native-tls → openssl-sys.

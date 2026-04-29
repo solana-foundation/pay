@@ -355,12 +355,11 @@ mod tests {
 
     #[test]
     fn validate_with_optional_fields() {
-        let md = "---\nname: x\ntitle: X\ndescription: \"A data service with optional fields configured for versioning and affiliate support\"\nuse_case: \"testing optional field handling, verifying affiliate config\"\ncategory: data\nservice_url: https://x.com\nversion: v2\nopenapi_url: https://x.com/openapi.json\naffiliate_policy:\n  enabled: true\n  default_percent: 10\nendpoints:\n  - method: GET\n    path: v1\n    description: \"Retrieve all available things with optional filtering\"\n    resource: things\n---\n";
+        let md = "---\nname: x\ntitle: X\ndescription: \"A data service with optional fields configured for versioning and affiliate support\"\nuse_case: \"testing optional field handling, verifying affiliate config\"\ncategory: data\nservice_url: https://x.com\nversion: v2\naffiliate_policy:\n  enabled: true\n  default_percent: 10\nendpoints:\n  - method: GET\n    path: v1\n    description: \"Retrieve all available things with optional filtering\"\n    resource: things\n---\n";
         let result = validate(md);
         assert!(result.is_ok());
         let v = result.unwrap();
         assert_eq!(v.spec.version, "v2");
-        assert!(v.spec.openapi_url.is_some());
         assert!(v.spec.affiliate_policy.is_some());
         assert_eq!(v.spec.endpoints[0].resource.as_deref(), Some("things"));
     }

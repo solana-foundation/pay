@@ -64,13 +64,37 @@ pub struct ProviderDetail {
     pub meta: pay_types::registry::ServiceMeta,
     pub version: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub openapi_url: Option<String>,
+    pub openapi: Option<pay_types::registry::OpenapiSource>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub affiliate_policy: Option<AffiliatePolicy>,
     pub source: ProviderSource,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
-    pub endpoints: Vec<EndpointSpec>,
+    pub endpoints: Vec<DetailEndpoint>,
+}
+
+/// A published endpoint — the spec fields plus probe-derived metadata.
+///
+/// Probed metadata (`protocol`, `supported_usd`, `probe_status`,
+/// `probe_description`) is empty when the build was run with probing
+/// disabled. Pricing comes from the probe when available, falling back to
+/// the spec's inline `pricing` field for offline/no-probe builds.
+#[derive(Debug, Clone, Serialize)]
+pub struct DetailEndpoint {
+    #[serde(flatten)]
+    pub spec: EndpointSpec,
+    /// Solana protocols this endpoint accepts (e.g. `["mpp", "x402"]`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protocol: Vec<String>,
+    /// USD-pegged stablecoin symbols accepted on Solana.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_usd: Vec<String>,
+    /// Stable label for the probe outcome (`"ok"`, `"auth_required"`, etc).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_status: Option<String>,
+    /// Endpoint description sourced from the 402 challenge body, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_description: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -118,6 +142,26 @@ pub struct BuildResult {
     /// Map of `"providers/<org>/<name>.json"` → serialized JSON.
     pub detail_files: HashMap<String, String>,
     pub errors: Vec<String>,
+}
+
+/// Options controlling a build run.
+#[derive(Debug, Clone)]
+pub struct BuildOptions {
+    /// Probe each endpoint to derive pricing, accepted protocols, and the
+    /// stablecoin set. Disable for fast offline builds and unit tests; CI
+    /// should always leave this on.
+    pub probe: bool,
+    /// Probe configuration when `probe == true`.
+    pub probe_config: crate::skills::probe::ProbeConfig,
+}
+
+impl Default for BuildOptions {
+    fn default() -> Self {
+        Self {
+            probe: true,
+            probe_config: crate::skills::probe::ProbeConfig::default(),
+        }
+    }
 }
 
 // ── Parsing ────────────────────────────────────────────────────────────────
@@ -173,6 +217,7 @@ fn content_sha(json: &str) -> String {
 
 fn collect_providers(
     root: &Path,
+    options: &BuildOptions,
     errors: &mut Vec<String>,
 ) -> Vec<(ProviderIndexEntry, ProviderDetail, String)> {
     let mut results = Vec::new();
@@ -200,6 +245,7 @@ fn collect_providers(
                     &operator_name,
                     &operator_name,
                     root,
+                    options,
                     errors,
                     &mut results,
                 );
@@ -220,6 +266,7 @@ fn collect_providers(
                         &operator_name,
                         &origin,
                         root,
+                        options,
                         errors,
                         &mut results,
                     );
@@ -261,6 +308,7 @@ fn process_provider_md(
     operator: &str,
     origin: &str,
     root: &Path,
+    options: &BuildOptions,
     errors: &mut Vec<String>,
     results: &mut Vec<(ProviderIndexEntry, ProviderDetail, String)>,
 ) {
@@ -304,12 +352,29 @@ fn process_provider_md(
         return;
     }
 
+    // Resolve the effective endpoint list. Specs using `openapi:` have their
+    // document fetched and parsed here; specs with inline `endpoints:` pass
+    // through unchanged. Each `ResolvedEndpoint` carries an optional
+    // `body_example` that the probe sends as the JSON body.
+    let resolved = match crate::skills::openapi::effective_endpoints(&spec) {
+        Ok(eps) => eps,
+        Err(e) => {
+            errors.push(format!("{fqn}: openapi resolve failed: {e}"));
+            return;
+        }
+    };
+
+    // Probe each endpoint (when probing is on) and synthesize the rich
+    // `DetailEndpoint` shape: probe-derived pricing wins over any inline
+    // pricing in the spec, with the spec value as fallback for offline builds.
+    let detail_endpoints = build_detail_endpoints(fqn, &spec.meta.service_url, resolved, options);
+
     let mut all_prices = Vec::new();
     let mut has_metering = false;
     let mut has_free_tier = false;
 
-    for ep in &spec.endpoints {
-        if let Some(ref pricing) = ep.pricing {
+    for ep in &detail_endpoints {
+        if let Some(ref pricing) = ep.spec.pricing {
             has_metering = true;
             all_prices.extend(collect_prices(pricing));
         } else {
@@ -330,7 +395,7 @@ fn process_provider_md(
         origin: origin.to_string(),
         meta: spec.meta.clone(),
         version: spec.version.clone(),
-        openapi_url: spec.openapi_url.clone(),
+        openapi: spec.openapi.clone(),
         affiliate_policy: spec.affiliate_policy.clone(),
         source: ProviderSource {
             skill: "pay-skills".into(),
@@ -342,7 +407,7 @@ fn process_provider_md(
         } else {
             Some(content)
         },
-        endpoints: spec.endpoints,
+        endpoints: detail_endpoints,
     };
 
     let detail_json = serde_json::to_string_pretty(&detail).expect("detail serialization failed");
@@ -513,19 +578,91 @@ fn collect_aggregators(root: &Path, errors: &mut Vec<String>) -> Vec<AggregatorE
     entries
 }
 
+/// Build the per-endpoint `DetailEndpoint` list for one provider.
+///
+/// When `options.probe` is true, every endpoint is hit (using each
+/// `ResolvedEndpoint.body_example` as the request body) and the probe results
+/// override the spec's inline pricing. When false, endpoints pass through
+/// unchanged with empty `protocol` / `supported_usd` / `probe_status` fields.
+fn build_detail_endpoints(
+    fqn: &str,
+    service_url: &str,
+    resolved: Vec<crate::skills::openapi::ResolvedEndpoint>,
+    options: &BuildOptions,
+) -> Vec<DetailEndpoint> {
+    if !options.probe {
+        return resolved
+            .into_iter()
+            .map(|r| DetailEndpoint {
+                spec: r.spec,
+                protocol: Vec::new(),
+                supported_usd: Vec::new(),
+                probe_status: None,
+                probe_description: None,
+            })
+            .collect();
+    }
+
+    let probe_provider = pay_types::registry::ProbeProvider {
+        fqn: fqn.to_string(),
+        service_url: service_url.to_string(),
+        endpoints: resolved
+            .iter()
+            .map(|r| pay_types::registry::ProbeEndpoint {
+                method: r.spec.method.clone(),
+                path: r.spec.path.clone(),
+                metered: true,
+                body: r.body_example.clone(),
+            })
+            .collect(),
+    };
+    let probe_result = crate::skills::probe::probe_provider(&probe_provider, &options.probe_config);
+
+    resolved
+        .into_iter()
+        .zip(probe_result.endpoints)
+        .map(|(r, probe)| {
+            let mut spec = r.spec;
+            // Probe-derived pricing wins. Fall back to the spec's inline
+            // pricing when the probe could not classify the endpoint.
+            if let Some(pricing) = crate::skills::probe::pricing_from_probe(&probe.paid) {
+                spec.pricing = Some(pricing);
+            }
+            DetailEndpoint {
+                spec,
+                protocol: probe.paid.protocols,
+                supported_usd: probe.paid.supported_usd,
+                probe_status: Some(probe.probe_status),
+                probe_description: probe.paid.description,
+            }
+        })
+        .collect()
+}
+
 // ── Public API ─────────────────────────────────────────────────────────────
 
-/// Build the skills index from a registry directory.
+/// Build the skills index from a registry directory using default options
+/// (probing enabled).
 ///
 /// `root` should point to the pay-skills repo root (containing `providers/`,
-/// `affiliates/`, `aggregators/` directories).
-///
-/// `base_url` is the CDN base URL for detail file references.
+/// `affiliates/`, `aggregators/` directories). `base_url` is the CDN base
+/// URL for detail file references.
 pub fn build(root: &Path, base_url: &str, generated_at: String) -> BuildResult {
+    build_with_options(root, base_url, generated_at, &BuildOptions::default())
+}
+
+/// Build the skills index with explicit options. Use this from the CLI to
+/// thread a `--no-probe` flag in for offline builds.
+pub fn build_with_options(
+    root: &Path,
+    base_url: &str,
+    generated_at: String,
+    options: &BuildOptions,
+) -> BuildResult {
     let mut errors = Vec::new();
 
     eprintln!("Collecting providers...");
-    let providers = collect_providers(root, &mut errors);
+    let providers = collect_providers(root, options, &mut errors);
     eprintln!();
 
     eprintln!("Collecting affiliates...");

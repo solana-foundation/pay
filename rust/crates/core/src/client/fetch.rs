@@ -7,6 +7,16 @@ use tracing::debug;
 use crate::client::runner::{self, RunOutcome};
 use crate::{Error, Result};
 
+/// Raw HTTP response — keeps status, headers, and body together so callers
+/// (e.g. the rich probe pipeline) can both run `classify_402` and extract
+/// additional 402 metadata without a second request.
+#[derive(Debug, Clone)]
+pub struct RawResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: String,
+}
+
 /// Fetch a URL with an explicit HTTP method/body, detecting 402 + MPP challenges.
 pub fn fetch_request(
     method: &str,
@@ -16,20 +26,49 @@ pub fn fetch_request(
 ) -> Result<RunOutcome> {
     let method = Method::from_bytes(method.as_bytes())
         .map_err(|e| Error::Mpp(format!("Invalid HTTP method `{method}`: {e}")))?;
-    fetch_request_with_method(method, url, extra_headers, body)
+    let raw = fetch_raw_with_method(method, url, extra_headers, body)?;
+    Ok(raw_to_outcome(raw, url))
 }
 
 /// Fetch a URL, detecting 402 + MPP challenges.
 pub fn fetch(url: &str, extra_headers: &[(String, String)]) -> Result<RunOutcome> {
-    fetch_request_with_method(Method::GET, url, extra_headers, None)
+    let raw = fetch_raw_with_method(Method::GET, url, extra_headers, None)?;
+    Ok(raw_to_outcome(raw, url))
 }
 
-fn fetch_request_with_method(
+/// Fetch a URL and return the raw status/headers/body — no 402 classification.
+///
+/// Use this when the caller needs to do its own analysis of the response
+/// (e.g. the skills probe enriches the response with all advertised payment
+/// protocols, not just the one Pay would settle on).
+pub fn fetch_raw(
+    method: &str,
+    url: &str,
+    extra_headers: &[(String, String)],
+    body: Option<&str>,
+) -> Result<RawResponse> {
+    let method = Method::from_bytes(method.as_bytes())
+        .map_err(|e| Error::Mpp(format!("Invalid HTTP method `{method}`: {e}")))?;
+    fetch_raw_with_method(method, url, extra_headers, body)
+}
+
+fn raw_to_outcome(raw: RawResponse, url: &str) -> RunOutcome {
+    if raw.status == 402 {
+        return runner::classify_402(&raw.headers, Some(&raw.body), url);
+    }
+    let exit_code = if raw.status >= 400 { 1 } else { 0 };
+    RunOutcome::Completed {
+        exit_code,
+        body: Some(raw.body),
+    }
+}
+
+fn fetch_raw_with_method(
     method: Method,
     url: &str,
     extra_headers: &[(String, String)],
     body: Option<&str>,
-) -> Result<RunOutcome> {
+) -> Result<RawResponse> {
     let client = Client::builder()
         .user_agent(format!("pay/{}", env!("CARGO_PKG_VERSION")))
         .build()
@@ -86,14 +125,10 @@ fn fetch_request_with_method(
 
     debug!(status, "Fetch complete");
 
-    if status == 402 {
-        return Ok(runner::classify_402(&headers, Some(&body), url));
-    }
-
-    let exit_code = if status >= 400 { 1 } else { 0 };
-    Ok(RunOutcome::Completed {
-        exit_code,
-        body: Some(body),
+    Ok(RawResponse {
+        status,
+        headers,
+        body,
     })
 }
 

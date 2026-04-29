@@ -68,6 +68,8 @@ impl DemoCommand {
             rpc_url,
             debugger: true,
             otlp_sidecar: self.otlp_sidecar,
+            openapi: None,
+            public_url: None,
         };
         cmd.run(active_account_name, true)
     }

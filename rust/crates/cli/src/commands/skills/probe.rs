@@ -175,13 +175,21 @@ fn parse_provider_file(
         .to_string_lossy()
         .replace('\\', "/");
 
-    let endpoints = spec
-        .endpoints
-        .iter()
-        .map(|ep| pay_types::registry::ProbeEndpoint {
-            method: ep.method.clone(),
-            path: ep.path.clone(),
-            metered: ep.pricing.is_some(),
+    // If the spec uses `openapi:` instead of inline `endpoints:`, resolve the
+    // OpenAPI document into an endpoint list. Resolved endpoints carry no
+    // pricing — flag them all `metered: true` so the prober actually hits
+    // them and lets the 402 response classify each one. The OpenAPI resolver
+    // also produces a `body_example` for POST/PUT/PATCH operations so probes
+    // get past server-side schema validation before the paywall fires.
+    let resolved = pay_core::skills::openapi::effective_endpoints(&spec)?;
+    let openapi_driven = spec.openapi.is_some();
+    let endpoints = resolved
+        .into_iter()
+        .map(|r| pay_types::registry::ProbeEndpoint {
+            method: r.spec.method,
+            path: r.spec.path,
+            metered: openapi_driven || r.spec.pricing.is_some(),
+            body: r.body_example,
         })
         .collect();
 

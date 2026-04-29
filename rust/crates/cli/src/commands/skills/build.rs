@@ -20,6 +20,19 @@ pub struct BuildCommand {
     /// Output directory (default: <path>/dist).
     #[arg(long, short)]
     pub output: Option<PathBuf>,
+
+    /// Skip live probing of endpoints (faster, but no probe-derived
+    /// pricing/protocol/supported_usd metadata in the output). Default: probe.
+    #[arg(long)]
+    pub no_probe: bool,
+
+    /// Per-endpoint probe timeout in seconds (only when probing is enabled).
+    #[arg(long, default_value_t = 10)]
+    pub probe_timeout: u64,
+
+    /// Max concurrent provider probes (only when probing is enabled).
+    #[arg(long, default_value_t = 5)]
+    pub probe_concurrency: usize,
 }
 
 impl BuildCommand {
@@ -47,7 +60,16 @@ impl BuildCommand {
             format_utc_timestamp(d.as_secs())
         };
 
-        let result = pay_core::skills::build::build(&root, &self.base_url, now);
+        let options = pay_core::skills::build::BuildOptions {
+            probe: !self.no_probe,
+            probe_config: pay_core::skills::probe::ProbeConfig {
+                timeout_secs: self.probe_timeout,
+                concurrency: self.probe_concurrency,
+                ..Default::default()
+            },
+        };
+        let result =
+            pay_core::skills::build::build_with_options(&root, &self.base_url, now, &options);
 
         // Report errors
         if !result.errors.is_empty() {

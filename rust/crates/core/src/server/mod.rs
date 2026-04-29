@@ -4,6 +4,9 @@ pub mod accounting;
 pub mod metering;
 
 #[cfg(feature = "server")]
+pub mod openapi;
+
+#[cfg(feature = "server")]
 pub mod payment;
 
 #[cfg(feature = "server")]

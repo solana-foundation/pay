@@ -60,6 +60,12 @@ pub struct ServiceMeta {
 }
 
 /// Provider frontmatter — the YAML block in a provider `.md` file.
+///
+/// Endpoints can be declared in one of two mutually-exclusive ways:
+/// - inline `endpoints:` list (legacy form, used by providers without an
+///   OpenAPI doc — e.g. the Cloud Run Google proxies),
+/// - `openapi:` source that points to (or inlines) an OpenAPI 3 document; the
+///   resolver walks `paths × methods` to synthesize the endpoint list.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ProviderFrontmatter {
     /// API name — must match the filename (without `.md`).
@@ -69,15 +75,46 @@ pub struct ProviderFrontmatter {
     /// API version (e.g. "v1", "v2").
     #[serde(default)]
     pub version: String,
-    /// Pointer to full OpenAPI spec (not auto-expanded).
-    #[serde(default)]
-    pub openapi_url: Option<String>,
+    /// Structured OpenAPI source resolved by `pay skills probe`/build.
+    ///
+    /// Mutually exclusive with `endpoints:`. When set, the resolver fetches /
+    /// reads the document, walks `paths × methods`, and synthesizes endpoint
+    /// specs that the prober then probes for stablecoin gating.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openapi: Option<OpenapiSource>,
     /// Opt-in to affiliate referrals.
     #[serde(default)]
     pub affiliate_policy: Option<AffiliatePolicy>,
-    /// API endpoints — at least one required.
-    #[serde(default)]
+    /// API endpoints — required when `openapi:` is not set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub endpoints: Vec<EndpointSpec>,
+}
+
+/// Pointer to (or inline copy of) an OpenAPI document.
+///
+/// Exactly one variant must be set. Variants are flattened into the parent
+/// `openapi:` mapping so spec authors can write any of:
+///
+/// ```yaml
+/// openapi:
+///   url: https://example.com/openapi.json
+///
+/// openapi:
+///   path: openapi.json   # resolved as `<service_url>/<path>`
+///
+/// openapi:
+///   content: |
+///     { "openapi": "3.1.0", ... }
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum OpenapiSource {
+    /// Absolute URL of an OpenAPI document. Fetched at build/probe time.
+    Url { url: String },
+    /// Path appended to `service_url` to fetch the OpenAPI document.
+    Path { path: String },
+    /// Inline OpenAPI document (typically a YAML `|` block of JSON).
+    Content { content: String },
 }
 
 /// Affiliate referral policy on a provider.
@@ -153,6 +190,11 @@ pub struct ProbeEndpoint {
     pub method: String,
     pub path: String,
     pub metered: bool,
+    /// JSON body to send during probing (e.g. derived from an OpenAPI example
+    /// or generated from a schema). Used for POST/PUT/PATCH only — GET probes
+    /// ignore it. `None` falls back to a minimal `{}` body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
 }
 
 /// A provider with its service URL and endpoints, ready for probing.
@@ -247,11 +289,24 @@ pub fn validate_provider(spec: &ProviderFrontmatter, fqn: &str) -> Vec<String> {
         ));
     }
 
-    // ── Endpoints ──
-    if spec.endpoints.is_empty() {
-        errs.push(format!(
-            "{fqn}: no endpoints defined\n  add at least one endpoint with method, path, and description\n"
-        ));
+    // ── openapi: vs endpoints: (mutually exclusive, exactly one required) ──
+    let has_openapi = spec.openapi.is_some();
+    let has_endpoints = !spec.endpoints.is_empty();
+    match (has_openapi, has_endpoints) {
+        (true, true) => errs.push(format!(
+            "{fqn}: cannot set both `openapi` and `endpoints`\n  \
+             pick one — `openapi` is resolved at probe time, `endpoints` is inline\n"
+        )),
+        (false, false) => errs.push(format!(
+            "{fqn}: must set either `openapi` or `endpoints`\n  \
+             add an `openapi: {{ url|path|content: ... }}` mapping or at least one endpoint\n"
+        )),
+        _ => {}
+    }
+    if let Some(src) = &spec.openapi {
+        for err in validate_openapi_source(src, fqn) {
+            errs.push(err);
+        }
     }
     for (i, ep) in spec.endpoints.iter().enumerate() {
         let label = if ep.path.is_empty() {
@@ -332,6 +387,46 @@ fn validate_pricing_precision(
     }
 }
 
+/// Validate an `OpenapiSource` value's contents (HTTPS, non-empty, sane shape).
+///
+/// Mutual-exclusion of variants is enforced by `serde(deny_unknown_fields)` on
+/// the untagged enum, so we only need to check that the chosen variant carries
+/// a non-empty value and uses HTTPS where applicable.
+fn validate_openapi_source(src: &OpenapiSource, fqn: &str) -> Vec<String> {
+    let mut errs = Vec::new();
+    match src {
+        OpenapiSource::Url { url } => {
+            if url.is_empty() {
+                errs.push(format!("{fqn}: openapi.url is empty\n"));
+            } else if !url.starts_with("https://") {
+                errs.push(format!(
+                    "{fqn}: openapi.url must start with https://\n  got: `{url}`\n"
+                ));
+            } else if url_has_ip_address(url) {
+                errs.push(format!(
+                    "{fqn}: openapi.url must use a domain name, not an IP address\n  got: `{url}`\n"
+                ));
+            }
+        }
+        OpenapiSource::Path { path } => {
+            if path.is_empty() {
+                errs.push(format!("{fqn}: openapi.path is empty\n"));
+            } else if path.starts_with("http://") || path.starts_with("https://") {
+                errs.push(format!(
+                    "{fqn}: openapi.path is relative to service_url and must not be a full URL\n  \
+                     use `openapi: {{ url: ... }}` for absolute URLs\n  got: `{path}`\n"
+                ));
+            }
+        }
+        OpenapiSource::Content { content } => {
+            if content.trim().is_empty() {
+                errs.push(format!("{fqn}: openapi.content is empty\n"));
+            }
+        }
+    }
+    errs
+}
+
 /// Check if a URL uses an IP address instead of a domain name.
 fn url_has_ip_address(url: &str) -> bool {
     let after_scheme = url
@@ -384,7 +479,7 @@ mod tests {
                 sandbox_service_url: None,
             },
             version: "v1".into(),
-            openapi_url: None,
+            openapi: None,
             affiliate_policy: None,
             endpoints: vec![EndpointSpec {
                 method: "POST".into(),
@@ -492,9 +587,155 @@ endpoints:
             "expected service_url error, got: {errs:?}"
         );
         assert!(
-            errs.iter().any(|e| e.contains("no endpoints defined")),
-            "expected endpoint presence error, got: {errs:?}"
+            errs.iter()
+                .any(|e| e.contains("must set either `openapi` or `endpoints`")),
+            "expected endpoint-presence error, got: {errs:?}"
         );
+    }
+
+    #[test]
+    fn openapi_with_url_passes_without_inline_endpoints() {
+        let mut spec = valid_spec();
+        spec.endpoints = vec![];
+        spec.openapi = Some(OpenapiSource::Url {
+            url: "https://api.example.com/openapi.json".into(),
+        });
+        let errs = validate_provider(&spec, "test/test-api");
+        assert!(errs.is_empty(), "expected no errors, got: {errs:?}");
+    }
+
+    #[test]
+    fn openapi_with_path_passes_without_inline_endpoints() {
+        let mut spec = valid_spec();
+        spec.endpoints = vec![];
+        spec.openapi = Some(OpenapiSource::Path {
+            path: "openapi.json".into(),
+        });
+        let errs = validate_provider(&spec, "test/test-api");
+        assert!(errs.is_empty(), "expected no errors, got: {errs:?}");
+    }
+
+    #[test]
+    fn openapi_with_inline_content_passes() {
+        let mut spec = valid_spec();
+        spec.endpoints = vec![];
+        spec.openapi = Some(OpenapiSource::Content {
+            content: "{\"openapi\":\"3.1.0\",\"paths\":{}}".into(),
+        });
+        let errs = validate_provider(&spec, "test/test-api");
+        assert!(errs.is_empty(), "expected no errors, got: {errs:?}");
+    }
+
+    #[test]
+    fn openapi_and_endpoints_together_are_rejected() {
+        let mut spec = valid_spec();
+        // valid_spec has one endpoint already
+        spec.openapi = Some(OpenapiSource::Path {
+            path: "openapi.json".into(),
+        });
+        let errs = validate_provider(&spec, "test/test-api");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("cannot set both `openapi` and `endpoints`")),
+            "expected mutual-exclusion error, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn openapi_url_must_be_https() {
+        let mut spec = valid_spec();
+        spec.endpoints = vec![];
+        spec.openapi = Some(OpenapiSource::Url {
+            url: "http://api.example.com/openapi.json".into(),
+        });
+        let errs = validate_provider(&spec, "test/test-api");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("openapi.url must start with https://")),
+            "expected https requirement error, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn openapi_path_must_not_be_absolute_url() {
+        let mut spec = valid_spec();
+        spec.endpoints = vec![];
+        spec.openapi = Some(OpenapiSource::Path {
+            path: "https://api.example.com/openapi.json".into(),
+        });
+        let errs = validate_provider(&spec, "test/test-api");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("openapi.path is relative to service_url")),
+            "expected relative-path error, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn openapi_yaml_url_form_parses() {
+        let yaml = r#"
+name: oa-api
+title: OpenAPI URL form
+description: Provider that ships an OpenAPI doc out-of-band; resolved at probe time by the prober.
+use_case: validating that the openapi.url form parses end-to-end through serde_yml in tests
+category: data
+service_url: https://api.example.com
+openapi:
+  url: https://api.example.com/openapi.json
+"#;
+        let spec: ProviderFrontmatter = serde_yml::from_str(yaml).unwrap();
+        match spec.openapi {
+            Some(OpenapiSource::Url { url }) => {
+                assert_eq!(url, "https://api.example.com/openapi.json")
+            }
+            other => panic!("expected OpenapiSource::Url, got {other:?}"),
+        }
+        assert!(spec.endpoints.is_empty());
+    }
+
+    #[test]
+    fn openapi_yaml_path_form_parses() {
+        let yaml = r#"
+name: oa-api
+title: OpenAPI path form
+description: Provider that hosts its OpenAPI doc on the same origin as service_url at a relative path.
+use_case: validating that the openapi.path form parses correctly through serde_yml in tests
+category: data
+service_url: https://api.example.com
+openapi:
+  path: openapi.json
+"#;
+        let spec: ProviderFrontmatter = serde_yml::from_str(yaml).unwrap();
+        match spec.openapi {
+            Some(OpenapiSource::Path { path }) => assert_eq!(path, "openapi.json"),
+            other => panic!("expected OpenapiSource::Path, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn openapi_yaml_content_form_parses_inline_json() {
+        let yaml = "
+name: oa-api
+title: OpenAPI inline form
+description: Provider that inlines its OpenAPI doc directly into the spec via a YAML literal block.
+use_case: validating that the openapi.content form parses inline JSON through serde_yml in tests
+category: data
+service_url: https://api.example.com
+openapi:
+  content: |
+    {
+      \"openapi\": \"3.1.0\",
+      \"paths\": {}
+    }
+";
+        let spec: ProviderFrontmatter = serde_yml::from_str(yaml).unwrap();
+        match spec.openapi {
+            Some(OpenapiSource::Content { content }) => {
+                assert!(content.contains("\"openapi\": \"3.1.0\""));
+                assert!(content.contains("\"paths\""));
+            }
+            other => panic!("expected OpenapiSource::Content, got {other:?}"),
+        }
     }
 
     #[test]
@@ -562,6 +803,7 @@ contact: ops@example.com
                 method: "POST".into(),
                 path: "v1/search".into(),
                 metered: true,
+                body: None,
             }],
         };
         let json = serde_json::to_string(&provider).unwrap();
