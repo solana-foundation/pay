@@ -10,7 +10,7 @@ pub struct UpdateCommand {
 impl UpdateCommand {
     pub fn run(self) -> pay_core::Result<()> {
         eprintln!("{}", "Updating skills catalog...".dimmed());
-        let catalog = pay_core::skills::update_skills(self.force)?;
+        let catalog = pay_core::skills::blocking::update_skills(self.force)?;
         eprintln!(
             "  {} {} providers",
             "Updated:".green(),

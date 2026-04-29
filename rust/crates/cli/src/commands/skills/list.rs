@@ -1,7 +1,7 @@
 use owo_colors::OwoColorize;
 
 pub fn run() -> pay_core::Result<()> {
-    let catalog = pay_core::skills::load_skills()?;
+    let catalog = pay_core::skills::blocking::load_skills()?;
 
     if catalog.providers.is_empty() {
         eprintln!(

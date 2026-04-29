@@ -18,26 +18,19 @@ fn default_network() -> String {
 }
 
 pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
-    let result = tokio::task::spawn_blocking(move || get_balance_sync(&params.network))
-        .await
-        .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
+    let network = params.network;
+    let accounts = pay_core::accounts::AccountsFile::load()
         .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
-
-    Ok(CallToolResult::success(vec![rmcp::model::Content::text(
-        result,
-    )]))
-}
-
-fn get_balance_sync(network: &str) -> Result<String, pay_core::Error> {
-    let accounts = pay_core::accounts::AccountsFile::load()?;
-    let (name, account) = accounts
-        .account_for_network(network)
-        .ok_or_else(|| pay_core::Error::Config(format!("No account configured for {network}")))?;
+    let (name, account) = accounts.account_for_network(&network).ok_or_else(|| {
+        rmcp::ErrorData::internal_error(format!("No account configured for {network}"), None)
+    })?;
 
     let pubkey = account
         .pubkey
         .as_deref()
-        .ok_or_else(|| pay_core::Error::Config("Account has no pubkey".to_string()))?;
+        .ok_or_else(|| rmcp::ErrorData::internal_error("Account has no pubkey", None))?
+        .to_string();
+    let name = name.to_string();
 
     let rpc_url = if network == "mainnet" {
         pay_core::balance::mainnet_rpc_url()
@@ -45,10 +38,9 @@ fn get_balance_sync(network: &str) -> Result<String, pay_core::Error> {
         std::env::var("PAY_RPC_URL").unwrap_or_else(|_| pay_core::balance::mainnet_rpc_url())
     };
 
-    let rt = tokio::runtime::Handle::current();
-    let balances = rt
-        .block_on(pay_core::client::balance::get_balances(&rpc_url, pubkey))
-        .map_err(|e| pay_core::Error::Config(format!("RPC error: {e}")))?;
+    let balances = pay_core::client::balance::get_balances(&rpc_url, &pubkey)
+        .await
+        .map_err(|e| rmcp::ErrorData::internal_error(format!("RPC error: {e}"), None))?;
 
     let sol = balances.sol_lamports as f64 / 1_000_000_000.0;
     let mut lines = vec![
@@ -66,5 +58,7 @@ fn get_balance_sync(network: &str) -> Result<String, pay_core::Error> {
         lines.push("No token balances found.".to_string());
     }
 
-    Ok(lines.join("\n"))
+    Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+        lines.join("\n"),
+    )]))
 }

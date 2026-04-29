@@ -46,19 +46,12 @@ struct EndpointEntry {
 
 pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
     let fqn = params.fqn.clone();
-    let mut catalog = tokio::task::spawn_blocking(pay_core::skills::load_skills)
+    let mut catalog = pay_core::skills::load_skills()
         .await
-        .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
         .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
-
-    // Load endpoints from detail file
-    let fqn_clone = fqn.clone();
-    let catalog = tokio::task::spawn_blocking(move || {
-        pay_core::skills::ensure_endpoints(&mut catalog, &fqn_clone).map(|()| catalog)
-    })
-    .await
-    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
-    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+    pay_core::skills::ensure_endpoints(&mut catalog, &fqn)
+        .await
+        .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
 
     let svc = catalog
         .providers

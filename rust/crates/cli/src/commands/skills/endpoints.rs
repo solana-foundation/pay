@@ -16,10 +16,10 @@ pub struct EndpointsCommand {
 
 impl EndpointsCommand {
     pub fn run(self) -> pay_core::Result<()> {
-        let mut catalog = pay_core::skills::load_skills()?;
+        let mut catalog = pay_core::skills::blocking::load_skills()?;
 
         // Lazy-fetch endpoints from CDN if needed
-        pay_core::skills::ensure_endpoints(&mut catalog, &self.service)?;
+        pay_core::skills::blocking::ensure_endpoints(&mut catalog, &self.service)?;
 
         let result = pay_core::skills::resource_endpoints(&catalog, &self.service, &self.resource)
             .ok_or_else(|| {

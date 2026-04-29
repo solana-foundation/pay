@@ -30,14 +30,12 @@ struct SkillEntry {
 pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
     let cache_bust = params.cache_bust;
     let catalog = if params.refresh || cache_bust {
-        tokio::task::spawn_blocking(move || pay_core::skills::update_skills(cache_bust))
+        pay_core::skills::update_skills(cache_bust)
             .await
-            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
     } else {
-        tokio::task::spawn_blocking(pay_core::skills::load_skills)
+        pay_core::skills::load_skills()
             .await
-            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
     };
 

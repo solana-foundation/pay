@@ -28,7 +28,7 @@ pub struct SearchCommand {
 
 impl SearchCommand {
     pub fn run(self) -> pay_core::Result<()> {
-        let catalog = pay_core::skills::load_skills()?;
+        let catalog = pay_core::skills::blocking::load_skills()?;
         let hits =
             pay_core::skills::search(&catalog, self.query.as_deref(), self.category.as_deref());
 

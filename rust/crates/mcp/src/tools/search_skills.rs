@@ -93,23 +93,18 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
 
     let cache_bust = params.cache_bust;
     let catalog = if params.refresh || cache_bust {
-        tokio::task::spawn_blocking(move || pay_core::skills::update_skills(cache_bust))
+        pay_core::skills::update_skills(cache_bust)
             .await
-            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
     } else {
-        tokio::task::spawn_blocking(pay_core::skills::load_skills)
+        pay_core::skills::load_skills()
             .await
-            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
     };
 
     let max_results = params.max_results.clamp(1, 10);
     let category = params.category.clone();
-    let response =
-        tokio::task::spawn_blocking(move || search_catalog(catalog, query, category, max_results))
-            .await
-            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+    let response = search_catalog(catalog, query, category, max_results).await;
 
     let json = serde_json::to_string_pretty(&response)
         .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
@@ -119,7 +114,7 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
     )]))
 }
 
-fn search_catalog(
+async fn search_catalog(
     mut catalog: pay_core::skills::Catalog,
     query: String,
     category: Option<String>,
@@ -136,7 +131,7 @@ fn search_catalog(
     let mut endpoint_errors = HashMap::new();
     for candidate in &preliminary {
         let fqn = candidate.service.name.clone();
-        if let Err(err) = pay_core::skills::ensure_endpoints(&mut catalog, &fqn) {
+        if let Err(err) = pay_core::skills::ensure_endpoints(&mut catalog, &fqn).await {
             endpoint_errors.insert(fqn, err.to_string());
         }
     }
@@ -383,14 +378,15 @@ mod tests {
         assert_eq!(params.max_results, 3);
     }
 
-    #[test]
-    fn search_response_includes_provider_selection_guidance() {
+    #[tokio::test]
+    async fn search_response_includes_provider_selection_guidance() {
         let response = search_catalog(
             bench_catalog(),
             "what's the volume of USDC that moved on Solana the past week".to_string(),
             None,
             5,
-        );
+        )
+        .await;
 
         assert!(!response.candidates.is_empty());
         assert!(
@@ -408,8 +404,8 @@ mod tests {
         assert!(response.next_step.contains("call plan") || response.next_step.contains("Compare"));
     }
 
-    #[test]
-    fn search_response_handles_empty_results_with_refresh_hint() {
+    #[tokio::test]
+    async fn search_response_handles_empty_results_with_refresh_hint() {
         let response = search_catalog(
             pay_core::skills::Catalog {
                 schema_version: "1".to_string(),
@@ -421,7 +417,8 @@ mod tests {
             "no matching service".to_string(),
             None,
             5,
-        );
+        )
+        .await;
 
         assert!(response.candidates.is_empty());
         assert!(response.next_step.contains("refresh=true"));
@@ -462,8 +459,8 @@ mod tests {
         assert!(endpoints[0].match_score > 0);
     }
 
-    #[test]
-    fn search_skills_csv_routing_bench() {
+    #[tokio::test]
+    async fn search_skills_csv_routing_bench() {
         let cases = parse_routing_cases(include_str!(
             "../../tests/fixtures/provider_routing_cases.csv"
         ));
@@ -508,7 +505,8 @@ mod tests {
                 case.prompt.clone(),
                 case.category.clone(),
                 5,
-            );
+            )
+            .await;
             let actual = response.candidates.first();
             let actual_provider = actual.map(|candidate| candidate.fqn.as_str()).unwrap_or("");
             let actual_endpoint = actual
