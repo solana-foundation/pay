@@ -42,12 +42,7 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
         .await
         .map_err(|e| rmcp::ErrorData::internal_error(format!("RPC error: {e}"), None))?;
 
-    let sol = balances.sol_lamports as f64 / 1_000_000_000.0;
-    let mut lines = vec![
-        format!("Account: {name} ({network})"),
-        format!("Address: {pubkey}"),
-        format!("SOL: {sol:.4}"),
-    ];
+    let mut lines = vec![];
 
     for token in &balances.tokens {
         let label = token.symbol.unwrap_or("unknown");

@@ -25,6 +25,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yml = "0.0.12"
 base64 = "0.22"
+crc32fast = "1.5"
+flate2 = "1.1"
 
 # Error handling
 thiserror = "2"
@@ -65,6 +67,7 @@ opentelemetry_sdk = "0.31"
 # Configuration
 figment = { version = "0.10", features = ["toml", "env"] }
 toml = "0.8"
+toml_edit = "0.22"
 
 # Temp files
 tempfile = "3"

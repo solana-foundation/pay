@@ -36,7 +36,7 @@ local wallet approval when payment is required, then retries the original
 request with the proof. The active Pay account only needs supported
 stablecoins such as USDC, USDT, or CASH; it does not need SOL for network fees.
 Server-side fee payers handle transaction fees and setup costs. Copy URLs
-returned by `search_skills` or `get_skill_endpoints` exactly; do not replace
+returned by `search_catalog` or `get_catalog_entry` exactly; do not replace
 them with upstream API hosts.
 
 `body` may be a string or a JSON value. JSON values are serialized before the
@@ -54,33 +54,43 @@ provided.
     #[tool(
         description = r#"Search paid API services for a user task and return ranked candidates with endpoint context.
 
-Use this as the first provider-selection action for Pay-owned tasks. Pass the
-user's actual task as `query`, such as "search Instagram influencers in Paris"
-or "run SQL over public crypto datasets". The response is ranked and includes
-reasons, endpoint/pricing candidates, tie-breaker guidance, call-plan fields,
-and the next provider-selection step. Select an endpoint only when it clearly
-matches the task; otherwise inspect one likely provider with
-`get_skill_endpoints` or ask the user.
+Use this for actionable Pay-owned tasks after the user asks to do something,
+such as "search Instagram influencers in Paris" or "run SQL over public crypto
+datasets". Do not use this as the first tool for capability questions like
+"can I use Pay to X?", "can I order X with Pay?", "does Pay support X?", or
+"what can Pay do?". For those, call `list_catalog` first because search ranks a
+task and can miss adjacent catalog providers. The response is ranked and
+includes reasons, endpoint/pricing candidates, tie-breaker guidance, call-plan
+fields, and the next provider-selection step. Select an endpoint only when it
+clearly matches the task; otherwise inspect one likely provider with
+`get_catalog_entry` or ask the user.
 "#
     )]
-    async fn search_skills(
+    async fn search_catalog(
         &self,
-        Parameters(params): Parameters<tools::search_skills::Params>,
+        Parameters(params): Parameters<tools::search_catalog::Params>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        tools::search_skills::run(params).await
+        tools::search_catalog::run(params).await
     }
 
-    #[tool(description = r#"List all available paid API services.
+    #[tool(description = r#"List all available Pay APIs/skills.
 
-Browse-only fallback. Do not use this for normal provider selection; call
-`search_skills` with the user's task instead. Returns every service with fqn,
-description, category, and use_case.
+Use this first for Pay capability and feasibility questions: "can I use Pay to
+X?", "can I order X with Pay?", "does Pay support X?", "what can Pay do?", or
+similar. Never answer "no" about Pay capabilities from memory or from a
+`search_catalog` result alone; inspect the full catalog with this tool first.
+Returns a compact category-grouped catalog by default to keep MCP hosts
+responsive. Set `include_details` only when the user needs the expanded raw
+service list with use cases. For actionable execution after capability is
+established, call `search_catalog` with the user's task. When the user asks what
+Pay can do, present the catalog grouped by category so they can scan available
+APIs/skills.
 "#)]
-    async fn list_skills(
+    async fn list_catalog(
         &self,
-        Parameters(params): Parameters<tools::list_skills::Params>,
+        Parameters(params): Parameters<tools::list_catalog::Params>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        tools::list_skills::run(params).await
+        tools::list_catalog::run(params).await
     }
 
     #[tool(
@@ -88,15 +98,15 @@ description, category, and use_case.
 
 Returns endpoints (each with a complete `url` for the `curl` tool),
 usage notes, pricing info, sandbox/production URLs, and a next-step hint. Call
-this after picking a service from `search_skills` when endpoint candidates are
+this after picking a service from `search_catalog` when endpoint candidates are
 not enough to make a precise paid-call plan.
 "#
     )]
-    async fn get_skill_endpoints(
+    async fn get_catalog_entry(
         &self,
-        Parameters(params): Parameters<tools::get_skill_endpoints::Params>,
+        Parameters(params): Parameters<tools::get_catalog_entry::Params>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        tools::get_skill_endpoints::run(params).await
+        tools::get_catalog_entry::run(params).await
     }
 
     #[tool(description = r#"Get the balance of the active pay account.
@@ -111,6 +121,24 @@ setup costs. Use this to check available funds before making paid API calls.
         Parameters(params): Parameters<tools::get_balance::Params>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         tools::get_balance::run(params).await
+    }
+
+    #[tool(
+        description = r#"Generate a top-up QR code PNG for the user's Pay account.
+
+Use this when the user asks to top up, fund, add money, deposit stablecoins, or
+create a QR code for adding funds to Pay. The user must choose the top-up method:
+`mobile_wallet` for a Solana Pay USDC QR code, or `onramp` for a provider QR
+code. When `method` is `onramp`, the user must also specify the provider
+(`coinbase`, `paypal`, or `venmo`). This tool does not spend funds or initiate
+a purchase; it only renders the QR PNG and returns the funding address.
+"#
+    )]
+    async fn topup(
+        &self,
+        Parameters(params): Parameters<tools::topup::Params>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        tools::topup::run(params).await
     }
 
     #[tool(description = r#"Create or validate a pay-skills provider listing.
@@ -161,10 +189,11 @@ mod tests {
         assert!(info.instructions.is_some());
         let instructions = info.instructions.unwrap();
         assert!(instructions.contains("Tool Routing"));
-        assert!(instructions.contains("search_skills({query})"));
+        assert!(instructions.contains("search_catalog({query})"));
         assert!(instructions.contains("Provider Selection Rules"));
         assert!(instructions.contains("Failure Recipes"));
         assert!(instructions.contains("402"));
+        assert!(instructions.contains("Never answer \"Can pay do X\" from memory"));
     }
 
     #[test]
@@ -177,7 +206,12 @@ mod tests {
     #[test]
     fn tool_descriptions_keep_provider_selection_pay_first() {
         let source = include_str!("server.rs");
-        assert!(source.contains("Use this as the first provider-selection action"));
+        assert!(source.contains("call `list_catalog` first"));
+        assert!(source.contains("Use this first for Pay capability and feasibility questions"));
+        assert!(source.contains("Never answer \"no\" about Pay capabilities"));
+        assert!(source.contains("present the catalog grouped"));
+        assert!(source.contains("Generate a top-up QR code PNG"));
+        assert!(source.contains("must also specify the provider"));
         assert!(source.contains("tie-breaker guidance"));
         assert!(source.contains("local wallet approval"));
         assert!(source.contains("does not need SOL for network fees"));

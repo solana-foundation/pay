@@ -176,7 +176,7 @@ pub fn group_search_results(hits: &[SearchHit]) -> Vec<SearchResultGroup> {
     groups
 }
 
-/// A service summary — used by the MCP `search_skills` tool.
+/// A service summary — used by the MCP `search_catalog` tool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceSummary {
     pub name: String,
@@ -944,7 +944,11 @@ pub async fn load_skills() -> Result<Catalog> {
     if let Some(path) = cfg.valid_cache_path() {
         let raw = std::fs::read_to_string(&path)
             .map_err(|e| Error::Config(format!("read cache: {e}")))?;
-        return parse_catalog(&raw);
+        let catalog = parse_catalog(&raw)?;
+        if !catalog.providers.is_empty() {
+            return Ok(catalog);
+        }
+        tracing::warn!(path = %path.display(), "Ignoring empty skills cache");
     }
 
     // Cache miss — fetch, merge, cache.
@@ -965,6 +969,7 @@ pub async fn load_skills() -> Result<Catalog> {
                         && name.ends_with(".json")
                         && let Ok(raw) = std::fs::read_to_string(entry.path())
                         && let Ok(cat) = parse_catalog(&raw)
+                        && !cat.providers.is_empty()
                     {
                         return Ok(cat);
                     }
@@ -973,6 +978,14 @@ pub async fn load_skills() -> Result<Catalog> {
             Err(fetch_err)
         }
     }
+}
+
+/// Load the newest non-empty cached skills catalog without touching the network.
+pub fn load_cached_skills() -> Result<Catalog> {
+    cached_catalogs()
+        .into_iter()
+        .find(|catalog| !catalog.providers.is_empty())
+        .ok_or_else(|| Error::Config("no cached skills catalog found".to_string()))
 }
 
 /// Force-refresh: fetch all sources, merge, write cache.
@@ -998,6 +1011,8 @@ async fn fetch_and_merge(cfg: &config::SkillsConfig, cache_bust: bool) -> Result
 
     let mut all_providers: Vec<Service> = Vec::new();
     let mut base_url = String::new();
+    let mut successful_sources = 0usize;
+    let mut failures = Vec::new();
 
     for source in &cfg.sources {
         let url = if cache_bust {
@@ -1012,15 +1027,31 @@ async fn fetch_and_merge(cfg: &config::SkillsConfig, cache_bust: bool) -> Result
         };
         match fetch_one_async(&client, &url).await {
             Ok(cat) => {
+                successful_sources += 1;
                 if base_url.is_empty() && !cat.base_url.is_empty() {
                     base_url = cat.base_url.clone();
                 }
                 all_providers.extend(cat.providers);
             }
             Err(e) => {
+                failures.push(format!("{}: {e}", source.url));
                 tracing::warn!(url = %source.url, error = %e, "Skipping skills source");
             }
         }
+    }
+
+    if successful_sources == 0 {
+        let reason = if cfg.sources.is_empty() {
+            "no skills sources configured".to_string()
+        } else {
+            format!("all skills sources failed: {}", failures.join("; "))
+        };
+        return Err(Error::Config(reason));
+    }
+    if all_providers.is_empty() {
+        return Err(Error::Config(
+            "skills sources returned no providers".to_string(),
+        ));
     }
 
     // Deduplicate by FQN (first wins).
@@ -1498,6 +1529,18 @@ fn collect_prices(pricing: &Option<serde_json::Value>, out: &mut Vec<f64>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn fetch_and_merge_rejects_empty_sources() {
+        let cfg = config::SkillsConfig {
+            ttl_minutes: 30,
+            sources: Vec::new(),
+        };
+
+        let err = fetch_and_merge(&cfg, false).await.unwrap_err();
+
+        assert!(err.to_string().contains("no skills sources configured"));
+    }
 
     /// A catalog with endpoints loaded (simulates post-lazy-fetch state).
     fn catalog_with_endpoints() -> Catalog {

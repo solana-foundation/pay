@@ -2,7 +2,7 @@ use std::process::{Command, Stdio};
 
 use clap::Args;
 
-const ALLOWED_TOOLS: &str = "mcp__pay__curl,mcp__pay__search_skills,mcp__pay__list_skills,mcp__pay__get_skill_endpoints,mcp__pay__get_balance,mcp__pay__create_skill";
+const ALLOWED_TOOLS: &str = "mcp__pay__curl,mcp__pay__search_catalog,mcp__pay__list_catalog,mcp__pay__get_catalog_entry,mcp__pay__get_balance,mcp__pay__topup,mcp__pay__create_skill";
 
 /// Run Claude Code with 402 payment support.
 ///
@@ -142,10 +142,11 @@ mod tests {
     fn allowed_tools_include_all_pay_mcp_tools() {
         for tool in [
             "mcp__pay__curl",
-            "mcp__pay__search_skills",
-            "mcp__pay__list_skills",
-            "mcp__pay__get_skill_endpoints",
+            "mcp__pay__search_catalog",
+            "mcp__pay__list_catalog",
+            "mcp__pay__get_catalog_entry",
             "mcp__pay__get_balance",
+            "mcp__pay__topup",
             "mcp__pay__create_skill",
         ] {
             assert!(ALLOWED_TOOLS.split(',').any(|allowed| allowed == tool));

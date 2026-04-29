@@ -6,14 +6,14 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct Params {
     #[schemars(
-        description = "Fully qualified name returned by search_skills (e.g. 'solana-foundation/google/bigquery')"
+        description = "Fully qualified name returned by search_catalog or list_catalog (e.g. 'solana-foundation/google/bigquery')"
     )]
     pub fqn: String,
 }
 
-/// Full skill detail returned to the LLM after selection.
+/// Full catalog entry detail returned to the LLM after selection.
 #[derive(Debug, Serialize)]
-struct SkillDetail {
+struct CatalogEntryDetail {
     fqn: String,
     title: String,
     description: String,
@@ -64,7 +64,7 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
     let content = svc.content.clone();
 
     let base_url = &svc.meta.service_url;
-    let detail = SkillDetail {
+    let detail = CatalogEntryDetail {
         fqn: svc.fqn.clone(),
         title: svc.meta.title.clone(),
         description: svc.meta.description.clone(),
@@ -152,8 +152,8 @@ mod tests {
     }
 
     #[test]
-    fn skill_detail_serializes_next_step_guidance() {
-        let detail = SkillDetail {
+    fn catalog_entry_detail_serializes_next_step_guidance() {
+        let detail = CatalogEntryDetail {
             fqn: "example/search".to_string(),
             title: "Example Search".to_string(),
             description: "Search example data".to_string(),

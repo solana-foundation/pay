@@ -5646,6 +5646,7 @@ dependencies = [
  "solana-pubkey 3.0.0",
  "tempfile",
  "tokio",
+ "toml_edit 0.22.27",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
@@ -5723,9 +5724,13 @@ dependencies = [
 name = "pay-mcp"
 version = "0.9.0"
 dependencies = [
+ "base64 0.22.1",
+ "crc32fast",
+ "flate2",
  "pay-core",
  "pay-keystore",
  "pay-types",
+ "qrcode",
  "rmcp",
  "schemars 0.8.22",
  "serde",

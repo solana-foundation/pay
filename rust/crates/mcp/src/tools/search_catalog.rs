@@ -9,9 +9,9 @@ const MAX_ENDPOINTS_PER_CANDIDATE: usize = 5;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct Params {
-    /// Natural-language task to route to the best provider.
+    /// Natural-language task to route to the best provider. Do not use for Pay capability questions.
     #[schemars(
-        description = "Describe the user's task in natural language, not just a provider name"
+        description = "Actionable user task to route to a provider. Do not use for Pay capability questions like \"what can Pay do?\" or \"does Pay support X?\"; call list_catalog instead."
     )]
     pub query: String,
     /// Optional category filter such as ai_ml, data, finance, maps, media, or search.
@@ -35,7 +35,7 @@ pub struct Params {
 }
 
 #[derive(Debug, Serialize)]
-struct SearchResponse {
+struct SearchCatalogResponse {
     query: String,
     candidates: Vec<CandidateEntry>,
     selection_guidance: Vec<String>,
@@ -104,7 +104,7 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
 
     let max_results = params.max_results.clamp(1, 10);
     let category = params.category.clone();
-    let response = search_catalog(catalog, query, category, max_results).await;
+    let response = build_search_catalog_response(catalog, query, category, max_results).await;
 
     let json = serde_json::to_string_pretty(&response)
         .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
@@ -114,12 +114,12 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
     )]))
 }
 
-async fn search_catalog(
+async fn build_search_catalog_response(
     mut catalog: pay_core::skills::Catalog,
     query: String,
     category: Option<String>,
     max_results: usize,
-) -> SearchResponse {
+) -> SearchCatalogResponse {
     let lookup_limit = (max_results * ENDPOINT_LOOKUP_MULTIPLIER).clamp(max_results, 20);
     let preliminary = pay_core::skills::search_services_ranked(
         &catalog,
@@ -173,7 +173,7 @@ async fn search_catalog(
         .collect();
     let next_step = next_step_for_candidates(&candidates);
 
-    SearchResponse {
+    SearchCatalogResponse {
         query,
         candidates,
         selection_guidance: selection_guidance(),
@@ -184,11 +184,12 @@ async fn search_catalog(
 
 fn selection_guidance() -> Vec<String> {
     [
+        "For Pay capability or feasibility questions, call list_catalog before answering no; search results alone are not a complete capability check.",
         "Use the top candidate only when its provider and endpoint clearly match the user's task.",
         "Prefer exact endpoint fit over broad provider metadata.",
         "Hard-reject wrong network/currency, unusable method/body shape, invalid 402 challenges, and prices above the user's stated limit.",
         "For close candidates, compare endpoint fit, supported network/currency, usable request shape, freshness/result quality, and total estimated price in that order.",
-        "Call get_skill_endpoints once for the most likely provider when compact endpoint candidates are insufficient; do not browse every provider.",
+        "Call get_catalog_entry once for the most likely provider when compact endpoint candidates are insufficient; do not browse every provider.",
         "Ask the user before multi-call exploration, schema probing, broad crawls, unclear pricing, or a provider tie that remains unresolved.",
     ]
     .into_iter()
@@ -212,12 +213,12 @@ fn call_plan_fields() -> Vec<String> {
 
 fn next_step_for_candidates(candidates: &[CandidateEntry]) -> String {
     let Some(top) = candidates.first() else {
-        return "No matching provider was found. Retry search_skills once with refresh=true if the catalog may be stale; otherwise ask the user before using a non-Pay fallback.".to_string();
+        return "No matching provider was found. Retry search_catalog once with refresh=true if the catalog may be stale; otherwise ask the user before using a non-Pay fallback.".to_string();
     };
 
     if top.endpoint_lookup_error.is_some() || top.endpoints.is_empty() {
         return format!(
-            "Inspect `{}` with get_skill_endpoints before paying; compact endpoint details were unavailable or incomplete.",
+            "Inspect `{}` with get_catalog_entry before paying; compact endpoint details were unavailable or incomplete.",
             top.fqn
         );
     }
@@ -232,7 +233,7 @@ fn next_step_for_candidates(candidates: &[CandidateEntry]) -> String {
     }
 
     format!(
-        "If `{}` and one returned endpoint clearly match, make a compact call plan and call curl with the endpoint's exact url. If not, call get_skill_endpoints for `{}` before paying.",
+        "If `{}` and one returned endpoint clearly match, make a compact call plan and call curl with the endpoint's exact url. If not, call get_catalog_entry for `{}` before paying.",
         top.fqn, top.fqn
     )
 }
@@ -379,8 +380,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_response_includes_provider_selection_guidance() {
-        let response = search_catalog(
+    async fn search_catalog_response_includes_provider_selection_guidance() {
+        let response = build_search_catalog_response(
             bench_catalog(),
             "what's the volume of USDC that moved on Solana the past week".to_string(),
             None,
@@ -405,8 +406,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_response_handles_empty_results_with_refresh_hint() {
-        let response = search_catalog(
+    async fn search_catalog_response_handles_empty_results_with_refresh_hint() {
+        let response = build_search_catalog_response(
             pay_core::skills::Catalog {
                 schema_version: "1".to_string(),
                 generated_at: "test".to_string(),
@@ -460,7 +461,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_skills_csv_routing_bench() {
+    async fn search_catalog_csv_routing_bench() {
         let cases = parse_routing_cases(include_str!(
             "../../tests/fixtures/provider_routing_cases.csv"
         ));
@@ -500,7 +501,7 @@ mod tests {
         let mut total_score = 0.0;
         let mut top1_matches = 0usize;
         for case in cases {
-            let response = search_catalog(
+            let response = build_search_catalog_response(
                 catalog.clone(),
                 case.prompt.clone(),
                 case.category.clone(),

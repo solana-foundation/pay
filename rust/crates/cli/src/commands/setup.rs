@@ -4,6 +4,7 @@
 
 use dialoguer::Confirm;
 use owo_colors::OwoColorize;
+use toml_edit::{Array, DocumentMut, Item, Table, Value, value};
 
 #[cfg(target_os = "linux")]
 const POLKIT_POLICY_PATH: &str = "/usr/share/polkit-1/actions/sh.pay.unlock-keypair.policy";
@@ -141,6 +142,10 @@ fn claude_desktop_config_path() -> Option<std::path::PathBuf> {
     }
 }
 
+fn codex_config_path() -> Option<std::path::PathBuf> {
+    home_dir().map(|h| h.join(".codex").join("config.toml"))
+}
+
 fn home_dir() -> Option<std::path::PathBuf> {
     std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
@@ -184,6 +189,28 @@ fn install_mcp_configs() {
             }
             Err(e) => {
                 eprintln!("  {} Failed to configure {app_name}: {e}", "!".yellow());
+            }
+        }
+    }
+
+    if let Some(config_path) = codex_config_path()
+        && config_path.parent().is_none_or(|parent| parent.exists())
+    {
+        match add_codex_mcp_entry(&config_path, &pay_bin) {
+            Ok(McpInstallResult::Added) => {
+                eprintln!("  {} pay MCP added to Codex", "✔".green());
+                installed_any = true;
+            }
+            Ok(McpInstallResult::AlreadyPresent) => {
+                eprintln!("  {} pay MCP already configured in Codex", "✔".green());
+                installed_any = true;
+            }
+            Ok(McpInstallResult::Updated) => {
+                eprintln!("  {} pay MCP updated in Codex", "✔".green());
+                installed_any = true;
+            }
+            Err(e) => {
+                eprintln!("  {} Failed to configure Codex: {e}", "!".yellow());
             }
         }
     }
@@ -261,6 +288,176 @@ fn add_mcp_entry(config_path: &std::path::Path, pay_bin: &str) -> Result<McpInst
     }
 
     Ok(result)
+}
+
+/// Add or update the `pay` MCP server entry in Codex's TOML config.
+fn add_codex_mcp_entry(
+    config_path: &std::path::Path,
+    pay_bin: &str,
+) -> Result<McpInstallResult, String> {
+    let raw = if config_path.exists() {
+        std::fs::read_to_string(config_path)
+            .map_err(|e| format!("read {}: {e}", config_path.display()))?
+    } else {
+        String::new()
+    };
+    let mut config = if raw.trim().is_empty() {
+        DocumentMut::new()
+    } else {
+        raw.parse::<DocumentMut>()
+            .map_err(|e| format!("parse {}: {e}", config_path.display()))?
+    };
+
+    let existed = codex_pay_entry_exists(&config);
+    let already_present = codex_pay_entry_matches(&config, pay_bin);
+    if already_present {
+        return Ok(McpInstallResult::AlreadyPresent);
+    }
+
+    {
+        let mcp_servers = ensure_toml_table(&mut config["mcp_servers"]);
+        let pay = ensure_toml_table(&mut mcp_servers["pay"]);
+        pay["command"] = value(pay_bin);
+        pay["args"] = string_array_item(&["mcp"]);
+        pay["enabled"] = value(true);
+        pay["enabled_tools"] = string_array_item(super::codex::PAY_MCP_ENABLED_TOOLS);
+    }
+
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create dir {}: {e}", parent.display()))?;
+    }
+    std::fs::write(config_path, config.to_string())
+        .map_err(|e| format!("write {}: {e}", config_path.display()))?;
+
+    Ok(if existed {
+        McpInstallResult::Updated
+    } else {
+        McpInstallResult::Added
+    })
+}
+
+fn ensure_toml_table(item: &mut Item) -> &mut Table {
+    if !item.is_table() {
+        *item = Item::Table(Table::new());
+    }
+    item.as_table_mut().expect("item was just set to a table")
+}
+
+fn string_array_item(values: &[&str]) -> Item {
+    let mut array = Array::new();
+    for value in values {
+        array.push(*value);
+    }
+    Item::Value(Value::Array(array))
+}
+
+fn codex_pay_entry_exists(config: &DocumentMut) -> bool {
+    config
+        .get("mcp_servers")
+        .and_then(Item::as_table)
+        .and_then(|servers| servers.get("pay"))
+        .is_some()
+}
+
+fn codex_pay_entry_matches(config: &DocumentMut, pay_bin: &str) -> bool {
+    let Some(pay) = config
+        .get("mcp_servers")
+        .and_then(Item::as_table)
+        .and_then(|servers| servers.get("pay"))
+        .and_then(Item::as_table)
+    else {
+        return false;
+    };
+
+    let command_matches = pay
+        .get("command")
+        .and_then(Item::as_str)
+        .is_some_and(|command| command == pay_bin);
+    let args_match = item_string_array(pay.get("args")).is_some_and(|args| args == ["mcp"]);
+    let enabled_matches = pay
+        .get("enabled")
+        .and_then(Item::as_bool)
+        .unwrap_or_default();
+    let enabled_tools_match = item_string_array(pay.get("enabled_tools"))
+        .is_some_and(|tools| tools == super::codex::PAY_MCP_ENABLED_TOOLS);
+
+    command_matches && args_match && enabled_matches && enabled_tools_match
+}
+
+fn item_string_array(item: Option<&Item>) -> Option<Vec<&str>> {
+    item?
+        .as_array()?
+        .iter()
+        .map(|value| value.as_str())
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_mcp_entry_includes_enabled_tools() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"model = "gpt-5"
+
+[mcp_servers.other]
+command = "other"
+"#,
+        )
+        .unwrap();
+
+        let result = add_codex_mcp_entry(&config_path, "/usr/local/bin/pay").unwrap();
+
+        assert!(matches!(result, McpInstallResult::Added));
+        let raw = std::fs::read_to_string(&config_path).unwrap();
+        assert!(raw.contains(r#"model = "gpt-5""#));
+        assert!(raw.contains("enabled_tools"));
+        let parsed = raw.parse::<DocumentMut>().unwrap();
+        assert!(codex_pay_entry_matches(&parsed, "/usr/local/bin/pay"));
+    }
+
+    #[test]
+    fn codex_mcp_entry_updates_existing_without_allowlist() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[mcp_servers.pay]
+command = "pay"
+args = ["mcp"]
+enabled = true
+"#,
+        )
+        .unwrap();
+
+        let result = add_codex_mcp_entry(&config_path, "pay").unwrap();
+
+        assert!(matches!(result, McpInstallResult::Updated));
+        let raw = std::fs::read_to_string(&config_path).unwrap();
+        assert!(raw.contains("enabled_tools"));
+        let parsed = raw.parse::<DocumentMut>().unwrap();
+        assert!(codex_pay_entry_matches(&parsed, "pay"));
+    }
+
+    #[test]
+    fn codex_mcp_entry_is_idempotent_when_allowlist_matches() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+
+        assert!(matches!(
+            add_codex_mcp_entry(&config_path, "pay").unwrap(),
+            McpInstallResult::Added
+        ));
+        assert!(matches!(
+            add_codex_mcp_entry(&config_path, "pay").unwrap(),
+            McpInstallResult::AlreadyPresent
+        ));
+    }
 }
 
 // ── Skill installation ─────────────────────────────────────────────────────

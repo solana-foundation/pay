@@ -5,12 +5,13 @@ use std::process::{Command, Stdio};
 
 use clap::Args;
 
-const PAY_MCP_ENABLED_TOOLS: &[&str] = &[
+pub(crate) const PAY_MCP_ENABLED_TOOLS: &[&str] = &[
     "curl",
-    "search_skills",
-    "list_skills",
-    "get_skill_endpoints",
+    "search_catalog",
+    "list_catalog",
+    "get_catalog_entry",
     "get_balance",
+    "topup",
     "create_skill",
 ];
 
@@ -215,11 +216,11 @@ mod tests {
 
     #[test]
     fn config_string_escapes_quotes_and_angle_examples() {
-        let value = r#"Call get_skill_endpoints("<fqn>") then use "<url from results>"."#;
+        let value = r#"Call get_catalog_entry("<fqn>") then use "<url from results>"."#;
 
         assert_eq!(
             config_string("instructions", value),
-            r#"instructions="Call get_skill_endpoints(\"<fqn>\") then use \"<url from results>\".""#
+            r#"instructions="Call get_catalog_entry(\"<fqn>\") then use \"<url from results>\".""#
         );
     }
 
@@ -234,7 +235,7 @@ mod tests {
 
         assert!(args.contains(&r#"mcp_servers.pay.command="C:\\Users\\me\\pay.exe""#.to_string()));
         assert!(args.contains(
-            &r#"mcp_servers.pay.enabled_tools=["curl","search_skills","list_skills","get_skill_endpoints","get_balance","create_skill"]"#.to_string()
+            &r#"mcp_servers.pay.enabled_tools=["curl","search_catalog","list_catalog","get_catalog_entry","get_balance","topup","create_skill"]"#.to_string()
         ));
         assert!(
             args.contains(&r#"mcp_servers.pay.env={PAY_ACTIVE_ACCOUNT="default"}"#.to_string())
