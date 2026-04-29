@@ -186,6 +186,176 @@ fn filter_discovery(doc: &mut Value, allowed: &HashSet<(String, String)>) {
     }
 }
 
+/// Drop schemas / parameters / requestBodies / responses that no surviving
+/// operation transitively references. Run *after* [`filter_to_endpoints`]
+/// so the reachability seed only includes kept operations — the upstream's
+/// dead schema baggage gets cut along with the methods that referenced it.
+///
+/// Handles both shapes:
+/// - **OpenAPI 3**: walks `paths.<path>.<method>` (plus `security:` + the
+///   root `tags:`) for `$ref` strings, then BFS-expands through
+///   `components.{schemas,parameters,requestBodies,responses,headers,examples,
+///   links,callbacks,pathItems}`. Unreferenced sub-entries are removed.
+/// - **Google Discovery**: walks `resources.*.methods.*.{request,response,
+///   parameters}` for `$ref` strings (each pointing into the top-level
+///   `schemas` bucket), BFS-expands through `schemas`, and removes
+///   unreferenced top-level schemas.
+pub fn prune_unused_components(doc: &mut Value) {
+    if doc.get("openapi").is_some() || doc.get("swagger").is_some() {
+        prune_openapi3_components(doc);
+    } else if doc
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .is_some_and(|k| k.starts_with("discovery#"))
+    {
+        prune_discovery_schemas(doc);
+    } else if doc.get("paths").is_some() {
+        // Best-effort fallback for OpenAPI-shaped docs missing the marker.
+        prune_openapi3_components(doc);
+    } else if doc.get("schemas").is_some() && doc.get("resources").is_some() {
+        prune_discovery_schemas(doc);
+    }
+}
+
+/// Recursively walk a JSON value collecting every `$ref` string.
+fn collect_refs(value: &Value, refs: &mut HashSet<String>) {
+    match value {
+        Value::Object(map) => {
+            for (k, v) in map {
+                if k == "$ref" {
+                    if let Some(s) = v.as_str() {
+                        refs.insert(s.to_string());
+                    }
+                } else {
+                    collect_refs(v, refs);
+                }
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr {
+                collect_refs(v, refs);
+            }
+        }
+        _ => {}
+    }
+}
+
+const OPENAPI3_COMPONENT_SUBKEYS: &[&str] = &[
+    "schemas",
+    "parameters",
+    "requestBodies",
+    "responses",
+    "examples",
+    "headers",
+    "links",
+    "callbacks",
+    "pathItems",
+];
+
+fn prune_openapi3_components(doc: &mut Value) {
+    let mut reachable: HashSet<String> = HashSet::new();
+
+    // Seed: every $ref under the kept paths and root-level fields that may
+    // legitimately reference components (`security` is name-based not $ref,
+    // skip it; `tags` is name-based too).
+    if let Some(paths) = doc.get("paths") {
+        collect_refs(paths, &mut reachable);
+    }
+    // BFS through components: each ref's target may itself reference more.
+    let mut frontier: Vec<String> = reachable.iter().cloned().collect();
+    while let Some(r) = frontier.pop() {
+        let Some(pointer) = r.strip_prefix('#') else {
+            continue; // external/file refs not supported
+        };
+        if let Some(target) = doc.pointer(pointer) {
+            let mut new_refs = HashSet::new();
+            collect_refs(target, &mut new_refs);
+            for nr in new_refs {
+                if reachable.insert(nr.clone()) {
+                    frontier.push(nr);
+                }
+            }
+        }
+    }
+
+    // Prune unreferenced sub-entries from `components.<sub>`.
+    let mut drop_components = false;
+    if let Some(components) = doc.get_mut("components").and_then(|v| v.as_object_mut()) {
+        for sub_key in OPENAPI3_COMPONENT_SUBKEYS {
+            let to_remove: Vec<String> = match components.get(*sub_key).and_then(|v| v.as_object())
+            {
+                Some(sub) => sub
+                    .keys()
+                    .filter(|k| {
+                        let full_ref = format!("#/components/{sub_key}/{k}");
+                        !reachable.contains(&full_ref)
+                    })
+                    .cloned()
+                    .collect(),
+                None => continue,
+            };
+            if let Some(sub) = components.get_mut(*sub_key).and_then(|v| v.as_object_mut()) {
+                for k in to_remove {
+                    sub.remove(&k);
+                }
+                if sub.is_empty() {
+                    components.remove(*sub_key);
+                }
+            }
+        }
+        drop_components = components.is_empty();
+    }
+    if drop_components && let Some(root) = doc.as_object_mut() {
+        root.remove("components");
+    }
+}
+
+fn prune_discovery_schemas(doc: &mut Value) {
+    let mut reachable: HashSet<String> = HashSet::new();
+
+    // Seed from kept resources/methods. Discovery `$ref` values are bare
+    // schema names (no `#/...` prefix); they index into the top-level
+    // `schemas` bucket.
+    if let Some(resources) = doc.get("resources") {
+        collect_refs(resources, &mut reachable);
+    }
+    // Top-level `methods` (some discovery docs put methods at the root).
+    if let Some(methods) = doc.get("methods") {
+        collect_refs(methods, &mut reachable);
+    }
+
+    // BFS expand through schemas — each schema may reference others.
+    let mut frontier: Vec<String> = reachable.iter().cloned().collect();
+    while let Some(name) = frontier.pop() {
+        if let Some(schema) = doc.pointer(&format!("/schemas/{name}")) {
+            let mut new_refs = HashSet::new();
+            collect_refs(schema, &mut new_refs);
+            for nr in new_refs {
+                if reachable.insert(nr.clone()) {
+                    frontier.push(nr);
+                }
+            }
+        }
+    }
+
+    // Drop unreferenced schemas; drop the bucket entirely if empty.
+    let mut drop_bucket = false;
+    if let Some(schemas) = doc.get_mut("schemas").and_then(|v| v.as_object_mut()) {
+        let to_remove: Vec<String> = schemas
+            .keys()
+            .filter(|k| !reachable.contains(*k))
+            .cloned()
+            .collect();
+        for k in to_remove {
+            schemas.remove(&k);
+        }
+        drop_bucket = schemas.is_empty();
+    }
+    if drop_bucket && let Some(root) = doc.as_object_mut() {
+        root.remove("schemas");
+    }
+}
+
 /// Walk a discovery container (root or nested resource) and prune `methods`
 /// and nested `resources` that don't survive the allowlist. Returns `true` if
 /// the container has any surviving methods or resources after pruning.
@@ -395,6 +565,115 @@ mod tests {
         let paths = doc["paths"].as_object().unwrap();
         assert!(paths.contains_key("/v1/a"));
         assert!(!paths.contains_key("/v1/b"));
+    }
+
+    #[test]
+    fn prune_openapi3_drops_unreferenced_schemas() {
+        let mut doc = json!({
+            "openapi": "3.0.0",
+            "paths": {
+                "/v1/keep": {
+                    "post": {
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/Used"}
+                                }
+                            }
+                        },
+                        "responses": {
+                            "200": {"$ref": "#/components/responses/Ok"}
+                        }
+                    }
+                }
+            },
+            "components": {
+                "schemas": {
+                    "Used":      {"type": "object", "properties": {"nested": {"$ref": "#/components/schemas/Nested"}}},
+                    "Nested":    {"type": "string"},
+                    "Orphan":    {"type": "object"},
+                    "AlsoOrphan":{"type": "object"}
+                },
+                "responses": {
+                    "Ok":         {"description": "ok"},
+                    "Unused":     {"description": "unused"}
+                },
+                "requestBodies": {"DeadBody": {"description": "x"}},
+                "parameters":    {"DeadParam": {"name": "p"}}
+            }
+        });
+        prune_unused_components(&mut doc);
+
+        let schemas = doc["components"]["schemas"].as_object().unwrap();
+        assert!(schemas.contains_key("Used"));
+        assert!(schemas.contains_key("Nested")); // transitive
+        assert!(!schemas.contains_key("Orphan"));
+        assert!(!schemas.contains_key("AlsoOrphan"));
+
+        let responses = doc["components"]["responses"].as_object().unwrap();
+        assert!(responses.contains_key("Ok"));
+        assert!(!responses.contains_key("Unused"));
+
+        // Unused buckets dropped entirely.
+        assert!(
+            !doc["components"]
+                .as_object()
+                .unwrap()
+                .contains_key("requestBodies")
+        );
+        assert!(
+            !doc["components"]
+                .as_object()
+                .unwrap()
+                .contains_key("parameters")
+        );
+    }
+
+    #[test]
+    fn prune_openapi3_drops_components_object_when_empty() {
+        let mut doc = json!({
+            "openapi": "3.0.0",
+            "paths": {"/v1/x": {"get": {}}},
+            "components": {
+                "schemas": {"Orphan": {"type": "object"}},
+                "parameters": {"DeadParam": {"name": "p"}}
+            }
+        });
+        prune_unused_components(&mut doc);
+        assert!(!doc.as_object().unwrap().contains_key("components"));
+    }
+
+    #[test]
+    fn prune_discovery_drops_unreferenced_schemas() {
+        let mut doc = json!({
+            "kind": "discovery#restDescription",
+            "schemas": {
+                "Used":     {"type": "object", "properties": {"x": {"$ref": "Nested"}}},
+                "Nested":   {"type": "string"},
+                "Orphan":   {"type": "object"},
+                "Disjoint": {"type": "object", "properties": {"y": {"$ref": "OtherOrphan"}}},
+                "OtherOrphan": {"type": "object"}
+            },
+            "resources": {
+                "things": {
+                    "methods": {
+                        "lookup": {
+                            "httpMethod": "POST",
+                            "path": "v1/things:lookup",
+                            "request":  {"$ref": "Used"},
+                            "response": {"$ref": "Used"}
+                        }
+                    }
+                }
+            }
+        });
+        prune_unused_components(&mut doc);
+        let schemas = doc["schemas"].as_object().unwrap();
+        assert!(schemas.contains_key("Used"));
+        assert!(schemas.contains_key("Nested")); // transitive
+        assert!(!schemas.contains_key("Orphan"));
+        assert!(!schemas.contains_key("Disjoint"));
+        assert!(!schemas.contains_key("OtherOrphan"));
     }
 
     #[test]

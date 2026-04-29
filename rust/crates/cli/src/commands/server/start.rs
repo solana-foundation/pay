@@ -135,6 +135,11 @@ impl StartCommand {
                     .unwrap_or_else(|| std::path::Path::new("."));
                 let mut doc = pay_core::server::openapi::load_document(&source, spec_dir)?;
                 pay_core::server::openapi::filter_to_endpoints(&mut doc, &api.endpoints);
+                // Drop schemas/parameters/responses no surviving operation
+                // references — for heavily-trimmed proxies (e.g. bigquery
+                // 47 endpoints → 2) this cuts the served openapi size from
+                // hundreds of KB to a handful.
+                pay_core::server::openapi::prune_unused_components(&mut doc);
                 Some(Arc::new(doc))
             }
             None => None,

@@ -983,6 +983,7 @@ struct ProviderDetailFile {
     content: Option<String>,
     /// Pointer to the upstream OpenAPI doc (preserved for traceability).
     #[serde(default)]
+    #[allow(dead_code)]
     openapi: Option<pay_types::registry::OpenapiSource>,
     /// Inlined OpenAPI / Discovery document, populated at build time when
     /// the spec declared `openapi: { url: ... }`. Lets MCP / CLI consumers
