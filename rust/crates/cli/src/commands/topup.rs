@@ -47,13 +47,16 @@ impl TopupCommand {
             }
         };
 
-        if let Some(received) = crate::tui::run_topup_flow(&pubkey, &rpc_url, &account_name)? {
+        if let Some(completion) = crate::tui::run_topup_flow(&pubkey, &rpc_url, &account_name)? {
             use owo_colors::OwoColorize;
             eprintln!();
             eprintln!("  {}", "Funded!".green().bold());
-            let amount = crate::commands::account::new::format_received(&received);
+            let amount = crate::commands::account::new::format_received(&completion.received);
             if !amount.is_empty() {
                 eprintln!("  {} {}", "✔".green(), amount.green());
+            }
+            if let Some(hash) = &completion.tx_hash {
+                eprintln!("  {} https://solscan.io/tx/{hash}", "tx".dimmed());
             }
             eprintln!();
         }

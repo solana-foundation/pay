@@ -5,8 +5,6 @@
 //! challenges within that budget/time are then paid automatically.
 
 use std::io;
-#[cfg(target_os = "macos")]
-use std::process::Command as ProcessCommand;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -15,8 +13,9 @@ use crate::commands::ToolKind;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
-use pay_core::client::balance::{AccountBalances, ReceivedFunds};
-use qrcode::{Color as QrColor, QrCode};
+use pay_core::client::balance::{AccountBalances, ReceivedFunds, ReceivedToken};
+use qrcode::QrCode;
+use qrcode::render::unicode;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -30,6 +29,23 @@ const POLL_COUNTDOWN: Duration = Duration::from_secs(4);
 /// Result from the polling thread: what changed + current totals.
 struct TopupDetected {
     received: ReceivedFunds,
+    /// On-chain transaction hash for the funding transfer (only present
+    /// when MoonPay reports completion via the on-ramp status endpoint).
+    tx_hash: Option<String>,
+}
+
+/// Status updates from the on-ramp poller thread (`/onramp/status`).
+#[derive(Debug)]
+enum OnrampUpdate {
+    /// MoonPay has reported a completed payment + on-chain transfer.
+    Completed {
+        tx_hash: Option<String>,
+        crypto_amount: Option<String>,
+        crypto_currency: Option<String>,
+    },
+    /// MoonPay has reported failure. The TUI surfaces the reason and stays
+    /// open so the user can retry.
+    Failed { reason: String },
 }
 
 struct RenderedQr {
@@ -58,6 +74,11 @@ const STEP_AMOUNT: u64 = 500_000; // 0.50 USDC in base units (6 decimals)
 const TOPUP_MAX_STEPS: usize = 25;
 const TOPUP_STEP_USDC: f64 = 1.0;
 const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+/// Polling cadence for `/onramp/status`.
+const ONRAMP_POLL_INTERVAL: Duration = Duration::from_secs(3);
+/// Hard cap on the on-ramp poller — if we don't see a terminal status by then,
+/// the thread exits silently. (The user can press `r` to relaunch.)
+const ONRAMP_POLL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 const CARD_WIDTH: u16 = 36;
 const CARD_BG: Color = Color::Rgb(35, 40, 50);
@@ -125,7 +146,7 @@ pub fn setup_session(tool: ToolKind, account_name: &str) -> io::Result<SessionSe
     with_terminal(|terminal| run(terminal, tool, account_name))
 }
 
-const DEFAULT_ONRAMP_URL: &str = "https://www.coinbase.com/";
+const DEFAULT_ONRAMP_URL: &str = "https://buy.moonpay.com/";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TopupOption {
@@ -135,7 +156,9 @@ enum TopupOption {
 
 impl TopupOption {
     fn all() -> [Self; 2] {
-        [Self::TransferFromExistingAccount, Self::BuyStablecoins]
+        // Buy stablecoins is the recommended flow for new users — list it first
+        // so it's the default-highlighted card.
+        [Self::BuyStablecoins, Self::TransferFromExistingAccount]
     }
 
     fn title(self) -> &'static str {
@@ -148,7 +171,7 @@ impl TopupOption {
     fn subtitle(self) -> &'static str {
         match self {
             Self::TransferFromExistingAccount => "Scan with any Solana wallet",
-            Self::BuyStablecoins => "Choose an onramp provider",
+            Self::BuyStablecoins => "Pay with card, Apple Pay, or bank",
         }
     }
 }
@@ -156,60 +179,76 @@ impl TopupOption {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TopupFocus {
     Methods,
-    Providers,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BuyProvider {
-    Venmo,
-    Paypal,
-    Coinbase,
+/// Resolve the on-ramp host from `PAY_ONRAMP_HOST`, falling back to
+/// `https://pay.sh`. Trailing slashes are stripped so callers can `format!`
+/// without double-slash hazards.
+fn resolve_onramp_host() -> String {
+    let raw = std::env::var("PAY_ONRAMP_HOST").unwrap_or_else(|_| "https://pay.sh".to_string());
+    raw.trim_end_matches('/').to_string()
 }
 
-impl BuyProvider {
-    fn all() -> [Self; 3] {
-        [Self::Coinbase, Self::Paypal, Self::Venmo]
-    }
-
-    fn title(self) -> &'static str {
-        match self {
-            Self::Venmo => "Venmo",
-            Self::Paypal => "PayPal",
-            Self::Coinbase => "Coinbase",
-        }
-    }
-
-    fn subtitle(self) -> &'static str {
-        match self {
-            Self::Venmo => "Buy stablecoins like PYUSD",
-            Self::Paypal => "Buy stablecoins like PYUSD",
-            Self::Coinbase => "Buy stablecoins like USDC",
-        }
-    }
-
-    fn url(self) -> &'static str {
-        match self {
-            Self::Venmo => "https://venmo.com/",
-            Self::Paypal => "https://www.paypal.com/",
-            Self::Coinbase => "https://www.coinbase.com/",
-        }
-    }
-}
-
-/// Returns `true` if funds were detected, `false` if the user dismissed.
+/// Run the interactive top-up TUI for an account.
+///
+/// Presents two options to the user:
+///
+/// 1. **Buy stablecoins** (default) — opens the MoonPay on-ramp in the user's
+///    browser via `pay-web-ui`'s `/onramp` page and polls
+///    `GET {host}/onramp/status?externalTransactionId=<id>` until MoonPay
+///    reports a terminal status. The on-ramp host is read from the
+///    `PAY_ONRAMP_HOST` env var (default: `https://pay.sh`).
+/// 2. **Top-up from mobile wallet** — renders a Solana Pay QR code that any
+///    Solana wallet can scan, while polling the RPC for incoming SOL/SPL token
+///    balance changes against `pubkey`.
+///
+/// Both paths run concurrently: an on-chain balance increase or a MoonPay
+/// `completed` webhook will end the flow with `Ok(Some(_))`. The user can
+/// dismiss the TUI at any time with `Esc`/`q`/`Ctrl-C`, which yields
+/// `Ok(None)`.
+///
+/// When stderr is not a TTY (e.g. CI, piped output), this falls back to
+/// printing static top-up instructions and returns `Ok(None)` immediately.
+///
+/// # Parameters
+/// - `pubkey`: base58 destination address shown in the QR code and threaded
+///   into the MoonPay widget as the locked `walletAddress`.
+/// - `rpc_url`: Solana JSON-RPC endpoint used by the background balance poller
+///   to detect on-chain top-ups.
+/// - `account_name`: human-readable account label rendered in the TUI and
+///   forwarded to `/onramp` as a query param for the browser title.
+///
+/// # Returns
+/// - `Ok(Some(TopupCompletion))` if funds landed (either path). The completion
+///   carries a synthesized [`ReceivedFunds`] for amount formatting and an
+///   optional on-chain tx hash (only populated for MoonPay completions).
+/// - `Ok(None)` if the user dismissed without funding.
+/// - `Err(_)` if the terminal could not be entered or restored.
 pub fn run_topup_flow(
     pubkey: &str,
     rpc_url: &str,
     account_name: &str,
-) -> pay_core::Result<Option<ReceivedFunds>> {
+) -> pay_core::Result<Option<TopupCompletion>> {
     if !std::io::IsTerminal::is_terminal(&std::io::stderr()) {
         print_topup_instructions(pubkey);
         return Ok(None);
     }
 
-    let result = with_terminal(|terminal| run_topup(terminal, pubkey, rpc_url, account_name))?;
+    let onramp_host = resolve_onramp_host();
+    let result =
+        with_terminal(|terminal| run_topup(terminal, pubkey, rpc_url, account_name, &onramp_host))?;
 
-    Ok(result.map(|d| d.received))
+    Ok(result.map(|d| TopupCompletion {
+        received: d.received,
+        tx_hash: d.tx_hash,
+    }))
+}
+
+/// Funds detected during a topup TUI session.
+pub struct TopupCompletion {
+    pub received: ReceivedFunds,
+    /// On-chain tx hash, when known (only set for MoonPay completions).
+    pub tx_hash: Option<String>,
 }
 
 fn run_topup(
@@ -217,14 +256,18 @@ fn run_topup(
     pubkey: &str,
     rpc_url: &str,
     account_name: &str,
+    onramp_host: &str,
 ) -> io::Result<Option<TopupDetected>> {
     let options = TopupOption::all();
-    let providers = BuyProvider::all();
     let mut selected = 0usize;
-    let mut provider_selected = 0usize;
-    let mut focus = TopupFocus::Methods;
-    let mut amount_pos: usize = 5; // default $5
+    let focus = TopupFocus::Methods;
+    let mut amount_pos: usize = 10; // default $10
     let started_at = Instant::now();
+
+    // Active MoonPay session (set after the user hits Enter on "Buy stablecoins").
+    let mut onramp: Option<OnrampSession> = None;
+    let mut onramp_error: Option<String> = None;
+    let (otx, orx) = mpsc::channel::<OnrampUpdate>();
 
     // Fetch initial balances (best-effort; skip polling if RPC is unreachable)
     let initial_balances = tokio::runtime::Runtime::new()
@@ -251,7 +294,10 @@ fn run_topup(
             if let Ok(current) = rt.block_on(pay_core::client::balance::get_balances(&rpc, &pk)) {
                 let received = current.diff_received(&initial);
                 if received.has_any() {
-                    let _ = tx.send(TopupDetected { received });
+                    let _ = tx.send(TopupDetected {
+                        received,
+                        tx_hash: None,
+                    });
                 }
             }
             // Send a sentinel None to signal "check finished, nothing found"
@@ -284,12 +330,41 @@ fn run_topup(
                 account_name,
                 &options,
                 selected,
-                &providers,
-                provider_selected,
                 focus,
                 amount_pos,
+                onramp.as_ref(),
+                onramp_error.as_deref(),
             )?;
             return Ok(Some(received));
+        }
+
+        // Drain on-ramp poller updates.
+        while let Ok(update) = orx.try_recv() {
+            match update {
+                OnrampUpdate::Completed {
+                    tx_hash,
+                    crypto_amount,
+                    crypto_currency,
+                } => {
+                    let received = synthesize_received_funds(&crypto_amount, &crypto_currency);
+                    let detected = TopupDetected { received, tx_hash };
+                    blink_checkmark(
+                        terminal,
+                        pubkey,
+                        account_name,
+                        &options,
+                        selected,
+                        focus,
+                        amount_pos,
+                        onramp.as_ref(),
+                        onramp_error.as_deref(),
+                    )?;
+                    return Ok(Some(detected));
+                }
+                OnrampUpdate::Failed { reason } => {
+                    onramp_error = Some(reason);
+                }
+            }
         }
         // If we were checking and the thread finished (channel empty), mark done
         if checking && last_check_at.is_some_and(|t| t.elapsed() >= Duration::from_secs(6)) {
@@ -321,12 +396,12 @@ fn run_topup(
                 account_name,
                 &options,
                 selected,
-                &providers,
-                provider_selected,
                 focus,
                 &status,
                 amount_pos,
                 None,
+                onramp.as_ref(),
+                onramp_error.as_deref(),
             );
         })?;
 
@@ -338,44 +413,44 @@ fn run_topup(
             }
 
             match key.code {
-                KeyCode::Up => match focus {
-                    TopupFocus::Methods => selected = selected.saturating_sub(1),
-                    TopupFocus::Providers => {
-                        provider_selected = provider_selected.saturating_sub(1);
-                    }
-                },
-                KeyCode::Down if focus == TopupFocus::Methods && selected < options.len() - 1 => {
-                    selected += 1
+                KeyCode::Up => {
+                    selected = selected.saturating_sub(1);
                 }
-                KeyCode::Down
-                    if focus == TopupFocus::Providers
-                        && provider_selected < providers.len() - 1 =>
-                {
-                    provider_selected += 1
+                KeyCode::Down if selected < options.len() - 1 => {
+                    selected += 1;
                 }
                 KeyCode::Down => {}
                 KeyCode::Left => {
                     if options[selected] == TopupOption::TransferFromExistingAccount {
                         amount_pos = amount_pos.saturating_sub(1);
-                    } else {
-                        focus = TopupFocus::Methods;
                     }
                 }
-                KeyCode::Right => match options[selected] {
-                    TopupOption::TransferFromExistingAccount => {
-                        if amount_pos < TOPUP_MAX_STEPS {
-                            amount_pos += 1;
-                        }
-                    }
-                    TopupOption::BuyStablecoins => focus = TopupFocus::Providers,
-                },
-                KeyCode::Enter => {
-                    if options[selected] == TopupOption::BuyStablecoins
-                        && focus == TopupFocus::Providers
+                KeyCode::Right => {
+                    if options[selected] == TopupOption::TransferFromExistingAccount
+                        && amount_pos < TOPUP_MAX_STEPS
                     {
-                        open_url(providers[provider_selected].url())?;
+                        amount_pos += 1;
                     }
-                    return Ok(None);
+                }
+                KeyCode::Enter => {
+                    if options[selected] == TopupOption::BuyStablecoins {
+                        // Launch (or relaunch) a MoonPay session.
+                        let session =
+                            launch_onramp_session(onramp_host, pubkey, account_name, &otx);
+                        onramp_error = None;
+                        onramp = Some(session);
+                    } else {
+                        return Ok(None);
+                    }
+                }
+                KeyCode::Char('r') | KeyCode::Char('R')
+                    if options[selected] == TopupOption::BuyStablecoins && onramp.is_some() =>
+                {
+                    // Reopen the existing MoonPay tab without rotating the
+                    // externalTransactionId — the in-flight session is still valid.
+                    if let Some(session) = onramp.as_ref() {
+                        let _ = open_url(&session.url);
+                    }
                 }
                 KeyCode::Char('r') | KeyCode::Char('R')
                     if has_baseline && past_delay && !checking =>
@@ -401,6 +476,13 @@ struct BlinkState {
     visible: bool,
 }
 
+/// Active MoonPay session state surfaced into the TUI.
+struct OnrampSession {
+    external_id: String,
+    url: String,
+    started_at: Instant,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn blink_checkmark(
     terminal: &mut Terminal<CrosstermBackend<io::Stderr>>,
@@ -408,10 +490,10 @@ fn blink_checkmark(
     account_name: &str,
     options: &[TopupOption],
     selected: usize,
-    providers: &[BuyProvider],
-    provider_selected: usize,
     focus: TopupFocus,
     amount_pos: usize,
+    onramp: Option<&OnrampSession>,
+    onramp_error: Option<&str>,
 ) -> io::Result<()> {
     for i in 0..5 {
         let visible = i % 2 == 0;
@@ -425,12 +507,12 @@ fn blink_checkmark(
                 account_name,
                 options,
                 selected,
-                providers,
-                provider_selected,
                 focus,
                 &PollStatus::RpcUnavailable, // status bar doesn't matter during blink
                 amount_pos,
                 blink.as_ref(),
+                onramp,
+                onramp_error,
             );
         })?;
         std::thread::sleep(Duration::from_millis(300));
@@ -495,12 +577,12 @@ fn render_topup_selector(
     account_name: &str,
     options: &[TopupOption],
     selected: usize,
-    providers: &[BuyProvider],
-    provider_selected: usize,
     focus: TopupFocus,
     status: &PollStatus,
     amount_pos: usize,
     blink: Option<&BlinkState>,
+    onramp: Option<&OnrampSession>,
+    onramp_error: Option<&str>,
 ) {
     frame.render_widget(Clear, area);
     frame.render_widget(
@@ -619,11 +701,11 @@ fn render_topup_selector(
             render_qr_detail(frame, right[1], pubkey, account_name, amount_pos, blink)
         }
         TopupOption::BuyStablecoins => {
-            render_provider_list(frame, right[1], providers, provider_selected, focus)
+            render_buy_stablecoins_detail(frame, right[1], pubkey, onramp, onramp_error)
         }
     }
 
-    render_topup_controls(frame, chunks[1], active, status);
+    render_topup_controls(frame, chunks[1], active, status, onramp.is_some());
 }
 
 fn render_qr_detail(
@@ -716,58 +798,113 @@ fn solana_pay_url(pubkey: &str, amount_pos: usize) -> String {
     }
 }
 
-fn render_provider_list(
+fn render_buy_stablecoins_detail(
     frame: &mut ratatui::Frame,
     area: Rect,
-    providers: &[BuyProvider],
-    selected: usize,
-    focus: TopupFocus,
+    pubkey: &str,
+    onramp: Option<&OnrampSession>,
+    onramp_error: Option<&str>,
 ) {
-    let lines = providers
-        .iter()
-        .enumerate()
-        .flat_map(|(idx, provider)| {
-            let is_selected = idx == selected;
-            let is_active = is_selected && focus == TopupFocus::Providers;
-            let title = Line::from(vec![
-                Span::styled(
-                    if is_selected { "⏵ " } else { "  " },
-                    Style::default().fg(if is_active {
-                        Color::Green
-                    } else if is_selected {
-                        TOPUP_CARD_INACTIVE_SELECTED_BG
-                    } else {
-                        Color::Black
-                    }),
-                ),
-                Span::styled(
-                    provider.title(),
-                    Style::default()
-                        .fg(if is_selected {
-                            Color::Green
-                        } else {
-                            Color::White
-                        })
-                        .add_modifier(if is_selected {
-                            Modifier::BOLD
-                        } else {
-                            Modifier::empty()
-                        }),
-                ),
-            ]);
-            let subtitle = Line::from(vec![
-                Span::raw("  "),
-                Span::styled(
-                    provider.subtitle(),
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::DIM),
-                ),
-            ]);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(TOPUP_MAIN_BG)),
+        area,
+    );
 
-            [title, subtitle, Line::default()]
-        })
-        .collect::<Vec<_>>();
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "Buy stablecoins via MoonPay",
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::raw(""));
+
+    match onramp {
+        None => {
+            lines.push(Line::from(Span::styled(
+                "Pay with card, Apple Pay, or bank.",
+                Style::default().fg(Color::Gray),
+            )));
+            lines.push(Line::from(Span::styled(
+                "USDC will be sent to:",
+                Style::default().fg(Color::Gray),
+            )));
+            lines.push(Line::from(Span::styled(
+                format!("  {pubkey}"),
+                Style::default().fg(Color::White),
+            )));
+            lines.push(Line::raw(""));
+            lines.push(Line::from(vec![
+                Span::styled("Press ", Style::default().fg(Color::Gray)),
+                Span::styled(
+                    "Enter",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    " to open MoonPay in your browser.",
+                    Style::default().fg(Color::Gray),
+                ),
+            ]));
+            lines.push(Line::from(Span::styled(
+                "We'll wait here and confirm when funds land.",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        Some(session) => {
+            let elapsed = session.started_at.elapsed().as_secs();
+            lines.push(Line::from(Span::styled(
+                "MoonPay opened in your browser.",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::raw(""));
+            lines.push(Line::from(vec![
+                Span::styled("Status:  ", Style::default().fg(Color::Gray)),
+                Span::styled("waiting for payment…", Style::default().fg(Color::Yellow)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("Elapsed: ", Style::default().fg(Color::Gray)),
+                Span::styled(format!("{elapsed}s"), Style::default().fg(Color::White)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("Tx ID:   ", Style::default().fg(Color::Gray)),
+                Span::styled(
+                    session.external_id.clone(),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+            lines.push(Line::raw(""));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "r",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" reopen browser  ·  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    "Esc",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" abort", Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+    }
+
+    if let Some(err) = onramp_error {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            format!("Last attempt failed: {err}"),
+            Style::default().fg(Color::Red),
+        )));
+        lines.push(Line::from(Span::styled(
+            "Press Enter to retry.",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
 
     frame.render_widget(
         Paragraph::new(lines).style(Style::default().bg(TOPUP_MAIN_BG)),
@@ -861,6 +998,7 @@ fn render_topup_controls(
     area: Rect,
     active: TopupOption,
     status: &PollStatus,
+    onramp_active: bool,
 ) {
     let mut spans = match active {
         TopupOption::TransferFromExistingAccount => vec![
@@ -871,13 +1009,19 @@ fn render_topup_controls(
             Span::styled("Esc", Style::default().fg(Color::Red).bold()),
             Span::styled(" skip", Style::default().dim()),
         ],
+        TopupOption::BuyStablecoins if onramp_active => vec![
+            Span::styled("↑ ↓", Style::default().fg(Color::Cyan).bold()),
+            Span::styled(" move  │  ", Style::default().dim()),
+            Span::styled("r", Style::default().fg(Color::Cyan).bold()),
+            Span::styled(" reopen  │  ", Style::default().dim()),
+            Span::styled("Esc", Style::default().fg(Color::Red).bold()),
+            Span::styled(" abort", Style::default().dim()),
+        ],
         TopupOption::BuyStablecoins => vec![
             Span::styled("↑ ↓", Style::default().fg(Color::Cyan).bold()),
             Span::styled(" move  │  ", Style::default().dim()),
-            Span::styled("← →", Style::default().fg(Color::Cyan).bold()),
-            Span::styled(" switch pane  │  ", Style::default().dim()),
             Span::styled("Enter", Style::default().fg(Color::Green).bold()),
-            Span::styled(" open  │  ", Style::default().dim()),
+            Span::styled(" open MoonPay  │  ", Style::default().dim()),
             Span::styled("Esc", Style::default().fg(Color::Red).bold()),
             Span::styled(" skip", Style::default().dim()),
         ],
@@ -938,21 +1082,137 @@ fn print_topup_instructions(pubkey: &str) {
     eprintln!("  2. Buy funds using an onramp such as Coinbase: {DEFAULT_ONRAMP_URL}");
 }
 
-fn open_url(url: &str) -> io::Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        let status = ProcessCommand::new("open").arg(url).status()?;
-        if !status.success() {
-            return Err(io::Error::other("failed to open URL"));
-        }
-        Ok(())
-    }
+/// Build a sanitized `externalTransactionId` (UUID v4 with the `pay-` prefix).
+fn new_external_id() -> String {
+    format!("pay-{}", uuid::Uuid::new_v4())
+}
 
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = url;
-        Ok(())
+/// Compose the on-ramp URL we open in the browser. The page reads these query
+/// params and POSTs to `/onramp/sign` to fetch a MoonPay signature.
+fn build_onramp_url(host: &str, pubkey: &str, account_name: &str, external_id: &str) -> String {
+    format!(
+        "{host}/onramp?walletAddress={}&externalTransactionId={}&account={}",
+        urlencoding::encode(pubkey),
+        urlencoding::encode(external_id),
+        urlencoding::encode(account_name),
+    )
+}
+
+/// Launch a fresh on-ramp session: open the browser and start a status poller.
+fn launch_onramp_session(
+    onramp_host: &str,
+    pubkey: &str,
+    account_name: &str,
+    updates: &mpsc::Sender<OnrampUpdate>,
+) -> OnrampSession {
+    let host = onramp_host.trim_end_matches('/').to_string();
+    let external_id = new_external_id();
+    let url = build_onramp_url(&host, pubkey, account_name, &external_id);
+    let _ = open_url(&url);
+    spawn_onramp_poller(host, external_id.clone(), updates.clone());
+    OnrampSession {
+        external_id,
+        url,
+        started_at: Instant::now(),
     }
+}
+
+/// Background thread that polls `GET {host}/onramp/status?externalTransactionId=<id>`
+/// every [`ONRAMP_POLL_INTERVAL`] until it sees a terminal status, exits, or
+/// hits [`ONRAMP_POLL_TIMEOUT`].
+fn spawn_onramp_poller(host: String, external_id: String, tx: mpsc::Sender<OnrampUpdate>) {
+    std::thread::spawn(move || {
+        #[derive(serde::Deserialize)]
+        struct StatusResp {
+            status: String,
+            #[serde(rename = "txHash")]
+            tx_hash: Option<String>,
+            #[serde(rename = "cryptoAmount")]
+            crypto_amount: Option<String>,
+            #[serde(rename = "cryptoCurrency")]
+            crypto_currency: Option<String>,
+            #[serde(rename = "failureReason")]
+            failure_reason: Option<String>,
+        }
+
+        let Ok(rt) = tokio::runtime::Runtime::new() else {
+            return;
+        };
+        let url = format!(
+            "{host}/onramp/status?externalTransactionId={}",
+            urlencoding::encode(&external_id)
+        );
+        let client = reqwest::Client::new();
+        let started = Instant::now();
+
+        rt.block_on(async {
+            loop {
+                if started.elapsed() > ONRAMP_POLL_TIMEOUT {
+                    return;
+                }
+                if let Ok(resp) = client.get(&url).send().await
+                    && resp.status().is_success()
+                    && let Ok(body) = resp.json::<StatusResp>().await
+                {
+                    match body.status.as_str() {
+                        "completed" => {
+                            let _ = tx.send(OnrampUpdate::Completed {
+                                tx_hash: body.tx_hash,
+                                crypto_amount: body.crypto_amount,
+                                crypto_currency: body.crypto_currency,
+                            });
+                            return;
+                        }
+                        "failed" => {
+                            let _ = tx.send(OnrampUpdate::Failed {
+                                reason: body
+                                    .failure_reason
+                                    .unwrap_or_else(|| "unknown reason".into()),
+                            });
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+                tokio::time::sleep(ONRAMP_POLL_INTERVAL).await;
+            }
+        });
+    });
+}
+
+/// Convert a MoonPay completion (amount + currency code) into a [`ReceivedFunds`]
+/// shape so the existing post-topup formatting logic in `account/new.rs` can
+/// render the same “Funded!” summary regardless of which top-up path the user
+/// took.
+fn synthesize_received_funds(amount: &Option<String>, currency: &Option<String>) -> ReceivedFunds {
+    let ui_amount = amount
+        .as_deref()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    let symbol: Option<&'static str> = match currency.as_deref() {
+        Some("usdc_sol") | Some("usdc") => Some("USDC"),
+        Some("sol") => None, // surface as SOL via lamports below
+        _ => None,
+    };
+    if currency.as_deref() == Some("sol") {
+        let lamports = (ui_amount * 1_000_000_000.0) as u64;
+        return ReceivedFunds {
+            sol_lamports: lamports,
+            tokens: Vec::new(),
+        };
+    }
+    ReceivedFunds {
+        sol_lamports: 0,
+        tokens: vec![ReceivedToken {
+            mint: USDC_MINT.to_string(),
+            ui_amount,
+            symbol,
+        }],
+    }
+}
+
+fn open_url(url: &str) -> io::Result<()> {
+    webbrowser::open(url).map_err(io::Error::other)
 }
 
 fn run(

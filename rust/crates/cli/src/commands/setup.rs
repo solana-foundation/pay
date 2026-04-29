@@ -79,8 +79,12 @@ impl SetupCommand {
             .rpc_url
             .clone()
             .unwrap_or_else(pay_core::balance::mainnet_rpc_url);
-        let received = crate::tui::run_topup_flow(&pubkey, &rpc_url, "default")?;
-        super::account::new::print_next_steps("default", backend_name, received.as_ref());
+        let completion = crate::tui::run_topup_flow(&pubkey, &rpc_url, "default")?;
+        super::account::new::print_next_steps(
+            "default",
+            backend_name,
+            completion.as_ref().map(|c| &c.received),
+        );
         Ok(())
     }
 }
