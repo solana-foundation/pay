@@ -76,9 +76,6 @@ tempfile = "3"
 # Path expansion
 shellexpand = "3"
 
-# UUIDs (externalTransactionId for onramp)
-uuid = { version = "1", features = ["v4"] }
-
 # Open URLs in the user's browser (pay topup → MoonPay)
 webbrowser = "1"
 
