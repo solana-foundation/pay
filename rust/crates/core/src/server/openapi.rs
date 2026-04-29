@@ -258,6 +258,75 @@ fn filter_discovery(doc: &mut Value, allowed: &HashSet<(String, String)>) {
     }
 }
 
+/// Strip upstream-auth metadata that doesn't apply to proxy callers. The
+/// proxy handles upstream credentials internally (Google OAuth2, API keys,
+/// etc.); leaving the auth schemes in the served doc misleads agents into
+/// attaching tokens that the proxy won't honor anyway. Removes:
+///
+/// - `components.securitySchemes` (OpenAPI 3) — drops the bucket entirely.
+/// - `security:` arrays at the root and on every operation (OpenAPI 3).
+/// - `auth:` block (Google Discovery) at the root.
+/// - `scopes:` array on every Discovery method, recursively through nested
+///   resources.
+pub fn strip_upstream_auth(doc: &mut Value) {
+    if let Some(obj) = doc.as_object_mut() {
+        // OpenAPI 3 root-level security and securitySchemes bucket.
+        obj.remove("security");
+        if let Some(components) = obj.get_mut("components").and_then(|v| v.as_object_mut()) {
+            components.remove("securitySchemes");
+            if components.is_empty() {
+                obj.remove("components");
+            }
+        }
+        // Discovery root-level auth block.
+        obj.remove("auth");
+    }
+
+    // Per-operation security on OpenAPI 3 paths.
+    if let Some(paths) = doc.get_mut("paths").and_then(|v| v.as_object_mut()) {
+        for (_, item) in paths.iter_mut() {
+            let Some(item_obj) = item.as_object_mut() else {
+                continue;
+            };
+            for &method in HTTP_METHODS {
+                if let Some(op) = item_obj.get_mut(method).and_then(|v| v.as_object_mut()) {
+                    op.remove("security");
+                }
+            }
+        }
+    }
+
+    // Per-method `scopes` arrays on Discovery resources, recursively.
+    if let Some(resources) = doc.get_mut("resources").and_then(|v| v.as_object_mut()) {
+        strip_discovery_method_scopes(resources);
+    }
+    if let Some(methods) = doc.get_mut("methods").and_then(|v| v.as_object_mut()) {
+        for (_, m) in methods.iter_mut() {
+            if let Some(mobj) = m.as_object_mut() {
+                mobj.remove("scopes");
+            }
+        }
+    }
+}
+
+fn strip_discovery_method_scopes(resources: &mut Map<String, Value>) {
+    for (_, resource) in resources.iter_mut() {
+        let Some(robj) = resource.as_object_mut() else {
+            continue;
+        };
+        if let Some(methods) = robj.get_mut("methods").and_then(|v| v.as_object_mut()) {
+            for (_, m) in methods.iter_mut() {
+                if let Some(mobj) = m.as_object_mut() {
+                    mobj.remove("scopes");
+                }
+            }
+        }
+        if let Some(nested) = robj.get_mut("resources").and_then(|v| v.as_object_mut()) {
+            strip_discovery_method_scopes(nested);
+        }
+    }
+}
+
 /// Drop schemas / parameters / requestBodies / responses that no surviving
 /// operation transitively references. Run *after* [`filter_to_endpoints`]
 /// so the reachability seed only includes kept operations — the upstream's
@@ -746,6 +815,107 @@ mod tests {
         assert!(!schemas.contains_key("Orphan"));
         assert!(!schemas.contains_key("Disjoint"));
         assert!(!schemas.contains_key("OtherOrphan"));
+    }
+
+    #[test]
+    fn strip_auth_drops_openapi3_security_and_scheme_bucket() {
+        let mut doc = json!({
+            "openapi": "3.0.0",
+            "security": [{"oauth2": ["scope.a"]}],
+            "paths": {
+                "/v1/x": {
+                    "post": {
+                        "summary": "x",
+                        "security": [{"oauth2": ["scope.b"]}]
+                    }
+                }
+            },
+            "components": {
+                "schemas": {"Foo": {"type": "object"}},
+                "securitySchemes": {
+                    "oauth2": {"type": "oauth2", "flows": {}}
+                }
+            }
+        });
+        strip_upstream_auth(&mut doc);
+
+        // Root-level + per-operation security gone.
+        assert!(!doc.as_object().unwrap().contains_key("security"));
+        assert!(
+            !doc["paths"]["/v1/x"]["post"]
+                .as_object()
+                .unwrap()
+                .contains_key("security")
+        );
+        // securitySchemes bucket gone (other components survive).
+        let comp = doc["components"].as_object().unwrap();
+        assert!(!comp.contains_key("securitySchemes"));
+        assert!(comp.contains_key("schemas"));
+    }
+
+    #[test]
+    fn strip_auth_drops_components_when_only_security_schemes_were_left() {
+        let mut doc = json!({
+            "openapi": "3.0.0",
+            "components": {
+                "securitySchemes": {"oauth2": {"type": "oauth2"}}
+            }
+        });
+        strip_upstream_auth(&mut doc);
+        assert!(!doc.as_object().unwrap().contains_key("components"));
+    }
+
+    #[test]
+    fn strip_auth_drops_discovery_auth_and_method_scopes() {
+        let mut doc = json!({
+            "kind": "discovery#restDescription",
+            "auth": {
+                "oauth2": {"scopes": {"https://example.com/auth/x": {"description": "x"}}}
+            },
+            "resources": {
+                "things": {
+                    "methods": {
+                        "lookup": {
+                            "httpMethod": "POST",
+                            "path": "v1/things:lookup",
+                            "scopes": ["https://example.com/auth/x"]
+                        }
+                    },
+                    "resources": {
+                        "nested": {
+                            "methods": {
+                                "get": {
+                                    "httpMethod": "GET",
+                                    "path": "v1/things/nested",
+                                    "scopes": ["https://example.com/auth/y"]
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        strip_upstream_auth(&mut doc);
+
+        assert!(!doc.as_object().unwrap().contains_key("auth"));
+        // Scopes removed from every method, including nested resources.
+        assert!(
+            !doc["resources"]["things"]["methods"]["lookup"]
+                .as_object()
+                .unwrap()
+                .contains_key("scopes")
+        );
+        assert!(
+            !doc["resources"]["things"]["resources"]["nested"]["methods"]["get"]
+                .as_object()
+                .unwrap()
+                .contains_key("scopes")
+        );
+        // Methods themselves are still there (we only stripped scopes, not the methods).
+        assert_eq!(
+            doc["resources"]["things"]["methods"]["lookup"]["httpMethod"],
+            json!("POST")
+        );
     }
 
     #[test]

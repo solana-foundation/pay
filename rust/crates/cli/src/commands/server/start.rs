@@ -140,6 +140,11 @@ impl StartCommand {
                 // 47 endpoints → 2) this cuts the served openapi size from
                 // hundreds of KB to a handful.
                 pay_core::server::openapi::prune_unused_components(&mut doc);
+                // Strip upstream-auth metadata (OAuth2 scopes etc.) — the
+                // proxy handles upstream credentials internally; surfacing
+                // them on /openapi.json misleads agents into attaching
+                // tokens the proxy won't use.
+                pay_core::server::openapi::strip_upstream_auth(&mut doc);
                 Some(Arc::new(doc))
             }
             None => None,
