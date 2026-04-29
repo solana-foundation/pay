@@ -42,6 +42,11 @@ them with upstream API hosts.
 `body` may be a string or a JSON value. JSON values are serialized before the
 request and `Content-Type: application/json` is added when no content type is
 provided.
+
+For URLs that match a cached Pay catalog endpoint with an inlined OpenAPI
+document, Pay validates the method and JSON request body locally before sending.
+If required fields or types are wrong, the tool returns a clear validation error
+and does not submit the request or payment.
 "#
     )]
     async fn curl(

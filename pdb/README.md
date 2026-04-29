@@ -15,6 +15,18 @@ Runs against the [Solana Payment Sandbox](https://402.surfnet.dev) — no real f
 - **Frontend** — React SPA (`src/`) with Vite. Compact flow list with protocol badge, resource path, status, and latency. Expanded view shows a step-by-step sequence diagram alongside a timestamped event log.
 - **Embedded mode** — The frontend and backend are also compiled into the `pay` Rust binary (`crates/pdb`). Run `pay --sandbox server start --debugger spec.yml` to get the debugger alongside any gateway proxy.
 
+For source packaging, build or unpack the frontend before compiling Rust:
+
+```bash
+cd pdb && pnpm install --frozen-lockfile && pnpm build
+cd ../rust && cargo build --release
+```
+
+Release builds also publish `pay-pdb-dist-<version>.tar.gz`. Packagers such as
+Homebrew can unpack that artifact and set `PAY_PDB_DIST=/path/to/dist` before
+running Cargo. `build.rs` intentionally does not fetch the latest GitHub release
+so builds stay pinned, reproducible, and compatible with offline build systems.
+
 ## Quick start
 
 ```bash

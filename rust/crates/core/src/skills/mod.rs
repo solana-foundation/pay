@@ -1203,6 +1203,159 @@ pub fn service_fqn_for_resource_url(resource_url: &str) -> Option<String> {
     })
 }
 
+/// Validate a request against cached catalog OpenAPI metadata when a matching
+/// provider detail file is available locally.
+///
+/// This never refreshes the catalog or fetches provider details. If the URL is
+/// not confidently matched to a cached catalog endpoint, validation is skipped.
+pub fn validate_cached_catalog_request(
+    method: &str,
+    resource_url: &str,
+    body: Option<&str>,
+) -> Result<()> {
+    let Some(context) = cached_openapi_context_for_resource_url(resource_url) else {
+        return Ok(());
+    };
+
+    match openapi::validate_request(
+        &context.openapi_doc,
+        method,
+        &context.relative_path,
+        &context.query_params,
+        body,
+    ) {
+        openapi::RequestValidationOutcome::Valid | openapi::RequestValidationOutcome::NotInSpec => {
+            Ok(())
+        }
+        openapi::RequestValidationOutcome::Invalid(failure) => Err(Error::RequestValidation(
+            format_validation_failure(resource_url, &context, &failure),
+        )),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CachedOpenapiContext {
+    service_fqn: String,
+    relative_path: String,
+    query_params: Vec<(String, String)>,
+    openapi_doc: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+struct CachedOpenapiMatch {
+    prefix_len: usize,
+    service_fqn: String,
+    relative_path: String,
+    query_params: Vec<(String, String)>,
+    openapi_doc: serde_json::Value,
+}
+
+fn cached_openapi_context_for_resource_url(resource_url: &str) -> Option<CachedOpenapiContext> {
+    let target = ParsedUrl::parse(resource_url)?;
+    let mut matches = Vec::new();
+
+    for catalog in cached_catalogs() {
+        for svc in &catalog.providers {
+            let Some(detail) = cached_service_detail(svc) else {
+                continue;
+            };
+            let ProviderDetailFile {
+                endpoints,
+                openapi_doc,
+                ..
+            } = detail;
+            let Some(openapi_doc) = openapi_doc else {
+                continue;
+            };
+            let endpoints = if endpoints.is_empty() {
+                &svc.endpoints
+            } else {
+                &endpoints
+            };
+            if endpoints.is_empty() {
+                continue;
+            }
+
+            for base_url in service_base_urls(svc) {
+                let Some(base_match) = base_url_match(&target, base_url) else {
+                    continue;
+                };
+                if endpoints
+                    .iter()
+                    .any(|endpoint| endpoint_path_matches(&base_match.relative_path, endpoint))
+                {
+                    matches.push(CachedOpenapiMatch {
+                        prefix_len: base_match.prefix_len,
+                        service_fqn: svc.fqn.clone(),
+                        relative_path: base_match.relative_path,
+                        query_params: target.query_params.clone(),
+                        openapi_doc: openapi_doc.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    choose_unique_best_openapi_match(matches)
+}
+
+fn choose_unique_best_openapi_match(
+    matches: Vec<CachedOpenapiMatch>,
+) -> Option<CachedOpenapiContext> {
+    let best_prefix_len = matches.iter().map(|item| item.prefix_len).max()?;
+    let best: Vec<_> = matches
+        .into_iter()
+        .filter(|item| item.prefix_len == best_prefix_len)
+        .collect();
+    let mut fqns: Vec<_> = best.iter().map(|item| item.service_fqn.clone()).collect();
+    fqns.sort();
+    fqns.dedup();
+    if fqns.len() != 1 {
+        return None;
+    }
+
+    let best = best.into_iter().find(|item| item.service_fqn == fqns[0])?;
+    Some(CachedOpenapiContext {
+        service_fqn: best.service_fqn,
+        relative_path: best.relative_path,
+        query_params: best.query_params,
+        openapi_doc: best.openapi_doc,
+    })
+}
+
+fn cached_service_detail(svc: &Service) -> Option<ProviderDetailFile> {
+    if svc.sha.is_empty() {
+        return None;
+    }
+
+    let cache_file = detail_cache_dir().join(format!("{}.json", svc.sha));
+    std::fs::read_to_string(cache_file)
+        .ok()
+        .and_then(|raw| parse_detail(&raw).ok())
+}
+
+fn format_validation_failure(
+    resource_url: &str,
+    context: &CachedOpenapiContext,
+    failure: &openapi::RequestValidationFailure,
+) -> String {
+    let mut lines = vec![
+        "Pay catalog request validation failed before sending.".to_string(),
+        format!("Provider: {}", context.service_fqn),
+        format!("Request: {} {}", failure.method, resource_url),
+        format!("Catalog path: {}", failure.path),
+        "Problems:".to_string(),
+    ];
+    for problem in &failure.problems {
+        lines.push(format!("- {problem}"));
+    }
+    if let Some(example) = &failure.example {
+        lines.push(format!("Expected JSON body example: {example}"));
+    }
+    lines.push("The request was not sent. Fix the method/body or inspect the provider with get_catalog_entry.".to_string());
+    lines.join("\n")
+}
+
 fn cached_catalogs() -> Vec<Catalog> {
     let dir = std::path::PathBuf::from(shellexpand::tilde("~/.config/pay/skills").into_owned());
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -1321,16 +1474,22 @@ struct ParsedUrl {
     host: String,
     port: Option<u16>,
     path: String,
+    query_params: Vec<(String, String)>,
 }
 
 impl ParsedUrl {
     fn parse(raw: &str) -> Option<Self> {
         let url = reqwest::Url::parse(raw).ok()?;
+        let query_params = url
+            .query_pairs()
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect();
         Some(Self {
             scheme: url.scheme().to_ascii_lowercase(),
             host: url.host_str()?.to_ascii_lowercase(),
             port: url.port_or_known_default(),
             path: normalize_url_path(url.path()),
+            query_params,
         })
     }
 }

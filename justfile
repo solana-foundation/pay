@@ -4,22 +4,46 @@ mod ts 'typescript/Justfile'
 default:
     @just --list --unsorted
 
-# Install a target: `just install pay`, `just install deps`
-install target='deps':
+# Install a target: `just install pay`, `just install pay <cargo install args...>`, `just install deps`
+[positional-arguments]
+install target='deps' *cargo_args:
     #!/usr/bin/env bash
     set -euo pipefail
-    case "{{target}}" in
+
+    target="$1"
+    shift
+
+    build_pdb() {
+        if [ -n "${PAY_PDB_DIST:-}" ]; then
+            echo "Using prebuilt PDB assets from PAY_PDB_DIST=${PAY_PDB_DIST}"
+            return
+        fi
+        cd pdb
+        pnpm install --frozen-lockfile
+        pnpm build
+        cd ..
+    }
+
+    case "${target}" in
         pay)
-            cd pdb && pnpm install --frozen-lockfile && pnpm build
-            cd ../rust && cargo cli-install
+            build_pdb
+            if [ "$#" -gt 0 ]; then
+                cargo install "$@"
+            else
+                cd rust && cargo cli-install
+            fi
             ;;
         deps)
+            if [ "$#" -gt 0 ]; then
+                echo "install deps does not accept extra arguments"
+                exit 1
+            fi
             cd typescript && pnpm install
             cd ../rust && cargo fetch
             ;;
         *)
-            echo "Unknown target: {{target}}"
-            echo "Usage: just install pay | just install deps"
+            echo "Unknown target: ${target}"
+            echo "Usage: just install pay [cargo install args...] | just install deps"
             exit 1
             ;;
     esac
@@ -34,10 +58,47 @@ test:
     cd typescript && pnpm --filter @solana/pay test
     cd rust && cargo test --workspace
 
-# Build everything
-build:
-    cd typescript && pnpm --filter @solana/pay build
-    cd rust && cargo build --release
+# Build a target: `just build`, `just build pay`, `just build pdb`
+build target='all':
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    build_pdb() {
+        if [ -n "${PAY_PDB_DIST:-}" ]; then
+            echo "Using prebuilt PDB assets from PAY_PDB_DIST=${PAY_PDB_DIST}"
+            return
+        fi
+        cd pdb
+        pnpm install --frozen-lockfile
+        pnpm build
+        cd ..
+    }
+
+    case "{{ target }}" in
+        all)
+            cd typescript && pnpm --filter @solana/pay build && cd ..
+            build_pdb
+            cd rust && cargo build --release
+            ;;
+        pay)
+            build_pdb
+            cd rust && cargo build --release
+            ;;
+        pdb)
+            build_pdb
+            ;;
+        rust)
+            cd rust && cargo build --release
+            ;;
+        typescript|ts)
+            cd typescript && pnpm --filter @solana/pay build
+            ;;
+        *)
+            echo "Unknown build target: {{ target }}"
+            echo "Usage: just build [all|pay|pdb|rust|typescript]"
+            exit 1
+            ;;
+    esac
 
 # Format everything
 fmt:

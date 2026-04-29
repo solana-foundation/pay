@@ -58,12 +58,26 @@ pub enum RunOutcome {
 /// Appends `-D <tempfile>` after user args to capture response headers.
 /// stdout/stderr/stdin are inherited so the user sees normal curl output.
 pub fn run_curl(user_args: &[String]) -> Result<RunOutcome> {
+    validate_curl_args_against_catalog(user_args)?;
     run_curl_inner(user_args, &[])
 }
 
 /// Run `curl` with extra headers injected (used for retry after payment).
 pub fn run_curl_with_headers(user_args: &[String], extra_headers: &[String]) -> Result<RunOutcome> {
     run_curl_inner(user_args, extra_headers)
+}
+
+/// Validate a curl invocation against cached Pay catalog OpenAPI metadata.
+pub fn validate_curl_args_against_catalog(user_args: &[String]) -> Result<()> {
+    let request = ParsedCurlRequest::from_args(user_args);
+    if let Some(url) = request.url.as_deref() {
+        crate::skills::validate_cached_catalog_request(
+            &request.method,
+            url,
+            request.body.as_deref(),
+        )?;
+    }
+    Ok(())
 }
 
 fn run_curl_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunOutcome> {
@@ -394,6 +408,103 @@ fn find_url_in_args(args: &[String]) -> Option<String> {
     args.iter()
         .find(|a| a.starts_with("http://") || a.starts_with("https://"))
         .cloned()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedCurlRequest {
+    url: Option<String>,
+    method: String,
+    body: Option<String>,
+}
+
+impl ParsedCurlRequest {
+    fn from_args(args: &[String]) -> Self {
+        let mut url = None;
+        let mut explicit_method = None;
+        let mut body = None;
+        let mut force_get = false;
+        let mut i = 0;
+
+        while i < args.len() {
+            let arg = &args[i];
+            match arg.as_str() {
+                "-X" | "--request" => {
+                    if let Some(value) = args.get(i + 1) {
+                        explicit_method = Some(value.to_ascii_uppercase());
+                        i += 1;
+                    }
+                }
+                "--url" => {
+                    if let Some(value) = args.get(i + 1) {
+                        url = Some(value.clone());
+                        i += 1;
+                    }
+                }
+                "-d" | "--data" | "--data-raw" | "--data-binary" | "--data-ascii"
+                | "--data-urlencode" | "--json" => {
+                    if let Some(value) = args.get(i + 1) {
+                        append_curl_body(&mut body, value);
+                        i += 1;
+                    }
+                }
+                "-G" | "--get" => {
+                    force_get = true;
+                }
+                "-I" | "--head" => {
+                    explicit_method = Some("HEAD".to_string());
+                }
+                _ => {
+                    if let Some(value) = arg.strip_prefix("--request=") {
+                        explicit_method = Some(value.to_ascii_uppercase());
+                    } else if let Some(value) = arg.strip_prefix("--url=") {
+                        url = Some(value.to_string());
+                    } else if let Some(value) = arg.strip_prefix("--data=") {
+                        append_curl_body(&mut body, value);
+                    } else if let Some(value) = arg.strip_prefix("--data-raw=") {
+                        append_curl_body(&mut body, value);
+                    } else if let Some(value) = arg.strip_prefix("--data-binary=") {
+                        append_curl_body(&mut body, value);
+                    } else if let Some(value) = arg.strip_prefix("--data-ascii=") {
+                        append_curl_body(&mut body, value);
+                    } else if let Some(value) = arg.strip_prefix("--data-urlencode=") {
+                        append_curl_body(&mut body, value);
+                    } else if let Some(value) = arg.strip_prefix("--json=") {
+                        append_curl_body(&mut body, value);
+                    } else if arg.starts_with("-X") && arg.len() > 2 {
+                        explicit_method = Some(arg[2..].to_ascii_uppercase());
+                    } else if arg.starts_with("-d") && arg.len() > 2 {
+                        append_curl_body(&mut body, &arg[2..]);
+                    } else if url.is_none()
+                        && (arg.starts_with("http://") || arg.starts_with("https://"))
+                    {
+                        url = Some(arg.clone());
+                    }
+                }
+            }
+            i += 1;
+        }
+
+        let method = explicit_method.unwrap_or_else(|| {
+            if force_get || body.is_none() {
+                "GET".to_string()
+            } else {
+                "POST".to_string()
+            }
+        });
+
+        Self { url, method, body }
+    }
+}
+
+fn append_curl_body(body: &mut Option<String>, value: &str) {
+    match body {
+        Some(body) if !body.is_empty() => {
+            body.push('&');
+            body.push_str(value);
+        }
+        Some(body) => body.push_str(value),
+        None => *body = Some(value.to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -821,6 +932,44 @@ HTTP request sent, awaiting response...
         assert_eq!(
             find_url_in_args(&args),
             Some("https://example.com/api".to_string())
+        );
+    }
+
+    #[test]
+    fn parsed_curl_request_extracts_method_url_and_json_body() {
+        let args = vec![
+            "--json".to_string(),
+            r#"{"query":"solana"}"#.to_string(),
+            "https://example.com/api/search".to_string(),
+        ];
+
+        assert_eq!(
+            ParsedCurlRequest::from_args(&args),
+            ParsedCurlRequest {
+                url: Some("https://example.com/api/search".to_string()),
+                method: "POST".to_string(),
+                body: Some(r#"{"query":"solana"}"#.to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn parsed_curl_request_honors_explicit_request_and_url_flags() {
+        let args = vec![
+            "--request=PATCH".to_string(),
+            "--data-raw".to_string(),
+            r#"{"name":"pay"}"#.to_string(),
+            "--url".to_string(),
+            "https://example.com/api/item".to_string(),
+        ];
+
+        assert_eq!(
+            ParsedCurlRequest::from_args(&args),
+            ParsedCurlRequest {
+                url: Some("https://example.com/api/item".to_string()),
+                method: "PATCH".to_string(),
+                body: Some(r#"{"name":"pay"}"#.to_string()),
+            }
         );
     }
 

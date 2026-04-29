@@ -19,28 +19,36 @@ fn default_network() -> String {
 
 pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
     let network = params.network;
-    let accounts = pay_core::accounts::AccountsFile::load()
-        .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
-    let (name, account) = accounts.account_for_network(&network).ok_or_else(|| {
-        rmcp::ErrorData::internal_error(format!("No account configured for {network}"), None)
-    })?;
+    let accounts = match pay_core::accounts::AccountsFile::load() {
+        Ok(accounts) => accounts,
+        Err(err) => {
+            return Ok(super::tool_error(format!(
+                "Failed to load Pay accounts: {err}"
+            )));
+        }
+    };
+    let Some((_name, account)) = accounts.account_for_network(&network) else {
+        return Ok(super::tool_error(format!(
+            "No account configured for {network}. Run `pay setup` first."
+        )));
+    };
 
-    let pubkey = account
-        .pubkey
-        .as_deref()
-        .ok_or_else(|| rmcp::ErrorData::internal_error("Account has no pubkey", None))?
-        .to_string();
-    let name = name.to_string();
-
+    let Some(pubkey) = account.pubkey.as_deref() else {
+        return Ok(super::tool_error(
+            "Account has no pubkey. Run `pay setup` again.",
+        ));
+    };
+    let pubkey = pubkey.to_string();
     let rpc_url = if network == "mainnet" {
         pay_core::balance::mainnet_rpc_url()
     } else {
         std::env::var("PAY_RPC_URL").unwrap_or_else(|_| pay_core::balance::mainnet_rpc_url())
     };
 
-    let balances = pay_core::client::balance::get_balances(&rpc_url, &pubkey)
-        .await
-        .map_err(|e| rmcp::ErrorData::internal_error(format!("RPC error: {e}"), None))?;
+    let balances = match pay_core::client::balance::get_balances(&rpc_url, &pubkey).await {
+        Ok(balances) => balances,
+        Err(err) => return Ok(super::tool_error(format!("RPC error: {err}"))),
+    };
 
     let mut lines = vec![];
 

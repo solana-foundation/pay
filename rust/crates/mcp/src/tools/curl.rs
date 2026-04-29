@@ -15,7 +15,7 @@ pub struct Params {
     )]
     pub headers: Option<std::collections::HashMap<String, String>>,
     #[schemars(
-        description = "Request body for POST/PUT/PATCH. Pass either a string or a JSON value; JSON values are serialized before sending."
+        description = "Request body for POST/PUT/PATCH. Pass either a string or a JSON value; JSON values are serialized before sending and validated locally against cached Pay catalog OpenAPI schemas when available."
     )]
     pub body: Option<BodyParam>,
 }
@@ -66,25 +66,27 @@ pub fn prepare_headers(
 pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
     let headers = prepare_headers(&params.headers, params.body.is_some());
     let method = params.method.clone().unwrap_or_else(|| "GET".to_string());
-    let body = params
-        .body
-        .clone()
-        .map(BodyParam::into_string)
-        .transpose()
-        .map_err(|e| {
-            rmcp::ErrorData::invalid_params(format!("Failed to serialize request body: {e}"), None)
-        })?;
+    let body = match params.body.clone().map(BodyParam::into_string).transpose() {
+        Ok(body) => body,
+        Err(err) => {
+            return Ok(super::tool_error(format!(
+                "Failed to serialize request body: {err}"
+            )));
+        }
+    };
     let url = params.url.clone();
 
     let response =
         tokio::task::spawn_blocking(move || do_paid_fetch(&method, &url, &headers, body))
             .await
-            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
 
-    Ok(CallToolResult::success(vec![rmcp::model::Content::text(
-        response,
-    )]))
+    match response {
+        Ok(response) => Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+            response,
+        )])),
+        Err(err) => Ok(pay_error_to_tool_result(err)),
+    }
 }
 
 fn do_paid_fetch(
@@ -94,6 +96,8 @@ fn do_paid_fetch(
     body: Option<String>,
 ) -> Result<String, pay_core::Error> {
     use pay_core::client::runner::RunOutcome;
+
+    pay_core::skills::validate_cached_catalog_request(method, url, body.as_deref())?;
 
     let outcome =
         pay_core::client::fetch::fetch_request(method, url, extra_headers, body.as_deref())?;
@@ -188,6 +192,14 @@ fn do_paid_fetch(
             Ok(body.unwrap_or_else(|| "Request completed.".to_string()))
         }
     }
+}
+
+fn pay_error_to_tool_result(err: pay_core::Error) -> CallToolResult {
+    let message = match err {
+        pay_core::Error::RequestValidation(message) => message,
+        other => format!("Pay curl failed: {other}"),
+    };
+    super::tool_error(message)
 }
 
 fn interpret_retry(
@@ -326,6 +338,31 @@ mod tests {
     fn do_paid_fetch_returns_error_for_invalid_url() {
         let result = do_paid_fetch("GET", "not-a-url", &[], None);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn request_validation_errors_are_returned_as_tool_content() {
+        let result = pay_error_to_tool_result(pay_core::Error::RequestValidation(
+            "body.email is required".to_string(),
+        ));
+
+        assert_eq!(result.is_error, Some(true));
+        let text = result.content[0].as_text().unwrap();
+        assert_eq!(text.text, "body.email is required");
+    }
+
+    #[test]
+    fn payment_errors_are_returned_as_tool_content() {
+        let result = pay_error_to_tool_result(pay_core::Error::PaymentRejected(
+            "insufficient funds".to_string(),
+        ));
+
+        assert_eq!(result.is_error, Some(true));
+        let text = result.content[0].as_text().unwrap();
+        assert_eq!(
+            text.text,
+            "Pay curl failed: Payment rejected: insufficient funds"
+        );
     }
 
     // ── Env var propagation for network/account overrides ─────────────

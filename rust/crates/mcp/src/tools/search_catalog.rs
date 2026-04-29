@@ -85,29 +85,36 @@ fn default_max_results() -> usize {
 pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
     let query = params.query.trim().to_string();
     if query.is_empty() {
-        return Err(rmcp::ErrorData::invalid_params(
-            "`query` must describe the user's task".to_string(),
-            None,
-        ));
+        return Ok(super::tool_error("`query` must describe the user's task"));
     }
 
     let cache_bust = params.cache_bust;
-    let catalog = if params.refresh || cache_bust {
+    let catalog_result = if params.refresh || cache_bust {
         pay_core::skills::update_skills(cache_bust)
             .await
-            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
+            .map_err(|e| format!("Failed to refresh Pay catalog: {e}"))
     } else {
         pay_core::skills::load_skills()
             .await
-            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
+            .map_err(|e| format!("Failed to load Pay catalog: {e}"))
+    };
+    let catalog = match catalog_result {
+        Ok(catalog) => catalog,
+        Err(message) => return Ok(super::tool_error(message)),
     };
 
     let max_results = params.max_results.clamp(1, 10);
     let category = params.category.clone();
     let response = build_search_catalog_response(catalog, query, category, max_results).await;
 
-    let json = serde_json::to_string_pretty(&response)
-        .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+    let json = match serde_json::to_string_pretty(&response) {
+        Ok(json) => json,
+        Err(err) => {
+            return Ok(super::tool_error(format!(
+                "Failed to serialize response: {err}"
+            )));
+        }
+    };
 
     Ok(CallToolResult::success(vec![rmcp::model::Content::text(
         json,

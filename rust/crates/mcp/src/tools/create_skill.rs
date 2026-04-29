@@ -36,6 +36,7 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
         Ok(validated) => {
             let spec_json = serde_json::to_string_pretty(&validated.spec).unwrap_or_default();
             let (metered, free) = endpoint_counts(&validated.spec);
+            let mut is_error = false;
             let mut response = format!(
                 "Provider spec is valid.\n\n\
                  - endpoints: {} total ({metered} metered, {free} free)\n\
@@ -50,6 +51,7 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
             if let Some(path) = output_path.as_deref() {
                 let path_errors = validate_output_path(path, &validated.spec.name);
                 if !path_errors.is_empty() {
+                    is_error = true;
                     response.push_str("\n## Output path needs attention\n\n");
                     response.push_str("The provider content was valid, but I did not write it because the requested path is not contributor-ready:\n\n");
                     for err in &path_errors {
@@ -78,6 +80,7 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
                         ));
                         }
                         Err(e) => {
+                            is_error = true;
                             response.push_str(&format!("\nFailed to write to {path}: {e}\n"));
                         }
                     }
@@ -99,9 +102,13 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
                 ));
             }
 
-            Ok(CallToolResult::success(vec![rmcp::model::Content::text(
-                response,
-            )]))
+            if is_error {
+                Ok(super::tool_error(response))
+            } else {
+                Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+                    response,
+                )]))
+            }
         }
         Err(errors) => {
             let mut response = format!("Validation failed with {} error(s):\n\n", errors.len());
@@ -123,9 +130,7 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
                 "\n## JSON Schema for provider frontmatter\n\n```json\n{schema_json}\n```\n"
             ));
 
-            Ok(CallToolResult::success(vec![rmcp::model::Content::text(
-                response,
-            )]))
+            Ok(super::tool_error(response))
         }
     }
 }

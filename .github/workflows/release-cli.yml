@@ -68,6 +68,12 @@ jobs:
           node-version: lts/*
       - name: Build PDB frontend
         run: cd ../pdb && pnpm install --frozen-lockfile && pnpm build
+      - name: Package PDB frontend
+        run: tar -C ../pdb -czf pay-pdb-dist-${{ steps.resolve.outputs.version }}.tar.gz dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pay-pdb-dist
+          path: rust/pay-pdb-dist-${{ steps.resolve.outputs.version }}.tar.gz
 
       - uses: dtolnay/rust-toolchain@stable
         with:

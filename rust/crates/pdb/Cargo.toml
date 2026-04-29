@@ -15,7 +15,7 @@ include_dir = "0.7.4"
 mime_guess = { version = "2.0.4", default-features = false }
 serde = { workspace = true }
 serde_json = { workspace = true }
-solana-transaction = { workspace = true }
+solana-transaction = { workspace = true, features = ["bincode"] }
 tokio = { workspace = true }
 
 [dev-dependencies]
@@ -23,6 +23,6 @@ solana-hash = { workspace = true }
 solana-instruction = { workspace = true }
 solana-message = { workspace = true }
 solana-pubkey = { workspace = true }
-solana-signature = { workspace = true }
+solana-signature = { workspace = true, features = ["rand"] }
 
 [build-dependencies]

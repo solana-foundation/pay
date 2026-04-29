@@ -92,18 +92,23 @@ struct ResolvedAccount {
 }
 
 pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
-    let account = resolve_account(params.account.as_deref())?;
+    let account = match resolve_account(params.account.as_deref()) {
+        Ok(account) => account,
+        Err(message) => return Ok(super::tool_error(message)),
+    };
     let pixels_per_module = params
         .pixels_per_module
         .unwrap_or(DEFAULT_PIXELS_PER_MODULE);
     if !(1..=32).contains(&pixels_per_module) {
-        return Err(rmcp::ErrorData::invalid_params(
-            "`pixels_per_module` must be between 1 and 32".to_string(),
-            None,
+        return Ok(super::tool_error(
+            "`pixels_per_module` must be between 1 and 32",
         ));
     }
 
-    let amount_usdc = validate_amount(params.amount_usdc)?;
+    let amount_usdc = match validate_amount(params.amount_usdc) {
+        Ok(amount_usdc) => amount_usdc,
+        Err(message) => return Ok(super::tool_error(message)),
+    };
     let (provider, target_url, response_amount, instructions) = match params.method {
         TopupMethod::MobileWallet => (
             None,
@@ -112,12 +117,11 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
             "Scan with a Solana mobile wallet and send USDC to this Pay account.",
         ),
         TopupMethod::Onramp => {
-            let provider = params.onramp.ok_or_else(|| {
-                rmcp::ErrorData::invalid_params(
-                    "`onramp` is required when `method` is `onramp`".to_string(),
-                    None,
-                )
-            })?;
+            let Some(provider) = params.onramp else {
+                return Ok(super::tool_error(
+                    "`onramp` is required when `method` is `onramp`",
+                ));
+            };
             (
                 Some(provider),
                 provider.url().to_string(),
@@ -127,10 +131,14 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
         }
     };
 
-    let png = encode_qr_png(&target_url, pixels_per_module)
-        .map_err(|e| rmcp::ErrorData::internal_error(e, None))?;
-    let path = write_qr_png(params.method, &account.address, &png)
-        .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+    let png = match encode_qr_png(&target_url, pixels_per_module) {
+        Ok(png) => png,
+        Err(err) => return Ok(super::tool_error(format!("Failed to encode QR PNG: {err}"))),
+    };
+    let path = match write_qr_png(params.method, &account.address, &png) {
+        Ok(path) => path,
+        Err(err) => return Ok(super::tool_error(format!("Failed to write QR PNG: {err}"))),
+    };
 
     let response = TopupResponse {
         method: params.method.as_str(),
@@ -143,8 +151,14 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
         amount_usdc: response_amount,
         instructions,
     };
-    let json = serde_json::to_string_pretty(&response)
-        .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+    let json = match serde_json::to_string_pretty(&response) {
+        Ok(json) => json,
+        Err(err) => {
+            return Ok(super::tool_error(format!(
+                "Failed to serialize response: {err}"
+            )));
+        }
+    };
     let image = general_purpose::STANDARD.encode(&png);
 
     Ok(CallToolResult::success(vec![
@@ -153,9 +167,9 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
     ]))
 }
 
-fn resolve_account(account: Option<&str>) -> Result<ResolvedAccount, rmcp::ErrorData> {
+fn resolve_account(account: Option<&str>) -> Result<ResolvedAccount, String> {
     let accounts = pay_core::accounts::AccountsFile::load()
-        .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        .map_err(|e| format!("Failed to load Pay accounts: {e}"))?;
     let mainnet = pay_core::accounts::MAINNET_NETWORK;
 
     if let Some(account) = account.map(str::trim).filter(|account| !account.is_empty()) {
@@ -163,7 +177,7 @@ fn resolve_account(account: Option<&str>) -> Result<ResolvedAccount, rmcp::Error
             && let Some(named) = network_accounts.get(account)
         {
             let address = named.pubkey.clone().ok_or_else(|| {
-                rmcp::ErrorData::internal_error(format!("Account `{account}` has no pubkey"), None)
+                format!("Account `{account}` has no pubkey. Run `pay setup` again.")
             })?;
             return Ok(ResolvedAccount {
                 label: account.to_string(),
@@ -177,12 +191,13 @@ fn resolve_account(account: Option<&str>) -> Result<ResolvedAccount, rmcp::Error
         });
     }
 
-    let (name, account) = accounts.account_for_network(mainnet).ok_or_else(|| {
-        rmcp::ErrorData::internal_error("No mainnet account found. Run `pay setup` first.", None)
-    })?;
-    let address = account.pubkey.clone().ok_or_else(|| {
-        rmcp::ErrorData::internal_error(format!("Account `{name}` has no pubkey"), None)
-    })?;
+    let (name, account) = accounts
+        .account_for_network(mainnet)
+        .ok_or_else(|| "No mainnet account found. Run `pay setup` first.".to_string())?;
+    let address = account
+        .pubkey
+        .clone()
+        .ok_or_else(|| format!("Account `{name}` has no pubkey. Run `pay setup` again."))?;
 
     Ok(ResolvedAccount {
         label: name.to_string(),
@@ -190,13 +205,10 @@ fn resolve_account(account: Option<&str>) -> Result<ResolvedAccount, rmcp::Error
     })
 }
 
-fn validate_amount(amount: Option<f64>) -> Result<f64, rmcp::ErrorData> {
+fn validate_amount(amount: Option<f64>) -> Result<f64, String> {
     let amount = amount.unwrap_or(DEFAULT_AMOUNT_USDC);
     if !amount.is_finite() || amount < 0.0 {
-        return Err(rmcp::ErrorData::invalid_params(
-            "`amount_usdc` must be a finite non-negative number".to_string(),
-            None,
-        ));
+        return Err("`amount_usdc` must be a finite non-negative number".to_string());
     }
     Ok(amount)
 }

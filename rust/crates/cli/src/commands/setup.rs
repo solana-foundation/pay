@@ -88,8 +88,8 @@ impl SetupCommand {
 /// `pay setup --update`: re-install MCP configs and agent skill.
 fn run_update() -> pay_core::Result<()> {
     eprintln!();
-    install_mcp_configs();
     maybe_install_skill();
+    install_mcp_configs();
     eprintln!("  {}", "Update complete.".dimmed());
     eprintln!();
     Ok(())
@@ -393,6 +393,65 @@ fn item_string_array(item: Option<&Item>) -> Option<Vec<&str>> {
         .collect()
 }
 
+// ── Skill installation ─────────────────────────────────────────────────────
+
+/// If `npx` is on PATH, offer to install the pay agent skill for coding agents.
+fn maybe_install_skill() {
+    let npx_bin = if cfg!(windows) { "npx.cmd" } else { "npx" };
+    let has_npx = std::process::Command::new(npx_bin)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+
+    if !has_npx {
+        return;
+    }
+
+    eprintln!();
+    let install = Confirm::with_theme(&dialoguer::theme::ColorfulTheme::default())
+        .with_prompt("Install pay skill for your coding agents? (Claude Code, Cursor, …)")
+        .default(true)
+        .interact()
+        .unwrap_or(false);
+
+    if !install {
+        return;
+    }
+
+    eprintln!();
+    let status = std::process::Command::new(npx_bin)
+        .args([
+            "-y",
+            "skills",
+            "add",
+            "https://github.com/solana-foundation/pay",
+            "--skill",
+            "pay",
+            "-y",
+        ])
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {
+            eprintln!("  {} Skill installed", "✔".green());
+        }
+        _ => {
+            eprintln!(
+                "{}",
+                "  Skill install failed — you can retry later with:".dimmed()
+            );
+            eprintln!(
+                "{}",
+                "  npx -y skills add https://github.com/solana-foundation/pay --skill pay -y"
+                    .dimmed()
+            );
+        }
+    }
+    eprintln!();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -458,65 +517,6 @@ enabled = true
             McpInstallResult::AlreadyPresent
         ));
     }
-}
-
-// ── Skill installation ─────────────────────────────────────────────────────
-
-/// If `npx` is on PATH, offer to install the pay agent skill for coding agents.
-fn maybe_install_skill() {
-    let npx_bin = if cfg!(windows) { "npx.cmd" } else { "npx" };
-    let has_npx = std::process::Command::new(npx_bin)
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
-
-    if !has_npx {
-        return;
-    }
-
-    eprintln!();
-    let install = Confirm::with_theme(&dialoguer::theme::ColorfulTheme::default())
-        .with_prompt("Install pay skill for your coding agents? (Claude Code, Cursor, …)")
-        .default(true)
-        .interact()
-        .unwrap_or(false);
-
-    if !install {
-        return;
-    }
-
-    eprintln!();
-    let status = std::process::Command::new(npx_bin)
-        .args([
-            "-y",
-            "skills",
-            "add",
-            "https://github.com/solana-foundation/pay",
-            "--skill",
-            "pay",
-            "-y",
-        ])
-        .status();
-
-    match status {
-        Ok(s) if s.success() => {
-            eprintln!("  {} Skill installed", "✔".green());
-        }
-        _ => {
-            eprintln!(
-                "{}",
-                "  Skill install failed — you can retry later with:".dimmed()
-            );
-            eprintln!(
-                "{}",
-                "  npx -y skills add https://github.com/solana-foundation/pay --skill pay -y"
-                    .dimmed()
-            );
-        }
-    }
-    eprintln!();
 }
 
 // ── Linux polkit ───────────────────────────────────────────────────────────

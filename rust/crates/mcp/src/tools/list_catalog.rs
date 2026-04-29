@@ -75,17 +75,21 @@ struct ListCatalogResponse {
 
 pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
     let cache_bust = params.cache_bust;
-    let catalog = if params.refresh || cache_bust {
+    let catalog_result = if params.refresh || cache_bust {
         pay_core::skills::update_skills(cache_bust)
             .await
-            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?
+            .map_err(|e| format!("Failed to refresh Pay catalog: {e}"))
     } else {
         match pay_core::skills::load_cached_skills() {
-            Ok(catalog) => catalog,
+            Ok(catalog) => Ok(catalog),
             Err(_) => pay_core::skills::load_skills()
                 .await
-                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?,
+                .map_err(|e| format!("Failed to load Pay catalog: {e}")),
         }
+    };
+    let catalog = match catalog_result {
+        Ok(catalog) => catalog,
+        Err(message) => return Ok(super::tool_error(message)),
     };
 
     let entries: Vec<CatalogServiceEntry> = catalog
@@ -103,8 +107,14 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
         .collect();
     let response = build_response(params.question, params.include_details, entries);
 
-    let json = serde_json::to_string_pretty(&response)
-        .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+    let json = match serde_json::to_string_pretty(&response) {
+        Ok(json) => json,
+        Err(err) => {
+            return Ok(super::tool_error(format!(
+                "Failed to serialize response: {err}"
+            )));
+        }
+    };
 
     Ok(CallToolResult::success(vec![rmcp::model::Content::text(
         json,

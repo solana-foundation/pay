@@ -500,6 +500,7 @@ fn pay_mpp_and_retry(
     ctx: PaymentRetryContext<'_, '_>,
 ) -> pay_core::Result<()> {
     let is_json = no_dna::should_json(ctx.output_fmt);
+    validate_tool_request_before_signing(ctx.tool)?;
 
     if ctx.verbose && !is_json {
         eprintln!("{}", "Paying...".dimmed());
@@ -573,6 +574,7 @@ fn pay_x402_and_retry(
     ctx: PaymentRetryContext<'_, '_>,
 ) -> pay_core::Result<()> {
     let is_json = no_dna::should_json(ctx.output_fmt);
+    validate_tool_request_before_signing(ctx.tool)?;
 
     if ctx.verbose && !is_json {
         eprintln!("{}", "Paying...".dimmed());
@@ -605,6 +607,7 @@ fn pay_x402_siwx_and_retry(
     ctx: PaymentRetryContext<'_, '_>,
 ) -> pay_core::Result<()> {
     let is_json = no_dna::should_json(ctx.output_fmt);
+    validate_tool_request_before_signing(ctx.tool)?;
 
     if ctx.verbose && !is_json {
         eprintln!("{}", "Signing in...".dimmed());
@@ -646,6 +649,7 @@ fn pay_session_and_retry(
     use solana_mpp::SessionMode;
 
     let is_json = no_dna::should_json(output_fmt);
+    validate_tool_request_before_signing(tool)?;
 
     // Deposit = min_voucher_delta * 1000, clamped to [1 USDC, cap].
     let min_delta = req
@@ -719,6 +723,14 @@ fn pay_session_and_retry(
 
     let retry_outcome = retry_with_header(tool, "Authorization", &auth_header, fetch_headers)?;
     handle_retry_outcome(retry_outcome, is_json)
+}
+
+fn validate_tool_request_before_signing(tool: &Tool) -> pay_core::Result<()> {
+    match tool {
+        Tool::Curl(args) => pay_core::runner::validate_curl_args_against_catalog(args),
+        Tool::Fetch { url } => pay_core::skills::validate_cached_catalog_request("GET", url, None),
+        Tool::Wget(_) => Ok(()),
+    }
 }
 
 /// Render the "Generated <network> wallet" notice when an ephemeral

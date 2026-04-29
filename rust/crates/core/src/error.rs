@@ -24,4 +24,7 @@ pub enum Error {
 
     #[error("Payment rejected: {0}")]
     PaymentRejected(String),
+
+    #[error("Request validation error: {0}")]
+    RequestValidation(String),
 }
