@@ -96,12 +96,20 @@ pub struct ProviderFrontmatter {
 /// `openapi:` mapping so spec authors can write any of:
 ///
 /// ```yaml
+/// # Absolute URL — fetched as-is
 /// openapi:
 ///   url: https://example.com/openapi.json
 ///
+/// # Relative URL — resolved against service_url at fetch time
 /// openapi:
-///   path: openapi.json   # resolved as `<service_url>/<path>`
+///   url: openapi.json
 ///
+/// # Local filesystem path — only valid for `pay server start --openapi`,
+/// # rejected by the pay-skills registry validator
+/// openapi:
+///   path: ./openapi.json
+///
+/// # Inline document — useful for small specs that change rarely
 /// openapi:
 ///   content: |
 ///     { "openapi": "3.1.0", ... }
@@ -109,9 +117,15 @@ pub struct ProviderFrontmatter {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged, deny_unknown_fields)]
 pub enum OpenapiSource {
-    /// Absolute URL of an OpenAPI document. Fetched at build/probe time.
+    /// Absolute (`https://...`) or relative URL. The pay-skills resolver
+    /// fetches absolute URLs as-is and resolves relative URLs against the
+    /// provider's `service_url`. The pay-server gateway uses the same
+    /// semantics for its `--openapi` flag.
     Url { url: String },
-    /// Path appended to `service_url` to fetch the OpenAPI document.
+    /// Local filesystem path, used by `pay server start --openapi` to read
+    /// a doc co-located with the YAML on disk. The pay-skills registry
+    /// validator rejects this variant — registry providers must use `url:`
+    /// so consumers can fetch the doc remotely.
     Path { path: String },
     /// Inline OpenAPI document (typically a YAML `|` block of JSON).
     Content { content: String },
@@ -400,7 +414,7 @@ fn validate_openapi_source(src: &OpenapiSource, fqn: &str) -> Vec<String> {
                 errs.push(format!("{fqn}: openapi.url is empty\n"));
             } else if !url.starts_with("https://") {
                 errs.push(format!(
-                    "{fqn}: openapi.url must start with https://\n  got: `{url}`\n"
+                    "{fqn}: openapi.url must be a fully-qualified https:// URL\n  got: `{url}`\n"
                 ));
             } else if url_has_ip_address(url) {
                 errs.push(format!(
@@ -408,15 +422,10 @@ fn validate_openapi_source(src: &OpenapiSource, fqn: &str) -> Vec<String> {
                 ));
             }
         }
-        OpenapiSource::Path { path } => {
-            if path.is_empty() {
-                errs.push(format!("{fqn}: openapi.path is empty\n"));
-            } else if path.starts_with("http://") || path.starts_with("https://") {
-                errs.push(format!(
-                    "{fqn}: openapi.path is relative to service_url and must not be a full URL\n  \
-                     use `openapi: {{ url: ... }}` for absolute URLs\n  got: `{path}`\n"
-                ));
-            }
+        OpenapiSource::Path { path: _ } => {
+            errs.push(format!(
+                "{fqn}: openapi.path is for local filesystem reads (used by `pay server start --openapi`); registry providers must use `openapi: {{ url: <fully-qualified https URL> }}`\n"
+            ));
         }
         OpenapiSource::Content { content } => {
             if content.trim().is_empty() {
@@ -605,14 +614,38 @@ endpoints:
     }
 
     #[test]
-    fn openapi_with_path_passes_without_inline_endpoints() {
+    fn openapi_relative_url_rejected() {
+        // Registry providers must use a fully-qualified https:// URL.
+        // Relative URLs would be ambiguous when the registry is consumed
+        // remotely; reject them at validation time.
+        let mut spec = valid_spec();
+        spec.endpoints = vec![];
+        spec.openapi = Some(OpenapiSource::Url {
+            url: "openapi.json".into(),
+        });
+        let errs = validate_provider(&spec, "test/test-api");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("openapi.url must be a fully-qualified https://")),
+            "expected fully-qualified rejection, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn openapi_path_is_rejected_for_registry() {
+        // `path:` is filesystem-only (used by `pay server start --openapi`).
+        // Registry providers must use `url:` so the doc is fetchable remotely.
         let mut spec = valid_spec();
         spec.endpoints = vec![];
         spec.openapi = Some(OpenapiSource::Path {
             path: "openapi.json".into(),
         });
         let errs = validate_provider(&spec, "test/test-api");
-        assert!(errs.is_empty(), "expected no errors, got: {errs:?}");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("openapi.path is for local filesystem")),
+            "expected filesystem-only rejection, got: {errs:?}"
+        );
     }
 
     #[test]
@@ -651,23 +684,23 @@ endpoints:
         let errs = validate_provider(&spec, "test/test-api");
         assert!(
             errs.iter()
-                .any(|e| e.contains("openapi.url must start with https://")),
+                .any(|e| e.contains("openapi.url must be a fully-qualified https://")),
             "expected https requirement error, got: {errs:?}"
         );
     }
 
     #[test]
-    fn openapi_path_must_not_be_absolute_url() {
+    fn openapi_url_with_non_https_scheme_rejected() {
         let mut spec = valid_spec();
         spec.endpoints = vec![];
-        spec.openapi = Some(OpenapiSource::Path {
-            path: "https://api.example.com/openapi.json".into(),
+        spec.openapi = Some(OpenapiSource::Url {
+            url: "ftp://api.example.com/openapi.json".into(),
         });
         let errs = validate_provider(&spec, "test/test-api");
         assert!(
             errs.iter()
-                .any(|e| e.contains("openapi.path is relative to service_url")),
-            "expected relative-path error, got: {errs:?}"
+                .any(|e| e.contains("openapi.url must be a fully-qualified https://")),
+            "expected fully-qualified rejection, got: {errs:?}"
         );
     }
 

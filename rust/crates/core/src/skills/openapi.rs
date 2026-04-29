@@ -124,28 +124,66 @@ pub fn parse_endpoints(body: &str) -> Result<Vec<ResolvedEndpoint>> {
 /// If `spec.openapi` is set, fetch/parse the OpenAPI document and synthesize
 /// endpoints from it. Otherwise return `spec.endpoints` as-is wrapped without
 /// body examples.
+///
+/// Use [`effective_openapi`] when you also need the parsed OpenAPI document
+/// itself (e.g. to embed it in the published index for offline consumers).
 pub fn effective_endpoints(spec: &ProviderFrontmatter) -> Result<Vec<ResolvedEndpoint>> {
+    Ok(effective_openapi(spec)?.endpoints)
+}
+
+/// Resolved openapi for one provider spec — both the synthesized endpoint
+/// list and (when one was loaded) the parsed source document.
+#[derive(Debug, Clone)]
+pub struct ResolvedOpenapi {
+    pub endpoints: Vec<ResolvedEndpoint>,
+    /// The parsed OpenAPI / Discovery JSON. `None` when the spec uses
+    /// inline `endpoints:` (no source document) — present whenever
+    /// `openapi:` is set and the document fetched/parsed successfully.
+    pub document: Option<Value>,
+}
+
+/// Like [`effective_endpoints`] but also returns the parsed source document
+/// when one was loaded. Used by `pay skills build` to inline the full
+/// OpenAPI doc in each provider's detail JSON so consumers get schemas and
+/// types without a follow-up HTTP round-trip after `pay skills update`.
+pub fn effective_openapi(spec: &ProviderFrontmatter) -> Result<ResolvedOpenapi> {
     match &spec.openapi {
-        Some(source) => resolve_endpoints(source, &spec.meta.service_url),
-        None => Ok(spec
-            .endpoints
-            .iter()
-            .cloned()
-            .map(|spec| ResolvedEndpoint {
-                spec,
-                body_example: None,
+        Some(source) => {
+            let body = load_document(source, &spec.meta.service_url)?;
+            let endpoints = parse_endpoints(&body)?;
+            let document = serde_json::from_str::<Value>(&body).ok();
+            Ok(ResolvedOpenapi {
+                endpoints,
+                document,
             })
-            .collect()),
+        }
+        None => Ok(ResolvedOpenapi {
+            endpoints: spec
+                .endpoints
+                .iter()
+                .cloned()
+                .map(|spec| ResolvedEndpoint {
+                    spec,
+                    body_example: None,
+                })
+                .collect(),
+            document: None,
+        }),
     }
 }
 
-fn load_document(source: &OpenapiSource, service_url: &str) -> Result<String> {
+fn load_document(source: &OpenapiSource, _service_url: &str) -> Result<String> {
     match source {
-        OpenapiSource::Url { url } => fetch(url),
-        OpenapiSource::Path { path } => {
-            let url = join_url(service_url, path);
-            fetch(&url)
+        OpenapiSource::Url { url } => {
+            // Registry providers must use a fully-qualified https:// URL —
+            // validation rejects anything else. We don't accept relative URLs
+            // because the registry is consumed remotely and resolving against
+            // `service_url` would be fragile/ambiguous.
+            fetch(url)
         }
+        OpenapiSource::Path { path } => Err(Error::Mpp(format!(
+            "openapi.path ({path}) is filesystem-only (used by `pay server start --openapi`); registry providers must use `openapi: {{ url: <https URL> }}`"
+        ))),
         OpenapiSource::Content { content } => Ok(content.clone()),
     }
 }
@@ -174,6 +212,7 @@ fn fetch(url: &str) -> Result<String> {
     Ok(body)
 }
 
+#[cfg(test)]
 fn join_url(service_url: &str, path: &str) -> String {
     let base = service_url.trim_end_matches('/');
     let suffix = path.trim_start_matches('/');

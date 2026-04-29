@@ -70,6 +70,13 @@ pub struct ProviderDetail {
     pub source: ProviderSource,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// The full OpenAPI / Discovery document, inlined at build time when the
+    /// spec declares `openapi: { url: ... }`. Lets consumers get the
+    /// upstream schema/types/components after `pay skills update` without a
+    /// follow-up HTTP round-trip. `None` when the spec uses inline
+    /// `endpoints:` or the build couldn't parse the doc as JSON.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub openapi_doc: Option<serde_json::Value>,
     pub endpoints: Vec<DetailEndpoint>,
 }
 
@@ -491,22 +498,24 @@ fn process_provider_md(
         return;
     }
 
-    // Resolve the effective endpoint list. Specs using `openapi:` have their
-    // document fetched and parsed here; specs with inline `endpoints:` pass
-    // through unchanged. Each `ResolvedEndpoint` carries an optional
-    // `body_example` that the probe sends as the JSON body.
-    let resolved = match crate::skills::openapi::effective_endpoints(&spec) {
-        Ok(eps) => eps,
+    // Resolve openapi: fetch the source doc (when set), parse it, synthesize
+    // the endpoint list, and keep the parsed document for inlining into the
+    // published detail JSON. Specs with inline `endpoints:` skip the fetch
+    // and just wrap each spec entry as a body-less `ResolvedEndpoint`.
+    let resolved = match crate::skills::openapi::effective_openapi(&spec) {
+        Ok(r) => r,
         Err(e) => {
             errors.push(format!("{fqn}: openapi resolve failed: {e}"));
             return;
         }
     };
+    let openapi_doc = resolved.document;
 
     // Probe each endpoint (when probing is on) and synthesize the rich
     // `DetailEndpoint` shape: probe-derived pricing wins over any inline
     // pricing in the spec, with the spec value as fallback for offline builds.
-    let detail_endpoints = build_detail_endpoints(fqn, &spec.meta.service_url, resolved, options);
+    let detail_endpoints =
+        build_detail_endpoints(fqn, &spec.meta.service_url, resolved.endpoints, options);
 
     let mut all_prices = Vec::new();
     let mut has_metering = false;
@@ -546,6 +555,7 @@ fn process_provider_md(
         } else {
             Some(content)
         },
+        openapi_doc,
         endpoints: detail_endpoints,
     };
 

@@ -56,22 +56,55 @@ pub async fn logging_middleware(
     let status = response.status().as_u16();
     let res_headers = extract_headers(response.headers());
 
-    // Consume body to capture it, then re-wrap.
-    // Use 256KB limit to handle HTML payment pages (~50KB).
-    let (parts, body) = response.into_parts();
-    let bytes = axum::body::to_bytes(body, 256 * 1024)
-        .await
-        .unwrap_or_default();
+    // Capture body for debugger (small enough to be useful, large enough to
+    // cover OpenAPI specs etc.). Once `to_bytes` errors on size overflow the
+    // body is consumed and unrecoverable, so we pre-check Content-Length and
+    // pass oversized responses through *without* capturing them — the body
+    // stays intact for the client.
+    const BODY_CAPTURE_LIMIT: usize = 8 * 1024 * 1024;
 
-    let res_body = if bytes.is_empty() {
-        None
-    } else {
-        let s = String::from_utf8_lossy(&bytes);
-        Some(if s.len() > 4096 {
-            format!("{}…", &s[..4096])
-        } else {
-            s.to_string()
-        })
+    let advertised_len = response
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok());
+
+    let (response, res_body): (Response, Option<String>) = match advertised_len {
+        Some(len) if len > BODY_CAPTURE_LIMIT => (
+            response,
+            Some(format!(
+                "<elided: response body {len} bytes exceeds {BODY_CAPTURE_LIMIT} capture limit>"
+            )),
+        ),
+        _ => {
+            let (parts, body) = response.into_parts();
+            match axum::body::to_bytes(body, BODY_CAPTURE_LIMIT).await {
+                Ok(bytes) => {
+                    let summary = if bytes.is_empty() {
+                        None
+                    } else {
+                        let s = String::from_utf8_lossy(&bytes);
+                        Some(if s.len() > 4096 {
+                            format!("{}…", &s[..4096])
+                        } else {
+                            s.to_string()
+                        })
+                    };
+                    (Response::from_parts(parts, Body::from(bytes)), summary)
+                }
+                // Body unbounded and too big — body is now consumed, we can
+                // only return an error response. This is the rare case where
+                // a streamed response without Content-Length blew past the
+                // limit; debugger UX trumps client UX here since we can't
+                // recover the bytes.
+                Err(_) => (
+                    Response::from_parts(parts, Body::empty()),
+                    Some(format!(
+                        "<elided: streaming response exceeded {BODY_CAPTURE_LIMIT} byte capture limit>"
+                    )),
+                ),
+            }
+        }
     };
 
     let ms = start.elapsed().as_millis() as u64;
@@ -91,7 +124,7 @@ pub async fn logging_middleware(
 
     pdb.correlation.lock().unwrap().ingest(entry);
 
-    Response::from_parts(parts, Body::from(bytes))
+    response
 }
 
 fn extract_headers(headers: &axum::http::HeaderMap) -> HashMap<String, String> {

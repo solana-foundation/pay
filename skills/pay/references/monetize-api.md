@@ -63,6 +63,14 @@ Use `routing.type: proxy` to forward paid requests to an upstream API. Use
 `routing.type: respond` when the gateway itself should return the response after
 payment verification, useful for demos and simple paid endpoints.
 
+The `endpoints[]` list does double duty: it sets pricing AND acts as an
+**allowlist** for what your gateway exposes. Requests whose method+path
+don't match an entry in `endpoints[]` get a 404 from the proxy, even if the
+upstream API supports them. This is intentional — for shared-tenant proxies
+you typically want only stateless transforms (`:translate`, `:annotate`,
+`:recognize`) and not CRUD on persistent resources, IAM mutations, or
+operations that leak across tenants.
+
 Important runtime fields:
 
 - `operator.currencies.usd`: stablecoin symbols accepted for USD-denominated
@@ -78,6 +86,35 @@ Important runtime fields:
 - `recipients`: named wallet aliases used by payment splits.
 - `metering.dimensions`: pricing. Omit `metering` for free endpoints.
 - `session`: optional MPP session config for voucher-based repeated calls.
+
+### Serving `/openapi.json`
+
+If your upstream ships an OpenAPI 3 or Google Discovery JSON document, point
+Pay at it and the gateway will serve a filtered + URL-rewritten copy at
+`GET /openapi.json`:
+
+```sh
+pay server start provider.yml --openapi openapi.json
+```
+
+What the gateway does with that document:
+
+- **Filter to the allowlist** — only paths/methods listed in your YAML's
+  `endpoints[]` survive. Every other operation is stripped from `paths`
+  (OpenAPI 3) or `resources.*.methods.*` (Discovery). Empty path-items and
+  empty resource containers are dropped. The served spec describes exactly
+  what your gateway actually proxies — nothing more.
+- **Rewrite the base URL** — for `routing.type: proxy` specs, `rootUrl`
+  (Discovery) and `servers[].url` (OpenAPI 3) are rewritten per request from
+  the `Host` header (with `X-Forwarded-Proto` honored). Agents can therefore
+  drive the proxy by reading `/openapi.json` alone — they don't need to know
+  the upstream URL.
+- **Override the public URL** — pass `--public-url https://<your-domain>`
+  when the gateway sits behind a reverse proxy or load balancer that strips
+  `Host`.
+
+The `--openapi` value is a path or URL; it accepts either a local file
+(relative to the YAML's directory by default) or `https://...`.
 
 ## Pricing And Splits
 
@@ -223,8 +260,14 @@ Example Cloud Run command:
 ```sh
 pay server start /app/providers/google/bigquery.yml \
   --bind 0.0.0.0:8080 \
+  --openapi /app/providers/google/bigquery.json \
   --otlp-sidecar 127.0.0.1:4318
 ```
+
+When you pass `--openapi`, mount the JSON next to the YAML in the same
+volume (typically a GCS-backed volume on Cloud Run). The gateway reads it
+once at startup, filters it against `endpoints[]`, and serves the result
+from memory at `/openapi.json`.
 
 For GCP deployments, a typical setup is Cloud Run for the Pay process, Secret
 Manager for runtime secrets, Cloud KMS/HSM for signing, Artifact Registry or a
@@ -245,7 +288,7 @@ providers/<operator>/<origin>/<name>.md
 Use the two-level path when you operate the API directly. Use the three-level
 path when your gateway proxies another provider.
 
-Minimal provider listing:
+Minimal provider listing (inline endpoints):
 
 ```markdown
 ---
@@ -260,7 +303,6 @@ version: v1
 endpoints:
   - method: POST
     path: v1/search
-    resource: search
     description: "Search records by keyword with structured filters and pagination"
     pricing:
       dimensions:
@@ -282,6 +324,51 @@ Use `v1/search` for direct lookup. Include filters in the first request and keep
 - Batch records when supported.
 - Ask before broad crawls, bulk enrichment, dynamic pricing, or purchases.
 ```
+
+### `openapi:` form (recommended when you serve `/openapi.json`)
+
+If your gateway serves `/openapi.json` (see "Serving `/openapi.json`"
+above), drop the inline `endpoints[]` from the registry markdown and point
+`openapi:` at the doc instead. `pay skills build` resolves it at build
+time, walks `paths × methods`, probes each endpoint, and reconstructs
+pricing/protocol/`supported_usd` from the live 402 challenge:
+
+```markdown
+---
+name: my-api
+title: "My API"
+description: "..."
+use_case: "..."
+category: data
+service_url: https://my-api.example.com
+openapi:
+  url: openapi.json
+---
+
+## Usage Notes
+...
+```
+
+`openapi:` accepts two forms in the registry:
+
+- `openapi: { url: https://my-api.example.com/openapi.json }` —
+  fully-qualified `https://` URL, fetched as-is at build time. This is
+  the recommended form when your gateway exposes `/openapi.json` itself.
+- `openapi: { content: | ... }` — inline JSON body via a YAML literal
+  block. Useful for small specs that change rarely.
+
+The registry validator requires the `url:` value to be a fully-qualified
+`https://` URL — relative URLs are not accepted because the registry is
+consumed remotely and resolving against `service_url` would be ambiguous.
+`openapi: { path: ... }` is **not** valid in the registry either —
+`path:` is filesystem-only and reserved for `pay server start --openapi
+<file>`, where the doc is co-located with the YAML on disk.
+
+Specs must declare exactly one of `endpoints:` or `openapi:`. Inline
+`endpoints:` is fine for tiny APIs and when you don't have an OpenAPI
+document; `openapi:` is the right shape once a doc exists, because it keeps
+the registry markdown thin and lets the build pipeline re-derive endpoint
+metadata each time the upstream API changes.
 
 ## Frontmatter Best Practices
 
@@ -328,13 +415,28 @@ optimize execution and reduce wasted paid calls:
 From a local checkout of `https://github.com/solana-foundation/pay-skills`:
 
 ```sh
-pay skills build . --output /tmp/pay-skills-dist
+# Static + structural validation; --no-probe skips the network round-trip.
+pay skills build . --output /tmp/pay-skills-dist --no-probe
+
+# Probe-driven validation: hit each endpoint, classify, surface the result.
 pay skills probe . \
   --files providers/<operator>/<name>.md \
   --currencies USDC,USDT \
   --timeout 15 \
   --concurrency 5
+
+# Solana-compat gate: warns per non-Solana endpoint, errors when zero
+# classifiable endpoints accept Solana stables.
+pay skills validate . \
+  --files providers/<operator>/<name>.md \
+  --currencies USDC,USDT
 ```
+
+`pay skills validate` is the CI gate. Pass `--changed-from origin/main` to
+auto-detect changed providers via git diff, and `--format github` to emit
+`::warning::` / `::error::` workflow-command annotations that surface
+inline on the PR. `--strict` upgrades non-Solana warnings to blocking
+errors when you want zero tolerance.
 
 If you already have runtime YAML, generate provider markdown from it:
 
@@ -352,10 +454,35 @@ The sync command creates a starting point from runtime YAML. Before running
 such as `use_case` plus spend-aware usage notes when they were not present in
 the YAML.
 
+### Partial rebuild on merge
+
+Full rebuilds re-probe every provider and take 5-15 minutes for a registry
+of 30 providers. `pay skills build` accepts `--only` and `--previous-dist`
+so a merge-time CI job only re-probes what actually changed:
+
+```sh
+# Pull the prior dist from the publish bucket
+gcloud storage rsync gs://pay-skills/v1/ ./prev-dist --recursive
+
+# Rebuild just the providers that changed in this merge; copy the rest verbatim
+pay skills build . \
+  --only operator/foo,operator/bar \
+  --previous-dist ./prev-dist \
+  --output ./dist
+```
+
+Providers in `--only` go through the full resolve+probe path. Every other
+provider's `dist/providers/<fqn>.json` and its `skills.json` index entry
+are copied unchanged from `--previous-dist`. The two CI workflows in the
+`pay-skills` repo (`validate.yml` for PRs, `build-skills.yml` for merges)
+already wire this up — fall back to a full rebuild when no prior dist
+exists (first run, manual dispatch).
+
 Before opening a PR:
 
-- `pay skills build` succeeds.
-- Changed paid providers pass `pay skills probe`.
+- `pay skills build --no-probe` succeeds.
+- `pay skills validate --files <changed>` either passes or emits warnings
+  you've reviewed; nothing should be marked `block`.
 - Paid endpoints return HTTP 402 before payment.
 - Challenges are MPP, MPP session, or x402.
 - Currency is USDC or USDT, with Solana mainnet support.
@@ -364,6 +491,8 @@ Before opening a PR:
 - Provider descriptions and endpoint descriptions meet length limits.
 
 Open the PR against `https://github.com/solana-foundation/pay-skills`. CI runs
-static validation and probes changed providers. After merge, the public skills
-index is rebuilt and agents can discover the provider through
-`pay skills search` and Pay MCP `search_skills`.
+static validation and probes changed providers via `pay skills validate`,
+posting per-endpoint warnings inline. After merge, the partial-rebuild
+workflow re-probes only the providers in the diff, merges them into the
+prior `dist/`, and republishes. Agents discover the updated provider
+through `pay skills search` and Pay MCP `search_skills`.

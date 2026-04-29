@@ -817,6 +817,66 @@ pub fn load_service_endpoints(catalog: &Catalog, service_name: &str) -> Result<V
     Ok(detail.endpoints)
 }
 
+/// Load the inlined OpenAPI document for `service_name` from the catalog's
+/// detail JSON (cached locally after the first fetch).
+///
+/// Returns `None` when the provider was published with inline `endpoints:`
+/// (no openapi source), or when the build couldn't parse the source doc.
+/// Returns `Some(value)` for providers whose spec declared
+/// `openapi: { url: ... }` — the document is embedded verbatim in the
+/// detail JSON so consumers don't need a follow-up HTTP fetch.
+pub fn load_service_openapi(
+    catalog: &Catalog,
+    service_name: &str,
+) -> Result<Option<serde_json::Value>> {
+    let svc = find_service(catalog, service_name)
+        .ok_or_else(|| Error::Config(format!("service `{service_name}` not found")))?;
+
+    if catalog.base_url.is_empty() {
+        return Err(Error::Config(
+            "no base_url in catalog — cannot fetch openapi detail".into(),
+        ));
+    }
+
+    let detail_url = format!("{}/providers/{}.json", catalog.base_url, svc.fqn);
+
+    let cache_dir =
+        std::path::PathBuf::from(shellexpand::tilde("~/.config/pay/skills/detail").into_owned());
+    let cache_file = cache_dir.join(format!("{}.json", svc.sha));
+
+    if cache_file.exists()
+        && let Ok(raw) = std::fs::read_to_string(&cache_file)
+        && let Ok(detail) = parse_detail(&raw)
+    {
+        return Ok(detail.openapi_doc);
+    }
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| Error::Config(format!("http client: {e}")))?;
+
+    let resp = client
+        .get(&detail_url)
+        .send()
+        .map_err(|e| Error::Config(format!("fetch {detail_url}: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(Error::Config(format!(
+            "{detail_url} returned {}",
+            resp.status()
+        )));
+    }
+    let raw = resp
+        .text()
+        .map_err(|e| Error::Config(format!("read {detail_url}: {e}")))?;
+
+    let detail = parse_detail(&raw)?;
+    let _ = std::fs::create_dir_all(&cache_dir);
+    let _ = std::fs::write(&cache_file, &raw);
+
+    Ok(detail.openapi_doc)
+}
+
 /// Convenience: load endpoints and inject them into the catalog's service.
 pub fn ensure_endpoints(catalog: &mut Catalog, service_name: &str) -> Result<()> {
     let base_url = catalog.base_url.clone();
@@ -921,6 +981,15 @@ struct ProviderDetailFile {
     endpoints: Vec<Endpoint>,
     #[serde(default)]
     content: Option<String>,
+    /// Pointer to the upstream OpenAPI doc (preserved for traceability).
+    #[serde(default)]
+    openapi: Option<pay_types::registry::OpenapiSource>,
+    /// Inlined OpenAPI / Discovery document, populated at build time when
+    /// the spec declared `openapi: { url: ... }`. Lets MCP / CLI consumers
+    /// access the upstream schema right after `pay skills update` without
+    /// hitting the network again.
+    #[serde(default)]
+    openapi_doc: Option<serde_json::Value>,
 }
 
 fn parse_detail(raw: &str) -> Result<ProviderDetailFile> {
