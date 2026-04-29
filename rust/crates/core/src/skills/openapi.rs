@@ -55,13 +55,48 @@ pub fn resolve_endpoints(
 
 /// Pure parser — no I/O. Synthesize endpoint specs from an OpenAPI JSON body.
 ///
-/// Walks `paths.{path}.{method}` and emits one `ResolvedEndpoint` per HTTP
-/// method declared. Description is taken from the operation's `summary`
-/// first, then `description`, falling back to `"<METHOD> <path>"`.
+/// Dispatches on the document's shape:
+/// - **OpenAPI 3 / Swagger 2** (`openapi:` or `swagger:` key): walk
+///   `paths.{path}.{method}`.
+/// - **Google Discovery** (`kind: discovery#restDescription`): walk
+///   `resources.*.methods.*` recursively (and any top-level `methods`).
+///
+/// Description is taken from the operation's `summary` first, then
+/// `description`, falling back to `"<METHOD> <path>"`.
 pub fn parse_endpoints(body: &str) -> Result<Vec<ResolvedEndpoint>> {
     let doc: Value = serde_json::from_str(body)
         .map_err(|e| Error::Mpp(format!("OpenAPI document is not valid JSON: {e}")))?;
 
+    let mut endpoints = if doc.get("openapi").is_some() || doc.get("swagger").is_some() {
+        parse_openapi3_endpoints(&doc)?
+    } else if doc
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .is_some_and(|k| k.starts_with("discovery#"))
+    {
+        parse_discovery_endpoints(&doc)?
+    } else if doc.get("paths").is_some() {
+        // Best-effort fallback for OpenAPI-shaped docs missing the marker.
+        parse_openapi3_endpoints(&doc)?
+    } else if doc.get("resources").is_some() || doc.get("methods").is_some() {
+        // Discovery-shaped doc that didn't ship the `kind` marker.
+        parse_discovery_endpoints(&doc)?
+    } else {
+        return Err(Error::Mpp(
+            "OpenAPI document has no `paths` (OpenAPI 3) or `resources`/`methods` (Discovery) entries".into(),
+        ));
+    };
+
+    endpoints.sort_by(|a, b| {
+        a.spec
+            .path
+            .cmp(&b.spec.path)
+            .then_with(|| a.spec.method.cmp(&b.spec.method))
+    });
+    Ok(endpoints)
+}
+
+fn parse_openapi3_endpoints(doc: &Value) -> Result<Vec<ResolvedEndpoint>> {
     let paths = doc
         .get("paths")
         .and_then(|v| v.as_object())
@@ -99,10 +134,8 @@ pub fn parse_endpoints(body: &str) -> Result<Vec<ResolvedEndpoint>> {
                 pricing: None,
             };
 
-            // Bodies only matter for write methods. GET/DELETE rarely have
-            // requestBody; even when they do, we don't include it in the probe.
             let body_example = if matches!(method, "post" | "put" | "patch") {
-                extract_or_generate_body(op, &doc).map(|v| v.to_string())
+                extract_or_generate_body(op, doc).map(|v| v.to_string())
             } else {
                 None
             };
@@ -110,13 +143,134 @@ pub fn parse_endpoints(body: &str) -> Result<Vec<ResolvedEndpoint>> {
             endpoints.push(ResolvedEndpoint { spec, body_example });
         }
     }
-    endpoints.sort_by(|a, b| {
-        a.spec
-            .path
-            .cmp(&b.spec.path)
-            .then_with(|| a.spec.method.cmp(&b.spec.method))
-    });
     Ok(endpoints)
+}
+
+fn parse_discovery_endpoints(doc: &Value) -> Result<Vec<ResolvedEndpoint>> {
+    let mut endpoints = Vec::new();
+    if let Some(resources) = doc.get("resources").and_then(|v| v.as_object()) {
+        walk_discovery_resources(resources, doc, None, &mut endpoints);
+    }
+    if let Some(methods) = doc.get("methods").and_then(|v| v.as_object()) {
+        emit_discovery_methods(methods, doc, None, &mut endpoints);
+    }
+    Ok(endpoints)
+}
+
+fn walk_discovery_resources(
+    resources: &Map<String, Value>,
+    root: &Value,
+    parent_resource: Option<&str>,
+    endpoints: &mut Vec<ResolvedEndpoint>,
+) {
+    for (name, resource) in resources {
+        let resource_path = match parent_resource {
+            Some(p) => format!("{p}.{name}"),
+            None => name.clone(),
+        };
+        if let Some(methods) = resource.get("methods").and_then(|v| v.as_object()) {
+            emit_discovery_methods(methods, root, Some(&resource_path), endpoints);
+        }
+        if let Some(nested) = resource.get("resources").and_then(|v| v.as_object()) {
+            walk_discovery_resources(nested, root, Some(&resource_path), endpoints);
+        }
+    }
+}
+
+fn emit_discovery_methods(
+    methods: &Map<String, Value>,
+    root: &Value,
+    resource_path: Option<&str>,
+    endpoints: &mut Vec<ResolvedEndpoint>,
+) {
+    for (_, m) in methods {
+        let http_method = m
+            .get("httpMethod")
+            .and_then(|v| v.as_str())
+            .unwrap_or("GET")
+            .to_uppercase();
+        let path = m
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if path.is_empty() {
+            continue;
+        }
+        let description = m
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{} {}", http_method, path));
+
+        let body_example = if matches!(http_method.as_str(), "POST" | "PUT" | "PATCH") {
+            extract_or_generate_discovery_body(m, root).map(|v| v.to_string())
+        } else {
+            None
+        };
+
+        endpoints.push(ResolvedEndpoint {
+            spec: EndpointSpec {
+                method: http_method,
+                path: normalize_path(&path),
+                description,
+                resource: resource_path.map(str::to_string),
+                pricing: None,
+            },
+            body_example,
+        });
+    }
+}
+
+/// Discovery `request` fields look like `{"$ref": "SchemaName"}` indexing
+/// into the top-level `schemas` bucket. Walk that schema with the existing
+/// schema-based generator (which tolerates Discovery's `$ref` form because
+/// `generate_from_schema` handles unrecognized strings as opaque names).
+fn extract_or_generate_discovery_body(method: &Value, root: &Value) -> Option<Value> {
+    let request = method.get("request")?;
+    let ref_name = request.get("$ref").and_then(|v| v.as_str())?;
+    let schema = root.get("schemas").and_then(|s| s.get(ref_name))?.clone();
+    // Convert Discovery's `$ref: "Foo"` (bare name) to the JSON-Pointer form
+    // `generate_from_schema` understands when it recurses for nested refs.
+    let normalized = rewrite_discovery_refs(schema);
+    let example = generate_from_schema(&normalized, root, 0);
+    if example.is_null() {
+        None
+    } else {
+        Some(example)
+    }
+}
+
+/// Rewrite every `$ref: "Name"` (Discovery form) inside `schema` to
+/// `$ref: "#/schemas/Name"` so [`resolve_ref`] finds the target via
+/// `doc.pointer`.
+fn rewrite_discovery_refs(mut value: Value) -> Value {
+    rewrite_refs_in_place(&mut value);
+    value
+}
+
+fn rewrite_refs_in_place(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::String(s)) = map.get_mut("$ref")
+                && !s.starts_with('#')
+                && !s.starts_with("http")
+            {
+                *s = format!("#/schemas/{s}");
+            }
+            for (_, v) in map.iter_mut() {
+                rewrite_refs_in_place(v);
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                rewrite_refs_in_place(v);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Return the effective endpoint list for a provider spec.
