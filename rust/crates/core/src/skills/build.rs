@@ -6,12 +6,12 @@
 //! - `dist/skills.json` — lightweight index for search
 //! - `dist/providers/<org>/<name>.json` — per-provider detail files
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result};
 
@@ -38,7 +38,7 @@ pub struct SkillsIndex {
 }
 
 /// Lightweight provider entry in the index — enough for search, no endpoints.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderIndexEntry {
     pub fqn: String,
     #[serde(flatten)]
@@ -153,6 +153,13 @@ pub struct BuildOptions {
     pub probe: bool,
     /// Probe configuration when `probe == true`.
     pub probe_config: crate::skills::probe::ProbeConfig,
+    /// When `Some`, only the listed provider FQNs are (re)built from source;
+    /// every other provider is copied verbatim from `previous_dist`. Used to
+    /// turn a full merge-time rebuild into a fast partial rebuild.
+    pub only: Option<HashSet<String>>,
+    /// Path to a previously-built `dist/` directory. Required when `only` is
+    /// `Some` so unchanged providers can be copied through without probing.
+    pub previous_dist: Option<PathBuf>,
 }
 
 impl Default for BuildOptions {
@@ -160,6 +167,8 @@ impl Default for BuildOptions {
         Self {
             probe: true,
             probe_config: crate::skills::probe::ProbeConfig::default(),
+            only: None,
+            previous_dist: None,
         }
     }
 }
@@ -215,16 +224,98 @@ fn content_sha(json: &str) -> String {
 
 // ── Collectors ─────────────────────────────────────────────────────────────
 
+/// Container for the previous build artifacts indexed by FQN, used to copy
+/// unchanged providers through during a partial rebuild.
+#[allow(dead_code)]
+struct PreviousDist {
+    entries: HashMap<String, ProviderIndexEntry>,
+    detail_json: HashMap<String, String>,
+}
+
+/// Read the previous `dist/` directory: skills.json (for index entries) and
+/// every `providers/**.json` file (for the detail bodies).
+fn load_previous_dist(dir: &Path) -> Result<PreviousDist> {
+    #[derive(Deserialize)]
+    struct PartialIndex {
+        providers: Vec<ProviderIndexEntry>,
+    }
+    let index_path = dir.join("skills.json");
+    let raw = fs::read_to_string(&index_path)
+        .map_err(|e| Error::Config(format!("previous dist: read {}: {e}", index_path.display())))?;
+    let parsed: PartialIndex = serde_json::from_str(&raw)
+        .map_err(|e| Error::Config(format!("previous dist: skills.json parse error: {e}")))?;
+    let entries: HashMap<String, ProviderIndexEntry> = parsed
+        .providers
+        .into_iter()
+        .map(|p| (p.fqn.clone(), p))
+        .collect();
+
+    let providers_root = dir.join("providers");
+    let mut detail_json = HashMap::new();
+    if providers_root.is_dir() {
+        collect_detail_files(&providers_root, &providers_root, &mut detail_json)?;
+    }
+
+    Ok(PreviousDist {
+        entries,
+        detail_json,
+    })
+}
+
+fn collect_detail_files(dir: &Path, root: &Path, out: &mut HashMap<String, String>) -> Result<()> {
+    let entries = fs::read_dir(dir)
+        .map_err(|e| Error::Config(format!("read previous {}: {e}", dir.display())))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_detail_files(&path, root, out)?;
+        } else if path.extension().and_then(|e| e.to_str()) == Some("json") {
+            let rel = path.strip_prefix(root).unwrap_or(&path);
+            let fqn = rel
+                .with_extension("")
+                .to_string_lossy()
+                .replace('\\', "/")
+                .to_string();
+            let json = fs::read_to_string(&path)
+                .map_err(|e| Error::Config(format!("read previous {}: {e}", path.display())))?;
+            out.insert(fqn, json);
+        }
+    }
+    Ok(())
+}
+
 fn collect_providers(
     root: &Path,
     options: &BuildOptions,
     errors: &mut Vec<String>,
-) -> Vec<(ProviderIndexEntry, ProviderDetail, String)> {
+) -> Vec<(ProviderIndexEntry, String)> {
     let mut results = Vec::new();
     let dir = root.join("providers");
     if !dir.is_dir() {
         return results;
     }
+
+    // Partial-build mode — load the previous dist so we can copy unchanged
+    // providers through without touching the network.
+    #[allow(unused_variables)]
+    let previous = if options.only.is_some() {
+        match options.previous_dist.as_deref() {
+            Some(prev_dir) => match load_previous_dist(prev_dir) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    errors.push(format!("previous dist load failed: {e}"));
+                    return results;
+                }
+            },
+            None => {
+                errors
+                    .push("--only requires --previous-dist (path to a prior build's dist/)".into());
+                return results;
+            }
+        }
+    } else {
+        None
+    };
 
     // Walk: providers/<operator>/<name>.md          → FQN: operator/name
     //       providers/<operator>/<origin>/<name>.md  → FQN: operator/origin/name
@@ -238,7 +329,7 @@ fn collect_providers(
                 // 2-level: operator/name.md (native API)
                 let name = path.file_stem().unwrap().to_string_lossy().to_string();
                 let fqn = format!("{operator_name}/{name}");
-                process_provider_md(
+                dispatch_provider(
                     &path,
                     &fqn,
                     &name,
@@ -246,6 +337,7 @@ fn collect_providers(
                     &operator_name,
                     root,
                     options,
+                    previous.as_ref(),
                     errors,
                     &mut results,
                 );
@@ -259,7 +351,7 @@ fn collect_providers(
                     }
                     let name = md_path.file_stem().unwrap().to_string_lossy().to_string();
                     let fqn = format!("{operator_name}/{origin}/{name}");
-                    process_provider_md(
+                    dispatch_provider(
                         &md_path,
                         &fqn,
                         &name,
@@ -267,6 +359,7 @@ fn collect_providers(
                         &origin,
                         root,
                         options,
+                        previous.as_ref(),
                         errors,
                         &mut results,
                     );
@@ -276,6 +369,52 @@ fn collect_providers(
     }
 
     results
+}
+
+/// Decide whether to rebuild a provider from source (full
+/// `process_provider_md`) or copy the previous dist's entry through. Honors
+/// `options.only` — when set, FQNs not in the set are copied; FQNs in the
+/// set are rebuilt.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_provider(
+    path: &Path,
+    fqn: &str,
+    name: &str,
+    operator: &str,
+    origin: &str,
+    root: &Path,
+    options: &BuildOptions,
+    previous: Option<&PreviousDist>,
+    errors: &mut Vec<String>,
+    results: &mut Vec<(ProviderIndexEntry, String)>,
+) {
+    if let Some(only) = &options.only
+        && !only.contains(fqn)
+    {
+        // Copy through from previous dist.
+        if let Some(prev) = previous {
+            match (prev.entries.get(fqn), prev.detail_json.get(fqn)) {
+                (Some(entry), Some(json)) => {
+                    eprintln!("  provider: {fqn} (copied)");
+                    results.push((entry.clone(), json.clone()));
+                }
+                _ => {
+                    errors.push(format!(
+                        "{fqn}: not in --only list and missing from previous dist"
+                    ));
+                }
+            }
+        } else {
+            errors.push(format!(
+                "{fqn}: not in --only list and no previous dist provided"
+            ));
+        }
+        return;
+    }
+
+    process_provider_md(
+        path, fqn, name, operator, origin, root, options, errors, results,
+    );
 }
 
 fn sorted_subdirs(dir: &Path) -> Vec<PathBuf> {
@@ -310,7 +449,7 @@ fn process_provider_md(
     root: &Path,
     options: &BuildOptions,
     errors: &mut Vec<String>,
-    results: &mut Vec<(ProviderIndexEntry, ProviderDetail, String)>,
+    results: &mut Vec<(ProviderIndexEntry, String)>,
 ) {
     eprintln!("  provider: {fqn}");
 
@@ -424,7 +563,8 @@ fn process_provider_md(
         sha,
     };
 
-    results.push((index_entry, detail, detail_json));
+    let _ = detail; // detail is owned by detail_json now
+    results.push((index_entry, detail_json));
 }
 
 fn collect_affiliates(root: &Path, errors: &mut Vec<String>) -> Vec<AffiliateEntry> {
@@ -675,7 +815,7 @@ pub fn build_with_options(
 
     // Check for duplicate FQNs
     let mut seen: HashMap<String, String> = HashMap::new();
-    for (idx, _, _) in &providers {
+    for (idx, _) in &providers {
         let skill = "pay-skills"; // TODO: support remote sources
         if let Some(prev) = seen.get(&idx.fqn) {
             errors.push(format!(
@@ -688,13 +828,13 @@ pub fn build_with_options(
 
     // Build detail files map
     let mut detail_files = HashMap::new();
-    for (_, detail, json) in &providers {
-        let key = format!("providers/{}.json", detail.fqn);
+    for (entry, json) in &providers {
+        let key = format!("providers/{}.json", entry.fqn);
         detail_files.insert(key, json.clone());
     }
 
     let mut provider_entries: Vec<ProviderIndexEntry> =
-        providers.into_iter().map(|(idx, _, _)| idx).collect();
+        providers.into_iter().map(|(idx, _)| idx).collect();
     provider_entries.sort_by(|a, b| a.fqn.cmp(&b.fqn));
 
     // ISO 8601 timestamp — passed in by the CLI so the core stays pure.

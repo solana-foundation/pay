@@ -26,10 +26,18 @@ pub struct SetupCommand {
     /// 1Password vault name.
     #[arg(long)]
     pub vault: Option<String>,
+
+    /// Re-install MCP configs and agent skill without creating a new account.
+    #[arg(long)]
+    pub update: bool,
 }
 
 impl SetupCommand {
     pub fn run(self) -> pay_core::Result<()> {
+        if self.update {
+            return run_update();
+        }
+
         // Abort before any prompts if the default account already exists.
         if !self.force
             && let Ok(accounts) = pay_core::accounts::AccountsFile::load()
@@ -53,6 +61,9 @@ impl SetupCommand {
         // Offer to install the agent skill if npx is available.
         maybe_install_skill();
 
+        // Install MCP configs into Claude / Codex / Claude Desktop.
+        install_mcp_configs();
+
         let (pubkey, backend_name) = super::account::new::create_account(
             "default",
             self.backend.as_deref(),
@@ -72,6 +83,187 @@ impl SetupCommand {
         Ok(())
     }
 }
+
+/// `pay setup --update`: re-install MCP configs and agent skill.
+fn run_update() -> pay_core::Result<()> {
+    eprintln!();
+    install_mcp_configs();
+    maybe_install_skill();
+    eprintln!("  {}", "Update complete.".dimmed());
+    eprintln!();
+    Ok(())
+}
+
+// ── MCP config installation ────────────────────────────────────────────────
+
+/// Well-known MCP config locations for each supported app.
+fn mcp_config_targets() -> Vec<(&'static str, std::path::PathBuf)> {
+    let mut targets = Vec::new();
+
+    // Claude Code: ~/.claude.json
+    if let Some(home) = home_dir() {
+        targets.push(("Claude Code", home.join(".claude.json")));
+    }
+
+    // Claude Desktop
+    if let Some(path) = claude_desktop_config_path() {
+        targets.push(("Claude Desktop", path));
+    }
+
+    targets
+}
+
+fn claude_desktop_config_path() -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        home_dir().map(|h| {
+            h.join("Library")
+                .join("Application Support")
+                .join("Claude")
+                .join("claude_desktop_config.json")
+        })
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var("APPDATA").ok().map(|appdata| {
+            std::path::PathBuf::from(appdata)
+                .join("Claude")
+                .join("claude_desktop_config.json")
+        })
+    }
+    #[cfg(target_os = "linux")]
+    {
+        home_dir().map(|h| {
+            h.join(".config")
+                .join("Claude")
+                .join("claude_desktop_config.json")
+        })
+    }
+}
+
+fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()
+        .map(std::path::PathBuf::from)
+}
+
+/// Resolve the `pay` binary path for the MCP config.
+fn pay_command() -> String {
+    std::env::current_exe()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "pay".to_string())
+}
+
+/// Install the pay MCP server entry into all detected app configs.
+fn install_mcp_configs() {
+    let pay_bin = pay_command();
+    let targets = mcp_config_targets();
+    let mut installed_any = false;
+
+    for (app_name, config_path) in &targets {
+        // Only install into apps the user actually has (config dir exists).
+        if let Some(parent) = config_path.parent()
+            && !parent.exists()
+        {
+            continue;
+        }
+
+        match add_mcp_entry(config_path, &pay_bin) {
+            Ok(McpInstallResult::Added) => {
+                eprintln!("  {} pay MCP added to {app_name}", "✔".green());
+                installed_any = true;
+            }
+            Ok(McpInstallResult::AlreadyPresent) => {
+                eprintln!("  {} pay MCP already configured in {app_name}", "✔".green());
+                installed_any = true;
+            }
+            Ok(McpInstallResult::Updated) => {
+                eprintln!("  {} pay MCP updated in {app_name}", "✔".green());
+                installed_any = true;
+            }
+            Err(e) => {
+                eprintln!("  {} Failed to configure {app_name}: {e}", "!".yellow());
+            }
+        }
+    }
+
+    if !installed_any {
+        eprintln!(
+            "{}",
+            "  No supported apps found. Add pay MCP manually:".dimmed()
+        );
+        eprintln!(
+            "{}",
+            "  https://github.com/solana-foundation/pay#mcp-server".dimmed()
+        );
+    }
+    eprintln!();
+}
+
+enum McpInstallResult {
+    Added,
+    AlreadyPresent,
+    Updated,
+}
+
+/// Add or update the `pay` MCP server entry in a JSON config file.
+fn add_mcp_entry(config_path: &std::path::Path, pay_bin: &str) -> Result<McpInstallResult, String> {
+    let mut config: serde_json::Value = if config_path.exists() {
+        let raw = std::fs::read_to_string(config_path)
+            .map_err(|e| format!("read {}: {e}", config_path.display()))?;
+        if raw.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(&raw)
+                .map_err(|e| format!("parse {}: {e}", config_path.display()))?
+        }
+    } else {
+        serde_json::json!({})
+    };
+
+    let servers = config
+        .as_object_mut()
+        .ok_or("config is not a JSON object")?
+        .entry("mcpServers")
+        .or_insert_with(|| serde_json::json!({}));
+
+    let new_entry = serde_json::json!({
+        "command": pay_bin,
+        "args": ["mcp"]
+    });
+
+    let result = if let Some(existing) = servers.get("pay") {
+        if existing.get("command").and_then(|v| v.as_str()) == Some(pay_bin)
+            && existing.get("args") == Some(&serde_json::json!(["mcp"]))
+        {
+            McpInstallResult::AlreadyPresent
+        } else {
+            servers["pay"] = new_entry;
+            McpInstallResult::Updated
+        }
+    } else {
+        servers
+            .as_object_mut()
+            .ok_or("mcpServers is not an object")?
+            .insert("pay".to_string(), new_entry);
+        McpInstallResult::Added
+    };
+
+    if !matches!(result, McpInstallResult::AlreadyPresent) {
+        if let Some(parent) = config_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create dir {}: {e}", parent.display()))?;
+        }
+        let json = serde_json::to_string_pretty(&config).map_err(|e| format!("serialize: {e}"))?;
+        std::fs::write(config_path, json + "\n")
+            .map_err(|e| format!("write {}: {e}", config_path.display()))?;
+    }
+
+    Ok(result)
+}
+
+// ── Skill installation ─────────────────────────────────────────────────────
 
 /// If `npx` is on PATH, offer to install the pay agent skill for coding agents.
 fn maybe_install_skill() {
@@ -129,6 +321,8 @@ fn maybe_install_skill() {
     }
     eprintln!();
 }
+
+// ── Linux polkit ───────────────────────────────────────────────────────────
 
 #[cfg(target_os = "linux")]
 pub(crate) fn install_linux_polkit_policy_if_needed() -> pay_core::Result<()> {

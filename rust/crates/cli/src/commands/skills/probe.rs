@@ -21,7 +21,7 @@ pub struct ProbeCommand {
 
     /// Specific provider .md files to probe (relative to path).
     /// When omitted, probes all providers.
-    #[arg(long)]
+    #[arg(long, num_args = 1..)]
     pub files: Vec<PathBuf>,
 
     /// Accepted stablecoin symbols (comma-separated).
@@ -127,7 +127,7 @@ fn walk_providers(
 }
 
 /// Collect specific providers from file paths.
-fn collect_specific_providers(
+pub(crate) fn collect_specific_providers(
     root: &std::path::Path,
     files: &[PathBuf],
 ) -> pay_core::Result<Vec<pay_types::registry::ProbeProvider>> {

@@ -33,6 +33,17 @@ pub struct BuildCommand {
     /// Max concurrent provider probes (only when probing is enabled).
     #[arg(long, default_value_t = 5)]
     pub probe_concurrency: usize,
+
+    /// Comma-separated FQNs to (re)build from source. Every other provider
+    /// is copied verbatim from `--previous-dist`. Useful for fast partial
+    /// rebuilds at merge time.
+    #[arg(long, value_delimiter = ',', value_name = "FQN1,FQN2,...")]
+    pub only: Vec<String>,
+
+    /// Path to a previously-built `dist/` directory. Required when `--only`
+    /// is set; unchanged providers are sourced from here.
+    #[arg(long, value_name = "DIR")]
+    pub previous_dist: Option<PathBuf>,
 }
 
 impl BuildCommand {
@@ -60,6 +71,16 @@ impl BuildCommand {
             format_utc_timestamp(d.as_secs())
         };
 
+        let only = if self.only.is_empty() {
+            None
+        } else {
+            Some(
+                self.only
+                    .iter()
+                    .cloned()
+                    .collect::<std::collections::HashSet<_>>(),
+            )
+        };
         let options = pay_core::skills::build::BuildOptions {
             probe: !self.no_probe,
             probe_config: pay_core::skills::probe::ProbeConfig {
@@ -67,6 +88,8 @@ impl BuildCommand {
                 concurrency: self.probe_concurrency,
                 ..Default::default()
             },
+            only,
+            previous_dist: self.previous_dist,
         };
         let result =
             pay_core::skills::build::build_with_options(&root, &self.base_url, now, &options);
