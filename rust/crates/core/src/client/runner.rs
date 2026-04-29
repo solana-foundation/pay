@@ -130,12 +130,26 @@ fn run_curl_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunO
 
 /// Run `wget` with the given user args, detecting 402 + MPP challenges.
 pub fn run_wget(user_args: &[String]) -> Result<RunOutcome> {
+    validate_wget_args_against_catalog(user_args)?;
     run_wget_inner(user_args, &[])
 }
 
 /// Run `wget` with extra headers injected (used for retry after payment).
 pub fn run_wget_with_headers(user_args: &[String], extra_headers: &[String]) -> Result<RunOutcome> {
     run_wget_inner(user_args, extra_headers)
+}
+
+/// Validate a wget invocation against cached Pay catalog OpenAPI metadata.
+pub fn validate_wget_args_against_catalog(user_args: &[String]) -> Result<()> {
+    let request = ParsedWgetRequest::from_args(user_args);
+    if let Some(url) = request.url.as_deref() {
+        crate::skills::validate_cached_catalog_request(
+            &request.method,
+            url,
+            request.body.as_deref(),
+        )?;
+    }
+    Ok(())
 }
 
 fn run_wget_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunOutcome> {
@@ -504,6 +518,81 @@ fn append_curl_body(body: &mut Option<String>, value: &str) {
         }
         Some(body) => body.push_str(value),
         None => *body = Some(value.to_string()),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedWgetRequest {
+    url: Option<String>,
+    method: String,
+    body: Option<String>,
+}
+
+impl ParsedWgetRequest {
+    fn from_args(args: &[String]) -> Self {
+        let mut url = None;
+        let mut explicit_method = None;
+        let mut body = None;
+        let mut post_body_seen = false;
+        let mut i = 0;
+
+        while i < args.len() {
+            let arg = &args[i];
+            match arg.as_str() {
+                "--method" => {
+                    if let Some(value) = args.get(i + 1) {
+                        explicit_method = Some(value.to_ascii_uppercase());
+                        i += 1;
+                    }
+                }
+                "--post-data" | "--body-data" => {
+                    if let Some(value) = args.get(i + 1) {
+                        body = Some(value.clone());
+                        post_body_seen = true;
+                        i += 1;
+                    }
+                }
+                "--spider" => {
+                    explicit_method.get_or_insert_with(|| "HEAD".to_string());
+                }
+                _ => {
+                    if let Some(value) = arg.strip_prefix("--method=") {
+                        explicit_method = Some(value.to_ascii_uppercase());
+                    } else if let Some(value) = arg.strip_prefix("--post-data=") {
+                        body = Some(value.to_string());
+                        post_body_seen = true;
+                    } else if let Some(value) = arg.strip_prefix("--body-data=") {
+                        body = Some(value.to_string());
+                        post_body_seen = true;
+                    } else if matches!(
+                        arg.as_str(),
+                        "--post-file" | "--body-file" | "--post-file=" | "--body-file="
+                    ) {
+                        post_body_seen = true;
+                        if !arg.ends_with('=') && args.get(i + 1).is_some() {
+                            i += 1;
+                        }
+                    } else if arg.starts_with("--post-file=") || arg.starts_with("--body-file=") {
+                        post_body_seen = true;
+                    } else if url.is_none()
+                        && (arg.starts_with("http://") || arg.starts_with("https://"))
+                    {
+                        url = Some(arg.clone());
+                    }
+                }
+            }
+            i += 1;
+        }
+
+        let method = explicit_method.unwrap_or_else(|| {
+            if post_body_seen {
+                "POST".to_string()
+            } else {
+                "GET".to_string()
+            }
+        });
+
+        Self { url, method, body }
     }
 }
 
@@ -969,6 +1058,60 @@ HTTP request sent, awaiting response...
                 url: Some("https://example.com/api/item".to_string()),
                 method: "PATCH".to_string(),
                 body: Some(r#"{"name":"pay"}"#.to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn parsed_wget_request_extracts_post_data() {
+        let args = vec![
+            "--post-data".to_string(),
+            r#"{"productUrl":"https://example.com/item"}"#.to_string(),
+            "https://api.example.com/x402/buy".to_string(),
+        ];
+
+        assert_eq!(
+            ParsedWgetRequest::from_args(&args),
+            ParsedWgetRequest {
+                url: Some("https://api.example.com/x402/buy".to_string()),
+                method: "POST".to_string(),
+                body: Some(r#"{"productUrl":"https://example.com/item"}"#.to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn parsed_wget_request_honors_explicit_method() {
+        let args = vec![
+            "--method=PUT".to_string(),
+            "--body-data={\"name\":\"pay\"}".to_string(),
+            "https://api.example.com/items/1".to_string(),
+        ];
+
+        assert_eq!(
+            ParsedWgetRequest::from_args(&args),
+            ParsedWgetRequest {
+                url: Some("https://api.example.com/items/1".to_string()),
+                method: "PUT".to_string(),
+                body: Some(r#"{"name":"pay"}"#.to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn parsed_wget_request_body_file_defaults_to_post_without_body_for_validation() {
+        let args = vec![
+            "--body-file".to_string(),
+            "payload.json".to_string(),
+            "https://api.example.com/items".to_string(),
+        ];
+
+        assert_eq!(
+            ParsedWgetRequest::from_args(&args),
+            ParsedWgetRequest {
+                url: Some("https://api.example.com/items".to_string()),
+                method: "POST".to_string(),
+                body: None,
             }
         );
     }

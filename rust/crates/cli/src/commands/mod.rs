@@ -160,6 +160,7 @@ impl Command {
             Command::Wget(cmd) => (pay_core::run_wget(&cmd.args)?, Tool::Wget(&cmd.args)),
             Command::Fetch(cmd) => {
                 let parsed_headers = parse_header_args(&cmd.headers);
+                pay_core::skills::validate_cached_catalog_request("GET", &cmd.url, None)?;
                 let outcome = pay_core::fetch::fetch(&cmd.url, &parsed_headers)?;
                 let tool = Tool::Fetch { url: &cmd.url };
                 return handle_outcome(
@@ -729,7 +730,7 @@ fn validate_tool_request_before_signing(tool: &Tool) -> pay_core::Result<()> {
     match tool {
         Tool::Curl(args) => pay_core::runner::validate_curl_args_against_catalog(args),
         Tool::Fetch { url } => pay_core::skills::validate_cached_catalog_request("GET", url, None),
-        Tool::Wget(_) => Ok(()),
+        Tool::Wget(args) => pay_core::runner::validate_wget_args_against_catalog(args),
     }
 }
 
