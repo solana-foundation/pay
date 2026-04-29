@@ -27,6 +27,7 @@ serde_yml = "0.0.12"
 base64 = "0.22"
 crc32fast = "1.5"
 flate2 = "1.1"
+percent-encoding = "2"
 
 # Error handling
 thiserror = "2"
@@ -91,6 +92,7 @@ reqwest = { version = "0.12", features = [
 zeroize = "1"
 ed25519-dalek = { version = "2", default-features = false }
 rand = "0.8"
+uuid = { version = "1", features = ["v4"] }
 bs58 = "0.5"
 blake3 = "1"
 qrcode = { version = "0.14", default-features = false }

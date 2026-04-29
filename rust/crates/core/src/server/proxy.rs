@@ -11,9 +11,23 @@ use std::sync::Arc;
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::response::Response;
-use pay_types::metering::{ApiSpec, AuthConfig, RoutingConfig};
+use base64::Engine;
+use chrono::Utc;
+use hmac::{Hmac, Mac};
+use md5::{Digest, Md5};
+use pay_types::metering::{
+    AccessTokenFetchConfig, AccessTokenInjectConfig, AccessTokenResponseConfig, ApiSpec,
+    AuthConfig, HmacAlgorithm, HmacCanonicalComponent, HmacCanonicalConfig, HmacDigestAlgorithm,
+    HmacEncoding, HmacPrepareBinding, HmacPrepareValue, HmacQueryStyle, HmacSignatureConfig,
+    HmacStringEncoding, HmacTargetType, HmacTimestampFormat, HttpMethod, RoutingConfig,
+};
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
+use rand::RngCore;
 use serde_json::json;
+use sha1::Sha1;
+use sha2::{Sha256, Sha512};
 use tokio::sync::RwLock;
+use uuid::Uuid;
 
 use crate::server::telemetry;
 
@@ -26,6 +40,13 @@ const STRIP_HEADERS: &[&str] = &[
     "payment-signature",
     "payment-required",
 ];
+
+/// Percent-encode every ASCII byte except RFC 3986 unreserved characters.
+const RFC3986_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
 
 /// Resolve the effective routing for a request path.
 ///
@@ -91,31 +112,20 @@ pub async fn forward_request(
             .unwrap());
     }
 
-    // Build upstream URL (with path rewrites), then inject query param auth if configured.
-    let mut upstream_url = routing
+    // Build the upstream URL (with path rewrites) and prepare the forwarded
+    // request state before converting it into a reqwest request.
+    let upstream_url = routing
         .upstream_url(path_and_query)
         .expect("Proxy routing must have a URL");
-
-    if let Some(AuthConfig::QueryParam {
-        key,
-        value_from_env,
-    }) = routing.auth()
-    {
-        let secret = std::env::var(value_from_env).unwrap_or_default();
-        let separator = if upstream_url.contains('?') { "&" } else { "?" };
-        upstream_url = format!("{upstream_url}{separator}{key}={secret}");
-    }
+    let mut prepared = PreparedUpstreamRequest::new(&upstream_url).map_err(|e| {
+        telemetry::record_upstream_error(&api.subdomain, uri.path(), &upstream_url, &e);
+        error_response(StatusCode::BAD_GATEWAY, &e)
+    })?;
 
     tracing::debug!(
         subdomain = %api.subdomain,
-        upstream = %upstream_url,
+        upstream = %prepared.url,
         "Forwarding request"
-    );
-
-    let client = reqwest::Client::new();
-    let mut upstream_req = client.request(
-        reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap(),
-        &upstream_url,
     );
 
     // Forward headers.
@@ -125,23 +135,30 @@ pub async fn forward_request(
             continue;
         }
         if let Ok(v) = value.to_str() {
-            upstream_req = upstream_req.header(name_str, v);
+            prepared.add_forwarded_header(name_str, v);
         }
     }
 
-    // Inject auth header if configured.
+    // Inject auth into the prepared upstream request.
     match routing.auth() {
-        Some(AuthConfig::Header {
-            key,
-            prefix,
-            value_from_env,
-        }) => {
-            let secret = std::env::var(value_from_env).unwrap_or_default();
-            let value = match prefix {
-                Some(p) => format!("{p}{secret}"),
-                None => secret,
-            };
-            upstream_req = upstream_req.header(key.as_str(), value);
+        Some(
+            AuthConfig::Header { .. } | AuthConfig::QueryParam { .. } | AuthConfig::Hmac { .. },
+        ) => {
+            apply_prepared_request_auth(
+                &mut prepared,
+                &method,
+                body.as_ref(),
+                routing.auth().expect("routing auth checked above"),
+            )
+            .map_err(|e| {
+                telemetry::record_upstream_error(
+                    &api.subdomain,
+                    uri.path(),
+                    prepared.url.as_str(),
+                    &e,
+                );
+                error_response(StatusCode::BAD_GATEWAY, &e)
+            })?;
         }
         Some(AuthConfig::Oauth2 {
             token_url,
@@ -159,10 +176,10 @@ pub async fn forward_request(
             .await
             {
                 Ok(token) => {
-                    upstream_req = upstream_req.header("authorization", format!("Bearer {token}"));
+                    prepared.set_header("authorization", format!("Bearer {token}"));
                     for (header_name, env_ref) in headers {
                         if let Ok(val) = std::env::var(&env_ref.from_env) {
-                            upstream_req = upstream_req.header(header_name.as_str(), val);
+                            prepared.set_header(header_name, val);
                         }
                     }
                 }
@@ -170,7 +187,7 @@ pub async fn forward_request(
                     telemetry::record_upstream_error(
                         &api.subdomain,
                         uri.path(),
-                        &upstream_url,
+                        prepared.url.as_str(),
                         &format!("OAuth2 token error: {e}"),
                     );
                     tracing::error!(error = %e, "Failed to fetch OAuth2 token");
@@ -181,8 +198,42 @@ pub async fn forward_request(
                 }
             }
         }
+        Some(AuthConfig::AccessToken {
+            prepare,
+            fetch,
+            inject,
+        }) => {
+            apply_access_token_auth(
+                &mut prepared,
+                &method,
+                body.as_ref(),
+                prepare,
+                fetch,
+                inject,
+            )
+            .await
+            .map_err(|e| {
+                telemetry::record_upstream_error(
+                    &api.subdomain,
+                    uri.path(),
+                    prepared.url.as_str(),
+                    &e,
+                );
+                error_response(StatusCode::BAD_GATEWAY, &e)
+            })?;
+        }
         _ => {}
     }
+
+    let client = reqwest::Client::new();
+    let mut upstream_req = client.request(
+        reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap(),
+        prepared.url.clone(),
+    );
+    for (name, value) in &prepared.headers {
+        upstream_req = upstream_req.header(name.as_str(), value);
+    }
+    let upstream_url = prepared.url.to_string();
 
     // Forward body. Always set content-length for POST/PUT/PATCH
     // (some upstreams like Google APIs require it even when empty).
@@ -263,6 +314,664 @@ pub fn error_response(status: StatusCode, message: &str) -> Response {
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_string(&body).unwrap()))
         .unwrap()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedUpstreamRequest {
+    url: reqwest::Url,
+    headers: Vec<(String, String)>,
+}
+
+impl PreparedUpstreamRequest {
+    /// Parse the routed upstream URL into a mutable request shape that can be
+    /// amended by auth code before we build the final `reqwest` request.
+    fn new(upstream_url: &str) -> Result<Self, String> {
+        let url =
+            reqwest::Url::parse(upstream_url).map_err(|e| format!("Invalid upstream URL: {e}"))?;
+        Ok(Self {
+            url,
+            headers: Vec::new(),
+        })
+    }
+
+    fn add_forwarded_header(&mut self, name: &str, value: &str) {
+        self.headers.push((name.to_string(), value.to_string()));
+    }
+
+    fn set_header(&mut self, name: &str, value: impl Into<String>) {
+        self.headers
+            .retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
+        self.headers.push((name.to_string(), value.into()));
+    }
+
+    fn header_value(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .rev()
+            .find(|(existing, _)| existing.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
+    fn append_query_param(&mut self, name: &str, value: &str) {
+        self.url.query_pairs_mut().append_pair(name, value);
+    }
+
+    fn set_query_param(&mut self, name: &str, value: &str) {
+        let existing: Vec<(String, String)> = self
+            .url
+            .query_pairs()
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .filter(|(key, _)| key != name)
+            .collect();
+        self.url.set_query(None);
+        {
+            let mut pairs = self.url.query_pairs_mut();
+            for (key, existing_value) in existing {
+                pairs.append_pair(&key, &existing_value);
+            }
+            pairs.append_pair(name, value);
+        }
+    }
+}
+
+/// Apply a direct auth scheme to a mutable upstream request.
+///
+/// This helper is intentionally limited to schemes that operate entirely on the
+/// already-prepared request. Token-fetching flows are handled separately.
+fn apply_prepared_request_auth(
+    prepared: &mut PreparedUpstreamRequest,
+    method: &Method,
+    body: &[u8],
+    auth: &AuthConfig,
+) -> Result<(), String> {
+    match auth {
+        AuthConfig::Header {
+            key,
+            prefix,
+            value_from_env,
+        } => {
+            let secret = std::env::var(value_from_env).unwrap_or_default();
+            let value = match prefix {
+                Some(p) => format!("{p}{secret}"),
+                None => secret,
+            };
+            prepared.set_header(key, value);
+            Ok(())
+        }
+        AuthConfig::QueryParam {
+            key,
+            value_from_env,
+        } => {
+            let secret = std::env::var(value_from_env).unwrap_or_default();
+            prepared.append_query_param(key, &secret);
+            Ok(())
+        }
+        AuthConfig::Hmac {
+            algorithm,
+            secret_from_env,
+            secret_suffix,
+            key_id_from_env,
+            prepare,
+            canonical,
+            signature,
+        } => apply_hmac_auth(
+            prepared,
+            method,
+            body,
+            algorithm,
+            secret_from_env,
+            secret_suffix.as_deref(),
+            key_id_from_env.as_deref(),
+            prepare,
+            canonical,
+            signature,
+        ),
+        AuthConfig::Oauth2 { .. } => Err(
+            "Nested oauth2 auth is not supported when preparing another upstream request"
+                .to_string(),
+        ),
+        AuthConfig::AccessToken { .. } => Err(
+            "Nested access_token auth is not supported when preparing another upstream request"
+                .to_string(),
+        ),
+    }
+}
+
+/// Apply a cached access-token flow to the main upstream request.
+async fn apply_access_token_auth(
+    prepared: &mut PreparedUpstreamRequest,
+    _method: &Method,
+    body: &[u8],
+    prepare: &[HmacPrepareBinding],
+    fetch: &AccessTokenFetchConfig,
+    inject: &AccessTokenInjectConfig,
+) -> Result<(), String> {
+    for binding in prepare {
+        let value = resolve_hmac_prepare_value(&prepared.url, body, &binding.value)?;
+        apply_hmac_target(prepared, &binding.target.kind, &binding.target.name, &value);
+    }
+
+    let token = access_token(fetch).await?;
+    let rendered = render_access_token_template(&inject.template, &token)?;
+    apply_hmac_target(
+        prepared,
+        &inject.target.kind,
+        &inject.target.name,
+        &rendered,
+    );
+    Ok(())
+}
+
+/// Apply generic HMAC request signing to the prepared upstream request.
+///
+/// The sequence is:
+/// 1. resolve the configured secret/key id from the environment
+/// 2. apply all `prepare` bindings to the mutable request
+/// 3. build the canonical string from the post-prepare request state
+/// 4. compute the HMAC and write the rendered signature to its destination
+fn apply_hmac_auth(
+    prepared: &mut PreparedUpstreamRequest,
+    method: &Method,
+    body: &[u8],
+    algorithm: &HmacAlgorithm,
+    secret_from_env: &str,
+    secret_suffix: Option<&str>,
+    key_id_from_env: Option<&str>,
+    prepare: &[HmacPrepareBinding],
+    canonical: &HmacCanonicalConfig,
+    signature: &HmacSignatureConfig,
+) -> Result<(), String> {
+    let secret = std::env::var(secret_from_env)
+        .map_err(|_| format!("HMAC secret env var not set: {secret_from_env}"))?;
+    let key_id = match key_id_from_env {
+        Some(env_name) => Some(
+            std::env::var(env_name)
+                .map_err(|_| format!("HMAC key ID env var not set: {env_name}"))?,
+        ),
+        None => None,
+    };
+
+    for binding in prepare {
+        let value = resolve_hmac_prepare_value(&prepared.url, body, &binding.value)?;
+        apply_hmac_target(prepared, &binding.target.kind, &binding.target.name, &value);
+    }
+
+    let canonical_string = build_hmac_canonical_string(prepared, method, canonical)?;
+    let signing_secret = match secret_suffix {
+        Some(suffix) => format!("{secret}{suffix}"),
+        None => secret,
+    };
+    let signature_bytes = compute_hmac_signature_bytes(
+        algorithm,
+        signing_secret.as_bytes(),
+        canonical_string.as_bytes(),
+    )?;
+    let encoded_signature = encode_bytes(signature_bytes.as_ref(), &signature.encoding);
+    let rendered_signature = render_hmac_template(
+        &signature.destination.template,
+        encoded_signature.as_str(),
+        key_id.as_deref(),
+    )?;
+
+    apply_hmac_target(
+        prepared,
+        &signature.destination.kind,
+        &signature.destination.name,
+        &rendered_signature,
+    );
+    Ok(())
+}
+
+/// Write a resolved value to either a header or query parameter.
+fn apply_hmac_target(
+    prepared: &mut PreparedUpstreamRequest,
+    kind: &HmacTargetType,
+    name: &str,
+    value: &str,
+) {
+    match kind {
+        HmacTargetType::Header => prepared.set_header(name, value),
+        HmacTargetType::QueryParam => prepared.set_query_param(name, value),
+    }
+}
+
+/// Resolve one `prepare` binding against the final upstream URL and raw body.
+fn resolve_hmac_prepare_value(
+    upstream_url: &reqwest::Url,
+    body: &[u8],
+    value: &HmacPrepareValue,
+) -> Result<String, String> {
+    match value {
+        HmacPrepareValue::Literal { value } => Ok(value.clone()),
+        HmacPrepareValue::Env { from_env } => {
+            std::env::var(from_env).map_err(|_| format!("HMAC prepare env var not set: {from_env}"))
+        }
+        HmacPrepareValue::UpstreamHost {} => host_header_value(upstream_url),
+        HmacPrepareValue::Timestamp { format } => Ok(match format {
+            HmacTimestampFormat::Rfc1123Gmt => current_gmt_date(),
+            HmacTimestampFormat::Iso8601Zulu => current_iso8601_zulu(),
+            HmacTimestampFormat::UnixSeconds => Utc::now().timestamp().to_string(),
+        }),
+        HmacPrepareValue::UuidV4 {} => Ok(random_uuid_v4()),
+        HmacPrepareValue::RandomHex { bytes } => Ok(random_hex(*bytes as usize)),
+        HmacPrepareValue::BodyDigest {
+            algorithm,
+            encoding,
+        } => Ok(encode_bytes(
+            digest_bytes(algorithm, body).as_ref(),
+            encoding,
+        )),
+    }
+}
+
+/// Render the canonical string that becomes the HMAC message.
+///
+/// Header lookups are case-insensitive and operate on the post-prepare header
+/// set. Query lookups operate on the final upstream URL after any prepare-time
+/// query mutations.
+fn build_hmac_canonical_string(
+    prepared: &PreparedUpstreamRequest,
+    method: &Method,
+    canonical: &HmacCanonicalConfig,
+) -> Result<String, String> {
+    let mut parts = Vec::with_capacity(canonical.components.len());
+
+    for component in &canonical.components {
+        let part = match component {
+            HmacCanonicalComponent::Method {} => method.as_str().to_string(),
+            HmacCanonicalComponent::Path {} => prepared.url.path().to_string(),
+            HmacCanonicalComponent::Query { style, encoding } => {
+                canonical_query_component(&prepared.url, style, encoding)?
+            }
+            HmacCanonicalComponent::Header { name } => prepared
+                .header_value(name)
+                .map(str::to_string)
+                .ok_or_else(|| format!("HMAC canonical header `{name}` is missing"))?,
+            HmacCanonicalComponent::Headers {
+                names,
+                join_with,
+                format,
+            } => {
+                let mut rendered = Vec::with_capacity(names.len());
+                for name in names {
+                    let value = prepared
+                        .header_value(name)
+                        .ok_or_else(|| format!("HMAC canonical header `{name}` is missing"))?;
+                    rendered.push(render_named_value_template(format, name, value)?);
+                }
+                rendered.join(join_with)
+            }
+            HmacCanonicalComponent::Literal { value } => value.clone(),
+        };
+        parts.push(part);
+    }
+
+    Ok(parts.join(&canonical.join_with))
+}
+
+/// Render the final query string for canonicalization.
+///
+/// `raw` preserves the exact query string order and encoding already present on
+/// the upstream URL. `sorted_pairs` reorders pairs by name and then value using
+/// the raw `k=v` substrings.
+fn canonical_query_component(
+    url: &reqwest::Url,
+    style: &HmacQueryStyle,
+    encoding: &HmacStringEncoding,
+) -> Result<String, String> {
+    let raw_query = url
+        .query()
+        .filter(|query| !query.is_empty())
+        .ok_or_else(|| "HMAC canonical query is missing".to_string())?;
+    let rendered = match style {
+        HmacQueryStyle::Raw => raw_query.to_string(),
+        HmacQueryStyle::SortedPairs => {
+            let mut pairs = parse_raw_query_pairs(raw_query);
+            pairs.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+            pairs
+                .into_iter()
+                .map(|(name, value)| format!("{name}={value}"))
+                .collect::<Vec<_>>()
+                .join("&")
+        }
+    };
+    Ok(match encoding {
+        HmacStringEncoding::None => rendered,
+        HmacStringEncoding::PercentRfc3986 => percent_encode_rfc3986(&rendered),
+    })
+}
+
+/// Split a raw query string into `name=value` pairs without decoding it.
+fn parse_raw_query_pairs(raw_query: &str) -> Vec<(String, String)> {
+    raw_query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| match pair.split_once('=') {
+            Some((name, value)) => (name.to_string(), value.to_string()),
+            None => (pair.to_string(), String::new()),
+        })
+        .collect()
+}
+
+/// Compute the raw HMAC bytes for the configured hash algorithm.
+fn compute_hmac_signature_bytes(
+    algorithm: &HmacAlgorithm,
+    secret: &[u8],
+    message: &[u8],
+) -> Result<Vec<u8>, String> {
+    match algorithm {
+        HmacAlgorithm::Sha1 => {
+            let mut mac = Hmac::<Sha1>::new_from_slice(secret)
+                .map_err(|e| format!("Invalid HMAC secret: {e}"))?;
+            mac.update(message);
+            Ok(mac.finalize().into_bytes().to_vec())
+        }
+        HmacAlgorithm::Sha256 => {
+            let mut mac = Hmac::<Sha256>::new_from_slice(secret)
+                .map_err(|e| format!("Invalid HMAC secret: {e}"))?;
+            mac.update(message);
+            Ok(mac.finalize().into_bytes().to_vec())
+        }
+        HmacAlgorithm::Sha512 => {
+            let mut mac = Hmac::<Sha512>::new_from_slice(secret)
+                .map_err(|e| format!("Invalid HMAC secret: {e}"))?;
+            mac.update(message);
+            Ok(mac.finalize().into_bytes().to_vec())
+        }
+    }
+}
+
+/// Compute a raw body digest for `prepare.value.from: body_digest`.
+fn digest_bytes(algorithm: &HmacDigestAlgorithm, body: &[u8]) -> Vec<u8> {
+    match algorithm {
+        HmacDigestAlgorithm::Md5 => {
+            let mut hasher = Md5::new();
+            hasher.update(body);
+            hasher.finalize().to_vec()
+        }
+        HmacDigestAlgorithm::Sha256 => {
+            let mut hasher = Sha256::new();
+            hasher.update(body);
+            hasher.finalize().to_vec()
+        }
+        HmacDigestAlgorithm::Sha512 => {
+            let mut hasher = Sha512::new();
+            hasher.update(body);
+            hasher.finalize().to_vec()
+        }
+    }
+}
+
+/// Encode raw bytes as either base64 or lowercase hex.
+fn encode_bytes(bytes: &[u8], encoding: &HmacEncoding) -> String {
+    match encoding {
+        HmacEncoding::Base64 => base64::engine::general_purpose::STANDARD.encode(bytes),
+        HmacEncoding::Hex => bytes.iter().map(|byte| format!("{byte:02x}")).collect(),
+    }
+}
+
+/// Render the configured signature destination template.
+fn render_hmac_template(
+    template: &str,
+    signature: &str,
+    key_id: Option<&str>,
+) -> Result<String, String> {
+    render_template(template, |token| match token {
+        "signature" => Some(signature.to_string()),
+        "key_id" => key_id.map(str::to_string),
+        _ => None,
+    })
+}
+
+/// Render the configured access-token destination template.
+fn render_access_token_template(template: &str, token: &str) -> Result<String, String> {
+    render_template(template, |placeholder| match placeholder {
+        "token" => Some(token.to_string()),
+        _ => None,
+    })
+}
+
+/// Render a `headers` canonical component template using `{name}` and
+/// `{value}` substitutions.
+fn render_named_value_template(template: &str, name: &str, value: &str) -> Result<String, String> {
+    render_template(template, |token| match token {
+        "name" => Some(name.to_string()),
+        "value" => Some(value.to_string()),
+        _ => None,
+    })
+}
+
+/// Render a simple `{token}` template and error on unmatched or unresolved
+/// placeholders.
+fn render_template(
+    template: &str,
+    resolve: impl Fn(&str) -> Option<String>,
+) -> Result<String, String> {
+    let mut rendered = String::with_capacity(template.len());
+    let mut current: Option<String> = None;
+
+    for ch in template.chars() {
+        match (&mut current, ch) {
+            (None, '{') => current = Some(String::new()),
+            (None, '}') => return Err("template contains unmatched `}`".to_string()),
+            (None, other) => rendered.push(other),
+            (Some(_), '{') => return Err("template contains nested `{`".to_string()),
+            (Some(token), '}') => {
+                let replacement = resolve(token.as_str()).ok_or_else(|| {
+                    format!("template contains unknown or unresolved token `{{{token}}}`")
+                })?;
+                rendered.push_str(&replacement);
+                current = None;
+            }
+            (Some(token), other) => token.push(other),
+        }
+    }
+
+    if current.is_some() {
+        return Err("template contains unterminated `{...` token".to_string());
+    }
+
+    Ok(rendered)
+}
+
+fn current_gmt_date() -> String {
+    Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string()
+}
+
+fn current_iso8601_zulu() -> String {
+    Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+fn random_hex(byte_count: usize) -> String {
+    let mut bytes = vec![0u8; byte_count];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn random_uuid_v4() -> String {
+    Uuid::new_v4().to_string()
+}
+
+fn percent_encode_rfc3986(input: &str) -> String {
+    utf8_percent_encode(input, RFC3986_ENCODE_SET).to_string()
+}
+
+fn host_header_value(url: &reqwest::Url) -> Result<String, String> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| "HMAC upstream_host requires a host in the upstream URL".to_string())?;
+    match url.port() {
+        Some(port) => Ok(format!("{host}:{port}")),
+        None => Ok(host.to_string()),
+    }
+}
+
+// =============================================================================
+// Generic access token cache
+// =============================================================================
+
+#[derive(PartialEq, Eq, Hash)]
+struct AccessTokenKey {
+    config: String,
+}
+
+static ACCESS_TOKEN_CACHE: std::sync::OnceLock<Arc<RwLock<HashMap<AccessTokenKey, CachedToken>>>> =
+    std::sync::OnceLock::new();
+
+fn access_token_cache() -> &'static Arc<RwLock<HashMap<AccessTokenKey, CachedToken>>> {
+    ACCESS_TOKEN_CACHE.get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
+}
+
+/// Fetch an access token using a nested HTTP request, reusing a cached token
+/// until shortly before expiry.
+async fn access_token(fetch: &AccessTokenFetchConfig) -> Result<String, String> {
+    let key = AccessTokenKey {
+        config: serde_json::to_string(fetch)
+            .map_err(|e| format!("Access token cache key serialization failed: {e}"))?,
+    };
+
+    {
+        let cache = access_token_cache().read().await;
+        if let Some(cached) = cache.get(&key)
+            && cached.expires_at > std::time::Instant::now() + std::time::Duration::from_secs(30)
+        {
+            return Ok(cached.access_token.clone());
+        }
+    }
+
+    let fetched = fetch_access_token(fetch).await?;
+    let ttl = fetched
+        .expires_in_secs
+        .saturating_sub(fetch.response.refresh_skew_seconds);
+    let expires_at = std::time::Instant::now() + std::time::Duration::from_secs(ttl);
+
+    {
+        let mut cache = access_token_cache().write().await;
+        cache.insert(
+            key,
+            CachedToken {
+                access_token: fetched.access_token.clone(),
+                expires_at,
+            },
+        );
+    }
+
+    Ok(fetched.access_token)
+}
+
+async fn fetch_access_token(fetch: &AccessTokenFetchConfig) -> Result<FetchedToken, String> {
+    let mut prepared = PreparedUpstreamRequest::new(&fetch.url)?;
+    let method = axum_method_from_spec(&fetch.method);
+
+    for binding in &fetch.prepare {
+        let value = resolve_hmac_prepare_value(&prepared.url, &[], &binding.value)?;
+        apply_hmac_target(
+            &mut prepared,
+            &binding.target.kind,
+            &binding.target.name,
+            &value,
+        );
+    }
+
+    if let Some(auth) = fetch.auth.as_deref() {
+        apply_prepared_request_auth(&mut prepared, &method, &[], auth)?;
+    }
+
+    let client = reqwest::Client::new();
+    let mut request = client.request(
+        reqwest_method_from_spec(&fetch.method),
+        prepared.url.clone(),
+    );
+    for (name, value) in &prepared.headers {
+        request = request.header(name.as_str(), value);
+    }
+
+    let response = request
+        .send()
+        .await
+        .map_err(|e| format!("Access token request failed: {e}"))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|e| format!("Access token response read failed: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("Access token request failed with {status}: {text}"));
+    }
+
+    let body: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("Invalid access token response: {e}"))?;
+    let access_token =
+        json_pointer_string(&body, &fetch.response.token_json_pointer, "access token")?;
+    let expires_in_secs = access_token_ttl_seconds(&body, &fetch.response)?;
+
+    Ok(FetchedToken {
+        access_token,
+        expires_in_secs,
+    })
+}
+
+fn access_token_ttl_seconds(
+    body: &serde_json::Value,
+    response: &AccessTokenResponseConfig,
+) -> Result<u64, String> {
+    if let Some(pointer) = &response.expires_in_json_pointer {
+        return json_pointer_u64(body, pointer, "access token expiry")
+            .map(|seconds| seconds.max(1));
+    }
+
+    let expires_at = json_pointer_u64(
+        body,
+        response
+            .expires_at_json_pointer
+            .as_ref()
+            .ok_or_else(|| "Access token response missing expiry pointer".to_string())?,
+        "access token expiry timestamp",
+    )?;
+
+    match response.expires_at_format {
+        pay_types::metering::AccessTokenExpiryFormat::UnixSeconds => {
+            let now = Utc::now().timestamp().max(0) as u64;
+            Ok(expires_at.saturating_sub(now).max(1))
+        }
+    }
+}
+
+fn json_pointer_string(
+    body: &serde_json::Value,
+    pointer: &str,
+    label: &str,
+) -> Result<String, String> {
+    body.pointer(pointer)
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| format!("Missing or invalid {label} at JSON Pointer `{pointer}`"))
+}
+
+fn json_pointer_u64(body: &serde_json::Value, pointer: &str, label: &str) -> Result<u64, String> {
+    body.pointer(pointer)
+        .and_then(|value| value.as_u64())
+        .ok_or_else(|| format!("Missing or invalid {label} at JSON Pointer `{pointer}`"))
+}
+
+fn reqwest_method_from_spec(method: &HttpMethod) -> reqwest::Method {
+    match method {
+        HttpMethod::Get => reqwest::Method::GET,
+        HttpMethod::Post => reqwest::Method::POST,
+        HttpMethod::Put => reqwest::Method::PUT,
+        HttpMethod::Patch => reqwest::Method::PATCH,
+        HttpMethod::Delete => reqwest::Method::DELETE,
+    }
+}
+
+fn axum_method_from_spec(method: &HttpMethod) -> Method {
+    match method {
+        HttpMethod::Get => Method::GET,
+        HttpMethod::Post => Method::POST,
+        HttpMethod::Put => Method::PUT,
+        HttpMethod::Patch => Method::PATCH,
+        HttpMethod::Delete => Method::DELETE,
+    }
 }
 
 // =============================================================================
@@ -482,7 +1191,15 @@ async fn fetch_gcp_metadata_token(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pay_types::metering::RoutingConfig;
+    use pay_types::metering::{
+        AccessTokenFetchConfig, AccessTokenInjectConfig, AccessTokenResponseConfig,
+        HmacCanonicalComponent, HmacCanonicalConfig, HmacDigestAlgorithm, HmacEncoding,
+        HmacPrepareBinding, HmacPrepareValue, HmacQueryStyle, HmacSignatureConfig,
+        HmacSignatureDestination, HmacStringEncoding, HmacTarget, HmacTargetType,
+        HmacTimestampFormat, HttpMethod, RoutingConfig,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     fn make_api(subdomain: &str) -> ApiSpec {
         ApiSpec {
@@ -506,6 +1223,280 @@ mod tests {
             operator: None,
             session: None,
             recipients: std::collections::HashMap::new(),
+        }
+    }
+
+    fn alibaba_hmac_auth_config(fixed_values: bool) -> AuthConfig {
+        let date_value = if fixed_values {
+            HmacPrepareValue::Literal {
+                value: "Wed, 26 Aug 2015 17:01:00 GMT".to_string(),
+            }
+        } else {
+            HmacPrepareValue::Timestamp {
+                format: HmacTimestampFormat::Rfc1123Gmt,
+            }
+        };
+        let nonce_value = if fixed_values {
+            HmacPrepareValue::Literal {
+                value: "test-nonce".to_string(),
+            }
+        } else {
+            HmacPrepareValue::RandomHex { bytes: 16 }
+        };
+
+        AuthConfig::Hmac {
+            algorithm: HmacAlgorithm::Sha1,
+            secret_from_env: "_TEST_ALIBABA_ACCESS_KEY_SECRET".to_string(),
+            secret_suffix: None,
+            key_id_from_env: Some("_TEST_ALIBABA_ACCESS_KEY_ID".to_string()),
+            prepare: vec![
+                HmacPrepareBinding {
+                    target: HmacTarget {
+                        kind: HmacTargetType::Header,
+                        name: "Accept".to_string(),
+                    },
+                    value: HmacPrepareValue::Literal {
+                        value: "application/json".to_string(),
+                    },
+                },
+                HmacPrepareBinding {
+                    target: HmacTarget {
+                        kind: HmacTargetType::Header,
+                        name: "Content-Type".to_string(),
+                    },
+                    value: HmacPrepareValue::Literal {
+                        value: "application/json;charset=utf-8".to_string(),
+                    },
+                },
+                HmacPrepareBinding {
+                    target: HmacTarget {
+                        kind: HmacTargetType::Header,
+                        name: "Content-MD5".to_string(),
+                    },
+                    value: HmacPrepareValue::BodyDigest {
+                        algorithm: HmacDigestAlgorithm::Md5,
+                        encoding: HmacEncoding::Base64,
+                    },
+                },
+                HmacPrepareBinding {
+                    target: HmacTarget {
+                        kind: HmacTargetType::Header,
+                        name: "Date".to_string(),
+                    },
+                    value: date_value,
+                },
+                HmacPrepareBinding {
+                    target: HmacTarget {
+                        kind: HmacTargetType::Header,
+                        name: "Host".to_string(),
+                    },
+                    value: HmacPrepareValue::UpstreamHost {},
+                },
+                HmacPrepareBinding {
+                    target: HmacTarget {
+                        kind: HmacTargetType::Header,
+                        name: "x-acs-signature-nonce".to_string(),
+                    },
+                    value: nonce_value,
+                },
+                HmacPrepareBinding {
+                    target: HmacTarget {
+                        kind: HmacTargetType::Header,
+                        name: "x-acs-signature-method".to_string(),
+                    },
+                    value: HmacPrepareValue::Literal {
+                        value: "HMAC-SHA1".to_string(),
+                    },
+                },
+                HmacPrepareBinding {
+                    target: HmacTarget {
+                        kind: HmacTargetType::Header,
+                        name: "x-acs-version".to_string(),
+                    },
+                    value: HmacPrepareValue::Literal {
+                        value: "2019-01-02".to_string(),
+                    },
+                },
+            ],
+            canonical: HmacCanonicalConfig {
+                join_with: "\n".to_string(),
+                components: vec![
+                    HmacCanonicalComponent::Method {},
+                    HmacCanonicalComponent::Header {
+                        name: "Accept".to_string(),
+                    },
+                    HmacCanonicalComponent::Header {
+                        name: "Content-MD5".to_string(),
+                    },
+                    HmacCanonicalComponent::Header {
+                        name: "Content-Type".to_string(),
+                    },
+                    HmacCanonicalComponent::Header {
+                        name: "Date".to_string(),
+                    },
+                    HmacCanonicalComponent::Headers {
+                        names: vec![
+                            "x-acs-signature-method".to_string(),
+                            "x-acs-signature-nonce".to_string(),
+                            "x-acs-version".to_string(),
+                        ],
+                        join_with: "\n".to_string(),
+                        format: "{name}:{value}".to_string(),
+                    },
+                    HmacCanonicalComponent::Path {},
+                ],
+            },
+            signature: HmacSignatureConfig {
+                encoding: HmacEncoding::Base64,
+                destination: HmacSignatureDestination {
+                    kind: HmacTargetType::Header,
+                    name: "Authorization".to_string(),
+                    template: "acs {key_id}:{signature}".to_string(),
+                },
+            },
+        }
+    }
+
+    fn isi_access_token_auth_config(token_url: &str) -> AuthConfig {
+        AuthConfig::AccessToken {
+            prepare: vec![HmacPrepareBinding {
+                target: HmacTarget {
+                    kind: HmacTargetType::QueryParam,
+                    name: "appkey".to_string(),
+                },
+                value: HmacPrepareValue::Env {
+                    from_env: "_TEST_ISI_APP_KEY".to_string(),
+                },
+            }],
+            fetch: AccessTokenFetchConfig {
+                url: token_url.to_string(),
+                method: HttpMethod::Get,
+                prepare: vec![
+                    HmacPrepareBinding {
+                        target: HmacTarget {
+                            kind: HmacTargetType::QueryParam,
+                            name: "AccessKeyId".to_string(),
+                        },
+                        value: HmacPrepareValue::Env {
+                            from_env: "_TEST_ISI_ACCESS_KEY_ID".to_string(),
+                        },
+                    },
+                    HmacPrepareBinding {
+                        target: HmacTarget {
+                            kind: HmacTargetType::QueryParam,
+                            name: "Action".to_string(),
+                        },
+                        value: HmacPrepareValue::Literal {
+                            value: "CreateToken".to_string(),
+                        },
+                    },
+                    HmacPrepareBinding {
+                        target: HmacTarget {
+                            kind: HmacTargetType::QueryParam,
+                            name: "Format".to_string(),
+                        },
+                        value: HmacPrepareValue::Literal {
+                            value: "JSON".to_string(),
+                        },
+                    },
+                    HmacPrepareBinding {
+                        target: HmacTarget {
+                            kind: HmacTargetType::QueryParam,
+                            name: "RegionId".to_string(),
+                        },
+                        value: HmacPrepareValue::Literal {
+                            value: "ap-southeast-1".to_string(),
+                        },
+                    },
+                    HmacPrepareBinding {
+                        target: HmacTarget {
+                            kind: HmacTargetType::QueryParam,
+                            name: "SignatureMethod".to_string(),
+                        },
+                        value: HmacPrepareValue::Literal {
+                            value: "HMAC-SHA1".to_string(),
+                        },
+                    },
+                    HmacPrepareBinding {
+                        target: HmacTarget {
+                            kind: HmacTargetType::QueryParam,
+                            name: "SignatureNonce".to_string(),
+                        },
+                        value: HmacPrepareValue::Literal {
+                            value: "4e1c1a27-4eaa-4df1-bf8f-78d4e5b79c3d".to_string(),
+                        },
+                    },
+                    HmacPrepareBinding {
+                        target: HmacTarget {
+                            kind: HmacTargetType::QueryParam,
+                            name: "SignatureVersion".to_string(),
+                        },
+                        value: HmacPrepareValue::Literal {
+                            value: "1.0".to_string(),
+                        },
+                    },
+                    HmacPrepareBinding {
+                        target: HmacTarget {
+                            kind: HmacTargetType::QueryParam,
+                            name: "Timestamp".to_string(),
+                        },
+                        value: HmacPrepareValue::Literal {
+                            value: "2019-04-18T08:32:31Z".to_string(),
+                        },
+                    },
+                    HmacPrepareBinding {
+                        target: HmacTarget {
+                            kind: HmacTargetType::QueryParam,
+                            name: "Version".to_string(),
+                        },
+                        value: HmacPrepareValue::Literal {
+                            value: "2019-07-17".to_string(),
+                        },
+                    },
+                ],
+                auth: Some(Box::new(AuthConfig::Hmac {
+                    algorithm: HmacAlgorithm::Sha1,
+                    secret_from_env: "_TEST_ISI_ACCESS_KEY_SECRET".to_string(),
+                    secret_suffix: Some("&".to_string()),
+                    key_id_from_env: None,
+                    prepare: vec![],
+                    canonical: HmacCanonicalConfig {
+                        join_with: "".to_string(),
+                        components: vec![
+                            HmacCanonicalComponent::Method {},
+                            HmacCanonicalComponent::Literal {
+                                value: "&%2F&".to_string(),
+                            },
+                            HmacCanonicalComponent::Query {
+                                style: HmacQueryStyle::SortedPairs,
+                                encoding: HmacStringEncoding::PercentRfc3986,
+                            },
+                        ],
+                    },
+                    signature: HmacSignatureConfig {
+                        encoding: HmacEncoding::Base64,
+                        destination: HmacSignatureDestination {
+                            kind: HmacTargetType::QueryParam,
+                            name: "Signature".to_string(),
+                            template: "{signature}".to_string(),
+                        },
+                    },
+                })),
+                response: AccessTokenResponseConfig {
+                    token_json_pointer: "/Token/Id".to_string(),
+                    expires_at_json_pointer: Some("/Token/ExpireTime".to_string()),
+                    expires_in_json_pointer: None,
+                    expires_at_format: pay_types::metering::AccessTokenExpiryFormat::UnixSeconds,
+                    refresh_skew_seconds: 60,
+                },
+            },
+            inject: AccessTokenInjectConfig {
+                target: HmacTarget {
+                    kind: HmacTargetType::Header,
+                    name: "X-NLS-Token".to_string(),
+                },
+                template: "{token}".to_string(),
+            },
         }
     }
 
@@ -550,6 +1541,119 @@ mod tests {
         assert!(STRIP_HEADERS.contains(&"connection"));
     }
 
+    #[test]
+    fn generic_hmac_reproduces_alibaba_signature() {
+        let body = br#"{"FormatType":"text","SourceLanguage":"en","TargetLanguage":"zh","SourceText":"Hello"}"#;
+        let mut prepared = PreparedUpstreamRequest::new(
+            "https://mt.cn-hangzhou.aliyuncs.com/api/translate/web/general",
+        )
+        .unwrap();
+        let auth = alibaba_hmac_auth_config(true);
+        let AuthConfig::Hmac {
+            algorithm,
+            secret_from_env,
+            secret_suffix,
+            key_id_from_env,
+            prepare,
+            canonical,
+            signature,
+        } = &auth
+        else {
+            panic!("expected HMAC auth config");
+        };
+
+        unsafe { std::env::set_var("_TEST_ALIBABA_ACCESS_KEY_ID", "test-id") };
+        unsafe { std::env::set_var("_TEST_ALIBABA_ACCESS_KEY_SECRET", "test-secret") };
+
+        apply_hmac_auth(
+            &mut prepared,
+            &Method::POST,
+            body,
+            algorithm,
+            secret_from_env,
+            secret_suffix.as_deref(),
+            key_id_from_env.as_deref(),
+            prepare,
+            canonical,
+            signature,
+        )
+        .unwrap();
+
+        unsafe { std::env::remove_var("_TEST_ALIBABA_ACCESS_KEY_ID") };
+        unsafe { std::env::remove_var("_TEST_ALIBABA_ACCESS_KEY_SECRET") };
+
+        assert_eq!(
+            prepared.header_value("Content-MD5"),
+            Some("jCZbaw/l8wB5VbGcfBmH0w==")
+        );
+        assert_eq!(
+            prepared.header_value("Host"),
+            Some("mt.cn-hangzhou.aliyuncs.com")
+        );
+        assert_eq!(
+            prepared.header_value("Authorization").unwrap(),
+            "acs test-id:3GVRsoc2POHOKxGKNukivfy9cbE="
+        );
+    }
+
+    #[test]
+    fn canonical_query_component_supports_raw_and_sorted_pairs() {
+        let raw = canonical_query_component(
+            &reqwest::Url::parse("https://example.com/v1/test?b=2&a=1&a=0").unwrap(),
+            &HmacQueryStyle::Raw,
+            &HmacStringEncoding::None,
+        )
+        .unwrap();
+        let sorted = canonical_query_component(
+            &reqwest::Url::parse("https://example.com/v1/test?b=2&a=1&a=0").unwrap(),
+            &HmacQueryStyle::SortedPairs,
+            &HmacStringEncoding::None,
+        )
+        .unwrap();
+
+        assert_eq!(raw, "b=2&a=1&a=0");
+        assert_eq!(sorted, "a=0&a=1&b=2");
+    }
+
+    #[test]
+    fn canonical_query_component_supports_percent_encoded_rendering() {
+        let encoded = canonical_query_component(
+            &reqwest::Url::parse("https://example.com/v1/test?text=hello%20world&lang=en").unwrap(),
+            &HmacQueryStyle::SortedPairs,
+            &HmacStringEncoding::PercentRfc3986,
+        )
+        .unwrap();
+
+        assert_eq!(encoded, "lang%3Den%26text%3Dhello%2520world");
+    }
+
+    #[test]
+    fn random_uuid_v4_generates_rfc4122_version_4_uuid() {
+        let uuid = Uuid::parse_str(&random_uuid_v4()).expect("generated UUID should parse");
+        assert_eq!(uuid.get_version(), Some(uuid::Version::Random));
+        assert_eq!(uuid.get_variant(), uuid::Variant::RFC4122);
+    }
+
+    #[test]
+    fn encode_bytes_supports_base64_and_hex() {
+        assert_eq!(encode_bytes(b"abc", &HmacEncoding::Base64), "YWJj");
+        assert_eq!(encode_bytes(b"abc", &HmacEncoding::Hex), "616263");
+    }
+
+    #[test]
+    fn build_hmac_canonical_string_rejects_missing_header_component() {
+        let prepared = PreparedUpstreamRequest::new("https://example.com/v1/check").unwrap();
+        let canonical = HmacCanonicalConfig {
+            join_with: "\n".to_string(),
+            components: vec![HmacCanonicalComponent::Header {
+                name: "Date".to_string(),
+            }],
+        };
+
+        let err = build_hmac_canonical_string(&prepared, &Method::GET, &canonical).unwrap_err();
+        assert!(err.contains("header `Date` is missing"));
+    }
+
     /// Spin up a one-shot axum server, return its base URL.
     async fn spawn_upstream(handler: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -589,6 +1693,118 @@ mod tests {
 
         let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
         assert_eq!(&body[..], b"hello from upstream");
+    }
+
+    #[tokio::test]
+    async fn forward_request_injects_cached_access_token_auth() {
+        let token_calls = Arc::new(AtomicUsize::new(0));
+        let token_query = Arc::new(Mutex::new(String::new()));
+        let token_calls_capture = Arc::clone(&token_calls);
+        let token_query_capture = Arc::clone(&token_query);
+        let token_app = axum::Router::new().route(
+            "/",
+            axum::routing::get(move |uri: axum::http::Uri| {
+                let token_calls_capture = Arc::clone(&token_calls_capture);
+                let token_query_capture = Arc::clone(&token_query_capture);
+                async move {
+                    token_calls_capture.fetch_add(1, Ordering::SeqCst);
+                    *token_query_capture.lock().unwrap() =
+                        uri.query().unwrap_or_default().to_string();
+                    axum::Json(serde_json::json!({
+                        "Token": {
+                            "Id": "isi-token-123",
+                            "ExpireTime": 4_102_444_800u64
+                        }
+                    }))
+                }
+            }),
+        );
+        let (token_base_url, _token_handle) = spawn_upstream(token_app).await;
+
+        #[derive(Debug, Default)]
+        struct CapturedIsiRequest {
+            token: Option<String>,
+            query: String,
+        }
+
+        let captured_request = Arc::new(Mutex::new(CapturedIsiRequest::default()));
+        let captured_request_clone = Arc::clone(&captured_request);
+        let upstream_app = axum::Router::new().route(
+            "/stream/v1/tts",
+            axum::routing::get(
+                move |uri: axum::http::Uri, headers: axum::http::HeaderMap| {
+                    let captured_request_clone = Arc::clone(&captured_request_clone);
+                    async move {
+                        let mut guard = captured_request_clone.lock().unwrap();
+                        guard.token = headers
+                            .get("x-nls-token")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string);
+                        guard.query = uri.query().unwrap_or_default().to_string();
+                        "ok"
+                    }
+                },
+            ),
+        );
+        let (upstream_base_url, _upstream_handle) = spawn_upstream(upstream_app).await;
+
+        unsafe { std::env::set_var("_TEST_ISI_APP_KEY", "app-key-123") };
+        unsafe { std::env::set_var("_TEST_ISI_ACCESS_KEY_ID", "test-id") };
+        unsafe { std::env::set_var("_TEST_ISI_ACCESS_KEY_SECRET", "test-secret") };
+
+        let api = ApiSpec {
+            routing: RoutingConfig::Proxy {
+                url: upstream_base_url.clone(),
+                path_rewrites: vec![],
+                auth: Some(isi_access_token_auth_config(&token_base_url)),
+            },
+            ..make_api("test")
+        };
+
+        let first_uri: Uri = format!("{upstream_base_url}/stream/v1/tts?text=hello")
+            .parse()
+            .unwrap();
+        let second_uri: Uri = format!("{upstream_base_url}/stream/v1/tts?text=hello-again")
+            .parse()
+            .unwrap();
+
+        let first = forward_request(
+            &api,
+            Method::GET,
+            &first_uri,
+            &HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .unwrap();
+        let second = forward_request(
+            &api,
+            Method::GET,
+            &second_uri,
+            &HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .unwrap();
+
+        unsafe { std::env::remove_var("_TEST_ISI_APP_KEY") };
+        unsafe { std::env::remove_var("_TEST_ISI_ACCESS_KEY_ID") };
+        unsafe { std::env::remove_var("_TEST_ISI_ACCESS_KEY_SECRET") };
+
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(token_calls.load(Ordering::SeqCst), 1);
+
+        let token_query = token_query.lock().unwrap().clone();
+        assert!(token_query.contains("Action=CreateToken"));
+        assert!(token_query.contains("AccessKeyId=test-id"));
+        assert!(token_query.contains("SignatureMethod=HMAC-SHA1"));
+        assert!(token_query.contains("Signature="));
+
+        let captured = captured_request.lock().unwrap();
+        assert_eq!(captured.token.as_deref(), Some("isi-token-123"));
+        assert!(captured.query.contains("text=hello-again"));
+        assert!(captured.query.contains("appkey=app-key-123"));
     }
 
     #[tokio::test]
@@ -779,8 +1995,6 @@ mod tests {
 
     #[tokio::test]
     async fn forward_request_injects_header_auth() {
-        use std::sync::{Arc, Mutex};
-
         let auth_header: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let captured = Arc::clone(&auth_header);
         let app = axum::Router::new().route(
@@ -823,6 +2037,280 @@ mod tests {
         assert_eq!(
             auth_header.lock().unwrap().as_deref(),
             Some("Bearer secret-123")
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_request_injects_hmac_auth() {
+        #[derive(Debug, Clone, Default)]
+        struct CapturedRequest {
+            authorization: Option<String>,
+            content_md5: Option<String>,
+            date: Option<String>,
+            host: Option<String>,
+            signature_nonce: Option<String>,
+            signature_method: Option<String>,
+            version: Option<String>,
+        }
+
+        let captured_headers: Arc<Mutex<CapturedRequest>> =
+            Arc::new(Mutex::new(CapturedRequest::default()));
+        let captured = Arc::clone(&captured_headers);
+        let app = axum::Router::new().route(
+            "/v1/secure",
+            axum::routing::post(move |headers: axum::http::HeaderMap| {
+                let captured = Arc::clone(&captured);
+                async move {
+                    let mut guard = captured.lock().unwrap();
+                    guard.authorization = headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string);
+                    guard.content_md5 = headers
+                        .get("content-md5")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string);
+                    guard.date = headers
+                        .get("date")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string);
+                    guard.host = headers
+                        .get("host")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string);
+                    guard.signature_nonce = headers
+                        .get("x-acs-signature-nonce")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string);
+                    guard.signature_method = headers
+                        .get("x-acs-signature-method")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string);
+                    guard.version = headers
+                        .get("x-acs-version")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string);
+                    "ok"
+                }
+            }),
+        );
+        let (base_url, _handle) = spawn_upstream(app).await;
+
+        unsafe { std::env::set_var("_TEST_ALIBABA_ACCESS_KEY_ID", "test-id") };
+        unsafe { std::env::set_var("_TEST_ALIBABA_ACCESS_KEY_SECRET", "test-secret") };
+
+        let api = ApiSpec {
+            routing: RoutingConfig::Proxy {
+                url: base_url.clone(),
+                path_rewrites: vec![],
+                auth: Some(alibaba_hmac_auth_config(false)),
+            },
+            ..make_api("test")
+        };
+
+        let uri: Uri = "/v1/secure".parse().unwrap();
+        let body =
+            Bytes::from_static(br#"{"FormatType":"text","SourceLanguage":"en","TargetLanguage":"zh","SourceText":"Hello"}"#);
+        let result =
+            forward_request(&api, Method::POST, &uri, &HeaderMap::new(), body.clone()).await;
+
+        let resp = result.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let captured = captured_headers.lock().unwrap().clone();
+        let mut expected = PreparedUpstreamRequest::new(&format!("{base_url}/v1/secure")).unwrap();
+        let auth = alibaba_hmac_auth_config(true);
+        let AuthConfig::Hmac {
+            algorithm,
+            secret_from_env,
+            secret_suffix,
+            key_id_from_env,
+            prepare,
+            canonical,
+            signature,
+        } = &auth
+        else {
+            panic!("expected HMAC auth config");
+        };
+        expected.set_header("Date", captured.date.as_deref().unwrap());
+        expected.set_header(
+            "x-acs-signature-nonce",
+            captured.signature_nonce.as_deref().unwrap(),
+        );
+        let replay_auth = AuthConfig::Hmac {
+            algorithm: algorithm.clone(),
+            secret_from_env: secret_from_env.clone(),
+            secret_suffix: secret_suffix.clone(),
+            key_id_from_env: key_id_from_env.clone(),
+            prepare: prepare
+                .iter()
+                .map(|binding| match binding.target.name.as_str() {
+                    "Date" => HmacPrepareBinding {
+                        target: binding.target.clone(),
+                        value: HmacPrepareValue::Literal {
+                            value: captured.date.clone().unwrap(),
+                        },
+                    },
+                    "x-acs-signature-nonce" => HmacPrepareBinding {
+                        target: binding.target.clone(),
+                        value: HmacPrepareValue::Literal {
+                            value: captured.signature_nonce.clone().unwrap(),
+                        },
+                    },
+                    _ => binding.clone(),
+                })
+                .collect(),
+            canonical: canonical.clone(),
+            signature: signature.clone(),
+        };
+        let AuthConfig::Hmac {
+            algorithm,
+            secret_from_env,
+            secret_suffix,
+            key_id_from_env,
+            prepare,
+            canonical,
+            signature,
+        } = &replay_auth
+        else {
+            unreachable!();
+        };
+        apply_hmac_auth(
+            &mut expected,
+            &Method::POST,
+            body.as_ref(),
+            algorithm,
+            secret_from_env,
+            secret_suffix.as_deref(),
+            key_id_from_env.as_deref(),
+            prepare,
+            canonical,
+            signature,
+        )
+        .unwrap();
+
+        unsafe { std::env::remove_var("_TEST_ALIBABA_ACCESS_KEY_ID") };
+        unsafe { std::env::remove_var("_TEST_ALIBABA_ACCESS_KEY_SECRET") };
+
+        assert_eq!(
+            captured.authorization.as_deref(),
+            expected.header_value("Authorization")
+        );
+        assert_eq!(
+            captured.content_md5.as_deref(),
+            expected.header_value("Content-MD5")
+        );
+        assert_eq!(captured.host.as_deref(), expected.header_value("Host"));
+        assert_eq!(captured.signature_method.as_deref(), Some("HMAC-SHA1"));
+        assert_eq!(captured.version.as_deref(), Some("2019-01-02"));
+        assert!(captured.date.is_some());
+        assert!(captured.signature_nonce.is_some());
+    }
+
+    #[tokio::test]
+    async fn forward_request_injects_hmac_signature_into_query_param() {
+        let app = axum::Router::new().route(
+            "/v1/check",
+            axum::routing::get(|uri: axum::http::Uri| async move {
+                uri.query().unwrap_or_default().to_string()
+            }),
+        );
+        let (base_url, _handle) = spawn_upstream(app).await;
+
+        unsafe { std::env::set_var("_TEST_HMAC_QUERY_SECRET", "query-secret") };
+        let api = ApiSpec {
+            routing: RoutingConfig::Proxy {
+                url: base_url.clone(),
+                path_rewrites: vec![],
+                auth: Some(AuthConfig::Hmac {
+                    algorithm: HmacAlgorithm::Sha256,
+                    secret_from_env: "_TEST_HMAC_QUERY_SECRET".to_string(),
+                    secret_suffix: None,
+                    key_id_from_env: None,
+                    prepare: vec![],
+                    canonical: HmacCanonicalConfig {
+                        join_with: "\n".to_string(),
+                        components: vec![
+                            HmacCanonicalComponent::Method {},
+                            HmacCanonicalComponent::Path {},
+                        ],
+                    },
+                    signature: HmacSignatureConfig {
+                        encoding: HmacEncoding::Hex,
+                        destination: HmacSignatureDestination {
+                            kind: HmacTargetType::QueryParam,
+                            name: "sig".to_string(),
+                            template: "{signature}".to_string(),
+                        },
+                    },
+                }),
+            },
+            ..make_api("test")
+        };
+
+        let uri: Uri = format!("{base_url}/v1/check?existing=1").parse().unwrap();
+        let result =
+            forward_request(&api, Method::GET, &uri, &HeaderMap::new(), Bytes::new()).await;
+
+        unsafe { std::env::remove_var("_TEST_HMAC_QUERY_SECRET") };
+
+        let resp = result.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        let query = String::from_utf8(body.to_vec()).unwrap();
+        assert!(query.contains("existing=1"));
+        assert!(query.contains("sig="));
+    }
+
+    #[tokio::test]
+    async fn forward_request_hmac_missing_canonical_header_returns_bad_gateway() {
+        let app = axum::Router::new().route("/v1/check", axum::routing::get(|| async { "ok" }));
+        let (base_url, _handle) = spawn_upstream(app).await;
+
+        unsafe { std::env::set_var("_TEST_HMAC_MISSING_SECRET", "secret") };
+        let api = ApiSpec {
+            routing: RoutingConfig::Proxy {
+                url: base_url.clone(),
+                path_rewrites: vec![],
+                auth: Some(AuthConfig::Hmac {
+                    algorithm: HmacAlgorithm::Sha256,
+                    secret_from_env: "_TEST_HMAC_MISSING_SECRET".to_string(),
+                    secret_suffix: None,
+                    key_id_from_env: None,
+                    prepare: vec![],
+                    canonical: HmacCanonicalConfig {
+                        join_with: "\n".to_string(),
+                        components: vec![HmacCanonicalComponent::Header {
+                            name: "Date".to_string(),
+                        }],
+                    },
+                    signature: HmacSignatureConfig {
+                        encoding: HmacEncoding::Hex,
+                        destination: HmacSignatureDestination {
+                            kind: HmacTargetType::Header,
+                            name: "Authorization".to_string(),
+                            template: "{signature}".to_string(),
+                        },
+                    },
+                }),
+            },
+            ..make_api("test")
+        };
+
+        let uri: Uri = format!("{base_url}/v1/check").parse().unwrap();
+        let result =
+            forward_request(&api, Method::GET, &uri, &HeaderMap::new(), Bytes::new()).await;
+
+        unsafe { std::env::remove_var("_TEST_HMAC_MISSING_SECRET") };
+
+        let error = result.unwrap_err();
+        assert_eq!(error.status(), StatusCode::BAD_GATEWAY);
+        let body = axum::body::to_bytes(error.into_body(), 2048).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("header `Date` is missing")
         );
     }
 

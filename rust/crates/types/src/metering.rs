@@ -236,6 +236,39 @@ pub enum AuthConfig {
         /// Environment variable holding the value.
         value_from_env: String,
     },
+    /// Generic HMAC request signing.
+    Hmac {
+        /// HMAC hash algorithm.
+        algorithm: HmacAlgorithm,
+        /// Env var containing the raw HMAC secret key.
+        secret_from_env: String,
+        /// Optional suffix appended to the resolved secret before signing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        secret_suffix: Option<String>,
+        /// Optional env var containing a public key identifier used by the
+        /// signature destination template.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key_id_from_env: Option<String>,
+        /// Header/query bindings to apply before canonicalization.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        prepare: Vec<HmacPrepareBinding>,
+        /// Canonical string construction rules.
+        canonical: HmacCanonicalConfig,
+        /// Signature output encoding and destination.
+        signature: HmacSignatureConfig,
+    },
+    /// Fetch and cache an access token with a nested upstream request, then
+    /// inject the token into the paid upstream call.
+    AccessToken {
+        /// Header/query bindings applied to the paid upstream request before
+        /// the fetched token is injected.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        prepare: Vec<HmacPrepareBinding>,
+        /// How to mint and cache the access token.
+        fetch: AccessTokenFetchConfig,
+        /// Where the fetched token is written on the paid upstream request.
+        inject: AccessTokenInjectConfig,
+    },
     /// OAuth2 — fetch access token and inject as `Authorization: Bearer`.
     Oauth2 {
         /// Token endpoint URL (e.g. `https://oauth2.googleapis.com/token`).
@@ -254,6 +287,265 @@ pub enum AuthConfig {
         #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
         headers: std::collections::HashMap<String, EnvRef>,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HmacAlgorithm {
+    /// HMAC-SHA1.
+    Sha1,
+    /// HMAC-SHA256.
+    Sha256,
+    /// HMAC-SHA512.
+    Sha512,
+}
+
+/// Output encoding for digests and signatures emitted by `auth.method: hmac`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HmacEncoding {
+    /// Standard RFC 4648 base64 without line wrapping.
+    Base64,
+    /// Lowercase hexadecimal.
+    Hex,
+}
+
+/// Extra text encodings applied while rendering canonical HMAC components.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HmacStringEncoding {
+    /// Leave the rendered value unchanged.
+    #[default]
+    None,
+    /// Percent-encode the rendered value using RFC 3986 rules.
+    PercentRfc3986,
+}
+
+/// Where an HMAC-derived value should be written on the upstream request.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HmacTargetType {
+    /// An HTTP request header.
+    Header,
+    /// A query-string parameter on the final upstream URL.
+    QueryParam,
+}
+
+/// Timestamp encodings available to `prepare.value.from: timestamp`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HmacTimestampFormat {
+    /// RFC 1123 timestamp in GMT, for example
+    /// `Wed, 26 Aug 2015 17:01:00 GMT`.
+    #[serde(rename = "rfc_1123_gmt")]
+    Rfc1123Gmt,
+    /// ISO 8601 UTC timestamp, for example `2019-04-18T08:32:31Z`.
+    #[serde(rename = "iso_8601_zulu")]
+    Iso8601Zulu,
+    /// Unix epoch seconds.
+    UnixSeconds,
+}
+
+/// How the final query string should be represented inside the canonical
+/// string before signing.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HmacQueryStyle {
+    /// Use the final query string exactly as it appears on the upstream URL,
+    /// without the leading `?`.
+    Raw,
+    /// Sort the final query parameters by name and then value, and join them
+    /// as `k=v&...`.
+    SortedPairs,
+}
+
+/// Digest algorithms available to `prepare.value.from: body_digest`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HmacDigestAlgorithm {
+    /// MD5 digest of the raw request body.
+    Md5,
+    /// SHA-256 digest of the raw request body.
+    Sha256,
+    /// SHA-512 digest of the raw request body.
+    Sha512,
+}
+
+/// A single pre-sign mutation applied to the upstream request.
+///
+/// `prepare` runs before canonicalization, so these bindings can populate
+/// headers or query params that are later referenced by the canonical string.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HmacPrepareBinding {
+    /// Where to write the derived value.
+    pub target: HmacTarget,
+    /// How the value is produced at request time.
+    pub value: HmacPrepareValue,
+}
+
+/// A writable location on the upstream request used by HMAC prepare/signature
+/// steps.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HmacTarget {
+    /// Whether the target is a header or query param.
+    #[serde(rename = "type")]
+    pub kind: HmacTargetType,
+    /// Header name or query parameter name.
+    pub name: String,
+}
+
+/// Runtime value sources for `prepare` bindings.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "from", rename_all = "snake_case")]
+pub enum HmacPrepareValue {
+    /// Use a literal string.
+    Literal { value: String },
+    /// Read the value from an environment variable at request time.
+    Env { from_env: String },
+    /// Use the final upstream host, including `:port` when present.
+    UpstreamHost {},
+    /// Generate a timestamp at signing time.
+    Timestamp { format: HmacTimestampFormat },
+    /// Generate a random UUIDv4 string.
+    UuidV4 {},
+    /// Generate a lowercase random hex string from the given byte length.
+    RandomHex { bytes: u16 },
+    /// Digest the raw request body and encode the result.
+    BodyDigest {
+        algorithm: HmacDigestAlgorithm,
+        encoding: HmacEncoding,
+    },
+}
+
+/// Canonical-string construction rules for `auth.method: hmac`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HmacCanonicalConfig {
+    /// Separator inserted between rendered components.
+    pub join_with: String,
+    /// Ordered canonical-string components.
+    pub components: Vec<HmacCanonicalComponent>,
+}
+
+/// One piece of the canonical string used as the HMAC message.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "from", rename_all = "snake_case")]
+pub enum HmacCanonicalComponent {
+    /// The HTTP method, for example `GET` or `POST`.
+    Method {},
+    /// The final upstream path after any path rewrites.
+    Path {},
+    /// The final upstream query string.
+    Query {
+        style: HmacQueryStyle,
+        /// Optional encoding applied after the query string is rendered.
+        #[serde(default)]
+        encoding: HmacStringEncoding,
+    },
+    /// A single header value, looked up case-insensitively.
+    Header { name: String },
+    /// A rendered group of headers, typically for schemes that sign
+    /// `name:value` lines in a fixed order.
+    Headers {
+        names: Vec<String>,
+        join_with: String,
+        format: String,
+    },
+    /// A literal string inserted verbatim.
+    Literal { value: String },
+}
+
+/// Controls how the computed HMAC signature is encoded and where it is
+/// written on the upstream request.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HmacSignatureConfig {
+    /// Encoding applied to the raw HMAC bytes.
+    pub encoding: HmacEncoding,
+    /// Signature destination and rendering template.
+    pub destination: HmacSignatureDestination,
+}
+
+/// Where the rendered signature is emitted after canonicalization.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HmacSignatureDestination {
+    /// Whether the signature is sent as a header or query param.
+    #[serde(rename = "type")]
+    pub kind: HmacTargetType,
+    /// Header/query parameter name that receives the rendered signature.
+    pub name: String,
+    /// Output template. Supported tokens are `{signature}` and `{key_id}`.
+    pub template: String,
+}
+
+/// How an `auth.method: access_token` flow mints a token from a token endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AccessTokenFetchConfig {
+    /// Token endpoint URL.
+    pub url: String,
+    /// HTTP method used for the token fetch request.
+    #[serde(default = "default_access_token_fetch_method")]
+    pub method: HttpMethod,
+    /// Header/query bindings applied before the token request is signed/sent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prepare: Vec<HmacPrepareBinding>,
+    /// Optional nested auth applied to the token request itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<Box<AuthConfig>>,
+    /// How to extract the token and expiry from the token endpoint response.
+    pub response: AccessTokenResponseConfig,
+}
+
+/// JSON extraction and cache semantics for a fetched access token.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AccessTokenResponseConfig {
+    /// JSON Pointer selecting the access token string.
+    pub token_json_pointer: String,
+    /// JSON Pointer selecting an absolute expiry timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_json_pointer: Option<String>,
+    /// JSON Pointer selecting a relative `expires_in` lifetime in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_in_json_pointer: Option<String>,
+    /// Encoding of the absolute expiry value.
+    #[serde(default)]
+    pub expires_at_format: AccessTokenExpiryFormat,
+    /// Seconds of safety margin subtracted before a cached token is treated
+    /// as expired and refreshed.
+    #[serde(default = "default_access_token_refresh_skew_seconds")]
+    pub refresh_skew_seconds: u64,
+}
+
+/// Supported absolute expiry encodings for fetched access tokens.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessTokenExpiryFormat {
+    /// Unix epoch seconds.
+    #[default]
+    UnixSeconds,
+}
+
+/// Destination and rendering template for a fetched access token.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AccessTokenInjectConfig {
+    /// Header/query location that receives the rendered token.
+    pub target: HmacTarget,
+    /// Output template. Supported token is `{token}`.
+    pub template: String,
+}
+
+fn default_access_token_fetch_method() -> HttpMethod {
+    HttpMethod::Get
+}
+
+fn default_access_token_refresh_skew_seconds() -> u64 {
+    60
 }
 
 /// A value resolved from an environment variable.
@@ -699,7 +991,14 @@ pub struct Service {
 pub fn validate_api_spec(spec: &ApiSpec) -> Vec<String> {
     let mut errs = Vec::new();
 
+    validate_routing_auth(&spec.routing, "routing auth", &mut errs);
+
     for ep in &spec.endpoints {
+        if let Some(routing) = &ep.routing {
+            let context = format!("endpoint `{}` routing auth", ep.path);
+            validate_routing_auth(routing, &context, &mut errs);
+        }
+
         let Some(metering) = &ep.metering else {
             continue;
         };
@@ -714,6 +1013,330 @@ pub fn validate_api_spec(spec: &ApiSpec) -> Vec<String> {
     }
 
     errs
+}
+
+fn validate_routing_auth(routing: &RoutingConfig, context: &str, errs: &mut Vec<String>) {
+    let Some(auth) = routing.auth() else {
+        return;
+    };
+    validate_auth_config(auth, context, errs);
+}
+
+fn validate_auth_config(auth: &AuthConfig, context: &str, errs: &mut Vec<String>) {
+    match auth {
+        AuthConfig::Hmac {
+            secret_from_env,
+            key_id_from_env,
+            prepare,
+            canonical,
+            signature,
+            ..
+        } => {
+            if secret_from_env.trim().is_empty() {
+                errs.push(format!("{context}: hmac.secret_from_env is empty"));
+            }
+
+            if let Some(key_id) = key_id_from_env
+                && key_id.trim().is_empty()
+            {
+                errs.push(format!("{context}: hmac.key_id_from_env is empty"));
+            }
+
+            if canonical.components.is_empty() {
+                errs.push(format!(
+                    "{context}: hmac.canonical.components must not be empty"
+                ));
+            }
+
+            validate_prepare_bindings(prepare, "hmac.prepare", context, errs);
+
+            for (idx, component) in canonical.components.iter().enumerate() {
+                let location = format!("{context}: hmac.canonical.components[{idx}]");
+                validate_hmac_canonical_component(component, &location, errs);
+            }
+
+            validate_hmac_signature_destination(
+                signature,
+                key_id_from_env.as_deref(),
+                context,
+                errs,
+            );
+        }
+        AuthConfig::AccessToken {
+            prepare,
+            fetch,
+            inject,
+        } => validate_access_token_auth(prepare, fetch, inject, context, errs),
+        _ => {}
+    }
+}
+
+fn validate_hmac_target(target: &HmacTarget, context: &str, errs: &mut Vec<String>) {
+    validate_hmac_target_name(&target.kind, &target.name, context, errs);
+}
+
+fn validate_hmac_target_name(
+    kind: &HmacTargetType,
+    name: &str,
+    context: &str,
+    errs: &mut Vec<String>,
+) {
+    if name.trim().is_empty() {
+        errs.push(format!("{context}.name is empty"));
+        return;
+    }
+
+    if matches!(kind, HmacTargetType::Header) && !is_valid_http_header_name(name) {
+        errs.push(format!(
+            "{context}.name `{}` is not a valid HTTP header name",
+            name
+        ));
+    }
+}
+
+fn validate_hmac_prepare_value(value: &HmacPrepareValue, context: &str, errs: &mut Vec<String>) {
+    match value {
+        HmacPrepareValue::Env { from_env } if from_env.trim().is_empty() => {
+            errs.push(format!("{context}.from_env is empty"));
+        }
+        HmacPrepareValue::Literal { value } if value.is_empty() => {
+            errs.push(format!("{context}.value is empty"));
+        }
+        HmacPrepareValue::RandomHex { bytes } if *bytes == 0 => {
+            errs.push(format!("{context}.bytes must be greater than 0"));
+        }
+        _ => {}
+    }
+}
+
+fn validate_hmac_canonical_component(
+    component: &HmacCanonicalComponent,
+    context: &str,
+    errs: &mut Vec<String>,
+) {
+    match component {
+        HmacCanonicalComponent::Header { name } => {
+            if name.trim().is_empty() {
+                errs.push(format!("{context}.name is empty"));
+            } else if !is_valid_http_header_name(name) {
+                errs.push(format!(
+                    "{context}.name `{name}` is not a valid HTTP header name"
+                ));
+            }
+        }
+        HmacCanonicalComponent::Query { .. } => {}
+        HmacCanonicalComponent::Headers { names, format, .. } => {
+            if names.is_empty() {
+                errs.push(format!("{context}.names must not be empty"));
+            }
+            for name in names {
+                if name.trim().is_empty() {
+                    errs.push(format!("{context}.names contains an empty header name"));
+                } else if !is_valid_http_header_name(name) {
+                    errs.push(format!(
+                        "{context}.names contains invalid HTTP header name `{name}`"
+                    ));
+                }
+            }
+            if let Err(error) = validate_template_tokens(format, &["name", "value"]) {
+                errs.push(format!("{context}.format {error}"));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn validate_hmac_signature_destination(
+    signature: &HmacSignatureConfig,
+    key_id_from_env: Option<&str>,
+    context: &str,
+    errs: &mut Vec<String>,
+) {
+    validate_hmac_target_name(
+        &signature.destination.kind,
+        &signature.destination.name,
+        context,
+        errs,
+    );
+
+    match validate_template_tokens(&signature.destination.template, &["signature", "key_id"]) {
+        Ok(tokens) => {
+            if !tokens.iter().any(|token| token == "signature") {
+                errs.push(format!(
+                    "{context}: hmac.signature.destination.template must contain `{{signature}}`"
+                ));
+            }
+            let missing_key_id = key_id_from_env.is_none()
+                || key_id_from_env.is_some_and(|value| value.trim().is_empty());
+            if tokens.iter().any(|token| token == "key_id") && missing_key_id {
+                errs.push(format!(
+                    "{context}: hmac.signature.destination.template uses `{{key_id}}` but hmac.key_id_from_env is not set"
+                ));
+            }
+        }
+        Err(error) => errs.push(format!(
+            "{context}: hmac.signature.destination.template {error}"
+        )),
+    }
+}
+
+fn validate_access_token_auth(
+    prepare: &[HmacPrepareBinding],
+    fetch: &AccessTokenFetchConfig,
+    inject: &AccessTokenInjectConfig,
+    context: &str,
+    errs: &mut Vec<String>,
+) {
+    validate_prepare_bindings(prepare, "access_token.prepare", context, errs);
+
+    if fetch.url.trim().is_empty() {
+        errs.push(format!("{context}: access_token.fetch.url is empty"));
+    }
+
+    validate_prepare_bindings(&fetch.prepare, "access_token.fetch.prepare", context, errs);
+
+    if let Some(auth) = fetch.auth.as_deref() {
+        match auth {
+            AuthConfig::Oauth2 { .. } => errs.push(format!(
+                "{context}: access_token.fetch.auth does not support nested oauth2 auth"
+            )),
+            AuthConfig::AccessToken { .. } => errs.push(format!(
+                "{context}: access_token.fetch.auth does not support nested access_token auth"
+            )),
+            _ => validate_auth_config(auth, &format!("{context}: access_token.fetch.auth"), errs),
+        }
+    }
+
+    if fetch.response.token_json_pointer.trim().is_empty() {
+        errs.push(format!(
+            "{context}: access_token.fetch.response.token_json_pointer is empty"
+        ));
+    } else if !is_valid_json_pointer(&fetch.response.token_json_pointer) {
+        errs.push(format!(
+            "{context}: access_token.fetch.response.token_json_pointer must be a JSON Pointer"
+        ));
+    }
+
+    let has_expires_at = fetch.response.expires_at_json_pointer.is_some();
+    let has_expires_in = fetch.response.expires_in_json_pointer.is_some();
+    if has_expires_at == has_expires_in {
+        errs.push(format!(
+            "{context}: access_token.fetch.response must set exactly one of expires_at_json_pointer or expires_in_json_pointer"
+        ));
+    }
+
+    if let Some(pointer) = &fetch.response.expires_at_json_pointer
+        && !is_valid_json_pointer(pointer)
+    {
+        errs.push(format!(
+            "{context}: access_token.fetch.response.expires_at_json_pointer must be a JSON Pointer"
+        ));
+    }
+
+    if let Some(pointer) = &fetch.response.expires_in_json_pointer
+        && !is_valid_json_pointer(pointer)
+    {
+        errs.push(format!(
+            "{context}: access_token.fetch.response.expires_in_json_pointer must be a JSON Pointer"
+        ));
+    }
+
+    validate_hmac_target(
+        &inject.target,
+        &format!("{context}: access_token.inject.target"),
+        errs,
+    );
+    match validate_template_tokens(&inject.template, &["token"]) {
+        Ok(tokens) => {
+            if !tokens.iter().any(|token| token == "token") {
+                errs.push(format!(
+                    "{context}: access_token.inject.template must contain `{{token}}`"
+                ));
+            }
+        }
+        Err(error) => errs.push(format!("{context}: access_token.inject.template {error}")),
+    }
+}
+
+fn validate_prepare_bindings(
+    bindings: &[HmacPrepareBinding],
+    label: &str,
+    context: &str,
+    errs: &mut Vec<String>,
+) {
+    let mut seen_targets = std::collections::HashSet::new();
+    for (idx, binding) in bindings.iter().enumerate() {
+        let location = format!("{context}: {label}[{idx}]");
+        validate_hmac_target(&binding.target, &format!("{location}.target"), errs);
+        validate_hmac_prepare_value(&binding.value, &format!("{location}.value"), errs);
+
+        let dedupe_key = match binding.target.kind {
+            HmacTargetType::Header => {
+                format!("header:{}", binding.target.name.to_ascii_lowercase())
+            }
+            HmacTargetType::QueryParam => format!("query_param:{}", binding.target.name),
+        };
+        if !seen_targets.insert(dedupe_key) {
+            errs.push(format!(
+                "{context}: {label} contains duplicate target `{}`",
+                binding.target.name
+            ));
+        }
+    }
+}
+
+fn is_valid_json_pointer(pointer: &str) -> bool {
+    pointer.starts_with('/')
+}
+
+fn validate_template_tokens(template: &str, allowed: &[&str]) -> Result<Vec<String>, String> {
+    let tokens = extract_template_tokens(template)?;
+    for token in &tokens {
+        if !allowed.iter().any(|allowed_token| allowed_token == token) {
+            return Err(format!("contains unknown token `{{{token}}}`"));
+        }
+    }
+    Ok(tokens)
+}
+
+fn extract_template_tokens(template: &str) -> Result<Vec<String>, String> {
+    let mut tokens = Vec::new();
+    let mut current: Option<String> = None;
+
+    for ch in template.chars() {
+        match (&mut current, ch) {
+            (None, '{') => current = Some(String::new()),
+            (None, '}') => return Err("contains unmatched `}`".to_string()),
+            (None, _) => {}
+            (Some(_), '{') => return Err("contains nested `{`".to_string()),
+            (Some(token), '}') => {
+                if token.is_empty() {
+                    return Err("contains empty `{}` token".to_string());
+                }
+                tokens.push(token.clone());
+                current = None;
+            }
+            (Some(token), other) => token.push(other),
+        }
+    }
+
+    if current.is_some() {
+        return Err("contains unterminated `{...` token".to_string());
+    }
+
+    Ok(tokens)
+}
+
+fn is_valid_http_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|byte| {
+            matches!(
+                byte,
+                b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.'
+                    | b'^' | b'_' | b'`' | b'|' | b'~' | b'0'..=b'9' | b'A'..=b'Z'
+                    | b'a'..=b'z'
+            )
+        })
 }
 
 /// Splits require explicit pricing dimensions — `sku_tiers` alone resolves
@@ -1852,7 +2475,7 @@ endpoints:
           tiers:
             - price_usd: 1.0
 "#;
-        let spec: ApiSpec = serde_yml::from_str(yaml).unwrap();
+        let spec: ApiSpec = serde_yml::from_str(&yaml).unwrap();
         let errs = validate_api_spec(&spec);
         assert!(
             errs.iter()
@@ -1886,7 +2509,7 @@ endpoints:
               tiers:
                 - price_usd: 1.0
 "#;
-        let spec: ApiSpec = serde_yml::from_str(yaml).unwrap();
+        let spec: ApiSpec = serde_yml::from_str(&yaml).unwrap();
         let errs = validate_api_spec(&spec);
         assert!(
             errs.iter().any(|e| e.contains("variant model=tiny-model")),
@@ -1917,8 +2540,483 @@ endpoints:
             - price_usd: 0.0
             - price_usd: 0.000001
 "#;
-        let spec: ApiSpec = serde_yml::from_str(yaml).unwrap();
+        let spec: ApiSpec = serde_yml::from_str(&yaml).unwrap();
         let errs = validate_api_spec(&spec);
         assert!(errs.is_empty(), "expected no errors, got: {errs:?}");
+    }
+
+    fn hmac_auth_yaml(auth_block: &str) -> String {
+        format!(
+            r#"
+name: mt
+subdomain: mt
+title: Machine Translation
+description: Alibaba Machine Translation
+category: ai_ml
+version: "2019-01-02"
+routing:
+  type: proxy
+  url: https://mt.cn-hangzhou.aliyuncs.com/
+  auth:
+{auth_block}
+endpoints:
+  - method: POST
+    path: api/translate/web/general
+"#
+        )
+    }
+
+    fn access_token_auth_yaml(auth_block: &str) -> String {
+        format!(
+            r#"
+name: isi
+subdomain: isi
+title: Intelligent Speech Interaction
+description: Alibaba Intelligent Speech Interaction
+category: ai_ml
+version: "v1"
+routing:
+  type: proxy
+  url: https://nls-gateway-ap-southeast-1.aliyuncs.com/
+  auth:
+{auth_block}
+endpoints:
+  - method: POST
+    path: stream/v1/asr
+"#
+        )
+    }
+
+    #[test]
+    fn parse_hmac_auth_config() {
+        let yaml = hmac_auth_yaml(
+            r#"    method: hmac
+    algorithm: sha1
+    secret_from_env: ALIBABA_MACHINE_TRANSLATION_ACCESS_KEY_SECRET
+    key_id_from_env: ALIBABA_MACHINE_TRANSLATION_ACCESS_KEY_ID
+    prepare:
+      - target:
+          type: header
+          name: Date
+        value:
+          from: timestamp
+          format: rfc_1123_gmt
+    canonical:
+      join_with: "\n"
+      components:
+        - from: method
+        - from: path
+        - from: header
+          name: Date
+    signature:
+      encoding: base64
+      destination:
+        type: header
+        name: Authorization
+        template: "acs {key_id}:{signature}""#,
+        );
+        let spec: ApiSpec = serde_yml::from_str(&yaml).unwrap();
+        match spec.routing {
+            RoutingConfig::Proxy {
+                auth:
+                    Some(AuthConfig::Hmac {
+                        algorithm,
+                        secret_from_env,
+                        key_id_from_env,
+                        canonical,
+                        signature,
+                        ..
+                    }),
+                ..
+            } => {
+                assert_eq!(
+                    secret_from_env,
+                    "ALIBABA_MACHINE_TRANSLATION_ACCESS_KEY_SECRET"
+                );
+                assert_eq!(
+                    key_id_from_env.as_deref(),
+                    Some("ALIBABA_MACHINE_TRANSLATION_ACCESS_KEY_ID")
+                );
+                assert!(matches!(algorithm, HmacAlgorithm::Sha1));
+                assert_eq!(canonical.components.len(), 3);
+                assert!(matches!(signature.encoding, HmacEncoding::Base64));
+            }
+            other => panic!("expected HMAC auth config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_hmac_rejects_missing_secret() {
+        let spec: ApiSpec = serde_yml::from_str(&hmac_auth_yaml(
+            r#"    method: hmac
+    algorithm: sha256
+    secret_from_env: ""
+    canonical:
+      join_with: "\n"
+      components:
+        - from: method
+    signature:
+      encoding: hex
+      destination:
+        type: header
+        name: Authorization
+        template: "{signature}""#,
+        ))
+        .unwrap();
+
+        let errs = validate_api_spec(&spec);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("hmac.secret_from_env is empty"))
+        );
+    }
+
+    #[test]
+    fn validate_hmac_rejects_unknown_template_token() {
+        let spec: ApiSpec = serde_yml::from_str(&hmac_auth_yaml(
+            r#"    method: hmac
+    algorithm: sha256
+    secret_from_env: TEST_SECRET
+    canonical:
+      join_with: "\n"
+      components:
+        - from: method
+    signature:
+      encoding: base64
+      destination:
+        type: header
+        name: Authorization
+        template: "sig {unknown}:{signature}""#,
+        ))
+        .unwrap();
+
+        let errs = validate_api_spec(&spec);
+        assert!(errs.iter().any(|e| e.contains("unknown token `{unknown}`")));
+    }
+
+    #[test]
+    fn validate_hmac_rejects_duplicate_prepare_targets() {
+        let spec: ApiSpec = serde_yml::from_str(&hmac_auth_yaml(
+            r#"    method: hmac
+    algorithm: sha256
+    secret_from_env: TEST_SECRET
+    prepare:
+      - target:
+          type: header
+          name: Date
+        value:
+          from: literal
+          value: first
+      - target:
+          type: header
+          name: date
+        value:
+          from: literal
+          value: second
+    canonical:
+      join_with: "\n"
+      components:
+        - from: method
+    signature:
+      encoding: hex
+      destination:
+        type: header
+        name: Authorization
+        template: "{signature}""#,
+        ))
+        .unwrap();
+
+        let errs = validate_api_spec(&spec);
+        assert!(errs.iter().any(
+            |e| e.contains("duplicate target `date`") || e.contains("duplicate target `Date`")
+        ));
+    }
+
+    #[test]
+    fn validate_hmac_rejects_empty_canonical_components() {
+        let spec: ApiSpec = serde_yml::from_str(&hmac_auth_yaml(
+            r#"    method: hmac
+    algorithm: sha512
+    secret_from_env: TEST_SECRET
+    canonical:
+      join_with: "\n"
+      components: []
+    signature:
+      encoding: base64
+      destination:
+        type: query_param
+        name: signature
+        template: "{signature}""#,
+        ))
+        .unwrap();
+
+        let errs = validate_api_spec(&spec);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("hmac.canonical.components must not be empty"))
+        );
+    }
+
+    #[test]
+    fn validate_hmac_rejects_key_id_template_without_env() {
+        let spec: ApiSpec = serde_yml::from_str(&hmac_auth_yaml(
+            r#"    method: hmac
+    algorithm: sha1
+    secret_from_env: TEST_SECRET
+    canonical:
+      join_with: "\n"
+      components:
+        - from: method
+    signature:
+      encoding: base64
+      destination:
+        type: header
+        name: Authorization
+        template: "acs {key_id}:{signature}""#,
+        ))
+        .unwrap();
+
+        let errs = validate_api_spec(&spec);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("uses `{key_id}` but hmac.key_id_from_env is not set"))
+        );
+    }
+
+    #[test]
+    fn parse_access_token_auth_config() {
+        let yaml = access_token_auth_yaml(
+            r#"    method: access_token
+    prepare:
+      - target:
+          type: query_param
+          name: appkey
+        value:
+          from: env
+          from_env: ALIBABA_ISI_APP_KEY
+    fetch:
+      url: https://nlsmeta.ap-southeast-1.aliyuncs.com/
+      method: GET
+      prepare:
+        - target:
+            type: query_param
+            name: Timestamp
+          value:
+            from: timestamp
+            format: iso_8601_zulu
+        - target:
+            type: query_param
+            name: SignatureNonce
+          value:
+            from: uuid_v4
+      auth:
+        method: hmac
+        algorithm: sha1
+        secret_from_env: ALIBABA_ISI_ACCESS_KEY_SECRET
+        secret_suffix: "&"
+        canonical:
+          join_with: ""
+          components:
+            - from: method
+            - from: literal
+              value: "&%2F&"
+            - from: query
+              style: sorted_pairs
+              encoding: percent_rfc3986
+        signature:
+          encoding: base64
+          destination:
+            type: query_param
+            name: Signature
+            template: "{signature}"
+      response:
+        token_json_pointer: /Token/Id
+        expires_at_json_pointer: /Token/ExpireTime
+        expires_at_format: unix_seconds
+    inject:
+      target:
+        type: header
+        name: X-NLS-Token
+      template: "{token}""#,
+        );
+        let spec: ApiSpec = serde_yml::from_str(&yaml).unwrap();
+        match spec.routing {
+            RoutingConfig::Proxy {
+                auth:
+                    Some(AuthConfig::AccessToken {
+                        prepare,
+                        fetch,
+                        inject,
+                    }),
+                ..
+            } => {
+                assert_eq!(prepare.len(), 1);
+                assert!(matches!(fetch.method, HttpMethod::Get));
+                assert_eq!(fetch.prepare.len(), 2);
+                assert_eq!(fetch.response.token_json_pointer, "/Token/Id");
+                assert_eq!(inject.target.name, "X-NLS-Token");
+            }
+            other => panic!("expected access_token auth config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_access_token_rejects_missing_token_pointer() {
+        let spec: ApiSpec = serde_yml::from_str(&access_token_auth_yaml(
+            r#"    method: access_token
+    fetch:
+      url: https://tokens.example.com/
+      response:
+        token_json_pointer: ""
+        expires_in_json_pointer: /expires_in
+    inject:
+      target:
+        type: header
+        name: Authorization
+      template: "Bearer {token}""#,
+        ))
+        .unwrap();
+
+        let errs = validate_api_spec(&spec);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("token_json_pointer is empty")),
+            "expected token pointer validation error, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_access_token_rejects_duplicate_prepare_targets() {
+        let spec: ApiSpec = serde_yml::from_str(&access_token_auth_yaml(
+            r#"    method: access_token
+    prepare:
+      - target:
+          type: query_param
+          name: appkey
+        value:
+          from: literal
+          value: one
+      - target:
+          type: query_param
+          name: appkey
+        value:
+          from: literal
+          value: two
+    fetch:
+      url: https://tokens.example.com/
+      response:
+        token_json_pointer: /token
+        expires_in_json_pointer: /expires_in
+    inject:
+      target:
+        type: header
+        name: Authorization
+      template: "Bearer {token}""#,
+        ))
+        .unwrap();
+
+        let errs = validate_api_spec(&spec);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("access_token.prepare contains duplicate target `appkey`")),
+            "expected duplicate target validation error, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_access_token_rejects_unknown_template_token() {
+        let spec: ApiSpec = serde_yml::from_str(&access_token_auth_yaml(
+            r#"    method: access_token
+    fetch:
+      url: https://tokens.example.com/
+      response:
+        token_json_pointer: /token
+        expires_in_json_pointer: /expires_in
+    inject:
+      target:
+        type: header
+        name: Authorization
+      template: "Bearer {unknown}""#,
+        ))
+        .unwrap();
+
+        let errs = validate_api_spec(&spec);
+        assert!(
+            errs.iter().any(|e| e.contains("unknown token `{unknown}`")),
+            "expected template validation error, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_access_token_rejects_missing_or_duplicate_expiry_fields() {
+        let missing: ApiSpec = serde_yml::from_str(&access_token_auth_yaml(
+            r#"    method: access_token
+    fetch:
+      url: https://tokens.example.com/
+      response:
+        token_json_pointer: /token
+    inject:
+      target:
+        type: header
+        name: Authorization
+      template: "Bearer {token}""#,
+        ))
+        .unwrap();
+        let duplicate: ApiSpec = serde_yml::from_str(&access_token_auth_yaml(
+            r#"    method: access_token
+    fetch:
+      url: https://tokens.example.com/
+      response:
+        token_json_pointer: /token
+        expires_at_json_pointer: /expires_at
+        expires_in_json_pointer: /expires_in
+    inject:
+      target:
+        type: header
+        name: Authorization
+      template: "Bearer {token}""#,
+        ))
+        .unwrap();
+
+        let missing_errs = validate_api_spec(&missing);
+        let duplicate_errs = validate_api_spec(&duplicate);
+        assert!(
+            missing_errs
+                .iter()
+                .any(|e| e.contains("must set exactly one"))
+        );
+        assert!(
+            duplicate_errs
+                .iter()
+                .any(|e| e.contains("must set exactly one"))
+        );
+    }
+
+    #[test]
+    fn validate_access_token_rejects_nested_oauth2_fetch_auth() {
+        let spec: ApiSpec = serde_yml::from_str(&access_token_auth_yaml(
+            r#"    method: access_token
+    fetch:
+      url: https://tokens.example.com/
+      auth:
+        method: oauth2
+        token_url: https://oauth.example.com/token
+      response:
+        token_json_pointer: /token
+        expires_in_json_pointer: /expires_in
+    inject:
+      target:
+        type: header
+        name: Authorization
+      template: "Bearer {token}""#,
+        ))
+        .unwrap();
+
+        let errs = validate_api_spec(&spec);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("does not support nested oauth2 auth")),
+            "expected nested oauth2 validation error, got: {errs:?}"
+        );
     }
 }
