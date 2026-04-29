@@ -96,7 +96,7 @@ brew install pay
 ```sh
 git clone https://github.com/solana-foundation/pay.git
 cd pay
-just install-pay
+just install pay
 ```
 
 ### Verify

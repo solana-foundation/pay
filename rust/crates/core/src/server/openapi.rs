@@ -73,12 +73,16 @@ pub fn load_document(source: &OpenapiSource, spec_dir: &Path) -> Result<Value> {
 ///   resource (recursing through nested `resources.<name>`); drops empty
 ///   `methods` / `resources` containers.
 pub fn filter_to_endpoints(doc: &mut Value, endpoints: &[Endpoint]) {
+    // Pre-canonicalize each YAML path so we can match it against openapi
+    // paths regardless of placeholder spelling. `bigquery/v2/projects/{projectsId}/queries`
+    // and `projects/{projectId}/queries` (after base-path strip) compare
+    // equal because we collapse `{anything}` → `{*}`.
     let allowed: HashSet<(String, String)> = endpoints
         .iter()
         .map(|e| {
             (
                 http_method_str(&e.method).to_string(),
-                normalize_path(&e.path),
+                canonical_path(&e.path),
             )
         })
         .collect();
@@ -137,6 +141,61 @@ fn normalize_path(path: &str) -> String {
     path.trim_start_matches('/').to_string()
 }
 
+/// Canonicalize a path for cross-format matching:
+/// - trim leading `/`
+/// - collapse every `{placeholder}` → `{*}` so `/projects/{projectId}/queries`
+///   matches the YAML's `/projects/{projectsId}/queries` (Google OpenAPI 3
+///   uses singular, Google Discovery uses plural; we tolerate both).
+fn canonical_path(path: &str) -> String {
+    let trimmed = path.trim_start_matches('/');
+    // Hand-rolled `{...}` → `{*}` substitution; no regex dep needed.
+    let mut out = String::with_capacity(trimmed.len());
+    let mut chars = trimmed.chars();
+    while let Some(c) = chars.next() {
+        if c == '{' {
+            // skip until matching '}'
+            for c2 in chars.by_ref() {
+                if c2 == '}' {
+                    break;
+                }
+            }
+            out.push_str("{*}");
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Extract the path component of `servers[0].url` in OpenAPI 3 docs.
+/// Returns the prefix (without leading/trailing slash) so we can prepend it
+/// to each `paths.<path>` key for matching against YAML allowlist entries.
+/// Empty string when no servers, no path component, or `/`.
+fn openapi3_base_path(doc: &Value) -> String {
+    let url = match doc
+        .get("servers")
+        .and_then(|s| s.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|s| s.get("url"))
+        .and_then(|v| v.as_str())
+    {
+        Some(u) => u,
+        None => return String::new(),
+    };
+    let after_scheme = match url.split("://").nth(1) {
+        Some(s) => s,
+        None => url,
+    };
+    let path_start = match after_scheme.find('/') {
+        Some(i) => i,
+        None => return String::new(),
+    };
+    after_scheme[path_start..]
+        .trim_start_matches('/')
+        .trim_end_matches('/')
+        .to_string()
+}
+
 fn http_method_str(method: &pay_types::metering::HttpMethod) -> &'static str {
     use pay_types::metering::HttpMethod::*;
     match method {
@@ -153,19 +212,32 @@ const HTTP_METHODS: &[&str] = &[
 ];
 
 fn filter_openapi3(doc: &mut Value, allowed: &HashSet<(String, String)>) {
+    // Compute the base path from servers[0].url so we can match the YAML's
+    // proxy-relative paths (e.g. `bigquery/v2/projects/...`) against the
+    // openapi's server-relative paths (e.g. `/projects/...`). For bigquery:
+    // base_path = "bigquery/v2", openapi_path = "/projects/{projectId}/queries"
+    // → combined "bigquery/v2/projects/{*}/queries" which matches the YAML's
+    // canonicalized "bigquery/v2/projects/{*}/queries".
+    let base_path = openapi3_base_path(doc);
+
     let Some(paths) = doc.get_mut("paths").and_then(|v| v.as_object_mut()) else {
         return;
     };
     let mut empty_paths: Vec<String> = Vec::new();
     for (path, item) in paths.iter_mut() {
-        let normalized = normalize_path(path);
+        let combined = if base_path.is_empty() {
+            normalize_path(path)
+        } else {
+            format!("{}/{}", base_path, path.trim_start_matches('/'))
+        };
+        let canon = canonical_path(&combined);
         let Some(item_obj) = item.as_object_mut() else {
             continue;
         };
         let methods_to_remove: Vec<String> = HTTP_METHODS
             .iter()
             .filter(|m| item_obj.contains_key(**m))
-            .filter(|m| !allowed.contains(&(m.to_uppercase(), normalized.clone())))
+            .filter(|m| !allowed.contains(&(m.to_uppercase(), canon.clone())))
             .map(|m| (*m).to_string())
             .collect();
         for m in methods_to_remove {
@@ -374,7 +446,7 @@ fn prune_resources(
                     .unwrap_or("")
                     .to_uppercase();
                 let path = m.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                if allowed.contains(&(http_method, normalize_path(path))) {
+                if allowed.contains(&(http_method, canonical_path(path))) {
                     None
                 } else {
                     Some(name.clone())
