@@ -10,7 +10,7 @@ Pay has two developer-facing parts:
   metered endpoints, verifies payment, then either proxies to an upstream API or
   responds directly.
 - A `pay-skills` provider markdown file lists the API in the public registry so
-  `pay skills search`, Pay MCP `search_skills`, Claude, and Codex can select the
+  `pay skills search`, Pay MCP `search_catalog`, Claude, and Codex can select the
   provider without guessing.
 
 ## Runtime YAML
@@ -395,7 +395,7 @@ not market the product.
 
 ## Markdown Body Best Practices
 
-The markdown body is loaded by agents after `get_skill_endpoints`, so it should
+The markdown body is loaded by agents after `get_catalog_entry`, so it should
 optimize execution and reduce wasted paid calls:
 
 - Explain the cheapest endpoint for common tasks.
@@ -495,4 +495,4 @@ static validation and probes changed providers via `pay skills validate`,
 posting per-endpoint warnings inline. After merge, the partial-rebuild
 workflow re-probes only the providers in the diff, merges them into the
 prior `dist/`, and republishes. Agents discover the updated provider
-through `pay skills search` and Pay MCP `search_skills`.
+through `pay skills search` and Pay MCP `search_catalog`.
