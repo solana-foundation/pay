@@ -1,6 +1,5 @@
 [alias]
 cli-install = "install --path crates/cli --locked --force"
-cli-install-gcp-kms = "install --path crates/cli --locked --force --features gcp_kms"
 
 [net]
 git-fetch-with-cli = true
