@@ -73,6 +73,8 @@ impl SearchCommand {
             print_condensed(&hits, &services);
         }
 
+        print_endpoints_tip();
+
         Ok(())
     }
 }
@@ -267,6 +269,14 @@ fn print_endpoint(hit: &SearchHit) {
         };
         eprintln!("            {}", desc.dimmed());
     }
+}
+
+fn print_endpoints_tip() {
+    eprintln!();
+    eprintln!(
+        "{}",
+        "use `pay skills endpoints <fqn> <resource>` to inspect a provider.".dimmed()
+    );
 }
 
 #[cfg(test)]
