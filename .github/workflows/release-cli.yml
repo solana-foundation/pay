@@ -135,6 +135,10 @@ jobs:
       - name: Build PDB frontend
         run: cd ../pdb && pnpm install --frozen-lockfile && pnpm build
 
+      - name: Copy PDB frontend for cross
+        if: matrix.use-cross
+        run: cp -R ../pdb/dist pdb-dist
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -149,10 +153,19 @@ jobs:
           key: release-${{ matrix.target }}
 
       - name: Build
+        if: ${{ !matrix.use-cross }}
         run: >-
-          ${{ matrix.use-cross && 'cross' || 'cargo' }} build --release
+          cargo build --release
           --target ${{ matrix.target }}
-          ${{ matrix.use-cross && '--features vendored-openssl' || '' }}
+
+      - name: Build (cross)
+        if: matrix.use-cross
+        env:
+          PAY_PDB_DIST: /project/pdb-dist
+        run: >-
+          cross build --release
+          --target ${{ matrix.target }}
+          --features vendored-openssl
 
       - name: Package (unix)
         if: runner.os != 'Windows'
