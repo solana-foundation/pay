@@ -26,6 +26,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
 const POLL_DELAY: Duration = Duration::from_secs(4);
 const POLL_COUNTDOWN: Duration = Duration::from_secs(4);
+const DEFAULT_PAY_MOONPAY_API_KEY: &str = "pk_live_6Op5JaLp1lLN0c97hkbeczKhgbrmLMQ";
 
 /// Result from the polling thread: what changed + current totals.
 struct TopupDetected {
@@ -1190,12 +1191,8 @@ fn new_external_id() -> String {
     format!("pay-{}", uuid::Uuid::new_v4())
 }
 
-fn resolve_moonpay_api_key() -> Result<String, String> {
-    match std::env::var("PAY_MOONPAY_API_KEY") {
-        Ok(value) if !value.trim().is_empty() => Ok(value),
-        Ok(_) => Err("PAY_MOONPAY_API_KEY is empty.".to_string()),
-        Err(_) => Err("PAY_MOONPAY_API_KEY is not set.".to_string()),
-    }
+fn resolve_moonpay_api_key() -> String {
+    std::env::var("PAY_MOONPAY_API_KEY").unwrap_or(DEFAULT_PAY_MOONPAY_API_KEY.into())
 }
 
 fn build_onramp_redirect_url(host: &str) -> String {
@@ -1221,7 +1218,7 @@ fn launch_onramp_session(
     updates: &mpsc::Sender<OnrampUpdate>,
 ) -> Result<OnrampSession, String> {
     let host = onramp_host.trim_end_matches('/').to_string();
-    let api_key = resolve_moonpay_api_key()?;
+    let api_key = resolve_moonpay_api_key();
     let external_id = new_external_id();
     let url = build_onramp_url(&host, pubkey, &external_id, &api_key);
     open_url(&url).map_err(|err| format!("failed to open MoonPay: {err}"))?;
@@ -2222,7 +2219,7 @@ mod tests {
     fn resolve_moonpay_api_key_reads_env() {
         let _api_key = EnvVarGuard::set("PAY_MOONPAY_API_KEY", "moonpay-key");
 
-        let value = resolve_moonpay_api_key().expect("env var should be read");
+        let value = resolve_moonpay_api_key();
 
         assert_eq!(value, "moonpay-key");
     }
