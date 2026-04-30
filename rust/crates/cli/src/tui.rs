@@ -1289,6 +1289,7 @@ fn render_card_panel(
             let tool_label = match tool {
                 ToolKind::Curl => "curl",
                 ToolKind::Wget => "wget",
+                ToolKind::Http => "http",
                 ToolKind::Fetch => "fetch",
                 ToolKind::Mcp => "mcp",
                 ToolKind::Claude | ToolKind::Codex => unreachable!(),

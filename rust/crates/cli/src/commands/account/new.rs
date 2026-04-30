@@ -205,8 +205,23 @@ fn build_keystore(
         }
 
         other => Err(pay_core::Error::Config(format!(
-            "Unknown backend: {other}. Use 'keychain', 'gnome-keyring', 'windows-hello', or '1password'."
+            "Unknown backend: {other}. Use {}.",
+            available_backends_hint()
         ))),
+    }
+}
+
+/// Comma-separated list of backends that work on the current OS.
+/// Used in error messages so we don't suggest `keychain` to a Linux user.
+fn available_backends_hint() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "'keychain' or '1password'"
+    } else if cfg!(target_os = "linux") {
+        "'gnome-keyring' or '1password'"
+    } else if cfg!(target_os = "windows") {
+        "'windows-hello' or '1password'"
+    } else {
+        "'1password'"
     }
 }
 
@@ -257,11 +272,11 @@ pub fn resolve_op_account() -> pay_core::Result<Option<String>> {
 pub fn pick_backend() -> pay_core::Result<String> {
     let has_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
     if !has_tty {
-        return Err(pay_core::Error::Config(
+        return Err(pay_core::Error::Config(format!(
             "No --backend specified and no interactive terminal available.\n  \
-             Use --backend=keychain or --backend=1password."
-                .to_string(),
-        ));
+             Pass --backend=<one of {}>.",
+            available_backends_hint()
+        )));
     }
 
     struct Opt {

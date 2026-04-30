@@ -3,6 +3,7 @@ pub mod claude;
 pub mod codex;
 pub mod curl;
 pub mod fetch;
+pub mod http;
 pub mod send;
 pub mod server;
 pub mod setup;
@@ -17,7 +18,7 @@ use pay_core::mpp;
 use pay_core::runner::RunOutcome;
 use pay_core::x402;
 use pay_core::x402::Challenge as X402Challenge;
-use pay_core::{run_curl_with_headers, run_wget_with_headers};
+use pay_core::{run_curl_with_headers, run_httpie_with_headers, run_wget_with_headers};
 use solana_mpp::{ChargeRequest, SessionRequest};
 
 use crate::no_dna;
@@ -29,6 +30,8 @@ pub enum Command {
     Curl(curl::CurlCommand),
     /// Download a resource via wget, handling 402 Payment Required flows.
     Wget(wget::WgetCommand),
+    /// Make an HTTP request via HTTPie, handling 402 Payment Required flows.
+    Http(http::HttpCommand),
     /// Fetch a URL using the built-in HTTP client (no external tool required).
     Fetch(fetch::FetchCommand),
     /// Run Claude Code with 402 payment support.
@@ -71,6 +74,7 @@ pub enum Command {
 pub enum ToolKind {
     Curl,
     Wget,
+    Http,
     Fetch,
     Claude,
     Codex,
@@ -91,6 +95,7 @@ impl Command {
         match self {
             Command::Curl(_) => ToolKind::Curl,
             Command::Wget(_) => ToolKind::Wget,
+            Command::Http(_) => ToolKind::Http,
             Command::Fetch(_) => ToolKind::Fetch,
             Command::Claude(_) => ToolKind::Claude,
             Command::Codex(_) => ToolKind::Codex,
@@ -111,6 +116,7 @@ impl Command {
 enum Tool<'a> {
     Curl(&'a [String]),
     Wget(&'a [String]),
+    Http(&'a [String]),
     Fetch { url: &'a str },
 }
 
@@ -158,6 +164,7 @@ impl Command {
         let (outcome, tool) = match &self {
             Command::Curl(cmd) => (pay_core::run_curl(&cmd.args)?, Tool::Curl(&cmd.args)),
             Command::Wget(cmd) => (pay_core::run_wget(&cmd.args)?, Tool::Wget(&cmd.args)),
+            Command::Http(cmd) => (pay_core::run_httpie(&cmd.args)?, Tool::Http(&cmd.args)),
             Command::Fetch(cmd) => {
                 let parsed_headers = parse_header_args(&cmd.headers);
                 pay_core::skills::validate_cached_catalog_request("GET", &cmd.url, None)?;
@@ -270,7 +277,7 @@ fn handle_outcome(
                 eprintln!(
                     "{}",
                     format!(
-                        "402 Payment Required (MPP) — {} {} — use --yolo for capped auto-pay",
+                        "402 Payment Required (MPP) — {} {}",
                         req.amount, req.currency
                     )
                     .dimmed()
@@ -325,10 +332,8 @@ fn handle_outcome(
             } else {
                 eprintln!(
                     "{}",
-                    format!(
-                        "402 Payment Required (MPP session) — cap ${cap_usdc:.2} USDC — use --yolo for capped auto-pay",
-                    )
-                    .dimmed()
+                    format!("402 Payment Required (MPP session) — cap ${cap_usdc:.2} USDC")
+                        .dimmed()
                 );
             }
         }
@@ -379,7 +384,7 @@ fn handle_outcome(
                 eprintln!(
                     "{}",
                     format!(
-                        "402 Payment Required (x402) — {} {} — use --yolo for capped auto-pay",
+                        "402 Payment Required (x402) — {} {}",
                         challenge.requirements.amount, challenge.requirements.currency
                     )
                     .dimmed()
@@ -416,10 +421,7 @@ fn handle_outcome(
                     "resource": resource_url,
                 }))?;
             } else {
-                eprintln!(
-                    "{}",
-                    "402 Sign-In Required (x402) — use --yolo to sign automatically".dimmed()
-                );
+                eprintln!("{}", "402 Sign-In Required (x402)".dimmed());
             }
         }
 
@@ -514,7 +516,19 @@ fn pay_mpp_and_retry(
         ctx.network_override,
         ctx.account_override,
     )?
-    .ok_or_else(|| pay_core::Error::Mpp("No compatible MPP challenge found".to_string()))?;
+    .ok_or_else(|| {
+        let networks = mpp_challenge_networks(challenges);
+        let offered = if networks.is_empty() {
+            "(none)".to_string()
+        } else {
+            networks.join(", ")
+        };
+        let active = ctx.network_override.unwrap_or("auto");
+        pay_core::Error::Mpp(format!(
+            "No MPP challenge matched the active network filter (active: {active}, offered: {offered}). \
+             Drop `--network` or check `pay account list` for accounts on the offered networks."
+        ))
+    })?;
     let (auth_header, ephemeral_notice) = mpp::build_credential(
         challenge,
         &store,
@@ -544,6 +558,26 @@ fn mpp_challenge_currencies(challenges: &[mpp::Challenge]) -> Vec<String> {
             Some(request.currency)
         })
         .collect()
+}
+
+/// Distinct networks advertised across MPP challenges, used by error messages
+/// to tell the user which networks the server offered.
+fn mpp_challenge_networks(challenges: &[mpp::Challenge]) -> Vec<String> {
+    let mut out: Vec<String> = challenges
+        .iter()
+        .filter_map(|challenge| {
+            let request: ChargeRequest = challenge.request.decode().ok()?;
+            request
+                .method_details
+                .as_ref()
+                .and_then(|v| v.get("network"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 fn mpp_challenges_json(challenges: &[mpp::Challenge]) -> serde_json::Value {
@@ -731,6 +765,9 @@ fn validate_tool_request_before_signing(tool: &Tool) -> pay_core::Result<()> {
         Tool::Curl(args) => pay_core::runner::validate_curl_args_against_catalog(args),
         Tool::Fetch { url } => pay_core::skills::validate_cached_catalog_request("GET", url, None),
         Tool::Wget(args) => pay_core::runner::validate_wget_args_against_catalog(args),
+        // TODO: catalog validation for HTTPie request-item syntax
+        // (`Header:Value`, `field=value`, `field:=raw`, …).
+        Tool::Http(_) => Ok(()),
     }
 }
 
@@ -797,6 +834,10 @@ fn retry_with_headers(
             let extra = retry_header_args(headers_to_add);
             run_wget_with_headers(args, &extra)
         }
+        Tool::Http(args) => {
+            let extra = retry_header_args_httpie(headers_to_add);
+            run_httpie_with_headers(args, &extra)
+        }
         Tool::Fetch { url, .. } => {
             let mut headers = fetch_headers.unwrap_or_default();
             headers.extend(
@@ -813,6 +854,14 @@ fn retry_header_args(headers_to_add: &[(&str, String)]) -> Vec<String> {
     headers_to_add
         .iter()
         .map(|(name, value)| format!("{name}: {value}"))
+        .collect()
+}
+
+/// Format headers as HTTPie request items: `Name:value` (no space after colon).
+fn retry_header_args_httpie(headers_to_add: &[(&str, String)]) -> Vec<String> {
+    headers_to_add
+        .iter()
+        .map(|(name, value)| format!("{name}:{value}"))
         .collect()
 }
 
