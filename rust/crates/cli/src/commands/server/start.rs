@@ -105,15 +105,6 @@ impl PaymentState for AppState {
     }
 }
 
-fn effective_server_network(op: Option<&OperatorConfig>, sandbox: bool) -> String {
-    if sandbox {
-        "localnet".to_string()
-    } else {
-        op.and_then(|o| o.network.clone())
-            .unwrap_or_else(|| "mainnet".to_string())
-    }
-}
-
 fn should_use_auto_fee_payer_signer(
     sandbox: bool,
     network: &str,
@@ -194,7 +185,9 @@ impl StartCommand {
         // Resolve config that doesn't need async.
         let currencies = resolve_operator_currencies(op, &self.currency);
 
-        let network = effective_server_network(op, sandbox);
+        let network = op
+            .and_then(|o| o.network.clone())
+            .unwrap_or_else(|| "mainnet".to_string());
 
         // RPC URL fallback chain. Network-aware so that `localnet`
         // defaults to the hosted Surfpool sandbox (where ephemeral
@@ -1779,11 +1772,9 @@ fn gateway_charge_challenges(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_pdb_config, effective_server_network, explorer_cluster_query, resolve_currency,
-        resolve_operator_currencies, should_use_auto_fee_payer_signer,
-        validate_browser_rpc_request,
+        build_pdb_config, explorer_cluster_query, resolve_currency, resolve_operator_currencies,
+        should_use_auto_fee_payer_signer, validate_browser_rpc_request,
     };
-    use pay_types::metering::OperatorConfig;
 
     #[test]
     fn explorer_cluster_query_mainnet_is_empty() {
@@ -1954,22 +1945,6 @@ endpoints:
         );
 
         assert_eq!(config["rpcUrl"], "https://402.surfnet.dev:8899");
-    }
-
-    #[test]
-    fn effective_server_network_forces_localnet_in_sandbox() {
-        let op = OperatorConfig {
-            signer: None,
-            recipient: None,
-            currencies: std::collections::BTreeMap::new(),
-            rpc_url: None,
-            network: Some("mainnet".to_string()),
-            fee_payer: true,
-        };
-
-        assert_eq!(effective_server_network(Some(&op), true), "localnet");
-        assert_eq!(effective_server_network(Some(&op), false), "mainnet");
-        assert_eq!(effective_server_network(None, false), "mainnet");
     }
 
     #[test]
