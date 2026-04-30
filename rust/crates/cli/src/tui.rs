@@ -26,7 +26,6 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
 const POLL_DELAY: Duration = Duration::from_secs(4);
 const POLL_COUNTDOWN: Duration = Duration::from_secs(4);
-const DEFAULT_PAY_MOONPAY_API_KEY: &str = "pk_live_6Op5JaLp1lLN0c97hkbeczKhgbrmLMQ";
 
 /// Result from the polling thread: what changed + current totals.
 struct TopupDetected {
@@ -492,14 +491,16 @@ fn run_topup(
                             let copied_to_clipboard = copy_to_clipboard(pubkey).is_ok();
                             animate_onramp_launch(
                                 terminal,
-                                pubkey,
-                                account_name,
-                                &options,
-                                selected,
-                                focus,
-                                &status,
-                                amount_pos,
-                                payment_method,
+                                TopupLaunchView {
+                                    pubkey,
+                                    account_name,
+                                    options: &options,
+                                    selected,
+                                    focus,
+                                    status: &status,
+                                    amount_pos,
+                                    payment_method,
+                                },
                                 copied_to_clipboard,
                             )?;
                             match launch_onramp_session(onramp_host, pubkey, payment_method, &otx) {
@@ -561,6 +562,18 @@ struct OnrampSession {
     started_at: Instant,
 }
 
+#[derive(Clone, Copy)]
+struct TopupLaunchView<'a> {
+    pubkey: &'a str,
+    account_name: &'a str,
+    options: &'a [TopupOption],
+    selected: usize,
+    focus: TopupFocus,
+    status: &'a PollStatus,
+    amount_pos: usize,
+    payment_method: OnrampPaymentMethod,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn blink_checkmark(
     terminal: &mut Terminal<CrosstermBackend<io::Stderr>>,
@@ -604,14 +617,7 @@ fn blink_checkmark(
 
 fn animate_onramp_launch(
     terminal: &mut Terminal<CrosstermBackend<io::Stderr>>,
-    pubkey: &str,
-    account_name: &str,
-    options: &[TopupOption],
-    selected: usize,
-    focus: TopupFocus,
-    status: &PollStatus,
-    amount_pos: usize,
-    payment_method: OnrampPaymentMethod,
+    view: TopupLaunchView<'_>,
     copied_to_clipboard: bool,
 ) -> io::Result<()> {
     let frames: &[&str] = if copied_to_clipboard {
@@ -636,14 +642,14 @@ fn animate_onramp_launch(
             render_topup_selector(
                 frame,
                 area,
-                pubkey,
-                account_name,
-                options,
-                selected,
-                focus,
-                status,
-                amount_pos,
-                payment_method,
+                view.pubkey,
+                view.account_name,
+                view.options,
+                view.selected,
+                view.focus,
+                view.status,
+                view.amount_pos,
+                view.payment_method,
                 None,
                 None,
                 Some(notice),
@@ -1316,8 +1322,12 @@ fn new_external_id() -> String {
     format!("pay-{}", uuid::Uuid::new_v4())
 }
 
-fn resolve_moonpay_api_key() -> String {
-    std::env::var("PAY_MOONPAY_API_KEY").unwrap_or(DEFAULT_PAY_MOONPAY_API_KEY.into())
+fn resolve_moonpay_api_key() -> Result<String, String> {
+    match std::env::var("PAY_MOONPAY_API_KEY") {
+        Ok(value) if !value.trim().is_empty() => Ok(value),
+        Ok(_) => Err("PAY_MOONPAY_API_KEY is empty.".to_string()),
+        Err(_) => Err("PAY_MOONPAY_API_KEY is not set.".to_string()),
+    }
 }
 
 fn build_onramp_redirect_url(host: &str) -> String {
@@ -1351,7 +1361,7 @@ fn launch_onramp_session(
     updates: &mpsc::Sender<OnrampUpdate>,
 ) -> Result<OnrampSession, String> {
     let host = onramp_host.trim_end_matches('/').to_string();
-    let api_key = resolve_moonpay_api_key();
+    let api_key = resolve_moonpay_api_key()?;
     let external_id = new_external_id();
     let url = build_onramp_url(&host, pubkey, &external_id, &api_key, payment_method);
     open_url(&url).map_err(|err| format!("failed to open MoonPay: {err}"))?;
@@ -2230,7 +2240,7 @@ mod tests {
             .query_pairs()
             .collect::<std::collections::HashMap<_, _>>();
 
-        assert_eq!(parsed.as_str().starts_with(MOONPAY_BUY_URL), true);
+        assert!(parsed.as_str().starts_with(MOONPAY_BUY_URL));
         assert_eq!(query.get("apiKey"), Some(&"moonpay-key".into()));
         assert_eq!(query.get("currencyCode"), Some(&"usdc_sol".into()));
         assert_eq!(query.get("walletAddress"), Some(&"wallet123".into()));
@@ -2241,7 +2251,7 @@ mod tests {
             Some(&"https://pay.sh/onramp/done".into())
         );
         assert_eq!(query.get("paymentMethod"), Some(&"paypal".into()));
-        assert!(query.get("account").is_none());
+        assert!(!query.contains_key("account"));
     }
 
     #[test]
@@ -2365,7 +2375,7 @@ mod tests {
     fn resolve_moonpay_api_key_reads_env() {
         let _api_key = EnvVarGuard::set("PAY_MOONPAY_API_KEY", "moonpay-key");
 
-        let value = resolve_moonpay_api_key();
+        let value = resolve_moonpay_api_key().expect("env API key should resolve");
 
         assert_eq!(value, "moonpay-key");
     }
