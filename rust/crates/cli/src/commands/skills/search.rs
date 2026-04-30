@@ -39,10 +39,16 @@ impl SearchCommand {
         );
         let hits = refreshed.hits;
 
-        if !refreshed.failed_services.is_empty() {
+        if !refreshed.unavailable_services.is_empty() {
             eprintln!(
                 "{}",
-                format_hydration_warning(&refreshed.failed_services).yellow()
+                format_unavailable_warning(&refreshed.unavailable_services).yellow()
+            );
+        }
+        if !refreshed.empty_services.is_empty() {
+            eprintln!(
+                "{}",
+                format_empty_warning(&refreshed.empty_services).yellow()
             );
         }
 
@@ -55,10 +61,17 @@ impl SearchCommand {
         }
 
         if hits.is_empty() {
-            eprintln!(
-                "{}",
-                "No results. Try a broader search or `pay skills search` to list all.".dimmed()
-            );
+            if refreshed.unavailable_services.is_empty() && refreshed.empty_services.is_empty() {
+                eprintln!(
+                    "{}",
+                    "No results. Try a broader search or `pay skills search` to list all.".dimmed()
+                );
+            } else {
+                eprintln!(
+                    "{}",
+                    "No actionable endpoint results. Matching services were skipped.".dimmed()
+                );
+            }
             return Ok(());
         }
 
@@ -81,7 +94,8 @@ impl SearchCommand {
 
 struct RefreshedSearchHits {
     hits: Vec<SearchHit>,
-    failed_services: Vec<String>,
+    unavailable_services: Vec<String>,
+    empty_services: Vec<String>,
 }
 
 fn refresh_search_hits<F>(
@@ -97,7 +111,8 @@ where
     if initial_hits.is_empty() {
         return RefreshedSearchHits {
             hits: initial_hits,
-            failed_services: Vec::new(),
+            unavailable_services: Vec::new(),
+            empty_services: Vec::new(),
         };
     }
 
@@ -111,16 +126,34 @@ where
     }
 
     let hits = skills::search(catalog, query, category);
-    let failed_services = services
-        .into_iter()
+    let actionable_services: BTreeSet<_> = hits
+        .iter()
+        .filter(|hit| !hit.path.is_empty())
+        .map(|hit| hit.service.clone())
+        .collect();
+    let unavailable_services = services
+        .iter()
         .filter(|service| {
-            hydration_failures.contains(service) && !service_has_endpoint_hits(&hits, service)
+            hydration_failures.contains(*service) && !actionable_services.contains(*service)
         })
+        .cloned()
+        .collect();
+    let empty_services = services
+        .iter()
+        .filter(|service| {
+            !hydration_failures.contains(*service) && !actionable_services.contains(*service)
+        })
+        .cloned()
+        .collect();
+    let hits = hits
+        .into_iter()
+        .filter(|hit| actionable_services.contains(&hit.service))
         .collect();
 
     RefreshedSearchHits {
         hits,
-        failed_services,
+        unavailable_services,
+        empty_services,
     }
 }
 
@@ -134,20 +167,28 @@ fn distinct_services(hits: &[SearchHit]) -> Vec<String> {
     seen
 }
 
-fn service_has_endpoint_hits(hits: &[SearchHit], service: &str) -> bool {
-    hits.iter()
-        .any(|hit| hit.service == service && !hit.path.is_empty())
-}
-
-fn format_hydration_warning(failed_services: &[String]) -> String {
-    let services = failed_services.join(", ");
-    if failed_services.len() == 1 {
+fn format_unavailable_warning(services: &[String]) -> String {
+    let services = services.join(", ");
+    if services.contains(", ") {
         format!(
-            "Warning: endpoint detail unavailable for {services}; showing service-level results."
+            "Warning: endpoint detail unavailable for {services}; skipping those services from results."
         )
     } else {
         format!(
-            "Warning: endpoint detail unavailable for {services}; showing service-level results for those services."
+            "Warning: endpoint detail unavailable for {services}; skipping that service from results."
+        )
+    }
+}
+
+fn format_empty_warning(services: &[String]) -> String {
+    let services = services.join(", ");
+    if services.contains(", ") {
+        format!(
+            "Warning: no published endpoints available for {services}; skipping those services from results."
+        )
+    } else {
+        format!(
+            "Warning: no published endpoints available for {services}; skipping that service from results."
         )
     }
 }
@@ -165,17 +206,8 @@ fn print_full_service(hits: &[SearchHit]) {
     }
     eprintln!();
 
-    let mut current_resource = String::new();
-    for hit in hits {
-        if hit.resource != current_resource && !hit.resource.is_empty() {
-            if !current_resource.is_empty() {
-                eprintln!();
-            }
-            current_resource = hit.resource.clone();
-            eprintln!("  {}", current_resource.bold());
-        }
-        print_endpoint(hit);
-    }
+    let refs: Vec<&SearchHit> = hits.iter().collect();
+    print_resource_groups(&refs);
     eprintln!();
     eprintln!("  {}", format!("{} endpoints", hits.len()).dimmed());
 }
@@ -207,13 +239,15 @@ fn print_condensed(hits: &[SearchHit], services: &[String]) {
         let shown_metered = metered.len().min(CONDENSED_METERED_LIMIT);
         let remaining_budget = CONDENSED_TOTAL_LIMIT.saturating_sub(shown_metered);
         let shown_free = free.len().min(remaining_budget);
+        let shown_hits: Vec<&SearchHit> = metered
+            .iter()
+            .take(shown_metered)
+            .chain(free.iter().take(shown_free))
+            .copied()
+            .copied()
+            .collect();
 
-        for hit in metered.iter().take(shown_metered) {
-            print_endpoint(hit);
-        }
-        for hit in free.iter().take(shown_free) {
-            print_endpoint(hit);
-        }
+        print_resource_groups(&shown_hits);
 
         let total = svc_hits.len();
         let shown = shown_metered + shown_free;
@@ -240,6 +274,20 @@ fn print_condensed(hits: &[SearchHit], services: &[String]) {
         )
         .dimmed()
     );
+}
+
+fn print_resource_groups(hits: &[&SearchHit]) {
+    let mut current_resource = String::new();
+    for hit in hits {
+        if hit.resource != current_resource && !hit.resource.is_empty() {
+            if !current_resource.is_empty() {
+                eprintln!();
+            }
+            current_resource = hit.resource.clone();
+            eprintln!("  {} {}", "resource:".dimmed(), current_resource.bold());
+        }
+        print_endpoint(hit);
+    }
 }
 
 fn print_endpoint(hit: &SearchHit) {
@@ -274,8 +322,13 @@ fn print_endpoint(hit: &SearchHit) {
 fn print_endpoints_tip() {
     eprintln!();
     eprintln!(
-        "{}",
+        "  {}",
         "use `pay skills endpoints <fqn> <resource>` to inspect a provider.".dimmed()
+    );
+    eprintln!(
+        "  {}",
+        "The bold service slug above is the <fqn>; each `resource:` heading names the <resource>."
+            .dimmed()
     );
 }
 
@@ -397,7 +450,8 @@ mod tests {
                 Ok(())
             });
 
-        assert!(refreshed.failed_services.is_empty());
+        assert!(refreshed.unavailable_services.is_empty());
+        assert!(refreshed.empty_services.is_empty());
         assert_eq!(
             distinct_services(&refreshed.hits),
             vec!["solana-foundation/google/bigquery".to_string()]
@@ -422,7 +476,8 @@ mod tests {
                 Ok(())
             });
 
-        assert!(refreshed.failed_services.is_empty());
+        assert!(refreshed.unavailable_services.is_empty());
+        assert!(refreshed.empty_services.is_empty());
         assert_eq!(
             distinct_services(&refreshed.hits),
             vec![
@@ -463,7 +518,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_search_hits_falls_back_to_placeholder_on_failure() {
+    fn refresh_search_hits_skips_service_on_hydration_failure() {
         let mut catalog = catalog_index_only();
 
         let refreshed = refresh_search_hits(
@@ -481,12 +536,13 @@ mod tests {
         );
 
         assert_eq!(
-            refreshed.failed_services,
+            refreshed.unavailable_services,
             vec!["solana-foundation/google/vision".to_string()]
         );
+        assert!(refreshed.empty_services.is_empty());
         assert_eq!(
-            format_hydration_warning(&refreshed.failed_services),
-            "Warning: endpoint detail unavailable for solana-foundation/google/vision; showing service-level results."
+            format_unavailable_warning(&refreshed.unavailable_services),
+            "Warning: endpoint detail unavailable for solana-foundation/google/vision; skipping that service from results."
         );
 
         let bigquery_hits: Vec<_> = refreshed
@@ -496,14 +552,58 @@ mod tests {
             .collect();
         assert!(bigquery_hits.iter().all(|hit| !hit.path.is_empty()));
 
-        let vision_hits: Vec<_> = refreshed
-            .hits
-            .iter()
-            .filter(|hit| hit.service == "solana-foundation/google/vision")
-            .collect();
-        assert_eq!(vision_hits.len(), 1);
-        assert!(vision_hits[0].method.is_empty());
-        assert!(vision_hits[0].path.is_empty());
-        assert!(vision_hits[0].resource.is_empty());
+        assert!(
+            refreshed
+                .hits
+                .iter()
+                .all(|hit| hit.service != "solana-foundation/google/vision")
+        );
+    }
+
+    #[test]
+    fn refresh_search_hits_skips_service_with_no_published_endpoints() {
+        let mut catalog = catalog_index_only();
+
+        let refreshed =
+            refresh_search_hits(&mut catalog, Some("google"), None, |catalog, service| {
+                match service {
+                    "solana-foundation/google/bigquery" => hydrate_bigquery(catalog),
+                    "solana-foundation/google/vision" => {}
+                    other => panic!("unexpected service: {other}"),
+                }
+                Ok(())
+            });
+
+        assert!(refreshed.unavailable_services.is_empty());
+        assert_eq!(
+            refreshed.empty_services,
+            vec!["solana-foundation/google/vision".to_string()]
+        );
+        assert_eq!(
+            format_empty_warning(&refreshed.empty_services),
+            "Warning: no published endpoints available for solana-foundation/google/vision; skipping that service from results."
+        );
+        assert_eq!(
+            distinct_services(&refreshed.hits),
+            vec!["solana-foundation/google/bigquery".to_string()]
+        );
+    }
+
+    #[test]
+    fn refresh_search_hits_returns_no_hits_when_only_empty_services_match() {
+        let mut catalog = catalog_index_only();
+
+        let refreshed =
+            refresh_search_hits(&mut catalog, Some("vision"), None, |_catalog, service| {
+                assert_eq!(service, "solana-foundation/google/vision");
+                Ok(())
+            });
+
+        assert!(refreshed.hits.is_empty());
+        assert!(refreshed.unavailable_services.is_empty());
+        assert_eq!(
+            refreshed.empty_services,
+            vec!["solana-foundation/google/vision".to_string()]
+        );
     }
 }
