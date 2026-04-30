@@ -378,6 +378,16 @@ impl PreparedUpstreamRequest {
 ///
 /// This helper is intentionally limited to schemes that operate entirely on the
 /// already-prepared request. Token-fetching flows are handled separately.
+struct HmacAuthConfigRef<'a> {
+    algorithm: &'a HmacAlgorithm,
+    secret_from_env: &'a str,
+    secret_suffix: Option<&'a str>,
+    key_id_from_env: Option<&'a str>,
+    prepare: &'a [HmacPrepareBinding],
+    canonical: &'a HmacCanonicalConfig,
+    signature: &'a HmacSignatureConfig,
+}
+
 fn apply_prepared_request_auth(
     prepared: &mut PreparedUpstreamRequest,
     method: &Method,
@@ -418,13 +428,15 @@ fn apply_prepared_request_auth(
             prepared,
             method,
             body,
-            algorithm,
-            secret_from_env,
-            secret_suffix.as_deref(),
-            key_id_from_env.as_deref(),
-            prepare,
-            canonical,
-            signature,
+            &HmacAuthConfigRef {
+                algorithm,
+                secret_from_env,
+                secret_suffix: secret_suffix.as_deref(),
+                key_id_from_env: key_id_from_env.as_deref(),
+                prepare,
+                canonical,
+                signature,
+            },
         ),
         AuthConfig::Oauth2 { .. } => Err(
             "Nested oauth2 auth is not supported when preparing another upstream request"
@@ -473,17 +485,11 @@ fn apply_hmac_auth(
     prepared: &mut PreparedUpstreamRequest,
     method: &Method,
     body: &[u8],
-    algorithm: &HmacAlgorithm,
-    secret_from_env: &str,
-    secret_suffix: Option<&str>,
-    key_id_from_env: Option<&str>,
-    prepare: &[HmacPrepareBinding],
-    canonical: &HmacCanonicalConfig,
-    signature: &HmacSignatureConfig,
+    auth: &HmacAuthConfigRef<'_>,
 ) -> Result<(), String> {
-    let secret = std::env::var(secret_from_env)
-        .map_err(|_| format!("HMAC secret env var not set: {secret_from_env}"))?;
-    let key_id = match key_id_from_env {
+    let secret = std::env::var(auth.secret_from_env)
+        .map_err(|_| format!("HMAC secret env var not set: {}", auth.secret_from_env))?;
+    let key_id = match auth.key_id_from_env {
         Some(env_name) => Some(
             std::env::var(env_name)
                 .map_err(|_| format!("HMAC key ID env var not set: {env_name}"))?,
@@ -491,32 +497,32 @@ fn apply_hmac_auth(
         None => None,
     };
 
-    for binding in prepare {
+    for binding in auth.prepare {
         let value = resolve_hmac_prepare_value(&prepared.url, body, &binding.value)?;
         apply_hmac_target(prepared, &binding.target.kind, &binding.target.name, &value);
     }
 
-    let canonical_string = build_hmac_canonical_string(prepared, method, canonical)?;
-    let signing_secret = match secret_suffix {
+    let canonical_string = build_hmac_canonical_string(prepared, method, auth.canonical)?;
+    let signing_secret = match auth.secret_suffix {
         Some(suffix) => format!("{secret}{suffix}"),
         None => secret,
     };
     let signature_bytes = compute_hmac_signature_bytes(
-        algorithm,
+        auth.algorithm,
         signing_secret.as_bytes(),
         canonical_string.as_bytes(),
     )?;
-    let encoded_signature = encode_bytes(signature_bytes.as_ref(), &signature.encoding);
+    let encoded_signature = encode_bytes(signature_bytes.as_ref(), &auth.signature.encoding);
     let rendered_signature = render_hmac_template(
-        &signature.destination.template,
+        &auth.signature.destination.template,
         encoded_signature.as_str(),
         key_id.as_deref(),
     )?;
 
     apply_hmac_target(
         prepared,
-        &signature.destination.kind,
-        &signature.destination.name,
+        &auth.signature.destination.kind,
+        &auth.signature.destination.name,
         &rendered_signature,
     );
     Ok(())
@@ -1569,13 +1575,15 @@ mod tests {
             &mut prepared,
             &Method::POST,
             body,
-            algorithm,
-            secret_from_env,
-            secret_suffix.as_deref(),
-            key_id_from_env.as_deref(),
-            prepare,
-            canonical,
-            signature,
+            &HmacAuthConfigRef {
+                algorithm,
+                secret_from_env,
+                secret_suffix: secret_suffix.as_deref(),
+                key_id_from_env: key_id_from_env.as_deref(),
+                prepare,
+                canonical,
+                signature,
+            },
         )
         .unwrap();
 
@@ -1756,7 +1764,7 @@ mod tests {
             routing: RoutingConfig::Proxy {
                 url: upstream_base_url.clone(),
                 path_rewrites: vec![],
-                auth: Some(isi_access_token_auth_config(&token_base_url)),
+                auth: Some(Box::new(isi_access_token_auth_config(&token_base_url))),
             },
             ..make_api("test")
         };
@@ -2018,11 +2026,11 @@ mod tests {
             routing: RoutingConfig::Proxy {
                 url: base_url,
                 path_rewrites: vec![],
-                auth: Some(AuthConfig::Header {
+                auth: Some(Box::new(AuthConfig::Header {
                     key: "x-api-key".to_string(),
                     prefix: Some("Bearer ".to_string()),
                     value_from_env: "_TEST_PROXY_AUTH".to_string(),
-                }),
+                })),
             },
             ..make_api("test")
         };
@@ -2103,7 +2111,7 @@ mod tests {
             routing: RoutingConfig::Proxy {
                 url: base_url.clone(),
                 path_rewrites: vec![],
-                auth: Some(alibaba_hmac_auth_config(false)),
+                auth: Some(Box::new(alibaba_hmac_auth_config(false))),
             },
             ..make_api("test")
         };
@@ -2179,13 +2187,15 @@ mod tests {
             &mut expected,
             &Method::POST,
             body.as_ref(),
-            algorithm,
-            secret_from_env,
-            secret_suffix.as_deref(),
-            key_id_from_env.as_deref(),
-            prepare,
-            canonical,
-            signature,
+            &HmacAuthConfigRef {
+                algorithm,
+                secret_from_env,
+                secret_suffix: secret_suffix.as_deref(),
+                key_id_from_env: key_id_from_env.as_deref(),
+                prepare,
+                canonical,
+                signature,
+            },
         )
         .unwrap();
 
@@ -2222,7 +2232,7 @@ mod tests {
             routing: RoutingConfig::Proxy {
                 url: base_url.clone(),
                 path_rewrites: vec![],
-                auth: Some(AuthConfig::Hmac {
+                auth: Some(Box::new(AuthConfig::Hmac {
                     algorithm: HmacAlgorithm::Sha256,
                     secret_from_env: "_TEST_HMAC_QUERY_SECRET".to_string(),
                     secret_suffix: None,
@@ -2243,7 +2253,7 @@ mod tests {
                             template: "{signature}".to_string(),
                         },
                     },
-                }),
+                })),
             },
             ..make_api("test")
         };
@@ -2271,7 +2281,7 @@ mod tests {
             routing: RoutingConfig::Proxy {
                 url: base_url.clone(),
                 path_rewrites: vec![],
-                auth: Some(AuthConfig::Hmac {
+                auth: Some(Box::new(AuthConfig::Hmac {
                     algorithm: HmacAlgorithm::Sha256,
                     secret_from_env: "_TEST_HMAC_MISSING_SECRET".to_string(),
                     secret_suffix: None,
@@ -2291,7 +2301,7 @@ mod tests {
                             template: "{signature}".to_string(),
                         },
                     },
-                }),
+                })),
             },
             ..make_api("test")
         };
@@ -2330,10 +2340,10 @@ mod tests {
             routing: RoutingConfig::Proxy {
                 url: base_url,
                 path_rewrites: vec![],
-                auth: Some(AuthConfig::QueryParam {
+                auth: Some(Box::new(AuthConfig::QueryParam {
                     key: "api_key".to_string(),
                     value_from_env: "_TEST_PROXY_QUERY_AUTH".to_string(),
-                }),
+                })),
             },
             ..make_api("test")
         };
@@ -2389,13 +2399,13 @@ mod tests {
             routing: RoutingConfig::Proxy {
                 url: "https://api.example.com".to_string(),
                 path_rewrites: vec![],
-                auth: Some(AuthConfig::Oauth2 {
+                auth: Some(Box::new(AuthConfig::Oauth2 {
                     token_url: "https://oauth.example.com/token".to_string(),
                     scopes: vec!["scope-a".to_string()],
                     client_id_from_env: Some("_TEST_MISSING_CLIENT_ID".to_string()),
                     client_secret_from_env: Some("_TEST_MISSING_CLIENT_SECRET".to_string()),
                     headers: HashMap::new(),
-                }),
+                })),
             },
             ..make_api("test")
         };

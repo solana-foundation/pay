@@ -92,7 +92,7 @@ pub enum RoutingConfig {
         path_rewrites: Vec<PathRewrite>,
         /// How the proxy injects upstream API credentials after payment.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        auth: Option<AuthConfig>,
+        auth: Option<Box<AuthConfig>>,
     },
     /// Respond directly — return 200 with the verified payment signature,
     /// or 401 if the request was denied. No upstream call.
@@ -148,7 +148,7 @@ impl RoutingConfig {
     /// The auth config, if this is a proxy route.
     pub fn auth(&self) -> Option<&AuthConfig> {
         match self {
-            Self::Proxy { auth, .. } => auth.as_ref(),
+            Self::Proxy { auth, .. } => auth.as_deref(),
             Self::Respond {} => None,
         }
     }
@@ -2475,7 +2475,7 @@ endpoints:
           tiers:
             - price_usd: 1.0
 "#;
-        let spec: ApiSpec = serde_yml::from_str(&yaml).unwrap();
+        let spec: ApiSpec = serde_yml::from_str(yaml).unwrap();
         let errs = validate_api_spec(&spec);
         assert!(
             errs.iter()
@@ -2509,7 +2509,7 @@ endpoints:
               tiers:
                 - price_usd: 1.0
 "#;
-        let spec: ApiSpec = serde_yml::from_str(&yaml).unwrap();
+        let spec: ApiSpec = serde_yml::from_str(yaml).unwrap();
         let errs = validate_api_spec(&spec);
         assert!(
             errs.iter().any(|e| e.contains("variant model=tiny-model")),
@@ -2540,7 +2540,7 @@ endpoints:
             - price_usd: 0.0
             - price_usd: 0.000001
 "#;
-        let spec: ApiSpec = serde_yml::from_str(&yaml).unwrap();
+        let spec: ApiSpec = serde_yml::from_str(yaml).unwrap();
         let errs = validate_api_spec(&spec);
         assert!(errs.is_empty(), "expected no errors, got: {errs:?}");
     }
@@ -2616,19 +2616,15 @@ endpoints:
         template: "acs {key_id}:{signature}""#,
         );
         let spec: ApiSpec = serde_yml::from_str(&yaml).unwrap();
-        match spec.routing {
-            RoutingConfig::Proxy {
-                auth:
-                    Some(AuthConfig::Hmac {
-                        algorithm,
-                        secret_from_env,
-                        key_id_from_env,
-                        canonical,
-                        signature,
-                        ..
-                    }),
+        match spec.routing.auth() {
+            Some(AuthConfig::Hmac {
+                algorithm,
+                secret_from_env,
+                key_id_from_env,
+                canonical,
+                signature,
                 ..
-            } => {
+            }) => {
                 assert_eq!(
                     secret_from_env,
                     "ALIBABA_MACHINE_TRANSLATION_ACCESS_KEY_SECRET"
@@ -2840,16 +2836,12 @@ endpoints:
       template: "{token}""#,
         );
         let spec: ApiSpec = serde_yml::from_str(&yaml).unwrap();
-        match spec.routing {
-            RoutingConfig::Proxy {
-                auth:
-                    Some(AuthConfig::AccessToken {
-                        prepare,
-                        fetch,
-                        inject,
-                    }),
-                ..
-            } => {
+        match spec.routing.auth() {
+            Some(AuthConfig::AccessToken {
+                prepare,
+                fetch,
+                inject,
+            }) => {
                 assert_eq!(prepare.len(), 1);
                 assert!(matches!(fetch.method, HttpMethod::Get));
                 assert_eq!(fetch.prepare.len(), 2);
