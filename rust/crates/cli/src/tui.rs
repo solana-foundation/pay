@@ -5,6 +5,8 @@
 //! challenges within that budget/time are then paid automatically.
 
 use std::io;
+use std::io::Write;
+use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -14,8 +16,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use pay_core::client::balance::{AccountBalances, ReceivedFunds, ReceivedToken};
-use qrcode::QrCode;
-use qrcode::render::unicode;
+use qrcode::{Color as QrColor, QrCode};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -30,12 +31,12 @@ const POLL_COUNTDOWN: Duration = Duration::from_secs(4);
 struct TopupDetected {
     received: ReceivedFunds,
     /// On-chain transaction hash for the funding transfer (only present
-    /// when MoonPay reports completion via the on-ramp status endpoint).
+    /// when MoonPay reports completion via the external-id status endpoint).
     tx_hash: Option<String>,
 }
 
-/// Status updates from the on-ramp poller thread (`/onramp/status`).
-#[derive(Debug)]
+/// Status updates from the MoonPay poller thread.
+#[derive(Debug, PartialEq, Eq)]
 enum OnrampUpdate {
     /// MoonPay has reported a completed payment + on-chain transfer.
     Completed {
@@ -74,7 +75,9 @@ const STEP_AMOUNT: u64 = 500_000; // 0.50 USDC in base units (6 decimals)
 const TOPUP_MAX_STEPS: usize = 25;
 const TOPUP_STEP_USDC: f64 = 1.0;
 const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-/// Polling cadence for `/onramp/status`.
+const MOONPAY_BUY_URL: &str = "https://buy.moonpay.com/v2/buy";
+const MOONPAY_EXTERNAL_TX_ENDPOINT: &str = "https://api.moonpay.com/v1/transactions/ext";
+/// Polling cadence for MoonPay's external transaction status endpoint.
 const ONRAMP_POLL_INTERVAL: Duration = Duration::from_secs(3);
 /// Hard cap on the on-ramp poller — if we don't see a terminal status by then,
 /// the thread exits silently. (The user can press `r` to relaunch.)
@@ -181,7 +184,7 @@ enum TopupFocus {
     Methods,
 }
 
-/// Resolve the on-ramp host from `PAY_ONRAMP_HOST`, falling back to
+/// Resolve the redirect host from `PAY_ONRAMP_HOST`, falling back to
 /// `https://pay.sh`. Trailing slashes are stripped so callers can `format!`
 /// without double-slash hazards.
 fn resolve_onramp_host() -> String {
@@ -193,11 +196,13 @@ fn resolve_onramp_host() -> String {
 ///
 /// Presents two options to the user:
 ///
-/// 1. **Buy stablecoins** (default) — opens the MoonPay on-ramp in the user's
-///    browser via `pay-web-ui`'s `/onramp` page and polls
-///    `GET {host}/onramp/status?externalTransactionId=<id>` until MoonPay
-///    reports a terminal status. The on-ramp host is read from the
-///    `PAY_ONRAMP_HOST` env var (default: `https://pay.sh`).
+/// 1. **Buy stablecoins** (default) — copies the destination wallet address to
+///    the clipboard, shows a brief launch animation, then opens MoonPay
+///    directly in the user's browser and polls MoonPay's
+///    `GET /v1/transactions/ext/{externalTransactionId}?apiKey=...` endpoint
+///    until a terminal status arrives. `PAY_ONRAMP_HOST` only controls the
+///    browser redirect target (`{host}/onramp/done`), defaulting to
+///    `https://pay.sh`.
 /// 2. **Top-up from mobile wallet** — renders a Solana Pay QR code that any
 ///    Solana wallet can scan, while polling the RPC for incoming SOL/SPL token
 ///    balance changes against `pubkey`.
@@ -212,11 +217,10 @@ fn resolve_onramp_host() -> String {
 ///
 /// # Parameters
 /// - `pubkey`: base58 destination address shown in the QR code and threaded
-///   into the MoonPay widget as the locked `walletAddress`.
+///   into MoonPay as the locked `walletAddress`.
 /// - `rpc_url`: Solana JSON-RPC endpoint used by the background balance poller
 ///   to detect on-chain top-ups.
-/// - `account_name`: human-readable account label rendered in the TUI and
-///   forwarded to `/onramp` as a query param for the browser title.
+/// - `account_name`: human-readable account label rendered in the TUI.
 ///
 /// # Returns
 /// - `Ok(Some(TopupCompletion))` if funds landed (either path). The completion
@@ -266,6 +270,7 @@ fn run_topup(
 
     // Active MoonPay session (set after the user hits Enter on "Buy stablecoins").
     let mut onramp: Option<OnrampSession> = None;
+    let mut onramp_notice: Option<String> = None;
     let mut onramp_error: Option<String> = None;
     let (otx, orx) = mpsc::channel::<OnrampUpdate>();
 
@@ -333,6 +338,7 @@ fn run_topup(
                 focus,
                 amount_pos,
                 onramp.as_ref(),
+                onramp_notice.as_deref(),
                 onramp_error.as_deref(),
             )?;
             return Ok(Some(received));
@@ -357,6 +363,7 @@ fn run_topup(
                         focus,
                         amount_pos,
                         onramp.as_ref(),
+                        onramp_notice.as_deref(),
                         onramp_error.as_deref(),
                     )?;
                     return Ok(Some(detected));
@@ -401,6 +408,7 @@ fn run_topup(
                 amount_pos,
                 None,
                 onramp.as_ref(),
+                onramp_notice.as_deref(),
                 onramp_error.as_deref(),
             );
         })?;
@@ -434,11 +442,32 @@ fn run_topup(
                 }
                 KeyCode::Enter => {
                     if options[selected] == TopupOption::BuyStablecoins {
-                        // Launch (or relaunch) a MoonPay session.
-                        let session =
-                            launch_onramp_session(onramp_host, pubkey, account_name, &otx);
-                        onramp_error = None;
-                        onramp = Some(session);
+                        if onramp.is_none() {
+                            let copied_to_clipboard = copy_to_clipboard(pubkey).is_ok();
+                            animate_onramp_launch(
+                                terminal,
+                                pubkey,
+                                account_name,
+                                &options,
+                                selected,
+                                focus,
+                                &status,
+                                amount_pos,
+                                copied_to_clipboard,
+                            )?;
+                            match launch_onramp_session(onramp_host, pubkey, &otx) {
+                                Ok(session) => {
+                                    onramp_notice = None;
+                                    onramp_error = None;
+                                    onramp = Some(session);
+                                }
+                                Err(reason) => {
+                                    onramp_notice = None;
+                                    onramp_error = Some(reason);
+                                    onramp = None;
+                                }
+                            }
+                        }
                     } else {
                         return Ok(None);
                     }
@@ -477,6 +506,7 @@ struct BlinkState {
 }
 
 /// Active MoonPay session state surfaced into the TUI.
+#[derive(Debug)]
 struct OnrampSession {
     external_id: String,
     url: String,
@@ -493,6 +523,7 @@ fn blink_checkmark(
     focus: TopupFocus,
     amount_pos: usize,
     onramp: Option<&OnrampSession>,
+    onramp_notice: Option<&str>,
     onramp_error: Option<&str>,
 ) -> io::Result<()> {
     for i in 0..5 {
@@ -512,11 +543,64 @@ fn blink_checkmark(
                 amount_pos,
                 blink.as_ref(),
                 onramp,
+                onramp_notice,
                 onramp_error,
             );
         })?;
         std::thread::sleep(Duration::from_millis(300));
     }
+    Ok(())
+}
+
+fn animate_onramp_launch(
+    terminal: &mut Terminal<CrosstermBackend<io::Stderr>>,
+    pubkey: &str,
+    account_name: &str,
+    options: &[TopupOption],
+    selected: usize,
+    focus: TopupFocus,
+    status: &PollStatus,
+    amount_pos: usize,
+    copied_to_clipboard: bool,
+) -> io::Result<()> {
+    let frames: &[&str] = if copied_to_clipboard {
+        &[
+            "Copying wallet address.",
+            "Copying wallet address..",
+            "Wallet address copied. Paste it into MoonPay when asked which wallet to fund.",
+            "Wallet address copied. Opening MoonPay...",
+        ]
+    } else {
+        &[
+            "Clipboard copy unavailable.",
+            "When MoonPay asks which wallet to fund, paste the pubkey shown above.",
+            "Opening MoonPay with this wallet address locked in..",
+            "Opening MoonPay with this wallet address locked in...",
+        ]
+    };
+
+    for notice in frames {
+        terminal.draw(|frame| {
+            let area = frame.area();
+            render_topup_selector(
+                frame,
+                area,
+                pubkey,
+                account_name,
+                options,
+                selected,
+                focus,
+                status,
+                amount_pos,
+                None,
+                None,
+                Some(notice),
+                None,
+            );
+        })?;
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
     Ok(())
 }
 
@@ -582,6 +666,7 @@ fn render_topup_selector(
     amount_pos: usize,
     blink: Option<&BlinkState>,
     onramp: Option<&OnrampSession>,
+    onramp_notice: Option<&str>,
     onramp_error: Option<&str>,
 ) {
     frame.render_widget(Clear, area);
@@ -700,9 +785,14 @@ fn render_topup_selector(
         TopupOption::TransferFromExistingAccount => {
             render_qr_detail(frame, right[1], pubkey, account_name, amount_pos, blink)
         }
-        TopupOption::BuyStablecoins => {
-            render_buy_stablecoins_detail(frame, right[1], pubkey, onramp, onramp_error)
-        }
+        TopupOption::BuyStablecoins => render_buy_stablecoins_detail(
+            frame,
+            right[1],
+            pubkey,
+            onramp,
+            onramp_notice,
+            onramp_error,
+        ),
     }
 
     render_topup_controls(frame, chunks[1], active, status, onramp.is_some());
@@ -803,6 +893,7 @@ fn render_buy_stablecoins_detail(
     area: Rect,
     pubkey: &str,
     onramp: Option<&OnrampSession>,
+    onramp_notice: Option<&str>,
     onramp_error: Option<&str>,
 ) {
     frame.render_widget(
@@ -843,12 +934,16 @@ fn render_buy_stablecoins_detail(
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    " to open MoonPay in your browser.",
+                    " to copy this wallet address and open MoonPay.",
                     Style::default().fg(Color::Gray),
                 ),
             ]));
             lines.push(Line::from(Span::styled(
-                "We'll wait here and confirm when funds land.",
+                "We'll copy the address first, then launch MoonPay.",
+                Style::default().fg(Color::DarkGray),
+            )));
+            lines.push(Line::from(Span::styled(
+                "When MoonPay asks which wallet to fund, paste your copied pubkey.",
                 Style::default().fg(Color::DarkGray),
             )));
         }
@@ -892,6 +987,14 @@ fn render_buy_stablecoins_detail(
                 Span::styled(" abort", Style::default().fg(Color::DarkGray)),
             ]));
         }
+    }
+
+    if let Some(notice) = onramp_notice {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            notice.to_string(),
+            Style::default().fg(Color::DarkGray),
+        )));
     }
 
     if let Some(err) = onramp_error {
@@ -1021,7 +1124,7 @@ fn render_topup_controls(
             Span::styled("↑ ↓", Style::default().fg(Color::Cyan).bold()),
             Span::styled(" move  │  ", Style::default().dim()),
             Span::styled("Enter", Style::default().fg(Color::Green).bold()),
-            Span::styled(" open MoonPay  │  ", Style::default().dim()),
+            Span::styled(" copy + open  │  ", Style::default().dim()),
             Span::styled("Esc", Style::default().fg(Color::Red).bold()),
             Span::styled(" skip", Style::default().dim()),
         ],
@@ -1079,7 +1182,7 @@ fn print_topup_instructions(pubkey: &str) {
     eprintln!("Top up your pay account:");
     eprintln!("  Address: {pubkey}");
     eprintln!("  1. Transfer funds from an existing Solana account.");
-    eprintln!("  2. Buy funds using an onramp such as Coinbase: {DEFAULT_ONRAMP_URL}");
+    eprintln!("  2. Buy funds with MoonPay: {DEFAULT_ONRAMP_URL}");
 }
 
 /// Build a sanitized `externalTransactionId` (UUID v4 with the `pay-` prefix).
@@ -1087,60 +1190,110 @@ fn new_external_id() -> String {
     format!("pay-{}", uuid::Uuid::new_v4())
 }
 
-/// Compose the on-ramp URL we open in the browser. The page reads these query
-/// params and POSTs to `/onramp/sign` to fetch a MoonPay signature.
-fn build_onramp_url(host: &str, pubkey: &str, account_name: &str, external_id: &str) -> String {
-    format!(
-        "{host}/onramp?walletAddress={}&externalTransactionId={}&account={}",
-        urlencoding::encode(pubkey),
-        urlencoding::encode(external_id),
-        urlencoding::encode(account_name),
-    )
-}
-
-/// Launch a fresh on-ramp session: open the browser and start a status poller.
-fn launch_onramp_session(
-    onramp_host: &str,
-    pubkey: &str,
-    account_name: &str,
-    updates: &mpsc::Sender<OnrampUpdate>,
-) -> OnrampSession {
-    let host = onramp_host.trim_end_matches('/').to_string();
-    let external_id = new_external_id();
-    let url = build_onramp_url(&host, pubkey, account_name, &external_id);
-    let _ = open_url(&url);
-    spawn_onramp_poller(host, external_id.clone(), updates.clone());
-    OnrampSession {
-        external_id,
-        url,
-        started_at: Instant::now(),
+fn resolve_moonpay_api_key() -> Result<String, String> {
+    match std::env::var("PAY_MOONPAY_API_KEY") {
+        Ok(value) if !value.trim().is_empty() => Ok(value),
+        Ok(_) => Err("PAY_MOONPAY_API_KEY is empty.".to_string()),
+        Err(_) => Err("PAY_MOONPAY_API_KEY is not set.".to_string()),
     }
 }
 
-/// Background thread that polls `GET {host}/onramp/status?externalTransactionId=<id>`
-/// every [`ONRAMP_POLL_INTERVAL`] until it sees a terminal status, exits, or
-/// hits [`ONRAMP_POLL_TIMEOUT`].
-fn spawn_onramp_poller(host: String, external_id: String, tx: mpsc::Sender<OnrampUpdate>) {
-    std::thread::spawn(move || {
-        #[derive(serde::Deserialize)]
-        struct StatusResp {
-            status: String,
-            #[serde(rename = "txHash")]
-            tx_hash: Option<String>,
-            #[serde(rename = "cryptoAmount")]
-            crypto_amount: Option<String>,
-            #[serde(rename = "cryptoCurrency")]
-            crypto_currency: Option<String>,
-            #[serde(rename = "failureReason")]
-            failure_reason: Option<String>,
-        }
+fn build_onramp_redirect_url(host: &str) -> String {
+    format!("{host}/onramp/done")
+}
 
+/// Compose the direct MoonPay checkout URL we open in the browser.
+fn build_onramp_url(host: &str, pubkey: &str, external_id: &str, api_key: &str) -> String {
+    let redirect_url = build_onramp_redirect_url(host);
+    format!(
+        "{MOONPAY_BUY_URL}?apiKey={}&currencyCode=usdc_sol&walletAddress={}&baseCurrencyAmount=20&externalTransactionId={}&redirectURL={}",
+        urlencoding::encode(api_key),
+        urlencoding::encode(pubkey),
+        urlencoding::encode(external_id),
+        urlencoding::encode(&redirect_url),
+    )
+}
+
+/// Launch a fresh MoonPay session: open the browser and start a status poller.
+fn launch_onramp_session(
+    onramp_host: &str,
+    pubkey: &str,
+    updates: &mpsc::Sender<OnrampUpdate>,
+) -> Result<OnrampSession, String> {
+    let host = onramp_host.trim_end_matches('/').to_string();
+    let api_key = resolve_moonpay_api_key()?;
+    let external_id = new_external_id();
+    let url = build_onramp_url(&host, pubkey, &external_id, &api_key);
+    open_url(&url).map_err(|err| format!("failed to open MoonPay: {err}"))?;
+    spawn_onramp_poller(external_id.clone(), api_key, updates.clone());
+    Ok(OnrampSession {
+        external_id,
+        url,
+        started_at: Instant::now(),
+    })
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct MoonpayCurrency {
+    code: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct MoonpayTransaction {
+    status: String,
+    #[serde(rename = "failureReason")]
+    failure_reason: Option<String>,
+    #[serde(rename = "cryptoTransactionId")]
+    crypto_transaction_id: Option<String>,
+    #[serde(rename = "quoteCurrencyAmount")]
+    quote_currency_amount: Option<serde_json::Number>,
+    currency: Option<MoonpayCurrency>,
+}
+
+fn moonpay_amount_string(amount: &Option<serde_json::Number>) -> Option<String> {
+    amount.as_ref().map(ToString::to_string)
+}
+
+fn interpret_moonpay_transactions(
+    transactions: &[MoonpayTransaction],
+) -> Result<Option<OnrampUpdate>, String> {
+    match transactions {
+        [] => Ok(None),
+        [transaction] => match transaction.status.as_str() {
+            "completed" => Ok(Some(OnrampUpdate::Completed {
+                tx_hash: transaction.crypto_transaction_id.clone(),
+                crypto_amount: moonpay_amount_string(&transaction.quote_currency_amount),
+                crypto_currency: transaction
+                    .currency
+                    .as_ref()
+                    .and_then(|currency| currency.code.clone()),
+            })),
+            "failed" => Ok(Some(OnrampUpdate::Failed {
+                reason: transaction
+                    .failure_reason
+                    .clone()
+                    .unwrap_or_else(|| "unknown reason".into()),
+            })),
+            _ => Ok(None),
+        },
+        _ => {
+            Err("multiple MoonPay transactions matched this top-up; refusing to guess.".to_string())
+        }
+    }
+}
+
+/// Background thread that polls MoonPay's external-id lookup endpoint every
+/// [`ONRAMP_POLL_INTERVAL`] until it sees a terminal status, exits, or hits
+/// [`ONRAMP_POLL_TIMEOUT`].
+fn spawn_onramp_poller(external_id: String, api_key: String, tx: mpsc::Sender<OnrampUpdate>) {
+    std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Runtime::new() else {
             return;
         };
         let url = format!(
-            "{host}/onramp/status?externalTransactionId={}",
-            urlencoding::encode(&external_id)
+            "{MOONPAY_EXTERNAL_TX_ENDPOINT}/{}?apiKey={}",
+            urlencoding::encode(&external_id),
+            urlencoding::encode(&api_key)
         );
         let client = reqwest::Client::new();
         let started = Instant::now();
@@ -1150,26 +1303,35 @@ fn spawn_onramp_poller(host: String, external_id: String, tx: mpsc::Sender<Onram
                 if started.elapsed() > ONRAMP_POLL_TIMEOUT {
                     return;
                 }
-                if let Ok(resp) = client.get(&url).send().await
-                    && resp.status().is_success()
-                    && let Ok(body) = resp.json::<StatusResp>().await
-                {
-                    match body.status.as_str() {
-                        "completed" => {
-                            let _ = tx.send(OnrampUpdate::Completed {
-                                tx_hash: body.tx_hash,
-                                crypto_amount: body.crypto_amount,
-                                crypto_currency: body.crypto_currency,
+                if let Ok(resp) = client.get(&url).send().await {
+                    match resp.status() {
+                        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
+                            let _ = tx.send(OnrampUpdate::Failed {
+                                reason: "MoonPay status polling was unauthorized; check PAY_MOONPAY_API_KEY."
+                                    .to_string(),
                             });
                             return;
                         }
-                        "failed" => {
-                            let _ = tx.send(OnrampUpdate::Failed {
-                                reason: body
-                                    .failure_reason
-                                    .unwrap_or_else(|| "unknown reason".into()),
-                            });
-                            return;
+                        status if status.is_success() => {
+                            if let Ok(body) = resp.json::<Vec<MoonpayTransaction>>().await {
+                                match interpret_moonpay_transactions(&body) {
+                                    Ok(Some(update)) => {
+                                        let is_terminal = matches!(
+                                            update,
+                                            OnrampUpdate::Completed { .. } | OnrampUpdate::Failed { .. }
+                                        );
+                                        let _ = tx.send(update);
+                                        if is_terminal {
+                                            return;
+                                        }
+                                    }
+                                    Ok(None) => {}
+                                    Err(reason) => {
+                                        let _ = tx.send(OnrampUpdate::Failed { reason });
+                                        return;
+                                    }
+                                }
+                            }
                         }
                         _ => {}
                     }
@@ -1213,6 +1375,66 @@ fn synthesize_received_funds(amount: &Option<String>, currency: &Option<String>)
 
 fn open_url(url: &str) -> io::Result<()> {
     webbrowser::open(url).map_err(io::Error::other)
+}
+
+fn pipe_to_command(program: &str, args: &[&str], text: &str) -> io::Result<()> {
+    let mut child = ProcessCommand::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(text.as_bytes())?;
+    }
+
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "{program} exited with status {status}"
+        )))
+    }
+}
+
+fn copy_to_clipboard(text: &str) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        return pipe_to_command("pbcopy", &[], text);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        return pipe_to_command("cmd", &["/C", "clip"], text);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let commands: &[(&str, &[&str])] = &[
+            ("wl-copy", &[]),
+            ("xclip", &["-selection", "clipboard"]),
+            ("xsel", &["--clipboard", "--input"]),
+        ];
+        let mut last_err = None;
+        for (program, args) in commands {
+            match pipe_to_command(program, args, text) {
+                Ok(()) => return Ok(()),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) => last_err = Some(err),
+            }
+        }
+        return Err(last_err.unwrap_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "no clipboard command available")
+        }));
+    }
+
+    #[allow(unreachable_code)]
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "clipboard copy is not supported on this platform",
+    ))
 }
 
 fn run(
@@ -1780,9 +2002,38 @@ fn render_controls(frame: &mut ratatui::Frame, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     const SAMPLE_SOLANA_PAY_URL: &str = "solana:11111111111111111111111111111111?amount=5&spl-token=\
          EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var(key).ok();
+            unsafe { std::env::remove_var(key) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
 
     #[test]
     fn topup_qr_render_keeps_square_physical_geometry() {
@@ -1824,5 +2075,155 @@ mod tests {
         let qr = render_qr(SAMPLE_SOLANA_PAY_URL, 1, 1).expect("QR should encode");
 
         assert!(qr.is_none());
+    }
+
+    #[test]
+    fn build_onramp_redirect_url_targets_done_page() {
+        assert_eq!(
+            build_onramp_redirect_url("https://pay.sh"),
+            "https://pay.sh/onramp/done"
+        );
+    }
+
+    #[test]
+    fn build_onramp_url_targets_moonpay_with_fixed_params() {
+        let url = build_onramp_url("https://pay.sh", "wallet123", "pay-abc", "moonpay-key");
+        let parsed = reqwest::Url::parse(&url).expect("MoonPay URL should parse");
+        let query = parsed
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+
+        assert_eq!(parsed.as_str().starts_with(MOONPAY_BUY_URL), true);
+        assert_eq!(query.get("apiKey"), Some(&"moonpay-key".into()));
+        assert_eq!(query.get("currencyCode"), Some(&"usdc_sol".into()));
+        assert_eq!(query.get("walletAddress"), Some(&"wallet123".into()));
+        assert_eq!(query.get("baseCurrencyAmount"), Some(&"20".into()));
+        assert_eq!(query.get("externalTransactionId"), Some(&"pay-abc".into()));
+        assert_eq!(
+            query.get("redirectURL"),
+            Some(&"https://pay.sh/onramp/done".into())
+        );
+        assert!(query.get("account").is_none());
+    }
+
+    #[test]
+    fn interpret_moonpay_transactions_keeps_polling_for_empty_array() {
+        let result = interpret_moonpay_transactions(&[]).expect("empty array should be valid");
+
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn interpret_moonpay_transactions_maps_completed_transaction() {
+        let body: Vec<MoonpayTransaction> = serde_json::from_str(
+            r#"[
+                {
+                    "status": "completed",
+                    "cryptoTransactionId": "tx-123",
+                    "quoteCurrencyAmount": 19.95,
+                    "currency": { "code": "usdc_sol" }
+                }
+            ]"#,
+        )
+        .expect("MoonPay payload should parse");
+
+        let result = interpret_moonpay_transactions(&body).expect("completed payload should parse");
+
+        assert_eq!(
+            result,
+            Some(OnrampUpdate::Completed {
+                tx_hash: Some("tx-123".to_string()),
+                crypto_amount: Some("19.95".to_string()),
+                crypto_currency: Some("usdc_sol".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn interpret_moonpay_transactions_maps_failed_transaction() {
+        let body: Vec<MoonpayTransaction> = serde_json::from_str(
+            r#"[
+                {
+                    "status": "failed",
+                    "failureReason": "card_declined"
+                }
+            ]"#,
+        )
+        .expect("MoonPay payload should parse");
+
+        let result = interpret_moonpay_transactions(&body).expect("failed payload should parse");
+
+        assert_eq!(
+            result,
+            Some(OnrampUpdate::Failed {
+                reason: "card_declined".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn interpret_moonpay_transactions_ignores_inflight_transaction() {
+        let body: Vec<MoonpayTransaction> = serde_json::from_str(
+            r#"[
+                {
+                    "status": "waitingPayment",
+                    "quoteCurrencyAmount": 20
+                }
+            ]"#,
+        )
+        .expect("MoonPay payload should parse");
+
+        let result = interpret_moonpay_transactions(&body).expect("in-flight payload should parse");
+
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn interpret_moonpay_transactions_rejects_multiple_matches() {
+        let body: Vec<MoonpayTransaction> = serde_json::from_str(
+            r#"[
+                { "status": "pending" },
+                { "status": "completed" }
+            ]"#,
+        )
+        .expect("MoonPay payload should parse");
+
+        let err = interpret_moonpay_transactions(&body).expect_err("multiple matches should fail");
+
+        assert!(err.contains("multiple MoonPay transactions matched"));
+    }
+
+    #[test]
+    fn synthesize_received_funds_maps_usdc_amounts() {
+        let received =
+            synthesize_received_funds(&Some("19.95".to_string()), &Some("usdc_sol".to_string()));
+
+        assert_eq!(received.sol_lamports, 0);
+        assert_eq!(received.tokens.len(), 1);
+        assert_eq!(received.tokens[0].mint, USDC_MINT);
+        assert_eq!(received.tokens[0].ui_amount, 19.95);
+        assert_eq!(received.tokens[0].symbol, Some("USDC"));
+    }
+
+    #[test]
+    #[serial]
+    fn launch_onramp_session_requires_api_key() {
+        let _api_key = EnvVarGuard::remove("PAY_MOONPAY_API_KEY");
+        let (tx, _rx) = mpsc::channel();
+
+        let err = launch_onramp_session("https://pay.sh", "wallet123", &tx)
+            .expect_err("missing API key should fail");
+
+        assert!(err.contains("PAY_MOONPAY_API_KEY"));
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_moonpay_api_key_reads_env() {
+        let _api_key = EnvVarGuard::set("PAY_MOONPAY_API_KEY", "moonpay-key");
+
+        let value = resolve_moonpay_api_key().expect("env var should be read");
+
+        assert_eq!(value, "moonpay-key");
     }
 }
