@@ -128,7 +128,9 @@ fn launch_windows(mcp_config: serde_json::Value, extra_args: &[String]) -> pay_c
         .stderr(Stdio::inherit())
         .status()
         .map_err(|e| {
-            pay_core::Error::Config(format!("Failed to launch claude: {e}. Is it installed?"))
+            pay_core::Error::Config(format!(
+                "Failed to launch `claude`: {e}. Install: `npm install -g @anthropic-ai/claude-code` (or see https://claude.com/claude-code)."
+            ))
         })?;
 
     Ok(status.code().unwrap_or(1))

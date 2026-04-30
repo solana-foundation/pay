@@ -77,7 +77,7 @@ impl EndpointsCommand {
             eprintln!(
                 "  {}",
                 format!(
-                    "Gateway: {}\nUse `pay curl <gateway><path>` to make requests.",
+                    "Gateway: {}\n\n  Use `pay curl <gateway><path>` to make requests.",
                     result.meta.service_url
                 )
                 .dimmed()

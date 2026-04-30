@@ -88,7 +88,8 @@ impl SolanaCommand {
 
         let status = cmd.status().map_err(|e| {
             pay_core::Error::Config(format!(
-                "Failed to launch solana: {e}. Is the Solana CLI installed?"
+                "Failed to launch `solana`: {e}. Install the Solana CLI: \
+                 `sh -c \"$(curl -sSfL https://release.anza.xyz/stable/install)\"` (see https://docs.anza.xyz/cli/install)."
             ))
         })?;
 

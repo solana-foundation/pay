@@ -47,7 +47,7 @@ to the normal wallet approval flow.
   batch, or multi-step endpoints only when the task requires them or they
   materially reduce total cost.
 - If price, schema, network support, or result quality is unclear after
-  `search_skills` and one `get_skill_endpoints` lookup, ask the user instead of
+  `search_catalog` and one `get_catalog_entry` lookup, ask the user instead of
   guessing.
 - If a paid call fails with 404, unsupported network, invalid payment challenge,
   or unusable schema, do not keep trying random providers. Try at most one clear
@@ -55,7 +55,7 @@ to the normal wallet approval flow.
 
 ## Cost Patterns
 
-- Use provider usage notes returned by `get_skill_endpoints`; they often include
+- Use provider usage notes returned by `get_catalog_entry`; they often include
   endpoint-specific ways to avoid wasted paid calls.
 - Batch records when an endpoint supports arrays.
 - Use the smallest `limit`, date window, media duration, or result fields that
@@ -70,9 +70,9 @@ to the normal wallet approval flow.
 ## Examples
 
 - "what's the volume of USDC that moved on Solana the past week" -> call
-  `search_skills` for blockchain analytics or BigQuery. Prefer one aggregate
+  `search_catalog` for blockchain analytics or BigQuery. Prefer one aggregate
   query/request over scraping dashboards or doing RPC loops.
-- "query public BigQuery data" -> call `search_skills` for BigQuery and use the
+- "query public BigQuery data" -> call `search_catalog` for BigQuery and use the
   returned gateway endpoint. Include partition filters and aggregate directly
   when the dataset/table is known.
 - "current wallet activity / transaction history / token volume" -> use

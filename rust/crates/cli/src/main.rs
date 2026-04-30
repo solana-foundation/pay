@@ -82,10 +82,16 @@ fn main() {
 
     // MCP server — needs its own runtime, exit early
     if matches!(opts.command, Command::Mcp) {
-        let rt = tokio::runtime::Builder::new_multi_thread()
+        let rt = match tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
-            .expect("Failed to create tokio runtime");
+        {
+            Ok(rt) => rt,
+            Err(err) => {
+                eprintln!("Failed to start MCP server: could not create tokio runtime: {err}");
+                std::process::exit(1);
+            }
+        };
         if let Err(err) = rt.block_on(pay_mcp::run_server(&pay_mcp::McpOptions::default())) {
             eprintln!("MCP server error: {err}");
             std::process::exit(1);
@@ -186,6 +192,7 @@ fn main() {
                 | Command::Install(_)
                 | Command::Curl(_)
                 | Command::Wget(_)
+                | Command::Http(_)
                 | Command::Fetch(_)
         ) {
         None
@@ -198,7 +205,7 @@ fn main() {
     let is_agent = no_dna::is_agent();
     let is_http_tool = matches!(
         opts.command,
-        Command::Curl(_) | Command::Wget(_) | Command::Fetch(_)
+        Command::Curl(_) | Command::Wget(_) | Command::Http(_) | Command::Fetch(_)
     );
     // HTTP tools always auto-pay (Touch ID is the approval gate, not the TUI)
     let auto_pay = opts.yolo || sandbox_mode || is_agent || is_http_tool || config.auto_pay;

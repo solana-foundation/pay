@@ -762,7 +762,11 @@ pub async fn load_service_endpoints(
     service_name: &str,
 ) -> Result<Vec<Endpoint>> {
     let svc = find_service(catalog, service_name)
-        .ok_or_else(|| Error::Config(format!("service `{service_name}` not found")))?;
+        .ok_or_else(|| {
+            Error::Config(format!(
+                "service `{service_name}` not found in catalog. Try `pay skills search <query>` to discover providers."
+            ))
+        })?;
 
     if svc.endpoints_loaded() {
         return Ok(svc.endpoints.clone());
@@ -808,7 +812,11 @@ pub async fn load_service_openapi(
     service_name: &str,
 ) -> Result<Option<serde_json::Value>> {
     let svc = find_service(catalog, service_name)
-        .ok_or_else(|| Error::Config(format!("service `{service_name}` not found")))?;
+        .ok_or_else(|| {
+            Error::Config(format!(
+                "service `{service_name}` not found in catalog. Try `pay skills search <query>` to discover providers."
+            ))
+        })?;
 
     if catalog.base_url.is_empty() {
         return Err(Error::Config(
@@ -849,7 +857,11 @@ pub async fn ensure_endpoints(catalog: &mut Catalog, service_name: &str) -> Resu
                 .iter()
                 .position(|s| s.name().eq_ignore_ascii_case(service_name))
         })
-        .ok_or_else(|| Error::Config(format!("service `{service_name}` not found")))?;
+        .ok_or_else(|| {
+            Error::Config(format!(
+                "service `{service_name}` not found in catalog. Try `pay skills search <query>` to discover providers."
+            ))
+        })?;
     let svc = &mut catalog.providers[idx];
 
     if svc.endpoints_loaded() {
@@ -985,7 +997,11 @@ pub fn load_cached_skills() -> Result<Catalog> {
     cached_catalogs()
         .into_iter()
         .find(|catalog| !catalog.providers.is_empty())
-        .ok_or_else(|| Error::Config("no cached skills catalog found".to_string()))
+        .ok_or_else(|| {
+            Error::Config(
+                "No cached skills catalog. Run `pay skills list` to populate it.".to_string(),
+            )
+        })
 }
 
 /// Force-refresh: fetch all sources, merge, write cache.

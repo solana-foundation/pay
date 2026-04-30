@@ -197,9 +197,26 @@ fn do_paid_fetch(
 fn pay_error_to_tool_result(err: pay_core::Error) -> CallToolResult {
     let message = match err {
         pay_core::Error::RequestValidation(message) => message,
+        pay_core::Error::PaymentRejected(reason) if is_user_rejection(&reason) => {
+            format!(
+                "User declined the OS authentication prompt for this paid request: {reason}. \
+                 The HTTP request was NOT sent and no funds moved. Ask the user for \
+                 clarification before retrying — they may have intended to decline (in which \
+                 case clarify what to do instead), or they may want to retry and approve at \
+                 the prompt."
+            )
+        }
         other => format!("Pay curl failed: {other}"),
     };
     super::tool_error(message)
+}
+
+/// True when a `PaymentRejected` reason came from the user denying their OS
+/// auth prompt (Apple Keychain, Windows Hello, GNOME Keyring, 1Password, or
+/// the generic fallback) — not from a server-side `verification_failed` body.
+/// See `signer::rejection_source` for the matching producer.
+fn is_user_rejection(reason: &str) -> bool {
+    reason.starts_with("rejected by user")
 }
 
 fn interpret_retry(
@@ -363,6 +380,53 @@ mod tests {
             text.text,
             "Pay curl failed: Payment rejected: insufficient funds"
         );
+    }
+
+    #[test]
+    fn user_rejection_emits_clarification_guidance_macos() {
+        let result = pay_error_to_tool_result(pay_core::Error::PaymentRejected(
+            "rejected by user at Apple Keychain".to_string(),
+        ));
+
+        assert_eq!(result.is_error, Some(true));
+        let text = &result.content[0].as_text().unwrap().text;
+        assert!(text.contains("User declined"));
+        assert!(text.contains("Apple Keychain"));
+        assert!(text.contains("NOT sent"));
+        assert!(text.contains("clarification"));
+    }
+
+    #[test]
+    fn user_rejection_emits_clarification_guidance_windows() {
+        let result = pay_error_to_tool_result(pay_core::Error::PaymentRejected(
+            "rejected by user at Windows Hello".to_string(),
+        ));
+        let text = &result.content[0].as_text().unwrap().text;
+        assert!(text.contains("User declined"));
+        assert!(text.contains("Windows Hello"));
+    }
+
+    #[test]
+    fn user_rejection_emits_clarification_guidance_linux() {
+        let result = pay_error_to_tool_result(pay_core::Error::PaymentRejected(
+            "rejected by user at GNOME Keyring".to_string(),
+        ));
+        let text = &result.content[0].as_text().unwrap().text;
+        assert!(text.contains("User declined"));
+        assert!(text.contains("GNOME Keyring"));
+    }
+
+    #[test]
+    fn server_rejection_does_not_use_user_rejection_path() {
+        // Server-side verification_failed → must keep the original "Pay curl
+        // failed" prefix so the LLM sees it as a server error, not a user
+        // declination.
+        let result = pay_error_to_tool_result(pay_core::Error::PaymentRejected(
+            "wrong network: expected localnet".to_string(),
+        ));
+        let text = &result.content[0].as_text().unwrap().text;
+        assert!(text.starts_with("Pay curl failed: Payment rejected:"));
+        assert!(!text.contains("User declined"));
     }
 
     // ── Env var propagation for network/account overrides ─────────────

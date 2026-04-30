@@ -145,7 +145,9 @@ fn launch_windows(codex_args: &[String]) -> pay_core::Result<i32> {
         .stderr(Stdio::inherit())
         .status()
         .map_err(|e| {
-            pay_core::Error::Config(format!("Failed to launch codex: {e}. Is it installed?"))
+            pay_core::Error::Config(format!(
+                "Failed to launch `codex`: {e}. Install: `npm install -g @openai/codex` (or see https://github.com/openai/codex)."
+            ))
         })?;
 
     Ok(status.code().unwrap_or(1))

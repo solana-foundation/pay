@@ -90,7 +90,10 @@ fn run_curl_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunO
 
     debug!(args = ?user_args, extra = ?extra_headers, "Running curl");
 
-    // Capture body to file. Capture stderr so we can swallow it on 402.
+    // Body goes to `-o body_file` so we can swallow it on 402; stdout is piped
+    // so curl's `-w` writeout (which it emits to stdout after the transfer) is
+    // captured and re-emitted on the success path. Without this, `pay curl -w
+    // '%{http_code}'` silently drops the writeout because we'd discard stdout.
     let mut cmd = Command::new("curl");
     cmd.args(user_args);
     for h in extra_headers {
@@ -99,7 +102,7 @@ fn run_curl_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunO
     cmd.arg("-D").arg(header_path);
     cmd.arg("-o").arg(body_path);
     cmd.stdin(Stdio::inherit())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
     let output = cmd.output()?;
@@ -112,16 +115,20 @@ fn run_curl_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunO
     debug!(?status_code, exit_code, "curl finished");
 
     if status_code == Some(402) {
-        // Swallow stderr and body on 402 — CLI handles display
+        // Swallow stderr/stdout/body on 402 — CLI handles display
         return Ok(classify_402(&headers, Some(&body), &url));
     }
 
-    // Not 402 — re-emit stderr (progress bar etc.) and print body
+    // Not 402 — re-emit stderr (progress bar etc.), body, then any -w writeout
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !stderr.is_empty() {
         eprint!("{stderr}");
     }
     print!("{body}");
+    let writeout = String::from_utf8_lossy(&output.stdout);
+    if !writeout.is_empty() {
+        print!("{writeout}");
+    }
     Ok(RunOutcome::Completed {
         exit_code,
         body: None,
@@ -132,6 +139,25 @@ fn run_curl_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunO
 pub fn run_wget(user_args: &[String]) -> Result<RunOutcome> {
     validate_wget_args_against_catalog(user_args)?;
     run_wget_inner(user_args, &[])
+}
+
+/// Run `http` (HTTPie) with the given user args, detecting 402 + MPP challenges.
+///
+/// HTTPie uses positional `Header:Value` request items rather than `-H` flags,
+/// so `extra_headers` for retry are appended as positional args.
+pub fn run_httpie(user_args: &[String]) -> Result<RunOutcome> {
+    run_httpie_inner(user_args, &[])
+}
+
+/// Run `http` with extra headers injected (used for retry after payment).
+///
+/// Each entry in `extra_headers` is the literal HTTPie request item
+/// (e.g. `"Authorization:Bearer …"`), already formatted by the caller.
+pub fn run_httpie_with_headers(
+    user_args: &[String],
+    extra_headers: &[String],
+) -> Result<RunOutcome> {
+    run_httpie_inner(user_args, extra_headers)
 }
 
 /// Run `wget` with extra headers injected (used for retry after payment).
@@ -197,6 +223,145 @@ fn run_wget_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunO
         exit_code,
         body: None,
     })
+}
+
+fn run_httpie_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunOutcome> {
+    use std::io::IsTerminal;
+
+    check_command_exists("http")?;
+
+    debug!(args = ?user_args, extra = ?extra_headers, "Running httpie");
+
+    // HTTPie has no `-D <file>` equivalent, so we capture stdout and parse the
+    // response status from the first `HTTP/x.y <code>` line. We force two flags
+    // *after* the user's args so they always win:
+    //   - `--print=hb` — httpie's default when piped is body-only, which would
+    //     hide the status line our parser needs.
+    //   - `--pretty=all` — only when our parent stdout is a TTY, so the user
+    //     sees colors despite our pipe (httpie would otherwise auto-disable
+    //     them). We strip ANSI codes for parsing.
+    let stdout_is_tty = std::io::stdout().is_terminal();
+    let stdin_is_tty = std::io::stdin().is_terminal();
+    let mut cmd = Command::new("http");
+    cmd.args(user_args);
+    for h in extra_headers {
+        cmd.arg(h);
+    }
+    cmd.arg("--print=hb");
+    if stdout_is_tty {
+        cmd.arg("--pretty=all");
+    }
+    // When parent stdin isn't a real TTY (e.g. CI / agent shell), httpie reads
+    // it as request body and conflicts with `field=value` items. Tell it to
+    // ignore stdin in that case; if a user is genuinely piping data in,
+    // they're expected to pass `--ignore-stdin` themselves or use `@file`.
+    if !stdin_is_tty {
+        cmd.arg("--ignore-stdin");
+    }
+    cmd.stdin(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let output = cmd.output()?;
+    let exit_code = output.status.code().unwrap_or(1);
+    let stdout_text = String::from_utf8_lossy(&output.stdout);
+    let stderr_text = String::from_utf8_lossy(&output.stderr);
+    let url = find_url_in_args(user_args).unwrap_or_default();
+
+    let (status_code, headers, body) = parse_httpie_output(&stdout_text);
+
+    debug!(?status_code, exit_code, "httpie finished");
+
+    if status_code == Some(402) {
+        // Swallow stdout/stderr on 402 — CLI handles display
+        return Ok(classify_402(&headers, body.as_deref(), &url));
+    }
+
+    if !stderr_text.is_empty() {
+        eprint!("{stderr_text}");
+    }
+    print!("{stdout_text}");
+    Ok(RunOutcome::Completed {
+        exit_code,
+        body: None,
+    })
+}
+
+/// Parse HTTPie's combined stdout into `(status, response_headers, body)`.
+///
+/// HTTPie writes the response as:
+/// ```text
+/// HTTP/1.1 <code> <reason>
+/// Header: value
+/// …
+/// <blank line>
+/// <body>
+/// ```
+/// In verbose mode (`-v`) the request is printed first, so we take the LAST
+/// `HTTP/x.y` line as the response status and the headers that follow it.
+/// ANSI escapes (from `--pretty=all`) are stripped before parsing.
+pub(crate) fn parse_httpie_output(
+    raw: &str,
+) -> (Option<u16>, Vec<(String, String)>, Option<String>) {
+    let cleaned = strip_ansi(raw);
+    let lines: Vec<&str> = cleaned.lines().collect();
+
+    let mut status_code = None;
+    let mut headers = Vec::new();
+    let mut body_lines: Option<Vec<&str>> = None;
+    let mut in_response_headers = false;
+
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed_full = line.trim();
+
+        if trimmed_full.starts_with("HTTP/") {
+            // Response status line. Reset — the LAST HTTP/ line wins so a
+            // verbose request line earlier in the stream doesn't confuse us.
+            status_code = trimmed_full
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse::<u16>().ok());
+            headers.clear();
+            body_lines = None;
+            in_response_headers = true;
+            continue;
+        }
+
+        if in_response_headers {
+            if trimmed_full.is_empty() {
+                body_lines = Some(lines[(i + 1)..].to_vec());
+                break;
+            }
+            if let Some((k, v)) = trimmed_full.split_once(':') {
+                let key = k.trim();
+                if !key.is_empty() && !key.contains(' ') {
+                    headers.push((key.to_lowercase(), v.trim().to_string()));
+                }
+            }
+        }
+    }
+
+    let body = body_lines.map(|lines| lines.join("\n"));
+    (status_code, headers, body)
+}
+
+/// Strip ANSI CSI escape sequences (`\x1b[...m` and friends) from a string.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            for next in chars.by_ref() {
+                if next.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Given 402 headers (and optional body), determine the payment protocol.
@@ -1253,6 +1418,95 @@ HTTP request sent, awaiting response...
             }
             _ => panic!("Expected UnknownPaymentRequired"),
         }
+    }
+
+    // ── parse_httpie_output / strip_ansi ─────────────────────────────────
+
+    #[test]
+    fn strip_ansi_removes_csi_sequences() {
+        let raw = "\x1b[34mHTTP\x1b[39;49;00m/\x1b[34m1.1\x1b[39;49;00m \x1b[34m200\x1b[39;49;00m \x1b[36mOK\x1b[39;49;00m";
+        assert_eq!(strip_ansi(raw), "HTTP/1.1 200 OK");
+    }
+
+    #[test]
+    fn strip_ansi_passes_through_plain_text() {
+        assert_eq!(
+            strip_ansi("plain text\nno escapes"),
+            "plain text\nno escapes"
+        );
+    }
+
+    #[test]
+    fn parse_httpie_basic_response() {
+        let raw = "HTTP/1.1 200 OK\nContent-Type: application/json\nContent-Length: 13\n\n{\"ok\":true}\n";
+        let (status, headers, body) = parse_httpie_output(raw);
+        assert_eq!(status, Some(200));
+        assert_eq!(headers.len(), 2);
+        assert_eq!(headers[0].0, "content-type");
+        // `lines()` strips line terminators; the rejoined body has no trailing \n.
+        assert_eq!(body.as_deref(), Some("{\"ok\":true}"));
+    }
+
+    #[test]
+    fn parse_httpie_402_response() {
+        let raw = "HTTP/1.1 402 Payment Required\nWWW-Authenticate: Payment realm=\"x\"\n\n{\"error\":\"verification_failed\",\"message\":\"bad\",\"retryable\":false}";
+        let (status, headers, body) = parse_httpie_output(raw);
+        assert_eq!(status, Some(402));
+        assert!(headers.iter().any(|(k, _)| k == "www-authenticate"));
+        assert!(body.as_deref().unwrap().contains("verification_failed"));
+    }
+
+    #[test]
+    fn parse_httpie_verbose_mode_picks_response_status() {
+        // -v prints request first (with `METHOD /path HTTP/1.1` line, NOT
+        // starting with `HTTP/`), then response.
+        let raw = "GET /api HTTP/1.1\nHost: example.com\nUser-Agent: HTTPie/3.2.4\n\nHTTP/1.1 200 OK\nContent-Type: application/json\n\n{\"ok\":1}";
+        let (status, headers, body) = parse_httpie_output(raw);
+        assert_eq!(status, Some(200));
+        assert!(
+            headers
+                .iter()
+                .any(|(k, v)| k == "content-type" && v == "application/json")
+        );
+        // Request headers (host, user-agent) must not bleed into response
+        // headers — `Host` is set by the client, never echoed by the server here.
+        assert!(!headers.iter().any(|(k, _)| k == "host"));
+        assert_eq!(body.as_deref(), Some("{\"ok\":1}"));
+    }
+
+    #[test]
+    fn parse_httpie_http2_status() {
+        let raw = "HTTP/2 404 Not Found\nContent-Type: text/html\n\n<html/>";
+        let (status, _, _) = parse_httpie_output(raw);
+        assert_eq!(status, Some(404));
+    }
+
+    #[test]
+    fn parse_httpie_handles_pretty_ansi() {
+        // Mimics --pretty=all output: status + first header colorized.
+        let raw = "\x1b[34mHTTP\x1b[39;49;00m/\x1b[34m1.1\x1b[39;49;00m \x1b[34m402\x1b[39;49;00m \x1b[36mPayment Required\x1b[39;49;00m\n\x1b[36mContent-Type\x1b[39;49;00m: application/json\n\n{\"error\":\"x\"}";
+        let (status, headers, body) = parse_httpie_output(raw);
+        assert_eq!(status, Some(402));
+        assert!(headers.iter().any(|(k, _)| k == "content-type"));
+        assert_eq!(body.as_deref(), Some("{\"error\":\"x\"}"));
+    }
+
+    #[test]
+    fn parse_httpie_no_body() {
+        // HEAD response or 204: headers but no blank line + body.
+        let raw = "HTTP/1.1 204 No Content\nDate: now\n";
+        let (status, headers, body) = parse_httpie_output(raw);
+        assert_eq!(status, Some(204));
+        assert_eq!(headers.len(), 1);
+        assert!(body.is_none());
+    }
+
+    #[test]
+    fn parse_httpie_empty_input() {
+        let (status, headers, body) = parse_httpie_output("");
+        assert_eq!(status, None);
+        assert!(headers.is_empty());
+        assert!(body.is_none());
     }
 
     #[test]

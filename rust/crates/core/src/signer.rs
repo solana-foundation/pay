@@ -285,7 +285,12 @@ pub fn load_signer_from_account_with_reason(
         network,
         &AuthIntent::from_reason(reason),
     )?;
-    MemorySigner::from_bytes(&bytes).map_err(|e| Error::Config(format!("Invalid keypair: {e}")))
+    MemorySigner::from_bytes(&bytes).map_err(|e| {
+        Error::Config(format!(
+            "Storage corrupted: keypair for account `{name}` on `{network}` failed to decode ({e}). \
+             Re-import the account: `pay account destroy --name {name}` then `pay account new --name {name}`."
+        ))
+    })
 }
 
 pub fn load_signer_from_account_with_intent(
@@ -295,7 +300,12 @@ pub fn load_signer_from_account_with_intent(
     intent: &AuthIntent,
 ) -> Result<MemorySigner> {
     let bytes = load_keypair_bytes_from_account_with_intent(account, name, network, intent)?;
-    MemorySigner::from_bytes(&bytes).map_err(|e| Error::Config(format!("Invalid keypair: {e}")))
+    MemorySigner::from_bytes(&bytes).map_err(|e| {
+        Error::Config(format!(
+            "Storage corrupted: keypair for account `{name}` on `{network}` failed to decode ({e}). \
+             Re-import the account: `pay account destroy --name {name}` then `pay account new --name {name}`."
+        ))
+    })
 }
 
 fn signer_from_ephemeral(account: &Account) -> Result<MemorySigner> {
@@ -361,7 +371,12 @@ pub fn load_signer_with_reason(source: &str, reason: &str) -> Result<MemorySigne
 /// Load a `MemorySigner` with a typed auth intent.
 pub fn load_signer_with_intent(source: &str, intent: &AuthIntent) -> Result<MemorySigner> {
     let bytes = load_signer_keypair_bytes_with_intent(source, intent)?;
-    MemorySigner::from_bytes(&bytes).map_err(|e| Error::Config(format!("Invalid keypair: {e}")))
+    MemorySigner::from_bytes(&bytes).map_err(|e| {
+        Error::Config(format!(
+            "Storage corrupted: keypair from `{source}` failed to decode ({e}). \
+             Re-import this keypair via `pay account new` or `pay account import`."
+        ))
+    })
 }
 
 pub fn load_signer_keypair_bytes_with_reason(
