@@ -5712,7 +5712,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yml",
- "serial_test",
  "shellexpand",
  "solana-mpp",
  "solana-pubkey 3.0.0",
