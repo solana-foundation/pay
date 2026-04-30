@@ -185,6 +185,43 @@ enum TopupFocus {
     Methods,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OnrampPaymentMethod {
+    Paypal,
+    Venmo,
+}
+
+impl OnrampPaymentMethod {
+    fn default() -> Self {
+        Self::Paypal
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Paypal => "PayPal",
+            Self::Venmo => "Venmo",
+        }
+    }
+
+    fn query_value(self) -> &'static str {
+        match self {
+            Self::Paypal => "paypal",
+            Self::Venmo => "venmo",
+        }
+    }
+
+    fn previous(self) -> Self {
+        match self {
+            Self::Paypal => Self::Venmo,
+            Self::Venmo => Self::Paypal,
+        }
+    }
+
+    fn next(self) -> Self {
+        self.previous()
+    }
+}
+
 /// Resolve the redirect host from `PAY_ONRAMP_HOST`, falling back to
 /// `https://pay.sh`. Trailing slashes are stripped so callers can `format!`
 /// without double-slash hazards.
@@ -265,6 +302,7 @@ fn run_topup(
 ) -> io::Result<Option<TopupDetected>> {
     let options = TopupOption::all();
     let mut selected = 0usize;
+    let mut payment_method = OnrampPaymentMethod::default();
     let focus = TopupFocus::Methods;
     let mut amount_pos: usize = 10; // default $10
     let started_at = Instant::now();
@@ -338,6 +376,7 @@ fn run_topup(
                 selected,
                 focus,
                 amount_pos,
+                payment_method,
                 onramp.as_ref(),
                 onramp_notice.as_deref(),
                 onramp_error.as_deref(),
@@ -363,6 +402,7 @@ fn run_topup(
                         selected,
                         focus,
                         amount_pos,
+                        payment_method,
                         onramp.as_ref(),
                         onramp_notice.as_deref(),
                         onramp_error.as_deref(),
@@ -407,6 +447,7 @@ fn run_topup(
                 focus,
                 &status,
                 amount_pos,
+                payment_method,
                 None,
                 onramp.as_ref(),
                 onramp_notice.as_deref(),
@@ -432,6 +473,8 @@ fn run_topup(
                 KeyCode::Left => {
                     if options[selected] == TopupOption::TransferFromExistingAccount {
                         amount_pos = amount_pos.saturating_sub(1);
+                    } else if options[selected] == TopupOption::BuyStablecoins && onramp.is_none() {
+                        payment_method = payment_method.previous();
                     }
                 }
                 KeyCode::Right => {
@@ -439,6 +482,8 @@ fn run_topup(
                         && amount_pos < TOPUP_MAX_STEPS
                     {
                         amount_pos += 1;
+                    } else if options[selected] == TopupOption::BuyStablecoins && onramp.is_none() {
+                        payment_method = payment_method.next();
                     }
                 }
                 KeyCode::Enter => {
@@ -454,9 +499,10 @@ fn run_topup(
                                 focus,
                                 &status,
                                 amount_pos,
+                                payment_method,
                                 copied_to_clipboard,
                             )?;
-                            match launch_onramp_session(onramp_host, pubkey, &otx) {
+                            match launch_onramp_session(onramp_host, pubkey, payment_method, &otx) {
                                 Ok(session) => {
                                     onramp_notice = None;
                                     onramp_error = None;
@@ -511,6 +557,7 @@ struct BlinkState {
 struct OnrampSession {
     external_id: String,
     url: String,
+    payment_method: OnrampPaymentMethod,
     started_at: Instant,
 }
 
@@ -523,6 +570,7 @@ fn blink_checkmark(
     selected: usize,
     focus: TopupFocus,
     amount_pos: usize,
+    payment_method: OnrampPaymentMethod,
     onramp: Option<&OnrampSession>,
     onramp_notice: Option<&str>,
     onramp_error: Option<&str>,
@@ -542,6 +590,7 @@ fn blink_checkmark(
                 focus,
                 &PollStatus::RpcUnavailable, // status bar doesn't matter during blink
                 amount_pos,
+                payment_method,
                 blink.as_ref(),
                 onramp,
                 onramp_notice,
@@ -562,6 +611,7 @@ fn animate_onramp_launch(
     focus: TopupFocus,
     status: &PollStatus,
     amount_pos: usize,
+    payment_method: OnrampPaymentMethod,
     copied_to_clipboard: bool,
 ) -> io::Result<()> {
     let frames: &[&str] = if copied_to_clipboard {
@@ -593,6 +643,7 @@ fn animate_onramp_launch(
                 focus,
                 status,
                 amount_pos,
+                payment_method,
                 None,
                 None,
                 Some(notice),
@@ -665,6 +716,7 @@ fn render_topup_selector(
     focus: TopupFocus,
     status: &PollStatus,
     amount_pos: usize,
+    payment_method: OnrampPaymentMethod,
     blink: Option<&BlinkState>,
     onramp: Option<&OnrampSession>,
     onramp_notice: Option<&str>,
@@ -790,13 +842,21 @@ fn render_topup_selector(
             frame,
             right[1],
             pubkey,
+            payment_method,
             onramp,
             onramp_notice,
             onramp_error,
         ),
     }
 
-    render_topup_controls(frame, chunks[1], active, status, onramp.is_some());
+    render_topup_controls(
+        frame,
+        chunks[1],
+        active,
+        status,
+        payment_method,
+        onramp.is_some(),
+    );
 }
 
 fn render_qr_detail(
@@ -893,6 +953,7 @@ fn render_buy_stablecoins_detail(
     frame: &mut ratatui::Frame,
     area: Rect,
     pubkey: &str,
+    payment_method: OnrampPaymentMethod,
     onramp: Option<&OnrampSession>,
     onramp_notice: Option<&str>,
     onramp_error: Option<&str>,
@@ -926,6 +987,54 @@ fn render_buy_stablecoins_detail(
                 Style::default().fg(Color::White),
             )));
             lines.push(Line::raw(""));
+            lines.push(Line::from(Span::styled(
+                "What payment method would you like to use to onramp?",
+                Style::default().fg(Color::Gray),
+            )));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    if payment_method == OnrampPaymentMethod::Paypal {
+                        "● "
+                    } else {
+                        "○ "
+                    },
+                    Style::default().fg(if payment_method == OnrampPaymentMethod::Paypal {
+                        Color::Green
+                    } else {
+                        Color::DarkGray
+                    }),
+                ),
+                Span::styled(
+                    OnrampPaymentMethod::Paypal.title(),
+                    Style::default().fg(if payment_method == OnrampPaymentMethod::Paypal {
+                        Color::White
+                    } else {
+                        Color::Gray
+                    }),
+                ),
+                Span::raw("   "),
+                Span::styled(
+                    if payment_method == OnrampPaymentMethod::Venmo {
+                        "● "
+                    } else {
+                        "○ "
+                    },
+                    Style::default().fg(if payment_method == OnrampPaymentMethod::Venmo {
+                        Color::Green
+                    } else {
+                        Color::DarkGray
+                    }),
+                ),
+                Span::styled(
+                    OnrampPaymentMethod::Venmo.title(),
+                    Style::default().fg(if payment_method == OnrampPaymentMethod::Venmo {
+                        Color::White
+                    } else {
+                        Color::Gray
+                    }),
+                ),
+            ]));
+            lines.push(Line::raw(""));
             lines.push(Line::from(vec![
                 Span::styled("Press ", Style::default().fg(Color::Gray)),
                 Span::styled(
@@ -940,7 +1049,10 @@ fn render_buy_stablecoins_detail(
                 ),
             ]));
             lines.push(Line::from(Span::styled(
-                "We'll copy the address first, then launch MoonPay.",
+                format!(
+                    "We'll copy the address first, then launch MoonPay with {}.",
+                    payment_method.title()
+                ),
                 Style::default().fg(Color::DarkGray),
             )));
             lines.push(Line::from(Span::styled(
@@ -964,6 +1076,13 @@ fn render_buy_stablecoins_detail(
             lines.push(Line::from(vec![
                 Span::styled("Elapsed: ", Style::default().fg(Color::Gray)),
                 Span::styled(format!("{elapsed}s"), Style::default().fg(Color::White)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("Method:  ", Style::default().fg(Color::Gray)),
+                Span::styled(
+                    session.payment_method.title(),
+                    Style::default().fg(Color::White),
+                ),
             ]));
             lines.push(Line::from(vec![
                 Span::styled("Tx ID:   ", Style::default().fg(Color::Gray)),
@@ -1102,6 +1221,7 @@ fn render_topup_controls(
     area: Rect,
     active: TopupOption,
     status: &PollStatus,
+    payment_method: OnrampPaymentMethod,
     onramp_active: bool,
 ) {
     let mut spans = match active {
@@ -1124,6 +1244,11 @@ fn render_topup_controls(
         TopupOption::BuyStablecoins => vec![
             Span::styled("↑ ↓", Style::default().fg(Color::Cyan).bold()),
             Span::styled(" move  │  ", Style::default().dim()),
+            Span::styled("← →", Style::default().fg(Color::Cyan).bold()),
+            Span::styled(
+                format!(" {}  │  ", payment_method.title()),
+                Style::default().dim(),
+            ),
             Span::styled("Enter", Style::default().fg(Color::Green).bold()),
             Span::styled(" copy + open  │  ", Style::default().dim()),
             Span::styled("Esc", Style::default().fg(Color::Red).bold()),
@@ -1200,14 +1325,21 @@ fn build_onramp_redirect_url(host: &str) -> String {
 }
 
 /// Compose the direct MoonPay checkout URL we open in the browser.
-fn build_onramp_url(host: &str, pubkey: &str, external_id: &str, api_key: &str) -> String {
+fn build_onramp_url(
+    host: &str,
+    pubkey: &str,
+    external_id: &str,
+    api_key: &str,
+    payment_method: OnrampPaymentMethod,
+) -> String {
     let redirect_url = build_onramp_redirect_url(host);
     format!(
-        "{MOONPAY_BUY_URL}?apiKey={}&currencyCode=usdc_sol&walletAddress={}&baseCurrencyAmount=20&externalTransactionId={}&redirectURL={}",
+        "{MOONPAY_BUY_URL}?apiKey={}&currencyCode=usdc_sol&walletAddress={}&baseCurrencyAmount=20&externalTransactionId={}&redirectURL={}&paymentMethod={}",
         urlencoding::encode(api_key),
         urlencoding::encode(pubkey),
         urlencoding::encode(external_id),
         urlencoding::encode(&redirect_url),
+        urlencoding::encode(payment_method.query_value()),
     )
 }
 
@@ -1215,17 +1347,19 @@ fn build_onramp_url(host: &str, pubkey: &str, external_id: &str, api_key: &str) 
 fn launch_onramp_session(
     onramp_host: &str,
     pubkey: &str,
+    payment_method: OnrampPaymentMethod,
     updates: &mpsc::Sender<OnrampUpdate>,
 ) -> Result<OnrampSession, String> {
     let host = onramp_host.trim_end_matches('/').to_string();
     let api_key = resolve_moonpay_api_key();
     let external_id = new_external_id();
-    let url = build_onramp_url(&host, pubkey, &external_id, &api_key);
+    let url = build_onramp_url(&host, pubkey, &external_id, &api_key, payment_method);
     open_url(&url).map_err(|err| format!("failed to open MoonPay: {err}"))?;
     spawn_onramp_poller(external_id.clone(), api_key, updates.clone());
     Ok(OnrampSession {
         external_id,
         url,
+        payment_method,
         started_at: Instant::now(),
     })
 }
@@ -2084,7 +2218,13 @@ mod tests {
 
     #[test]
     fn build_onramp_url_targets_moonpay_with_fixed_params() {
-        let url = build_onramp_url("https://pay.sh", "wallet123", "pay-abc", "moonpay-key");
+        let url = build_onramp_url(
+            "https://pay.sh",
+            "wallet123",
+            "pay-abc",
+            "moonpay-key",
+            OnrampPaymentMethod::Paypal,
+        );
         let parsed = reqwest::Url::parse(&url).expect("MoonPay URL should parse");
         let query = parsed
             .query_pairs()
@@ -2100,6 +2240,7 @@ mod tests {
             query.get("redirectURL"),
             Some(&"https://pay.sh/onramp/done".into())
         );
+        assert_eq!(query.get("paymentMethod"), Some(&"paypal".into()));
         assert!(query.get("account").is_none());
     }
 
@@ -2208,8 +2349,13 @@ mod tests {
         let _api_key = EnvVarGuard::remove("PAY_MOONPAY_API_KEY");
         let (tx, _rx) = mpsc::channel();
 
-        let err = launch_onramp_session("https://pay.sh", "wallet123", &tx)
-            .expect_err("missing API key should fail");
+        let err = launch_onramp_session(
+            "https://pay.sh",
+            "wallet123",
+            OnrampPaymentMethod::Paypal,
+            &tx,
+        )
+        .expect_err("missing API key should fail");
 
         assert!(err.contains("PAY_MOONPAY_API_KEY"));
     }
