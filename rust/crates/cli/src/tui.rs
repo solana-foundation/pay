@@ -1322,12 +1322,19 @@ fn new_external_id() -> String {
     format!("pay-{}", uuid::Uuid::new_v4())
 }
 
-fn resolve_moonpay_api_key() -> Result<String, String> {
+fn resolve_moonpay_api_key_with_default(default: Option<&str>) -> Result<String, String> {
     match std::env::var("PAY_MOONPAY_API_KEY") {
         Ok(value) if !value.trim().is_empty() => Ok(value),
-        Ok(_) => Err("PAY_MOONPAY_API_KEY is empty.".to_string()),
-        Err(_) => Err("PAY_MOONPAY_API_KEY is not set.".to_string()),
+        Ok(_) => Err("Provided PAY_MOONPAY_API_KEY is empty.".to_string()),
+        Err(_) => match default {
+            Some(value) if !value.trim().is_empty() => Ok(value.to_string()),
+            _ => Err("PAY_MOONPAY_API_KEY is not set at runtime or build time.".to_string()),
+        },
     }
+}
+
+fn resolve_moonpay_api_key() -> Result<String, String> {
+    resolve_moonpay_api_key_with_default(option_env!("PAY_MOONPAY_API_KEY"))
 }
 
 fn build_onramp_redirect_url(host: &str) -> String {
@@ -2379,5 +2386,27 @@ mod tests {
         let value = resolve_moonpay_api_key().expect("env API key should resolve");
 
         assert_eq!(value, "moonpay-key");
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_moonpay_api_key_uses_build_time_default() {
+        let _api_key = EnvVarGuard::remove("PAY_MOONPAY_API_KEY");
+
+        let value = resolve_moonpay_api_key_with_default(Some("moonpay-build-key"))
+            .expect("build-time API key should resolve");
+
+        assert_eq!(value, "moonpay-build-key");
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_moonpay_api_key_prefers_runtime_override() {
+        let _api_key = EnvVarGuard::set("PAY_MOONPAY_API_KEY", "moonpay-runtime-key");
+
+        let value = resolve_moonpay_api_key_with_default(Some("moonpay-build-key"))
+            .expect("runtime API key should override build-time value");
+
+        assert_eq!(value, "moonpay-runtime-key");
     }
 }
