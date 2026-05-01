@@ -1323,18 +1323,20 @@ fn new_external_id() -> String {
 }
 
 fn resolve_moonpay_api_key_with_default(default: Option<&str>) -> Result<String, String> {
-    match std::env::var("PAY_MOONPAY_API_KEY") {
+    match std::env::var("PAY_MOONPAY_PUBLISHABLE_API_KEY") {
         Ok(value) if !value.trim().is_empty() => Ok(value),
-        Ok(_) => Err("Provided PAY_MOONPAY_API_KEY is empty.".to_string()),
+        Ok(_) => Err("Provided PAY_MOONPAY_PUBLISHABLE_API_KEY is empty.".to_string()),
         Err(_) => match default {
             Some(value) if !value.trim().is_empty() => Ok(value.to_string()),
-            _ => Err("PAY_MOONPAY_API_KEY is not set at runtime or build time.".to_string()),
+            _ => Err(
+                "PAY_MOONPAY_PUBLISHABLE_API_KEY is not set at runtime or build time.".to_string(),
+            ),
         },
     }
 }
 
 fn resolve_moonpay_api_key() -> Result<String, String> {
-    resolve_moonpay_api_key_with_default(option_env!("PAY_MOONPAY_API_KEY"))
+    resolve_moonpay_api_key_with_default(option_env!("PAY_MOONPAY_PUBLISHABLE_API_KEY"))
 }
 
 fn build_onramp_redirect_url(host: &str) -> String {
@@ -1455,7 +1457,7 @@ fn spawn_onramp_poller(external_id: String, api_key: String, tx: mpsc::Sender<On
                     match resp.status() {
                         reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
                             let _ = tx.send(OnrampUpdate::Failed {
-                                reason: "MoonPay status polling was unauthorized; check PAY_MOONPAY_API_KEY."
+                                reason: "MoonPay status polling was unauthorized; check PAY_MOONPAY_PUBLISHABLE_API_KEY."
                                     .to_string(),
                             });
                             return;
@@ -2364,7 +2366,7 @@ mod tests {
     #[test]
     #[serial]
     fn launch_onramp_session_requires_api_key() {
-        let _api_key = EnvVarGuard::remove("PAY_MOONPAY_API_KEY");
+        let _api_key = EnvVarGuard::remove("PAY_MOONPAY_PUBLISHABLE_API_KEY");
         let (tx, _rx) = mpsc::channel();
 
         let err = launch_onramp_session(
@@ -2375,13 +2377,13 @@ mod tests {
         )
         .expect_err("missing API key should fail");
 
-        assert!(err.contains("PAY_MOONPAY_API_KEY"));
+        assert!(err.contains("PAY_MOONPAY_PUBLISHABLE_API_KEY"));
     }
 
     #[test]
     #[serial]
     fn resolve_moonpay_api_key_reads_env() {
-        let _api_key = EnvVarGuard::set("PAY_MOONPAY_API_KEY", "moonpay-key");
+        let _api_key = EnvVarGuard::set("PAY_MOONPAY_PUBLISHABLE_API_KEY", "moonpay-key");
 
         let value = resolve_moonpay_api_key().expect("env API key should resolve");
 
@@ -2391,7 +2393,7 @@ mod tests {
     #[test]
     #[serial]
     fn resolve_moonpay_api_key_uses_build_time_default() {
-        let _api_key = EnvVarGuard::remove("PAY_MOONPAY_API_KEY");
+        let _api_key = EnvVarGuard::remove("PAY_MOONPAY_PUBLISHABLE_API_KEY");
 
         let value = resolve_moonpay_api_key_with_default(Some("moonpay-build-key"))
             .expect("build-time API key should resolve");
@@ -2402,7 +2404,7 @@ mod tests {
     #[test]
     #[serial]
     fn resolve_moonpay_api_key_prefers_runtime_override() {
-        let _api_key = EnvVarGuard::set("PAY_MOONPAY_API_KEY", "moonpay-runtime-key");
+        let _api_key = EnvVarGuard::set("PAY_MOONPAY_PUBLISHABLE_API_KEY", "moonpay-runtime-key");
 
         let value = resolve_moonpay_api_key_with_default(Some("moonpay-build-key"))
             .expect("runtime API key should override build-time value");

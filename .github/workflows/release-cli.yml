@@ -154,7 +154,7 @@ jobs:
         run: |
           cat > Cross.toml <<'EOF'
           [build.env]
-          passthrough = ["PAY_MOONPAY_API_KEY", "PAY_PDB_DIST", "PAY_PDB_ALLOW_PLACEHOLDER"]
+          passthrough = ["PAY_MOONPAY_PUBLISHABLE_API_KEY", "PAY_PDB_DIST", "PAY_PDB_ALLOW_PLACEHOLDER"]
           EOF
 
       - uses: dtolnay/rust-toolchain@stable
@@ -173,7 +173,7 @@ jobs:
       - name: Build
         if: ${{ !matrix.use-cross }}
         env:
-          PAY_MOONPAY_API_KEY: ${{ steps.doppler.outputs.PAY_MOONPAY_API_KEY }}
+          PAY_MOONPAY_PUBLISHABLE_API_KEY: ${{ steps.doppler.outputs.PAY_MOONPAY_PUBLISHABLE_API_KEY }}
         run: >-
           cargo build --release
           --target ${{ matrix.target }}
@@ -181,7 +181,7 @@ jobs:
       - name: Build (cross)
         if: matrix.use-cross
         env:
-          PAY_MOONPAY_API_KEY: ${{ steps.doppler.outputs.PAY_MOONPAY_API_KEY }}
+          PAY_MOONPAY_PUBLISHABLE_API_KEY: ${{ steps.doppler.outputs.PAY_MOONPAY_PUBLISHABLE_API_KEY }}
           PAY_PDB_DIST: /project/pdb-dist
         run: >-
           cross build --release

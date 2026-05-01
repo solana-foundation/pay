@@ -48,7 +48,7 @@ jobs:
         with:
           context: ./rust
           build-args: |
-            PAY_MOONPAY_API_KEY=${{ steps.doppler.outputs.PAY_MOONPAY_API_KEY }}
+            PAY_MOONPAY_PUBLISHABLE_API_KEY=${{ steps.doppler.outputs.PAY_MOONPAY_PUBLISHABLE_API_KEY }}
           push: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.push) }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
