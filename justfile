@@ -6,12 +6,15 @@ default:
 
 # Install a target: `just install pay`, `just install pay <cargo install args...>`, `just install deps`
 [positional-arguments]
-install target='deps' *cargo_args:
+install *args:
     #!/usr/bin/env bash
     set -euo pipefail
 
-    target="$1"
-    shift
+    target='deps'
+    if [ "$#" -gt 0 ]; then
+        target="$1"
+        shift
+    fi
 
     build_pdb() {
         if [ -n "${PAY_PDB_DIST:-}" ]; then
@@ -28,9 +31,9 @@ install target='deps' *cargo_args:
         pay)
             build_pdb
             if [ "$#" -gt 0 ]; then
-                cargo install "$@"
+                doppler run -- cargo install "$@"
             else
-                cd rust && cargo cli-install
+                cd rust && doppler run -- cargo install --path crates/cli --locked --force
             fi
             ;;
         deps)
@@ -78,17 +81,17 @@ build target='all':
         all)
             cd typescript && pnpm --filter @solana/pay build && cd ..
             build_pdb
-            cd rust && cargo build --release
+            cd rust && just build
             ;;
         pay)
             build_pdb
-            cd rust && cargo build --release
+            cd rust && just build
             ;;
         pdb)
             build_pdb
             ;;
         rust)
-            cd rust && cargo build --release
+            cd rust && just build
             ;;
         typescript|ts)
             cd typescript && pnpm --filter @solana/pay build

@@ -2,7 +2,7 @@
 
 # Build release binary
 build:
-    cargo build --release
+    doppler run -- cargo build --release
 
 # Run all tests
 test:
@@ -29,11 +29,11 @@ check: fmt lint
 
 # Run the CLI (pass args after --)
 run *ARGS:
-    cargo run -- {{ARGS}}
+    doppler run -- cargo run -- {{ARGS}}
 
 # Build Docker image
 docker-build:
-    DOCKER_BUILDKIT=1 docker build --ssh default -t pay .
+    doppler run -- sh -c 'DOCKER_BUILDKIT=1 docker build --build-arg PAY_MOONPAY_PUBLISHABLE_API_KEY="$PAY_MOONPAY_PUBLISHABLE_API_KEY" --ssh default -t pay .'
 
 # Run Docker image (pass args after --)
 docker-run *ARGS:
@@ -41,8 +41,8 @@ docker-run *ARGS:
 
 # Start a payment gateway server
 serve SPEC *ARGS:
-    cargo run -- server start {{SPEC}} {{ARGS}}
+    doppler run -- cargo run -- server start {{SPEC}} {{ARGS}}
 
 # Start the payment verifier service (for Apigee / external gateways)
 apigee-serve *ARGS:
-    cargo run -p pay -- server verify {{ARGS}}
+    doppler run -- cargo run -p pay -- server verify {{ARGS}}

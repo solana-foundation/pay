@@ -1,0 +1,3 @@
+setup:
+  project: pay
+  config: dev
