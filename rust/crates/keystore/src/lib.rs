@@ -169,11 +169,17 @@ impl Keystore {
         validate_account_name(account)?;
         validate_keypair(keypair_bytes)?;
 
-        if self.auth_on_write {
+        let auth_reason = intent.prompt_message();
+        if self.auth_on_write && !self.store.enforces_auth() {
             self.auth.authenticate(intent)?;
         }
 
-        self.store.store(&keypair_key(account), keypair_bytes)?;
+        if self.store.enforces_auth() {
+            self.store
+                .store_with_auth(&keypair_key(account), keypair_bytes, &auth_reason)?;
+        } else {
+            self.store.store(&keypair_key(account), keypair_bytes)?;
+        }
         self.store
             .store(&pubkey_key(account), &keypair_bytes[32..64])?;
         Ok(())
@@ -192,11 +198,17 @@ impl Keystore {
     /// Delete a keypair with a typed auth intent.
     pub fn delete_with_intent(&self, account: &str, intent: &AuthIntent) -> Result<()> {
         validate_account_name(account)?;
-        if self.auth_on_write {
+        let auth_reason = intent.prompt_message();
+        if self.auth_on_write && !self.store.enforces_auth() {
             self.auth.authenticate(intent)?;
         }
 
-        self.store.delete(&keypair_key(account))?;
+        if self.store.enforces_auth() {
+            self.store
+                .delete_with_auth(&keypair_key(account), &auth_reason)?;
+        } else {
+            self.store.delete(&keypair_key(account))?;
+        }
         let _ = self.store.delete(&pubkey_key(account));
         Ok(())
     }
@@ -221,8 +233,16 @@ impl Keystore {
         intent: &AuthIntent,
     ) -> Result<Zeroizing<Vec<u8>>> {
         validate_account_name(account)?;
-        self.auth.authenticate(intent)?;
-        let keypair = self.store.load(&keypair_key(account))?;
+        let auth_reason = intent.prompt_message();
+        if !self.store.enforces_auth() {
+            self.auth.authenticate(intent)?;
+        }
+        let keypair = if self.store.enforces_auth() {
+            self.store
+                .load_with_auth(&keypair_key(account), &auth_reason)?
+        } else {
+            self.store.load(&keypair_key(account))?
+        };
         validate_keypair(&keypair)?;
         Ok(keypair)
     }

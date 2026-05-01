@@ -11,6 +11,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const HELPER_SOURCE: &str = include_str!("helper.swift");
 const CODESIGN: &str = "/usr/bin/codesign";
 const SWIFTC: &str = "/usr/bin/swiftc";
+const KEYPAIR_KEY_PREFIX: &str = "keypair:";
+const PUBKEY_KEY_PREFIX: &str = "pubkey:";
+const DEFAULT_STORE_KEYPAIR_REASON: &str = "store your pay account private key";
+const DEFAULT_READ_KEYPAIR_REASON: &str = "access your pay account private key";
+const DEFAULT_DELETE_KEYPAIR_REASON: &str = "delete your pay account private key";
 
 const ENTITLEMENTS_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -63,23 +68,71 @@ pub struct AppleKeychainStore;
 
 impl SecretStore for AppleKeychainStore {
     fn store(&self, key: &str, data: &[u8]) -> Result<()> {
-        helper_store(key, data)
+        self.store_with_auth(key, data, DEFAULT_STORE_KEYPAIR_REASON)
+    }
+
+    fn store_with_auth(&self, key: &str, data: &[u8], reason: &str) -> Result<()> {
+        match helper_key_kind(key)? {
+            HelperKeyKind::Keypair => helper_store("store-keypair", key, Some(reason), data),
+            HelperKeyKind::Pubkey => helper_store("store-pubkey", key, None, data),
+        }
     }
 
     fn load(&self, key: &str) -> Result<Zeroizing<Vec<u8>>> {
-        let hex = Zeroizing::new(helper_run(&["read", key])?);
+        self.load_with_auth(key, DEFAULT_READ_KEYPAIR_REASON)
+    }
+
+    fn load_with_auth(&self, key: &str, reason: &str) -> Result<Zeroizing<Vec<u8>>> {
+        let hex = match helper_key_kind(key)? {
+            HelperKeyKind::Keypair => Zeroizing::new(helper_run(&["read-keypair", key, reason])?),
+            HelperKeyKind::Pubkey => Zeroizing::new(helper_run(&["read-pubkey", key])?),
+        };
         crate::store::hex_decode(hex.trim()).map(Zeroizing::new)
     }
 
     fn exists(&self, key: &str) -> bool {
-        helper_run(&["exists", key])
+        helper_key_kind(key)
+            .and_then(|_| helper_run(&["exists", key]))
             .map(|out| out.trim() == "yes")
             .unwrap_or(false)
     }
 
     fn delete(&self, key: &str) -> Result<()> {
-        helper_run(&["delete", key])?;
+        self.delete_with_auth(key, DEFAULT_DELETE_KEYPAIR_REASON)
+    }
+
+    fn delete_with_auth(&self, key: &str, reason: &str) -> Result<()> {
+        match helper_key_kind(key)? {
+            HelperKeyKind::Keypair => {
+                helper_run(&["delete-keypair", key, reason])?;
+            }
+            HelperKeyKind::Pubkey => {
+                helper_run(&["delete-pubkey", key])?;
+            }
+        }
         Ok(())
+    }
+
+    fn enforces_auth(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HelperKeyKind {
+    Keypair,
+    Pubkey,
+}
+
+fn helper_key_kind(key: &str) -> Result<HelperKeyKind> {
+    if key.starts_with(KEYPAIR_KEY_PREFIX) {
+        Ok(HelperKeyKind::Keypair)
+    } else if key.starts_with(PUBKEY_KEY_PREFIX) {
+        Ok(HelperKeyKind::Pubkey)
+    } else {
+        Err(Error::Backend(format!(
+            "unsupported macOS Keychain storage key: {key}"
+        )))
     }
 }
 
@@ -454,14 +507,16 @@ fn is_user_cancel(msg: &str) -> bool {
     m == "denied" || m.contains("cancel")
 }
 
-fn helper_store(key: &str, data: &[u8]) -> Result<()> {
+fn helper_store(command: &str, key: &str, reason: Option<&str>, data: &[u8]) -> Result<()> {
     use std::io::Write;
 
     let hex = crate::store::hex_encode(data);
     let binary = helper_path()?;
 
     let mut child = Command::new(&binary)
-        .args(["store", key])
+        .arg(command)
+        .arg(key)
+        .args(reason)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -536,6 +591,29 @@ mod tests {
             .expect("set helper permissions");
 
         validate_helper_file(&helper).expect("private regular helper");
+    }
+
+    #[test]
+    fn apple_keychain_store_reports_auth_enforced() {
+        assert!(AppleKeychainStore.enforces_auth());
+    }
+
+    #[test]
+    fn helper_key_kind_accepts_typed_namespaces() {
+        assert_eq!(
+            helper_key_kind("keypair:default").unwrap(),
+            HelperKeyKind::Keypair
+        );
+        assert_eq!(
+            helper_key_kind("pubkey:default").unwrap(),
+            HelperKeyKind::Pubkey
+        );
+    }
+
+    #[test]
+    fn helper_key_kind_rejects_raw_namespaces() {
+        let err = helper_key_kind("default").expect_err("raw key rejected");
+        assert!(err.to_string().contains("unsupported"));
     }
 
     #[test]

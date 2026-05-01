@@ -8,6 +8,22 @@ pub trait SecretStore: Send + Sync {
     fn load(&self, key: &str) -> Result<Zeroizing<Vec<u8>>>;
     fn exists(&self, key: &str) -> bool;
     fn delete(&self, key: &str) -> Result<()>;
+
+    fn store_with_auth(&self, key: &str, data: &[u8], _reason: &str) -> Result<()> {
+        self.store(key, data)
+    }
+
+    fn load_with_auth(&self, key: &str, _reason: &str) -> Result<Zeroizing<Vec<u8>>> {
+        self.load(key)
+    }
+
+    fn delete_with_auth(&self, key: &str, _reason: &str) -> Result<()> {
+        self.delete(key)
+    }
+
+    fn enforces_auth(&self) -> bool {
+        false
+    }
 }
 
 // ── In-memory store (testing) ───────────────────────────────────────────────
