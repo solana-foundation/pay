@@ -215,7 +215,6 @@ impl AuthIntent {
         }
     }
 
-    #[cfg(any(test, target_os = "macos", target_os = "windows"))]
     pub(crate) fn prompt_message(&self) -> String {
         truncate_for_prompt(self.message(), 220)
     }
@@ -300,7 +299,6 @@ fn normalize_message(reason: &str) -> String {
     .to_string()
 }
 
-#[cfg(any(test, target_os = "macos", target_os = "windows"))]
 fn truncate_for_prompt(value: &str, max_chars: usize) -> String {
     let mut chars = value.chars();
     let truncated: String = chars.by_ref().take(max_chars).collect();
