@@ -30,7 +30,7 @@ jobs:
           auth-method: oidc
           doppler-identity-id: ${{ vars.DOPPLER_SERVICE_IDENTITY_ID }}
           doppler-project: ${{ vars.DOPPLER_PROJECT || 'pay' }}
-          doppler-config: ${{ vars.DOPPLER_CONFIG_CI || 'prd_cli' }}
+          doppler-config: ${{ vars.DOPPLER_CONFIG_CI || 'prd' }}
           inject-env-vars: true
       - uses: docker/login-action@v3
         with:
