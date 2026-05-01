@@ -19,9 +19,19 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      id-token: write
       packages: write
     steps:
       - uses: actions/checkout@v5
+      - name: Fetch Doppler secrets
+        id: doppler
+        uses: dopplerhq/secrets-fetch-action@v2.0.0
+        with:
+          auth-method: oidc
+          doppler-identity-id: ${{ vars.DOPPLER_SERVICE_IDENTITY_ID }}
+          doppler-project: ${{ vars.DOPPLER_PROJECT || 'pay' }}
+          doppler-config: ${{ vars.DOPPLER_CONFIG_CI || 'prd_cli' }}
+          inject-env-vars: true
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -37,6 +47,8 @@ jobs:
       - uses: docker/build-push-action@v6
         with:
           context: ./rust
+          build-args: |
+            PAY_MOONPAY_API_KEY=${{ steps.doppler.outputs.PAY_MOONPAY_API_KEY }}
           push: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.push) }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

@@ -1,5 +1,7 @@
 FROM rust:bookworm AS build
 
+ARG PAY_MOONPAY_API_KEY=""
+
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 
 RUN apt-get update && apt-get install -y \
@@ -17,7 +19,7 @@ RUN git config --global url."https://github.com/".insteadOf "git@github.com:" &&
 
 COPY . .
 
-RUN cargo build --release --features gcp_kms
+RUN PAY_MOONPAY_API_KEY="$PAY_MOONPAY_API_KEY" cargo build --release --features gcp_kms
 
 RUN cp target/release/pay /usr/local/bin/pay
 

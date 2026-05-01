@@ -17,6 +17,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -125,6 +126,15 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.preflight.outputs.tag }}
+      - name: Fetch Doppler secrets
+        id: doppler
+        uses: dopplerhq/secrets-fetch-action@v2.0.0
+        with:
+          auth-method: oidc
+          doppler-identity-id: ${{ vars.DOPPLER_SERVICE_IDENTITY_ID }}
+          doppler-project: ${{ vars.DOPPLER_PROJECT || 'pay' }}
+          doppler-config: ${{ vars.DOPPLER_CONFIG_CI || 'prd_cli' }}
+          inject-env-vars: true
 
       - uses: pnpm/action-setup@v4
         with:
@@ -144,7 +154,7 @@ jobs:
         run: |
           cat > Cross.toml <<'EOF'
           [build.env]
-          passthrough = ["PAY_PDB_DIST", "PAY_PDB_ALLOW_PLACEHOLDER"]
+          passthrough = ["PAY_MOONPAY_API_KEY", "PAY_PDB_DIST", "PAY_PDB_ALLOW_PLACEHOLDER"]
           EOF
 
       - uses: dtolnay/rust-toolchain@stable
@@ -162,6 +172,8 @@ jobs:
 
       - name: Build
         if: ${{ !matrix.use-cross }}
+        env:
+          PAY_MOONPAY_API_KEY: ${{ steps.doppler.outputs.PAY_MOONPAY_API_KEY }}
         run: >-
           cargo build --release
           --target ${{ matrix.target }}
@@ -169,6 +181,7 @@ jobs:
       - name: Build (cross)
         if: matrix.use-cross
         env:
+          PAY_MOONPAY_API_KEY: ${{ steps.doppler.outputs.PAY_MOONPAY_API_KEY }}
           PAY_PDB_DIST: /project/pdb-dist
         run: >-
           cross build --release
