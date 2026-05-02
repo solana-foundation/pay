@@ -231,7 +231,10 @@ const STEP_AMOUNT: u64 = 500_000; // 0.50 USDC in base units (6 decimals)
 const TOPUP_MAX_STEPS: usize = 25;
 const TOPUP_STEP_USDC: f64 = 1.0;
 const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-const DEFAULT_ONRAMP_HOST: &str = "https://pay.sh";
+/// Production onramp host — same gateway that serves the pay-api, just a
+/// different path (`/v1/onramp/start`). Reuses `pay_core::balance::DEFAULT_PAY_API_URL`
+/// so the two stay in sync if the host ever moves.
+const DEFAULT_ONRAMP_HOST: &str = pay_core::client::balance::DEFAULT_PAY_API_URL;
 
 const CARD_WIDTH: u16 = 36;
 const CARD_BG: Color = Color::Rgb(35, 40, 50);
@@ -371,7 +374,16 @@ impl OnrampPaymentMethod {
             // so they read OK on the dark TUI background.
             Self::Paypal => Color::Rgb(255, 196, 57),
             Self::Venmo => Color::Rgb(0, 140, 255),
-            Self::ApplePay => Color::Rgb(10, 10, 10),
+            Self::ApplePay => Color::White,
+        }
+    }
+
+    /// Foreground colour used for the title when the button is selected —
+    /// dark on light brand backgrounds (Apple Pay), white otherwise.
+    fn brand_text_color(self) -> Color {
+        match self {
+            Self::Paypal | Self::Venmo => Color::White,
+            Self::ApplePay => Color::Black,
         }
     }
 
@@ -393,7 +405,7 @@ impl OnrampPaymentMethod {
 }
 
 /// Resolve the redirect host from `PAY_ONRAMP_HOST`, falling back to
-/// `https://pay.sh`. Trailing slashes are stripped so callers can `format!`
+/// `https://api.gateway-402.com`. Trailing slashes are stripped so callers can `format!`
 /// without double-slash hazards.
 fn resolve_onramp_host() -> String {
     let raw = std::env::var("PAY_ONRAMP_HOST").unwrap_or_else(|_| DEFAULT_ONRAMP_HOST.to_string());
@@ -405,9 +417,10 @@ fn resolve_onramp_host() -> String {
 /// Presents two options to the user:
 ///
 /// 1. **Buy stablecoins** (default) — copies the destination wallet address to
-///    the clipboard, shows a brief launch animation, then opens the pay.sh
-///    onramp URL in the user's browser. `PAY_ONRAMP_HOST` controls the
-///    browser target, defaulting to `https://pay.sh`.
+///    the clipboard, shows a brief launch animation, then opens the
+///    `/v1/onramp/start` endpoint on the gateway in the user's browser.
+///    `PAY_ONRAMP_HOST` controls the host, defaulting to
+///    `DEFAULT_ONRAMP_HOST` (the production gateway).
 /// 2. **Top-up from mobile wallet** — renders a Solana Pay QR code that any
 ///    Solana wallet can scan, while polling the RPC for incoming SOL/SPL token
 ///    balance changes against `pubkey`.
@@ -669,7 +682,7 @@ fn run_topup(
                 KeyCode::Char('r') | KeyCode::Char('R')
                     if options[selected] == TopupOption::BuyStablecoins && onramp.is_some() =>
                 {
-                    // Reopen the pay.sh onramp URL. The server will create a
+                    // Reopen the gateway onramp URL. The server will create a
                     // fresh MoonPay checkout session for the new request.
                     if let Some(session) = onramp.as_ref() {
                         let _ = open_url(&session.url);
@@ -702,7 +715,6 @@ struct BlinkState {
 struct OnrampSession {
     url: String,
     payment_method: OnrampPaymentMethod,
-    started_at: Instant,
 }
 
 #[derive(Clone, Copy)]
@@ -979,6 +991,8 @@ fn render_topup_selector(
             frame,
             right[1],
             pubkey,
+            account_name,
+            status,
             payment_method,
             onramp,
             onramp_notice,
@@ -1208,108 +1222,26 @@ fn render_buy_stablecoins_detail(
     frame: &mut ratatui::Frame,
     area: Rect,
     pubkey: &str,
+    account_name: &str,
+    status: &PollStatus,
     payment_method: OnrampPaymentMethod,
     onramp: Option<&OnrampSession>,
     onramp_notice: Option<&str>,
     onramp_error: Option<&str>,
 ) {
-    frame.render_widget(
-        Block::default().style(Style::default().bg(TOPUP_MAIN_BG)),
+    // Same panel for both states (pre-launch + post-launch). The intro
+    // function decides which action-copy variant to show based on whether
+    // an onramp session is in flight.
+    render_buy_stablecoins_intro(
+        frame,
         area,
-    );
-
-    if onramp.is_none() {
-        render_buy_stablecoins_intro(
-            frame,
-            area,
-            pubkey,
-            payment_method,
-            onramp_notice,
-            onramp_error,
-        );
-        return;
-    }
-
-    let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from(Span::styled(
-        "Buy stablecoins via MoonPay",
-        Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD),
-    )));
-    lines.push(Line::raw(""));
-
-    match onramp {
-        None => unreachable!(),
-        Some(session) => {
-            let elapsed = session.started_at.elapsed().as_secs();
-            lines.push(Line::from(Span::styled(
-                "MoonPay opened in your browser.",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            )));
-            lines.push(Line::raw(""));
-            lines.push(Line::from(vec![
-                Span::styled("Status:  ", Style::default().fg(Color::Gray)),
-                Span::styled("waiting for funds…", Style::default().fg(Color::Yellow)),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("Elapsed: ", Style::default().fg(Color::Gray)),
-                Span::styled(format!("{elapsed}s"), Style::default().fg(Color::White)),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("Method:  ", Style::default().fg(Color::Gray)),
-                Span::styled(
-                    session.payment_method.title(),
-                    Style::default().fg(Color::White),
-                ),
-            ]));
-            lines.push(Line::from(Span::styled(
-                "pay will confirm once the balance changes on-chain.",
-                Style::default().fg(Color::DarkGray),
-            )));
-            lines.push(Line::raw(""));
-            lines.push(Line::from(vec![
-                Span::styled(
-                    "r",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(" reopen browser  ·  ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    "Esc",
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(" abort", Style::default().fg(Color::DarkGray)),
-            ]));
-        }
-    }
-
-    if let Some(notice) = onramp_notice {
-        lines.push(Line::raw(""));
-        lines.push(Line::from(Span::styled(
-            notice.to_string(),
-            Style::default().fg(Color::DarkGray),
-        )));
-    }
-
-    if let Some(err) = onramp_error {
-        lines.push(Line::raw(""));
-        lines.push(Line::from(Span::styled(
-            format!("Last attempt failed: {err}"),
-            Style::default().fg(Color::Red),
-        )));
-        lines.push(Line::from(Span::styled(
-            "Press Enter to retry.",
-            Style::default().fg(Color::DarkGray),
-        )));
-    }
-
-    frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(TOPUP_MAIN_BG)),
-        area,
+        pubkey,
+        account_name,
+        status,
+        payment_method,
+        onramp,
+        onramp_notice,
+        onramp_error,
     );
 }
 
@@ -1329,14 +1261,20 @@ const STABLECOIN_DESCRIPTION_LINES: &[&str] = &[
     "They move at internet speed: send and settle in seconds, anywhere in the world.",
 ];
 
-/// Render the pre-launch "What are stablecoins?" pane: title + explainer
-/// description, three brand-coloured payment-method buttons, and a short
-/// action description.
+/// Render the "Buy stablecoins" pane: title + explainer info panel, three
+/// brand-coloured payment-method buttons, and a short action description.
+/// Used both before launch (the "press Enter to open …" prompt) and after
+/// launch (a spinner + "Waiting for {method} payment …" line) so the
+/// layout never reflows when the user kicks off the onramp.
+#[allow(clippy::too_many_arguments)]
 fn render_buy_stablecoins_intro(
     frame: &mut ratatui::Frame,
     area: Rect,
     pubkey: &str,
+    account_name: &str,
+    status: &PollStatus,
     payment_method: OnrampPaymentMethod,
+    onramp: Option<&OnrampSession>,
     onramp_notice: Option<&str>,
     onramp_error: Option<&str>,
 ) {
@@ -1362,12 +1300,17 @@ fn render_buy_stablecoins_intro(
     // the panel grows as the terminal narrows, up to a fixed max.
     let panel_height = (wrapped + 2).clamp(3, 7);
 
+    // Pre-launch: just a thin spacer between buttons and action copy.
+    // Post-launch: replace it with a 4-row "money-flow" animation in the
+    // selected brand's colour.
+    let flow_height: u16 = if onramp.is_some() { 4 } else { 1 };
+
     let split = Layout::vertical([
         Constraint::Length(1),             // top spacer
         Constraint::Length(panel_height),  // info panel (dynamic)
         Constraint::Length(1),             // spacer
-        Constraint::Length(3),             // 3 brand buttons
-        Constraint::Length(1),             // spacer
+        Constraint::Length(3),             // brand button(s)
+        Constraint::Length(flow_height),   // flow animation OR spacer
         Constraint::Min(0),                // action copy
     ])
     .split(area);
@@ -1398,53 +1341,59 @@ fn render_buy_stablecoins_intro(
         .wrap(ratatui::widgets::Wrap { trim: true });
     frame.render_widget(description, info_area);
 
-    // ── three brand buttons, centered horizontally ─────────────────────
-    let methods = OnrampPaymentMethod::all();
-    let total_buttons_width =
-        PAYMENT_BUTTON_WIDTH * methods.len() as u16 + PAYMENT_BUTTON_GAP * 2;
-    let row_pad = split[3].width.saturating_sub(total_buttons_width) / 2;
-    let mut button_constraints = vec![Constraint::Length(row_pad)];
-    for i in 0..methods.len() {
-        button_constraints.push(Constraint::Length(PAYMENT_BUTTON_WIDTH));
-        if i + 1 < methods.len() {
-            button_constraints.push(Constraint::Length(PAYMENT_BUTTON_GAP));
-        }
-    }
-    button_constraints.push(Constraint::Min(0));
-    let columns = Layout::horizontal(button_constraints).split(split[3]);
+    // Spinner phase, used both by the action-copy primary line and the
+    // money-flow animation so they tick in lockstep.
+    let spinner_tick = match status {
+        PollStatus::Waiting { spinner_idx, .. }
+        | PollStatus::Checking { spinner_idx }
+        | PollStatus::Polling { spinner_idx, .. } => *spinner_idx,
+        PollStatus::Stalled => 0,
+    };
 
-    for (idx, method) in methods.iter().enumerate() {
-        // Skip the leading pad chunk (idx 0) and any gap chunks.
-        let chunk_idx = 1 + idx * 2;
-        let is_selected = *method == payment_method;
-        render_payment_button(frame, columns[chunk_idx], *method, is_selected);
+    // ── payment buttons + (when launched) money-flow animation ─────────
+    if let Some(session) = onramp {
+        // Single centered button for the active method.
+        let btn_pad = split[3].width.saturating_sub(PAYMENT_BUTTON_WIDTH) / 2;
+        let btn_area = Rect {
+            x: split[3].x + btn_pad,
+            y: split[3].y,
+            width: PAYMENT_BUTTON_WIDTH,
+            height: split[3].height,
+        };
+        render_payment_button(frame, btn_area, session.payment_method, true);
+        render_money_flow(
+            frame,
+            split[4],
+            session.payment_method.brand_color(),
+            spinner_tick,
+        );
+    } else {
+        let methods = OnrampPaymentMethod::all();
+        let total_buttons_width =
+            PAYMENT_BUTTON_WIDTH * methods.len() as u16 + PAYMENT_BUTTON_GAP * 2;
+        let row_pad = split[3].width.saturating_sub(total_buttons_width) / 2;
+        let mut button_constraints = vec![Constraint::Length(row_pad)];
+        for i in 0..methods.len() {
+            button_constraints.push(Constraint::Length(PAYMENT_BUTTON_WIDTH));
+            if i + 1 < methods.len() {
+                button_constraints.push(Constraint::Length(PAYMENT_BUTTON_GAP));
+            }
+        }
+        button_constraints.push(Constraint::Min(0));
+        let columns = Layout::horizontal(button_constraints).split(split[3]);
+
+        for (idx, method) in methods.iter().enumerate() {
+            // Skip the leading pad chunk (idx 0) and any gap chunks.
+            let chunk_idx = 1 + idx * 2;
+            let is_selected = *method == payment_method;
+            render_payment_button(frame, columns[chunk_idx], *method, is_selected);
+        }
     }
 
     // ── action copy ────────────────────────────────────────────────────
-    let mut action_lines = vec![
-        Line::from(vec![
-            Span::styled("Press ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                "Enter",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(" to open {} and convert dollars to USDC.", payment_method.title()),
-                Style::default().fg(Color::Gray),
-            ),
-        ])
-        .centered(),
-        Line::from(vec![
-            Span::styled("On Solana, funds arrive at ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                pubkey.to_string(),
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" within a second.", Style::default().fg(Color::Gray)),
-        ])
-        .centered(),
+    // Closing copy ("Once funded …") + optional notice/error are shared
+    // between pre- and post-launch states.
+    let mut closing_lines = vec![
         Line::from(Span::styled(
             format!(
                 "Once funded, your pay account — secured by {} — can spend on any pay-enabled API.",
@@ -1454,13 +1403,9 @@ fn render_buy_stablecoins_intro(
         ))
         .centered(),
     ];
-
-    // Surface the launch animation notice + any error from the most recent
-    // attempt — without these the user has no signal that Enter did
-    // anything when launch_onramp_session fails (e.g. API key missing).
     if let Some(notice) = onramp_notice {
-        action_lines.push(Line::raw(""));
-        action_lines.push(
+        closing_lines.push(Line::raw(""));
+        closing_lines.push(
             Line::from(Span::styled(
                 notice.to_string(),
                 Style::default().fg(Color::Yellow),
@@ -1469,15 +1414,15 @@ fn render_buy_stablecoins_intro(
         );
     }
     if let Some(err) = onramp_error {
-        action_lines.push(Line::raw(""));
-        action_lines.push(
+        closing_lines.push(Line::raw(""));
+        closing_lines.push(
             Line::from(Span::styled(
                 format!("Last attempt failed: {err}"),
                 Style::default().fg(Color::Red),
             ))
             .centered(),
         );
-        action_lines.push(
+        closing_lines.push(
             Line::from(Span::styled(
                 "Press Enter to retry.",
                 Style::default().fg(Color::DarkGray),
@@ -1486,8 +1431,90 @@ fn render_buy_stablecoins_intro(
         );
     }
 
-    let action = Paragraph::new(action_lines).style(Style::default().bg(TOPUP_MAIN_BG));
-    frame.render_widget(action, split[5]);
+    if onramp.is_some() {
+        // Post-launch: replace the spinner + Solana lines with a small
+        // bordered destination box (account name + dimmed network/pubkey),
+        // then the shared closing copy below it.
+        let action_split = Layout::vertical([
+            Constraint::Length(4), // destination box (2 borders + 2 content)
+            Constraint::Length(1), // spacer
+            Constraint::Min(0),    // closing copy
+        ])
+        .split(split[5]);
+
+        const DEST_BOX_MAX_WIDTH: u16 = 52;
+        let box_width = DEST_BOX_MAX_WIDTH.min(action_split[0].width);
+        let box_pad = action_split[0].width.saturating_sub(box_width) / 2;
+        let box_area = Rect {
+            x: action_split[0].x + box_pad,
+            y: action_split[0].y,
+            width: box_width,
+            height: action_split[0].height,
+        };
+        let dest_block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::White))
+            .padding(Padding::horizontal(1))
+            .style(Style::default().bg(TOPUP_MAIN_BG));
+        let dest_lines = vec![
+            Line::from(Span::styled(
+                account_name.to_string(),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .centered(),
+            Line::from(Span::styled(
+                format!("[{pubkey}]"),
+                Style::default().fg(Color::DarkGray),
+            ))
+            .centered(),
+        ];
+        let dest = Paragraph::new(dest_lines)
+            .block(dest_block)
+            .style(Style::default().bg(TOPUP_MAIN_BG));
+        frame.render_widget(dest, box_area);
+
+        let closing = Paragraph::new(closing_lines).style(Style::default().bg(TOPUP_MAIN_BG));
+        frame.render_widget(closing, action_split[2]);
+    } else {
+        // Pre-launch: keep the original 3-line copy.
+        let mut action_lines = vec![
+            Line::from(vec![
+                Span::styled("Press ", Style::default().fg(Color::Gray)),
+                Span::styled(
+                    "Enter",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(
+                        " to open {} and convert dollars to USDC.",
+                        payment_method.title()
+                    ),
+                    Style::default().fg(Color::Gray),
+                ),
+            ])
+            .centered(),
+            Line::from(vec![
+                Span::styled("On Solana, funds arrive at ", Style::default().fg(Color::Gray)),
+                Span::styled(
+                    pubkey.to_string(),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" within a second.", Style::default().fg(Color::Gray)),
+            ])
+            .centered(),
+        ];
+        action_lines.extend(closing_lines);
+
+        let action = Paragraph::new(action_lines).style(Style::default().bg(TOPUP_MAIN_BG));
+        frame.render_widget(action, split[5]);
+    }
 }
 
 /// Estimate the number of visual lines `text_lines` will occupy when each
@@ -1547,8 +1574,10 @@ fn render_payment_button(
     } else {
         TOPUP_CARD_BG
     };
+    // Selected text is white by default, but flip to black on light brand
+    // backgrounds (Apple Pay) so the title stays legible.
     let fg = if is_selected {
-        Color::White
+        method.brand_text_color()
     } else {
         Color::Gray
     };
@@ -1563,6 +1592,46 @@ fn render_payment_button(
     ])
     .block(block);
     frame.render_widget(card, area);
+}
+
+/// Vertical "money is flowing in" animation rendered beneath the active
+/// payment-method button. Each row shows either a bright `▼`, a dim `▽`,
+/// or a blank, with the bright glyph drifting downward as `tick`
+/// advances — giving the impression of falling drops in the brand colour.
+fn render_money_flow(frame: &mut ratatui::Frame, area: Rect, color: Color, tick: usize) {
+    let height = area.height as usize;
+    if height == 0 {
+        return;
+    }
+    // Cycle length controls drop spacing: longer = sparser drops. Adding
+    // a couple of empty phases past the visible rows keeps the column
+    // from looking constantly full.
+    let cycle = (height + 2).max(6) as i32;
+    // Spinner ticks every ~80ms. Slow the drop ~3× so each row dwells
+    // for ~240ms — money trickling in, not raining.
+    const FLOW_DAMPING: i32 = 3;
+    let slow_tick = (tick as i32) / FLOW_DAMPING;
+    let bright = Style::default().fg(color).add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(color).add_modifier(Modifier::DIM);
+
+    let lines: Vec<Line<'static>> = (0..height)
+        .map(|row| {
+            // phase increases as slow_tick increases; subtracting `row`
+            // makes higher rows lead the cycle, so the drop falls.
+            let phase = ((slow_tick - row as i32).rem_euclid(cycle)) as usize;
+            let span = match phase {
+                0 => Span::styled("▼", bright),
+                1 => Span::styled("▽", dim),
+                _ => Span::raw(" "),
+            };
+            Line::from(span).centered()
+        })
+        .collect();
+
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(TOPUP_MAIN_BG)),
+        area,
+    );
 }
 
 fn unavailable_qr() -> RenderedQr {
@@ -1731,16 +1800,18 @@ fn print_topup_instructions(pubkey: &str, onramp_host: &str) {
 }
 
 fn build_onramp_redirect_url(host: &str) -> String {
-    format!("{host}/onramp/done")
+    format!("{host}/v1/onramp/complete")
 }
 
-/// Compose the pay.sh onramp URL we open in the browser.
+/// Compose the onramp URL we open in the browser. Points at the gateway's
+/// `/v1/onramp/start` endpoint, which redirects to MoonPay with the server-side
+/// API key + currency defaults applied.
 fn build_onramp_url(
     host: &str,
     pubkey: &str,
     payment_method: Option<OnrampPaymentMethod>,
 ) -> String {
-    let base = format!("{}/onramp", host.trim_end_matches('/'));
+    let base = format!("{}/v1/onramp/start", host.trim_end_matches('/'));
     let redirect_url = build_onramp_redirect_url(host);
     let mut url = reqwest::Url::parse(&base).expect("onramp URL should parse");
     {
@@ -1762,11 +1833,10 @@ fn launch_onramp_session(
 ) -> Result<OnrampSession, String> {
     let host = onramp_host.trim_end_matches('/').to_string();
     let url = build_onramp_url(&host, pubkey, Some(payment_method));
-    open_url(&url).map_err(|err| format!("failed to open pay.sh onramp: {err}"))?;
+    open_url(&url).map_err(|err| format!("failed to open onramp: {err}"))?;
     Ok(OnrampSession {
         url,
         payment_method,
-        started_at: Instant::now(),
     })
 }
 
@@ -2754,15 +2824,15 @@ mod tests {
     #[test]
     fn build_onramp_redirect_url_targets_done_page() {
         assert_eq!(
-            build_onramp_redirect_url("https://pay.sh"),
-            "https://pay.sh/onramp/done"
+            build_onramp_redirect_url("https://api.gateway-402.com"),
+            "https://api.gateway-402.com/v1/onramp/complete"
         );
     }
 
     #[test]
-    fn build_onramp_url_targets_pay_sh_with_fixed_params() {
+    fn build_onramp_url_targets_gateway_with_fixed_params() {
         let url = build_onramp_url(
-            "https://pay.sh",
+            "https://api.gateway-402.com",
             "wallet123",
             Some(OnrampPaymentMethod::Paypal),
         );
@@ -2771,11 +2841,12 @@ mod tests {
             .query_pairs()
             .collect::<std::collections::HashMap<_, _>>();
 
-        assert_eq!(parsed.path(), "/onramp");
+        assert_eq!(parsed.host_str(), Some("api.gateway-402.com"));
+        assert_eq!(parsed.path(), "/v1/onramp/start");
         assert_eq!(query.get("walletAddress"), Some(&"wallet123".into()));
         assert_eq!(
             query.get("redirectURL"),
-            Some(&"https://pay.sh/onramp/done".into())
+            Some(&"https://api.gateway-402.com/v1/onramp/complete".into())
         );
         assert_eq!(query.get("paymentMethod"), Some(&"paypal".into()));
         assert!(!query.contains_key("apiKey"));
@@ -2787,13 +2858,23 @@ mod tests {
 
     #[test]
     fn build_onramp_url_omits_payment_method_when_absent() {
-        let url = build_onramp_url("https://pay.sh", "wallet123", None);
+        let url = build_onramp_url("https://api.gateway-402.com", "wallet123", None);
         let parsed = reqwest::Url::parse(&url).expect("onramp URL should parse");
         let query = parsed
             .query_pairs()
             .collect::<std::collections::HashMap<_, _>>();
 
-        assert_eq!(parsed.path(), "/onramp");
+        assert_eq!(parsed.path(), "/v1/onramp/start");
         assert!(!query.contains_key("paymentMethod"));
+    }
+
+    #[test]
+    fn default_onramp_host_matches_pay_api_host() {
+        // Both the balance API and the onramp endpoint live on the same
+        // gateway — keep them locked to a single source of truth.
+        assert_eq!(
+            DEFAULT_ONRAMP_HOST,
+            pay_core::client::balance::DEFAULT_PAY_API_URL
+        );
     }
 }

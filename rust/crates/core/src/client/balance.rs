@@ -14,7 +14,7 @@
 use serde::Deserialize;
 
 /// Default pay-api host. Override with `PAY_API_URL`.
-pub const DEFAULT_PAY_API_URL: &str = "http://api.gateway-402.com";
+pub const DEFAULT_PAY_API_URL: &str = "https://api.gateway-402.com";
 
 /// Default mainnet RPC URL. Override with `PAY_MAINNET_RPC_URL`.
 pub fn mainnet_rpc_url() -> String {
