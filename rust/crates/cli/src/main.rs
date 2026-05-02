@@ -218,6 +218,30 @@ fn main() {
     let output_fmt = opts.output;
 
     let verbose = opts.verbose;
+
+    // First-run UX: when a payment-bearing command is invoked on a fresh
+    // install (e.g. `npx @solana/pay claude "buy me some flowers"`), run
+    // `pay setup` first so the user lands in the wizard instead of a
+    // cryptic "no account configured" error mid-flight. Sandbox flows
+    // generate ephemeral wallets on first use, so they're exempt.
+    if opts.command.requires_account() && !sandbox_mode && !has_any_account() {
+        eprintln!(
+            "{}",
+            "No pay account configured — running `pay setup` first…".dimmed()
+        );
+        if let Err(err) = (commands::setup::SetupCommand {
+            force: false,
+            backend: None,
+            vault: None,
+            update: false,
+        })
+        .run()
+        {
+            eprintln!("{}", format!("Error: setup failed: {err}").dimmed());
+            std::process::exit(1);
+        }
+    }
+
     if let Err(err) = opts.command.execute(
         auto_pay,
         output_fmt,
@@ -239,6 +263,15 @@ fn main() {
         }
         std::process::exit(1);
     }
+}
+
+/// True if any pay account exists on disk (any network, any name).
+/// Errors loading the file are treated as "no account" so the first-run
+/// path triggers a clean setup instead of bailing on a corrupt config.
+fn has_any_account() -> bool {
+    pay_core::accounts::AccountsFile::load()
+        .map(|f| f.accounts.values().any(|net| !net.is_empty()))
+        .unwrap_or(false)
 }
 
 fn init_logging(

@@ -208,20 +208,16 @@ pub async fn get_balances(rpc_url: &str, pubkey: &str) -> crate::Result<AccountB
     .await?;
     let sol_lamports = sol_resp["result"]["value"].as_u64().unwrap_or(0);
 
-    let (tokens, tokens_unavailable) = match fetch_stablecoins_via_api(
-        &client,
-        &pay_api_url(),
-        pubkey,
-        infer_network(rpc_url),
-    )
-    .await
-    {
-        Ok(t) => (t, false),
-        Err(e) => {
-            tracing::debug!(error = %e, "pay-api unreachable; returning empty token balances");
-            (Vec::new(), true)
-        }
-    };
+    let (tokens, tokens_unavailable) =
+        match fetch_stablecoins_via_api(&client, &pay_api_url(), pubkey, infer_network(rpc_url))
+            .await
+        {
+            Ok(t) => (t, false),
+            Err(e) => {
+                tracing::debug!(error = %e, "pay-api unreachable; returning empty token balances");
+                (Vec::new(), true)
+            }
+        };
 
     Ok(AccountBalances {
         sol_lamports,
@@ -282,9 +278,12 @@ pub async fn get_balances_batch(
         let client = client.clone();
         let api = api.clone();
         let pk = pk.clone();
-        set.spawn(
-            async move { (pk.clone(), fetch_stablecoins_via_api(&client, &api, &pk, network).await) },
-        );
+        set.spawn(async move {
+            (
+                pk.clone(),
+                fetch_stablecoins_via_api(&client, &api, &pk, network).await,
+            )
+        });
     }
 
     while let Some(Ok((pk, result))) = set.join_next().await {
@@ -389,7 +388,10 @@ mod tests {
         assert_eq!(infer_network("http://127.0.0.1:8899"), "sandbox");
         assert_eq!(infer_network("http://localhost:8899"), "sandbox");
         assert_eq!(infer_network("https://402.surfnet.dev:8899"), "sandbox");
-        assert_eq!(infer_network("https://api.mainnet-beta.solana.com"), "mainnet");
+        assert_eq!(
+            infer_network("https://api.mainnet-beta.solana.com"),
+            "mainnet"
+        );
         assert_eq!(infer_network("https://my-helius.example.com"), "mainnet");
     }
 

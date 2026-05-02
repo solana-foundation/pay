@@ -17,7 +17,11 @@ pub fn current_user_account_name() -> String {
         .or_else(|| {
             // `whoami.exe` on Windows, `whoami` elsewhere — both write the
             // username to stdout (Windows form: `DOMAIN\user`).
-            let bin = if cfg!(windows) { "whoami.exe" } else { "whoami" };
+            let bin = if cfg!(windows) {
+                "whoami.exe"
+            } else {
+                "whoami"
+            };
             std::process::Command::new(bin)
                 .output()
                 .ok()

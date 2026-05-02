@@ -94,6 +94,36 @@ impl Command {
         }
     }
 
+    /// Whether this command needs a configured pay account before it can
+    /// run usefully. Used by `main` to auto-run `pay setup` on a fresh
+    /// install when the user invokes a payment-bearing command directly
+    /// (e.g. `npx @solana/pay claude "buy me some flowers"`).
+    ///
+    /// Setup itself, account-management subcommands, and informational
+    /// commands (whoami, skills, mcp, server) are excluded — they either
+    /// don't need an account or handle the missing-account case
+    /// gracefully on their own.
+    pub fn requires_account(&self) -> bool {
+        match self {
+            Command::Curl(_)
+            | Command::Wget(_)
+            | Command::Http(_)
+            | Command::Fetch(_)
+            | Command::Claude(_)
+            | Command::Codex(_)
+            | Command::Solana(_)
+            | Command::Send(_)
+            | Command::Topup(_) => true,
+            Command::Setup(_)
+            | Command::Account { .. }
+            | Command::Whoami(_)
+            | Command::Skills { .. }
+            | Command::Install(_)
+            | Command::Server { .. }
+            | Command::Mcp => false,
+        }
+    }
+
     /// Which tool this command wraps.
     #[allow(dead_code)] // used by session budget TUI (currently disabled)
     pub fn tool_kind(&self) -> ToolKind {

@@ -58,7 +58,6 @@ enum CheckMsg {
     Done,
 }
 
-
 struct RenderedQr {
     lines: Vec<Line<'static>>,
     width: u16,
@@ -202,9 +201,7 @@ impl PollState {
         }
         let spinner_idx = (self.cycle_elapsed(now).as_millis() / 80) as usize;
         if !self.past_delay(now) {
-            let secs_left = POLL_DELAY
-                .saturating_sub(self.cycle_elapsed(now))
-                .as_secs();
+            let secs_left = POLL_DELAY.saturating_sub(self.cycle_elapsed(now)).as_secs();
             return PollStatus::Waiting {
                 secs_left,
                 spinner_idx,
@@ -955,11 +952,7 @@ fn render_topup_selector(
         // Reuse the Solana logo's brand colors so each option has a
         // distinct identity when active. No border — full background fill.
         let brand = option.brand_color();
-        let bg = if is_active {
-            brand
-        } else {
-            TOPUP_CARD_BG
-        };
+        let bg = if is_active { brand } else { TOPUP_CARD_BG };
         let title_color = if is_active || is_selected {
             Color::White
         } else {
@@ -1218,6 +1211,7 @@ fn solana_pay_url(pubkey: &str, amount_pos: usize) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_buy_stablecoins_detail(
     frame: &mut ratatui::Frame,
     area: Rect,
@@ -1306,12 +1300,12 @@ fn render_buy_stablecoins_intro(
     let flow_height: u16 = if onramp.is_some() { 4 } else { 1 };
 
     let split = Layout::vertical([
-        Constraint::Length(1),             // top spacer
-        Constraint::Length(panel_height),  // info panel (dynamic)
-        Constraint::Length(1),             // spacer
-        Constraint::Length(3),             // brand button(s)
-        Constraint::Length(flow_height),   // flow animation OR spacer
-        Constraint::Min(0),                // action copy
+        Constraint::Length(1),            // top spacer
+        Constraint::Length(panel_height), // info panel (dynamic)
+        Constraint::Length(1),            // spacer
+        Constraint::Length(3),            // brand button(s)
+        Constraint::Length(flow_height),  // flow animation OR spacer
+        Constraint::Min(0),               // action copy
     ])
     .split(area);
 
@@ -1499,7 +1493,10 @@ fn render_buy_stablecoins_intro(
             ])
             .centered(),
             Line::from(vec![
-                Span::styled("On Solana, funds arrive at ", Style::default().fg(Color::Gray)),
+                Span::styled(
+                    "On Solana, funds arrive at ",
+                    Style::default().fg(Color::Gray),
+                ),
                 Span::styled(
                     pubkey.to_string(),
                     Style::default()
@@ -2532,7 +2529,10 @@ mod tests {
         let mut state = PollState::new(now, Some(healthy_baseline()));
         let t = now + POLL_DELAY;
         state.on_check_started(t);
-        assert_eq!(state.decide(t + Duration::from_millis(500)), PollDecision::Idle);
+        assert_eq!(
+            state.decide(t + Duration::from_millis(500)),
+            PollDecision::Idle
+        );
         assert_eq!(state.decide(t + POLL_INTERVAL), PollDecision::Idle);
     }
 
@@ -2748,35 +2748,6 @@ mod tests {
         // exact count which depends on word boundaries).
         let total = wrapped_line_count(STABLECOIN_DESCRIPTION_LINES, 60);
         assert!(total > 3, "expected growth past 3 lines, got {total}");
-    }
-
-
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<String>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let previous = std::env::var(key).ok();
-            unsafe { std::env::set_var(key, value) };
-            Self { key, previous }
-        }
-
-        fn remove(key: &'static str) -> Self {
-            let previous = std::env::var(key).ok();
-            unsafe { std::env::remove_var(key) };
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match &self.previous {
-                Some(value) => unsafe { std::env::set_var(self.key, value) },
-                None => unsafe { std::env::remove_var(self.key) },
-            }
-        }
     }
 
     #[test]

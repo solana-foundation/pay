@@ -1168,10 +1168,7 @@ fn parse_catalog(raw: &str) -> Result<Catalog> {
     serde_json::from_str(raw).map_err(|e| Error::Config(format!("parse catalog: {e}")))
 }
 
-fn write_cache(
-    cfg: &config::SkillsConfig,
-    catalog: &Catalog,
-) -> Result<std::path::PathBuf> {
+fn write_cache(cfg: &config::SkillsConfig, catalog: &Catalog) -> Result<std::path::PathBuf> {
     let path = cfg.new_cache_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)

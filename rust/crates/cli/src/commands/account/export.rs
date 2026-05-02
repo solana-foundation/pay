@@ -25,9 +25,7 @@ impl ExportCommand {
             .get(pay_core::accounts::MAINNET_NETWORK)
             .and_then(|net| net.iter().find(|(n, _)| *n == &self.name))
             .map(|(_, a)| a)
-            .ok_or_else(|| {
-                pay_core::Error::Config(format!("Account '{}' not found", self.name))
-            })?;
+            .ok_or_else(|| pay_core::Error::Config(format!("Account '{}' not found", self.name)))?;
 
         let intent = pay_core::keystore::AuthIntent::export_account(&self.name);
         let keypair_bytes = pay_core::signer::load_keypair_bytes_from_account_with_intent(
@@ -72,4 +70,3 @@ impl ExportCommand {
         Ok(())
     }
 }
-

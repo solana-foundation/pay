@@ -15,9 +15,11 @@ use pay_types::metering::{ApiSpec, OperatorConfig, RoutingConfig, SignerConfig};
 use solana_mpp::server::Mpp;
 use solana_mpp::solana_keychain::SolanaSigner;
 use solana_mpp::solana_keychain::memory::MemorySigner;
+use tokio::time::{Duration, Instant};
 
 const AUTO_OPERATOR_ACCOUNT_NAME: &str = "gateway";
 const BROWSER_RPC_PROXY_PATH: &str = "/__402/rpc";
+const FEE_PAYER_BALANCE_OBSERVE_INTERVAL: Duration = Duration::from_secs(300);
 const BROWSER_RPC_ALLOWED_METHODS: &[&str] = &[
     "getLatestBlockhash",
     "surfnet_setAccount",
@@ -681,6 +683,7 @@ impl StartCommand {
             };
             if let Some(ref wallet) = fee_payer_wallet {
                 wallet.observe("startup", &api.subdomain, "__startup").await;
+                spawn_fee_payer_balance_observer(wallet.clone(), api.subdomain.clone());
             }
 
             eprintln!(
@@ -906,6 +909,20 @@ impl StartCommand {
                 .map_err(|e| pay_core::Error::Config(format!("Server error: {e}")))
         })
     }
+}
+
+fn spawn_fee_payer_balance_observer(wallet: FeePayerWallet, subdomain: String) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval_at(
+            Instant::now() + FEE_PAYER_BALANCE_OBSERVE_INTERVAL,
+            FEE_PAYER_BALANCE_OBSERVE_INTERVAL,
+        );
+
+        loop {
+            interval.tick().await;
+            wallet.observe("periodic", &subdomain, "__periodic").await;
+        }
+    });
 }
 
 fn build_endpoints_json(api: &ApiSpec) -> serde_json::Value {

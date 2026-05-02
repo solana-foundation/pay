@@ -61,5 +61,8 @@ const SUBCOMMAND_HELP: &[(&str, &str)] = &[
     ("import", "Import an account from a JSON key file"),
     ("default", "Set the default account"),
     ("rm", "Remove an account (alias: destroy)"),
-    ("export", "Export an account to a JSON key file (alias: backup)"),
+    (
+        "export",
+        "Export an account to a JSON key file (alias: backup)",
+    ),
 ];
