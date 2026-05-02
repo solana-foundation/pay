@@ -17,6 +17,9 @@ RUN git config --global url."https://github.com/".insteadOf "git@github.com:" &&
 
 COPY . .
 
+ARG PAY_PDB_ALLOW_PLACEHOLDER
+ENV PAY_PDB_ALLOW_PLACEHOLDER=${PAY_PDB_ALLOW_PLACEHOLDER}
+
 RUN cargo build --release --features gcp_kms
 
 RUN cp target/release/pay /usr/local/bin/pay
