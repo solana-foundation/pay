@@ -465,8 +465,8 @@ fn run_topup(
                 KeyCode::Char('r') | KeyCode::Char('R')
                     if options[selected] == TopupOption::BuyStablecoins && onramp.is_some() =>
                 {
-                    // Reopen the existing MoonPay tab without rotating the
-                    // externalTransactionId — the in-flight session is still valid.
+                    // Reopen the pay.sh onramp URL. The server will create a
+                    // fresh MoonPay checkout session for the new request.
                     if let Some(session) = onramp.as_ref() {
                         let _ = open_url(&session.url);
                     }
@@ -498,7 +498,6 @@ struct BlinkState {
 /// Active MoonPay session state surfaced into the TUI.
 #[derive(Debug)]
 struct OnrampSession {
-    external_id: String,
     url: String,
     payment_method: OnrampPaymentMethod,
     started_at: Instant,
@@ -1032,13 +1031,6 @@ fn render_buy_stablecoins_detail(
                     Style::default().fg(Color::White),
                 ),
             ]));
-            lines.push(Line::from(vec![
-                Span::styled("Tx ID:   ", Style::default().fg(Color::Gray)),
-                Span::styled(
-                    session.external_id.clone(),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]));
             lines.push(Line::from(Span::styled(
                 "pay will confirm once the balance changes on-chain.",
                 Style::default().fg(Color::DarkGray),
@@ -1260,13 +1252,8 @@ fn print_topup_instructions(pubkey: &str, onramp_host: &str) {
     eprintln!("Top up your pay account:");
     eprintln!("  Address: {pubkey}");
     eprintln!("  1. Transfer funds from an existing Solana account.");
-    let url = build_onramp_url(onramp_host, pubkey, &new_external_id(), None);
+    let url = build_onramp_url(onramp_host, pubkey, None);
     eprintln!("  2. Buy funds with MoonPay: {url}");
-}
-
-/// Build a sanitized `externalTransactionId` (UUID v4 with the `pay-` prefix).
-fn new_external_id() -> String {
-    format!("pay-{}", uuid::Uuid::new_v4())
 }
 
 fn build_onramp_redirect_url(host: &str) -> String {
@@ -1277,7 +1264,6 @@ fn build_onramp_redirect_url(host: &str) -> String {
 fn build_onramp_url(
     host: &str,
     pubkey: &str,
-    external_id: &str,
     payment_method: Option<OnrampPaymentMethod>,
 ) -> String {
     let base = format!("{}/onramp", host.trim_end_matches('/'));
@@ -1285,10 +1271,7 @@ fn build_onramp_url(
     let mut url = reqwest::Url::parse(&base).expect("onramp URL should parse");
     {
         let mut query = url.query_pairs_mut();
-        query.append_pair("currencyCode", "usdc_sol");
         query.append_pair("walletAddress", pubkey);
-        query.append_pair("baseCurrencyAmount", "20");
-        query.append_pair("externalTransactionId", external_id);
         query.append_pair("redirectURL", &redirect_url);
         if let Some(payment_method) = payment_method {
             query.append_pair("paymentMethod", payment_method.query_value());
@@ -1304,11 +1287,9 @@ fn launch_onramp_session(
     payment_method: OnrampPaymentMethod,
 ) -> Result<OnrampSession, String> {
     let host = onramp_host.trim_end_matches('/').to_string();
-    let external_id = new_external_id();
-    let url = build_onramp_url(&host, pubkey, &external_id, Some(payment_method));
+    let url = build_onramp_url(&host, pubkey, Some(payment_method));
     open_url(&url).map_err(|err| format!("failed to open pay.sh onramp: {err}"))?;
     Ok(OnrampSession {
-        external_id,
         url,
         payment_method,
         started_at: Instant::now(),
@@ -2004,7 +1985,6 @@ mod tests {
         let url = build_onramp_url(
             "https://pay.sh",
             "wallet123",
-            "pay-abc",
             Some(OnrampPaymentMethod::Paypal),
         );
         let parsed = reqwest::Url::parse(&url).expect("onramp URL should parse");
@@ -2013,22 +1993,22 @@ mod tests {
             .collect::<std::collections::HashMap<_, _>>();
 
         assert_eq!(parsed.path(), "/onramp");
-        assert_eq!(query.get("currencyCode"), Some(&"usdc_sol".into()));
         assert_eq!(query.get("walletAddress"), Some(&"wallet123".into()));
-        assert_eq!(query.get("baseCurrencyAmount"), Some(&"20".into()));
-        assert_eq!(query.get("externalTransactionId"), Some(&"pay-abc".into()));
         assert_eq!(
             query.get("redirectURL"),
             Some(&"https://pay.sh/onramp/done".into())
         );
         assert_eq!(query.get("paymentMethod"), Some(&"paypal".into()));
         assert!(!query.contains_key("apiKey"));
+        assert!(!query.contains_key("currencyCode"));
+        assert!(!query.contains_key("baseCurrencyAmount"));
+        assert!(!query.contains_key("externalTransactionId"));
         assert!(!query.contains_key("account"));
     }
 
     #[test]
     fn build_onramp_url_omits_payment_method_when_absent() {
-        let url = build_onramp_url("https://pay.sh", "wallet123", "pay-abc", None);
+        let url = build_onramp_url("https://pay.sh", "wallet123", None);
         let parsed = reqwest::Url::parse(&url).expect("onramp URL should parse");
         let query = parsed
             .query_pairs()
