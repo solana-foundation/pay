@@ -6,12 +6,16 @@ default:
 
 # Install a target: `just install pay`, `just install pay <cargo install args...>`, `just install deps`
 [positional-arguments]
-install target='deps' *cargo_args:
+install *args:
     #!/usr/bin/env bash
     set -euo pipefail
 
-    target="$1"
-    shift
+    if [ "$#" -eq 0 ]; then
+        target='deps'
+    else
+        target="$1"
+        shift
+    fi
 
     build_pdb() {
         if [ -n "${PAY_PDB_DIST:-}" ]; then
