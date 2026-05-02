@@ -27,9 +27,13 @@ fmt:
 # Format + lint
 check: fmt lint
 
-# Run the CLI (pass args after --)
-run *ARGS:
-    cargo run -- {{ARGS}}
+# Run a workspace binary, forwarding subcommands.
+# Examples:
+#   just run pay whoami
+#   just run pay accounts
+#   just run pay account new ludo
+run BIN *ARGS:
+    cargo run -p {{BIN}} -- {{ARGS}}
 
 # Build Docker image
 docker-build:

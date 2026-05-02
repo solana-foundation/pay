@@ -11,8 +11,8 @@ use pay_core::keystore::Keystore;
 /// keystore backend and the entry from accounts.yml.
 #[derive(clap::Args)]
 pub struct DestroyCommand {
-    /// Account name to destroy. Defaults to "default".
-    #[arg(default_value = "default")]
+    /// Account name to destroy (required).
+    #[arg(value_name = "NAME")]
     pub account: String,
 
     /// Remove from the sandbox (localnet) network instead of mainnet.
@@ -101,11 +101,11 @@ impl DestroyCommand {
             if export {
                 let export_path = format!("backup-{}.json", self.account);
                 let export_cmd = super::export::ExportCommand {
+                    name: self.account.clone(),
                     path: Some(export_path.clone()),
-                    name: Some(self.account.clone()),
                 };
                 // Try exporting, but don't fail the whole remove if it errors
-                match export_cmd.run(None) {
+                match export_cmd.run() {
                     Ok(()) => {}
                     Err(e) => eprintln!("  {}", format!("Export failed: {e}").dimmed()),
                 }

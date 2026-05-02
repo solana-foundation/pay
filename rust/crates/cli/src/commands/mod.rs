@@ -11,6 +11,7 @@ pub mod skills;
 pub mod solana;
 pub mod topup;
 pub mod wget;
+pub mod whoami;
 
 use clap::Subcommand;
 use owo_colors::OwoColorize;
@@ -39,11 +40,15 @@ pub enum Command {
     /// Run Codex with 402 payment support.
     Codex(codex::CodexCommand),
     /// Manage accounts (new, import, list, destroy, export).
+    /// With no subcommand, lists accounts and prints the available subcommands.
     #[command(alias = "accounts")]
     Account {
         #[command(subcommand)]
-        command: account::AccountCommand,
+        command: Option<account::AccountCommand>,
     },
+    /// Show the system user, the active mainnet account, and its stablecoin
+    /// balances.
+    Whoami(whoami::WhoamiCommand),
     /// Run a Solana CLI command with your pay account keypair.
     Solana(solana::SolanaCommand),
     /// Send SOL to a recipient address.
@@ -100,6 +105,7 @@ impl Command {
             Command::Claude(_) => ToolKind::Claude,
             Command::Codex(_) => ToolKind::Codex,
             Command::Account { .. }
+            | Command::Whoami(_)
             | Command::Skills { .. }
             | Command::Install(_)
             | Command::Send(_)
@@ -137,7 +143,11 @@ impl Command {
             .unwrap_or_else(|_| "pay".to_string());
 
         match self {
-            Command::Account { command } => return command.run(keypair_override),
+            Command::Account { command } => match command {
+                Some(cmd) => return cmd.run(),
+                None => return account::run_default(),
+            },
+            Command::Whoami(cmd) => return cmd.run(),
             Command::Skills { command } => return command.run(),
             Command::Install(cmd) => return cmd.run(),
             Command::Solana(cmd) => std::process::exit(cmd.run(keypair_override)?),

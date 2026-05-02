@@ -4,6 +4,14 @@ mod ts 'typescript/Justfile'
 default:
     @just --list --unsorted
 
+# Run a workspace binary, forwarding subcommands.
+# Examples:
+#   just run pay whoami
+#   just run pay accounts
+#   just run pay account new ludo
+run BIN *ARGS:
+    cd rust && cargo run -p {{BIN}} -- {{ARGS}}
+
 # Install a target: `just install pay`, `just install pay <cargo install args...>`, `just install deps`
 [positional-arguments]
 install *args:

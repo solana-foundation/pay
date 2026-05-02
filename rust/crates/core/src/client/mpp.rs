@@ -565,6 +565,7 @@ mod tests {
                 2_000_000,
                 "USDT",
             )],
+            tokens_unavailable: false,
         };
 
         let selected = select_candidate_index_for_balances(&candidates, &balances).unwrap();
@@ -598,6 +599,7 @@ mod tests {
                     "USDT",
                 ),
             ],
+            tokens_unavailable: false,
         };
 
         let selected = select_candidate_index_for_balances(&candidates, &balances).unwrap();
@@ -631,6 +633,7 @@ mod tests {
                     "USDT",
                 ),
             ],
+            tokens_unavailable: false,
         };
 
         let selected = select_candidate_index_for_balances(&candidates, &balances).unwrap();
@@ -651,6 +654,7 @@ mod tests {
                 999_999,
                 "USDT",
             )],
+            tokens_unavailable: false,
         };
 
         assert!(select_candidate_index_for_balances(&candidates, &balances).is_none());

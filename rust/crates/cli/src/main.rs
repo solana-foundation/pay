@@ -4,6 +4,7 @@ pub mod debugger_proxy;
 mod no_dna;
 mod observability;
 mod output;
+pub mod system;
 pub mod tui;
 
 use clap::Parser;
@@ -188,6 +189,7 @@ fn main() {
             opts.command,
             Command::Setup(_)
                 | Command::Account { .. }
+                | Command::Whoami(_)
                 | Command::Skills { .. }
                 | Command::Install(_)
                 | Command::Curl(_)

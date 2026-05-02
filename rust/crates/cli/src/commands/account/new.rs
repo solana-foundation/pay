@@ -7,8 +7,7 @@ use pay_core::keystore::Keystore;
 /// Generate a new keypair and store it securely.
 #[derive(clap::Args)]
 pub struct NewCommand {
-    /// Account name. Defaults to "default".
-    #[arg(long, default_value = "default")]
+    /// Account name (required).
     pub name: String,
 
     /// Storage backend: "keychain" (macOS), "gnome-keyring" (Linux),

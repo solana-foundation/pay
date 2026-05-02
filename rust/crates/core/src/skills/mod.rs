@@ -966,8 +966,10 @@ pub async fn load_skills() -> Result<Catalog> {
     // Cache miss — fetch, merge, cache.
     match fetch_and_merge(&cfg, false).await {
         Ok(catalog) => {
-            let _ = write_cache(&cfg, &catalog);
-            cfg.clean_stale_caches();
+            if let Ok(written) = write_cache(&cfg, &catalog) {
+                cfg.clean_stale_caches(&written);
+            }
+            clean_stale_detail_cache(&catalog);
             Ok(catalog)
         }
         Err(fetch_err) => {
@@ -1010,11 +1012,9 @@ pub fn load_cached_skills() -> Result<Catalog> {
 pub async fn update_skills(cache_bust: bool) -> Result<Catalog> {
     let cfg = config::SkillsConfig::load()?;
     let catalog = fetch_and_merge(&cfg, cache_bust).await?;
-    write_cache(&cfg, &catalog)?;
-    cfg.clean_stale_caches();
-    if cache_bust {
-        clean_stale_detail_cache(&catalog);
-    }
+    let written = write_cache(&cfg, &catalog)?;
+    cfg.clean_stale_caches(&written);
+    clean_stale_detail_cache(&catalog);
     Ok(catalog)
 }
 
@@ -1168,7 +1168,10 @@ fn parse_catalog(raw: &str) -> Result<Catalog> {
     serde_json::from_str(raw).map_err(|e| Error::Config(format!("parse catalog: {e}")))
 }
 
-fn write_cache(cfg: &config::SkillsConfig, catalog: &Catalog) -> Result<()> {
+fn write_cache(
+    cfg: &config::SkillsConfig,
+    catalog: &Catalog,
+) -> Result<std::path::PathBuf> {
     let path = cfg.new_cache_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -1177,7 +1180,7 @@ fn write_cache(cfg: &config::SkillsConfig, catalog: &Catalog) -> Result<()> {
     let json = serde_json::to_string(catalog)
         .map_err(|e| Error::Config(format!("serialize catalog: {e}")))?;
     std::fs::write(&path, json).map_err(|e| Error::Config(format!("write cache: {e}")))?;
-    Ok(())
+    Ok(path)
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────

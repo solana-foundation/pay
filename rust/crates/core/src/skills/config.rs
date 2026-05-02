@@ -157,16 +157,24 @@ impl SkillsConfig {
         dir.join(format!("skills-{ts}-{hash}.json"))
     }
 
-    /// Clean up old cache files that don't match the current hash.
-    pub fn clean_stale_caches(&self) {
+    /// Remove every `skills-*.json` cache file except `keep`.
+    ///
+    /// Catalog files are timestamped, so even with an unchanged source hash
+    /// each successful update writes a new file. Without this prune, repeat
+    /// `pay skills update` calls would accumulate one stale catalog per run.
+    pub fn clean_stale_caches(&self, keep: &std::path::Path) {
         let dir = cache_dir();
-        let hash = self.sources_hash();
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with("skills-") && name.ends_with(".json") && !name.contains(&hash) {
-                    let _ = std::fs::remove_file(entry.path());
-                }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path == keep {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("skills-") && name.ends_with(".json") {
+                let _ = std::fs::remove_file(&path);
             }
         }
     }
@@ -361,7 +369,7 @@ mod tests {
         // Should not panic when cache dir doesn't exist
         let mut cfg = SkillsConfig::default();
         cfg.add_source("https://nonexistent-test-12345.example.com/catalog.json");
-        cfg.clean_stale_caches(); // no-op, no panic
+        cfg.clean_stale_caches(std::path::Path::new("/nonexistent/keep.json"));
     }
 
     #[test]

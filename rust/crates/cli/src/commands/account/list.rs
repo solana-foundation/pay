@@ -2,6 +2,14 @@
 
 use owo_colors::OwoColorize;
 
+use crate::components::{
+    explorer_link, format_account_header, print_balance_unavailable, print_balances,
+    print_topup_note,
+};
+
+const MAINNET: &str = "mainnet";
+const BALANCE_INDENT: &str = "    ";
+
 /// List all registered accounts.
 #[derive(clap::Args)]
 pub struct ListCommand;
@@ -98,20 +106,13 @@ pub fn print_account_list(
         }
     }
 
-    eprintln!();
+    // Track whether any mainnet account had a non-zero stablecoin balance —
+    // used to surface a single yellow "run `pay topup`" hint at the end.
+    let mut any_mainnet_funded = false;
+    let mut mainnet_seen = false;
 
     for (network, named_accounts) in &accounts.accounts {
-        // Print network header
-        eprintln!("  {}:", network.dimmed());
-
-        // Use a network-appropriate RPC URL for explorer links so localnet
-        // accounts link to the sandbox explorer rather than mainnet.
-        let network_rpc = match network.as_str() {
-            "mainnet" => rpc_url.clone(),
-            "localnet" => pay_core::config::SANDBOX_RPC_URL.to_string(),
-            "devnet" => "https://api.devnet.solana.com".to_string(),
-            _ => rpc_url.clone(),
-        };
+        eprintln!("{}:", network);
 
         for (name, account) in named_accounts {
             // Determine if this is the active account for its network:
@@ -122,7 +123,6 @@ pub fn print_account_list(
             let is_active = if any_active {
                 account.active
             } else {
-                // First alphabetically (BTreeMap) is active by default
                 named_accounts
                     .iter()
                     .next()
@@ -148,54 +148,55 @@ pub fn print_account_list(
             );
 
             let marker = if is_active {
-                "●".green().to_string()
+                "● ".green().to_string()
             } else {
-                " ".to_string()
+                "  ".to_string()
             };
 
-            let pubkey_display = account
-                .pubkey
-                .as_deref()
-                .map(|p| {
-                    if p.len() > 12 {
-                        format!("{}…{}", &p[..6], &p[p.len() - 4..])
-                    } else {
-                        p.to_string()
-                    }
-                })
-                .unwrap_or_else(|| "unknown".to_string());
+            let name_styled = if is_red {
+                name.red().bold().to_string()
+            } else if is_highlighted {
+                name.green().bold().to_string()
+            } else if is_active {
+                name.bold().to_string()
+            } else {
+                name.to_string()
+            };
 
-            let backend = account.keystore.to_string();
+            let pubkey = account.pubkey.as_deref().unwrap_or("(no pubkey)");
+            eprintln!(
+                "{marker}{}",
+                format_account_header(&name_styled, network, pubkey)
+            );
 
             let bal = account
                 .pubkey
                 .as_ref()
                 .and_then(|pk| balance_cache.get(pk))
                 .and_then(|b| b.as_ref());
-            let balance_str = format_balance_display(bal, account.pubkey.as_deref(), &network_rpc);
-
-            // Pad before colorizing so ANSI codes don't break alignment
-            let name_col = format!("{:<12}", name);
-            let pubkey_col = format!("{:<14}", pubkey_display);
-            let backend_col = format!("{:<16}", backend);
-
-            let name_styled = if is_red {
-                name_col.red().bold().to_string()
-            } else if is_highlighted {
-                name_col.green().bold().to_string()
-            } else if is_active {
-                name_col.bold().to_string()
-            } else {
-                name_col.dimmed().to_string()
+            let funded = match bal {
+                Some(b) if b.tokens_unavailable => {
+                    print_balance_unavailable(BALANCE_INDENT, account.pubkey.as_deref(), &rpc_url);
+                    false
+                }
+                Some(b) => print_balances(b, BALANCE_INDENT),
+                None => {
+                    print_balance_unavailable(BALANCE_INDENT, account.pubkey.as_deref(), &rpc_url);
+                    false
+                }
             };
 
-            eprintln!(
-                "    {marker} {} {} {} {balance_str}",
-                name_styled,
-                pubkey_col.dimmed(),
-                backend_col.dimmed(),
-            );
+            if network == MAINNET {
+                mainnet_seen = true;
+                if funded {
+                    any_mainnet_funded = true;
+                }
+            }
         }
+    }
+
+    if mainnet_seen && !any_mainnet_funded {
+        print_topup_note();
     }
 
     eprintln!();
@@ -241,36 +242,6 @@ pub fn format_balance_display(
         }
         None => explorer_link(pubkey, rpc_url),
     }
-}
-
-/// Clickable terminal hyperlink to Solana Explorer token page.
-///
-/// For non-mainnet RPC URLs (localhost, sandbox), appends the custom cluster
-/// query params so the explorer connects to the right network.
-pub fn explorer_link(pubkey: Option<&str>, rpc_url: &str) -> String {
-    match pubkey {
-        Some(pk) if !pk.is_empty() => {
-            let base = format!("https://explorer.solana.com/address/{pk}/tokens");
-            let url = if rpc_url.contains("mainnet") {
-                base
-            } else {
-                let encoded = percent_encode_rpc(rpc_url);
-                format!("{base}?cluster=custom&customUrl={encoded}")
-            };
-            format!("\x1b]8;;{url}\x1b\\{}\x1b]8;;\x1b\\", "balance ↗".dimmed())
-        }
-        _ => "—".dimmed().to_string(),
-    }
-}
-
-fn percent_encode_rpc(url: &str) -> String {
-    url.chars()
-        .map(|c| match c {
-            ':' => "%3A".to_string(),
-            '/' => "%2F".to_string(),
-            c => c.to_string(),
-        })
-        .collect()
 }
 
 /// Fetch balances for a single pubkey (with retry). Returns None on failure.

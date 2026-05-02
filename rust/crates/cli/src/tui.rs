@@ -22,17 +22,42 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
 
-const POLL_DELAY: Duration = Duration::from_secs(4);
-const POLL_COUNTDOWN: Duration = Duration::from_secs(4);
+/// Wait this long after the cycle starts (TUI open or QR recompute) before
+/// the first balance check. Gives the user time to scan & broadcast.
+const POLL_DELAY: Duration = Duration::from_secs(5);
+/// Minimum spacing between consecutive balance checks once polling begins.
+const POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// Total polling window for a single cycle. After this, polling stops and
+/// the user has to press R to start a new cycle.
+const POLL_WINDOW: Duration = Duration::from_secs(300);
+/// Safety timeout: if a spawned check thread doesn't report back within this
+/// duration we assume it's wedged and clear the `checking` flag so the next
+/// tick can dispatch a new one.
+const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Result from the polling thread: what changed + current totals.
+#[derive(Debug, Clone)]
 struct TopupDetected {
     received: ReceivedFunds,
     /// On-chain transaction hash for the funding transfer, when known.
     tx_hash: Option<String>,
 }
+
+/// Message sent from the spawned balance-check thread back to the TUI loop.
+#[derive(Debug)]
+enum CheckMsg {
+    /// First successful balance fetch — promotes from "no baseline" to
+    /// "polling for diffs". The previous baseline (if any) was unhealthy
+    /// (`tokens_unavailable`) and is replaced.
+    BaselineEstablished(AccountBalances),
+    /// Diff against the existing baseline detected incoming funds.
+    Detected(TopupDetected),
+    /// Check finished without anything to report — clear `checking`.
+    Done,
+}
+
 
 struct RenderedQr {
     lines: Vec<Line<'static>>,
@@ -41,15 +66,161 @@ struct RenderedQr {
 }
 
 /// What the status line should show.
+///
+/// All non-stalled variants render the same way in the bottom status bar
+/// (`<spinner> waiting for transfer…`), but we keep them as distinct cases
+/// so the state machine remains introspectable and unit-testable.
+#[derive(Debug, PartialEq, Eq)]
 enum PollStatus {
-    /// Initial balance fetch failed — no polling possible.
-    RpcUnavailable,
-    /// Waiting for the initial delay before first check.
-    Waiting { secs_left: u64 },
-    /// Currently fetching balances from RPC.
+    /// Cycle just started — waiting POLL_DELAY before the first check.
+    Waiting { secs_left: u64, spinner_idx: usize },
+    /// A balance check is currently in flight.
     Checking { spinner_idx: usize },
-    /// Countdown until the next automatic refresh.
-    Countdown { secs_left: u64 },
+    /// Idle between 1s polls. `secs_left_in_window` is how many seconds
+    /// remain before the cycle stalls.
+    Polling {
+        secs_left_in_window: u64,
+        spinner_idx: usize,
+    },
+    /// Cycle window (POLL_WINDOW) elapsed without detecting a topup.
+    /// Triggers the yellow "press R" banner; polling halts until reset.
+    Stalled,
+}
+
+/// Pure state machine for the topup balance-polling cadence. Held inside
+/// `run_topup_flow` and consulted each tick to decide whether to spawn a
+/// new check, what status to render, etc. All time-dependent methods take
+/// `now: Instant` so they're deterministic in tests.
+struct PollState {
+    /// When the current polling cycle started (TUI open, QR recompute, or
+    /// R press). Resets the delay/window timers.
+    cycle_started_at: Instant,
+    /// When the most recent check thread was spawned. Drives both the
+    /// 1s POLL_INTERVAL throttle and the CHECK_TIMEOUT stuck-thread reset.
+    last_check_started_at: Option<Instant>,
+    /// Reference balances for diff_received. `None` means no successful
+    /// fetch yet — the next check will establish baseline rather than diff.
+    /// `Some(b)` with `b.tokens_unavailable` is treated as no baseline so
+    /// pay-api flakes during init don't poison the diff.
+    baseline: Option<AccountBalances>,
+    /// True while a spawned check thread is still in flight.
+    checking: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PollDecision {
+    /// Don't spawn anything this tick.
+    Idle,
+    /// Spawn a balance-check thread now.
+    SpawnCheck,
+}
+
+impl PollState {
+    fn new(now: Instant, baseline: Option<AccountBalances>) -> Self {
+        Self {
+            cycle_started_at: now,
+            last_check_started_at: None,
+            baseline: baseline.filter(|b| !b.tokens_unavailable),
+            checking: false,
+        }
+    }
+
+    /// Restart the cycle: reset the 5s delay and the 5min window. Called
+    /// when the QR is recomputed (amount slider moved) or the user presses
+    /// R. Baseline is preserved across resets so we keep diffing against
+    /// the original snapshot.
+    fn reset_cycle(&mut self, now: Instant) {
+        self.cycle_started_at = now;
+        self.last_check_started_at = None;
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn has_healthy_baseline(&self) -> bool {
+        self.baseline
+            .as_ref()
+            .is_some_and(|b| !b.tokens_unavailable)
+    }
+
+    fn cycle_elapsed(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.cycle_started_at)
+    }
+
+    fn past_delay(&self, now: Instant) -> bool {
+        self.cycle_elapsed(now) >= POLL_DELAY
+    }
+
+    fn past_window(&self, now: Instant) -> bool {
+        self.cycle_elapsed(now) >= POLL_WINDOW
+    }
+
+    /// Whether to spawn a check this tick.
+    fn decide(&self, now: Instant) -> PollDecision {
+        if self.checking || !self.past_delay(now) || self.past_window(now) {
+            return PollDecision::Idle;
+        }
+        match self.last_check_started_at {
+            None => PollDecision::SpawnCheck,
+            Some(t) if now.saturating_duration_since(t) >= POLL_INTERVAL => {
+                PollDecision::SpawnCheck
+            }
+            _ => PollDecision::Idle,
+        }
+    }
+
+    fn on_check_started(&mut self, now: Instant) {
+        self.checking = true;
+        self.last_check_started_at = Some(now);
+    }
+
+    fn on_check_done(&mut self) {
+        self.checking = false;
+    }
+
+    fn on_baseline_established(&mut self, b: AccountBalances) {
+        // Only accept healthy baselines — defensive guard.
+        if !b.tokens_unavailable {
+            self.baseline = Some(b);
+        }
+        self.checking = false;
+    }
+
+    /// If a check thread spawned more than CHECK_TIMEOUT ago and never sent
+    /// a result, free the `checking` slot so the next tick can retry.
+    fn clear_stuck_check(&mut self, now: Instant) {
+        if self.checking
+            && self
+                .last_check_started_at
+                .is_some_and(|t| now.saturating_duration_since(t) >= CHECK_TIMEOUT)
+        {
+            self.checking = false;
+        }
+    }
+
+    fn status(&self, now: Instant) -> PollStatus {
+        if self.past_window(now) {
+            return PollStatus::Stalled;
+        }
+        let spinner_idx = (self.cycle_elapsed(now).as_millis() / 80) as usize;
+        if !self.past_delay(now) {
+            let secs_left = POLL_DELAY
+                .saturating_sub(self.cycle_elapsed(now))
+                .as_secs();
+            return PollStatus::Waiting {
+                secs_left,
+                spinner_idx,
+            };
+        }
+        if self.checking {
+            return PollStatus::Checking { spinner_idx };
+        }
+        let secs_left_in_window = POLL_WINDOW
+            .saturating_sub(self.cycle_elapsed(now))
+            .as_secs();
+        PollStatus::Polling {
+            secs_left_in_window,
+            spinner_idx,
+        }
+    }
 }
 
 /// Slider range: $0.00 to $15.00 in $0.50 increments = 30 steps, + 1 YOLO step = 31
@@ -67,8 +238,6 @@ const CARD_BG: Color = Color::Rgb(35, 40, 50);
 const TOPUP_SIDEBAR_BG: Color = Color::Rgb(24, 24, 27);
 const TOPUP_MAIN_BG: Color = Color::Rgb(9, 9, 11);
 const TOPUP_CARD_BG: Color = Color::Rgb(39, 39, 42);
-const TOPUP_CARD_ACTIVE_BG: Color = Color::Rgb(74, 222, 128);
-const TOPUP_CARD_INACTIVE_SELECTED_BG: Color = Color::Rgb(34, 84, 61);
 const SOLANA_PURPLE: Color = Color::Rgb(153, 69, 255);
 const SOLANA_BLUE: Color = Color::Rgb(80, 120, 255);
 const SOLANA_GREEN: Color = Color::Rgb(20, 241, 149);
@@ -148,10 +317,12 @@ impl TopupOption {
         }
     }
 
-    fn subtitle(self) -> &'static str {
+    /// Solana-brand background color for the option card when active.
+    /// Picked from the logo palette directly above the cards.
+    fn brand_color(self) -> Color {
         match self {
-            Self::TransferFromExistingAccount => "Scan with any Solana wallet",
-            Self::BuyStablecoins => "Pay with card, Apple Pay, or bank",
+            Self::TransferFromExistingAccount => SOLANA_PURPLE,
+            Self::BuyStablecoins => SOLANA_GREEN,
         }
     }
 }
@@ -165,6 +336,7 @@ enum TopupFocus {
 enum OnrampPaymentMethod {
     Paypal,
     Venmo,
+    ApplePay,
 }
 
 impl OnrampPaymentMethod {
@@ -172,10 +344,15 @@ impl OnrampPaymentMethod {
         Self::Paypal
     }
 
+    fn all() -> [Self; 3] {
+        [Self::Paypal, Self::Venmo, Self::ApplePay]
+    }
+
     fn title(self) -> &'static str {
         match self {
             Self::Paypal => "PayPal",
             Self::Venmo => "Venmo",
+            Self::ApplePay => "Apple Pay",
         }
     }
 
@@ -183,18 +360,35 @@ impl OnrampPaymentMethod {
         match self {
             Self::Paypal => "paypal",
             Self::Venmo => "venmo",
+            Self::ApplePay => "apple_pay",
+        }
+    }
+
+    /// Brand-color background used when this option is selected.
+    fn brand_color(self) -> Color {
+        match self {
+            // Approximations of each brand's primary color, dimmed slightly
+            // so they read OK on the dark TUI background.
+            Self::Paypal => Color::Rgb(255, 196, 57),
+            Self::Venmo => Color::Rgb(0, 140, 255),
+            Self::ApplePay => Color::Rgb(10, 10, 10),
         }
     }
 
     fn previous(self) -> Self {
         match self {
-            Self::Paypal => Self::Venmo,
+            Self::Paypal => Self::ApplePay,
             Self::Venmo => Self::Paypal,
+            Self::ApplePay => Self::Venmo,
         }
     }
 
     fn next(self) -> Self {
-        self.previous()
+        match self {
+            Self::Paypal => Self::Venmo,
+            Self::Venmo => Self::ApplePay,
+            Self::ApplePay => Self::Paypal,
+        }
     }
 }
 
@@ -265,6 +459,53 @@ pub struct TopupCompletion {
     pub tx_hash: Option<String>,
 }
 
+/// Spawn a background thread that fetches the current balance and reports
+/// the result back over `tx`:
+///
+/// - No baseline yet → forward `BaselineEstablished` on first healthy fetch.
+/// - Healthy baseline → diff against it; emit `Detected` on incoming funds,
+///   else `Done`.
+/// - Pay-api or RPC unavailable → emit `Done` so `checking` clears for the
+///   next tick to retry.
+fn spawn_check(
+    tx: &mpsc::Sender<CheckMsg>,
+    baseline: Option<AccountBalances>,
+    rpc_url: &str,
+    pubkey: &str,
+) {
+    let rpc = rpc_url.to_string();
+    let pk = pubkey.to_string();
+    let tx = tx.clone();
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt,
+            Err(_) => {
+                let _ = tx.send(CheckMsg::Done);
+                return;
+            }
+        };
+        let msg = match rt.block_on(pay_core::client::balance::get_balances(&rpc, &pk)) {
+            Ok(current) if current.tokens_unavailable => CheckMsg::Done,
+            Ok(current) => match baseline {
+                None => CheckMsg::BaselineEstablished(current),
+                Some(b) => {
+                    let received = current.diff_received(&b);
+                    if received.has_any() {
+                        CheckMsg::Detected(TopupDetected {
+                            received,
+                            tx_hash: None,
+                        })
+                    } else {
+                        CheckMsg::Done
+                    }
+                }
+            },
+            Err(_) => CheckMsg::Done,
+        };
+        let _ = tx.send(msg);
+    });
+}
+
 fn run_topup(
     terminal: &mut Terminal<CrosstermBackend<io::Stderr>>,
     pubkey: &str,
@@ -276,105 +517,68 @@ fn run_topup(
     let mut selected = 0usize;
     let mut payment_method = OnrampPaymentMethod::default();
     let focus = TopupFocus::Methods;
-    let mut amount_pos: usize = 10; // default $10
-    let started_at = Instant::now();
+    let mut amount_pos: usize = 3; // default $3
+    let mut last_amount_pos = amount_pos;
 
     // Active MoonPay session (set after the user hits Enter on "Buy stablecoins").
     let mut onramp: Option<OnrampSession> = None;
     let mut onramp_notice: Option<String> = None;
     let mut onramp_error: Option<String> = None;
 
-    // Fetch initial balances (best-effort; skip polling if RPC is unreachable)
+    // Best-effort initial baseline. `PollState::new` filters out unhealthy
+    // (`tokens_unavailable`) baselines so the next check re-establishes one.
     let initial_balances = tokio::runtime::Runtime::new()
         .unwrap()
         .block_on(pay_core::client::balance::get_balances(rpc_url, pubkey))
         .ok();
+    let mut poll = PollState::new(Instant::now(), initial_balances);
 
-    // Channel for background balance checks
-    let (tx, rx) = mpsc::channel::<TopupDetected>();
-    let mut last_check_at: Option<Instant> = None;
-    let mut checking = false;
-
-    // Trigger a balance check on the background thread.
-    let trigger_check = |tx: &mpsc::Sender<TopupDetected>,
-                         initial: &AccountBalances,
-                         rpc_url: &str,
-                         pubkey: &str| {
-        let rpc = rpc_url.to_string();
-        let pk = pubkey.to_string();
-        let initial = initial.clone();
-        let tx = tx.clone();
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            if let Ok(current) = rt.block_on(pay_core::client::balance::get_balances(&rpc, &pk)) {
-                let received = current.diff_received(&initial);
-                if received.has_any() {
-                    let _ = tx.send(TopupDetected {
-                        received,
-                        tx_hash: None,
-                    });
-                }
-            }
-            // Send a sentinel None to signal "check finished, nothing found"
-        });
-    };
+    // Channel for background balance checks.
+    let (tx, rx) = mpsc::channel::<CheckMsg>();
 
     loop {
-        let elapsed = started_at.elapsed();
-        let has_baseline = initial_balances.is_some();
-        let past_delay = elapsed >= POLL_DELAY;
+        let now = Instant::now();
 
-        // Auto-trigger first check after POLL_DELAY, then every POLL_COUNTDOWN
-        if has_baseline && past_delay && !checking {
-            let should_check = match last_check_at {
-                None => true,
-                Some(t) => t.elapsed() >= POLL_COUNTDOWN,
-            };
-            if should_check {
-                checking = true;
-                last_check_at = Some(Instant::now());
-                trigger_check(&tx, initial_balances.as_ref().unwrap(), rpc_url, pubkey);
+        // Recompute QR cycle when the amount slider moves.
+        if amount_pos != last_amount_pos {
+            poll.reset_cycle(now);
+            last_amount_pos = amount_pos;
+        }
+
+        // Spawn next check if cadence allows.
+        if poll.decide(now) == PollDecision::SpawnCheck {
+            poll.on_check_started(now);
+            spawn_check(&tx, poll.baseline.clone(), rpc_url, pubkey);
+        }
+
+        // Drain check results.
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                CheckMsg::BaselineEstablished(b) => poll.on_baseline_established(b),
+                CheckMsg::Detected(detected) => {
+                    blink_checkmark(
+                        terminal,
+                        pubkey,
+                        account_name,
+                        &options,
+                        selected,
+                        focus,
+                        amount_pos,
+                        payment_method,
+                        onramp.as_ref(),
+                        onramp_notice.as_deref(),
+                        onramp_error.as_deref(),
+                    )?;
+                    return Ok(Some(detected));
+                }
+                CheckMsg::Done => poll.on_check_done(),
             }
         }
 
-        // Check if a background check detected incoming funds
-        if let Ok(received) = rx.try_recv() {
-            blink_checkmark(
-                terminal,
-                pubkey,
-                account_name,
-                &options,
-                selected,
-                focus,
-                amount_pos,
-                payment_method,
-                onramp.as_ref(),
-                onramp_notice.as_deref(),
-                onramp_error.as_deref(),
-            )?;
-            return Ok(Some(received));
-        }
+        // Safety reset for wedged check threads.
+        poll.clear_stuck_check(now);
 
-        // If we were checking and the thread finished (channel empty), mark done
-        if checking && last_check_at.is_some_and(|t| t.elapsed() >= Duration::from_secs(6)) {
-            checking = false; // RPC timed out or returned no change
-        }
-
-        let status = if !has_baseline {
-            PollStatus::RpcUnavailable
-        } else if !past_delay {
-            let secs_left = POLL_DELAY.as_secs().saturating_sub(elapsed.as_secs());
-            PollStatus::Waiting { secs_left }
-        } else if checking {
-            let spinner_idx = (elapsed.as_millis() / 80) as usize;
-            PollStatus::Checking { spinner_idx }
-        } else {
-            let since_last = last_check_at.map(|t| t.elapsed()).unwrap_or_default();
-            let secs_left = POLL_COUNTDOWN
-                .as_secs()
-                .saturating_sub(since_last.as_secs());
-            PollStatus::Countdown { secs_left }
-        };
+        let status = poll.status(now);
 
         terminal.draw(|frame| {
             let area = frame.area();
@@ -471,12 +675,10 @@ fn run_topup(
                         let _ = open_url(&session.url);
                     }
                 }
-                KeyCode::Char('r') | KeyCode::Char('R')
-                    if has_baseline && past_delay && !checking =>
-                {
-                    checking = true;
-                    last_check_at = Some(Instant::now());
-                    trigger_check(&tx, initial_balances.as_ref().unwrap(), rpc_url, pubkey);
+                KeyCode::Char('r') | KeyCode::Char('R') => {
+                    // Restart the cycle: resets the 5s delay and 5min window
+                    // so polling resumes (or unstalls) regardless of state.
+                    poll.reset_cycle(Instant::now());
                 }
                 KeyCode::Char('q') | KeyCode::Esc => {
                     return Ok(None);
@@ -542,7 +744,10 @@ fn blink_checkmark(
                 options,
                 selected,
                 focus,
-                &PollStatus::RpcUnavailable, // status bar doesn't matter during blink
+                &PollStatus::Polling {
+                    secs_left_in_window: 0,
+                    spinner_idx: 0,
+                }, // status bar doesn't matter during blink
                 amount_pos,
                 payment_method,
                 blink.as_ref(),
@@ -735,46 +940,31 @@ fn render_topup_selector(
         let chunk_idx = idx * 2;
         let is_selected = idx == selected;
         let is_active = is_selected && focus == TopupFocus::Methods;
-        let border_color = if is_active {
-            TOPUP_CARD_ACTIVE_BG
-        } else if is_selected {
-            TOPUP_CARD_INACTIVE_SELECTED_BG
+        // Reuse the Solana logo's brand colors so each option has a
+        // distinct identity when active. No border — full background fill.
+        let brand = option.brand_color();
+        let bg = if is_active {
+            brand
         } else {
-            Color::DarkGray
+            TOPUP_CARD_BG
         };
-        let title_color = if is_active {
-            TOPUP_CARD_ACTIVE_BG
-        } else {
-            Color::White
-        };
-        let subtitle_color = if is_selected {
+        let title_color = if is_active || is_selected {
             Color::White
         } else {
             Color::Gray
         };
-        let marker_color = if is_selected {
-            TOPUP_CARD_ACTIVE_BG
-        } else {
-            TOPUP_CARD_BG
-        };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(border_color))
-            .style(Style::default().bg(TOPUP_CARD_BG));
+        let block = Block::default().style(Style::default().bg(bg));
+        // Card height is 3 — pad a blank line above the title so it lands
+        // on the middle row.
         let card = Paragraph::new(vec![
+            Line::default(),
             Line::from(Span::styled(
                 option.title(),
                 Style::default()
                     .fg(title_color)
                     .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(vec![
-                Span::styled(
-                    if is_active { "● " } else { "  " },
-                    Style::default().fg(marker_color),
-                ),
-                Span::styled(option.subtitle(), Style::default().fg(subtitle_color)),
-            ]),
+            ))
+            .centered(),
         ])
         .block(block);
         frame.render_widget(card, option_chunks[chunk_idx]);
@@ -796,6 +986,12 @@ fn render_topup_selector(
         ),
     }
 
+    // Top banner — only rendered when the polling cycle has stalled; the
+    // QR view's scan-instruction now lives in the slider title.
+    if matches!(status, PollStatus::Stalled) {
+        render_stalled_banner(frame, right[0]);
+    }
+
     render_topup_controls(
         frame,
         chunks[1],
@@ -804,6 +1000,39 @@ fn render_topup_selector(
         payment_method,
         onramp.is_some(),
     );
+}
+
+/// Build the human-readable scan-instruction text shown in the QR top
+/// banner. Pure: separated from the render path so we can unit-test it.
+fn scan_banner_text(account_name: &str, amount_pos: usize) -> String {
+    if amount_pos == 0 {
+        format!("Scan to send any amount of USDC to @{account_name}")
+    } else {
+        let amount = amount_pos as f64 * TOPUP_STEP_USDC;
+        format!("Scan to send ${amount:.0} USDC to @{account_name}")
+    }
+}
+
+/// Yellow notice rendered at the top of the right panel when the polling
+/// window has elapsed. Asks the developer to press R to start a new cycle.
+fn render_stalled_banner(frame: &mut ratatui::Frame, area: Rect) {
+    let banner = Paragraph::new(Line::from(vec![
+        Span::styled(
+            "▲ idle 5m — press ",
+            Style::default().fg(Color::Yellow).bold().bg(TOPUP_MAIN_BG),
+        ),
+        Span::styled(
+            "R",
+            Style::default().fg(Color::Cyan).bold().bg(TOPUP_MAIN_BG),
+        ),
+        Span::styled(
+            " to refresh ",
+            Style::default().fg(Color::Yellow).bold().bg(TOPUP_MAIN_BG),
+        ),
+    ]))
+    .style(Style::default().bg(TOPUP_MAIN_BG))
+    .right_aligned();
+    frame.render_widget(banner, area);
 }
 
 fn render_qr_detail(
@@ -820,12 +1049,23 @@ fn render_qr_detail(
         area,
     );
 
-    // Reserve slider space first so the QR gets whatever remains.
-    let split = Layout::vertical([Constraint::Min(0), Constraint::Length(5)]).split(area);
+    // Layout (top to bottom):
+    //   slider        — borderless, sized 2× QR width, centered
+    //   QR            — fills remaining vertical space, centered
+    //   scan label    — white bold "Scan to send … to @account"
+    //   dimmed helper — "Requires Solana wallet mobile application"
+    let split = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(0),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(area);
 
-    // Compute QR size to get the exact area it occupies, even during blink.
+    // Render the QR first so we know its actual width — the slider sits
+    // above and is sized to 2× that width.
     let url = solana_pay_url(pubkey, amount_pos);
-    let qr = render_qr(&url, split[0].width, split[0].height)
+    let qr = render_qr(&url, split[1].width, split[1].height)
         .ok()
         .flatten()
         .unwrap_or_else(unavailable_qr);
@@ -834,8 +1074,7 @@ fn render_qr_detail(
         Constraint::Length(qr.height),
         Constraint::Min(0),
     ])
-    .split(split[0]);
-
+    .split(split[1]);
     let h_pad = qr_area[1].width.saturating_sub(qr.width) / 2;
     let v_pad = qr_area[1].height.saturating_sub(qr.height) / 2;
     let qr_rect = Rect {
@@ -845,6 +1084,25 @@ fn render_qr_detail(
         height: qr.height.min(qr_area[1].height),
     };
 
+    // ── slider (borderless, fixed width = 2× QR, centered) ─────────────
+    let slider_width = qr.width.saturating_mul(2).min(split[0].width);
+    let slider_h_pad = split[0].width.saturating_sub(slider_width) / 2;
+    let slider_area = Rect {
+        x: split[0].x + slider_h_pad,
+        y: split[0].y,
+        width: slider_width,
+        height: split[0].height,
+    };
+    render_topup_slider(
+        frame,
+        slider_area,
+        slider_title_spans(amount_pos),
+        amount_pos,
+        TOPUP_MAX_STEPS,
+        &[(0, "any"), (5, "$5"), (10, "$10"), (25, "$25")],
+    );
+
+    // ── QR (or success checkmark) ───────────────────────────────────────
     if let Some(b) = blink {
         render_success_checkmark(frame, qr_rect, b.visible);
     } else {
@@ -854,36 +1112,86 @@ fn render_qr_detail(
         );
     }
 
+    // ── scan label + dimmed helper ──────────────────────────────────────
+    let scan_label = Paragraph::new(Line::from(Span::styled(
+        scan_banner_text(account_name, amount_pos),
+        Style::default().fg(Color::White).bold().bg(TOPUP_MAIN_BG),
+    )))
+    .style(Style::default().bg(TOPUP_MAIN_BG))
+    .centered();
+    frame.render_widget(scan_label, split[2]);
+
+    let helper = Paragraph::new(Line::from(Span::styled(
+        "Requires Solana wallet mobile application",
+        Style::default().fg(Color::DarkGray).bg(TOPUP_MAIN_BG),
+    )))
+    .style(Style::default().bg(TOPUP_MAIN_BG))
+    .centered();
+    frame.render_widget(helper, split[3]);
+}
+
+/// Build the slider title for the QR view — e.g.
+/// ` Top-up amount: $3 (← → to adjust) `. Pure helper so we can unit-test
+/// the wording without spinning up a Frame.
+fn slider_title_spans<'a>(amount_pos: usize) -> Vec<Span<'a>> {
     let amount_str = if amount_pos == 0 {
         "any".to_string()
     } else {
         format!("${:.0}", amount_pos as f64 * TOPUP_STEP_USDC)
     };
-    let title = Line::from(vec![
-        Span::raw(" Send "),
-        Span::styled(
-            amount_str,
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" to account "),
-        Span::styled(
-            format!("@{account_name}"),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" "),
-    ]);
-    render_slider_box(
-        frame,
-        split[1],
-        title,
-        amount_pos,
-        TOPUP_MAX_STEPS,
-        &[(0, "any"), (5, "$5"), (10, "$10"), (25, "$25")],
-        false,
+    vec![
+        Span::raw("Top-up amount: "),
+        Span::styled(amount_str, Style::default().fg(Color::Green).bold()),
+        Span::styled(" (← → to adjust)", Style::default().dim()),
+    ]
+}
+
+/// Borderless slider used in the QR view. Three rows: centered title,
+/// the bar with arrows, and the scale labels. No surrounding box —
+/// the caller positions and sizes `area` to control the visual width.
+fn render_topup_slider<'a>(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    title_spans: Vec<Span<'a>>,
+    position: usize,
+    max_steps: usize,
+    scale_labels: &[(usize, &str)],
+) {
+    let bar_width = area.width as usize;
+    let track_width = bar_width.saturating_sub(6); // 3 chars per arrow
+    let track_last = track_width.saturating_sub(1);
+    let cursor_pos = (position.min(max_steps) * track_last)
+        .checked_div(max_steps)
+        .unwrap_or(0);
+
+    let arrow_style = Style::default().fg(Color::Cyan).bold();
+    let mut bar_spans = vec![Span::styled(" ◀ ", arrow_style)];
+    for i in 0..track_width {
+        let color = if i == cursor_pos {
+            bar_color(i, track_width, true)
+        } else if i < cursor_pos {
+            bar_color(i, track_width, false)
+        } else {
+            Color::Rgb(50, 55, 60)
+        };
+        bar_spans.push(Span::styled("▐", Style::default().fg(color)));
+    }
+    bar_spans.push(Span::styled(" ▶ ", arrow_style));
+
+    let lines = vec![
+        Line::from(title_spans).centered(),
+        Line::from(bar_spans),
+        Line::from(render_scale_spans(
+            bar_width,
+            max_steps,
+            track_last,
+            scale_labels,
+        )),
+    ];
+
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(TOPUP_MAIN_BG)),
+        area,
     );
 }
 
@@ -910,6 +1218,18 @@ fn render_buy_stablecoins_detail(
         area,
     );
 
+    if onramp.is_none() {
+        render_buy_stablecoins_intro(
+            frame,
+            area,
+            pubkey,
+            payment_method,
+            onramp_notice,
+            onramp_error,
+        );
+        return;
+    }
+
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(Span::styled(
         "Buy stablecoins via MoonPay",
@@ -920,93 +1240,7 @@ fn render_buy_stablecoins_detail(
     lines.push(Line::raw(""));
 
     match onramp {
-        None => {
-            lines.push(Line::from(Span::styled(
-                "Pay with card, Apple Pay, or bank.",
-                Style::default().fg(Color::Gray),
-            )));
-            lines.push(Line::from(Span::styled(
-                "USDC will be sent to:",
-                Style::default().fg(Color::Gray),
-            )));
-            lines.push(Line::from(Span::styled(
-                format!("  {pubkey}"),
-                Style::default().fg(Color::White),
-            )));
-            lines.push(Line::raw(""));
-            lines.push(Line::from(Span::styled(
-                "What payment method would you like to use to onramp?",
-                Style::default().fg(Color::Gray),
-            )));
-            lines.push(Line::from(vec![
-                Span::styled(
-                    if payment_method == OnrampPaymentMethod::Paypal {
-                        "● "
-                    } else {
-                        "○ "
-                    },
-                    Style::default().fg(if payment_method == OnrampPaymentMethod::Paypal {
-                        Color::Green
-                    } else {
-                        Color::DarkGray
-                    }),
-                ),
-                Span::styled(
-                    OnrampPaymentMethod::Paypal.title(),
-                    Style::default().fg(if payment_method == OnrampPaymentMethod::Paypal {
-                        Color::White
-                    } else {
-                        Color::Gray
-                    }),
-                ),
-                Span::raw("   "),
-                Span::styled(
-                    if payment_method == OnrampPaymentMethod::Venmo {
-                        "● "
-                    } else {
-                        "○ "
-                    },
-                    Style::default().fg(if payment_method == OnrampPaymentMethod::Venmo {
-                        Color::Green
-                    } else {
-                        Color::DarkGray
-                    }),
-                ),
-                Span::styled(
-                    OnrampPaymentMethod::Venmo.title(),
-                    Style::default().fg(if payment_method == OnrampPaymentMethod::Venmo {
-                        Color::White
-                    } else {
-                        Color::Gray
-                    }),
-                ),
-            ]));
-            lines.push(Line::raw(""));
-            lines.push(Line::from(vec![
-                Span::styled("Press ", Style::default().fg(Color::Gray)),
-                Span::styled(
-                    "Enter",
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    " to copy this wallet address and open MoonPay.",
-                    Style::default().fg(Color::Gray),
-                ),
-            ]));
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "We'll copy the address first, then launch MoonPay with {}.",
-                    payment_method.title()
-                ),
-                Style::default().fg(Color::DarkGray),
-            )));
-            lines.push(Line::from(Span::styled(
-                "When MoonPay asks which wallet to fund, paste your copied pubkey.",
-                Style::default().fg(Color::DarkGray),
-            )));
-        }
+        None => unreachable!(),
         Some(session) => {
             let elapsed = session.started_at.elapsed().as_secs();
             lines.push(Line::from(Span::styled(
@@ -1077,6 +1311,258 @@ fn render_buy_stablecoins_detail(
         Paragraph::new(lines).style(Style::default().bg(TOPUP_MAIN_BG)),
         area,
     );
+}
+
+/// Width reserved for each payment-method button.
+const PAYMENT_BUTTON_WIDTH: u16 = 18;
+/// Horizontal gap between adjacent payment-method buttons.
+const PAYMENT_BUTTON_GAP: u16 = 2;
+/// Max width of the centered "What are stablecoins?" info panel. The panel
+/// is also capped to the available area width.
+const STABLECOIN_PANEL_MAX_WIDTH: u16 = 128;
+/// Reassuring explainer aimed at non-crypto users. One entry per line so we
+/// control exactly where breaks happen — the info panel renders as-is, no
+/// auto-wrap, so nothing can smash sentences together at narrow widths.
+const STABLECOIN_DESCRIPTION_LINES: &[&str] = &[
+    "Stablecoins are digital dollars: each one equals $1 USD, fully backed and regulated.",
+    "They're high-resolution money — divisible down to micro-cents ($0.000001), so APIs can charge precisely what they deliver.",
+    "They move at internet speed: send and settle in seconds, anywhere in the world.",
+];
+
+/// Render the pre-launch "What are stablecoins?" pane: title + explainer
+/// description, three brand-coloured payment-method buttons, and a short
+/// action description.
+fn render_buy_stablecoins_intro(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    pubkey: &str,
+    payment_method: OnrampPaymentMethod,
+    onramp_notice: Option<&str>,
+    onramp_error: Option<&str>,
+) {
+    // ── info panel: title in the border top-left, dynamic height ───────
+    //
+    // Measure the wrapped description first so the panel grows to fit
+    // narrow terminals (text wraps to more lines) up to a fixed cap. The
+    // overall layout height for the panel is then `content + 2 borders`.
+    let panel_width = STABLECOIN_PANEL_MAX_WIDTH.min(area.width);
+    let text_width = panel_width.saturating_sub(4); // 2 borders + 2 padding
+    let description_lines: Vec<Line> = STABLECOIN_DESCRIPTION_LINES
+        .iter()
+        .map(|l| {
+            Line::from(Span::styled(
+                *l,
+                Style::default().fg(Color::Gray).bg(TOPUP_MAIN_BG),
+            ))
+        })
+        .collect();
+    let wrapped = wrapped_line_count(STABLECOIN_DESCRIPTION_LINES, text_width);
+    // Panel total height = wrapped content lines + 2 borders. Floor at 3
+    // (1 content line + borders); cap at 7 (5 content lines + borders) —
+    // the panel grows as the terminal narrows, up to a fixed max.
+    let panel_height = (wrapped + 2).clamp(3, 7);
+
+    let split = Layout::vertical([
+        Constraint::Length(1),             // top spacer
+        Constraint::Length(panel_height),  // info panel (dynamic)
+        Constraint::Length(1),             // spacer
+        Constraint::Length(3),             // 3 brand buttons
+        Constraint::Length(1),             // spacer
+        Constraint::Min(0),                // action copy
+    ])
+    .split(area);
+
+    let info_h_pad = split[1].width.saturating_sub(panel_width) / 2;
+    let info_area = Rect {
+        x: split[1].x + info_h_pad,
+        y: split[1].y,
+        width: panel_width,
+        height: split[1].height,
+    };
+    let info_block = Block::default()
+        .title(Span::styled(
+            " What are stablecoins? ",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .title_alignment(ratatui::layout::Alignment::Center)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .padding(Padding::horizontal(1))
+        .style(Style::default().bg(TOPUP_MAIN_BG));
+    let description = Paragraph::new(description_lines)
+        .block(info_block)
+        .alignment(ratatui::layout::Alignment::Center)
+        .wrap(ratatui::widgets::Wrap { trim: true });
+    frame.render_widget(description, info_area);
+
+    // ── three brand buttons, centered horizontally ─────────────────────
+    let methods = OnrampPaymentMethod::all();
+    let total_buttons_width =
+        PAYMENT_BUTTON_WIDTH * methods.len() as u16 + PAYMENT_BUTTON_GAP * 2;
+    let row_pad = split[3].width.saturating_sub(total_buttons_width) / 2;
+    let mut button_constraints = vec![Constraint::Length(row_pad)];
+    for i in 0..methods.len() {
+        button_constraints.push(Constraint::Length(PAYMENT_BUTTON_WIDTH));
+        if i + 1 < methods.len() {
+            button_constraints.push(Constraint::Length(PAYMENT_BUTTON_GAP));
+        }
+    }
+    button_constraints.push(Constraint::Min(0));
+    let columns = Layout::horizontal(button_constraints).split(split[3]);
+
+    for (idx, method) in methods.iter().enumerate() {
+        // Skip the leading pad chunk (idx 0) and any gap chunks.
+        let chunk_idx = 1 + idx * 2;
+        let is_selected = *method == payment_method;
+        render_payment_button(frame, columns[chunk_idx], *method, is_selected);
+    }
+
+    // ── action copy ────────────────────────────────────────────────────
+    let mut action_lines = vec![
+        Line::from(vec![
+            Span::styled("Press ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                "Enter",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" to open {} and convert dollars to USDC.", payment_method.title()),
+                Style::default().fg(Color::Gray),
+            ),
+        ])
+        .centered(),
+        Line::from(vec![
+            Span::styled("On Solana, funds arrive at ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                pubkey.to_string(),
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" within a second.", Style::default().fg(Color::Gray)),
+        ])
+        .centered(),
+        Line::from(Span::styled(
+            format!(
+                "Once funded, your pay account — secured by {} — can spend on any pay-enabled API.",
+                host_keystore_name()
+            ),
+            Style::default().fg(Color::DarkGray),
+        ))
+        .centered(),
+    ];
+
+    // Surface the launch animation notice + any error from the most recent
+    // attempt — without these the user has no signal that Enter did
+    // anything when launch_onramp_session fails (e.g. API key missing).
+    if let Some(notice) = onramp_notice {
+        action_lines.push(Line::raw(""));
+        action_lines.push(
+            Line::from(Span::styled(
+                notice.to_string(),
+                Style::default().fg(Color::Yellow),
+            ))
+            .centered(),
+        );
+    }
+    if let Some(err) = onramp_error {
+        action_lines.push(Line::raw(""));
+        action_lines.push(
+            Line::from(Span::styled(
+                format!("Last attempt failed: {err}"),
+                Style::default().fg(Color::Red),
+            ))
+            .centered(),
+        );
+        action_lines.push(
+            Line::from(Span::styled(
+                "Press Enter to retry.",
+                Style::default().fg(Color::DarkGray),
+            ))
+            .centered(),
+        );
+    }
+
+    let action = Paragraph::new(action_lines).style(Style::default().bg(TOPUP_MAIN_BG));
+    frame.render_widget(action, split[5]);
+}
+
+/// Estimate the number of visual lines `text_lines` will occupy when each
+/// is word-wrapped to `text_width` columns. Rough but reliable: counts
+/// words and packs them greedily, matching the behaviour of
+/// `Paragraph::wrap` closely enough to size a layout slot. Always returns
+/// at least 1.
+fn wrapped_line_count(text_lines: &[&str], text_width: u16) -> u16 {
+    if text_width == 0 {
+        return text_lines.len().max(1) as u16;
+    }
+    let width = text_width as usize;
+    let mut total: u16 = 0;
+    for line in text_lines {
+        let mut used = 0usize;
+        let mut lines_for_this = 1u16;
+        for word in line.split_whitespace() {
+            let w = word.chars().count();
+            if used == 0 {
+                used = w;
+            } else if used + 1 + w <= width {
+                used += 1 + w;
+            } else {
+                lines_for_this += 1;
+                used = w;
+            }
+        }
+        total = total.saturating_add(lines_for_this);
+    }
+    total.max(1)
+}
+
+/// Human-readable name for the OS keystore that backs the pay account.
+/// Used in user-facing copy that reassures non-crypto users their account
+/// is secured by something they already trust.
+const fn host_keystore_name() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Apple Keychain"
+    } else if cfg!(target_os = "windows") {
+        "Credential Manager"
+    } else {
+        "your system keyring"
+    }
+}
+
+/// 3-line button cell rendered like the option cards in the left pane:
+/// brand-coloured background when selected, dark-gray otherwise. Title is
+/// vertically centered, white bold.
+fn render_payment_button(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    method: OnrampPaymentMethod,
+    is_selected: bool,
+) {
+    let bg = if is_selected {
+        method.brand_color()
+    } else {
+        TOPUP_CARD_BG
+    };
+    let fg = if is_selected {
+        Color::White
+    } else {
+        Color::Gray
+    };
+    let block = Block::default().style(Style::default().bg(bg));
+    let card = Paragraph::new(vec![
+        Line::default(),
+        Line::from(Span::styled(
+            method.title(),
+            Style::default().fg(fg).add_modifier(Modifier::BOLD),
+        ))
+        .centered(),
+    ])
+    .block(block);
+    frame.render_widget(card, area);
 }
 
 fn unavailable_qr() -> RenderedQr {
@@ -1200,36 +1686,24 @@ fn render_topup_controls(
         ],
     };
 
+    const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let status_spans = match status {
-        PollStatus::RpcUnavailable => vec![Span::styled(
-            "offline",
-            Style::default().fg(Color::Red).bold(),
-        )],
-        PollStatus::Waiting { secs_left } => vec![
-            Span::styled("waiting ", Style::default().fg(Color::Yellow).bold()),
+        PollStatus::Waiting { spinner_idx, .. }
+        | PollStatus::Checking { spinner_idx }
+        | PollStatus::Polling { spinner_idx, .. } => vec![
             Span::styled(
-                format!("{secs_left}s…"),
-                Style::default().fg(Color::Yellow).bold(),
+                SPINNER[spinner_idx % SPINNER.len()],
+                Style::default().fg(Color::Green).bold(),
+            ),
+            Span::styled(
+                " waiting for transfer…",
+                Style::default().fg(Color::Green).bold(),
             ),
         ],
-        PollStatus::Checking { spinner_idx } => {
-            const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-            vec![
-                Span::styled(
-                    SPINNER[spinner_idx % SPINNER.len()],
-                    Style::default().fg(Color::Green).bold(),
-                ),
-                Span::styled(" checking…", Style::default().fg(Color::Green).bold()),
-            ]
-        }
-        PollStatus::Countdown { secs_left } => vec![
-            Span::styled(
-                format!("{secs_left}s"),
-                Style::default().fg(Color::DarkGray).bold(),
-            ),
-            Span::styled("  ", Style::default()),
+        PollStatus::Stalled => vec![
+            Span::styled("stopped  ", Style::default().fg(Color::Yellow).bold()),
             Span::styled("R", Style::default().fg(Color::Cyan).bold()),
-            Span::styled(" refresh", Style::default().dim()),
+            Span::styled(" refresh", Style::default().fg(Color::Yellow).bold()),
         ],
     };
 
@@ -1929,6 +2403,311 @@ mod tests {
 
     const SAMPLE_SOLANA_PAY_URL: &str = "solana:11111111111111111111111111111111?amount=5&spl-token=\
          EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
+    // ── PollState tests ─────────────────────────────────────────────────
+    //
+    // The state machine takes `now: Instant` on every time-dependent call
+    // so we can advance "time" deterministically by adding Durations to a
+    // fixed origin.
+
+    fn healthy_baseline() -> AccountBalances {
+        AccountBalances::default()
+    }
+
+    fn unhealthy_baseline() -> AccountBalances {
+        AccountBalances {
+            tokens_unavailable: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn poll_state_filters_unhealthy_baseline_at_construction() {
+        let now = Instant::now();
+        let state = PollState::new(now, Some(unhealthy_baseline()));
+        assert!(!state.has_healthy_baseline());
+        assert!(state.baseline.is_none());
+    }
+
+    #[test]
+    fn poll_state_idle_during_initial_delay() {
+        let now = Instant::now();
+        let state = PollState::new(now, Some(healthy_baseline()));
+        assert_eq!(state.decide(now), PollDecision::Idle);
+        assert_eq!(
+            state.decide(now + POLL_DELAY - Duration::from_millis(1)),
+            PollDecision::Idle
+        );
+    }
+
+    #[test]
+    fn poll_state_first_check_at_delay_boundary() {
+        let now = Instant::now();
+        let state = PollState::new(now, Some(healthy_baseline()));
+        assert_eq!(state.decide(now + POLL_DELAY), PollDecision::SpawnCheck);
+    }
+
+    #[test]
+    fn poll_state_spawns_even_without_baseline_to_establish_one() {
+        // No baseline → next check should still fire so the thread can
+        // promote a healthy fetch into the new baseline.
+        let now = Instant::now();
+        let state = PollState::new(now, None);
+        assert_eq!(state.decide(now + POLL_DELAY), PollDecision::SpawnCheck);
+    }
+
+    #[test]
+    fn poll_state_does_not_double_spawn_while_checking() {
+        let now = Instant::now();
+        let mut state = PollState::new(now, Some(healthy_baseline()));
+        let t = now + POLL_DELAY;
+        state.on_check_started(t);
+        assert_eq!(state.decide(t + Duration::from_millis(500)), PollDecision::Idle);
+        assert_eq!(state.decide(t + POLL_INTERVAL), PollDecision::Idle);
+    }
+
+    #[test]
+    fn poll_state_throttles_to_one_per_second() {
+        let now = Instant::now();
+        let mut state = PollState::new(now, Some(healthy_baseline()));
+        let t0 = now + POLL_DELAY;
+        state.on_check_started(t0);
+        state.on_check_done();
+        // Same second: no spawn.
+        assert_eq!(
+            state.decide(t0 + Duration::from_millis(500)),
+            PollDecision::Idle
+        );
+        // POLL_INTERVAL elapsed: spawn.
+        assert_eq!(state.decide(t0 + POLL_INTERVAL), PollDecision::SpawnCheck);
+    }
+
+    #[test]
+    fn poll_state_stalls_after_window() {
+        let now = Instant::now();
+        let state = PollState::new(now, Some(healthy_baseline()));
+        let after = now + POLL_WINDOW + Duration::from_secs(1);
+        assert_eq!(state.decide(after), PollDecision::Idle);
+        assert_eq!(state.status(after), PollStatus::Stalled);
+    }
+
+    #[test]
+    fn poll_state_stalled_state_does_not_spawn_even_without_recent_check() {
+        // Edge: never spawned, but window already elapsed (e.g. user idled
+        // through the entire 5 minutes without UI interaction).
+        let now = Instant::now();
+        let state = PollState::new(now, Some(healthy_baseline()));
+        assert_eq!(
+            state.decide(now + POLL_WINDOW + Duration::from_secs(10)),
+            PollDecision::Idle
+        );
+    }
+
+    #[test]
+    fn poll_state_reset_cycle_clears_stalled() {
+        let now = Instant::now();
+        let mut state = PollState::new(now, Some(healthy_baseline()));
+        let stalled_at = now + POLL_WINDOW + Duration::from_secs(1);
+        assert_eq!(state.status(stalled_at), PollStatus::Stalled);
+
+        state.reset_cycle(stalled_at);
+        // After reset the cycle restarts at `stalled_at` — back to Waiting.
+        assert!(matches!(
+            state.status(stalled_at),
+            PollStatus::Waiting { .. }
+        ));
+        // And the first check fires again at +POLL_DELAY from the reset.
+        assert_eq!(
+            state.decide(stalled_at + POLL_DELAY),
+            PollDecision::SpawnCheck
+        );
+    }
+
+    #[test]
+    fn poll_state_reset_cycle_clears_last_check_at() {
+        let now = Instant::now();
+        let mut state = PollState::new(now, Some(healthy_baseline()));
+        state.on_check_started(now + POLL_DELAY);
+        state.on_check_done();
+        state.reset_cycle(now + POLL_DELAY);
+        // After reset, decide() should treat us as fresh (Waiting), not
+        // immediately ready for another check.
+        assert_eq!(state.decide(now + POLL_DELAY), PollDecision::Idle);
+    }
+
+    #[test]
+    fn poll_state_baseline_established_promotes_to_healthy() {
+        let now = Instant::now();
+        let mut state = PollState::new(now, None);
+        assert!(!state.has_healthy_baseline());
+        state.on_baseline_established(healthy_baseline());
+        assert!(state.has_healthy_baseline());
+        assert!(!state.checking);
+    }
+
+    #[test]
+    fn poll_state_baseline_established_rejects_unhealthy_payload() {
+        let now = Instant::now();
+        let mut state = PollState::new(now, None);
+        state.on_baseline_established(unhealthy_baseline());
+        // Defensive: an unhealthy fetch must never become a baseline.
+        assert!(!state.has_healthy_baseline());
+        assert!(!state.checking);
+    }
+
+    #[test]
+    fn poll_state_clear_stuck_check_releases_after_timeout() {
+        let now = Instant::now();
+        let mut state = PollState::new(now, Some(healthy_baseline()));
+        let t = now + POLL_DELAY;
+        state.on_check_started(t);
+        // Just before timeout: still considered checking.
+        state.clear_stuck_check(t + CHECK_TIMEOUT - Duration::from_millis(1));
+        assert!(state.checking);
+        // At/after timeout: cleared.
+        state.clear_stuck_check(t + CHECK_TIMEOUT);
+        assert!(!state.checking);
+    }
+
+    #[test]
+    fn poll_state_status_waiting_counts_down() {
+        let now = Instant::now();
+        let state = PollState::new(now, Some(healthy_baseline()));
+        match state.status(now) {
+            PollStatus::Waiting { secs_left, .. } => {
+                assert_eq!(secs_left, POLL_DELAY.as_secs());
+            }
+            other => panic!("expected Waiting, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn poll_state_status_polling_reports_window_remaining() {
+        let now = Instant::now();
+        let mut state = PollState::new(now, Some(healthy_baseline()));
+        let t = now + POLL_DELAY + Duration::from_secs(10);
+        state.on_check_started(t);
+        state.on_check_done();
+        match state.status(t) {
+            PollStatus::Polling {
+                secs_left_in_window,
+                ..
+            } => {
+                let elapsed = (POLL_DELAY + Duration::from_secs(10)).as_secs();
+                assert_eq!(secs_left_in_window, POLL_WINDOW.as_secs() - elapsed);
+            }
+            other => panic!("expected Polling, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn poll_state_status_checking_during_in_flight() {
+        let now = Instant::now();
+        let mut state = PollState::new(now, Some(healthy_baseline()));
+        let t = now + POLL_DELAY;
+        state.on_check_started(t);
+        assert!(matches!(
+            state.status(t + Duration::from_millis(50)),
+            PollStatus::Checking { .. }
+        ));
+    }
+
+    // ── diff_received resilience tests are over in pay-core ─────────────
+    // (see crates/core/src/client/balance.rs `diff_received_*` tests).
+
+    // ── scan_banner_text ───────────────────────────────────────────────
+
+    #[test]
+    fn scan_banner_text_uses_dollar_amount_for_nonzero_pos() {
+        assert_eq!(
+            scan_banner_text("default", 3),
+            "Scan to send $3 USDC to @default"
+        );
+    }
+
+    #[test]
+    fn scan_banner_text_handles_any_amount() {
+        assert_eq!(
+            scan_banner_text("default", 0),
+            "Scan to send any amount of USDC to @default"
+        );
+    }
+
+    #[test]
+    fn scan_banner_text_includes_account_name() {
+        assert!(scan_banner_text("alice", 5).contains("@alice"));
+    }
+
+    // ── wrapped_line_count ─────────────────────────────────────────────
+
+    #[test]
+    fn wrapped_line_count_short_lines_unchanged() {
+        let lines = ["hello world", "foo bar"];
+        assert_eq!(wrapped_line_count(&lines, 80), 2);
+    }
+
+    #[test]
+    fn wrapped_line_count_wraps_when_width_is_narrow() {
+        // "hello world" is 11 chars; at width 5 the words don't both fit.
+        let lines = ["hello world"];
+        assert_eq!(wrapped_line_count(&lines, 5), 2);
+    }
+
+    #[test]
+    fn wrapped_line_count_zero_width_falls_back_to_line_count() {
+        let lines = ["a", "b", "c"];
+        assert_eq!(wrapped_line_count(&lines, 0), 3);
+    }
+
+    #[test]
+    fn wrapped_line_count_empty_input_is_at_least_one() {
+        assert_eq!(wrapped_line_count(&[], 80), 1);
+    }
+
+    #[test]
+    fn wrapped_line_count_actual_description_at_full_width_is_three() {
+        // At the panel's max inner width (128 - 4 = 124), the live
+        // description's three logical lines each fit on one rendered line.
+        assert_eq!(wrapped_line_count(STABLECOIN_DESCRIPTION_LINES, 124), 3);
+    }
+
+    #[test]
+    fn wrapped_line_count_actual_description_at_narrow_width_grows() {
+        // Halve the inner width — the longest sentence will need to wrap,
+        // so total > 3 (we just want to confirm it grows past 3, not the
+        // exact count which depends on word boundaries).
+        let total = wrapped_line_count(STABLECOIN_DESCRIPTION_LINES, 60);
+        assert!(total > 3, "expected growth past 3 lines, got {total}");
+    }
+
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var(key).ok();
+            unsafe { std::env::remove_var(key) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
 
     #[test]
     fn topup_qr_render_keeps_square_physical_geometry() {

@@ -39,13 +39,18 @@ impl SetupCommand {
             return run_update();
         }
 
-        // Abort before any prompts if the default account already exists.
+        // Account name comes from the system user (`$USER` / `$USERNAME` /
+        // `whoami`), sanitised. Cross-platform — works on Windows, macOS,
+        // Linux. Falls back to "default" if nothing is resolvable.
+        let account_name = crate::system::current_user_account_name();
+
+        // Abort before any prompts if this user already has an account.
         if !self.force
             && let Ok(accounts) = pay_core::accounts::AccountsFile::load()
             && accounts
                 .accounts
                 .get(pay_core::accounts::MAINNET_NETWORK)
-                .is_some_and(|net| net.contains_key("default"))
+                .is_some_and(|net| net.contains_key(&account_name))
         {
             super::account::list::print_account_list(
                 &accounts,
@@ -53,7 +58,9 @@ impl SetupCommand {
             );
             eprintln!(
                 "{}",
-                "  A default account already exists. Use --force to replace it, or `pay account new --name <name>` to add another.".dimmed()
+                format!(
+                    "  Account '{account_name}' already exists. Use --force to replace it, or `pay account new <NAME>` to add another."
+                ).dimmed()
             );
             eprintln!();
             return Ok(());
@@ -66,7 +73,7 @@ impl SetupCommand {
         install_mcp_configs();
 
         let (pubkey, backend_name) = super::account::new::create_account(
-            "default",
+            &account_name,
             self.backend.as_deref(),
             self.vault.as_deref(),
             self.force,
@@ -79,9 +86,9 @@ impl SetupCommand {
             .rpc_url
             .clone()
             .unwrap_or_else(pay_core::balance::mainnet_rpc_url);
-        let completion = crate::tui::run_topup_flow(&pubkey, &rpc_url, "default")?;
+        let completion = crate::tui::run_topup_flow(&pubkey, &rpc_url, &account_name)?;
         super::account::new::print_next_steps(
-            "default",
+            &account_name,
             backend_name,
             completion.as_ref().map(|c| &c.received),
         );

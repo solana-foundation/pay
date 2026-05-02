@@ -1,18 +1,17 @@
 //! `pay account import` — import an account from a JSON key file.
 
-use dialoguer::{Confirm, Input, theme::ColorfulTheme};
+use dialoguer::{Confirm, theme::ColorfulTheme};
 use owo_colors::OwoColorize;
 use pay_core::keystore::Keystore;
 
 /// Import an account from a JSON key file into a secure keystore.
 #[derive(clap::Args)]
 pub struct ImportCommand {
+    /// Account name (required).
+    pub name: String,
+
     /// Path to the JSON key file.
     pub file: String,
-
-    /// Account name. Defaults to "default".
-    #[arg(long)]
-    pub name: Option<String>,
 
     /// Storage backend: "keychain", "gnome-keyring", "windows-hello", "1password".
     #[arg(long)]
@@ -68,8 +67,8 @@ impl ImportCommand {
             }
         }
 
-        // 4. Resolve account name — check for conflicts
-        let name = resolve_name(&theme, self.name.as_deref(), &accounts)?;
+        // 4. Resolve account name — confirm overwrite if it already exists.
+        let name = resolve_name(&theme, &self.name, &accounts)?;
 
         // 4. Pick backend and import
         let backend_id = match &self.backend {
@@ -168,54 +167,30 @@ fn display_balance(pubkey: &str) {
 
 fn resolve_name(
     theme: &ColorfulTheme,
-    explicit: Option<&str>,
+    name: &str,
     accounts: &pay_core::accounts::AccountsFile,
 ) -> pay_core::Result<String> {
     let has_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
+    let exists = accounts
+        .accounts
+        .get(pay_core::accounts::MAINNET_NETWORK)
+        .is_some_and(|net| net.contains_key(name));
 
-    let mainnet_has = |name: &str| {
-        accounts
-            .accounts
-            .get(pay_core::accounts::MAINNET_NETWORK)
-            .is_some_and(|net| net.contains_key(name))
-    };
-
-    if let Some(name) = explicit {
-        if mainnet_has(name) && has_tty {
-            let overwrite = Confirm::with_theme(theme)
-                .with_prompt(format!(
-                    "Account '{}' already exists. Overwrite?",
-                    name.yellow()
-                ))
-                .default(false)
-                .interact()
-                .map_err(|e| pay_core::Error::Config(format!("Prompt error: {e}")))?;
-
-            if !overwrite {
-                return Err(pay_core::Error::Config("Import cancelled.".to_string()));
-            }
-        }
-        return Ok(name.to_string());
-    }
-
-    if mainnet_has("default") && has_tty {
-        let choice = dialoguer::Select::with_theme(theme)
-            .with_prompt(format!("Account '{}' already exists", "default".yellow()))
-            .items(["Overwrite 'default'", "Create with a different name"])
-            .default(1)
+    if exists && has_tty {
+        let overwrite = Confirm::with_theme(theme)
+            .with_prompt(format!(
+                "Account '{}' already exists. Overwrite?",
+                name.yellow()
+            ))
+            .default(false)
             .interact()
             .map_err(|e| pay_core::Error::Config(format!("Prompt error: {e}")))?;
 
-        if choice == 1 {
-            let name: String = Input::with_theme(theme)
-                .with_prompt("Account name")
-                .interact_text()
-                .map_err(|e| pay_core::Error::Config(format!("Prompt error: {e}")))?;
-            return Ok(name);
+        if !overwrite {
+            return Err(pay_core::Error::Config("Import cancelled.".to_string()));
         }
     }
-
-    Ok("default".to_string())
+    Ok(name.to_string())
 }
 
 pub(super) fn build_keystore(
