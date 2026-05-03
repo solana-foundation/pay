@@ -1696,19 +1696,15 @@ fn render_qr_with_version(
 
 fn render_qr_code(code: &QrCode, max_width: u16, max_height: u16) -> Option<RenderedQr> {
     let modules = code.width();
-    let Some((module_cols, module_subrows)) =
-        choose_qr_module_cells(modules, max_width, max_height)
-    else {
-        return None;
-    };
+    let (module_cols, module_subrows) = choose_qr_module_cells(modules, max_width, max_height)?;
 
     let scaled_rows = modules * module_subrows;
     let mut lines = Vec::with_capacity(scaled_rows.div_ceil(2));
     for top_subrow in (0..scaled_rows).step_by(2) {
         let mut spans = Vec::with_capacity(modules);
         for x in 0..modules {
-            let top_dark = qr_subrow_dark(&code, x, top_subrow, module_subrows);
-            let bottom_dark = qr_subrow_dark(&code, x, top_subrow + 1, module_subrows);
+            let top_dark = qr_subrow_dark(code, x, top_subrow, module_subrows);
+            let bottom_dark = qr_subrow_dark(code, x, top_subrow + 1, module_subrows);
             spans.push(render_qr_half_block(top_dark, bottom_dark, module_cols));
         }
 

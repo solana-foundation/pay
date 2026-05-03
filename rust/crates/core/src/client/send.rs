@@ -45,6 +45,18 @@ pub struct SendResult {
     pub to: String,
 }
 
+/// Parameters for a fee-payer-backed stablecoin send.
+pub struct StablecoinSendRequest<'a> {
+    pub amount: &'a str,
+    pub recipient: &'a str,
+    pub currency: &'a str,
+    pub network: &'a str,
+    pub account_override: Option<&'a str>,
+    pub memo: Option<&'a str>,
+    pub fee_within: bool,
+    pub rpc_url: Option<&'a str>,
+}
+
 #[derive(Serialize)]
 struct ApiSendRequest<'a> {
     recipient: &'a str,
@@ -229,16 +241,18 @@ pub async fn send_stablecoin_direct(
 /// The server returns an MPP charge challenge. The client signs the stablecoin
 /// payment, the server co-signs as fee payer, and the successful retry returns
 /// the on-chain transaction signature.
-pub fn send_stablecoin(
-    amount_str: &str,
-    recipient: &str,
-    currency: &str,
-    network: &str,
-    account_override: Option<&str>,
-    memo: Option<&str>,
-    fee_within: bool,
-    rpc_url: Option<&str>,
-) -> Result<SendResult> {
+pub fn send_stablecoin(request: StablecoinSendRequest<'_>) -> Result<SendResult> {
+    let StablecoinSendRequest {
+        amount: amount_str,
+        recipient,
+        currency,
+        network,
+        account_override,
+        memo,
+        fee_within,
+        rpc_url,
+    } = request;
+
     let normalized_currency = currency.trim();
     if normalized_currency.is_empty() {
         return Err(Error::Config("Currency must not be empty".to_string()));

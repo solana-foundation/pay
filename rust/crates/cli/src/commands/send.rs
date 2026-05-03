@@ -89,14 +89,16 @@ impl SendCommand {
         }
 
         let result = pay_core::client::send::send_stablecoin(
-            &amount,
-            &recipient,
-            &currency,
-            network,
-            account_override,
-            self.memo.as_deref(),
-            fee_within,
-            rpc_url.as_deref(),
+            pay_core::client::send::StablecoinSendRequest {
+                amount: &amount,
+                recipient: &recipient,
+                currency: &currency,
+                network,
+                account_override,
+                memo: self.memo.as_deref(),
+                fee_within,
+                rpc_url: rpc_url.as_deref(),
+            },
         )?;
 
         let title = send_success_title(&result);
