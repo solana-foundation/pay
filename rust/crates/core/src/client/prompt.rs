@@ -46,7 +46,15 @@ fn meaningful_description(description: Option<&str>) -> Option<&str> {
 fn normalized_nonempty(value: &str) -> Option<String> {
     let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
     let value = value.trim();
-    (!value.is_empty()).then(|| value.to_string())
+    (!value.is_empty()).then(|| display_reason(value))
+}
+
+fn display_reason(value: &str) -> String {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    first.to_lowercase().chain(chars).collect()
 }
 
 fn is_generic_api_access(description: &str) -> bool {
@@ -130,7 +138,18 @@ mod tests {
             &[Some("https://api.gateway-402.com/v1/query")],
         );
 
-        assert_eq!(context.reason, "Run a SQL query");
+        assert_eq!(context.reason, "run a SQL query");
+        assert_eq!(context.operator, "gateway-402.com");
+    }
+
+    #[test]
+    fn payment_prompt_context_lowercases_reason_first_letter() {
+        let context = payment_prompt_context(
+            Some(" Run   request "),
+            &[Some("https://api.gateway-402.com/v1/query")],
+        );
+
+        assert_eq!(context.reason, "run request");
         assert_eq!(context.operator, "gateway-402.com");
     }
 

@@ -139,6 +139,17 @@ impl AuthIntent {
         }
     }
 
+    pub fn with_account_context(&self, account: &str) -> Self {
+        let account = prompt_detail(account);
+        match self {
+            Self::AuthorizePayment { message, limit } => Self::AuthorizePayment {
+                message: payment_message_with_account(message, &account),
+                limit: *limit,
+            },
+            other => other.clone(),
+        }
+    }
+
     pub fn default_payment() -> Self {
         Self::AuthorizePayment {
             message: "authorize a payment with pay".to_string(),
@@ -271,6 +282,29 @@ fn truncate_detail(value: &str, max_chars: usize) -> String {
     }
 }
 
+fn payment_message_with_account(message: &str, account: &str) -> String {
+    if !message.trim_start().starts_with("authorize a payment of ") {
+        return message.to_string();
+    }
+
+    let account = truncate_detail(&prompt_detail(account), 64);
+    let (headline, details) = message
+        .split_once("\n\n")
+        .map_or((message, None), |(headline, details)| {
+            (headline, Some(details))
+        });
+    let headline = headline.trim_end_matches('.').trim();
+    if headline.is_empty() || headline.ends_with(&format!(" from {account}")) {
+        return message.to_string();
+    }
+
+    let headline = format!("{headline} from {account}.");
+    match details {
+        Some(details) => format!("{headline}\n\n{details}"),
+        None => headline,
+    }
+}
+
 fn parse_usd_minor_units(amount: &str) -> Option<u64> {
     let amount = amount.trim().strip_prefix('$').unwrap_or(amount.trim());
     if amount.is_empty() {
@@ -379,6 +413,39 @@ mod tests {
             AuthIntent::authorize_payment_details("$1.00", "Run a SQL query", "gateway-402.com")
                 .prompt_message(),
             "authorize a payment of $1.00.\n\nreason: Run a SQL query\n\noperator: gateway-402.com"
+        );
+    }
+
+    #[test]
+    fn payment_details_include_account_on_first_sentence() {
+        assert_eq!(
+            AuthIntent::authorize_payment_details("$0.30", "Send USDC", "gateway-402.com")
+                .with_account_context("test")
+                .prompt_message(),
+            "authorize a payment of $0.30 from test.\n\nreason: Send USDC\n\noperator: gateway-402.com"
+        );
+    }
+
+    #[test]
+    fn payment_details_truncate_account_name() {
+        let account = "a".repeat(65);
+        let message =
+            AuthIntent::authorize_payment_details("$0.30", "Send USDC", "gateway-402.com")
+                .with_account_context(&account)
+                .prompt_message();
+
+        assert!(message.starts_with(
+            "authorize a payment of $0.30 from aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa..."
+        ));
+    }
+
+    #[test]
+    fn account_context_leaves_legacy_payment_prompt_unchanged() {
+        assert_eq!(
+            AuthIntent::authorize_payment("$0.30", "accessing API")
+                .with_account_context("test")
+                .prompt_message(),
+            "authorize payment of $0.30 for accessing API"
         );
     }
 

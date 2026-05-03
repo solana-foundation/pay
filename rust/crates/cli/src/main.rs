@@ -71,26 +71,6 @@ struct Opts {
     debugger: bool,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn account_global_flag_can_follow_push_alias() {
-        let opts =
-            Opts::try_parse_from(["pay", "push", "--account", "test", "max", "ludo"]).unwrap();
-
-        assert_eq!(opts.account.as_deref(), Some("test"));
-        match opts.command {
-            Some(Command::Send(cmd)) => {
-                assert_eq!(cmd.amount, "max");
-                assert_eq!(cmd.recipient, "ludo");
-            }
-            _ => panic!("expected send command"),
-        }
-    }
-}
-
 fn main() {
     if commands::help::root_overview_help_requested() {
         if commands::help::args_include_no_dna() {
@@ -490,6 +470,21 @@ fn format_duration(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_global_flag_can_follow_push_alias() {
+        let opts =
+            Opts::try_parse_from(["pay", "push", "--account", "test", "max", "ludo"]).unwrap();
+
+        assert_eq!(opts.account.as_deref(), Some("test"));
+        match opts.command {
+            Some(Command::Send(cmd)) => {
+                assert_eq!(cmd.amount, "max");
+                assert_eq!(cmd.recipient, "ludo");
+            }
+            _ => panic!("expected send command"),
+        }
+    }
 
     #[test]
     fn format_cap_less_than_one() {

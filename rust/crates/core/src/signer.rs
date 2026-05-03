@@ -178,8 +178,9 @@ pub fn load_keypair_bytes_from_account_with_intent(
     network: &str,
     intent: &AuthIntent,
 ) -> Result<crate::keystore::Zeroizing<Vec<u8>>> {
+    let account_intent = intent.with_account_context(name);
     if account.keystore == Keystore::Ephemeral {
-        maybe_authenticate_ephemeral_account(account, network, intent)?;
+        maybe_authenticate_ephemeral_account(account, network, &account_intent)?;
         return account
             .ephemeral_keypair_bytes()
             .map(crate::keystore::Zeroizing::new)
@@ -207,7 +208,7 @@ pub fn load_keypair_bytes_from_account_with_intent(
                         false,
                     )
                 };
-                ks.load_keypair_with_intent(name, intent)
+                ks.load_keypair_with_intent(name, &account_intent)
                     .map_err(|e| map_keystore_backend_error("keychain", e))
             }
             #[cfg(not(target_os = "macos"))]
@@ -229,7 +230,7 @@ pub fn load_keypair_bytes_from_account_with_intent(
                         false,
                     )
                 };
-                ks.load_keypair_with_intent(name, intent)
+                ks.load_keypair_with_intent(name, &account_intent)
                     .map_err(|e| map_keystore_backend_error("gnome-keyring", e))
             }
             #[cfg(not(target_os = "linux"))]
@@ -252,7 +253,7 @@ pub fn load_keypair_bytes_from_account_with_intent(
                         false,
                     )
                 };
-                ks.load_keypair_with_intent(name, intent)
+                ks.load_keypair_with_intent(name, &account_intent)
                     .map_err(|e| map_keystore_backend_error("windows-hello", e))
             }
             #[cfg(not(target_os = "windows"))]
@@ -270,10 +271,10 @@ pub fn load_keypair_bytes_from_account_with_intent(
             } else {
                 crate::keystore::Keystore::onepassword(op_account)
             };
-            ks.load_keypair_with_intent(name, intent)
+            ks.load_keypair_with_intent(name, &account_intent)
                 .map_err(|e| map_keystore_backend_error("1password", e))
         }
-        Keystore::File => load_signer_keypair_bytes_with_intent(&source, intent),
+        Keystore::File => load_signer_keypair_bytes_with_intent(&source, &account_intent),
         Keystore::Ephemeral => unreachable!("handled above"),
     }
 }
@@ -510,8 +511,9 @@ fn load_from_keystore_backend(
         }
     };
 
+    let account_intent = intent.with_account_context(account);
     let bytes = keystore
-        .load_keypair_with_intent(account, intent)
+        .load_keypair_with_intent(account, &account_intent)
         .map_err(|e| map_keystore_backend_error(backend, e))?;
 
     Ok(bytes)
