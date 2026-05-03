@@ -12,6 +12,7 @@ use pay_core::accounts::{
 use pay_core::balance::AccountBalances;
 use pay_core::send::{STABLECOIN_DECIMALS, format_token_amount, parse_token_amount};
 use pay_types::Stablecoin;
+use solana_pubkey::Pubkey;
 
 use crate::{components, no_dna};
 
@@ -31,7 +32,7 @@ pub struct SendCommand {
     /// entire selected stablecoin balance.
     pub amount: String,
 
-    /// Recipient public key (base-58).
+    /// Recipient public key (base-58) or account name.
     pub recipient: String,
 
     /// Stablecoin symbol. When omitted, pay selects an eligible balance or
@@ -57,11 +58,12 @@ impl SendCommand {
         verbose: bool,
     ) -> pay_core::Result<()> {
         let amount = self.amount;
-        let recipient = self.recipient;
+        let recipient_input = self.recipient;
         let config = pay_core::Config::load().unwrap_or_default();
         let network = network_override.unwrap_or(pay_core::accounts::MAINNET_NETWORK);
         let rpc_url = configured_rpc_url(&config);
         let fee_within = effective_fee_within(&amount, self.fee_within);
+        let recipient = resolve_recipient_pubkey(&recipient_input, network)?;
 
         let stablecoin = resolve_send_currency(
             &amount,
@@ -151,6 +153,37 @@ fn configured_rpc_url(config: &pay_core::Config) -> Option<&str> {
         .rpc_url
         .as_deref()
         .filter(|url| !url.trim().is_empty())
+}
+
+fn resolve_recipient_pubkey(recipient: &str, network: &str) -> pay_core::Result<String> {
+    if Pubkey::from_str(recipient).is_ok() {
+        return Ok(recipient.to_string());
+    }
+
+    let file = AccountsFile::load()?;
+    resolve_recipient_pubkey_from_file(recipient, network, &file)
+}
+
+fn resolve_recipient_pubkey_from_file(
+    recipient: &str,
+    network: &str,
+    file: &AccountsFile,
+) -> pay_core::Result<String> {
+    if Pubkey::from_str(recipient).is_ok() {
+        return Ok(recipient.to_string());
+    }
+
+    if let Some(account) = file.named_account_for_network(network, recipient) {
+        return account.pubkey.clone().ok_or_else(|| {
+            pay_core::Error::Config(format!(
+                "Account `{recipient}` exists on {network} but has no pubkey"
+            ))
+        });
+    }
+
+    Err(pay_core::Error::Config(format!(
+        "Recipient `{recipient}` is neither a valid Solana pubkey nor a configured {network} account name"
+    )))
 }
 
 fn resolve_send_currency(
@@ -387,7 +420,25 @@ fn stablecoin_balance_summary(balances: &AccountBalances) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pay_core::accounts::{Account, Keystore};
     use pay_core::balance::TokenBalance;
+
+    const VALID_PUBKEY: &str = "11111111111111111111111111111111";
+    const NAMED_PUBKEY: &str = "4BuiY9QUUfPoAGNJBja3JapAuVWMc9c7in6UCgyC2zPR";
+
+    fn test_account(pubkey: Option<&str>) -> Account {
+        Account {
+            keystore: Keystore::AppleKeychain,
+            active: false,
+            auth_required: Some(false),
+            pubkey: pubkey.map(str::to_string),
+            vault: None,
+            account: None,
+            path: None,
+            secret_key_b58: None,
+            created_at: None,
+        }
+    }
 
     fn balances(tokens: Vec<(&'static str, u64)>) -> AccountBalances {
         AccountBalances {
@@ -403,6 +454,52 @@ mod tests {
                 .collect(),
             tokens_unavailable: false,
         }
+    }
+
+    #[test]
+    fn resolve_recipient_pubkey_accepts_literal_pubkey_first() {
+        let mut file = AccountsFile::default();
+        file.upsert("mainnet", VALID_PUBKEY, test_account(Some(NAMED_PUBKEY)));
+
+        let resolved = resolve_recipient_pubkey_from_file(VALID_PUBKEY, "mainnet", &file).unwrap();
+
+        assert_eq!(resolved, VALID_PUBKEY);
+    }
+
+    #[test]
+    fn resolve_recipient_pubkey_falls_back_to_account_name() {
+        let mut file = AccountsFile::default();
+        file.upsert("mainnet", "alice", test_account(Some(NAMED_PUBKEY)));
+
+        let resolved = resolve_recipient_pubkey_from_file("alice", "mainnet", &file).unwrap();
+
+        assert_eq!(resolved, NAMED_PUBKEY);
+    }
+
+    #[test]
+    fn resolve_recipient_pubkey_errors_for_unknown_name() {
+        let file = AccountsFile::default();
+
+        let err = resolve_recipient_pubkey_from_file("alice", "mainnet", &file).unwrap_err();
+
+        assert!(
+            err.to_string().contains(
+                "Recipient `alice` is neither a valid Solana pubkey nor a configured mainnet account name"
+            )
+        );
+    }
+
+    #[test]
+    fn resolve_recipient_pubkey_errors_when_account_has_no_pubkey() {
+        let mut file = AccountsFile::default();
+        file.upsert("mainnet", "alice", test_account(None));
+
+        let err = resolve_recipient_pubkey_from_file("alice", "mainnet", &file).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("Account `alice` exists on mainnet but has no pubkey")
+        );
     }
 
     #[test]

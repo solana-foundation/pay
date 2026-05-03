@@ -61,7 +61,7 @@ struct Opts {
 
     /// Use a specific named account from `~/.config/pay/accounts.yml`.
     /// For `--local` / `--sandbox`, this selects a wallet within `localnet`.
-    #[arg(long)]
+    #[arg(long, global = true)]
     account: Option<String>,
 
     /// Launch the Payment Debugger proxy on port 1402. All MCP curl
@@ -69,6 +69,26 @@ struct Opts {
     /// http://127.0.0.1:1402/
     #[arg(long)]
     debugger: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn account_global_flag_can_follow_push_alias() {
+        let opts =
+            Opts::try_parse_from(["pay", "push", "--account", "test", "max", "ludo"]).unwrap();
+
+        assert_eq!(opts.account.as_deref(), Some("test"));
+        match opts.command {
+            Some(Command::Send(cmd)) => {
+                assert_eq!(cmd.amount, "max");
+                assert_eq!(cmd.recipient, "ludo");
+            }
+            _ => panic!("expected send command"),
+        }
+    }
 }
 
 fn main() {
