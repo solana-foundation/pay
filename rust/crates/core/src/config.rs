@@ -73,7 +73,7 @@ impl Config {
     /// 1. `accounts.yml` default account
     /// 2. `PAY_ACTIVE_ACCOUNT` env var
     /// 3. Config file `keypair` field
-    /// 4. Legacy: probe Keychain / 1Password directly
+    /// 4. Legacy: probe keystores directly
     pub fn default_active_account_name(&self) -> Option<String> {
         // 1. accounts.yml — only return a source string for keystore-backed
         //    accounts. Ephemeral accounts have no signer source string and

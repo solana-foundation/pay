@@ -21,11 +21,6 @@ for network fees because server-side fee payers handle fees and setup costs.
   signing approval.
 - Paid API calls spend supported stablecoins. Do not ask users to top up SOL for
   these calls; server-side fee payers handle network fees and setup costs.
-- When `--yolo` is used, the user still defines a spending cap up front. Pay
-  tracks the budget and refuses to continue once the cap would be exceeded, so
-  automatic payment is bounded rather than open-ended.
-- Do not use or recommend `--yolo` unless the user explicitly requests bounded
-  automatic payment in the current task.
 - Do not raise spending limits, top up funds, bridge funds, or change wallet
   settings unless the user explicitly asks for that specific operation.
 - Use sandbox mode for tests; it uses an ephemeral devnet wallet instead of real

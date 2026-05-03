@@ -11,12 +11,12 @@ pub struct NewCommand {
     pub name: String,
 
     /// Storage backend: "keychain" (macOS), "gnome-keyring" (Linux),
-    /// "windows-hello" (Windows), "1password".
+    /// or "windows-hello" (Windows).
     #[arg(long)]
     pub backend: Option<String>,
 
-    /// 1Password vault name.
-    #[arg(long)]
+    /// Legacy vault name.
+    #[arg(long, hide = true)]
     pub vault: Option<String>,
 
     /// Replace existing account.
@@ -218,13 +218,13 @@ fn build_keystore(
 /// Used in error messages so we don't suggest `keychain` to a Linux user.
 fn available_backends_hint() -> &'static str {
     if cfg!(target_os = "macos") {
-        "'keychain' or '1password'"
+        "'keychain'"
     } else if cfg!(target_os = "linux") {
-        "'gnome-keyring' or '1password'"
+        "'gnome-keyring'"
     } else if cfg!(target_os = "windows") {
-        "'windows-hello' or '1password'"
+        "'windows-hello'"
     } else {
-        "'1password'"
+        "a supported platform backend"
     }
 }
 
@@ -287,43 +287,39 @@ pub fn pick_backend() -> pay_core::Result<String> {
         label: String,
     }
 
-    let mut options = Vec::new();
-
     // Only show platform-native backend on the current OS
     #[cfg(target_os = "macos")]
-    options.push(Opt {
+    let options = [Opt {
         id: "keychain",
         label: "macOS Keychain (Touch ID)".into(),
-    });
+    }];
 
     #[cfg(target_os = "linux")]
-    {
-        let gnome_available = Keystore::gnome_keyring_available();
-        if gnome_available {
-            options.push(Opt {
+    let options = {
+        if Keystore::gnome_keyring_available() {
+            vec![Opt {
                 id: "gnome-keyring",
                 label: "GNOME Keyring (password prompt)".into(),
-            });
+            }]
+        } else {
+            Vec::new()
         }
-    }
+    };
 
     #[cfg(target_os = "windows")]
-    {
-        let wh_available = Keystore::windows_hello_available();
-        if wh_available {
-            options.push(Opt {
+    let options = {
+        if Keystore::windows_hello_available() {
+            vec![Opt {
                 id: "windows-hello",
                 label: "Windows Hello (fingerprint / face / PIN)".into(),
-            });
+            }]
+        } else {
+            Vec::new()
         }
-    }
+    };
 
-    if Keystore::onepassword_available() {
-        options.push(Opt {
-            id: "1password",
-            label: "1Password".into(),
-        });
-    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    let options: Vec<Opt> = Vec::new();
 
     if options.is_empty() {
         return Err(pay_core::Error::Config(

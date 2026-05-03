@@ -56,7 +56,6 @@ ad-hoc page scraping.
 - Pay does not ask agents for private keys, seed phrases, provider API keys, or
   custodial credentials.
 - Wallet keys stay in the operating system's secure credential store.
-- Real payments require local user authorization unless the user explicitly
-  configured bounded auto-pay.
+- Real payments require local user authorization.
 - Server-side fee payers handle network fees; the Pay account needs supported
   stablecoins such as USDC, USDT, PYUSD, CASH, or USDG.

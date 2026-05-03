@@ -220,7 +220,7 @@ impl PollState {
     }
 }
 
-/// Slider range: $0.00 to $15.00 in $0.50 increments = 30 steps, + 1 YOLO step = 31
+/// Slider range: $0.00 to $15.00 in $0.50 increments = 30 steps, + 1 no-cap step = 31
 const MAX_STEPS: usize = 31;
 const STEP_AMOUNT: u64 = 500_000; // 0.50 USDC in base units (6 decimals)
 
@@ -2015,7 +2015,7 @@ fn run(
                 },
                 KeyCode::Enter => {
                     let cap = if budget_pos >= MAX_STEPS {
-                        u64::MAX // YOLO
+                        u64::MAX
                     } else {
                         (budget_pos as u64) * STEP_AMOUNT
                     };
@@ -2128,9 +2128,9 @@ fn render_budget_box(
     focus: &Focus,
     account_name: &str,
 ) {
-    let is_yolo = position >= MAX_STEPS;
-    let amount_str = if is_yolo {
-        "YOLO".to_string()
+    let is_no_cap = position >= MAX_STEPS;
+    let amount_str = if is_no_cap {
+        "No cap".to_string()
     } else {
         format!("${:.0}", position as f64 * 0.5)
     };
@@ -2162,7 +2162,7 @@ fn render_budget_box(
             (10, "$5"),
             (20, "$10"),
             (30, "$15"),
-            (31, "YOLO"),
+            (31, "No cap"),
         ],
         *focus == Focus::Budget,
     );
@@ -2221,10 +2221,10 @@ fn render_card_panel(
     let bg = Block::default().style(Style::default().bg(CARD_BG));
     frame.render_widget(bg, area);
 
-    let is_yolo = budget_pos >= MAX_STEPS;
+    let is_no_cap = budget_pos >= MAX_STEPS;
     let dollars = (budget_pos as f64) * 0.50;
-    let budget_str = if is_yolo {
-        " YOLO ".to_string()
+    let budget_str = if is_no_cap {
+        " No cap ".to_string()
     } else {
         format!(" ${:.2} ", dollars)
     };

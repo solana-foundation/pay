@@ -592,7 +592,7 @@ fn mpp_challenges_within_cap(
     unsupported_currencies.dedup();
     if !unsupported_currencies.is_empty() {
         return Err(pay_core::Error::PaymentRejected(format!(
-            "--yolo-upto is a stablecoin-denominated cap and cannot price advertised MPP currencies automatically: {}",
+            "The automatic payment cap is stablecoin-denominated and cannot price advertised MPP currencies automatically: {}",
             unsupported_currencies.join(", ")
         )));
     }
@@ -659,7 +659,7 @@ fn payment_cap_error(
     payment_cap: u64,
 ) -> pay_core::Error {
     pay_core::Error::PaymentRejected(format!(
-        "{protocol} payment requires {} {currency}, above --yolo-upto {} stablecoins",
+        "{protocol} payment requires {} {currency}, above the automatic payment cap of {} stablecoins",
         format_stablecoin_amount(required_micro),
         format_stablecoin_amount(payment_cap),
     ))
@@ -675,7 +675,7 @@ fn amount_as_stablecoin_micro(amount: &str, currency: &str) -> pay_core::Result<
     }
 
     Err(pay_core::Error::PaymentRejected(format!(
-        "--yolo-upto is a stablecoin-denominated cap and cannot price `{currency}` payments automatically"
+        "The automatic payment cap is stablecoin-denominated and cannot price `{currency}` payments automatically"
     )))
 }
 

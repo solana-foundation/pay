@@ -20,12 +20,12 @@ pub struct SetupCommand {
     pub force: bool,
 
     /// Storage backend: "keychain" (macOS), "gnome-keyring" (Linux),
-    /// "windows-hello" (Windows), "1password".
+    /// or "windows-hello" (Windows).
     #[arg(long)]
     pub backend: Option<String>,
 
-    /// 1Password vault name.
-    #[arg(long)]
+    /// Legacy vault name.
+    #[arg(long, hide = true)]
     pub vault: Option<String>,
 
     /// Re-install MCP configs and agent skill without creating a new account.

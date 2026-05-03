@@ -26,7 +26,12 @@ struct Opts {
     command: Option<Command>,
 
     /// Automatically satisfy 402 challenges up to this stablecoin cap.
-    #[arg(long = "yolo-upto", value_name = "AMOUNT", value_parser = parse_stablecoin_cap)]
+    #[arg(
+        long = "yolo-upto",
+        value_name = "AMOUNT",
+        value_parser = parse_stablecoin_cap,
+        hide = true
+    )]
     yolo_upto: Option<u64>,
 
     /// Sandbox mode: force network=localnet and route to the hosted

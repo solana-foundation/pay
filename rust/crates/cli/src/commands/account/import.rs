@@ -13,12 +13,12 @@ pub struct ImportCommand {
     /// Path to the JSON key file.
     pub file: String,
 
-    /// Storage backend: "keychain", "gnome-keyring", "windows-hello", "1password".
+    /// Storage backend: "keychain", "gnome-keyring", or "windows-hello".
     #[arg(long)]
     pub backend: Option<String>,
 
-    /// 1Password vault name.
-    #[arg(long)]
+    /// Legacy vault name.
+    #[arg(long, hide = true)]
     pub vault: Option<String>,
 }
 
