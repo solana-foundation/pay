@@ -87,13 +87,63 @@ impl SetupCommand {
             .clone()
             .unwrap_or_else(pay_core::balance::mainnet_rpc_url);
         let completion = crate::tui::run_topup_flow(&pubkey, &rpc_url, &account_name)?;
-        super::account::new::print_next_steps(
-            &account_name,
-            backend_name,
-            completion.as_ref().map(|c| &c.received),
-        );
+        if let Some(completion) = completion {
+            print_setup_success(backend_name, &completion, &rpc_url);
+        } else {
+            print_setup_aborted(&account_name, backend_name);
+        }
         Ok(())
     }
+}
+
+fn print_setup_success(
+    backend_name: &str,
+    completion: &crate::tui::TopupCompletion,
+    rpc_url: &str,
+) {
+    crate::components::print_notice(
+        crate::components::NoticeLevel::Success,
+        "Setup complete",
+        &setup_success_body(backend_name, completion, rpc_url),
+    );
+}
+
+fn setup_success_body(
+    backend_name: &str,
+    completion: &crate::tui::TopupCompletion,
+    rpc_url: &str,
+) -> String {
+    let mut lines = vec![format!("Account secured in {backend_name}")];
+    if let Some(amount) = super::topup::topup_received_amount(&completion.received) {
+        lines.push(format!("Account funded with {amount}"));
+    }
+    if let Some(hash) = &completion.tx_hash {
+        let cluster = crate::network::SolanaNetwork::Mainnet.explorer_cluster(rpc_url);
+        lines.push(format!(
+            "{} {hash}",
+            crate::components::solana_transaction_link(hash, &cluster)
+        ));
+    }
+    lines.push(String::new());
+    lines.push("Ready to go. Time to make HTTP pay for itself.".to_string());
+    lines.push("$ pay claude".to_string());
+    lines.push("$ pay codex".to_string());
+    lines.join("\n")
+}
+
+fn print_setup_aborted(account_name: &str, backend_name: &str) {
+    crate::components::print_notice(
+        crate::components::NoticeLevel::Warning,
+        "Setup aborted",
+        &setup_aborted_body(account_name, backend_name),
+    );
+}
+
+fn setup_aborted_body(account_name: &str, backend_name: &str) -> String {
+    let topup_cmd = crate::commands::topup::topup_retry_command(account_name);
+    format!(
+        "Account secured in {backend_name}\nA top-up is required before making paid requests.\n$ {topup_cmd}"
+    )
 }
 
 /// `pay setup --update`: re-install MCP configs and agent skill.

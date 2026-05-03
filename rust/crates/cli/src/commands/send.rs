@@ -26,6 +26,7 @@ const DEFAULT_STABLECOIN: Stablecoin = Stablecoin::Usdc;
 ///   pay send 5 <address> --currency USDT         Send 5 USDT
 ///   pay send max <address>                       Send an entire stablecoin balance
 ///   pay send 1 <address> --memo invoice-123      Attach memo metadata
+///   pay send 1 <address> --memo-hex 48656c6c6f  Attach hex-encoded memo text
 #[derive(clap::Args)]
 pub struct SendCommand {
     /// Amount of stablecoin to send (e.g. "1.25"), or "max" to send the
@@ -43,6 +44,10 @@ pub struct SendCommand {
     /// Optional memo metadata for the recipient split.
     #[arg(long, value_name = "MEMO")]
     pub memo: Option<String>,
+
+    /// Hex-encoded UTF-8 memo metadata for the recipient split.
+    #[arg(long, value_name = "HEX", conflicts_with = "memo")]
+    pub memo_hex: Option<String>,
 
     /// Take the fee-payer refund out of AMOUNT instead of adding it on top.
     /// This is implied when AMOUNT is "max".
@@ -64,6 +69,7 @@ impl SendCommand {
         let rpc_url = configured_rpc_url(&config);
         let fee_within = effective_fee_within(&amount, self.fee_within);
         let recipient = resolve_recipient_pubkey(&recipient_input, network)?;
+        let memo = resolve_memo(self.memo.as_deref(), self.memo_hex.as_deref())?;
 
         let stablecoin = resolve_send_currency(
             &amount,
@@ -93,7 +99,7 @@ impl SendCommand {
                 stablecoin,
                 network,
                 account_override,
-                memo: self.memo.as_deref(),
+                memo: memo.as_deref(),
                 fee_within,
                 rpc_url,
             },
@@ -142,6 +148,74 @@ fn send_success_body(result: &pay_core::client::send::SendResult) -> String {
 
 fn effective_fee_within(amount: &str, fee_within: bool) -> bool {
     fee_within || sends_entire_balance(amount)
+}
+
+fn resolve_memo(memo: Option<&str>, memo_hex: Option<&str>) -> pay_core::Result<Option<String>> {
+    match (memo, memo_hex) {
+        (Some(_), Some(_)) => Err(pay_core::Error::Config(
+            "Pass either --memo or --memo-hex, not both".to_string(),
+        )),
+        (Some(value), None) => normalize_memo_text(value),
+        (None, Some(value)) => decode_memo_hex(value),
+        (None, None) => Ok(None),
+    }
+}
+
+fn normalize_memo_text(value: &str) -> pay_core::Result<Option<String>> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    validate_memo_len(value)?;
+    Ok(Some(value.to_string()))
+}
+
+fn decode_memo_hex(value: &str) -> pay_core::Result<Option<String>> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let hex = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value);
+    if !hex.len().is_multiple_of(2) {
+        return Err(pay_core::Error::Config(
+            "Memo hex must contain an even number of digits".to_string(),
+        ));
+    }
+
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    let mut chars = hex.as_bytes().chunks_exact(2);
+    for pair in &mut chars {
+        let high = hex_digit(pair[0])?;
+        let low = hex_digit(pair[1])?;
+        bytes.push((high << 4) | low);
+    }
+
+    let memo = String::from_utf8(bytes)
+        .map_err(|_| pay_core::Error::Config("Memo hex must decode to UTF-8 text".to_string()))?;
+    normalize_memo_text(&memo)
+}
+
+fn hex_digit(byte: u8) -> pay_core::Result<u8> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(pay_core::Error::Config(
+            "Memo hex must contain only hexadecimal digits".to_string(),
+        )),
+    }
+}
+
+fn validate_memo_len(value: &str) -> pay_core::Result<()> {
+    if value.len() > 566 {
+        return Err(pay_core::Error::Config(
+            "Memo cannot exceed 566 bytes".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn sends_entire_balance(amount: &str) -> bool {
@@ -589,6 +663,62 @@ mod tests {
         assert!(effective_fee_within("*", false));
         assert!(effective_fee_within("1", true));
         assert!(!effective_fee_within("1", false));
+    }
+
+    #[test]
+    fn resolve_memo_accepts_text() {
+        assert_eq!(
+            resolve_memo(Some("Hello world"), None).unwrap(),
+            Some("Hello world".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_memo_decodes_hex_text() {
+        assert_eq!(
+            resolve_memo(None, Some("48656c6c6f20776f726c64")).unwrap(),
+            Some("Hello world".to_string())
+        );
+        assert_eq!(
+            resolve_memo(None, Some("0x48656c6c6f")).unwrap(),
+            Some("Hello".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_memo_rejects_both_forms() {
+        let err = resolve_memo(Some("hello"), Some("68656c6c6f")).unwrap_err();
+
+        assert!(err.to_string().contains("Pass either --memo or --memo-hex"));
+    }
+
+    #[test]
+    fn resolve_memo_rejects_invalid_hex() {
+        let odd = resolve_memo(None, Some("abc")).unwrap_err();
+        assert!(
+            odd.to_string()
+                .contains("Memo hex must contain an even number of digits")
+        );
+
+        let invalid = resolve_memo(None, Some("zz")).unwrap_err();
+        assert!(
+            invalid
+                .to_string()
+                .contains("Memo hex must contain only hexadecimal digits")
+        );
+    }
+
+    #[test]
+    fn resolve_memo_rejects_non_utf8_hex() {
+        let err = resolve_memo(None, Some("ff")).unwrap_err();
+
+        assert!(err.to_string().contains("Memo hex must decode to UTF-8"));
+    }
+
+    #[test]
+    fn resolve_memo_treats_empty_values_as_absent() {
+        assert_eq!(resolve_memo(Some(""), None).unwrap(), None);
+        assert_eq!(resolve_memo(None, Some("")).unwrap(), None);
     }
 
     #[test]

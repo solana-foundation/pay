@@ -397,20 +397,22 @@ pub fn print_next_steps(
         eprintln!("  {}", "$ pay claude".bold());
         eprintln!("  {}", "$ pay codex".bold());
     } else {
-        let topup_cmd = if name == "default" {
-            "pay topup".to_string()
-        } else {
-            format!("pay topup --account {name}")
-        };
         eprintln!();
-        eprintln!(
-            "  {}",
-            "A top-up is required before making paid requests.".dimmed()
+        crate::components::print_notice(
+            crate::components::NoticeLevel::Warning,
+            "Top-up required",
+            &topup_required_body(name),
         );
-        eprintln!("  {}", format!("When ready, run: $ {topup_cmd}").dimmed());
     }
 
     eprintln!();
+}
+
+fn topup_required_body(name: &str) -> String {
+    format!(
+        "A top-up is required before making paid requests.\n$ {}",
+        crate::commands::topup::topup_retry_command(name)
+    )
 }
 
 pub fn format_received(r: &pay_core::client::balance::ReceivedFunds) -> String {
@@ -437,4 +439,25 @@ pub fn generate_keypair() -> (Vec<u8>, String) {
 
     let pubkey_b58 = bs58::encode(&verifying_key.to_bytes()).into_string();
     (keypair_bytes, pubkey_b58)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn topup_required_body_uses_default_topup_command_for_default_account() {
+        assert_eq!(
+            topup_required_body("default"),
+            "A top-up is required before making paid requests.\n$ pay topup"
+        );
+    }
+
+    #[test]
+    fn topup_required_body_uses_named_account_topup_command() {
+        assert_eq!(
+            topup_required_body("test-2"),
+            "A top-up is required before making paid requests.\n$ pay topup --account test-2"
+        );
+    }
 }

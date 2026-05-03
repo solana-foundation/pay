@@ -9219,7 +9219,7 @@ dependencies = [
 [[package]]
 name = "solana-mpp"
 version = "0.6.0"
-source = "git+https://github.com/solana-foundation/mpp-sdk?branch=main#b8e30ba110fe1f721405302469d19e204d207066"
+source = "git+https://github.com/solana-foundation/mpp-sdk?branch=main#b94bb9dd571b557d4fb27018c2b589a05d4d99a1"
 dependencies = [
  "base64 0.22.1",
  "bincode",
@@ -11290,7 +11290,7 @@ dependencies = [
 [[package]]
 name = "solana-x402"
 version = "0.1.0"
-source = "git+https://github.com/solana-foundation/x402-sdk?branch=main#30e6c348f3c28a37db9b7edfcd428e1c60460aaa"
+source = "git+https://github.com/solana-foundation/x402-sdk?branch=main#b19ea82c3ebc0240a75b19fa46a4fc8d8819c1ee"
 dependencies = [
  "base64 0.22.1",
  "bincode",
@@ -12061,7 +12061,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "230a1b821ccbd75b185820a1f1ff7b14d21da1e442e22c0863ea5f08771a8874"
 dependencies = [
  "rustix 1.1.4",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
