@@ -1063,9 +1063,11 @@ fn render_qr_detail(
     //   QR            — fills remaining vertical space, centered
     //   scan label    — white bold "Scan to send … to @account"
     //   dimmed helper — "Requires Solana wallet mobile application"
+    //   dimmed address
     let split = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(0),
+        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
@@ -1137,6 +1139,14 @@ fn render_qr_detail(
     .style(Style::default().bg(TOPUP_MAIN_BG))
     .centered();
     frame.render_widget(helper, split[3]);
+
+    let address = Paragraph::new(Line::from(Span::styled(
+        pubkey.to_string(),
+        Style::default().fg(Color::DarkGray).bg(TOPUP_MAIN_BG),
+    )))
+    .style(Style::default().bg(TOPUP_MAIN_BG))
+    .centered();
+    frame.render_widget(address, split[4]);
 }
 
 /// Build the slider title for the QR view — e.g.
