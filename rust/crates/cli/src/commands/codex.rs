@@ -20,6 +20,7 @@ pub(crate) const PAY_MCP_ENABLED_TOOLS: &[&str] = &[
 /// Launches Codex with the pay MCP server injected automatically.
 /// All arguments are passed through to the `codex` binary.
 #[derive(Args)]
+#[command(disable_help_flag = true)]
 pub struct CodexCommand {
     /// Arguments forwarded to codex.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]

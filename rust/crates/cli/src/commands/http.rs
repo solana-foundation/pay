@@ -4,6 +4,7 @@ use clap::Args;
 ///
 /// All arguments are passed through to the real `http` binary.
 #[derive(Args)]
+#[command(disable_help_flag = true)]
 pub struct HttpCommand {
     /// Arguments forwarded to httpie.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]

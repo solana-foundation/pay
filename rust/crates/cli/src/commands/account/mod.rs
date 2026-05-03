@@ -17,7 +17,7 @@ pub enum AccountCommand {
     /// List all registered accounts with balances.
     #[command(alias = "ls")]
     List(list::ListCommand),
-    /// Set the default account.
+    /// Update default account.
     Default(default::DefaultCommand),
     /// Permanently delete an account and its secret key.
     #[command(alias = "rm", alias = "destroy")]
@@ -59,7 +59,7 @@ pub fn run_default() -> pay_core::Result<()> {
 const SUBCOMMAND_HELP: &[(&str, &str)] = &[
     ("new", "Create a new account"),
     ("import", "Import an account from a JSON key file"),
-    ("default", "Set the default account"),
+    ("default", "Update default account"),
     ("rm", "Remove an account (alias: destroy)"),
     (
         "export",

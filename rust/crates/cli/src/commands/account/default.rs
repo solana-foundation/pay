@@ -1,6 +1,6 @@
-//! `pay account default` — set the default account.
+//! `pay account default` — update default account.
 
-/// Set which account is used by default.
+/// Update which account is used by default.
 #[derive(clap::Args)]
 pub struct DefaultCommand {
     /// Account name to make the default.

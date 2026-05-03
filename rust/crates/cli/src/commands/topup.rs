@@ -1,11 +1,11 @@
-/// Fund your pay account.
+/// Import funds from Venmo, PayPal, or a mobile wallet.
 #[derive(clap::Args)]
 pub struct TopupCommand {
-    /// Account address to fund. Defaults to your mainnet account.
+    /// Account address to receive funds. Defaults to your mainnet account.
     #[arg(long)]
     pub account: Option<String>,
 
-    /// Fund the sandbox (localnet) account instead of mainnet.
+    /// Use the sandbox (localnet) account instead of mainnet.
     #[arg(long)]
     pub sandbox: bool,
 }

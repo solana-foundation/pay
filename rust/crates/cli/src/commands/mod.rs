@@ -8,7 +8,6 @@ pub mod send;
 pub mod server;
 pub mod setup;
 pub mod skills;
-pub mod solana;
 pub mod topup;
 pub mod wget;
 pub mod whoami;
@@ -39,7 +38,7 @@ pub enum Command {
     Claude(claude::ClaudeCommand),
     /// Run Codex with 402 payment support.
     Codex(codex::CodexCommand),
-    /// Manage accounts (new, import, list, destroy, export).
+    /// Manage accounts (new, import, list, default, remove, export).
     /// With no subcommand, lists accounts and prints the available subcommands.
     #[command(alias = "accounts")]
     Account {
@@ -49,15 +48,14 @@ pub enum Command {
     /// Show the system user, the active mainnet account, and its stablecoin
     /// balances.
     Whoami(whoami::WhoamiCommand),
-    /// Run a Solana CLI command with your pay account keypair.
-    Solana(solana::SolanaCommand),
-    /// Send SOL to a recipient address.
+    /// Send stablecoins to a recipient address.
+    #[command(alias = "push")]
     Send(send::SendCommand),
     /// Generate a keypair, store it, and fund your account.
     Setup(setup::SetupCommand),
-    /// Fund your account on localnet via Surfpool.
+    /// Import funds from Venmo, PayPal, or a mobile wallet.
     Topup(topup::TopupCommand),
-    /// Payment gateway server (start, scaffold).
+    /// As a developer, use pay to gate your API with stablecoin payments.
     Server {
         #[command(subcommand)]
         command: server::ServerCommand,
@@ -111,7 +109,6 @@ impl Command {
             | Command::Fetch(_)
             | Command::Claude(_)
             | Command::Codex(_)
-            | Command::Solana(_)
             | Command::Send(_)
             | Command::Topup(_) => true,
             Command::Setup(_)
@@ -141,7 +138,6 @@ impl Command {
             | Command::Send(_)
             | Command::Setup(_)
             | Command::Topup(_)
-            | Command::Solana(_)
             | Command::Server { .. } => ToolKind::Mcp,
             Command::Mcp => ToolKind::Mcp,
         }
@@ -162,6 +158,7 @@ impl Command {
         self,
         auto_pay: bool,
         output_fmt: Option<OutputFormat>,
+        payment_cap: Option<u64>,
         keypair_override: Option<&str>,
         network_override: Option<&str>,
         account_override: Option<&str>,
@@ -177,11 +174,17 @@ impl Command {
                 Some(cmd) => return cmd.run(),
                 None => return account::run_default(),
             },
-            Command::Whoami(cmd) => return cmd.run(),
+            Command::Whoami(cmd) => return cmd.run(network_override, account_override),
             Command::Skills { command } => return command.run(),
             Command::Install(cmd) => return cmd.run(),
-            Command::Solana(cmd) => std::process::exit(cmd.run(keypair_override)?),
-            Command::Send(cmd) => return cmd.run(keypair_override, verbose),
+            Command::Send(cmd) => {
+                return cmd.run(
+                    keypair_override,
+                    network_override,
+                    account_override,
+                    verbose,
+                );
+            }
             Command::Setup(cmd) => return cmd.run(),
             Command::Topup(cmd) => return cmd.run(),
             Command::Server { command } => return command.run(keypair_override, sandbox),
@@ -215,6 +218,7 @@ impl Command {
                     &tool,
                     auto_pay,
                     output_fmt,
+                    payment_cap,
                     Some(parsed_headers),
                     network_override,
                     account_override,
@@ -230,6 +234,7 @@ impl Command {
             &tool,
             auto_pay,
             output_fmt,
+            payment_cap,
             None,
             network_override,
             account_override,
@@ -245,6 +250,7 @@ fn handle_outcome(
     tool: &Tool,
     auto_pay: bool,
     output_fmt: Option<OutputFormat>,
+    payment_cap: Option<u64>,
     fetch_headers: Option<Vec<(String, String)>>,
     network_override: Option<&str>,
     account_override: Option<&str>,
@@ -264,6 +270,13 @@ fn handle_outcome(
             challenges.push((*challenge).clone());
             challenges.extend(alternatives);
             if auto_pay {
+                let capped_challenges;
+                let challenges_to_pay = if let Some(cap) = payment_cap {
+                    capped_challenges = mpp_challenges_within_cap(&challenges, cap)?;
+                    capped_challenges.as_slice()
+                } else {
+                    challenges.as_slice()
+                };
                 if verbose && !is_json {
                     let currencies = mpp_challenge_currencies(&challenges).join(", ");
                     eprintln!(
@@ -281,7 +294,7 @@ fn handle_outcome(
                     );
                 }
                 return pay_mpp_and_retry(
-                    &challenges,
+                    challenges_to_pay,
                     &resource_url,
                     PaymentRetryContext {
                         tool,
@@ -337,6 +350,7 @@ fn handle_outcome(
                 / 1_000_000.0;
 
             if auto_pay {
+                enforce_session_cap(req.as_ref(), payment_cap)?;
                 if verbose && !is_json {
                     eprintln!(
                         "{}",
@@ -383,6 +397,12 @@ fn handle_outcome(
             resource_url,
         } => {
             if auto_pay {
+                enforce_payment_cap(
+                    &challenge.requirements.amount,
+                    &challenge.requirements.currency,
+                    payment_cap,
+                    "x402",
+                )?;
                 if verbose && !is_json {
                     eprintln!(
                         "{}",
@@ -526,6 +546,170 @@ fn handle_outcome(
     }
 
     Ok(())
+}
+
+fn mpp_challenges_within_cap(
+    challenges: &[mpp::Challenge],
+    payment_cap: u64,
+) -> pay_core::Result<Vec<mpp::Challenge>> {
+    let mut allowed = Vec::new();
+    let mut lowest_required: Option<(u64, String, String)> = None;
+    let mut unsupported_currencies = Vec::new();
+
+    for challenge in challenges {
+        let request: ChargeRequest = challenge.request.decode().map_err(|e| {
+            pay_core::Error::Mpp(format!("Failed to decode challenge request: {e}"))
+        })?;
+        let amount_micro = match amount_as_stablecoin_micro(&request.amount, &request.currency) {
+            Ok(amount_micro) => amount_micro,
+            Err(pay_core::Error::PaymentRejected(_)) => {
+                unsupported_currencies.push(request.currency);
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+
+        if amount_micro <= payment_cap {
+            allowed.push(challenge.clone());
+        }
+
+        if lowest_required
+            .as_ref()
+            .is_none_or(|(lowest, _, _)| amount_micro < *lowest)
+        {
+            lowest_required = Some((amount_micro, request.amount, request.currency));
+        }
+    }
+
+    if !allowed.is_empty() {
+        return Ok(allowed);
+    }
+
+    if let Some((required_micro, _amount, currency)) = lowest_required {
+        return Err(payment_cap_error(
+            "MPP",
+            &currency,
+            required_micro,
+            payment_cap,
+        ));
+    }
+
+    unsupported_currencies.sort();
+    unsupported_currencies.dedup();
+    if !unsupported_currencies.is_empty() {
+        return Err(pay_core::Error::PaymentRejected(format!(
+            "--yolo-upto is a stablecoin-denominated cap and cannot price advertised MPP currencies automatically: {}",
+            unsupported_currencies.join(", ")
+        )));
+    }
+
+    Err(pay_core::Error::PaymentRejected(
+        "no MPP payment challenge was available".to_string(),
+    ))
+}
+
+fn enforce_session_cap(
+    request: Option<&SessionRequest>,
+    payment_cap: Option<u64>,
+) -> pay_core::Result<()> {
+    let Some(payment_cap) = payment_cap else {
+        return Ok(());
+    };
+    let Some(request) = request else {
+        return Err(pay_core::Error::Mpp(
+            "session payment cap requires a decoded SessionRequest".to_string(),
+        ));
+    };
+    let required_micro = request
+        .cap
+        .parse::<u64>()
+        .map_err(|e| pay_core::Error::Mpp(format!("Invalid session cap: {e}")))?;
+
+    if required_micro <= payment_cap {
+        return Ok(());
+    }
+
+    Err(payment_cap_error(
+        "MPP session",
+        "USDC",
+        required_micro,
+        payment_cap,
+    ))
+}
+
+fn enforce_payment_cap(
+    amount: &str,
+    currency: &str,
+    payment_cap: Option<u64>,
+    protocol: &str,
+) -> pay_core::Result<()> {
+    let Some(payment_cap) = payment_cap else {
+        return Ok(());
+    };
+    let required_micro = amount_as_stablecoin_micro(amount, currency)?;
+    if required_micro <= payment_cap {
+        return Ok(());
+    }
+    Err(payment_cap_error(
+        protocol,
+        currency,
+        required_micro,
+        payment_cap,
+    ))
+}
+
+fn payment_cap_error(
+    protocol: &str,
+    currency: &str,
+    required_micro: u64,
+    payment_cap: u64,
+) -> pay_core::Error {
+    pay_core::Error::PaymentRejected(format!(
+        "{protocol} payment requires {} {currency}, above --yolo-upto {} stablecoins",
+        format_stablecoin_amount(required_micro),
+        format_stablecoin_amount(payment_cap),
+    ))
+}
+
+fn amount_as_stablecoin_micro(amount: &str, currency: &str) -> pay_core::Result<u64> {
+    let raw = amount
+        .parse::<u64>()
+        .map_err(|e| pay_core::Error::Mpp(format!("Invalid payment amount `{amount}`: {e}")))?;
+
+    if is_known_stablecoin(currency) {
+        return Ok(raw);
+    }
+
+    Err(pay_core::Error::PaymentRejected(format!(
+        "--yolo-upto is a stablecoin-denominated cap and cannot price `{currency}` payments automatically"
+    )))
+}
+
+fn is_known_stablecoin(currency: &str) -> bool {
+    let symbol = currency.to_ascii_uppercase();
+    matches!(symbol.as_str(), "USDC" | "USDT" | "PYUSD" | "CASH")
+        || matches!(
+            currency,
+            solana_mpp::protocol::solana::mints::USDC_MAINNET
+                | solana_mpp::protocol::solana::mints::USDC_DEVNET
+                | solana_mpp::protocol::solana::mints::USDT_MAINNET
+                | solana_mpp::protocol::solana::mints::PYUSD_MAINNET
+                | solana_mpp::protocol::solana::mints::PYUSD_DEVNET
+                | solana_mpp::protocol::solana::mints::CASH_MAINNET
+        )
+}
+
+fn format_stablecoin_amount(amount: u64) -> String {
+    let whole = amount / 1_000_000;
+    let fraction = amount % 1_000_000;
+    if fraction == 0 {
+        return whole.to_string();
+    }
+    let mut fraction = format!("{fraction:06}");
+    while fraction.ends_with('0') {
+        fraction.pop();
+    }
+    format!("{whole}.{fraction}")
 }
 
 struct PaymentRetryContext<'a, 'tool> {
@@ -1006,6 +1190,72 @@ mod tests {
         assert_eq!(headers.len(), 1);
         assert_eq!(headers[0].0, "Location");
         assert_eq!(headers[0].1, "https://example.com:8080/path");
+    }
+
+    #[test]
+    fn amount_as_stablecoin_micro_treats_known_stablecoins_as_six_decimals() {
+        assert_eq!(
+            amount_as_stablecoin_micro("1250000", "USDC").unwrap(),
+            1_250_000
+        );
+        assert_eq!(amount_as_stablecoin_micro("5000", "CASH").unwrap(), 5_000);
+        assert_eq!(
+            amount_as_stablecoin_micro(
+                "1000000",
+                solana_mpp::protocol::solana::mints::USDC_MAINNET,
+            )
+            .unwrap(),
+            1_000_000
+        );
+    }
+
+    #[test]
+    fn amount_as_stablecoin_micro_rejects_sol_under_stablecoin_cap() {
+        assert!(amount_as_stablecoin_micro("1000000000", "SOL").is_err());
+    }
+
+    #[test]
+    fn mpp_cap_filter_skips_unpriced_assets_when_stablecoin_fits() {
+        let challenges = vec![
+            mpp_challenge("SOL", "1000000000"),
+            mpp_challenge("USDC", "500000"),
+        ];
+        let allowed = mpp_challenges_within_cap(&challenges, 1_000_000).unwrap();
+        assert_eq!(allowed.len(), 1);
+        let request: ChargeRequest = allowed[0].request.decode().unwrap();
+        assert_eq!(request.currency, "USDC");
+    }
+
+    #[test]
+    fn mpp_cap_filter_rejects_when_only_unpriced_assets_are_available() {
+        let challenges = vec![mpp_challenge("SOL", "1000000000")];
+        let err = mpp_challenges_within_cap(&challenges, 1_000_000)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot price advertised MPP currencies"));
+    }
+
+    fn mpp_challenge(currency: &str, amount: &str) -> mpp::Challenge {
+        let request = serde_json::json!({
+            "amount": amount,
+            "currency": currency,
+            "recipient": "So11111111111111111111111111111111111111112",
+            "methodDetails": { "network": "mainnet" }
+        });
+        mpp::Challenge::new(
+            currency,
+            "test",
+            "solana",
+            "charge",
+            solana_mpp::Base64UrlJson::from_value(&request).unwrap(),
+        )
+    }
+
+    #[test]
+    fn format_stablecoin_amount_trims_fraction() {
+        assert_eq!(format_stablecoin_amount(1_000_000), "1");
+        assert_eq!(format_stablecoin_amount(1_250_000), "1.25");
+        assert_eq!(format_stablecoin_amount(1), "0.000001");
     }
 
     #[test]

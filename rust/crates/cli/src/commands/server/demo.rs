@@ -8,8 +8,6 @@ use crate::commands::server::start::StartCommand;
 
 const DEMO_SPEC: &str = include_str!("payment-debugger.yml");
 
-use owo_colors::OwoColorize;
-
 #[derive(clap::Args)]
 pub struct DemoCommand {
     /// Address to bind to.
@@ -51,7 +49,6 @@ impl DemoCommand {
         let spec_path = std::path::PathBuf::from("pay-demo.yaml");
         std::fs::write(&spec_path, DEMO_SPEC)
             .map_err(|e| pay_core::Error::Config(format!("Failed to write pay-demo.yaml: {e}")))?;
-        eprintln!("  {} ./pay-demo.yaml", "Scaffolding".green());
 
         // Default to hosted sandbox. --local overrides to localhost.
         let rpc_url = if self.local {
@@ -70,6 +67,7 @@ impl DemoCommand {
             otlp_sidecar: self.otlp_sidecar,
             openapi: None,
             public_url: None,
+            scaffolded_spec: Some("./pay-demo.yaml".to_string()),
         };
         cmd.run(active_account_name, true)
     }

@@ -92,9 +92,14 @@ pub fn build_payment(
 ) -> Result<BuiltPayment> {
     let requirements = &challenge.requirements;
     let amount = format_amount(&requirements.amount, &requirements.currency);
-    let desc = crate::client::prompt::payment_description(
+    let prompt_context = crate::client::prompt::payment_prompt_context(
         requirements.description.as_deref(),
         &[Some(requirements.resource.as_str()), resource_url],
+    );
+    let intent = crate::keystore::AuthIntent::authorize_payment_details(
+        &amount,
+        &prompt_context.reason,
+        &prompt_context.operator,
     );
 
     let cluster = normalize_network(
@@ -113,12 +118,12 @@ pub fn build_payment(
     let user_opted_into_sandbox = network_override.is_some() || cluster == "localnet";
     let network = network_override.map(str::to_string).unwrap_or(cluster);
 
-    let (signer, ephemeral_notice) = crate::signer::load_signer_for_network_payment(
+    let (signer, ephemeral_notice) = crate::signer::load_signer_for_network_payment_with_intent(
         &network,
         store,
         account_override,
         &amount,
-        &desc,
+        &intent,
     )?;
 
     let rpc_url =
@@ -322,8 +327,10 @@ fn format_amount(amount: &str, currency: &str) -> String {
 fn format_value(v: f64) -> String {
     if v == 0.0 {
         "0".to_string()
-    } else if v >= 0.01 {
+    } else if v >= 0.01 && is_cent_exact(v) {
         format!("{v:.2}")
+    } else if v >= 0.01 {
+        format_precise_value(v, 6)
     } else if v >= 0.001 {
         format!("{v:.3}")
     } else if v >= 0.0001 {
@@ -331,6 +338,19 @@ fn format_value(v: f64) -> String {
     } else {
         format!("{v:.6}")
     }
+}
+
+fn is_cent_exact(v: f64) -> bool {
+    let rounded_to_cent = (v * 100.0).round() / 100.0;
+    (v - rounded_to_cent).abs() < 0.0000005
+}
+
+fn format_precise_value(v: f64, decimals: usize) -> String {
+    let mut value = format!("{v:.decimals$}");
+    while value.contains('.') && value.ends_with('0') {
+        value.pop();
+    }
+    value
 }
 
 fn detect_x402_version(headers: &[(String, String)], body: Option<&str>) -> u64 {
@@ -407,6 +427,11 @@ mod tests {
     }
 
     #[test]
+    fn format_value_preserves_fractional_cent_fees() {
+        assert_eq!(format_value(1.0015), "1.0015");
+    }
+
+    #[test]
     fn format_value_cents() {
         assert_eq!(format_value(0.01), "0.01");
     }
@@ -429,6 +454,11 @@ mod tests {
     #[test]
     fn format_amount_usdc() {
         assert_eq!(format_amount("1000000", "USDC"), "$1.00");
+    }
+
+    #[test]
+    fn format_amount_usdc_with_fee_fraction() {
+        assert_eq!(format_amount("1001500", "USDC"), "$1.0015");
     }
 
     #[test]

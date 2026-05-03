@@ -58,6 +58,10 @@ pub enum RunOutcome {
 /// Appends `-D <tempfile>` after user args to capture response headers.
 /// stdout/stderr/stdin are inherited so the user sees normal curl output.
 pub fn run_curl(user_args: &[String]) -> Result<RunOutcome> {
+    if is_passthrough_metadata_request(user_args) {
+        return run_plain_command("curl", user_args);
+    }
+
     validate_curl_args_against_catalog(user_args)?;
     run_curl_inner(user_args, &[])
 }
@@ -137,6 +141,10 @@ fn run_curl_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunO
 
 /// Run `wget` with the given user args, detecting 402 + MPP challenges.
 pub fn run_wget(user_args: &[String]) -> Result<RunOutcome> {
+    if is_passthrough_metadata_request(user_args) {
+        return run_plain_command("wget", user_args);
+    }
+
     validate_wget_args_against_catalog(user_args)?;
     run_wget_inner(user_args, &[])
 }
@@ -146,6 +154,10 @@ pub fn run_wget(user_args: &[String]) -> Result<RunOutcome> {
 /// HTTPie uses positional `Header:Value` request items rather than `-H` flags,
 /// so `extra_headers` for retry are appended as positional args.
 pub fn run_httpie(user_args: &[String]) -> Result<RunOutcome> {
+    if is_passthrough_metadata_request(user_args) {
+        return run_plain_command("http", user_args);
+    }
+
     run_httpie_inner(user_args, &[])
 }
 
@@ -589,6 +601,31 @@ fn find_url_in_args(args: &[String]) -> Option<String> {
         .cloned()
 }
 
+fn is_passthrough_metadata_request(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "-h" | "--help" | "--manual" | "-V" | "--version"
+        ) || arg.starts_with("--help=")
+    })
+}
+
+fn run_plain_command(program: &str, args: &[String]) -> Result<RunOutcome> {
+    check_command_exists(program)?;
+
+    let status = Command::new(program)
+        .args(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()?;
+
+    Ok(RunOutcome::Completed {
+        exit_code: status.code().unwrap_or(1),
+        body: None,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedCurlRequest {
     url: Option<String>,
@@ -810,6 +847,25 @@ HTTP request sent, awaiting response...
                 .1,
             "https://pay.example.com"
         );
+    }
+
+    #[test]
+    fn passthrough_metadata_request_detects_help_and_version() {
+        assert!(is_passthrough_metadata_request(&["--help".to_string()]));
+        assert!(is_passthrough_metadata_request(&["-h".to_string()]));
+        assert!(is_passthrough_metadata_request(&["--help=all".to_string()]));
+        assert!(is_passthrough_metadata_request(&["--version".to_string()]));
+        assert!(is_passthrough_metadata_request(&["-V".to_string()]));
+    }
+
+    #[test]
+    fn passthrough_metadata_request_ignores_normal_requests() {
+        let args = vec![
+            "-H".to_string(),
+            "X-Mode: help".to_string(),
+            "https://example.com".to_string(),
+        ];
+        assert!(!is_passthrough_metadata_request(&args));
     }
 
     #[test]

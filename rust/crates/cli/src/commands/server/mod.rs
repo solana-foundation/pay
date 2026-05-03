@@ -6,27 +6,27 @@ use clap::Subcommand;
 
 #[derive(Subcommand)]
 pub enum ServerCommand {
-    /// Start the payment gateway proxy for an API spec.
-    Start(start::StartCommand),
-    /// Start the gateway with a bundled demo spec (payment-debugger).
+    /// Start a local demo with a dashboard for tracing payments.
     Demo(demo::DemoCommand),
-    /// Generate a starter provider YAML spec.
+    /// Start a proxy that enables stablecoin payments for your API.
+    Start(start::StartCommand),
+    /// Create a YAML file that defines endpoints and payment requirements.
     Scaffold(scaffold::ScaffoldCommand),
 }
 
 impl ServerCommand {
     pub fn otlp_sidecar(&self) -> Option<&str> {
         match self {
-            Self::Start(cmd) => cmd.otlp_sidecar.as_deref(),
             Self::Demo(cmd) => cmd.otlp_sidecar.as_deref(),
+            Self::Start(cmd) => cmd.otlp_sidecar.as_deref(),
             Self::Scaffold(_) => None,
         }
     }
 
     pub fn run(self, active_account_name: Option<&str>, sandbox: bool) -> pay_core::Result<()> {
         match self {
-            Self::Start(cmd) => cmd.run(active_account_name, sandbox),
             Self::Demo(cmd) => cmd.run(active_account_name, sandbox),
+            Self::Start(cmd) => cmd.run(active_account_name, sandbox),
             Self::Scaffold(cmd) => cmd.run(),
         }
     }

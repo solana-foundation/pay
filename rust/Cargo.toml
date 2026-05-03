@@ -17,7 +17,7 @@ pay-mcp = { path = "crates/mcp" }
 pay-pdb = { path = "crates/pdb" }
 
 # CLI
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "wrap_help"] }
 glob = "0.3"
 
 # Serialization

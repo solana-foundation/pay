@@ -9,6 +9,7 @@ const ALLOWED_TOOLS: &str = "mcp__pay__curl,mcp__pay__search_catalog,mcp__pay__l
 /// Launches Claude Code with the pay MCP server injected automatically.
 /// All arguments are passed through to the `claude` binary.
 #[derive(Args)]
+#[command(disable_help_flag = true)]
 pub struct ClaudeCommand {
     /// Arguments forwarded to claude.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]

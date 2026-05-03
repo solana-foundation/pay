@@ -4,6 +4,7 @@ use clap::Args;
 ///
 /// All arguments are passed through to the real wget binary.
 #[derive(Args)]
+#[command(disable_help_flag = true)]
 pub struct WgetCommand {
     /// Arguments forwarded to wget.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]

@@ -17,6 +17,8 @@ use solana_mpp::solana_keychain::SolanaSigner;
 use solana_mpp::solana_keychain::memory::MemorySigner;
 use tokio::time::{Duration, Instant};
 
+use crate::components::{PAY_SH_TAGLINE, render_pay_banner};
+
 const AUTO_OPERATOR_ACCOUNT_NAME: &str = "gateway";
 const BROWSER_RPC_PROXY_PATH: &str = "/__402/rpc";
 const FEE_PAYER_BALANCE_OBSERVE_INTERVAL: Duration = Duration::from_secs(300);
@@ -75,6 +77,9 @@ pub struct StartCommand {
     /// is derived from the request's `Host` header at serve time.
     #[arg(long, value_name = "URL")]
     pub public_url: Option<String>,
+
+    #[arg(skip)]
+    pub scaffolded_spec: Option<String>,
 }
 
 #[derive(Clone)]
@@ -583,11 +588,10 @@ impl StartCommand {
                 .count();
             let free_count = api.endpoints.len() - metered_count;
 
-            eprintln!();
-            eprintln!("  {}   {}", "╔═╗ ╔═╗ ╦ ╦".bold(), "╔═╗ ╦ ╦".dimmed());
-            eprintln!("  {}   {}", "╠═╝ ╠═╣ ╚╦╝".bold(), "╚═╗ ╠═╣".dimmed());
-            eprintln!("  {}  {} {}", "╩   ╩ ╩  ╩".bold(), "○".dimmed(), "╚═╝ ╩ ╩".dimmed());
-            eprintln!("  {}", "Developer Tools for Programmable Payments".dimmed());
+            eprintln!("{}", render_pay_banner(PAY_SH_TAGLINE.dimmed()));
+            if let Some(scaffolded_spec) = &self.scaffolded_spec {
+                eprintln!("  {} {}", "Scaffolding".green(), scaffolded_spec);
+            }
             eprintln!();
 
             // Network link

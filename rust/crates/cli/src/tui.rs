@@ -1,6 +1,6 @@
 //! Interactive TUI for configuring a payment session.
 //!
-//! Shown before making requests when no `--yolo` flag is set.
+//! Shown before making requests when automatic payment is not pre-approved.
 //! Lets the user set a spending cap and session duration — all 402
 //! challenges within that budget/time are then paid automatically.
 
@@ -16,7 +16,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use pay_core::client::balance::{AccountBalances, ReceivedFunds};
-use qrcode::{Color as QrColor, QrCode};
+use qrcode::{Color as QrColor, QrCode, Version as QrVersion};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -227,6 +227,8 @@ const STEP_AMOUNT: u64 = 500_000; // 0.50 USDC in base units (6 decimals)
 /// Topup amount slider: 0 = any amount, 1-25 = $1 to $25 in $1 steps
 const TOPUP_MAX_STEPS: usize = 25;
 const TOPUP_STEP_USDC: f64 = 1.0;
+const TOPUP_AMOUNT_LABEL_WIDTH: usize = 3;
+const TOPUP_SLIDER_CELL: &str = "▐";
 const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 /// Production onramp host — same gateway that serves the pay-api, just a
 /// different path (`/v1/onramp/start`). Reuses `pay_core::balance::DEFAULT_PAY_API_URL`
@@ -1072,7 +1074,7 @@ fn render_qr_detail(
     // Render the QR first so we know its actual width — the slider sits
     // above and is sized to 2× that width.
     let url = solana_pay_url(pubkey, amount_pos);
-    let qr = render_qr(&url, split[1].width, split[1].height)
+    let qr = render_topup_qr(&url, pubkey, split[1].width, split[1].height)
         .ok()
         .flatten()
         .unwrap_or_else(unavailable_qr);
@@ -1141,16 +1143,24 @@ fn render_qr_detail(
 /// ` Top-up amount: $3 (← → to adjust) `. Pure helper so we can unit-test
 /// the wording without spinning up a Frame.
 fn slider_title_spans<'a>(amount_pos: usize) -> Vec<Span<'a>> {
-    let amount_str = if amount_pos == 0 {
-        "any".to_string()
-    } else {
-        format!("${:.0}", amount_pos as f64 * TOPUP_STEP_USDC)
-    };
+    let amount_str = format!(
+        "{:>width$}",
+        topup_amount_label(amount_pos),
+        width = TOPUP_AMOUNT_LABEL_WIDTH
+    );
     vec![
         Span::raw("Top-up amount: "),
         Span::styled(amount_str, Style::default().fg(Color::Green).bold()),
         Span::styled(" (← → to adjust)", Style::default().dim()),
     ]
+}
+
+fn topup_amount_label(amount_pos: usize) -> String {
+    if amount_pos == 0 {
+        "any".to_string()
+    } else {
+        format!("${:.0}", amount_pos as f64 * TOPUP_STEP_USDC)
+    }
 }
 
 /// Borderless slider used in the QR view. Three rows: centered title,
@@ -1181,7 +1191,7 @@ fn render_topup_slider<'a>(
         } else {
             Color::Rgb(50, 55, 60)
         };
-        bar_spans.push(Span::styled("▐", Style::default().fg(color)));
+        bar_spans.push(Span::styled(TOPUP_SLIDER_CELL, Style::default().fg(color)));
     }
     bar_spans.push(Span::styled(" ▶ ", arrow_style));
 
@@ -1649,11 +1659,47 @@ fn render_qr(
     max_height: u16,
 ) -> Result<Option<RenderedQr>, qrcode::types::QrError> {
     let code = QrCode::with_error_correction_level(data.as_bytes(), qrcode::EcLevel::L)?;
+    Ok(render_qr_code(&code, max_width, max_height))
+}
+
+fn render_topup_qr(
+    data: &str,
+    pubkey: &str,
+    max_width: u16,
+    max_height: u16,
+) -> Result<Option<RenderedQr>, qrcode::types::QrError> {
+    let version = topup_qr_version(pubkey)?;
+    let stable = render_qr_with_version(data, version, max_width, max_height)?;
+
+    if stable.is_some() {
+        Ok(stable)
+    } else {
+        render_qr(data, max_width, max_height)
+    }
+}
+
+fn topup_qr_version(pubkey: &str) -> Result<QrVersion, qrcode::types::QrError> {
+    let sizing_url = solana_pay_url(pubkey, TOPUP_MAX_STEPS);
+    let code = QrCode::with_error_correction_level(sizing_url.as_bytes(), qrcode::EcLevel::L)?;
+    Ok(code.version())
+}
+
+fn render_qr_with_version(
+    data: &str,
+    version: QrVersion,
+    max_width: u16,
+    max_height: u16,
+) -> Result<Option<RenderedQr>, qrcode::types::QrError> {
+    let code = QrCode::with_version(data.as_bytes(), version, qrcode::EcLevel::L)?;
+    Ok(render_qr_code(&code, max_width, max_height))
+}
+
+fn render_qr_code(code: &QrCode, max_width: u16, max_height: u16) -> Option<RenderedQr> {
     let modules = code.width();
     let Some((module_cols, module_subrows)) =
         choose_qr_module_cells(modules, max_width, max_height)
     else {
-        return Ok(None);
+        return None;
     };
 
     let scaled_rows = modules * module_subrows;
@@ -1671,11 +1717,11 @@ fn render_qr(
     let width = lines.first().map(Line::width).unwrap_or(0) as u16;
     let height = lines.len() as u16;
 
-    Ok(Some(RenderedQr {
+    Some(RenderedQr {
         lines,
         width,
         height,
-    }))
+    })
 }
 
 fn qr_subrow_dark(code: &QrCode, x: usize, subrow: usize, module_subrows: usize) -> bool {
@@ -2372,9 +2418,25 @@ fn render_scale_spans(
             .checked_div(max_steps)
             .unwrap_or(0);
         let label_center = arrow_width + track_pos;
-        let label_start = label_center
-            .saturating_sub(label_width / 2)
-            .min(bar_width.saturating_sub(label_width));
+        let preferred_start = label_center.saturating_sub(label_width / 2);
+        let label_start = if bar_width <= label_width {
+            0
+        } else {
+            let bar_max_start = bar_width.saturating_sub(label_width);
+            let track_start = arrow_width.min(bar_max_start);
+            let track_end = arrow_width
+                .saturating_add(track_last)
+                .min(bar_width.saturating_sub(1));
+
+            if track_end >= track_start.saturating_add(label_width.saturating_sub(1)) {
+                preferred_start.clamp(
+                    track_start,
+                    track_end.saturating_sub(label_width.saturating_sub(1)),
+                )
+            } else {
+                preferred_start.min(bar_max_start)
+            }
+        };
 
         for (idx, ch) in label.chars().enumerate() {
             if let Some(slot) = chars.get_mut(label_start + idx) {
@@ -2708,6 +2770,48 @@ mod tests {
         assert!(scan_banner_text("alice", 5).contains("@alice"));
     }
 
+    #[test]
+    fn topup_amount_label_formats_any_and_dollar_steps() {
+        assert_eq!(topup_amount_label(0), "any");
+        assert_eq!(topup_amount_label(3), "$3");
+        assert_eq!(topup_amount_label(25), "$25");
+    }
+
+    #[test]
+    fn topup_slider_title_keeps_amount_slot_stable() {
+        for (amount_pos, expected) in [(0, "any"), (1, " $1"), (3, " $3"), (10, "$10"), (25, "$25")]
+        {
+            let spans = slider_title_spans(amount_pos);
+            let amount = spans[1].content.as_ref();
+
+            assert_eq!(amount, expected);
+            assert_eq!(amount.chars().count(), TOPUP_AMOUNT_LABEL_WIDTH);
+        }
+    }
+
+    #[test]
+    fn topup_slider_cell_is_single_char_slot() {
+        assert_eq!(TOPUP_SLIDER_CELL, "▐");
+        assert_eq!(TOPUP_SLIDER_CELL.chars().count(), 1);
+    }
+
+    #[test]
+    fn render_scale_spans_keeps_edge_labels_inside_track() {
+        let spans = render_scale_spans(
+            40,
+            TOPUP_MAX_STEPS,
+            33,
+            &[(0, "any"), (TOPUP_MAX_STEPS, "$25")],
+        );
+        let line = spans[0].content.as_ref();
+
+        assert_eq!(line.len(), 40);
+        assert_eq!(&line[0..3], "   ");
+        assert_eq!(&line[3..6], "any");
+        assert_eq!(&line[34..37], "$25");
+        assert_eq!(&line[37..40], "   ");
+    }
+
     // ── wrapped_line_count ─────────────────────────────────────────────
 
     #[test]
@@ -2783,6 +2887,30 @@ mod tests {
 
         assert!(qr.width <= 120);
         assert!(qr.height <= 30);
+    }
+
+    #[test]
+    fn topup_qr_render_keeps_dimensions_stable_across_amounts() {
+        let pubkey = "11111111111111111111111111111111";
+        let any = render_topup_qr(&solana_pay_url(pubkey, 0), pubkey, 120, 60)
+            .expect("any QR should encode")
+            .expect("any QR should fit");
+        let max = render_topup_qr(&solana_pay_url(pubkey, TOPUP_MAX_STEPS), pubkey, 120, 60)
+            .expect("max QR should encode")
+            .expect("max QR should fit");
+
+        assert_eq!(any.width, max.width);
+        assert_eq!(any.height, max.height);
+    }
+
+    #[test]
+    fn topup_qr_version_matches_max_amount_payload() {
+        let pubkey = "11111111111111111111111111111111";
+        let max_url = solana_pay_url(pubkey, TOPUP_MAX_STEPS);
+        let max_code = QrCode::with_error_correction_level(max_url.as_bytes(), qrcode::EcLevel::L)
+            .expect("max QR should encode");
+
+        assert_eq!(topup_qr_version(pubkey).unwrap(), max_code.version());
     }
 
     #[test]

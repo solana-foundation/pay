@@ -131,7 +131,17 @@ pub fn load_signer_for_network_payment(
     desc: &str,
 ) -> Result<(MemorySigner, Option<ResolvedEphemeral>)> {
     let intent = AuthIntent::authorize_payment(amount, desc);
-    load_signer_for_network_with_intent(network, store, account_override, &intent).map_err(|e| {
+    load_signer_for_network_payment_with_intent(network, store, account_override, amount, &intent)
+}
+
+pub fn load_signer_for_network_payment_with_intent(
+    network: &str,
+    store: &dyn AccountsStore,
+    account_override: Option<&str>,
+    amount: &str,
+    intent: &AuthIntent,
+) -> Result<(MemorySigner, Option<ResolvedEphemeral>)> {
+    load_signer_for_network_with_intent(network, store, account_override, intent).map_err(|e| {
         match e {
             Error::PaymentRejected(where_) => {
                 Error::PaymentRejected(format!("{amount} payment authorization was {where_}"))
@@ -198,7 +208,7 @@ pub fn load_keypair_bytes_from_account_with_intent(
                     )
                 };
                 ks.load_keypair_with_intent(name, intent)
-                    .map_err(|e| Error::Config(format!("keychain: {e}")))
+                    .map_err(|e| map_keystore_backend_error("keychain", e))
             }
             #[cfg(not(target_os = "macos"))]
             {
@@ -220,7 +230,7 @@ pub fn load_keypair_bytes_from_account_with_intent(
                     )
                 };
                 ks.load_keypair_with_intent(name, intent)
-                    .map_err(|e| Error::Config(format!("gnome-keyring: {e}")))
+                    .map_err(|e| map_keystore_backend_error("gnome-keyring", e))
             }
             #[cfg(not(target_os = "linux"))]
             {
@@ -243,7 +253,7 @@ pub fn load_keypair_bytes_from_account_with_intent(
                     )
                 };
                 ks.load_keypair_with_intent(name, intent)
-                    .map_err(|e| Error::Config(format!("windows-hello: {e}")))
+                    .map_err(|e| map_keystore_backend_error("windows-hello", e))
             }
             #[cfg(not(target_os = "windows"))]
             {
@@ -260,13 +270,8 @@ pub fn load_keypair_bytes_from_account_with_intent(
             } else {
                 crate::keystore::Keystore::onepassword(op_account)
             };
-            ks.load_keypair_with_intent(name, intent).map_err(|e| {
-                if matches!(e, crate::keystore::Error::AuthDenied(_)) {
-                    Error::PaymentRejected("rejected by user at 1Password".to_string())
-                } else {
-                    Error::Config(format!("1password: {e}"))
-                }
-            })
+            ks.load_keypair_with_intent(name, intent)
+                .map_err(|e| map_keystore_backend_error("1password", e))
         }
         Keystore::File => load_signer_keypair_bytes_with_intent(&source, intent),
         Keystore::Ephemeral => unreachable!("handled above"),
@@ -415,6 +420,14 @@ fn rejection_source(backend: &str) -> &'static str {
     }
 }
 
+fn map_keystore_backend_error(backend: &str, e: crate::keystore::Error) -> Error {
+    if matches!(e, crate::keystore::Error::AuthDenied(_)) {
+        Error::PaymentRejected(rejection_source(backend).to_string())
+    } else {
+        Error::Config(format!("{backend}: {e}"))
+    }
+}
+
 fn load_from_file(path: &str) -> Result<crate::keystore::Zeroizing<Vec<u8>>> {
     let expanded = shellexpand::tilde(path);
     // Newer solana-keychain split file vs inline-string parsing into two
@@ -499,13 +512,7 @@ fn load_from_keystore_backend(
 
     let bytes = keystore
         .load_keypair_with_intent(account, intent)
-        .map_err(|e| {
-            if matches!(e, crate::keystore::Error::AuthDenied(_)) {
-                Error::PaymentRejected(rejection_source(backend).to_string())
-            } else {
-                Error::Config(format!("{backend}: {e}"))
-            }
-        })?;
+        .map_err(|e| map_keystore_backend_error(backend, e))?;
 
     Ok(bytes)
 }
@@ -524,6 +531,36 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("Failed to load keypair"));
+    }
+
+    #[test]
+    fn keystore_auth_denial_maps_to_payment_rejected() {
+        let err = map_keystore_backend_error(
+            "keychain",
+            crate::keystore::Error::AuthDenied("cancel".into()),
+        );
+
+        match err {
+            Error::PaymentRejected(reason) => {
+                assert_eq!(reason, "rejected by user at Apple Keychain");
+            }
+            other => panic!("expected PaymentRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn keystore_backend_error_stays_config_error() {
+        let err = map_keystore_backend_error(
+            "keychain",
+            crate::keystore::Error::Backend("missing helper".into()),
+        );
+
+        match err {
+            Error::Config(message) => {
+                assert_eq!(message, "keychain: Keystore error: missing helper");
+            }
+            other => panic!("expected Config, got {other:?}"),
+        }
     }
 
     #[test]

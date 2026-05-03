@@ -8,10 +8,16 @@ pub fn is_agent() -> bool {
     std::env::var("NO_DNA").is_ok_and(|v| !v.is_empty())
 }
 
+/// Force NO_DNA mode for the current process.
+pub fn enable_for_process() {
+    // SAFETY: called during CLI startup before worker threads are spawned.
+    unsafe { std::env::set_var("NO_DNA", "1") };
+}
+
 /// Resolve whether output should be JSON.
 ///
 /// Precedence (highest to lowest):
-/// 1. Explicit `--output` flag (if user passed it)
+/// 1. Explicit output override (used by the `--no-dna` startup path)
 /// 2. `NO_DNA` env var -> JSON
 /// 3. TTY detection -> text for terminals, JSON for pipes
 pub fn should_json(explicit_output: Option<OutputFormat>) -> bool {

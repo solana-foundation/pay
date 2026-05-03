@@ -23,3 +23,39 @@ pub fn link(text: &str, url: &str) -> String {
 pub fn link_with_arrow(text: &str, url: &str) -> String {
     format!("{} {}", link(text, url), LINK_ARROW.dimmed())
 }
+
+/// Build the `?cluster=...` query suffix for Solana Explorer URLs.
+pub fn solana_explorer_cluster_query(network: &str, rpc_url: &str) -> String {
+    match network {
+        "mainnet" | "mainnet-beta" => String::new(),
+        "devnet" => "?cluster=devnet".to_string(),
+        "localnet" | "sandbox" => {
+            format!("?cluster=custom&customUrl={}", urlencoding::encode(rpc_url))
+        }
+        _ => String::new(),
+    }
+}
+
+/// Link to a Solana transaction receipt on Solana Explorer.
+pub fn solana_transaction_link(signature: &str, _network: &str, _rpc_url: &str) -> String {
+    let url =
+        format!("https://explorer.solana.com/tx/{signature}?cluster=mainnet-beta&view=receipt");
+    link_with_arrow("Link to receipt", &url)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn solana_transaction_link_uses_mainnet_receipt_view() {
+        let rendered = solana_transaction_link("sig123", "mainnet", "");
+
+        assert!(
+            rendered.contains(
+                "https://explorer.solana.com/tx/sig123?cluster=mainnet-beta&view=receipt"
+            )
+        );
+        assert!(rendered.contains("Link to receipt"));
+    }
+}
