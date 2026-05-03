@@ -18,5 +18,5 @@ pub use help::{
     ACCOUNT_MANAGEMENT_COMMANDS, AGENT_COMMANDS, DEVELOPER_COMMANDS, OTHER_COMMANDS,
     ROOT_COMMAND_SUMMARY, ROOT_HELP_TEMPLATE, SUPPORTED_PASS_THROUGH_COMMANDS,
 };
-pub use link::{link, link_with_arrow, solana_transaction_link};
-pub use notice::{NoticeLevel, notice};
+pub use link::{link, link_with_arrow, solana_explorer_cluster_query, solana_transaction_link};
+pub use notice::{NoticeLevel, notice, print_notice, print_notice_with_machine_output};

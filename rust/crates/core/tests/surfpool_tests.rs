@@ -47,12 +47,39 @@ async fn start_jit_surfnet() -> &'static Surfnet {
         .await
 }
 
-fn keypair_to_file(keypair: &Keypair) -> tempfile::NamedTempFile {
-    use std::io::Write;
-    let mut file = tempfile::NamedTempFile::new().unwrap();
-    let bytes: Vec<u8> = keypair.to_bytes().to_vec();
-    write!(file, "{}", serde_json::to_string(&bytes).unwrap()).unwrap();
-    file
+async fn submit_sol_transfer(
+    rpc_url: &str,
+    payer: &Keypair,
+    recipient: &str,
+    lamports: u64,
+) -> String {
+    use solana_message::Message;
+    use solana_mpp::solana_keychain::SolanaSigner;
+    use solana_mpp::solana_keychain::memory::MemorySigner;
+    use solana_mpp::solana_rpc_client::rpc_client::RpcClient;
+    use solana_pubkey::Pubkey;
+    use solana_signature::Signature;
+    use solana_system_interface::instruction as system_instruction;
+    use solana_transaction::Transaction;
+
+    let signer = MemorySigner::from_bytes(&payer.to_bytes()).unwrap();
+    let sender = signer.pubkey();
+    let recipient = recipient.parse::<Pubkey>().unwrap();
+    let rpc = RpcClient::new(rpc_url.to_string());
+    let blockhash = rpc.get_latest_blockhash().unwrap();
+    let ix = system_instruction::transfer(&sender, &recipient, lamports);
+    let message = Message::new_with_blockhash(&[ix], Some(&sender), &blockhash);
+    let mut tx = Transaction::new_unsigned(message);
+    let sig_bytes = signer.sign_message(&tx.message_data()).await.unwrap();
+    let sig = Signature::from(<[u8; 64]>::from(sig_bytes));
+    let signer_index = tx
+        .message
+        .account_keys
+        .iter()
+        .position(|key| key == &sender)
+        .unwrap();
+    tx.signatures[signer_index] = sig;
+    rpc.send_and_confirm_transaction(&tx).unwrap().to_string()
 }
 
 // =============================================================================
@@ -125,125 +152,6 @@ async fn balance_invalid_pubkey() {
     let surfnet = start_surfnet().await;
     let rpc = surfnet.rpc_url().to_string();
     let result = client::balance::get_balances(&rpc, "not-a-pubkey").await;
-    assert!(result.is_err());
-}
-
-// =============================================================================
-// send
-// =============================================================================
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn send_sol_basic() {
-    let surfnet = start_surfnet().await;
-    let payer = Keypair::new();
-    surfnet
-        .cheatcodes()
-        .fund_sol(&payer.pubkey(), 1_000_000_000)
-        .unwrap();
-    let recipient = Keypair::new();
-
-    // Write payer keypair to a temp file
-    let kp_file = keypair_to_file(&payer);
-    let kp_path = kp_file.path().to_string_lossy().to_string();
-
-    let rpc = surfnet.rpc_url().to_string();
-    let recip = recipient.pubkey().to_string();
-    let kp = kp_path.clone();
-    let result = client::send::send_sol("0.5", &recip, &kp, &rpc).await;
-
-    assert!(result.is_ok(), "send_sol failed: {:?}", result.err());
-    let result = result.unwrap();
-    assert_eq!(result.lamports, 500_000_000);
-    assert!(!result.signature.is_empty());
-
-    // Verify recipient got the SOL
-    let rpc2 = surfnet.rpc_url().to_string();
-    let rpk = recipient.pubkey().to_string();
-    let balance = client::balance::get_balances(&rpc2, &rpk).await.unwrap();
-    assert_eq!(balance.sol_lamports, 500_000_000);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn send_sol_drain() {
-    let surfnet = start_surfnet().await;
-    let payer = Keypair::new();
-    surfnet
-        .cheatcodes()
-        .fund_sol(&payer.pubkey(), 10_000_000_000)
-        .unwrap();
-    let recipient = Keypair::new();
-
-    let kp_file = keypair_to_file(&payer);
-    let kp_path = kp_file.path().to_string_lossy().to_string();
-
-    // "*" means drain all (minus fees)
-    let rpc = surfnet.rpc_url().to_string();
-    let recip = recipient.pubkey().to_string();
-    let kp = kp_path.clone();
-    let result = client::send::send_sol("*", &recip, &kp, &rpc).await;
-
-    assert!(result.is_ok(), "drain failed: {:?}", result.err());
-
-    // Payer should have ~0 SOL left
-    let rpc2 = surfnet.rpc_url().to_string();
-    let ppk = payer.pubkey().to_string();
-    let payer_balance = client::balance::get_balances(&rpc2, &ppk).await.unwrap();
-    assert!(
-        payer_balance.sol_lamports < 10_000,
-        "Payer should be drained, got {}",
-        payer_balance.sol_lamports
-    );
-
-    // Recipient should have almost all the SOL
-    let rpc3 = surfnet.rpc_url().to_string();
-    let rpk2 = recipient.pubkey().to_string();
-    let recv_balance = client::balance::get_balances(&rpc3, &rpk2).await.unwrap();
-    assert!(
-        recv_balance.sol_lamports > 9_000_000_000,
-        "Recipient should have most SOL"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn send_sol_invalid_recipient() {
-    let surfnet = start_surfnet().await;
-    let payer = Keypair::new();
-    surfnet
-        .cheatcodes()
-        .fund_sol(&payer.pubkey(), 1_000_000_000)
-        .unwrap();
-    let kp_file = keypair_to_file(&payer);
-    let kp_path = kp_file.path().to_string_lossy().to_string();
-
-    let _rpc = surfnet.rpc_url().to_string();
-    let _kp = kp_path.clone();
-    let result =
-        client::send::send_sol("0.1", "not-a-valid-pubkey", &kp_path, surfnet.rpc_url()).await;
-    assert!(result.is_err());
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn send_sol_insufficient_funds() {
-    let surfnet = start_surfnet().await;
-    // Create a wallet with very little SOL
-    let broke = Keypair::new();
-    surfnet
-        .cheatcodes()
-        .fund_sol(&broke.pubkey(), 5000)
-        .unwrap(); // 5000 lamports, not even enough for fees
-    let recipient = Keypair::new();
-
-    let kp_file = keypair_to_file(&broke);
-    let kp_path = kp_file.path().to_string_lossy().to_string();
-
-    let rpc = surfnet.rpc_url().to_string();
-    let recip = recipient.pubkey().to_string();
-    let kp = kp_path.clone();
-    let result = client::send::send_sol("1.0", &recip, &kp, &rpc).await;
     assert!(result.is_err());
 }
 
@@ -527,16 +435,13 @@ async fn push_session_full_flow() {
     // Submit a real SOL transfer to surfpool as a stand-in for the Fiber
     // channel open. The server verifies this tx is confirmed on-chain before
     // accepting the open.
-    let kp_file = keypair_to_file(&client_kp);
-    let send_result = client::send::send_sol(
-        "0.01",
-        &operator.pubkey().to_string(),
-        kp_file.path().to_str().unwrap(),
+    let open_tx_sig = submit_sol_transfer(
         &rpc_url,
+        &client_kp,
+        &operator.pubkey().to_string(),
+        10_000_000,
     )
-    .await
-    .expect("deposit SOL transfer failed");
-    let open_tx_sig = send_result.signature;
+    .await;
 
     // Channel ID is any valid Solana pubkey (would be the real Fiber channel
     // in production; here it's just a key for the in-memory store).

@@ -59,4 +59,4 @@ ad-hoc page scraping.
 - Real payments require local user authorization unless the user explicitly
   configured bounded auto-pay.
 - Server-side fee payers handle network fees; the Pay account needs supported
-  stablecoins such as USDC, USDT, or CASH.
+  stablecoins such as USDC, USDT, PYUSD, CASH, or USDG.

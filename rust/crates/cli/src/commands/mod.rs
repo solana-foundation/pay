@@ -3,6 +3,7 @@ pub mod claude;
 pub mod codex;
 pub mod curl;
 pub mod fetch;
+pub mod help;
 pub mod http;
 pub mod send;
 pub mod server;
@@ -19,6 +20,7 @@ use pay_core::runner::RunOutcome;
 use pay_core::x402;
 use pay_core::x402::Challenge as X402Challenge;
 use pay_core::{run_curl_with_headers, run_httpie_with_headers, run_wget_with_headers};
+use pay_types::Stablecoin;
 use solana_mpp::{ChargeRequest, SessionRequest};
 
 use crate::no_dna;
@@ -178,12 +180,7 @@ impl Command {
             Command::Skills { command } => return command.run(),
             Command::Install(cmd) => return cmd.run(),
             Command::Send(cmd) => {
-                return cmd.run(
-                    keypair_override,
-                    network_override,
-                    account_override,
-                    verbose,
-                );
+                return cmd.run(network_override, account_override, verbose);
             }
             Command::Setup(cmd) => return cmd.run(),
             Command::Topup(cmd) => return cmd.run(),
@@ -525,13 +522,10 @@ fn handle_outcome(
                 } else {
                     reason
                 };
-                eprintln!(
-                    "{}",
-                    crate::components::notice(
-                        crate::components::NoticeLevel::Error,
-                        "Payment rejected by verifier",
-                        &body,
-                    )
+                crate::components::print_notice(
+                    crate::components::NoticeLevel::Error,
+                    "Payment rejected by verifier",
+                    &body,
                 );
             }
             std::process::exit(1);
@@ -686,17 +680,7 @@ fn amount_as_stablecoin_micro(amount: &str, currency: &str) -> pay_core::Result<
 }
 
 fn is_known_stablecoin(currency: &str) -> bool {
-    let symbol = currency.to_ascii_uppercase();
-    matches!(symbol.as_str(), "USDC" | "USDT" | "PYUSD" | "CASH")
-        || matches!(
-            currency,
-            solana_mpp::protocol::solana::mints::USDC_MAINNET
-                | solana_mpp::protocol::solana::mints::USDC_DEVNET
-                | solana_mpp::protocol::solana::mints::USDT_MAINNET
-                | solana_mpp::protocol::solana::mints::PYUSD_MAINNET
-                | solana_mpp::protocol::solana::mints::PYUSD_DEVNET
-                | solana_mpp::protocol::solana::mints::CASH_MAINNET
-        )
+    Stablecoin::parse_symbol(currency).is_some() || Stablecoin::from_mint(currency).is_some()
 }
 
 fn format_stablecoin_amount(amount: u64) -> String {
@@ -1020,13 +1004,10 @@ fn render_generated_wallet_notice(
         "{}\nStored at ~/.config/pay/accounts.yml — reused on subsequent runs.",
         pubkey
     );
-    eprintln!(
-        "{}",
-        crate::components::notice(
-            crate::components::NoticeLevel::Info,
-            &format!("Generated {} wallet", resolved.network),
-            &body,
-        )
+    crate::components::print_notice(
+        crate::components::NoticeLevel::Info,
+        &format!("Generated {} wallet", resolved.network),
+        &body,
     );
     Ok(())
 }
@@ -1108,13 +1089,10 @@ fn handle_retry_outcome(outcome: RunOutcome, is_json: bool) -> pay_core::Result<
                 } else {
                     reason
                 };
-                eprintln!(
-                    "{}",
-                    crate::components::notice(
-                        crate::components::NoticeLevel::Error,
-                        "Payment rejected by verifier",
-                        &body,
-                    )
+                crate::components::print_notice(
+                    crate::components::NoticeLevel::Error,
+                    "Payment rejected by verifier",
+                    &body,
                 );
             }
             std::process::exit(1);
@@ -1199,12 +1177,15 @@ mod tests {
             1_250_000
         );
         assert_eq!(amount_as_stablecoin_micro("5000", "CASH").unwrap(), 5_000);
+        assert_eq!(amount_as_stablecoin_micro("5000", "USDG").unwrap(), 5_000);
         assert_eq!(
-            amount_as_stablecoin_micro(
-                "1000000",
-                solana_mpp::protocol::solana::mints::USDC_MAINNET,
-            )
-            .unwrap(),
+            amount_as_stablecoin_micro("1000000", pay_types::stablecoin_mints::USDC_MAINNET,)
+                .unwrap(),
+            1_000_000
+        );
+        assert_eq!(
+            amount_as_stablecoin_micro("1000000", pay_types::stablecoin_mints::USDG_MAINNET)
+                .unwrap(),
             1_000_000
         );
     }

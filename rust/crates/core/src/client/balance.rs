@@ -11,6 +11,7 @@
 //! - `PAY_MAINNET_RPC_URL` — override the default Solana mainnet RPC.
 //! - `PAY_API_URL`         — override the pay-api host (default [`DEFAULT_PAY_API_URL`]).
 
+use pay_types::Stablecoin;
 use serde::Deserialize;
 
 /// Default pay-api host. Override with `PAY_API_URL`.
@@ -28,13 +29,7 @@ pub fn pay_api_url() -> String {
 }
 
 fn mint_symbol(mint: &str) -> Option<&'static str> {
-    match mint {
-        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" => Some("USDC"),
-        "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB" => Some("USDT"),
-        "2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo" => Some("PYUSD"),
-        "CASHx9KJUStyftLFWGvEVf59SGeG9sh5FfcnZMVPCASH" => Some("CASH"),
-        _ => None,
-    }
+    Stablecoin::symbol_for_mint(mint)
 }
 
 /// Map an RPC URL to the network name pay-api expects.
@@ -358,6 +353,14 @@ mod tests {
         assert_eq!(
             mint_symbol("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"),
             Some("USDT")
+        );
+    }
+
+    #[test]
+    fn mint_symbol_usdg() {
+        assert_eq!(
+            mint_symbol("2u1tszSeqZ3qBWF3uNGPFc8TzMk2tdiwknnRMWGWjGWH"),
+            Some("USDG")
         );
     }
 

@@ -5,6 +5,8 @@
 
 use owo_colors::OwoColorize;
 
+use crate::network::SolanaExplorerCluster;
+
 /// The character appended to visually indicate a clickable link.
 pub const LINK_ARROW: &str = "↗";
 
@@ -25,21 +27,16 @@ pub fn link_with_arrow(text: &str, url: &str) -> String {
 }
 
 /// Build the `?cluster=...` query suffix for Solana Explorer URLs.
-pub fn solana_explorer_cluster_query(network: &str, rpc_url: &str) -> String {
-    match network {
-        "mainnet" | "mainnet-beta" => String::new(),
-        "devnet" => "?cluster=devnet".to_string(),
-        "localnet" | "sandbox" => {
-            format!("?cluster=custom&customUrl={}", urlencoding::encode(rpc_url))
-        }
-        _ => String::new(),
-    }
+pub fn solana_explorer_cluster_query(cluster: &SolanaExplorerCluster) -> String {
+    cluster.query_suffix()
 }
 
 /// Link to a Solana transaction receipt on Solana Explorer.
-pub fn solana_transaction_link(signature: &str, _network: &str, _rpc_url: &str) -> String {
-    let url =
-        format!("https://explorer.solana.com/tx/{signature}?cluster=mainnet-beta&view=receipt");
+pub fn solana_transaction_link(signature: &str, cluster: &SolanaExplorerCluster) -> String {
+    let url = format!(
+        "https://explorer.solana.com/tx/{signature}{}",
+        cluster.transaction_receipt_query_suffix()
+    );
     link_with_arrow("Link to receipt", &url)
 }
 
@@ -49,7 +46,7 @@ mod tests {
 
     #[test]
     fn solana_transaction_link_uses_mainnet_receipt_view() {
-        let rendered = solana_transaction_link("sig123", "mainnet", "");
+        let rendered = solana_transaction_link("sig123", &SolanaExplorerCluster::Mainnet);
 
         assert!(
             rendered.contains(
@@ -57,5 +54,19 @@ mod tests {
             )
         );
         assert!(rendered.contains("Link to receipt"));
+    }
+
+    #[test]
+    fn solana_transaction_link_uses_custom_rpc_url() {
+        let rendered = solana_transaction_link(
+            "sig123",
+            &SolanaExplorerCluster::Custom {
+                rpc_url: "http://localhost:8899".to_string(),
+            },
+        );
+
+        assert!(rendered.contains(
+            "https://explorer.solana.com/tx/sig123?cluster=custom&customUrl=http%3A%2F%2Flocalhost%3A8899&view=receipt"
+        ));
     }
 }

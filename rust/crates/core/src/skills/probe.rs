@@ -12,6 +12,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
+use pay_types::Stablecoin;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -23,13 +24,15 @@ use crate::client::runner::{self, RunOutcome};
 /// Known Solana mint addresses → symbol mappings.
 const MINT_MAP: &[(&str, &str, u8)] = &[
     // (mint, symbol, decimals)
-    ("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "USDC", 6),
-    ("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", "USDT", 6),
+    (pay_types::stablecoin_mints::USDC_MAINNET, "USDC", 6),
+    (pay_types::stablecoin_mints::USDC_DEVNET, "USDC", 6),
+    (pay_types::stablecoin_mints::USDT_MAINNET, "USDT", 6),
+    (pay_types::stablecoin_mints::PYUSD_MAINNET, "PYUSD", 6),
+    (pay_types::stablecoin_mints::PYUSD_DEVNET, "PYUSD", 6),
+    (pay_types::stablecoin_mints::CASH_MAINNET, "CASH", 6),
+    (pay_types::stablecoin_mints::USDG_MAINNET, "USDG", 6),
     ("So11111111111111111111111111111111111111112", "SOL", 9),
 ];
-
-/// USD-pegged stablecoin symbols accepted as canonical pricing units.
-const USD_STABLES: &[&str] = &["USDC", "USDT", "PYUSD", "USDS", "FDUSD", "DAI"];
 
 /// Normalize a currency identifier to its symbol (uppercase).
 /// Recognizes known mint addresses and maps them to symbols.
@@ -54,7 +57,7 @@ fn decimals_for(symbol: &str) -> u8 {
 }
 
 fn is_usd_stable(symbol: &str) -> bool {
-    USD_STABLES.iter().any(|s| s.eq_ignore_ascii_case(symbol))
+    Stablecoin::parse_symbol(symbol).is_some()
 }
 
 /// Solana CAIP-2 networks all start with `solana:`. Treat the bare slug

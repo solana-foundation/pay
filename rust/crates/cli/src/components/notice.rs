@@ -43,6 +43,39 @@ pub fn notice(level: NoticeLevel, title: &str, body: &str) -> String {
     out
 }
 
+/// Print a notice to stderr, using compact text when NO_DNA is active.
+pub fn print_notice(level: NoticeLevel, title: &str, body: &str) {
+    if crate::no_dna::is_agent() {
+        eprint!("{}", agent_notice(title, body));
+    } else {
+        eprint!("{}", notice(level, title, body));
+    }
+}
+
+/// Print a notice, or in NO_DNA mode print a compact title to stderr and
+/// machine-readable output to stdout.
+pub fn print_notice_with_machine_output(
+    level: NoticeLevel,
+    title: &str,
+    body: &str,
+    machine_output: &str,
+) {
+    if crate::no_dna::is_agent() {
+        eprintln!("{}", title.dimmed());
+        println!("{machine_output}");
+    } else {
+        print_notice(level, title, body);
+    }
+}
+
+fn agent_notice(title: &str, body: &str) -> String {
+    let mut out = format!("{}\n", title.dimmed());
+    for line in body.lines() {
+        out.push_str(&format!("{}\n", line.dimmed()));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,5 +112,15 @@ mod tests {
         let rendered = notice(NoticeLevel::Info, "Wallet generated", "ready");
 
         assert_eq!(strip_ansi(&rendered), "│ Wallet generated\n│ ready\n");
+    }
+
+    #[test]
+    fn agent_notice_omits_rail() {
+        let rendered = agent_notice("Payment rejected", "declined\ntry again");
+
+        assert_eq!(
+            strip_ansi(&rendered),
+            "Payment rejected\ndeclined\ntry again\n"
+        );
     }
 }

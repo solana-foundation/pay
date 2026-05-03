@@ -34,7 +34,7 @@ Use this as the primary HTTP tool for Pay gateway URLs and for any URL that
 returns HTTP 402. The tool prepares MPP, x402, or SIWX credentials, asks for
 local wallet approval when payment is required, then retries the original
 request with the proof. The active Pay account only needs supported
-stablecoins such as USDC, USDT, or CASH; it does not need SOL for network fees.
+stablecoins such as USDC, USDT, PYUSD, CASH, or USDG; it does not need SOL for network fees.
 Server-side fee payers handle transaction fees and setup costs. Copy URLs
 returned by `search_catalog` or `get_catalog_entry` exactly; do not replace
 them with upstream API hosts.
@@ -117,7 +117,7 @@ not enough to make a precise paid-call plan.
     #[tool(description = r#"Get the balance of the active pay account.
 
 Returns stablecoin balances for the currently configured account. Paid API
-calls spend supported stablecoins such as USDC, USDT, or CASH; the account does
+calls spend supported stablecoins such as USDC, USDT, PYUSD, CASH, or USDG; the account does
 not need SOL for network fees because server-side fee payers handle fees and
 setup costs. Use this to check available funds before making paid API calls.
 "#)]

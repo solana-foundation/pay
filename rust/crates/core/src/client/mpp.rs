@@ -2,6 +2,7 @@
 //!
 //! Thin wrapper around `solana_mpp` for challenge detection and credential building.
 
+use pay_types::Stablecoin;
 use solana_mpp::client::build_credential_header;
 use solana_mpp::protocol::solana::default_rpc_url;
 use solana_mpp::solana_keychain::SolanaSigner;
@@ -271,11 +272,7 @@ fn decoded_charge_candidates(
         let network = network_override
             .map(str::to_string)
             .unwrap_or(challenge_network);
-        let mint = solana_mpp::protocol::solana::resolve_stablecoin_mint(
-            &request.currency,
-            Some(&network),
-        )
-        .map(str::to_string);
+        let mint = resolve_challenge_mint(&request.currency, &network);
         let embedded_blockhash = details.recent_blockhash;
         let user_opted_into_sandbox =
             should_auto_fund_surfpool(network_override, embedded_blockhash.as_deref());
@@ -295,6 +292,20 @@ fn decoded_charge_candidates(
     }
 
     Ok(candidates)
+}
+
+fn resolve_challenge_mint(currency: &str, network: &str) -> Option<String> {
+    if currency.eq_ignore_ascii_case("SOL") {
+        return None;
+    }
+    if let Some(stablecoin) = Stablecoin::parse_symbol(currency) {
+        return Some(stablecoin.mint(Some(network)).to_string());
+    }
+    if Stablecoin::from_mint(currency).is_some() {
+        return Some(currency.to_string());
+    }
+    solana_mpp::protocol::solana::resolve_stablecoin_mint(currency, Some(network))
+        .map(str::to_string)
 }
 
 fn select_candidate_index_for_balances(
@@ -619,6 +630,28 @@ mod tests {
 
         let selected = select_candidate_index_for_balances(&candidates, &balances).unwrap();
         assert_eq!(candidates[selected].currency, "USDT");
+    }
+
+    #[test]
+    fn balance_selector_resolves_usdg_symbol_to_supported_mint() {
+        let challenges = vec![challenge_for_currency("USDG", "1000000")];
+        let candidates = decoded_charge_candidates(&challenges, None).unwrap();
+        let balances = crate::client::balance::AccountBalances {
+            sol_lamports: 0,
+            tokens: vec![token_balance(
+                pay_types::stablecoin_mints::USDG_MAINNET,
+                1_000_000,
+                "USDG",
+            )],
+            tokens_unavailable: false,
+        };
+
+        let selected = select_candidate_index_for_balances(&candidates, &balances).unwrap();
+        assert_eq!(candidates[selected].currency, "USDG");
+        assert_eq!(
+            candidates[selected].mint.as_deref(),
+            Some(pay_types::stablecoin_mints::USDG_MAINNET)
+        );
     }
 
     #[test]

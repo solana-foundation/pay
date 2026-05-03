@@ -11,13 +11,15 @@ use pay_core::PaymentState;
 use pay_core::accounts::AccountsStore;
 use pay_core::server::session::SessionMpp;
 use pay_core::server::telemetry::FeePayerWallet;
+use pay_types::Stablecoin;
 use pay_types::metering::{ApiSpec, OperatorConfig, RoutingConfig, SignerConfig};
 use solana_mpp::server::Mpp;
 use solana_mpp::solana_keychain::SolanaSigner;
 use solana_mpp::solana_keychain::memory::MemorySigner;
 use tokio::time::{Duration, Instant};
 
-use crate::components::{PAY_SH_TAGLINE, render_pay_banner};
+use crate::components::{PAY_SH_TAGLINE, render_pay_banner, solana_explorer_cluster_query};
+use crate::network::SolanaNetwork;
 
 const AUTO_OPERATOR_ACCOUNT_NAME: &str = "gateway";
 const BROWSER_RPC_PROXY_PATH: &str = "/__402/rpc";
@@ -114,10 +116,10 @@ impl PaymentState for AppState {
 
 fn should_use_auto_fee_payer_signer(
     sandbox: bool,
-    network: &str,
+    network: &SolanaNetwork,
     signer_cfg: Option<&SignerConfig>,
 ) -> bool {
-    sandbox || (signer_cfg.is_none() && matches!(network, "localnet" | "devnet"))
+    sandbox || (signer_cfg.is_none() && network.is_throwaway())
 }
 
 impl StartCommand {
@@ -192,9 +194,10 @@ impl StartCommand {
         // Resolve config that doesn't need async.
         let currencies = resolve_operator_currencies(op, &self.currency);
 
-        let network = op
-            .and_then(|o| o.network.clone())
-            .unwrap_or_else(|| "mainnet".to_string());
+        let network = SolanaNetwork::from_slug(
+            op.and_then(|o| o.network.clone())
+                .unwrap_or_else(|| "mainnet".to_string()),
+        );
 
         // RPC URL fallback chain. Network-aware so that `localnet`
         // defaults to the hosted Surfpool sandbox (where ephemeral
@@ -205,21 +208,7 @@ impl StartCommand {
             .and_then(|o| o.rpc_url.clone())
             .or(self.rpc_url.clone())
             .or_else(|| std::env::var("PAY_RPC_URL").ok())
-            .unwrap_or_else(|| match network.as_str() {
-                // localnet → Surfpool sandbox (lets the smart-default
-                // auto-create + auto-fund the ephemeral on first run).
-                "localnet" => pay_core::config::SANDBOX_RPC_URL.to_string(),
-                "devnet" => "https://api.devnet.solana.com".to_string(),
-                "mainnet" => "https://api.mainnet-beta.solana.com".to_string(),
-                // Unknown network → fall through to the old default.
-                _ => {
-                    if sandbox {
-                        pay_core::config::SANDBOX_RPC_URL.to_string()
-                    } else {
-                        pay_core::config::LOCAL_RPC_URL.to_string()
-                    }
-                }
-            });
+            .unwrap_or_else(|| network.default_rpc_url(sandbox));
 
         let fee_payer = op.map(|o| o.fee_payer).unwrap_or(false);
         let signer_cfg = op.and_then(|o| o.signer.clone());
@@ -264,7 +253,7 @@ impl StartCommand {
                 &network,
                 signer_cfg.as_ref(),
             ) {
-                let auto_network = network.as_str();
+                let auto_network = network.slug();
                 let store = pay_core::accounts::FileAccountsStore::default_path();
                 let _ = pay_core::accounts::load_or_create_exact_ephemeral_for_network_as(
                     auto_network,
@@ -393,7 +382,7 @@ impl StartCommand {
             let currency_configs: Vec<_> = currencies
                 .iter()
                 .map(|currency| {
-                    let (mpp_currency, decimals) = resolve_currency(currency, &network);
+                    let (mpp_currency, decimals) = resolve_currency(currency, network.slug());
                     (currency.clone(), mpp_currency, decimals)
                 })
                 .collect();
@@ -404,7 +393,7 @@ impl StartCommand {
                         recipient: recipient.clone(),
                         currency: mpp_currency.clone(),
                         decimals: *decimals,
-                        network: network.clone(),
+                        network: network.slug().to_string(),
                         rpc_url: Some(rpc_url.clone()),
                         secret_key: Some(secret_key.clone()),
                         fee_payer,
@@ -458,7 +447,7 @@ impl StartCommand {
                     operator: recipient.clone(),
                     currency: session_mpp_currency.clone(),
                     decimals: session_decimals,
-                    network: network.clone(),
+                    network: network.slug().to_string(),
                     max_cap: cap_base,
                     min_voucher_delta: sess.min_voucher_delta,
                     modes: modes.clone(),
@@ -588,14 +577,17 @@ impl StartCommand {
                 .count();
             let free_count = api.endpoints.len() - metered_count;
 
-            eprintln!("{}", render_pay_banner(PAY_SH_TAGLINE.dimmed()));
+            let banner = render_pay_banner(PAY_SH_TAGLINE.dimmed());
+            if !banner.is_empty() {
+                eprintln!("{banner}");
+            }
             if let Some(scaffolded_spec) = &self.scaffolded_spec {
                 eprintln!("  {} {}", "Scaffolding".green(), scaffolded_spec);
             }
             eprintln!();
 
             // Network link
-            let network_label = if sandbox { "sandbox" } else { &network };
+            let network_label = if sandbox { "sandbox" } else { network.slug() };
             let network_url = if sandbox {
                 if rpc_url.contains("localhost") || rpc_url.contains("127.0.0.1") {
                     "http://localhost:18488".to_string()
@@ -607,17 +599,14 @@ impl StartCommand {
             };
             let network_link = crate::components::link::link_with_arrow(network_label, &network_url);
 
-            // Operator link (explorer token page). The cluster query
-            // segment depends on the network:
-            //   - mainnet → no param (mainnet is the explorer default)
-            //   - devnet  → ?cluster=devnet
-            //   - localnet/sandbox → ?cluster=custom&customUrl=<rpc>
+            // Operator link (explorer token page).
             let short_recipient = if recipient.len() > 8 {
                 format!("{}...{}", &recipient[..4], &recipient[recipient.len() - 4..])
             } else {
                 recipient.clone()
             };
-            let cluster_query = explorer_cluster_query(&network, &rpc_url);
+            let explorer_cluster = network.explorer_cluster(&rpc_url);
+            let cluster_query = solana_explorer_cluster_query(&explorer_cluster);
             let operator_url = format!(
                 "https://explorer.solana.com/address/{}/tokens{}",
                 recipient, cluster_query
@@ -662,19 +651,16 @@ impl StartCommand {
             // configured cluster. Tell the user upfront instead of
             // letting every payment fail at simulation time.
             if operator_sol == 0.0 {
-                eprintln!(
-                    "{}",
-                    crate::components::notice(
-                        crate::components::NoticeLevel::Warning,
-                        "Operator wallet has 0 SOL",
-                        &format!(
-                            "{recipient}\non `{network}` via {rpc_url}\n\n\
-                             Even with operator.fee_payer = true, the wallet must \
-                             exist on chain (any prior credit) for SPL token \
-                             transfers to derive an ATA. Send a small amount of \
-                             SOL to the address above and restart the server."
-                        ),
-                    )
+                crate::components::print_notice(
+                    crate::components::NoticeLevel::Warning,
+                    "Operator wallet has 0 SOL",
+                    &format!(
+                        "{recipient}\non `{network}` via {rpc_url}\n\n\
+                         Even with operator.fee_payer = true, the wallet must \
+                         exist on chain (any prior credit) for SPL token \
+                         transfers to derive an ATA. Send a small amount of \
+                         SOL to the address above and restart the server."
+                    ),
                 );
             }
 
@@ -776,7 +762,7 @@ impl StartCommand {
             };
 
             let pdb_state = if debugger {
-                let pdb_config = build_pdb_config(&api, &recipient, &network, &rpc_url);
+                let pdb_config = build_pdb_config(&api, &recipient, network.slug(), &rpc_url);
                 let pdb = pay_pdb::PdbState::new(pdb_config);
                 pdb.spawn_cleanup();
                 Some(pdb)
@@ -1151,16 +1137,14 @@ fn rpc_proxy_error(status: axum::http::StatusCode, message: &'static str) -> Res
 /// Resolve a currency label to the value used in the MPP challenge.
 /// SPL tokens use their mint address; SOL uses "sol".
 fn resolve_currency(currency: &str, network: &str) -> (String, u8) {
-    match currency.to_uppercase().as_str() {
-        "SOL" => ("sol".to_string(), 9),
-        "USDC" | "USDT" | "PYUSD" | "CASH" => (
-            solana_mpp::protocol::solana::resolve_stablecoin_mint(currency, Some(network))
-                .unwrap_or(currency)
-                .to_string(),
-            6,
-        ),
-        other => (other.to_string(), 6),
+    let currency = currency.trim();
+    if currency.eq_ignore_ascii_case("SOL") {
+        return ("sol".to_string(), 9);
     }
+    if let Some(stablecoin) = Stablecoin::parse_symbol(currency) {
+        return (stablecoin.mint(Some(network)).to_string(), 6);
+    }
+    (currency.to_string(), 6)
 }
 
 fn resolve_operator_currencies(op: Option<&OperatorConfig>, cli_currency: &str) -> Vec<String> {
@@ -1292,23 +1276,6 @@ async fn resolve_signer_with_store(
                 })?;
             Ok(Arc::new(signer))
         }
-    }
-}
-
-/// Build the `?cluster=...` query suffix for a Solana Explorer URL.
-///
-/// - `mainnet`            → empty string (mainnet is the explorer default)
-/// - `devnet`             → `?cluster=devnet`
-/// - `localnet` (any RPC) → `?cluster=custom&customUrl=<rpc>` so the
-///   explorer talks to the local validator (Surfpool sandbox or real
-///   localhost) instead of guessing.
-/// - anything else        → empty string (let the explorer decide)
-fn explorer_cluster_query(network: &str, rpc_url: &str) -> String {
-    match network {
-        "mainnet" => String::new(),
-        "devnet" => "?cluster=devnet".to_string(),
-        "localnet" => format!("?cluster=custom&customUrl={}", urlencoding::encode(rpc_url)),
-        _ => String::new(),
     }
 }
 
@@ -1793,52 +1760,10 @@ fn gateway_charge_challenges(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_pdb_config, explorer_cluster_query, resolve_currency, resolve_operator_currencies,
+        build_pdb_config, resolve_currency, resolve_operator_currencies,
         should_use_auto_fee_payer_signer, validate_browser_rpc_request,
     };
-
-    #[test]
-    fn explorer_cluster_query_mainnet_is_empty() {
-        // Mainnet is the explorer's default — appending `?cluster=mainnet`
-        // would just add noise. The user's expected URL was bare.
-        assert_eq!(
-            explorer_cluster_query("mainnet", "https://api.mainnet-beta.solana.com"),
-            ""
-        );
-    }
-
-    #[test]
-    fn explorer_cluster_query_devnet_picks_devnet() {
-        assert_eq!(
-            explorer_cluster_query("devnet", "https://api.devnet.solana.com"),
-            "?cluster=devnet"
-        );
-    }
-
-    #[test]
-    fn explorer_cluster_query_localnet_uses_custom_with_url_encoding() {
-        // The RPC URL must be URL-encoded so the explorer parses it as
-        // a single query value.
-        assert_eq!(
-            explorer_cluster_query("localnet", "https://402.surfnet.dev:8899"),
-            "?cluster=custom&customUrl=https%3A%2F%2F402.surfnet.dev%3A8899"
-        );
-    }
-
-    #[test]
-    fn explorer_cluster_query_localnet_with_localhost_rpc() {
-        assert_eq!(
-            explorer_cluster_query("localnet", "http://localhost:8899"),
-            "?cluster=custom&customUrl=http%3A%2F%2Flocalhost%3A8899"
-        );
-    }
-
-    #[test]
-    fn explorer_cluster_query_unknown_network_falls_back_to_empty() {
-        // Anything we don't recognize gets the bare URL — let the
-        // explorer apply its own default rather than guessing.
-        assert_eq!(explorer_cluster_query("foonet", "http://example/"), "");
-    }
+    use crate::network::SolanaNetwork;
 
     #[test]
     fn resolve_operator_currencies_prefers_usd_group() {
@@ -1876,11 +1801,15 @@ currencies:
     fn resolve_currency_uses_mpp_stablecoin_constants() {
         assert_eq!(
             resolve_currency("USDT", "mainnet").0,
-            solana_mpp::protocol::solana::mints::USDT_MAINNET
+            pay_types::stablecoin_mints::USDT_MAINNET
         );
         assert_eq!(
             resolve_currency("CASH", "mainnet").0,
-            solana_mpp::protocol::solana::mints::CASH_MAINNET
+            pay_types::stablecoin_mints::CASH_MAINNET
+        );
+        assert_eq!(
+            resolve_currency("USDG", "mainnet").0,
+            pay_types::stablecoin_mints::USDG_MAINNET
         );
     }
 
@@ -1978,15 +1907,19 @@ endpoints:
 
         assert!(should_use_auto_fee_payer_signer(
             true,
-            "localnet",
+            &SolanaNetwork::Localnet,
             Some(&signer),
         ));
         assert!(!should_use_auto_fee_payer_signer(
             false,
-            "mainnet",
+            &SolanaNetwork::Mainnet,
             Some(&signer),
         ));
-        assert!(should_use_auto_fee_payer_signer(false, "devnet", None));
+        assert!(should_use_auto_fee_payer_signer(
+            false,
+            &SolanaNetwork::Devnet,
+            None
+        ));
     }
 
     // ── resolve_signer (operator.signer in YAML) ───────────────────────────

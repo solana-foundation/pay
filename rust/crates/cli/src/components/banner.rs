@@ -17,6 +17,14 @@ pub fn help_banner() -> String {
 
 /// Render the Pay banner with a leading blank line.
 pub fn render_banner(tagline: impl std::fmt::Display) -> String {
+    if crate::no_dna::is_agent() {
+        return String::new();
+    }
+
+    render_banner_art(tagline)
+}
+
+fn render_banner_art(tagline: impl std::fmt::Display) -> String {
     let mut output = String::from("\n");
     output.push_str(
         &PAY_SH_BANNER
@@ -75,7 +83,7 @@ mod tests {
 
     #[test]
     fn banner_art_starts_at_column_zero_after_blank_line() {
-        let banner = help_banner();
+        let banner = render_banner_art(PAY_SH_TAGLINE);
 
         assert!(banner.starts_with("\n\x1b["));
         assert!(!banner.starts_with("\n "));
