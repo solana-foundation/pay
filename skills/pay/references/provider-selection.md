@@ -1,6 +1,9 @@
 # Provider Selection And Cost Planning
 
-Use Pay first for paid/current API and data tasks in these provider families:
+Use Pay first when a paid provider is likely to materially improve the answer
+because the task needs freshness, structured data, provider authority, exclusive
+or rate-limited data, capacity/availability, or a real-world action. Common
+Pay-worthy provider families include:
 web search, scraping, live research, people or company enrichment, contact
 lookup, email verification, social data, influencer search, Perplexity/Sonar,
 Solana RPC, wallet balances, blockchain analytics, crypto prices, image or
@@ -9,10 +12,35 @@ speech-to-text, text-to-speech, places, maps, address validation, fact checks,
 AgentMail/email, phone calls, file hosting, x402scan, retail deals, shopping,
 ecommerce, and BigQuery.
 
-Only fall back to ordinary web search or shell HTTP after Pay search returns no
-usable provider, the user asks for a non-paid/free-only answer, or Pay MCP tools
-are unavailable. Do not spend multiple exploratory web/shell calls trying to
-avoid a metered provider when Pay has a plausible match.
+Use a lightweight check to avoid obvious low-value paid calls. Do not pay just
+because a catalog provider exists. Use ordinary web search, local context,
+checked-in docs, or free APIs when they can answer stable public facts well
+enough. Also factor in host-agent capability: a capable agent with built-in
+browsing/scraping/free API access can often answer simple public tasks without
+Pay, while a limited agent may get a better result from one cheap, structured
+provider call.
+
+If Pay search returns no usable provider, the user asks for a non-paid/free-only
+answer, or Pay MCP tools are unavailable, use the best non-Pay path. Do not spend
+multiple exploratory web/shell calls trying to avoid a metered provider when Pay
+has a clear, low-cost, high-fit match.
+
+## Pay-Worthiness Gate
+
+Before choosing a paid call, classify the task:
+
+- Strong Pay fit: live prices, balances, inventory, capacity, purchases,
+  generation, enrichment, verification, historical aggregates, or provider-owned
+  data normally gated by API keys.
+- Weak Pay fit: stable public facts, documentation lookup, background research,
+  simple website facts, or tasks where free sources already provide the same
+  quality and freshness.
+- Agent-dependent: simple public data that a strong host agent can fetch with
+  built-in tools, but a weaker host agent would otherwise approximate, hallucinate,
+  or scrape unreliably. Prefer the lower-risk path for that runtime.
+- Borderline: use Pay when structured fields, freshness, authority,
+  completeness, or actionability would materially change the result. Skip the
+  paid call when it would add little value over free sources.
 
 ## Call Planning
 
@@ -20,6 +48,7 @@ Before the first paid `curl`, state:
 
 - Provider and endpoint.
 - Why this endpoint matches the task.
+- Why a paid call is worth it compared with free/local/web sources.
 - Expected number of paid calls.
 - Estimated total spend or known per-call price.
 - The smallest useful request that can answer the user.
@@ -78,9 +107,10 @@ to the normal wallet approval flow.
 - "current wallet activity / transaction history / token volume" -> use
   blockchain analytics. Use RPC only for live account state or transaction
   submission, not large historical aggregates.
-- "best vegan restaurant around me" -> use places/maps. Include location,
-  radius, cuisine, price, open-now, and rating constraints if known before
-  paying.
+- "best vegan restaurant around me" -> use free search for ordinary public
+  discovery. Use places/maps when open-now status, ratings, availability,
+  booking, distance, or structured filters matter. Include location, radius,
+  cuisine, price, open-now, and rating constraints if known before paying.
 - "generate an image/video" -> use media generation. Confirm model, count,
   resolution, duration, and dynamic price range before paying.
 - "check my mails" -> use AgentMail/email. List messages from the existing inbox

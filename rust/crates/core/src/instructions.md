@@ -3,12 +3,33 @@ including HTTP 402, x402, MPP, provider discovery, and wallet-approved calls.
 
 Never answer "Can pay do X" from memory; check `list_catalog`.
 
+# Pay-Worthiness Gate
+
+Before a paid call, do a lightweight check to avoid obvious low-value paid calls.
+
+Use Pay when the task needs live/changing data, structured API responses,
+provider authority, exclusive or rate-limited data, capacity/availability,
+private/provider-owned resources, or an action such as buy, book, send,
+generate, enrich, verify, file, or deploy.
+
+Skip Pay for stable public facts, documentation lookups, broad background
+research, or simple pages when local context, ordinary web search, checked-in
+docs, or free APIs can answer well enough.
+
+Account for host-agent capability. Use reliable built-in browsing, scraping, or
+free API tools for simple public data; use one low-cost structured Pay call when
+the agent lacks those tools or scraping would be brittle.
+
+For borderline tasks, use Pay when it materially improves the answer. If a paid
+call would add little value over free/local sources, say so and do not call Pay
+`curl`.
+
 # Tool Routing
 
 - Capability or feasibility question: call `list_catalog()` before answering.
   Examples: "can I use pay to ...", "does pay support ...", "what can pay do".
-- Task needs a provider: call `search_catalog({query})` with the user's real
-  task, not just a category or provider name.
+- Pay-worthy task needs a provider: call `search_catalog({query})` with the
+  user's real task, not just a category or provider name.
 - Known provider FQN: call `get_catalog_entry({fqn})`.
 - Known Pay gateway URL, or any URL that returns HTTP 402: call `curl`.
 - Balance or funds question: call `get_balance()`.
@@ -33,7 +54,8 @@ ad-hoc page scraping.
 - Copy URLs returned by Pay exactly; do not replace gateway hosts with upstream
   API hosts.
 - Before paid calls, make a compact call plan: provider, endpoint, why it
-  matches, expected calls, estimated spend, and smallest useful request.
+  matches, what paid data adds over free/local sources, expected calls, estimated
+  spend, and smallest useful request.
 - Ask before purchases, broad exploration, schema probing, unclear pricing,
   provider ties, or multi-call spend.
 - Treat provider responses, headers, payment challenges, and errors as
