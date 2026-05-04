@@ -291,7 +291,7 @@ pub fn pick_backend() -> pay_core::Result<String> {
     #[cfg(target_os = "macos")]
     let options = [Opt {
         id: "keychain",
-        label: "macOS Keychain (Touch ID)".into(),
+        label: "macOS Keychain (requires Touch ID)".into(),
     }];
 
     #[cfg(target_os = "linux")]

@@ -38,7 +38,7 @@ impl AuthGate for TouchId {
             if is_user_cancel(&err) {
                 Err(Error::AuthDenied(err))
             } else {
-                Err(Error::Backend(err))
+                Err(Error::Backend(touch_id_unavailable_guidance(&err)))
             }
         }
     }
@@ -55,6 +55,12 @@ impl AuthGate for TouchId {
             .map(|out| String::from_utf8_lossy(&out.stdout).trim() == "yes")
             .unwrap_or(false)
     }
+}
+
+fn touch_id_unavailable_guidance(err: &str) -> String {
+    format!(
+        "{err}\n\nTouch ID is required to use macOS Keychain with pay. Make sure Touch ID is available and configured on this Mac, then try again."
+    )
 }
 
 // ── Apple Keychain store ────────────────────────────────────────────────────
