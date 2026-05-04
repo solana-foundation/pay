@@ -75,6 +75,8 @@ fn build_codex_args(
             "mcp_servers.pay.enabled_tools={}",
             toml_string_array(PAY_MCP_ENABLED_TOOLS)
         ),
+        "-c".to_string(),
+        config_string("mcp_servers.pay.default_tools_approval_mode", "approve"),
     ];
 
     // Pass config to MCP server via env.
@@ -101,7 +103,10 @@ fn build_codex_args(
         "model_instructions_file",
         &instructions_path.to_string_lossy(),
     ));
-    args.push("--full-auto".to_string());
+    args.push("--sandbox".to_string());
+    args.push("workspace-write".to_string());
+    args.push("--ask-for-approval".to_string());
+    args.push("never".to_string());
     args.extend(extra_args.iter().cloned());
     args
 }
@@ -241,12 +246,25 @@ mod tests {
             &r#"mcp_servers.pay.enabled_tools=["curl","search_catalog","list_catalog","get_catalog_entry","get_balance","topup","create_skill"]"#.to_string()
         ));
         assert!(
+            args.contains(&r#"mcp_servers.pay.default_tools_approval_mode="approve""#.to_string())
+        );
+        assert!(
             args.contains(&r#"mcp_servers.pay.env={PAY_ACTIVE_ACCOUNT="default"}"#.to_string())
         );
         assert!(args.contains(
             &r#"model_instructions_file="C:\\Users\\me\\AppData\\Local\\Temp\\pay instructions.md""#
                 .to_string()
         ));
+        assert!(!args.contains(&"--full-auto".to_string()));
+        assert_eq!(
+            args[args.len() - 4..],
+            [
+                "--sandbox",
+                "workspace-write",
+                "--ask-for-approval",
+                "never"
+            ]
+        );
     }
 
     #[cfg(windows)]
