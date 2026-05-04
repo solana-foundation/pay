@@ -58,7 +58,7 @@ pub enum Command {
     Setup(setup::SetupCommand),
     /// Import funds from Venmo, PayPal, or a mobile wallet.
     Topup(topup::TopupCommand),
-    /// As a developer, use pay to gate your API with stablecoin payments.
+    /// Gate your API with stablecoin payments.
     Server {
         #[command(subcommand)]
         command: server::ServerCommand,
@@ -68,7 +68,7 @@ pub enum Command {
         #[command(subcommand)]
         command: skills::SkillsCommand,
     },
-    /// Author providers for the skills catalog: scaffold, build, probe, validate.
+    /// Make your API discoverable in pay's public catalog.
     Catalog {
         #[command(subcommand)]
         command: catalog::CatalogCommand,

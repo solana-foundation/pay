@@ -41,6 +41,6 @@ Have an idea? Feel free to open an [issue](https://github.com/solana-foundation/
 
 ## License
 
-Solana Pay is open source and available under the Apache License, Version 2.0. See the [LICENSE](./LICENSE) file for more info.
+Solana Pay is open source and available under the MIT License. See the [LICENSE](./LICENSE) file for more info.
 
 ![Solana Pay](./images/solana-pay.png)

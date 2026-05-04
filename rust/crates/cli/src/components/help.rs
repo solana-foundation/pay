@@ -18,8 +18,8 @@ Supported pass-through:
   \x1b[1mcurl\x1b[0m, \x1b[1mwget\x1b[0m, \x1b[1mhttp\x1b[0m, \x1b[1mclaude\x1b[0m, \x1b[1mcodex\x1b[0m, \x1b[1mwhoami\x1b[0m
 
 Developers:
-  \x1b[1mserver\x1b[0m:  As a developer, use pay to gate your API with stablecoin payments
-  \x1b[1mcatalog\x1b[0m: Author providers for the skills catalog (scaffold, build, probe, validate)
+  \x1b[1mserver\x1b[0m:  Gate your API with stablecoin payments
+  \x1b[1mcatalog\x1b[0m: Make your API discoverable in pay's public catalog
 
 Agents:
   \x1b[1mmcp\x1b[0m:    Start the MCP server for agent clients

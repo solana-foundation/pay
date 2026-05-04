@@ -4,7 +4,7 @@
     "version": "0.0.0",
     "author": "Solana Maintainers <maintainers@solana.foundation>",
     "repository": "https://github.com/solana-labs/solana-pay",
-    "license": "Apache-2.0",
+    "license": "MIT",
     "engines": {
         "node": ">=18"
     },
