@@ -101,7 +101,6 @@ fn build_codex_args(
         "model_instructions_file",
         &instructions_path.to_string_lossy(),
     ));
-    args.push("--full-auto".to_string());
     args.extend(extra_args.iter().cloned());
     args
 }

@@ -49,7 +49,7 @@ pub fn resolve_endpoints(
     source: &OpenapiSource,
     service_url: &str,
 ) -> Result<Vec<ResolvedEndpoint>> {
-    let body = load_document(source, service_url)?;
+    let body = load_document(source, service_url, None)?;
     parse_endpoints(&body)
 }
 
@@ -285,6 +285,17 @@ pub fn effective_endpoints(spec: &ProviderFrontmatter) -> Result<Vec<ResolvedEnd
     Ok(effective_openapi(spec)?.endpoints)
 }
 
+/// Like [`effective_endpoints`], but resolves [`OpenapiSource::Path`] relative
+/// to `spec_dir` (the directory containing the provider's `.md`/`PAY.md`
+/// file). Use this in build/probe paths where the spec file's location is
+/// known.
+pub fn effective_endpoints_relative_to(
+    spec: &ProviderFrontmatter,
+    spec_dir: Option<&std::path::Path>,
+) -> Result<Vec<ResolvedEndpoint>> {
+    Ok(effective_openapi_relative_to(spec, spec_dir)?.endpoints)
+}
+
 /// Resolved openapi for one provider spec — both the synthesized endpoint
 /// list and (when one was loaded) the parsed source document.
 #[derive(Debug, Clone)]
@@ -301,9 +312,20 @@ pub struct ResolvedOpenapi {
 /// OpenAPI doc in each provider's detail JSON so consumers get schemas and
 /// types without a follow-up HTTP round-trip after `pay skills update`.
 pub fn effective_openapi(spec: &ProviderFrontmatter) -> Result<ResolvedOpenapi> {
+    effective_openapi_relative_to(spec, None)
+}
+
+/// Same as [`effective_openapi`], but `OpenapiSource::Path` values are read
+/// relative to `spec_dir` (typically the directory holding the provider's
+/// `PAY.md`). When `spec_dir` is `None`, behaves like [`effective_openapi`]
+/// (Path is rejected because there's no anchor to resolve against).
+pub fn effective_openapi_relative_to(
+    spec: &ProviderFrontmatter,
+    spec_dir: Option<&std::path::Path>,
+) -> Result<ResolvedOpenapi> {
     match &spec.openapi {
         Some(source) => {
-            let body = load_document(source, &spec.meta.service_url)?;
+            let body = load_document(source, &spec.meta.service_url, spec_dir)?;
             let endpoints = parse_endpoints(&body)?;
             let document = serde_json::from_str::<Value>(&body).ok();
             Ok(ResolvedOpenapi {
@@ -1167,7 +1189,11 @@ fn segment_template_matches(template: &str, target: &str) -> bool {
     }
 }
 
-fn load_document(source: &OpenapiSource, _service_url: &str) -> Result<String> {
+fn load_document(
+    source: &OpenapiSource,
+    _service_url: &str,
+    spec_dir: Option<&std::path::Path>,
+) -> Result<String> {
     match source {
         OpenapiSource::Url { url } => {
             // Registry providers must use a fully-qualified https:// URL —
@@ -1176,9 +1202,30 @@ fn load_document(source: &OpenapiSource, _service_url: &str) -> Result<String> {
             // `service_url` would be fragile/ambiguous.
             fetch(url)
         }
-        OpenapiSource::Path { path } => Err(Error::Mpp(format!(
-            "openapi.path ({path}) is filesystem-only (used by `pay server start --openapi`); registry providers must use `openapi: {{ url: <https URL> }}`"
-        ))),
+        OpenapiSource::Path { path } => {
+            let resolved = match spec_dir {
+                Some(dir) => {
+                    let candidate = std::path::Path::new(path);
+                    if candidate.is_absolute() {
+                        candidate.to_path_buf()
+                    } else {
+                        dir.join(candidate)
+                    }
+                }
+                None => {
+                    return Err(Error::Mpp(format!(
+                        "openapi.path ({path}) requires a spec-file anchor; \
+                         no spec_dir was provided to load_document"
+                    )));
+                }
+            };
+            std::fs::read_to_string(&resolved).map_err(|e| {
+                Error::Mpp(format!(
+                    "openapi.path read failed for {}: {e}",
+                    resolved.display()
+                ))
+            })
+        }
         OpenapiSource::Content { content } => Ok(content.clone()),
     }
 }
@@ -1799,7 +1846,7 @@ mod tests {
         let src = OpenapiSource::Content {
             content: content.clone(),
         };
-        let body = load_document(&src, "https://api.example.com").unwrap();
+        let body = load_document(&src, "https://api.example.com", None).unwrap();
         assert_eq!(body, content);
     }
 

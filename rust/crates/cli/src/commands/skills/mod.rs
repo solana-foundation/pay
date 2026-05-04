@@ -1,13 +1,10 @@
-pub mod build;
 pub mod endpoints;
 pub mod install;
 pub mod list;
-pub mod probe;
 pub mod provider;
 pub mod remove;
 pub mod search;
 pub mod update;
-pub mod validate;
 
 use clap::Subcommand;
 
@@ -27,13 +24,6 @@ pub enum SkillsCommand {
     List,
     /// Refresh the local skills cache from all sources.
     Update(update::UpdateCommand),
-    /// Build the skills index from a pay-skills registry directory.
-    Build(build::BuildCommand),
-    /// Probe endpoints to verify they return valid Solana 402 challenges.
-    Probe(probe::ProbeCommand),
-    /// Validate changed providers (CI gate): warns per non-Solana endpoint
-    /// and errors when zero classifiable endpoints accept Solana stables.
-    Validate(validate::ValidateCommand),
     /// Manage providers in the registry.
     Provider {
         #[command(subcommand)]
@@ -50,9 +40,6 @@ impl SkillsCommand {
             Self::Remove(cmd) => cmd.run(),
             Self::List => list::run(),
             Self::Update(cmd) => cmd.run(),
-            Self::Build(cmd) => cmd.run(),
-            Self::Probe(cmd) => cmd.run(),
-            Self::Validate(cmd) => cmd.run(),
             Self::Provider { command } => command.run(),
         }
     }

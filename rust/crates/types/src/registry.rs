@@ -422,10 +422,13 @@ fn validate_openapi_source(src: &OpenapiSource, fqn: &str) -> Vec<String> {
                 ));
             }
         }
-        OpenapiSource::Path { path: _ } => {
-            errs.push(format!(
-                "{fqn}: openapi.path is for local filesystem reads (used by `pay server start --openapi`); registry providers must use `openapi: {{ url: <fully-qualified https URL> }}`\n"
-            ));
+        OpenapiSource::Path { path } => {
+            if path.trim().is_empty() {
+                errs.push(format!("{fqn}: openapi.path is empty\n"));
+            }
+            // Path is resolved relative to the provider's PAY.md at build
+            // time; the resolved doc gets inlined into the published dist
+            // so consumers don't need filesystem access.
         }
         OpenapiSource::Content { content } => {
             if content.trim().is_empty() {
@@ -632,19 +635,27 @@ endpoints:
     }
 
     #[test]
-    fn openapi_path_is_rejected_for_registry() {
-        // `path:` is filesystem-only (used by `pay server start --openapi`).
-        // Registry providers must use `url:` so the doc is fetchable remotely.
+    fn openapi_path_passes_validation() {
+        // `path:` resolves relative to the provider's PAY.md at build time;
+        // the resolved doc is inlined into the published dist.
         let mut spec = valid_spec();
         spec.endpoints = vec![];
         spec.openapi = Some(OpenapiSource::Path {
             path: "openapi.json".into(),
         });
         let errs = validate_provider(&spec, "test/test-api");
+        assert!(errs.is_empty(), "expected no errors, got: {errs:?}");
+    }
+
+    #[test]
+    fn openapi_path_empty_is_rejected() {
+        let mut spec = valid_spec();
+        spec.endpoints = vec![];
+        spec.openapi = Some(OpenapiSource::Path { path: "".into() });
+        let errs = validate_provider(&spec, "test/test-api");
         assert!(
-            errs.iter()
-                .any(|e| e.contains("openapi.path is for local filesystem")),
-            "expected filesystem-only rejection, got: {errs:?}"
+            errs.iter().any(|e| e.contains("openapi.path is empty")),
+            "expected empty-path rejection, got: {errs:?}"
         );
     }
 

@@ -1,126 +1,22 @@
-//! `pay skills validate` — apply Solana-compatibility gates to a probe run.
+//! Solana-compatibility verdict: classify probe results into ok / non-Solana /
+//! free / indeterminate / error and aggregate them per provider. Used by
+//! `pay catalog build` to surface a verdict alongside its build/dist output.
 //!
-//! Used by CI on PRs:
-//!   - **Warning** for every gated endpoint that doesn't accept Solana
-//!     stablecoin payment (e.g. Base-only).
-//!   - **Error** when a provider has zero gated endpoints that accept Solana,
-//!     i.e. nothing in the diff actually works through pay's wallet.
-//!
-//! Indeterminate statuses (`siwx_required`, `auth_required`,
-//! `unprobeable_needs_body`, `not_found`, …) neither warn nor error — they
-//! pass through silently because the probe couldn't classify them.
+//! - **Warning** for every gated endpoint that doesn't accept Solana
+//!   stablecoin payment (e.g. Base-only).
+//! - **Error** when a provider has zero gated endpoints that accept Solana,
+//!   i.e. nothing in the diff actually works through pay's wallet.
+//! - Indeterminate statuses (`siwx_required`, `auth_required`,
+//!   `unprobeable_needs_body`, `not_found`, …) neither warn nor error — they
+//!   pass through silently because the probe couldn't classify them.
 
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
-use clap::ValueEnum;
 use owo_colors::OwoColorize;
 use serde::Serialize;
 
-use pay_core::skills::probe::{EndpointProbeResult, ProbeConfig, ProbeReport, ProviderProbeResult};
-
-#[derive(Debug, Clone, ValueEnum)]
-pub enum OutputFormat {
-    /// Human-readable table.
-    Table,
-    /// Structured JSON.
-    Json,
-    /// GitHub Actions `::warning::` / `::error::` annotations.
-    Github,
-}
-
-/// Validate that changed providers serve at least one Solana-compatible
-/// endpoint. Designed for CI on pull requests.
-#[derive(clap::Args)]
-pub struct ValidateCommand {
-    /// Path to the pay-skills registry directory.
-    #[arg(default_value = ".")]
-    pub path: PathBuf,
-
-    /// Specific provider `.md` files to validate (relative to `path`).
-    /// Mutually exclusive with `--changed-from`.
-    #[arg(long, num_args = 1..)]
-    pub files: Vec<PathBuf>,
-
-    /// Git ref to diff against; validates every `providers/**/*.md` that
-    /// changed between `<ref>` and `HEAD`. Typical CI use: `origin/main`.
-    #[arg(long, value_name = "REF", conflicts_with = "files")]
-    pub changed_from: Option<String>,
-
-    /// Treat every warning as an error (block on first non-Solana endpoint).
-    #[arg(long)]
-    pub strict: bool,
-
-    /// Accepted stablecoin symbols (comma-separated).
-    #[arg(long, default_value = "USDC,USDT", value_delimiter = ',')]
-    pub currencies: Vec<String>,
-
-    /// Per-endpoint timeout in seconds.
-    #[arg(long, default_value = "10")]
-    pub timeout: u64,
-
-    /// Max concurrent provider probes.
-    #[arg(long, default_value = "5")]
-    pub concurrency: usize,
-
-    /// Output format. `github` is the format CI uses for inline annotations.
-    #[arg(long, default_value = "table")]
-    pub format: OutputFormat,
-}
-
-impl ValidateCommand {
-    pub fn run(self) -> pay_core::Result<()> {
-        let files = if let Some(ref base) = self.changed_from {
-            git_changed_provider_files(&self.path, base)?
-        } else if !self.files.is_empty() {
-            self.files.clone()
-        } else {
-            return Err(pay_core::Error::Config(
-                "specify either --files or --changed-from".into(),
-            ));
-        };
-
-        if files.is_empty() {
-            eprintln!("{}", "No changed provider files to validate.".dimmed());
-            return Ok(());
-        }
-
-        let config = ProbeConfig {
-            accepted_currencies: self.currencies.iter().map(|c| c.to_uppercase()).collect(),
-            timeout_secs: self.timeout,
-            concurrency: self.concurrency,
-        };
-
-        let providers = super::probe::collect_specific_providers(&self.path, &files)?;
-        if providers.is_empty() {
-            eprintln!("{}", "No matching providers found.".yellow());
-            return Ok(());
-        }
-
-        let total_eps: usize = providers.iter().map(|p| p.endpoints.len()).sum();
-        eprintln!(
-            "Validating {} provider(s) ({} endpoints) against Solana stables [{}]...",
-            providers.len().to_string().bold(),
-            total_eps.to_string().bold(),
-            self.currencies.join(", ").dimmed(),
-        );
-        eprintln!();
-
-        let report = pay_core::skills::probe::probe_providers(providers, &config);
-        let validation = validate_report(&report, self.strict);
-
-        match self.format {
-            OutputFormat::Table => render_table(&validation),
-            OutputFormat::Json => render_json(&validation)?,
-            OutputFormat::Github => render_github(&validation),
-        }
-
-        if validation.has_errors() {
-            std::process::exit(1);
-        }
-        Ok(())
-    }
-}
+use pay_core::skills::probe::{EndpointProbeResult, ProbeReport, ProviderProbeResult};
 
 /// Categorize a single endpoint result against the Solana-compat gate.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -184,12 +80,12 @@ pub fn validate_report(report: &ProbeReport, strict: bool) -> ValidationReport {
     let providers = report
         .providers
         .iter()
-        .map(|p| validate_provider(p, strict))
+        .map(|p| verdict_for_provider(p, strict))
         .collect();
     ValidationReport { providers, strict }
 }
 
-fn validate_provider(provider: &ProviderProbeResult, strict: bool) -> ProviderVerdict {
+fn verdict_for_provider(provider: &ProviderProbeResult, strict: bool) -> ProviderVerdict {
     let endpoints: Vec<EndpointVerdictRow> = provider
         .endpoints
         .iter()
@@ -281,15 +177,19 @@ fn verdict_for_endpoint(ep: &EndpointProbeResult) -> EndpointVerdictRow {
 }
 
 fn provider_md_path(fqn: &str) -> String {
-    // FQN matches the relative path under providers/, sans the `.md`
-    // extension (e.g. `merit-systems/stabledomains/domains` →
-    // `providers/merit-systems/stabledomains/domains.md`).
-    format!("providers/{fqn}.md")
+    // FQN matches the relative path under providers/ to the provider's
+    // directory; PAY.md lives inside that directory (e.g.
+    // `merit-systems/stabledomains/domains` →
+    // `providers/merit-systems/stabledomains/domains/PAY.md`).
+    format!("providers/{fqn}/PAY.md")
 }
 
 // ── git-diff plumbing ───────────────────────────────────────────────────────
 
-fn git_changed_provider_files(repo_root: &Path, base_ref: &str) -> pay_core::Result<Vec<PathBuf>> {
+pub fn git_changed_provider_files(
+    repo_root: &Path,
+    base_ref: &str,
+) -> pay_core::Result<Vec<PathBuf>> {
     let output = ProcessCommand::new("git")
         .args(["diff", "--name-only", "--diff-filter=ACMR"])
         .arg(format!("{base_ref}...HEAD"))
@@ -306,17 +206,51 @@ fn git_changed_provider_files(repo_root: &Path, base_ref: &str) -> pay_core::Res
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let files: Vec<PathBuf> = stdout
-        .lines()
-        .filter(|line| line.starts_with("providers/") && line.ends_with(".md"))
-        .map(PathBuf::from)
-        .collect();
-    Ok(files)
+
+    // Resolve every changed file under `providers/` to the PAY.md of its
+    // containing provider. This catches sidecar files (e.g. `openapi.json`,
+    // schemas) that don't end in `/PAY.md` but still belong to a provider —
+    // a change there must rebuild the provider's dist entry. Files that
+    // can't be resolved (e.g. a deleted provider's whole directory) are
+    // dropped silently.
+    let mut seen = std::collections::BTreeSet::new();
+    for line in stdout.lines() {
+        if !line.starts_with("providers/") {
+            continue;
+        }
+        if let Some(pay_md) = resolve_to_pay_md(repo_root, Path::new(line)) {
+            seen.insert(pay_md);
+        }
+    }
+    Ok(seen.into_iter().collect())
+}
+
+/// Walk up from a changed file to the nearest ancestor directory that
+/// contains a `PAY.md`. Returns the relative path to that `PAY.md` (under
+/// the repo root) or `None` if no such ancestor exists. The walk stops at
+/// `providers/` so we never escape the registry.
+fn resolve_to_pay_md(repo_root: &Path, changed: &Path) -> Option<PathBuf> {
+    // If the changed file IS a PAY.md, use it directly.
+    if changed.file_name() == Some(std::ffi::OsStr::new("PAY.md")) {
+        return Some(changed.to_path_buf());
+    }
+    let mut cursor = changed.parent()?;
+    loop {
+        // Stop once we've walked above `providers/`.
+        if cursor == Path::new("providers") || cursor.as_os_str().is_empty() {
+            return None;
+        }
+        let candidate_rel = cursor.join("PAY.md");
+        if repo_root.join(&candidate_rel).is_file() {
+            return Some(candidate_rel);
+        }
+        cursor = cursor.parent()?;
+    }
 }
 
 // ── renderers ──────────────────────────────────────────────────────────────
 
-fn render_table(report: &ValidationReport) {
+pub fn render_verdict_table(report: &ValidationReport) {
     let mut block_count = 0;
     let mut warn_count = 0;
     for provider in &report.providers {
@@ -369,33 +303,17 @@ fn render_table(report: &ValidationReport) {
             );
         }
     }
-    eprintln!();
-    if block_count > 0 {
-        eprintln!(
-            "{} {} provider(s), {} non-Solana endpoint warning(s)",
-            "Validation failed:".red().bold(),
-            block_count.to_string().red(),
-            warn_count
-        );
-    } else if warn_count > 0 {
-        eprintln!(
-            "{} {} non-Solana endpoint(s) flagged",
-            "Validation passed with warnings:".yellow().bold(),
-            warn_count
-        );
-    } else {
-        eprintln!("{}", "Validation passed.".green().bold());
-    }
+    let _ = (block_count, warn_count);
 }
 
-fn render_json(report: &ValidationReport) -> pay_core::Result<()> {
+pub fn render_verdict_json(report: &ValidationReport) -> pay_core::Result<()> {
     let json = serde_json::to_string_pretty(report)
         .map_err(|e| pay_core::Error::Config(format!("json: {e}")))?;
     println!("{json}");
     Ok(())
 }
 
-fn render_github(report: &ValidationReport) {
+pub fn render_verdict_github(report: &ValidationReport) {
     // GitHub Actions workflow-command annotations:
     //   ::error file=...,title=...::message
     //   ::warning file=...,title=...::message
@@ -573,15 +491,63 @@ mod tests {
     }
 
     #[test]
-    fn provider_md_path_drops_md_suffix() {
+    fn provider_md_path_appends_pay_md() {
         assert_eq!(
             provider_md_path("merit-systems/stabledomains/domains"),
-            "providers/merit-systems/stabledomains/domains.md"
+            "providers/merit-systems/stabledomains/domains/PAY.md"
         );
     }
 
     #[test]
     fn encode_actions_escapes_percent_and_newlines() {
         assert_eq!(encode_actions("a%b\nc\rd"), "a%25b%0Ac%0Dd");
+    }
+
+    #[test]
+    fn resolve_to_pay_md_returns_self_for_pay_md() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider_dir = tmp.path().join("providers/foo/bar");
+        std::fs::create_dir_all(&provider_dir).unwrap();
+        std::fs::write(provider_dir.join("PAY.md"), "").unwrap();
+
+        let resolved =
+            resolve_to_pay_md(tmp.path(), Path::new("providers/foo/bar/PAY.md")).unwrap();
+        assert_eq!(resolved, PathBuf::from("providers/foo/bar/PAY.md"));
+    }
+
+    #[test]
+    fn resolve_to_pay_md_walks_up_for_sidecar_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider_dir = tmp.path().join("providers/foo/bar");
+        std::fs::create_dir_all(&provider_dir).unwrap();
+        std::fs::write(provider_dir.join("PAY.md"), "").unwrap();
+
+        // openapi.json sidecar lives next to PAY.md.
+        let resolved =
+            resolve_to_pay_md(tmp.path(), Path::new("providers/foo/bar/openapi.json")).unwrap();
+        assert_eq!(resolved, PathBuf::from("providers/foo/bar/PAY.md"));
+    }
+
+    #[test]
+    fn resolve_to_pay_md_walks_up_through_subdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider_dir = tmp.path().join("providers/foo/bar");
+        std::fs::create_dir_all(provider_dir.join("schemas")).unwrap();
+        std::fs::write(provider_dir.join("PAY.md"), "").unwrap();
+
+        let resolved = resolve_to_pay_md(
+            tmp.path(),
+            Path::new("providers/foo/bar/schemas/req.json"),
+        )
+        .unwrap();
+        assert_eq!(resolved, PathBuf::from("providers/foo/bar/PAY.md"));
+    }
+
+    #[test]
+    fn resolve_to_pay_md_returns_none_when_no_pay_md() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("providers/foo")).unwrap();
+        let resolved = resolve_to_pay_md(tmp.path(), Path::new("providers/foo/orphan.txt"));
+        assert_eq!(resolved, None);
     }
 }

@@ -1,4 +1,5 @@
 pub mod account;
+pub mod catalog;
 pub mod claude;
 pub mod codex;
 pub mod curl;
@@ -67,6 +68,11 @@ pub enum Command {
         #[command(subcommand)]
         command: skills::SkillsCommand,
     },
+    /// Author providers for the skills catalog: scaffold, build, probe, validate.
+    Catalog {
+        #[command(subcommand)]
+        command: catalog::CatalogCommand,
+    },
     /// Add a provider source (shorthand for `skills add`).
     #[command(alias = "add", short_flag = 'i')]
     Install(skills::install::InstallCommand),
@@ -117,6 +123,7 @@ impl Command {
             | Command::Account { .. }
             | Command::Whoami(_)
             | Command::Skills { .. }
+            | Command::Catalog { .. }
             | Command::Install(_)
             | Command::Server { .. }
             | Command::Mcp => false,
@@ -136,6 +143,7 @@ impl Command {
             Command::Account { .. }
             | Command::Whoami(_)
             | Command::Skills { .. }
+            | Command::Catalog { .. }
             | Command::Install(_)
             | Command::Send(_)
             | Command::Setup(_)
@@ -178,6 +186,7 @@ impl Command {
             },
             Command::Whoami(cmd) => return cmd.run(network_override, account_override),
             Command::Skills { command } => return command.run(),
+            Command::Catalog { command } => return command.run(),
             Command::Install(cmd) => return cmd.run(),
             Command::Send(cmd) => {
                 return cmd.run(network_override, account_override, verbose);

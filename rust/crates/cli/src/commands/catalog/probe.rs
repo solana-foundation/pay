@@ -1,90 +1,49 @@
+//! Probe helpers shared by `pay catalog build` modes (single-file, changed-from,
+//! full registry). Loads provider specs from disk, resolves OpenAPI to an
+//! endpoint list, and renders raw probe results when `--verbose` is on.
+
 use std::path::PathBuf;
 
-use clap::ValueEnum;
 use owo_colors::OwoColorize;
 
 use pay_core::skills::build::parse_frontmatter;
-use pay_core::skills::probe::{ProbeConfig, ProbeReport, ProbeStatus};
+use pay_core::skills::probe::{ProbeReport, ProbeStatus};
 
-#[derive(Debug, Clone, ValueEnum)]
-pub enum OutputFormat {
-    Table,
-    Json,
-}
+/// Parse a single PAY.md / .md file into a `ProbeProvider`. The FQN is derived
+/// via [`super::derive_fqn_from_path`] so single-segment FQNs (e.g. `syra/PAY.md`)
+/// work the same way as in `pay catalog build`.
+pub fn parse_single_provider(
+    path: &std::path::Path,
+) -> pay_core::Result<pay_types::registry::ProbeProvider> {
+    let (fqn, _name, _op, _origin) = super::derive_fqn_from_path(path)?;
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| pay_core::Error::Config(format!("read {}: {e}", path.display())))?;
+    let (yaml_str, _) = parse_frontmatter(&text)?;
+    let spec: pay_types::registry::ProviderFrontmatter = serde_yml::from_str(&yaml_str)
+        .map_err(|e| pay_core::Error::Config(format!("{}: {e}", path.display())))?;
 
-/// Probe provider endpoints to verify they return valid Solana 402 challenges.
-#[derive(clap::Args)]
-pub struct ProbeCommand {
-    /// Path to the pay-skills registry directory.
-    #[arg(default_value = ".")]
-    pub path: PathBuf,
+    let spec_dir = path.parent();
+    let resolved = pay_core::skills::openapi::effective_endpoints_relative_to(&spec, spec_dir)?;
+    let openapi_driven = spec.openapi.is_some();
+    let endpoints = resolved
+        .into_iter()
+        .map(|r| pay_types::registry::ProbeEndpoint {
+            method: r.spec.method,
+            path: r.spec.path,
+            metered: openapi_driven || r.spec.pricing.is_some(),
+            body: r.body_example,
+        })
+        .collect();
 
-    /// Specific provider .md files to probe (relative to path).
-    /// When omitted, probes all providers.
-    #[arg(long, num_args = 1..)]
-    pub files: Vec<PathBuf>,
-
-    /// Accepted stablecoin symbols (comma-separated).
-    #[arg(long, default_value = "USDC,USDT", value_delimiter = ',')]
-    pub currencies: Vec<String>,
-
-    /// Per-endpoint timeout in seconds.
-    #[arg(long, default_value = "10")]
-    pub timeout: u64,
-
-    /// Max concurrent provider probes.
-    #[arg(long, default_value = "5")]
-    pub concurrency: usize,
-
-    /// Output format.
-    #[arg(long, default_value = "table")]
-    pub format: OutputFormat,
-}
-
-impl ProbeCommand {
-    pub fn run(self) -> pay_core::Result<()> {
-        let config = ProbeConfig {
-            accepted_currencies: self.currencies.iter().map(|c| c.to_uppercase()).collect(),
-            timeout_secs: self.timeout,
-            concurrency: self.concurrency,
-        };
-
-        let providers = if self.files.is_empty() {
-            collect_all_providers(&self.path)?
-        } else {
-            collect_specific_providers(&self.path, &self.files)?
-        };
-
-        if providers.is_empty() {
-            eprintln!("{}", "No provider files found.".yellow());
-            return Ok(());
-        }
-
-        let total_eps: usize = providers.iter().map(|p| p.endpoints.len()).sum();
-        eprintln!(
-            "Probing {} provider(s) ({} endpoints)...",
-            providers.len().to_string().bold(),
-            total_eps.to_string().bold(),
-        );
-        eprintln!();
-
-        let report = pay_core::skills::probe::probe_providers(providers, &config);
-
-        match self.format {
-            OutputFormat::Table => render_table(&report),
-            OutputFormat::Json => render_json(&report)?,
-        }
-
-        if report.failed > 0 {
-            std::process::exit(1);
-        }
-
-        Ok(())
-    }
+    Ok(pay_types::registry::ProbeProvider {
+        fqn,
+        service_url: spec.meta.service_url,
+        endpoints,
+    })
 }
 
 /// Collect all providers from the registry directory.
-fn collect_all_providers(
+pub fn collect_all_providers(
     root: &std::path::Path,
 ) -> pay_core::Result<Vec<pay_types::registry::ProbeProvider>> {
     let providers_dir = root.join("providers");
@@ -101,12 +60,22 @@ fn collect_all_providers(
     Ok(result)
 }
 
-/// Walk the providers directory tree and collect provider specs.
+/// Walk the providers directory tree looking for `<dir>/PAY.md` files. The
+/// first PAY.md encountered along a path stops the recursion: deeper
+/// directories under that provider are not searched.
 fn walk_providers(
     dir: &std::path::Path,
     providers_root: &std::path::Path,
     result: &mut Vec<pay_types::registry::ProbeProvider>,
 ) -> pay_core::Result<()> {
+    let pay_md = dir.join("PAY.md");
+    if pay_md.is_file() {
+        if let Some(provider) = parse_provider_file(&pay_md, providers_root)? {
+            result.push(provider);
+        }
+        return Ok(());
+    }
+
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Ok(());
     };
@@ -117,17 +86,13 @@ fn walk_providers(
         let path = entry.path();
         if path.is_dir() {
             walk_providers(&path, providers_root, result)?;
-        } else if path.extension().and_then(|e| e.to_str()) == Some("md")
-            && let Some(provider) = parse_provider_file(&path, providers_root)?
-        {
-            result.push(provider);
         }
     }
     Ok(())
 }
 
 /// Collect specific providers from file paths.
-pub(crate) fn collect_specific_providers(
+pub fn collect_specific_providers(
     root: &std::path::Path,
     files: &[PathBuf],
 ) -> pay_core::Result<Vec<pay_types::registry::ProbeProvider>> {
@@ -167,11 +132,13 @@ fn parse_provider_file(
     let spec: pay_types::registry::ProviderFrontmatter = serde_yml::from_str(&yaml_str)
         .map_err(|e| pay_core::Error::Config(format!("{}: {e}", path.display())))?;
 
-    // Build FQN from path relative to providers/
-    let fqn = path
+    // Build FQN from path relative to providers/. PAY.md lives inside its
+    // provider's directory, so the FQN is the parent directory's relative
+    // path (e.g. `providers/quicknode/rpc/PAY.md` → `quicknode/rpc`).
+    let provider_dir = path.parent().unwrap_or(path);
+    let fqn = provider_dir
         .strip_prefix(providers_root)
-        .unwrap_or(path)
-        .with_extension("")
+        .unwrap_or(provider_dir)
         .to_string_lossy()
         .replace('\\', "/");
 
@@ -181,7 +148,8 @@ fn parse_provider_file(
     // them and lets the 402 response classify each one. The OpenAPI resolver
     // also produces a `body_example` for POST/PUT/PATCH operations so probes
     // get past server-side schema validation before the paywall fires.
-    let resolved = pay_core::skills::openapi::effective_endpoints(&spec)?;
+    let spec_dir = path.parent();
+    let resolved = pay_core::skills::openapi::effective_endpoints_relative_to(&spec, spec_dir)?;
     let openapi_driven = spec.openapi.is_some();
     let endpoints = resolved
         .into_iter()
@@ -201,7 +169,7 @@ fn parse_provider_file(
 }
 
 /// Render results as a colored table.
-fn render_table(report: &ProbeReport) {
+pub fn render_probe_table(report: &ProbeReport) {
     for provider in &report.providers {
         let status_icon = if provider.pass {
             "OK".green().to_string()
@@ -247,22 +215,14 @@ fn render_table(report: &ProbeReport) {
         }
         eprintln!();
     }
-
-    let summary = format!(
-        "Results: {}/{} endpoints passed",
-        report.passed, report.total_endpoints
-    );
-    if report.failed == 0 {
-        eprintln!("{}", summary.green());
-    } else {
-        eprintln!("{}", summary.red());
-    }
 }
 
-/// Render results as JSON (for CI consumption).
-fn render_json(report: &ProbeReport) -> pay_core::Result<()> {
-    let json = serde_json::to_string_pretty(report)
-        .map_err(|e| pay_core::Error::Config(format!("JSON serialization: {e}")))?;
-    println!("{json}");
-    Ok(())
+/// Probe provider details into a [`ProbeReport`] using the standard
+/// timeout/concurrency knobs. Thin wrapper used by `pay catalog build` to keep
+/// the call site short.
+pub fn run_probe(
+    providers: Vec<pay_types::registry::ProbeProvider>,
+    config: &pay_core::skills::probe::ProbeConfig,
+) -> ProbeReport {
+    pay_core::skills::probe::probe_providers(providers, config)
 }

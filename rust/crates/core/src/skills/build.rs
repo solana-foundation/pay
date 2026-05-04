@@ -324,58 +324,73 @@ fn collect_providers(
         None
     };
 
-    // Walk: providers/<operator>/<name>.md          → FQN: operator/name
-    //       providers/<operator>/<origin>/<name>.md  → FQN: operator/origin/name
-    let operators = sorted_subdirs(&dir);
-    for operator in &operators {
-        let operator_name = operator.file_name().unwrap().to_string_lossy().to_string();
-
-        for entry in sorted_entries(operator) {
-            let path = entry.path();
-            if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("md") {
-                // 2-level: operator/name.md (native API)
-                let name = path.file_stem().unwrap().to_string_lossy().to_string();
-                let fqn = format!("{operator_name}/{name}");
-                dispatch_provider(
-                    &path,
-                    &fqn,
-                    &name,
-                    &operator_name,
-                    &operator_name,
-                    root,
-                    options,
-                    previous.as_ref(),
-                    errors,
-                    &mut results,
-                );
-            } else if path.is_dir() {
-                // 3-level: operator/origin/*.md (proxied APIs)
-                let origin = path.file_name().unwrap().to_string_lossy().to_string();
-                for md_entry in sorted_entries(&path) {
-                    let md_path = md_entry.path();
-                    if md_path.extension().and_then(|e| e.to_str()) != Some("md") {
-                        continue;
-                    }
-                    let name = md_path.file_stem().unwrap().to_string_lossy().to_string();
-                    let fqn = format!("{operator_name}/{origin}/{name}");
-                    dispatch_provider(
-                        &md_path,
-                        &fqn,
-                        &name,
-                        &operator_name,
-                        &origin,
-                        root,
-                        options,
-                        previous.as_ref(),
-                        errors,
-                        &mut results,
-                    );
-                }
-            }
-        }
-    }
+    // Walk: every directory under providers/ that contains a `PAY.md` is a
+    // provider. The FQN is the path from `providers/` to that directory:
+    //   providers/<op>/<name>/PAY.md             → FQN: op/name
+    //   providers/<op>/<origin>/<name>/PAY.md    → FQN: op/origin/name
+    walk_for_pay_md(
+        &dir,
+        &dir,
+        root,
+        options,
+        previous.as_ref(),
+        errors,
+        &mut results,
+    );
 
     results
+}
+
+/// Recurse through `providers/` looking for directories that contain a
+/// `PAY.md`. Each such directory is one provider; deeper directories under
+/// it are not searched.
+#[allow(clippy::too_many_arguments)]
+fn walk_for_pay_md(
+    dir: &Path,
+    providers_root: &Path,
+    root: &Path,
+    options: &BuildOptions,
+    previous: Option<&PreviousDist>,
+    errors: &mut Vec<String>,
+    results: &mut Vec<(ProviderIndexEntry, String)>,
+) {
+    let pay_md = dir.join("PAY.md");
+    if pay_md.is_file() {
+        let rel = dir.strip_prefix(providers_root).unwrap_or(dir);
+        let fqn = rel.to_string_lossy().replace('\\', "/");
+        let segments: Vec<&str> = fqn.split('/').filter(|s| !s.is_empty()).collect();
+        if segments.is_empty() {
+            errors.push(format!(
+                "{}: PAY.md cannot live directly under providers/ — \
+                 wrap it in an operator/name directory",
+                pay_md.display()
+            ));
+            return;
+        }
+        let operator = segments[0].to_string();
+        let name = segments[segments.len() - 1].to_string();
+        let origin = if segments.len() >= 3 {
+            segments[segments.len() - 2].to_string()
+        } else {
+            operator.clone()
+        };
+        dispatch_provider(
+            &pay_md, &fqn, &name, &operator, &origin, root, options, previous, errors, results,
+        );
+        return;
+    }
+
+    for entry in sorted_subdirs(dir) {
+        walk_for_pay_md(
+            &entry,
+            providers_root,
+            root,
+            options,
+            previous,
+            errors,
+            results,
+        );
+    }
 }
 
 /// Decide whether to rebuild a provider from source (full
@@ -419,6 +434,7 @@ fn dispatch_provider(
         return;
     }
 
+    eprintln!("  provider: {fqn}");
     process_provider_md(
         path, fqn, name, operator, origin, root, options, errors, results,
     );
@@ -437,15 +453,6 @@ fn sorted_subdirs(dir: &Path) -> Vec<PathBuf> {
     dirs
 }
 
-fn sorted_entries(dir: &Path) -> Vec<fs::DirEntry> {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut v: Vec<_> = entries.filter_map(|e| e.ok()).collect();
-    v.sort_by_key(|e| e.file_name());
-    v
-}
-
 #[allow(clippy::too_many_arguments)]
 fn process_provider_md(
     path: &Path,
@@ -458,8 +465,6 @@ fn process_provider_md(
     errors: &mut Vec<String>,
     results: &mut Vec<(ProviderIndexEntry, String)>,
 ) {
-    eprintln!("  provider: {fqn}");
-
     let text = match fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) => {
@@ -486,7 +491,7 @@ fn process_provider_md(
 
     if spec.name != name {
         errors.push(format!(
-            "{fqn}: name=`{}` but filename is `{name}`",
+            "{fqn}: name=`{}` but parent directory is `{name}`",
             spec.name
         ));
         return;
@@ -502,7 +507,9 @@ fn process_provider_md(
     // the endpoint list, and keep the parsed document for inlining into the
     // published detail JSON. Specs with inline `endpoints:` skip the fetch
     // and just wrap each spec entry as a body-less `ResolvedEndpoint`.
-    let resolved = match crate::skills::openapi::effective_openapi(&spec) {
+    // `openapi.path` is resolved relative to the .md file's parent directory.
+    let spec_dir = path.parent();
+    let resolved = match crate::skills::openapi::effective_openapi_relative_to(&spec, spec_dir) {
         Ok(r) => r,
         Err(e) => {
             errors.push(format!("{fqn}: openapi resolve failed: {e}"));
@@ -575,6 +582,61 @@ fn process_provider_md(
 
     let _ = detail; // detail is owned by detail_json now
     results.push((index_entry, detail_json));
+}
+
+/// Build a single provider from a `.md` (or `PAY.md`) file. The FQN, operator,
+/// origin, and name are passed in by the caller because a standalone file has
+/// no surrounding `providers/` tree to derive them from. Used by
+/// `pay catalog build --file <PATH>` to validate one provider in isolation.
+pub fn build_single_provider(
+    path: &Path,
+    fqn: &str,
+    name: &str,
+    operator: &str,
+    origin: &str,
+    options: &BuildOptions,
+) -> BuildResult {
+    let mut errors = Vec::new();
+    let mut results = Vec::new();
+    let root = path.parent().unwrap_or(Path::new("."));
+
+    process_provider_md(
+        path,
+        fqn,
+        name,
+        operator,
+        origin,
+        root,
+        options,
+        &mut errors,
+        &mut results,
+    );
+
+    let providers: Vec<(ProviderIndexEntry, String)> = results;
+    let mut detail_files = HashMap::new();
+    for (entry, json) in &providers {
+        detail_files.insert(format!("providers/{}.json", entry.fqn), json.clone());
+    }
+
+    let providers_index: Vec<ProviderIndexEntry> = providers.into_iter().map(|(e, _)| e).collect();
+    let provider_count = providers_index.len();
+    let index = SkillsIndex {
+        version: 1,
+        generated_at: String::new(),
+        base_url: String::new(),
+        provider_count,
+        affiliate_count: 0,
+        aggregator_count: 0,
+        providers: providers_index,
+        affiliates: Vec::new(),
+        aggregators: Vec::new(),
+    };
+
+    BuildResult {
+        index,
+        detail_files,
+        errors,
+    }
 }
 
 fn collect_affiliates(root: &Path, errors: &mut Vec<String>) -> Vec<AffiliateEntry> {
@@ -813,15 +875,12 @@ pub fn build_with_options(
 
     eprintln!("Collecting providers...");
     let providers = collect_providers(root, options, &mut errors);
-    eprintln!();
 
     eprintln!("Collecting affiliates...");
     let affiliates = collect_affiliates(root, &mut errors);
-    eprintln!();
 
     eprintln!("Collecting aggregators...");
     let aggregators = collect_aggregators(root, &mut errors);
-    eprintln!();
 
     // Check for duplicate FQNs
     let mut seen: HashMap<String, String> = HashMap::new();
