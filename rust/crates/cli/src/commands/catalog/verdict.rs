@@ -535,11 +535,8 @@ mod tests {
         std::fs::create_dir_all(provider_dir.join("schemas")).unwrap();
         std::fs::write(provider_dir.join("PAY.md"), "").unwrap();
 
-        let resolved = resolve_to_pay_md(
-            tmp.path(),
-            Path::new("providers/foo/bar/schemas/req.json"),
-        )
-        .unwrap();
+        let resolved =
+            resolve_to_pay_md(tmp.path(), Path::new("providers/foo/bar/schemas/req.json")).unwrap();
         assert_eq!(resolved, PathBuf::from("providers/foo/bar/PAY.md"));
     }
 

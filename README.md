@@ -144,3 +144,6 @@ This grants `pay` the right to prompt for your password or fingerprint before ac
 ## License
 
 Apache-2.0 — see [LICENSE](./LICENSE).
+
+Subject to the foregoing, the Terms of Service available at solana.com/tos
+

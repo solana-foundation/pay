@@ -226,3 +226,5 @@ A Solana Pay transfer request URL describes a non-interactive request for a SOL 
 ## License
 
 The Solana Pay JavaScript SDK is open source and available under the Apache License, Version 2.0. See the [LICENSE](./LICENSE) file for more info.
+
+Subject to the foregoing, the Terms of Service available at solana.com/tos
