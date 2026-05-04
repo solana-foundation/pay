@@ -210,12 +210,14 @@ fn main() {
                 | Command::Account { .. }
                 | Command::Whoami(_)
                 | Command::Skills { .. }
+                | Command::Catalog { .. }
                 | Command::Install(_)
                 | Command::Send(_)
                 | Command::Curl(_)
                 | Command::Wget(_)
                 | Command::Http(_)
                 | Command::Fetch(_)
+                | Command::Mcp
         ) {
         None
     } else if matches!(command, Command::Server { .. } | Command::Topup(_)) {
