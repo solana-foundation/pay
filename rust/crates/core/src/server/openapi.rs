@@ -106,21 +106,47 @@ pub fn filter_to_endpoints(doc: &mut Value, endpoints: &[Endpoint]) {
     }
 }
 
-/// Rewrite the document's base-URL fields to `public_url`.
+/// Rewrite the document's base-URL fields to `public_url`, preserving the
+/// upstream's path component so that `servers[0].url + paths[i]` still
+/// resolves to a route the proxy actually accepts.
 ///
-/// - OpenAPI 3: every `servers[].url` is replaced with `public_url`.
-/// - Discovery: `rootUrl` is set to `public_url` (with trailing `/` so
-///   `rootUrl + servicePath` still composes correctly); `baseUrl` and
-///   `mtlsRootUrl` are likewise rewritten when present.
+/// Why preserve the path: Google's BigQuery upstream advertises
+/// `servers[0].url = https://bigquery.googleapis.com/bigquery/v2` with
+/// `paths: { /projects/.../queries }`. The proxy's allowlist mirrors that —
+/// it accepts `/bigquery/v2/projects/.../queries`. If we naively rewrite
+/// `servers[0].url` to just `https://bigquery.google.gateway-402.com`, the
+/// downstream consumer constructs `https://…/projects/…` (no `/bigquery/v2`)
+/// and 404s. Keeping the upstream's `/bigquery/v2` suffix on the proxy URL
+/// yields `https://…/bigquery/v2/projects/…` which routes correctly.
+///
+/// Behavior:
+/// - **OpenAPI 3**: each `servers[].url` is replaced with
+///   `public_url + <upstream path>`. Upstream-root URLs (no path component)
+///   collapse to plain `public_url`.
+/// - **Discovery**: `rootUrl`/`baseUrl`/`mtlsRootUrl` are rewritten to
+///   `public_url` (with trailing `/`). Discovery composes as
+///   `rootUrl + servicePath` so the upstream path is carried by
+///   `servicePath`, not the root URL — no preservation needed here.
 pub fn rewrite_urls(doc: &mut Value, public_url: &str) {
-    let trimmed = public_url.trim_end_matches('/').to_string();
-    let with_slash = format!("{trimmed}/");
+    let proxy_root = public_url.trim_end_matches('/').to_string();
+    let with_slash = format!("{proxy_root}/");
 
     if let Some(servers) = doc.get_mut("servers").and_then(|v| v.as_array_mut()) {
         for entry in servers {
-            if let Some(obj) = entry.as_object_mut() {
-                obj.insert("url".to_string(), Value::String(trimmed.clone()));
-            }
+            let Some(obj) = entry.as_object_mut() else {
+                continue;
+            };
+            let upstream_path = obj
+                .get("url")
+                .and_then(|v| v.as_str())
+                .map(extract_path_component)
+                .unwrap_or_default();
+            let rewritten = if upstream_path.is_empty() {
+                proxy_root.clone()
+            } else {
+                format!("{proxy_root}/{upstream_path}")
+            };
+            obj.insert("url".to_string(), Value::String(rewritten));
         }
     }
 
@@ -132,6 +158,23 @@ pub fn rewrite_urls(doc: &mut Value, public_url: &str) {
         if root_obj.contains_key(key) {
             root_obj.insert(key.to_string(), Value::String(with_slash.clone()));
         }
+    }
+}
+
+/// Extract the path component of an absolute URL with no leading/trailing
+/// slashes. Returns `""` for root-level URLs (no path or just `/`). Used by
+/// `rewrite_urls` to carry the upstream base path onto the proxy URL.
+fn extract_path_component(url: &str) -> String {
+    let after_scheme = match url.split("://").nth(1) {
+        Some(s) => s,
+        None => url,
+    };
+    match after_scheme.find('/') {
+        Some(i) => after_scheme[i..]
+            .trim_start_matches('/')
+            .trim_end_matches('/')
+            .to_string(),
+        None => String::new(),
     }
 }
 
@@ -656,18 +699,43 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_urls_updates_openapi3_servers() {
+    fn rewrite_urls_preserves_upstream_path_component() {
+        // BigQuery shape: upstream advertises a /bigquery/v2 base in
+        // servers[0].url and bare `/projects/...` paths. The proxy's
+        // allowlist accepts `/bigquery/v2/...`, so the rewritten server
+        // must keep the path component or downstream consumers 404.
         let mut doc = json!({
             "openapi": "3.1.0",
             "servers": [
-                {"url": "https://upstream.example.com/foo"},
+                {"url": "https://bigquery.googleapis.com/bigquery/v2"},
                 {"url": "https://other.example.com/"}
             ]
         });
-        rewrite_urls(&mut doc, "https://proxy.example.com");
+        rewrite_urls(&mut doc, "https://bigquery.proxy.example.com");
         let servers = doc["servers"].as_array().unwrap();
-        assert_eq!(servers[0]["url"], json!("https://proxy.example.com"));
-        assert_eq!(servers[1]["url"], json!("https://proxy.example.com"));
+        assert_eq!(
+            servers[0]["url"],
+            json!("https://bigquery.proxy.example.com/bigquery/v2")
+        );
+        // Root-level upstream collapses to plain proxy URL.
+        assert_eq!(
+            servers[1]["url"],
+            json!("https://bigquery.proxy.example.com")
+        );
+    }
+
+    #[test]
+    fn rewrite_urls_strips_trailing_slash_on_proxy_url() {
+        let mut doc = json!({
+            "openapi": "3.1.0",
+            "servers": [{"url": "https://upstream.example.com/v1/"}]
+        });
+        // Trailing slash on public_url should not double up.
+        rewrite_urls(&mut doc, "https://proxy.example.com/");
+        assert_eq!(
+            doc["servers"][0]["url"],
+            json!("https://proxy.example.com/v1")
+        );
     }
 
     #[test]
@@ -690,6 +758,199 @@ mod tests {
         let mut doc = json!({"foo": "bar"});
         rewrite_urls(&mut doc, "https://proxy.example.com");
         assert_eq!(doc, json!({"foo": "bar"}));
+    }
+
+    #[test]
+    fn rewrite_urls_handles_root_level_upstream_unchanged() {
+        // Civicinfo / language / speech / etc. shape: upstream root-level
+        // with a trailing slash. Path collapses to empty → bare proxy URL.
+        // This is the pre-fix behavior, kept stable for the majority case.
+        for upstream in [
+            "https://civicinfo.googleapis.com/",
+            "https://civicinfo.googleapis.com",
+            "https://language.googleapis.com/",
+            "https://speech.googleapis.com/",
+        ] {
+            let mut doc = json!({
+                "openapi": "3.0.0",
+                "servers": [{"url": upstream}]
+            });
+            rewrite_urls(&mut doc, "https://proxy.example.com");
+            assert_eq!(
+                doc["servers"][0]["url"],
+                json!("https://proxy.example.com"),
+                "root-level upstream `{upstream}` should produce bare proxy URL"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_urls_handles_multi_segment_upstream_path() {
+        // Hypothetical upstream that nests deeper than bigquery.
+        let mut doc = json!({
+            "openapi": "3.0.0",
+            "servers": [{"url": "https://api.example.com/v3/foo/bar"}]
+        });
+        rewrite_urls(&mut doc, "https://proxy.example.com");
+        assert_eq!(
+            doc["servers"][0]["url"],
+            json!("https://proxy.example.com/v3/foo/bar")
+        );
+    }
+
+    #[test]
+    fn rewrite_urls_handles_trailing_slash_on_upstream() {
+        // `https://x.com/v2/` should produce `proxy/v2`, not `proxy/v2/`.
+        let mut doc = json!({
+            "openapi": "3.0.0",
+            "servers": [{"url": "https://upstream.example.com/v2/"}]
+        });
+        rewrite_urls(&mut doc, "https://proxy.example.com");
+        assert_eq!(
+            doc["servers"][0]["url"],
+            json!("https://proxy.example.com/v2")
+        );
+    }
+
+    #[test]
+    fn rewrite_urls_handles_url_with_port() {
+        let mut doc = json!({
+            "openapi": "3.0.0",
+            "servers": [{"url": "https://localhost:8443/api/v2"}]
+        });
+        rewrite_urls(&mut doc, "https://proxy.example.com:9443");
+        assert_eq!(
+            doc["servers"][0]["url"],
+            json!("https://proxy.example.com:9443/api/v2")
+        );
+    }
+
+    #[test]
+    fn rewrite_urls_mixed_servers_each_keep_their_own_path() {
+        // A server array with one path-bearing entry and one root entry —
+        // each is rewritten independently, preserving its own path.
+        let mut doc = json!({
+            "openapi": "3.0.0",
+            "servers": [
+                {"url": "https://upstream.example.com/api/v2"},
+                {"url": "https://upstream.example.com/"}
+            ]
+        });
+        rewrite_urls(&mut doc, "https://proxy.example.com");
+        let servers = doc["servers"].as_array().unwrap();
+        assert_eq!(servers[0]["url"], json!("https://proxy.example.com/api/v2"));
+        assert_eq!(servers[1]["url"], json!("https://proxy.example.com"));
+    }
+
+    /// End-to-end flow modeled on bigquery: load an upstream-shaped doc,
+    /// filter it down to a YAML's allowlist, rewrite the URLs, then
+    /// reconstruct `servers[0].url + paths[i]` and assert that's the URL
+    /// the proxy actually accepts (`/bigquery/v2/projects/.../queries`).
+    ///
+    /// This is the regression test for the audit failure in pay-skills:
+    /// catalog consumers were constructing bare URLs that 404'd because
+    /// `rewrite_urls` was stripping the upstream base path.
+    #[test]
+    fn pipeline_bigquery_shape_constructs_correct_proxy_url() {
+        let mut doc = json!({
+            "openapi": "3.0.0",
+            "servers": [{"url": "https://bigquery.googleapis.com/bigquery/v2"}],
+            "paths": {
+                "/projects/{projectId}/queries": {
+                    "post": {"summary": "kept"},
+                    "get":  {"summary": "drop me"}
+                },
+                "/projects/{projectId}/datasets": {
+                    "get": {"summary": "drop me too"}
+                }
+            }
+        });
+        // Mirrors the bigquery.yml allowlist (POST queries only).
+        let endpoints = vec![ep(Post, "bigquery/v2/projects/{projectsId}/queries")];
+        filter_to_endpoints(&mut doc, &endpoints);
+        rewrite_urls(&mut doc, "https://bigquery.proxy.example.com");
+
+        // Server keeps the upstream base path on the proxy URL.
+        assert_eq!(
+            doc["servers"][0]["url"],
+            json!("https://bigquery.proxy.example.com/bigquery/v2")
+        );
+        // Only the allow-listed POST survives.
+        let paths = doc["paths"].as_object().unwrap();
+        assert_eq!(paths.len(), 1);
+        let queries = paths["/projects/{projectId}/queries"].as_object().unwrap();
+        assert!(queries.contains_key("post"));
+        assert!(!queries.contains_key("get"));
+
+        // A consumer constructing `servers[0].url + path` lands on the URL
+        // the proxy actually accepts.
+        let server = doc["servers"][0]["url"].as_str().unwrap();
+        let path = paths.keys().next().unwrap();
+        assert_eq!(
+            format!("{server}{path}"),
+            "https://bigquery.proxy.example.com/bigquery/v2/projects/{projectId}/queries"
+        );
+    }
+
+    /// End-to-end flow modeled on civicinfo: upstream root server, paths
+    /// already include the version prefix. The constructed URL must keep
+    /// that prefix and not have it duplicated.
+    #[test]
+    fn pipeline_civicinfo_shape_constructs_correct_proxy_url() {
+        let mut doc = json!({
+            "openapi": "3.0.0",
+            "servers": [{"url": "https://civicinfo.googleapis.com/"}],
+            "paths": {
+                "/civicinfo/v2/divisions": {"get": {"summary": "kept"}},
+                "/civicinfo/v2/elections": {"get": {"summary": "drop me"}}
+            }
+        });
+        let endpoints = vec![ep(Get, "civicinfo/v2/divisions")];
+        filter_to_endpoints(&mut doc, &endpoints);
+        rewrite_urls(&mut doc, "https://civicinfo.proxy.example.com");
+
+        // Root-level upstream → bare proxy URL.
+        assert_eq!(
+            doc["servers"][0]["url"],
+            json!("https://civicinfo.proxy.example.com")
+        );
+        let paths = doc["paths"].as_object().unwrap();
+        assert_eq!(paths.len(), 1);
+        assert!(paths.contains_key("/civicinfo/v2/divisions"));
+
+        let server = doc["servers"][0]["url"].as_str().unwrap();
+        let path = paths.keys().next().unwrap();
+        assert_eq!(
+            format!("{server}{path}"),
+            "https://civicinfo.proxy.example.com/civicinfo/v2/divisions"
+        );
+    }
+
+    /// End-to-end flow on a service that emits an empty `paths: {}` after
+    /// filtering (e.g. the YAML's allowlist doesn't match anything in the
+    /// upstream). `rewrite_urls` should still run and produce a sane
+    /// servers entry — no panic, no malformed output.
+    #[test]
+    fn pipeline_handles_empty_paths_after_filter() {
+        let mut doc = json!({
+            "openapi": "3.0.0",
+            "servers": [{"url": "https://documentai.googleapis.com/"}],
+            "paths": {
+                "/v1/{name}:reviewDocument": {"post": {}}
+            }
+        });
+        // Allowlist that doesn't match anything (different path shape).
+        let endpoints = vec![ep(
+            Post,
+            "v1/projects/{*}/locations/{*}/processors/{*}:process",
+        )];
+        filter_to_endpoints(&mut doc, &endpoints);
+        rewrite_urls(&mut doc, "https://documentai.proxy.example.com");
+        assert_eq!(
+            doc["servers"][0]["url"],
+            json!("https://documentai.proxy.example.com")
+        );
+        assert!(doc["paths"].as_object().unwrap().is_empty());
     }
 
     #[test]
