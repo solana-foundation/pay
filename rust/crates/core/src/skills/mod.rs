@@ -907,7 +907,14 @@ pub async fn ensure_endpoints(catalog: &mut Catalog, service_name: &str) -> Resu
     }
 
     let raw = fetch_url(&detail_url).await?;
-    let detail = parse_detail(&raw)?;
+    let detail = match parse_detail(&raw) {
+        Ok(detail) => detail,
+        Err(e) => {
+            tracing::warn!(url = %detail_url, "Failed to parse provider detail JSON: {e}");
+            return Err(e);
+        }
+    };
+
     let _ = std::fs::create_dir_all(&cache_dir);
     let _ = std::fs::write(&cache_file, &raw);
 
