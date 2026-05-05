@@ -45,7 +45,7 @@ struct TopupDetected {
     tx_hash: Option<String>,
 }
 
-/// Message sent from the spawned balance-check thread back to the TUI loop.
+/// Message sent from the spawned stablecoin-check thread back to the TUI loop.
 #[derive(Debug)]
 enum CheckMsg {
     /// First successful balance fetch — promotes from "no baseline" to
@@ -86,7 +86,7 @@ enum PollStatus {
     Stalled,
 }
 
-/// Pure state machine for the topup balance-polling cadence. Held inside
+/// Pure state machine for the topup stablecoin-polling cadence. Held inside
 /// `run_topup_flow` and consulted each tick to decide whether to spawn a
 /// new check, what status to render, etc. All time-dependent methods take
 /// `now: Instant` so they're deterministic in tests.
@@ -97,8 +97,9 @@ struct PollState {
     /// When the most recent check thread was spawned. Drives both the
     /// 1s POLL_INTERVAL throttle and the CHECK_TIMEOUT stuck-thread reset.
     last_check_started_at: Option<Instant>,
-    /// Reference balances for diff_received. `None` means no successful
-    /// fetch yet — the next check will establish baseline rather than diff.
+    /// Reference stablecoin balances for diff_received. `None` means no
+    /// successful fetch yet — the next check will establish baseline rather
+    /// than diff.
     /// `Some(b)` with `b.tokens_unavailable` is treated as no baseline so
     /// pay-api flakes during init don't poison the diff.
     baseline: Option<AccountBalances>,
@@ -110,7 +111,7 @@ struct PollState {
 enum PollDecision {
     /// Don't spawn anything this tick.
     Idle,
-    /// Spawn a balance-check thread now.
+    /// Spawn a stablecoin balance-check thread now.
     SpawnCheck,
 }
 
@@ -154,15 +155,22 @@ impl PollState {
 
     /// Whether to spawn a check this tick.
     fn decide(&self, now: Instant) -> PollDecision {
-        if self.checking || !self.past_delay(now) || self.past_window(now) {
+        if self.checking || self.past_window(now) {
             return PollDecision::Idle;
         }
-        match self.last_check_started_at {
-            None => PollDecision::SpawnCheck,
-            Some(t) if now.saturating_duration_since(t) >= POLL_INTERVAL => {
-                PollDecision::SpawnCheck
-            }
-            _ => PollDecision::Idle,
+
+        let interval_elapsed = match self.last_check_started_at {
+            None => true,
+            Some(t) => now.saturating_duration_since(t) >= POLL_INTERVAL,
+        };
+        if !interval_elapsed {
+            return PollDecision::Idle;
+        }
+
+        if self.baseline.is_none() || self.past_delay(now) {
+            PollDecision::SpawnCheck
+        } else {
+            PollDecision::Idle
         }
     }
 
@@ -420,12 +428,12 @@ fn resolve_onramp_host() -> String {
 ///    `/v1/onramp/start` endpoint on the gateway in the user's browser.
 ///    `PAY_ONRAMP_HOST` controls the host, defaulting to
 ///    `DEFAULT_ONRAMP_HOST` (the production gateway).
-/// 2. **Top-up from mobile wallet** — renders a Solana Pay QR code that any
-///    Solana wallet can scan, while polling the RPC for incoming SOL/SPL token
-///    balance changes against `pubkey`.
+/// 2. **Top-up from mobile wallet** — renders a USDC Solana Pay QR code that
+///    any Solana wallet can scan, while polling pay-api for incoming
+///    stablecoin balance changes against `pubkey`.
 ///
-/// Both paths rely on balance polling: an on-chain balance increase will end
-/// the flow with `Ok(Some(_))`. The user can
+/// Both paths rely on stablecoin balance polling: a USDC/stablecoin increase
+/// will end the flow with `Ok(Some(_))`. The user can
 /// dismiss the TUI at any time with `Esc`/`q`/`Ctrl-C`, which yields
 /// `Ok(None)`.
 ///
@@ -435,8 +443,8 @@ fn resolve_onramp_host() -> String {
 /// # Parameters
 /// - `pubkey`: base58 destination address shown in the QR code and threaded
 ///   into the onramp URL as the locked `walletAddress`.
-/// - `rpc_url`: Solana JSON-RPC endpoint used by the background balance poller
-///   to detect on-chain top-ups.
+/// - `rpc_url`: used only to infer which network the pay-api stablecoin
+///   balance poller should query.
 /// - `account_name`: human-readable account label rendered in the TUI.
 ///
 /// # Returns
@@ -471,15 +479,15 @@ pub struct TopupCompletion {
     pub tx_hash: Option<String>,
 }
 
-/// Spawn a background thread that fetches the current balance and reports
+/// Spawn a background thread that fetches the current stablecoin balances and reports
 /// the result back over `tx`:
 ///
-/// - No baseline yet → forward `BaselineEstablished` on first healthy fetch.
-/// - Healthy baseline → diff against it; emit `Detected` on incoming funds,
+/// - No baseline yet → forward `BaselineEstablished` on first healthy stablecoin fetch.
+/// - Healthy baseline → diff against it; emit `Detected` on incoming stablecoin funds,
 ///   else `Done`.
 /// - Pay-api or RPC unavailable → emit `Done` so `checking` clears for the
 ///   next tick to retry.
-fn spawn_check(
+fn spawn_stablecoin_check(
     tx: &mpsc::Sender<CheckMsg>,
     baseline: Option<AccountBalances>,
     rpc_url: &str,
@@ -496,7 +504,9 @@ fn spawn_check(
                 return;
             }
         };
-        let msg = match rt.block_on(pay_core::client::balance::get_balances(&rpc, &pk)) {
+        let msg = match rt.block_on(pay_core::client::balance::get_stablecoin_balances(
+            &rpc, &pk,
+        )) {
             Ok(current) if current.tokens_unavailable => CheckMsg::Done,
             Ok(current) => match baseline {
                 None => CheckMsg::BaselineEstablished(current),
@@ -537,13 +547,10 @@ fn run_topup(
     let mut onramp_notice: Option<String> = None;
     let mut onramp_error: Option<String> = None;
 
-    // Best-effort initial baseline. `PollState::new` filters out unhealthy
-    // (`tokens_unavailable`) baselines so the next check re-establishes one.
-    let initial_balances = tokio::runtime::Runtime::new()
-        .unwrap()
-        .block_on(pay_core::client::balance::get_balances(rpc_url, pubkey))
-        .ok();
-    let mut poll = PollState::new(Instant::now(), initial_balances);
+    // Establish the first stablecoin baseline after the first TUI paint so
+    // network latency never shows up as a blank pre-render pause.
+    let mut poll = PollState::new(Instant::now(), None);
+    let mut first_frame_drawn = false;
 
     // Channel for background balance checks.
     let (tx, rx) = mpsc::channel::<CheckMsg>();
@@ -558,9 +565,9 @@ fn run_topup(
         }
 
         // Spawn next check if cadence allows.
-        if poll.decide(now) == PollDecision::SpawnCheck {
+        if first_frame_drawn && poll.decide(now) == PollDecision::SpawnCheck {
             poll.on_check_started(now);
-            spawn_check(&tx, poll.baseline.clone(), rpc_url, pubkey);
+            spawn_stablecoin_check(&tx, poll.baseline.clone(), rpc_url, pubkey);
         }
 
         // Drain check results.
@@ -611,6 +618,7 @@ fn run_topup(
                 onramp_error.as_deref(),
             );
         })?;
+        first_frame_drawn = true;
 
         if event::poll(Duration::from_millis(50))?
             && let Event::Key(key) = event::read()?
@@ -2584,11 +2592,11 @@ mod tests {
 
     #[test]
     fn poll_state_spawns_even_without_baseline_to_establish_one() {
-        // No baseline → next check should still fire so the thread can
-        // promote a healthy fetch into the new baseline.
+        // No baseline → check immediately so the thread can promote a
+        // healthy fetch into the new baseline right after the first paint.
         let now = Instant::now();
         let state = PollState::new(now, None);
-        assert_eq!(state.decide(now + POLL_DELAY), PollDecision::SpawnCheck);
+        assert_eq!(state.decide(now), PollDecision::SpawnCheck);
     }
 
     #[test]

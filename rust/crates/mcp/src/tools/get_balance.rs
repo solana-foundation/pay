@@ -45,9 +45,10 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
         std::env::var("PAY_RPC_URL").unwrap_or_else(|_| pay_core::balance::mainnet_rpc_url())
     };
 
-    let balances = match pay_core::client::balance::get_balances(&rpc_url, &pubkey).await {
+    let balances = match pay_core::client::balance::get_stablecoin_balances(&rpc_url, &pubkey).await
+    {
         Ok(balances) => balances,
-        Err(err) => return Ok(super::tool_error(format!("RPC error: {err}"))),
+        Err(err) => return Ok(super::tool_error(format!("Balance lookup error: {err}"))),
     };
 
     let mut lines = vec![];

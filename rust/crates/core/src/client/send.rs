@@ -321,7 +321,7 @@ fn stablecoin_raw_balance_for_sender(
         .enable_all()
         .build()
         .map_err(|e| Error::Config(format!("Failed to create runtime: {e}")))?;
-    let balances = rt.block_on(balance::get_balances(rpc_url, sender))?;
+    let balances = rt.block_on(balance::get_stablecoin_balances(rpc_url, sender))?;
     balances
         .tokens
         .iter()

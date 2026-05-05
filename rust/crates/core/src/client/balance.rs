@@ -13,6 +13,7 @@
 
 use pay_types::Stablecoin;
 use serde::Deserialize;
+use std::collections::HashMap;
 
 /// Default pay-api host. Override with `PAY_API_URL`.
 pub const DEFAULT_PAY_API_URL: &str = "https://api.gateway-402.com";
@@ -189,10 +190,7 @@ async fn fetch_stablecoins_via_api(
 
 /// Fetch SOL (direct RPC) and stablecoin balances (via pay-api) for a single pubkey.
 pub async fn get_balances(rpc_url: &str, pubkey: &str) -> crate::Result<AccountBalances> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .map_err(|e| crate::Error::Config(e.to_string()))?;
+    let client = balance_client()?;
 
     let sol_resp = rpc_call(
         &client,
@@ -221,6 +219,40 @@ pub async fn get_balances(rpc_url: &str, pubkey: &str) -> crate::Result<AccountB
     })
 }
 
+/// Fetch only stablecoin balances via pay-api.
+///
+/// This is used by top-up flows where SOL transfers are intentionally ignored
+/// and startup should not pay for an extra direct Solana RPC round trip.
+pub async fn get_stablecoin_balances(
+    rpc_url: &str,
+    pubkey: &str,
+) -> crate::Result<AccountBalances> {
+    let client = balance_client()?;
+    let (tokens, tokens_unavailable) =
+        match fetch_stablecoins_via_api(&client, &pay_api_url(), pubkey, infer_network(rpc_url))
+            .await
+        {
+            Ok(t) => (t, false),
+            Err(e) => {
+                tracing::debug!(error = %e, "pay-api unreachable; returning empty token balances");
+                (Vec::new(), true)
+            }
+        };
+
+    Ok(AccountBalances {
+        sol_lamports: 0,
+        tokens,
+        tokens_unavailable,
+    })
+}
+
+fn balance_client() -> crate::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|e| crate::Error::Config(e.to_string()))
+}
+
 /// Fetch SOL and stablecoin balances for multiple pubkeys efficiently.
 ///
 /// SOL: one `getMultipleAccounts` call.
@@ -228,21 +260,18 @@ pub async fn get_balances(rpc_url: &str, pubkey: &str) -> crate::Result<AccountB
 pub async fn get_balances_batch(
     rpc_url: &str,
     pubkeys: &[String],
-) -> std::collections::HashMap<String, AccountBalances> {
+) -> HashMap<String, AccountBalances> {
     if pubkeys.is_empty() {
-        return std::collections::HashMap::new();
+        return HashMap::new();
     }
 
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-    {
+    let client = match balance_client() {
         Ok(c) => c,
-        Err(_) => return std::collections::HashMap::new(),
+        Err(_) => return HashMap::new(),
     };
 
     // Initialise every pubkey with zero balances so missing entries still surface.
-    let mut balances: std::collections::HashMap<String, AccountBalances> = pubkeys
+    let mut balances: HashMap<String, AccountBalances> = pubkeys
         .iter()
         .map(|pk| (pk.clone(), AccountBalances::default()))
         .collect();
@@ -265,7 +294,44 @@ pub async fn get_balances_batch(
         }
     }
 
-    // ── Tokens: concurrent pay-api calls ─────────────────────────────────
+    fetch_stablecoin_balances_batch_into(&client, rpc_url, pubkeys, &mut balances).await;
+
+    balances
+}
+
+/// Fetch only stablecoin balances for multiple pubkeys.
+///
+/// This skips the direct Solana RPC `getMultipleAccounts` request and uses one
+/// concurrent pay-api call per pubkey.
+pub async fn get_stablecoin_balances_batch(
+    rpc_url: &str,
+    pubkeys: &[String],
+) -> HashMap<String, AccountBalances> {
+    if pubkeys.is_empty() {
+        return HashMap::new();
+    }
+
+    let client = match balance_client() {
+        Ok(c) => c,
+        Err(_) => return HashMap::new(),
+    };
+
+    let mut balances: HashMap<String, AccountBalances> = pubkeys
+        .iter()
+        .map(|pk| (pk.clone(), AccountBalances::default()))
+        .collect();
+
+    fetch_stablecoin_balances_batch_into(&client, rpc_url, pubkeys, &mut balances).await;
+
+    balances
+}
+
+async fn fetch_stablecoin_balances_batch_into(
+    client: &reqwest::Client,
+    rpc_url: &str,
+    pubkeys: &[String],
+    balances: &mut HashMap<String, AccountBalances>,
+) {
     let api = pay_api_url();
     let network = infer_network(rpc_url);
     let mut set = tokio::task::JoinSet::new();
@@ -296,8 +362,6 @@ pub async fn get_balances_batch(
             }
         }
     }
-
-    balances
 }
 
 async fn rpc_call(

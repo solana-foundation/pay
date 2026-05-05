@@ -6,7 +6,7 @@
 //! network, which is `--sandbox`/`--local` (→ `localnet`),
 //! `--mainnet` (→ `mainnet`), or — without any flag — `mainnet`.
 //!
-//! Stablecoin balances are fetched via `pay_core::balance::get_balances`,
+//! Stablecoin balances are fetched via `pay_core::balance::get_stablecoin_balances`,
 //! which routes through the pay-api service (`PAY_API_URL`).
 
 use std::process;
@@ -96,7 +96,7 @@ impl WhoamiCommand {
             }
         };
 
-        match rt.block_on(pay_core::balance::get_balances(&rpc_url, pubkey)) {
+        match rt.block_on(pay_core::balance::get_stablecoin_balances(&rpc_url, pubkey)) {
             Ok(b) if b.tokens_unavailable => print_balance_unavailable("", Some(pubkey), &rpc_url),
             Ok(b) => {
                 let any_nonzero = print_balances(&b, "");

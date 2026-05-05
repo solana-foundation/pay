@@ -54,13 +54,13 @@ pub fn print_account_list(
 
     let rt = tokio::runtime::Runtime::new().ok();
 
-    // Cache balances by pubkey to avoid duplicate RPC calls (rate limiting)
+    // Cache stablecoin balances by pubkey to avoid duplicate pay-api calls.
     let mut balance_cache: HashMap<String, Option<pay_core::client::balance::AccountBalances>> =
         HashMap::new();
 
     if let Some(rt) = &rt {
-        // Group unique pubkeys by their network's RPC URL, then send one
-        // JSON-RPC batch request per RPC endpoint (concurrently).
+        // Group unique pubkeys by their network's RPC URL so pay-api receives
+        // the correct network for each account.
         let mut by_rpc: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
         for (network, named_accounts) in &accounts.accounts {
@@ -85,13 +85,13 @@ pub fn print_account_list(
             pubkeys.dedup();
         }
 
-        // One batch request per RPC endpoint, all concurrent
+        // One stablecoin balance batch per RPC endpoint, all concurrent.
         let results_vec = rt.block_on(async {
             let mut set = tokio::task::JoinSet::new();
             for (rpc, pubkeys) in by_rpc {
-                set.spawn(
-                    async move { pay_core::balance::get_balances_batch(&rpc, &pubkeys).await },
-                );
+                set.spawn(async move {
+                    pay_core::balance::get_stablecoin_balances_batch(&rpc, &pubkeys).await
+                });
             }
             let mut out = Vec::new();
             while let Some(Ok(results)) = set.join_next().await {
@@ -204,8 +204,8 @@ pub fn print_account_list(
 
 /// Format a balance for display. Reusable across list, import, etc.
 ///
-/// Returns a colored string like "7.00 USDC  0.1234 SOL" or a clickable
-/// explorer link if the balance couldn't be fetched.
+/// Returns a colored string like "7.00 USDC" or a clickable explorer link if
+/// the balance couldn't be fetched.
 pub fn format_balance_display(
     bal: Option<&pay_core::client::balance::AccountBalances>,
     pubkey: Option<&str>,
@@ -230,10 +230,6 @@ pub fn format_balance_display(
                 let label = token.symbol.unwrap_or(&token.mint[..8]);
                 parts.push(format!("{:.2} {label}", token.ui_amount));
             }
-            let sol = bal.sol_lamports as f64 / 1_000_000_000.0;
-            if sol > 0.0 {
-                parts.push(format!("{sol:.4} SOL").dimmed().to_string());
-            }
             if parts.is_empty() {
                 explorer_link(pubkey, rpc_url)
             } else {
@@ -244,7 +240,7 @@ pub fn format_balance_display(
     }
 }
 
-/// Fetch balances for a single pubkey (with retry). Returns None on failure.
+/// Fetch stablecoin balances for a single pubkey. Returns None on failure.
 pub fn fetch_balance(pubkey: &str) -> Option<pay_core::client::balance::AccountBalances> {
     let config = pay_core::Config::load().unwrap_or_default();
     let rpc_url = config
@@ -253,6 +249,6 @@ pub fn fetch_balance(pubkey: &str) -> Option<pay_core::client::balance::AccountB
         .unwrap_or_else(pay_core::balance::mainnet_rpc_url);
 
     let rt = tokio::runtime::Runtime::new().ok()?;
-    rt.block_on(pay_core::balance::get_balances(&rpc_url, pubkey))
+    rt.block_on(pay_core::balance::get_stablecoin_balances(&rpc_url, pubkey))
         .ok()
 }

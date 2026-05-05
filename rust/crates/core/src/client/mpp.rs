@@ -159,9 +159,9 @@ pub fn build_credential(
     Ok((header, ephemeral_notice))
 }
 
-/// Select a charge challenge the configured wallet can actually pay.
+/// Select a stablecoin charge challenge the configured wallet can actually pay.
 ///
-/// If balances cannot be fetched, the first Solana charge challenge is
+/// If balances cannot be fetched, the first stablecoin Solana charge challenge is
 /// returned so older payment paths continue to work. If balances are known and
 /// none of the advertised currencies is funded enough, payment is rejected
 /// before the client signs anything.
@@ -194,7 +194,9 @@ pub fn select_challenge_by_balance<'a>(
         warn!(error = %e, "Could not auto-fund wallet via Surfpool before challenge selection");
     }
 
-    let balances = match rt.block_on(crate::client::balance::get_balances(&rpc_url, &pubkey)) {
+    let balances = match rt.block_on(crate::client::balance::get_stablecoin_balances(
+        &rpc_url, &pubkey,
+    )) {
         Ok(balances) => balances,
         Err(e) => {
             warn!(error = %e, %rpc_url, %pubkey, "Could not fetch balances for MPP challenge selection");
@@ -224,7 +226,7 @@ struct DecodedChargeCandidate {
     index: usize,
     amount: u64,
     currency: String,
-    mint: Option<String>,
+    mint: String,
     network: String,
     embedded_blockhash: Option<String>,
     user_opted_into_sandbox: bool,
@@ -272,7 +274,9 @@ fn decoded_charge_candidates(
         let network = network_override
             .map(str::to_string)
             .unwrap_or(challenge_network);
-        let mint = resolve_challenge_mint(&request.currency, &network);
+        let Some(mint) = resolve_challenge_mint(&request.currency, &network) else {
+            continue;
+        };
         let embedded_blockhash = details.recent_blockhash;
         let user_opted_into_sandbox =
             should_auto_fund_surfpool(network_override, embedded_blockhash.as_deref());
@@ -321,13 +325,10 @@ fn has_sufficient_balance(
     candidate: &DecodedChargeCandidate,
     balances: &crate::client::balance::AccountBalances,
 ) -> bool {
-    match &candidate.mint {
-        None => balances.sol_lamports >= candidate.amount,
-        Some(mint) => balances
-            .tokens
-            .iter()
-            .any(|token| token.mint == *mint && token.raw_amount >= candidate.amount),
-    }
+    balances
+        .tokens
+        .iter()
+        .any(|token| token.mint == candidate.mint && token.raw_amount >= candidate.amount)
 }
 
 fn account_pubkey_for_network(
@@ -612,6 +613,22 @@ mod tests {
     }
 
     #[test]
+    fn decoded_charge_candidates_skip_sol_challenges() {
+        let challenges = vec![
+            challenge_for_currency("SOL", "1000000000"),
+            challenge_for_currency("USDC", "1000000"),
+        ];
+        let candidates = decoded_charge_candidates(&challenges, None).unwrap();
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].currency, "USDC");
+        assert_eq!(
+            candidates[0].mint.as_str(),
+            solana_mpp::protocol::solana::mints::USDC_MAINNET
+        );
+    }
+
+    #[test]
     fn balance_selector_picks_first_funded_currency() {
         let challenges = vec![
             challenge_for_currency("USDC", "1000000"),
@@ -649,8 +666,8 @@ mod tests {
         let selected = select_candidate_index_for_balances(&candidates, &balances).unwrap();
         assert_eq!(candidates[selected].currency, "USDG");
         assert_eq!(
-            candidates[selected].mint.as_deref(),
-            Some(pay_types::stablecoin_mints::USDG_MAINNET)
+            candidates[selected].mint.as_str(),
+            pay_types::stablecoin_mints::USDG_MAINNET
         );
     }
 
