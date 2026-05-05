@@ -71,11 +71,13 @@ pub fn create_account(
             .map_err(|e| pay_core::Error::Config(format!("{e}")))?;
         let pubkey_b58 = bs58::encode(&pubkey).into_string();
         eprintln!();
-        eprintln!(
-            "{}",
-            "  Account already exists. Use --force to replace it.".dimmed()
+        crate::components::print_notice(
+            crate::components::NoticeLevel::Info,
+            "Account already exists",
+            &format!(
+                "`{name}` is already stored in {backend_display}.\nUse --force to replace it."
+            ),
         );
-        eprintln!();
 
         // Ensure the account is registered in accounts.yml even if the
         // keypair already exists in the keystore (e.g. after a reset).

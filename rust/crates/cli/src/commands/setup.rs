@@ -56,11 +56,12 @@ impl SetupCommand {
                 &accounts,
                 None::<super::account::list::Highlight>,
             );
-            eprintln!(
-                "{}",
-                format!(
-                    "  Account '{account_name}' already exists. Use --force to replace it, or `pay account new <NAME>` to add another."
-                ).dimmed()
+            crate::components::print_notice(
+                crate::components::NoticeLevel::Info,
+                "Account already exists",
+                &format!(
+                    "`{account_name}` is already configured.\nUse --force to replace it, or `pay account new <NAME>` to add another."
+                ),
             );
             eprintln!();
             return Ok(());
@@ -78,8 +79,6 @@ impl SetupCommand {
             self.vault.as_deref(),
             self.force,
         )?;
-
-        eprintln!();
 
         let config = pay_core::Config::load().unwrap_or_default();
         let rpc_url = config
