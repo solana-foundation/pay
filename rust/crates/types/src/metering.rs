@@ -700,15 +700,70 @@ pub struct SplitRule {
 // API Categories
 // =============================================================================
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ApiCategory {
     AiMl,
-    Search,
-    Maps,
-    Data,
+    Cloud,
     Compute,
+    Data,
+    Devtools,
+    Finance,
+    Identity,
+    Maps,
+    Media,
+    Messaging,
+    Other,
     Productivity,
+    Search,
+    Security,
+    Shopping,
+    Storage,
+    Translation,
+}
+
+impl ApiCategory {
+    pub const ALL: [Self; 17] = [
+        Self::AiMl,
+        Self::Cloud,
+        Self::Compute,
+        Self::Data,
+        Self::Devtools,
+        Self::Finance,
+        Self::Identity,
+        Self::Maps,
+        Self::Media,
+        Self::Messaging,
+        Self::Other,
+        Self::Productivity,
+        Self::Search,
+        Self::Security,
+        Self::Shopping,
+        Self::Storage,
+        Self::Translation,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AiMl => "ai_ml",
+            Self::Cloud => "cloud",
+            Self::Compute => "compute",
+            Self::Data => "data",
+            Self::Devtools => "devtools",
+            Self::Finance => "finance",
+            Self::Identity => "identity",
+            Self::Maps => "maps",
+            Self::Media => "media",
+            Self::Messaging => "messaging",
+            Self::Other => "other",
+            Self::Productivity => "productivity",
+            Self::Search => "search",
+            Self::Security => "security",
+            Self::Shopping => "shopping",
+            Self::Storage => "storage",
+            Self::Translation => "translation",
+        }
+    }
 }
 
 // =============================================================================
@@ -1570,17 +1625,17 @@ mod tests {
 
     #[test]
     fn api_category_serde() {
-        for cat in [
-            ApiCategory::AiMl,
-            ApiCategory::Search,
-            ApiCategory::Maps,
-            ApiCategory::Data,
-            ApiCategory::Compute,
-            ApiCategory::Productivity,
-        ] {
+        let slugs: Vec<&str> = ApiCategory::ALL
+            .iter()
+            .map(|category| category.as_str())
+            .collect();
+        assert_eq!(slugs, crate::registry::KNOWN_CATEGORIES);
+
+        for cat in ApiCategory::ALL {
             let json = serde_json::to_string(&cat).unwrap();
+            assert_eq!(json, format!("\"{}\"", cat.as_str()));
             let back: ApiCategory = serde_json::from_str(&json).unwrap();
-            assert_eq!(format!("{:?}", back), format!("{:?}", cat));
+            assert_eq!(back, cat);
         }
     }
 

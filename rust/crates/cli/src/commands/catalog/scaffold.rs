@@ -237,7 +237,7 @@ fn render_pay_md(args: RenderArgs<'_>) -> String {
          title: {title}\n\
          {description_line}\n\
          use_case: TODO  # describe when an agent should pick {fqn} over alternatives.\n\
-         category: TODO  # one of: ai_ml, analytics, cloud, compute, data, devtools, finance, identity, iot, maps, media, messaging, other, productivity, search, security, storage, translation\n\
+         category: TODO  # one of: ai_ml, cloud, compute, data, devtools, finance, identity, maps, media, messaging, other, productivity, search, security, shopping, storage, translation\n\
          service_url: {service_url}\n\
          openapi:\n  url: {openapi_url}\n\
          ---\n\

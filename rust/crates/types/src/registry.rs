@@ -10,14 +10,12 @@ use serde::{Deserialize, Serialize};
 
 pub const KNOWN_CATEGORIES: &[&str] = &[
     "ai_ml",
-    "analytics",
     "cloud",
     "compute",
     "data",
     "devtools",
     "finance",
     "identity",
-    "iot",
     "maps",
     "media",
     "messaging",
@@ -25,6 +23,7 @@ pub const KNOWN_CATEGORIES: &[&str] = &[
     "productivity",
     "search",
     "security",
+    "shopping",
     "storage",
     "translation",
 ];
@@ -46,9 +45,9 @@ pub struct ServiceMeta {
     /// Hint for LLMs: when should this skill be used? (max 255 chars).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub use_case: Option<String>,
-    /// Category. One of: ai_ml, data, compute, maps, search, translation,
-    /// productivity, finance, identity, storage, messaging, media, iot,
-    /// security, analytics, devtools, cloud, other.
+    /// Category. One of: ai_ml, cloud, compute, data, devtools, finance,
+    /// identity, maps, media, messaging, other, productivity, search,
+    /// security, shopping, storage, translation.
     #[serde(default)]
     pub category: String,
     /// Live URL where the API is reachable (production).

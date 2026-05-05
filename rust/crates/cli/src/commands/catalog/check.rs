@@ -83,6 +83,14 @@ pub struct CheckCommand {
     #[arg(long, short = 'v')]
     pub verbose: bool,
 
+    /// Also write a GitHub-flavored markdown summary to this path
+    /// (regardless of `--format`). Lets PR CI emit inline annotations
+    /// *and* a tidy step-summary table from a single probe run, instead
+    /// of re-probing every endpoint just to get a different output shape.
+    /// Workflows append this file to `$GITHUB_STEP_SUMMARY`.
+    #[arg(long, value_name = "PATH")]
+    pub summary_out: Option<PathBuf>,
+
     // ── Diff modes ──────────────────────────────────────────────────────
     /// Specific provider PAY.md files to check (relative to the registry root
     /// when `path` is a directory, absolute otherwise). Used by CI to pass a
@@ -293,6 +301,15 @@ impl CheckCommand {
         endpoint_count: usize,
         title_prefix: &str,
     ) -> pay_core::Result<()> {
+        // Optional markdown sidecar — written before any potential exit
+        // so the file is on disk even when validation blocks. PR CI cats
+        // this into `$GITHUB_STEP_SUMMARY`.
+        if let Some(path) = &self.summary_out {
+            let body = render_markdown_summary(validation);
+            std::fs::write(path, body)
+                .map_err(|e| pay_core::Error::Config(format!("write {}: {e}", path.display())))?;
+        }
+
         match self.format {
             ReportFormat::Json => {
                 render_verdict_json(validation)?;
@@ -386,6 +403,80 @@ impl VerdictStats {
         }
         lines.join("\n")
     }
+}
+
+/// Render a GitHub-flavored markdown step-summary for a verdict report.
+/// Mirrors what the previous workflow generated via Python — top-line
+/// status, per-provider table, and per-provider details for non-Solana
+/// endpoints.
+fn render_markdown_summary(validation: &ValidationReport) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(out, "### Solana-compatibility verdict");
+    let _ = writeln!(out);
+
+    let blocks = validation.providers.iter().filter(|p| p.block).count();
+    let warns: usize = validation
+        .providers
+        .iter()
+        .map(|p| p.non_solana_count)
+        .sum();
+    let oks: usize = validation.providers.iter().map(|p| p.ok_count).sum();
+
+    if blocks > 0 {
+        let _ = writeln!(out, ":no_entry: **{blocks}** provider(s) blocked");
+    } else if warns > 0 {
+        let _ = writeln!(out, ":warning: {warns} non-Solana endpoint(s) flagged");
+    } else {
+        let _ = writeln!(
+            out,
+            ":white_check_mark: {oks} Solana-compatible endpoint(s)"
+        );
+    }
+    let _ = writeln!(out);
+    let _ = writeln!(out, "| Provider | OK | Non-Solana | Verdict |");
+    let _ = writeln!(out, "|----------|----|------------|---------|");
+    for p in &validation.providers {
+        let v = if p.block {
+            ":no_entry: BLOCK"
+        } else if p.non_solana_count > 0 {
+            ":warning: warn"
+        } else {
+            ":white_check_mark: pass"
+        };
+        let _ = writeln!(
+            out,
+            "| `{}` | {} | {} | {} |",
+            p.fqn, p.ok_count, p.non_solana_count, v
+        );
+    }
+    for p in &validation.providers {
+        if p.non_solana_count == 0 {
+            continue;
+        }
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "<details><summary>{} — non-Solana endpoints</summary>",
+            p.fqn
+        );
+        let _ = writeln!(out);
+        let _ = writeln!(out, "| Method | Path | Status | Note |");
+        let _ = writeln!(out, "|--------|------|--------|------|");
+        for ep in &p.endpoints {
+            if !matches!(ep.verdict, super::verdict::EndpointVerdict::NotSolana) {
+                continue;
+            }
+            let _ = writeln!(
+                out,
+                "| `{}` | `{}` | `{}` | {} |",
+                ep.method, ep.path, ep.probe_status, ep.note
+            );
+        }
+        let _ = writeln!(out);
+        let _ = writeln!(out, "</details>");
+    }
+    out
 }
 
 fn verdict_stats(validation: &ValidationReport) -> VerdictStats {
