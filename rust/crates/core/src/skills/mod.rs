@@ -107,7 +107,7 @@ pub struct Endpoint {
     #[serde(default)]
     pub full_path: String,
     #[serde(default)]
-    pub resource: String,
+    pub resource: Option<String>,
     #[serde(default)]
     pub description: String,
     #[serde(default)]
@@ -127,7 +127,7 @@ pub struct SearchHit {
     pub path: String,
     pub full_path: String,
     pub description: String,
-    pub resource: String,
+    pub resource: Option<String>,
     pub pricing: Option<serde_json::Value>,
     pub metered: bool,
 }
@@ -148,7 +148,7 @@ pub struct EndpointHit {
     pub url: String,
     pub path: String,
     pub description: String,
-    pub resource: String,
+    pub resource: Option<String>,
     pub metered: bool,
 }
 
@@ -302,7 +302,7 @@ pub fn search(catalog: &Catalog, query: Option<&str>, category: Option<&str>) ->
                 path: String::new(),
                 full_path: String::new(),
                 description: svc.meta.description.clone(),
-                resource: String::new(),
+                resource: None,
                 pricing: None,
                 metered: svc.has_metering,
             });
@@ -574,7 +574,10 @@ fn score_service_for_query(
         && svc.endpoints.iter().any(|ep| {
             let haystack = format!(
                 "{} {} {} {}",
-                ep.method, ep.path, ep.resource, ep.description
+                ep.method,
+                ep.path,
+                ep.resource.as_deref().unwrap_or(""),
+                ep.description
             )
             .to_lowercase();
             !query_lower.is_empty() && haystack.contains(query_lower)
@@ -605,7 +608,13 @@ fn score_service_for_query(
 
 fn endpoint_term_matches(svc: &Service, term: &str) -> bool {
     svc.endpoints.iter().any(|ep| {
-        let haystack = format!("{} {} {}", ep.path, ep.resource, ep.description).to_lowercase();
+        let haystack = format!(
+            "{} {} {}",
+            ep.path,
+            ep.resource.as_deref().unwrap_or(""),
+            ep.description
+        )
+        .to_lowercase();
         contains_query_term(&haystack, term)
     })
 }
@@ -677,10 +686,13 @@ pub fn service_detail(catalog: &Catalog, service_name: &str) -> Option<ServiceDe
 
     let mut groups: BTreeMap<String, (u32, u32, Vec<String>)> = BTreeMap::new();
     for ep in &svc.endpoints {
-        let resource = if ep.resource.is_empty() {
+        let Some(resource) = &ep.resource else {
+            continue;
+        };
+        let resource = if resource.is_empty() {
             "(default)"
         } else {
-            &ep.resource
+            resource
         };
         let entry = groups
             .entry(resource.to_string())
@@ -720,7 +732,13 @@ pub fn resource_endpoints(
     let endpoints: Vec<Endpoint> = svc
         .endpoints
         .iter()
-        .filter(|ep| ep.resource.eq_ignore_ascii_case(resource_name))
+        .filter(|ep| {
+            if let Some(resource) = &ep.resource {
+                resource.eq_ignore_ascii_case(resource_name)
+            } else {
+                false
+            }
+        })
         .cloned()
         .collect();
 
@@ -2324,7 +2342,7 @@ mod tests {
             method: "GET".to_string(),
             path: "test".to_string(),
             full_path: String::new(),
-            resource: String::new(),
+            resource: None,
             description: "test".to_string(),
             pricing: None,
         }];
@@ -2396,7 +2414,7 @@ mod tests {
             method: "GET".to_string(),
             path: "old".to_string(),
             full_path: String::new(),
-            resource: String::new(),
+            resource: None,
             description: "old endpoint".to_string(),
             pricing: None,
         }];

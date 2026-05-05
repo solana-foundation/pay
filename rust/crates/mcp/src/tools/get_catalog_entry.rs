@@ -142,7 +142,7 @@ mod tests {
             path: "v1/search".to_string(),
             full_path: String::new(),
             description: "Search records by keyword with pagination".to_string(),
-            resource: "search".to_string(),
+            resource: Some("search".to_string()),
             pricing: Some(serde_json::json!({
                 "dimensions": [
                     {

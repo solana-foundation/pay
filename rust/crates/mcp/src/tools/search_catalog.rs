@@ -67,8 +67,8 @@ struct EndpointEntry {
     method: String,
     path: String,
     url: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    resource: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resource: Option<String>,
     description: String,
     metered: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -290,7 +290,7 @@ fn score_endpoint_for_query(
     terms: &[String],
 ) -> u32 {
     let path = ep.path.to_lowercase();
-    let resource = ep.resource.to_lowercase();
+    let resource = ep.resource.as_deref().unwrap_or("").to_lowercase();
     let description = ep.description.to_lowercase();
     let haystack = format!("{} {} {} {}", ep.method, path, resource, description).to_lowercase();
     let mut score = if !query_lower.is_empty() && haystack.contains(query_lower) {
@@ -450,7 +450,7 @@ mod tests {
                 method: "POST".to_string(),
                 path: "v1/search".to_string(),
                 full_path: String::new(),
-                resource: "search".to_string(),
+                resource: Some("search".to_string()),
                 description: "Search indexed documents".to_string(),
                 pricing: Some(serde_json::json!({
                     "dimensions": [{ "tiers": [{ "price_usd": 0.01 }, { "price_usd": 0.02 }] }]
@@ -1381,7 +1381,7 @@ mod tests {
             method: method.to_string(),
             path: path.to_string(),
             full_path: String::new(),
-            resource: resource.to_string(),
+            resource: Some(resource.to_string()),
             description: description.to_string(),
             pricing: (price_usd > 0.0).then(|| {
                 serde_json::json!({

@@ -279,11 +279,14 @@ fn print_condensed(hits: &[SearchHit], services: &[String]) {
 fn print_resource_groups(hits: &[&SearchHit]) {
     let mut current_resource = String::new();
     for hit in hits {
-        if hit.resource != current_resource && !hit.resource.is_empty() {
+        if let Some(hit_resource) = hit.resource.as_deref()
+            && hit_resource != current_resource
+            && !hit_resource.is_empty()
+        {
             if !current_resource.is_empty() {
                 eprintln!();
             }
-            current_resource = hit.resource.clone();
+            current_resource = hit_resource.to_string();
             eprintln!("  {} {}", "resource:".dimmed(), current_resource.bold());
         }
         print_endpoint(hit);
@@ -382,7 +385,7 @@ mod tests {
             method: method.to_string(),
             path: path.to_string(),
             full_path: String::new(),
-            resource: resource.to_string(),
+            resource: Some(resource.to_string()),
             description: description.to_string(),
             pricing: metered
                 .then(|| json!({ "dimensions": [{ "tiers": [{ "price_usd": 1.0 }] }] })),
@@ -459,7 +462,12 @@ mod tests {
         assert_eq!(refreshed.hits.len(), 2);
         assert!(refreshed.hits.iter().all(|hit| !hit.method.is_empty()));
         assert!(refreshed.hits.iter().all(|hit| !hit.path.is_empty()));
-        assert!(refreshed.hits.iter().all(|hit| !hit.resource.is_empty()));
+        assert!(
+            refreshed
+                .hits
+                .iter()
+                .all(|hit| hit.resource.as_deref().unwrap_or("").is_empty())
+        );
     }
 
     #[test]
@@ -514,7 +522,7 @@ mod tests {
                 .contains("/v2/projects/gateway-402/queries")
         );
         assert_eq!(grouped[1].service, "solana-foundation/google/vision");
-        assert_eq!(grouped[1].endpoints[0].resource, "images");
+        assert_eq!(grouped[1].endpoints[0].resource, Some("images".to_string()));
     }
 
     #[test]
