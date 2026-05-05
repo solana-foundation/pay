@@ -248,6 +248,7 @@ impl StartCommand {
             //
             //   4. **None** — leaves fee_payer_signer empty. Caught by
             //      the early-validation guard below if `fee_payer: true`.
+            let mut generated_gateway_account: Option<(String, String)> = None;
             let fee_payer_signer: Option<Arc<dyn SolanaSigner>> = if should_use_auto_fee_payer_signer(
                 sandbox,
                 &network,
@@ -268,17 +269,10 @@ impl StartCommand {
                         "use your pay account as the gateway fee payer",
                     )?;
                 if let Some(resolved) = ephemeral_notice {
-                    eprintln!(
-                        "  {} {} {}",
-                        "Generated".green(),
-                        resolved.network.bold(),
-                        format!(
-                            "{} wallet ({})",
-                            resolved.account_name,
-                            resolved.account.pubkey.as_deref().unwrap_or("?")
-                        )
-                        .dimmed()
-                    );
+                    generated_gateway_account = Some((
+                        resolved.account_name,
+                        resolved.account.pubkey.unwrap_or_else(|| "?".to_string()),
+                    ));
                 }
                 Some(Arc::new(signer) as Arc<dyn SolanaSigner>)
             } else if let Some(ref cfg) = signer_cfg {
@@ -578,11 +572,24 @@ impl StartCommand {
             let free_count = api.endpoints.len() - metered_count;
 
             let banner = render_pay_banner(PAY_SH_TAGLINE.dimmed());
+            let has_startup_status =
+                generated_gateway_account.is_some() || self.scaffolded_spec.is_some();
             if !banner.is_empty() {
                 eprintln!("{banner}");
+                if has_startup_status {
+                    eprintln!();
+                }
+            }
+            if let Some((account_name, pubkey)) = &generated_gateway_account {
+                eprintln!(
+                    "{} account {} {}",
+                    "Generating".green(),
+                    account_name,
+                    pubkey
+                );
             }
             if let Some(scaffolded_spec) = &self.scaffolded_spec {
-                eprintln!("  {} {}", "Scaffolding".green(), scaffolded_spec);
+                eprintln!("{} {}", "Scaffolding".green(), scaffolded_spec);
             }
             eprintln!();
 
@@ -613,9 +620,9 @@ impl StartCommand {
             );
             let operator_link = crate::components::link::link_with_arrow(&short_recipient, &operator_url);
 
-            eprintln!("  {}\t{}", "network".dimmed(), network_link);
+            eprintln!("{}\t{}", "network".dimmed(), network_link);
             eprintln!(
-                "  {}\t{} via {}",
+                "{}\t{} via {}",
                 "currency".dimmed(),
                 "$".green(),
                 currencies.join(", ").green()
@@ -641,7 +648,7 @@ impl StartCommand {
             } else {
                 balance_text.red().to_string()
             };
-            eprintln!("  {}\t{}{}", "operator".dimmed(), operator_link, balance_colored);
+            eprintln!("{}\t{}{}", "operator".dimmed(), operator_link, balance_colored);
             eprintln!();
 
             // Loud warning when the wallet is empty. The most common
@@ -677,7 +684,7 @@ impl StartCommand {
             }
 
             eprintln!(
-                "  {}",
+                "{}",
                 format!(
                     "{} endpoints ({} metered, {} free)",
                     api.endpoints.len(),
@@ -696,7 +703,10 @@ impl StartCommand {
                 .unwrap_or(20);
 
             let rule = format!(
-                "  {}{}{}", "─".repeat(9), "─".repeat(max_path_len + 2), "─".repeat(10)
+                "{}{}{}",
+                "─".repeat(9),
+                "─".repeat(max_path_len + 2),
+                "─".repeat(10)
             );
             eprintln!("{}", rule.dimmed());
 
@@ -736,7 +746,7 @@ impl StartCommand {
                 // Pad after the link (padding itself is not clickable)
                 let padding = " ".repeat(max_path_len.saturating_sub(ep.path.len()));
                 eprintln!(
-                    "  {} {}{} {}",
+                    "{} {}{} {}",
                     method_colored,
                     path_linked,
                     padding,

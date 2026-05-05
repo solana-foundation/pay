@@ -73,7 +73,7 @@ impl Config {
     /// 1. `accounts.yml` default account
     /// 2. `PAY_ACTIVE_ACCOUNT` env var
     /// 3. Config file `keypair` field
-    /// 4. Legacy: probe keystores directly
+    /// 4. Legacy: probe platform-native keystores directly
     pub fn default_active_account_name(&self) -> Option<String> {
         // 1. accounts.yml — only return a source string for keystore-backed
         //    accounts. Ephemeral accounts have no signer source string and
@@ -99,7 +99,11 @@ impl Config {
             return Some(expand_path(path).to_string());
         }
 
-        // 4. Legacy: probe keystores directly (no accounts.yml yet)
+        // 4. Legacy: probe platform-native keystores directly (no
+        // accounts.yml yet). Do not probe 1Password here: `op item get`
+        // can show a desktop auth prompt just to answer "does this item
+        // exist?", which is surprising for commands like `pay claude` on a
+        // machine with no pay account configured.
         #[cfg(target_os = "macos")]
         {
             let ks = crate::keystore::Keystore::apple_keychain();
@@ -114,14 +118,6 @@ impl Config {
                 return Some("gnome-keyring:default".to_string());
             }
         }
-
-        {
-            let ks = crate::keystore::Keystore::onepassword(None);
-            if ks.exists("default") {
-                return Some("1password:default".to_string());
-            }
-        }
-
         None
     }
 }

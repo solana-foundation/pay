@@ -65,7 +65,7 @@ struct Opts {
     verbose: bool,
 
     /// Use a specific named account from `~/.config/pay/accounts.yml`.
-    /// For `--local` / `--sandbox`, this selects a wallet within `localnet`.
+    /// In sandbox/local modes, this selects a wallet within `localnet`.
     #[arg(long, global = true)]
     account: Option<String>,
 

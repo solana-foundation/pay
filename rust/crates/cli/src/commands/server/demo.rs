@@ -1,8 +1,8 @@
 //! `pay server demo` — start the gateway with a bundled demo spec.
 //!
 //! Extracts the embedded payment-debugger.yml to `./pay-demo.yaml` in the
-//! current working directory, then invokes `pay server start` with sandbox
-//! and debugger forced on.
+//! current working directory, then invokes `pay server start` with sandbox and
+//! debugger implied.
 
 use crate::commands::server::start::StartCommand;
 
@@ -22,10 +22,6 @@ pub struct DemoCommand {
     #[arg(long, default_value = "USDC")]
     pub currency: String,
 
-    /// Use hosted Surfpool sandbox (https://402.surfnet.dev:8899). Default.
-    #[arg(long, conflicts_with = "local")]
-    pub sandbox: bool,
-
     /// Use local Surfpool (http://localhost:8899) instead of hosted sandbox.
     #[arg(long)]
     pub local: bool,
@@ -36,21 +32,14 @@ pub struct DemoCommand {
 }
 
 impl DemoCommand {
-    pub fn run(self, active_account_name: Option<&str>, sandbox: bool) -> pay_core::Result<()> {
-        // Demo mode always uses sandbox — require top-level --sandbox so
-        // main.rs has already set up an ephemeral keypair (avoids Touch ID).
-        if !sandbox {
-            return Err(pay_core::Error::Config(
-                "pay server demo requires sandbox mode. Run:\n    pay --sandbox server demo".into(),
-            ));
-        }
-
+    pub fn run(self, active_account_name: Option<&str>, _sandbox: bool) -> pay_core::Result<()> {
         // Extract embedded spec to ./pay-demo.yaml in the current directory
         let spec_path = std::path::PathBuf::from("pay-demo.yaml");
         std::fs::write(&spec_path, DEMO_SPEC)
             .map_err(|e| pay_core::Error::Config(format!("Failed to write pay-demo.yaml: {e}")))?;
 
-        // Default to hosted sandbox. --local overrides to localhost.
+        // Demo mode always runs on sandbox. Default to hosted Surfpool;
+        // --local overrides to localhost.
         let rpc_url = if self.local {
             Some(pay_core::config::LOCAL_RPC_URL.to_string())
         } else {
