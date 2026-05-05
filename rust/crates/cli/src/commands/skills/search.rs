@@ -462,12 +462,8 @@ mod tests {
         assert_eq!(refreshed.hits.len(), 2);
         assert!(refreshed.hits.iter().all(|hit| !hit.method.is_empty()));
         assert!(refreshed.hits.iter().all(|hit| !hit.path.is_empty()));
-        assert!(
-            refreshed
-                .hits
-                .iter()
-                .all(|hit| hit.resource.as_deref().unwrap_or("").is_empty())
-        );
+        assert_eq!(refreshed.hits[0].resource.as_deref(), Some("jobs"));
+        assert_eq!(refreshed.hits[1].resource.as_deref(), Some("datasets"));
     }
 
     #[test]
