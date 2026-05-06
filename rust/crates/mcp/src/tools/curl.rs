@@ -1,4 +1,5 @@
-use rmcp::model::CallToolResult;
+use base64::{Engine, engine::general_purpose};
+use rmcp::model::{CallToolResult, Content};
 use rmcp::schemars;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -82,19 +83,122 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
 
     match response {
-        Ok(response) => Ok(CallToolResult::success(vec![rmcp::model::Content::text(
-            response,
-        )])),
+        Ok((body, content_type)) => Ok(CallToolResult::success(body_to_mcp_content(
+            body,
+            content_type.as_deref(),
+            "Request completed.",
+        ))),
         Err(err) => Ok(pay_error_to_tool_result(err)),
     }
 }
+
+/// Route a response body to the right MCP content kind based on its MIME type.
+///
+/// - `image/*` → base64-encoded `Content::image` (so the LLM can see it)
+/// - other binary (`application/pdf`, `application/octet-stream`, etc.) →
+///   spilled to a tempfile, response carries the path as `Content::text`
+///   (the JSON-RPC transport mangles raw bytes; tempfile keeps them intact)
+/// - text-typed (`text/*`, `application/json`, `application/xml`) →
+///   `Content::text` with UTF-8 lossy decode
+/// - empty body → `Content::text(empty_message)`
+fn body_to_mcp_content(
+    body: Vec<u8>,
+    content_type: Option<&str>,
+    empty_message: &str,
+) -> Vec<Content> {
+    if body.is_empty() {
+        return vec![Content::text(empty_message.to_string())];
+    }
+
+    let mime = mime_from_content_type(content_type);
+
+    if mime.starts_with("image/") {
+        let encoded = general_purpose::STANDARD.encode(&body);
+        return vec![Content::image(encoded, mime)];
+    }
+
+    if is_binary_content_type(&mime) {
+        match write_body_to_tempfile(&body, &mime) {
+            Ok(path) => vec![Content::text(format!(
+                "Binary response ({} bytes, {mime}) written to {path}",
+                body.len()
+            ))],
+            Err(err) => vec![Content::text(format!(
+                "Binary response ({} bytes, {mime}) — failed to spill to tempfile: {err}",
+                body.len()
+            ))],
+        }
+    } else {
+        vec![Content::text(String::from_utf8_lossy(&body).into_owned())]
+    }
+}
+
+fn mime_from_content_type(content_type: Option<&str>) -> String {
+    content_type
+        .and_then(|v| v.split(';').next())
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "application/octet-stream".to_string())
+}
+
+/// True for MIME types whose payloads are not safe to embed as UTF-8 text.
+/// Text-typed MIMEs (`text/*`, `application/json`, `application/xml`,
+/// `application/*+json`, `application/*+xml`) return false.
+fn is_binary_content_type(mime: &str) -> bool {
+    if mime.starts_with("text/") {
+        return false;
+    }
+    if mime == "application/json" || mime == "application/xml" {
+        return false;
+    }
+    if mime.starts_with("application/") && (mime.ends_with("+json") || mime.ends_with("+xml")) {
+        return false;
+    }
+    true
+}
+
+fn write_body_to_tempfile(body: &[u8], mime: &str) -> std::io::Result<String> {
+    use std::io::Write;
+    let extension = extension_for_mime(mime);
+    let mut path = std::env::temp_dir();
+    let name = format!(
+        "pay-curl-{}{extension}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    path.push(name);
+    let mut file = std::fs::File::create(&path)?;
+    file.write_all(body)?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// Pick a sensible filename extension for a MIME type using `mime_guess`'s
+/// MIME→ext map. The extension is purely a hint for the human reading the
+/// tempfile path — readers should always trust `Content-Type`, not the
+/// suffix.
+fn extension_for_mime(mime: &str) -> String {
+    let parsed: Option<mime_guess::Mime> = mime.parse().ok();
+    parsed
+        .as_ref()
+        .and_then(|m| mime_guess::get_mime_extensions(m))
+        .and_then(|exts| exts.first())
+        .map(|ext| format!(".{ext}"))
+        .unwrap_or_else(|| ".bin".to_string())
+}
+
+/// Result of a paid fetch: raw response body bytes and the content-type the
+/// server advertised. Bytes (not String) so binary payloads — images, PDFs,
+/// octet streams — round-trip without UTF-8 mangling.
+type PaidFetchResult = (Vec<u8>, Option<String>);
 
 fn do_paid_fetch(
     method: &str,
     url: &str,
     extra_headers: &[(String, String)],
     body: Option<String>,
-) -> Result<String, pay_core::Error> {
+) -> Result<PaidFetchResult, pay_core::Error> {
     use pay_core::client::runner::RunOutcome;
 
     pay_core::skills::validate_cached_catalog_request(method, url, body.as_deref())?;
@@ -188,9 +292,11 @@ fn do_paid_fetch(
         RunOutcome::UnknownPaymentRequired { .. } => Err(pay_core::Error::Mpp(
             "402 Payment Required but no recognized protocol".to_string(),
         )),
-        RunOutcome::Completed { body, .. } => {
-            Ok(body.unwrap_or_else(|| "Request completed.".to_string()))
-        }
+        RunOutcome::Completed {
+            body,
+            content_type,
+            ..
+        } => Ok((body.unwrap_or_default(), content_type)),
     }
 }
 
@@ -221,12 +327,12 @@ fn is_user_rejection(reason: &str) -> bool {
 
 fn interpret_retry(
     outcome: pay_core::client::runner::RunOutcome,
-) -> Result<String, pay_core::Error> {
+) -> Result<PaidFetchResult, pay_core::Error> {
     use pay_core::client::runner::RunOutcome;
     match outcome {
-        RunOutcome::Completed { body, .. } => {
-            Ok(body.unwrap_or_else(|| "Payment successful.".to_string()))
-        }
+        RunOutcome::Completed {
+            body, content_type, ..
+        } => Ok((body.unwrap_or_default(), content_type)),
         RunOutcome::PaymentRejected { reason, .. } => Err(pay_core::Error::PaymentRejected(reason)),
         _ => Err(pay_core::Error::Mpp(
             "Server returned 402 again after payment".to_string(),
@@ -457,5 +563,147 @@ mod tests {
         assert_eq!(pay_core::x402::X402_V1_PAYMENT_HEADER, "X-PAYMENT");
         assert_eq!(pay_core::x402::X402_V2_PAYMENT_HEADER, "PAYMENT-SIGNATURE");
         assert_eq!(pay_core::x402::SIGN_IN_WITH_X_HEADER, "SIGN-IN-WITH-X");
+    }
+
+    // ── body_to_mcp_content content-type routing ──────────────────────
+    //
+    // Regression coverage for #350.4: pay-mcp must keep binary payloads
+    // intact across the MCP transport. Text → Content::text, image →
+    // base64 Content::image, other binary → tempfile path.
+
+    #[test]
+    fn is_binary_content_type_recognizes_text() {
+        assert!(!is_binary_content_type("text/plain"));
+        assert!(!is_binary_content_type("text/html"));
+        assert!(!is_binary_content_type("text/csv"));
+        assert!(!is_binary_content_type("application/json"));
+        assert!(!is_binary_content_type("application/xml"));
+        assert!(!is_binary_content_type("application/ld+json"));
+        assert!(!is_binary_content_type("application/atom+xml"));
+    }
+
+    #[test]
+    fn is_binary_content_type_recognizes_binary() {
+        assert!(is_binary_content_type("application/pdf"));
+        assert!(is_binary_content_type("application/octet-stream"));
+        assert!(is_binary_content_type("application/zip"));
+        assert!(is_binary_content_type("image/png"));
+        assert!(is_binary_content_type("audio/mpeg"));
+        assert!(is_binary_content_type("video/mp4"));
+    }
+
+    #[test]
+    fn body_to_mcp_content_routes_text_as_text() {
+        let body = b"plain string".to_vec();
+        let content = body_to_mcp_content(body, Some("text/plain"), "empty");
+        assert_eq!(content.len(), 1);
+        let text = content[0].as_text().expect("text content").text.clone();
+        assert_eq!(text, "plain string");
+    }
+
+    #[test]
+    fn body_to_mcp_content_routes_json_as_text() {
+        let body = br#"{"ok":true}"#.to_vec();
+        let content = body_to_mcp_content(body, Some("application/json"), "empty");
+        let text = content[0].as_text().expect("text content").text.clone();
+        assert_eq!(text, r#"{"ok":true}"#);
+    }
+
+    #[test]
+    fn body_to_mcp_content_strips_charset_parameter() {
+        let body = b"hello".to_vec();
+        let content = body_to_mcp_content(body, Some("text/plain; charset=utf-8"), "empty");
+        let text = content[0].as_text().expect("text content").text.clone();
+        assert_eq!(text, "hello");
+    }
+
+    #[test]
+    fn body_to_mcp_content_routes_image_as_base64_image() {
+        // Real PNG signature so encoding is meaningful.
+        let body: Vec<u8> = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        let content = body_to_mcp_content(body.clone(), Some("image/png"), "empty");
+        assert_eq!(content.len(), 1);
+        let image = content[0].as_image().expect("image content");
+        assert_eq!(image.mime_type, "image/png");
+        let decoded = general_purpose::STANDARD.decode(&image.data).unwrap();
+        assert_eq!(decoded, body, "base64 round-trips byte-for-byte");
+    }
+
+    #[test]
+    fn body_to_mcp_content_spills_pdf_to_tempfile() {
+        let body: Vec<u8> = b"%PDF-1.4 fake content with \xFF\xFE bytes".to_vec();
+        let content = body_to_mcp_content(body.clone(), Some("application/pdf"), "empty");
+        let text = content[0].as_text().expect("text content").text.clone();
+        // Text content should describe the spill and contain a path
+        assert!(text.contains("Binary response"));
+        assert!(text.contains("application/pdf"));
+        // Extract the path and verify the file contents match exactly
+        let path = text.split(" written to ").nth(1).expect("path in message");
+        let on_disk = std::fs::read(path).expect("tempfile readable");
+        assert_eq!(on_disk, body, "spilled bytes preserved");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn body_to_mcp_content_octet_stream_spills_to_tempfile() {
+        let body: Vec<u8> = vec![0x00, 0x01, 0x02, 0xFF, 0xFE, 0xFD];
+        let content = body_to_mcp_content(body.clone(), Some("application/octet-stream"), "empty");
+        let text = content[0].as_text().expect("text content").text.clone();
+        let path = text.split(" written to ").nth(1).expect("path in message");
+        let on_disk = std::fs::read(path).expect("tempfile readable");
+        assert_eq!(on_disk, body);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn body_to_mcp_content_empty_body_returns_message() {
+        let content = body_to_mcp_content(vec![], Some("application/json"), "Request completed.");
+        let text = content[0].as_text().expect("text content").text.clone();
+        assert_eq!(text, "Request completed.");
+    }
+
+    #[test]
+    fn body_to_mcp_content_missing_content_type_treats_as_binary() {
+        // No content-type → treat as octet-stream (safer than mangling
+        // potential binary payload through UTF-8 lossy decode).
+        let body: Vec<u8> = vec![0xFF, 0xFE, 0x00];
+        let content = body_to_mcp_content(body.clone(), None, "empty");
+        let text = content[0].as_text().expect("text content").text.clone();
+        assert!(text.contains("Binary response"));
+        let path = text.split(" written to ").nth(1).expect("path in message");
+        let on_disk = std::fs::read(path).expect("tempfile readable");
+        assert_eq!(on_disk, body);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn body_to_mcp_content_text_with_invalid_utf8_uses_replacement_chars() {
+        // Caller advertised text/plain but body has invalid UTF-8 — we keep
+        // it as text and replace bad sequences (data is lost, but caller
+        // chose the text route by labeling it text/plain).
+        let body: Vec<u8> = vec![b'h', b'i', 0xFF, 0xFE];
+        let content = body_to_mcp_content(body, Some("text/plain"), "empty");
+        let text = content[0].as_text().expect("text content").text.clone();
+        assert!(text.starts_with("hi"));
+        assert!(text.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn extension_for_mime_known_types() {
+        assert_eq!(extension_for_mime("application/pdf"), ".pdf");
+        assert_eq!(extension_for_mime("image/png"), ".png");
+        // mime_guess returns the first registered extension, which is
+        // database-version dependent (e.g. JPEG resolves to ".jpe" today).
+        // Just assert we get a non-empty leading-dot extension that's
+        // not the generic fallback.
+        let jpg = extension_for_mime("image/jpeg");
+        assert!(jpg.starts_with('.'));
+        assert_ne!(jpg, ".bin");
+    }
+
+    #[test]
+    fn extension_for_mime_unknown_falls_back_to_bin() {
+        assert_eq!(extension_for_mime("application/x-totally-made-up"), ".bin");
+        assert_eq!(extension_for_mime(""), ".bin");
     }
 }

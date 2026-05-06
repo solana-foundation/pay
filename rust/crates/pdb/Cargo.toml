@@ -12,7 +12,7 @@ base64 = { workspace = true }
 bincode = { workspace = true }
 chrono = { workspace = true }
 include_dir = "0.7.4"
-mime_guess = { version = "2.0.4", default-features = false }
+mime_guess = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 solana-transaction = { workspace = true, features = ["bincode"] }

@@ -417,13 +417,16 @@ fn probe_endpoint(
 
     let (status, paid, probe_status, http_status) = match raw {
         Ok(raw) => {
+            let body_text = raw.body_text();
+            let content_type = raw.content_type().map(str::to_string);
             let outcome = if raw.status == 402 {
-                runner::classify_402(&raw.headers, Some(&raw.body), url)
+                runner::classify_402(&raw.headers, Some(&body_text), url)
             } else {
                 let exit_code = if raw.status >= 400 { 1 } else { 0 };
                 RunOutcome::Completed {
                     exit_code,
                     body: Some(raw.body.clone()),
+                    content_type,
                 }
             };
             let probe_status_kind = classify_outcome(outcome, &config.accepted_currencies);
@@ -436,7 +439,7 @@ fn probe_endpoint(
                 },
                 other => other,
             };
-            let paid = extract_paid_endpoint(&raw.headers, Some(&raw.body));
+            let paid = extract_paid_endpoint(&raw.headers, Some(&body_text));
             let label = probe_status_str(&probe_status_kind, raw.status, &paid);
             (probe_status_kind, paid, label.to_string(), raw.status)
         }

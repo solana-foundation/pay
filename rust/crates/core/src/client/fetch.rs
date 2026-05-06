@@ -10,11 +10,48 @@ use crate::{Error, Result};
 /// Raw HTTP response — keeps status, headers, and body together so callers
 /// (e.g. the rich probe pipeline) can both run `classify_402` and extract
 /// additional 402 metadata without a second request.
+///
+/// `body` is held as raw bytes so binary responses (images, PDFs,
+/// arbitrary `application/octet-stream`) round-trip without UTF-8
+/// mangling. Use [`RawResponse::body_text`] when a string view is needed
+/// (e.g. parsing a 402 challenge body, which is always JSON).
 #[derive(Debug, Clone)]
 pub struct RawResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
-    pub body: String,
+    pub body: Vec<u8>,
+}
+
+impl RawResponse {
+    /// UTF-8 view of the body, with invalid sequences replaced by `U+FFFD`.
+    /// Right call for text-typed responses (`text/*`, `application/json`,
+    /// `application/xml`) where the wire format is guaranteed to be UTF-8.
+    /// Wrong call for `image/*`, `application/pdf`, etc. — those should be
+    /// handled as `Vec<u8>` directly.
+    pub fn body_text(&self) -> String {
+        String::from_utf8_lossy(&self.body).into_owned()
+    }
+
+    /// `content-type` header value (case-insensitive lookup), or `None` if
+    /// the server didn't send one. Includes the full value with
+    /// parameters (e.g. `text/plain; charset=utf-8`); use
+    /// [`RawResponse::mime_type`] to strip params and lowercase.
+    pub fn content_type(&self) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// Lowercased MIME type with parameters stripped — `"text/plain"` from
+    /// `"Text/Plain; charset=UTF-8"`. Empty string when the header is
+    /// missing or malformed.
+    pub fn mime_type(&self) -> String {
+        self.content_type()
+            .and_then(|v| v.split(';').next())
+            .map(|s| s.trim().to_ascii_lowercase())
+            .unwrap_or_default()
+    }
 }
 
 /// Fetch a URL with an explicit HTTP method/body, detecting 402 + MPP challenges.
@@ -54,12 +91,16 @@ pub fn fetch_raw(
 
 fn raw_to_outcome(raw: RawResponse, url: &str) -> RunOutcome {
     if raw.status == 402 {
-        return runner::classify_402(&raw.headers, Some(&raw.body), url);
+        // 402 challenge bodies are always JSON-as-text per spec; the
+        // text view is correct here.
+        return runner::classify_402(&raw.headers, Some(&raw.body_text()), url);
     }
     let exit_code = if raw.status >= 400 { 1 } else { 0 };
+    let content_type = raw.content_type().map(str::to_string);
     RunOutcome::Completed {
         exit_code,
         body: Some(raw.body),
+        content_type,
     }
 }
 
@@ -119,8 +160,13 @@ fn fetch_raw_with_method(
         })
         .collect();
 
+    // Use `bytes()` not `text()` — `text()` UTF-8-decodes lossily and
+    // replaces non-UTF-8 sequences with `U+FFFD`, irreversibly mangling
+    // binary responses (images, PDFs, octet-streams). Callers that want
+    // a string view ask for `body_text()` explicitly.
     let body = resp
-        .text()
+        .bytes()
+        .map(|b| b.to_vec())
         .map_err(|e| Error::Mpp(format!("Failed to read body: {e}")))?;
 
     debug!(status, "Fetch complete");
@@ -165,9 +211,9 @@ mod tests {
 
         let result = fetch(&format!("{base_url}/data"), &[]).unwrap();
         match result {
-            RunOutcome::Completed { exit_code, body } => {
+            RunOutcome::Completed { exit_code, body, .. } => {
                 assert_eq!(exit_code, 0);
-                assert_eq!(body.unwrap(), "hello world");
+                assert_eq!(body.unwrap(), b"hello world");
             }
             _ => panic!("Expected Completed"),
         }
@@ -183,9 +229,9 @@ mod tests {
 
         let result = fetch(&format!("{base_url}/missing"), &[]).unwrap();
         match result {
-            RunOutcome::Completed { exit_code, body } => {
+            RunOutcome::Completed { exit_code, body, .. } => {
                 assert_eq!(exit_code, 1);
-                assert_eq!(body.unwrap(), "not found");
+                assert_eq!(body.unwrap(), b"not found");
             }
             _ => panic!("Expected Completed"),
         }
@@ -221,7 +267,7 @@ mod tests {
         let result = fetch(&format!("{base_url}/echo-header"), &headers).unwrap();
         match result {
             RunOutcome::Completed { body, .. } => {
-                assert_eq!(body.unwrap(), "test-value");
+                assert_eq!(body.unwrap(), b"test-value");
             }
             _ => panic!("Expected Completed"),
         }
@@ -244,9 +290,9 @@ mod tests {
         .unwrap();
 
         match result {
-            RunOutcome::Completed { exit_code, body } => {
+            RunOutcome::Completed { exit_code, body, .. } => {
                 assert_eq!(exit_code, 0);
-                assert_eq!(body.unwrap(), "{\"query\":\"SELECT 1\"}");
+                assert_eq!(body.unwrap(), br#"{"query":"SELECT 1"}"#);
             }
             _ => panic!("Expected Completed"),
         }
@@ -268,5 +314,105 @@ mod tests {
     fn fetch_connection_refused_errors() {
         let result = fetch("http://127.0.0.1:1/nope", &[]);
         assert!(result.is_err());
+    }
+
+    /// Regression for #350.4: binary responses must round-trip byte-for-byte
+    /// — `text()` UTF-8 decoding silently mangles non-UTF-8 sequences (PNG
+    /// header `0x89 0x50 0x4E 0x47` becomes `U+FFFD 0x50 0x4E 0x47`), which
+    /// is an irreversible corruption.
+    #[test]
+    fn fetch_preserves_binary_bytes() {
+        let payload: Vec<u8> = vec![
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0xFF, 0xFE, 0x00, 0x01,
+        ];
+        let payload_for_handler = payload.clone();
+        let app = axum::Router::new().route(
+            "/blob",
+            axum::routing::get(move || {
+                let bytes = payload_for_handler.clone();
+                async move {
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+                        bytes,
+                    )
+                }
+            }),
+        );
+        let base_url = start_server(app);
+
+        let raw = fetch_raw("GET", &format!("{base_url}/blob"), &[], None).unwrap();
+        assert_eq!(raw.body, payload, "raw bytes must match exactly");
+        assert_eq!(raw.mime_type(), "application/octet-stream");
+    }
+
+    #[test]
+    fn fetch_completed_carries_content_type() {
+        let app = axum::Router::new().route(
+            "/img",
+            axum::routing::get(|| async {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "image/png")],
+                    vec![0x89, b'P', b'N', b'G'],
+                )
+            }),
+        );
+        let base_url = start_server(app);
+
+        let result = fetch(&format!("{base_url}/img"), &[]).unwrap();
+        match result {
+            RunOutcome::Completed {
+                content_type, body, ..
+            } => {
+                assert_eq!(content_type.as_deref(), Some("image/png"));
+                assert_eq!(body.unwrap(), vec![0x89, b'P', b'N', b'G']);
+            }
+            _ => panic!("Expected Completed"),
+        }
+    }
+
+    #[test]
+    fn body_text_replaces_invalid_utf8() {
+        let raw = RawResponse {
+            status: 200,
+            headers: vec![],
+            body: vec![0xFF, 0xFE, b'h', b'i'],
+        };
+        let text = raw.body_text();
+        assert!(text.contains("hi"));
+        assert!(text.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn content_type_lookup_is_case_insensitive() {
+        let raw = RawResponse {
+            status: 200,
+            headers: vec![("Content-Type".to_string(), "image/jpeg".to_string())],
+            body: vec![],
+        };
+        assert_eq!(raw.content_type(), Some("image/jpeg"));
+        assert_eq!(raw.mime_type(), "image/jpeg");
+    }
+
+    #[test]
+    fn mime_type_strips_parameters() {
+        let raw = RawResponse {
+            status: 200,
+            headers: vec![(
+                "content-type".to_string(),
+                "Text/Plain; charset=UTF-8".to_string(),
+            )],
+            body: vec![],
+        };
+        assert_eq!(raw.mime_type(), "text/plain");
+    }
+
+    #[test]
+    fn mime_type_empty_when_header_missing() {
+        let raw = RawResponse {
+            status: 200,
+            headers: vec![],
+            body: vec![],
+        };
+        assert_eq!(raw.mime_type(), "");
     }
 }
