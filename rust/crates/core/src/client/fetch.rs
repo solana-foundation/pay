@@ -211,7 +211,9 @@ mod tests {
 
         let result = fetch(&format!("{base_url}/data"), &[]).unwrap();
         match result {
-            RunOutcome::Completed { exit_code, body, .. } => {
+            RunOutcome::Completed {
+                exit_code, body, ..
+            } => {
                 assert_eq!(exit_code, 0);
                 assert_eq!(body.unwrap(), b"hello world");
             }
@@ -229,7 +231,9 @@ mod tests {
 
         let result = fetch(&format!("{base_url}/missing"), &[]).unwrap();
         match result {
-            RunOutcome::Completed { exit_code, body, .. } => {
+            RunOutcome::Completed {
+                exit_code, body, ..
+            } => {
                 assert_eq!(exit_code, 1);
                 assert_eq!(body.unwrap(), b"not found");
             }
@@ -290,7 +294,9 @@ mod tests {
         .unwrap();
 
         match result {
-            RunOutcome::Completed { exit_code, body, .. } => {
+            RunOutcome::Completed {
+                exit_code, body, ..
+            } => {
                 assert_eq!(exit_code, 0);
                 assert_eq!(body.unwrap(), br#"{"query":"SELECT 1"}"#);
             }
