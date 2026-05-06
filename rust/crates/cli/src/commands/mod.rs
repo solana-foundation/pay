@@ -540,9 +540,12 @@ fn handle_outcome(
             std::process::exit(1);
         }
 
-        RunOutcome::Completed { exit_code, body } => {
+        RunOutcome::Completed {
+            exit_code, body, ..
+        } => {
             if let Some(body) = body {
-                print!("{body}");
+                use std::io::Write;
+                let _ = std::io::stdout().write_all(&body);
             }
             std::process::exit(exit_code);
         }
@@ -1081,9 +1084,12 @@ fn retry_header_args_httpie(headers_to_add: &[(&str, String)]) -> Vec<String> {
 
 fn handle_retry_outcome(outcome: RunOutcome, is_json: bool) -> pay_core::Result<()> {
     match outcome {
-        RunOutcome::Completed { exit_code, body } => {
+        RunOutcome::Completed {
+            exit_code, body, ..
+        } => {
             if let Some(body) = body {
-                print!("{body}");
+                use std::io::Write;
+                let _ = std::io::stdout().write_all(&body);
             }
             std::process::exit(exit_code);
         }

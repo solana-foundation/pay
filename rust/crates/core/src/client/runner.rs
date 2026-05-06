@@ -48,8 +48,17 @@ pub enum RunOutcome {
     /// The command completed (any status other than 402).
     Completed {
         exit_code: i32,
-        /// Response body (only set by the built-in fetch, not by curl/wget wrappers).
-        body: Option<String>,
+        /// Response body (only set by the built-in fetch, not by curl/wget
+        /// wrappers). Held as raw bytes so binary responses round-trip
+        /// without UTF-8 mangling. Use [`String::from_utf8_lossy`] to get
+        /// a text view when the content-type guarantees UTF-8 (e.g. JSON).
+        body: Option<Vec<u8>>,
+        /// `content-type` header value (when known). Set by the built-in
+        /// fetch path; `None` for the external curl/wget/httpie wrappers
+        /// (those discard headers after parsing). Lets consumers route
+        /// binary responses (image/*, application/pdf, …) differently
+        /// from text — see `pay-mcp`'s curl tool.
+        content_type: Option<String>,
     },
 }
 
@@ -112,23 +121,30 @@ fn run_curl_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunO
     let output = cmd.output()?;
     let exit_code = output.status.code().unwrap_or(1);
     let headers_raw = std::fs::read_to_string(header_path).unwrap_or_default();
-    let body = std::fs::read_to_string(body_path).unwrap_or_default();
+    // Read body as raw bytes — `read_to_string` is lossy on non-UTF-8 and
+    // would silently mangle binary responses (images, PDFs, …) before we
+    // ever print them.
+    let body = std::fs::read(body_path).unwrap_or_default();
     let (status_code, headers) = parse_http_headers(&headers_raw);
     let url = find_url_in_args(user_args).unwrap_or_default();
 
     debug!(?status_code, exit_code, "curl finished");
 
     if status_code == Some(402) {
-        // Swallow stderr/stdout/body on 402 — CLI handles display
-        return Ok(classify_402(&headers, Some(&body), &url));
+        // Swallow stderr/stdout/body on 402 — CLI handles display.
+        // 402 challenge bodies are JSON per spec; lossy decode is fine.
+        let body_text = String::from_utf8_lossy(&body);
+        return Ok(classify_402(&headers, Some(&body_text), &url));
     }
 
-    // Not 402 — re-emit stderr (progress bar etc.), body, then any -w writeout
+    // Not 402 — re-emit stderr (progress bar etc.), body, then any -w writeout.
+    // `write_all(&body)` so binary bytes pass through untouched; print!
+    // would route through Display which goes through UTF-8.
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !stderr.is_empty() {
         eprint!("{stderr}");
     }
-    print!("{body}");
+    let _ = std::io::Write::write_all(&mut std::io::stdout(), &body);
     let writeout = String::from_utf8_lossy(&output.stdout);
     if !writeout.is_empty() {
         print!("{writeout}");
@@ -136,6 +152,7 @@ fn run_curl_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunO
     Ok(RunOutcome::Completed {
         exit_code,
         body: None,
+        content_type: None,
     })
 }
 
@@ -234,6 +251,7 @@ fn run_wget_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunO
     Ok(RunOutcome::Completed {
         exit_code,
         body: None,
+        content_type: None,
     })
 }
 
@@ -296,6 +314,7 @@ fn run_httpie_inner(user_args: &[String], extra_headers: &[String]) -> Result<Ru
     Ok(RunOutcome::Completed {
         exit_code,
         body: None,
+        content_type: None,
     })
 }
 
@@ -623,6 +642,7 @@ fn run_plain_command(program: &str, args: &[String]) -> Result<RunOutcome> {
     Ok(RunOutcome::Completed {
         exit_code: status.code().unwrap_or(1),
         body: None,
+        content_type: None,
     })
 }
 

@@ -160,7 +160,7 @@ pub fn send_stablecoin(request: StablecoinSendRequest<'_>) -> Result<SendResult>
 
     let first = fetch::fetch_raw("POST", &api_url, &headers, Some(&body))?;
     if first.status != 402 {
-        let receipt = parse_send_receipt_or_error(first.status, &first.body)?;
+        let receipt = parse_send_receipt_or_error(first.status, &first.body_text())?;
         return Ok(SendResult {
             signature: receipt.signature,
             amount_raw: 0,
@@ -178,7 +178,7 @@ pub fn send_stablecoin(request: StablecoinSendRequest<'_>) -> Result<SendResult>
     }
 
     let challenge_response: Option<ApiSendChallengeResponse> =
-        serde_json::from_str(&first.body).ok();
+        serde_json::from_str(&first.body_text()).ok();
     let challenges = mpp::parse_headers(&first.headers);
     if challenges.is_empty() {
         return Err(Error::InvalidChallenge(
@@ -208,7 +208,7 @@ pub fn send_stablecoin(request: StablecoinSendRequest<'_>) -> Result<SendResult>
         ("authorization".to_string(), auth_header),
     ];
     let retry = fetch::fetch_raw("POST", &api_url, &retry_headers, Some(&body))?;
-    let receipt = parse_send_receipt_or_error(retry.status, &retry.body)?;
+    let receipt = parse_send_receipt_or_error(retry.status, &retry.body_text())?;
 
     let sender = account_pubkey_for_network(network, account_override)?
         .unwrap_or_else(|| String::from("(unknown)"));
