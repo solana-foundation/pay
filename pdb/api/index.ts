@@ -122,6 +122,7 @@ async function createApp() {
     if (req.path === "/" || req.path.startsWith("/__402/pdb"))
       return next();
     const start = Date.now();
+    const requestUrl = `${req.protocol}://${req.get("host") || "localhost"}${req.originalUrl}`;
 
     const chunks: Buffer[] = [];
     let writeHeadHeaders: Record<string, string> = {};
@@ -152,6 +153,7 @@ async function createApp() {
       for (const [k, v] of Object.entries(req.headers)) {
         if (typeof v === "string") reqHeaders[k] = v;
       }
+      const reqBody = serializeRequestBody(req.method, req.body);
       const resHeaders: Record<string, string> = { ...writeHeadHeaders };
       for (const [k, v] of Object.entries(res.getHeaders())) {
         if (v != null) resHeaders[k] = String(v);
@@ -171,9 +173,11 @@ async function createApp() {
         ts: new Date().toISOString(),
         method: req.method,
         path: req.path,
+        url: requestUrl,
         status: res.statusCode,
         ms: Date.now() - start,
         reqHeaders,
+        reqBody,
         resHeaders,
         resBody,
         clientIp,
@@ -566,6 +570,23 @@ function toWebRequest(req: express.Request): globalThis.Request {
       ? undefined
       : JSON.stringify(req.body),
   });
+}
+
+function serializeRequestBody(method: string, body: unknown): string | null {
+  if (method === "GET" || method === "HEAD" || body == null) {
+    return null;
+  }
+
+  if (typeof body === "string") {
+    return body.length > 4096 ? `${body.slice(0, 4096)}…` : body;
+  }
+
+  try {
+    const serialized = JSON.stringify(body);
+    return serialized.length > 4096 ? `${serialized.slice(0, 4096)}…` : serialized;
+  } catch {
+    return null;
+  }
 }
 
 // ── Local dev server ──
