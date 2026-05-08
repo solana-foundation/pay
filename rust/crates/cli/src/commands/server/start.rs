@@ -8,6 +8,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use owo_colors::OwoColorize;
 use pay_core::PaymentState;
+use pay_core::ReplayStore;
 use pay_core::accounts::AccountsStore;
 use pay_core::server::session::SessionMpp;
 use pay_core::server::telemetry::FeePayerWallet;
@@ -91,6 +92,7 @@ struct AppState {
     session_mpp: Option<Arc<SessionMpp>>,
     browser_rpc_url: Option<String>,
     fee_payer_wallet: Option<FeePayerWallet>,
+    replay_store: ReplayStore,
 }
 
 impl PaymentState for AppState {
@@ -111,6 +113,9 @@ impl PaymentState for AppState {
     }
     fn fee_payer_wallet(&self) -> Option<&FeePayerWallet> {
         self.fee_payer_wallet.as_ref()
+    }
+    fn replay_store(&self) -> Option<&ReplayStore> {
+        Some(&self.replay_store)
     }
 }
 
@@ -769,6 +774,7 @@ impl StartCommand {
                 session_mpp,
                 browser_rpc_url: Some(BROWSER_RPC_PROXY_PATH.to_string()),
                 fee_payer_wallet,
+                replay_store: ReplayStore::default(),
             };
 
             let pdb_state = if debugger {

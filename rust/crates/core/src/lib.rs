@@ -34,6 +34,8 @@ pub use server::{AccountingKey, AccountingStore, InMemoryStore, current_period};
 #[cfg(feature = "server")]
 use pay_types::metering::ApiSpec;
 #[cfg(feature = "server")]
+pub use server::payment::ReplayStore;
+#[cfg(feature = "server")]
 pub use solana_mpp;
 #[cfg(feature = "server")]
 use solana_mpp::server::Mpp;
@@ -53,6 +55,9 @@ pub trait PaymentState: Clone + Send + Sync + 'static {
         None
     }
     fn fee_payer_wallet(&self) -> Option<&server::telemetry::FeePayerWallet> {
+        None
+    }
+    fn replay_store(&self) -> Option<&server::payment::ReplayStore> {
         None
     }
 }
