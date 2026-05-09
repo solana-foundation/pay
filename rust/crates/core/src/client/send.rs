@@ -201,6 +201,9 @@ pub fn send_stablecoin(request: StablecoinSendRequest<'_>) -> Result<SendResult>
         Some(network),
         account_override,
         Some(&api_url),
+        // `pay send` is the user explicitly transferring funds, not an
+        // automated paid-API call — bypass policy enforcement.
+        None,
     )?;
 
     let retry_headers = vec![

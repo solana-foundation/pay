@@ -39,7 +39,7 @@ owo-colors = "4"
 dialoguer = "0.12"
 
 # Time
-chrono = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
 
 # MCP
 rmcp = { version = "0.9", features = ["server", "transport-io"] }

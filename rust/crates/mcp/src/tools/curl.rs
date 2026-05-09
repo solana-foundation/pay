@@ -200,6 +200,10 @@ fn do_paid_fetch(
     body: Option<String>,
 ) -> Result<PaidFetchResult, pay_core::Error> {
     use pay_core::client::runner::RunOutcome;
+    use pay_core::policy::{
+        FilePolicyStore, PolicyContext, PolicyStore, record_payment_with_store,
+        resolve_active_policy,
+    };
 
     pay_core::skills::validate_cached_catalog_request(method, url, body.as_deref())?;
 
@@ -208,6 +212,30 @@ fn do_paid_fetch(
     let store = pay_core::accounts::FileAccountsStore::default_path();
     let network_override = std::env::var("PAY_NETWORK_ENFORCED").ok();
     let account_override = std::env::var("PAY_ACTIVE_ACCOUNT").ok();
+
+    // Policy resolution: per call so `pay policy update` mid-session takes
+    // effect immediately.
+    let policy_store = FilePolicyStore::default_path();
+    let cli_policy = std::env::var("PAY_POLICY").ok();
+    let account_policy_name = network_override.as_deref().and_then(|net| {
+        let file = pay_core::accounts::AccountsFile::load().ok()?;
+        let acct = if let Some(name) = account_override.as_deref() {
+            file.named_account_for_network(net, name)?
+        } else {
+            file.account_for_network(net)?.1
+        };
+        acct.policy.clone()
+    });
+    let policies = policy_store.load_policies()?;
+    let resolved_policy = resolve_active_policy(
+        cli_policy.as_deref(),
+        account_policy_name.as_deref(),
+        &policies,
+    )?;
+    let policy_ctx = resolved_policy.as_ref().map(|p| PolicyContext {
+        policy: p.clone(),
+        store: &policy_store,
+    });
 
     match outcome {
         RunOutcome::MppChallenge {
@@ -231,23 +259,41 @@ fn do_paid_fetch(
                 network_override.as_deref(),
                 account_override.as_deref(),
                 Some(url),
+                policy_ctx.as_ref(),
             )?;
+            // Capture amount for post-success policy recording. Uses the
+            // pay-core helper so MCP doesn't need to depend on solana-mpp.
+            let amount_for_record = if policy_ctx.is_some() {
+                Some(pay_core::client::mpp::amount_micro_usdc_from_challenge(selected)?)
+            } else {
+                None
+            };
             let mut headers = extra_headers.to_vec();
             headers.push(("Authorization".to_string(), auth_header));
-            interpret_retry(pay_core::client::fetch::fetch_request(
+            let result = interpret_retry(pay_core::client::fetch::fetch_request(
                 method,
                 url,
                 &headers,
                 body.as_deref(),
-            )?)
+            )?)?;
+            if let (Some(ctx), Some(amt)) = (&policy_ctx, amount_for_record) {
+                record_payment_with_store(ctx, amt, chrono::Utc::now())?;
+            }
+            Ok(result)
         }
         RunOutcome::X402Challenge { challenge, .. } => {
+            let amount_for_record = if policy_ctx.is_some() {
+                Some(pay_core::client::x402::amount_micro_usdc_from_challenge(&challenge)?)
+            } else {
+                None
+            };
             let built_payment = pay_core::client::x402::build_payment(
                 &challenge,
                 &store,
                 network_override.as_deref(),
                 account_override.as_deref(),
                 Some(url),
+                policy_ctx.as_ref(),
             )?;
             let mut headers = extra_headers.to_vec();
             headers.extend(
@@ -256,20 +302,27 @@ fn do_paid_fetch(
                     .into_iter()
                     .map(|(name, value)| (name.to_string(), value)),
             );
-            interpret_retry(pay_core::client::fetch::fetch_request(
+            let result = interpret_retry(pay_core::client::fetch::fetch_request(
                 method,
                 url,
                 &headers,
                 body.as_deref(),
-            )?)
+            )?)?;
+            if let (Some(ctx), Some(amt)) = (&policy_ctx, amount_for_record) {
+                record_payment_with_store(ctx, amt, chrono::Utc::now())?;
+            }
+            Ok(result)
         }
         RunOutcome::X402SignInChallenge { challenge, .. } => {
+            // SIWX is a sign-in flow; no on-chain payment, no policy
+            // gate / record.
             let built_payment = pay_core::client::x402::build_siwx_auth_header(
                 &challenge,
                 &store,
                 network_override.as_deref(),
                 account_override.as_deref(),
                 Some(url),
+                None,
             )?;
             let mut headers = extra_headers.to_vec();
             headers.extend(

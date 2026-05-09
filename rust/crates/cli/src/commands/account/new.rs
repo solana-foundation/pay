@@ -364,6 +364,7 @@ pub fn save_account(
             path,
             secret_key_b58: None,
             created_at: None,
+            policy: None,
         },
     );
     accounts.save()

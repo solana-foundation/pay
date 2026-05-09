@@ -139,6 +139,12 @@ pub struct Account {
     /// ephemerals may have less SOL because faucets reset).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
+
+    /// Optional spending-policy name to apply for paid requests using this
+    /// account. Resolved against `~/.config/pay/policies.toml`. Overridden
+    /// by the per-invocation `--policy <name>` flag.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy: Option<String>,
 }
 
 impl Account {
@@ -570,6 +576,7 @@ fn generate_ephemeral_account() -> Account {
         path: None,
         secret_key_b58: Some(bs58::encode(&full).into_string()),
         created_at: Some(now_rfc3339()),
+        policy: None,
     }
 }
 
@@ -642,6 +649,7 @@ mod tests {
             account: None,
             secret_key_b58: None,
             created_at: None,
+            policy: None,
         }
     }
 
@@ -656,6 +664,7 @@ mod tests {
             path: None,
             secret_key_b58: Some("test-secret-bytes-base58".to_string()),
             created_at: Some("2026-04-10T00:00:00Z".to_string()),
+            policy: None,
         }
     }
 
@@ -710,6 +719,7 @@ mod tests {
             account: None,
             secret_key_b58: None,
             created_at: None,
+            policy: None,
         };
         assert_eq!(
             acct.signer_source("legacy"),
@@ -729,6 +739,7 @@ mod tests {
             account: None,
             secret_key_b58: None,
             created_at: None,
+            policy: None,
         };
         assert_eq!(
             acct.signer_source("myacct"),
@@ -749,6 +760,7 @@ mod tests {
             path: None,
             secret_key_b58: Some(bs58::encode(&raw_bytes).into_string()),
             created_at: Some("2026-04-10T00:00:00Z".to_string()),
+            policy: None,
         };
         assert_eq!(acct.ephemeral_keypair_bytes(), Some(raw_bytes));
     }

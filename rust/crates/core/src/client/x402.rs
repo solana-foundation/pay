@@ -28,6 +28,18 @@ use crate::{Error, Result};
 
 pub use solana_x402::{SIGN_IN_WITH_X_HEADER, X402_V1_PAYMENT_HEADER, X402_V2_PAYMENT_HEADER};
 
+/// Extract the priced amount from an x402 challenge as micro-USDC.
+///
+/// Mirrors [`crate::client::mpp::amount_micro_usdc_from_challenge`] for the
+/// x402 protocol so downstream crates can record post-payment spend without
+/// reaching for `solana-x402` types directly.
+pub fn amount_micro_usdc_from_challenge(challenge: &Challenge) -> Result<u64> {
+    crate::policy::parse_amount_micro_usdc(
+        &challenge.requirements.amount,
+        &challenge.requirements.currency,
+    )
+}
+
 #[derive(Debug, Clone)]
 pub struct Challenge {
     pub x402_version: u64,
@@ -89,8 +101,25 @@ pub fn build_payment(
     network_override: Option<&str>,
     account_override: Option<&str>,
     resource_url: Option<&str>,
+    policy_ctx: Option<&crate::policy::PolicyContext<'_>>,
 ) -> Result<BuiltPayment> {
     let requirements = &challenge.requirements;
+
+    // Policy gate runs before signer load — rejected requests never
+    // surface a Touch ID prompt.
+    if let Some(ctx) = policy_ctx {
+        let amount_micro =
+            crate::policy::parse_amount_micro_usdc(&requirements.amount, &requirements.currency)?;
+        let origin = crate::policy::extract_origin(resource_url);
+        crate::policy::gate_payment_with_store(
+            ctx,
+            amount_micro,
+            &requirements.recipient,
+            origin.as_deref(),
+            chrono::Utc::now(),
+        )?;
+    }
+
     let amount = format_amount(&requirements.amount, &requirements.currency);
     let prompt_context = crate::client::prompt::payment_prompt_context(
         requirements.description.as_deref(),
@@ -183,12 +212,17 @@ pub fn build_payment(
 }
 
 /// Build a signed x402 SIWX-only retry header.
+///
+/// SIWX is a sign-in flow with no on-chain payment, so policy enforcement
+/// is a no-op here even when a `policy_ctx` is supplied — the parameter is
+/// accepted for signature symmetry with [`build_payment`].
 pub fn build_siwx_auth_header(
     challenge: &SiwxAuthChallenge,
     store: &dyn AccountsStore,
     network_override: Option<&str>,
     account_override: Option<&str>,
     resource_url: Option<&str>,
+    _policy_ctx: Option<&crate::policy::PolicyContext<'_>>,
 ) -> Result<BuiltPayment> {
     let preferred_chain_id = network_override.and_then(siwx_chain_id_for_network);
     let chain = solana_x402::siwx::select_siwx_chain(
@@ -860,6 +894,7 @@ mod tests {
             path: None,
             secret_key_b58: Some(bs58::encode(TEST_KEYPAIR_BYTES).into_string()),
             created_at: Some("2026-04-27T00:00:00Z".to_string()),
+            policy: None,
         };
         let mut file = AccountsFile::default();
         file.upsert("devnet", "default", account);
@@ -882,7 +917,7 @@ mod tests {
             ),
         };
 
-        let built = build_siwx_auth_header(&challenge, &store, Some("devnet"), None, None).unwrap();
+        let built = build_siwx_auth_header(&challenge, &store, Some("devnet"), None, None, None).unwrap();
         let payload = solana_x402::siwx::parse_siwx_header(&built.headers[0].1).unwrap();
 
         assert_eq!(built.headers.len(), 1);
@@ -913,7 +948,7 @@ mod tests {
         let store = MemoryAccountsStore::new();
 
         let err =
-            build_siwx_auth_header(&challenge, &store, Some("devnet"), None, None).unwrap_err();
+            build_siwx_auth_header(&challenge, &store, Some("devnet"), None, None, None).unwrap_err();
 
         assert!(
             err.to_string()
@@ -941,7 +976,7 @@ mod tests {
             siwx: None,
         };
 
-        let err = build_payment(&challenge, &store, Some("localnet"), None, None).unwrap_err();
+        let err = build_payment(&challenge, &store, Some("localnet"), None, None, None).unwrap_err();
         let msg = err.to_string();
 
         assert!(msg.contains("you forced network `localnet`"));
@@ -962,7 +997,7 @@ mod tests {
             siwx: None,
         };
 
-        let err = build_payment(&challenge, &store, None, None, None).unwrap_err();
+        let err = build_payment(&challenge, &store, None, None, None, None).unwrap_err();
         let msg = err.to_string();
 
         assert!(msg.contains("No account configured for network `mainnet`"));
@@ -979,7 +1014,7 @@ mod tests {
             requirements,
             siwx: None,
         };
-        let err = build_payment(&challenge, &store, None, Some("alice"), None).unwrap_err();
+        let err = build_payment(&challenge, &store, None, Some("alice"), None, None).unwrap_err();
         let msg = err.to_string();
 
         assert!(msg.contains("No account named `alice` configured for network `mainnet`"));

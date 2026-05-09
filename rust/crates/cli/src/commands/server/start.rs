@@ -1981,6 +1981,7 @@ endpoints:
             path: None,
             secret_key_b58: Some(bs58::encode(&VALID_TEST_KEYPAIR_BYTES[..]).into_string()),
             created_at: Some("2026-04-10T00:00:00Z".to_string()),
+            policy: None,
         };
         (acct, pubkey)
     }
@@ -2100,6 +2101,7 @@ endpoints:
             // Valid base58 but wrong length (decodes to <64 bytes).
             secret_key_b58: Some("abc".to_string()),
             created_at: Some("2026-04-10T00:00:00Z".to_string()),
+            policy: None,
         };
         file.upsert(pay_core::accounts::MAINNET_NETWORK, "broken", bad);
         let store = MemoryAccountsStore::with_file(file);

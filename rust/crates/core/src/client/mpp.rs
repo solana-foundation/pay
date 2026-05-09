@@ -18,6 +18,20 @@ use crate::{Error, Result};
 // Re-export the challenge type for the runner/CLI.
 pub use solana_mpp::PaymentChallenge as Challenge;
 
+/// Extract the priced amount from an MPP challenge as micro-USDC.
+///
+/// Decodes the inner `ChargeRequest`, then runs it through the same
+/// stablecoin-amount parser used by the policy gate. Lets callers in
+/// downstream crates (e.g. `pay-mcp`) record the spend after a successful
+/// retry without needing a direct `solana-mpp` dependency.
+pub fn amount_micro_usdc_from_challenge(challenge: &Challenge) -> Result<u64> {
+    let request: ChargeRequest = challenge
+        .request
+        .decode()
+        .map_err(|e| Error::Mpp(format!("Failed to decode challenge request: {e}")))?;
+    crate::policy::parse_amount_micro_usdc(&request.amount, &request.currency)
+}
+
 /// Try to extract an MPP challenge from the `www-authenticate` header value.
 pub fn parse(header_value: &str) -> Option<Challenge> {
     parse_all([header_value]).into_iter().next()
@@ -60,11 +74,32 @@ pub fn build_credential(
     network_override: Option<&str>,
     account_override: Option<&str>,
     resource_url: Option<&str>,
+    policy_ctx: Option<&crate::policy::PolicyContext<'_>>,
 ) -> Result<(String, Option<ResolvedEphemeral>)> {
     let request: ChargeRequest = challenge
         .request
         .decode()
         .map_err(|e| Error::Mpp(format!("Failed to decode challenge request: {e}")))?;
+
+    // Run the policy gate before any keystore access so a rejected request
+    // never triggers Touch ID. We rely on the existing PaymentRejected error
+    // path so the CLI / MCP rendering stays unchanged.
+    if let Some(ctx) = policy_ctx {
+        let amount_micro =
+            crate::policy::parse_amount_micro_usdc(&request.amount, &request.currency)?;
+        let origin = crate::policy::extract_origin(resource_url);
+        // MPP `recipient` is optional in the upstream type; fall back to
+        // empty string so allowlist mismatch surfaces as a real reject
+        // rather than a silent pass.
+        let recipient = request.recipient.as_deref().unwrap_or("");
+        crate::policy::gate_payment_with_store(
+            ctx,
+            amount_micro,
+            recipient,
+            origin.as_deref(),
+            chrono::Utc::now(),
+        )?;
+    }
 
     let amount = format_amount(&request.amount, &request.currency);
     let prompt_context = crate::client::prompt::payment_prompt_context(

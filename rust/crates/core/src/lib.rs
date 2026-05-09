@@ -4,6 +4,7 @@ pub mod config;
 pub mod error;
 pub mod instructions;
 pub mod keystore;
+pub mod policy;
 pub mod signer;
 pub mod skills;
 

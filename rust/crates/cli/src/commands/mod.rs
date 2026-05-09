@@ -6,6 +6,7 @@ pub mod curl;
 pub mod fetch;
 pub mod help;
 pub mod http;
+pub mod policy;
 pub mod send;
 pub mod server;
 pub mod setup;
@@ -76,6 +77,12 @@ pub enum Command {
     /// Add a provider source (shorthand for `skills add`).
     #[command(alias = "add", short_flag = 'i')]
     Install(skills::install::InstallCommand),
+    /// Manage local spending policies that gate paid HTTP calls.
+    #[command(alias = "policies")]
+    Policy {
+        #[command(subcommand)]
+        command: Option<policy::PolicyCommand>,
+    },
     /// Start the MCP server (for Claude Code, Cursor, etc.)
     Mcp,
 }
@@ -125,6 +132,7 @@ impl Command {
             | Command::Skills { .. }
             | Command::Catalog { .. }
             | Command::Install(_)
+            | Command::Policy { .. }
             | Command::Server { .. }
             | Command::Mcp => false,
         }
@@ -145,6 +153,7 @@ impl Command {
             | Command::Skills { .. }
             | Command::Catalog { .. }
             | Command::Install(_)
+            | Command::Policy { .. }
             | Command::Send(_)
             | Command::Setup(_)
             | Command::Topup(_)
@@ -172,6 +181,7 @@ impl Command {
         keypair_override: Option<&str>,
         network_override: Option<&str>,
         account_override: Option<&str>,
+        policy_override: Option<&str>,
         verbose: bool,
         sandbox: bool,
     ) -> pay_core::Result<()> {
@@ -183,6 +193,10 @@ impl Command {
             Command::Account { command } => match command {
                 Some(cmd) => return cmd.run(),
                 None => return account::run_default(),
+            },
+            Command::Policy { command } => match command {
+                Some(cmd) => return cmd.run(),
+                None => return policy::run_default(),
             },
             Command::Whoami(cmd) => return cmd.run(network_override, account_override),
             Command::Skills { command } => return command.run(),
@@ -228,6 +242,7 @@ impl Command {
                     Some(parsed_headers),
                     network_override,
                     account_override,
+                    policy_override,
                     sandbox,
                     verbose,
                 );
@@ -244,6 +259,7 @@ impl Command {
             None,
             network_override,
             account_override,
+            policy_override,
             sandbox,
             verbose,
         )
@@ -260,6 +276,7 @@ fn handle_outcome(
     fetch_headers: Option<Vec<(String, String)>>,
     network_override: Option<&str>,
     account_override: Option<&str>,
+    policy_override: Option<&str>,
     sandbox: bool,
     verbose: bool,
 ) -> pay_core::Result<()> {
@@ -308,6 +325,7 @@ fn handle_outcome(
                         fetch_headers,
                         network_override,
                         account_override,
+                        policy_override,
                         verbose,
                     },
                 );
@@ -428,6 +446,7 @@ fn handle_outcome(
                         fetch_headers,
                         network_override,
                         account_override,
+                        policy_override,
                         verbose,
                     },
                 );
@@ -475,6 +494,7 @@ fn handle_outcome(
                         fetch_headers,
                         network_override,
                         account_override,
+                        policy_override,
                         verbose,
                     },
                 );
@@ -714,7 +734,36 @@ struct PaymentRetryContext<'a, 'tool> {
     fetch_headers: Option<Vec<(String, String)>>,
     network_override: Option<&'a str>,
     account_override: Option<&'a str>,
+    policy_override: Option<&'a str>,
     verbose: bool,
+}
+
+/// Resolve which policy applies for the current invocation.
+///
+/// Returns `None` if no policy is configured anywhere, or `Some(Policy)`
+/// otherwise. Errors only when the user explicitly named a policy that
+/// doesn't exist.
+fn resolve_policy_for_invocation(
+    cli_override: Option<&str>,
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+) -> pay_core::Result<Option<pay_core::policy::Policy>> {
+    let policy_store = pay_core::policy::FilePolicyStore::default_path();
+    let policies = pay_core::policy::PolicyStore::load_policies(&policy_store)?;
+
+    // Look up the per-account binding when we know which account is in use.
+    let account_policy = if let Some(net) = network_override {
+        let file = pay_core::accounts::AccountsFile::load().unwrap_or_default();
+        let acct_opt = match account_override {
+            Some(name) => file.named_account_for_network(net, name).cloned(),
+            None => file.account_for_network(net).map(|(_, a)| a.clone()),
+        };
+        acct_opt.and_then(|a| a.policy)
+    } else {
+        None
+    };
+
+    pay_core::policy::resolve_active_policy(cli_override, account_policy.as_deref(), &policies)
 }
 
 fn pay_mpp_and_retry(
@@ -749,12 +798,36 @@ fn pay_mpp_and_retry(
              Drop `--network` or check `pay account list` for accounts on the offered networks."
         ))
     })?;
+
+    // Resolve the active policy (CLI flag → account binding → default).
+    let resolved_policy = resolve_policy_for_invocation(
+        ctx.policy_override,
+        ctx.network_override,
+        ctx.account_override,
+    )?;
+    let policy_store = pay_core::policy::FilePolicyStore::default_path();
+    let policy_ctx = resolved_policy.as_ref().map(|p| pay_core::policy::PolicyContext {
+        policy: p.clone(),
+        store: &policy_store,
+    });
+
+    // Capture the amount before signing so we can record the spend after a
+    // successful retry. Decoding the challenge can fail; if it does, we
+    // record nothing (better to under-count than to crash post-payment).
+    let amount_for_record: Option<u64> = if policy_ctx.is_some() {
+        let req: ChargeRequest = challenge.request.decode().ok().unwrap_or_default();
+        pay_core::policy::parse_amount_micro_usdc(&req.amount, &req.currency).ok()
+    } else {
+        None
+    };
+
     let (auth_header, ephemeral_notice) = mpp::build_credential(
         challenge,
         &store,
         ctx.network_override,
         ctx.account_override,
         Some(resource_url),
+        policy_ctx.as_ref(),
     )?;
 
     if let Some(resolved) = ephemeral_notice {
@@ -767,6 +840,19 @@ fn pay_mpp_and_retry(
 
     let retry_outcome =
         retry_with_header(ctx.tool, "Authorization", &auth_header, ctx.fetch_headers)?;
+
+    // Record the spend ONLY when the retry will exit cleanly. `RunOutcome::Completed`
+    // with a 2xx exit_code is the success signal — anything else means the
+    // payment didn't actually succeed and the daily counter shouldn't move.
+    let succeeded = matches!(
+        &retry_outcome,
+        RunOutcome::Completed { exit_code, .. } if *exit_code == 0
+    );
+    if succeeded
+        && let (Some(ctx), Some(amt)) = (&policy_ctx, amount_for_record)
+    {
+        pay_core::policy::record_payment_with_store(ctx, amt, chrono::Utc::now())?;
+    }
     handle_retry_outcome(retry_outcome, is_json)
 }
 
@@ -836,12 +922,34 @@ fn pay_x402_and_retry(
     }
 
     let store = pay_core::accounts::FileAccountsStore::default_path();
+
+    let resolved_policy = resolve_policy_for_invocation(
+        ctx.policy_override,
+        ctx.network_override,
+        ctx.account_override,
+    )?;
+    let policy_store = pay_core::policy::FilePolicyStore::default_path();
+    let policy_ctx = resolved_policy.as_ref().map(|p| pay_core::policy::PolicyContext {
+        policy: p.clone(),
+        store: &policy_store,
+    });
+    let amount_for_record: Option<u64> = if policy_ctx.is_some() {
+        pay_core::policy::parse_amount_micro_usdc(
+            &challenge.requirements.amount,
+            &challenge.requirements.currency,
+        )
+        .ok()
+    } else {
+        None
+    };
+
     let built_payment = x402::build_payment(
         challenge,
         &store,
         ctx.network_override,
         ctx.account_override,
         Some(resource_url),
+        policy_ctx.as_ref(),
     )?;
 
     if let Some(resolved) = built_payment.ephemeral_notice {
@@ -853,6 +961,16 @@ fn pay_x402_and_retry(
     }
 
     let retry_outcome = retry_with_headers(ctx.tool, &built_payment.headers, ctx.fetch_headers)?;
+
+    let succeeded = matches!(
+        &retry_outcome,
+        RunOutcome::Completed { exit_code, .. } if *exit_code == 0
+    );
+    if succeeded
+        && let (Some(ctx), Some(amt)) = (&policy_ctx, amount_for_record)
+    {
+        pay_core::policy::record_payment_with_store(ctx, amt, chrono::Utc::now())?;
+    }
     handle_retry_outcome(retry_outcome, is_json)
 }
 
@@ -869,12 +987,14 @@ fn pay_x402_siwx_and_retry(
     }
 
     let store = pay_core::accounts::FileAccountsStore::default_path();
+    // SIWX is sign-in only — no on-chain payment, so no policy gate / record.
     let built_payment = x402::build_siwx_auth_header(
         challenge,
         &store,
         ctx.network_override,
         ctx.account_override,
         Some(resource_url),
+        None,
     )?;
 
     if let Some(resolved) = built_payment.ephemeral_notice {

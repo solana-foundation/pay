@@ -67,6 +67,24 @@ When a command, Claude Code, Codex, or another MCP client hits a paid endpoint, 
 pay setup    # Touch ID on macOS, Windows Hello on Windows, GNOME Keyring on Linux, or choose 1Password
 ```
 
+### 🛡️ Spending Policies
+
+For agent flows where Touch ID per call isn't practical, `pay` enforces a named spending policy locally before signing. A policy is a per-tx cap, a daily cap, an optional recipient/origin allowlist, an expiry, and a kill switch — all checked before any keystore access. If a request fails the policy, no signature is produced and nothing leaves your machine.
+
+```sh
+pay policy create work \
+    --max-per-tx 0.10 \
+    --daily-cap 1.00 \
+    --allow api.example.com \
+    --default
+
+pay policy status                 # remaining daily budget
+pay policy pause                  # one-command kill switch
+pay --policy work claude          # apply per invocation, or use --default
+```
+
+Policies live at `~/.config/pay/policies.toml` and can be bound to specific accounts. They compose with biometrics — both gates run; the stricter one wins.
+
 ### 📚 Open Source Catalog
 
 The paid API catalog is open source in the [`pay-skills`](https://github.com/solana-foundation/pay-skills) repo.
@@ -115,7 +133,10 @@ pay whoami
 # 2. Make a paid gated API call to https://debugger.pay.sh sandbox endpoints
 pay --sandbox curl https://debugger.pay.sh/mpp/quote/AAPL
 
-# 3. Or let your AI agent handle it
+# 3. (Optional) Cap what an agent can spend
+pay policy create agent --max-per-tx 0.10 --daily-cap 1.00 --default
+
+# 4. Let your AI agent handle paid calls within the policy
 pay claude
 ```
 

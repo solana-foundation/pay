@@ -69,6 +69,12 @@ struct Opts {
     #[arg(long, global = true)]
     account: Option<String>,
 
+    /// Apply this named spending policy from `~/.config/pay/policies.toml`
+    /// to the current invocation. Overrides any per-account binding and the
+    /// `policies.default` setting.
+    #[arg(long, global = true, value_name = "NAME")]
+    policy: Option<String>,
+
     /// Launch the Payment Debugger proxy on port 1402. All MCP curl
     /// requests are routed through it, and the PDB UI is served at
     /// http://127.0.0.1:1402/
@@ -211,6 +217,7 @@ fn main() {
             command,
             Command::Setup(_)
                 | Command::Account { .. }
+                | Command::Policy { .. }
                 | Command::Whoami(_)
                 | Command::Skills { .. }
                 | Command::Catalog { .. }
@@ -277,6 +284,7 @@ fn main() {
         keypair_override.as_deref(),
         network_override.as_deref(),
         opts.account.as_deref(),
+        opts.policy.as_deref(),
         verbose,
         sandbox_mode,
     ) {

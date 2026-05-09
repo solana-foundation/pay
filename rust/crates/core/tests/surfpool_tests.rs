@@ -1336,12 +1336,13 @@ async fn mpp_build_credential_with_surfnet() {
                 path: None,
                 secret_key_b58: Some(bs58::encode(&payer_bytes).into_string()),
                 created_at: Some("2026-04-10T00:00:00Z".to_string()),
+                policy: None,
             },
         );
         let store = pay_core::accounts::MemoryAccountsStore::with_file(file);
 
         let result =
-            client::mpp::build_credential(&challenge_clone, &store, Some("localnet"), None, None);
+            client::mpp::build_credential(&challenge_clone, &store, Some("localnet"), None, None, None);
         unsafe { std::env::remove_var("PAY_RPC_URL") };
         result
     })

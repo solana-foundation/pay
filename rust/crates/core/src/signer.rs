@@ -648,6 +648,7 @@ mod tests {
             path: None,
             secret_key_b58: Some(bs58::encode(&full).into_string()),
             created_at: Some("2026-04-10T00:00:00Z".to_string()),
+            policy: None,
         }
     }
 
@@ -818,6 +819,7 @@ mod tests {
             account: None,
             secret_key_b58: None,
             created_at: None,
+            policy: None,
         };
 
         let err = signer_from_ephemeral(&account).unwrap_err();
