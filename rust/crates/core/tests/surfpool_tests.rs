@@ -443,8 +443,7 @@ async fn replayed_authorization_is_rejected() {
     let status = resp.status();
     let body = resp.text().await.unwrap();
     assert_eq!(
-        status,
-        402,
+        status, 402,
         "replayed credential must not be accepted (got {status}): {body}"
     );
     assert!(
