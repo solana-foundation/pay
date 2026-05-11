@@ -1,0 +1,25 @@
+{
+  "cli_version": "0.6.2-nightly.202605080644.bb4c8faf",
+  "checkpoint_id": "d5cfe09820f4",
+  "strategy": "manual-commit",
+  "branch": "fix/mpp",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "rust/crates/core/src/skills/openapi.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/d5/cfe09820f4/0/metadata.json",
+      "transcript": "/d5/cfe09820f4/0/full.jsonl",
+      "content_hash": "/d5/cfe09820f4/0/content_hash.txt",
+      "prompt": "/d5/cfe09820f4/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 137,
+    "cache_creation_tokens": 195411,
+    "cache_read_tokens": 9289733,
+    "output_tokens": 53190,
+    "api_call_count": 102
+  }
+}

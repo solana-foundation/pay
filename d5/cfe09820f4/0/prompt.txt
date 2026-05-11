@@ -1,0 +1,9 @@
+can you also add some guidelines regarding the descriptions in the OPENAPI.json? some clear examples with do's and don't. specially for the field used for populating the reason: [Image #1]
+
+---
+
+ok, do it. more than 32 chars, less than 64 chars
+
+---
+
+so?

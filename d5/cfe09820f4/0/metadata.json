@@ -1,0 +1,123 @@
+{
+  "cli_version": "0.6.2-nightly.202605080644.bb4c8faf",
+  "checkpoint_id": "d5cfe09820f4",
+  "session_id": "47b25239-0273-4b50-b8bd-33f20eba9227",
+  "strategy": "manual-commit",
+  "created_at": "2026-05-11T19:22:27.22932Z",
+  "branch": "fix/mpp",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "rust/crates/core/src/skills/openapi.rs"
+  ],
+  "agent": "Claude Code",
+  "model": "",
+  "turn_id": "3827b93f22fe",
+  "token_usage": {
+    "input_tokens": 137,
+    "cache_creation_tokens": 195411,
+    "cache_read_tokens": 9289733,
+    "output_tokens": 53190,
+    "api_call_count": 102
+  },
+  "session_metrics": {
+    "turn_count": 2
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-05-11T19:22:27.214772Z",
+    "agent_lines": 0,
+    "agent_removed": 0,
+    "human_added": 1225,
+    "human_modified": 63,
+    "human_removed": 0,
+    "total_committed": 1225,
+    "total_lines_changed": 1387,
+    "agent_percentage": 0,
+    "metric_version": 2
+  },
+  "prompt_attributions": [
+    {
+      "checkpoint_number": 1,
+      "user_lines_added": 5803,
+      "user_lines_removed": 0,
+      "agent_lines_added": 0,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        ".agents/skills/pay/SKILL.md": 98,
+        ".agents/skills/pay/references/monetize-api.md": 498,
+        ".agents/skills/pay/references/provider-selection.md": 87,
+        ".agents/skills/pay/references/security.md": 63,
+        ".agents/skills/pay/references/setup-cli.md": 52,
+        ".axel/events.jsonl": 919,
+        ".claude/agents/entire-search.md": 25,
+        ".claude/scheduled_tasks.lock": 1,
+        ".claude/settings.json": 153,
+        ".claude/settings.local.json": 16,
+        ".claude/skills/pay/SKILL.md": 98,
+        "gateway/kong/Dockerfile": 12,
+        "gateway/kong/Dockerfile.konnect": 9,
+        "gateway/kong/Dockerfile.package": 14,
+        "gateway/kong/Justfile": 34,
+        "gateway/kong/README.md": 105,
+        "gateway/kong/RELEASE.md": 89,
+        "gateway/kong/dev/docker-compose.yml": 21,
+        "gateway/kong/dev/kong.conf": 7,
+        "gateway/kong/dev/kong.yml": 34,
+        "gateway/kong/examples/deck/kong.yaml": 34,
+        "gateway/kong/examples/k8s/httproute.yaml": 19,
+        "gateway/kong/examples/k8s/kongplugin.yaml": 32,
+        "gateway/kong/examples/k8s/schema-configmap.yaml": 89,
+        "gateway/kong/examples/k8s/secret.yaml": 7,
+        "gateway/kong/examples/k8s/values.yaml": 6,
+        "gateway/kong/examples/konnect/README.md": 20,
+        "gateway/kong/kong/plugins/solana-kong-402/handler.lua": 586,
+        "gateway/kong/kong/plugins/solana-kong-402/handler_test.lua": 234,
+        "gateway/kong/kong/plugins/solana-kong-402/schema.lua": 91,
+        "gateway/kong/mpp/error.lua": 15,
+        "gateway/kong/mpp/expires.lua": 44,
+        "gateway/kong/mpp/init.lua": 45,
+        "gateway/kong/mpp/protocol/core/challenge.lua": 154,
+        "gateway/kong/mpp/protocol/core/headers.lua": 198,
+        "gateway/kong/mpp/protocol/core/types.lua": 68,
+        "gateway/kong/mpp/protocol/intents/charge.lua": 49,
+        "gateway/kong/mpp/protocol/solana.lua": 45,
+        "gateway/kong/mpp/server/init.lua": 176,
+        "gateway/kong/mpp/server/solana_verify.lua": 190,
+        "gateway/kong/mpp/store.lua": 42,
+        "gateway/kong/mpp/util/base64url.lua": 63,
+        "gateway/kong/mpp/util/bit.lua": 87,
+        "gateway/kong/mpp/util/crypto.lua": 169,
+        "gateway/kong/mpp/util/json.lua": 263,
+        "gateway/kong/mpp/util/uint.lua": 96,
+        "gateway/kong/scripts/check_coverage.sh": 26,
+        "pay-account-default-96WoyH3J.json": 1,
+        "pay-account-default-C4E3ZZ4y.json": 1,
+        "pay-demo.yaml": 205,
+        "rust/.claude/settings.local.json": 10,
+        "rust/crates/core/src/skills/openapi.rs": 166,
+        "rust/pay-demo.yaml": 205,
+        "rust/syra/PAY.md": 21,
+        "skills-lock.json": 11
+      }
+    },
+    {
+      "checkpoint_number": 2,
+      "user_lines_added": 120,
+      "user_lines_removed": 20,
+      "agent_lines_added": 5778,
+      "agent_lines_removed": 0,
+      "user_added_per_file": {
+        ".axel/events.jsonl": 42,
+        ".claude/settings.local.json": 16,
+        "rust/.claude/settings.local.json": 10,
+        "rust/Cargo.lock": 7,
+        "rust/Cargo.toml": 1,
+        "rust/crates/core/src/skills/openapi.rs": 44
+      },
+      "user_removed_per_file": {
+        "rust/Cargo.lock": 7,
+        "rust/Cargo.toml": 1,
+        "rust/crates/core/src/skills/openapi.rs": 12
+      }
+    }
+  ]
+}
