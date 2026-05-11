@@ -149,6 +149,7 @@ pub struct BuildResult {
     /// Map of `"providers/<org>/<name>.json"` → serialized JSON.
     pub detail_files: HashMap<String, String>,
     pub errors: Vec<String>,
+    pub warnings: Vec<String>,
 }
 
 /// Options controlling a build run.
@@ -295,6 +296,7 @@ fn collect_providers(
     root: &Path,
     options: &BuildOptions,
     errors: &mut Vec<String>,
+    warnings: &mut Vec<String>,
 ) -> Vec<(ProviderIndexEntry, String)> {
     let mut results = Vec::new();
     let dir = root.join("providers");
@@ -335,6 +337,7 @@ fn collect_providers(
         options,
         previous.as_ref(),
         errors,
+        warnings,
         &mut results,
     );
 
@@ -352,6 +355,7 @@ fn walk_for_pay_md(
     options: &BuildOptions,
     previous: Option<&PreviousDist>,
     errors: &mut Vec<String>,
+    warnings: &mut Vec<String>,
     results: &mut Vec<(ProviderIndexEntry, String)>,
 ) {
     let pay_md = dir.join("PAY.md");
@@ -375,7 +379,8 @@ fn walk_for_pay_md(
             operator.clone()
         };
         dispatch_provider(
-            &pay_md, &fqn, &name, &operator, &origin, root, options, previous, errors, results,
+            &pay_md, &fqn, &name, &operator, &origin, root, options, previous, errors, warnings,
+            results,
         );
         return;
     }
@@ -388,6 +393,7 @@ fn walk_for_pay_md(
             options,
             previous,
             errors,
+            warnings,
             results,
         );
     }
@@ -408,6 +414,7 @@ fn dispatch_provider(
     options: &BuildOptions,
     previous: Option<&PreviousDist>,
     errors: &mut Vec<String>,
+    warnings: &mut Vec<String>,
     results: &mut Vec<(ProviderIndexEntry, String)>,
 ) {
     if let Some(only) = &options.only
@@ -436,7 +443,7 @@ fn dispatch_provider(
 
     eprintln!("  provider: {fqn}");
     process_provider_md(
-        path, fqn, name, operator, origin, root, options, errors, results,
+        path, fqn, name, operator, origin, root, options, errors, warnings, results,
     );
 }
 
@@ -463,6 +470,7 @@ fn process_provider_md(
     root: &Path,
     options: &BuildOptions,
     errors: &mut Vec<String>,
+    warnings: &mut Vec<String>,
     results: &mut Vec<(ProviderIndexEntry, String)>,
 ) {
     let text = match fs::read_to_string(path) {
@@ -517,6 +525,41 @@ fn process_provider_md(
         }
     };
     let openapi_doc = resolved.document;
+
+    if let (Some(source), Some(doc)) = (&spec.openapi, &openapi_doc) {
+        for finding in crate::skills::openapi::validate_committed_openapi_document(
+            source,
+            doc,
+            path.parent(),
+            &spec.meta.service_url,
+            spec.meta.sandbox_service_url.as_deref(),
+        ) {
+            match finding.severity {
+                crate::skills::openapi::CatalogFindingSeverity::Error => {
+                    errors.push(format!("{fqn}: {}", finding.message));
+                }
+                crate::skills::openapi::CatalogFindingSeverity::Warning => {
+                    warnings.push(format!("{fqn}: {}", finding.message));
+                }
+            }
+        }
+    }
+
+    // Validate operation summaries (the text shown on the OS biometric prompt
+    // at payment time). Runs only on openapi-driven providers — inline
+    // `endpoints:` descriptions are already validated by `validate_provider`.
+    if let Some(doc) = &openapi_doc {
+        for finding in crate::skills::openapi::validate_operation_summary_findings(doc) {
+            match finding.severity {
+                crate::skills::openapi::CatalogFindingSeverity::Error => {
+                    errors.push(format!("{fqn}: {}", finding.message));
+                }
+                crate::skills::openapi::CatalogFindingSeverity::Warning => {
+                    warnings.push(format!("{fqn}: {}", finding.message));
+                }
+            }
+        }
+    }
 
     // Probe each endpoint (when probing is on) and synthesize the rich
     // `DetailEndpoint` shape: probe-derived pricing wins over any inline
@@ -597,6 +640,7 @@ pub fn build_single_provider(
     options: &BuildOptions,
 ) -> BuildResult {
     let mut errors = Vec::new();
+    let mut warnings = Vec::new();
     let mut results = Vec::new();
     let root = path.parent().unwrap_or(Path::new("."));
 
@@ -609,6 +653,7 @@ pub fn build_single_provider(
         root,
         options,
         &mut errors,
+        &mut warnings,
         &mut results,
     );
 
@@ -636,6 +681,7 @@ pub fn build_single_provider(
         index,
         detail_files,
         errors,
+        warnings,
     }
 }
 
@@ -793,9 +839,13 @@ fn collect_aggregators(root: &Path, errors: &mut Vec<String>) -> Vec<AggregatorE
 /// Build the per-endpoint `DetailEndpoint` list for one provider.
 ///
 /// When `options.probe` is true, every endpoint is hit (using each
-/// `ResolvedEndpoint.body_example` as the request body) and the probe results
-/// override the spec's inline pricing. When false, endpoints pass through
-/// unchanged with empty `protocol` / `supported_usd` / `probe_status` fields.
+/// `ResolvedEndpoint.body_example` as the request body). The published detail
+/// keeps endpoints that are either Solana-payable (`ok`) or genuinely free
+/// (`HTTP 2xx`, reported as `free`), because free discovery/metadata endpoints
+/// can be needed to construct a later paid call. Other probe outcomes are
+/// omitted from the published catalog because agents cannot call them through
+/// Pay. When probing is disabled, endpoints pass through unchanged with empty
+/// `protocol` / `supported_usd` / `probe_status` fields.
 fn build_detail_endpoints(
     fqn: &str,
     service_url: &str,
@@ -833,22 +883,33 @@ fn build_detail_endpoints(
     resolved
         .into_iter()
         .zip(probe_result.endpoints)
-        .map(|(r, probe)| {
-            let mut spec = r.spec;
-            // Probe-derived pricing wins. Fall back to the spec's inline
-            // pricing when the probe could not classify the endpoint.
-            if let Some(pricing) = crate::skills::probe::pricing_from_probe(&probe.paid) {
-                spec.pricing = Some(pricing);
+        .filter_map(|(r, probe)| {
+            if !should_publish_probed_endpoint(&probe) {
+                return None;
             }
-            DetailEndpoint {
+            let mut spec = r.spec;
+            // Probe-derived pricing wins. A 2xx probe is classified as free,
+            // so clear any stale inline pricing. For indeterminate endpoints
+            // (only possible when this filter is relaxed), fall back to the
+            // spec's inline pricing.
+            match crate::skills::probe::pricing_from_probe(&probe.paid) {
+                Some(pricing) => spec.pricing = Some(pricing),
+                None if probe.probe_status == "free" => spec.pricing = None,
+                None => {}
+            }
+            Some(DetailEndpoint {
                 spec,
                 protocol: probe.paid.protocols,
                 supported_usd: probe.paid.supported_usd,
                 probe_status: Some(probe.probe_status),
                 probe_description: probe.paid.description,
-            }
+            })
         })
         .collect()
+}
+
+fn should_publish_probed_endpoint(probe: &crate::skills::probe::EndpointProbeResult) -> bool {
+    matches!(probe.probe_status.as_str(), "ok" | "free")
 }
 
 // ── Public API ─────────────────────────────────────────────────────────────
@@ -872,9 +933,10 @@ pub fn build_with_options(
     options: &BuildOptions,
 ) -> BuildResult {
     let mut errors = Vec::new();
+    let mut warnings = Vec::new();
 
     eprintln!("Collecting providers...");
-    let providers = collect_providers(root, options, &mut errors);
+    let providers = collect_providers(root, options, &mut errors, &mut warnings);
 
     eprintln!("Collecting affiliates...");
     let affiliates = collect_affiliates(root, &mut errors);
@@ -925,5 +987,161 @@ pub fn build_with_options(
         index,
         detail_files,
         errors,
+        warnings,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::thread;
+
+    use serde_json::json;
+
+    use super::*;
+
+    fn endpoint(
+        method: &str,
+        path: &str,
+        pricing: Option<serde_json::Value>,
+    ) -> crate::skills::openapi::ResolvedEndpoint {
+        crate::skills::openapi::ResolvedEndpoint {
+            spec: EndpointSpec {
+                method: method.to_string(),
+                path: path.to_string(),
+                description: format!("Fetch test endpoint for {path}"),
+                resource: None,
+                pricing,
+            },
+            body_example: None,
+        }
+    }
+
+    fn start_probe_server(expected_requests: usize) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = thread::spawn(move || {
+            for stream in listener.incoming().take(expected_requests).flatten() {
+                handle_probe_request(stream);
+            }
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    fn handle_probe_request(mut stream: TcpStream) {
+        let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+        let mut request_line = String::new();
+        reader
+            .read_line(&mut request_line)
+            .expect("read request line");
+
+        let mut content_length = 0usize;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read header");
+            let trimmed = line.trim_end();
+            if trimmed.is_empty() {
+                break;
+            }
+            if let Some(value) = trimmed
+                .strip_prefix("Content-Length:")
+                .or_else(|| trimmed.strip_prefix("content-length:"))
+            {
+                content_length = value.trim().parse().unwrap_or(0);
+            }
+        }
+        if content_length > 0 {
+            let mut body = vec![0u8; content_length];
+            reader.read_exact(&mut body).expect("read request body");
+        }
+
+        let path = request_line.split_whitespace().nth(1).unwrap_or("/");
+        let (status, body) = match path {
+            "/paid" => (
+                "402 Payment Required",
+                x402_body("solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"),
+            ),
+            "/free" => ("200 OK", r#"{"items":[]}"#.to_string()),
+            "/wrong-chain" => ("402 Payment Required", x402_body("eip155:8453")),
+            "/auth" => (
+                "401 Unauthorized",
+                r#"{"error":"api key required"}"#.to_string(),
+            ),
+            _ => ("404 Not Found", r#"{"error":"not found"}"#.to_string()),
+        };
+        let response = format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write response");
+    }
+
+    fn x402_body(network: &str) -> String {
+        json!({
+            "x402Version": 2,
+            "error": "Payment Required",
+            "accepts": [{
+                "scheme": "exact",
+                "network": network,
+                "asset": pay_types::stablecoin_mints::USDC_MAINNET,
+                "amount": "10000",
+                "payTo": "J7ZvJEspvwP1oRxQZ7mYmNmT22NTm3GWq3t7HEbvPZYx",
+                "maxTimeoutSeconds": 300
+            }]
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn build_keeps_solana_paid_and_free_200_endpoints() {
+        let (service_url, handle) = start_probe_server(4);
+        let endpoints = vec![
+            endpoint("GET", "/paid", None),
+            endpoint(
+                "GET",
+                "/free",
+                Some(json!({
+                    "dimensions": [{
+                        "direction": "usage",
+                        "unit": "requests",
+                        "scale": 1,
+                        "tiers": [{ "price_usd": 9.99 }]
+                    }]
+                })),
+            ),
+            endpoint("GET", "/wrong-chain", None),
+            endpoint("GET", "/auth", None),
+        ];
+        let options = BuildOptions {
+            probe: true,
+            probe_config: crate::skills::probe::ProbeConfig {
+                timeout_secs: 2,
+                concurrency: 1,
+                ..Default::default()
+            },
+            only: None,
+            previous_dist: None,
+        };
+
+        let detail = build_detail_endpoints("test/provider", &service_url, endpoints, &options);
+        handle.join().expect("server thread");
+
+        let paths: Vec<&str> = detail.iter().map(|ep| ep.spec.path.as_str()).collect();
+        assert_eq!(paths, vec!["/paid", "/free"]);
+
+        let paid = &detail[0];
+        assert_eq!(paid.probe_status.as_deref(), Some("ok"));
+        assert_eq!(paid.protocol, vec!["x402".to_string()]);
+        assert_eq!(paid.supported_usd, vec!["USDC".to_string()]);
+        assert!(paid.spec.pricing.is_some());
+
+        let free = &detail[1];
+        assert_eq!(free.probe_status.as_deref(), Some("free"));
+        assert!(free.protocol.is_empty());
+        assert!(free.supported_usd.is_empty());
+        assert!(free.spec.pricing.is_none());
     }
 }

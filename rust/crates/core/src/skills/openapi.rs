@@ -28,6 +28,7 @@ use crate::{Error, Result};
 const HTTP_METHODS: &[&str] = &["get", "post", "put", "patch", "delete"];
 const FETCH_TIMEOUT_SECS: u64 = 15;
 const MAX_SCHEMA_DEPTH: u32 = 6;
+const MAX_COMMITTED_OPENAPI_BYTES: u64 = 1_048_576;
 
 /// One endpoint resolved from an OpenAPI document — both the spec entry that
 /// gets published to the index and the optional probe body extracted from
@@ -144,6 +145,518 @@ fn parse_openapi3_endpoints(doc: &Value) -> Result<Vec<ResolvedEndpoint>> {
         }
     }
     Ok(endpoints)
+}
+
+/// Length window for the reason text shown on the OS biometric prompt.
+///
+/// The prompt truncates at 64 chars (`AuthIntent::authorize_payment_details`
+/// in pay-keystore). Below 24 chars the line is too generic to authorize a
+/// debit on — it's all an attacker needs to slip past a hurried user.
+pub const SUMMARY_MIN_LEN: usize = 24;
+pub const SUMMARY_MAX_LEN: usize = 63;
+
+/// Generic placeholders that must not appear as an operation's effective
+/// reason text. Compared case-insensitively. `"<METHOD> <path>"` is checked
+/// separately because it depends on the operation.
+const GENERIC_PLACEHOLDERS: &[&str] = &[
+    "api access",
+    "endpoint",
+    "request",
+    "call",
+    "todo",
+    "fixme",
+    "tbd",
+];
+
+const TEMPLATE_TOKENS: &[&str] = &["{{", "<todo>", "fixme", "tbd", "xxx"];
+const ACTION_VERBS: &[&str] = &[
+    "run",
+    "search",
+    "get",
+    "fetch",
+    "list",
+    "create",
+    "submit",
+    "send",
+    "generate",
+    "solve",
+    "translate",
+    "validate",
+    "verify",
+    "lookup",
+    "look",
+    "resolve",
+    "score",
+    "detect",
+    "classify",
+    "extract",
+    "parse",
+    "analyze",
+    "check",
+    "find",
+    "read",
+    "poll",
+    "start",
+    "cancel",
+    "upload",
+    "download",
+    "convert",
+    "render",
+    "capture",
+    "transcribe",
+    "synthesize",
+    "moderate",
+    "enrich",
+    "compare",
+    "calculate",
+    "estimate",
+    "simulate",
+    "buy",
+    "renew",
+    "deploy",
+    "host",
+    "report",
+];
+const MARKETING_WORDS: &[&str] = &["best", "fastest", "cheapest", "unlimited", "free"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogFindingSeverity {
+    Error,
+    Warning,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogFinding {
+    pub severity: CatalogFindingSeverity,
+    pub message: String,
+}
+
+impl CatalogFinding {
+    fn error(message: String) -> Self {
+        Self {
+            severity: CatalogFindingSeverity::Error,
+            message,
+        }
+    }
+
+    fn warning(message: String) -> Self {
+        Self {
+            severity: CatalogFindingSeverity::Warning,
+            message,
+        }
+    }
+}
+
+/// Walk every operation in `doc` and validate the `summary` / `description`
+/// text that becomes the OS payment prompt reason.
+///
+/// Blocking errors enforce S1-S7 from the pay-skills contributing guide.
+/// Warnings enforce S8-S10: distinct summaries, action-verb starts, and no
+/// marketing superlatives.
+pub fn validate_operation_summaries(doc: &Value) -> Vec<String> {
+    validate_operation_summary_findings(doc)
+        .into_iter()
+        .filter(|finding| finding.severity == CatalogFindingSeverity::Error)
+        .map(|finding| finding.message)
+        .collect()
+}
+
+pub fn validate_operation_summary_findings(doc: &Value) -> Vec<CatalogFinding> {
+    let mut findings = Vec::new();
+    let mut valid_summaries = Vec::new();
+    collect_operation_summary_findings(doc, &mut findings, &mut valid_summaries);
+    add_duplicate_summary_warnings(&mut findings, &valid_summaries);
+    findings
+}
+
+pub fn validate_committed_openapi_document(
+    source: &OpenapiSource,
+    doc: &Value,
+    spec_dir: Option<&std::path::Path>,
+    service_url: &str,
+    sandbox_service_url: Option<&str>,
+) -> Vec<CatalogFinding> {
+    let mut findings = Vec::new();
+    match source {
+        OpenapiSource::Url { url } => findings.push(CatalogFinding::error(format!(
+            "openapi.url is not allowed in the public registry\n  \
+             got: `{url}`\n  \
+             commit the spec next to PAY.md and use `openapi: {{ path: openapi.json }}`"
+        ))),
+        OpenapiSource::Path { path } => {
+            let Some(dir) = spec_dir else {
+                findings.push(CatalogFinding::error(format!(
+                    "openapi.path ({path}) requires a PAY.md directory anchor"
+                )));
+                return findings;
+            };
+            let resolved = dir.join(path);
+            match std::fs::metadata(&resolved) {
+                Ok(meta) if meta.len() > MAX_COMMITTED_OPENAPI_BYTES => {
+                    findings.push(CatalogFinding::error(format!(
+                        "openapi.path `{path}` is too large ({} bytes, max {MAX_COMMITTED_OPENAPI_BYTES})\n  \
+                         trim the committed spec to the operations exposed through this gateway",
+                        meta.len()
+                    )));
+                }
+                Ok(_) => {}
+                Err(e) => findings.push(CatalogFinding::error(format!(
+                    "openapi.path metadata failed for {}: {e}",
+                    resolved.display()
+                ))),
+            }
+        }
+        OpenapiSource::Content { content } => {
+            let len = content.len() as u64;
+            if len > MAX_COMMITTED_OPENAPI_BYTES {
+                findings.push(CatalogFinding::error(format!(
+                    "openapi.content is too large ({len} bytes, max {MAX_COMMITTED_OPENAPI_BYTES})\n  \
+                     use a committed `openapi.path` sidecar and trim it to the offered operations"
+                )));
+            }
+        }
+    }
+
+    if !is_openapi3_document(doc) {
+        findings.push(CatalogFinding::error(
+            "OpenAPI document must be valid OpenAPI 3.0 or 3.1\n  \
+             expected an `openapi` field starting with `3.0.` or `3.1.`"
+                .into(),
+        ));
+    }
+
+    for reference in remote_refs(doc) {
+        findings.push(CatalogFinding::error(format!(
+            "OpenAPI document contains remote `$ref` `{reference}`\n  \
+             use same-document refs or committed relative sidecars only"
+        )));
+    }
+
+    findings.extend(validate_server_urls(doc, service_url, sandbox_service_url));
+    findings
+}
+
+#[derive(Debug, Clone)]
+struct OperationSummary {
+    label: String,
+    effective: String,
+}
+
+fn collect_operation_summary_findings(
+    doc: &Value,
+    findings: &mut Vec<CatalogFinding>,
+    valid_summaries: &mut Vec<OperationSummary>,
+) {
+    if let Some(paths) = doc.get("paths").and_then(|v| v.as_object()) {
+        for (path, item) in paths {
+            let Some(item_obj) = item.as_object() else {
+                continue;
+            };
+            for &method in HTTP_METHODS {
+                let Some(op) = item_obj.get(method) else {
+                    continue;
+                };
+                validate_one_operation(op, method, path, findings, valid_summaries);
+            }
+        }
+    }
+    // Discovery docs (Google APIs): walk resources.*.methods.* recursively
+    // and any top-level `methods`. The effective field is `description` —
+    // Discovery has no `summary`.
+    if let Some(resources) = doc.get("resources").and_then(|v| v.as_object()) {
+        validate_discovery_resources(resources, findings, valid_summaries);
+    }
+    if let Some(methods) = doc.get("methods").and_then(|v| v.as_object()) {
+        validate_discovery_methods(methods, findings, valid_summaries);
+    }
+}
+
+fn validate_discovery_resources(
+    resources: &Map<String, Value>,
+    findings: &mut Vec<CatalogFinding>,
+    valid_summaries: &mut Vec<OperationSummary>,
+) {
+    for resource in resources.values() {
+        if let Some(methods) = resource.get("methods").and_then(|v| v.as_object()) {
+            validate_discovery_methods(methods, findings, valid_summaries);
+        }
+        if let Some(nested) = resource.get("resources").and_then(|v| v.as_object()) {
+            validate_discovery_resources(nested, findings, valid_summaries);
+        }
+    }
+}
+
+fn validate_discovery_methods(
+    methods: &Map<String, Value>,
+    findings: &mut Vec<CatalogFinding>,
+    valid_summaries: &mut Vec<OperationSummary>,
+) {
+    for (name, method) in methods {
+        let http_method = method
+            .get("httpMethod")
+            .and_then(|v| v.as_str())
+            .unwrap_or("GET");
+        let path = method
+            .get("path")
+            .or_else(|| method.get("id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(name);
+        validate_one_operation(method, http_method, path, findings, valid_summaries);
+    }
+}
+
+fn validate_one_operation(
+    op: &Value,
+    method: &str,
+    path: &str,
+    findings: &mut Vec<CatalogFinding>,
+    valid_summaries: &mut Vec<OperationSummary>,
+) {
+    let summary = op
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let description = op
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let label = format!("{} {}", method.to_uppercase(), path);
+
+    // S1: at least one non-empty field.
+    let raw = match summary.or(description) {
+        Some(s) => s,
+        None => {
+            findings.push(CatalogFinding::error(format!(
+                "{label}: operation has no `summary` or `description`\n  \
+                 add a concrete `summary` (24–63 chars) — this becomes the `reason:` line \
+                 on the user's biometric payment prompt\n"
+            )));
+            return;
+        }
+    };
+
+    // Collapse internal whitespace to count what the user will actually see.
+    let effective: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let len = effective.chars().count();
+
+    // S2 / S3: length window.
+    if len < SUMMARY_MIN_LEN {
+        findings.push(CatalogFinding::error(format!(
+            "{label}: operation summary too short ({len} chars, min {SUMMARY_MIN_LEN})\n  \
+             got: \"{effective}\"\n  \
+             write a concrete sentence, verb-first, naming the domain object — \
+             this becomes the `reason:` line on the user's biometric payment prompt\n"
+        )));
+        return;
+    }
+    if len > SUMMARY_MAX_LEN {
+        findings.push(CatalogFinding::error(format!(
+            "{label}: operation summary too long ({len} chars, max {SUMMARY_MAX_LEN})\n  \
+             got: \"{effective}\"\n  \
+             trim it — the OS biometric prompt truncates at 64 chars and shows `…`\n"
+        )));
+        return;
+    }
+
+    // S4: generic placeholders and METHOD-path echo.
+    let lowered = effective.to_ascii_lowercase();
+    if GENERIC_PLACEHOLDERS
+        .iter()
+        .any(|p| lowered == *p || lowered == format!("the {p}"))
+    {
+        findings.push(CatalogFinding::error(format!(
+            "{label}: operation summary is a generic placeholder \"{effective}\"\n  \
+             write a specific verb-first sentence (e.g. `Run a BigQuery SQL query`)\n"
+        )));
+        return;
+    }
+    let method_path_echo = format!("{} {}", method.to_uppercase(), path).to_ascii_lowercase();
+    if lowered == method_path_echo {
+        findings.push(CatalogFinding::error(format!(
+            "{label}: operation summary echoes the method/path \"{effective}\"\n  \
+             write a sentence about what the call does, not its URL shape\n"
+        )));
+        return;
+    }
+
+    // S5: template tokens.
+    if let Some(token) = TEMPLATE_TOKENS.iter().find(|t| lowered.contains(*t)) {
+        findings.push(CatalogFinding::error(format!(
+            "{label}: operation summary contains unresolved template token `{token}`\n  \
+             got: \"{effective}\"\n  \
+             replace the placeholder with the real text\n"
+        )));
+        return;
+    }
+
+    // S6: markdown link syntax.
+    if effective.contains("](") {
+        findings.push(CatalogFinding::error(format!(
+            "{label}: operation summary contains markdown link syntax `](`\n  \
+             got: \"{effective}\"\n  \
+             the OS payment prompt renders plain text — drop the link\n"
+        )));
+        return;
+    }
+
+    // S7: ASCII-printable only.
+    if let Some(c) = effective.chars().find(|c| !matches!(c, '\x20'..='\x7E')) {
+        findings.push(CatalogFinding::error(format!(
+            "{label}: operation summary contains non-ASCII character `{c}` (U+{:04X})\n  \
+             got: \"{effective}\"\n  \
+             use plain ASCII — smart quotes, emoji, and zero-width chars render unpredictably\n",
+            c as u32
+        )));
+        return;
+    }
+
+    if let Some(first) = first_token(&effective)
+        && !ACTION_VERBS.contains(&first.to_ascii_lowercase().as_str())
+    {
+        findings.push(CatalogFinding::warning(format!(
+            "{label}: operation summary should start with an action verb\n  \
+             got: \"{effective}\"\n  \
+             start with a concrete verb such as `Search`, `Create`, `Fetch`, or `Generate`\n"
+        )));
+    }
+
+    if let Some(word) = marketing_word(&effective) {
+        findings.push(CatalogFinding::warning(format!(
+            "{label}: operation summary contains marketing language `{word}`\n  \
+             got: \"{effective}\"\n  \
+             describe the paid action plainly without superlatives or cost claims\n"
+        )));
+    }
+
+    valid_summaries.push(OperationSummary { label, effective });
+}
+
+fn add_duplicate_summary_warnings(
+    findings: &mut Vec<CatalogFinding>,
+    summaries: &[OperationSummary],
+) {
+    for (idx, summary) in summaries.iter().enumerate() {
+        if summaries[..idx]
+            .iter()
+            .any(|other| other.effective.eq_ignore_ascii_case(&summary.effective))
+        {
+            continue;
+        }
+        let duplicates: Vec<&OperationSummary> = summaries
+            .iter()
+            .filter(|other| other.effective.eq_ignore_ascii_case(&summary.effective))
+            .collect();
+        if duplicates.len() < 2 {
+            continue;
+        }
+        let labels = duplicates
+            .iter()
+            .map(|op| op.label.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        findings.push(CatalogFinding::warning(format!(
+            "{}: operation summary is reused across multiple operations\n  \
+             got: \"{}\"\n  \
+             duplicate operations: {labels}\n",
+            summary.label, summary.effective
+        )));
+    }
+}
+
+fn first_token(value: &str) -> Option<&str> {
+    value
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .find(|part| !part.is_empty())
+}
+
+fn marketing_word(value: &str) -> Option<&'static str> {
+    for token in value.split(|c: char| !c.is_ascii_alphanumeric()) {
+        for word in MARKETING_WORDS {
+            if token.eq_ignore_ascii_case(word) {
+                return Some(word);
+            }
+        }
+    }
+    None
+}
+
+fn is_openapi3_document(doc: &Value) -> bool {
+    doc.get("openapi")
+        .and_then(Value::as_str)
+        .is_some_and(|version| version.starts_with("3.0.") || version.starts_with("3.1."))
+}
+
+fn remote_refs(doc: &Value) -> Vec<String> {
+    let mut refs = Vec::new();
+    collect_remote_refs(doc, &mut refs);
+    refs.sort();
+    refs.dedup();
+    refs
+}
+
+fn collect_remote_refs(value: &Value, refs: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            for (key, value) in map {
+                if key == "$ref"
+                    && let Some(reference) = value.as_str()
+                    && (reference.starts_with("http://")
+                        || reference.starts_with("https://")
+                        || reference.starts_with("//"))
+                {
+                    refs.push(reference.to_string());
+                }
+                collect_remote_refs(value, refs);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_remote_refs(value, refs);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn validate_server_urls(
+    doc: &Value,
+    service_url: &str,
+    sandbox_service_url: Option<&str>,
+) -> Vec<CatalogFinding> {
+    let Some(servers) = doc.get("servers").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let allowed = [Some(service_url), sandbox_service_url];
+    let mut findings = Vec::new();
+    for server in servers {
+        let Some(url) = server.get("url").and_then(Value::as_str) else {
+            continue;
+        };
+        if url.starts_with('/') || url.contains('{') {
+            continue;
+        }
+        if !allowed
+            .iter()
+            .flatten()
+            .any(|allowed| same_origin_or_base(url, allowed))
+        {
+            findings.push(CatalogFinding::warning(format!(
+                "OpenAPI servers[] entry does not match service_url or sandbox_service_url\n  \
+                 got: `{url}`\n  \
+                 expected base URL under `{service_url}`"
+            )));
+        }
+    }
+    findings
+}
+
+fn same_origin_or_base(server_url: &str, expected_base: &str) -> bool {
+    let server = server_url.trim_end_matches('/');
+    let expected = expected_base.trim_end_matches('/');
+    server == expected || server.starts_with(&format!("{expected}/"))
 }
 
 fn parse_discovery_endpoints(doc: &Value) -> Result<Vec<ResolvedEndpoint>> {
@@ -1848,6 +2361,114 @@ mod tests {
         };
         let body = load_document(&src, "https://api.example.com", None).unwrap();
         assert_eq!(body, content);
+    }
+
+    #[test]
+    fn operation_summary_findings_include_warnings() {
+        let doc = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/v1/a": {
+                    "post": { "summary": "Best customer enrichment report" }
+                },
+                "/v1/b": {
+                    "post": { "summary": "Best customer enrichment report" }
+                }
+            }
+        });
+
+        let findings = validate_operation_summary_findings(&doc);
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.severity == CatalogFindingSeverity::Warning),
+            "expected only warnings, got: {findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("should start with an action verb")),
+            "expected action-verb warning, got: {findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("marketing language `best`")),
+            "expected marketing warning, got: {findings:?}"
+        );
+        assert!(
+            findings.iter().any(|finding| finding
+                .message
+                .contains("reused across multiple operations")),
+            "expected duplicate warning, got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn committed_openapi_validation_rejects_remote_refs_and_non_openapi3() {
+        let doc = json!({
+            "swagger": "2.0",
+            "paths": {},
+            "components": {
+                "schemas": {
+                    "External": { "$ref": "https://example.com/schema.json" }
+                }
+            }
+        });
+        let source = OpenapiSource::Content {
+            content: doc.to_string(),
+        };
+
+        let findings = validate_committed_openapi_document(
+            &source,
+            &doc,
+            None,
+            "https://api.example.com",
+            None,
+        );
+
+        assert!(
+            findings.iter().any(|finding| {
+                finding.severity == CatalogFindingSeverity::Error
+                    && finding.message.contains("OpenAPI 3.0 or 3.1")
+            }),
+            "expected OpenAPI version error, got: {findings:?}"
+        );
+        assert!(
+            findings.iter().any(|finding| {
+                finding.severity == CatalogFindingSeverity::Error
+                    && finding.message.contains("remote `$ref`")
+            }),
+            "expected remote ref error, got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn committed_openapi_validation_warns_on_server_mismatch() {
+        let doc = json!({
+            "openapi": "3.1.0",
+            "servers": [{ "url": "https://upstream.example.com" }],
+            "paths": {}
+        });
+        let source = OpenapiSource::Content {
+            content: doc.to_string(),
+        };
+
+        let findings = validate_committed_openapi_document(
+            &source,
+            &doc,
+            None,
+            "https://api.example.com",
+            None,
+        );
+
+        assert!(
+            findings.iter().any(|finding| {
+                finding.severity == CatalogFindingSeverity::Warning
+                    && finding.message.contains("servers[] entry does not match")
+            }),
+            "expected servers[] mismatch warning, got: {findings:?}"
+        );
     }
 
     // ── Body example tests ──

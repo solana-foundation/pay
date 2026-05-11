@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use clap::ValueEnum;
 use owo_colors::OwoColorize;
 
+use pay_core::skills::build::{BuildOptions, BuildResult};
 use pay_core::skills::probe::{ProbeConfig, ProbeReport};
 
 use super::derive_fqn_from_path;
@@ -150,28 +151,40 @@ impl CheckCommand {
         // Frontmatter + endpoint validation via the build core. Aborts before
         // probing if the YAML/category/length checks fail — no point probing
         // a file that's syntactically broken.
-        let options = pay_core::skills::build::BuildOptions {
-            probe: false,
-            probe_config: ProbeConfig::default(),
-            only: None,
-            previous_dist: None,
-        };
         let validation_only = pay_core::skills::build::build_single_provider(
-            path, &fqn, &name, &operator, &origin, &options,
+            path,
+            &fqn,
+            &name,
+            &operator,
+            &origin,
+            &static_build_options(),
         );
-        if !validation_only.errors.is_empty() {
-            print_validation_errors(&validation_only.errors);
-            std::process::exit(1);
-        }
+        let static_validation = self.handle_static_validation(validation_only);
 
         let provider = parse_single_provider(path)?;
-        let endpoint_count = provider.endpoints.len();
+        let endpoint_count = static_validation
+            .endpoint_count
+            .max(provider.endpoints.len());
 
         if self.no_probe {
+            self.render_static_warnings(&static_validation.warnings);
+            let level = if static_validation.warnings.is_empty() {
+                NoticeLevel::Success
+            } else {
+                NoticeLevel::Warning
+            };
+            let title = if static_validation.warnings.is_empty() {
+                "PAY.md check successful"
+            } else {
+                "PAY.md check passed with warnings"
+            };
             print_notice(
-                NoticeLevel::Success,
-                "PAY.md check successful",
-                &format!("{endpoint_count} endpoints walked, probe skipped (--no-probe)"),
+                level,
+                title,
+                &format!(
+                    "{endpoint_count} endpoints walked, probe skipped (--no-probe){}",
+                    warning_suffix(static_validation.warnings.len())
+                ),
             );
             return Ok(());
         }
@@ -179,8 +192,15 @@ impl CheckCommand {
         let report = run_probe(vec![provider], &self.probe_config());
         let validation = validate_report(&report, self.strict);
 
+        self.render_static_warnings(&static_validation.warnings);
         self.render_verbose(&report, &validation);
-        self.emit_summary(&report, &validation, endpoint_count, "PAY.md")
+        self.emit_summary(
+            &report,
+            &validation,
+            endpoint_count,
+            &static_validation.warnings,
+            "PAY.md",
+        )
     }
 
     // ── Mode 2a: explicit list of paths (CI) ────────────────────────────
@@ -214,6 +234,7 @@ impl CheckCommand {
             );
             return Ok(());
         }
+        let static_validation = self.static_check_paths(root, files)?;
         let providers = collect_specific_providers(root, files)?;
         if providers.is_empty() {
             print_notice(
@@ -226,27 +247,44 @@ impl CheckCommand {
 
         let total_endpoints: usize = providers.iter().map(|p| p.endpoints.len()).sum();
         if self.no_probe {
-            print_notice(
-                NoticeLevel::Success,
-                &format!("{title_prefix} check successful"),
-                &format!(
-                    "{total_endpoints} endpoints walked across {} provider{}, probe skipped (--no-probe)",
-                    providers.len(),
-                    if providers.len() == 1 { "" } else { "s" },
-                ),
+            self.render_static_warnings(&static_validation.warnings);
+            let level = if static_validation.warnings.is_empty() {
+                NoticeLevel::Success
+            } else {
+                NoticeLevel::Warning
+            };
+            let title = if static_validation.warnings.is_empty() {
+                format!("{title_prefix} check successful")
+            } else {
+                format!("{title_prefix} check passed with warnings")
+            };
+            let body = format!(
+                "{total_endpoints} endpoints walked across {} provider{}, probe skipped (--no-probe){}",
+                providers.len(),
+                if providers.len() == 1 { "" } else { "s" },
+                warning_suffix(static_validation.warnings.len()),
             );
+            print_notice(level, &title, &body);
             return Ok(());
         }
         let report = run_probe(providers, &self.probe_config());
         let validation = validate_report(&report, self.strict);
 
+        self.render_static_warnings(&static_validation.warnings);
         self.render_verbose(&report, &validation);
-        self.emit_summary(&report, &validation, total_endpoints, title_prefix)
+        self.emit_summary(
+            &report,
+            &validation,
+            total_endpoints,
+            &static_validation.warnings,
+            title_prefix,
+        )
     }
 
     // ── Mode 3: full registry (read-only) ──────────────────────────────
 
     fn run_full_registry(self, root: &Path) -> pay_core::Result<()> {
+        let static_validation = self.static_check_registry(root);
         let providers = collect_all_providers(root)?;
         if providers.is_empty() {
             print_notice(
@@ -259,22 +297,138 @@ impl CheckCommand {
 
         let total_endpoints: usize = providers.iter().map(|p| p.endpoints.len()).sum();
         if self.no_probe {
-            print_notice(
-                NoticeLevel::Success,
-                "Registry check successful",
-                &format!(
-                    "{total_endpoints} endpoints walked across {} provider{}, probe skipped (--no-probe)",
-                    providers.len(),
-                    if providers.len() == 1 { "" } else { "s" },
-                ),
+            self.render_static_warnings(&static_validation.warnings);
+            let level = if static_validation.warnings.is_empty() {
+                NoticeLevel::Success
+            } else {
+                NoticeLevel::Warning
+            };
+            let title = if static_validation.warnings.is_empty() {
+                "Registry check successful"
+            } else {
+                "Registry check passed with warnings"
+            };
+            let body = format!(
+                "{total_endpoints} endpoints walked across {} provider{}, probe skipped (--no-probe){}",
+                providers.len(),
+                if providers.len() == 1 { "" } else { "s" },
+                warning_suffix(static_validation.warnings.len()),
             );
+            print_notice(level, title, &body);
             return Ok(());
         }
         let report = run_probe(providers, &self.probe_config());
         let validation = validate_report(&report, self.strict);
 
+        self.render_static_warnings(&static_validation.warnings);
         self.render_verbose(&report, &validation);
-        self.emit_summary(&report, &validation, total_endpoints, "Registry")
+        self.emit_summary(
+            &report,
+            &validation,
+            total_endpoints,
+            &static_validation.warnings,
+            "Registry",
+        )
+    }
+
+    // ── Static validation ───────────────────────────────────────────────
+
+    fn static_check_registry(&self, root: &Path) -> StaticValidation {
+        let result = pay_core::skills::build::build_with_options(
+            root,
+            "",
+            String::new(),
+            &static_build_options(),
+        );
+        self.handle_static_validation(result)
+    }
+
+    fn static_check_paths(
+        &self,
+        root: &Path,
+        files: &[PathBuf],
+    ) -> pay_core::Result<StaticValidation> {
+        let mut combined = StaticValidation::default();
+        let mut errors = Vec::new();
+        let mut warnings = Vec::new();
+
+        for file in files {
+            let full_path = if file.is_absolute() {
+                file.clone()
+            } else {
+                root.join(file)
+            };
+            if !full_path.exists() {
+                warnings.push(format!("{}: file not found, skipped", file.display()));
+                continue;
+            }
+            let canonical = full_path.canonicalize().map_err(|e| {
+                pay_core::Error::Config(format!("invalid file `{}`: {e}", full_path.display()))
+            })?;
+            let (fqn, name, operator, origin) = derive_provider_identity(root, &canonical)?;
+            let result = pay_core::skills::build::build_single_provider(
+                &canonical,
+                &fqn,
+                &name,
+                &operator,
+                &origin,
+                &static_build_options(),
+            );
+            combined.provider_count += result.index.provider_count;
+            combined.endpoint_count += result
+                .index
+                .providers
+                .iter()
+                .map(|provider| provider.endpoint_count)
+                .sum::<usize>();
+            errors.extend(result.errors);
+            warnings.extend(result.warnings);
+        }
+
+        if !errors.is_empty() {
+            self.render_static_warnings(&warnings);
+            self.render_static_errors(&errors);
+            std::process::exit(1);
+        }
+        combined.warnings = warnings;
+        Ok(combined)
+    }
+
+    fn handle_static_validation(&self, result: BuildResult) -> StaticValidation {
+        if !result.errors.is_empty() {
+            self.render_static_warnings(&result.warnings);
+            self.render_static_errors(&result.errors);
+            std::process::exit(1);
+        }
+        StaticValidation {
+            provider_count: result.index.provider_count,
+            endpoint_count: result
+                .index
+                .providers
+                .iter()
+                .map(|provider| provider.endpoint_count)
+                .sum(),
+            warnings: result.warnings,
+        }
+    }
+
+    fn render_static_errors(&self, errors: &[String]) {
+        if matches!(self.format, ReportFormat::Github) {
+            render_github_static_findings("error", errors);
+        } else {
+            print_validation_errors(errors);
+        }
+    }
+
+    fn render_static_warnings(&self, warnings: &[String]) {
+        if warnings.is_empty() {
+            return;
+        }
+        match self.format {
+            ReportFormat::Github => render_github_static_findings("warning", warnings),
+            ReportFormat::Json => {}
+            ReportFormat::Table => print_validation_warnings(warnings),
+        }
     }
 
     // ── Shared rendering ────────────────────────────────────────────────
@@ -299,13 +453,14 @@ impl CheckCommand {
         report: &ProbeReport,
         validation: &ValidationReport,
         endpoint_count: usize,
+        static_warnings: &[String],
         title_prefix: &str,
     ) -> pay_core::Result<()> {
         // Optional markdown sidecar — written before any potential exit
         // so the file is on disk even when validation blocks. PR CI cats
         // this into `$GITHUB_STEP_SUMMARY`.
         if let Some(path) = &self.summary_out {
-            let body = render_markdown_summary(validation);
+            let body = render_markdown_summary(validation, static_warnings);
             std::fs::write(path, body)
                 .map_err(|e| pay_core::Error::Config(format!("write {}: {e}", path.display())))?;
         }
@@ -329,7 +484,8 @@ impl CheckCommand {
         }
 
         let stats = verdict_stats(validation);
-        let body = stats.format(endpoint_count, report.failed);
+        let static_warning_count = static_warnings.len();
+        let body = stats.format(endpoint_count, report.failed, static_warning_count);
 
         if validation.has_errors() {
             print_notice(
@@ -339,7 +495,7 @@ impl CheckCommand {
             );
             std::process::exit(1);
         }
-        let warn = !stats.is_clean();
+        let warn = !stats.is_clean() || static_warning_count > 0;
         let level = if warn {
             NoticeLevel::Warning
         } else {
@@ -353,6 +509,66 @@ impl CheckCommand {
         print_notice(level, &title, &body);
         Ok(())
     }
+}
+
+#[derive(Debug, Default)]
+struct StaticValidation {
+    provider_count: usize,
+    endpoint_count: usize,
+    warnings: Vec<String>,
+}
+
+fn static_build_options() -> BuildOptions {
+    BuildOptions {
+        probe: false,
+        probe_config: ProbeConfig::default(),
+        only: None,
+        previous_dist: None,
+    }
+}
+
+fn warning_suffix(count: usize) -> String {
+    if count == 0 {
+        String::new()
+    } else {
+        format!(
+            "\n{count} static validation warning{}",
+            if count == 1 { "" } else { "s" }
+        )
+    }
+}
+
+fn derive_provider_identity(
+    root: &Path,
+    path: &Path,
+) -> pay_core::Result<(String, String, String, String)> {
+    let providers_root = root.join("providers");
+    let provider_dir = path.parent().unwrap_or(path);
+    let rel = match provider_dir.strip_prefix(&providers_root) {
+        Ok(rel) => rel,
+        Err(_) => return derive_fqn_from_path(path),
+    };
+    let segments: Vec<String> = rel
+        .components()
+        .filter_map(|component| component.as_os_str().to_str().map(String::from))
+        .filter(|segment| !segment.is_empty() && segment != "." && segment != "..")
+        .collect();
+    if segments.is_empty() {
+        return Err(pay_core::Error::Config(format!(
+            "{} has no provider path under {}/providers",
+            path.display(),
+            root.display()
+        )));
+    }
+    let fqn = segments.join("/");
+    let name = segments.last().unwrap().clone();
+    let operator = segments.first().unwrap().clone();
+    let origin = if segments.len() >= 3 {
+        segments[segments.len() - 2].clone()
+    } else {
+        operator.clone()
+    };
+    Ok((fqn, name, operator, origin))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -369,7 +585,12 @@ impl VerdictStats {
         self.blocked == 0 && self.non_solana == 0
     }
 
-    fn format(&self, endpoint_count: usize, probe_failed: usize) -> String {
+    fn format(
+        &self,
+        endpoint_count: usize,
+        probe_failed: usize,
+        static_warning_count: usize,
+    ) -> String {
         let mut lines = Vec::new();
         lines.push(format!(
             "{} endpoint{} tested across {} provider{}",
@@ -401,6 +622,12 @@ impl VerdictStats {
         if probe_failed > 0 && self.classified == 0 {
             lines.push(format!("{probe_failed} probe failure(s) — see --verbose"));
         }
+        if static_warning_count > 0 {
+            lines.push(format!(
+                "{static_warning_count} static validation warning{}",
+                if static_warning_count == 1 { "" } else { "s" },
+            ));
+        }
         lines.join("\n")
     }
 }
@@ -409,7 +636,7 @@ impl VerdictStats {
 /// Mirrors what the previous workflow generated via Python — top-line
 /// status, per-provider table, and per-provider details for non-Solana
 /// endpoints.
-fn render_markdown_summary(validation: &ValidationReport) -> String {
+fn render_markdown_summary(validation: &ValidationReport, static_warnings: &[String]) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     let _ = writeln!(out, "### Solana-compatibility verdict");
@@ -476,7 +703,20 @@ fn render_markdown_summary(validation: &ValidationReport) -> String {
         let _ = writeln!(out);
         let _ = writeln!(out, "</details>");
     }
+    if !static_warnings.is_empty() {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "### Static validation warnings");
+        let _ = writeln!(out);
+        for warning in static_warnings {
+            let first_line = warning.lines().next().unwrap_or(warning);
+            let _ = writeln!(out, "- `{}`", escape_markdown_inline(first_line));
+        }
+    }
     out
+}
+
+fn escape_markdown_inline(value: &str) -> String {
+    value.replace('`', "\\`")
 }
 
 fn verdict_stats(validation: &ValidationReport) -> VerdictStats {
@@ -518,6 +758,41 @@ pub(super) fn print_validation_errors(errors: &[String]) {
     print_notice(NoticeLevel::Error, &title, body.trim_end());
 }
 
+fn print_validation_warnings(warnings: &[String]) {
+    let title = if warnings.len() == 1 {
+        "Validation warning".to_string()
+    } else {
+        format!("{} validation warnings", warnings.len())
+    };
+    let mut body = String::new();
+    for warning in warnings {
+        let mut lines = warning.trim_end().lines();
+        if let Some(first) = lines.next() {
+            body.push_str(&format!("- {first}\n"));
+        }
+        for line in lines {
+            body.push_str(&format!("  {line}\n"));
+        }
+    }
+    print_notice(NoticeLevel::Warning, &title, body.trim_end());
+}
+
+fn render_github_static_findings(kind: &str, findings: &[String]) {
+    for finding in findings {
+        println!(
+            "::{kind} title={title}::{message}",
+            title = encode_actions("pay-skills static validation"),
+            message = encode_actions(finding),
+        );
+    }
+}
+
+fn encode_actions(msg: &str) -> String {
+    msg.replace('%', "%25")
+        .replace('\r', "%0D")
+        .replace('\n', "%0A")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -537,7 +812,7 @@ mod tests {
         let s = stats(1, 0, 3, 0);
         assert!(s.is_clean());
         assert_eq!(
-            s.format(9, 0),
+            s.format(9, 0, 0),
             "9 endpoints tested across 1 provider\n3/3 gates compatible with Solana"
         );
     }
@@ -547,7 +822,7 @@ mod tests {
         let s = stats(1, 0, 1, 2);
         assert!(!s.is_clean());
         assert_eq!(
-            s.format(9, 0),
+            s.format(9, 0, 0),
             "9 endpoints tested across 1 provider\n\
              1/3 gates compatible with Solana\n\
              2 non-Solana endpoints flagged"
@@ -558,11 +833,22 @@ mod tests {
     fn verdict_stats_blocks_when_zero_solana_ok() {
         let s = stats(1, 1, 0, 2);
         assert_eq!(
-            s.format(9, 0),
+            s.format(9, 0, 0),
             "9 endpoints tested across 1 provider\n\
              0/2 gates compatible with Solana\n\
              2 non-Solana endpoints flagged\n\
              1 provider blocked (zero Solana-compatible gates)"
+        );
+    }
+
+    #[test]
+    fn verdict_stats_includes_static_warnings() {
+        let s = stats(1, 0, 1, 0);
+        assert_eq!(
+            s.format(1, 0, 2),
+            "1 endpoint tested across 1 provider\n\
+             1/1 gates compatible with Solana\n\
+             2 static validation warnings"
         );
     }
 }

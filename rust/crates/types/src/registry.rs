@@ -29,6 +29,15 @@ pub const KNOWN_CATEGORIES: &[&str] = &[
 ];
 
 pub const AFFILIATE_TYPES: &[&str] = &["agent", "cli", "platform"];
+const TUNNEL_HOST_SUFFIXES: &[&str] = &[
+    ".ngrok.io",
+    ".ngrok-free.app",
+    ".trycloudflare.com",
+    ".loca.lt",
+    ".localtunnel.me",
+    ".localhost.run",
+    ".serveo.net",
+];
 
 /// Common metadata shared across all service representations (frontmatter,
 /// index entries, runtime catalog, search results, detail views).
@@ -238,6 +247,18 @@ pub fn validate_provider(spec: &ProviderFrontmatter, fqn: &str) -> Vec<String> {
     let mut errs = Vec::new();
     let m = &spec.meta;
 
+    validate_fqn_segments(fqn, &mut errs);
+
+    // ── Title ──
+    if m.title.trim().is_empty() {
+        errs.push(format!("{fqn}: missing required field `title`\n"));
+    } else if contains_placeholder(&m.title) {
+        errs.push(format!(
+            "{fqn}: title contains an unresolved placeholder\n  got: \"{}\"\n",
+            m.title
+        ));
+    }
+
     // ── Category ──
     if !KNOWN_CATEGORIES.contains(&m.category.as_str()) {
         errs.push(format!(
@@ -248,6 +269,12 @@ pub fn validate_provider(spec: &ProviderFrontmatter, fqn: &str) -> Vec<String> {
     }
 
     // ── Description (min 64, max 255) ──
+    if contains_placeholder(&m.description) {
+        errs.push(format!(
+            "{fqn}: description contains an unresolved placeholder\n  got: \"{}\"\n",
+            m.description
+        ));
+    }
     if m.description.len() < 64 {
         errs.push(format!(
             "{fqn}: description too short ({} chars, min 64)\n  got: \"{}\"\n",
@@ -271,6 +298,11 @@ pub fn validate_provider(spec: &ProviderFrontmatter, fqn: &str) -> Vec<String> {
                  add a use_case field (32-255 chars) describing when this API should be used\n"
             ));
         }
+        Some(uc) if contains_placeholder(uc) => {
+            errs.push(format!(
+                "{fqn}: use_case contains an unresolved placeholder\n  got: \"{uc}\"\n"
+            ));
+        }
         Some(uc) if uc.len() < 32 => {
             errs.push(format!(
                 "{fqn}: use_case too short ({} chars, min 32)\n  got: \"{uc}\"\n",
@@ -288,18 +320,9 @@ pub fn validate_provider(spec: &ProviderFrontmatter, fqn: &str) -> Vec<String> {
     }
 
     // ── service_url (HTTPS only, domain names only) ──
-    if m.service_url.is_empty() {
-        errs.push(format!("{fqn}: missing required field `service_url`\n"));
-    } else if !m.service_url.starts_with("https://") {
-        errs.push(format!(
-            "{fqn}: service_url must start with https://\n  got: `{}`\n",
-            m.service_url
-        ));
-    } else if url_has_ip_address(&m.service_url) {
-        errs.push(format!(
-            "{fqn}: service_url must use a domain name, not an IP address\n  got: `{}`\n",
-            m.service_url
-        ));
+    validate_registry_url(fqn, "service_url", &m.service_url, true, &mut errs);
+    if let Some(url) = &m.sandbox_service_url {
+        validate_registry_url(fqn, "sandbox_service_url", url, false, &mut errs);
     }
 
     // ── openapi: vs endpoints: (mutually exclusive, exactly one required) ──
@@ -312,7 +335,7 @@ pub fn validate_provider(spec: &ProviderFrontmatter, fqn: &str) -> Vec<String> {
         )),
         (false, false) => errs.push(format!(
             "{fqn}: must set either `openapi` or `endpoints`\n  \
-             add an `openapi: {{ url|path|content: ... }}` mapping or at least one endpoint\n"
+             add an `openapi: {{ path|content: ... }}` mapping or at least one endpoint\n"
         )),
         _ => {}
     }
@@ -340,6 +363,12 @@ pub fn validate_provider(spec: &ProviderFrontmatter, fqn: &str) -> Vec<String> {
             errs.push(format!(
                 "{fqn}: {label} — description too short ({} chars, min 32)\n  got: \"{}\"\n",
                 ep.description.len(),
+                ep.description
+            ));
+        }
+        if contains_placeholder(&ep.description) {
+            errs.push(format!(
+                "{fqn}: {label} — description contains an unresolved placeholder\n  got: \"{}\"\n",
                 ep.description
             ));
         }
@@ -409,21 +438,28 @@ fn validate_openapi_source(src: &OpenapiSource, fqn: &str) -> Vec<String> {
     let mut errs = Vec::new();
     match src {
         OpenapiSource::Url { url } => {
-            if url.is_empty() {
-                errs.push(format!("{fqn}: openapi.url is empty\n"));
-            } else if !url.starts_with("https://") {
-                errs.push(format!(
-                    "{fqn}: openapi.url must be a fully-qualified https:// URL\n  got: `{url}`\n"
-                ));
-            } else if url_has_ip_address(url) {
-                errs.push(format!(
-                    "{fqn}: openapi.url must use a domain name, not an IP address\n  got: `{url}`\n"
-                ));
-            }
+            errs.push(format!(
+                "{fqn}: openapi.url is not allowed in the public registry\n  \
+                 got: `{url}`\n  \
+                 commit the spec next to PAY.md and use `openapi: {{ path: openapi.json }}` \
+                 (or `content:` for tiny specs)\n"
+            ));
         }
         OpenapiSource::Path { path } => {
             if path.trim().is_empty() {
                 errs.push(format!("{fqn}: openapi.path is empty\n"));
+            } else {
+                let p = std::path::Path::new(path);
+                if p.is_absolute() {
+                    errs.push(format!(
+                        "{fqn}: openapi.path must be relative to PAY.md\n  got: `{path}`\n"
+                    ));
+                }
+                if path.split('/').any(|part| part == "..") {
+                    errs.push(format!(
+                        "{fqn}: openapi.path must not escape the provider directory\n  got: `{path}`\n"
+                    ));
+                }
             }
             // Path is resolved relative to the provider's PAY.md at build
             // time; the resolved doc gets inlined into the published dist
@@ -438,22 +474,120 @@ fn validate_openapi_source(src: &OpenapiSource, fqn: &str) -> Vec<String> {
     errs
 }
 
+fn validate_fqn_segments(fqn: &str, errs: &mut Vec<String>) {
+    if fqn.trim().is_empty() {
+        errs.push("provider fqn is empty\n".to_string());
+        return;
+    }
+    for segment in fqn.split('/') {
+        if segment.is_empty() {
+            errs.push(format!("{fqn}: FQN contains an empty path segment\n"));
+            continue;
+        }
+        if !is_url_safe_segment(segment) {
+            errs.push(format!(
+                "{fqn}: FQN segment `{segment}` must be lowercase and URL-safe\n  \
+                 use lowercase letters, digits, and single hyphens (for example `market-data`)\n"
+            ));
+        }
+    }
+}
+
+fn is_url_safe_segment(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    !bytes.is_empty()
+        && bytes[0] != b'-'
+        && bytes[bytes.len() - 1] != b'-'
+        && bytes
+            .iter()
+            .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-'))
+        && !segment.contains("--")
+}
+
+fn contains_placeholder(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    ["todo", "fixme", "tbd", "{{", "<todo>", "your-"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+}
+
+fn validate_registry_url(
+    fqn: &str,
+    field: &str,
+    url: &str,
+    required: bool,
+    errs: &mut Vec<String>,
+) {
+    if url.trim().is_empty() {
+        if required {
+            errs.push(format!("{fqn}: missing required field `{field}`\n"));
+        } else {
+            errs.push(format!("{fqn}: {field} is empty\n"));
+        }
+        return;
+    }
+    if !url.starts_with("https://") {
+        errs.push(format!(
+            "{fqn}: {field} must start with https://\n  got: `{url}`\n"
+        ));
+        return;
+    }
+
+    let Some(host) = url_host(url) else {
+        errs.push(format!(
+            "{fqn}: {field} must include a production hostname\n  got: `{url}`\n"
+        ));
+        return;
+    };
+
+    let host_lower = host.to_ascii_lowercase();
+    if url_has_ip_address(url)
+        || host_lower == "localhost"
+        || host_lower.ends_with(".localhost")
+        || host_lower.ends_with(".local")
+    {
+        errs.push(format!(
+            "{fqn}: {field} must use a production domain name, not localhost or an IP address\n  got: `{url}`\n"
+        ));
+        return;
+    }
+
+    if TUNNEL_HOST_SUFFIXES
+        .iter()
+        .any(|suffix| host_lower.ends_with(suffix))
+    {
+        errs.push(format!(
+            "{fqn}: {field} must not use a tunnel or temporary preview domain\n  got: `{url}`\n"
+        ));
+    }
+}
+
 /// Check if a URL uses an IP address instead of a domain name.
 fn url_has_ip_address(url: &str) -> bool {
+    let Some(host) = url_host(url) else {
+        return false;
+    };
+    if host.starts_with('[') && host.ends_with(']') {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>().is_ok()
+}
+
+fn url_host(url: &str) -> Option<&str> {
     let after_scheme = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))
         .unwrap_or(url);
-    let host_port = after_scheme.split('/').next().unwrap_or("");
-
-    // Bracketed IPv6: [::1] or [::1]:8080
-    if host_port.starts_with('[') {
-        return true;
+    let host_port = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    if host_port.is_empty() {
+        return None;
     }
-
-    // IPv4 or bare IPv6: strip port suffix
+    if let Some(end) = host_port.strip_prefix('[').and_then(|rest| rest.find(']')) {
+        let end = end + 1;
+        return Some(&host_port[..=end]);
+    }
     let host = host_port.split(':').next().unwrap_or("");
-    host.parse::<std::net::IpAddr>().is_ok()
+    (!host.is_empty()).then_some(host)
 }
 
 pub fn validate_affiliate(spec: &AffiliateFrontmatter, name: &str) -> Vec<String> {
@@ -605,21 +739,22 @@ endpoints:
     }
 
     #[test]
-    fn openapi_with_url_passes_without_inline_endpoints() {
+    fn openapi_url_rejected_even_without_inline_endpoints() {
         let mut spec = valid_spec();
         spec.endpoints = vec![];
         spec.openapi = Some(OpenapiSource::Url {
             url: "https://api.example.com/openapi.json".into(),
         });
         let errs = validate_provider(&spec, "test/test-api");
-        assert!(errs.is_empty(), "expected no errors, got: {errs:?}");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("openapi.url is not allowed")),
+            "expected committed-spec rejection, got: {errs:?}"
+        );
     }
 
     #[test]
     fn openapi_relative_url_rejected() {
-        // Registry providers must use a fully-qualified https:// URL.
-        // Relative URLs would be ambiguous when the registry is consumed
-        // remotely; reject them at validation time.
         let mut spec = valid_spec();
         spec.endpoints = vec![];
         spec.openapi = Some(OpenapiSource::Url {
@@ -628,8 +763,8 @@ endpoints:
         let errs = validate_provider(&spec, "test/test-api");
         assert!(
             errs.iter()
-                .any(|e| e.contains("openapi.url must be a fully-qualified https://")),
-            "expected fully-qualified rejection, got: {errs:?}"
+                .any(|e| e.contains("openapi.url is not allowed")),
+            "expected committed-spec rejection, got: {errs:?}"
         );
     }
 
@@ -685,7 +820,7 @@ endpoints:
     }
 
     #[test]
-    fn openapi_url_must_be_https() {
+    fn openapi_http_url_rejected_as_remote_source() {
         let mut spec = valid_spec();
         spec.endpoints = vec![];
         spec.openapi = Some(OpenapiSource::Url {
@@ -694,8 +829,8 @@ endpoints:
         let errs = validate_provider(&spec, "test/test-api");
         assert!(
             errs.iter()
-                .any(|e| e.contains("openapi.url must be a fully-qualified https://")),
-            "expected https requirement error, got: {errs:?}"
+                .any(|e| e.contains("openapi.url is not allowed")),
+            "expected committed-spec rejection, got: {errs:?}"
         );
     }
 
@@ -709,8 +844,8 @@ endpoints:
         let errs = validate_provider(&spec, "test/test-api");
         assert!(
             errs.iter()
-                .any(|e| e.contains("openapi.url must be a fully-qualified https://")),
-            "expected fully-qualified rejection, got: {errs:?}"
+                .any(|e| e.contains("openapi.url is not allowed")),
+            "expected committed-spec rejection, got: {errs:?}"
         );
     }
 
