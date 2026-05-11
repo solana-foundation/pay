@@ -1,0 +1,39 @@
+{
+  "cli_version": "0.6.2-nightly.202605080644.bb4c8faf",
+  "checkpoint_id": "c6986f0bfa64",
+  "session_id": "47b25239-0273-4b50-b8bd-33f20eba9227",
+  "strategy": "manual-commit",
+  "created_at": "2026-05-11T19:29:19.774392Z",
+  "branch": "fix/mpp",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "rust/crates/cli/src/tui.rs"
+  ],
+  "agent": "Claude Code",
+  "model": "",
+  "turn_id": "3827b93f22fe",
+  "checkpoint_transcript_start": 565,
+  "transcript_lines_at_start": 565,
+  "token_usage": {
+    "input_tokens": 0,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 0,
+    "output_tokens": 0,
+    "api_call_count": 0
+  },
+  "session_metrics": {
+    "turn_count": 2
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-05-11T19:29:19.759999Z",
+    "agent_lines": 24,
+    "agent_removed": 5,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 24,
+    "total_lines_changed": 29,
+    "agent_percentage": 100,
+    "metric_version": 2
+  }
+}

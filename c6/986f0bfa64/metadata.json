@@ -1,0 +1,25 @@
+{
+  "cli_version": "0.6.2-nightly.202605080644.bb4c8faf",
+  "checkpoint_id": "c6986f0bfa64",
+  "strategy": "manual-commit",
+  "branch": "fix/mpp",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "rust/crates/cli/src/tui.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/c6/986f0bfa64/0/metadata.json",
+      "transcript": "/c6/986f0bfa64/0/full.jsonl",
+      "content_hash": "/c6/986f0bfa64/0/content_hash.txt",
+      "prompt": ""
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 0,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 0,
+    "output_tokens": 0,
+    "api_call_count": 0
+  }
+}
