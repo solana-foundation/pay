@@ -454,12 +454,13 @@ async fn replayed_authorization_is_rejected() {
         "expected replay rejection in body, got: {body}"
     );
 
-    // Step 5: Replay against a *different* path with the same credential.
-    // This should also be rejected — payment proof is single-use regardless of
-    // route. (PR #359's hashed key includes path/method, which would *fail*
-    // this stronger property.)
+    // Step 5: Replay against a *different* metered path with the same
+    // credential. The challenge HMAC pinned the original resource, so this
+    // should also be rejected (credential mismatch or signature consumed).
+    // Skipping `/v1/simple/other` because non-metered paths bypass the MPP
+    // middleware entirely; using `/v1/translate` which is metered.
     let resp = client
-        .post(format!("{url}/v1/simple/other"))
+        .post(format!("{url}/v1/translate"))
         .header("host", "testapi.localhost")
         .header("authorization", &auth)
         .body("{}")
@@ -469,7 +470,7 @@ async fn replayed_authorization_is_rejected() {
     assert_eq!(
         resp.status(),
         402,
-        "replayed credential on a different route must not be accepted"
+        "replayed credential on a different metered route must not be accepted"
     );
 }
 
