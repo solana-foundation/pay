@@ -1660,12 +1660,12 @@ fn render_money_flow(frame: &mut ratatui::Frame, area: Rect, color: Color, tick:
 }
 
 fn unavailable_qr() -> RenderedQr {
-    let lines = vec![Line::from(Span::styled(
-        "QR unavailable",
-        Style::default().fg(Color::DarkGray),
-    ))];
+    let lines = ["Make this window larger", "to show the QR code"]
+        .into_iter()
+        .map(|text| Line::from(Span::styled(text, Style::default().fg(Color::DarkGray))).centered())
+        .collect::<Vec<_>>();
     RenderedQr {
-        width: lines.first().map(Line::width).unwrap_or(0) as u16,
+        width: lines.iter().map(Line::width).max().unwrap_or(0) as u16,
         height: lines.len() as u16,
         lines,
     }
@@ -2932,6 +2932,25 @@ mod tests {
         let qr = render_qr(SAMPLE_SOLANA_PAY_URL, 1, 1).expect("QR should encode");
 
         assert!(qr.is_none());
+    }
+
+    #[test]
+    fn unavailable_qr_asks_user_to_resize_window() {
+        let qr = unavailable_qr();
+        let text = qr
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(text, vec!["Make this window larger", "to show the QR code"]);
+        assert_eq!(qr.width, "Make this window larger".len() as u16);
+        assert_eq!(qr.height, 2);
     }
 
     #[test]
