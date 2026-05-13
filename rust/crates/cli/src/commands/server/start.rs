@@ -1,6 +1,7 @@
 //! `pay server start` — start a payment gateway proxy.
 
 use std::process::Command as ProcessCommand;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use axum::middleware;
@@ -15,7 +16,6 @@ use pay_types::Stablecoin;
 use pay_types::metering::{ApiSpec, OperatorConfig, RoutingConfig, SignerConfig};
 use solana_mpp::server::Mpp;
 use solana_mpp::solana_keychain::SolanaSigner;
-use solana_mpp::solana_keychain::memory::MemorySigner;
 use tokio::time::{Duration, Instant};
 
 use crate::components::{PAY_SH_TAGLINE, render_pay_banner, solana_explorer_cluster_query};
@@ -120,6 +120,83 @@ fn should_use_auto_fee_payer_signer(
     signer_cfg: Option<&SignerConfig>,
 ) -> bool {
     sandbox || (signer_cfg.is_none() && network.is_throwaway())
+}
+
+fn resolve_session_splits(
+    api: &ApiSpec,
+    session: &pay_types::metering::SessionSpec,
+) -> pay_core::Result<Vec<solana_mpp::server::session::Split>> {
+    let mut splits = Vec::with_capacity(session.splits.len());
+    let mut total_bps = 0u32;
+
+    for rule in &session.splits {
+        if rule.amount.is_some() {
+            return Err(pay_core::Error::Config(format!(
+                "session split `{}` uses `amount`; session channel splits must use `percent`",
+                rule.recipient
+            )));
+        }
+
+        let percent = rule.percent.ok_or_else(|| {
+            pay_core::Error::Config(format!(
+                "session split `{}` must set `percent`",
+                rule.recipient
+            ))
+        })?;
+        if !percent.is_finite() || percent <= 0.0 {
+            return Err(pay_core::Error::Config(format!(
+                "session split `{}` percent must be positive",
+                rule.recipient
+            )));
+        }
+
+        let bps = (percent * 100.0).round();
+        if !(1.0..10_000.0).contains(&bps) {
+            return Err(pay_core::Error::Config(format!(
+                "session split `{}` percent must convert to 1..9999 basis points",
+                rule.recipient
+            )));
+        }
+        let bps = bps as u16;
+        total_bps += u32::from(bps);
+        if total_bps >= 10_000 {
+            return Err(pay_core::Error::Config(
+                "session splits must leave a positive primary recipient share".to_string(),
+            ));
+        }
+
+        let alias = api.recipients.get(&rule.recipient).ok_or_else(|| {
+            pay_core::Error::Config(format!(
+                "session split references unknown recipient `{}`",
+                rule.recipient
+            ))
+        })?;
+        let account = resolve_static_account(&alias.account)?;
+        let recipient = solana_pubkey::Pubkey::from_str(&account).map_err(|e| {
+            pay_core::Error::Config(format!(
+                "session split `{}` recipient is not a valid Solana pubkey: {e}",
+                rule.recipient
+            ))
+        })?;
+
+        splits.push(solana_mpp::server::session::Split { recipient, bps });
+    }
+
+    Ok(splits)
+}
+
+fn resolve_static_account(account: &str) -> pay_core::Result<String> {
+    if let Some(name) = account
+        .strip_prefix("${")
+        .and_then(|value| value.strip_suffix('}'))
+    {
+        return std::env::var(name).map_err(|_| {
+            pay_core::Error::Config(format!(
+                "session split account references unset environment variable `{name}`"
+            ))
+        });
+    }
+    Ok(account.to_string())
 }
 
 impl StartCommand {
@@ -428,17 +505,21 @@ impl StartCommand {
                         .collect()
                 };
                 let using_local_rpc = rpc_url.contains("localhost") || rpc_url.contains("127.0.0.1");
-                let fiber_program_id = if using_local_rpc {
-                    Some(ensure_local_fiber_program(&rpc_url)?)
-                } else {
-                    std::env::var("PAY_FIBER_PROGRAM_ID")
-                        .ok()
-                        .and_then(|value| solana_pubkey::Pubkey::from_str(&value).ok())
-                };
+                let channel_program_id = std::env::var("PAY_PAYMENT_CHANNELS_PROGRAM_ID")
+                    .or_else(|_| std::env::var("PAY_FIBER_PROGRAM_ID"))
+                    .ok()
+                    .and_then(|value| solana_pubkey::Pubkey::from_str(&value).ok())
+                    .unwrap_or_else(solana_mpp::program::payment_channels::default_program_id);
+                let session_operator = fee_payer_signer
+                    .as_ref()
+                    .map(|signer| signer.pubkey().to_string())
+                    .unwrap_or_else(|| recipient.clone());
+                let session_splits = resolve_session_splits(&api, sess)?;
 
                 let config = SessionConfig {
                     recipient: recipient.clone(),
-                    operator: recipient.clone(),
+                    operator: session_operator.clone(),
+                    splits: session_splits,
                     currency: session_mpp_currency.clone(),
                     decimals: session_decimals,
                     network: network.slug().to_string(),
@@ -446,12 +527,15 @@ impl StartCommand {
                     min_voucher_delta: sess.min_voucher_delta,
                     modes: modes.clone(),
                     rpc_url: Some(rpc_url.clone()),
-                    program_id: fiber_program_id,
+                    program_id: Some(channel_program_id),
                     ..Default::default()
                 };
 
                 let mut smpp = SessionMpp::new(config, session_secret)
                     .with_realm(api.title.clone());
+                if let Some(operator_signer) = fee_payer_signer.clone() {
+                    smpp = smpp.with_payment_channel_signer(operator_signer);
+                }
 
                 // Wire up the multi-delegate chain when pull mode is enabled.
                 if modes.contains(&SessionMode::Pull) {
@@ -465,7 +549,7 @@ impl StartCommand {
                             )
                             .unwrap()
                         });
-                    let operator_pk = solana_pubkey::Pubkey::from_str(&recipient)
+                    let operator_pk = solana_pubkey::Pubkey::from_str(&session_operator)
                         .unwrap_or_else(|_| solana_pubkey::Pubkey::default());
 
                     if using_local_rpc {
@@ -533,28 +617,9 @@ impl StartCommand {
                         }));
                     }
 
-                    let operator_signer = fee_payer_signer.clone().ok_or_else(|| {
-                        pay_core::Error::Config(
-                            "pull-mode sessions require an operator signer".to_string(),
-                        )
-                    })?;
-                    let fiber_program_id = fiber_program_id.ok_or_else(|| {
-                        pay_core::Error::Config(
-                            "pull-mode sessions require a Fiber program ID; set PAY_FIBER_PROGRAM_ID or use local RPC"
-                                .to_string(),
-                        )
-                    })?;
-
-                    smpp = smpp.with_open_channel_batcher(
-                        operator_signer,
-                        rpc_url.clone(),
-                        fiber_program_id,
-                        sess.batch_open_interval_ms,
-                    );
                     tracing::info!(
-                        interval_ms = sess.batch_open_interval_ms,
-                        fiber_program_id = %fiber_program_id,
-                        "enabled pull-mode Fiber batcher"
+                        channel_program_id = %channel_program_id,
+                        "enabled payment-channel session runtime"
                     );
                 }
 
@@ -783,6 +848,7 @@ impl StartCommand {
             let verify_pdb = pdb_state.clone();
             let rpc_proxy_url = rpc_url.clone();
             let rpc_proxy_client = reqwest::Client::new();
+            let delivery_state = state.clone();
             let mut app = axum::Router::new()
                 .route("/__402/health", get(|| async { "ok" }))
                 .route(
@@ -801,6 +867,12 @@ impl StartCommand {
                     "/__402/verify",
                     post(move |body: axum::Json<GatewayVerifyRequest>| async move {
                         gateway_verify(verify_mpps.clone(), body.0, verify_pdb.as_ref()).await
+                    }),
+                )
+                .route(
+                    "/__402/session/deliveries",
+                    post(move |body: axum::Json<SessionDeliveryRequest>| {
+                        reserve_session_delivery(delivery_state.clone(), body.0)
                     }),
                 );
 
@@ -1418,86 +1490,6 @@ fn ensure_local_multi_delegator_program(rpc_url: &str, program_id: &str) -> pay_
     Ok(())
 }
 
-fn ensure_local_fiber_program(rpc_url: &str) -> pay_core::Result<solana_pubkey::Pubkey> {
-    use std::str::FromStr;
-
-    let repo =
-        std::env::var("PAY_FIBER_REPO").unwrap_or_else(|_| "/Users/ludo/Coding/fiber".to_string());
-    let repo_path = std::path::Path::new(&repo);
-    let deploy_dir = repo_path.join("target/deploy");
-    let keypair_path = deploy_dir.join("fiber_native-keypair.json");
-    let program_so_path = deploy_dir.join("fiber_native.so");
-
-    if !keypair_path.exists() {
-        return Err(pay_core::Error::Config(format!(
-            "Fiber program keypair not found at {}",
-            keypair_path.display()
-        )));
-    }
-
-    let keypair_path_str = keypair_path.to_string_lossy();
-    let signer = MemorySigner::from_private_key_file(&keypair_path_str).map_err(|e| {
-        pay_core::Error::Config(format!("failed to load Fiber program keypair: {e}"))
-    })?;
-    let program_id =
-        solana_pubkey::Pubkey::from_str(&signer.pubkey().to_string()).map_err(|e| {
-            pay_core::Error::Config(format!("invalid Fiber program ID from keypair: {e}"))
-        })?;
-
-    if local_program_is_executable(rpc_url, &program_id.to_string()) {
-        eprintln!("  {}", "Fiber program already deployed locally".dimmed());
-        return Ok(program_id);
-    }
-
-    if !program_so_path.exists() {
-        eprintln!("  {}", "building local Fiber program...".dimmed());
-        let status = ProcessCommand::new("cargo")
-            .arg("build-sbf")
-            .current_dir(repo_path.join("native"))
-            .status()
-            .map_err(|e| {
-                pay_core::Error::Config(format!("failed to invoke cargo build-sbf for Fiber: {e}"))
-            })?;
-        if !status.success() {
-            return Err(pay_core::Error::Config(
-                "cargo build-sbf for Fiber failed".to_string(),
-            ));
-        }
-    }
-
-    eprintln!(
-        "  {}",
-        "deploying Fiber program to local Surfpool...".dimmed()
-    );
-    let status = ProcessCommand::new("surfpool")
-        .arg("run")
-        .arg("deployment")
-        .arg("--env")
-        .arg("localnet")
-        .arg("--unsupervised")
-        .current_dir(repo_path)
-        .status()
-        .map_err(|e| {
-            pay_core::Error::Config(format!(
-                "failed to invoke surfpool deployment runbook for Fiber: {e}"
-            ))
-        })?;
-    if !status.success() {
-        return Err(pay_core::Error::Config(
-            "surfpool deployment runbook for Fiber failed".to_string(),
-        ));
-    }
-
-    if !local_program_is_executable(rpc_url, &program_id.to_string()) {
-        return Err(pay_core::Error::Config(format!(
-            "Fiber program {program_id} still not executable after deploy"
-        )));
-    }
-
-    eprintln!("  {}", "Fiber program deployed locally".green());
-    Ok(program_id)
-}
-
 fn local_program_is_executable(rpc_url: &str, program_id: &str) -> bool {
     let output = ProcessCommand::new("curl")
         .arg("-s")
@@ -1586,6 +1578,72 @@ struct GatewayVerifyResponse {
     challenge_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     external_id: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionDeliveryRequest {
+    session_id: String,
+    amount: String,
+    #[serde(default)]
+    delivery_id: Option<String>,
+    #[serde(default)]
+    commit_url: Option<String>,
+    #[serde(default)]
+    proof: Option<String>,
+    #[serde(default)]
+    expires_at: Option<i64>,
+}
+
+async fn reserve_session_delivery(
+    state: AppState,
+    req: SessionDeliveryRequest,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use solana_mpp::server::session::DeliveryRequest;
+
+    let Some(session_mpp) = state.session_mpp.as_ref() else {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({
+                "error": "session_not_configured",
+                "message": "This gateway is not configured for session payments",
+            })),
+        )
+            .into_response();
+    };
+
+    let amount = match req.amount.parse::<u64>() {
+        Ok(amount) if amount > 0 => amount,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({
+                    "error": "invalid_amount",
+                    "message": "amount must be a positive base-unit integer",
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let mut delivery = DeliveryRequest::new(req.session_id, amount);
+    delivery.delivery_id = req.delivery_id;
+    delivery.commit_url = req.commit_url;
+    delivery.proof = req.proof;
+    delivery.expires_at = req.expires_at;
+
+    match session_mpp.begin_delivery(delivery).await {
+        Ok(directive) => axum::Json(directive).into_response(),
+        Err(error) => (
+            StatusCode::PAYMENT_REQUIRED,
+            axum::Json(serde_json::json!({
+                "error": "delivery_reservation_failed",
+                "message": error.to_string(),
+            })),
+        )
+            .into_response(),
+    }
 }
 
 async fn gateway_verify(

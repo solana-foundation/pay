@@ -276,25 +276,14 @@ pub async fn forward_request(
         }
     }
 
-    let response_body = upstream_resp.bytes().await.map_err(|e| {
-        telemetry::record_upstream_error(
-            &api.subdomain,
-            uri.path(),
-            &upstream_url,
-            &format!("upstream body read error: {e}"),
-        );
-        error_response(
-            StatusCode::BAD_GATEWAY,
-            &format!("Upstream body read error: {e}"),
-        )
-    })?;
-
     let mut resp = Response::builder().status(status);
     for (name, value) in &response_headers {
         resp = resp.header(name, value);
     }
 
-    Ok(resp.body(Body::from(response_body)).unwrap())
+    Ok(resp
+        .body(Body::from_stream(upstream_resp.bytes_stream()))
+        .unwrap())
 }
 
 /// Resolve the API spec from a Host header subdomain.

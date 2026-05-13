@@ -916,9 +916,13 @@ fn pay_session_and_retry(
         .unwrap_or(1_000_000);
     let deposit = (min_delta * 1_000).max(1_000_000).min(cap);
 
-    // Prefer pull mode if advertised — it doesn't require an on-chain Fiber channel.
+    // Prefer the payment-channel push path. Pull mode is only used when a
+    // server explicitly advertises pull without push.
+    let supports_push = req
+        .map(|r| r.modes.is_empty() || r.modes.contains(&SessionMode::Push))
+        .unwrap_or(true);
     let use_pull = req
-        .map(|r| r.modes.contains(&SessionMode::Pull))
+        .map(|r| !supports_push && r.modes.contains(&SessionMode::Pull))
         .unwrap_or(false);
 
     let auth_header = if use_pull {
@@ -967,7 +971,22 @@ fn pay_session_and_retry(
             );
         }
 
-        let (_handle, header) = pay_core::session::open_session_header(challenge, deposit)?;
+        let header = if let Some(request) = req {
+            let store = pay_core::accounts::FileAccountsStore::default_path();
+            let (_handle, header) = pay_core::session::open_payment_channel_session_header(
+                challenge,
+                request,
+                &store,
+                network_override,
+                account_override,
+                deposit,
+                sandbox,
+            )?;
+            header
+        } else {
+            let (_handle, header) = pay_core::session::open_session_header(challenge, deposit)?;
+            header
+        };
 
         if verbose && !is_json {
             eprintln!("{}", "Push session opened — sending request…\n".dimmed());

@@ -4,6 +4,7 @@ import type {
   FlowEvent,
   FlowStatus,
   Protocol,
+  SessionInfo,
   StepStatus,
   SSEMessage,
 } from "./types.js";
@@ -103,7 +104,10 @@ export class FlowCorrelation {
     // 402 challenges
     if (status === 402) {
       if (resHeaders["www-authenticate"]?.startsWith("Payment")) {
-        return { protocol: "mpp", phase: "challenge" };
+        return {
+          protocol: isSessionChallenge(entry) ? "session" : "mpp",
+          phase: "challenge",
+        };
       }
       // x402: returns 402 JSON with x402Version in body, no special header
       if (
@@ -117,6 +121,9 @@ export class FlowCorrelation {
     }
 
     // Payment retries (successful follow-ups)
+    if (isSessionAuthorization(reqHeaders["authorization"])) {
+      return { protocol: "session", phase: "retry" };
+    }
     if (resHeaders["payment-receipt"]) {
       return { protocol: "mpp", phase: "retry" };
     }
@@ -143,6 +150,8 @@ export class FlowCorrelation {
     // Payment step is now in-progress
     steps[2].status = "in-progress";
 
+    const session = protocol === "session" ? sessionFromChallenge(entry) : undefined;
+
     const flow: PaymentFlow = {
       id,
       protocol,
@@ -152,6 +161,7 @@ export class FlowCorrelation {
       startedAt: now,
       updatedAt: now,
       durationMs: 0,
+      session,
       steps,
       events: [
         {
@@ -163,7 +173,7 @@ export class FlowCorrelation {
           ts: now,
           message: `402 Payment Required`,
           detail:
-            protocol === "mpp"
+            protocol === "mpp" || protocol === "session"
               ? `www-authenticate: ${truncate(resHeader(entry, "www-authenticate"), 120)}`
               : `x-payment-required: ${truncate(resHeader(entry, "x-payment-required"), 120)}`,
         },
@@ -208,6 +218,8 @@ export class FlowCorrelation {
     }
 
     // Update flow
+    const sessionUpdate =
+      protocol === "session" ? sessionFromAuthorization(entry, flow.session) : undefined;
     flow.paymentHeaders = entry.reqHeaders;
     flow.responseHeaders = entry.resHeaders;
     flow.responseBody = entry.resBody;
@@ -217,12 +229,18 @@ export class FlowCorrelation {
 
     if (entry.status >= 200 && entry.status < 300) {
       flow.status = "resource-delivered";
+      if (sessionUpdate) flow.session = sessionUpdate;
       flow.events.push({
         ts: now,
-        message: `Payment accepted`,
+        message:
+          protocol === "session"
+            ? sessionAcceptedMessage(sessionUpdate)
+            : `Payment accepted`,
         detail:
           protocol === "mpp"
             ? `payment-receipt: ${truncate(resHeader(entry, "payment-receipt"), 120)}`
+            : protocol === "session"
+              ? sessionEventDetail(sessionUpdate)
             : `x-payment-response verified`,
       });
       flow.events.push({
@@ -234,6 +252,7 @@ export class FlowCorrelation {
       });
     } else {
       flow.status = "failed";
+      if (sessionUpdate) flow.session = { ...sessionUpdate, state: "failed" };
       flow.events.push({
         ts: now,
         message: `Payment retry failed with ${entry.status}`,
@@ -286,6 +305,9 @@ export class FlowCorrelation {
       step.ts = now;
     }
 
+    const session =
+      protocol === "session" ? sessionFromAuthorization(entry, undefined) : undefined;
+
     const flow: PaymentFlow = {
       id,
       protocol,
@@ -295,12 +317,19 @@ export class FlowCorrelation {
       startedAt: now,
       updatedAt: now,
       durationMs: entry.ms,
+      session,
       steps,
       events: [
         {
           ts: now,
-          message: `${entry.method} ${entry.path} → ${entry.status}`,
-          detail: "Payment flow completed (challenge not captured)",
+          message:
+            protocol === "session"
+              ? sessionAcceptedMessage(session)
+              : `${entry.method} ${entry.path} → ${entry.status}`,
+          detail:
+            protocol === "session"
+              ? sessionEventDetail(session)
+              : "Payment flow completed (challenge not captured)",
         },
       ],
       responseHeaders: entry.resHeaders,
@@ -352,20 +381,22 @@ function flowKey(clientIp: string, path: string): string {
 }
 
 function buildSteps(protocol: Protocol): FlowStep[] {
+  const challengeLabel =
+    protocol === "session" ? "402 Session Intent" : "402 Payment Required";
+  const paymentLabel =
+    protocol === "session" ? "Open / Voucher" : "Payment Retry";
+
   return [
     { key: "request", label: "Client Request", status: "pending", ts: null },
     {
       key: "challenge",
-      label: "402 Payment Required",
+      label: challengeLabel,
       status: "pending",
       ts: null,
     },
     {
       key: "payment",
-      label:
-        protocol === "mpp"
-          ? "Payment Retry"
-          : "Payment Retry",
+      label: paymentLabel,
       status: "pending",
       ts: null,
     },
@@ -414,4 +445,225 @@ function resHeader(entry: LogEntry, key: string): string {
 
 function truncate(s: string, max: number): string {
   return s.length > max ? s.slice(0, max) + "…" : s;
+}
+
+function isSessionChallenge(entry: LogEntry): boolean {
+  return paymentChallengeFromHeader(resHeader(entry, "www-authenticate"))?.intent === "session";
+}
+
+function sessionFromChallenge(entry: LogEntry): SessionInfo | undefined {
+  const challenge = paymentChallengeFromHeader(resHeader(entry, "www-authenticate"));
+  if (challenge?.intent !== "session") return undefined;
+
+  const request = decodeJson<Record<string, unknown>>(challenge.request);
+  const modes = Array.isArray(request?.modes) ? request.modes : [];
+  const mode = modes.find((m): m is "push" | "pull" => m === "push" || m === "pull");
+
+  return {
+    state: "opening",
+    mode,
+    currency: stringValue(request?.currency),
+    decimals: numberValue(request?.decimals),
+    cap: stringValue(request?.cap),
+    minVoucherDelta: stringValue(request?.minVoucherDelta),
+    recipient: stringValue(request?.recipient),
+    splits: sessionSplits(request?.splits),
+    updatedAt: entry.ts,
+  };
+}
+
+function isSessionAuthorization(auth: string | undefined): boolean {
+  const credential = paymentCredentialFromAuthorization(auth);
+  return credential?.challenge?.intent === "session";
+}
+
+function sessionFromAuthorization(
+  entry: LogEntry,
+  previous: SessionInfo | undefined,
+): SessionInfo | undefined {
+  const credential = paymentCredentialFromAuthorization(entry.reqHeaders["authorization"]);
+  if (credential?.challenge?.intent !== "session") return undefined;
+
+  const payload = credential.payload;
+  const action = sessionAction(payload?.action);
+  const receipt = parseCommitReceipt(entry.resBody);
+  const voucher = payload?.voucher as Record<string, unknown> | undefined;
+  const voucherData = voucher?.data as Record<string, unknown> | undefined;
+  const cumulative =
+    receipt?.cumulative ??
+    stringValue(voucherData?.cumulativeAmount) ??
+    stringValue(voucherData?.cumulative) ??
+    previous?.cumulative;
+  const sessionId =
+    receipt?.sessionId ??
+    stringValue(payload?.channelId) ??
+    stringValue(payload?.tokenAccount) ??
+    stringValue(voucherData?.channelId) ??
+    previous?.sessionId;
+  const hasVoucher = Boolean(voucherData);
+  const state =
+    entry.status >= 200 && entry.status < 300
+      ? action === "close"
+        ? "closed"
+        : "open"
+      : "failed";
+
+  return {
+    ...previous,
+    sessionId,
+    state,
+    action,
+    mode:
+      sessionMode(payload?.mode) ??
+      previous?.mode,
+    currency: receipt?.currency ?? previous?.currency,
+    deposit: stringValue(payload?.deposit) ?? previous?.deposit,
+    approvedAmount: stringValue(payload?.approvedAmount) ?? previous?.approvedAmount,
+    cumulative,
+    delta: receipt?.amount ?? previous?.delta,
+    voucherCount: (previous?.voucherCount ?? 0) + (hasVoucher ? 1 : 0),
+    authorizedSigner:
+      stringValue(payload?.authorizedSigner) ?? previous?.authorizedSigner,
+    owner: stringValue(payload?.owner) ?? previous?.owner,
+    payer: stringValue(payload?.payer) ?? stringValue(credential.source) ?? previous?.payer,
+    deliveryId: receipt?.deliveryId ?? stringValue(payload?.deliveryId) ?? previous?.deliveryId,
+    openedAt: previous?.openedAt ?? (action === "open" ? entry.ts : null),
+    updatedAt: entry.ts,
+  };
+}
+
+function sessionAcceptedMessage(session: SessionInfo | undefined): string {
+  switch (session?.action) {
+    case "open":
+      return "Session channel opened";
+    case "voucher":
+      return "Session voucher accepted";
+    case "commit":
+      return "Session delivery committed";
+    case "topUp":
+      return "Session channel topped up";
+    case "close":
+      return "Session channel closed";
+    default:
+      return "Session action accepted";
+  }
+}
+
+function sessionEventDetail(session: SessionInfo | undefined): string | undefined {
+  if (!session) return undefined;
+  const parts = [
+    session.sessionId ? `session=${shorten(session.sessionId)}` : undefined,
+    session.mode ? `mode=${session.mode}` : undefined,
+    session.cumulative ? `cumulative=${session.cumulative}` : undefined,
+    session.delta ? `delta=${session.delta}` : undefined,
+    session.deliveryId ? `delivery=${shorten(session.deliveryId)}` : undefined,
+  ].filter(Boolean);
+  return parts.length > 0 ? parts.join(" · ") : undefined;
+}
+
+function paymentChallengeFromHeader(header: string): Record<string, string> | undefined {
+  const challenge = header
+    .split(/\n(?=Payment\s+)/)
+    .find((part) => part.startsWith("Payment") && part.includes("intent=\"session\""))
+    ?? (header.startsWith("Payment") ? header : undefined);
+  if (!challenge) return undefined;
+  return parseHeaderParams(challenge.replace(/^Payment\s*/i, ""));
+}
+
+function paymentCredentialFromAuthorization(
+  auth: string | undefined,
+): { challenge?: Record<string, string>; payload?: Record<string, unknown>; source?: unknown } | undefined {
+  if (!auth) return undefined;
+  const token = auth.replace(/^Payment\s+/i, "").trim();
+  if (!token || token === auth) return undefined;
+  return decodeJson(token);
+}
+
+function parseHeaderParams(value: string): Record<string, string> {
+  const params: Record<string, string> = {};
+  const re = /([A-Za-z][A-Za-z0-9_-]*)=(?:"([^"]*)"|([^,\s]+))/g;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(value))) {
+    params[match[1]] = match[2] ?? match[3] ?? "";
+  }
+  return params;
+}
+
+function decodeJson<T>(encoded: string | undefined): T | undefined {
+  if (!encoded) return undefined;
+  try {
+    const normalized = encoded.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
+    return JSON.parse(Buffer.from(padded, "base64").toString("utf8")) as T;
+  } catch {
+    return undefined;
+  }
+}
+
+function parseCommitReceipt(body: string | null):
+  | {
+      amount?: string;
+      cumulative?: string;
+      currency?: string;
+      deliveryId?: string;
+      sessionId?: string;
+    }
+  | undefined {
+  if (!body) return undefined;
+  try {
+    const parsed = JSON.parse(body) as Record<string, unknown>;
+    if (!("sessionId" in parsed) && !("cumulative" in parsed)) return undefined;
+    return {
+      amount: stringValue(parsed.amount),
+      cumulative: stringValue(parsed.cumulative),
+      currency: stringValue(parsed.currency),
+      deliveryId: stringValue(parsed.deliveryId),
+      sessionId: stringValue(parsed.sessionId),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function sessionSplits(value: unknown): SessionInfo["splits"] {
+  if (!Array.isArray(value)) return undefined;
+  return value
+    .map((split): NonNullable<SessionInfo["splits"]>[number] | null => {
+      if (!split || typeof split !== "object") return null;
+      const obj = split as Record<string, unknown>;
+      const recipient = stringValue(obj.recipient);
+      const bps = numberValue(obj.bps);
+      if (!recipient || bps === undefined) return null;
+      const label = stringValue(obj.label);
+      return label ? { recipient, bps, label } : { recipient, bps };
+    })
+    .filter((split): split is NonNullable<SessionInfo["splits"]>[number] => split !== null);
+}
+
+function sessionAction(value: unknown): SessionInfo["action"] | undefined {
+  return value === "open" ||
+    value === "voucher" ||
+    value === "commit" ||
+    value === "topUp" ||
+    value === "close"
+    ? value
+    : undefined;
+}
+
+function sessionMode(value: unknown): "push" | "pull" | undefined {
+  return value === "push" || value === "pull" ? value : undefined;
+}
+
+function stringValue(value: unknown): string | undefined {
+  if (typeof value === "string") return value;
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  return undefined;
+}
+
+function numberValue(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function shorten(value: string): string {
+  return value.length > 16 ? `${value.slice(0, 6)}…${value.slice(-6)}` : value;
 }

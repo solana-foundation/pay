@@ -1,6 +1,6 @@
 // ── Protocol & Status ──
 
-export type Protocol = "mpp" | "x402";
+export type Protocol = "mpp" | "x402" | "session";
 
 export type FlowStatus =
   | "payment-required" // 402 sent, awaiting retry
@@ -27,6 +27,40 @@ export interface FlowEvent {
   detail?: string; // Extra context (header values, errors, etc.)
 }
 
+// ── Session Channel ──
+
+export type SessionState = "opening" | "open" | "settling" | "closed" | "failed";
+
+export interface SessionSplit {
+  recipient: string;
+  bps: number;
+  label?: string;
+}
+
+export interface SessionInfo {
+  sessionId?: string;
+  state: SessionState;
+  action?: "open" | "voucher" | "commit" | "topUp" | "close";
+  mode?: "push" | "pull";
+  currency?: string;
+  decimals?: number;
+  cap?: string;
+  minVoucherDelta?: string;
+  deposit?: string;
+  approvedAmount?: string;
+  cumulative?: string;
+  delta?: string;
+  voucherCount?: number;
+  authorizedSigner?: string;
+  owner?: string;
+  payer?: string;
+  recipient?: string;
+  splits?: SessionSplit[];
+  deliveryId?: string;
+  openedAt?: string | null;
+  updatedAt?: string | null;
+}
+
 // ── Payment Flow ──
 
 export interface PaymentFlow {
@@ -40,6 +74,7 @@ export interface PaymentFlow {
   durationMs: number;
   amount?: string;
   payer?: string;
+  session?: SessionInfo;
   steps: FlowStep[];
   events: FlowEvent[];
   // Raw data for detail inspection

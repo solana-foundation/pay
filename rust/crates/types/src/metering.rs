@@ -634,7 +634,7 @@ pub struct SessionSpec {
     pub min_voucher_delta: u64,
     /// Session modes this server accepts.
     ///
-    /// Allowed values: `"push"` (Fiber channel, client-funded) and/or
+    /// Allowed values: `"push"` (payment channel, client-funded) and/or
     /// `"pull"` (SPL token delegation, operator fee-pays the approve tx).
     ///
     /// Defaults to `["push"]` when omitted.
@@ -647,11 +647,15 @@ pub struct SessionSpec {
     /// ```
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub modes: Vec<String>,
-    /// Fiber channel-open batch flush interval in milliseconds.
+    /// Legacy pull-mode channel-open batch flush interval in milliseconds.
     ///
     /// Defaults to `400` when omitted.
     #[serde(default = "default_session_batch_open_interval_ms")]
     pub batch_open_interval_ms: u64,
+    /// Channel settlement splits. Session splits are percentage-only and are
+    /// converted to basis points for the payment channel distribution.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub splits: Vec<SplitRule>,
 }
 
 fn default_session_batch_open_interval_ms() -> u64 {

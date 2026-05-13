@@ -55,6 +55,24 @@ pub async fn logging_middleware(
 
     let status = response.status().as_u16();
     let res_headers = extract_headers(response.headers());
+    if is_streaming_response(&res_headers) {
+        let ms = start.elapsed().as_millis() as u64;
+        let entry = LogEntry {
+            id: pdb.next_log_id(),
+            ts: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            method,
+            path,
+            status,
+            ms,
+            req_headers,
+            res_headers,
+            res_body: Some("<streaming response; body not captured>".to_string()),
+            client_ip,
+        };
+
+        pdb.correlation.lock().unwrap().ingest(entry);
+        return response;
+    }
 
     // Capture body for debugger (small enough to be useful, large enough to
     // cover OpenAPI specs etc.). Once `to_bytes` errors on size overflow the
@@ -125,6 +143,17 @@ pub async fn logging_middleware(
     pdb.correlation.lock().unwrap().ingest(entry);
 
     response
+}
+
+fn is_streaming_response(headers: &HashMap<String, String>) -> bool {
+    headers
+        .get("content-type")
+        .map(|content_type| {
+            let content_type = content_type.to_ascii_lowercase();
+            content_type.starts_with("text/event-stream")
+                || content_type.starts_with("application/x-ndjson")
+        })
+        .unwrap_or(false)
 }
 
 fn extract_headers(headers: &axum::http::HeaderMap) -> HashMap<String, String> {

@@ -89,6 +89,7 @@ tokio = { version = "1", features = ["rt-multi-thread"] }
 reqwest = { version = "0.12", features = [
     "blocking",
     "rustls-tls",
+    "stream",
 ], default-features = false }
 
 # Crypto (already in dep tree via solana crates)
@@ -122,5 +123,5 @@ solana-signature = "3.2"
 solana-system-interface = "2.0"
 solana-transaction = "3.1"
 
-# [patch."https://github.com/solana-foundation/mpp-sdk"]
-# solana-mpp = { path = "../../mpp-sdk/rust" }
+[patch."https://github.com/solana-foundation/mpp-sdk"]
+solana-mpp = { path = "../../mpp-sdk/rust" }

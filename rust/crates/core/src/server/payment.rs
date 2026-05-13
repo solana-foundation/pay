@@ -286,6 +286,22 @@ async fn handle_session_authorization(
                     );
                     response
                 }
+                SessionOutcome::Commit(receipt) => {
+                    tracing::info!(
+                        subdomain = %subdomain,
+                        path = %path,
+                        delivery_id = %receipt.delivery_id,
+                        "Session delivery committed"
+                    );
+                    telemetry::record_paid_request_completed(
+                        "session",
+                        subdomain,
+                        path,
+                        StatusCode::OK,
+                        None,
+                    );
+                    (StatusCode::OK, axum::Json(receipt)).into_response()
+                }
                 SessionOutcome::Closed(_params) => {
                     tracing::info!(subdomain = %subdomain, path = %path, "Session closed");
                     (StatusCode::OK, axum::Json(json!({"status": "closed"}))).into_response()
