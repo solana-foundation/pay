@@ -4,7 +4,8 @@
 //! voucher dependencies. The proxy can feed it provider-specific observations
 //! and use the returned base-unit deltas to decide when a new voucher is needed.
 
-use pay_types::metering::{BillingUnit, MeterDirection};
+use super::metering::{RequestProperties, evaluate_condition};
+use pay_types::metering::{BillingUnit, MeterDimension, MeterDirection, Metering, PriceTier};
 use thiserror::Error;
 
 const MICRO_USD_PER_USD: u128 = 1_000_000;
@@ -13,6 +14,19 @@ const MICRO_USD_PER_USD: u128 = 1_000_000;
 pub enum SessionMeteringError {
     #[error("session meter spec must contain at least one dimension")]
     EmptySpec,
+    #[error("session metering does not support sku_tiers")]
+    UnsupportedSkuTiers,
+    #[error("metering config has no dimensions for session billing")]
+    NoDimensions,
+    #[error("dimension {direction:?}/{unit:?} has no tiers")]
+    NoPriceTier {
+        direction: MeterDirection,
+        unit: BillingUnit,
+    },
+    #[error("price_usd must be finite and non-negative")]
+    InvalidPrice,
+    #[error("price_usd is not exactly representable as microUSD")]
+    InexactMicroUsdPrice,
     #[error("dimension {direction:?}/{unit:?} has scale 0")]
     InvalidScale {
         direction: MeterDirection,
@@ -37,6 +51,28 @@ pub enum SessionMeteringError {
 }
 
 pub type Result<T> = std::result::Result<T, SessionMeteringError>;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SessionMeteringContext<'a> {
+    pub variant_hint: Option<&'a str>,
+    pub request_properties: Option<&'a RequestProperties>,
+}
+
+impl<'a> SessionMeteringContext<'a> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_variant_hint(mut self, hint: &'a str) -> Self {
+        self.variant_hint = Some(hint);
+        self
+    }
+
+    pub fn with_request_properties(mut self, properties: &'a RequestProperties) -> Self {
+        self.request_properties = Some(properties);
+        self
+    }
+}
 
 /// A session meter spec with integer prices.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +103,30 @@ impl SessionMeterSpec {
 
         Ok(())
     }
+}
+
+pub fn spec_from_metering(
+    metering: &Metering,
+    context: SessionMeteringContext<'_>,
+) -> Result<SessionMeterSpec> {
+    if !metering.sku_tiers.is_empty() {
+        return Err(SessionMeteringError::UnsupportedSkuTiers);
+    }
+
+    let dimensions = select_dimensions(metering, context.variant_hint)?;
+    let properties = context
+        .request_properties
+        .cloned()
+        .unwrap_or_else(RequestProperties::default);
+
+    let spec = SessionMeterSpec::new(
+        dimensions
+            .iter()
+            .map(|dimension| dimension_from_metering(dimension, &properties))
+            .collect::<Result<Vec<_>>>()?,
+    );
+    spec.validate()?;
+    Ok(spec)
 }
 
 /// Price for one billable usage dimension.
@@ -274,6 +334,142 @@ pub fn rate_observation(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateMode {
+    Streaming,
+    Final,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionUsageGate {
+    spec: SessionMeterSpec,
+    settlement: StablecoinSettlement,
+    baseline_base_units: u64,
+    committed_base_units: u64,
+    min_voucher_delta: u64,
+    last_observation: UsageObservation,
+}
+
+impl SessionUsageGate {
+    pub fn new(
+        spec: SessionMeterSpec,
+        settlement: StablecoinSettlement,
+        baseline_base_units: u64,
+        min_voucher_delta: u64,
+    ) -> Result<Self> {
+        spec.validate()?;
+        Ok(Self {
+            spec,
+            settlement,
+            baseline_base_units,
+            committed_base_units: baseline_base_units,
+            min_voucher_delta,
+            last_observation: UsageObservation::new(),
+        })
+    }
+
+    pub fn observe(
+        &mut self,
+        current: UsageObservation,
+        mode: GateMode,
+    ) -> Result<SessionGateDecision> {
+        let rated = rate_voucher_delta(
+            &self.spec,
+            self.settlement,
+            &self.last_observation,
+            &current,
+        )?;
+        let total_rated = rate_voucher_delta(
+            &self.spec,
+            self.settlement,
+            &UsageObservation::new(),
+            &current,
+        )?;
+        self.last_observation = current;
+
+        let target_cumulative = self
+            .baseline_base_units
+            .checked_add(total_rated.current_base_units)
+            .ok_or(SessionMeteringError::Overflow {
+                context: "gate target cumulative",
+            })?;
+        let outstanding = target_cumulative.saturating_sub(self.committed_base_units);
+        let threshold = self.min_voucher_delta.max(1);
+
+        if outstanding == 0 || (mode == GateMode::Streaming && outstanding < threshold) {
+            return Ok(SessionGateDecision::Continue {
+                rated,
+                target_cumulative_base_units: target_cumulative,
+                committed_base_units: self.committed_base_units,
+                outstanding_base_units: outstanding,
+            });
+        }
+
+        Ok(SessionGateDecision::VoucherRequired {
+            rated,
+            target_cumulative_base_units: target_cumulative,
+            committed_base_units: self.committed_base_units,
+            outstanding_base_units: outstanding,
+        })
+    }
+
+    pub fn record_commit(&mut self, committed_base_units: u64) {
+        self.committed_base_units = self.committed_base_units.max(committed_base_units);
+    }
+
+    pub fn committed_base_units(&self) -> u64 {
+        self.committed_base_units
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionGateDecision {
+    Continue {
+        rated: RatedVoucherDelta,
+        target_cumulative_base_units: u64,
+        committed_base_units: u64,
+        outstanding_base_units: u64,
+    },
+    VoucherRequired {
+        rated: RatedVoucherDelta,
+        target_cumulative_base_units: u64,
+        committed_base_units: u64,
+        outstanding_base_units: u64,
+    },
+}
+
+impl SessionGateDecision {
+    pub fn requires_voucher(&self) -> bool {
+        matches!(self, Self::VoucherRequired { .. })
+    }
+
+    pub fn target_cumulative_base_units(&self) -> u64 {
+        match self {
+            Self::Continue {
+                target_cumulative_base_units,
+                ..
+            }
+            | Self::VoucherRequired {
+                target_cumulative_base_units,
+                ..
+            } => *target_cumulative_base_units,
+        }
+    }
+
+    pub fn outstanding_base_units(&self) -> u64 {
+        match self {
+            Self::Continue {
+                outstanding_base_units,
+                ..
+            }
+            | Self::VoucherRequired {
+                outstanding_base_units,
+                ..
+            } => *outstanding_base_units,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StablecoinSettlement {
     pub decimals: u8,
 }
@@ -363,6 +559,110 @@ fn rate_units(units: u64, dimension: &SessionMeterDimension) -> Result<u64> {
     })
 }
 
+fn select_dimensions<'a>(
+    metering: &'a Metering,
+    variant_hint: Option<&str>,
+) -> Result<&'a [MeterDimension]> {
+    if !metering.variants.is_empty() {
+        if let Some(hint) = variant_hint
+            && let Some(variant) = metering
+                .variants
+                .iter()
+                .find(|variant| hint.contains(&variant.value))
+        {
+            return Ok(&variant.dimensions);
+        }
+
+        return metering
+            .variants
+            .first()
+            .map(|variant| variant.dimensions.as_slice())
+            .ok_or(SessionMeteringError::NoDimensions);
+    }
+
+    if metering.dimensions.is_empty() {
+        return Err(SessionMeteringError::NoDimensions);
+    }
+
+    Ok(&metering.dimensions)
+}
+
+fn dimension_from_metering(
+    dimension: &MeterDimension,
+    properties: &RequestProperties,
+) -> Result<SessionMeterDimension> {
+    if dimension.scale == 0 {
+        return Err(SessionMeteringError::InvalidScale {
+            direction: dimension.direction,
+            unit: dimension.unit,
+        });
+    }
+
+    let tier = select_price_tier(dimension, properties)?;
+    let price_micro_usd = price_usd_to_micro_usd(tier.price_usd)?;
+    Ok(SessionMeterDimension::required(
+        dimension.direction,
+        dimension.unit,
+        dimension.scale,
+        price_micro_usd,
+    ))
+}
+
+fn select_price_tier<'a>(
+    dimension: &'a MeterDimension,
+    properties: &RequestProperties,
+) -> Result<&'a PriceTier> {
+    if dimension.tiers.is_empty() {
+        return Err(SessionMeteringError::NoPriceTier {
+            direction: dimension.direction,
+            unit: dimension.unit,
+        });
+    }
+
+    if dimension.tiers.iter().any(|tier| tier.up_to.is_some()) {
+        return Ok(dimension
+            .tiers
+            .iter()
+            .find(|tier| tier.price_usd > 0.0)
+            .unwrap_or(&dimension.tiers[0]));
+    }
+
+    for tier in &dimension.tiers {
+        if let Some(condition) = &tier.condition
+            && !evaluate_condition(condition, properties)
+        {
+            continue;
+        }
+        return Ok(tier);
+    }
+
+    dimension
+        .tiers
+        .last()
+        .ok_or(SessionMeteringError::NoPriceTier {
+            direction: dimension.direction,
+            unit: dimension.unit,
+        })
+}
+
+fn price_usd_to_micro_usd(price_usd: f64) -> Result<u64> {
+    if !price_usd.is_finite() || price_usd < 0.0 {
+        return Err(SessionMeteringError::InvalidPrice);
+    }
+
+    let micro_usd = price_usd * MICRO_USD_PER_USD as f64;
+    let rounded = micro_usd.round();
+    if (micro_usd - rounded).abs() > 1e-6 {
+        return Err(SessionMeteringError::InexactMicroUsdPrice);
+    }
+    if rounded > u64::MAX as f64 {
+        return Err(SessionMeteringError::Overflow {
+            context: "price_usd conversion",
+        });
+    }
+    Ok(rounded as u64)
+}
+
 fn ceil_div(numerator: u128, denominator: u128) -> Result<u128> {
     if denominator == 0 {
         return Err(SessionMeteringError::Overflow {
@@ -386,6 +686,281 @@ mod tests {
             SessionMeterDimension::required(MeterDirection::Input, BillingUnit::Tokens, 10, 3),
             SessionMeterDimension::required(MeterDirection::Output, BillingUnit::Tokens, 2, 5),
         ])
+    }
+
+    fn one_tier_dimension(
+        direction: MeterDirection,
+        unit: BillingUnit,
+        scale: u64,
+        price_usd: f64,
+    ) -> MeterDimension {
+        MeterDimension {
+            direction,
+            unit,
+            scale,
+            period: None,
+            tiers: vec![PriceTier {
+                up_to: None,
+                price_usd,
+                condition: None,
+                notes: None,
+                splits: vec![],
+            }],
+        }
+    }
+
+    fn metering_with_dimensions(dimensions: Vec<MeterDimension>) -> Metering {
+        Metering {
+            dimensions,
+            variants: vec![],
+            sku_tiers: vec![],
+            splits: vec![],
+        }
+    }
+
+    #[test]
+    fn adapter_converts_flat_agent_gateway_request_pricing() {
+        let metering = metering_with_dimensions(vec![one_tier_dimension(
+            MeterDirection::Usage,
+            BillingUnit::Requests,
+            1,
+            0.01,
+        )]);
+
+        let spec = spec_from_metering(&metering, SessionMeteringContext::new()).unwrap();
+
+        assert_eq!(spec.dimensions[0].price_micro_usd, 10_000);
+        let current = UsageObservation::new().with(MeterDirection::Usage, BillingUnit::Requests, 1);
+        let rated = rate_voucher_delta(
+            &spec,
+            StablecoinSettlement::usdc(),
+            &UsageObservation::new(),
+            &current,
+        )
+        .unwrap();
+        assert_eq!(rated.current_base_units, 10_000);
+    }
+
+    #[test]
+    fn adapter_loads_agent_gateway_gemini_yaml_shape() {
+        let api: pay_types::metering::ApiSpec = serde_yml::from_str(
+            r#"
+name: generativelanguage
+subdomain: generativelanguage
+title: "Generative Language API"
+description: "Gemini API"
+category: ai_ml
+version: v1beta
+routing:
+  type: proxy
+  url: https://generativelanguage.googleapis.com/
+endpoints:
+  - method: POST
+    path: "v1beta/models/{modelsId}:streamGenerateContent"
+    description: "Stream generated content."
+    metering:
+      variants:
+        - param: model
+          value: gemini-2.5-flash
+          dimensions:
+            - direction: input
+              unit: quota_units
+              scale: 1
+              tiers:
+                - price_usd: 0.000003
+            - direction: output
+              unit: quota_units
+              scale: 1
+              tiers:
+                - price_usd: 0.000005
+"#,
+        )
+        .unwrap();
+        let metering = api.endpoints[0].metering.as_ref().unwrap();
+
+        let spec = spec_from_metering(
+            metering,
+            SessionMeteringContext::new()
+                .with_variant_hint("v1beta/models/gemini-2.5-flash:streamGenerateContent"),
+        )
+        .unwrap();
+
+        assert_eq!(spec.dimensions.len(), 2);
+        assert_eq!(spec.dimensions[0].unit, BillingUnit::QuotaUnits);
+        assert_eq!(spec.dimensions[0].price_micro_usd, 3);
+        assert_eq!(spec.dimensions[1].price_micro_usd, 5);
+    }
+
+    #[test]
+    fn adapter_selects_variant_by_hint() {
+        let metering = Metering {
+            dimensions: vec![],
+            variants: vec![
+                pay_types::metering::MeterVariant {
+                    param: "model".to_string(),
+                    value: "gemini-2.5-pro".to_string(),
+                    dimensions: vec![one_tier_dimension(
+                        MeterDirection::Output,
+                        BillingUnit::Tokens,
+                        1,
+                        0.000010,
+                    )],
+                },
+                pay_types::metering::MeterVariant {
+                    param: "model".to_string(),
+                    value: "gemini-2.5-flash".to_string(),
+                    dimensions: vec![one_tier_dimension(
+                        MeterDirection::Output,
+                        BillingUnit::QuotaUnits,
+                        1,
+                        0.000005,
+                    )],
+                },
+            ],
+            sku_tiers: vec![],
+            splits: vec![],
+        };
+
+        let spec = spec_from_metering(
+            &metering,
+            SessionMeteringContext::new().with_variant_hint("models/gemini-2.5-flash"),
+        )
+        .unwrap();
+
+        assert_eq!(spec.dimensions[0].unit, BillingUnit::QuotaUnits);
+        assert_eq!(spec.dimensions[0].price_micro_usd, 5);
+    }
+
+    #[test]
+    fn adapter_falls_back_to_first_variant_for_unknown_hint() {
+        let metering = Metering {
+            dimensions: vec![],
+            variants: vec![pay_types::metering::MeterVariant {
+                param: "model".to_string(),
+                value: "default".to_string(),
+                dimensions: vec![one_tier_dimension(
+                    MeterDirection::Usage,
+                    BillingUnit::Requests,
+                    1,
+                    0.001,
+                )],
+            }],
+            sku_tiers: vec![],
+            splits: vec![],
+        };
+
+        let spec = spec_from_metering(
+            &metering,
+            SessionMeteringContext::new().with_variant_hint("missing"),
+        )
+        .unwrap();
+
+        assert_eq!(spec.dimensions[0].price_micro_usd, 1_000);
+    }
+
+    #[test]
+    fn adapter_evaluates_conditional_tiers() {
+        let metering = metering_with_dimensions(vec![MeterDimension {
+            direction: MeterDirection::Input,
+            unit: BillingUnit::Tokens,
+            scale: 1,
+            period: None,
+            tiers: vec![
+                PriceTier {
+                    up_to: None,
+                    price_usd: 0.000002,
+                    condition: Some(pay_types::metering::MeterCondition::ContextLength {
+                        op: pay_types::metering::CompareOp::Lte,
+                        value: 200_000,
+                    }),
+                    notes: None,
+                    splits: vec![],
+                },
+                PriceTier {
+                    up_to: None,
+                    price_usd: 0.000004,
+                    condition: Some(pay_types::metering::MeterCondition::ContextLength {
+                        op: pay_types::metering::CompareOp::Gt,
+                        value: 200_000,
+                    }),
+                    notes: None,
+                    splits: vec![],
+                },
+            ],
+        }]);
+        let props = RequestProperties {
+            context_length: Some(250_000),
+            ..Default::default()
+        };
+
+        let spec = spec_from_metering(
+            &metering,
+            SessionMeteringContext::new().with_request_properties(&props),
+        )
+        .unwrap();
+
+        assert_eq!(spec.dimensions[0].price_micro_usd, 4);
+    }
+
+    #[test]
+    fn adapter_uses_first_non_free_tier_for_volume_tiers() {
+        let metering = metering_with_dimensions(vec![MeterDimension {
+            direction: MeterDirection::Usage,
+            unit: BillingUnit::Characters,
+            scale: 1_000_000,
+            period: None,
+            tiers: vec![
+                PriceTier {
+                    up_to: Some(1_000_000),
+                    price_usd: 0.0,
+                    condition: None,
+                    notes: None,
+                    splits: vec![],
+                },
+                PriceTier {
+                    up_to: None,
+                    price_usd: 30.0,
+                    condition: None,
+                    notes: None,
+                    splits: vec![],
+                },
+            ],
+        }]);
+
+        let spec = spec_from_metering(&metering, SessionMeteringContext::new()).unwrap();
+
+        assert_eq!(spec.dimensions[0].price_micro_usd, 30_000_000);
+    }
+
+    #[test]
+    fn adapter_rejects_sub_micro_usd_prices() {
+        let metering = metering_with_dimensions(vec![one_tier_dimension(
+            MeterDirection::Input,
+            BillingUnit::Tokens,
+            1,
+            0.0000001,
+        )]);
+
+        let err = spec_from_metering(&metering, SessionMeteringContext::new()).unwrap_err();
+
+        assert!(matches!(err, SessionMeteringError::InexactMicroUsdPrice));
+    }
+
+    #[test]
+    fn adapter_rejects_sku_tiers_for_session_hot_path() {
+        let metering = Metering {
+            dimensions: vec![],
+            variants: vec![],
+            sku_tiers: vec![pay_types::metering::SkuTier {
+                sku: "places".to_string(),
+                level: pay_types::metering::SkuLevel::Essentials,
+            }],
+            splits: vec![],
+        };
+
+        let err = spec_from_metering(&metering, SessionMeteringContext::new()).unwrap_err();
+
+        assert!(matches!(err, SessionMeteringError::UnsupportedSkuTiers));
     }
 
     #[test]
@@ -532,5 +1107,56 @@ mod tests {
         )]);
         let err = spec.validate().unwrap_err();
         assert!(matches!(err, SessionMeteringError::InvalidScale { .. }));
+    }
+
+    #[test]
+    fn gate_requires_voucher_when_streaming_outstanding_reaches_min_delta() {
+        let mut gate =
+            SessionUsageGate::new(gemini_spec(), StablecoinSettlement::usdc(), 100, 10).unwrap();
+        let current = UsageObservation::new()
+            .with(MeterDirection::Input, BillingUnit::Tokens, 27)
+            .with(MeterDirection::Output, BillingUnit::Tokens, 2);
+
+        let decision = gate.observe(current, GateMode::Streaming).unwrap();
+
+        assert!(decision.requires_voucher());
+        assert_eq!(decision.target_cumulative_base_units(), 114);
+        assert_eq!(decision.outstanding_base_units(), 14);
+    }
+
+    #[test]
+    fn gate_allows_small_streaming_delta_but_requires_it_on_final() {
+        let spec = SessionMeterSpec::new([SessionMeterDimension::required(
+            MeterDirection::Usage,
+            BillingUnit::Requests,
+            1,
+            5,
+        )]);
+        let mut gate = SessionUsageGate::new(spec, StablecoinSettlement::usdc(), 0, 10).unwrap();
+        let current = UsageObservation::new().with(MeterDirection::Usage, BillingUnit::Requests, 1);
+
+        let streaming = gate.observe(current.clone(), GateMode::Streaming).unwrap();
+        let final_decision = gate.observe(current, GateMode::Final).unwrap();
+
+        assert!(!streaming.requires_voucher());
+        assert!(final_decision.requires_voucher());
+        assert_eq!(final_decision.outstanding_base_units(), 5);
+    }
+
+    #[test]
+    fn gate_records_commit_and_continues_for_same_usage() {
+        let mut gate =
+            SessionUsageGate::new(gemini_spec(), StablecoinSettlement::usdc(), 100, 1).unwrap();
+        let current = UsageObservation::new()
+            .with(MeterDirection::Input, BillingUnit::Tokens, 27)
+            .with(MeterDirection::Output, BillingUnit::Tokens, 448);
+
+        let first = gate.observe(current.clone(), GateMode::Streaming).unwrap();
+        assert!(first.requires_voucher());
+        gate.record_commit(first.target_cumulative_base_units());
+        let second = gate.observe(current, GateMode::Streaming).unwrap();
+
+        assert!(!second.requires_voucher());
+        assert_eq!(second.outstanding_base_units(), 0);
     }
 }

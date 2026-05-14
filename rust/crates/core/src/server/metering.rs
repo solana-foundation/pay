@@ -6,7 +6,7 @@ use pay_types::metering::{
 use serde::{Deserialize, Serialize};
 
 /// Properties extracted from an incoming request, used to evaluate metering conditions.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct RequestProperties {
     pub input_tokens: Option<u64>,
     pub input_characters: Option<u64>,
@@ -278,7 +278,7 @@ fn first_non_free_price(tiers: &[PriceTier]) -> f64 {
         .unwrap_or(0.0)
 }
 
-fn evaluate_condition(condition: &MeterCondition, props: &RequestProperties) -> bool {
+pub(crate) fn evaluate_condition(condition: &MeterCondition, props: &RequestProperties) -> bool {
     let (actual, op, threshold) = match condition {
         MeterCondition::InputTokens { op, value } => (props.input_tokens, op, *value),
         MeterCondition::InputCharacters { op, value } => (props.input_characters, op, *value),

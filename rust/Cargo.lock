@@ -5732,6 +5732,7 @@ dependencies = [
 name = "pay-core"
 version = "0.17.0"
 dependencies = [
+ "async-stream",
  "axum",
  "base64 0.22.1",
  "bincode",
@@ -5740,6 +5741,7 @@ dependencies = [
  "chrono",
  "ed25519-dalek 2.2.0",
  "figment",
+ "futures-util",
  "hmac 0.12.1",
  "md-5",
  "openssl-sys",
@@ -5757,6 +5759,7 @@ dependencies = [
  "sha2 0.10.9",
  "shellexpand",
  "solana-client",
+ "solana-commitment-config",
  "solana-hash 3.1.0",
  "solana-instruction 3.4.0",
  "solana-message 3.1.0",
@@ -5859,7 +5862,6 @@ dependencies = [
 [[package]]
 name = "payment_channels_client"
 version = "0.1.0"
-source = "git+https://github.com/solana-foundation/mpp-sdk?branch=feat%2Fsessions#56645e547c91406dc6c1ac073659436d4a0bb614"
 dependencies = [
  "borsh 1.6.1",
  "num-derive",
@@ -9239,7 +9241,6 @@ dependencies = [
 [[package]]
 name = "solana-mpp"
 version = "0.6.0"
-source = "git+https://github.com/solana-foundation/mpp-sdk?branch=feat%2Fsessions#56645e547c91406dc6c1ac073659436d4a0bb614"
 dependencies = [
  "base64 0.22.1",
  "bincode",

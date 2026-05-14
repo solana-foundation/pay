@@ -37,6 +37,8 @@ use pay_types::metering::ApiSpec;
 pub use solana_mpp;
 #[cfg(feature = "server")]
 use solana_mpp::server::Mpp;
+#[cfg(feature = "server")]
+use std::sync::Arc;
 
 /// Trait that the application state must implement for the payment middleware.
 #[cfg(feature = "server")]
@@ -50,6 +52,9 @@ pub trait PaymentState: Clone + Send + Sync + 'static {
         None
     }
     fn session_mpp(&self) -> Option<&server::session::SessionMpp> {
+        None
+    }
+    fn session_mpp_handle(&self) -> Option<Arc<server::session::SessionMpp>> {
         None
     }
     fn fee_payer_wallet(&self) -> Option<&server::telemetry::FeePayerWallet> {

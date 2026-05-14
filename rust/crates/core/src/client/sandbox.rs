@@ -70,6 +70,21 @@ pub async fn fund_via_surfpool(rpc_url: &str, pubkey: &str) -> Result<()> {
     Ok(())
 }
 
+/// Ensure an owner has a Surfpool USDC token account with the requested amount.
+///
+/// This is useful for recipient-only accounts in local demos: they do not need
+/// SOL, but settlement/distribution instructions still validate their ATAs.
+pub async fn set_surfpool_usdc_token_account(
+    rpc_url: &str,
+    pubkey: &str,
+    amount: u64,
+) -> Result<()> {
+    check_surfpool(rpc_url).await?;
+    set_usdc_amount(rpc_url, pubkey, amount).await?;
+    info!(pubkey = %pubkey, amount, "Sandbox USDC token account ensured");
+    Ok(())
+}
+
 async fn check_surfpool(rpc_url: &str) -> Result<()> {
     let resp = reqwest::Client::new()
         .post(rpc_url)
@@ -139,11 +154,15 @@ async fn fund_sol(rpc_url: &str, pubkey: &str) -> Result<()> {
 const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 
 async fn fund_usdc(rpc_url: &str, pubkey: &str) -> Result<()> {
+    set_usdc_amount(rpc_url, pubkey, 1_000_000_000_u64).await
+}
+
+async fn set_usdc_amount(rpc_url: &str, pubkey: &str, amount: u64) -> Result<()> {
     rpc_call(
         rpc_url,
         "surfnet_setTokenAccount",
         serde_json::json!([pubkey, USDC_MINT, {
-            "amount": 1_000_000_000_u64,
+            "amount": amount,
         }, TOKEN_PROGRAM]),
     )
     .await

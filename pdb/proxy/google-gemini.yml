@@ -36,8 +36,12 @@ session:
   # Official Gemini token prices can be sub-µUSDC per token. We settle in
   # 0.000001 USDC quanta (1 µUSDC) once usage has accumulated enough value.
   min_voucher_delta: 1
-  # Supported session modes (push = Fiber channel, pull = SPL delegation).
-  modes: [push, pull]
+  # Idle delay before the operator closes and settles the channel.
+  close_delay_ms: 15000
+  # Pull follows charge semantics at the payment boundary: the operator opens
+  # and funds the payment-channel, then the client signs cumulative vouchers.
+  modes: [pull]
+  pull_voucher_strategy: client_voucher
   splits:
     - recipient: platform
       percent: 0.1

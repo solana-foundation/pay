@@ -19,8 +19,8 @@ use std::sync::Arc;
 use solana_mpp::client::session::ActiveSession;
 use solana_mpp::solana_keychain::SolanaSigner;
 use solana_mpp::{
-    PaymentChallenge, PaymentCredential, SessionAction, SessionRequest, format_authorization,
-    parse_www_authenticate,
+    PaymentChallenge, PaymentCredential, SessionAction, SessionMode, SessionRequest,
+    format_authorization, parse_www_authenticate,
 };
 use solana_pubkey::Pubkey;
 use tokio::sync::Mutex;
@@ -152,8 +152,36 @@ impl SessionHandle {
         grace_period: u32,
         transaction: String,
     ) -> Result<String> {
+        self.open_payment_channel_header_with_mode(
+            SessionMode::Push,
+            deposit,
+            payer,
+            payee,
+            mint,
+            salt,
+            grace_period,
+            transaction,
+        )
+        .await
+    }
+
+    /// Build an `Authorization` header for a payment-channel `open` action
+    /// using an explicit submission mode.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open_payment_channel_header_with_mode(
+        &self,
+        mode: SessionMode,
+        deposit: u64,
+        payer: &str,
+        payee: &str,
+        mint: &str,
+        salt: u64,
+        grace_period: u32,
+        transaction: String,
+    ) -> Result<String> {
         let session = self.inner.lock().await;
-        let SessionAction::Open(payload) = session.open_payment_channel_action(
+        let SessionAction::Open(payload) = session.open_payment_channel_action_with_mode(
+            mode,
             deposit,
             payer,
             payee,
@@ -248,6 +276,30 @@ pub fn open_payment_channel_session_header(
     network_override: Option<&str>,
     account_override: Option<&str>,
     deposit: u64,
+    sandbox: bool,
+) -> Result<(SessionHandle, String)> {
+    open_payment_channel_session_header_with_mode(
+        challenge,
+        request,
+        store,
+        network_override,
+        account_override,
+        deposit,
+        solana_mpp::SessionMode::Push,
+        sandbox,
+    )
+}
+
+/// Open a payment-channel session with an explicit submission mode.
+#[allow(clippy::too_many_arguments)]
+pub fn open_payment_channel_session_header_with_mode(
+    challenge: &PaymentChallenge,
+    request: &solana_mpp::SessionRequest,
+    store: &dyn crate::accounts::AccountsStore,
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+    deposit: u64,
+    submission_mode: solana_mpp::SessionMode,
     sandbox: bool,
 ) -> Result<(SessionHandle, String)> {
     use solana_hash::Hash;
@@ -358,7 +410,8 @@ pub fn open_payment_channel_session_header(
         .map_err(|e| Error::Mpp(format!("build_open_payment_channel_tx: {e}")))?;
 
     let handle = SessionHandle::new(open_tx.channel_id, session_signer, challenge.clone());
-    let auth_header = rt.block_on(handle.open_payment_channel_header(
+    let auth_header = rt.block_on(handle.open_payment_channel_header_with_mode(
+        submission_mode.clone(),
         deposit,
         &payer.to_string(),
         &payee.to_string(),
@@ -372,6 +425,7 @@ pub fn open_payment_channel_session_header(
         payer = %payer,
         channel = %open_tx.channel_id,
         deposit,
+        mode = ?submission_mode,
         "payment-channel session authorization header ready"
     );
 
@@ -585,7 +639,9 @@ mod tests {
     use super::*;
     use crate::accounts::{Account, AccountsFile, Keystore, MemoryAccountsStore};
     use serial_test::serial;
-    use solana_mpp::{Base64UrlJson, SessionMode, SessionSplit, parse_authorization};
+    use solana_mpp::{
+        Base64UrlJson, SessionMode, SessionPullVoucherStrategy, SessionSplit, parse_authorization,
+    };
     use surfpool_sdk::{Keypair, Signer};
 
     fn test_request() -> SessionRequest {
@@ -605,6 +661,7 @@ mod tests {
             external_id: Some("ext-123".to_string()),
             min_voucher_delta: Some("25".to_string()),
             modes: vec![SessionMode::Push, SessionMode::Pull],
+            pull_voucher_strategy: Some(SessionPullVoucherStrategy::ClientVoucher),
             recent_blockhash: None,
         }
     }

@@ -901,7 +901,7 @@ fn pay_session_and_retry(
     sandbox: bool,
     verbose: bool,
 ) -> pay_core::Result<()> {
-    use solana_mpp::SessionMode;
+    use solana_mpp::{SessionMode, SessionPullVoucherStrategy};
 
     let is_json = no_dna::should_json(output_fmt);
     validate_tool_request_before_signing(tool)?;
@@ -916,13 +916,21 @@ fn pay_session_and_retry(
         .unwrap_or(1_000_000);
     let deposit = (min_delta * 1_000).max(1_000_000).min(cap);
 
-    // Prefer the payment-channel push path. Pull mode is only used when a
-    // server explicitly advertises pull without push.
     let supports_push = req
         .map(|r| r.modes.is_empty() || r.modes.contains(&SessionMode::Push))
         .unwrap_or(true);
+    let supports_pull = req
+        .map(|r| r.modes.contains(&SessionMode::Pull))
+        .unwrap_or(false);
     let use_pull = req
-        .map(|r| !supports_push && r.modes.contains(&SessionMode::Pull))
+        .map(|r| {
+            r.modes.contains(&SessionMode::Pull)
+                && (!supports_push
+                    || matches!(
+                        r.pull_voucher_strategy.as_ref(),
+                        Some(SessionPullVoucherStrategy::ClientVoucher)
+                    ))
+        })
         .unwrap_or(false);
 
     let auth_header = if use_pull {
@@ -932,42 +940,85 @@ fn pay_session_and_retry(
             ));
         };
 
-        if verbose && !is_json {
-            eprintln!(
-                "{}",
-                format!(
-                    "Opening pull-mode session (deposit {} µUSDC, operator {})…",
-                    deposit,
-                    &request.operator[..8.min(request.operator.len())]
-                )
-                .dimmed()
-            );
-        }
-
         let store = pay_core::accounts::FileAccountsStore::default_path();
-        let (_handle, header) = pay_core::session::open_pull_session_header(
-            challenge,
-            request,
-            &store,
-            network_override,
-            account_override,
-            deposit,
-            sandbox,
-        )?;
+        match request.pull_voucher_strategy.as_ref() {
+            Some(SessionPullVoucherStrategy::ClientVoucher) => {
+                if verbose && !is_json {
+                    eprintln!(
+                        "{}",
+                        format!(
+                            "Opening pull client-voucher session (deposit {} µUSDC)…",
+                            deposit
+                        )
+                        .dimmed()
+                    );
+                }
 
-        if verbose && !is_json {
-            eprintln!(
-                "{}",
-                "Pull session ready — delegation txs built, sending request…\n".dimmed()
-            );
+                let (_handle, header) =
+                    pay_core::session::open_payment_channel_session_header_with_mode(
+                        challenge,
+                        request,
+                        &store,
+                        network_override,
+                        account_override,
+                        deposit,
+                        SessionMode::Pull,
+                        sandbox,
+                    )?;
+
+                if verbose && !is_json {
+                    eprintln!("{}", "Pull session opened — sending request…\n".dimmed());
+                }
+                header
+            }
+            Some(SessionPullVoucherStrategy::OperatedVoucher) => {
+                if verbose && !is_json {
+                    eprintln!(
+                        "{}",
+                        format!(
+                            "Opening pull operated-voucher session (deposit {} µUSDC, operator {})…",
+                            deposit,
+                            &request.operator[..8.min(request.operator.len())]
+                        )
+                        .dimmed()
+                    );
+                }
+
+                let (_handle, header) = pay_core::session::open_pull_session_header(
+                    challenge,
+                    request,
+                    &store,
+                    network_override,
+                    account_override,
+                    deposit,
+                    sandbox,
+                )?;
+
+                if verbose && !is_json {
+                    eprintln!(
+                        "{}",
+                        "Pull operated-voucher session ready — delegation txs built, sending request…\n"
+                            .dimmed()
+                    );
+                }
+                header
+            }
+            None => {
+                return Err(pay_core::Error::Mpp(
+                    "pull-mode session challenge missing pullVoucherStrategy".to_string(),
+                ));
+            }
         }
-
-        header
     } else {
         if verbose && !is_json {
             eprintln!(
                 "{}",
-                format!("Opening push session (deposit {} µUSDC)…", deposit).dimmed()
+                format!(
+                    "Opening {}session (deposit {} µUSDC)…",
+                    if supports_pull { "push " } else { "" },
+                    deposit
+                )
+                .dimmed()
             );
         }
 

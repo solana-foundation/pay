@@ -19,6 +19,9 @@ pub mod session;
 pub mod session_metering;
 
 #[cfg(feature = "server")]
+pub mod session_stream;
+
+#[cfg(feature = "server")]
 pub mod telemetry;
 
 pub use accounting::{AccountingKey, AccountingStore, InMemoryStore, current_period};
