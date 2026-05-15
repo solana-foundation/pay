@@ -173,9 +173,21 @@ impl Keystore {
             self.auth.authenticate(intent)?;
         }
 
+        // Audit #11: the import is logically a single operation, but it
+        // touches two backend records — the keypair and the public-key
+        // metadata. If the second write fails after the first has
+        // committed, the API would otherwise return Err while leaving
+        // private key bytes orphaned in the backend. Roll back the
+        // keypair write on a pubkey-write failure so the post-import
+        // state matches the returned result.
         self.store.store(&keypair_key(account), keypair_bytes)?;
-        self.store
-            .store(&pubkey_key(account), &keypair_bytes[32..64])?;
+        if let Err(e) = self
+            .store
+            .store(&pubkey_key(account), &keypair_bytes[32..64])
+        {
+            let _ = self.store.delete(&keypair_key(account));
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -717,6 +729,77 @@ mod tests {
         // pubkey should work even with DenyAuth — no auth required for pubkey
         let pk = ks.pubkey("test").unwrap();
         assert_eq!(pk, vec![0xBB; 32]);
+    }
+
+    // ── Audit #11: import atomicity ─────────────────────────────────────
+
+    /// SecretStore that succeeds on the first `store()` call and fails on
+    /// every subsequent one. Used to simulate the split-write hazard the
+    /// audit describes: the keypair record lands, but the follow-up pubkey
+    /// write fails partway through.
+    struct FailOnSecondStore {
+        inner: store::InMemoryStore,
+        writes: std::sync::atomic::AtomicU32,
+    }
+
+    impl FailOnSecondStore {
+        fn new() -> Self {
+            Self {
+                inner: store::InMemoryStore::new(),
+                writes: std::sync::atomic::AtomicU32::new(0),
+            }
+        }
+    }
+
+    impl SecretStore for FailOnSecondStore {
+        fn store(&self, key: &str, data: &[u8]) -> Result<()> {
+            let nth = self
+                .writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if nth >= 1 {
+                return Err(Error::Backend(
+                    "simulated backend failure on second write".to_string(),
+                ));
+            }
+            self.inner.store(key, data)
+        }
+
+        fn load(&self, key: &str) -> Result<Zeroizing<Vec<u8>>> {
+            self.inner.load(key)
+        }
+
+        fn exists(&self, key: &str) -> bool {
+            self.inner.exists(key)
+        }
+
+        fn delete(&self, key: &str) -> Result<()> {
+            self.inner.delete(key)
+        }
+    }
+
+    #[test]
+    fn import_rolls_back_keypair_when_pubkey_write_fails() {
+        // Simulate a backend that commits the keypair record but then
+        // errors on the pubkey write. The audit (#11) calls out the case
+        // where `import_with_intent` returns Err while the keypair has
+        // already been persisted, leaving orphaned private key material.
+        let ks = Keystore {
+            auth: Box::new(auth::NoAuth),
+            store: Box::new(FailOnSecondStore::new()),
+            auth_on_write: false,
+        };
+
+        let result = ks.import("victim", &test_keypair(), SyncMode::ThisDeviceOnly);
+        assert!(result.is_err(), "import must surface the backend failure");
+
+        // After the failed import, no keypair record may remain. If this
+        // assertion fails, the API returned Err but private key bytes are
+        // still sitting in the backend — the exact mismatch the audit
+        // describes.
+        assert!(
+            !ks.store.exists(&keypair_key("victim")),
+            "keypair record must be rolled back when the pubkey write fails",
+        );
     }
 
     // ── Full lifecycle test ─────────────────────────────────────────────

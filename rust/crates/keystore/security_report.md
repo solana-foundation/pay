@@ -13,6 +13,8 @@ Each finding below is one of:
 - **resolved** — fix already merged; we either added a regression test or
   pointed to an existing one.
 - **fix-in-progress** — being worked on in this branch.
+- **partial** — one or more layers of a multi-layer finding are fixed in
+  this branch; the remaining layers are tracked as sub-tasks.
 - **deferred** — finding acknowledged but the fix is out of scope for this
   branch (typically because it crosses crate boundaries or needs cross-team
   product input). Tracked separately.
@@ -29,6 +31,7 @@ Each finding below is one of:
 | 70  | medium        | macOS trusts PATH for several binaries                                        | resolved |
 | 36  | medium        | Gateway fee-payer approval omits server and fee terms                         | deferred |
 | 17  | medium        | Session-opening approval omits deposit and operator terms                     | deferred |
+| 11  | medium        | Keystore import can leave partial account records after a write failure       | partial  |
 
 (Rows added as we work through findings.)
 
@@ -268,3 +271,45 @@ duplication isn't worth it.
 **Out of this finding's scope:** the auditor also recommends renewing
 approval on lifetime expiry or cap exhaustion. That's a server runtime
 behavior, not a keystore concern; tracked separately if/when it lands.
+
+### #11 — Keystore import can leave partial account records after a write failure (medium) — partial
+
+The audit calls out three independent hazards that can leave the API
+result out of sync with the durable backend state. They're tracked here
+as sub-tasks so the backend-specific work is visible.
+
+**11-A (core split-write rollback) — resolved.**
+
+`Keystore::import_with_intent` writes two backend records: the 64-byte
+keypair and the 32-byte pubkey. If the second write failed, the API
+returned `Err` while the keypair was already committed. `lib.rs:176-184`
+now performs a best-effort `delete(keypair_key(account))` when the pubkey
+write fails, so the post-call state matches the returned result for every
+backend (the fix lives above the `SecretStore` trait, so all current and
+future stores get it).
+
+Regression test: `import_rolls_back_keypair_when_pubkey_write_fails` uses
+a `FailOnSecondStore` mock that commits the first write and errors on the
+second. Currently passes; verified failing against the pre-fix version of
+`import_with_intent`.
+
+**11-B (1Password delete-before-create) — deferred (tracked with #6).**
+
+`OnePasswordStore::store` (`store.rs:217-218`) deletes the existing item
+before creating the new one. If the create fails (CLI not signed in,
+network blip, etc.), the previous account is gone. The auditor's
+recommended path — `op item edit` on the existing item, falling back to
+`op item create` for new ones, with verification after the write — has
+significant overlap with #6 (the 1Password argv-leak finding) because
+both require changing the secret-transport contract with the `op` CLI.
+Best landed in a dedicated `op`-backend PR alongside #6.
+
+**11-C (macOS Keychain delete-before-add) — deferred.**
+
+`helper.swift:doStore` calls `SecItemDelete` and then `SecItemAdd`. The
+recommended fix is to prefer `SecItemUpdate` when the item already
+exists, and fall back to `SecItemAdd` when it does not. Small enough to
+land standalone; deferred because it requires touching the embedded
+Swift helper and re-running the build-time codesign path, which is best
+tested on a macOS workstation in isolation rather than mixed into the
+core-rollback commit.
