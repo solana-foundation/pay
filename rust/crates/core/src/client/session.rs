@@ -1,6 +1,6 @@
 //! Session intent client — open channels, sign vouchers, close.
 //!
-//! A session keeps a pre-funded on-chain Fiber channel open across many API
+//! A session keeps a pre-funded on-chain payment channel open across many API
 //! calls. Each call consumes a small voucher increment instead of a full
 //! on-chain transaction, making high-frequency AI workloads cheap.
 //!
@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! 1. Server returns 402 with session challenge (intent="session")
-//! 2. Client creates a Fiber channel on-chain → gets channel_id + tx_sig
+//! 2. Client creates a payment channel on-chain → gets channel_id + tx_sig
 //! 3. Client calls SessionHandle::new() and sends open_header() on first request
 //! 4. For each subsequent request: voucher_header(cost_per_request)
 //! 5. When done: close_header() triggers on-chain settlement
@@ -19,8 +19,8 @@ use std::sync::Arc;
 use solana_mpp::client::session::ActiveSession;
 use solana_mpp::solana_keychain::SolanaSigner;
 use solana_mpp::{
-    PaymentChallenge, PaymentCredential, SessionAction, SessionRequest, format_authorization,
-    parse_www_authenticate,
+    PaymentChallenge, PaymentCredential, SessionAction, SessionMode, SessionRequest,
+    format_authorization, parse_www_authenticate,
 };
 use solana_pubkey::Pubkey;
 use tokio::sync::Mutex;
@@ -61,7 +61,7 @@ impl SessionHandle {
 
     /// Create a handle wrapping an already-opened channel.
     ///
-    /// `channel_id` is the on-chain Fiber channel public key — obtained after
+    /// `channel_id` is the on-chain payment-channel public key — obtained after
     /// broadcasting and confirming the open transaction.
     /// `signer` is the session key whose public key was passed as
     /// `authorized_signer` in the open transaction.
@@ -140,6 +140,62 @@ impl SessionHandle {
         build_header(&self.challenge, &SessionAction::Open(payload))
     }
 
+    /// Build an `Authorization` header for a payment-channel `open` action.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open_payment_channel_header(
+        &self,
+        deposit: u64,
+        payer: &str,
+        payee: &str,
+        mint: &str,
+        salt: u64,
+        grace_period: u32,
+        transaction: String,
+    ) -> Result<String> {
+        self.open_payment_channel_header_with_mode(
+            SessionMode::Push,
+            deposit,
+            payer,
+            payee,
+            mint,
+            salt,
+            grace_period,
+            transaction,
+        )
+        .await
+    }
+
+    /// Build an `Authorization` header for a payment-channel `open` action
+    /// using an explicit submission mode.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open_payment_channel_header_with_mode(
+        &self,
+        mode: SessionMode,
+        deposit: u64,
+        payer: &str,
+        payee: &str,
+        mint: &str,
+        salt: u64,
+        grace_period: u32,
+        transaction: String,
+    ) -> Result<String> {
+        let session = self.inner.lock().await;
+        let SessionAction::Open(payload) = session.open_payment_channel_action_with_mode(
+            mode,
+            deposit,
+            payer,
+            payee,
+            mint,
+            salt,
+            grace_period,
+            "pending",
+        ) else {
+            unreachable!("open_payment_channel_action always returns SessionAction::Open")
+        };
+        let payload = payload.with_transaction(transaction);
+        build_header(&self.challenge, &SessionAction::Open(payload))
+    }
+
     /// Build an `Authorization` header for a top-up after adding more funds
     /// on-chain.
     ///
@@ -176,7 +232,7 @@ impl SessionHandle {
 /// returns the `Authorization` header value to use for the retry.
 ///
 /// The server currently trusts the deposit without on-chain verification,
-/// so this works without a real Fiber channel for development/testing.
+/// so this works without a real payment channel for development/testing.
 pub fn open_session_header(
     challenge: &PaymentChallenge,
     deposit: u64,
@@ -205,6 +261,173 @@ pub fn open_session_header(
         .build()
         .map_err(|e| Error::Mpp(format!("Failed to build runtime: {e}")))?;
     let auth_header = rt.block_on(handle.open_header(deposit, "demo_open_tx"))?;
+
+    Ok((handle, auth_header))
+}
+
+/// Open a payment-channel push session with a payer-signed transaction.
+///
+/// The transaction is signed by the payer and fee-payer/cosigned by the server
+/// when it processes the `open` action.
+pub fn open_payment_channel_session_header(
+    challenge: &PaymentChallenge,
+    request: &solana_mpp::SessionRequest,
+    store: &dyn crate::accounts::AccountsStore,
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+    deposit: u64,
+    sandbox: bool,
+) -> Result<(SessionHandle, String)> {
+    open_payment_channel_session_header_with_mode(
+        challenge,
+        request,
+        store,
+        network_override,
+        account_override,
+        deposit,
+        solana_mpp::SessionMode::Push,
+        sandbox,
+    )
+}
+
+/// Open a payment-channel session with an explicit submission mode.
+#[allow(clippy::too_many_arguments)]
+pub fn open_payment_channel_session_header_with_mode(
+    challenge: &PaymentChallenge,
+    request: &solana_mpp::SessionRequest,
+    store: &dyn crate::accounts::AccountsStore,
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+    deposit: u64,
+    submission_mode: solana_mpp::SessionMode,
+    sandbox: bool,
+) -> Result<(SessionHandle, String)> {
+    use solana_hash::Hash;
+    use solana_mpp::client::build_open_payment_channel_tx;
+    use solana_mpp::program::payment_channels::{self, Distribution};
+    use solana_mpp::protocol::solana::{default_rpc_url, programs};
+    use solana_mpp::solana_keychain::MemorySigner;
+    use solana_pubkey::Pubkey;
+    use std::str::FromStr;
+
+    let network = network_override.map(str::to_string).unwrap_or_else(|| {
+        request
+            .network
+            .clone()
+            .unwrap_or_else(|| "mainnet".to_string())
+    });
+    let intent = crate::keystore::AuthIntent::open_session();
+    let (signer, ephemeral_notice) = crate::signer::load_signer_for_network_with_intent(
+        &network,
+        store,
+        account_override,
+        &intent,
+    )?;
+    let payer = signer.pubkey();
+    let rpc_url =
+        std::env::var("PAY_RPC_URL").unwrap_or_else(|_| default_rpc_url(&network).to_string());
+
+    let fee_payer = Pubkey::from_str(&request.operator)
+        .map_err(|_| Error::Mpp(format!("invalid operator pubkey: {}", request.operator)))?;
+    let payee = Pubkey::from_str(&request.recipient)
+        .map_err(|_| Error::Mpp(format!("invalid recipient pubkey: {}", request.recipient)))?;
+    let mint = Pubkey::from_str(&request.currency).map_err(|_| {
+        Error::Mpp(format!(
+            "invalid mint address in challenge: {}",
+            request.currency
+        ))
+    })?;
+    let program_id = request
+        .program_id
+        .as_deref()
+        .map(Pubkey::from_str)
+        .transpose()
+        .map_err(|e| Error::Mpp(format!("invalid channel program id: {e}")))?
+        .unwrap_or_else(payment_channels::default_program_id);
+    let token_program = Pubkey::from_str(programs::TOKEN_PROGRAM).unwrap();
+    let recipients = request
+        .splits
+        .iter()
+        .map(|split| {
+            Ok(Distribution {
+                recipient: Pubkey::from_str(&split.recipient).map_err(|e| {
+                    Error::Mpp(format!("invalid split recipient {}: {e}", split.recipient))
+                })?,
+                bps: split.bps,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let salt = rand::random::<u64>();
+    let grace_period = 900;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| Error::Mpp(format!("Failed to create async runtime: {e}")))?;
+
+    if sandbox && ephemeral_notice.is_some() {
+        let pubkey = payer.to_string();
+        let rpc = rpc_url.clone();
+        if let Err(e) = rt.block_on(crate::client::sandbox::fund_via_surfpool(&rpc, &pubkey)) {
+            tracing::warn!(error = %e, "Surfpool auto-fund failed — USDC balance may be 0");
+        }
+    }
+
+    let recent_blockhash = if let Some(blockhash) = request.recent_blockhash.as_deref() {
+        Hash::from_str(blockhash)
+            .map_err(|e| Error::Mpp(format!("invalid recentBlockhash in challenge: {e}")))?
+    } else {
+        use solana_mpp::solana_rpc_client::rpc_client::RpcClient;
+        RpcClient::new(rpc_url.clone())
+            .get_latest_blockhash()
+            .map_err(|e| Error::Mpp(format!("failed to get recent blockhash: {e}")))?
+    };
+
+    let sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+    let vk = sk.verifying_key();
+    let mut kp_bytes = [0u8; 64];
+    kp_bytes[..32].copy_from_slice(sk.as_bytes());
+    kp_bytes[32..].copy_from_slice(vk.as_bytes());
+    let session_signer: Box<dyn solana_mpp::solana_keychain::SolanaSigner> =
+        Box::new(MemorySigner::from_bytes(&kp_bytes).map_err(|e| Error::Mpp(e.to_string()))?);
+    let authorized_signer = session_signer.pubkey();
+
+    let open_tx = rt
+        .block_on(build_open_payment_channel_tx(
+            &signer,
+            &payee,
+            &mint,
+            &authorized_signer,
+            salt,
+            deposit,
+            grace_period,
+            recipients,
+            &token_program,
+            &program_id,
+            &fee_payer,
+            recent_blockhash,
+        ))
+        .map_err(|e| Error::Mpp(format!("build_open_payment_channel_tx: {e}")))?;
+
+    let handle = SessionHandle::new(open_tx.channel_id, session_signer, challenge.clone());
+    let auth_header = rt.block_on(handle.open_payment_channel_header_with_mode(
+        submission_mode.clone(),
+        deposit,
+        &payer.to_string(),
+        &payee.to_string(),
+        &mint.to_string(),
+        salt,
+        grace_period,
+        open_tx.transaction,
+    ))?;
+
+    tracing::info!(
+        payer = %payer,
+        channel = %open_tx.channel_id,
+        deposit,
+        mode = ?submission_mode,
+        "payment-channel session authorization header ready"
+    );
 
     Ok((handle, auth_header))
 }
@@ -416,7 +639,9 @@ mod tests {
     use super::*;
     use crate::accounts::{Account, AccountsFile, Keystore, MemoryAccountsStore};
     use serial_test::serial;
-    use solana_mpp::{Base64UrlJson, SessionMode, SessionSplit, parse_authorization};
+    use solana_mpp::{
+        Base64UrlJson, SessionMode, SessionPullVoucherStrategy, SessionSplit, parse_authorization,
+    };
     use surfpool_sdk::{Keypair, Signer};
 
     fn test_request() -> SessionRequest {
@@ -429,13 +654,14 @@ mod tests {
             recipient: solana_pubkey::Pubkey::new_unique().to_string(),
             splits: vec![SessionSplit {
                 recipient: solana_pubkey::Pubkey::new_unique().to_string(),
-                amount: "100".to_string(),
+                bps: 100,
             }],
             program_id: Some(solana_pubkey::Pubkey::new_unique().to_string()),
             description: Some("test session".to_string()),
             external_id: Some("ext-123".to_string()),
             min_voucher_delta: Some("25".to_string()),
             modes: vec![SessionMode::Push, SessionMode::Pull],
+            pull_voucher_strategy: Some(SessionPullVoucherStrategy::ClientVoucher),
             recent_blockhash: None,
         }
     }

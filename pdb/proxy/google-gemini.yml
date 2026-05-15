@@ -3,8 +3,8 @@ subdomain: gemini
 title: "Gemini AI (Session)"
 description: >
   Generate content with Gemini models using a pre-funded Solana session channel.
-  Open one channel per session and pay per request with signed vouchers —
-  no on-chain transaction per call.
+  Open one channel per session and pay for Gemini usage with signed cumulative
+  vouchers — no on-chain transaction per call.
 category: ai_ml
 version: v1beta
 routing:
@@ -20,6 +20,11 @@ operator:
   network: "localnet"
   fee_payer: true
 
+recipients:
+  platform:
+    account: "DZwGzbZaqqaBsUPLJTvGqhhQjoi6PcTQ42HnZLYm4ici"
+    label: "Platform Fee"
+
 # Session channel parameters.
 # The middleware issues a 402 with intent="session" instead of intent="charge".
 # Clients send signed vouchers on each call; no on-chain tx per request.
@@ -28,10 +33,19 @@ session:
   # Clients may request a lower cap; the server will not accept higher.
   cap_usdc: 10.0
   # Minimum voucher increment (base units = µUSDC).
-  # Prevents spam vouchers smaller than one API call's cost.
-  min_voucher_delta: 1000   # 0.001 USDC
-  # Supported session modes (push = Fiber channel, pull = SPL delegation).
-  modes: [push, pull]
+  # Official Gemini token prices can be sub-µUSDC per token. We settle in
+  # 0.000001 USDC quanta (1 µUSDC) once usage has accumulated enough value.
+  min_voucher_delta: 1
+  # Idle delay before the operator closes and settles the channel.
+  close_delay_ms: 15000
+  # Pull follows charge semantics at the payment boundary: the operator opens
+  # and funds the payment-channel, then the client signs cumulative vouchers.
+  modes: [pull]
+  pull_voucher_strategy: client_voucher
+  splits:
+    - recipient: platform
+      percent: 0.1
+      memo: "Platform fee"
 
 endpoints:
   # ── Free ──────────────────────────────────────────────────────────────────
@@ -46,35 +60,150 @@ endpoints:
     resource: "models"
     description: "Get model metadata. Free — no payment required."
 
-  # ── Metered (session voucher per call) ────────────────────────────────────
+  # ── Metered (Gemini pricing quantized to 0.000001 USDC) ───────────────────
 
   - method: POST
     path: "v1beta/models/{modelsId}:generateContent"
     resource: "models"
     description: >
-      Generate content with a Gemini model. Requires a session voucher
-      incrementing by at least the per-request cost below.
+      Generate content with a Gemini model. Requires session vouchers metered
+      against official Gemini API paid-tier standard pricing, quantized to
+      0.000001 USDC settlement increments where sub-µUSDC token prices require
+      batching.
     metering:
-      dimensions:
-        - direction: usage
-          unit: requests
-          scale: 1
-          tiers:
-            - price_usd: 0.001   # 0.001 USDC per request (= 1000 µUSDC)
+      variants: &official_gemini_generation_metering
+        - param: model
+          value: gemini-3.1-pro-preview
+          dimensions:
+            - direction: input
+              unit: tokens
+              scale: 1
+              tiers:
+                - price_usd: 0.000002
+                  condition: { field: context_length, op: "<=", value: 200000 }
+                  notes: "Official Gemini 3.1 Pro Preview input, $2.00 / 1M tokens, prompts <= 200k"
+                - price_usd: 0.000004
+                  condition: { field: context_length, op: ">", value: 200000 }
+                  notes: "Official Gemini 3.1 Pro Preview input, $4.00 / 1M tokens, prompts > 200k"
+            - direction: output
+              unit: tokens
+              scale: 1
+              tiers:
+                - price_usd: 0.000012
+                  condition: { field: context_length, op: "<=", value: 200000 }
+                  notes: "Official Gemini 3.1 Pro Preview output, $12.00 / 1M tokens, prompts <= 200k"
+                - price_usd: 0.000018
+                  condition: { field: context_length, op: ">", value: 200000 }
+                  notes: "Official Gemini 3.1 Pro Preview output, $18.00 / 1M tokens, prompts > 200k"
+        - param: model
+          value: gemini-3.1-flash-lite
+          dimensions:
+            - direction: input
+              unit: quota_units
+              scale: 1
+              tiers:
+                - price_usd: 0.000001
+                  notes: "4 input tokens per quota unit; official Gemini 3.1 Flash-Lite input is $0.25 / 1M tokens"
+            - direction: output
+              unit: quota_units
+              scale: 1
+              tiers:
+                - price_usd: 0.000003
+                  notes: "2 output tokens per quota unit; official Gemini 3.1 Flash-Lite output is $1.50 / 1M tokens, including thinking tokens"
+        - param: model
+          value: gemini-2.5-pro
+          dimensions:
+            - direction: input
+              unit: quota_units
+              scale: 1
+              tiers:
+                - price_usd: 0.000005
+                  condition: { field: context_length, op: "<=", value: 200000 }
+                  notes: "4 input tokens per quota unit; official Gemini 2.5 Pro input is $1.25 / 1M tokens, prompts <= 200k"
+                - price_usd: 0.000005
+                  condition: { field: context_length, op: ">", value: 200000 }
+                  notes: "2 input tokens per quota unit; official Gemini 2.5 Pro input is $2.50 / 1M tokens, prompts > 200k"
+            - direction: output
+              unit: tokens
+              scale: 1
+              tiers:
+                - price_usd: 0.00001
+                  condition: { field: context_length, op: "<=", value: 200000 }
+                  notes: "Official Gemini 2.5 Pro output, $10.00 / 1M tokens, prompts <= 200k"
+                - price_usd: 0.000015
+                  condition: { field: context_length, op: ">", value: 200000 }
+                  notes: "Official Gemini 2.5 Pro output, $15.00 / 1M tokens, prompts > 200k"
+        - param: model
+          value: gemini-2.5-flash-lite
+          dimensions:
+            - direction: input
+              unit: quota_units
+              scale: 1
+              tiers:
+                - price_usd: 0.000001
+                  notes: "10 input tokens per quota unit; official Gemini 2.5 Flash-Lite input is $0.10 / 1M tokens"
+            - direction: output
+              unit: quota_units
+              scale: 1
+              tiers:
+                - price_usd: 0.000002
+                  notes: "5 output tokens per quota unit; official Gemini 2.5 Flash-Lite output is $0.40 / 1M tokens"
+        - param: model
+          value: gemini-2.5-flash
+          dimensions:
+            - direction: input
+              unit: quota_units
+              scale: 1
+              tiers:
+                - price_usd: 0.000003
+                  notes: "10 input tokens per quota unit; official Gemini 2.5 Flash input is $0.30 / 1M tokens"
+            - direction: output
+              unit: quota_units
+              scale: 1
+              tiers:
+                - price_usd: 0.000005
+                  notes: "2 output tokens per quota unit; official Gemini 2.5 Flash output is $2.50 / 1M tokens, including thinking tokens"
+        - param: model
+          value: gemini-2.0-flash-lite
+          dimensions:
+            - direction: input
+              unit: quota_units
+              scale: 1
+              tiers:
+                - price_usd: 0.000003
+                  notes: "40 input tokens per quota unit; official Gemini 2.0 Flash-Lite input is $0.075 / 1M tokens; model deprecated June 1, 2026"
+            - direction: output
+              unit: quota_units
+              scale: 1
+              tiers:
+                - price_usd: 0.000003
+                  notes: "10 output tokens per quota unit; official Gemini 2.0 Flash-Lite output is $0.30 / 1M tokens; model deprecated June 1, 2026"
+        - param: model
+          value: gemini-2.0-flash
+          dimensions:
+            - direction: input
+              unit: quota_units
+              scale: 1
+              tiers:
+                - price_usd: 0.000001
+                  notes: "10 input tokens per quota unit; official Gemini 2.0 Flash input is $0.10 / 1M tokens; model deprecated June 1, 2026"
+            - direction: output
+              unit: quota_units
+              scale: 1
+              tiers:
+                - price_usd: 0.000002
+                  notes: "5 output tokens per quota unit; official Gemini 2.0 Flash output is $0.40 / 1M tokens; model deprecated June 1, 2026"
 
   - method: POST
     path: "v1beta/models/{modelsId}:streamGenerateContent"
     resource: "models"
     description: >
-      Stream generated content with a Gemini model. Same per-request cost
-      as generateContent.
+      Stream generated content with a Gemini model. Requires session vouchers
+      metered against official Gemini API paid-tier standard pricing, quantized
+      to 0.000001 USDC settlement increments where sub-µUSDC token prices
+      require batching.
     metering:
-      dimensions:
-        - direction: usage
-          unit: requests
-          scale: 1
-          tiers:
-            - price_usd: 0.001
+      variants: *official_gemini_generation_metering
 
   - method: POST
     path: "v1beta/models/{modelsId}:countTokens"

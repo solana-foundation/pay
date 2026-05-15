@@ -91,7 +91,12 @@ impl FlowCorrelation {
             if let Some(www_auth) = entry.res_headers.get("www-authenticate")
                 && www_auth.starts_with("Payment")
             {
-                return Some((Protocol::Mpp, Phase::Challenge));
+                let protocol = if is_session_challenge(entry) {
+                    Protocol::Session
+                } else {
+                    Protocol::Mpp
+                };
+                return Some((protocol, Phase::Challenge));
             }
             if entry.path.starts_with("/x402/")
                 || entry.res_headers.contains_key("x-payment-required")
@@ -103,6 +108,9 @@ impl FlowCorrelation {
         }
 
         // Payment retries
+        if is_session_authorization(entry.req_headers.get("authorization")) {
+            return Some((Protocol::Session, Phase::Retry));
+        }
         if entry.res_headers.contains_key("payment-receipt") {
             return Some((Protocol::Mpp, Phase::Retry));
         }
@@ -141,6 +149,17 @@ impl FlowCorrelation {
                     120
                 )
             ),
+            Protocol::Session => format!(
+                "www-authenticate: {}",
+                truncate(
+                    entry
+                        .res_headers
+                        .get("www-authenticate")
+                        .map(|s| s.as_str())
+                        .unwrap_or(""),
+                    120
+                )
+            ),
             Protocol::X402 => format!(
                 "x-payment-required: {}",
                 truncate(
@@ -154,7 +173,16 @@ impl FlowCorrelation {
             ),
         };
 
-        let amount = extract_amount(entry);
+        let amount = if matches!(protocol, Protocol::Session) {
+            None
+        } else {
+            extract_amount(entry)
+        };
+        let session = if matches!(protocol, Protocol::Session) {
+            session_from_challenge(entry)
+        } else {
+            None
+        };
 
         let flow = PaymentFlow {
             id,
@@ -167,6 +195,7 @@ impl FlowCorrelation {
             duration_ms: 0,
             amount,
             payer: None,
+            session,
             steps,
             events: vec![
                 FlowEvent {
@@ -206,17 +235,28 @@ impl FlowCorrelation {
             });
 
         let Some(idx) = idx else {
+            if matches!(protocol, Protocol::Session) && self.merge_session_delivery(entry) {
+                return;
+            }
             self.create_standalone_delivery(entry, protocol);
             return;
         };
 
         let flow = &mut self.flows[idx];
         if flow.status != FlowStatus::PaymentRequired {
+            if matches!(protocol, Protocol::Session) && self.merge_session_delivery(entry) {
+                return;
+            }
             self.create_standalone_delivery(entry, protocol);
             return;
         }
 
         let now = &entry.ts;
+        let session_update = if matches!(protocol, Protocol::Session) {
+            session_from_authorization(entry, flow.session.as_ref())
+        } else {
+            None
+        };
         flow.payment_headers = Some(entry.req_headers.clone());
         flow.payer = extract_payer(&entry.req_headers);
         flow.response_headers = Some(entry.res_headers.clone());
@@ -226,6 +266,9 @@ impl FlowCorrelation {
 
         if entry.status >= 200 && entry.status < 300 {
             flow.status = FlowStatus::ResourceDelivered;
+            if session_update.is_some() {
+                flow.session = session_update.clone();
+            }
             let detail = match protocol {
                 Protocol::Mpp => format!(
                     "payment-receipt: {}",
@@ -238,11 +281,17 @@ impl FlowCorrelation {
                         120
                     )
                 ),
+                Protocol::Session => session_event_detail(session_update.as_ref())
+                    .unwrap_or_else(|| "session action verified".into()),
                 Protocol::X402 => "x-payment-response verified".into(),
             };
             flow.events.push(FlowEvent {
                 ts: now.clone(),
-                message: "Payment accepted".into(),
+                message: if matches!(protocol, Protocol::Session) {
+                    session_accepted_message(session_update.as_ref())
+                } else {
+                    "Payment accepted".into()
+                },
                 detail: Some(detail),
             });
             flow.events.push(FlowEvent {
@@ -255,6 +304,10 @@ impl FlowCorrelation {
             });
         } else {
             flow.status = FlowStatus::Failed;
+            if let Some(mut session) = session_update {
+                session.state = SessionState::Failed;
+                flow.session = Some(session);
+            }
             flow.events.push(FlowEvent {
                 ts: now.clone(),
                 message: format!("Payment retry failed with {}", entry.status),
@@ -281,6 +334,11 @@ impl FlowCorrelation {
             step.status = StepStatus::Completed;
             step.ts = Some(now.clone());
         }
+        let session = if matches!(protocol, Protocol::Session) {
+            session_from_authorization(entry, None)
+        } else {
+            None
+        };
 
         let flow = PaymentFlow {
             id,
@@ -293,11 +351,21 @@ impl FlowCorrelation {
             duration_ms: entry.ms,
             amount: None,
             payer: extract_payer(&entry.req_headers),
+            session: session.clone(),
             steps,
             events: vec![FlowEvent {
                 ts: now.clone(),
-                message: format!("{} {} → {}", entry.method, entry.path, entry.status),
-                detail: Some("Payment flow completed (challenge not captured)".into()),
+                message: if matches!(protocol, Protocol::Session) {
+                    session_accepted_message(session.as_ref())
+                } else {
+                    format!("{} {} → {}", entry.method, entry.path, entry.status)
+                },
+                detail: Some(if matches!(protocol, Protocol::Session) {
+                    session_event_detail(session.as_ref())
+                        .unwrap_or_else(|| "Session flow completed (challenge not captured)".into())
+                } else {
+                    "Payment flow completed (challenge not captured)".into()
+                }),
             }],
             challenge_headers: None,
             payment_headers: None,
@@ -307,6 +375,76 @@ impl FlowCorrelation {
 
         self.add_flow(flow.clone());
         let _ = self.tx.send(SseMessage::FlowCreated { flow });
+    }
+
+    fn merge_session_delivery(&mut self, entry: &LogEntry) -> bool {
+        let preliminary = match session_from_authorization(entry, None) {
+            Some(session) => session,
+            None => return false,
+        };
+        if !matches!(
+            preliminary.action.as_deref(),
+            Some("commit") | Some("voucher")
+        ) {
+            return false;
+        }
+        let Some(session_id) = preliminary.session_id.as_deref() else {
+            return false;
+        };
+
+        let Some(idx) = self.flows.iter().rposition(|flow| {
+            matches!(flow.protocol, Protocol::Session)
+                && flow.resource == entry.path
+                && flow
+                    .session
+                    .as_ref()
+                    .and_then(|session| session.session_id.as_deref())
+                    == Some(session_id)
+        }) else {
+            return false;
+        };
+
+        let flow = &mut self.flows[idx];
+        let now = &entry.ts;
+        let Some(mut session_update) = session_from_authorization(entry, flow.session.as_ref())
+        else {
+            return false;
+        };
+
+        flow.payment_headers = Some(entry.req_headers.clone());
+        if let Some(payer) = extract_payer(&entry.req_headers) {
+            flow.payer = Some(payer);
+        }
+        flow.response_headers = Some(entry.res_headers.clone());
+        flow.response_body = entry.res_body.clone();
+        flow.updated_at = now.clone();
+        flow.duration_ms = elapsed_ms(&flow.started_at, now)
+            .unwrap_or_else(|| flow.duration_ms.saturating_add(entry.ms));
+
+        if entry.status >= 200 && entry.status < 300 {
+            flow.status = FlowStatus::ResourceDelivered;
+            flow.events.push(FlowEvent {
+                ts: now.clone(),
+                message: session_accepted_message(Some(&session_update)),
+                detail: session_event_detail(Some(&session_update)),
+            });
+        } else {
+            flow.status = FlowStatus::Failed;
+            session_update.state = SessionState::Failed;
+            flow.events.push(FlowEvent {
+                ts: now.clone(),
+                message: format!("Session retry failed with {}", entry.status),
+                detail: entry
+                    .res_body
+                    .as_deref()
+                    .map(|body| truncate(body, 2000).to_string()),
+            });
+        }
+
+        flow.session = Some(session_update);
+        update_steps(flow);
+        let _ = self.tx.send(SseMessage::FlowUpdated { flow: flow.clone() });
+        true
     }
 
     // ── Helpers ──
@@ -347,7 +485,12 @@ fn is_x402_body(body: &Option<String>) -> bool {
 fn build_steps(protocol: &Protocol) -> Vec<FlowStep> {
     let payment_label = match protocol {
         Protocol::Mpp => "Payment Retry",
+        Protocol::Session => "Open / Voucher",
         Protocol::X402 => "Payment Retry",
+    };
+    let challenge_label = match protocol {
+        Protocol::Session => "402 Session Intent",
+        Protocol::Mpp | Protocol::X402 => "402 Payment Required",
     };
     vec![
         FlowStep {
@@ -358,7 +501,7 @@ fn build_steps(protocol: &Protocol) -> Vec<FlowStep> {
         },
         FlowStep {
             key: "challenge".into(),
-            label: "402 Payment Required".into(),
+            label: challenge_label.into(),
             status: StepStatus::Pending,
             ts: None,
         },
@@ -410,6 +553,16 @@ fn truncate(s: &str, max: usize) -> &str {
     if s.len() > max { &s[..max] } else { s }
 }
 
+fn elapsed_ms(start: &str, end: &str) -> Option<u64> {
+    let start = chrono::DateTime::parse_from_rfc3339(start).ok()?;
+    let end = chrono::DateTime::parse_from_rfc3339(end).ok()?;
+    u64::try_from(
+        end.timestamp_millis()
+            .saturating_sub(start.timestamp_millis()),
+    )
+    .ok()
+}
+
 /// Extract a human-readable amount from the 402 challenge headers.
 /// MPP: parses the base64 `request` param from `www-authenticate`.
 /// x402: parses the JSON response body for `amount`.
@@ -425,9 +578,18 @@ fn extract_amount(entry: &LogEntry) -> Option<String> {
                 .or_else(|_| base64::engine::general_purpose::STANDARD.decode(&rest[..end]))
             && let Ok(json) = serde_json::from_slice::<serde_json::Value>(&decoded)
         {
-            let amount = json["amount"].as_str().unwrap_or("0");
-            let decimals = json["methodDetails"]["decimals"].as_u64().unwrap_or(6);
+            let amount = json["amount"]
+                .as_str()
+                .or_else(|| json["cap"].as_str())
+                .unwrap_or("0");
+            let decimals = json["methodDetails"]["decimals"]
+                .as_u64()
+                .or_else(|| json["decimals"].as_u64())
+                .unwrap_or(6);
             if let Ok(raw) = amount.parse::<u64>() {
+                if raw == u64::MAX {
+                    return Some("unbounded".to_string());
+                }
                 let value = raw as f64 / 10f64.powi(decimals as i32);
                 return Some(format!("{:.4} USDC", value));
             }
@@ -500,6 +662,318 @@ fn extract_payer(headers: &HashMap<String, String>) -> Option<String> {
     json["source"].as_str().map(|s| s.to_string())
 }
 
+fn is_session_challenge(entry: &LogEntry) -> bool {
+    entry
+        .res_headers
+        .get("www-authenticate")
+        .and_then(|header| payment_challenge_from_header(header))
+        .and_then(|params| params.get("intent").cloned())
+        .is_some_and(|intent| intent == "session")
+}
+
+fn session_from_challenge(entry: &LogEntry) -> Option<SessionInfo> {
+    let challenge = entry
+        .res_headers
+        .get("www-authenticate")
+        .and_then(|header| payment_challenge_from_header(header))?;
+    if challenge.get("intent").map(String::as_str) != Some("session") {
+        return None;
+    }
+    let request = challenge
+        .get("request")
+        .and_then(|encoded| decode_json_value(encoded))?;
+    let mode = request
+        .get("modes")
+        .and_then(|modes| modes.as_array())
+        .and_then(|modes| {
+            modes
+                .iter()
+                .filter_map(|mode| mode.as_str())
+                .find(|mode| *mode == "push" || *mode == "pull")
+        })
+        .map(str::to_string);
+
+    Some(SessionInfo {
+        session_id: None,
+        state: SessionState::Opening,
+        action: None,
+        mode,
+        currency: value_string(request.get("currency")),
+        decimals: request
+            .get("decimals")
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u8::try_from(v).ok()),
+        cap: value_string(request.get("cap")),
+        min_voucher_delta: value_string(request.get("minVoucherDelta")),
+        deposit: None,
+        approved_amount: None,
+        cumulative: None,
+        delta: None,
+        voucher_count: None,
+        authorized_signer: None,
+        owner: None,
+        payer: None,
+        recipient: value_string(request.get("recipient")),
+        splits: session_splits(request.get("splits")),
+        delivery_id: None,
+        opened_at: None,
+        updated_at: Some(entry.ts.clone()),
+    })
+}
+
+fn is_session_authorization(auth: Option<&String>) -> bool {
+    payment_credential_from_authorization(auth)
+        .and_then(|credential| {
+            credential
+                .get("challenge")
+                .and_then(|challenge| challenge.get("intent"))
+                .and_then(|intent| intent.as_str())
+                .map(str::to_string)
+        })
+        .is_some_and(|intent| intent == "session")
+}
+
+fn session_from_authorization(
+    entry: &LogEntry,
+    previous: Option<&SessionInfo>,
+) -> Option<SessionInfo> {
+    let credential = payment_credential_from_authorization(entry.req_headers.get("authorization"))?;
+    let challenge = credential.get("challenge")?;
+    if challenge.get("intent").and_then(|v| v.as_str()) != Some("session") {
+        return None;
+    }
+    let payload = credential.get("payload")?;
+    let action = session_action(payload.get("action"));
+    let receipt = parse_commit_receipt(entry.res_body.as_deref());
+    let voucher_data = payload
+        .get("voucher")
+        .and_then(|voucher| voucher.get("data"));
+    let cumulative = receipt
+        .as_ref()
+        .and_then(|r| r.cumulative.clone())
+        .or_else(|| value_string(voucher_data.and_then(|d| d.get("cumulativeAmount"))))
+        .or_else(|| value_string(voucher_data.and_then(|d| d.get("cumulative"))))
+        .or_else(|| previous.and_then(|s| s.cumulative.clone()));
+    let session_id = receipt
+        .as_ref()
+        .and_then(|r| r.session_id.clone())
+        .or_else(|| value_string(payload.get("channelId")))
+        .or_else(|| value_string(payload.get("tokenAccount")))
+        .or_else(|| value_string(voucher_data.and_then(|d| d.get("channelId"))))
+        .or_else(|| previous.and_then(|s| s.session_id.clone()));
+    let has_voucher = voucher_data.is_some();
+    let state = if entry.status >= 200 && entry.status < 300 {
+        if action.as_deref() == Some("close") {
+            SessionState::Closed
+        } else {
+            SessionState::Open
+        }
+    } else {
+        SessionState::Failed
+    };
+
+    let previous_vouchers = previous.and_then(|s| s.voucher_count).unwrap_or(0);
+    let action_is_open = action.as_deref() == Some("open");
+
+    Some(SessionInfo {
+        session_id,
+        state,
+        action,
+        mode: session_mode(payload.get("mode")).or_else(|| previous.and_then(|s| s.mode.clone())),
+        currency: previous.and_then(|s| s.currency.clone()),
+        decimals: previous.and_then(|s| s.decimals),
+        cap: previous.and_then(|s| s.cap.clone()),
+        min_voucher_delta: previous.and_then(|s| s.min_voucher_delta.clone()),
+        deposit: value_string(payload.get("deposit"))
+            .or_else(|| previous.and_then(|s| s.deposit.clone())),
+        approved_amount: value_string(payload.get("approvedAmount"))
+            .or_else(|| previous.and_then(|s| s.approved_amount.clone())),
+        cumulative,
+        delta: receipt
+            .as_ref()
+            .and_then(|r| r.amount.clone())
+            .or_else(|| previous.and_then(|s| s.delta.clone())),
+        voucher_count: Some(previous_vouchers + if has_voucher { 1 } else { 0 }),
+        authorized_signer: value_string(payload.get("authorizedSigner"))
+            .or_else(|| previous.and_then(|s| s.authorized_signer.clone())),
+        owner: value_string(payload.get("owner"))
+            .or_else(|| previous.and_then(|s| s.owner.clone())),
+        payer: value_string(payload.get("payer"))
+            .or_else(|| value_string(credential.get("source")))
+            .or_else(|| previous.and_then(|s| s.payer.clone())),
+        recipient: previous.and_then(|s| s.recipient.clone()),
+        splits: previous.map(|s| s.splits.clone()).unwrap_or_default(),
+        delivery_id: receipt
+            .as_ref()
+            .and_then(|r| r.delivery_id.clone())
+            .or_else(|| value_string(payload.get("deliveryId")))
+            .or_else(|| previous.and_then(|s| s.delivery_id.clone())),
+        opened_at: previous
+            .and_then(|s| s.opened_at.clone())
+            .or_else(|| action_is_open.then(|| entry.ts.clone())),
+        updated_at: Some(entry.ts.clone()),
+    })
+}
+
+fn session_accepted_message(session: Option<&SessionInfo>) -> String {
+    match session.and_then(|s| s.action.as_deref()) {
+        Some("open") => "Session channel opened".into(),
+        Some("voucher") => "Session voucher accepted".into(),
+        Some("commit") => "Session delivery committed".into(),
+        Some("topUp") => "Session channel topped up".into(),
+        Some("close") => "Session channel closed".into(),
+        _ => "Session action accepted".into(),
+    }
+}
+
+fn session_event_detail(session: Option<&SessionInfo>) -> Option<String> {
+    let session = session?;
+    let parts = [
+        session
+            .session_id
+            .as_ref()
+            .map(|id| format!("session={}", shorten(id))),
+        session.mode.as_ref().map(|mode| format!("mode={mode}")),
+        session
+            .cumulative
+            .as_ref()
+            .map(|cumulative| format!("cumulative={cumulative}")),
+        session.delta.as_ref().map(|delta| format!("delta={delta}")),
+        session
+            .delivery_id
+            .as_ref()
+            .map(|delivery| format!("delivery={}", shorten(delivery))),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+fn payment_challenge_from_header(header: &str) -> Option<HashMap<String, String>> {
+    let challenge = header
+        .split("\nPayment ")
+        .map(|part| {
+            if part.starts_with("Payment ") {
+                part.to_string()
+            } else {
+                format!("Payment {part}")
+            }
+        })
+        .find(|part| part.starts_with("Payment ") && part.contains("intent=\"session\""))
+        .or_else(|| header.starts_with("Payment ").then(|| header.to_string()))?;
+    Some(parse_header_params(
+        challenge.trim_start_matches("Payment ").trim(),
+    ))
+}
+
+fn payment_credential_from_authorization(auth: Option<&String>) -> Option<serde_json::Value> {
+    let auth = auth?;
+    if !auth.to_ascii_lowercase().starts_with("payment ") {
+        return None;
+    }
+    decode_json_value(auth.get(8..)?.trim())
+}
+
+fn parse_header_params(value: &str) -> HashMap<String, String> {
+    let mut params = HashMap::new();
+    for segment in value.split(',') {
+        let Some((key, raw_value)) = segment.trim().split_once('=') else {
+            continue;
+        };
+        let parsed = raw_value
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .to_string();
+        params.insert(key.trim().to_string(), parsed);
+    }
+    params
+}
+
+fn decode_json_value(encoded: &str) -> Option<serde_json::Value> {
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(encoded))
+        .ok()?;
+    serde_json::from_slice(&decoded).ok()
+}
+
+struct CommitReceiptView {
+    amount: Option<String>,
+    cumulative: Option<String>,
+    delivery_id: Option<String>,
+    session_id: Option<String>,
+}
+
+fn parse_commit_receipt(body: Option<&str>) -> Option<CommitReceiptView> {
+    let parsed: serde_json::Value = serde_json::from_str(body?).ok()?;
+    if parsed.get("sessionId").is_none() && parsed.get("cumulative").is_none() {
+        return None;
+    }
+    Some(CommitReceiptView {
+        amount: value_string(parsed.get("amount")),
+        cumulative: value_string(parsed.get("cumulative")),
+        delivery_id: value_string(parsed.get("deliveryId")),
+        session_id: value_string(parsed.get("sessionId")),
+    })
+}
+
+fn session_splits(value: Option<&serde_json::Value>) -> Vec<SessionSplit> {
+    value
+        .and_then(|value| value.as_array())
+        .map(|splits| {
+            splits
+                .iter()
+                .filter_map(|split| {
+                    let recipient = value_string(split.get("recipient"))?;
+                    let bps = split
+                        .get("bps")
+                        .and_then(|value| value.as_u64())
+                        .and_then(|value| u16::try_from(value).ok())?;
+                    Some(SessionSplit {
+                        recipient,
+                        bps,
+                        label: value_string(split.get("label")),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn session_action(value: Option<&serde_json::Value>) -> Option<String> {
+    match value.and_then(|value| value.as_str()) {
+        Some("open" | "voucher" | "commit" | "topUp" | "close") => {
+            value.and_then(|value| value.as_str()).map(str::to_string)
+        }
+        _ => None,
+    }
+}
+
+fn session_mode(value: Option<&serde_json::Value>) -> Option<String> {
+    match value.and_then(|value| value.as_str()) {
+        Some("push" | "pull") => value.and_then(|value| value.as_str()).map(str::to_string),
+        _ => None,
+    }
+}
+
+fn value_string(value: Option<&serde_json::Value>) -> Option<String> {
+    match value? {
+        serde_json::Value::String(value) => Some(value.clone()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn shorten(value: &str) -> String {
+    if value.len() > 16 {
+        format!("{}…{}", &value[..6], &value[value.len() - 6..])
+    } else {
+        value.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -517,6 +991,35 @@ mod tests {
             res_body: None,
             client_ip: "127.0.0.1".into(),
         }
+    }
+
+    fn encode_json(value: serde_json::Value) -> String {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value.to_string().as_bytes())
+    }
+
+    fn session_challenge_header() -> String {
+        let request = encode_json(serde_json::json!({
+            "cap": "1000000",
+            "currency": "USDC",
+            "decimals": 6,
+            "operator": "operator",
+            "recipient": "recipient",
+            "minVoucherDelta": "1",
+            "modes": ["push"],
+            "splits": [{"recipient": "split-recipient", "bps": 1000}]
+        }));
+        format!(
+            "Payment realm=\"test\", method=\"solana\", intent=\"session\", request=\"{request}\""
+        )
+    }
+
+    fn session_authorization(payload: serde_json::Value) -> String {
+        let credential = encode_json(serde_json::json!({
+            "challenge": {"intent": "session"},
+            "payload": payload,
+            "source": "payer-wallet"
+        }));
+        format!("Payment {credential}")
     }
 
     #[test]
@@ -585,6 +1088,136 @@ mod tests {
         let flows = engine.snapshot();
         assert_eq!(flows.len(), 1);
         assert!(matches!(flows[0].protocol, Protocol::X402));
+    }
+
+    #[test]
+    fn session_challenge_creates_session_flow() {
+        let (tx, _rx) = broadcast::channel(16);
+        let mut engine = FlowCorrelation::new(tx);
+
+        let mut entry = make_entry("POST", "/v1/generate", 402);
+        entry
+            .res_headers
+            .insert("www-authenticate".into(), session_challenge_header());
+
+        engine.ingest(entry);
+
+        let flows = engine.snapshot();
+        assert_eq!(flows.len(), 1);
+        assert!(matches!(flows[0].protocol, Protocol::Session));
+        assert_eq!(flows[0].steps[1].label, "402 Session Intent");
+        assert_eq!(flows[0].amount, None);
+        let session = flows[0].session.as_ref().expect("session metadata");
+        assert!(matches!(session.state, SessionState::Opening));
+        assert_eq!(session.currency.as_deref(), Some("USDC"));
+        assert_eq!(session.splits.len(), 1);
+    }
+
+    #[test]
+    fn session_open_retry_marks_channel_open() {
+        let (tx, _rx) = broadcast::channel(16);
+        let mut engine = FlowCorrelation::new(tx);
+
+        let mut challenge = make_entry("POST", "/v1/generate", 402);
+        challenge
+            .res_headers
+            .insert("www-authenticate".into(), session_challenge_header());
+        engine.ingest(challenge);
+
+        let mut retry = make_entry("POST", "/v1/generate", 200);
+        retry.req_headers.insert(
+            "authorization".into(),
+            session_authorization(serde_json::json!({
+                "action": "open",
+                "mode": "push",
+                "channelId": "channel-111",
+                "deposit": "1000000",
+                "authorizedSigner": "session-signer",
+                "signature": "open-signature"
+            })),
+        );
+        engine.ingest(retry);
+
+        let flows = engine.snapshot();
+        assert_eq!(flows.len(), 1);
+        assert_eq!(flows[0].status, FlowStatus::ResourceDelivered);
+        let session = flows[0].session.as_ref().expect("session metadata");
+        assert!(matches!(session.state, SessionState::Open));
+        assert_eq!(session.action.as_deref(), Some("open"));
+        assert_eq!(session.session_id.as_deref(), Some("channel-111"));
+        assert_eq!(session.deposit.as_deref(), Some("1000000"));
+    }
+
+    #[test]
+    fn session_commit_retry_merges_into_delivered_session_flow() {
+        let (tx, _rx) = broadcast::channel(16);
+        let mut engine = FlowCorrelation::new(tx);
+
+        let mut challenge = make_entry("POST", "/v1/generate", 402);
+        challenge
+            .res_headers
+            .insert("www-authenticate".into(), session_challenge_header());
+        engine.ingest(challenge);
+
+        let mut open = make_entry("POST", "/v1/generate", 200);
+        open.req_headers.insert(
+            "authorization".into(),
+            session_authorization(serde_json::json!({
+                "action": "open",
+                "mode": "push",
+                "channelId": "channel-111",
+                "deposit": "1000000",
+                "authorizedSigner": "session-signer",
+                "signature": "open-signature"
+            })),
+        );
+        engine.ingest(open);
+
+        let mut commit = make_entry("POST", "/v1/generate", 200);
+        commit.req_headers.insert(
+            "authorization".into(),
+            session_authorization(serde_json::json!({
+                "action": "commit",
+                "deliveryId": "delivery-1",
+                "voucher": {
+                    "data": {
+                        "channelId": "channel-111",
+                        "cumulativeAmount": "25",
+                        "expiresAt": 4102444800_u64
+                    },
+                    "signature": "voucher-signature"
+                }
+            })),
+        );
+        commit.res_body = Some(
+            serde_json::json!({
+                "deliveryId": "delivery-1",
+                "sessionId": "channel-111",
+                "amount": "25",
+                "cumulative": "25",
+                "status": "committed"
+            })
+            .to_string(),
+        );
+        engine.ingest(commit);
+
+        let flows = engine.snapshot();
+        assert_eq!(flows.len(), 1);
+        assert_eq!(flows[0].status, FlowStatus::ResourceDelivered);
+        assert!(
+            flows[0]
+                .events
+                .iter()
+                .any(|event| event.message == "Session delivery committed")
+        );
+        let session = flows[0].session.as_ref().expect("session metadata");
+        assert_eq!(session.action.as_deref(), Some("commit"));
+        assert_eq!(session.session_id.as_deref(), Some("channel-111"));
+        assert_eq!(session.cumulative.as_deref(), Some("25"));
+        assert_eq!(session.delta.as_deref(), Some("25"));
+        assert_eq!(session.delivery_id.as_deref(), Some("delivery-1"));
+        assert_eq!(session.voucher_count, Some(1));
+        assert_eq!(session.currency.as_deref(), Some("USDC"));
     }
 
     #[test]

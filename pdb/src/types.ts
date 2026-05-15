@@ -4,6 +4,9 @@ export type {
   StepStatus,
   FlowStep,
   FlowEvent,
+  SessionState,
+  SessionSplit,
+  SessionInfo,
   PaymentFlow,
   SSEMessage,
 } from "../api/types";

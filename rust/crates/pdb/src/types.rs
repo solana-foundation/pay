@@ -6,11 +6,12 @@ use serde::Serialize;
 
 // ── Protocol & Status ──
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Protocol {
     Mpp,
     X402,
+    Session,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -52,6 +53,73 @@ pub struct FlowEvent {
     pub detail: Option<String>,
 }
 
+// ── Session Channel ──
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SessionState {
+    Opening,
+    Open,
+    Settling,
+    Closed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSplit {
+    pub recipient: String,
+    pub bps: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    pub state: SessionState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decimals: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cap: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_voucher_delta: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deposit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approved_amount: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cumulative: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voucher_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorized_signer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recipient: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub splits: Vec<SessionSplit>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub opened_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}
+
 // ── Payment Flow ──
 
 #[derive(Debug, Clone, Serialize)]
@@ -73,6 +141,8 @@ pub struct PaymentFlow {
     pub challenge_headers: Option<HashMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payment_headers: Option<HashMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]

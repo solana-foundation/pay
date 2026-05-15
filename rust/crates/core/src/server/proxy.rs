@@ -29,7 +29,8 @@ use sha2::{Sha256, Sha512};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use crate::server::telemetry;
+use crate::server::session_stream::{self, SessionStreamContext};
+use crate::server::{metering, payment, telemetry};
 
 /// Headers to strip when forwarding to upstream.
 const STRIP_HEADERS: &[&str] = &[
@@ -75,17 +76,31 @@ pub fn resolve_routing<'a>(api: &'a ApiSpec, path: &str) -> &'a RoutingConfig {
 /// - Returns the upstream response (status, headers, body)
 ///
 /// For `Respond` routing, returns 200 with `{"status":"ok"}`.
-#[tracing::instrument(
-    name = "proxy_forward",
-    skip(api, headers, body),
-    fields(subdomain = %api.subdomain, method = %method, path = %uri.path())
-)]
 pub async fn forward_request(
     api: &ApiSpec,
     method: Method,
     uri: &Uri,
     headers: &HeaderMap,
     body: Bytes,
+) -> Result<Response, Response> {
+    forward_request_with_session_metering(api, method, uri, headers, body, None).await
+}
+
+/// Forward a request and optionally meter the streamed response against an open
+/// session. The plain [`forward_request`] wrapper keeps existing callers and
+/// tests on the unmetered path.
+#[tracing::instrument(
+    name = "proxy_forward",
+    skip(api, headers, body, session_context),
+    fields(subdomain = %api.subdomain, method = %method, path = %uri.path())
+)]
+pub async fn forward_request_with_session_metering(
+    api: &ApiSpec,
+    method: Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    body: Bytes,
+    session_context: Option<SessionStreamContext>,
 ) -> Result<Response, Response> {
     let path_and_query = uri
         .path_and_query()
@@ -276,25 +291,58 @@ pub async fn forward_request(
         }
     }
 
-    let response_body = upstream_resp.bytes().await.map_err(|e| {
-        telemetry::record_upstream_error(
-            &api.subdomain,
-            uri.path(),
-            &upstream_url,
-            &format!("upstream body read error: {e}"),
-        );
-        error_response(
-            StatusCode::BAD_GATEWAY,
-            &format!("Upstream body read error: {e}"),
-        )
-    })?;
-
     let mut resp = Response::builder().status(status);
     for (name, value) in &response_headers {
         resp = resp.header(name, value);
     }
 
-    Ok(resp.body(Body::from(response_body)).unwrap())
+    let content_type = response_headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let is_sse = content_type
+        .split(';')
+        .any(|part| part.trim().eq_ignore_ascii_case("text/event-stream"));
+
+    let stream = upstream_resp.bytes_stream();
+    if let Some(meter) = build_session_stream_meter(api, &method, uri, headers, session_context) {
+        return Ok(resp
+            .body(Body::from_stream(session_stream::meter_response_stream(
+                stream, meter, is_sse,
+            )))
+            .unwrap());
+    }
+
+    Ok(resp.body(Body::from_stream(stream)).unwrap())
+}
+
+fn build_session_stream_meter(
+    api: &ApiSpec,
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    session_context: Option<SessionStreamContext>,
+) -> Option<session_stream::SessionStreamMeter> {
+    let context = session_context?;
+    let match_method = if *method == Method::HEAD {
+        "GET"
+    } else {
+        method.as_str()
+    };
+    let path = uri.path().trim_start_matches('/');
+    let endpoint = metering::find_endpoint(api, match_method, path)?;
+    let metering = endpoint.metering.as_ref()?;
+    let props = payment::extract_request_properties(headers, path);
+    let variant_hint = payment::extract_variant_hint(path);
+
+    match session_stream::meter_from_config(metering, &props, variant_hint.as_deref(), context) {
+        Ok(Some(meter)) => Some(meter),
+        Ok(None) => None,
+        Err(error) => {
+            tracing::debug!(%error, path, "session stream metering disabled for endpoint");
+            None
+        }
+    }
 }
 
 /// Resolve the API spec from a Host header subdomain.
