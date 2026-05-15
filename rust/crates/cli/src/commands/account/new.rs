@@ -95,11 +95,11 @@ pub fn create_account(
 
     let (keypair_bytes, pubkey_b58) = generate_keypair();
 
-    let sync = if backend_id == "1password" {
-        pay_core::keystore::SyncMode::CloudSync
-    } else {
-        pay_core::keystore::SyncMode::ThisDeviceOnly
-    };
+    // Audit #5: SyncMode::CloudSync is parked in the keystore until
+    // cloud sync is a real, enforced feature. Every supported backend is
+    // effectively device-only at the keystore boundary, so we always
+    // pass ThisDeviceOnly.
+    let sync = pay_core::keystore::SyncMode::ThisDeviceOnly;
 
     let intent = pay_core::keystore::AuthIntent::create_account(name);
     ks.import_with_intent(name, &keypair_bytes, sync, &intent)

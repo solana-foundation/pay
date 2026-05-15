@@ -23,13 +23,23 @@ pub use store::SecretStore;
 pub use zeroize::Zeroizing;
 
 /// Controls whether the key syncs to cloud storage.
+///
+/// Audit #5: every supported backend currently stores items as
+/// device-only, and the keystore does not yet propagate `SyncMode` into
+/// the backend write path. The `CloudSync` variant is commented out
+/// until cloud sync is a real, enforced feature — accepting it today
+/// would silently mislead callers into believing Pay had honored a sync
+/// policy that the backend never sees. Re-add the variant alongside the
+/// `kSecAttrSynchronizable` plumbing on macOS (and the equivalent on
+/// other backends) when the feature lands.
 #[derive(Debug, Clone, Copy, Default)]
 pub enum SyncMode {
     /// Key stays on this device only (default).
     #[default]
     ThisDeviceOnly,
-    /// Key syncs to cloud (iCloud Keychain, 1Password, etc.).
-    CloudSync,
+    // CloudSync — reserved for future cloud-sync support. Do NOT
+    // re-enable without also wiring the policy through `SecretStore` and
+    // having each backend declare which modes it can honor.
 }
 
 /// Composed keystore: auth gate + secret store + shared logic.

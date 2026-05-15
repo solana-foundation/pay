@@ -36,6 +36,7 @@ Each finding below is one of:
 | 9   | medium        | SOL send approval omits the transfer amount                                   | resolved |
 | 8   | medium        | Keypair import trusts caller-supplied public key bytes                        | resolved |
 | 7   | medium        | Keypair loads can use unrelated auth policies from reason text                | resolved |
+| 5   | medium        | Keystore imports accept `SyncMode` but never enforce it                       | partial  |
 
 (Rows added as we work through findings.)
 
@@ -437,3 +438,45 @@ narrow recommendation was about `load_keypair`. If we want to harden the
 public surface further, the cleanest follow-up is to delete those
 reason-string conveniences entirely and require typed intents at the API
 boundary; tracked as a non-finding follow-up.
+
+### #5 — Keystore imports accept `SyncMode` but never enforce it (medium) — partial
+
+`SyncMode` was a two-variant enum, but the import code discarded it
+(`_sync` parameter) and the `SecretStore` trait never received it. A
+caller asking for `CloudSync` against a device-only backend (or
+`ThisDeviceOnly` against 1Password, which is inherently synced through
+the 1Password cloud) silently fell back to the backend's default
+behavior — the API appeared to honor a storage policy that nothing
+enforced.
+
+**Action this branch — minimal fix per product direction:**
+
+- Commented out the `CloudSync` variant in
+  `rust/crates/keystore/src/lib.rs:36-43`. The variant is left in place
+  as a comment with a `Do NOT re-enable without …` note so the future
+  cloud-sync work has a clear marker. Only `ThisDeviceOnly` is
+  constructible today, so callers can no longer request a mode the
+  keystore does not enforce.
+- Removed the two CLI sites that previously chose `CloudSync` for the
+  1Password backend
+  (`rust/crates/cli/src/commands/account/import.rs:82` and
+  `rust/crates/cli/src/commands/account/new.rs:98`). Both now pass
+  `ThisDeviceOnly` unconditionally; the 1Password branch was redundant
+  anyway given that backend is being removed (see #10).
+- No `SecretStore` trait change. The `_sync` parameter on
+  `Keystore::import*` keeps its underscore — accurate today because the
+  one remaining variant matches every backend's actual behavior.
+
+**Why "partial":** the auditor's broader recommendation is to thread
+`SyncMode` into `SecretStore` so each backend can declare which modes it
+supports and fail-closed on a mismatch. That contract change is the
+right shape once cloud sync is a real product feature (e.g. macOS
+`kSecAttrAccessibleWhenUnlocked` + `kSecAttrSynchronizable`). Deferring
+that work until the feature is real; the current commenting-out keeps
+the API honest in the meantime.
+
+**Regression test:** the existing
+`sync_mode_default_is_this_device_only` assertion is still meaningful
+and stays. No new test needed: with only one variant, the previous
+"silently accepts an unsupported mode" failure mode is unreachable by
+construction.
