@@ -13,6 +13,9 @@ Each finding below is one of:
 - **resolved** — fix already merged; we either added a regression test or
   pointed to an existing one.
 - **fix-in-progress** — being worked on in this branch.
+- **deferred** — finding acknowledged but the fix is out of scope for this
+  branch (typically because it crosses crate boundaries or needs cross-team
+  product input). Tracked separately.
 - **wontfix** — accepted risk or out of scope (with rationale).
 - **open** — not yet triaged.
 
@@ -24,6 +27,8 @@ Each finding below is one of:
 | 28  | high          | macOS helper uses the current directory when `HOME` is empty                  | resolved |
 | 2   | high          | Reserved `.pubkey` account names let `pubkey()` return private keypair bytes  | resolved |
 | 70  | medium        | macOS trusts PATH for several binaries                                        | resolved |
+| 36  | medium        | Gateway fee-payer approval omits server and fee terms                         | deferred |
+| 17  | medium        | Session-opening approval omits deposit and operator terms                     | deferred |
 
 (Rows added as we work through findings.)
 
@@ -188,3 +193,78 @@ fails the test on the absolute-path assertion.
 **Not in scope of this finding:** the 1Password `op` CLI is still
 PATH-resolved (`store::OnePasswordStore`); that is finding #10 and tracked
 separately.
+
+### #36 — Gateway fee-payer approval omits server and fee terms (medium) — deferred
+
+`AuthIntent::use_gateway_fee_payer()` returns a unit-style variant with a
+hard-coded "use your pay account as the gateway fee payer" message. The
+intent has no fields for network, server identity, recipient/operator
+pubkey, pull-mode flag, fee budget, lifetime, or server-wide caching, so
+the OS auth prompt is identical for a sandbox gateway, a mainnet public
+gateway, and a pull-mode operator setup. On Linux the static
+`sh.pay.use-gateway-fee-payer` Polkit action carries no amount bucket,
+unlike the per-tier `AuthIntent::AuthorizePayment` actions.
+
+Three live call sites in `rust/crates/cli/src/commands/server/start.rs`:
+
+- `:288` — default-account fallback when no `operator.signer` block is
+  configured.
+- `:1268` — `SignerConfig::Account` loader.
+- `:1277` — `SignerConfig::File` loader.
+
+**Why deferred:** the fix crosses the keystore → cli boundary, requires a
+new structured `GatewayFeePayerTerms` type, a per-bucket Polkit action set
+in `rust/config/polkit/sh.pay.unlock-keypair.policy`, and CLI plumbing to
+populate the terms at each call site. Best done as its own PR alongside
+#17 (same architectural pattern), with explicit product decisions on:
+
+- whether to require an explicit fee cap / session lifetime, and what the
+  default lifetime should be when the gateway operator doesn't set one;
+- whether to add a Pay-controlled confirmation dialog when terms cannot
+  be displayed safely in the OS prompt.
+
+**Planned scope:** see #17 for the shared design notes — both findings will
+land together.
+
+### #17 — Session-opening approval omits deposit and operator terms (medium) — deferred
+
+`AuthIntent::open_session()` is structurally the same problem as #36 — a
+unit-style variant with a hard-coded "authorize opening a pay session"
+message. The single call site in
+`rust/crates/core/src/client/session.rs:250` (inside
+`open_pull_session_header`) already has `request.operator`,
+`request.currency` (the resolved mint), the resolved `network`, and the
+caller-supplied `deposit` in scope, but none of them are passed into the
+intent.
+
+**Why deferred:** the architectural change (extend the variant to carry a
+structured terms type, render those terms into the prompt, add a
+deposit-bucket Polkit action set) is parallel to the #36 work and is
+cleanest to land together. Doing it standalone first is viable but the
+duplication isn't worth it.
+
+**Planned scope, shared with #36:**
+
+1. Replace the `OpenSession(String)` and `UseGatewayFeePayer(String)`
+   variants with structs that carry the audit-requested fields:
+   - session: `{ network, operator, mint, deposit_micro_usdc, user_pubkey? }`
+   - gateway fee payer: `{ network, server, recipient?, pull_mode, fee_budget?, session_lifetime?, cached_for_server }`
+2. Build prompt text from the terms (network + concrete identifiers +
+   cap / lifetime) using the existing truncation helpers, like
+   `authorize_payment_details` does today.
+3. Linux Polkit: map the deposit / fee-budget to a `PaymentLimit` bucket
+   and route to per-bucket actions
+   (`sh.pay.open-session-up-to-usd-*`, `sh.pay.use-gateway-fee-payer-up-to-usd-*`),
+   mirroring `polkit_payment_limit_action`. Add the new action ids to
+   `rust/config/polkit/sh.pay.unlock-keypair.policy`.
+4. Thread the values from the call sites:
+   - `core/src/client/session.rs:250`
+   - `cli/src/commands/server/start.rs:288`, `:1268`, `:1277`
+5. Tests: unit tests on intent rendering + Polkit mapping (mirroring the
+   existing payment-intent tests). End-to-end CLI test is hard because
+   server startup mocks aren't there yet — keep it scoped to the intent +
+   mapping layer.
+
+**Out of this finding's scope:** the auditor also recommends renewing
+approval on lifetime expiry or cap exhaustion. That's a server runtime
+behavior, not a keystore concern; tracked separately if/when it lands.
