@@ -1,7 +1,7 @@
-import { createEmptyClient, type DefaultRpcSubscriptionsChannelConfig, type TransactionSigner } from '@solana/kit';
+import { createClient, type DefaultRpcSubscriptionsChannelConfig, type TransactionSigner } from '@solana/kit';
 import { planAndSendTransactions } from '@solana/kit-plugin-instruction-plan';
-import { payer } from '@solana/kit-plugin-payer';
-import { rpc, rpcTransactionPlanExecutor, rpcTransactionPlanner } from '@solana/kit-plugin-rpc';
+import { rpcTransactionPlanExecutor, rpcTransactionPlanner, solanaRpcConnection } from '@solana/kit-plugin-rpc';
+import { payer } from '@solana/kit-plugin-signer';
 
 import { solanaPayMerchant } from './plugins/merchant.js';
 import { solanaPayWallet } from './plugins/wallet.js';
@@ -34,7 +34,9 @@ export type MerchantClient = ReturnType<typeof createMerchantClient>;
  * ```
  */
 export function createMerchantClient(config: MerchantClientConfig) {
-    return createEmptyClient().use(rpc(config.rpcUrl, config.rpcSubscriptionsConfig)).use(solanaPayMerchant());
+    return createClient()
+        .use(solanaRpcConnection({ rpcUrl: config.rpcUrl, rpcSubscriptionsConfig: config.rpcSubscriptionsConfig }))
+        .use(solanaPayMerchant());
 }
 
 /** Configuration for {@link createWalletClient}. */
@@ -68,8 +70,8 @@ export type WalletClient = ReturnType<typeof createWalletClient>;
  * ```
  */
 export function createWalletClient(config: WalletClientConfig) {
-    return createEmptyClient()
-        .use(rpc(config.rpcUrl, config.rpcSubscriptionsConfig))
+    return createClient()
+        .use(solanaRpcConnection({ rpcUrl: config.rpcUrl, rpcSubscriptionsConfig: config.rpcSubscriptionsConfig }))
         .use(payer(config.payer))
         .use(rpcTransactionPlanner())
         .use(rpcTransactionPlanExecutor())
@@ -106,8 +108,8 @@ export type SolanaPayClient = ReturnType<typeof createSolanaPayClient>;
  * ```
  */
 export function createSolanaPayClient(config: SolanaPayClientConfig) {
-    return createEmptyClient()
-        .use(rpc(config.rpcUrl, config.rpcSubscriptionsConfig))
+    return createClient()
+        .use(solanaRpcConnection({ rpcUrl: config.rpcUrl, rpcSubscriptionsConfig: config.rpcSubscriptionsConfig }))
         .use(payer(config.payer))
         .use(rpcTransactionPlanner())
         .use(rpcTransactionPlanExecutor())

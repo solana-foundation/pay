@@ -18,7 +18,7 @@ npm install @solana/pay @solana/kit
 
 | Package | Version |
 |---------|---------|
-| `@solana/kit` | `^6.1.0` |
+| `@solana/kit` | `^6.9.0` |
 
 ### Optional dependencies (for `createTransfer` / `validateTransfer`)
 
@@ -117,12 +117,13 @@ await validateTransfer(rpc, signatureInfo.signature, { recipient, amount: 1 });
 Compose with other kit plugins for full control:
 
 ```ts
-import { createEmptyClient } from '@solana/kit';
-import { rpc, payerFromFile } from '@solana/kit-plugins';
+import { createClient } from '@solana/kit';
+import { solanaRpcConnection } from '@solana/kit-plugin-rpc';
+import { payerFromFile } from '@solana/kit-plugin-signer';
 import { solanaPayMerchant, solanaPayWallet } from '@solana/pay';
 
-const client = await createEmptyClient()
-  .use(rpc('https://api.devnet.solana.com'))
+const client = await createClient()
+  .use(solanaRpcConnection({ rpcUrl: 'https://api.devnet.solana.com' }))
   .use(payerFromFile('~/.config/solana/id.json'))
   .use(solanaPayMerchant())
   .use(solanaPayWallet());

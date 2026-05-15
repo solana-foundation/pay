@@ -1,7 +1,8 @@
 import type { GetSignaturesForAddressApi, GetTransactionApi, Rpc, RpcSubscriptions } from '@solana/kit';
-import { generateKeyPairSigner, lamports, TransactionSigner } from '@solana/kit';
+import { createClient, generateKeyPairSigner, lamports, TransactionSigner } from '@solana/kit';
+import { litesvm } from '@solana/kit-plugin-litesvm';
+import { airdropPayer, generatedPayer } from '@solana/kit-plugin-signer';
 import type { LogsNotificationsApi } from '@solana/rpc-subscriptions-api';
-import { createClient } from '@solana/kit-client-litesvm';
 import {
     findAssociatedTokenPda,
     getCreateAssociatedTokenIdempotentInstructionAsync,
@@ -44,6 +45,9 @@ function withUnsupportedRpcStubs() {
 
 async function createTestClient() {
     const client = await createClient()
+        .use(await generatedPayer())
+        .use(litesvm())
+        .use(airdropPayer(lamports(100_000_000_000n)))
         .use(withUnsupportedRpcStubs())
         .use(solanaPayMerchant())
         .use(solanaPayWallet())
@@ -61,41 +65,37 @@ describe.concurrent('Integration: SOL transfers', () => {
     beforeAll(async () => {
         client = await createTestClient();
         payer = client.payer;
-        client.svm.airdrop(payer.address, lamports(100_000_000_000n));
         recipient = await generateKeyPairSigner();
-        client.svm.airdrop(recipient.address, lamports(1n));
     });
 
     it('should transfer 1 SOL', async () => {
         const instructions = await client.pay.createTransfer({ recipient: recipient.address, amount: 1 });
         await client.sendTransaction(instructions);
 
-        expect(client.svm.getBalance(recipient.address)).toBe(lamports(1_000_000_001n));
+        expect(client.svm.getBalance(recipient.address)).toBe(lamports(1_000_000_000n));
     });
 
     it('should transfer 0.5 SOL (fractional)', async () => {
         const r = await generateKeyPairSigner();
-        client.svm.airdrop(r.address, lamports(1n));
 
         const instructions = await client.pay.createTransfer({ recipient: r.address, amount: 0.5 });
         await client.sendTransaction(instructions);
 
-        expect(client.svm.getBalance(r.address)).toBe(lamports(500_000_001n));
+        expect(client.svm.getBalance(r.address)).toBe(lamports(500_000_000n));
     });
 
-    it('should transfer 1 lamport (0.000000001 SOL)', async () => {
+    it('should transfer 1 lamport to an existing rent-exempt account', async () => {
         const r = await generateKeyPairSigner();
-        client.svm.airdrop(r.address, lamports(1n));
+        client.svm.airdrop(r.address, lamports(1_000_000_000n));
 
         const instructions = await client.pay.createTransfer({ recipient: r.address, amount: 0.000000001 });
         await client.sendTransaction(instructions);
 
-        expect(client.svm.getBalance(r.address)).toBe(lamports(2n));
+        expect(client.svm.getBalance(r.address)).toBe(lamports(1_000_000_001n));
     });
 
     it('should transfer with memo', async () => {
         const r = await generateKeyPairSigner();
-        client.svm.airdrop(r.address, lamports(1n));
 
         const instructions = await client.pay.createTransfer({
             recipient: r.address,
@@ -104,25 +104,23 @@ describe.concurrent('Integration: SOL transfers', () => {
         });
         await client.sendTransaction(instructions);
 
-        expect(client.svm.getBalance(r.address)).toBe(lamports(1_000_001n));
+        expect(client.svm.getBalance(r.address)).toBe(lamports(1_000_000n));
     });
 
     it('should transfer with reference', async () => {
         const r = await generateKeyPairSigner();
-        client.svm.airdrop(r.address, lamports(1n));
         const reference = (await generateKeyPairSigner()).address;
 
         const instructions = await client.pay.createTransfer({ recipient: r.address, amount: 0.001, reference });
         await client.sendTransaction(instructions);
 
-        expect(client.svm.getBalance(r.address)).toBe(lamports(1_000_001n));
+        expect(client.svm.getBalance(r.address)).toBe(lamports(1_000_000n));
     });
 
     it('should throw on insufficient funds', async () => {
         const poorSender = await generateKeyPairSigner();
-        client.svm.airdrop(poorSender.address, lamports(100n));
+        client.svm.airdrop(poorSender.address, lamports(900_000_000n));
         const r = await generateKeyPairSigner();
-        client.svm.airdrop(r.address, lamports(1n));
 
         await expect(client.pay.createTransfer({ recipient: r.address, amount: 1 }, poorSender)).rejects.toThrow(
             'insufficient funds',
@@ -139,7 +137,6 @@ describe('Integration: URL round-trip', () => {
 
     it('should encodeURL → parseURL → createTransfer → send', async () => {
         const r = await generateKeyPairSigner();
-        client.svm.airdrop(r.address, lamports(1n));
 
         const url = encodeURL({ recipient: r.address, amount: 0.25 });
         const parsed = parseURL(url);
@@ -151,7 +148,7 @@ describe('Integration: URL round-trip', () => {
         });
         await client.sendTransaction(instructions);
 
-        expect(client.svm.getBalance(r.address)).toBe(lamports(250_000_001n));
+        expect(client.svm.getBalance(r.address)).toBe(lamports(250_000_000n));
     });
 });
 

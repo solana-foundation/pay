@@ -11,12 +11,14 @@ function createMockSigner(addr: Address): TransactionSigner {
 }
 
 vi.mock('@solana/kit-plugin-rpc', () => ({
-    rpc: (url: string) => (client: any) => ({ ...client, rpc: { __mockRpcUrl: url } }),
-    rpcTransactionPlanner: () => (client: any) => ({ ...client, transactionPlanner: vi.fn() }),
     rpcTransactionPlanExecutor: () => (client: any) => ({ ...client, transactionPlanExecutor: vi.fn() }),
+    rpcTransactionPlanner: () => (client: any) => ({ ...client, transactionPlanner: vi.fn() }),
+    solanaRpcConnection:
+        ({ rpcUrl }: { rpcUrl: string }) =>
+        (client: any) => ({ ...client, rpc: { __mockRpcUrl: rpcUrl } }),
 }));
 
-vi.mock('@solana/kit-plugin-payer', () => ({
+vi.mock('@solana/kit-plugin-signer', () => ({
     payer: (signer: TransactionSigner) => (client: any) => ({ ...client, payer: signer }),
 }));
 
