@@ -34,6 +34,7 @@ Each finding below is one of:
 | 11  | medium        | Keystore import can leave partial account records after a write failure       | partial  |
 | 10  | medium        | 1Password backend trusts a PATH-resolved `op` binary for secret operations    | wontfix  |
 | 9   | medium        | SOL send approval omits the transfer amount                                   | resolved |
+| 8   | medium        | Keypair import trusts caller-supplied public key bytes                        | resolved |
 
 (Rows added as we work through findings.)
 
@@ -355,3 +356,45 @@ If a real SOL-transfer flow is added later, build the intent from the
 canonical recipient *and* the resolved lamport amount (use
 `AuthIntent::authorize_payment_details` or extend `authorize_payment` to
 carry a SOL `PaymentLimit` bucket), per the auditor's recommended shape.
+
+### #8 — Keypair import trusts caller-supplied public key bytes (medium) — resolved
+
+`validate_keypair` previously only checked that the imported buffer was
+64 bytes long. A caller could supply `[secret_seed_A || pubkey_B]` where
+`pubkey_B` was unrelated to `secret_seed_A`, and the keystore would
+record that account with the wrong public-key metadata. `pubkey()` would
+later return `pubkey_B` and Pay could display or sign with the wrong
+account identity.
+
+**Fix** (`lib.rs`):
+
+- Added `ed25519-dalek` to the crate's dependencies (already a workspace
+  dep).
+- `validate_keypair` now returns `Result<[u8; PUBKEY_LEN]>`: it interprets
+  bytes `0..32` as the Ed25519 signing seed, derives the matching
+  `VerifyingKey`, and rejects the import if it does not byte-equal the
+  caller-supplied `32..64` half.
+- `import_with_intent` uses the *derived* pubkey (not the caller-supplied
+  bytes) for the pubkey-metadata write, so the stored identity always
+  comes from the validated signing key.
+- `load_keypair_with_intent` was already calling `validate_keypair`, so
+  stored records that disagree with the secret half are now also rejected
+  on read — defense-in-depth against direct backend tampering.
+
+**Backward compatibility:** Solana keypairs produced by `solana-keygen`,
+by `pay setup`, or by `pay-core`'s own `SigningKey::generate(...).to_keypair_bytes()`
+always have matched halves and import / load identically before and
+after the fix. The only thing that breaks is what the audit asked for:
+imports with mismatched halves.
+
+**Regression test:** `import_rejects_mismatched_pubkey_bytes` imports a
+`[0xAA; 32] || [0xBB; 32]` buffer (length-valid, derivation-invalid) and
+asserts the import is rejected and no record is left behind. Failed
+against the pre-fix `validate_keypair`; passes after the derivation
+check is added.
+
+**Test fixture cleanup:** added `make_keypair(seed_byte)` and
+`pubkey_for(seed_byte)` helpers in the tests module. Existing tests that
+used `[0xAA; 32] || [0xBB; 32]`-style buffers now use the helpers, so
+all imports go through the new derivation check. No production caller
+code changed.

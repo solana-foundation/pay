@@ -167,7 +167,12 @@ impl Keystore {
         intent: &AuthIntent,
     ) -> Result<()> {
         validate_account_name(account)?;
-        validate_keypair(keypair_bytes)?;
+        // Audit #8: derive the pubkey from the secret seed; reject any
+        // caller-supplied bytes that disagree with the derivation. The
+        // returned pubkey is what we then commit as the metadata record,
+        // so the stored identity always comes from the validated signing
+        // key.
+        let derived_pubkey = validate_keypair(keypair_bytes)?;
 
         if self.auth_on_write {
             self.auth.authenticate(intent)?;
@@ -183,7 +188,7 @@ impl Keystore {
         self.store.store(&keypair_key(account), keypair_bytes)?;
         if let Err(e) = self
             .store
-            .store(&pubkey_key(account), &keypair_bytes[32..64])
+            .store(&pubkey_key(account), &derived_pubkey)
         {
             let _ = self.store.delete(&keypair_key(account));
             return Err(e);
@@ -285,14 +290,46 @@ fn validate_account_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_keypair(bytes: &[u8]) -> Result<()> {
+/// Validate a 64-byte Solana / Ed25519 keypair and return the public key
+/// derived from its secret seed.
+///
+/// Solana stores keypairs as `[secret_seed_32 || public_key_32]`. This
+/// function does not trust the caller-supplied public-key bytes:
+///   1. checks the buffer is exactly 64 bytes;
+///   2. interprets bytes `0..32` as the Ed25519 signing seed;
+///   3. derives the matching `VerifyingKey` via `ed25519-dalek`;
+///   4. rejects the import if the derived public key does not byte-equal
+///      the caller-supplied `32..64` half.
+///
+/// The returned 32 bytes are the *derived* public key. Callers should use
+/// this value for the pubkey-metadata record so the stored identity comes
+/// from the validated signing key — never from caller-supplied bytes that
+/// could disagree with the secret (audit #8).
+fn validate_keypair(bytes: &[u8]) -> Result<[u8; PUBKEY_LEN]> {
     if bytes.len() != KEYPAIR_LEN {
         return Err(Error::InvalidKeypair(format!(
             "expected {KEYPAIR_LEN} bytes, got {}",
             bytes.len()
         )));
     }
-    Ok(())
+
+    let seed: [u8; 32] = bytes[..32]
+        .try_into()
+        .expect("32 bytes guaranteed by length check");
+    let derived = ed25519_dalek::SigningKey::from_bytes(&seed)
+        .verifying_key()
+        .to_bytes();
+
+    let supplied: [u8; 32] = bytes[32..KEYPAIR_LEN]
+        .try_into()
+        .expect("32 bytes guaranteed by length check");
+    if derived != supplied {
+        return Err(Error::InvalidKeypair(
+            "public key bytes do not match the secret-derived public key".to_string(),
+        ));
+    }
+
+    Ok(derived)
 }
 
 fn validate_pubkey(bytes: &[u8]) -> Result<()> {
@@ -319,10 +356,30 @@ fn pubkey_key(account: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Build a real Ed25519 keypair (secret seed + derived public key) for
+    /// an all-`seed_byte` secret. Tests need this rather than a hand-rolled
+    /// `[0xAA; 32] || [0xBB; 32]` buffer because `validate_keypair` now
+    /// rejects pubkey halves that don't derive from the secret (audit #8).
+    fn make_keypair(seed_byte: u8) -> Vec<u8> {
+        let seed = [seed_byte; 32];
+        let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let pk = sk.verifying_key().to_bytes();
+        let mut out = seed.to_vec();
+        out.extend_from_slice(&pk);
+        out
+    }
+
+    /// 32-byte Ed25519 public key derived from an all-`seed_byte` secret.
+    fn pubkey_for(seed_byte: u8) -> Vec<u8> {
+        let seed = [seed_byte; 32];
+        ed25519_dalek::SigningKey::from_bytes(&seed)
+            .verifying_key()
+            .to_bytes()
+            .to_vec()
+    }
+
     fn test_keypair() -> Vec<u8> {
-        let mut bytes = vec![0xAA; 32];
-        bytes.extend_from_slice(&[0xBB; 32]);
-        bytes
+        make_keypair(0xAA)
     }
 
     #[test]
@@ -340,7 +397,7 @@ mod tests {
         ks.import("test", &test_keypair(), SyncMode::ThisDeviceOnly)
             .unwrap();
         let pubkey = ks.pubkey("test").unwrap();
-        assert_eq!(pubkey, vec![0xBB; 32]);
+        assert_eq!(pubkey, pubkey_for(0xAA));
     }
 
     #[test]
@@ -351,7 +408,7 @@ mod tests {
         let kp = ks.load_keypair("test", "unit test").unwrap();
         assert_eq!(kp.len(), 64);
         assert_eq!(&kp[..32], &[0xAA; 32]);
-        assert_eq!(&kp[32..], &[0xBB; 32]);
+        assert_eq!(&kp[32..], pubkey_for(0xAA).as_slice());
     }
 
     #[test]
@@ -398,16 +455,13 @@ mod tests {
     #[test]
     fn in_memory_multiple_accounts() {
         let ks = Keystore::in_memory();
-        let mut kp1 = vec![0x11; 32];
-        kp1.extend_from_slice(&[0x22; 32]);
-        let mut kp2 = vec![0x33; 32];
-        kp2.extend_from_slice(&[0x44; 32]);
+        ks.import("acct1", &make_keypair(0x11), SyncMode::ThisDeviceOnly)
+            .unwrap();
+        ks.import("acct2", &make_keypair(0x33), SyncMode::ThisDeviceOnly)
+            .unwrap();
 
-        ks.import("acct1", &kp1, SyncMode::ThisDeviceOnly).unwrap();
-        ks.import("acct2", &kp2, SyncMode::ThisDeviceOnly).unwrap();
-
-        assert_eq!(ks.pubkey("acct1").unwrap(), vec![0x22; 32]);
-        assert_eq!(ks.pubkey("acct2").unwrap(), vec![0x44; 32]);
+        assert_eq!(ks.pubkey("acct1").unwrap(), pubkey_for(0x11));
+        assert_eq!(ks.pubkey("acct2").unwrap(), pubkey_for(0x33));
 
         ks.delete("acct1", "test").unwrap();
         assert!(!ks.exists("acct1"));
@@ -420,11 +474,10 @@ mod tests {
         ks.import("test", &test_keypair(), SyncMode::ThisDeviceOnly)
             .unwrap();
 
-        let mut kp2 = vec![0xCC; 32];
-        kp2.extend_from_slice(&[0xDD; 32]);
-        ks.import("test", &kp2, SyncMode::ThisDeviceOnly).unwrap();
+        ks.import("test", &make_keypair(0xCC), SyncMode::ThisDeviceOnly)
+            .unwrap();
 
-        assert_eq!(ks.pubkey("test").unwrap(), vec![0xDD; 32]);
+        assert_eq!(ks.pubkey("test").unwrap(), pubkey_for(0xCC));
     }
 
     #[test]
@@ -580,13 +633,11 @@ mod tests {
     fn audit_2_pubkey_collision_attack_is_blocked() {
         let ks = Keystore::in_memory();
 
-        let mut victim_keypair = vec![0xAAu8; 32];
-        victim_keypair.extend_from_slice(&[0xBBu8; 32]);
+        let victim_keypair = make_keypair(0xAA);
         ks.import("victim", &victim_keypair, SyncMode::ThisDeviceOnly)
             .unwrap();
 
-        let mut attacker_keypair = vec![0xCCu8; 32];
-        attacker_keypair.extend_from_slice(&[0xDDu8; 32]);
+        let attacker_keypair = make_keypair(0xCC);
 
         let attempt = ks.import("victim.pubkey", &attacker_keypair, SyncMode::ThisDeviceOnly);
         assert!(
@@ -603,7 +654,7 @@ mod tests {
         assert!(!ks.exists("victim.pubkey"));
 
         let leaked = ks.pubkey("victim").expect("legitimate pubkey still readable");
-        assert_eq!(leaked, vec![0xBBu8; 32], "must return the legitimate pubkey");
+        assert_eq!(leaked, pubkey_for(0xAA), "must return the legitimate pubkey");
         assert_ne!(
             leaked,
             attacker_keypair[..32].to_vec(),
@@ -709,7 +760,9 @@ mod tests {
         ks.store
             .store(&keypair_key("test"), &test_keypair())
             .unwrap();
-        ks.store.store(&pubkey_key("test"), &[0xBB; 32]).unwrap();
+        ks.store
+            .store(&pubkey_key("test"), &pubkey_for(0xAA))
+            .unwrap();
 
         let result = ks.delete("test", "test");
         assert!(result.is_err());
@@ -728,7 +781,28 @@ mod tests {
             .unwrap();
         // pubkey should work even with DenyAuth — no auth required for pubkey
         let pk = ks.pubkey("test").unwrap();
-        assert_eq!(pk, vec![0xBB; 32]);
+        assert_eq!(pk, pubkey_for(0xAA));
+    }
+
+    // ── Audit #8: keypair pubkey/secret consistency ─────────────────────
+
+    #[test]
+    fn import_rejects_mismatched_pubkey_bytes() {
+        // 0xAA...0xBB is a length-valid 64-byte buffer where the second
+        // half is NOT the Ed25519 public key derived from the first half.
+        // The audit (#8) calls out the case where a caller can supply
+        // unrelated public-key bytes alongside a real signing seed. After
+        // this fix, validate_keypair must reject the import.
+        let ks = Keystore::in_memory();
+        let mut keypair = vec![0xAAu8; 32];
+        keypair.extend_from_slice(&[0xBBu8; 32]);
+
+        let result = ks.import("victim", &keypair, SyncMode::ThisDeviceOnly);
+        assert!(
+            result.is_err(),
+            "import must reject a keypair whose public-key half does not derive from the secret",
+        );
+        assert!(!ks.exists("victim"));
     }
 
     // ── Audit #11: import atomicity ─────────────────────────────────────
@@ -808,12 +882,10 @@ mod tests {
     fn full_lifecycle_import_read_delete() {
         let ks = Keystore::in_memory();
 
-        // Generate a realistic keypair
+        // Realistic Ed25519 keypair: all-0x42 seed plus its derived pubkey.
         let secret = [0x42u8; 32];
-        let public = [0x7Fu8; 32];
-        let mut keypair = Vec::new();
-        keypair.extend_from_slice(&secret);
-        keypair.extend_from_slice(&public);
+        let public = pubkey_for(0x42);
+        let keypair = make_keypair(0x42);
 
         // Import
         ks.import("alice", &keypair, SyncMode::ThisDeviceOnly)
@@ -827,7 +899,7 @@ mod tests {
         // Load full keypair (auth required — NoAuth passes)
         let loaded = ks.load_keypair("alice", "test").unwrap();
         assert_eq!(&loaded[..32], &secret);
-        assert_eq!(&loaded[32..], &public);
+        assert_eq!(&loaded[32..], public.as_slice());
 
         // Delete
         ks.delete("alice", "test").unwrap();
