@@ -22,6 +22,7 @@ Each finding below is one of:
 | --- | ------------- | ----------------------------------------------------------------------------- | -------- |
 | 52  | high          | Use of `/tmp` is unsafe                                                       | resolved |
 | 28  | high          | macOS helper uses the current directory when `HOME` is empty                  | resolved |
+| 2   | high          | Reserved `.pubkey` account names let `pubkey()` return private keypair bytes  | resolved |
 
 (Rows added as we work through findings.)
 
@@ -109,3 +110,50 @@ instead of trusting `HOME`. Skipped because the existing defense-in-depth
 (ownership + perms + byte-equality + codesign) already blocks code-execution
 even if `HOME` points to an unexpected absolute path. Revisit if a stronger
 guarantee is needed.
+
+### #2 — Reserved `.pubkey` account names let `pubkey()` return private keypair bytes (high) — resolved
+
+**Original attack** (from the report):
+
+| Operation                                       | Storage key      | Data                       |
+| ----------------------------------------------- | ---------------- | -------------------------- |
+| `import_with_intent("victim.pubkey", keypair)`  | `victim.pubkey`  | 64-byte private keypair    |
+| `pubkey("victim")`                              | `victim.pubkey`  | expected 32-byte public key |
+
+In the original layout, the private keypair lived at the storage key
+`account` and the public-key metadata at `format!("{account}.pubkey")`.
+A caller-supplied `victim.pubkey` account therefore aliased the public-key
+key for `victim`. Because `pubkey()` was unauthenticated and did not check
+the value length, the attacker's 64-byte private keypair could be read out
+verbatim through the public-key API.
+
+**Fix** (all three layers must hold to block the attack; current code has them all):
+
+1. **Typed storage prefixes** (`lib.rs:296-302`): `keypair_key` and
+   `pubkey_key` prepend `keypair:` and `pubkey:`. The `:` byte is not in
+   the allowed account-name charset, so no valid account name can produce
+   either typed key.
+2. **Reserved-suffix rejection** (`lib.rs:268-272`): `validate_account_name`
+   rejects names ending in `.pubkey` (case-insensitive), so the very first
+   import call fails before any storage write.
+3. **Size check on read** (`lib.rs:205-210`): `pubkey()` now runs
+   `validate_pubkey` after load and rejects anything other than 32 bytes —
+   defense-in-depth for corrupted or future-bug storage state.
+
+**Regression tests** in `lib.rs`:
+
+- `reserved_pubkey_suffix_is_rejected` — unit test for layer 2.
+- `pubkey_rejects_private_keypair_sized_value` — unit test for layer 3
+  (bypasses validation by writing directly to the underlying store, then
+  asserts `pubkey()` refuses to return 64 bytes).
+- `typed_storage_keys_do_not_alias_valid_account_names` — unit test for
+  layer 1.
+- `audit_2_pubkey_collision_attack_is_blocked` — new end-to-end test that
+  walks the auditor's exact narrative: legit `victim` import → attacker
+  attempts `victim.pubkey` → rejection + `pubkey("victim")` still returns
+  the legitimate public bytes, never the attacker's. Covers case variants
+  of the suffix too.
+
+**Failure demonstrated:** temporarily disabling the reserved-suffix check
+makes `audit_2_pubkey_collision_attack_is_blocked` fail on the import
+assertion, confirming the test catches that regression.

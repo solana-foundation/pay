@@ -549,6 +549,69 @@ mod tests {
         assert!(!ks.exists("pubkey:victim"));
     }
 
+    /// End-to-end regression for audit finding #2.
+    ///
+    /// Original attack: when account names allowed `.` and the pubkey
+    /// metadata key was `format!("{account}.pubkey")`, importing an account
+    /// named `victim.pubkey` placed the attacker's 64-byte keypair under the
+    /// same storage key that `pubkey("victim")` later loaded. Because
+    /// `pubkey()` did not enforce a 32-byte size, an unauthenticated caller
+    /// could retrieve raw secret-key bytes.
+    ///
+    /// Mitigations exercised here (all three must hold to block the attack):
+    ///   1. typed storage prefixes (`keypair:` / `pubkey:`) prevent the
+    ///      attacker's storage key from aliasing the legitimate pubkey key;
+    ///   2. `validate_account_name` rejects the reserved `.pubkey` suffix
+    ///      (case-insensitive) before any storage write happens;
+    ///   3. `pubkey()` validates that the loaded value is exactly 32 bytes.
+    #[test]
+    fn audit_2_pubkey_collision_attack_is_blocked() {
+        let ks = Keystore::in_memory();
+
+        let mut victim_keypair = vec![0xAAu8; 32];
+        victim_keypair.extend_from_slice(&[0xBBu8; 32]);
+        ks.import("victim", &victim_keypair, SyncMode::ThisDeviceOnly)
+            .unwrap();
+
+        let mut attacker_keypair = vec![0xCCu8; 32];
+        attacker_keypair.extend_from_slice(&[0xDDu8; 32]);
+
+        let attempt = ks.import("victim.pubkey", &attacker_keypair, SyncMode::ThisDeviceOnly);
+        assert!(
+            attempt.is_err(),
+            "import of `victim.pubkey` must be rejected"
+        );
+        assert!(
+            attempt
+                .unwrap_err()
+                .to_string()
+                .contains("reserved suffix"),
+            "rejection must cite the reserved suffix",
+        );
+        assert!(!ks.exists("victim.pubkey"));
+
+        let leaked = ks.pubkey("victim").expect("legitimate pubkey still readable");
+        assert_eq!(leaked, vec![0xBBu8; 32], "must return the legitimate pubkey");
+        assert_ne!(
+            leaked,
+            attacker_keypair[..32].to_vec(),
+            "must never leak any byte from the attacker's secret half",
+        );
+        assert_ne!(
+            leaked,
+            attacker_keypair[32..].to_vec(),
+            "must never return the attacker's public half either",
+        );
+
+        for variant in ["victim.PUBKEY", "victim.Pubkey", "VICTIM.pubkey"] {
+            assert!(
+                ks.import(variant, &attacker_keypair, SyncMode::ThisDeviceOnly)
+                    .is_err(),
+                "case variant {variant:?} of the reserved suffix must also be rejected",
+            );
+        }
+    }
+
     #[test]
     fn hex_roundtrip() {
         let data = vec![0xDE, 0xAD, 0xBE, 0xEF];
