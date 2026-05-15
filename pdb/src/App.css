@@ -369,12 +369,16 @@ body {
   background: var(--bg-raised);
   display: grid;
   grid-template-columns: 220px 1fr 1fr;
+  height: clamp(220px, 48vh, 500px);
   min-height: 220px;
-  max-height: 500px;
   overflow: hidden;
   animation: slideDown 0.15s ease;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+}
+
+.flow-detail > * {
+  min-height: 0;
 }
 
 /* ── Sequence Diagram ── */
@@ -454,10 +458,16 @@ body {
 /* ── Detail Panel (tabs + content) ── */
 
 .detail-panel {
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
   overflow: hidden;
   min-height: 0;
+  border-right: 1px solid var(--border);
+}
+
+.detail-content {
+  min-height: 0;
+  overflow: hidden;
 }
 
 .detail-tabs {
@@ -492,6 +502,118 @@ body {
   border-bottom-color: var(--accent);
 }
 
+.replay-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.replay-card {
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.replay-header h3,
+.raw-http-header h3 {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--fg-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 8px;
+}
+
+.replay-header p,
+.raw-http-header span,
+.replay-note {
+  color: var(--fg-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.replay-actions {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 8px;
+  margin-top: 14px;
+  min-width: 0;
+}
+
+.replay-button {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  font-family: var(--font);
+  font-size: 12px;
+  font-weight: 500;
+  padding: 8px 12px;
+  border-radius: var(--radius);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  flex: 1 1 0;
+  min-width: 0;
+  white-space: nowrap;
+}
+
+.replay-button:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.replay-button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.replay-button.copied {
+  border-color: var(--green);
+  color: var(--green);
+}
+
+.replay-note {
+  margin-top: 10px;
+}
+
+.replay-panel .splits {
+  border-right: none;
+  padding-top: 14px;
+}
+
+.raw-http-panel {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  height: 100%;
+  padding: 16px 20px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  min-height: 0;
+  overscroll-behavior: contain;
+}
+
+.raw-http-header {
+  flex-shrink: 0;
+  margin-bottom: 12px;
+}
+
+.raw-http-pre {
+  margin: 0;
+  padding: 12px 14px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.6;
+  min-height: 0;
+  overflow-x: auto;
+  overflow-y: visible;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 /* ── Payment Splits ── */
 
 .splits {
@@ -499,7 +621,6 @@ body {
   overflow-y: auto;
   min-height: 0;
   flex: 1;
-  border-right: 1px solid var(--border);
 }
 
 .splits h3 {

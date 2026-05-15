@@ -33,6 +33,10 @@ export interface PaymentFlow {
   id: string; // "flow-1", "flow-2", …
   protocol: Protocol;
   resource: string; // URL path, e.g. "/mpp/quote/GOOG"
+  requestMethod: string;
+  requestUrl: string;
+  requestHeaders?: Record<string, string>;
+  requestBody?: string | null;
   status: FlowStatus;
   clientIp: string;
   startedAt: string; // ISO
@@ -45,6 +49,7 @@ export interface PaymentFlow {
   // Raw data for detail inspection
   challengeHeaders?: Record<string, string>;
   paymentHeaders?: Record<string, string>;
+  responseStatus?: number;
   responseHeaders?: Record<string, string>;
   responseBody?: string | null;
 }

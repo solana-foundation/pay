@@ -15,9 +15,11 @@ export interface LogEntry {
   ts: string;
   method: string;
   path: string;
+  url: string;
   status: number;
   ms: number;
   reqHeaders: Record<string, string>;
+  reqBody: string | null;
   resHeaders: Record<string, string>;
   resBody: string | null;
   clientIp: string;
@@ -146,7 +148,11 @@ export class FlowCorrelation {
     const flow: PaymentFlow = {
       id,
       protocol,
-      resource: entry.path,
+      resource: entry.url,
+      requestMethod: entry.method,
+      requestUrl: entry.url,
+      requestHeaders: entry.reqHeaders,
+      requestBody: entry.reqBody,
       status: "payment-required",
       clientIp: entry.clientIp,
       startedAt: now,
@@ -164,11 +170,14 @@ export class FlowCorrelation {
           message: `402 Payment Required`,
           detail:
             protocol === "mpp"
-              ? `www-authenticate: ${truncate(resHeader(entry, "www-authenticate"), 120)}`
-              : `x-payment-required: ${truncate(resHeader(entry, "x-payment-required"), 120)}`,
+              ? formatHeaderDetail("www-authenticate", resHeader(entry, "www-authenticate"))
+              : formatHeaderDetail("x-payment-required", resHeader(entry, "x-payment-required")),
         },
       ],
       challengeHeaders: entry.resHeaders,
+      responseStatus: entry.status,
+      responseHeaders: entry.resHeaders,
+      responseBody: entry.resBody,
     };
 
     this.addFlow(flow);
@@ -183,7 +192,7 @@ export class FlowCorrelation {
     if (!flow || flow.status !== "payment-required") {
       // Path-only fallback: find most recent pending flow for this path
       flow = [...this.flows].reverse().find(
-        (f) => f.resource === entry.path && f.status === "payment-required"
+        (f) => pathFromUrl(f.requestUrl) === entry.path && f.status === "payment-required"
       ) ?? null;
     }
 
@@ -209,8 +218,12 @@ export class FlowCorrelation {
 
     // Update flow
     flow.paymentHeaders = entry.reqHeaders;
+    flow.responseStatus = entry.status;
     flow.responseHeaders = entry.resHeaders;
     flow.responseBody = entry.resBody;
+    if (!flow.requestBody && entry.reqBody) {
+      flow.requestBody = entry.reqBody;
+    }
     flow.updatedAt = now;
     flow.durationMs =
       new Date(now).getTime() - new Date(flow.startedAt).getTime();
@@ -222,8 +235,8 @@ export class FlowCorrelation {
         message: `Payment accepted`,
         detail:
           protocol === "mpp"
-            ? `payment-receipt: ${truncate(resHeader(entry, "payment-receipt"), 120)}`
-            : `x-payment-response verified`,
+            ? formatHeaderDetail("payment-receipt", resHeader(entry, "payment-receipt"))
+            : formatHeaderDetail("x-payment-response", "verified"),
       });
       flow.events.push({
         ts: now,
@@ -289,7 +302,11 @@ export class FlowCorrelation {
     const flow: PaymentFlow = {
       id,
       protocol,
-      resource: entry.path,
+      resource: entry.url,
+      requestMethod: entry.method,
+      requestUrl: entry.url,
+      requestHeaders: entry.reqHeaders,
+      requestBody: entry.reqBody,
       status: "resource-delivered",
       clientIp: entry.clientIp,
       startedAt: now,
@@ -303,6 +320,7 @@ export class FlowCorrelation {
           detail: "Payment flow completed (challenge not captured)",
         },
       ],
+      responseStatus: entry.status,
       responseHeaders: entry.resHeaders,
       responseBody: entry.resBody,
     };
@@ -335,9 +353,9 @@ export class FlowCorrelation {
     this.flows.push(flow);
     if (this.flows.length > MAX_FLOWS) {
       const removed = this.flows.shift()!;
-      this.flowIndex.delete(flowKey(removed.clientIp, removed.resource));
+      this.flowIndex.delete(flowKey(removed.clientIp, pathFromUrl(removed.requestUrl)));
     }
-    this.flowIndex.set(flowKey(flow.clientIp, flow.resource), flow);
+    this.flowIndex.set(flowKey(flow.clientIp, pathFromUrl(flow.requestUrl)), flow);
   }
 
   private emit(msg: SSEMessage): void {
@@ -414,4 +432,30 @@ function resHeader(entry: LogEntry, key: string): string {
 
 function truncate(s: string, max: number): string {
   return s.length > max ? s.slice(0, max) + "…" : s;
+}
+
+function formatHeaderDetail(name: string, value: string): string {
+  return `${name}: ${truncate(redactHeaderValue(name, value), 120)}`;
+}
+
+function redactHeaderValue(name: string, value: string): string {
+  switch (name.toLowerCase()) {
+    case "authorization":
+    case "www-authenticate":
+    case "payment-receipt":
+    case "x-payment":
+    case "x-payment-response":
+    case "x-payment-required":
+      return "[REDACTED]";
+    default:
+      return value;
+  }
+}
+
+function pathFromUrl(url: string): string {
+  try {
+    return new URL(url).pathname;
+  } catch {
+    return url;
+  }
 }
