@@ -157,13 +157,6 @@ impl AuthIntent {
         }
     }
 
-    pub fn send_sol(recipient: &str) -> Self {
-        Self::AuthorizePayment {
-            message: format!("authorize sending SOL to {recipient}"),
-            limit: None,
-        }
-    }
-
     pub fn create_account(account: &str) -> Self {
         Self::CreateAccount(format!("set up the \"{account}\" payment account"))
     }
@@ -196,10 +189,7 @@ impl AuthIntent {
         let message = normalize_message(reason);
         let lower = message.to_ascii_lowercase();
 
-        if lower.starts_with("authorize payment")
-            || lower.starts_with("authorize a payment")
-            || lower.starts_with("authorize sending")
-        {
+        if lower.starts_with("authorize payment") || lower.starts_with("authorize a payment") {
             let limit = payment_limit_from_message(&message);
             Self::AuthorizePayment { message, limit }
         } else if lower.starts_with("set up") || lower.starts_with("store keypair") {
@@ -497,10 +487,6 @@ mod tests {
 
     #[test]
     fn from_reason_maps_known_reason_shapes_to_variants() {
-        assert!(matches!(
-            AuthIntent::from_reason("authorize sending SOL to recipient"),
-            AuthIntent::AuthorizePayment { .. }
-        ));
         assert!(matches!(
             AuthIntent::from_reason("set up the \"default\" payment account"),
             AuthIntent::CreateAccount(_)

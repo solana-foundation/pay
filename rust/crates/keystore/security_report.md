@@ -33,6 +33,7 @@ Each finding below is one of:
 | 17  | medium        | Session-opening approval omits deposit and operator terms                     | deferred |
 | 11  | medium        | Keystore import can leave partial account records after a write failure       | partial  |
 | 10  | medium        | 1Password backend trusts a PATH-resolved `op` binary for secret operations    | wontfix  |
+| 9   | medium        | SOL send approval omits the transfer amount                                   | resolved |
 
 (Rows added as we work through findings.)
 
@@ -325,3 +326,32 @@ The same reasoning extends to **every 1Password-specific finding** in the
 audit (#6, #14, #24, #27, #29, #32, #41, #43) and to sub-item **#11-B**
 above — all of them become inapplicable once the backend is removed.
 They will be batch-closed in `security_report.md` when the removal lands.
+
+### #9 — SOL send approval omits the transfer amount (medium) — resolved (by removing the dead code path)
+
+The auditor reports that `AuthIntent::send_sol(recipient)` builds the SOL
+transfer prompt without an amount or `PaymentLimit`, so the OS auth
+prompt cannot tell the user whether they are approving 0.1 SOL, 10 SOL,
+or a drain. The auditor also says the caller is
+`pay_core::client::send::send_sol()`.
+
+**Status of the alleged caller:** there is no `pay_core::client::send::send_sol`
+function in the current tree. `crates/core/src/client/send.rs` only exposes
+`send_stablecoin`, `parse_token_amount`, and `format_token_amount`. Direct
+SOL transfers go through the stablecoin path (different intent shape).
+
+**Status of `AuthIntent::send_sol`:** the only references to it were the
+constructor definition in `auth.rs:160` and a single Polkit-mapping unit
+test assertion in `linux/mod.rs:349`. No production caller exists in the
+workspace.
+
+**Fix applied:** removed the dead `AuthIntent::send_sol` constructor.
+Also removed the `"authorize sending"` prefix branch from
+`AuthIntent::from_reason` and the corresponding unit test — that prefix
+was reachable only through `send_sol`-shaped messages, so it had no live
+producer either.
+
+If a real SOL-transfer flow is added later, build the intent from the
+canonical recipient *and* the resolved lamport amount (use
+`AuthIntent::authorize_payment_details` or extend `authorize_payment` to
+carry a SOL `PaymentLimit` bucket), per the auditor's recommended shape.

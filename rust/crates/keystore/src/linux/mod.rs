@@ -346,10 +346,6 @@ mod tests {
             POLKIT_ACTION_PAYMENT
         );
         assert_eq!(
-            polkit_action_for_intent(&AuthIntent::send_sol("11111111111111111111111111111111")),
-            POLKIT_ACTION_PAYMENT
-        );
-        assert_eq!(
             polkit_action_for_intent(&AuthIntent::authorize_payment("$0.0501", "accessing API")),
             "sh.pay.authorize-payment-up-to-usd-01"
         );
