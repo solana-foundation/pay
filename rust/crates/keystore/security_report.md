@@ -32,6 +32,7 @@ Each finding below is one of:
 | 36  | medium        | Gateway fee-payer approval omits server and fee terms                         | deferred |
 | 17  | medium        | Session-opening approval omits deposit and operator terms                     | deferred |
 | 11  | medium        | Keystore import can leave partial account records after a write failure       | partial  |
+| 10  | medium        | 1Password backend trusts a PATH-resolved `op` binary for secret operations    | wontfix  |
 
 (Rows added as we work through findings.)
 
@@ -313,3 +314,14 @@ land standalone; deferred because it requires touching the embedded
 Swift helper and re-running the build-time codesign path, which is best
 tested on a macOS workstation in isolation rather than mixed into the
 core-rollback commit.
+
+### #10 — 1Password backend trusts a PATH-resolved `op` binary for secret operations (medium) — wontfix
+
+The 1Password (`op` CLI) backend is being removed from `pay-keystore`.
+Once the `store::OnePasswordStore` / `store::OnePasswordAuth` types and
+their `op` invocations are gone, this finding ceases to apply.
+
+The same reasoning extends to **every 1Password-specific finding** in the
+audit (#6, #14, #24, #27, #29, #32, #41, #43) and to sub-item **#11-B**
+above — all of them become inapplicable once the backend is removed.
+They will be batch-closed in `security_report.md` when the removal lands.
