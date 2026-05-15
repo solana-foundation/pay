@@ -227,8 +227,15 @@ impl Keystore {
     }
 
     /// Load the full 64-byte keypair. Triggers auth prompt.
+    ///
+    /// `reason` is used only as display text. Audit #7: this entry point
+    /// is a key-read operation, so the intent is pinned to
+    /// [`AuthIntent::use_account`]. Caller-supplied reason text never
+    /// upgrades the operation into a privileged variant
+    /// (`DeleteAccount`, `AuthorizePayment`, …), which would otherwise
+    /// shift the Linux Polkit action away from the account-use action.
     pub fn load_keypair(&self, account: &str, reason: &str) -> Result<Zeroizing<Vec<u8>>> {
-        self.load_keypair_with_intent(account, &AuthIntent::from_reason(reason))
+        self.load_keypair_with_intent(account, &AuthIntent::use_account(reason))
     }
 
     /// Load the full 64-byte keypair with a typed auth intent.
@@ -782,6 +789,83 @@ mod tests {
         // pubkey should work even with DenyAuth — no auth required for pubkey
         let pk = ks.pubkey("test").unwrap();
         assert_eq!(pk, pubkey_for(0xAA));
+    }
+
+    // ── Audit #7: load_keypair intent classification ────────────────────
+
+    /// AuthGate that records the most recent intent it was asked to
+    /// authenticate. Used to assert that key-read APIs hand the gate the
+    /// right typed variant regardless of caller-supplied reason text.
+    #[derive(Clone)]
+    struct RecordingAuth {
+        captured: std::sync::Arc<std::sync::Mutex<Option<AuthIntent>>>,
+    }
+
+    impl RecordingAuth {
+        fn new() -> Self {
+            Self {
+                captured: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            }
+        }
+
+        fn captured(&self) -> AuthIntent {
+            self.captured
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("authenticate() must have been called")
+        }
+    }
+
+    impl AuthGate for RecordingAuth {
+        fn authenticate(&self, intent: &AuthIntent) -> Result<()> {
+            *self.captured.lock().unwrap() = Some(intent.clone());
+            Ok(())
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn load_keypair_does_not_inherit_privileged_intent_from_reason() {
+        // Audit #7: `load_keypair` is a key-read operation. Privileged
+        // operation classes (DeleteAccount / AuthorizePayment / …) must
+        // never be selected from caller-supplied reason text because they
+        // also change the Linux Polkit action.
+        let recorder = RecordingAuth::new();
+        let ks = Keystore {
+            auth: Box::new(recorder.clone()),
+            store: Box::new(store::InMemoryStore::new()),
+            auth_on_write: false,
+        };
+        ks.import("victim", &test_keypair(), SyncMode::ThisDeviceOnly)
+            .unwrap();
+
+        // The auditor's exact example: delete-shaped prose used as a
+        // load_keypair reason. The captured intent must be UseAccount,
+        // not DeleteAccount.
+        ks.load_keypair("victim", "delete the \"victim\" payment account")
+            .unwrap();
+        let captured = recorder.captured();
+        assert!(
+            matches!(captured, AuthIntent::UseAccount(_)),
+            "expected UseAccount, got {captured:?}",
+        );
+
+        // Payment-shaped prose must also be classified as UseAccount —
+        // otherwise the Linux Polkit action would shift to a payment
+        // bucket for a read operation.
+        ks.load_keypair(
+            "victim",
+            "authorize payment of $0.0001 for loading the victim keypair",
+        )
+        .unwrap();
+        let captured = recorder.captured();
+        assert!(
+            matches!(captured, AuthIntent::UseAccount(_)),
+            "expected UseAccount, got {captured:?}",
+        );
     }
 
     // ── Audit #8: keypair pubkey/secret consistency ─────────────────────

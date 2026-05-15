@@ -35,6 +35,7 @@ Each finding below is one of:
 | 10  | medium        | 1Password backend trusts a PATH-resolved `op` binary for secret operations    | wontfix  |
 | 9   | medium        | SOL send approval omits the transfer amount                                   | resolved |
 | 8   | medium        | Keypair import trusts caller-supplied public key bytes                        | resolved |
+| 7   | medium        | Keypair loads can use unrelated auth policies from reason text                | resolved |
 
 (Rows added as we work through findings.)
 
@@ -398,3 +399,41 @@ check is added.
 used `[0xAA; 32] || [0xBB; 32]`-style buffers now use the helpers, so
 all imports go through the new derivation check. No production caller
 code changed.
+
+### #7 — Keypair loads can use unrelated auth policies from reason text (medium) — resolved
+
+`Keystore::load_keypair(account, reason)` is a key-read operation. The
+previous implementation routed `reason` through `AuthIntent::from_reason`,
+whose prefix-matching could classify the text as `DeleteAccount`,
+`AuthorizePayment`, `ImportAccount`, `OpenSession`, etc. Each of those
+variants maps to a different Linux Polkit action, so caller-controlled
+prose could shift the policy bucket for a key-read into something else
+entirely (a per-amount payment action for `"authorize payment of $0.0001
+for loading the victim keypair"`, the delete-account action for
+`"delete the \"victim\" payment account"`, and so on).
+
+**Fix** (`lib.rs:229-239`): `load_keypair(reason)` now always builds an
+`AuthIntent::use_account(reason)`. The text still appears verbatim in the
+OS prompt; only the operation classification is pinned. The typed
+`load_keypair_with_intent` API is unchanged and remains the supported
+path for callers that need a specific operation class.
+
+**Regression test:** `load_keypair_does_not_inherit_privileged_intent_from_reason`
+uses a `RecordingAuth` mock that captures the intent passed to
+`authenticate`. After a real-keypair import, it calls `load_keypair` with
+both the auditor's exact delete-shaped example (`"delete the \"victim\"
+payment account"`) and a payment-shaped reason, and asserts the captured
+intent is `UseAccount` in both cases. Failed against the pre-fix
+`from_reason` routing (which yielded `DeleteAccount` for the first
+example); passes after the fix.
+
+**Production callers checked:** every production caller in this workspace
+(`pay-core`, `pay-cli`) already uses the typed `*_with_intent` APIs.
+`load_keypair(reason)` is only exercised from the keystore crate's own
+tests. The same prefix-matching shape exists in `Keystore::delete(reason)`,
+`Keystore::authenticate(reason)`, and `Keystore::import_with_reason(reason)`
+— those convenience entry points are also test-only, and the auditor's
+narrow recommendation was about `load_keypair`. If we want to harden the
+public surface further, the cleanest follow-up is to delete those
+reason-string conveniences entirely and require typed intents at the API
+boundary; tracked as a non-finding follow-up.
