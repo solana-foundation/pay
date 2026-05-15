@@ -102,10 +102,7 @@ impl SecretStore for AppleKeychainStore {
 const EMBEDDED_HELPER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pay-helper"));
 
 fn helper_path() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .filter(|home| !home.is_empty())
-        .ok_or_else(|| Error::Backend("HOME is required for macOS Keychain helper".to_string()))?;
-    let cache_dir = PathBuf::from(home).join(".cache").join("pay");
+    let cache_dir = resolve_cache_dir(std::env::var_os("HOME").as_deref())?;
     let binary = cache_dir.join("pay.sh");
     let entitlements = cache_dir.join("pay.sh.entitlements");
 
@@ -116,6 +113,34 @@ fn helper_path() -> Result<PathBuf> {
 
     install_helper(&cache_dir, &binary, &entitlements)?;
     Ok(binary)
+}
+
+/// Compute the Keychain helper cache directory from a `HOME` value.
+///
+/// The returned path is the parent of an executable that is later spawned
+/// with key material on stdin, so `HOME` must be present, non-empty, and an
+/// absolute path. A missing, empty, or relative `HOME` would let
+/// `PathBuf::from(home).join(".cache").join("pay")` resolve under the
+/// process current working directory, where a local attacker who controls
+/// the CWD can plant a `.cache/pay/pay.sh`.
+///
+/// This function does not touch the filesystem — callers still go through
+/// `prepare_cache_dir` / `validate_cache_dir` for ownership, permissions,
+/// and symlink rejection on the resolved path.
+fn resolve_cache_dir(home: Option<&std::ffi::OsStr>) -> Result<PathBuf> {
+    let home = home
+        .filter(|home| !home.is_empty())
+        .ok_or_else(|| Error::Backend("HOME is required for macOS Keychain helper".to_string()))?;
+
+    let home = PathBuf::from(home);
+    if !home.is_absolute() {
+        return Err(Error::Backend(format!(
+            "HOME must be an absolute path for the macOS Keychain helper: {}",
+            home.display()
+        )));
+    }
+
+    Ok(home.join(".cache").join("pay"))
 }
 
 fn install_helper(cache_dir: &Path, binary: &Path, entitlements: &Path) -> Result<()> {
@@ -590,5 +615,42 @@ mod tests {
 
         let err = validate_cache_dir(dir.path()).expect_err("unsafe directory rejected");
         assert!(err.to_string().contains("unsafe permissions"));
+    }
+
+    // ── resolve_cache_dir: HOME validation (audit #28) ─────────────────────
+
+    #[test]
+    fn resolve_cache_dir_rejects_missing_home() {
+        let err = resolve_cache_dir(None).expect_err("missing HOME rejected");
+        assert!(err.to_string().contains("HOME is required"));
+    }
+
+    #[test]
+    fn resolve_cache_dir_rejects_empty_home() {
+        let err = resolve_cache_dir(Some(std::ffi::OsStr::new("")))
+            .expect_err("empty HOME rejected");
+        assert!(err.to_string().contains("HOME is required"));
+    }
+
+    #[test]
+    fn resolve_cache_dir_rejects_relative_home() {
+        // A relative HOME (e.g. set to "" or to a bare path by a misconfigured
+        // launcher) would let `PathBuf::from(home).join(".cache").join("pay")`
+        // resolve under the process current working directory. A local
+        // attacker who controls the CWD can plant `./cache/pay/pay.sh`
+        // there, so resolve must require an absolute path.
+        let err = resolve_cache_dir(Some(std::ffi::OsStr::new("relative/path")))
+            .expect_err("relative HOME rejected");
+        assert!(
+            err.to_string().contains("absolute"),
+            "expected 'absolute' in error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_cache_dir_returns_subpath_of_absolute_home() {
+        let path = resolve_cache_dir(Some(std::ffi::OsStr::new("/Users/test")))
+            .expect("absolute HOME accepted");
+        assert_eq!(path, PathBuf::from("/Users/test/.cache/pay"));
     }
 }
