@@ -190,8 +190,17 @@ impl AuthIntent {
         let lower = message.to_ascii_lowercase();
 
         if lower.starts_with("authorize payment") || lower.starts_with("authorize a payment") {
-            let limit = payment_limit_from_message(&message);
-            Self::AuthorizePayment { message, limit }
+            // Audit #4: do not infer a payment-limit bucket from
+            // free-form prose. Display text may be locale-formatted,
+            // truncated, or otherwise unparseable, and treating it as a
+            // policy input let a "$50,000" message be classified as the
+            // `$50` bucket on Linux. The intent now stores `None`; the
+            // Linux backend maps `None` to the most restrictive Polkit
+            // action so unparseable amounts fail closed.
+            Self::AuthorizePayment {
+                message,
+                limit: None,
+            }
         } else if lower.starts_with("set up") || lower.starts_with("store keypair") {
             Self::CreateAccount(message)
         } else if lower.starts_with("import") {
@@ -233,18 +242,6 @@ impl AuthIntent {
     pub(crate) fn prompt_message(&self) -> String {
         truncate_for_prompt(self.message(), 220)
     }
-}
-
-fn payment_limit_from_message(message: &str) -> Option<PaymentLimit> {
-    let start = message.find('$')?;
-    let mut amount = message[start..]
-        .chars()
-        .take_while(|ch| ch.is_ascii_digit() || *ch == '$' || *ch == '.')
-        .collect::<String>();
-    while amount.ends_with('.') {
-        amount.pop();
-    }
-    PaymentLimit::from_amount(&amount)
 }
 
 fn prompt_detail(value: &str) -> String {
@@ -295,39 +292,43 @@ fn payment_message_with_account(message: &str, account: &str) -> String {
     }
 }
 
+/// Parse a USD amount into minor units (1/10000 of a dollar).
+///
+/// Audit #4: parsing is delegated to `rust_decimal`, whose `from_str`
+/// implementation is strict — it rejects commas, locale formatting,
+/// embedded whitespace, and any non-numeric suffix. We additionally
+/// reject negative values and a leading `+`. Anything malformed maps
+/// to `None`; combined with the Linux Polkit routing fix, that means
+/// unparseable amounts fail closed to the most restrictive bucket.
+///
+/// Fractional precision beyond 4 places (the smallest bucket) is
+/// rounded up so we never under-classify the bucket for a slightly
+/// larger amount.
 fn parse_usd_minor_units(amount: &str) -> Option<u64> {
-    let amount = amount.trim().strip_prefix('$').unwrap_or(amount.trim());
-    if amount.is_empty() {
+    use rust_decimal::Decimal;
+    use std::str::FromStr;
+
+    let trimmed = amount.trim();
+    let amount = trimmed.strip_prefix('$').unwrap_or(trimmed);
+    if amount.is_empty() || amount.starts_with('+') {
+        return None;
+    }
+    // rust_decimal accepts scientific notation ("1e3" parses as 1000).
+    // The display string flows into the OS auth prompt verbatim, so we
+    // reject it here — both because it would look broken in the prompt
+    // and because the audit (#4) wants to keep the parse surface
+    // narrow.
+    if amount.bytes().any(|b| b == b'e' || b == b'E') {
         return None;
     }
 
-    let mut parts = amount.split('.');
-    let whole = parts.next()?;
-    let frac = parts.next().unwrap_or("");
-    if parts.next().is_some()
-        || whole.is_empty()
-        || !whole.bytes().all(|b| b.is_ascii_digit())
-        || !frac.bytes().all(|b| b.is_ascii_digit())
-    {
+    let value = Decimal::from_str(amount).ok()?;
+    if value.is_sign_negative() {
         return None;
     }
 
-    let whole_units = whole.parse::<u64>().ok()?.checked_mul(10_000)?;
-    let frac_units = fractional_units(frac)?;
-    whole_units.checked_add(frac_units)
-}
-
-fn fractional_units(frac: &str) -> Option<u64> {
-    let mut units = 0u64;
-    let mut multiplier = 1_000u64;
-    for b in frac.bytes().take(4) {
-        units = units.checked_add((b - b'0') as u64 * multiplier)?;
-        multiplier /= 10;
-    }
-    if frac.bytes().skip(4).any(|b| b != b'0') {
-        units = units.checked_add(1)?;
-    }
-    Some(units)
+    let scaled = value.checked_mul(Decimal::from(10_000))?.ceil();
+    u64::try_from(scaled).ok()
 }
 
 /// How the user proves identity before accessing secrets.
@@ -544,6 +545,10 @@ mod tests {
 
     #[test]
     fn authorize_payment_captures_limit() {
+        // Typed constructors validate the amount string explicitly and
+        // record the parsed bucket. (Prose-derived intents go through
+        // `from_reason`, which after audit #4 no longer infers a limit
+        // from the message — see `audit_4_comma_formatted_amount_does_not_downgrade_limit`.)
         assert_eq!(
             AuthIntent::authorize_payment("$0.05", "accessing API api.example.com").payment_limit(),
             Some(PaymentLimit::Usd005)
@@ -553,10 +558,53 @@ mod tests {
                 .payment_limit(),
             Some(PaymentLimit::Usd1)
         );
+    }
+
+    /// Audit #4: the typed `PaymentLimit::from_amount` parser must
+    /// reject every form of malformed input — commas, locale
+    /// formatting, embedded whitespace or trailing junk, negative
+    /// numbers, leading `+`. `rust_decimal::Decimal::from_str` gives us
+    /// strict parsing for free; this test pins that behavior so a
+    /// future swap-out can't quietly loosen it.
+    #[test]
+    fn audit_4_amount_parser_rejects_malformed_inputs() {
+        let reject = [
+            "$50,000",      // comma
+            "50,000",       // comma without prefix
+            "$1 000",       // embedded whitespace
+            "$1.0.0",       // double-dot
+            "$1.0e3",       // scientific notation
+            "$-1",          // negative
+            "$+5",          // leading plus
+            "$",            // empty after prefix
+            "five dollars", // not numeric
+        ];
+        for amount in reject {
+            assert!(
+                PaymentLimit::from_amount(amount).is_none(),
+                "{amount:?} must be rejected",
+            );
+        }
+    }
+
+    /// Audit #4: `AuthIntent::from_reason` must NOT infer a payment-limit
+    /// bucket from free-form prose. The legacy prose parser truncated at
+    /// commas, so `$50,000` was misread as `$50` and the intent received
+    /// the `Usd50` bucket. The intent now stores `None` for any prose-
+    /// derived limit; the Linux backend separately maps `None` to the
+    /// most restrictive Polkit action.
+    #[test]
+    fn audit_4_comma_formatted_amount_does_not_downgrade_limit() {
+        let intent =
+            AuthIntent::from_reason("authorize payment of $50,000 for accessing API");
+        assert!(
+            matches!(intent, AuthIntent::AuthorizePayment { .. }),
+            "still classified as a payment authorization",
+        );
         assert_eq!(
-            AuthIntent::from_reason("authorize payment of $0.0501 for accessing API")
-                .payment_limit(),
-            Some(PaymentLimit::Usd01)
+            intent.payment_limit(),
+            None,
+            "prose-derived intents must not advertise a parsed limit",
         );
     }
 }

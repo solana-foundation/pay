@@ -37,6 +37,7 @@ Each finding below is one of:
 | 8   | medium        | Keypair import trusts caller-supplied public key bytes                        | resolved |
 | 7   | medium        | Keypair loads can use unrelated auth policies from reason text                | resolved |
 | 5   | medium        | Keystore imports accept `SyncMode` but never enforce it                       | partial  |
+| 4   | medium        | Payment amount parsing can downgrade Linux authentication policy              | resolved |
 
 (Rows added as we work through findings.)
 
@@ -480,3 +481,75 @@ the API honest in the meantime.
 and stays. No new test needed: with only one variant, the previous
 "silently accepts an unsupported mode" failure mode is unreachable by
 construction.
+
+### #4 — Payment amount parsing can downgrade Linux authentication policy (medium) — resolved
+
+The auditor identified three coupled defects in the amount → Polkit
+action pipeline:
+
+1. **Parse-failure downgrade** — when `limit` was `None`, the Linux
+   backend fell back to the *generic* `sh.pay.authorize-payment` action,
+   which is *less* restrictive than the per-bucket actions.
+2. **Comma truncation in prose parser** — `payment_limit_from_message`
+   walked the message with
+   `take_while(|ch| ch.is_ascii_digit() || *ch == '$' || *ch == '.')`,
+   so a `"$50,000"` message was truncated to `"$50"` and classified as
+   the `Usd50` bucket.
+3. **Free-form prose driving policy** — `AuthIntent::from_reason` called
+   `payment_limit_from_message` on caller-supplied prose. Per the
+   auditor: stop deriving policy from display text.
+
+**Fix** (three small changes that compose):
+
+- `src/auth.rs` — `AuthIntent::from_reason` now sets `limit: None` for
+  any prose-derived `AuthorizePayment` and `payment_limit_from_message`
+  has been deleted. Prose can still flow through as display text; it
+  never selects a payment bucket.
+- `src/linux/mod.rs` — `polkit_action_for_intent` for
+  `AuthorizePayment { limit: None }` now maps to
+  `sh.pay.authorize-payment-above-usd-50` (the most restrictive bucket)
+  instead of the generic action. Combined with #1, any unparseable
+  amount (commas, locale formatting, malformed input, prose) requests
+  the strictest policy — failing closed.
+- The `POLKIT_ACTION_PAYMENT` constant was removed; its sole consumer
+  was the unwrap_or above. The generic action ID still exists in the
+  installed policy file as a catch-all and is reachable via the
+  `LEGACY_POLKIT_ACTION` missing-action fallback, but it is no longer
+  the default for unparseable amounts.
+
+**Regression tests:**
+
+- `audit_4_comma_formatted_amount_does_not_downgrade_limit` (`auth.rs`)
+  — `AuthIntent::from_reason("authorize payment of $50,000 ...")` now
+  yields `payment_limit() == None`. Failed against the pre-fix prose
+  parser (`Some(Usd50)`).
+- `audit_4_unparseable_amount_maps_to_most_restrictive_polkit_action`
+  (`linux/mod.rs`, gated to Linux builds) — `AuthorizePayment { limit:
+  None }` routes to the AboveUsd50 action.
+- `audit_4_typed_payment_with_comma_amount_uses_restrictive_bucket`
+  (`linux/mod.rs`) — `AuthIntent::authorize_payment("$50,000", "...")`
+  routes to AboveUsd50 (the typed constructor's
+  `PaymentLimit::from_amount("$50,000")` already returned `None`; the
+  fix is in how `None` is now routed).
+
+**Behavior change for `default_payment`:** `AuthIntent::default_payment()`
+(used by `pay-core::signer` when no concrete amount is supplied) now
+maps to the AboveUsd50 Polkit action on Linux instead of the generic
+one. This is the auditor's "fail closed" direction; the existing
+`LEGACY_POLKIT_ACTION` fallback ensures backward compat with policy
+files that don't have the per-bucket actions installed.
+
+**Parser swap-in (`rust_decimal`):** `parse_usd_minor_units` now uses
+`rust_decimal::Decimal::from_str` (added to the workspace as a new
+direct dep, `default-features = false, features = ["std"]`). That gives
+us strict numeric parsing for free: commas, locale formatting,
+embedded whitespace, double-decimals, and non-numeric suffixes all
+return `Err` and route to `None`. We additionally reject negative
+values, a leading `+`, and scientific notation (`e` / `E`) — the last
+because the amount string flows into the OS auth prompt verbatim and
+`"$1.0e3"` would look broken in the prompt even though it's a valid
+`Decimal`. The hand-rolled `fractional_units` helper is deleted; ceil
+rounding is now `Decimal::ceil()` on the scaled value.
+
+`audit_4_amount_parser_rejects_malformed_inputs` pins the strict
+behavior so a future parser change can't quietly loosen it.

@@ -6,7 +6,10 @@ use std::collections::HashMap;
 
 // ── Polkit auth gate ────────────────────────────────────────────────────────
 
-const POLKIT_ACTION_PAYMENT: &str = "sh.pay.authorize-payment";
+// The generic `sh.pay.authorize-payment` action still exists in the
+// installed policy file as a catch-all, but `polkit_action_for_intent`
+// no longer falls back to it (audit #4): unparseable amounts route to
+// the most restrictive bucket so policy choice tracks the real risk.
 const POLKIT_ACTION_CREATE: &str = "sh.pay.create-keypair";
 const POLKIT_ACTION_IMPORT: &str = "sh.pay.import-keypair";
 const POLKIT_ACTION_EXPORT: &str = "sh.pay.export-keypair";
@@ -95,9 +98,15 @@ async fn polkit_authenticate(action: &str) -> Result<()> {
 
 fn polkit_action_for_intent(intent: &AuthIntent) -> &'static str {
     match intent {
+        // Audit #4: an `AuthorizePayment` without a structured `limit`
+        // means the caller could not validate the amount (parse failure,
+        // prose-derived intent, locale formatting). Falling back to the
+        // generic payment action would be *less* restrictive than the
+        // bucketed actions. Fail closed to the most restrictive bucket
+        // so unparseable amounts request the strictest policy.
         AuthIntent::AuthorizePayment { limit, .. } => limit
             .map(polkit_payment_limit_action)
-            .unwrap_or(POLKIT_ACTION_PAYMENT),
+            .unwrap_or_else(|| polkit_payment_limit_action(crate::PaymentLimit::AboveUsd50)),
         AuthIntent::CreateAccount(_) => POLKIT_ACTION_CREATE,
         AuthIntent::ImportAccount(_) => POLKIT_ACTION_IMPORT,
         AuthIntent::ExportAccount(_) => POLKIT_ACTION_EXPORT,
@@ -341,9 +350,13 @@ mod tests {
             )),
             "sh.pay.authorize-payment-up-to-usd-005"
         );
+        // Audit #4: a payment intent with no structured amount must NOT
+        // fall back to the generic action — that would be less
+        // restrictive than the per-bucket actions. Map to AboveUsd50
+        // instead so unparseable amounts request the strictest policy.
         assert_eq!(
             polkit_action_for_intent(&AuthIntent::default_payment()),
-            POLKIT_ACTION_PAYMENT
+            "sh.pay.authorize-payment-above-usd-50",
         );
         assert_eq!(
             polkit_action_for_intent(&AuthIntent::authorize_payment("$0.0501", "accessing API")),
@@ -390,6 +403,35 @@ mod tests {
                 "Use your pay account with the Solana CLI."
             )),
             POLKIT_ACTION_USE
+        );
+    }
+
+    /// Audit #4: `AuthorizePayment { limit: None }` (parse failure /
+    /// missing structured amount) must NOT fall back to the generic
+    /// payment action, which is *less* restrictive than the bucketed
+    /// actions. Falling closed to the most restrictive policy
+    /// (`AboveUsd50`) means an unparseable amount fails up, not down.
+    #[test]
+    fn audit_4_unparseable_amount_maps_to_most_restrictive_polkit_action() {
+        let intent = AuthIntent::AuthorizePayment {
+            message: "authorize payment".to_string(),
+            limit: None,
+        };
+        assert_eq!(
+            polkit_action_for_intent(&intent),
+            "sh.pay.authorize-payment-above-usd-50",
+        );
+    }
+
+    /// Audit #4: typed payment intents whose amount string fails to
+    /// parse (commas, locale formatting, malformed input) must also
+    /// route to the most restrictive bucket — never the generic action.
+    #[test]
+    fn audit_4_typed_payment_with_comma_amount_uses_restrictive_bucket() {
+        let intent = AuthIntent::authorize_payment("$50,000", "accessing API");
+        assert_eq!(
+            polkit_action_for_intent(&intent),
+            "sh.pay.authorize-payment-above-usd-50",
         );
     }
 }

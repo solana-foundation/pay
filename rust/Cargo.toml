@@ -100,6 +100,9 @@ bs58 = "0.5"
 blake3 = "1"
 qrcode = { version = "0.14", default-features = false }
 mime_guess = { version = "2.0", default-features = false, features = ["rev-mappings"] }
+# Strict numeric parsing for payment amounts (audit #4): rejects commas
+# and locale formatting that the hand-rolled parser used to accept.
+rust_decimal = { version = "1", default-features = false, features = ["std"] }
 
 # Solana MPP (includes keypair loading + charge building)
 solana-mpp = { git = "https://github.com/solana-foundation/mpp-sdk", branch = "main", default-features = false, features = [
