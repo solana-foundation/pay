@@ -653,4 +653,25 @@ mod tests {
             .expect("absolute HOME accepted");
         assert_eq!(path, PathBuf::from("/Users/test/.cache/pay"));
     }
+
+    /// Audit #70: a local attacker who controls earlier `PATH` entries can
+    /// hijack any system binary invoked by bare name. The Keychain backend
+    /// pins `swiftc`, `codesign`, and `security` to their canonical absolute
+    /// paths. This test fails closed if a future refactor reintroduces a
+    /// PATH-based lookup for any of the three.
+    #[test]
+    fn macos_invokes_system_binaries_by_absolute_path() {
+        assert!(
+            SWIFTC.starts_with('/'),
+            "SWIFTC must be an absolute path: {SWIFTC}"
+        );
+        assert!(
+            CODESIGN.starts_with('/'),
+            "CODESIGN must be an absolute path: {CODESIGN}"
+        );
+        assert!(
+            HELPER_SOURCE.contains("URL(fileURLWithPath: \"/usr/bin/security\")"),
+            "Swift helper must invoke /usr/bin/security by absolute path",
+        );
+    }
 }

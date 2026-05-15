@@ -23,6 +23,7 @@ Each finding below is one of:
 | 52  | high          | Use of `/tmp` is unsafe                                                       | resolved |
 | 28  | high          | macOS helper uses the current directory when `HOME` is empty                  | resolved |
 | 2   | high          | Reserved `.pubkey` account names let `pubkey()` return private keypair bytes  | resolved |
+| 70  | medium        | macOS trusts PATH for several binaries                                        | resolved |
 
 (Rows added as we work through findings.)
 
@@ -157,3 +158,33 @@ verbatim through the public-key API.
 **Failure demonstrated:** temporarily disabling the reserved-suffix check
 makes `audit_2_pubkey_collision_attack_is_blocked` fail on the import
 assertion, confirming the test catches that regression.
+
+### #70 — macOS trusts PATH for several binaries (medium) — resolved
+
+The macOS backend invokes three system binaries while installing and
+verifying the Swift helper. Each is now resolved by absolute path so a
+local attacker who controls earlier `PATH` entries cannot substitute a
+hostile binary:
+
+- `swiftc` → `/usr/bin/swiftc` (constants `SWIFTC` in `src/macos/mod.rs`
+  and `build.rs`)
+- `codesign` → `/usr/bin/codesign` (constants `CODESIGN` in
+  `src/macos/mod.rs` and `build.rs`)
+- `security` → `/usr/bin/security` (`URL(fileURLWithPath:)` in
+  `src/macos/helper.swift`)
+
+No bare-name `Command::new("swiftc"|"codesign"|"security")` invocations
+remain in the crate.
+
+**Regression test:** `macos_invokes_system_binaries_by_absolute_path`
+asserts the two Rust constants start with `/` and that the embedded
+Swift source literally contains `URL(fileURLWithPath: "/usr/bin/security")`.
+A future edit that reintroduces a PATH-based lookup for any of the three
+binaries will fail the test.
+
+**Failure demonstrated:** temporarily flipping `SWIFTC` to `"swiftc"`
+fails the test on the absolute-path assertion.
+
+**Not in scope of this finding:** the 1Password `op` CLI is still
+PATH-resolved (`store::OnePasswordStore`); that is finding #10 and tracked
+separately.
