@@ -178,7 +178,7 @@ https://<YOUR DEPLOYMENT URL>?recipient=<YOUR WALLET ADDRESS>&label=Your+Store+N
 
 ## License
 
-The Solana Pay Point of Sale app is open source and available under the MIT License. See the [LICENSE](./LICENSE) file for more info.
+The Solana Pay Point of Sale app is open source and available under the MIT License. See the [LICENSE](../../../../../LICENSE) file for more info.
 
 <!-- Links -->
 
