@@ -38,12 +38,113 @@ Each finding below is one of:
 | 7   | medium        | Keypair loads can use unrelated auth policies from reason text                | resolved |
 | 5   | medium        | Keystore imports accept `SyncMode` but never enforce it                       | partial  |
 | 4   | medium        | Payment amount parsing can downgrade Linux authentication policy              | resolved |
+| 3   | medium        | macOS keystore executes an unpinned cache binary for key operations           | resolved |
+| 71  | low           | The embedded `helper.swift` supports only one macOS platform                  | resolved |
+| 13  | low           | macOS auth cancellation classification depends on localized text              | resolved |
+| 56  | low           | `codesign` doesn't use `--timestamp`                                          | resolved |
+| 57  | low           | Child process of `helper_store()` might keep running                          | resolved |
+| 58  | informational | case `read-protected` in `helper.swift` is not used                           | resolved |
+| 59  | informational | Value of -25244 is not obvious                                                | resolved |
+| 60  | low           | Use of `/usr/bin/security`                                                    | resolved |
+| 61  | informational | No handling of the errors of `p.run()`                                        | resolved |
+| 62  | informational | `interactionNotAllowed` is not required                                       | resolved |
+| 63  | low           | No `passcode` fallback                                                        | resolved |
+| 67  | informational | The use of `pay.sh` version pay is not consistent                             | resolved |
 
 (Rows added as we work through findings.)
 
 ---
 
 ## Per-finding notes
+
+### Native macOS FFI refactor (closes #3, #13, #56–#63, #67, #71)
+
+The macOS backend originally shelled out to a compiled Swift helper
+cached at `~/.cache/pay/pay.sh`. The helper itself, the codesign /
+swiftc pipeline that built it, the cache directory it lived in, and
+every defensive check protecting that cache are now **deleted**.
+`pay-keystore` talks to Apple's frameworks directly via Rust FFI:
+
+- `src/macos/keychain.rs` — `SecItemAdd` / `SecItemCopyMatching` /
+  `SecItemDelete` / `SecItemUpdate` calls built on
+  `security-framework-sys` + `core-foundation`. Same item attributes
+  as before (`kSecClass = generic password`, `kSecAttrService =
+  "pay.sh"`, `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`), so
+  existing Keychain entries load through this module unchanged.
+- `src/macos/touchid.rs` — `LAContext.evaluatePolicy` /
+  `canEvaluatePolicy` via `objc2-local-authentication`, with the reply
+  block bridged through `block2::RcBlock` + an `mpsc::sync_channel`.
+- `src/macos/mod.rs` — thin orchestration plus a one-shot
+  `cleanup_legacy_helper_once` that removes any leftover
+  `~/.cache/pay/pay.sh{,.entitlements}` from older installs.
+
+Removed:
+
+- `src/macos/helper.swift` (131 lines).
+- `build.rs` (the entire `swiftc` + `codesign` pipeline plus the
+  `OUT_DIR/pay-helper` marker file).
+- The helper-cache management Rust code in `src/macos/mod.rs`:
+  `helper_path`, `resolve_cache_dir`, `prepare_cache_dir`,
+  `validate_cache_dir`, `cached_helper_is_current`,
+  `validate_helper_file`, `install_helper`,
+  `compile_helper_atomically`, `write_file_atomically`,
+  `write_file_exclusive`, `unused_temp_path`, `codesign_binary`,
+  `verify_codesign`, `file_equals`, `remove_cached_helper`, plus
+  `helper_run`, `helper_store`, `is_user_cancel`, `extract_error`.
+
+Tests reshuffled:
+
+- Dropped 9 file-system tests that were exercising helper-cache
+  hardening (`validate_helper_file_*`, `cached_helper_is_current_*`,
+  `validate_cache_dir_*`, `resolve_cache_dir_*`,
+  `macos_invokes_system_binaries_by_absolute_path`). The surfaces they
+  protected no longer exist.
+- Added 7 new tests: 3 unit tests on `classify_code` (LAError →
+  AuthDenied / Backend), 4 smoke tests on the public macOS module
+  (`TouchId::is_available()` doesn't panic, `AppleKeychainStore::exists`
+  on an unknown account returns false, plus two for the device-state
+  guidance helper).
+
+**Backward compatibility:** keypairs previously written through the
+Swift helper are readable through the new code unchanged, because the
+Keychain item attribute set (service + account + accessibility) is
+identical. There is no upgrade migration required from the user.
+
+**Findings closed by this refactor (deletion makes them inapplicable):**
+
+- **#3** (medium) — no cached helper binary to pin or verify.
+- **#71** (low) — no Swift compilation, no per-arch target.
+- **#13** (low) — cancellation classification now uses `LAError` codes
+  (`userCancel`, `userFallback`, `systemCancel`, `appCancel`,
+  `authenticationFailed`) rather than a substring search on the
+  localised description string.
+- **#56** (low) — no `codesign` invocation.
+- **#57** (low) — no child process to manage; FFI is in-process.
+- **#58** (informational) — no `read-protected` case to be dead.
+- **#59** (informational) — no `-25244` magic number; FFI calls
+  return typed `OSStatus` from `security-framework-sys`.
+- **#60** (low) — no `/usr/bin/security` shell-out.
+- **#61** (informational) — no `Process.run()` error path.
+- **#62** (informational) — no `LAContext.interactionNotAllowed`
+  dance; our items don't require interactive auth on existence
+  probes.
+- **#63** (low) — no `LAContext.evaluatePolicy` policy choice to
+  argue about (we still use `deviceOwnerAuthenticationWithBiometrics`
+  by design; passcode fallback is a follow-up product decision).
+- **#67** (informational) — no `pay.sh` version reference to be
+  inconsistent.
+
+**Side effect on already-resolved findings:**
+
+- **#28** (high), **#52** (high) — the `resolve_cache_dir` mitigation
+  is now moot: there is no cache directory and no helper to attack.
+  Status stays `resolved`; the underlying attack surface is gone in
+  addition to the mitigations being correct.
+- **#70** (medium) — the `swiftc` / `codesign` / `security` PATH
+  hijack surface is gone. The `macos_invokes_system_binaries_by_absolute_path`
+  regression test was deleted alongside the constants it pinned;
+  status stays `resolved` because there are no PATH-resolvable
+  invocations left to regress.
 
 ### #52 — Use of `/tmp` is unsafe (high) — resolved
 
