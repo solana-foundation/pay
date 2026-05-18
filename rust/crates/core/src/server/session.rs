@@ -713,7 +713,8 @@ impl SessionLifecycleRunloop {
         let due = self
             .deadlines
             .iter()
-            .filter_map(|(channel_id, deadline)| (*deadline <= now).then(|| channel_id.clone()))
+            .filter(|(_, deadline)| **deadline <= now)
+            .map(|(channel_id, _)| channel_id.clone())
             .collect::<Vec<_>>();
 
         for channel_id in due {
@@ -1978,8 +1979,7 @@ mod tests {
         let err = session
             .process(&auth_header)
             .await
-            .err()
-            .expect("non-session intent should error");
+            .expect_err("non-session intent should error");
         assert!(
             err.to_string().contains("Expected 'session' intent"),
             "got: {err}"
@@ -1992,8 +1992,7 @@ mod tests {
         let err = session
             .process("Bearer definitely-not-mpp")
             .await
-            .err()
-            .expect("invalid auth should error");
+            .expect_err("invalid auth should error");
         assert!(
             err.to_string().contains("Invalid authorization header"),
             "got: {err}"
@@ -2013,8 +2012,7 @@ mod tests {
         let err = session
             .process(&auth_header)
             .await
-            .err()
-            .expect("unknown action should error");
+            .expect_err("unknown action should error");
         assert!(
             err.to_string()
                 .contains("Unrecognized session action payload"),

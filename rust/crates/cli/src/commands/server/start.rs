@@ -623,7 +623,6 @@ impl StartCommand {
                     pull_voucher_strategy: sdk_pull_voucher_strategy,
                     rpc_url: Some(rpc_url.clone()),
                     program_id: Some(channel_program_id),
-                    ..Default::default()
                 };
 
                 let mut smpp = SessionMpp::new(config, session_secret)
