@@ -103,7 +103,7 @@ qrcode = { version = "0.14", default-features = false }
 mime_guess = { version = "2.0", default-features = false, features = ["rev-mappings"] }
 
 # Solana MPP (includes keypair loading + charge building)
-solana-mpp = { path = "../../mpp-sdk/rust", default-features = false, features = [
+solana-mpp = { git = "https://github.com/solana-foundation/mpp-sdk", branch = "main", default-features = false, features = [
     "client",
     "server",
 ] }

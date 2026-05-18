@@ -5862,6 +5862,7 @@ dependencies = [
 [[package]]
 name = "payment_channels_client"
 version = "0.1.0"
+source = "git+https://github.com/solana-foundation/mpp-sdk?branch=main#eeec054cef84a7acc2c346aadf890b17ef1a6203"
 dependencies = [
  "borsh 1.6.1",
  "num-derive",
@@ -9241,6 +9242,7 @@ dependencies = [
 [[package]]
 name = "solana-mpp"
 version = "0.6.0"
+source = "git+https://github.com/solana-foundation/mpp-sdk?branch=main#eeec054cef84a7acc2c346aadf890b17ef1a6203"
 dependencies = [
  "base64 0.22.1",
  "bincode",
