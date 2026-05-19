@@ -71,6 +71,7 @@ Each finding below is one of:
 | 49  | informational | Several public rust object can be shielded (Linux part)                       | resolved |
 | 44  | informational | The linux `AuthGate.is_available` doesn't check the Polkit action exists      | resolved |
 | 47  | informational | Errors in `polkit_authenticate()` don't show all situations                   | resolved |
+| 35  | low           | Linux Polkit falls back to a generic prompt when specific actions are missing | resolved |
 
 (Rows added as we work through findings.)
 
@@ -603,6 +604,35 @@ the API honest in the meantime.
 and stays. No new test needed: with only one variant, the previous
 "silently accepts an unsupported mode" failure mode is unreachable by
 construction.
+
+### #35 — Linux Polkit falls back to a generic prompt when specific actions are missing (low) — resolved
+
+`Polkit::authenticate` previously fell back to
+`sh.pay.unlock-keypair` (the legacy catch-all action) whenever the
+typed action (per-amount payment bucket, delete/import/session/
+gateway-fee-payer) returned `is_missing_action`. That silently
+**downgraded** the authorization an admin or policy engine saw: an
+administrator who tightened the per-bucket action could be bypassed
+through the legacy generic action without realizing it.
+
+**Fix** (`src/linux/mod.rs` — `Polkit::authenticate`): removed the
+fallback match arm. If the typed action isn't installed, the
+structured `is not installed` error surfaces unchanged to the
+caller, so the operator can fix their policy file or notice a
+mismatched policy set.
+
+**Why the legacy action stays defined:** `LEGACY_POLKIT_ACTION` is
+still referenced as the probe target in `Polkit::is_available`
+(audit #44) — that's a non-interactive availability check, not an
+authorization fallback, so it doesn't change which action the
+authorization is granted against.
+
+**UX note:** users on a host with only the legacy action installed
+will now get a clear "polkit action 'sh.pay.…' is not installed"
+error from `pay setup`-installable paths, with instructions to
+reinstall the policy file. The previous silent fallback was
+convenient for fresh installs but defeated the per-bucket policy
+work done in audit #4.
 
 ### #47 — Errors in `polkit_authenticate()` don't show all situations (informational) — resolved
 

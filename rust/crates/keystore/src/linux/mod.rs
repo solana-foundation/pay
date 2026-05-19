@@ -23,15 +23,18 @@ pub(crate) struct Polkit;
 
 impl AuthGate for Polkit {
     fn authenticate(&self, intent: &AuthIntent) -> Result<()> {
+        // Audit #35: the previous implementation fell back to the
+        // generic `sh.pay.unlock-keypair` action whenever the typed
+        // action (per-amount payment bucket, delete/import/session/
+        // gateway-fee-payer) was missing. That silently changes which
+        // authorization the user and the policy engine see — an admin
+        // who tightened `authorize-payment-above-usd-50` got bypassed
+        // through the catch-all. Fail closed instead: if the typed
+        // action isn't installed, surface that as a structured error
+        // so the operator can fix the policy file or notice that a
+        // previously-typed action was demoted to the legacy bucket.
         let action = polkit_action_for_intent(intent);
-        run(async move {
-            match polkit_authenticate(action, true).await {
-                Err(e) if action != LEGACY_POLKIT_ACTION && is_missing_action(&e) => {
-                    polkit_authenticate(LEGACY_POLKIT_ACTION, true).await
-                }
-                result => result,
-            }
-        })
+        run(async move { polkit_authenticate(action, true).await })
     }
 
     fn is_available(&self) -> bool {
