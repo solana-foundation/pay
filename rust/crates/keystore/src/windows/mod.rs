@@ -2,8 +2,6 @@
 
 use crate::{AuthGate, AuthIntent, Error, Result, SecretStore, Zeroizing};
 use std::cell::Cell;
-use std::ffi::c_void;
-use std::mem::{MaybeUninit, transmute, transmute_copy};
 use std::slice;
 use windows::{
     Foundation::IAsyncOperation,
@@ -19,12 +17,11 @@ use windows::{
         System::{
             Com::{COINIT_MULTITHREADED, CoInitializeEx},
             Console::GetConsoleWindow,
+            WinRT::IUserConsentVerifierInterop,
         },
         UI::WindowsAndMessaging::{GetForegroundWindow, IsWindowVisible},
     },
-    core::{
-        GUID, HRESULT, HSTRING, IInspectable, IInspectable_Vtbl, Interface, PCWSTR, PWSTR, Type,
-    },
+    core::{HSTRING, PCWSTR, PWSTR},
 };
 
 // ── COM initialization ──────────────────────────────────────────────────────
@@ -106,40 +103,18 @@ impl AuthGate for WindowsHelloAuth {
     }
 }
 
-// Desktop apps need the HWND-based interop API for Windows Hello prompts. The
-// plain UserConsentVerifier::RequestVerificationAsync API is the UWP path.
-windows::core::imp::define_interface!(
-    IUserConsentVerifierInterop,
-    IUserConsentVerifierInteropVtbl,
-    0x39e050c3_4e74_441a_8dc0_b81104df949c
-);
-
-impl core::ops::Deref for IUserConsentVerifierInterop {
-    type Target = IInspectable;
-
-    fn deref(&self) -> &Self::Target {
-        unsafe { transmute(self) }
-    }
-}
-
-windows::core::imp::interface_hierarchy!(
-    IUserConsentVerifierInterop,
-    windows::core::IUnknown,
-    IInspectable
-);
-
-#[repr(C)]
-pub struct IUserConsentVerifierInteropVtbl {
-    pub base__: IInspectable_Vtbl,
-    pub request_verification_for_window_async: unsafe extern "system" fn(
-        *mut c_void,
-        HWND,
-        MaybeUninit<HSTRING>,
-        *const GUID,
-        *mut *mut c_void,
-    ) -> HRESULT,
-}
-
+// Audit #65: desktop apps need the HWND-based interop API for the
+// Windows Hello prompt — the plain
+// `UserConsentVerifier::RequestVerificationAsync` is the UWP path
+// and ignores parent-window context.
+//
+// Earlier code hand-rolled the `IUserConsentVerifierInterop` COM
+// interface (vtable + IID + transmute_copy on HSTRING). The `windows`
+// crate now ships the interop under `Win32::System::WinRT` when the
+// `Win32_System_WinRT` feature is enabled, with a typed
+// `RequestVerificationForWindowAsync` method. Using the upstream
+// definition removes the manual transmutes and the per-call IID
+// argument.
 fn request_verification(message: &str) -> windows::core::Result<UserConsentVerificationResult> {
     let message = HSTRING::from(message);
 
@@ -156,19 +131,9 @@ fn request_verification_for_window_async(
     hwnd: HWND,
     message: &HSTRING,
 ) -> windows::core::Result<IAsyncOperation<UserConsentVerificationResult>> {
-    let interop = windows::core::factory::<UserConsentVerifier, IUserConsentVerifierInterop>()?;
-
-    unsafe {
-        let mut result__ = core::mem::zeroed();
-        (Interface::vtable(&interop).request_verification_for_window_async)(
-            Interface::as_raw(&interop),
-            hwnd,
-            transmute_copy(message),
-            &<IAsyncOperation<UserConsentVerificationResult> as Interface>::IID,
-            &mut result__,
-        )
-        .and_then(|| Type::from_abi(result__))
-    }
+    let interop: IUserConsentVerifierInterop =
+        windows::core::factory::<UserConsentVerifier, IUserConsentVerifierInterop>()?;
+    unsafe { interop.RequestVerificationForWindowAsync(hwnd, message) }
 }
 
 fn prompt_parent_window() -> Option<HWND> {

@@ -82,6 +82,7 @@ Each finding below is one of:
 | 64  | informational | Errors of the `COM` initialization are not caught                             | resolved |
 | 68  | low           | Windows: Immutable pointers casted to mutable pointers                        | resolved |
 | 69  | low           | In windows, the function `cred_read()` isn't sufficiently hardened            | resolved |
+| 65  | informational | Old windows API used                                                          | resolved |
 
 (Rows added as we work through findings.)
 
@@ -614,6 +615,30 @@ the API honest in the meantime.
 and stays. No new test needed: with only one variant, the previous
 "silently accepts an unsupported mode" failure mode is unreachable by
 construction.
+
+### #65 — Old windows API used (informational) — resolved
+
+`IUserConsentVerifierInterop` was hand-rolled with
+`windows::core::imp::define_interface!`, a manual `IInspectable_Vtbl`
+layout, a per-call IID argument, and `transmute_copy(message)`
+to coerce the `HSTRING` into the COM ABI shape. The `windows` crate
+ships a typed `Win32::System::WinRT::IUserConsentVerifierInterop`
+with a `RequestVerificationForWindowAsync` method that handles all
+of that internally.
+
+**Fix** (`src/windows/mod.rs`, `Cargo.toml`):
+
+- Added `Win32_System_WinRT` to the `windows` dep features.
+- Replaced the entire hand-rolled interface block (interface
+  definition, vtable struct, `Deref`-to-`IInspectable` impl,
+  `interface_hierarchy!` invocation, manual transmutes) with the
+  upstream import: `use windows::Win32::System::WinRT::IUserConsentVerifierInterop`.
+- `request_verification_for_window_async` now calls
+  `interop.RequestVerificationForWindowAsync(hwnd, message)`
+  directly. No `transmute`, no `transmute_copy`, no manual vtable.
+
+Net: -45 lines, including all the unsafe transmutes the audit
+flagged as risky.
 
 ### #69 — `cred_read()` isn't sufficiently hardened (low) — resolved
 
