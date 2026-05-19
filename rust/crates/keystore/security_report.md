@@ -86,6 +86,7 @@ Each finding below is one of:
 | 66  | low           | `GetForegroundWindow()` returns the window with keyboard focus at the time of the call | resolved |
 | 15  | low           | Windows Hello unavailable states are reported as user-denied auth             | resolved |
 | 21  | informational | Windows Credential Manager exposes keypairs without Windows Hello             | deferred |
+| 18  | low           | Windows missing-keypair deletes block account cleanup                         | resolved |
 
 (Rows added as we work through findings.)
 
@@ -618,6 +619,30 @@ the API honest in the meantime.
 and stays. No new test needed: with only one variant, the previous
 "silently accepts an unsupported mode" failure mode is unreachable by
 construction.
+
+### #18 — Windows missing-keypair deletes block account cleanup (low) — resolved
+
+`CredDeleteW` returns `ERROR_NOT_FOUND` (HRESULT `0x80070490`)
+when the target credential is absent. `cred_delete` was
+forwarding this as a generic `Error::Backend("CredDeleteW failed:
+…")`. The shared `Keystore::delete_with_intent` (after audit #12)
+propagates both legs of the keypair/pubkey delete, so a
+previously-half-deleted account would now error on the missing
+record instead of completing the cleanup. Other backends —
+InMemoryStore, macOS Keychain (`errSecItemNotFound`), Linux
+Secret Service (empty search result) — already swallow this case.
+
+**Fix** (`src/windows/mod.rs` — `cred_delete`): match on the
+returned `windows::core::Error` code and treat
+`HRESULT_ERROR_NOT_FOUND` as `Ok(())`. Other errors stay in the
+`Backend` catch-all.
+
+**CLI integration:** `cli/src/commands/account/destroy.rs:133`
+calls `Keystore::delete_with_intent` and surfaces failures
+through the existing UX. With #12 now propagating the pubkey
+leg and #18 making the Windows delete idempotent, a `pay account
+destroy` retry after a partially-failed previous attempt cleans
+up cleanly instead of looping on a stuck record.
 
 ### #21 — Windows Credential Manager exposes keypairs without Windows Hello (informational) — deferred
 

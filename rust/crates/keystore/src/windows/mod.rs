@@ -315,9 +315,24 @@ fn cred_exists(target: &[u16]) -> bool {
     found
 }
 
+/// HRESULT for `ERROR_NOT_FOUND` returned by `CredDeleteW` when the
+/// target credential is absent. `0x80070490` = `HRESULT_FROM_WIN32(1168)`.
+const HRESULT_ERROR_NOT_FOUND: i32 = 0x8007_0490u32 as i32;
+
 fn cred_delete(target: &[u16]) -> Result<()> {
-    unsafe { CredDeleteW(PCWSTR(target.as_ptr()), CRED_TYPE_GENERIC, 0) }
-        .map_err(|e| Error::Backend(format!("CredDeleteW failed: {e}")))
+    // Audit #18: treat ERROR_NOT_FOUND as success so delete is
+    // idempotent across backends. macOS Keychain and Linux Secret
+    // Service already return Ok on a missing item; without this,
+    // Windows differs and breaks the shared
+    // `Keystore::delete_with_intent` rollback semantics
+    // (specifically audit #12, which now propagates the pubkey delete
+    // result — a missing pubkey record would otherwise spuriously
+    // fail account cleanup on Windows).
+    match unsafe { CredDeleteW(PCWSTR(target.as_ptr()), CRED_TYPE_GENERIC, 0) } {
+        Ok(()) => Ok(()),
+        Err(e) if e.code().0 == HRESULT_ERROR_NOT_FOUND => Ok(()),
+        Err(e) => Err(Error::Backend(format!("CredDeleteW failed: {e}"))),
+    }
 }
 
 /// The canonical prompt message is a sentence fragment so macOS can render it
