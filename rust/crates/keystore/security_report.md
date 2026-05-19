@@ -87,6 +87,7 @@ Each finding below is one of:
 | 15  | low           | Windows Hello unavailable states are reported as user-denied auth             | resolved |
 | 21  | informational | Windows Credential Manager exposes keypairs without Windows Hello             | deferred |
 | 18  | low           | Windows missing-keypair deletes block account cleanup                         | resolved |
+| 42  | low           | Not everything is zeroized out                                                | resolved |
 
 (Rows added as we work through findings.)
 
@@ -619,6 +620,35 @@ the API honest in the meantime.
 and stays. No new test needed: with only one variant, the previous
 "silently accepts an unsupported mode" failure mode is unreachable by
 construction.
+
+### #42 — Not everything is zeroized out (low) — resolved
+
+The auditor flagged three places where intermediate buffers held
+key material without `Zeroizing` wrap:
+
+| Site                                 | Status after this PR |
+| ------------------------------------ | -------------------- |
+| 1Password `load` stdout              | n/a — backend being removed (#10) |
+| macOS `helper_run` stdout            | resolved-by-ffi — `helper_run` deleted (c27c622) |
+| Windows `cred_read` intermediate Vec | this commit |
+| Windows `cred_write` blob copy       | this commit |
+
+**Fix** (`src/windows/mod.rs`):
+
+- `cred_write` — the audit #68 fix introduced a local
+  `blob.to_vec()` copy to give Windows a writable pointer; that
+  copy now wraps in `Zeroizing` so the bytes are wiped on drop
+  (normal return *and* unwind paths).
+- `cred_read` — the post-`from_raw_parts(...).to_vec()` buffer is
+  now `Zeroizing` the moment it's allocated, not just at the
+  function's return site. Same rationale: bounds the window in
+  which raw key bytes sit in a freelist-reclaimable allocation.
+
+macOS keychain.rs already wraps the bytes from `CFData.bytes()`
+in `Zeroizing` at the load boundary (`src/macos/keychain.rs:105`),
+and `Keystore::load_keypair_with_intent` returns
+`Zeroizing<Vec<u8>>` to the caller — the cross-platform load
+contract is uniformly zeroizing.
 
 ### #18 — Windows missing-keypair deletes block account cleanup (low) — resolved
 

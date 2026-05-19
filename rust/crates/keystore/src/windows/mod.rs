@@ -212,8 +212,13 @@ fn cred_write(target: &[u16], blob: &[u8]) -> Result<()> {
     // compiler may miscompile around the &[u8] immutability assumption.
     // Copy into owned, mutable buffers up front so the pointers we
     // hand to Windows truly point at writable memory.
+    //
+    // Audit #42: the local blob copy holds key material until the
+    // function returns. Wrap it in Zeroizing so the bytes are wiped
+    // on drop (normal return *and* any unwind path), instead of
+    // sitting in the freelist for whoever asks for that memory next.
     let mut target = target.to_vec();
-    let mut blob = blob.to_vec();
+    let mut blob = Zeroizing::new(blob.to_vec());
     let cred = CREDENTIALW {
         Type: CRED_TYPE_GENERIC,
         TargetName: PWSTR(target.as_mut_ptr()),
@@ -288,8 +293,12 @@ fn cred_read(target: &[u16]) -> Result<Zeroizing<Vec<u8>>> {
         .ok_or_else(|| Error::Backend("CredReadW returned success with null pointer".into()))?;
 
     let size = cred.CredentialBlobSize as usize;
-    let blob = if size == 0 {
-        Vec::new()
+    // Audit #42: wrap the intermediate copy in Zeroizing the moment
+    // it's allocated, not just at the function's return site. If the
+    // function unwinds between `to_vec()` and the wrap, the bytes
+    // would otherwise linger in the freelist.
+    let blob: Zeroizing<Vec<u8>> = if size == 0 {
+        Zeroizing::new(Vec::new())
     } else if cred.CredentialBlob.is_null() {
         return Err(Error::Backend(
             "CredReadW returned non-zero size with null blob pointer".into(),
@@ -299,10 +308,10 @@ fn cred_read(target: &[u16]) -> Result<Zeroizing<Vec<u8>>> {
         // points to `size` initialized bytes owned by Windows until
         // guard is dropped, and is `*const u8`-aligned (u8 has
         // alignment 1, so no alignment check is needed).
-        unsafe { slice::from_raw_parts(cred.CredentialBlob, size) }.to_vec()
+        Zeroizing::new(unsafe { slice::from_raw_parts(cred.CredentialBlob, size) }.to_vec())
     };
     drop(guard);
-    Ok(Zeroizing::new(blob))
+    Ok(blob)
 }
 
 fn cred_exists(target: &[u16]) -> bool {
