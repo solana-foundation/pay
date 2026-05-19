@@ -78,6 +78,7 @@ Each finding below is one of:
 | 31  | low           | Linux Secret Service relock failure can mask a completed mutation             | resolved |
 | 50  | informational | The `lock()`s on linux too aggressive                                         | resolved |
 | 30  | low           | Linux keystore calls can panic inside Tokio runtime contexts                  | resolved |
+| 45  | informational | `polkit.message` could be used to display custom messages                     | resolved |
 
 (Rows added as we work through findings.)
 
@@ -610,6 +611,32 @@ the API honest in the meantime.
 and stays. No new test needed: with only one variant, the previous
 "silently accepts an unsupported mode" failure mode is unreachable by
 construction.
+
+### #45 — `polkit.message` could be used to display custom messages (informational) — resolved
+
+The auditor pointed out that polkit's `details` map accepts a
+well-known `polkit.message` key that GNOME, KDE, and MATE polkit
+agents will display in the prompt. Pay was passing an empty
+`details` map, so the prompt fell back to the static
+`<description>` from the policy file. The policy file's text can
+only describe the *action class* (e.g. "Pay session approval"),
+not the per-call intent details Pay's typed `AuthIntent` already
+carries.
+
+**Fix** (`src/linux/mod.rs`):
+
+- `Polkit::authenticate` forwards `intent.message().to_owned()`
+  into a new `polkit_authenticate_with_message` helper.
+- That helper inserts `polkit.message → intent.message()` into the
+  `details` map. Empty messages are skipped so agents fall back to
+  the policy file's per-action `<description>`.
+- The original `polkit_authenticate(action, interactive)` is kept
+  as a thin wrapper for callers that don't have an intent in scope
+  (the non-interactive probe in `Polkit::is_available`).
+
+Cross-agent behavior: polkit agents that ignore the key still
+display the policy-file text, so the change is monotonic — better
+when supported, no worse when not.
 
 ### #30 — Linux keystore calls can panic inside Tokio runtime contexts (low) — resolved
 
