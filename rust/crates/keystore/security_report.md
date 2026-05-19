@@ -80,6 +80,7 @@ Each finding below is one of:
 | 30  | low           | Linux keystore calls can panic inside Tokio runtime contexts                  | resolved |
 | 45  | informational | `polkit.message` could be used to display custom messages                     | resolved |
 | 64  | informational | Errors of the `COM` initialization are not caught                             | resolved |
+| 68  | low           | Windows: Immutable pointers casted to mutable pointers                        | resolved |
 
 (Rows added as we work through findings.)
 
@@ -612,6 +613,27 @@ the API honest in the meantime.
 and stays. No new test needed: with only one variant, the previous
 "silently accepts an unsupported mode" failure mode is unreachable by
 construction.
+
+### #68 — Windows: Immutable pointers casted to mutable pointers (low) — resolved
+
+`cred_write` cast `&[u16]` and `&[u8]` slices to `*mut` via
+`as_ptr().cast_mut()` to satisfy `CREDENTIALW`'s pointer types.
+That tells Windows the buffers are writable even though the slice
+itself may have been a static or otherwise read-only memory region
+(`include_bytes!`, string literal, etc.). Even when Windows doesn't
+actually write, the compiler may miscompile around the `&[u8]`
+immutability assumption.
+
+**Fix** (`src/windows/mod.rs` — `cred_write`): copy `target` and
+`blob` into local `Vec`s up front, then hand `as_mut_ptr()` to
+`CREDENTIALW`. The pointers Windows receives now genuinely point at
+writable memory owned by the function frame; callers can pass any
+slice shape without aliasing concerns.
+
+The same shape applies to `cred_read` / `cred_delete` only at the
+`PCWSTR(target.as_ptr())` call sites, which are `const` Windows
+APIs — they take `*const` pointers and the cast is sound. No
+change needed there.
 
 ### #64 — Errors of the `COM` initialization are not caught (informational) — resolved
 

@@ -216,14 +216,24 @@ fn to_wide(s: &str) -> Vec<u16> {
 }
 
 fn cred_write(target: &[u16], blob: &[u8]) -> Result<()> {
+    // Audit #68: CREDENTIALW takes `*mut` pointers, but the caller
+    // hands us `&[u16]` / `&[u8]` slices. Casting `as_ptr().cast_mut()`
+    // tells Windows "you may write here" while the underlying storage
+    // may be read-only (e.g. if a caller ever feeds in include_bytes!
+    // or a static slice). Even if Windows doesn't actually write, the
+    // compiler may miscompile around the &[u8] immutability assumption.
+    // Copy into owned, mutable buffers up front so the pointers we
+    // hand to Windows truly point at writable memory.
+    let mut target = target.to_vec();
+    let mut blob = blob.to_vec();
     let cred = CREDENTIALW {
         Type: CRED_TYPE_GENERIC,
-        TargetName: PWSTR(target.as_ptr().cast_mut()),
+        TargetName: PWSTR(target.as_mut_ptr()),
         CredentialBlobSize: blob
             .len()
             .try_into()
             .map_err(|_| Error::Backend("credential blob too large".into()))?,
-        CredentialBlob: blob.as_ptr().cast_mut(),
+        CredentialBlob: blob.as_mut_ptr(),
         // CRED_PERSIST_LOCAL_MACHINE: credential is per-user, persists across
         // reboots, and is protected by DPAPI (user-scoped encryption).
         // It does NOT grant access to other users on the machine despite
