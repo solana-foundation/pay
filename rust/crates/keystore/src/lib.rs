@@ -52,6 +52,45 @@ pub enum SyncMode {
 /// (Keychain ACLs, DPAPI, Secret Service encryption). The auth gate
 /// provides UX-level protection (biometric prompts) but does not prevent
 /// programmatic access by code running in the same process.
+///
+/// ## Threat coverage by backend
+///
+/// | Threat                                  | macOS Keychain   | Linux Secret Service | Windows Cred. Mgr. |
+/// | --------------------------------------- | ---------------- | -------------------- | ------------------ |
+/// | Different OS user account               | blocked          | blocked              | blocked            |
+/// | Same-user process (e.g. malware)        | **not blocked**  | **not blocked**      | **not blocked**    |
+/// | Physical access, device unlocked        | **not blocked**  | **not blocked**      | **not blocked**    |
+/// | Physical access, device locked          | blocked          | depends on keyring lock state | blocked   |
+///
+/// "Blocked" means the OS credential store refuses to release the
+/// keypair bytes; "not blocked" means the auth-gate prompt is the only
+/// barrier and a co-resident program could load the key without one.
+///
+/// **macOS** — items use `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`,
+/// so the keychain refuses reads while the screen is locked, but any
+/// program running as the same user with the screen unlocked can call
+/// `SecItemCopyMatching` and skip our [`AuthGate`](auth::AuthGate)
+/// entirely. We do not currently set `kSecAttrAccessControl` to bind
+/// the item to biometric presence — see `security_report.md` (audit #1)
+/// for the rationale.
+///
+/// **Linux** — Secret Service decrypts items only when the user's
+/// keyring is unlocked. "Locked device" coverage therefore depends on
+/// the keyring being relocked when the session locks (true under GNOME
+/// `gnome-keyring-daemon` with default settings; not guaranteed on
+/// every desktop). Same-user processes can talk to Secret Service
+/// directly and bypass our Polkit gate.
+///
+/// **Windows** — Credential Manager binds items to the OS user
+/// session; locking the device evicts the secrets from the working
+/// set, but any same-user process can call `CredReadW` without
+/// invoking Windows Hello.
+///
+/// **All backends** — physical access to an unlocked device is treated
+/// as game-over: a sufficiently determined attacker can drive the UI
+/// to trigger our own auth prompts. The auth gate is intended for
+/// remote / unattended-process protection, not for shoulder-surfing
+/// defense.
 pub struct Keystore {
     auth: Box<dyn AuthGate>,
     store: Box<dyn SecretStore>,

@@ -50,6 +50,7 @@ Each finding below is one of:
 | 62  | informational | `interactionNotAllowed` is not required                                       | resolved |
 | 63  | low           | No `passcode` fallback                                                        | resolved |
 | 67  | informational | The use of `pay.sh` version pay is not consistent                             | resolved |
+| 37  | informational | Security note doesn't cover all the nuances                                   | resolved |
 
 (Rows added as we work through findings.)
 
@@ -582,6 +583,33 @@ the API honest in the meantime.
 and stays. No new test needed: with only one variant, the previous
 "silently accepts an unsupported mode" failure mode is unreachable by
 construction.
+
+### #37 — Security note doesn't cover all the nuances (informational) — resolved
+
+The crate-level `Keystore` doc previously had a one-paragraph security
+note that did not distinguish backends or threat classes. The auditor
+asked for an explicit matrix that calls out which threats each backend
+actually blocks.
+
+**Fix** (`src/lib.rs:46-95`): expanded the `# Security note` into a
+threat-by-backend table covering the four scenarios the auditor lists
+(different OS user, same-user process, unlocked physical access,
+locked physical access) for macOS / Linux / Windows, plus a
+per-backend caveat block. Notable verified facts:
+
+- macOS items use `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`,
+  which gates on screen-unlock but **not** biometric presence. Cross-
+  references audit #1 for the rationale on not setting
+  `kSecAttrAccessControl`.
+- Linux "locked physical access" coverage depends on the desktop
+  relocking the keyring; this is true under default GNOME but not
+  guaranteed elsewhere.
+- All backends are "not blocked" for same-user processes — the
+  [`AuthGate`](src/auth.rs) prompt is the only barrier and is
+  bypassable by a co-resident program calling the underlying
+  Secret Service / Keychain / Credential Manager directly.
+
+No code change; doc-only.
 
 ### #4 — Payment amount parsing can downgrade Linux authentication policy (medium) — resolved
 
