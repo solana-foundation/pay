@@ -5824,6 +5824,7 @@ dependencies = [
 name = "pay-core"
 version = "0.17.0"
 dependencies = [
+ "async-stream",
  "axum",
  "base64 0.22.1",
  "bincode",
@@ -5832,6 +5833,7 @@ dependencies = [
  "chrono",
  "ed25519-dalek 2.2.0",
  "figment",
+ "futures-util",
  "hmac 0.12.1",
  "md-5",
  "openssl-sys",
@@ -5849,6 +5851,7 @@ dependencies = [
  "sha2 0.10.9",
  "shellexpand",
  "solana-client",
+ "solana-commitment-config",
  "solana-hash 3.1.0",
  "solana-instruction 3.4.0",
  "solana-message 3.1.0",
@@ -5954,6 +5957,23 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yml",
+]
+
+[[package]]
+name = "payment_channels_client"
+version = "0.1.0"
+source = "git+https://github.com/solana-foundation/mpp-sdk?branch=main#eeec054cef84a7acc2c346aadf890b17ef1a6203"
+dependencies = [
+ "borsh 1.6.1",
+ "num-derive",
+ "num-traits",
+ "solana-account 3.4.0",
+ "solana-account-info 3.1.1",
+ "solana-address 2.6.0",
+ "solana-cpi 3.1.0",
+ "solana-instruction 3.4.0",
+ "solana-program-error 3.0.1",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -6890,12 +6910,14 @@ dependencies = [
  "tokio",
  "tokio-native-tls",
  "tokio-rustls 0.26.4",
+ "tokio-util 0.7.18",
  "tower",
  "tower-http",
  "tower-service",
  "url 2.5.8",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams",
  "web-sys",
  "webpki-roots 1.0.6",
 ]
@@ -9401,19 +9423,22 @@ dependencies = [
 [[package]]
 name = "solana-mpp"
 version = "0.6.0"
-source = "git+https://github.com/solana-foundation/mpp-sdk?branch=main#e0fd4b2208bab04824a2ee511b4f6b37f3e24e0c"
+source = "git+https://github.com/solana-foundation/mpp-sdk?branch=main#eeec054cef84a7acc2c346aadf890b17ef1a6203"
 dependencies = [
  "base64 0.22.1",
  "bincode",
  "blake3",
+ "borsh 1.6.1",
  "bs58",
  "ed25519-dalek 2.2.0",
  "hmac 0.12.1",
+ "payment_channels_client",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
  "serde_json_canonicalizer",
  "sha2 0.10.9",
+ "solana-address 2.6.0",
  "solana-commitment-config",
  "solana-hash 3.1.0",
  "solana-instruction 3.4.0",
@@ -13291,6 +13316,19 @@ dependencies = [
  "indexmap 2.14.0",
  "wasm-encoder",
  "wasmparser",
+]
+
+[[package]]
+name = "wasm-streams"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15053d8d85c7eccdbefef60f06769760a563c7f0a9d6902a13d35c7800b0ad65"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

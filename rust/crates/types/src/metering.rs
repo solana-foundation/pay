@@ -634,7 +634,7 @@ pub struct SessionSpec {
     pub min_voucher_delta: u64,
     /// Session modes this server accepts.
     ///
-    /// Allowed values: `"push"` (Fiber channel, client-funded) and/or
+    /// Allowed values: `"push"` (payment channel, client-funded) and/or
     /// `"pull"` (SPL token delegation, operator fee-pays the approve tx).
     ///
     /// Defaults to `["push"]` when omitted.
@@ -647,15 +647,46 @@ pub struct SessionSpec {
     /// ```
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub modes: Vec<String>,
-    /// Fiber channel-open batch flush interval in milliseconds.
+    /// Pull voucher strategy.
+    ///
+    /// This disambiguates pull-mode sessions:
+    /// - `disabled`: do not advertise or accept pull sessions.
+    /// - `client_voucher`: client signs vouchers; no multi-delegate setup.
+    /// - `operated_voucher`: operator signs vouchers after metering and uses
+    ///   multi-delegate setup for delegated token movement.
+    #[serde(default)]
+    pub pull_voucher_strategy: SessionPullVoucherStrategy,
+    /// Legacy pull-mode channel-open batch flush interval in milliseconds.
     ///
     /// Defaults to `400` when omitted.
     #[serde(default = "default_session_batch_open_interval_ms")]
     pub batch_open_interval_ms: u64,
+    /// Idle delay before the operator closes and settles the payment channel.
+    ///
+    /// Defaults to `15000` when omitted. Set to `0` to disable automatic close.
+    #[serde(default = "default_session_close_delay_ms")]
+    pub close_delay_ms: u64,
+    /// Channel settlement splits. Session splits are percentage-only and are
+    /// converted to basis points for the payment channel distribution.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub splits: Vec<SplitRule>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionPullVoucherStrategy {
+    #[default]
+    Disabled,
+    ClientVoucher,
+    OperatedVoucher,
 }
 
 fn default_session_batch_open_interval_ms() -> u64 {
     400
+}
+
+fn default_session_close_delay_ms() -> u64 {
+    15_000
 }
 
 /// Named recipient alias declared at the API spec level.
@@ -958,7 +989,7 @@ pub enum HttpMethod {
     Delete,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MeterDirection {
     Input,
@@ -967,7 +998,7 @@ pub enum MeterDirection {
     Storage,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BillingUnit {
     Tokens,
@@ -1621,6 +1652,14 @@ mod tests {
         assert!(matches!(lte, CompareOp::Lte));
         let gt: CompareOp = serde_json::from_str(r#"">""#).unwrap();
         assert!(matches!(gt, CompareOp::Gt));
+    }
+
+    #[test]
+    fn session_spec_defaults_auto_close_delay() {
+        let session: SessionSpec = serde_json::from_str(r#"{"cap_usdc":10.0}"#).unwrap();
+
+        assert_eq!(session.batch_open_interval_ms, 400);
+        assert_eq!(session.close_delay_ms, 15_000);
     }
 
     #[test]

@@ -13,9 +13,11 @@ use solana_mpp::{
     AUTHORIZATION_HEADER, PAYMENT_RECEIPT_HEADER, WWW_AUTHENTICATE_HEADER, format_receipt,
     format_www_authenticate_many, parse_authorization, server::html as mpp_html,
 };
+use std::sync::Arc;
 
 use crate::PaymentState;
 use crate::server::metering::{self, RequestProperties};
+use crate::server::session_stream::SessionStreamContext;
 use crate::server::telemetry;
 
 /// Small non-generic helpers keep the middleware readable and, importantly for
@@ -141,7 +143,12 @@ pub async fn payment_middleware<S: PaymentState>(
         .get(AUTHORIZATION_HEADER)
         .and_then(|v| v.to_str().ok());
 
-    if let Some(session_mpp) = state.session_mpp() {
+    let session_mpp_handle = state.session_mpp_handle();
+    let session_mpp = session_mpp_handle
+        .as_deref()
+        .or_else(|| state.session_mpp());
+
+    if let Some(session_mpp) = session_mpp {
         if auth_header.is_none() {
             let price = metering::resolve_price(meter, &props, variant_hint.as_deref(), None);
             return session_challenge_response(session_mpp, &method, &path, subdomain, price);
@@ -150,6 +157,7 @@ pub async fn payment_middleware<S: PaymentState>(
         if let Some(auth_value) = auth_header.filter(|value| is_session_authorization(value)) {
             return handle_session_authorization(
                 session_mpp,
+                session_mpp_handle.clone(),
                 auth_value,
                 subdomain,
                 &path,
@@ -247,22 +255,29 @@ fn session_challenge_response(
 
 #[tracing::instrument(
     name = "session_authorization",
-    skip(session_mpp, auth_value, req, next),
+    skip(session_mpp, session_mpp_handle, auth_value, req, next),
     fields(subdomain = %subdomain, path = %path)
 )]
 async fn handle_session_authorization(
     session_mpp: &crate::server::session::SessionMpp,
+    session_mpp_handle: Option<Arc<crate::server::session::SessionMpp>>,
     auth_value: &str,
     subdomain: &str,
     path: &str,
-    req: Request<Body>,
+    mut req: Request<Body>,
     next: Next,
 ) -> Response {
     match session_mpp.process(auth_value).await {
         Ok(outcome) => {
             use crate::server::session::SessionOutcome;
             match outcome {
-                SessionOutcome::Active(_state) => {
+                SessionOutcome::Active(state) => {
+                    attach_session_stream_context(
+                        session_mpp_handle,
+                        &mut req,
+                        state.channel_id.clone(),
+                        state.cumulative,
+                    );
                     tracing::info!(subdomain = %subdomain, path = %path, "Session action accepted — forwarding");
                     let response = next.run(req).await;
                     telemetry::record_paid_request_completed(
@@ -274,7 +289,16 @@ async fn handle_session_authorization(
                     );
                     response
                 }
-                SessionOutcome::Voucher(_cumulative) => {
+                SessionOutcome::Voucher {
+                    channel_id,
+                    cumulative,
+                } => {
+                    attach_session_stream_context(
+                        session_mpp_handle,
+                        &mut req,
+                        channel_id,
+                        cumulative,
+                    );
                     tracing::info!(subdomain = %subdomain, path = %path, "Voucher accepted — forwarding");
                     let response = next.run(req).await;
                     telemetry::record_paid_request_completed(
@@ -286,9 +310,33 @@ async fn handle_session_authorization(
                     );
                     response
                 }
-                SessionOutcome::Closed(_params) => {
+                SessionOutcome::Commit(receipt) => {
+                    tracing::info!(
+                        subdomain = %subdomain,
+                        path = %path,
+                        delivery_id = %receipt.delivery_id,
+                        "Session delivery committed"
+                    );
+                    telemetry::record_paid_request_completed(
+                        "session",
+                        subdomain,
+                        path,
+                        StatusCode::OK,
+                        None,
+                    );
+                    (StatusCode::OK, axum::Json(receipt)).into_response()
+                }
+                SessionOutcome::Closed { signature, .. } => {
                     tracing::info!(subdomain = %subdomain, path = %path, "Session closed");
-                    (StatusCode::OK, axum::Json(json!({"status": "closed"}))).into_response()
+                    (
+                        StatusCode::OK,
+                        axum::Json(json!({
+                            "status": "closed",
+                            "signature": signature,
+                            "transactionId": signature,
+                        })),
+                    )
+                        .into_response()
                 }
             }
         }
@@ -305,6 +353,22 @@ async fn handle_session_authorization(
                 .into_response()
         }
     }
+}
+
+fn attach_session_stream_context(
+    session_mpp: Option<Arc<crate::server::session::SessionMpp>>,
+    req: &mut Request<Body>,
+    session_id: String,
+    committed_base_units: u64,
+) {
+    let Some(session_mpp) = session_mpp else {
+        return;
+    };
+    req.extensions_mut().insert(SessionStreamContext::new(
+        session_mpp,
+        session_id,
+        committed_base_units,
+    ));
 }
 
 fn charge_challenge_response(
@@ -614,7 +678,7 @@ fn parse_query_params(uri: &axum::http::Uri) -> std::collections::HashMap<String
         .unwrap_or_default()
 }
 
-fn extract_request_properties(headers: &HeaderMap, _path: &str) -> RequestProperties {
+pub(crate) fn extract_request_properties(headers: &HeaderMap, _path: &str) -> RequestProperties {
     let body_size = headers
         .get("content-length")
         .and_then(|v| v.to_str().ok())
@@ -625,7 +689,7 @@ fn extract_request_properties(headers: &HeaderMap, _path: &str) -> RequestProper
     }
 }
 
-fn extract_variant_hint(path: &str) -> Option<String> {
+pub(crate) fn extract_variant_hint(path: &str) -> Option<String> {
     let parts: Vec<&str> = path.split('/').collect();
     for (i, part) in parts.iter().enumerate() {
         if (*part == "models" || *part == "voices")

@@ -2,6 +2,8 @@ import type { PaymentFlow } from "../types";
 import { Amount } from "./Amount";
 import { ProtocolBadge } from "./ProtocolBadge";
 import { StatusIndicator } from "./StatusIndicator";
+import type { SessionInfo } from "../types";
+import { formatUnits } from "../lib/format";
 
 function fmtTime(iso: string): string {
   const d = new Date(iso);
@@ -17,6 +19,18 @@ function fmtDuration(ms: number): string {
   return `${(ms / 1000).toFixed(1)}s`;
 }
 
+function sessionRowAmount(session: SessionInfo | undefined): string | undefined {
+  if (!session) return undefined;
+  const decimals = session.decimals ?? 6;
+  const currency = session.currency ?? "USDC";
+  if (session.cumulative) {
+    return `paid ${formatUnits(session.cumulative, decimals, currency)}`;
+  }
+  const cap = session.deposit ?? session.approvedAmount ?? session.cap;
+  if (cap) return `cap ${formatUnits(cap, decimals, currency)}`;
+  return undefined;
+}
+
 interface Props {
   flow: PaymentFlow;
   selected: boolean;
@@ -24,16 +38,27 @@ interface Props {
 }
 
 export function FlowRow({ flow, selected, onClick }: Props) {
+  const channelOpen = flow.session?.state === "open";
+  const sessionAmount = sessionRowAmount(flow.session);
+
   return (
     <div
-      className={`flow-row${selected ? " selected" : ""}`}
+      className={`flow-row${selected ? " selected" : ""}${channelOpen ? " channel-open" : ""}`}
       onClick={onClick}
     >
       <ProtocolBadge protocol={flow.protocol} />
       <span className="resource">{flow.resource}</span>
-      <StatusIndicator status={flow.status} />
+      {channelOpen && (
+        <span className="session-inline session-inline-status">
+          <span className="session-inline-dot" />
+          open
+        </span>
+      )}
+      {!channelOpen && <StatusIndicator status={flow.status} />}
       <span className="amount-slot">
-        {flow.amount && <Amount value={parseFloat(flow.amount)} />}
+        {flow.session
+          ? sessionAmount && <span className="session-row-amount">{sessionAmount}</span>
+          : flow.amount && <Amount value={parseFloat(flow.amount)} />}
       </span>
       <span className="duration">{fmtDuration(flow.durationMs)}</span>
       <span className="timestamp">{fmtTime(flow.startedAt)}</span>

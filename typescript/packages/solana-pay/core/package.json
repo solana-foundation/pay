@@ -1,6 +1,6 @@
 {
     "name": "@solana/pay",
-    "version": "1.0.16",
+    "version": "1.0.17",
     "author": "Solana Maintainers <maintainers@solana.foundation>",
     "repository": "https://github.com/solana-foundation/pay",
     "license": "MIT",
@@ -52,7 +52,7 @@
         "release": "npm run clean && npm run build"
     },
     "dependencies": {
-        "@solana/plugin-interfaces": "^6.5.0",
+        "@solana/plugin-interfaces": "^6.9.0",
         "@solana/qr-code-styling": "^1.6.0"
     },
     "peerDependencies": {
@@ -60,13 +60,13 @@
         "@solana-program/system": "^0.12.0",
         "@solana-program/token": "^0.12.0",
         "@solana-program/token-2022": "^0.9.0",
-        "@solana/keys": "^6.5.0",
-        "@solana/kit": "^6.5.0",
-        "@solana/kit-plugin-instruction-plan": "^0.8.0",
-        "@solana/kit-plugin-payer": "^0.8.0",
-        "@solana/kit-plugin-rpc": "^0.8.0",
-        "@solana/rpc-subscriptions-api": "^6.5.0",
-        "@solana/rpc-subscriptions-spec": "^6.5.0"
+        "@solana/keys": "^6.9.0",
+        "@solana/kit": "^6.9.0",
+        "@solana/kit-plugin-instruction-plan": "^0.10.0",
+        "@solana/kit-plugin-rpc": "^0.11.1",
+        "@solana/kit-plugin-signer": "^0.10.0",
+        "@solana/rpc-subscriptions-api": "^6.9.0",
+        "@solana/rpc-subscriptions-spec": "^6.9.0"
     },
     "preferUnplugged": true,
     "supportedPlatforms": {
@@ -106,15 +106,15 @@
         "@solana-program/token": "^0.12.0",
         "@solana-program/token-2022": "^0.9.0",
         "@solana/eslint-config-solana": "^6.0.0",
-        "@solana/keys": "^6.5.0",
-        "@solana/kit": "^6.5.0",
-        "@solana/kit-client-litesvm": "^0.8.0",
-        "@solana/kit-plugin-instruction-plan": "^0.8.0",
-        "@solana/kit-plugin-payer": "^0.8.0",
-        "@solana/kit-plugin-rpc": "^0.8.0",
+        "@solana/keys": "^6.9.0",
+        "@solana/kit": "^6.9.0",
+        "@solana/kit-plugin-instruction-plan": "^0.10.0",
+        "@solana/kit-plugin-litesvm": "^0.10.0",
+        "@solana/kit-plugin-rpc": "^0.11.1",
+        "@solana/kit-plugin-signer": "^0.10.0",
         "@solana/prettier-config-solana": "^0.0.6",
-        "@solana/rpc-subscriptions-api": "^6.5.0",
-        "@solana/rpc-subscriptions-spec": "^6.5.0",
+        "@solana/rpc-subscriptions-api": "^6.9.0",
+        "@solana/rpc-subscriptions-spec": "^6.9.0",
         "@types/node": "^20.0.0",
         "@vitest/coverage-v8": "^4.1.2",
         "eslint": "^9.39.1",
