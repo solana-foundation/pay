@@ -66,6 +66,7 @@ Each finding below is one of:
 | 51  | informational | Function `helper_path()` could cache results                                  | resolved-by-ffi |
 | 53  | informational | Use of `#[cfg(unix)]` is redundant                                            | resolved-by-ffi |
 | 54  | low           | Errors with `set_permissions()` are ignored                                   | resolved-by-ffi |
+| 55  | low           | Order of signing addresses                                                    | resolved-by-ffi |
 
 (Rows added as we work through findings.)
 
@@ -598,6 +599,22 @@ the API honest in the meantime.
 and stays. No new test needed: with only one variant, the previous
 "silently accepts an unsupported mode" failure mode is unreachable by
 construction.
+
+### #55 — Order of signing addresses (low) — resolved-by-ffi
+
+The auditor flagged the `codesign` signer-prefix ordering used by
+the keystore's build script: it tried `Developer ID Application`
+first, then fell back to `Apple Development`. For local builds the
+recommended order is the reverse — local/team certificates first,
+distribution certificates only when present.
+
+**Post-FFI status:** the keystore's `build.rs` and its
+`codesign_binary` helper are deleted. Nothing in the pay-keystore
+crate calls `codesign` anymore. The macOS Justfile codesign step
+added later (see root `Justfile` `install pay` recipe) is an ad-hoc
+sign with `--sign -`, which doesn't consult signer prefixes at all
+— it just stamps the binary with a content hash. The ordering
+question no longer applies.
 
 ### #54 — Errors with `set_permissions()` are ignored (low) — resolved-by-ffi
 
