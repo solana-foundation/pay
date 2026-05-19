@@ -33,13 +33,25 @@ thread_local! {
     static COM_INIT: Cell<bool> = const { Cell::new(false) };
 }
 
-fn ensure_com_init() {
+fn ensure_com_init() -> Result<()> {
+    // Audit #64: the previous version dropped the CoInitializeEx
+    // result on the floor, so a genuine COM-init failure surfaced
+    // later as a confusing WinRT call error. Propagating the
+    // HRESULT here keeps the failure attached to its source.
+    //
+    // Returning Ok if the cell is already set means the per-thread
+    // initialization stays one-shot, but the result of the first
+    // call is the one that matters for fault diagnosis.
     COM_INIT.with(|cell| {
-        if !cell.get() {
-            let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-            cell.set(true);
+        if cell.get() {
+            return Ok(());
         }
-    });
+        unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
+            .ok()
+            .map_err(|e| Error::Backend(format!("COM init failed: {e}")))?;
+        cell.set(true);
+        Ok(())
+    })
 }
 
 // ── Windows Hello auth gate ─────────────────────────────────────────────────
@@ -48,7 +60,11 @@ pub struct WindowsHelloAuth;
 
 impl WindowsHelloAuth {
     pub fn is_available() -> bool {
-        ensure_com_init();
+        // Audit #64: an init failure on the availability probe just
+        // surfaces as "not available", which is the safer answer.
+        if ensure_com_init().is_err() {
+            return false;
+        }
         UserConsentVerifier::CheckAvailabilityAsync()
             .and_then(|op| op.get())
             .map(|r| r == UserConsentVerifierAvailability::Available)
@@ -58,7 +74,7 @@ impl WindowsHelloAuth {
 
 impl AuthGate for WindowsHelloAuth {
     fn authenticate(&self, intent: &AuthIntent) -> Result<()> {
-        ensure_com_init();
+        ensure_com_init()?;
 
         let message = windows_hello_reason_wrapper(&intent.prompt_message());
         let result = request_verification(&message)

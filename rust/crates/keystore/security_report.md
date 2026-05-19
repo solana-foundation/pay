@@ -79,6 +79,7 @@ Each finding below is one of:
 | 50  | informational | The `lock()`s on linux too aggressive                                         | resolved |
 | 30  | low           | Linux keystore calls can panic inside Tokio runtime contexts                  | resolved |
 | 45  | informational | `polkit.message` could be used to display custom messages                     | resolved |
+| 64  | informational | Errors of the `COM` initialization are not caught                             | resolved |
 
 (Rows added as we work through findings.)
 
@@ -611,6 +612,27 @@ the API honest in the meantime.
 and stays. No new test needed: with only one variant, the previous
 "silently accepts an unsupported mode" failure mode is unreachable by
 construction.
+
+### #64 — Errors of the `COM` initialization are not caught (informational) — resolved
+
+`ensure_com_init` dropped the `CoInitializeEx` result on the floor
+(`let _ = ...`). A genuine COM-init failure surfaced later as a
+confusing WinRT call error in `request_verification` or
+`CheckAvailabilityAsync` rather than at its source.
+
+**Fix** (`src/windows/mod.rs`):
+
+- `ensure_com_init` now returns `Result<()>`. On failure it
+  propagates an `Error::Backend("COM init failed: {hresult}")`.
+- `AuthGate::authenticate` propagates the init error with `?`.
+- `WindowsHelloAuth::is_available` treats an init failure as
+  "not available" (the safer answer) — callers branching on it
+  expect a bool, and a backend that can't initialize COM cannot
+  meaningfully say "available".
+
+The per-thread `OnceLock`-style cell semantics are preserved: only
+the first call does the real work; subsequent calls return Ok(())
+without retrying the HRESULT.
 
 ### #45 — `polkit.message` could be used to display custom messages (informational) — resolved
 
