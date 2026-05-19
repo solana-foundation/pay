@@ -65,6 +65,7 @@ Each finding below is one of:
 | 23  | low           | macOS auth reason leaks through helper process arguments                      | resolved-by-ffi |
 | 51  | informational | Function `helper_path()` could cache results                                  | resolved-by-ffi |
 | 53  | informational | Use of `#[cfg(unix)]` is redundant                                            | resolved-by-ffi |
+| 54  | low           | Errors with `set_permissions()` are ignored                                   | resolved-by-ffi |
 
 (Rows added as we work through findings.)
 
@@ -597,6 +598,20 @@ the API honest in the meantime.
 and stays. No new test needed: with only one variant, the previous
 "silently accepts an unsupported mode" failure mode is unreachable by
 construction.
+
+### #54 — Errors with `set_permissions()` are ignored (low) — resolved-by-ffi
+
+The auditor pointed out that `set_permissions()` errors on the
+cached helper file were ignored. Because the cached helper carried
+private key bytes, a silent permissions failure could leave it
+group/world-readable on an NFS-style mount, undermining the
+defense-in-depth around the cache directory.
+
+**Post-FFI status:** there is no cached helper file. `set_permissions`,
+the `.cache/pay/pay.sh` install path, the `0o700` directory hardening
+pass, and `validate_helper_file`'s mode check are all deleted (commit
+c27c622). Storage and load happen in-process via Security.framework;
+there is no on-disk artifact for the user to set permissions on.
 
 ### #53 — Use of `#[cfg(unix)]` is redundant (informational) — resolved-by-ffi
 
