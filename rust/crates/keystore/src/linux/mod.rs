@@ -235,7 +235,15 @@ impl SecretStore for SecretServiceStore {
             let col = get_or_create_collection(&ss).await?;
             ensure_unlocked(&col).await?;
             let result = store_item(&col, &key, &data).await;
-            col.lock().await.map_err(ss_err)?;
+            // Audit #31: don't let a relock failure mask a successful
+            // mutation. If the inner store succeeded, the keypair
+            // record is durably on disk; returning the relock error
+            // here would tell the caller "import failed" while the
+            // backend already holds the data — exactly the
+            // inconsistency the audit flagged. Best-effort relock; the
+            // collection remains in whatever state Secret Service
+            // managed to leave it in.
+            let _ = col.lock().await;
             result
         })
     }
@@ -257,7 +265,10 @@ impl SecretStore for SecretServiceStore {
                 Ok(Zeroizing::new(item.get_secret().await.map_err(ss_err)?))
             }
             .await;
-            col.lock().await.map_err(ss_err)?;
+            // Audit #31: same reasoning as `store` — once we've read
+            // the secret bytes, surfacing a relock error would lose
+            // the loaded data on the floor.
+            let _ = col.lock().await;
             result
         })
     }
@@ -296,7 +307,8 @@ impl SecretStore for SecretServiceStore {
                 for item in col.search_items(attrs(&key)).await.map_err(ss_err)? {
                     item.delete().await.map_err(ss_err)?;
                 }
-                col.lock().await.map_err(ss_err)?;
+                // Audit #31: best-effort relock — see store/load.
+                let _ = col.lock().await;
             }
             if let Ok(default) = ss.get_default_collection().await {
                 for item in default.search_items(attrs(&key)).await.map_err(ss_err)? {

@@ -75,6 +75,7 @@ Each finding below is one of:
 | 46  | low           | Checks on error texts or zbus are not robust                                  | resolved |
 | 22  | informational | GNOME Keyring exposes keypairs without the Pay Polkit gate                    | resolved-with-rationale |
 | 33  | low           | Linux Secret Service default-collection fallback is inconsistent              | resolved |
+| 31  | low           | Linux Secret Service relock failure can mask a completed mutation             | resolved |
 
 (Rows added as we work through findings.)
 
@@ -607,6 +608,29 @@ the API honest in the meantime.
 and stays. No new test needed: with only one variant, the previous
 "silently accepts an unsupported mode" failure mode is unreachable by
 construction.
+
+### #31 — Linux Secret Service relock failure can mask a completed mutation (low) — resolved
+
+`SecretServiceStore::store` (and the parallel paths in `load` and
+`delete`) saved the result of the inner operation, then called
+`col.lock().await.map_err(ss_err)?` before returning. If the inner
+mutation succeeded but the relock failed, the call returned the
+relock error — telling the caller the operation failed while the
+backend already held the new state. The shared
+`Keystore::import_with_intent` would then halt before writing the
+`.pubkey` record, leaving a keypair-only account record on disk.
+
+**Fix** (`src/linux/mod.rs`): switched the three relock sites to
+best-effort (`let _ = col.lock().await;`). The collection ends up
+in whatever state Secret Service managed to leave it in; the
+mutation/load result is what the caller sees, matching the durable
+state. If the user's session policy demands a tight relock window,
+the relock can still be re-attempted by the next operation (which
+re-runs `ensure_unlocked` + `lock`).
+
+Side benefit: pairs with audit #50 (overly aggressive relock) —
+both are nudging Pay toward leaving the user's keyring in the state
+the user expected, not bouncing it around per Pay operation.
 
 ### #33 — Linux Secret Service default-collection fallback is inconsistent (low) — resolved
 
