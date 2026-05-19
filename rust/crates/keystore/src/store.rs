@@ -82,14 +82,25 @@ pub fn hex_encode(data: &[u8]) -> Zeroizing<String> {
 }
 
 pub fn hex_decode(hex: &str) -> Result<Vec<u8>> {
-    if !hex.len().is_multiple_of(2) {
+    // Operate on bytes, not the string's `char` iterator: hex is
+    // ASCII-only, and slicing the `&str` with byte offsets would panic
+    // on any non-ASCII multi-byte input that snuck through (audit #19 —
+    // an even-byte non-ASCII string passes the length check then
+    // crashes `&hex[i..i + 2]` mid-codepoint). Rejecting non-ASCII up
+    // front converts that panic into a clean InvalidKeypair error.
+    let bytes = hex.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
         return Err(Error::InvalidKeypair("odd hex length".to_string()));
     }
-    (0..hex.len())
-        .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(&hex[i..i + 2], 16)
-                .map_err(|e| Error::InvalidKeypair(format!("hex: {e}")))
+    bytes
+        .chunks_exact(2)
+        .map(|pair| {
+            // SAFETY: ASCII validity is part of the contract here —
+            // `from_str_radix` would just reject non-ASCII anyway, but
+            // we check up front so the error message is precise.
+            let s = std::str::from_utf8(pair)
+                .map_err(|_| Error::InvalidKeypair("hex contains non-ASCII bytes".to_string()))?;
+            u8::from_str_radix(s, 16).map_err(|e| Error::InvalidKeypair(format!("hex: {e}")))
         })
         .collect()
 }
@@ -312,4 +323,37 @@ impl SecretStore for OnePasswordStore {
 
 fn stderr_str(stderr: &[u8]) -> String {
     String::from_utf8_lossy(stderr).trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hex_decode_rejects_non_ascii_input() {
+        // Two-byte UTF-8 char ('é') keeps the byte count even, which
+        // is the exact shape that used to slip past the length check
+        // and then panic in `&hex[i..i+2]` (audit #19).
+        let even_byte_non_ascii = "éé";
+        assert_eq!(even_byte_non_ascii.len(), 4);
+        let err = hex_decode(even_byte_non_ascii)
+            .expect_err("non-ASCII hex input must error, not panic");
+        assert!(matches!(err, Error::InvalidKeypair(_)));
+    }
+
+    #[test]
+    fn hex_decode_rejects_odd_length() {
+        assert!(matches!(
+            hex_decode("abc"),
+            Err(Error::InvalidKeypair(_))
+        ));
+    }
+
+    #[test]
+    fn hex_decode_roundtrips_ascii() {
+        let bytes = [0u8, 1, 2, 254, 255];
+        let encoded = hex_encode(&bytes);
+        let decoded = hex_decode(&encoded).expect("ASCII roundtrip");
+        assert_eq!(decoded, bytes);
+    }
 }

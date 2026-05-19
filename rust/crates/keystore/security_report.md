@@ -54,6 +54,7 @@ Each finding below is one of:
 | 39  | informational | Static calls used where trait is available                                    | partial  |
 | 38  | informational | `is_available()` functions called inconsistently                              | resolved |
 | 40  | informational | `lock()` errors not detected                                                  | resolved |
+| 19  | low           | `hex_decode` can panic on non-ASCII input                                     | resolved |
 
 (Rows added as we work through findings.)
 
@@ -586,6 +587,33 @@ the API honest in the meantime.
 and stays. No new test needed: with only one variant, the previous
 "silently accepts an unsupported mode" failure mode is unreachable by
 construction.
+
+### #19 — `hex_decode` can panic on non-ASCII input (low) — resolved
+
+`hex_decode` walked the input string with byte offsets (`&hex[i..i + 2]`)
+after only verifying the byte length was even. Multi-byte UTF-8
+characters (e.g. `"éé"` — 4 bytes, even length) would pass the length
+check, then slice the string mid-codepoint and panic.
+
+Reachable when a backend returns a malformed value through the hex
+loader — for example, a compromised 1Password item, a corrupted file
+on disk, or a future backend that doesn't sanitize stored bytes.
+
+**Fix** (`src/store.rs`): rewrote the loop to operate on `hex.as_bytes()`
+via `chunks_exact(2)`, then validate each chunk with
+`std::str::from_utf8` before `u8::from_str_radix`. Non-ASCII bytes
+return `Error::InvalidKeypair("hex contains non-ASCII bytes")`; the
+function no longer panics on any input.
+
+**Regression tests** (`store.rs` tests module):
+
+- `hex_decode_rejects_non_ascii_input` — feeds `"éé"` (4 bytes, even
+  length) and asserts an `InvalidKeypair` error. Panicked against the
+  pre-fix code; passes after.
+- `hex_decode_rejects_odd_length` — keeps the existing odd-length
+  guarantee.
+- `hex_decode_roundtrips_ascii` — sanity-checks that normal hex
+  decoding still works.
 
 ### #40 — `lock()` errors not detected (informational) — resolved
 
