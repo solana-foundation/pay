@@ -62,6 +62,7 @@ Each finding below is one of:
 | 25  | low           | Concurrent keystore mutations can desynchronize keypair and public-key records | partial |
 | 16  | low           | Windows account names differing only by case share Credential Manager targets | resolved |
 | 1   | informational | macOS Keychain helper exposes private key commands without item-level authentication | resolved-with-rationale |
+| 23  | low           | macOS auth reason leaks through helper process arguments                      | resolved-by-ffi |
 
 (Rows added as we work through findings.)
 
@@ -594,6 +595,42 @@ the API honest in the meantime.
 and stays. No new test needed: with only one variant, the previous
 "silently accepts an unsupported mode" failure mode is unreachable by
 construction.
+
+### #23 — macOS auth reason leaks through helper process arguments (low) — resolved-by-ffi
+
+**Audit relevantContent (stale):**
+
+```rust
+let output = Command::new(&binary)
+    .args(["authenticate", &message])
+    .output()
+```
+
+The auditor's concern: the user-facing approval reason (which can
+contain payment amounts, recipients, account names) was passed to
+the Swift helper as a command-line argument. Process metadata like
+`ps -ef` exposes argv to any same-user observer while the child is
+running. A wall-of-shame-grade privacy leak, not a key compromise,
+but still worth fixing.
+
+**Post-FFI status:** there is no child process. The native FFI in
+`src/macos/touchid.rs:43-47` passes the reason as an in-process
+`NSString` to `LAContext.evaluatePolicy`:
+
+```rust
+let reason = NSString::from_str(reason);
+unsafe {
+    ctx.evaluatePolicy_localizedReason_reply(
+        LAPolicy::DeviceOwnerAuthenticationWithBiometrics,
+        &reason,
+        &block,
+    );
+}
+```
+
+Nothing escapes to argv, the environment, or stdin/stdout, and no
+external observer sees the reason text outside the Touch ID prompt
+itself.
 
 ### #1 — macOS Keychain helper exposes private key commands without item-level authentication (informational) — resolved-with-rationale
 
