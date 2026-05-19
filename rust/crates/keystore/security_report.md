@@ -61,6 +61,7 @@ Each finding below is one of:
 | 12  | low           | Delete can report success while leaving stale public-key metadata             | resolved |
 | 25  | low           | Concurrent keystore mutations can desynchronize keypair and public-key records | partial |
 | 16  | low           | Windows account names differing only by case share Credential Manager targets | resolved |
+| 1   | informational | macOS Keychain helper exposes private key commands without item-level authentication | resolved-with-rationale |
 
 (Rows added as we work through findings.)
 
@@ -593,6 +594,63 @@ the API honest in the meantime.
 and stays. No new test needed: with only one variant, the previous
 "silently accepts an unsupported mode" failure mode is unreachable by
 construction.
+
+### #1 — macOS Keychain helper exposes private key commands without item-level authentication (informational) — resolved-with-rationale
+
+The auditor observes that the macOS Keychain item is stored with
+`kSecAttrAccessibleWhenUnlockedThisDeviceOnly` only — there is no
+`kSecAttrAccessControl` binding the read to biometric presence. Touch
+ID is enforced through a separate `LAContext.evaluatePolicy` gate
+before each load. A program running as the same user with the screen
+unlocked could therefore call `SecItemCopyMatching` directly and
+bypass our auth gate.
+
+**Decision: keep the current LA-as-separate-gate model.**
+
+The recommended fix —
+`SecAccessControlCreateWithFlags(.biometryCurrentSet)` plus
+`kSecAttrAccessControl` on the stored item — works correctly only if
+the calling binary has a **stable code-signing identity**. The
+Keychain ACL keys on the binary's designated requirement (derived
+from its code signature). Without an Apple Developer ID + team
+identifier:
+
+- Ad-hoc signatures hash the binary bytes; the requirement changes on
+  every rebuild.
+- The user would be re-prompted with the "Allow / Always Allow" login-
+  password dialog after every `pay` upgrade or rebuild — strictly
+  worse UX than today, and a habituation hazard if the user reflex-
+  clicks "Always Allow."
+- A genuine attacker on the same machine can already trigger our
+  auth gate via UI automation, so the attack model the ACL would
+  defend against ("co-resident process bypasses LA gate") is roughly
+  the same threat shape as "co-resident process drives the UI."
+
+**Mitigations actually in place today:**
+
+- `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` — Keychain refuses
+  reads while the screen is locked; item never syncs to iCloud and
+  doesn't appear in keychain backups.
+- `LAContext.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, ...)`
+  in `src/macos/touchid.rs:43-47` — biometrics-only (no passcode
+  fallback), called immediately before every `load_keypair_with_intent`
+  via `Keystore::load_keypair_with_intent` (`src/lib.rs`).
+- The post-FFI implementation no longer exposes "raw" `read` /
+  `delete` commands as a child-process surface (the Swift helper is
+  gone — see audit #3 / #71). Storage and load happen in-process
+  behind `AppleKeychainStore::{store, load, delete}`.
+- The `pay` binary is ad-hoc codesigned at install time
+  (`just install pay` → `codesign --sign - --force …` in the root
+  `Justfile`), which gives the Keychain a stable identity for the
+  installed binary on this Mac (cross-machine identity still requires
+  a real Developer ID, which we do not have).
+
+**Revisit if:** we ship a Developer ID Application-signed `pay`
+binary. At that point the ACL becomes durable across releases and
+the trade-off flips — we can move to
+`SecAccessControlCreateWithFlags(.biometryCurrentSet)` and keep the
+LA gate as defense in depth (or remove it once the ACL covers the
+same threat).
 
 ### #16 — Windows account names differing only by case share Credential Manager targets (low) — resolved
 
