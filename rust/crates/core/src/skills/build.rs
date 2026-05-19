@@ -561,6 +561,40 @@ fn process_provider_md(
         }
     }
 
+    // Validate operation-level documentation: every path placeholder is
+    // declared, every parameter has enough signal (description/enum/format/
+    // pattern/example) for an agent to know what to send, every required body
+    // field is described. Empty `{}` bodies must be marked intentional.
+    if let Some(doc) = &openapi_doc {
+        for finding in crate::skills::openapi::validate_operation_documentation(doc) {
+            match finding.severity {
+                crate::skills::openapi::CatalogFindingSeverity::Error => {
+                    errors.push(format!("{fqn}: {}", finding.message));
+                }
+                crate::skills::openapi::CatalogFindingSeverity::Warning => {
+                    warnings.push(format!("{fqn}: {}", finding.message));
+                }
+            }
+        }
+    }
+
+    // Verify the committed openapi.json sidecar is pretty-printed (multi-line,
+    // indented). Minified one-liners aren't reviewable in PR diffs.
+    if let Some(source) = &spec.openapi {
+        for finding in
+            crate::skills::openapi::validate_committed_spec_formatting(source, path.parent())
+        {
+            match finding.severity {
+                crate::skills::openapi::CatalogFindingSeverity::Error => {
+                    errors.push(format!("{fqn}: {}", finding.message));
+                }
+                crate::skills::openapi::CatalogFindingSeverity::Warning => {
+                    warnings.push(format!("{fqn}: {}", finding.message));
+                }
+            }
+        }
+    }
+
     // Probe each endpoint (when probing is on) and synthesize the rich
     // `DetailEndpoint` shape: probe-derived pricing wins over any inline
     // pricing in the spec, with the spec value as fallback for offline builds.

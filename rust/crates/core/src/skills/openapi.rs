@@ -1969,6 +1969,383 @@ fn resolve_ref(ref_str: &str, doc: &Value) -> Option<Value> {
     doc.pointer(pointer).cloned()
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// Operation documentation validation
+//
+// Catches the documentation gaps that prevent an agent from forming a
+// valid request: undeclared path placeholders, parameters or required
+// body properties without enough signal (description, format, enum,
+// pattern, example, title) to disambiguate the intended value.
+// ─────────────────────────────────────────────────────────────────────
+
+const MAX_DOC_WALK_DEPTH: u32 = 8;
+
+/// Walk every operation in the document and flag parameter / body
+/// documentation gaps. Errors block PR landing; warnings surface in the
+/// step summary.
+pub fn validate_operation_documentation(doc: &Value) -> Vec<CatalogFinding> {
+    let mut findings = Vec::new();
+    let Some(paths) = doc.get("paths").and_then(|v| v.as_object()) else {
+        return findings;
+    };
+    for (path, item) in paths {
+        let Some(item_obj) = item.as_object() else {
+            continue;
+        };
+        let path_level_params: Vec<Value> = item_obj
+            .get("parameters")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        for &method in HTTP_METHODS {
+            let Some(op) = item_obj.get(method) else {
+                continue;
+            };
+            validate_operation_documentation_one(
+                doc,
+                op,
+                method,
+                path,
+                &path_level_params,
+                &mut findings,
+            );
+        }
+    }
+    findings
+}
+
+fn validate_operation_documentation_one(
+    doc: &Value,
+    op: &Value,
+    method: &str,
+    path: &str,
+    path_level_params: &[Value],
+    findings: &mut Vec<CatalogFinding>,
+) {
+    let label = format!("{} {}", method.to_uppercase(), path);
+
+    // Resolve all parameters (path-level + op-level, $ref-dereffed).
+    let mut all_params: Vec<Value> = path_level_params.to_vec();
+    if let Some(arr) = op.get("parameters").and_then(|v| v.as_array()) {
+        all_params.extend(arr.iter().cloned());
+    }
+    let resolved_params: Vec<Value> = all_params
+        .iter()
+        .map(|p| {
+            if let Some(r) = p.get("$ref").and_then(|v| v.as_str()) {
+                resolve_ref(r, doc).unwrap_or_else(|| p.clone())
+            } else {
+                p.clone()
+            }
+        })
+        .collect();
+
+    // Path placeholders must be declared.
+    let url_placeholders = extract_url_placeholders(path);
+    let declared_path: std::collections::HashSet<String> = resolved_params
+        .iter()
+        .filter(|p| p.get("in").and_then(|v| v.as_str()) == Some("path"))
+        .filter_map(|p| p.get("name").and_then(|v| v.as_str()).map(String::from))
+        .collect();
+    for placeholder in &url_placeholders {
+        if !declared_path.contains(placeholder) {
+            findings.push(CatalogFinding::error(format!(
+                "{label}: path placeholder `{{{placeholder}}}` is not declared in `parameters[]`\n  \
+                 add `{{ in: path, name: {placeholder}, required: true, schema: {{ type: string }}, description: \"…\" }}` to the operation or path-level parameters\n"
+            )));
+        }
+    }
+
+    // Each parameter needs a description (or an equivalent semantic signal).
+    for p in &resolved_params {
+        let Some(pname) = p.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let ploc = p.get("in").and_then(|v| v.as_str()).unwrap_or("");
+        let is_required = p
+            .get("required")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(ploc == "path");
+        if parameter_is_documented(doc, p) {
+            continue;
+        }
+        let severity = if is_required {
+            CatalogFindingSeverity::Error
+        } else {
+            CatalogFindingSeverity::Warning
+        };
+        findings.push(CatalogFinding {
+            severity,
+            message: format!(
+                "{label}: parameter `{ploc}.{pname}` has no description (and no enum/format/pattern/example to disambiguate it)\n  \
+                 add `description: \"…\"` to the parameter (or to its referenced schema) so agents know what value to send\n"
+            ),
+        });
+    }
+
+    // Request body (POST/PUT/PATCH) checks: present schema, non-empty object,
+    // required props all documented.
+    if !matches!(method, "post" | "put" | "patch") {
+        return;
+    }
+    let Some(rb) = op.get("requestBody") else {
+        return;
+    };
+    let rb = if let Some(r) = rb.get("$ref").and_then(|v| v.as_str()) {
+        resolve_ref(r, doc).unwrap_or_else(|| rb.clone())
+    } else {
+        rb.clone()
+    };
+    let Some(content) = rb.get("content").and_then(|v| v.as_object()) else {
+        return;
+    };
+    for (ct, c) in content {
+        if !ct.starts_with("application/json") {
+            continue;
+        }
+        let schema = c.get("schema").cloned().unwrap_or(Value::Null);
+        let has_example = c.get("example").is_some() || c.get("examples").is_some();
+        if schema.is_null() && !has_example {
+            findings.push(CatalogFinding::error(format!(
+                "{label}: request body `{ct}` has no `schema` or `example`\n  \
+                 agents can't form the request — add a schema or at least a concrete example\n"
+            )));
+            continue;
+        }
+        let resolved_schema = deref_schema(&schema, doc);
+
+        // Empty-object schema: tell the agent it's intentional.
+        let is_object = resolved_schema.get("type").and_then(|v| v.as_str()) == Some("object");
+        let has_props = resolved_schema
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .map(|o| !o.is_empty())
+            .unwrap_or(false);
+        let has_additional = resolved_schema.get("additionalProperties").is_some();
+        let has_ref = resolved_schema.get("$ref").is_some();
+        let has_combo = ["allOf", "anyOf", "oneOf"]
+            .iter()
+            .any(|k| resolved_schema.get(*k).and_then(|v| v.as_array()).map_or(false, |a| !a.is_empty()));
+        if is_object && !has_props && !has_additional && !has_ref && !has_combo {
+            findings.push(CatalogFinding::warning(format!(
+                "{label}: request body schema is an empty `object` with no `properties`, `additionalProperties`, or `$ref`\n  \
+                 if the endpoint takes no parameters, set `additionalProperties: false` and add a short `description`; \
+                 otherwise list the expected properties\n"
+            )));
+        }
+
+        let mut undescribed_required: Vec<String> = Vec::new();
+        walk_required_props(doc, &resolved_schema, "", 0, &mut undescribed_required);
+        if !undescribed_required.is_empty() {
+            let shown: String = undescribed_required
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            let more = if undescribed_required.len() > 5 {
+                format!(", … +{}", undescribed_required.len() - 5)
+            } else {
+                String::new()
+            };
+            findings.push(CatalogFinding::error(format!(
+                "{label}: request body `{ct}` has required fields without descriptions: [{shown}{more}]\n  \
+                 each required field needs `description`, `enum`, `format`, `pattern`, `const`, `example`, or `title` so agents know what value to send\n"
+            )));
+        }
+    }
+}
+
+fn extract_url_placeholders(path: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = path.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            if let Some(end) = bytes[i + 1..].iter().position(|&b| b == b'}') {
+                if let Ok(name) = std::str::from_utf8(&bytes[i + 1..i + 1 + end]) {
+                    if !name.is_empty() {
+                        out.push(name.to_string());
+                    }
+                }
+                i += end + 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+fn deref_schema(schema: &Value, doc: &Value) -> Value {
+    if let Some(r) = schema.get("$ref").and_then(|v| v.as_str()) {
+        if let Some(target) = resolve_ref(r, doc) {
+            return target;
+        }
+    }
+    schema.clone()
+}
+
+fn parameter_is_documented(doc: &Value, param: &Value) -> bool {
+    if param
+        .get("description")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.trim().is_empty())
+    {
+        return true;
+    }
+    if param.get("example").is_some() || param.get("examples").is_some() {
+        return true;
+    }
+    let Some(schema) = param.get("schema") else {
+        return false;
+    };
+    schema_provides_signal(&deref_schema(schema, doc))
+}
+
+fn schema_provides_signal(schema: &Value) -> bool {
+    if schema
+        .get("description")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.trim().is_empty())
+    {
+        return true;
+    }
+    for key in [
+        "enum", "const", "format", "pattern", "example", "examples", "title",
+    ] {
+        if schema.get(key).is_some() {
+            return true;
+        }
+    }
+    if let Some(items) = schema.get("items") {
+        if schema_provides_signal(items) {
+            return true;
+        }
+    }
+    false
+}
+
+fn walk_required_props(
+    doc: &Value,
+    schema: &Value,
+    prefix: &str,
+    depth: u32,
+    undescribed: &mut Vec<String>,
+) {
+    if depth > MAX_DOC_WALK_DEPTH {
+        return;
+    }
+    let schema = deref_schema(schema, doc);
+    let required: std::collections::HashSet<String> = schema
+        .get("required")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if let Some(props) = schema.get("properties").and_then(|v| v.as_object()) {
+        for (name, prop) in props {
+            let dotted = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}.{name}")
+            };
+            let prop_resolved = deref_schema(prop, doc);
+            // A property entry may carry its own `description` alongside a
+            // `$ref`; OpenAPI 3.1 allows it. Check the inline prop *and* the
+            // resolved target so we don't flag a documented `$ref`'d field.
+            let documented =
+                schema_provides_signal(prop) || schema_provides_signal(&prop_resolved);
+            if required.contains(name) && !documented {
+                undescribed.push(dotted.clone());
+            }
+            let t = prop_resolved.get("type").and_then(|v| v.as_str());
+            if t == Some("object") || prop_resolved.get("properties").is_some() {
+                walk_required_props(doc, &prop_resolved, &dotted, depth + 1, undescribed);
+            } else if t == Some("array") {
+                if let Some(items) = prop_resolved.get("items") {
+                    walk_required_props(
+                        doc,
+                        items,
+                        &format!("{dotted}[]"),
+                        depth + 1,
+                        undescribed,
+                    );
+                }
+            }
+        }
+    }
+
+    for combo in ["allOf", "anyOf", "oneOf"] {
+        if let Some(arr) = schema.get(combo).and_then(|v| v.as_array()) {
+            for sub in arr {
+                walk_required_props(doc, sub, prefix, depth + 1, undescribed);
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Committed spec file formatting
+//
+// `pay catalog check` requires committed openapi.json sidecars to be
+// pretty-printed (multi-line, indented). Reviewers need diffable specs;
+// minified one-liners hide intent in PR review.
+// ─────────────────────────────────────────────────────────────────────
+
+pub fn validate_committed_spec_formatting(
+    source: &OpenapiSource,
+    spec_dir: Option<&std::path::Path>,
+) -> Vec<CatalogFinding> {
+    let mut findings = Vec::new();
+    let OpenapiSource::Path { path } = source else {
+        return findings;
+    };
+    let Some(dir) = spec_dir else {
+        return findings;
+    };
+    let resolved = dir.join(path);
+    let body = match std::fs::read_to_string(&resolved) {
+        Ok(b) => b,
+        Err(_) => return findings,
+    };
+    // Tiny single-line objects are fine — only flag anything substantial.
+    if body.len() < 256 {
+        return findings;
+    }
+    if is_pretty_printed(&body) {
+        return findings;
+    }
+    findings.push(CatalogFinding::warning(format!(
+        "openapi.path `{path}` is minified — committed specs should be pretty-printed so PR diffs are reviewable\n  \
+         reformat with: `jq . {path} > {path}.tmp && mv {path}.tmp {path}` (or any `python3 -m json.tool` equivalent)\n"
+    )));
+    findings
+}
+
+fn is_pretty_printed(body: &str) -> bool {
+    // A pretty-printed JSON document has at least one newline followed by an
+    // indent (1+ space or tab) in its first 1 KiB. Indent width is irrelevant —
+    // `jq .` uses 2, `python -m json.tool` uses 4, both pass.
+    let prefix_end = body.len().min(1024);
+    let prefix = &body[..prefix_end];
+    let mut chars = prefix.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\n' {
+            if let Some(&next) = chars.peek() {
+                if next == ' ' || next == '\t' {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2469,6 +2846,253 @@ mod tests {
             }),
             "expected servers[] mismatch warning, got: {findings:?}"
         );
+    }
+
+    // ── Operation-documentation tests ──
+
+    #[test]
+    fn operation_doc_validation_flags_undeclared_path_placeholder() {
+        let doc = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/users/{userId}": {
+                    "get": {
+                        "summary": "Get a user by their identifier",
+                        "parameters": []
+                    }
+                }
+            }
+        });
+        let findings = validate_operation_documentation(&doc);
+        assert!(
+            findings.iter().any(|f| f.severity == CatalogFindingSeverity::Error
+                && f.message.contains("{userId}")
+                && f.message.contains("not declared")),
+            "expected undeclared-path-param error, got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn operation_doc_validation_flags_undescribed_required_param() {
+        let doc = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/lookup": {
+                    "get": {
+                        "summary": "Look up something by id",
+                        "parameters": [
+                            { "in": "query", "name": "id", "required": true,
+                              "schema": { "type": "string" } }
+                        ]
+                    }
+                }
+            }
+        });
+        let findings = validate_operation_documentation(&doc);
+        assert!(
+            findings.iter().any(|f| f.severity == CatalogFindingSeverity::Error
+                && f.message.contains("query.id")
+                && f.message.contains("no description")),
+            "expected required-param error, got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn operation_doc_validation_accepts_schema_signal() {
+        // A required parameter without a top-level description is OK if its
+        // schema carries enough signal (description / enum / format / pattern).
+        let doc = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/x": {
+                    "get": {
+                        "summary": "Read X with a typed query parameter",
+                        "parameters": [
+                            { "in": "query", "name": "mode", "required": true,
+                              "schema": { "type": "string", "enum": ["fast","slow"] } },
+                            { "in": "query", "name": "email", "required": true,
+                              "schema": { "type": "string", "format": "email" } },
+                            { "in": "query", "name": "uid", "required": true,
+                              "schema": { "$ref": "#/components/schemas/UserId" } }
+                        ]
+                    }
+                }
+            },
+            "components": {
+                "schemas": {
+                    "UserId": { "type": "string", "description": "Opaque user identifier." }
+                }
+            }
+        });
+        let findings = validate_operation_documentation(&doc);
+        assert!(
+            !findings.iter().any(|f| f.severity == CatalogFindingSeverity::Error),
+            "expected no errors, got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn operation_doc_validation_flags_required_body_props() {
+        let doc = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/register": {
+                    "post": {
+                        "summary": "Register a new account from inputs",
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "required": ["domain","email"],
+                                        "properties": {
+                                            "domain": { "type": "string" },
+                                            "email": { "type": "string", "format": "email" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let findings = validate_operation_documentation(&doc);
+        let err = findings.iter().find(|f| f.severity == CatalogFindingSeverity::Error
+            && f.message.contains("required fields without descriptions"))
+            .expect("expected required-body-prop error");
+        assert!(err.message.contains("[domain]"), "got: {}", err.message);
+        // email has format:email → considered documented, so should NOT appear.
+        assert!(!err.message.contains("email"), "email should not be flagged: {}", err.message);
+    }
+
+    #[test]
+    fn operation_doc_validation_warns_on_empty_object_body() {
+        let doc = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/trending": {
+                    "post": {
+                        "summary": "List trending items globally",
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": { "type": "object", "properties": {} }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let findings = validate_operation_documentation(&doc);
+        assert!(
+            findings.iter().any(|f| f.severity == CatalogFindingSeverity::Warning
+                && f.message.contains("empty `object`")),
+            "expected empty-object warning, got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn operation_doc_validation_recurses_into_nested_required_props() {
+        let doc = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/place": {
+                    "post": {
+                        "summary": "Create a place from coordinates",
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "required": ["center"],
+                                        "properties": {
+                                            "center": {
+                                                "type": "object",
+                                                "description": "Center point.",
+                                                "required": ["latitude","longitude"],
+                                                "properties": {
+                                                    "latitude": { "type": "number" },
+                                                    "longitude": { "type": "number" }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let findings = validate_operation_documentation(&doc);
+        let err = findings
+            .iter()
+            .find(|f| f.severity == CatalogFindingSeverity::Error
+                && f.message.contains("required fields without descriptions"))
+            .expect("expected nested-required error");
+        assert!(err.message.contains("center.latitude"), "got: {}", err.message);
+        assert!(err.message.contains("center.longitude"), "got: {}", err.message);
+    }
+
+    // ── Pretty-print formatting tests ──
+
+    #[test]
+    fn pretty_print_detector_recognizes_pretty_and_minified() {
+        let pretty = "{\n  \"openapi\": \"3.1.0\",\n  \"paths\": {}\n}";
+        let minified = r#"{"openapi":"3.1.0","paths":{},"components":{"schemas":{"X":{"type":"string"}}}}"#;
+        assert!(is_pretty_printed(pretty));
+        assert!(!is_pretty_printed(minified));
+    }
+
+    #[test]
+    fn formatting_validation_warns_on_minified_committed_spec() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("openapi.json");
+        // Make sure the file is large enough to trip the "trivial size" guard.
+        let mut body = String::from(r#"{"openapi":"3.1.0","info":{"title":"X","version":"1"},"paths":{}"#);
+        body.push_str(",\"components\":{\"schemas\":{");
+        for i in 0..32 {
+            if i > 0 { body.push(','); }
+            body.push_str(&format!("\"Schema{i}\":{{\"type\":\"object\",\"properties\":{{}}}}"));
+        }
+        body.push_str("}}}");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(body.as_bytes()).unwrap();
+        drop(f);
+
+        let source = OpenapiSource::Path {
+            path: "openapi.json".to_string(),
+        };
+        let findings = validate_committed_spec_formatting(&source, Some(dir.path()));
+        assert!(
+            findings.iter().any(|f| f.severity == CatalogFindingSeverity::Warning
+                && f.message.contains("minified")
+                && f.message.contains("jq .")),
+            "expected minified warning with jq hint, got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn formatting_validation_is_silent_for_pretty_printed_committed_spec() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("openapi.json");
+        let body = serde_json::to_string_pretty(&json!({
+            "openapi": "3.1.0",
+            "info": { "title": "X", "version": "1" },
+            "paths": {},
+            "components": { "schemas": { "Pad": { "type": "string", "description": "pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad" }}}
+        })).unwrap();
+        std::fs::File::create(&path).unwrap().write_all(body.as_bytes()).unwrap();
+
+        let source = OpenapiSource::Path {
+            path: "openapi.json".to_string(),
+        };
+        let findings = validate_committed_spec_formatting(&source, Some(dir.path()));
+        assert!(findings.is_empty(), "expected silence, got: {findings:?}");
     }
 
     // ── Body example tests ──
