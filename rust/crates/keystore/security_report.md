@@ -70,6 +70,7 @@ Each finding below is one of:
 | 48  | informational | The use of number 19 in `process_start_time()` isn't obvious                  | resolved |
 | 49  | informational | Several public rust object can be shielded (Linux part)                       | resolved |
 | 44  | informational | The linux `AuthGate.is_available` doesn't check the Polkit action exists      | resolved |
+| 47  | informational | Errors in `polkit_authenticate()` don't show all situations                   | resolved |
 
 (Rows added as we work through findings.)
 
@@ -602,6 +603,27 @@ the API honest in the meantime.
 and stays. No new test needed: with only one variant, the previous
 "silently accepts an unsupported mode" failure mode is unreachable by
 construction.
+
+### #47 — Errors in `polkit_authenticate()` don't show all situations (informational) — resolved
+
+`polkit_authenticate` collapsed every non-authorized polkit reply
+into `Error::AuthDenied("authentication cancelled")`, even when the
+user wasn't actually challenged. PolicyKit's reply already carries a
+`challenge: bool` flag that distinguishes "user cancelled the
+prompt" from "policy refused to challenge" — the latter happens when
+the action's `allow_active`/`allow_inactive` is set to `no` or an
+admin rule denies the action outright.
+
+**Fix** (`src/linux/mod.rs`): destructured the tuple's `challenge`
+field and split the error:
+
+- `authorized=true` → `Ok(())`
+- `authorized=false, challenge=true` →
+  `AuthDenied("authentication cancelled")` — caller can prompt user
+  to try again.
+- `authorized=false, challenge=false` →
+  `AuthDenied("not authorized by polkit policy")` — retrying is
+  useless; caller should surface the policy-config issue.
 
 ### #44 — Linux `AuthGate.is_available` doesn't check Polkit action exists (informational) — resolved
 

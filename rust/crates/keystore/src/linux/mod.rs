@@ -104,14 +104,26 @@ async fn polkit_authenticate(action: &str, interactive: bool) -> Result<()> {
             }
         })?;
 
-    let (authorized, _, _): (bool, bool, HashMap<String, String>) = reply
+    let (authorized, challenge, _): (bool, bool, HashMap<String, String>) = reply
         .body()
         .map_err(|e| Error::Backend(format!("polkit response: {e}")))?;
 
+    // Audit #47: PolicyKit's reply tells us *why* an unauthorized
+    // result came back. `challenge=true` means the user was prompted
+    // and dismissed/cancelled. `challenge=false` means policy refused
+    // to even challenge the user — e.g. the action's
+    // `allow_active`/`allow_inactive` is set to `no`, or an admin
+    // rule denies the action. Retrying after a policy denial is
+    // pointless; surfacing that distinction lets callers display the
+    // right next step instead of nudging the user to "try again."
     if authorized {
         Ok(())
-    } else {
+    } else if challenge {
         Err(Error::AuthDenied("authentication cancelled".to_string()))
+    } else {
+        Err(Error::AuthDenied(
+            "not authorized by polkit policy".to_string(),
+        ))
     }
 }
 
