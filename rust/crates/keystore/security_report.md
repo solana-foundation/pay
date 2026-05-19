@@ -52,6 +52,7 @@ Each finding below is one of:
 | 67  | informational | The use of `pay.sh` version pay is not consistent                             | resolved |
 | 37  | informational | Security note doesn't cover all the nuances                                   | resolved |
 | 39  | informational | Static calls used where trait is available                                    | partial  |
+| 38  | informational | `is_available()` functions called inconsistently                              | resolved |
 
 (Rows added as we work through findings.)
 
@@ -584,6 +585,34 @@ the API honest in the meantime.
 and stays. No new test needed: with only one variant, the previous
 "silently accepts an unsupported mode" failure mode is unreachable by
 construction.
+
+### #38 — `is_available()` functions called inconsistently (informational) — resolved
+
+The auditor's matrix flagged that each platform's `*_available()` shim
+was checking a different layer:
+
+| Backend  | Was checking | Real gap |
+| -------- | ------------ | -------- |
+| macOS    | auth gate only | none — Keychain always present |
+| Linux    | store only     | **yes** — Polkit action could be missing while Secret Service is up |
+| Windows  | auth gate only | none — Credential Manager always present |
+
+**Fix** (`src/lib.rs`): `gnome_keyring_available` now requires
+**both** `SecretServiceStore.is_available()` **and**
+`Polkit.is_available()` to return true. Reporting the backend as
+"available" when only Secret Service is up was the audit's
+documented hazard: callers could commit to the GNOME path on a host
+whose Polkit action is missing, then hit the failure at the next
+`authenticate()` call instead of at the explicit availability probe.
+
+macOS and Windows checks stay as-is — the auditor's matrix marks
+"Keychain access follows device lock, no separate check needed" and
+"Credential Manager always available if WinRT works", which matches
+the current per-platform checks (auth gate only).
+
+**Why this also touches audit #44:** the underlying Polkit-action
+existence check that `Polkit::is_available` performs is the work
+described in #44; both findings now share the same code path.
 
 ### #39 — Static calls used where trait is available (informational) — partial
 

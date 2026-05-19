@@ -157,10 +157,20 @@ impl Keystore {
         Self::new(linux::Polkit, linux::SecretServiceStore, true)
     }
 
-    /// Check if GNOME Secret Service is available (Linux only).
+    /// Check if the Linux GNOME Keyring backend is fully available.
+    ///
+    /// "Fully available" means both layers the backend needs are usable:
+    /// the Secret Service D-Bus collection (the store) **and** the
+    /// Polkit auth gate. Reporting "yes" purely on Secret Service alone
+    /// would let a caller commit to GNOME Keyring on a host whose Polkit
+    /// action is missing, only to fail at the next `authenticate()`
+    /// call. macOS and Windows backends only need the auth gate to be
+    /// usable (Keychain / Credential Manager are always present on
+    /// those platforms); Linux is the one place where both legs can
+    /// move independently. (audit #38 / #44)
     #[cfg(target_os = "linux")]
     pub fn gnome_keyring_available() -> bool {
-        linux::SecretServiceStore.is_available()
+        linux::SecretServiceStore.is_available() && linux::Polkit.is_available()
     }
 
     /// Windows Credential Manager + Windows Hello.
