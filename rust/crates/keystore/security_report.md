@@ -64,6 +64,7 @@ Each finding below is one of:
 | 1   | informational | macOS Keychain helper exposes private key commands without item-level authentication | resolved-with-rationale |
 | 23  | low           | macOS auth reason leaks through helper process arguments                      | resolved-by-ffi |
 | 51  | informational | Function `helper_path()` could cache results                                  | resolved-by-ffi |
+| 53  | informational | Use of `#[cfg(unix)]` is redundant                                            | resolved-by-ffi |
 
 (Rows added as we work through findings.)
 
@@ -596,6 +597,17 @@ the API honest in the meantime.
 and stays. No new test needed: with only one variant, the previous
 "silently accepts an unsupported mode" failure mode is unreachable by
 construction.
+
+### #53 — Use of `#[cfg(unix)]` is redundant (informational) — resolved-by-ffi
+
+The auditor noted that `#[cfg(unix)]` annotations inside the macOS
+module were redundant — macOS is always Unix. The recommendation was
+to drop them.
+
+**Verified:** `grep -rn '#\[cfg(unix)\]' rust/crates/keystore/src/macos/`
+returns zero matches in the post-FFI tree. The annotations lived on
+filesystem-permissions code paths that were deleted alongside the
+Swift helper (commit c27c622). Nothing to remove.
 
 ### #51 — Function `helper_path()` could cache results (informational) — resolved-by-ffi
 
