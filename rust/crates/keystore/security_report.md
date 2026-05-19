@@ -81,6 +81,7 @@ Each finding below is one of:
 | 45  | informational | `polkit.message` could be used to display custom messages                     | resolved |
 | 64  | informational | Errors of the `COM` initialization are not caught                             | resolved |
 | 68  | low           | Windows: Immutable pointers casted to mutable pointers                        | resolved |
+| 69  | low           | In windows, the function `cred_read()` isn't sufficiently hardened            | resolved |
 
 (Rows added as we work through findings.)
 
@@ -613,6 +614,35 @@ the API honest in the meantime.
 and stays. No new test needed: with only one variant, the previous
 "silently accepts an unsupported mode" failure mode is unreachable by
 construction.
+
+### #69 — `cred_read()` isn't sufficiently hardened (low) — resolved
+
+The auditor listed four concerns about `cred_read`:
+
+1. **No null-check before `&*ptr`** — `CredReadW` can in theory
+   return `Ok` with a null out-pointer; dereferencing would UB.
+2. **`CredentialBlobSize as usize` without validation** — DWORD is
+   `u32`; cast is widening on 64-bit, identity on 32-bit. Not
+   strictly an overflow, but a sanity check against the "size > 0
+   with null blob pointer" mismatch was missing.
+3. **`slice::from_raw_parts` alignment** — `*const u8` has
+   alignment 1, so this is not a concrete bug, but the audit
+   asked for explicit handling.
+4. **`CredFree` not called if `to_vec()` panics** — leak on
+   OOM-style unwinds.
+
+**Fix** (`src/windows/mod.rs`):
+
+- New RAII guard `CredentialGuard(*mut CREDENTIALW)` that calls
+  `CredFree` in `Drop`. `Drop` runs on every unwind path, so the
+  allocation never leaks even if `to_vec()` panics.
+- `cred_read` now wraps the returned pointer in the guard, refuses
+  to dereference a null pointer (returns `Error::Backend`),
+  validates `CredentialBlobSize == 0 ⇒ empty vec`, and refuses to
+  slice when `CredentialBlobSize > 0 && CredentialBlob.is_null()`.
+- `cred_exists` also routes through the guard, replacing the
+  ad-hoc "`if found && !ptr.is_null() { CredFree(...) }`" branch.
+- Alignment is documented as no-op (u8 alignment is 1).
 
 ### #68 — Windows: Immutable pointers casted to mutable pointers (low) — resolved
 

@@ -244,16 +244,76 @@ fn cred_write(target: &[u16], blob: &[u8]) -> Result<()> {
     unsafe { CredWriteW(&cred, 0) }.map_err(|e| Error::Backend(format!("CredWriteW failed: {e}")))
 }
 
+/// RAII guard for a `*mut CREDENTIALW` returned by `CredReadW`.
+///
+/// Audit #69: the previous `cred_read` ran `to_vec()` between
+/// `CredReadW` and `CredFree`. If `to_vec()` panicked (OOM, etc.)
+/// the credential allocation leaked. The guard ensures `CredFree`
+/// runs on every unwind path.
+struct CredentialGuard(*mut CREDENTIALW);
+
+impl CredentialGuard {
+    /// Safety: `ptr` must be a Windows-allocated `CREDENTIALW` from
+    /// `CredReadW` (or null, in which case the guard is a no-op).
+    fn new(ptr: *mut CREDENTIALW) -> Self {
+        Self(ptr)
+    }
+
+    fn as_ref(&self) -> Option<&CREDENTIALW> {
+        if self.0.is_null() {
+            None
+        } else {
+            // Safety: ptr was returned by Windows and lives until
+            // CredFree runs (which only happens in Drop).
+            Some(unsafe { &*self.0 })
+        }
+    }
+}
+
+impl Drop for CredentialGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { CredFree(self.0.cast()) };
+        }
+    }
+}
+
 fn cred_read(target: &[u16]) -> Result<Zeroizing<Vec<u8>>> {
     let mut ptr: *mut CREDENTIALW = std::ptr::null_mut();
     unsafe { CredReadW(PCWSTR(target.as_ptr()), CRED_TYPE_GENERIC, 0, &mut ptr) }
         .map_err(|e| Error::Backend(format!("CredReadW failed: {e}")))?;
 
-    let blob = unsafe {
-        let c = &*ptr;
-        slice::from_raw_parts(c.CredentialBlob, c.CredentialBlobSize as usize).to_vec()
+    // Audit #69 hardening:
+    //   - null-check the returned pointer (CredReadW can in theory
+    //     return Ok with a null out-pointer; we refuse to dereference
+    //     it);
+    //   - guard the pointer in CredentialGuard so CredFree always
+    //     runs, even if a downstream allocation panics;
+    //   - validate CredentialBlobSize as usize without truncation
+    //     (the field is DWORD = u32; cast is widening on 64-bit and
+    //     identity on 32-bit, but we still reject the "blob pointer
+    //     is null but size > 0" mismatch);
+    //   - require non-null CredentialBlob before slicing.
+    let guard = CredentialGuard::new(ptr);
+    let cred = guard
+        .as_ref()
+        .ok_or_else(|| Error::Backend("CredReadW returned success with null pointer".into()))?;
+
+    let size = cred.CredentialBlobSize as usize;
+    let blob = if size == 0 {
+        Vec::new()
+    } else if cred.CredentialBlob.is_null() {
+        return Err(Error::Backend(
+            "CredReadW returned non-zero size with null blob pointer".into(),
+        ));
+    } else {
+        // Safety: cred.CredentialBlob is non-null (just checked),
+        // points to `size` initialized bytes owned by Windows until
+        // guard is dropped, and is `*const u8`-aligned (u8 has
+        // alignment 1, so no alignment check is needed).
+        unsafe { slice::from_raw_parts(cred.CredentialBlob, size) }.to_vec()
     };
-    unsafe { CredFree(ptr.cast()) };
+    drop(guard);
     Ok(Zeroizing::new(blob))
 }
 
@@ -261,9 +321,9 @@ fn cred_exists(target: &[u16]) -> bool {
     let mut ptr: *mut CREDENTIALW = std::ptr::null_mut();
     let found =
         unsafe { CredReadW(PCWSTR(target.as_ptr()), CRED_TYPE_GENERIC, 0, &mut ptr).is_ok() };
-    if found && !ptr.is_null() {
-        unsafe { CredFree(ptr.cast()) };
-    }
+    // Audit #69: route through CredentialGuard so we don't have to
+    // remember to call CredFree by hand on every branch.
+    let _ = CredentialGuard::new(ptr);
     found
 }
 
