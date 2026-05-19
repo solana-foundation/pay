@@ -458,6 +458,21 @@ mod tests {
     }
 
     #[test]
+    fn exists_validates_account_name() {
+        // audit #26: `exists()` must reject invalid account names
+        // (empty, illegal characters, reserved `.pubkey` suffix) before
+        // touching the backend. A bypass would let callers probe
+        // arbitrary backend keys through what is otherwise a typed API.
+        let ks = Keystore::in_memory();
+        assert!(!ks.exists(""), "empty name must report false");
+        assert!(!ks.exists("bad/name"), "illegal character must report false");
+        assert!(
+            !ks.exists("victim.pubkey"),
+            "reserved .pubkey suffix must report false even if the backend has data"
+        );
+    }
+
+    #[test]
     fn in_memory_pubkey() {
         let ks = Keystore::in_memory();
         ks.import("test", &test_keypair(), SyncMode::ThisDeviceOnly)

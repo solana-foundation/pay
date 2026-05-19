@@ -55,6 +55,7 @@ Each finding below is one of:
 | 38  | informational | `is_available()` functions called inconsistently                              | resolved |
 | 40  | informational | `lock()` errors not detected                                                  | resolved |
 | 19  | low           | `hex_decode` can panic on non-ASCII input                                     | resolved |
+| 26  | low           | Keystore existence probes skip account-name validation                        | resolved |
 
 (Rows added as we work through findings.)
 
@@ -587,6 +588,36 @@ the API honest in the meantime.
 and stays. No new test needed: with only one variant, the previous
 "silently accepts an unsupported mode" failure mode is unreachable by
 construction.
+
+### #26 — Keystore existence probes skip account-name validation (low) — resolved
+
+**Audit relevantContent (stale):**
+
+```rust
+pub fn exists(&self, account: &str) -> bool {
+    self.store.exists(&keypair_key(account))
+}
+```
+
+**Current code** (`src/lib.rs` — `Keystore::exists`):
+
+```rust
+pub fn exists(&self, account: &str) -> bool {
+    validate_account_name(account).is_ok() && self.store.exists(&keypair_key(account))
+}
+```
+
+The validation guard was added in commit `ea2aa021` (2026-05-01), two
+weeks before the audit was published (2026-05-15) but evidently
+captured against an earlier snapshot. With the guard in place,
+`exists("bad/name")`, `exists("")`, and `exists("victim.pubkey")` all
+short-circuit to `false` without touching the backend, matching the
+behavior of the other typed APIs (`import`, `pubkey`, `delete`,
+`load_keypair`).
+
+**Regression test** (`lib.rs` tests module):
+`exists_validates_account_name` — asserts the three rejection cases
+(empty, illegal char, reserved `.pubkey` suffix) all return `false`.
 
 ### #19 — `hex_decode` can panic on non-ASCII input (low) — resolved
 
