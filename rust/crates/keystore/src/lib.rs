@@ -192,12 +192,19 @@ impl Keystore {
     // ── Public API ──────────────────────────────────────────────────────
 
     /// Import a 64-byte keypair (32 secret + 32 public).
+    ///
+    /// Authenticates with [`AuthIntent::import_account`] (audit #20): the
+    /// previous version routed through [`AuthIntent::create_account`],
+    /// which is a different Polkit action on Linux (`sh.pay.create-account`
+    /// vs `sh.pay.import-account`). Convenience callers that didn't supply
+    /// an explicit intent therefore prompted the user with the wrong
+    /// approval class for an import.
     pub fn import(&self, account: &str, keypair_bytes: &[u8], _sync: SyncMode) -> Result<()> {
         self.import_with_intent(
             account,
             keypair_bytes,
             _sync,
-            &AuthIntent::create_account(account),
+            &AuthIntent::import_account(account),
         )
     }
 
@@ -899,6 +906,28 @@ mod tests {
         fn is_available(&self) -> bool {
             true
         }
+    }
+
+    #[test]
+    fn import_uses_import_account_intent_not_create_account() {
+        // Audit #20: the convenience `import()` API used to authenticate
+        // with `AuthIntent::create_account`, which on Linux maps to
+        // `sh.pay.create-account` rather than the import-specific
+        // `sh.pay.import-account`. Caller without an explicit intent
+        // therefore prompted with the wrong approval class.
+        let recorder = RecordingAuth::new();
+        let ks = Keystore {
+            auth: Box::new(recorder.clone()),
+            store: Box::new(store::InMemoryStore::new()),
+            auth_on_write: true,
+        };
+        ks.import("victim", &test_keypair(), SyncMode::ThisDeviceOnly)
+            .expect("import should succeed under RecordingAuth");
+        let captured = recorder.captured();
+        assert!(
+            matches!(captured, AuthIntent::ImportAccount(_)),
+            "expected ImportAccount, got {captured:?}",
+        );
     }
 
     #[test]

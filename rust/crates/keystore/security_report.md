@@ -56,6 +56,7 @@ Each finding below is one of:
 | 40  | informational | `lock()` errors not detected                                                  | resolved |
 | 19  | low           | `hex_decode` can panic on non-ASCII input                                     | resolved |
 | 26  | low           | Keystore existence probes skip account-name validation                        | resolved |
+| 20  | low           | Import convenience API authenticates with a create-account intent             | resolved |
 
 (Rows added as we work through findings.)
 
@@ -588,6 +589,25 @@ the API honest in the meantime.
 and stays. No new test needed: with only one variant, the previous
 "silently accepts an unsupported mode" failure mode is unreachable by
 construction.
+
+### #20 — Import convenience API authenticates with a create-account intent (low) — resolved
+
+`Keystore::import()` is the public convenience wrapper for importing
+an existing 64-byte keypair. It authenticated with
+`AuthIntent::create_account(account)` — a different operation class
+from the `AuthIntent::import_account(account)` constructor already
+defined alongside it. On Linux that distinction maps to two separate
+Polkit actions (`sh.pay.create-account` vs `sh.pay.import-account`),
+so callers using the convenience API got the wrong approval class.
+
+**Fix** (`src/lib.rs` — `Keystore::import`): switched the convenience
+constructor to `AuthIntent::import_account(account)`. Callers that
+need explicit control still go through `import_with_intent`.
+
+**Regression test** (`lib.rs` tests module):
+`import_uses_import_account_intent_not_create_account` — uses the
+existing `RecordingAuth` mock to capture the intent passed to
+`authenticate`, then asserts it matches `AuthIntent::ImportAccount`.
 
 ### #26 — Keystore existence probes skip account-name validation (low) — resolved
 
