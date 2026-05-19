@@ -98,13 +98,21 @@ async fn polkit_authenticate(action: &str, interactive: bool) -> Result<()> {
             ),
         )
         .await
-        .map_err(|e| {
-            let msg = e.to_string();
-            if msg.contains("No such action") || msg.contains("not registered") {
+        .map_err(|e| match &e {
+            // Audit #46: classify by the structured zbus error name
+            // instead of substring-matching localized text. PolicyKit
+            // raises `org.freedesktop.PolicyKit1.Error.NoSuchAction`
+            // for genuinely missing actions; some older daemons use
+            // `org.freedesktop.DBus.Error.Failed` with the same
+            // semantic body. Match by name only — display text varies
+            // by locale and polkit version.
+            zbus::Error::MethodError(name, _, _)
+                if name.as_str().contains("NoSuchAction")
+                    || name.as_str().contains("Error.Failed") =>
+            {
                 missing_action_error(action)
-            } else {
-                Error::Backend(format!("polkit: {msg}"))
             }
+            _ => Error::Backend(format!("polkit: {e}")),
         })?;
 
     let (authorized, challenge, _): (bool, bool, HashMap<String, String>) = reply

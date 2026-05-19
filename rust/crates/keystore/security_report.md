@@ -72,6 +72,7 @@ Each finding below is one of:
 | 44  | informational | The linux `AuthGate.is_available` doesn't check the Polkit action exists      | resolved |
 | 47  | informational | Errors in `polkit_authenticate()` don't show all situations                   | resolved |
 | 35  | low           | Linux Polkit falls back to a generic prompt when specific actions are missing | resolved |
+| 46  | low           | Checks on error texts or zbus are not robust                                  | resolved |
 
 (Rows added as we work through findings.)
 
@@ -604,6 +605,24 @@ the API honest in the meantime.
 and stays. No new test needed: with only one variant, the previous
 "silently accepts an unsupported mode" failure mode is unreachable by
 construction.
+
+### #46 — Checks on error texts or zbus are not robust (low) — resolved
+
+The "polkit action is missing" classifier in `polkit_authenticate`
+matched substrings on the localized error text
+(`"No such action"`, `"not registered"`). PolicyKit translates these
+strings per-locale and the wording changes across versions; on a
+French desktop or a future polkit release, a real missing-action
+error would have been reported as a generic backend error.
+
+**Fix** (`src/linux/mod.rs`): switched the classifier to match on
+the structured `zbus::Error::MethodError(OwnedErrorName, _, _)`
+pattern. PolicyKit raises the missing-action condition with the
+typed name `org.freedesktop.PolicyKit1.Error.NoSuchAction`; older
+daemons sometimes use `org.freedesktop.DBus.Error.Failed` with the
+same semantic body. Either name → `missing_action_error(action)`;
+everything else stays in the `Backend(format!("polkit: {e}"))`
+catch-all. Names are stable across locales and major versions.
 
 ### #35 — Linux Polkit falls back to a generic prompt when specific actions are missing (low) — resolved
 
