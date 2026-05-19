@@ -160,7 +160,7 @@ impl Keystore {
     /// Check if GNOME Secret Service is available (Linux only).
     #[cfg(target_os = "linux")]
     pub fn gnome_keyring_available() -> bool {
-        linux::SecretServiceStore::is_available()
+        linux::SecretServiceStore.is_available()
     }
 
     /// Windows Credential Manager + Windows Hello.
@@ -176,7 +176,7 @@ impl Keystore {
     /// Check if Windows Hello is available.
     #[cfg(target_os = "windows")]
     pub fn windows_hello_available() -> bool {
-        windows::WindowsHelloAuth::is_available()
+        AuthGate::is_available(&windows::WindowsHelloAuth)
     }
 
     // ── Public API ──────────────────────────────────────────────────────

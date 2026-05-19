@@ -51,6 +51,7 @@ Each finding below is one of:
 | 63  | low           | No `passcode` fallback                                                        | resolved |
 | 67  | informational | The use of `pay.sh` version pay is not consistent                             | resolved |
 | 37  | informational | Security note doesn't cover all the nuances                                   | resolved |
+| 39  | informational | Static calls used where trait is available                                    | partial  |
 
 (Rows added as we work through findings.)
 
@@ -583,6 +584,24 @@ the API honest in the meantime.
 and stays. No new test needed: with only one variant, the previous
 "silently accepts an unsupported mode" failure mode is unreachable by
 construction.
+
+### #39 — Static calls used where trait is available (informational) — partial
+
+`Keystore::gnome_keyring_available` and `Keystore::windows_hello_available`
+were calling the inherent `is_available` method on the concrete type, which
+would silently diverge if the trait signature ever changed. Switched both
+to explicit trait-method dispatch:
+
+- `SecretStore::is_available(&linux::SecretServiceStore)` (`src/lib.rs`)
+- `AuthGate::is_available(&windows::WindowsHelloAuth)` (`src/lib.rs`)
+
+**Why partial:** the third call site flagged by the auditor —
+`Keystore::onepassword_available` — is the 1Password backend, which is
+being removed (see #10). Tracked with that removal rather than touched
+here.
+
+No regression test: this is a static-dispatch shape change that the
+compiler will catch if the traits diverge.
 
 ### #37 — Security note doesn't cover all the nuances (informational) — resolved
 

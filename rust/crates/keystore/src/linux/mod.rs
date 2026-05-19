@@ -172,7 +172,13 @@ const COLLECTION_LABEL: &str = "pay";
 pub struct SecretServiceStore;
 
 impl SecretServiceStore {
-    pub fn is_available() -> bool {
+    /// Probe the Secret Service backend without storing anything.
+    ///
+    /// Takes `&self` so callers go through method-call dispatch rather
+    /// than the inherent static (audit #39): keeps the call shape
+    /// consistent with the per-backend `AuthGate::is_available` impls,
+    /// which all take `&self`.
+    pub fn is_available(&self) -> bool {
         run(async { SecretService::connect(EncryptionType::Dh).await.is_ok() })
     }
 }
