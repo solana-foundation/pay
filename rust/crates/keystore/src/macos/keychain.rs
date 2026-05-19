@@ -35,10 +35,14 @@ const SERVICE: &str = "pay.sh";
 
 pub fn store(account: &str, data: &[u8]) -> Result<()> {
     let mut pairs = base_query(account);
-    pairs.push(pair(unsafe { kSecValueData }, CFData::from_buffer(data).as_CFType()));
-    pairs.push(pair(unsafe { kSecAttrAccessible }, k_str(unsafe {
-        kSecAttrAccessibleWhenUnlockedThisDeviceOnly
-    })));
+    pairs.push(pair(
+        unsafe { kSecValueData },
+        CFData::from_buffer(data).as_CFType(),
+    ));
+    pairs.push(pair(
+        unsafe { kSecAttrAccessible },
+        k_str(unsafe { kSecAttrAccessibleWhenUnlockedThisDeviceOnly }),
+    ));
     let dict = CFDictionary::from_CFType_pairs(&pairs);
 
     // SAFETY: `dict` is a valid CFDictionary owned by this stack frame
@@ -65,9 +69,8 @@ fn update(account: &str, data: &[u8]) -> Result<()> {
 
     // SAFETY: both dicts are valid CFDictionaries with disjoint
     // ownership; SecItemUpdate copies whatever it needs.
-    let status = unsafe {
-        SecItemUpdate(query.as_concrete_TypeRef(), updates.as_concrete_TypeRef())
-    };
+    let status =
+        unsafe { SecItemUpdate(query.as_concrete_TypeRef(), updates.as_concrete_TypeRef()) };
     osstatus_to_result("SecItemUpdate", status)
 }
 
@@ -77,7 +80,10 @@ pub fn load(account: &str) -> Result<Zeroizing<Vec<u8>>> {
     // don't set `kSecMatchLimit` because security-framework-sys does
     // not export `kSecMatchLimitOne` (and the default already covers
     // the single-item case).
-    pairs.push(pair(unsafe { kSecReturnData }, CFBoolean::true_value().as_CFType()));
+    pairs.push(pair(
+        unsafe { kSecReturnData },
+        CFBoolean::true_value().as_CFType(),
+    ));
     let dict = CFDictionary::from_CFType_pairs(&pairs);
 
     let mut result: CFTypeRef = std::ptr::null();
@@ -132,9 +138,18 @@ pub fn delete(account: &str) -> Result<()> {
 
 fn base_query(account: &str) -> Vec<(CFString, CFType)> {
     vec![
-        pair(unsafe { kSecClass }, k_str(unsafe { kSecClassGenericPassword })),
-        pair(unsafe { kSecAttrService }, CFString::new(SERVICE).as_CFType()),
-        pair(unsafe { kSecAttrAccount }, CFString::new(account).as_CFType()),
+        pair(
+            unsafe { kSecClass },
+            k_str(unsafe { kSecClassGenericPassword }),
+        ),
+        pair(
+            unsafe { kSecAttrService },
+            CFString::new(SERVICE).as_CFType(),
+        ),
+        pair(
+            unsafe { kSecAttrAccount },
+            CFString::new(account).as_CFType(),
+        ),
     ]
 }
 

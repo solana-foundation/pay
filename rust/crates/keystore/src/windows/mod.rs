@@ -96,9 +96,9 @@ impl AuthGate for WindowsHelloAuth {
             UserConsentVerificationResult::DeviceBusy => {
                 Err(Error::Backend("Windows Hello: device busy".into()))
             }
-            UserConsentVerificationResult::DisabledByPolicy => Err(Error::Backend(
-                "Windows Hello: disabled by policy".into(),
-            )),
+            UserConsentVerificationResult::DisabledByPolicy => {
+                Err(Error::Backend("Windows Hello: disabled by policy".into()))
+            }
             UserConsentVerificationResult::NotConfiguredForUser => Err(Error::Backend(
                 "Windows Hello: not configured — set up in Settings first".into(),
             )),

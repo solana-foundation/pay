@@ -64,7 +64,8 @@ pub fn can_evaluate() -> bool {
     // `LAError` code blocked us — only whether biometric is usable
     // right now — so just check Ok.
     // SAFETY: `ctx` is a valid LAContext.
-    unsafe { ctx.canEvaluatePolicy_error(LAPolicy::DeviceOwnerAuthenticationWithBiometrics) }.is_ok()
+    unsafe { ctx.canEvaluatePolicy_error(LAPolicy::DeviceOwnerAuthenticationWithBiometrics) }
+        .is_ok()
 }
 
 fn classify(error: &NSError) -> Error {

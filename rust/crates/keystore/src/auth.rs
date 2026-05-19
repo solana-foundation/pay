@@ -595,8 +595,7 @@ mod tests {
     /// most restrictive Polkit action.
     #[test]
     fn audit_4_comma_formatted_amount_does_not_downgrade_limit() {
-        let intent =
-            AuthIntent::from_reason("authorize payment of $50,000 for accessing API");
+        let intent = AuthIntent::from_reason("authorize payment of $50,000 for accessing API");
         assert!(
             matches!(intent, AuthIntent::AuthorizePayment { .. }),
             "still classified as a payment authorization",

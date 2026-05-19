@@ -125,10 +125,7 @@ impl Keystore {
 
     /// Return (creating if needed) the per-account write lock.
     fn account_lock(&self, account: &str) -> Arc<Mutex<()>> {
-        let mut map = self
-            .account_locks
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let mut map = self.account_locks.lock().unwrap_or_else(|p| p.into_inner());
         Arc::clone(map.entry(account.to_string()).or_default())
     }
 
@@ -294,10 +291,7 @@ impl Keystore {
         // keypair write on a pubkey-write failure so the post-import
         // state matches the returned result.
         self.store.store(&keypair_key(account), keypair_bytes)?;
-        if let Err(e) = self
-            .store
-            .store(&pubkey_key(account), &derived_pubkey)
-        {
+        if let Err(e) = self.store.store(&pubkey_key(account), &derived_pubkey) {
             let _ = self.store.delete(&keypair_key(account));
             return Err(e);
         }
@@ -409,10 +403,9 @@ fn validate_account_name(name: &str) -> Result<()> {
     // Enforcing lowercase-only at the validator gives every backend the
     // same uniqueness contract — the doc comment in this file (and the
     // error message users see) now matches the actual allowed set.
-    if !name
-        .bytes()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'_' || b == b'-')
-    {
+    if !name.bytes().all(|b| {
+        b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'_' || b == b'-'
+    }) {
         return Err(Error::InvalidKeypair(format!(
             "account name contains invalid characters: {name:?} (allowed: a-z, 0-9, '.', '_', '-')"
         )));
@@ -534,7 +527,10 @@ mod tests {
         // Service. Reject uppercase up front so every backend sees
         // the same uniqueness contract.
         assert!(
-            matches!(validate_account_name("Default"), Err(Error::InvalidKeypair(_))),
+            matches!(
+                validate_account_name("Default"),
+                Err(Error::InvalidKeypair(_))
+            ),
             "uppercase initial letter must be rejected"
         );
         assert!(
@@ -542,7 +538,10 @@ mod tests {
             "all-uppercase must be rejected"
         );
         assert!(
-            matches!(validate_account_name("MyAccount"), Err(Error::InvalidKeypair(_))),
+            matches!(
+                validate_account_name("MyAccount"),
+                Err(Error::InvalidKeypair(_))
+            ),
             "mixed-case must be rejected"
         );
         assert!(
@@ -563,7 +562,10 @@ mod tests {
         // arbitrary backend keys through what is otherwise a typed API.
         let ks = Keystore::in_memory();
         assert!(!ks.exists(""), "empty name must report false");
-        assert!(!ks.exists("bad/name"), "illegal character must report false");
+        assert!(
+            !ks.exists("bad/name"),
+            "illegal character must report false"
+        );
         assert!(
             !ks.exists("victim.pubkey"),
             "reserved .pubkey suffix must report false even if the backend has data"
@@ -791,9 +793,7 @@ mod tests {
         // from a tampered or corrupted store) must be rejected, not
         // returned to the caller as if it were a valid public key.
         let ks = Keystore::in_memory();
-        ks.store
-            .store(&pubkey_key("victim"), &[0u8; 16])
-            .unwrap();
+        ks.store.store(&pubkey_key("victim"), &[0u8; 16]).unwrap();
         let result = ks.pubkey("victim");
         assert!(matches!(result, Err(Error::InvalidKeypair(_))));
     }
@@ -812,9 +812,7 @@ mod tests {
             account_locks: Mutex::new(HashMap::new()),
         };
         // Plant a wrong-length record directly under the typed key.
-        ks.store
-            .store(&keypair_key("victim"), &[0u8; 48])
-            .unwrap();
+        ks.store.store(&keypair_key("victim"), &[0u8; 48]).unwrap();
         let result = ks.load_keypair("victim", "unit test");
         assert!(matches!(result, Err(Error::InvalidKeypair(_))));
 
@@ -869,16 +867,19 @@ mod tests {
             "import of `victim.pubkey` must be rejected"
         );
         assert!(
-            attempt
-                .unwrap_err()
-                .to_string()
-                .contains("reserved suffix"),
+            attempt.unwrap_err().to_string().contains("reserved suffix"),
             "rejection must cite the reserved suffix",
         );
         assert!(!ks.exists("victim.pubkey"));
 
-        let leaked = ks.pubkey("victim").expect("legitimate pubkey still readable");
-        assert_eq!(leaked, pubkey_for(0xAA), "must return the legitimate pubkey");
+        let leaked = ks
+            .pubkey("victim")
+            .expect("legitimate pubkey still readable");
+        assert_eq!(
+            leaked,
+            pubkey_for(0xAA),
+            "must return the legitimate pubkey"
+        );
         assert_ne!(
             leaked,
             attacker_keypair[..32].to_vec(),

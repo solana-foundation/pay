@@ -56,9 +56,7 @@ impl SecretStore for InMemoryStore {
         // Returning false on poison is intentional — exists() has no
         // Result channel, and reporting "not present" is the safer
         // failure mode for callers that branch on it (audit #40).
-        self.data
-            .lock()
-            .is_ok_and(|guard| guard.contains_key(key))
+        self.data.lock().is_ok_and(|guard| guard.contains_key(key))
     }
 
     fn delete(&self, key: &str) -> Result<()> {
@@ -336,17 +334,14 @@ mod tests {
         // and then panic in `&hex[i..i+2]` (audit #19).
         let even_byte_non_ascii = "éé";
         assert_eq!(even_byte_non_ascii.len(), 4);
-        let err = hex_decode(even_byte_non_ascii)
-            .expect_err("non-ASCII hex input must error, not panic");
+        let err =
+            hex_decode(even_byte_non_ascii).expect_err("non-ASCII hex input must error, not panic");
         assert!(matches!(err, Error::InvalidKeypair(_)));
     }
 
     #[test]
     fn hex_decode_rejects_odd_length() {
-        assert!(matches!(
-            hex_decode("abc"),
-            Err(Error::InvalidKeypair(_))
-        ));
+        assert!(matches!(hex_decode("abc"), Err(Error::InvalidKeypair(_))));
     }
 
     #[test]
