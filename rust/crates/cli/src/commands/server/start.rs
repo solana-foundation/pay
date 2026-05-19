@@ -130,7 +130,7 @@ fn resolve_session_splits(
     session: &pay_types::metering::SessionSpec,
 ) -> pay_core::Result<Vec<solana_mpp::server::session::Split>> {
     let mut splits = Vec::with_capacity(session.splits.len());
-    let mut total_bps = 0u32;
+    let mut total_bps: u16 = 0;
 
     for rule in &session.splits {
         if rule.amount.is_some() {
@@ -146,7 +146,13 @@ fn resolve_session_splits(
                 rule.recipient
             ))
         })?;
-        if !percent.is_finite() || percent <= 0.0 {
+        if !percent.is_finite() {
+            return Err(pay_core::Error::Config(format!(
+                "session split `{}` percent must be a finite number",
+                rule.recipient
+            )));
+        }
+        if percent <= 0.0 {
             return Err(pay_core::Error::Config(format!(
                 "session split `{}` percent must be positive",
                 rule.recipient
@@ -161,7 +167,7 @@ fn resolve_session_splits(
             )));
         }
         let bps = bps as u16;
-        total_bps += u32::from(bps);
+        total_bps += bps;
         if total_bps >= 10_000 {
             return Err(pay_core::Error::Config(
                 "session splits must leave a positive primary recipient share".to_string(),

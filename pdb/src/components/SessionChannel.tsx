@@ -1,5 +1,6 @@
 import type { PaymentFlow, SessionInfo } from "../types";
 import { explorerTokenUrl, useConfig } from "../hooks/useConfig";
+import { formatUnits, shortAddr } from "../lib/format";
 
 const U64_MAX = "18446744073709551615";
 const SESSION_COLORS = [
@@ -10,7 +11,6 @@ const SESSION_COLORS = [
   "#db6d28",
   "#a371f7",
 ];
-const USDC_MAINNET_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
 interface SessionRecipient {
   label: string;
@@ -34,44 +34,6 @@ interface CapacityUsage {
   percentLabel?: string;
   remainingAmount?: string;
   usedAmount?: string;
-}
-
-function shortAddr(addr: string | undefined): string {
-  if (!addr) return "pending";
-  if (addr.length <= 14) return addr;
-  return `${addr.slice(0, 5)}...${addr.slice(-5)}`;
-}
-
-function currencyLabel(currency: string | undefined): string {
-  if (!currency || currency === USDC_MAINNET_MINT) return "USDC";
-  return currency.length > 12 ? shortAddr(currency) : currency;
-}
-
-function formatUnits(
-  raw: string | undefined,
-  decimals = 6,
-  currency = "USDC",
-): string {
-  const label = currencyLabel(currency);
-  if (!raw) return "pending";
-  if (raw === U64_MAX) return "unbounded";
-  if (!/^\d+$/.test(raw)) return raw;
-
-  try {
-    const value = BigInt(raw);
-    const divisor = 10n ** BigInt(decimals);
-    const whole = value / divisor;
-    const fraction = value % divisor;
-    if (fraction === 0n) return `${whole.toString()} ${label}`;
-
-    const fractionText = fraction
-      .toString()
-      .padStart(decimals, "0")
-      .replace(/0+$/, "");
-    return `${whole.toString()}.${fractionText} ${label}`;
-  } catch {
-    return `${raw} ${label}`;
-  }
 }
 
 function applyBps(raw: string | undefined, bps: number): string | undefined {

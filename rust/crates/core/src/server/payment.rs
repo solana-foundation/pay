@@ -289,15 +289,16 @@ async fn handle_session_authorization(
                     );
                     response
                 }
-                SessionOutcome::Voucher(cumulative) => {
-                    if let Some(session_id) = voucher_session_id(auth_value) {
-                        attach_session_stream_context(
-                            session_mpp_handle,
-                            &mut req,
-                            session_id,
-                            cumulative,
-                        );
-                    }
+                SessionOutcome::Voucher {
+                    channel_id,
+                    cumulative,
+                } => {
+                    attach_session_stream_context(
+                        session_mpp_handle,
+                        &mut req,
+                        channel_id,
+                        cumulative,
+                    );
                     tracing::info!(subdomain = %subdomain, path = %path, "Voucher accepted — forwarding");
                     let response = next.run(req).await;
                     telemetry::record_paid_request_completed(
@@ -368,15 +369,6 @@ fn attach_session_stream_context(
         session_id,
         committed_base_units,
     ));
-}
-
-fn voucher_session_id(auth_value: &str) -> Option<String> {
-    let credential = parse_authorization(auth_value).ok()?;
-    let action: solana_mpp::SessionAction = serde_json::from_value(credential.payload).ok()?;
-    match action {
-        solana_mpp::SessionAction::Voucher(payload) => Some(payload.voucher.data.channel_id),
-        _ => None,
-    }
 }
 
 fn charge_challenge_response(

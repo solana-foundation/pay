@@ -323,8 +323,8 @@ impl MultiDelegateChain for RpcMultiDelegateChain {
 pub enum SessionOutcome {
     /// `open` or `topup` — channel state after the action.
     Active(ChannelState),
-    /// `voucher` accepted — the new settled cumulative (base units).
-    Voucher(u64),
+    /// `voucher` accepted — channel id + new settled cumulative (base units).
+    Voucher { channel_id: String, cumulative: u64 },
     /// `commit` accepted — receipt for the metered delivery.
     Commit(CommitReceipt),
     /// `close` accepted — `FinalizeParams` carries what's needed to submit the
@@ -449,16 +449,12 @@ impl SessionOperatorRuntime {
             return false;
         };
 
-        tokio::task::spawn_blocking(move || {
-            use solana_mpp::solana_rpc_client::rpc_client::RpcClient;
-
-            RpcClient::new(rpc_url)
-                .get_account(&channel)
-                .map(|account| account.data.as_slice() == [2])
-                .unwrap_or(false)
-        })
-        .await
-        .unwrap_or(false)
+        use solana_mpp::solana_rpc_client::nonblocking::rpc_client::RpcClient;
+        RpcClient::new(rpc_url)
+            .get_account(&channel)
+            .await
+            .map(|account| account.data.as_slice() == [2])
+            .unwrap_or(false)
     }
 
     async fn submit_payment_channel_settlement(
@@ -991,7 +987,7 @@ impl SessionMpp {
         if request.modes == [SessionMode::Push] {
             request.modes.clear();
         }
-        request.recent_blockhash = self.fetch_recent_blockhash();
+        request.recent_blockhash = self.prefetch_latest_blockhash();
         let encoded = Base64UrlJson::from_typed(&request)
             .map_err(|e| Error::Mpp(format!("Failed to encode session request: {e}")))?;
         Ok(PaymentChallenge::with_secret_key(
@@ -1086,9 +1082,13 @@ impl SessionMpp {
                     .verify_voucher(p)
                     .await
                     .map_err(|e| Error::PaymentRejected(e.to_string()))?;
-                self.record_committed_watermark(p.voucher.data.channel_id.clone(), cumulative);
-                self.touch_channel(p.voucher.data.channel_id.clone());
-                Ok(SessionOutcome::Voucher(cumulative))
+                let channel_id = p.voucher.data.channel_id.clone();
+                self.record_committed_watermark(channel_id.clone(), cumulative);
+                self.touch_channel(channel_id.clone());
+                Ok(SessionOutcome::Voucher {
+                    channel_id,
+                    cumulative,
+                })
             }
 
             SessionAction::Commit(p) => {
@@ -1365,11 +1365,11 @@ impl SessionMpp {
             .map_err(|e| Error::Mpp(e.to_string()))
     }
 
-    /// Best-effort blockhash prefetch for session challenges.
+    /// Best-effort prefetch of the latest blockhash for session challenges.
     ///
-    /// The challenge remains valid without this field, so RPC failures are
-    /// logged and ignored instead of failing challenge generation.
-    fn fetch_recent_blockhash(&self) -> Option<String> {
+    /// Calls the same RPC as [`fetch_latest_blockhash`] but swallows errors
+    /// (logged at debug) since the challenge remains valid without this field.
+    fn prefetch_latest_blockhash(&self) -> Option<String> {
         use solana_mpp::solana_rpc_client::rpc_client::RpcClient;
 
         let rpc_url = self.rpc_url.as_ref()?;
@@ -1384,9 +1384,9 @@ impl SessionMpp {
 }
 
 fn spl_token_program() -> solana_pubkey::Pubkey {
+    use solana_mpp::protocol::solana::programs;
     use std::str::FromStr;
-    solana_pubkey::Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
-        .expect("valid SPL token program id")
+    solana_pubkey::Pubkey::from_str(programs::TOKEN_PROGRAM).expect("valid SPL token program id")
 }
 
 fn decode_base64_transaction(tx_base64: &str) -> Result<solana_transaction::Transaction> {
@@ -1955,8 +1955,8 @@ mod tests {
     }
 
     #[test]
-    fn fetch_recent_blockhash_without_rpc_returns_none() {
-        assert_eq!(test_session_mpp().fetch_recent_blockhash(), None);
+    fn prefetch_latest_blockhash_without_rpc_returns_none() {
+        assert_eq!(test_session_mpp().prefetch_latest_blockhash(), None);
     }
 
     #[tokio::test]
@@ -2038,7 +2038,8 @@ mod tests {
         assert_eq!(session.committed_watermark(&opened.channel_id), Some(0));
 
         let voucher_header = handle.voucher_header(75).await.unwrap();
-        let SessionOutcome::Voucher(cumulative) = session.process(&voucher_header).await.unwrap()
+        let SessionOutcome::Voucher { cumulative, .. } =
+            session.process(&voucher_header).await.unwrap()
         else {
             panic!("expected voucher outcome");
         };
