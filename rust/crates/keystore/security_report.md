@@ -85,6 +85,7 @@ Each finding below is one of:
 | 65  | informational | Old windows API used                                                          | resolved |
 | 66  | low           | `GetForegroundWindow()` returns the window with keyboard focus at the time of the call | resolved |
 | 15  | low           | Windows Hello unavailable states are reported as user-denied auth             | resolved |
+| 21  | informational | Windows Credential Manager exposes keypairs without Windows Hello             | deferred |
 
 (Rows added as we work through findings.)
 
@@ -617,6 +618,42 @@ the API honest in the meantime.
 and stays. No new test needed: with only one variant, the previous
 "silently accepts an unsupported mode" failure mode is unreachable by
 construction.
+
+### #21 — Windows Credential Manager exposes keypairs without Windows Hello (informational) — deferred
+
+Symmetrical to audit #1 (macOS) and #22 (Linux). The auditor
+observes that the stored credential under
+`pay.sh/<account>` is read back by `CredReadW` without invoking
+Windows Hello — any same-user process can call `CredReadW`
+directly and bypass `WindowsHelloAuth::authenticate`. The Windows
+Hello gate is a per-call wrapper, not an item-level binding.
+
+**Why deferred:**
+
+Binding the stored credential to Windows Hello requires switching
+the storage path from raw Credential Manager
+(`CredWriteW` / `CredReadW`) to **DPAPI-NG** (Data Protection API
+Next Gen) with a Windows Hello protector — the equivalent of the
+macOS biometric-ACL question (audit #1) and Linux Secret Service
+item-binding (audit #22). DPAPI-NG protectors are out of scope for
+this audit cycle because:
+
+- The migration would need a one-shot re-encrypt step for every
+  existing user's stored keypair, which means handling old + new
+  side-by-side until everyone has rotated.
+- DPAPI-NG with a Windows Hello protector requires testing across
+  the Windows Hello configurations (PIN-only, fingerprint, face,
+  device-bound TPM key), which we can't reasonably exercise from
+  the macOS host this audit is running on.
+- The current `WindowsHelloAuth` gate, combined with the
+  per-account write lock from audit #25 and the typed intent
+  routing from audit #7, gives the same user-presence guarantee at
+  the call site as the macOS LA-gate model (which we accepted as
+  resolved-with-rationale in #1).
+
+**Revisit if:** we ship a Windows-supported release and have a
+Windows test environment, or a security event makes the
+in-process bypass concrete.
 
 ### #15 — Windows Hello unavailable states are reported as user-denied auth (low) — resolved
 
