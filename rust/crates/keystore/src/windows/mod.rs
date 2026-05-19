@@ -77,24 +77,34 @@ impl AuthGate for WindowsHelloAuth {
         let result = request_verification(&message)
             .map_err(|e| Error::Backend(format!("Windows Hello request failed: {e}")))?;
 
+        // Audit #15: distinguish user-attempt outcomes (Verified /
+        // Canceled / RetriesExhausted — `AuthDenied`, retryable by
+        // the user) from device-state outcomes (DeviceBusy /
+        // DisabledByPolicy / NotConfiguredForUser — `Backend`, not
+        // retryable without operator / admin action). The previous
+        // collapse to `AuthDenied` for everything led the higher-up
+        // UX to nudge the user to "try again" even when the device
+        // wasn't configured for biometrics at all.
         match result {
             UserConsentVerificationResult::Verified => Ok(()),
             UserConsentVerificationResult::Canceled => {
                 Err(Error::AuthDenied("Windows Hello: cancelled".into()))
             }
-            UserConsentVerificationResult::DeviceBusy => {
-                Err(Error::AuthDenied("Windows Hello: device busy".into()))
-            }
             UserConsentVerificationResult::RetriesExhausted => {
                 Err(Error::AuthDenied("Windows Hello: too many attempts".into()))
             }
-            UserConsentVerificationResult::DisabledByPolicy => Err(Error::AuthDenied(
+            UserConsentVerificationResult::DeviceBusy => {
+                Err(Error::Backend("Windows Hello: device busy".into()))
+            }
+            UserConsentVerificationResult::DisabledByPolicy => Err(Error::Backend(
                 "Windows Hello: disabled by policy".into(),
             )),
-            UserConsentVerificationResult::NotConfiguredForUser => Err(Error::AuthDenied(
+            UserConsentVerificationResult::NotConfiguredForUser => Err(Error::Backend(
                 "Windows Hello: not configured — set up in Settings first".into(),
             )),
-            _ => Err(Error::AuthDenied("Windows Hello: auth failed".into())),
+            _ => Err(Error::Backend(
+                "Windows Hello: unexpected verification result".into(),
+            )),
         }
     }
 

@@ -84,6 +84,7 @@ Each finding below is one of:
 | 69  | low           | In windows, the function `cred_read()` isn't sufficiently hardened            | resolved |
 | 65  | informational | Old windows API used                                                          | resolved |
 | 66  | low           | `GetForegroundWindow()` returns the window with keyboard focus at the time of the call | resolved |
+| 15  | low           | Windows Hello unavailable states are reported as user-denied auth             | resolved |
 
 (Rows added as we work through findings.)
 
@@ -616,6 +617,33 @@ the API honest in the meantime.
 and stays. No new test needed: with only one variant, the previous
 "silently accepts an unsupported mode" failure mode is unreachable by
 construction.
+
+### #15 — Windows Hello unavailable states are reported as user-denied auth (low) — resolved
+
+`WindowsHelloAuth::authenticate` collapsed every non-success
+`UserConsentVerificationResult` into `Error::AuthDenied`. That
+includes device-state outcomes (`DeviceBusy`, `DisabledByPolicy`,
+`NotConfiguredForUser`) which are not user-attempted denials —
+they're configuration / hardware availability issues that need
+admin or operator action, not "try again."
+
+**Fix** (`src/windows/mod.rs` — `WindowsHelloAuth::authenticate`):
+split the match into two error classes that the audit explicitly
+asked for:
+
+| Result                       | Error class | Reason                               |
+| ---------------------------- | ----------- | ------------------------------------ |
+| `Verified`                   | `Ok(())`    | success                              |
+| `Canceled`                   | `AuthDenied`| user cancelled                       |
+| `RetriesExhausted`           | `AuthDenied`| user exhausted attempts              |
+| `DeviceBusy`                 | `Backend`   | device-state, not a user denial      |
+| `DisabledByPolicy`           | `Backend`   | admin policy blocks Hello entirely   |
+| `NotConfiguredForUser`       | `Backend`   | needs Settings setup                 |
+| _ (unknown variant)          | `Backend`   | future-proof default                 |
+
+Callers can branch on `Error::Backend` (device-state) vs
+`Error::AuthDenied` (user-attempt) to show the right next step
+instead of generically nudging "try again."
 
 ### #66 — `GetForegroundWindow()` returns whatever has keyboard focus (low) — resolved
 
