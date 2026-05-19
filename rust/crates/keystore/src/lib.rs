@@ -178,6 +178,20 @@ impl Keystore {
         Self::new(linux::Polkit, linux::SecretServiceStore, true)
     }
 
+    /// GNOME Keyring without the polkit gate.
+    ///
+    /// Used by callers that have already authenticated through a
+    /// higher-level policy and want to skip the per-call polkit prompt
+    /// (e.g. pay-core's signer resolver when an account doesn't require
+    /// per-network auth). Exposed as a dedicated constructor so the
+    /// concrete Linux store stays `pub(crate)` (audit #49) — external
+    /// crates can no longer bypass the auth coupling by hand-rolling
+    /// `Keystore::new(NoAuth, SecretServiceStore, …)`.
+    #[cfg(target_os = "linux")]
+    pub fn gnome_keyring_no_auth() -> Self {
+        Self::new(auth::NoAuth, linux::SecretServiceStore, false)
+    }
+
     /// Check if the Linux GNOME Keyring backend is fully available.
     ///
     /// "Fully available" means both layers the backend needs are usable:

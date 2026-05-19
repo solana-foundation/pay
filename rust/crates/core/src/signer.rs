@@ -224,11 +224,7 @@ pub fn load_keypair_bytes_from_account_with_intent(
                 let ks = if account.auth_required_for_network(network) {
                     crate::keystore::Keystore::gnome_keyring()
                 } else {
-                    crate::keystore::Keystore::new(
-                        crate::keystore::auth::NoAuth,
-                        crate::keystore::linux::SecretServiceStore,
-                        false,
-                    )
+                    crate::keystore::Keystore::gnome_keyring_no_auth()
                 };
                 ks.load_keypair_with_intent(name, &account_intent)
                     .map_err(|e| map_keystore_backend_error("gnome-keyring", e))

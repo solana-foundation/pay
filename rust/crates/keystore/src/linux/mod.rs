@@ -19,7 +19,7 @@ const POLKIT_ACTION_GATEWAY_FEE_PAYER: &str = "sh.pay.use-gateway-fee-payer";
 const POLKIT_ACTION_USE: &str = "sh.pay.use-keypair";
 const LEGACY_POLKIT_ACTION: &str = "sh.pay.unlock-keypair";
 
-pub struct Polkit;
+pub(crate) struct Polkit;
 
 impl AuthGate for Polkit {
     fn authenticate(&self, intent: &AuthIntent) -> Result<()> {
@@ -170,7 +170,7 @@ fn process_start_time() -> Result<u64> {
 const SERVICE_ATTR: &str = "pay.sh";
 const COLLECTION_LABEL: &str = "pay";
 
-pub struct SecretServiceStore;
+pub(crate) struct SecretServiceStore;
 
 impl SecretServiceStore {
     /// Probe the Secret Service backend without storing anything.

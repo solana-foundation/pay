@@ -68,6 +68,7 @@ Each finding below is one of:
 | 54  | low           | Errors with `set_permissions()` are ignored                                   | resolved-by-ffi |
 | 55  | low           | Order of signing addresses                                                    | resolved-by-ffi |
 | 48  | informational | The use of number 19 in `process_start_time()` isn't obvious                  | resolved |
+| 49  | informational | Several public rust object can be shielded (Linux part)                       | resolved |
 
 (Rows added as we work through findings.)
 
@@ -600,6 +601,36 @@ the API honest in the meantime.
 and stays. No new test needed: with only one variant, the previous
 "silently accepts an unsupported mode" failure mode is unreachable by
 construction.
+
+### #49 — Several public rust object can be shielded (Linux part) — resolved
+
+The auditor flagged that several `pub` types could be `pub(crate)`,
+since they're only used internally by the keystore. Letting external
+crates hand-roll `Keystore::new(NoAuth, Polkit, …)` defeats the
+intended auth coupling.
+
+**Linux scope of this commit:**
+
+- `linux::Polkit` → `pub(crate)` (`src/linux/mod.rs`). No external
+  user references it.
+- `linux::SecretServiceStore` → `pub(crate)` (`src/linux/mod.rs`).
+  Previously referenced by `pay-core::signer::Keystore::GnomeKeyring`
+  branch, which built `Keystore::new(NoAuth, SecretServiceStore, false)`
+  by hand. That call site now uses a sanctioned constructor:
+- New `Keystore::gnome_keyring_no_auth()` (`src/lib.rs`) — returns a
+  `Keystore` with `NoAuth + SecretServiceStore`. Used by pay-core for
+  the "account doesn't require per-network auth" branch.
+
+**Out of Linux scope:**
+
+- macOS visibility (`TouchId`, `AppleKeychainStore`) — tracked under
+  the same finding but lives in the macOS module; treated in the
+  macOS queue if/when a similar tightening is wanted. The current
+  macOS path doesn't have an external user that would break.
+- 1Password (`OnePasswordAuth`, `OnePasswordStore`) — being removed
+  (#10), no point tightening visibility.
+- Windows (`WindowsHelloAuth`, `WindowsCredentialStore`) — handled
+  in the Windows queue if applicable.
 
 ### #48 — The use of number 19 in `process_start_time()` isn't obvious (informational) — resolved
 
