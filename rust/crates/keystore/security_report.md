@@ -76,6 +76,7 @@ Each finding below is one of:
 | 22  | informational | GNOME Keyring exposes keypairs without the Pay Polkit gate                    | resolved-with-rationale |
 | 33  | low           | Linux Secret Service default-collection fallback is inconsistent              | resolved |
 | 31  | low           | Linux Secret Service relock failure can mask a completed mutation             | resolved |
+| 50  | informational | The `lock()`s on linux too aggressive                                         | resolved |
 
 (Rows added as we work through findings.)
 
@@ -608,6 +609,24 @@ the API honest in the meantime.
 and stays. No new test needed: with only one variant, the previous
 "silently accepts an unsupported mode" failure mode is unreachable by
 construction.
+
+### #50 — Linux locks are too aggressive (informational) — resolved
+
+`SecretServiceStore::store|load|delete` always called
+`col.lock().await` after the inner work, even when the user had
+left the `pay` collection unlocked on purpose. That can interfere
+with another app in the same session that's also using the keyring
+— a per-Pay-operation forced relock looks like a flap.
+
+**Fix** (`src/linux/mod.rs`):
+
+- `ensure_unlocked` now returns `Result<bool>` — `true` if we
+  unlocked the collection, `false` if it was already open.
+- Each store/load/delete path captures that boolean and only
+  performs the trailing `col.lock().await` when it was previously
+  locked. Combined with audit #31's best-effort relock semantics,
+  Pay now leaves the user's keyring in the state the user had set,
+  not the state Pay's own per-operation policy would prefer.
 
 ### #31 — Linux Secret Service relock failure can mask a completed mutation (low) — resolved
 

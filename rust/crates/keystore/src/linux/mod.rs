@@ -233,17 +233,17 @@ impl SecretStore for SecretServiceStore {
         run(async move {
             let ss = connect().await?;
             let col = get_or_create_collection(&ss).await?;
-            ensure_unlocked(&col).await?;
+            // Audit #50: only relock if we were the ones who unlocked
+            // the collection. If the user left their keyring open on
+            // purpose (e.g. another app is also using it), Pay
+            // shouldn't slam it shut every time we touch a key.
+            let we_unlocked = ensure_unlocked(&col).await?;
             let result = store_item(&col, &key, &data).await;
             // Audit #31: don't let a relock failure mask a successful
-            // mutation. If the inner store succeeded, the keypair
-            // record is durably on disk; returning the relock error
-            // here would tell the caller "import failed" while the
-            // backend already holds the data — exactly the
-            // inconsistency the audit flagged. Best-effort relock; the
-            // collection remains in whatever state Secret Service
-            // managed to leave it in.
-            let _ = col.lock().await;
+            // mutation — best-effort.
+            if we_unlocked {
+                let _ = col.lock().await;
+            }
             result
         })
     }
@@ -255,7 +255,7 @@ impl SecretStore for SecretServiceStore {
             let col = get_collection(&ss).await.ok_or_else(|| {
                 Error::Backend("pay keyring not found — run `pay setup` first".to_string())
             })?;
-            ensure_unlocked(&col).await?;
+            let we_unlocked = ensure_unlocked(&col).await?;
 
             let result = async {
                 let items = col.search_items(attrs(&key)).await.map_err(ss_err)?;
@@ -265,10 +265,11 @@ impl SecretStore for SecretServiceStore {
                 Ok(Zeroizing::new(item.get_secret().await.map_err(ss_err)?))
             }
             .await;
-            // Audit #31: same reasoning as `store` — once we've read
-            // the secret bytes, surfacing a relock error would lose
-            // the loaded data on the floor.
-            let _ = col.lock().await;
+            // Audit #50: only relock if we were the ones who unlocked.
+            // Audit #31: best-effort — don't lose the loaded bytes.
+            if we_unlocked {
+                let _ = col.lock().await;
+            }
             result
         })
     }
@@ -303,12 +304,15 @@ impl SecretStore for SecretServiceStore {
         run(async move {
             let ss = connect().await?;
             if let Some(col) = get_collection(&ss).await {
-                ensure_unlocked(&col).await?;
+                let we_unlocked = ensure_unlocked(&col).await?;
                 for item in col.search_items(attrs(&key)).await.map_err(ss_err)? {
                     item.delete().await.map_err(ss_err)?;
                 }
-                // Audit #31: best-effort relock — see store/load.
-                let _ = col.lock().await;
+                // Audit #50: only relock if we did the unlock.
+                // Audit #31: best-effort — see store/load.
+                if we_unlocked {
+                    let _ = col.lock().await;
+                }
             }
             if let Ok(default) = ss.get_default_collection().await {
                 for item in default.search_items(attrs(&key)).await.map_err(ss_err)? {
@@ -354,7 +358,15 @@ async fn get_or_create_collection<'a>(
         .map_err(ss_err)
 }
 
-async fn ensure_unlocked(col: &secret_service::Collection<'_>) -> Result<()> {
+/// Unlock the collection if needed and report whether we were the
+/// ones who unlocked it.
+///
+/// Audit #50: the relock at the end of each operation used to fire
+/// unconditionally, which could lock the user's keyring even when
+/// they had left it unlocked on purpose (e.g. for ongoing use by
+/// another app in the same session). Callers should pair this with
+/// a relock only when the return value is `true`.
+async fn ensure_unlocked(col: &secret_service::Collection<'_>) -> Result<bool> {
     if col.is_locked().await.unwrap_or(true) {
         col.unlock().await.map_err(|e| {
             let msg = e.to_string().to_lowercase();
@@ -364,8 +376,10 @@ async fn ensure_unlocked(col: &secret_service::Collection<'_>) -> Result<()> {
                 Error::Backend(format!("unlock failed: {e}"))
             }
         })?;
+        Ok(true)
+    } else {
+        Ok(false)
     }
-    Ok(())
 }
 
 async fn store_item(col: &secret_service::Collection<'_>, key: &str, secret: &[u8]) -> Result<()> {
