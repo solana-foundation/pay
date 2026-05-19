@@ -73,6 +73,7 @@ Each finding below is one of:
 | 47  | informational | Errors in `polkit_authenticate()` don't show all situations                   | resolved |
 | 35  | low           | Linux Polkit falls back to a generic prompt when specific actions are missing | resolved |
 | 46  | low           | Checks on error texts or zbus are not robust                                  | resolved |
+| 22  | informational | GNOME Keyring exposes keypairs without the Pay Polkit gate                    | resolved-with-rationale |
 
 (Rows added as we work through findings.)
 
@@ -605,6 +606,53 @@ the API honest in the meantime.
 and stays. No new test needed: with only one variant, the previous
 "silently accepts an unsupported mode" failure mode is unreachable by
 construction.
+
+### #22 — GNOME Keyring exposes keypairs without the Pay Polkit gate (informational) — resolved-with-rationale
+
+The auditor observes that the Secret Service item stored under the
+`pay` collection is a plain generic-password record. The
+[`Polkit`](src/linux/mod.rs) auth gate is a per-call wrapper in
+front of the store — any program with a Secret Service connection
+can call `search_items(service="pay.sh", account=…)` and read the
+keypair bytes without invoking polkit. Symmetrical to audit #1 on
+macOS and #21 on Windows.
+
+**Decision: accept with rationale, no code change.**
+
+Secret Service doesn't expose item-level authorization hooks that
+we could bind to a Polkit action. The freedesktop spec gives us:
+
+- **Collection-level lock** — already used; relies on the user's
+  login keyring being relocked when the desktop session locks.
+  Documented under the audit #37 threat-matrix expansion.
+- **Item attributes** — visible to anyone with read access; not an
+  authorization layer.
+- **Item secrets** — encrypted in transit, but any caller in the
+  same session can ask for them.
+
+No mainstream Linux desktop ships a Secret Service implementation
+that gates reads on a specific PolicyKit action. Implementing that
+would require either patching `gnome-keyring-daemon` (out of scope
+for this repo) or replacing the store with a custom Pay-only daemon
+(huge platform surface; the user already runs the polkit gate, which
+catches the common case of an unattended same-user process trying
+to use the key).
+
+**Mitigations actually in place today:**
+
+- `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` analog: the `pay`
+  collection is relocked after each operation
+  (`src/linux/mod.rs:store|load|delete` — `col.lock().await.map_err(ss_err)?`).
+- `Polkit::authenticate` runs before every keystore mutation /
+  load path via `Keystore::{import,delete,load_keypair}_with_intent`
+  — covers our own callers; doesn't bind co-resident programs.
+- `Keystore::gnome_keyring_available` (audit #38, #44) now
+  requires both polkit and Secret Service to be reachable, so
+  callers can't silently end up on a half-configured backend.
+
+**Revisit if:** a future freedesktop Secret Service spec exposes
+per-action ACLs (no current LWN-tracked work in this direction), or
+we ship our own Pay-aware daemon for Linux.
 
 ### #46 — Checks on error texts or zbus are not robust (low) — resolved
 
