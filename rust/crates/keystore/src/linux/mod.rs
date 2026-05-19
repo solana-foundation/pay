@@ -152,16 +152,17 @@ fn is_missing_action(error: &Error) -> bool {
 }
 
 fn process_start_time() -> Result<u64> {
-    let stat = std::fs::read_to_string("/proc/self/stat")
-        .map_err(|e| Error::Backend(format!("read /proc/self/stat: {e}")))?;
-    let after_comm = stat
-        .rfind(')')
-        .ok_or_else(|| Error::Backend("parse /proc/self/stat".to_string()))?;
-    let fields: Vec<&str> = stat[after_comm + 2..].split_ascii_whitespace().collect();
-    fields
-        .get(19)
-        .and_then(|s| s.parse::<u64>().ok())
-        .ok_or_else(|| Error::Backend("parse /proc/self/stat: starttime field missing".to_string()))
+    // Audit #48: the previous implementation parsed /proc/self/stat by
+    // hand and indexed field 19. The `19` came from the offset of
+    // `starttime` in the post-`comm` field list, which is not obvious
+    // without the proc(5) man page in hand. `procfs` reads the same
+    // file and exposes `starttime` as a named field, removing the
+    // magic-number maintenance hazard.
+    use procfs::process::Process;
+    Process::myself()
+        .and_then(|p| p.stat())
+        .map(|s| s.starttime)
+        .map_err(|e| Error::Backend(format!("/proc/self/stat: {e}")))
 }
 
 // ── Secret Service store ────────────────────────────────────────────────────

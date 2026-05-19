@@ -67,6 +67,7 @@ Each finding below is one of:
 | 53  | informational | Use of `#[cfg(unix)]` is redundant                                            | resolved-by-ffi |
 | 54  | low           | Errors with `set_permissions()` are ignored                                   | resolved-by-ffi |
 | 55  | low           | Order of signing addresses                                                    | resolved-by-ffi |
+| 48  | informational | The use of number 19 in `process_start_time()` isn't obvious                  | resolved |
 
 (Rows added as we work through findings.)
 
@@ -599,6 +600,20 @@ the API honest in the meantime.
 and stays. No new test needed: with only one variant, the previous
 "silently accepts an unsupported mode" failure mode is unreachable by
 construction.
+
+### #48 — The use of number 19 in `process_start_time()` isn't obvious (informational) — resolved
+
+`process_start_time` parsed `/proc/self/stat` by hand and indexed
+field 19. The `19` is the offset of `starttime` in the post-`comm`
+field list per proc(5); not obvious without the man page in hand,
+and the file format has gained fields in newer kernels (so the index
+also has to drift).
+
+**Fix** (`src/linux/mod.rs`, `Cargo.toml`): added `procfs = "0.17"`
+under the `cfg(target_os = "linux")` target dependencies and switched
+`process_start_time` to `Process::myself().stat().starttime`. The
+named field reads the same value, drops the magic number, and lets
+`procfs` track any future kernel additions to the `stat` line.
 
 ### #55 — Order of signing addresses (low) — resolved-by-ffi
 

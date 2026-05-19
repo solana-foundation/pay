@@ -23,6 +23,7 @@ objc2-local-authentication = "0.3"
 block2 = "0.6"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+procfs = { version = "0.17", default-features = false }
 secret-service = { version = "3", features = ["rt-tokio-crypto-rust"] }
 tokio = { version = "1", features = ["rt"] }
 zbus = { version = "3", default-features = false, features = ["tokio"] }
