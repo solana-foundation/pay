@@ -2123,9 +2123,12 @@ fn validate_operation_documentation_one(
             .unwrap_or(false);
         let has_additional = resolved_schema.get("additionalProperties").is_some();
         let has_ref = resolved_schema.get("$ref").is_some();
-        let has_combo = ["allOf", "anyOf", "oneOf"]
-            .iter()
-            .any(|k| resolved_schema.get(*k).and_then(|v| v.as_array()).map_or(false, |a| !a.is_empty()));
+        let has_combo = ["allOf", "anyOf", "oneOf"].iter().any(|k| {
+            resolved_schema
+                .get(*k)
+                .and_then(|v| v.as_array())
+                .map_or(false, |a| !a.is_empty())
+        });
         if is_object && !has_props && !has_additional && !has_ref && !has_combo {
             findings.push(CatalogFinding::warning(format!(
                 "{label}: request body schema is an empty `object` with no `properties`, `additionalProperties`, or `$ref`\n  \
@@ -2258,8 +2261,7 @@ fn walk_required_props(
             // A property entry may carry its own `description` alongside a
             // `$ref`; OpenAPI 3.1 allows it. Check the inline prop *and* the
             // resolved target so we don't flag a documented `$ref`'d field.
-            let documented =
-                schema_provides_signal(prop) || schema_provides_signal(&prop_resolved);
+            let documented = schema_provides_signal(prop) || schema_provides_signal(&prop_resolved);
             if required.contains(name) && !documented {
                 undescribed.push(dotted.clone());
             }
@@ -2268,13 +2270,7 @@ fn walk_required_props(
                 walk_required_props(doc, &prop_resolved, &dotted, depth + 1, undescribed);
             } else if t == Some("array") {
                 if let Some(items) = prop_resolved.get("items") {
-                    walk_required_props(
-                        doc,
-                        items,
-                        &format!("{dotted}[]"),
-                        depth + 1,
-                        undescribed,
-                    );
+                    walk_required_props(doc, items, &format!("{dotted}[]"), depth + 1, undescribed);
                 }
             }
         }
@@ -2865,9 +2861,11 @@ mod tests {
         });
         let findings = validate_operation_documentation(&doc);
         assert!(
-            findings.iter().any(|f| f.severity == CatalogFindingSeverity::Error
-                && f.message.contains("{userId}")
-                && f.message.contains("not declared")),
+            findings
+                .iter()
+                .any(|f| f.severity == CatalogFindingSeverity::Error
+                    && f.message.contains("{userId}")
+                    && f.message.contains("not declared")),
             "expected undeclared-path-param error, got: {findings:?}"
         );
     }
@@ -2890,9 +2888,11 @@ mod tests {
         });
         let findings = validate_operation_documentation(&doc);
         assert!(
-            findings.iter().any(|f| f.severity == CatalogFindingSeverity::Error
-                && f.message.contains("query.id")
-                && f.message.contains("no description")),
+            findings
+                .iter()
+                .any(|f| f.severity == CatalogFindingSeverity::Error
+                    && f.message.contains("query.id")
+                    && f.message.contains("no description")),
             "expected required-param error, got: {findings:?}"
         );
     }
@@ -2926,7 +2926,9 @@ mod tests {
         });
         let findings = validate_operation_documentation(&doc);
         assert!(
-            !findings.iter().any(|f| f.severity == CatalogFindingSeverity::Error),
+            !findings
+                .iter()
+                .any(|f| f.severity == CatalogFindingSeverity::Error),
             "expected no errors, got: {findings:?}"
         );
     }
@@ -2958,12 +2960,20 @@ mod tests {
             }
         });
         let findings = validate_operation_documentation(&doc);
-        let err = findings.iter().find(|f| f.severity == CatalogFindingSeverity::Error
-            && f.message.contains("required fields without descriptions"))
+        let err = findings
+            .iter()
+            .find(|f| {
+                f.severity == CatalogFindingSeverity::Error
+                    && f.message.contains("required fields without descriptions")
+            })
             .expect("expected required-body-prop error");
         assert!(err.message.contains("[domain]"), "got: {}", err.message);
         // email has format:email → considered documented, so should NOT appear.
-        assert!(!err.message.contains("email"), "email should not be flagged: {}", err.message);
+        assert!(
+            !err.message.contains("email"),
+            "email should not be flagged: {}",
+            err.message
+        );
     }
 
     #[test]
@@ -2987,8 +2997,10 @@ mod tests {
         });
         let findings = validate_operation_documentation(&doc);
         assert!(
-            findings.iter().any(|f| f.severity == CatalogFindingSeverity::Warning
-                && f.message.contains("empty `object`")),
+            findings
+                .iter()
+                .any(|f| f.severity == CatalogFindingSeverity::Warning
+                    && f.message.contains("empty `object`")),
             "expected empty-object warning, got: {findings:?}"
         );
     }
@@ -3029,11 +3041,21 @@ mod tests {
         let findings = validate_operation_documentation(&doc);
         let err = findings
             .iter()
-            .find(|f| f.severity == CatalogFindingSeverity::Error
-                && f.message.contains("required fields without descriptions"))
+            .find(|f| {
+                f.severity == CatalogFindingSeverity::Error
+                    && f.message.contains("required fields without descriptions")
+            })
             .expect("expected nested-required error");
-        assert!(err.message.contains("center.latitude"), "got: {}", err.message);
-        assert!(err.message.contains("center.longitude"), "got: {}", err.message);
+        assert!(
+            err.message.contains("center.latitude"),
+            "got: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("center.longitude"),
+            "got: {}",
+            err.message
+        );
     }
 
     // ── Pretty-print formatting tests ──
@@ -3041,7 +3063,8 @@ mod tests {
     #[test]
     fn pretty_print_detector_recognizes_pretty_and_minified() {
         let pretty = "{\n  \"openapi\": \"3.1.0\",\n  \"paths\": {}\n}";
-        let minified = r#"{"openapi":"3.1.0","paths":{},"components":{"schemas":{"X":{"type":"string"}}}}"#;
+        let minified =
+            r#"{"openapi":"3.1.0","paths":{},"components":{"schemas":{"X":{"type":"string"}}}}"#;
         assert!(is_pretty_printed(pretty));
         assert!(!is_pretty_printed(minified));
     }
@@ -3052,11 +3075,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("openapi.json");
         // Make sure the file is large enough to trip the "trivial size" guard.
-        let mut body = String::from(r#"{"openapi":"3.1.0","info":{"title":"X","version":"1"},"paths":{}"#);
+        let mut body =
+            String::from(r#"{"openapi":"3.1.0","info":{"title":"X","version":"1"},"paths":{}"#);
         body.push_str(",\"components\":{\"schemas\":{");
         for i in 0..32 {
-            if i > 0 { body.push(','); }
-            body.push_str(&format!("\"Schema{i}\":{{\"type\":\"object\",\"properties\":{{}}}}"));
+            if i > 0 {
+                body.push(',');
+            }
+            body.push_str(&format!(
+                "\"Schema{i}\":{{\"type\":\"object\",\"properties\":{{}}}}"
+            ));
         }
         body.push_str("}}}");
         let mut f = std::fs::File::create(&path).unwrap();
@@ -3068,9 +3096,11 @@ mod tests {
         };
         let findings = validate_committed_spec_formatting(&source, Some(dir.path()));
         assert!(
-            findings.iter().any(|f| f.severity == CatalogFindingSeverity::Warning
-                && f.message.contains("minified")
-                && f.message.contains("jq .")),
+            findings
+                .iter()
+                .any(|f| f.severity == CatalogFindingSeverity::Warning
+                    && f.message.contains("minified")
+                    && f.message.contains("jq .")),
             "expected minified warning with jq hint, got: {findings:?}"
         );
     }
@@ -3086,7 +3116,10 @@ mod tests {
             "paths": {},
             "components": { "schemas": { "Pad": { "type": "string", "description": "pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad" }}}
         })).unwrap();
-        std::fs::File::create(&path).unwrap().write_all(body.as_bytes()).unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(body.as_bytes())
+            .unwrap();
 
         let source = OpenapiSource::Path {
             path: "openapi.json".to_string(),
