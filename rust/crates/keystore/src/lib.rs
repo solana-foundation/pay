@@ -692,6 +692,48 @@ mod tests {
     }
 
     #[test]
+    fn pubkey_rejects_truncated_backend_record() {
+        // audit #34: load APIs must not trust whatever length the
+        // backend returns. A truncated pubkey record (e.g. 16 bytes
+        // from a tampered or corrupted store) must be rejected, not
+        // returned to the caller as if it were a valid public key.
+        let ks = Keystore::in_memory();
+        ks.store
+            .store(&pubkey_key("victim"), &[0u8; 16])
+            .unwrap();
+        let result = ks.pubkey("victim");
+        assert!(matches!(result, Err(Error::InvalidKeypair(_))));
+    }
+
+    #[test]
+    fn load_keypair_rejects_malformed_backend_record() {
+        // audit #34: load_keypair_with_intent runs validate_keypair on
+        // the bytes returned by the SecretStore. A backend record that
+        // is the wrong length (or fails the derive-then-compare check)
+        // must surface as an InvalidKeypair error, never reach the
+        // caller as a "valid" 64-byte slice.
+        let ks = Keystore {
+            auth: Box::new(auth::NoAuth),
+            store: Box::new(store::InMemoryStore::new()),
+            auth_on_write: false,
+        };
+        // Plant a wrong-length record directly under the typed key.
+        ks.store
+            .store(&keypair_key("victim"), &[0u8; 48])
+            .unwrap();
+        let result = ks.load_keypair("victim", "unit test");
+        assert!(matches!(result, Err(Error::InvalidKeypair(_))));
+
+        // Same with a 64-byte buffer whose halves disagree — caught by
+        // the derive-then-compare path in validate_keypair.
+        ks.store
+            .store(&keypair_key("victim2"), &[0xAA; 64])
+            .unwrap();
+        let result = ks.load_keypair("victim2", "unit test");
+        assert!(matches!(result, Err(Error::InvalidKeypair(_))));
+    }
+
+    #[test]
     fn typed_storage_keys_do_not_alias_valid_account_names() {
         let ks = Keystore::in_memory();
         ks.import("victim", &test_keypair(), SyncMode::ThisDeviceOnly)

@@ -57,6 +57,7 @@ Each finding below is one of:
 | 19  | low           | `hex_decode` can panic on non-ASCII input                                     | resolved |
 | 26  | low           | Keystore existence probes skip account-name validation                        | resolved |
 | 20  | low           | Import convenience API authenticates with a create-account intent             | resolved |
+| 34  | low           | Keystore load APIs trust malformed backend record lengths                     | resolved |
 
 (Rows added as we work through findings.)
 
@@ -589,6 +590,31 @@ the API honest in the meantime.
 and stays. No new test needed: with only one variant, the previous
 "silently accepts an unsupported mode" failure mode is unreachable by
 construction.
+
+### #34 — Keystore load APIs trust malformed backend record lengths (low) — resolved
+
+The audit calls out that `Keystore::pubkey` and
+`load_keypair_with_intent` could return whatever bytes the backend
+held, without validating that the buffer was the documented length.
+
+**Current code already validates** (added with the audit #2 / #8 fixes
+in earlier commits): `pubkey()` runs `validate_pubkey` (32-byte length
+check); `load_keypair_with_intent` runs `validate_keypair` (64-byte
+length **plus** the seed-to-pubkey derivation check from audit #8, so
+even a length-valid but mismatched 64-byte buffer is rejected).
+
+**Pinning regression tests** (`lib.rs` tests module):
+
+- `pubkey_rejects_truncated_backend_record` — plants a 16-byte record
+  under `pubkey_key("victim")` directly via the store and asserts
+  `pubkey()` returns `InvalidKeypair`.
+- `load_keypair_rejects_malformed_backend_record` — plants a 48-byte
+  record (length-wrong) and a 64-byte all-`0xAA` record (length-OK,
+  derivation-wrong) and asserts both return `InvalidKeypair`.
+- The existing `pubkey_rejects_private_keypair_sized_value` already
+  covered the 64-bytes-under-pubkey-key case (audit #2).
+
+These three tests collectively pin every shape the audit flagged.
 
 ### #20 — Import convenience API authenticates with a create-account intent (low) — resolved
 
