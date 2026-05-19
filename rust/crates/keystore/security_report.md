@@ -69,6 +69,7 @@ Each finding below is one of:
 | 55  | low           | Order of signing addresses                                                    | resolved-by-ffi |
 | 48  | informational | The use of number 19 in `process_start_time()` isn't obvious                  | resolved |
 | 49  | informational | Several public rust object can be shielded (Linux part)                       | resolved |
+| 44  | informational | The linux `AuthGate.is_available` doesn't check the Polkit action exists      | resolved |
 
 (Rows added as we work through findings.)
 
@@ -601,6 +602,33 @@ the API honest in the meantime.
 and stays. No new test needed: with only one variant, the previous
 "silently accepts an unsupported mode" failure mode is unreachable by
 construction.
+
+### #44 — Linux `AuthGate.is_available` doesn't check Polkit action exists (informational) — resolved
+
+`Polkit::is_available` only probed the system bus
+(`zbus::Connection::system().await.is_ok()`). Even when the polkit
+action was missing, it returned `true` — the failure then showed up
+at the next interactive `authenticate()` call as a structured
+"polkit action is not installed" error.
+
+**Fix** (`src/linux/mod.rs`):
+
+- Parametrized `polkit_authenticate(action, interactive: bool)`.
+  PolicyKit's `CheckAuthorizationFlags` bit 0 is
+  `AllowUserInteraction`; `interactive=false` clears it so the
+  caller gets the authorized/challenge tuple back without blocking
+  on a user prompt.
+- `Polkit::is_available` now drives a non-interactive
+  `CheckAuthorization` against `LEGACY_POLKIT_ACTION` (the catch-all
+  installed by `pay setup`). Anything that isn't a missing-action
+  error (Ok / AuthDenied / other backend) means the action is
+  reachable.
+- Existing interactive callers in `Polkit::authenticate` pass
+  `interactive=true` unchanged.
+
+Audit #38 already composes `Polkit::is_available` into
+`Keystore::gnome_keyring_available`, so the new probe now flows
+through to the public availability shim as well.
 
 ### #49 — Several public rust object can be shielded (Linux part) — resolved
 

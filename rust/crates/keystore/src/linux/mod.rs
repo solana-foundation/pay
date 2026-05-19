@@ -25,9 +25,9 @@ impl AuthGate for Polkit {
     fn authenticate(&self, intent: &AuthIntent) -> Result<()> {
         let action = polkit_action_for_intent(intent);
         run(async move {
-            match polkit_authenticate(action).await {
+            match polkit_authenticate(action, true).await {
                 Err(e) if action != LEGACY_POLKIT_ACTION && is_missing_action(&e) => {
-                    polkit_authenticate(LEGACY_POLKIT_ACTION).await
+                    polkit_authenticate(LEGACY_POLKIT_ACTION, true).await
                 }
                 result => result,
             }
@@ -35,11 +35,26 @@ impl AuthGate for Polkit {
     }
 
     fn is_available(&self) -> bool {
-        run(async { zbus::Connection::system().await.is_ok() })
+        // Audit #44: probing the system bus alone reported "available"
+        // even when the polkit action wasn't installed — the failure
+        // then showed up at the next interactive call. Drive a
+        // non-interactive `CheckAuthorization` against the legacy
+        // action and treat anything that isn't a missing-action error
+        // (Ok / AuthDenied / other backend errors) as "the action is
+        // reachable; we just may not be authorized yet."
+        run(async {
+            if zbus::Connection::system().await.is_err() {
+                return false;
+            }
+            match polkit_authenticate(LEGACY_POLKIT_ACTION, false).await {
+                Ok(()) => true,
+                Err(e) => !is_missing_action(&e),
+            }
+        })
     }
 }
 
-async fn polkit_authenticate(action: &str) -> Result<()> {
+async fn polkit_authenticate(action: &str, interactive: bool) -> Result<()> {
     use zbus::zvariant::{OwnedValue, Value};
 
     let conn = zbus::Connection::system()
@@ -59,7 +74,11 @@ async fn polkit_authenticate(action: &str) -> Result<()> {
     .into();
 
     let details: HashMap<String, String> = HashMap::new();
-    let flags: u32 = 0x1; // AllowUserInteraction
+    // PolicyKit `CheckAuthorizationFlags`: bit 0 = AllowUserInteraction.
+    // Non-interactive probes (`is_available`) clear it so the call
+    // returns immediately with an authorized/challenge bool pair
+    // instead of blocking on a user prompt (audit #44).
+    let flags: u32 = u32::from(interactive);
 
     let reply = conn
         .call_method(
