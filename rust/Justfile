@@ -1,8 +1,20 @@
 # Task runner for pay CLI
 
-# Build release binary
+# Build release binary. On macOS, ad-hoc codesign the result so the
+# Keychain ACL recognizes it as a stable identity across rebuilds — without
+# this, every fresh build prompts for the login password the first time it
+# touches a previously-stored Keychain item.
 build:
     cargo build --release
+    @just codesign-mac target/release/pay
+
+# Ad-hoc codesign a Mach-O on macOS. No-op on other platforms or if the
+# file doesn't exist. Used by `build` and by the top-level `install`
+# recipe so the Keychain ACL identity is stable across reinstalls.
+codesign-mac PATH:
+    @if [ "$(uname)" = "Darwin" ] && [ -f "{{ PATH }}" ]; then \
+        codesign --sign - --force "{{ PATH }}"; \
+    fi
 
 # Run all tests
 test:

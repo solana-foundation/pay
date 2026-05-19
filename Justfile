@@ -36,6 +36,15 @@ install *args:
         cd ..
     }
 
+    # On macOS, ad-hoc codesign the just-installed binary so its Keychain
+    # ACL identity is stable across reinstalls. Without this, every
+    # `just install pay` reinstall prompts the user for their login
+    # password the first time `pay` touches a previously-stored item.
+    codesign_installed_pay() {
+        local root="${CARGO_INSTALL_ROOT:-${CARGO_HOME:-$HOME/.cargo}}"
+        (cd "{{ justfile_directory() }}/rust" && just codesign-mac "$root/bin/pay")
+    }
+
     case "${target}" in
         pay)
             build_pdb
@@ -44,6 +53,7 @@ install *args:
             else
                 cd rust && cargo cli-install
             fi
+            codesign_installed_pay
             ;;
         deps)
             if [ "$#" -gt 0 ]; then
@@ -108,17 +118,17 @@ build target='all':
         all)
             cd typescript && pnpm --filter @solana/pay build && cd ..
             build_pdb
-            cd rust && cargo build --release
+            cd rust && cargo build --release && just codesign-mac target/release/pay
             ;;
         pay)
             build_pdb
-            cd rust && cargo build --release
+            cd rust && cargo build --release && just codesign-mac target/release/pay
             ;;
         pdb)
             build_pdb
             ;;
         rust)
-            cd rust && cargo build --release
+            cd rust && cargo build --release && just codesign-mac target/release/pay
             ;;
         typescript|ts)
             cd typescript && pnpm --filter @solana/pay build
