@@ -58,6 +58,7 @@ Each finding below is one of:
 | 26  | low           | Keystore existence probes skip account-name validation                        | resolved |
 | 20  | low           | Import convenience API authenticates with a create-account intent             | resolved |
 | 34  | low           | Keystore load APIs trust malformed backend record lengths                     | resolved |
+| 12  | low           | Delete can report success while leaving stale public-key metadata             | resolved |
 
 (Rows added as we work through findings.)
 
@@ -590,6 +591,39 @@ the API honest in the meantime.
 and stays. No new test needed: with only one variant, the previous
 "silently accepts an unsupported mode" failure mode is unreachable by
 construction.
+
+### #12 — Delete can report success while leaving stale public-key metadata (low) — resolved
+
+`Keystore::delete_with_intent` removed the keypair record, then ran
+the pubkey-metadata delete with the result discarded
+(`let _ = self.store.delete(&pubkey_key(account));`). If the pubkey
+delete failed, the API still returned `Ok(())` while leaving the
+keystore in a split state: `exists()` returned `false` because the
+keypair was gone, while `pubkey()` could still return the stale
+metadata.
+
+**Fix** (`src/lib.rs` — `Keystore::delete_with_intent`): propagate the
+second `delete` result. The function returns `Err` if either leg
+fails, so the API result honestly reflects the durable state.
+
+**Idempotency check across backends:**
+
+- `InMemoryStore` — `HashMap::remove` returns `Option`, we ignore
+  the value and return `Ok`. Idempotent.
+- macOS Keychain (`keychain.rs`) — already treats
+  `errSecItemNotFound` as `Ok`. Idempotent.
+- Linux Secret Service (`linux/mod.rs`) — iterates matching items;
+  an empty match list returns `Ok`. Idempotent.
+- Windows Credential Manager — `CredDeleteW` currently errors on
+  missing items; tracked as audit #18 and fixed in the Windows
+  queue. Once that fix lands, re-running `delete_with_intent` on an
+  already-deleted account stays `Ok`.
+
+**Regression test** (`lib.rs` tests module):
+`delete_surfaces_pubkey_record_failure` — uses a `FailOnNthDeleteStore`
+mock that errors on the second `delete` call. After an import, the
+test asserts `Keystore::delete` surfaces the error instead of
+swallowing it.
 
 ### #34 — Keystore load APIs trust malformed backend record lengths (low) — resolved
 

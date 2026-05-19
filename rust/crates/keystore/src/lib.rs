@@ -273,6 +273,15 @@ impl Keystore {
     }
 
     /// Delete a keypair with a typed auth intent.
+    ///
+    /// audit #12: do not silently swallow the pubkey-metadata delete.
+    /// The previous implementation removed the private keypair record
+    /// and treated the `.pubkey` cleanup as best-effort; a failure on
+    /// the second leg left the keystore split — `exists()` reported
+    /// `false` because the keypair was gone, while `pubkey()` could
+    /// still return stale metadata. Propagating the second error makes
+    /// the API result honest: callers see exactly the durable state
+    /// they got.
     pub fn delete_with_intent(&self, account: &str, intent: &AuthIntent) -> Result<()> {
         validate_account_name(account)?;
         if self.auth_on_write {
@@ -280,7 +289,7 @@ impl Keystore {
         }
 
         self.store.delete(&keypair_key(account))?;
-        let _ = self.store.delete(&pubkey_key(account));
+        self.store.delete(&pubkey_key(account))?;
         Ok(())
     }
 
@@ -948,6 +957,69 @@ mod tests {
         fn is_available(&self) -> bool {
             true
         }
+    }
+
+    /// Store mock that fails on the Nth delete (counted from the
+    /// first call). Lets us simulate "keypair delete works, pubkey
+    /// delete fails" — the audit #12 scenario.
+    struct FailOnNthDeleteStore {
+        inner: store::InMemoryStore,
+        deletes: std::sync::atomic::AtomicU32,
+        fail_on_nth: u32,
+    }
+
+    impl FailOnNthDeleteStore {
+        fn new(fail_on_nth: u32) -> Self {
+            Self {
+                inner: store::InMemoryStore::new(),
+                deletes: std::sync::atomic::AtomicU32::new(0),
+                fail_on_nth,
+            }
+        }
+    }
+
+    impl SecretStore for FailOnNthDeleteStore {
+        fn store(&self, key: &str, data: &[u8]) -> Result<()> {
+            self.inner.store(key, data)
+        }
+        fn load(&self, key: &str) -> Result<Zeroizing<Vec<u8>>> {
+            self.inner.load(key)
+        }
+        fn exists(&self, key: &str) -> bool {
+            self.inner.exists(key)
+        }
+        fn delete(&self, key: &str) -> Result<()> {
+            let nth = self
+                .deletes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if nth == self.fail_on_nth {
+                return Err(Error::Backend(
+                    "simulated delete failure on Nth call".to_string(),
+                ));
+            }
+            self.inner.delete(key)
+        }
+    }
+
+    #[test]
+    fn delete_surfaces_pubkey_record_failure() {
+        // audit #12: the second delete (pubkey metadata) used to be
+        // discarded via `let _ = ...`. A failure there left the
+        // keystore split — keypair gone, pubkey record stale, API
+        // returned Ok(()). Propagate the error so callers see the
+        // real durable state.
+        let ks = Keystore {
+            auth: Box::new(auth::NoAuth),
+            store: Box::new(FailOnNthDeleteStore::new(1)),
+            auth_on_write: false,
+        };
+        ks.import("victim", &test_keypair(), SyncMode::ThisDeviceOnly)
+            .unwrap();
+        let result = ks.delete("victim", "unit test");
+        assert!(
+            result.is_err(),
+            "pubkey-delete failure must surface to the caller, not be swallowed",
+        );
     }
 
     #[test]
