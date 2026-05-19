@@ -19,7 +19,7 @@ use windows::{
             Console::GetConsoleWindow,
             WinRT::IUserConsentVerifierInterop,
         },
-        UI::WindowsAndMessaging::{GetForegroundWindow, IsWindowVisible},
+        UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId, IsWindowVisible},
     },
     core::{HSTRING, PCWSTR, PWSTR},
 };
@@ -142,9 +142,22 @@ fn prompt_parent_window() -> Option<HWND> {
         return Some(console);
     }
 
+    // Audit #66: `GetForegroundWindow()` returns whatever window has
+    // keyboard focus at this instant — could be the user's browser,
+    // another terminal, or any random app. Using it as a Pay parent
+    // could attach our Touch-ID prompt to an unrelated window, which
+    // is confusing at best and a UI-redress risk at worst. Only use
+    // the foreground window if it belongs to our own process; falling
+    // through to `None` triggers the UWP path
+    // (`RequestVerificationAsync`), which renders the prompt without
+    // a parent.
     let foreground = unsafe { GetForegroundWindow() };
     if !foreground.is_invalid() {
-        return Some(foreground);
+        let mut foreground_pid: u32 = 0;
+        unsafe { GetWindowThreadProcessId(foreground, Some(&mut foreground_pid)) };
+        if foreground_pid == std::process::id() {
+            return Some(foreground);
+        }
     }
 
     if !console.is_invalid() {

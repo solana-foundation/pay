@@ -83,6 +83,7 @@ Each finding below is one of:
 | 68  | low           | Windows: Immutable pointers casted to mutable pointers                        | resolved |
 | 69  | low           | In windows, the function `cred_read()` isn't sufficiently hardened            | resolved |
 | 65  | informational | Old windows API used                                                          | resolved |
+| 66  | low           | `GetForegroundWindow()` returns the window with keyboard focus at the time of the call | resolved |
 
 (Rows added as we work through findings.)
 
@@ -615,6 +616,25 @@ the API honest in the meantime.
 and stays. No new test needed: with only one variant, the previous
 "silently accepts an unsupported mode" failure mode is unreachable by
 construction.
+
+### #66 — `GetForegroundWindow()` returns whatever has keyboard focus (low) — resolved
+
+`prompt_parent_window` used the result of
+`GetForegroundWindow()` directly as the parent HWND for the
+Windows Hello prompt. That returns whichever window has keyboard
+focus *at the instant of the call* — could be the user's browser,
+another terminal, or any random app. Attaching our Touch-ID
+prompt to an unrelated window is confusing at best, and at worst
+a UI-redress hazard.
+
+**Fix** (`src/windows/mod.rs` — `prompt_parent_window`): after
+`GetForegroundWindow()`, call `GetWindowThreadProcessId` on the
+returned HWND and only use it as the parent if the PID matches
+`std::process::id()`. If it doesn't, fall through to `None`,
+which routes the prompt through the UWP
+`UserConsentVerifier::RequestVerificationAsync` path — that
+renders the prompt without a parent window, but with the correct
+Windows Hello chrome.
 
 ### #65 — Old windows API used (informational) — resolved
 
