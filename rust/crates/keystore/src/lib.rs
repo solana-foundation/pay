@@ -388,15 +388,22 @@ fn validate_account_name(name: &str) -> Result<()> {
             "account name cannot be empty".to_string(),
         ));
     }
+    // audit #16: reject uppercase ASCII letters. The Windows Credential
+    // Manager backend keys items by case-insensitive target name, so
+    // `Default` and `default` collide there even though they would be
+    // distinct accounts on macOS Keychain and Linux Secret Service.
+    // Enforcing lowercase-only at the validator gives every backend the
+    // same uniqueness contract — the doc comment in this file (and the
+    // error message users see) now matches the actual allowed set.
     if !name
         .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'_' || b == b'-')
     {
         return Err(Error::InvalidKeypair(format!(
             "account name contains invalid characters: {name:?} (allowed: a-z, 0-9, '.', '_', '-')"
         )));
     }
-    if name.to_ascii_lowercase().ends_with(RESERVED_PUBKEY_SUFFIX) {
+    if name.ends_with(RESERVED_PUBKEY_SUFFIX) {
         return Err(Error::InvalidKeypair(format!(
             "account name uses reserved suffix: {RESERVED_PUBKEY_SUFFIX}"
         )));
@@ -503,6 +510,35 @@ mod tests {
         ks.import("test", &test_keypair(), SyncMode::ThisDeviceOnly)
             .unwrap();
         assert!(ks.exists("test"));
+    }
+
+    #[test]
+    fn validate_rejects_uppercase_letters() {
+        // audit #16: Windows Credential Manager folds case, so
+        // `Default` and `default` would collide there even though
+        // they would be distinct on macOS Keychain / Linux Secret
+        // Service. Reject uppercase up front so every backend sees
+        // the same uniqueness contract.
+        assert!(
+            matches!(validate_account_name("Default"), Err(Error::InvalidKeypair(_))),
+            "uppercase initial letter must be rejected"
+        );
+        assert!(
+            matches!(validate_account_name("FOO"), Err(Error::InvalidKeypair(_))),
+            "all-uppercase must be rejected"
+        );
+        assert!(
+            matches!(validate_account_name("MyAccount"), Err(Error::InvalidKeypair(_))),
+            "mixed-case must be rejected"
+        );
+        assert!(
+            validate_account_name("default").is_ok(),
+            "lowercase must continue to work"
+        );
+        assert!(
+            validate_account_name("alice-1.test_2").is_ok(),
+            "lowercase + allowed punctuation must continue to work"
+        );
     }
 
     #[test]

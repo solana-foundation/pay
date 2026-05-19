@@ -60,6 +60,7 @@ Each finding below is one of:
 | 34  | low           | Keystore load APIs trust malformed backend record lengths                     | resolved |
 | 12  | low           | Delete can report success while leaving stale public-key metadata             | resolved |
 | 25  | low           | Concurrent keystore mutations can desynchronize keypair and public-key records | partial |
+| 16  | low           | Windows account names differing only by case share Credential Manager targets | resolved |
 
 (Rows added as we work through findings.)
 
@@ -592,6 +593,36 @@ the API honest in the meantime.
 and stays. No new test needed: with only one variant, the previous
 "silently accepts an unsupported mode" failure mode is unreachable by
 construction.
+
+### #16 — Windows account names differing only by case share Credential Manager targets (low) — resolved
+
+The shared `validate_account_name` accepted ASCII letters in either
+case, so `Default` and `default` were both valid logical names. The
+Windows backend's `cred_write` / `cred_read` use `pay.sh/<key>` as
+the Credential Manager target, which folds case — those two names
+collide on Windows but stay distinct on macOS / Linux. Same logical
+input, two different durable states across backends.
+
+**Fix** (`src/lib.rs` — `validate_account_name`): tightened the
+allowed character set to `a-z 0-9 . _ -` (lowercase letters only).
+Every backend now sees the same uniqueness contract; the error
+message that users see also matches the actual allowed set, which
+previously claimed lowercase only while quietly accepting uppercase
+too.
+
+**Backward compatibility:** any account that was created with
+mixed-case characters (e.g. `MyAccount`) will fail the validator on
+the next call to `import`, `delete`, `pubkey`, `load_keypair`, or
+`exists`. The stored bytes remain on the backend; users can re-import
+under a lowercase name to recover. We do not silently lowercase the
+input because that would change which storage key the backend reads
+from — a quiet redirect to a different (possibly attacker-planted)
+record is worse than the explicit "rename your account" error.
+
+**Regression test** (`lib.rs` tests module):
+`validate_rejects_uppercase_letters` — covers leading-uppercase,
+all-uppercase, mixed-case, and confirms lowercase + allowed
+punctuation continues to work.
 
 ### #25 — Concurrent keystore mutations can desynchronize keypair and public-key records (low) — partial
 
