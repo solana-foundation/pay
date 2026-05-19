@@ -38,7 +38,7 @@ impl SecretStore for InMemoryStore {
     fn store(&self, key: &str, data: &[u8]) -> Result<()> {
         self.data
             .lock()
-            .unwrap()
+            .map_err(|_| Error::Backend("in-memory store mutex poisoned".to_string()))?
             .insert(key.to_string(), Zeroizing::new(data.to_vec()));
         Ok(())
     }
@@ -46,18 +46,26 @@ impl SecretStore for InMemoryStore {
     fn load(&self, key: &str) -> Result<Zeroizing<Vec<u8>>> {
         self.data
             .lock()
-            .unwrap()
+            .map_err(|_| Error::Backend("in-memory store mutex poisoned".to_string()))?
             .get(key)
             .map(|z| Zeroizing::new(z.to_vec()))
             .ok_or_else(|| Error::Backend(format!("key not found: {key}")))
     }
 
     fn exists(&self, key: &str) -> bool {
-        self.data.lock().unwrap().contains_key(key)
+        // Returning false on poison is intentional — exists() has no
+        // Result channel, and reporting "not present" is the safer
+        // failure mode for callers that branch on it (audit #40).
+        self.data
+            .lock()
+            .is_ok_and(|guard| guard.contains_key(key))
     }
 
     fn delete(&self, key: &str) -> Result<()> {
-        self.data.lock().unwrap().remove(key);
+        self.data
+            .lock()
+            .map_err(|_| Error::Backend("in-memory store mutex poisoned".to_string()))?
+            .remove(key);
         Ok(())
     }
 }

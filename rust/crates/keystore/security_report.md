@@ -53,6 +53,7 @@ Each finding below is one of:
 | 37  | informational | Security note doesn't cover all the nuances                                   | resolved |
 | 39  | informational | Static calls used where trait is available                                    | partial  |
 | 38  | informational | `is_available()` functions called inconsistently                              | resolved |
+| 40  | informational | `lock()` errors not detected                                                  | resolved |
 
 (Rows added as we work through findings.)
 
@@ -585,6 +586,26 @@ the API honest in the meantime.
 and stays. No new test needed: with only one variant, the previous
 "silently accepts an unsupported mode" failure mode is unreachable by
 construction.
+
+### #40 — `lock()` errors not detected (informational) — resolved
+
+`InMemoryStore`'s `SecretStore` impl was unwrapping the inner mutex
+on every operation. A poisoned mutex (panic in another thread while
+holding the lock) would crash the process instead of returning a
+recoverable error.
+
+**Fix** (`src/store.rs`): the three `Result`-returning operations
+(`store`, `load`, `delete`) now map a poison error to
+`Error::Backend("in-memory store mutex poisoned")`. `exists` has no
+`Result` channel, so it returns `false` on poison — the safer failure
+mode for callers that branch on it (matches the "key absent" path
+they already handle).
+
+The audit applies cleanly to the in-memory store; the 1Password
+store's separate `.lock()` call site is out of scope here since that
+backend is being removed (#10). The Linux Secret Service backend
+uses async `col.lock().await`, which is a Secret Service collection
+relock — different semantics (see #31, #50), tracked separately.
 
 ### #38 — `is_available()` functions called inconsistently (informational) — resolved
 
