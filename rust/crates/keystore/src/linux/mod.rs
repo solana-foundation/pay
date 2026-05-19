@@ -403,15 +403,44 @@ fn ss_err(e: secret_service::Error) -> Error {
     Error::Backend(e.to_string())
 }
 
+/// Block on an async future from a synchronous context.
+///
+/// Audit #30: the previous implementation always built a new
+/// current-thread runtime and called `block_on` directly. Tokio
+/// panics when you `block_on` a future from a thread that's already
+/// inside a runtime, which is exactly the situation `pay server
+/// start` creates — the main process runtime calls into
+/// `Keystore::load_keypair_with_intent` during signer resolution.
+///
+/// Detect a live runtime via `Handle::try_current()`. If one exists,
+/// move the runtime construction onto a dedicated OS thread so the
+/// new runtime is created off the caller's runtime thread. If no
+/// runtime is active, build the runtime inline as before.
 fn run<F, T>(future: F) -> T
 where
-    F: std::future::Future<Output = T>,
+    F: std::future::Future<Output = T> + Send,
+    T: Send + 'static,
 {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime")
-        .block_on(future)
+    let build_and_block = move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime")
+            .block_on(future)
+    };
+    if tokio::runtime::Handle::try_current().is_ok() {
+        // We're inside another Tokio runtime. Building a current-
+        // thread runtime here would panic. Spawn a dedicated OS
+        // thread that owns the inner runtime, then join it back.
+        std::thread::scope(|scope| {
+            scope
+                .spawn(build_and_block)
+                .join()
+                .expect("Secret Service runtime thread panicked")
+        })
+    } else {
+        build_and_block()
+    }
 }
 
 #[cfg(test)]

@@ -77,6 +77,7 @@ Each finding below is one of:
 | 33  | low           | Linux Secret Service default-collection fallback is inconsistent              | resolved |
 | 31  | low           | Linux Secret Service relock failure can mask a completed mutation             | resolved |
 | 50  | informational | The `lock()`s on linux too aggressive                                         | resolved |
+| 30  | low           | Linux keystore calls can panic inside Tokio runtime contexts                  | resolved |
 
 (Rows added as we work through findings.)
 
@@ -609,6 +610,29 @@ the API honest in the meantime.
 and stays. No new test needed: with only one variant, the previous
 "silently accepts an unsupported mode" failure mode is unreachable by
 construction.
+
+### #30 — Linux keystore calls can panic inside Tokio runtime contexts (low) — resolved
+
+The shared `run(...)` helper built a new current-thread Tokio
+runtime and called `block_on` directly. Tokio panics if you
+`block_on` from a thread that's already inside a runtime. `pay
+server start` triggers exactly that path: the main server runtime
+calls `Keystore::load_keypair_with_intent` during signer
+resolution, which hits `SecretServiceStore::load`, which hits
+`run(...)`.
+
+**Fix** (`src/linux/mod.rs`): detect a live runtime via
+`tokio::runtime::Handle::try_current()`. If one is active, move the
+runtime construction onto a dedicated OS thread via
+`std::thread::scope` — the inner runtime is created off the
+caller's runtime thread, so Tokio's "you can't block_on from inside
+a runtime" check no longer applies. If no runtime is active (CLI
+invocations, tests), the helper builds inline as before.
+
+Added `Send` bounds on the future and return type because the
+in-runtime path crosses a thread boundary. Both the `secret-service`
+futures and our own state are already `Send` (`String`, `Vec<u8>`,
+`Zeroizing<Vec<u8>>`).
 
 ### #50 — Linux locks are too aggressive (informational) — resolved
 
