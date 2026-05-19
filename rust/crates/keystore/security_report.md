@@ -74,6 +74,7 @@ Each finding below is one of:
 | 35  | low           | Linux Polkit falls back to a generic prompt when specific actions are missing | resolved |
 | 46  | low           | Checks on error texts or zbus are not robust                                  | resolved |
 | 22  | informational | GNOME Keyring exposes keypairs without the Pay Polkit gate                    | resolved-with-rationale |
+| 33  | low           | Linux Secret Service default-collection fallback is inconsistent              | resolved |
 
 (Rows added as we work through findings.)
 
@@ -606,6 +607,27 @@ the API honest in the meantime.
 and stays. No new test needed: with only one variant, the previous
 "silently accepts an unsupported mode" failure mode is unreachable by
 construction.
+
+### #33 — Linux Secret Service default-collection fallback is inconsistent (low) — resolved
+
+`SecretServiceStore` had three different policies for the `pay`
+collection vs the Secret Service default collection:
+
+- `load` — required the `pay` collection; errored otherwise.
+- `exists` — searched the `pay` collection if present, fell back to
+  the default collection if not.
+- `delete` — searched both collections regardless.
+
+That asymmetry let `exists("alice")` return `true` for an account
+that lived in the default collection but that `load("alice")` would
+then refuse to read. The audit asked for one rule.
+
+**Fix** (`src/linux/mod.rs` — `exists`): only probe the `pay`
+collection. If the user hasn't run `pay setup` yet, `exists` returns
+`false` (consistent with `load`'s "pay keyring not found" error).
+The default-collection fallback in `delete` is retained on purpose:
+delete is a cleanup path, not a read path, so the asymmetry there
+is intentional transitional housekeeping.
 
 ### #22 — GNOME Keyring exposes keypairs without the Pay Polkit gate (informational) — resolved-with-rationale
 

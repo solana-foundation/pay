@@ -263,20 +263,22 @@ impl SecretStore for SecretServiceStore {
     }
 
     fn exists(&self, key: &str) -> bool {
+        // Audit #33: only probe the `pay` collection. Previously,
+        // `exists` fell back to the default Secret Service collection
+        // when `pay` was absent, but `load` errored in that case. The
+        // asymmetry let `exists` report `true` for an item that
+        // `load` would refuse to read. Aligning on "only the `pay`
+        // collection counts" keeps every caller's view of the
+        // keystore consistent. `delete` still cleans the default
+        // collection too — that's transitional cleanup, not a read
+        // path, so the asymmetry there is by design.
         let key = key.to_owned();
         run(async move {
             let Ok(ss) = connect().await else {
                 return false;
             };
             let Some(col) = get_collection(&ss).await else {
-                let Ok(default) = ss.get_default_collection().await else {
-                    return false;
-                };
-                return default
-                    .search_items(attrs(&key))
-                    .await
-                    .map(|items| !items.is_empty())
-                    .unwrap_or(false);
+                return false;
             };
             col.search_items(attrs(&key))
                 .await
