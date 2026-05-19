@@ -59,6 +59,7 @@ Each finding below is one of:
 | 20  | low           | Import convenience API authenticates with a create-account intent             | resolved |
 | 34  | low           | Keystore load APIs trust malformed backend record lengths                     | resolved |
 | 12  | low           | Delete can report success while leaving stale public-key metadata             | resolved |
+| 25  | low           | Concurrent keystore mutations can desynchronize keypair and public-key records | partial |
 
 (Rows added as we work through findings.)
 
@@ -591,6 +592,44 @@ the API honest in the meantime.
 and stays. No new test needed: with only one variant, the previous
 "silently accepts an unsupported mode" failure mode is unreachable by
 construction.
+
+### #25 — Concurrent keystore mutations can desynchronize keypair and public-key records (low) — partial
+
+The keystore stores one logical account as two backend records
+(`keypair:<name>` + `pubkey:<name>`). `import_with_intent` writes them
+in two separate calls; `delete_with_intent` removes them in two
+separate calls. With no synchronization, two same-account operations
+from different threads could interleave to produce a state no single
+successful operation could (e.g. `keypair = T1` + `pubkey = T2`).
+
+**Fix** (`src/lib.rs`): added a per-account `Mutex` map on `Keystore`
+itself. `import_with_intent` and `delete_with_intent` acquire the
+per-account lock around the two-store sequence, serializing
+same-account mutations within the process. The lock is acquired
+**after** auth/validation so an unauthorized caller can't induce
+serialization side-channels on other accounts.
+
+The mutex map is keyed by account name; entries are created lazily
+and never removed (they're zero-sized internally, so the memory
+footprint is one `Arc<Mutex<()>>` per imported account name — fine in
+practice).
+
+**Why partial:** the audit's framing was specifically about
+desynchronized records, which the per-account lock prevents within
+the process. Cross-process concurrency (two `pay` processes racing
+on the same backend) is **not** addressed by this fix and is out of
+scope for the current backends — Apple Keychain, Secret Service, and
+Credential Manager don't expose transactional primitives that would
+let us atomic-swap two records. Documenting this limit in the
+struct doc-comment.
+
+**Regression test** (`lib.rs` tests module):
+`concurrent_imports_leave_records_consistent` — 50 rounds of two
+threads importing different keypair bytes under the same account
+name. After each round, the test loads both records and asserts the
+pubkey matches the keypair that "won" the race. Without the per-
+account lock, the assertion fails under ~50 rounds reliably (the two
+writes are short and interleave easily on a multi-core host).
 
 ### #12 — Delete can report success while leaving stale public-key metadata (low) — resolved
 

@@ -22,6 +22,9 @@ pub use error::{Error, Result};
 pub use store::SecretStore;
 pub use zeroize::Zeroizing;
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 /// Controls whether the key syncs to cloud storage.
 ///
 /// Audit #5: every supported backend currently stores items as
@@ -95,6 +98,14 @@ pub struct Keystore {
     auth: Box<dyn AuthGate>,
     store: Box<dyn SecretStore>,
     auth_on_write: bool,
+    /// Per-account write lock (audit #25). Each logical account is two
+    /// backend records (`keypair:<name>` + `pubkey:<name>`); serializing
+    /// mutations on the same account in this process prevents two
+    /// concurrent imports / deletes from producing a state that no
+    /// single successful operation could (e.g. `keypair` from T1 +
+    /// `pubkey` from T2). Cross-process concurrency is out of scope —
+    /// the backends themselves don't expose transactional primitives.
+    account_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 impl Keystore {
@@ -108,7 +119,17 @@ impl Keystore {
             auth: Box::new(auth),
             store: Box::new(store),
             auth_on_write,
+            account_locks: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Return (creating if needed) the per-account write lock.
+    fn account_lock(&self, account: &str) -> Arc<Mutex<()>> {
+        let mut map = self
+            .account_locks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        Arc::clone(map.entry(account.to_string()).or_default())
     }
 
     /// In-memory keystore for testing. No auth, no persistence.
@@ -244,6 +265,13 @@ impl Keystore {
             self.auth.authenticate(intent)?;
         }
 
+        // Audit #25: serialize same-account mutations so an interleaved
+        // import / delete from another thread can't produce a state
+        // that no single successful operation could (e.g. keypair from
+        // T1 + pubkey from T2).
+        let lock = self.account_lock(account);
+        let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+
         // Audit #11: the import is logically a single operation, but it
         // touches two backend records — the keypair and the public-key
         // metadata. If the second write fails after the first has
@@ -287,6 +315,10 @@ impl Keystore {
         if self.auth_on_write {
             self.auth.authenticate(intent)?;
         }
+
+        // Audit #25: serialize same-account mutations (see import_with_intent).
+        let lock = self.account_lock(account);
+        let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
 
         self.store.delete(&keypair_key(account))?;
         self.store.delete(&pubkey_key(account))?;
@@ -598,6 +630,7 @@ mod tests {
             auth: Box::new(CountingAuth(counter.clone())),
             store: Box::new(store::InMemoryStore::new()),
             auth_on_write: true,
+            account_locks: Mutex::new(HashMap::new()),
         };
 
         ks.import("test", &test_keypair(), SyncMode::ThisDeviceOnly)
@@ -632,6 +665,7 @@ mod tests {
             auth: Box::new(CountingAuth(counter.clone())),
             store: Box::new(store::InMemoryStore::new()),
             auth_on_write: false,
+            account_locks: Mutex::new(HashMap::new()),
         };
 
         ks.import("test", &test_keypair(), SyncMode::ThisDeviceOnly)
@@ -725,6 +759,7 @@ mod tests {
             auth: Box::new(auth::NoAuth),
             store: Box::new(store::InMemoryStore::new()),
             auth_on_write: false,
+            account_locks: Mutex::new(HashMap::new()),
         };
         // Plant a wrong-length record directly under the typed key.
         ks.store
@@ -851,6 +886,7 @@ mod tests {
             auth: Box::new(DenyAuth),
             store: Box::new(store::InMemoryStore::new()),
             auth_on_write: true,
+            account_locks: Mutex::new(HashMap::new()),
         };
         let result = ks.import("test", &test_keypair(), SyncMode::ThisDeviceOnly);
         assert!(result.is_err());
@@ -865,6 +901,7 @@ mod tests {
             auth: Box::new(DenyAuth),
             store: Box::new(store::InMemoryStore::new()),
             auth_on_write: false,
+            account_locks: Mutex::new(HashMap::new()),
         };
         // DenyAuth would reject, but auth_on_write=false skips it for import
         ks.import("test", &test_keypair(), SyncMode::ThisDeviceOnly)
@@ -878,6 +915,7 @@ mod tests {
             auth: Box::new(DenyAuth),
             store: Box::new(store::InMemoryStore::new()),
             auth_on_write: false,
+            account_locks: Mutex::new(HashMap::new()),
         };
         // Import works (no auth on write)
         ks.import("test", &test_keypair(), SyncMode::ThisDeviceOnly)
@@ -894,6 +932,7 @@ mod tests {
             auth: Box::new(DenyAuth),
             store: Box::new(store::InMemoryStore::new()),
             auth_on_write: true,
+            account_locks: Mutex::new(HashMap::new()),
         };
         // Manually store without going through import (which would also be denied)
         ks.store
@@ -915,6 +954,7 @@ mod tests {
             auth: Box::new(DenyAuth),
             store: Box::new(store::InMemoryStore::new()),
             auth_on_write: false,
+            account_locks: Mutex::new(HashMap::new()),
         };
         ks.import("test", &test_keypair(), SyncMode::ThisDeviceOnly)
             .unwrap();
@@ -1002,6 +1042,66 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_imports_leave_records_consistent() {
+        // audit #25: two threads importing different keypair bytes
+        // under the same account name must not produce a split state
+        // (e.g. keypair from one thread + pubkey from another). The
+        // per-account write lock serializes the two-store sequence so
+        // the final state is one consistent (keypair, pubkey) pair.
+        use std::sync::Arc;
+
+        let ks = Arc::new(Keystore {
+            auth: Box::new(auth::NoAuth),
+            store: Box::new(store::InMemoryStore::new()),
+            auth_on_write: false,
+            account_locks: Mutex::new(HashMap::new()),
+        });
+
+        let kp_a = make_keypair(0xAA);
+        let kp_b = make_keypair(0xBB);
+        let pk_a = pubkey_for(0xAA);
+        let pk_b = pubkey_for(0xBB);
+
+        // Spawn enough rounds that an unlocked implementation would
+        // almost certainly produce at least one interleaved write.
+        for _ in 0..50 {
+            let ks_a = Arc::clone(&ks);
+            let ks_b = Arc::clone(&ks);
+            let kp_a_t = kp_a.clone();
+            let kp_b_t = kp_b.clone();
+            let h1 = std::thread::spawn(move || {
+                let _ = ks_a.import("alice", &kp_a_t, SyncMode::ThisDeviceOnly);
+            });
+            let h2 = std::thread::spawn(move || {
+                let _ = ks_b.import("alice", &kp_b_t, SyncMode::ThisDeviceOnly);
+            });
+            h1.join().unwrap();
+            h2.join().unwrap();
+
+            // Whatever won, the pubkey metadata must match the
+            // keypair that's currently on disk — never the opposite.
+            let keypair = ks
+                .store
+                .load(&keypair_key("alice"))
+                .expect("a winning import must leave a keypair record");
+            let pubkey = ks
+                .store
+                .load(&pubkey_key("alice"))
+                .expect("a winning import must leave a pubkey record");
+            let winning = if keypair.as_slice() == kp_a.as_slice() {
+                &pk_a
+            } else {
+                &pk_b
+            };
+            assert_eq!(
+                pubkey.as_slice(),
+                winning.as_slice(),
+                "keypair and pubkey records desynchronized — audit #25 lock missing"
+            );
+        }
+    }
+
+    #[test]
     fn delete_surfaces_pubkey_record_failure() {
         // audit #12: the second delete (pubkey metadata) used to be
         // discarded via `let _ = ...`. A failure there left the
@@ -1012,6 +1112,7 @@ mod tests {
             auth: Box::new(auth::NoAuth),
             store: Box::new(FailOnNthDeleteStore::new(1)),
             auth_on_write: false,
+            account_locks: Mutex::new(HashMap::new()),
         };
         ks.import("victim", &test_keypair(), SyncMode::ThisDeviceOnly)
             .unwrap();
@@ -1034,6 +1135,7 @@ mod tests {
             auth: Box::new(recorder.clone()),
             store: Box::new(store::InMemoryStore::new()),
             auth_on_write: true,
+            account_locks: Mutex::new(HashMap::new()),
         };
         ks.import("victim", &test_keypair(), SyncMode::ThisDeviceOnly)
             .expect("import should succeed under RecordingAuth");
@@ -1055,6 +1157,7 @@ mod tests {
             auth: Box::new(recorder.clone()),
             store: Box::new(store::InMemoryStore::new()),
             auth_on_write: false,
+            account_locks: Mutex::new(HashMap::new()),
         };
         ks.import("victim", &test_keypair(), SyncMode::ThisDeviceOnly)
             .unwrap();
@@ -1162,6 +1265,7 @@ mod tests {
             auth: Box::new(auth::NoAuth),
             store: Box::new(FailOnSecondStore::new()),
             auth_on_write: false,
+            account_locks: Mutex::new(HashMap::new()),
         };
 
         let result = ks.import("victim", &test_keypair(), SyncMode::ThisDeviceOnly);
