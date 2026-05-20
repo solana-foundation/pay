@@ -216,6 +216,35 @@ const ACTION_VERBS: &[&str] = &[
     "deploy",
     "host",
     "report",
+    "update",
+    "delete",
+    "modify",
+    "remove",
+    "replace",
+    "add",
+    "purchase",
+    "register",
+    "tip",
+    "pay",
+    "schedule",
+    "post",
+    "patch",
+    "put",
+    "merge",
+    "import",
+    "export",
+    "monitor",
+    "trace",
+    "recognize",
+    "annotate",
+    "summarize",
+    "embed",
+    "complete",
+    "browse",
+    "scrape",
+    "publish",
+    "approve",
+    "reject",
 ];
 const MARKETING_WORDS: &[&str] = &["best", "fastest", "cheapest", "unlimited", "free"];
 
@@ -317,10 +346,11 @@ pub fn validate_committed_openapi_document(
         }
     }
 
-    if !is_openapi3_document(doc) {
+    if !is_openapi3_document(doc) && !is_discovery_document(doc) {
         findings.push(CatalogFinding::error(
             "OpenAPI document must be valid OpenAPI 3.0 or 3.1\n  \
-             expected an `openapi` field starting with `3.0.` or `3.1.`"
+             expected an `openapi` field starting with `3.0.` or `3.1.`, \
+             or a Discovery doc with `kind: discovery#restDescription`"
                 .into(),
         ));
     }
@@ -587,6 +617,15 @@ fn is_openapi3_document(doc: &Value) -> bool {
     doc.get("openapi")
         .and_then(Value::as_str)
         .is_some_and(|version| version.starts_with("3.0.") || version.starts_with("3.1."))
+}
+
+/// True for a Google Discovery REST description (`kind: discovery#restDescription`).
+/// These docs ship instead of OpenAPI from Google's APIs and are accepted as a
+/// known spec format throughout the build pipeline.
+fn is_discovery_document(doc: &Value) -> bool {
+    doc.get("kind")
+        .and_then(Value::as_str)
+        .is_some_and(|k| k.starts_with("discovery#"))
 }
 
 fn remote_refs(doc: &Value) -> Vec<String> {
@@ -2127,7 +2166,7 @@ fn validate_operation_documentation_one(
             resolved_schema
                 .get(*k)
                 .and_then(|v| v.as_array())
-                .map_or(false, |a| !a.is_empty())
+                .is_some_and(|a| !a.is_empty())
         });
         if is_object && !has_props && !has_additional && !has_ref && !has_combo {
             findings.push(CatalogFinding::warning(format!(
@@ -2257,11 +2296,20 @@ fn walk_required_props(
             } else {
                 format!("{prefix}.{name}")
             };
-            let prop_resolved = deref_schema(prop, doc);
+            let prop_resolved_once = deref_schema(prop, doc);
+            // Follow a second level of `$ref` in case the first resolved
+            // target is itself a `$ref` alias (`Alias → Base`). Without
+            // this, walking stops at the alias node and the inner
+            // `type == "object"` / `properties` check below silently
+            // skips required fields one level deeper.
+            let prop_resolved = deref_schema(&prop_resolved_once, doc);
             // A property entry may carry its own `description` alongside a
-            // `$ref`; OpenAPI 3.1 allows it. Check the inline prop *and* the
-            // resolved target so we don't flag a documented `$ref`'d field.
-            let documented = schema_provides_signal(prop) || schema_provides_signal(&prop_resolved);
+            // `$ref`; OpenAPI 3.1 allows it. Check the inline prop, the
+            // first-resolved target, *and* the second-resolved target so
+            // we don't flag a documented `$ref`'d field at any depth.
+            let documented = schema_provides_signal(prop)
+                || schema_provides_signal(&prop_resolved_once)
+                || schema_provides_signal(&prop_resolved);
             if required.contains(name) && !documented {
                 undescribed.push(dotted.clone());
             }
@@ -2327,7 +2375,14 @@ fn is_pretty_printed(body: &str) -> bool {
     // A pretty-printed JSON document has at least one newline followed by an
     // indent (1+ space or tab) in its first 1 KiB. Indent width is irrelevant —
     // `jq .` uses 2, `python -m json.tool` uses 4, both pass.
-    let prefix_end = body.len().min(1024);
+    //
+    // Back off until we land on a UTF-8 char boundary: a `description` or
+    // `title` field whose multi-byte glyph (accented letter, emoji) crosses
+    // the 1 KiB mark would otherwise panic on `&body[..prefix_end]`.
+    let mut prefix_end = body.len().min(1024);
+    while prefix_end > 0 && !body.is_char_boundary(prefix_end) {
+        prefix_end -= 1;
+    }
     let prefix = &body[..prefix_end];
     let mut chars = prefix.chars().peekable();
     while let Some(c) = chars.next() {
@@ -3067,6 +3122,26 @@ mod tests {
             r#"{"openapi":"3.1.0","paths":{},"components":{"schemas":{"X":{"type":"string"}}}}"#;
         assert!(is_pretty_printed(pretty));
         assert!(!is_pretty_printed(minified));
+    }
+
+    #[test]
+    fn pretty_print_detector_handles_multi_byte_at_1kib_boundary() {
+        // A multi-byte UTF-8 glyph straddling the 1 KiB prefix end used
+        // to panic on `&body[..1024]`. Pad to byte 1022 then drop a
+        // 4-byte emoji so byte 1024 lands mid-codepoint, and verify
+        // the detector returns without panicking.
+        let mut body = String::with_capacity(1100);
+        body.push_str(r#"{"openapi":"3.1.0","#);
+        while body.len() < 1022 {
+            body.push('x');
+        }
+        body.push('🦀'); // 4 bytes
+        body.push_str(r#","paths":{}}"#);
+        // Truncating mid-glyph would split bytes 1022..1024 off
+        // the 4-byte sequence — exactly the panic the audit
+        // comment flagged.
+        assert!(!body.is_char_boundary(1024));
+        let _ = is_pretty_printed(&body);
     }
 
     #[test]
