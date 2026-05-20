@@ -300,7 +300,11 @@ impl Keystore {
 
     /// Check if a keypair exists for this account.
     pub fn exists(&self, account: &str) -> bool {
-        validate_account_name(account).is_ok() && self.store.exists(&keypair_key(account))
+        if validate_account_name(account).is_err() {
+            return false;
+        }
+        self.try_migrate_legacy(account);
+        self.store.exists(&keypair_key(account))
     }
 
     /// Delete a keypair. `reason` is shown in the OS auth prompt (Touch ID, etc.).
@@ -336,6 +340,7 @@ impl Keystore {
     /// Get the 32-byte public key without requiring auth.
     pub fn pubkey(&self, account: &str) -> Result<Vec<u8>> {
         validate_account_name(account)?;
+        self.try_migrate_legacy(account);
         let pubkey = self.store.load(&pubkey_key(account))?;
         validate_pubkey(&pubkey)?;
         Ok(pubkey.to_vec())
@@ -360,10 +365,48 @@ impl Keystore {
         intent: &AuthIntent,
     ) -> Result<Zeroizing<Vec<u8>>> {
         validate_account_name(account)?;
+        self.try_migrate_legacy(account);
         self.auth.authenticate(intent)?;
         let keypair = self.store.load(&keypair_key(account))?;
         validate_keypair(&keypair)?;
         Ok(keypair)
+    }
+
+    /// Migrate a legacy-format account to the current key format on first access.
+    ///
+    /// Before typed prefixes were introduced, accounts were stored as `{account}`
+    /// (keypair) and `{account}.pubkey` (pubkey metadata). This migrates any such
+    /// entry to `keypair:{account}` / `pubkey:{account}` so users who created
+    /// accounts before the format change don't need to re-import their key.
+    ///
+    /// Migration is a no-op if the new format already exists. Errors are silently
+    /// ignored — the subsequent read will surface a normal "not found" error.
+    fn try_migrate_legacy(&self, account: &str) {
+        if self.store.exists(&keypair_key(account)) {
+            return;
+        }
+        if !self.store.exists(account) {
+            return;
+        }
+        let lock = self.account_lock(account);
+        let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+        // Re-check under lock to prevent TOCTOU races.
+        if self.store.exists(&keypair_key(account)) {
+            return;
+        }
+        let Ok(kp) = self.store.load(account) else {
+            return;
+        };
+        if self.store.store(&keypair_key(account), kp.as_slice()).is_err() {
+            return;
+        }
+        let _ = self.store.delete(account);
+        let old_pk_key = format!("{account}.pubkey");
+        if let Ok(pk) = self.store.load(&old_pk_key) {
+            if self.store.store(&pubkey_key(account), pk.as_slice()).is_ok() {
+                let _ = self.store.delete(&old_pk_key);
+            }
+        }
     }
 
     /// Authenticate without loading anything (for standalone prompts).
@@ -898,6 +941,54 @@ mod tests {
                 "case variant {variant:?} of the reserved suffix must also be rejected",
             );
         }
+    }
+
+    // ── Legacy key format migration ─────────────────────────────────────
+
+    #[test]
+    fn migrate_legacy_format_on_exists() {
+        let ks = Keystore::in_memory();
+        ks.store.store("test", &test_keypair()).unwrap();
+        ks.store.store("test.pubkey", &pubkey_for(0xAA)).unwrap();
+
+        assert!(ks.exists("test"));
+        assert!(ks.store.exists(&keypair_key("test")));
+        assert!(ks.store.exists(&pubkey_key("test")));
+        assert!(!ks.store.exists("test"));
+        assert!(!ks.store.exists("test.pubkey"));
+    }
+
+    #[test]
+    fn migrate_legacy_format_on_pubkey() {
+        let ks = Keystore::in_memory();
+        ks.store.store("test", &test_keypair()).unwrap();
+        ks.store.store("test.pubkey", &pubkey_for(0xAA)).unwrap();
+
+        assert_eq!(ks.pubkey("test").unwrap(), pubkey_for(0xAA));
+    }
+
+    #[test]
+    fn migrate_legacy_format_on_load_keypair() {
+        let ks = Keystore::in_memory();
+        let kp = test_keypair();
+        ks.store.store("test", &kp).unwrap();
+        ks.store.store("test.pubkey", &pubkey_for(0xAA)).unwrap();
+
+        let loaded = ks.load_keypair("test", "test").unwrap();
+        assert_eq!(loaded.as_slice(), kp.as_slice());
+        assert!(!ks.store.exists("test"), "old keypair key must be removed");
+        assert!(!ks.store.exists("test.pubkey"), "old pubkey key must be removed");
+    }
+
+    #[test]
+    fn migrate_legacy_no_op_when_new_format_present() {
+        let ks = Keystore::in_memory();
+        ks.import("test", &test_keypair(), SyncMode::ThisDeviceOnly).unwrap();
+        // Plant a stale legacy entry — migration must not clobber the real one.
+        ks.store.store("test", &make_keypair(0xBB)).unwrap();
+
+        assert!(ks.exists("test"));
+        assert_eq!(ks.pubkey("test").unwrap(), pubkey_for(0xAA));
     }
 
     #[test]
