@@ -2203,16 +2203,16 @@ fn extract_url_placeholders(path: &str) -> Vec<String> {
     let bytes = path.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'{' {
-            if let Some(end) = bytes[i + 1..].iter().position(|&b| b == b'}') {
-                if let Ok(name) = std::str::from_utf8(&bytes[i + 1..i + 1 + end]) {
-                    if !name.is_empty() {
-                        out.push(name.to_string());
-                    }
-                }
-                i += end + 2;
-                continue;
+        if bytes[i] == b'{'
+            && let Some(end) = bytes[i + 1..].iter().position(|&b| b == b'}')
+        {
+            if let Ok(name) = std::str::from_utf8(&bytes[i + 1..i + 1 + end])
+                && !name.is_empty()
+            {
+                out.push(name.to_string());
             }
+            i += end + 2;
+            continue;
         }
         i += 1;
     }
@@ -2220,10 +2220,10 @@ fn extract_url_placeholders(path: &str) -> Vec<String> {
 }
 
 fn deref_schema(schema: &Value, doc: &Value) -> Value {
-    if let Some(r) = schema.get("$ref").and_then(|v| v.as_str()) {
-        if let Some(target) = resolve_ref(r, doc) {
-            return target;
-        }
+    if let Some(r) = schema.get("$ref").and_then(|v| v.as_str())
+        && let Some(target) = resolve_ref(r, doc)
+    {
+        return target;
     }
     schema.clone()
 }
@@ -2260,10 +2260,10 @@ fn schema_provides_signal(schema: &Value) -> bool {
             return true;
         }
     }
-    if let Some(items) = schema.get("items") {
-        if schema_provides_signal(items) {
-            return true;
-        }
+    if let Some(items) = schema.get("items")
+        && schema_provides_signal(items)
+    {
+        return true;
     }
     false
 }
@@ -2316,10 +2316,10 @@ fn walk_required_props(
             let t = prop_resolved.get("type").and_then(|v| v.as_str());
             if t == Some("object") || prop_resolved.get("properties").is_some() {
                 walk_required_props(doc, &prop_resolved, &dotted, depth + 1, undescribed);
-            } else if t == Some("array") {
-                if let Some(items) = prop_resolved.get("items") {
-                    walk_required_props(doc, items, &format!("{dotted}[]"), depth + 1, undescribed);
-                }
+            } else if t == Some("array")
+                && let Some(items) = prop_resolved.get("items")
+            {
+                walk_required_props(doc, items, &format!("{dotted}[]"), depth + 1, undescribed);
             }
         }
     }
@@ -2386,12 +2386,11 @@ fn is_pretty_printed(body: &str) -> bool {
     let prefix = &body[..prefix_end];
     let mut chars = prefix.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == '\n' {
-            if let Some(&next) = chars.peek() {
-                if next == ' ' || next == '\t' {
-                    return true;
-                }
-            }
+        if c == '\n'
+            && let Some(&next) = chars.peek()
+            && (next == ' ' || next == '\t')
+        {
+            return true;
         }
     }
     false
