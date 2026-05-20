@@ -78,7 +78,7 @@ Each finding below is one of:
 | 31  | low           | Linux Secret Service relock failure can mask a completed mutation             | resolved |
 | 50  | informational | The `lock()`s on linux too aggressive                                         | resolved |
 | 30  | low           | Linux keystore calls can panic inside Tokio runtime contexts                  | resolved |
-| 45  | informational | `polkit.message` could be used to display custom messages                     | resolved |
+| 45  | informational | `polkit.message` could be used to display custom messages                     | deferred |
 | 64  | informational | Errors of the `COM` initialization are not caught                             | resolved |
 | 68  | low           | Windows: Immutable pointers casted to mutable pointers                        | resolved |
 | 69  | low           | In windows, the function `cred_read()` isn't sufficiently hardened            | resolved |
@@ -851,31 +851,30 @@ The per-thread `OnceLock`-style cell semantics are preserved: only
 the first call does the real work; subsequent calls return Ok(())
 without retrying the HRESULT.
 
-### #45 — `polkit.message` could be used to display custom messages (informational) — resolved
+### #45 — `polkit.message` could be used to display custom messages (informational) — deferred
 
 The auditor pointed out that polkit's `details` map accepts a
 well-known `polkit.message` key that GNOME, KDE, and MATE polkit
-agents will display in the prompt. Pay was passing an empty
-`details` map, so the prompt fell back to the static
-`<description>` from the policy file. The policy file's text can
-only describe the *action class* (e.g. "Pay session approval"),
-not the per-call intent details Pay's typed `AuthIntent` already
-carries.
+agents will display in the prompt. The idea is sound, but polkit
+enforces a **trusted-caller restriction**: `CheckAuthorization` rejects
+any non-empty `details` map from unprivileged processes (anyone other
+than uid 0 or the registered action owner), returning:
 
-**Fix** (`src/linux/mod.rs`):
+```
+org.freedesktop.PolicyKit1.Error.NotAuthorized: Only trusted callers
+(e.g. uid 0 or an action owner) can use CheckAuthorization() and pass
+details
+```
 
-- `Polkit::authenticate` forwards `intent.message().to_owned()`
-  into a new `polkit_authenticate_with_message` helper.
-- That helper inserts `polkit.message → intent.message()` into the
-  `details` map. Empty messages are skipped so agents fall back to
-  the policy file's per-action `<description>`.
-- The original `polkit_authenticate(action, interactive)` is kept
-  as a thin wrapper for callers that don't have an intent in scope
-  (the non-interactive probe in `Polkit::is_available`).
+An initial implementation that inserted `polkit.message` into `details`
+broke `pay account export` (and every other polkit-gated command) for
+all non-root users. The change has been reverted; `details` remains an
+empty map.
 
-Cross-agent behavior: polkit agents that ignore the key still
-display the policy-file text, so the change is monotonic — better
-when supported, no worse when not.
+**Status:** deferred until there is a supported path for unprivileged
+callers to supply agent-display text (e.g. a polkit API version that
+lifts this restriction, or embedding the message in the policy file's
+`<message>` element via a template mechanism).
 
 ### #30 — Linux keystore calls can panic inside Tokio runtime contexts (low) — resolved
 

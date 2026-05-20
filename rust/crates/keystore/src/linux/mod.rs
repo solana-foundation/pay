@@ -34,14 +34,7 @@ impl AuthGate for Polkit {
         // so the operator can fix the policy file or notice that a
         // previously-typed action was demoted to the legacy bucket.
         let action = polkit_action_for_intent(intent);
-        // Audit #45: pass the typed `intent.message()` through the
-        // PolicyKit `details` map under the well-known
-        // `polkit.message` key so polkit agents (GNOME, KDE, MATE)
-        // display Pay-supplied prompt text alongside the per-action
-        // description from the policy file. Falls back gracefully on
-        // agents that ignore the key.
-        let message = intent.message().to_owned();
-        run(async move { polkit_authenticate_with_message(action, true, &message).await })
+        run(async move { polkit_authenticate(action, true).await })
     }
 
     fn is_available(&self) -> bool {
@@ -65,14 +58,6 @@ impl AuthGate for Polkit {
 }
 
 async fn polkit_authenticate(action: &str, interactive: bool) -> Result<()> {
-    polkit_authenticate_with_message(action, interactive, "").await
-}
-
-async fn polkit_authenticate_with_message(
-    action: &str,
-    interactive: bool,
-    message: &str,
-) -> Result<()> {
     use zbus::zvariant::{OwnedValue, Value};
 
     let conn = zbus::Connection::system()
@@ -91,14 +76,10 @@ async fn polkit_authenticate_with_message(
     ]
     .into();
 
-    // Audit #45: populate `polkit.message` so polkit agents
-    // (GNOME/KDE/MATE) can render Pay's typed intent text in the
-    // prompt. Empty messages are skipped so the agent falls back to
-    // the policy file's per-action <description>.
-    let mut details: HashMap<String, String> = HashMap::new();
-    if !message.is_empty() {
-        details.insert("polkit.message".to_owned(), message.to_owned());
-    }
+    // Polkit restricts non-empty `details` to trusted callers (uid 0
+    // or the action owner). Passing any key here as an unprivileged
+    // process — including `polkit.message` — triggers NotAuthorized.
+    let details: HashMap<String, String> = HashMap::new();
     // PolicyKit `CheckAuthorizationFlags`: bit 0 = AllowUserInteraction.
     // Non-interactive probes (`is_available`) clear it so the call
     // returns immediately with an authorized/challenge bool pair
