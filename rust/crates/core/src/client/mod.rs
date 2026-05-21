@@ -6,4 +6,5 @@ pub mod runner;
 pub mod sandbox;
 pub mod send;
 pub mod session;
+pub mod sign;
 pub mod x402;

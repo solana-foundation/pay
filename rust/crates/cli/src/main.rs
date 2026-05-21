@@ -216,6 +216,7 @@ fn main() {
                 | Command::Catalog { .. }
                 | Command::Install(_)
                 | Command::Send(_)
+                | Command::Sign(_)
                 | Command::Claude(_)
                 | Command::Codex(_)
                 | Command::Curl(_)
@@ -496,6 +497,24 @@ mod tests {
             }
             _ => panic!("expected send command"),
         }
+    }
+
+    #[test]
+    fn sign_command_parses_base64_transaction_arg() {
+        let opts = Opts::try_parse_from(["pay", "sign", "dHg="]).unwrap();
+
+        match opts.command {
+            Some(Command::Sign(cmd)) => assert_eq!(cmd.transaction, "dHg="),
+            _ => panic!("expected sign command"),
+        }
+    }
+
+    #[test]
+    fn command_catalog_includes_sign_command() {
+        let catalog = commands::help::command_catalog(&Opts::command());
+        let commands = catalog["flat_commands"].as_array().unwrap();
+
+        assert!(commands.iter().any(|command| command == "pay sign"));
     }
 
     #[test]

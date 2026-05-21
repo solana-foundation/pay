@@ -10,7 +10,7 @@ pub const SUPPORTED_PASS_THROUGH_COMMANDS: &[&str] =
     &["curl", "wget", "http", "claude", "codex", "whoami"];
 pub const DEVELOPER_COMMANDS: &[&str] = &["server", "catalog"];
 pub const AGENT_COMMANDS: &[&str] = &["mcp", "skills"];
-pub const ACCOUNT_MANAGEMENT_COMMANDS: &[&str] = &["topup", "account", "setup", "send"];
+pub const ACCOUNT_MANAGEMENT_COMMANDS: &[&str] = &["topup", "account", "setup", "send", "sign"];
 pub const OTHER_COMMANDS: &[&str] = &["fetch", "install"];
 
 pub const ROOT_COMMAND_SUMMARY: &str = "\
@@ -30,4 +30,5 @@ Account management:
   \x1b[1maccount\x1b[0m: Manage accounts (new, import, list, default, remove, export)
   \x1b[1msetup\x1b[0m:   Generate a keypair, store it, and fund your account
   \x1b[1msend\x1b[0m:    Send stablecoins to a recipient address
+  \x1b[1msign\x1b[0m:    Sign and submit a base64-encoded Solana transaction
 ";

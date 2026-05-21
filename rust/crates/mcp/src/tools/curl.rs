@@ -4,6 +4,9 @@ use rmcp::schemars;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static PAY_CURL_TEMPFILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct Params {
@@ -159,19 +162,39 @@ fn is_binary_content_type(mime: &str) -> bool {
 
 fn write_body_to_tempfile(body: &[u8], mime: &str) -> std::io::Result<String> {
     use std::io::Write;
+
     let extension = extension_for_mime(mime);
-    let mut path = std::env::temp_dir();
-    let name = format!(
-        "pay-curl-{}{extension}",
-        std::time::SystemTime::now()
+    let temp_dir = std::env::temp_dir();
+
+    for _ in 0..16 {
+        let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    );
-    path.push(name);
-    let mut file = std::fs::File::create(&path)?;
-    file.write_all(body)?;
-    Ok(path.to_string_lossy().into_owned())
+            .unwrap_or(0);
+        let counter = PAY_CURL_TEMPFILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = temp_dir.join(format!(
+            "pay-curl-{}-{timestamp}-{counter}{extension}",
+            std::process::id()
+        ));
+
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                file.write_all(body)?;
+                return Ok(path.to_string_lossy().into_owned());
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "failed to allocate a unique pay curl tempfile",
+    ))
 }
 
 /// Pick a sensible filename extension for a MIME type using `mime_guess`'s

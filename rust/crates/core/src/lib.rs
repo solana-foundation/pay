@@ -22,6 +22,7 @@ pub use client::runner::{
 pub use client::sandbox;
 pub use client::send;
 pub use client::session;
+pub use client::sign;
 pub use client::x402;
 
 // Server modules (gateway proxy)

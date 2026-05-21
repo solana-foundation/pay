@@ -9,6 +9,7 @@ pub mod http;
 pub mod send;
 pub mod server;
 pub mod setup;
+pub mod sign;
 pub mod skills;
 pub mod topup;
 pub mod wget;
@@ -54,6 +55,8 @@ pub enum Command {
     /// Send stablecoins to a recipient address.
     #[command(alias = "push")]
     Send(send::SendCommand),
+    /// Sign and submit a base64-encoded Solana transaction.
+    Sign(sign::SignCommand),
     /// Generate a keypair, store it, and fund your account.
     Setup(setup::SetupCommand),
     /// Import funds from Venmo, PayPal, or a mobile wallet.
@@ -118,6 +121,7 @@ impl Command {
             | Command::Claude(_)
             | Command::Codex(_)
             | Command::Send(_)
+            | Command::Sign(_)
             | Command::Topup(_) => true,
             Command::Setup(_)
             | Command::Account { .. }
@@ -146,6 +150,7 @@ impl Command {
             | Command::Catalog { .. }
             | Command::Install(_)
             | Command::Send(_)
+            | Command::Sign(_)
             | Command::Setup(_)
             | Command::Topup(_)
             | Command::Server { .. } => ToolKind::Mcp,
@@ -191,6 +196,7 @@ impl Command {
             Command::Send(cmd) => {
                 return cmd.run(network_override, account_override, verbose);
             }
+            Command::Sign(cmd) => return cmd.run(network_override, account_override),
             Command::Setup(cmd) => return cmd.run(),
             Command::Topup(cmd) => return cmd.run(),
             Command::Server { command } => return command.run(keypair_override, sandbox),

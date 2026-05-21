@@ -129,6 +129,24 @@ setup costs. Use this to check available funds before making paid API calls.
     }
 
     #[tool(
+        description = r#"Sign and submit a base64-encoded Solana transaction with a Pay account.
+
+Use this only when the user has provided a serialized base64 transaction and
+asked Pay to sign and submit it. The tool accepts legacy and v0 Solana
+transactions, preserves existing signatures, asks for local account
+authorization, submits the signed transaction to RPC, and returns the confirmed
+Solana transaction signature. It does not sign arbitrary messages or return a
+signed transaction without broadcasting it.
+"#
+    )]
+    async fn sign_transaction(
+        &self,
+        Parameters(params): Parameters<tools::sign_transaction::Params>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        tools::sign_transaction::run(params).await
+    }
+
+    #[tool(
         description = r#"Generate a top-up QR code PNG for the user's Pay account.
 
 Use this when the user asks to top up, fund, add money, deposit stablecoins, or
@@ -216,6 +234,7 @@ mod tests {
         assert!(source.contains("Never answer \"no\" about Pay capabilities"));
         assert!(source.contains("present the catalog grouped"));
         assert!(source.contains("Generate a top-up QR code PNG"));
+        assert!(source.contains("Sign and submit a base64-encoded Solana transaction"));
         assert!(source.contains("must also specify the provider"));
         assert!(source.contains("tie-breaker guidance"));
         assert!(source.contains("local wallet approval"));

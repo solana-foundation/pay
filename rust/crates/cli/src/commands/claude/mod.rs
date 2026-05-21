@@ -2,7 +2,7 @@ use std::process::{Command, Stdio};
 
 use clap::Args;
 
-const ALLOWED_TOOLS: &str = "mcp__pay__curl,mcp__pay__search_catalog,mcp__pay__list_catalog,mcp__pay__get_catalog_entry,mcp__pay__get_balance,mcp__pay__topup,mcp__pay__create_skill";
+const ALLOWED_TOOLS: &str = "mcp__pay__curl,mcp__pay__search_catalog,mcp__pay__list_catalog,mcp__pay__get_catalog_entry,mcp__pay__get_balance,mcp__pay__sign_transaction,mcp__pay__topup,mcp__pay__create_skill";
 
 /// Run Claude Code with 402 payment support.
 ///
@@ -149,6 +149,7 @@ mod tests {
             "mcp__pay__list_catalog",
             "mcp__pay__get_catalog_entry",
             "mcp__pay__get_balance",
+            "mcp__pay__sign_transaction",
             "mcp__pay__topup",
             "mcp__pay__create_skill",
         ] {
