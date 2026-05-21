@@ -12,6 +12,8 @@ Never answer "Can pay do X" from memory; check `list_catalog`.
 - Known provider FQN: call `get_catalog_entry({fqn})`.
 - Known Pay gateway URL, or any URL that returns HTTP 402: call `curl`.
 - Balance or funds question: call `get_balance()`.
+- User provides a base64 Solana transaction and asks Pay to sign and submit it:
+  call `sign_transaction({transaction})`.
 - Top-up, deposit, add funds, or QR code for funding Pay: call `topup`; require
   the user to choose `mobile_wallet` or `onramp`, and require an onramp provider
   when using `onramp`.
@@ -57,5 +59,7 @@ ad-hoc page scraping.
   custodial credentials.
 - Wallet keys stay in the operating system's secure credential store.
 - Real payments require local user authorization.
+- `sign_transaction` broadcasts the provided Solana transaction after local
+  account authorization; use it only when the user asked to sign and submit it.
 - Server-side fee payers handle network fees; the Pay account needs supported
   stablecoins such as USDC, USDT, PYUSD, CASH, or USDG.

@@ -4,6 +4,7 @@ pub mod get_balance;
 pub mod get_catalog_entry;
 pub mod list_catalog;
 pub mod search_catalog;
+pub mod sign_transaction;
 pub mod topup;
 
 pub(crate) fn tool_error(message: impl Into<String>) -> rmcp::model::CallToolResult {

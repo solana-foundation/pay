@@ -11,6 +11,7 @@ pub(crate) const PAY_MCP_ENABLED_TOOLS: &[&str] = &[
     "list_catalog",
     "get_catalog_entry",
     "get_balance",
+    "sign_transaction",
     "topup",
     "create_skill",
 ];
@@ -237,7 +238,7 @@ mod tests {
 
         assert!(args.contains(&r#"mcp_servers.pay.command="C:\\Users\\me\\pay.exe""#.to_string()));
         assert!(args.contains(
-            &r#"mcp_servers.pay.enabled_tools=["curl","search_catalog","list_catalog","get_catalog_entry","get_balance","topup","create_skill"]"#.to_string()
+            &r#"mcp_servers.pay.enabled_tools=["curl","search_catalog","list_catalog","get_catalog_entry","get_balance","sign_transaction","topup","create_skill"]"#.to_string()
         ));
         assert!(
             args.contains(&r#"mcp_servers.pay.env={PAY_ACTIVE_ACCOUNT="default"}"#.to_string())
