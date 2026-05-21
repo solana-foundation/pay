@@ -24,16 +24,20 @@ pub fn sign_and_submit_base64_transaction(
     let rpc_url = std::env::var("PAY_RPC_URL")
         .unwrap_or_else(|_| solana_mpp::protocol::solana::default_rpc_url(network).to_string());
     let submitter = RpcTransactionSubmitter { rpc_url };
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| Error::Config(format!("Failed to create signing runtime: {e}")))?;
+    let rt = signing_runtime()?;
 
     rt.block_on(sign_and_submit_with_submitter(
         transaction_base64,
         &signer,
         &submitter,
     ))
+}
+
+fn signing_runtime() -> Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| Error::Config(format!("Failed to create signing runtime: {e}")))
 }
 
 trait TransactionSubmitter {
@@ -300,6 +304,18 @@ mod tests {
 
         assert!(error.contains("fake RPC failure"));
         assert_eq!(submitter.submitted().len(), 1);
+    }
+
+    #[test]
+    fn signing_runtime_supports_blocking_rpc_client() {
+        let rt = signing_runtime().unwrap();
+
+        rt.block_on(async {
+            assert_eq!(
+                tokio::runtime::Handle::current().runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::MultiThread
+            );
+        });
     }
 
     fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
