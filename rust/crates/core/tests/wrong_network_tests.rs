@@ -8,7 +8,7 @@
 //! the explicit "expected X, received Y" context.
 //!
 //! This is the cross-repo integration test for the change in
-//! `solana-mpp-sdk/rust/src/server/mod.rs::check_network_blockhash` —
+//! `pay-kit/rust/crates/mpp/src/server/mod.rs::check_network_blockhash` —
 //! exercising it through pay-core's HTTP middleware (not just the SDK
 //! function in isolation, which is unit-tested in the SDK itself).
 //!

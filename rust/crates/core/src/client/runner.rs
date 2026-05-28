@@ -395,11 +395,56 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
+/// Caller's preference for which payment protocol to use when a 402
+/// advertises more than one. `Auto` mirrors the historical defaults
+/// (MPP first for one-shot Solana charges, fall back to x402). The
+/// `Only*` variants come from the user passing `--mpp` or `--x402` on
+/// the CLI (or any wrapper that sets `PAY_PROTOCOL_ENFORCED`) and turn
+/// "fall back" into "error" so the operator gets explicit feedback
+/// instead of a silent switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolPreference {
+    Auto,
+    OnlyMpp,
+    OnlyX402,
+}
+
+impl ProtocolPreference {
+    /// Read the preference from `PAY_PROTOCOL_ENFORCED`. The CLI sets
+    /// this from `--mpp` / `--x402`; the MCP launchers (`pay claude`,
+    /// `pay codex`) forward it so nested invocations stay consistent.
+    pub fn from_env() -> Self {
+        match std::env::var("PAY_PROTOCOL_ENFORCED").ok().as_deref() {
+            Some("mpp") => Self::OnlyMpp,
+            Some("x402") => Self::OnlyX402,
+            _ => Self::Auto,
+        }
+    }
+}
+
 /// Given 402 headers (and optional body), determine the payment protocol.
+///
+/// Reads the user's protocol preference from the environment. Internal
+/// callers in tests should prefer [`classify_402_with_preference`] so
+/// they don't have to mutate process-global state.
 pub(crate) fn classify_402(
     headers: &[(String, String)],
     body: Option<&str>,
     resource_url: &str,
+) -> RunOutcome {
+    classify_402_with_preference(headers, body, resource_url, ProtocolPreference::from_env())
+}
+
+/// Variant of [`classify_402`] that takes an explicit
+/// [`ProtocolPreference`] rather than reading the env var. The `--mpp`
+/// and `--x402` CLI flags map to `OnlyMpp` / `OnlyX402`; if the server
+/// only offers the other protocol the function returns
+/// `RunOutcome::PaymentRejected` rather than silently switching.
+pub(crate) fn classify_402_with_preference(
+    headers: &[(String, String)],
+    body: Option<&str>,
+    resource_url: &str,
+    preference: ProtocolPreference,
 ) -> RunOutcome {
     // A `verification_failed` body wins over a fresh challenge: it means the
     // server saw our payment header and rejected it. We must surface the
@@ -458,13 +503,16 @@ pub(crate) fn classify_402(
         // Non-Solana session — fall through to x402 or error.
     }
 
-    // Prefer MPP for one-shot Solana payments (native protocol).
+    // Default policy: prefer MPP for one-shot Solana payments (native
+    // protocol), fall back to x402. `--mpp` keeps MPP and refuses the
+    // x402 fallback; `--x402` skips the MPP selection entirely so we
+    // land on x402 even when MPP is also offered.
     let mut charge_challenges: Vec<mpp::Challenge> = mpp_challenges
         .iter()
         .filter(|challenge| solana_mpp::client::is_solana_charge_challenge(challenge))
         .cloned()
         .collect();
-    if !charge_challenges.is_empty() {
+    if !charge_challenges.is_empty() && preference != ProtocolPreference::OnlyX402 {
         let challenge = charge_challenges.remove(0);
         info!(resource = resource_url, "Detected MPP challenge (Solana)");
         return RunOutcome::MppChallenge {
@@ -474,21 +522,49 @@ pub(crate) fn classify_402(
         };
     }
 
-    // Fall back to x402 if it has a Solana path.
-    if let Some(challenge) = x402_challenge {
-        info!(resource = resource_url, "Detected x402 challenge (Solana)");
-        return RunOutcome::X402Challenge {
-            challenge: Box::new(challenge),
-            resource_url: resource_url.to_string(),
-        };
+    // Fall back to x402 if it has a Solana path. Skip when the user
+    // pinned MPP via `--mpp`.
+    if preference != ProtocolPreference::OnlyMpp {
+        if let Some(challenge) = x402_challenge {
+            info!(resource = resource_url, "Detected x402 challenge (Solana)");
+            return RunOutcome::X402Challenge {
+                challenge: Box::new(challenge),
+                resource_url: resource_url.to_string(),
+            };
+        }
+
+        if let Some(challenge) = x402_siwx_challenge {
+            info!(resource = resource_url, "Detected x402 sign-in challenge");
+            return RunOutcome::X402SignInChallenge {
+                challenge: Box::new(challenge),
+                resource_url: resource_url.to_string(),
+            };
+        }
     }
 
-    if let Some(challenge) = x402_siwx_challenge {
-        info!(resource = resource_url, "Detected x402 sign-in challenge");
-        return RunOutcome::X402SignInChallenge {
-            challenge: Box::new(challenge),
-            resource_url: resource_url.to_string(),
-        };
+    // The user forced a protocol via `--mpp` / `--x402` but the server
+    // only offers the other one. Surface that explicitly instead of
+    // letting the request loop on an UnknownPaymentRequired.
+    match preference {
+        ProtocolPreference::OnlyMpp if x402_challenge.is_some() || x402_siwx_challenge.is_some() => {
+            return RunOutcome::PaymentRejected {
+                reason: "Server only offers an x402 challenge, but --mpp was requested. \
+                         Drop --mpp to settle via x402, or pick a server that advertises MPP."
+                    .to_string(),
+                retryable: false,
+                resource_url: resource_url.to_string(),
+            };
+        }
+        ProtocolPreference::OnlyX402 if !charge_challenges.is_empty() => {
+            return RunOutcome::PaymentRejected {
+                reason: "Server only offers an MPP challenge, but --x402 was requested. \
+                         Drop --x402 to settle via MPP, or pick a server that advertises x402."
+                    .to_string(),
+                retryable: false,
+                resource_url: resource_url.to_string(),
+            };
+        }
+        _ => {}
     }
 
     // Neither protocol supports Solana — tell the user clearly.
@@ -992,6 +1068,141 @@ HTTP request sent, awaiting response...
 
         let outcome = classify_402(&headers, None, "https://example.com/resource");
         assert!(matches!(outcome, RunOutcome::X402Challenge { .. }));
+    }
+
+    /// Build a 402 with BOTH an MPP charge challenge AND an x402 header,
+    /// so `classify_402_with_preference` has a real choice between the
+    /// two protocols. Shared by the `--mpp` / `--x402` preference tests.
+    fn dual_protocol_402() -> Vec<(String, String)> {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        let mpp_request = serde_json::json!({
+            "amount": "1000000",
+            "currency": "USDC",
+            "recipient": "So11111111111111111111111111111111111111112",
+            "methodDetails": { "network": "devnet" }
+        });
+        let mpp_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&mpp_request).unwrap());
+
+        let x402_requirements = serde_json::json!({
+            "network": "solana",
+            "cluster": "devnet",
+            "recipient": "So11111111111111111111111111111111111111112",
+            "amount": "1000000",
+            "currency": "USDC",
+            "resource": "https://example.com/resource"
+        });
+
+        vec![
+            (
+                "www-authenticate".to_string(),
+                format!(
+                    "Payment id=\"dual\", realm=\"test\", method=\"solana\", intent=\"charge\", request=\"{mpp_b64}\""
+                ),
+            ),
+            (
+                solana_x402::X402_V1_PAYMENT_REQUIRED_HEADER.to_string(),
+                x402_requirements.to_string(),
+            ),
+        ]
+    }
+
+    #[test]
+    fn preference_auto_prefers_mpp_when_both_offered() {
+        let outcome = classify_402_with_preference(
+            &dual_protocol_402(),
+            None,
+            "https://example.com/resource",
+            ProtocolPreference::Auto,
+        );
+        assert!(matches!(outcome, RunOutcome::MppChallenge { .. }));
+    }
+
+    #[test]
+    fn preference_only_x402_picks_x402_when_both_offered() {
+        let outcome = classify_402_with_preference(
+            &dual_protocol_402(),
+            None,
+            "https://example.com/resource",
+            ProtocolPreference::OnlyX402,
+        );
+        assert!(matches!(outcome, RunOutcome::X402Challenge { .. }));
+    }
+
+    #[test]
+    fn preference_only_mpp_keeps_mpp_when_both_offered() {
+        let outcome = classify_402_with_preference(
+            &dual_protocol_402(),
+            None,
+            "https://example.com/resource",
+            ProtocolPreference::OnlyMpp,
+        );
+        assert!(matches!(outcome, RunOutcome::MppChallenge { .. }));
+    }
+
+    #[test]
+    fn preference_only_x402_rejects_when_server_only_offers_mpp() {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        let request_json = serde_json::json!({
+            "amount": "1000000",
+            "currency": "USDC",
+            "recipient": "So11111111111111111111111111111111111111112",
+            "methodDetails": { "network": "devnet" }
+        });
+        let b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&request_json).unwrap());
+        let headers = vec![(
+            "www-authenticate".to_string(),
+            format!(
+                "Payment id=\"mpp-only\", realm=\"test\", method=\"solana\", intent=\"charge\", request=\"{b64}\""
+            ),
+        )];
+
+        let outcome = classify_402_with_preference(
+            &headers,
+            None,
+            "https://example.com/resource",
+            ProtocolPreference::OnlyX402,
+        );
+        match outcome {
+            RunOutcome::PaymentRejected { reason, .. } => {
+                assert!(reason.contains("--x402"), "reason was {reason:?}");
+                assert!(reason.contains("MPP"), "reason was {reason:?}");
+            }
+            other => panic!("expected PaymentRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn preference_only_mpp_rejects_when_server_only_offers_x402() {
+        let requirements = serde_json::json!({
+            "network": "solana",
+            "cluster": "devnet",
+            "recipient": "So11111111111111111111111111111111111111112",
+            "amount": "1000000",
+            "currency": "USDC",
+            "resource": "https://example.com/resource"
+        });
+        let headers = vec![(
+            solana_x402::X402_V1_PAYMENT_REQUIRED_HEADER.to_string(),
+            requirements.to_string(),
+        )];
+
+        let outcome = classify_402_with_preference(
+            &headers,
+            None,
+            "https://example.com/resource",
+            ProtocolPreference::OnlyMpp,
+        );
+        match outcome {
+            RunOutcome::PaymentRejected { reason, .. } => {
+                assert!(reason.contains("--mpp"), "reason was {reason:?}");
+                assert!(reason.contains("x402"), "reason was {reason:?}");
+            }
+            other => panic!("expected PaymentRejected, got {other:?}"),
+        }
     }
 
     #[test]

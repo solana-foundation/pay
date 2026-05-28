@@ -88,6 +88,9 @@ fn build_codex_args(
     if let Ok(network) = std::env::var("PAY_NETWORK_ENFORCED") {
         env_parts.push(format!("PAY_NETWORK_ENFORCED={}", toml_string(&network)));
     }
+    if let Ok(protocol) = std::env::var("PAY_PROTOCOL_ENFORCED") {
+        env_parts.push(format!("PAY_PROTOCOL_ENFORCED={}", toml_string(&protocol)));
+    }
     if let Ok(proxy) = std::env::var("PAY_DEBUGGER_PROXY") {
         env_parts.push(format!("PAY_DEBUGGER_PROXY={}", toml_string(&proxy)));
     }

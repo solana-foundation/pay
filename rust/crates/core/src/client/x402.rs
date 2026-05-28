@@ -102,12 +102,28 @@ pub fn build_payment(
         &prompt_context.operator,
     );
 
-    let cluster = normalize_network(
+    let cluster_raw = normalize_network(
         requirements
             .cluster
             .as_deref()
             .unwrap_or(requirements.network.as_str()),
     );
+
+    // Surfpool embeds a base58 sentinel prefix in every blockhash it
+    // issues (`SURFNETxSAFEHASH…`). When the server's challenge carries
+    // such a blockhash, the server is on a Surfpool / surfnet fork even
+    // if the wire CAIP-2 says devnet — the x402 spec has no localnet
+    // sentinel of its own, so the blockhash itself self-identifies the
+    // ledger. Mirrors the MPP client's auto-sandbox detection in
+    // `mpp.rs::resolve_rpc_url` / `should_auto_fund_surfpool`.
+    let embedded_blockhash = requirements.recent_blockhash.as_deref();
+    let surfpool_detected = embedded_blockhash
+        .is_some_and(|h| h.starts_with(crate::client::mpp::SURFPOOL_BLOCKHASH_PREFIX));
+    let cluster = if surfpool_detected {
+        "localnet".to_string()
+    } else {
+        cluster_raw
+    };
 
     // x402 may carry a recent blockhash, but the current pay-side guard only
     // compares the selected account network against the challenge network.
@@ -126,8 +142,19 @@ pub fn build_payment(
         &intent,
     )?;
 
-    let rpc_url =
-        std::env::var("PAY_RPC_URL").unwrap_or_else(|_| default_rpc_url(&network).to_string());
+    let rpc_url = std::env::var("PAY_RPC_URL").unwrap_or_else(|_| {
+        if surfpool_detected {
+            // `default_rpc_url("localnet")` is `http://localhost:8899`
+            // (the in-process test-validator default). For an
+            // auto-detected Surfpool server, route to the hosted
+            // sandbox at `https://402.surfnet.dev:8899` instead so
+            // signing + funding land on the same ledger the server
+            // settles against.
+            crate::config::SANDBOX_RPC_URL.to_string()
+        } else {
+            default_rpc_url(&network).to_string()
+        }
+    });
     let rpc = RpcClient::new(rpc_url.clone());
 
     info!(
@@ -987,6 +1014,46 @@ mod tests {
             store.save_count(),
             0,
             "named-account miss must not lazily create"
+        );
+    }
+
+    #[test]
+    fn surfpool_blockhash_promotes_cluster_to_localnet() {
+        // Server advertises devnet CAIP-2 (no localnet sentinel exists
+        // in the x402 spec) but the recentBlockhash carries the
+        // Surfpool prefix. The client should treat this as
+        // localnet/sandbox — same auto-detection the MPP client does.
+        let mut requirements = sample_requirements();
+        requirements.network = solana_x402::exact::SOLANA_DEVNET.to_string();
+        requirements.cluster = Some("devnet".to_string());
+        requirements.recent_blockhash = Some(format!(
+            "{}xxxxxxxxxxxxxxxxxxx1892bcad",
+            crate::client::mpp::SURFPOOL_BLOCKHASH_PREFIX
+        ));
+
+        let challenge = Challenge {
+            x402_version: X402_VERSION_V2,
+            requirements,
+            siwx: None,
+        };
+
+        // We can't exercise the full build path here (it needs a live
+        // RPC for funding + signing) — but the network-intent check
+        // fires before any I/O. Without the surfpool promotion the
+        // check would compare a hypothetical `--mainnet` override
+        // against `devnet`; with the promotion in place it compares
+        // against `localnet` instead.
+        let store = MemoryAccountsStore::new();
+        let err = build_payment(&challenge, &store, Some("mainnet"), None, None).unwrap_err();
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("localnet"),
+            "expected promoted cluster `localnet` in error, got: {msg}"
+        );
+        assert!(
+            !msg.contains("devnet"),
+            "cluster should be promoted away from devnet, got: {msg}"
         );
     }
 }

@@ -5860,9 +5860,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "payment_channels_client"
+name = "payment-channels"
 version = "0.1.0"
-source = "git+https://github.com/solana-foundation/mpp-sdk?branch=main#eeec054cef84a7acc2c346aadf890b17ef1a6203"
+source = "git+https://github.com/solana-foundation/pay-kit?branch=main#e6b29f1f0364ffab4a3c16ceeb83a73eb35d8c2e"
 dependencies = [
  "borsh 1.6.1",
  "num-derive",
@@ -9242,7 +9242,7 @@ dependencies = [
 [[package]]
 name = "solana-mpp"
 version = "0.6.0"
-source = "git+https://github.com/solana-foundation/mpp-sdk?branch=main#eeec054cef84a7acc2c346aadf890b17ef1a6203"
+source = "git+https://github.com/solana-foundation/pay-kit?branch=main#e6b29f1f0364ffab4a3c16ceeb83a73eb35d8c2e"
 dependencies = [
  "base64 0.22.1",
  "bincode",
@@ -9251,7 +9251,7 @@ dependencies = [
  "bs58",
  "ed25519-dalek 2.2.0",
  "hmac 0.12.1",
- "payment_channels_client",
+ "payment-channels",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -9269,6 +9269,7 @@ dependencies = [
  "solana-system-interface 2.0.0",
  "solana-transaction",
  "solana-transaction-status",
+ "solana-zero-copy",
  "thiserror 2.0.18",
  "time",
  "tokio",
@@ -11316,7 +11317,7 @@ dependencies = [
 [[package]]
 name = "solana-x402"
 version = "0.1.0"
-source = "git+https://github.com/solana-foundation/x402-sdk?branch=main#006db2c6b7dbdd898edd60c3fd943ca9ee30fd85"
+source = "git+https://github.com/solana-foundation/pay-kit?branch=main#e6b29f1f0364ffab4a3c16ceeb83a73eb35d8c2e"
 dependencies = [
  "base64 0.22.1",
  "bincode",

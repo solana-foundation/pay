@@ -103,13 +103,13 @@ qrcode = { version = "0.14", default-features = false }
 mime_guess = { version = "2.0", default-features = false, features = ["rev-mappings"] }
 
 # Solana MPP (includes keypair loading + charge building)
-solana-mpp = { git = "https://github.com/solana-foundation/mpp-sdk", branch = "main", default-features = false, features = [
+solana-mpp = { git = "https://github.com/solana-foundation/pay-kit", branch = "main", default-features = false, features = [
     "client",
     "server",
 ] }
 
-# Solana x402
-solana-x402 = { git = "https://github.com/solana-foundation/x402-sdk", branch = "main", package = "solana-x402", default-features = false, features = [
+# Solana x402 (lives in the pay-kit workspace alongside solana-mpp)
+solana-x402 = { git = "https://github.com/solana-foundation/pay-kit", branch = "main", package = "solana-x402", default-features = false, features = [
     "client",
 ] }
 
