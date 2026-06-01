@@ -1,4 +1,6 @@
 pub mod demo;
+pub mod local_registration;
+pub mod plans;
 pub mod scaffold;
 pub mod start;
 
@@ -12,6 +14,19 @@ pub enum ServerCommand {
     Start(start::StartCommand),
     /// Create a YAML file that defines endpoints and payment requirements.
     Scaffold(scaffold::ScaffoldCommand),
+    /// Derive (and optionally write back) the on-chain `Plan` PDAs for
+    /// subscription endpoints declared in pay-demo.yaml.
+    Plans {
+        #[command(subcommand)]
+        command: PlansCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum PlansCommand {
+    /// Derive Plan PDAs from pay-demo.yaml. Pass `--write` to update the
+    /// YAML in place once the Plan accounts have been published on-chain.
+    Publish(plans::PublishCommand),
 }
 
 impl ServerCommand {
@@ -20,6 +35,7 @@ impl ServerCommand {
             Self::Demo(cmd) => cmd.otlp_sidecar.as_deref(),
             Self::Start(cmd) => cmd.otlp_sidecar.as_deref(),
             Self::Scaffold(_) => None,
+            Self::Plans { .. } => None,
         }
     }
 
@@ -28,6 +44,9 @@ impl ServerCommand {
             Self::Demo(cmd) => cmd.run(active_account_name, sandbox),
             Self::Start(cmd) => cmd.run(active_account_name, sandbox),
             Self::Scaffold(cmd) => cmd.run(),
+            Self::Plans { command } => match command {
+                PlansCommand::Publish(cmd) => cmd.run(),
+            },
         }
     }
 }

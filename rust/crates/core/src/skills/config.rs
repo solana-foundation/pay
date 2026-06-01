@@ -29,6 +29,18 @@ pub struct Source {
     pub name: String,
     /// Resolved URL to the catalog JSON.
     pub url: String,
+    /// Marks a transient source — currently the auto-registration written
+    /// by a running `pay server start` so the local API is discoverable
+    /// by an MCP agent on the same host. Ephemeral entries are TCP-probed
+    /// at boot and reaped if their server is gone, and the catalog loader
+    /// bypasses cache for them so live edits to the server's spec become
+    /// visible on the next agent call without waiting on the 30 min TTL.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ephemeral: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,6 +63,7 @@ impl Default for SkillsConfig {
             sources: vec![Source {
                 name: "pay-skills".to_string(),
                 url: DEFAULT_SOURCE.to_string(),
+                ephemeral: false,
             }],
         }
     }
@@ -94,6 +107,23 @@ impl SkillsConfig {
         self.sources.push(Source {
             name: derive_name(source),
             url,
+            ephemeral: false,
+        });
+        true
+    }
+
+    /// Add a source marked as ephemeral (auto-removed on graceful shutdown,
+    /// reaped at boot if its server isn't reachable). Caller supplies the
+    /// display `name` so multiple concurrent `pay server start` instances
+    /// don't collide on the URL-derived default. Returns true if new.
+    pub fn add_ephemeral_source(&mut self, name: &str, url: &str) -> bool {
+        if self.sources.iter().any(|s| s.url == url) {
+            return false;
+        }
+        self.sources.push(Source {
+            name: name.to_string(),
+            url: url.to_string(),
+            ephemeral: true,
         });
         true
     }
@@ -104,6 +134,29 @@ impl SkillsConfig {
         let before = self.sources.len();
         self.sources.retain(|s| s.url != url && s.name != source);
         self.sources.len() < before
+    }
+
+    /// Remove a source by exact URL match (no github-shorthand resolution).
+    /// Used by the ephemeral lifecycle hooks so they don't accidentally
+    /// rewrite a `company/apis` shorthand source registered by the user.
+    pub fn remove_source_by_url(&mut self, url: &str) -> bool {
+        let before = self.sources.len();
+        self.sources.retain(|s| s.url != url);
+        self.sources.len() < before
+    }
+
+    /// Borrow the ephemeral sources for boot-time liveness sweeps.
+    pub fn ephemeral_sources(&self) -> impl Iterator<Item = &Source> {
+        self.sources.iter().filter(|s| s.ephemeral)
+    }
+
+    /// True when at least one ephemeral source is registered. Catalog
+    /// callers use this to skip the on-disk cache and re-fetch every
+    /// load — ephemeral specs change as the developer edits + restarts
+    /// `pay server`, and a 30 min TTL would hide those edits from the
+    /// MCP agent in the same shell.
+    pub fn has_ephemeral_sources(&self) -> bool {
+        self.sources.iter().any(|s| s.ephemeral)
     }
 
     /// Deterministic 8-hex-char hash of the sorted source URLs.
@@ -240,7 +293,8 @@ mod tests {
         let cfg = SkillsConfig::default();
         assert_eq!(cfg.sources.len(), 1);
         assert_eq!(cfg.sources[0].name, "pay-skills");
-        assert!(cfg.sources[0].url.contains("pay-skills"));
+        assert_eq!(cfg.sources[0].url, DEFAULT_SOURCE);
+        assert!(!cfg.sources[0].ephemeral);
     }
 
     #[test]

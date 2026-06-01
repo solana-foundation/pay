@@ -288,6 +288,46 @@ fn do_paid_fetch(
         RunOutcome::SessionChallenge { .. } => Err(pay_core::Error::Mpp(
             "402 Payment Required (MPP session) — session payments require a stateful client with a Fiber channel".to_string(),
         )),
+        RunOutcome::SubscriptionChallenge { challenge, .. } => {
+            // Build + send the activation credential, same flow as
+            // `pay http`. Touch ID (or whatever keystore the active
+            // account uses) gates the signature, so an agent invocation
+            // can't silently commit a recurring on-chain delegation —
+            // the user still has to approve in the system prompt. On
+            // success we persist a local record to accounts.yml via
+            // pay-core's shared helper so the MCP path stays in sync
+            // with `pay subscriptions list`.
+            let built = pay_core::client::subscription::build_credential(
+                &challenge,
+                &store,
+                network_override.as_deref(),
+                account_override.as_deref(),
+                Some(url),
+            )?;
+            let mut headers = extra_headers.to_vec();
+            headers.push(("Authorization".to_string(), built.authorization.clone()));
+            let retry = pay_core::client::fetch::fetch_request(
+                method,
+                url,
+                &headers,
+                body.as_deref(),
+            )?;
+            if let RunOutcome::Completed { exit_code, .. } = &retry {
+                if *exit_code == 0 {
+                    if let Err(e) =
+                        pay_core::client::subscription::persist_local_subscription_after_activation(
+                            &built, &store,
+                        )
+                    {
+                        tracing::warn!(
+                            error = %e,
+                            "Subscription activation succeeded but local persistence failed"
+                        );
+                    }
+                }
+            }
+            interpret_retry(retry)
+        }
         RunOutcome::PaymentRejected { reason, .. } => Err(pay_core::Error::PaymentRejected(reason)),
         RunOutcome::UnknownPaymentRequired { .. } => Err(pay_core::Error::Mpp(
             "402 Payment Required but no recognized protocol".to_string(),

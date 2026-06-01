@@ -1504,6 +1504,7 @@ async fn mpp_build_credential_with_surfnet() {
                 path: None,
                 secret_key_b58: Some(bs58::encode(&payer_bytes).into_string()),
                 created_at: Some("2026-04-10T00:00:00Z".to_string()),
+                subscriptions: std::collections::BTreeMap::new(),
             },
         );
         let store = pay_core::accounts::MemoryAccountsStore::with_file(file);

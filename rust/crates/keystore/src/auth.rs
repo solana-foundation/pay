@@ -130,8 +130,14 @@ impl AuthIntent {
         let mut message = format!("authorize a payment of {amount}.");
         message.push_str("\n\nreason: ");
         message.push_str(&truncate_detail(&prompt_detail(reason), 64));
-        message.push_str("\n\noperator: ");
-        message.push_str(&prompt_detail(operator));
+        // Skip the "operator: ..." line when we don't have a meaningful
+        // domain (e.g. localhost/loopback requests where the prompt would
+        // render the placeholder "unknown" or an empty value). Keeps the
+        // Touch ID panel tight instead of advertising a blank field.
+        if let Some(label) = meaningful_operator(operator) {
+            message.push_str("\n\noperator: ");
+            message.push_str(&label);
+        }
 
         Self::AuthorizePayment {
             message,
@@ -265,6 +271,24 @@ fn prompt_detail(value: &str) -> String {
     } else {
         value.to_string()
     }
+}
+
+/// Normalise an operator label for the Touch ID prompt, returning `None`
+/// when the value is missing, blank, the prompt placeholder `"unknown"`,
+/// or a loopback hostname (`localhost`, `127.0.0.1`, `::1`). Loopback
+/// labels are noise on the prompt — the user already knows they invoked
+/// pay against their own server.
+fn meaningful_operator(value: &str) -> Option<String> {
+    let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let lower = value.to_ascii_lowercase();
+    if matches!(lower.as_str(), "unknown" | "localhost" | "127.0.0.1" | "::1" | "[::1]") {
+        return None;
+    }
+    Some(truncate_detail(value, 64))
 }
 
 fn truncate_detail(value: &str, max_chars: usize) -> String {
@@ -572,5 +596,37 @@ mod tests {
                 .payment_limit(),
             Some(PaymentLimit::Usd01)
         );
+    }
+
+    #[test]
+    fn authorize_payment_details_omits_operator_line_for_loopback() {
+        let intent = AuthIntent::authorize_payment_details("$1.00", "API access", "localhost");
+        let AuthIntent::AuthorizePayment { message, .. } = intent else {
+            panic!("expected AuthorizePayment");
+        };
+        assert!(message.contains("reason: API access"));
+        assert!(
+            !message.contains("operator:"),
+            "loopback operator should be omitted; got: {message:?}"
+        );
+    }
+
+    #[test]
+    fn authorize_payment_details_omits_operator_line_when_unknown() {
+        let intent = AuthIntent::authorize_payment_details("$1.00", "API access", "");
+        let AuthIntent::AuthorizePayment { message, .. } = intent else {
+            panic!("expected AuthorizePayment");
+        };
+        assert!(!message.contains("operator:"));
+    }
+
+    #[test]
+    fn authorize_payment_details_keeps_operator_line_for_real_domain() {
+        let intent =
+            AuthIntent::authorize_payment_details("$1.00", "API access", "api.example.com");
+        let AuthIntent::AuthorizePayment { message, .. } = intent else {
+            panic!("expected AuthorizePayment");
+        };
+        assert!(message.contains("operator: api.example.com"));
     }
 }

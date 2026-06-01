@@ -42,6 +42,21 @@ impl Stablecoin {
         }
     }
 
+    /// SPL mint decimals. All supported stablecoins are 6 today; keep
+    /// per-variant for forward-compat when a non-6 stablecoin lands.
+    pub fn decimals(self) -> u8 {
+        match self {
+            Self::Usdc | Self::Usdt | Self::Pyusd | Self::Cash | Self::Usdg => 6,
+        }
+    }
+
+    /// Look up the decimals for a mint by its base58 address. Returns
+    /// `None` when the mint is not a recognised stablecoin — callers can
+    /// fall back to 6 (the de-facto default) or render base units.
+    pub fn decimals_for_mint(mint: &str) -> Option<u8> {
+        Self::from_mint(mint).map(Self::decimals)
+    }
+
     pub fn mint(self, network: Option<&str>) -> &'static str {
         match self {
             Self::Usdc => match network {

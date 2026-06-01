@@ -110,17 +110,18 @@ fn print_setup_success(
 fn setup_success_body(
     backend_name: &str,
     completion: &crate::tui::TopupCompletion,
-    rpc_url: &str,
+    _rpc_url: &str,
 ) -> String {
     let mut lines = vec![format!("Account secured in {backend_name}")];
     if let Some(amount) = super::topup::topup_received_amount(&completion.received) {
         lines.push(format!("Account funded with {amount}"));
     }
     if let Some(hash) = &completion.tx_hash {
-        let cluster = crate::network::SolanaNetwork::Mainnet.explorer_cluster(rpc_url);
+        // Setup-time topup always lands on mainnet (real funds). pay.sh
+        // resolves the signature server-side; no rpc_url needed.
         lines.push(format!(
             "{} {hash}",
-            crate::components::solana_transaction_link(hash, &cluster)
+            crate::components::solana_transaction_link(hash, "mainnet")
         ));
     }
     lines.push(String::new());

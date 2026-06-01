@@ -137,11 +137,9 @@ fn send_success_title(result: &pay_core::client::send::SendResult) -> String {
 }
 
 fn send_success_body(result: &pay_core::client::send::SendResult) -> String {
-    let explorer_cluster =
-        crate::network::SolanaNetwork::from_slug(&result.network).explorer_cluster(&result.rpc_url);
     format!(
         "{} {}",
-        crate::components::solana_transaction_link(&result.signature, &explorer_cluster),
+        crate::components::solana_transaction_link(&result.signature, &result.network),
         result.signature
     )
 }
@@ -511,6 +509,7 @@ mod tests {
             path: None,
             secret_key_b58: None,
             created_at: None,
+            subscriptions: std::collections::BTreeMap::new(),
         }
     }
 

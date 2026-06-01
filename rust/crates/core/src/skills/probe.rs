@@ -517,6 +517,33 @@ fn classify_outcome(outcome: RunOutcome, accepted: &[String]) -> ProbeStatus {
             }
         }
 
+        RunOutcome::SubscriptionChallenge { challenge, .. } => {
+            // Subscription challenges are Solana too — surface them as a
+            // distinct protocol so catalog probes don't lump them in with
+            // one-shot charges. We still want the currency and recipient
+            // out of the request so the catalog row stays useful.
+            let request: solana_mpp::SubscriptionRequest = match challenge.request.decode() {
+                Ok(r) => r,
+                Err(e) => {
+                    return ProbeStatus::Error {
+                        message: format!("Failed to decode subscription challenge: {e}"),
+                    };
+                }
+            };
+            ProbeStatus::Ok {
+                protocol: "mpp-subscription".into(),
+                currency: normalize_currency(&request.currency),
+                network: request
+                    .method_details
+                    .as_ref()
+                    .and_then(|v| v.get("network"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("mainnet")
+                    .to_string(),
+                recipient: request.recipient,
+            }
+        }
+
         RunOutcome::X402Challenge { challenge, .. } => {
             let currency = normalize_currency(&challenge.requirements.currency);
             let network = challenge

@@ -5689,6 +5689,8 @@ name = "pay"
 version = "0.17.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
+ "bincode",
  "bs58",
  "chrono",
  "clap",
@@ -5715,8 +5717,12 @@ dependencies = [
  "serde_yml",
  "serial_test",
  "shellexpand",
+ "solana-instruction 3.4.0",
+ "solana-message 3.1.0",
  "solana-mpp",
  "solana-pubkey 3.0.0",
+ "solana-signature",
+ "solana-transaction",
  "tempfile",
  "tokio",
  "toml_edit 0.22.27",
@@ -5783,9 +5789,11 @@ dependencies = [
 name = "pay-integration"
 version = "0.17.0"
 dependencies = [
+ "base64 0.22.1",
  "pay-core",
  "pay-types",
  "serde_json",
+ "solana-mpp",
 ]
 
 [[package]]
@@ -5862,7 +5870,6 @@ dependencies = [
 [[package]]
 name = "payment-channels"
 version = "0.1.0"
-source = "git+https://github.com/solana-foundation/pay-kit?branch=main#e6b29f1f0364ffab4a3c16ceeb83a73eb35d8c2e"
 dependencies = [
  "borsh 1.6.1",
  "num-derive",
@@ -9242,7 +9249,6 @@ dependencies = [
 [[package]]
 name = "solana-mpp"
 version = "0.6.0"
-source = "git+https://github.com/solana-foundation/pay-kit?branch=main#e6b29f1f0364ffab4a3c16ceeb83a73eb35d8c2e"
 dependencies = [
  "base64 0.22.1",
  "bincode",
@@ -11317,7 +11323,6 @@ dependencies = [
 [[package]]
 name = "solana-x402"
 version = "0.1.0"
-source = "git+https://github.com/solana-foundation/pay-kit?branch=main#e6b29f1f0364ffab4a3c16ceeb83a73eb35d8c2e"
 dependencies = [
  "base64 0.22.1",
  "bincode",

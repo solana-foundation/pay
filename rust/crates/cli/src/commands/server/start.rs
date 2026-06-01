@@ -91,6 +91,7 @@ struct AppState {
     session_mpp: Option<Arc<SessionMpp>>,
     browser_rpc_url: Option<String>,
     fee_payer_wallet: Option<FeePayerWallet>,
+    fee_payer_signer: Option<Arc<dyn SolanaSigner>>,
 }
 
 impl PaymentState for AppState {
@@ -114,6 +115,9 @@ impl PaymentState for AppState {
     }
     fn fee_payer_wallet(&self) -> Option<&FeePayerWallet> {
         self.fee_payer_wallet.as_ref()
+    }
+    fn fee_payer_signer(&self) -> Option<Arc<dyn SolanaSigner>> {
+        self.fee_payer_signer.clone()
     }
 }
 
@@ -462,6 +466,34 @@ impl StartCommand {
                 ));
             }
 
+            // ── Ensure each subscription endpoint has its on-chain Plan ─
+            //
+            // A subscription endpoint can't emit a usable 402 challenge
+            // until the merchant's Plan PDA exists on-chain — the spec's
+            // `methodDetails.planId` field is required and the server
+            // re-derives it from `(operator, plan_id_numeric)`.
+            //
+            // For each `subscription:` block in the spec we:
+            //   1. compute the deterministic plan_id_numeric,
+            //   2. RPC-check whether the Plan PDA exists,
+            //   3. interactively prompt (dialoguer) to publish on miss,
+            //   4. broadcast `create_plan` with the operator's signer,
+            //   5. write plan_id / plan_id_numeric / plan_bump /
+            //      plan_created_at back into the YAML so subsequent
+            //      restarts (and the subscriber client) see the same PDA.
+            //
+            // Skipped silently when the YAML has no subscription
+            // endpoints. Server startup aborts if the operator declines
+            // the prompt — we can't serve a half-configured gateway.
+            let api = ensure_subscription_plans(
+                api,
+                &self.spec,
+                &recipient,
+                fee_payer_signer.clone(),
+                &rpc_url,
+            )
+            .await?;
+
             // ── Auto-fund the operator wallet on Surfpool ──
             //
             // Trigger when EITHER:
@@ -496,6 +528,18 @@ impl StartCommand {
             // ── Create MPP servers ──
             let secret_key = std::env::var("PAY_MPP_CHALLENGE_SECRET")
                 .unwrap_or_else(|_| bs58::encode(rand::random::<[u8; 32]>()).into_string());
+
+            // Mirror the charge HMAC secret into MPP_SECRET_KEY so the
+            // subscription middleware (which lazy-builds a SubscriptionServer
+            // per request, with `secret_key: None`) picks up the same
+            // secret via the SDK's env fallback. Without this, the per-
+            // request `SubscriptionServer::new` errors with "Missing
+            // MPP_SECRET_KEY env var". SAFETY: called before any threads
+            // are spawned (the request handler runs inside the runtime
+            // built below).
+            unsafe {
+                std::env::set_var("MPP_SECRET_KEY", &secret_key);
+            }
 
             let currency_configs: Vec<_> = currencies
                 .iter()
@@ -745,7 +789,16 @@ impl StartCommand {
                 .iter()
                 .filter(|e| e.metering.is_some())
                 .count();
-            let free_count = api.endpoints.len() - metered_count;
+            let subscription_count = api
+                .endpoints
+                .iter()
+                .filter(|e| e.subscription.is_some())
+                .count();
+            let free_count = api
+                .endpoints
+                .len()
+                .saturating_sub(metered_count)
+                .saturating_sub(subscription_count);
 
             let banner = render_pay_banner(PAY_SH_TAGLINE.dimmed());
             let has_startup_status =
@@ -859,13 +912,18 @@ impl StartCommand {
                 spawn_fee_payer_balance_observer(wallet.clone(), api.subdomain.clone());
             }
 
+            let mut category_parts: Vec<String> = Vec::new();
+            category_parts.push(format!("{metered_count} metered"));
+            if subscription_count > 0 {
+                category_parts.push(format!("{subscription_count} subscription"));
+            }
+            category_parts.push(format!("{free_count} free"));
             eprintln!(
                 "{}",
                 format!(
-                    "{} endpoints ({} metered, {} free)",
+                    "{} endpoints ({})",
                     api.endpoints.len(),
-                    metered_count,
-                    free_count
+                    category_parts.join(", ")
                 )
                 .dimmed()
             );
@@ -882,7 +940,7 @@ impl StartCommand {
                 "{}{}{}",
                 "─".repeat(9),
                 "─".repeat(max_path_len + 2),
-                "─".repeat(10)
+                "─".repeat(16)
             );
             eprintln!("{}", rule.dimmed());
 
@@ -910,11 +968,26 @@ impl StartCommand {
                                 .map(|t| t.price_usd)
                         })
                         .unwrap_or(0.0);
-                    format!("{:>8}", format!("${}", format_price(price)))
+                    format!("{:>14}", format!("${}", format_price(price)))
                         .yellow()
                         .to_string()
+                } else if let Some(ref sub) = ep.subscription {
+                    // Show `$9.99/30d` for subscription endpoints. Falls
+                    // back to bare period when neither `price_usd` nor
+                    // `amount_base_units` is set (shouldn't happen at
+                    // boot — `ensure_subscription_plans` validates it).
+                    let price = sub
+                        .price_usd
+                        .map(|p| format!("${}", format_price(p)))
+                        .or_else(|| {
+                            sub.amount_base_units.as_ref().map(|a| format!("{a}u"))
+                        })
+                        .unwrap_or_else(|| "?".to_string());
+                    format!("{:>14}", format!("{price}/{}", sub.period))
+                        .cyan()
+                        .to_string()
                 } else {
-                    format!("{:>8}", "free").green().to_string()
+                    format!("{:>14}", "free").green().to_string()
                 };
 
                 let path_url = format!("http://{}/{}", self.bind.replace("0.0.0.0", "127.0.0.1"), ep.path.trim_start_matches('/'));
@@ -945,6 +1018,7 @@ impl StartCommand {
                 session_mpp,
                 browser_rpc_url: Some(BROWSER_RPC_PROXY_PATH.to_string()),
                 fee_payer_wallet,
+                fee_payer_signer: fee_payer_signer.clone(),
             };
 
             let pdb_state = if debugger {
@@ -1002,6 +1076,40 @@ impl StartCommand {
                 );
             }
 
+            // Local-discovery: synthesized catalog at the IETF well-known
+            // path so a local MCP agent's `list_catalog` can pick up the
+            // running server's endpoints. Registered + reaped by the
+            // ephemeral-source lifecycle below.
+            {
+                let api_for_catalog = api.clone();
+                let public_override = public_url_override.clone();
+                let bind = self.bind.clone();
+                let has_openapi = openapi_doc.is_some();
+                app = app.route(
+                    pay_core::skills::local::WELL_KNOWN_PATH,
+                    get(move || {
+                        let api = api_for_catalog.clone();
+                        let public_override = public_override.clone();
+                        let bind = bind.clone();
+                        async move {
+                            let base_url = public_override.unwrap_or_else(|| {
+                                format!("http://{}", bind.replace("0.0.0.0", "127.0.0.1"))
+                            });
+                            let openapi_url = if has_openapi {
+                                Some(format!("{}/openapi.json", base_url.trim_end_matches('/')))
+                            } else {
+                                None
+                            };
+                            axum::Json(pay_core::skills::local::synthesize_catalog(
+                                &api,
+                                &base_url,
+                                openapi_url.as_deref(),
+                            ))
+                        }
+                    }),
+                );
+            }
+
             if let Some(ref pdb) = pdb_state {
                 app = app
                     .route(
@@ -1027,6 +1135,10 @@ impl StartCommand {
                 );
             }
 
+            // Captured for the local-skills registration call below — the
+            // `fallback` closure takes `api` by move, so we stash the
+            // subdomain string out of band first.
+            let api_subdomain_for_registration = api.subdomain.clone();
             let app = app
                 .fallback(any(move |req: axum::http::Request<axum::body::Body>| {
                     let api = api.clone();
@@ -1092,11 +1204,71 @@ impl StartCommand {
                 );
             }
             eprintln!();
-            axum::serve(listener, app)
+
+            // ── Local skills registration ──────────────────────────────────
+            //
+            // Reap dead ephemeral entries from prior crashed `pay server`
+            // runs before adding ours, then register this server so any
+            // MCP agent on the same host can discover its endpoints via
+            // the standard `list_catalog` path. The matching deregister
+            // fires on graceful shutdown below.
+            let _ = super::local_registration::sweep_dead_ephemeral_sources();
+            let registered_source_url = match super::local_registration::register(
+                &api_subdomain_for_registration,
+                &self.bind,
+            ) {
+                Ok((name, url)) => {
+                    tracing::debug!(
+                        name = %name,
+                        url = %url,
+                        "registered local skills source"
+                    );
+                    Some(url)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to register local skills source");
+                    None
+                }
+            };
+
+            let serve_result = axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown_signal())
                 .await
-                .map_err(|e| pay_core::Error::Config(format!("Server error: {e}")))
+                .map_err(|e| pay_core::Error::Config(format!("Server error: {e}")));
+
+            // Best-effort cleanup. We run this regardless of how serve
+            // exited so even an `Err(...)` return path leaves
+            // skills.yaml clean.
+            if let Some(url) = registered_source_url {
+                if let Err(e) = super::local_registration::deregister(&url) {
+                    tracing::warn!(error = %e, "failed to deregister local skills source");
+                }
+            }
+
+            serve_result
         })
     }
+}
+
+/// Wait for the first SIGINT or SIGTERM. Used to drive axum's
+/// `with_graceful_shutdown` so the local-skills cleanup hook gets a
+/// chance to run before the process exits.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let term = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+    tokio::select! { _ = ctrl_c => {}, _ = term => {} }
 }
 
 fn spawn_fee_payer_balance_observer(wallet: FeePayerWallet, subdomain: String) {
@@ -1343,6 +1515,316 @@ fn resolve_currency(currency: &str, network: &str) -> (String, u8) {
         return (stablecoin.mint(Some(network)).to_string(), 6);
     }
     (currency.to_string(), 6)
+}
+
+/// Walk every endpoint with a `subscription:` block, check whether its
+/// Plan PDA exists on-chain, and interactively publish missing ones.
+///
+/// Mutates the supplied `ApiSpec` in place so the returned value has
+/// fully-populated `subscription.plan_id` / `plan_id_numeric` /
+/// `plan_bump` / `plan_created_at` for every endpoint. Persists the
+/// same fields back to `spec_path` on disk via `write_back_published_plans`.
+async fn ensure_subscription_plans(
+    mut api: ApiSpec,
+    spec_path: &str,
+    operator_pubkey_str: &str,
+    fee_payer_signer: Option<Arc<dyn SolanaSigner>>,
+    rpc_url: &str,
+) -> pay_core::Result<ApiSpec> {
+    use dialoguer::Confirm;
+    use dialoguer::theme::ColorfulTheme;
+    use pay_core::server::subscription::{
+        check_plan_exists, compute_plan_id_numeric, publish_plan, PlanStatus,
+    };
+    use solana_mpp::program::subscriptions::{find_plan_pda, plan_id_seed, default_program_id};
+    use solana_pubkey::Pubkey;
+
+    // Bail early when the spec has no subscription endpoints — keeps the
+    // common case (charge / session) zero-overhead at startup.
+    if !api
+        .endpoints
+        .iter()
+        .any(|ep| ep.subscription.is_some())
+    {
+        return Ok(api);
+    }
+
+    let operator = Pubkey::from_str(operator_pubkey_str).map_err(|e| {
+        pay_core::Error::Config(format!(
+            "operator pubkey `{operator_pubkey_str}` is not valid base58: {e}"
+        ))
+    })?;
+    let program_id = default_program_id();
+
+    let mut publications: Vec<pay_core::server::subscription::PublishedPlan> = Vec::new();
+
+    for endpoint in api.endpoints.iter_mut() {
+        let Some(sub_spec) = endpoint.subscription.as_mut() else {
+            continue;
+        };
+
+        // Stable id derived from `(operator, endpoint.path)`. Reuse the
+        // value persisted in YAML if present so manual edits stick.
+        let plan_id_numeric = sub_spec
+            .plan_id_numeric
+            .unwrap_or_else(|| compute_plan_id_numeric(operator_pubkey_str, &endpoint.path));
+        let seed = plan_id_seed(plan_id_numeric);
+        let (plan_pda, plan_bump) = find_plan_pda(&operator, &seed, &program_id);
+
+        // Treat a YAML-pinned plan_id that disagrees with our derivation
+        // as a configuration error — the operator probably edited the
+        // numeric id but not the PDA string (or vice versa).
+        if let Some(yaml_plan_id) = sub_spec.plan_id.as_deref() {
+            if yaml_plan_id != plan_pda.to_string() {
+                return Err(pay_core::Error::Config(format!(
+                    "endpoint `{}` has plan_id `{yaml_plan_id}` but \
+                     plan_id_numeric={plan_id_numeric} derives to `{plan_pda}`. \
+                     Clear plan_id from the YAML and let `pay server start` regenerate it.",
+                    endpoint.path
+                )));
+            }
+        }
+
+        let status = check_plan_exists(rpc_url, &plan_pda).await?;
+        match status {
+            PlanStatus::Exists => {
+                tracing::info!(
+                    endpoint = %endpoint.path,
+                    plan = %plan_pda,
+                    "subscription Plan already on-chain — reusing",
+                );
+                sub_spec.plan_id = Some(plan_pda.to_string());
+                sub_spec.plan_id_numeric = Some(plan_id_numeric);
+                sub_spec.plan_bump = Some(plan_bump);
+                // created_at we cannot determine without an extra RPC fetch;
+                // leave any existing YAML value untouched. The client falls
+                // back to fetching the Plan when this is None.
+            }
+            PlanStatus::WrongOwner { actual_owner } => {
+                return Err(pay_core::Error::Config(format!(
+                    "endpoint `{}` derives Plan PDA `{plan_pda}` but that account is \
+                     owned by `{actual_owner}` (not the subscriptions program). \
+                     Choose a different plan_id_numeric or close the squatting account.",
+                    endpoint.path
+                )));
+            }
+            PlanStatus::Missing => {
+                let signer = match fee_payer_signer.clone() {
+                    Some(s) => s,
+                    None => {
+                        return Err(pay_core::Error::Config(format!(
+                            "endpoint `{}` requires publishing Plan `{plan_pda}` on-chain, but \
+                             no operator signer is configured. Set `operator.signer` in the YAML \
+                             or run with `--sandbox` for a localnet ephemeral.",
+                            endpoint.path
+                        )));
+                    }
+                };
+
+                eprintln!();
+                eprintln!(
+                    "{} {}",
+                    "Subscription endpoint needs an on-chain Plan:".bold(),
+                    endpoint.path,
+                );
+                eprintln!(
+                    "  period   {}\n  price    {} {}\n  plan PDA {}",
+                    sub_spec.period,
+                    sub_spec
+                        .price_usd
+                        .map(|p| format!("{p:.2}"))
+                        .unwrap_or_else(|| sub_spec.amount_base_units.clone().unwrap_or_default()),
+                    sub_spec.currency,
+                    plan_pda,
+                );
+                let theme = ColorfulTheme::default();
+                let confirmed = Confirm::with_theme(&theme)
+                    .with_prompt("Publish create_plan on-chain now? (costs ~0.001 SOL in rent + fees)")
+                    .default(false)
+                    .interact()
+                    .map_err(|e| {
+                        pay_core::Error::Config(format!("dialoguer prompt failed: {e}"))
+                    })?;
+                if !confirmed {
+                    return Err(pay_core::Error::Config(format!(
+                        "operator declined to publish Plan for endpoint `{}` — startup aborted.",
+                        endpoint.path
+                    )));
+                }
+
+                eprintln!("Publishing Plan…");
+                let mut published =
+                    publish_plan(sub_spec, &operator, signer, rpc_url, plan_id_numeric)
+                        .await
+                        .map_err(|e| {
+                            pay_core::Error::Config(format!(
+                                "create_plan broadcast failed for `{}`: {e}",
+                                endpoint.path
+                            ))
+                        })?;
+                published.endpoint_path = endpoint.path.clone();
+                eprintln!(
+                    "  {} {}",
+                    "✓".green(),
+                    format!(
+                        "Plan {} published (tx {})",
+                        published.plan_pda,
+                        published
+                            .broadcast_signature
+                            .as_deref()
+                            .unwrap_or("<existing>")
+                    )
+                    .dimmed()
+                );
+
+                sub_spec.plan_id = Some(published.plan_pda.clone());
+                sub_spec.plan_id_numeric = Some(published.plan_id_numeric);
+                sub_spec.plan_bump = Some(published.plan_bump);
+                sub_spec.plan_created_at = Some(published.plan_created_at);
+                publications.push(published);
+            }
+        }
+    }
+
+    // Persist any new plan IDs back to disk so subsequent restarts skip
+    // the publish prompt and the subscriber client picks up the same PDA.
+    if !publications.is_empty() {
+        let expanded = shellexpand::tilde(spec_path);
+        let raw = std::fs::read_to_string(expanded.as_ref()).map_err(|e| {
+            pay_core::Error::Config(format!(
+                "Failed to re-read spec {} for write-back: {e}",
+                spec_path
+            ))
+        })?;
+        let updated = write_back_published_plans(&raw, &publications);
+        std::fs::write(expanded.as_ref(), updated).map_err(|e| {
+            pay_core::Error::Config(format!("Failed to write spec {}: {e}", spec_path))
+        })?;
+    }
+
+    Ok(api)
+}
+
+/// In-place YAML rewrite of `plan_id` / `plan_id_numeric` / `plan_bump`
+/// / `plan_created_at` under each freshly-published subscription block.
+/// Preserves comments and key ordering — line-based rewrite rather than
+/// a full serde round-trip.
+fn write_back_published_plans(
+    yaml: &str,
+    publications: &[pay_core::server::subscription::PublishedPlan],
+) -> String {
+    use std::collections::HashMap;
+    // Lookup by endpoint path.
+    let by_path: HashMap<&str, &pay_core::server::subscription::PublishedPlan> = publications
+        .iter()
+        .map(|p| (p.endpoint_path.as_str(), p))
+        .collect();
+
+    let mut out = String::with_capacity(yaml.len() + 512);
+    let mut current_path: Option<String> = None;
+    let mut current_published: Option<&pay_core::server::subscription::PublishedPlan> = None;
+    let mut inside_subscription = false;
+    let mut subscription_indent: Option<usize> = None;
+    let mut wrote_fields = false;
+
+    for line in yaml.lines() {
+        let stripped = line.trim_start();
+        let indent = line.len() - stripped.len();
+
+        // Track current endpoint via `path:`.
+        if let Some(rest) = stripped.strip_prefix("path:") {
+            let path_value = rest.trim().trim_matches('"').trim_matches('\'').to_string();
+            current_published = by_path.get(path_value.as_str()).copied();
+            current_path = Some(path_value);
+            inside_subscription = false;
+            subscription_indent = None;
+            wrote_fields = false;
+        } else if stripped.starts_with("subscription:") {
+            inside_subscription = true;
+            subscription_indent = Some(indent);
+        } else if inside_subscription
+            && let Some(block_indent) = subscription_indent
+            && indent > block_indent
+        {
+            // Drop any pre-existing entries for the fields we're about to (re)write.
+            if let Some(published) = current_published {
+                let trimmed = stripped.trim_end();
+                if trimmed.starts_with("plan_id:")
+                    || trimmed.starts_with("plan_id_numeric:")
+                    || trimmed.starts_with("plan_bump:")
+                    || trimmed.starts_with("plan_created_at:")
+                {
+                    // Skip the existing line; we'll emit fresh ones below
+                    // when we leave the subscription block.
+                    let _ = published;
+                    continue;
+                }
+            }
+        } else if inside_subscription
+            && let Some(block_indent) = subscription_indent
+            && indent <= block_indent
+            && !stripped.is_empty()
+            && !stripped.starts_with('#')
+        {
+            // Leaving the subscription block — emit the published fields
+            // immediately before the closing line.
+            if let Some(published) = current_published
+                && !wrote_fields
+            {
+                let field_indent = " ".repeat(block_indent + 2);
+                out.push_str(&field_indent);
+                out.push_str("plan_id: ");
+                out.push_str(&published.plan_pda);
+                out.push('\n');
+                out.push_str(&field_indent);
+                out.push_str("plan_id_numeric: ");
+                out.push_str(&published.plan_id_numeric.to_string());
+                out.push('\n');
+                out.push_str(&field_indent);
+                out.push_str("plan_bump: ");
+                out.push_str(&published.plan_bump.to_string());
+                out.push('\n');
+                out.push_str(&field_indent);
+                out.push_str("plan_created_at: ");
+                out.push_str(&published.plan_created_at.to_string());
+                out.push('\n');
+                wrote_fields = true;
+            }
+            inside_subscription = false;
+            subscription_indent = None;
+        }
+
+        out.push_str(line);
+        out.push('\n');
+    }
+
+    // Trailing subscription block at EOF.
+    if inside_subscription
+        && let Some(published) = current_published
+        && !wrote_fields
+        && let Some(block_indent) = subscription_indent
+    {
+        let field_indent = " ".repeat(block_indent + 2);
+        out.push_str(&field_indent);
+        out.push_str("plan_id: ");
+        out.push_str(&published.plan_pda);
+        out.push('\n');
+        out.push_str(&field_indent);
+        out.push_str("plan_id_numeric: ");
+        out.push_str(&published.plan_id_numeric.to_string());
+        out.push('\n');
+        out.push_str(&field_indent);
+        out.push_str("plan_bump: ");
+        out.push_str(&published.plan_bump.to_string());
+        out.push('\n');
+        out.push_str(&field_indent);
+        out.push_str("plan_created_at: ");
+        out.push_str(&published.plan_created_at.to_string());
+        out.push('\n');
+    }
+
+    let _ = current_path;
+    out
 }
 
 fn resolve_operator_currencies(op: Option<&OperatorConfig>, cli_currency: &str) -> Vec<String> {
@@ -1850,7 +2332,17 @@ async fn gateway_verify(
             for mpp in &mpps {
                 match mpp.verify_credential(&credential).await {
                     Ok(receipt) => {
-                        let encoded = format_receipt(&receipt).unwrap_or_default();
+                        let kind = solana_mpp::ReceiptKind::Charge(receipt);
+                        let encoded = format_receipt(&kind).unwrap_or_default();
+                        // Pull the underlying Receipt out for the legacy
+                        // PDB logging path that still operates on the
+                        // intent-agnostic shape.
+                        let receipt = match &kind {
+                            solana_mpp::ReceiptKind::Charge(r) => r.clone(),
+                            // The charge verify path never produces a
+                            // Subscription kind; this arm is unreachable.
+                            solana_mpp::ReceiptKind::Subscription { base, .. } => base.clone(),
+                        };
 
                         // Log successful payment to PDB
                         if let Some(pdb) = pdb {
@@ -2155,6 +2647,7 @@ endpoints:
             path: None,
             secret_key_b58: Some(bs58::encode(&VALID_TEST_KEYPAIR_BYTES[..]).into_string()),
             created_at: Some("2026-04-10T00:00:00Z".to_string()),
+            subscriptions: std::collections::BTreeMap::new(),
         };
         (acct, pubkey)
     }
@@ -2274,6 +2767,7 @@ endpoints:
             // Valid base58 but wrong length (decodes to <64 bytes).
             secret_key_b58: Some("abc".to_string()),
             created_at: Some("2026-04-10T00:00:00Z".to_string()),
+            subscriptions: std::collections::BTreeMap::new(),
         };
         file.upsert(pay_core::accounts::MAINNET_NETWORK, "broken", bad);
         let store = MemoryAccountsStore::with_file(file);

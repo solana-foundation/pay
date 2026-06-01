@@ -4,6 +4,7 @@ use tempfile::NamedTempFile;
 use tracing::{debug, info};
 
 use crate::client::mpp;
+use crate::client::subscription;
 use crate::client::x402;
 use crate::{Error, Result};
 
@@ -19,6 +20,15 @@ pub enum RunOutcome {
     /// The server returned 402 with an MPP session challenge (intent="session").
     /// Session payments require a stateful client with a Fiber channel.
     SessionChallenge {
+        challenge: Box<mpp::Challenge>,
+        resource_url: String,
+    },
+    /// The server returned 402 with an MPP subscription challenge
+    /// (intent="subscription"). The activation transaction creates the
+    /// recurring delegation and collects the first-period charge in one
+    /// atomic transaction; renewals are server-driven and don't pass back
+    /// through this enum.
+    SubscriptionChallenge {
         challenge: Box<mpp::Challenge>,
         resource_url: String,
     },
@@ -427,7 +437,7 @@ impl ProtocolPreference {
 /// Reads the user's protocol preference from the environment. Internal
 /// callers in tests should prefer [`classify_402_with_preference`] so
 /// they don't have to mutate process-global state.
-pub(crate) fn classify_402(
+pub fn classify_402(
     headers: &[(String, String)],
     body: Option<&str>,
     resource_url: &str,
@@ -501,6 +511,23 @@ pub(crate) fn classify_402_with_preference(
             };
         }
         // Non-Solana session — fall through to x402 or error.
+    }
+
+    // Subscription challenge: checked before generic charge because the
+    // intent is more specific. Solana is the only method profile pay
+    // implements today, so we filter by both.
+    if let Some(challenge) = mpp_challenges
+        .iter()
+        .find(|c| subscription::is_subscription_challenge(c))
+    {
+        info!(
+            resource = resource_url,
+            "Detected MPP subscription challenge (Solana)"
+        );
+        return RunOutcome::SubscriptionChallenge {
+            challenge: Box::new(challenge.clone()),
+            resource_url: resource_url.to_string(),
+        };
     }
 
     // Default policy: prefer MPP for one-shot Solana payments (native
@@ -1024,6 +1051,94 @@ HTTP request sent, awaiting response...
             }
             other => panic!("expected MppChallenge, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn classify_402_with_subscription_intent() {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        let request_json = serde_json::json!({
+            "amount": "10000000",
+            "currency": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            "periodUnit": "day",
+            "periodCount": "30",
+            "recipient": "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
+            "methodDetails": {
+                "planId": "8tWbqLkUJoYy7zXc5h2EvCRoaQEv2xnQjUuYhc3rzCgT",
+                "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                "puller": "5fKb5cF22cFybZB1H4hLDydFhwoQy9JzKzRWaSbMkB6h",
+                "decimals": 6,
+                "network": "mainnet"
+            }
+        });
+        let b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&request_json).unwrap());
+        let headers = vec![(
+            "www-authenticate".to_string(),
+            format!(
+                "Payment id=\"sub-1\", realm=\"test\", method=\"solana\", \
+                 intent=\"subscription\", request=\"{b64}\""
+            ),
+        )];
+
+        let outcome = classify_402(&headers, None, "https://example.com/resource");
+        assert!(
+            matches!(outcome, RunOutcome::SubscriptionChallenge { .. }),
+            "expected SubscriptionChallenge, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn classify_402_prefers_subscription_over_charge_when_both_present() {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        // Charge challenge first.
+        let charge = serde_json::json!({
+            "amount": "1000000",
+            "currency": "USDC",
+            "recipient": "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
+            "methodDetails": {"network": "mainnet"}
+        });
+        let charge_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&charge).unwrap());
+        let charge_header = format!(
+            "Payment id=\"c\", realm=\"r\", method=\"solana\", intent=\"charge\", \
+             request=\"{charge_b64}\""
+        );
+
+        // Subscription challenge second.
+        let sub = serde_json::json!({
+            "amount": "10000000",
+            "currency": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            "periodUnit": "day",
+            "periodCount": "30",
+            "recipient": "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
+            "methodDetails": {
+                "planId": "8tWbqLkUJoYy7zXc5h2EvCRoaQEv2xnQjUuYhc3rzCgT",
+                "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                "puller": "5fKb5cF22cFybZB1H4hLDydFhwoQy9JzKzRWaSbMkB6h",
+                "decimals": 6,
+                "network": "mainnet"
+            }
+        });
+        let sub_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&sub).unwrap());
+        let sub_header = format!(
+            "Payment id=\"s\", realm=\"r\", method=\"solana\", intent=\"subscription\", \
+             request=\"{sub_b64}\""
+        );
+
+        let headers = vec![
+            ("www-authenticate".to_string(), charge_header),
+            ("www-authenticate".to_string(), sub_header),
+        ];
+
+        let outcome = classify_402(&headers, None, "https://example.com/resource");
+        assert!(
+            matches!(outcome, RunOutcome::SubscriptionChallenge { .. }),
+            "subscription must win over charge: {outcome:?}"
+        );
     }
 
     #[test]

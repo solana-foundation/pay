@@ -248,6 +248,7 @@ fn discover_legacy_account(name: &str) -> Option<Account> {
                 path: None,
                 secret_key_b58: None,
                 created_at: None,
+                subscriptions: std::collections::BTreeMap::new(),
             });
         }
     }
@@ -267,6 +268,7 @@ fn discover_legacy_account(name: &str) -> Option<Account> {
                 path: None,
                 secret_key_b58: None,
                 created_at: None,
+                subscriptions: std::collections::BTreeMap::new(),
             });
         }
     }
@@ -285,6 +287,7 @@ fn discover_legacy_account(name: &str) -> Option<Account> {
                 path: None,
                 secret_key_b58: None,
                 created_at: None,
+                subscriptions: std::collections::BTreeMap::new(),
             });
         }
     }

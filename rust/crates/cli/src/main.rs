@@ -238,6 +238,7 @@ fn main() {
                 | Command::Account { .. }
                 | Command::Whoami(_)
                 | Command::Skills { .. }
+                | Command::Subscriptions { .. }
                 | Command::Catalog { .. }
                 | Command::Install(_)
                 | Command::Send(_)

@@ -27,17 +27,25 @@ pub fn link_with_arrow(text: &str, url: &str) -> String {
 }
 
 /// Build the `?cluster=...` query suffix for Solana Explorer URLs.
+///
+/// Retained for the few places (e.g. server start's tokens-page link)
+/// that still point at Solana Explorer for non-receipt views; receipts
+/// route through pay.sh via [`solana_transaction_link`].
 pub fn solana_explorer_cluster_query(cluster: &SolanaExplorerCluster) -> String {
     cluster.query_suffix()
 }
 
-/// Link to a Solana transaction receipt on Solana Explorer.
-pub fn solana_transaction_link(signature: &str, cluster: &SolanaExplorerCluster) -> String {
-    let url = format!(
-        "https://explorer.solana.com/tx/{signature}{}",
-        cluster.transaction_receipt_query_suffix()
-    );
-    link_with_arrow("Link to receipt", &url)
+/// Link to a transaction receipt on pay.sh.
+///
+/// `network` is the pay-side slug (`mainnet`, `devnet`, `testnet`,
+/// `localnet`/`surfnet`). The pay.sh receipt page resolves the signature
+/// to the right chain via the `?network=` query (sandbox for local).
+/// Falls back to the bare signature when the network slug is unknown.
+pub fn solana_transaction_link(signature: &str, network: &str) -> String {
+    match pay_core::explorer::tx_url(network, signature) {
+        Some(url) => link_with_arrow("Link to receipt", &url),
+        None => signature.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -45,28 +53,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn solana_transaction_link_uses_mainnet_receipt_view() {
-        let rendered = solana_transaction_link("sig123", &SolanaExplorerCluster::Mainnet);
-
-        assert!(
-            rendered.contains(
-                "https://explorer.solana.com/tx/sig123?cluster=mainnet-beta&view=receipt"
-            )
-        );
+    fn solana_transaction_link_uses_pay_sh_for_mainnet() {
+        let rendered = solana_transaction_link("sig123", "mainnet");
+        assert!(rendered.contains("https://pay.sh/receipt/sig123"));
+        assert!(!rendered.contains("network="));
         assert!(rendered.contains("Link to receipt"));
     }
 
     #[test]
-    fn solana_transaction_link_uses_custom_rpc_url() {
-        let rendered = solana_transaction_link(
-            "sig123",
-            &SolanaExplorerCluster::Custom {
-                rpc_url: "http://localhost:8899".to_string(),
-            },
-        );
+    fn solana_transaction_link_marks_sandbox_for_localnet() {
+        let rendered = solana_transaction_link("sig123", "localnet");
+        assert!(rendered.contains("https://pay.sh/receipt/sig123?network=sandbox"));
+    }
 
-        assert!(rendered.contains(
-            "https://explorer.solana.com/tx/sig123?cluster=custom&customUrl=http%3A%2F%2Flocalhost%3A8899&view=receipt"
-        ));
+    #[test]
+    fn solana_transaction_link_falls_back_to_bare_signature_for_unknown_network() {
+        let rendered = solana_transaction_link("sig123", "solana-bogus");
+        assert_eq!(rendered, "sig123");
     }
 }

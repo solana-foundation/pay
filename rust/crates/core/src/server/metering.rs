@@ -577,6 +577,7 @@ mod tests {
                 resource: None,
                 routing: None,
                 metering: None,
+                subscription: None,
             }],
         );
         let ep = find_endpoint(&api, "GET", "v1/models");
@@ -595,6 +596,7 @@ mod tests {
                 resource: None,
                 routing: None,
                 metering: None,
+                subscription: None,
             }],
         );
         let ep = find_endpoint(&api, "POST", "v1/models/gpt-4:generate");
@@ -612,6 +614,7 @@ mod tests {
                 resource: None,
                 routing: None,
                 metering: None,
+                subscription: None,
             }],
         );
         assert!(find_endpoint(&api, "POST", "v1/models").is_none());
