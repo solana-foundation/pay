@@ -43,16 +43,10 @@ pub struct PublishCommand {
 impl PublishCommand {
     pub fn run(self) -> pay_core::Result<()> {
         let raw = std::fs::read_to_string(&self.spec).map_err(|e| {
-            pay_core::Error::Config(format!(
-                "Failed to read {}: {e}",
-                self.spec.display()
-            ))
+            pay_core::Error::Config(format!("Failed to read {}: {e}", self.spec.display()))
         })?;
         let api: pay_types::metering::ApiSpec = serde_yml::from_str(&raw).map_err(|e| {
-            pay_core::Error::Config(format!(
-                "Invalid YAML at {}: {e}",
-                self.spec.display()
-            ))
+            pay_core::Error::Config(format!("Invalid YAML at {}: {e}", self.spec.display()))
         })?;
 
         let owner_str = if let Some(o) = self.owner.clone() {
@@ -113,22 +107,22 @@ impl PublishCommand {
         eprintln!("Subscription endpoints:");
         for row in &rows {
             let status = match row.existing_plan.as_deref() {
-                Some(existing) if existing == row.derived_plan => "already pinned".green().to_string(),
+                Some(existing) if existing == row.derived_plan => {
+                    "already pinned".green().to_string()
+                }
                 Some(_) => "differs from spec".yellow().to_string(),
                 None => "pending publish".dimmed().to_string(),
             };
-            eprintln!(
-                "  {} {}",
-                format!("{} {}", row.method, row.path).bold(),
-                format!("[{}]", status)
-            );
+            let label = format!("{} {}", row.method, row.path);
+            let header = label.bold();
+            eprintln!("  {header} [{status}]");
             eprintln!("    period   {}", row.period);
             eprintln!("    currency {}", row.currency);
             eprintln!("    plan     {}", row.derived_plan);
-            if let Some(existing) = row.existing_plan.as_deref() {
-                if existing != row.derived_plan {
-                    eprintln!("    {} {}", "existing in YAML:".yellow(), existing);
-                }
+            if let Some(existing) = row.existing_plan.as_deref()
+                && existing != row.derived_plan
+            {
+                eprintln!("    {} {}", "existing in YAML:".yellow(), existing);
             }
         }
         eprintln!();
@@ -136,10 +130,7 @@ impl PublishCommand {
         if self.write {
             let updated = write_back_plan_ids(&raw, &rows)?;
             std::fs::write(&self.spec, updated).map_err(|e| {
-                pay_core::Error::Config(format!(
-                    "Failed to write {}: {e}",
-                    self.spec.display()
-                ))
+                pay_core::Error::Config(format!("Failed to write {}: {e}", self.spec.display()))
             })?;
             eprintln!(
                 "{} {}",

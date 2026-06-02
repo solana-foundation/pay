@@ -258,6 +258,24 @@ pub struct Subscription {
     /// Human-readable description echoed from the challenge.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+
+    /// Cached `authenticate`-intent credential. When present and unexpired,
+    /// the client attaches it as `Authorization: Payment <token>` to
+    /// subscription-gated requests so the server can authorise without
+    /// the wallet re-signing. Generated once per billing period during
+    /// activation (or lazily on the first 402 of the period).
+    ///
+    /// The token shape is the full `Payment <base64url(credential)>`
+    /// header value — callers MAY attach it verbatim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authenticate_token: Option<String>,
+
+    /// RFC 3339 expiry timestamp on the cached authenticate token. Used
+    /// to gate attachment: the client MUST treat the token as missing
+    /// once the wall clock crosses this value. Typically equal to the
+    /// current billing period's end.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authenticate_expires_at: Option<String>,
 }
 
 impl Account {
@@ -894,6 +912,8 @@ mod tests {
             expires_at: None,
             resource_url: None,
             description: None,
+            authenticate_token: None,
+            authenticate_expires_at: None,
         }
     }
 
@@ -1463,7 +1483,12 @@ mod tests {
             .unwrap();
         assert_eq!(stored.last_charged_period, Some(3));
         // Still exactly one entry, not duplicated.
-        let acct = f.accounts.get(MAINNET_NETWORK).unwrap().get("default").unwrap();
+        let acct = f
+            .accounts
+            .get(MAINNET_NETWORK)
+            .unwrap()
+            .get("default")
+            .unwrap();
         assert_eq!(acct.subscriptions.len(), 1);
     }
 
@@ -1539,7 +1564,12 @@ mod tests {
             SubscriptionStatus::Cancelled,
         );
         // Nothing to assert besides "did not panic".
-        let acct = f.accounts.get(MAINNET_NETWORK).unwrap().get("default").unwrap();
+        let acct = f
+            .accounts
+            .get(MAINNET_NETWORK)
+            .unwrap()
+            .get("default")
+            .unwrap();
         assert!(acct.subscriptions.is_empty());
     }
 
@@ -1556,12 +1586,8 @@ mod tests {
             fake_subscription("SubA", "PlanA"),
         )
         .unwrap();
-        f.upsert_subscription(
-            MAINNET_NETWORK,
-            "work",
-            fake_subscription("SubB", "PlanB"),
-        )
-        .unwrap();
+        f.upsert_subscription(MAINNET_NETWORK, "work", fake_subscription("SubB", "PlanB"))
+            .unwrap();
         f.upsert_subscription("devnet", "default", fake_subscription("SubC", "PlanC"))
             .unwrap();
 

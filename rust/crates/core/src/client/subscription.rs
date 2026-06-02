@@ -14,8 +14,8 @@
 //! authoritative wire shapes.
 
 use solana_mpp::client::{
-    build_subscription_activation_transaction_with_options, BuildSubscriptionActivationOptions,
-    SubscriptionMethodDetails,
+    BuildSubscriptionActivationOptions, SubscriptionMethodDetails,
+    build_subscription_activation_transaction_with_options,
 };
 use solana_mpp::format_authorization;
 use solana_mpp::protocol::core::PaymentCredential;
@@ -74,6 +74,13 @@ pub struct BuiltCredential {
     pub resource_url: Option<String>,
     /// Human-readable description echoed from the challenge.
     pub description: Option<String>,
+    /// `Authorization: Payment …` header signed against the bundled
+    /// `authenticate` challenge (when present in the 402). Populated by
+    /// [`build_credential`] when called with an authenticate challenge so
+    /// the post-activation persistence step caches it for re-use.
+    pub authenticate_token: Option<String>,
+    /// Server-set RFC 3339 expiration of [`Self::authenticate_token`].
+    pub authenticate_expires_at: Option<String>,
 }
 
 /// Try to extract a `subscription`-intent challenge from a `WWW-Authenticate`
@@ -188,6 +195,30 @@ pub fn build_credential(
     account_override: Option<&str>,
     resource_url: Option<&str>,
 ) -> Result<BuiltCredential> {
+    build_credential_with_authenticate(
+        challenge,
+        None,
+        store,
+        network_override,
+        account_override,
+        resource_url,
+    )
+}
+
+/// Variant of [`build_credential`] that ALSO signs an `authenticate`
+/// challenge bundled in the same 402 response. The activation transaction
+/// and the SIWMPP credential are produced from the SAME signer Arc — the
+/// keystore is unlocked once and the cached secret signs both. The
+/// authenticate token is returned on the [`BuiltCredential`] for the
+/// caller to thread into the persistence step.
+pub fn build_credential_with_authenticate(
+    challenge: &Challenge,
+    authenticate_challenge: Option<&Challenge>,
+    store: &dyn AccountsStore,
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+    resource_url: Option<&str>,
+) -> Result<BuiltCredential> {
     let decoded = decode(challenge)?;
 
     let amount_label = format_amount(&decoded.amount_base_units, decoded.decimals);
@@ -203,8 +234,10 @@ pub fn build_credential(
         .clone()
         .or_else(|| challenge.description.clone())
         .unwrap_or_else(|| {
-            format!("Subscribe ({amount_label} {currency} every {period_label})",
-                currency = decoded.currency_label)
+            format!(
+                "Subscribe ({amount_label} {currency} every {period_label})",
+                currency = decoded.currency_label
+            )
         });
     let prompt_context =
         crate::client::prompt::payment_prompt_context(Some(&reason), &[resource_url]);
@@ -271,9 +304,9 @@ pub fn build_credential(
     if crate::client::mpp::should_auto_fund_surfpool(network_override, embedded_blockhash) {
         let fund_url = rpc_url.clone();
         let pubkey = subscriber.clone();
-        if let Err(e) =
-            rt.block_on(crate::client::sandbox::fund_via_surfpool(&fund_url, &pubkey))
-        {
+        if let Err(e) = rt.block_on(crate::client::sandbox::fund_via_surfpool(
+            &fund_url, &pubkey,
+        )) {
             warn!(error = %e, "Could not auto-fund subscriber via Surfpool — broadcast may fail");
         }
     }
@@ -299,6 +332,25 @@ pub fn build_credential(
     // subscription row lands under the right `(network, account)` tuple.
     let account_name = resolve_account_name(store, &network, account_override)?;
 
+    // Sign the SIWMPP authenticate challenge with the SAME unlocked
+    // signer when present. We do this immediately so the user doesn't
+    // re-prompt later, and so the persistence step can cache the token
+    // in the same row as the freshly-activated subscription.
+    let (authenticate_token, authenticate_expires_at) = match authenticate_challenge {
+        Some(auth) => match sign_authenticate(&rt, &signer, auth, &decoded.method_details) {
+            Ok((header, expiry)) => (Some(header), Some(expiry)),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Subscription activation signed, but SIWMPP authenticate signing failed — \
+                     server will re-issue a 402 with a fresh authenticate challenge on next call"
+                );
+                (None, None)
+            }
+        },
+        None => (None, None),
+    };
+
     Ok(BuiltCredential {
         authorization,
         decoded,
@@ -308,7 +360,46 @@ pub fn build_credential(
         ephemeral_notice,
         resource_url: resource_url.map(str::to_string),
         description: extract_description(challenge),
+        authenticate_token,
+        authenticate_expires_at,
     })
+}
+
+/// Sign a SIWMPP `authenticate` challenge with the same signer the
+/// activation tx used. Returns (Authorization header, expires_at).
+fn sign_authenticate(
+    rt: &tokio::runtime::Runtime,
+    signer: &dyn SolanaSigner,
+    challenge: &Challenge,
+    method_details: &SubscriptionMethodDetails,
+) -> Result<(String, String)> {
+    use solana_mpp::program::subscriptions::{
+        default_program_id, find_subscription_pda, parse_pubkey,
+    };
+
+    let plan_pubkey = parse_pubkey(&method_details.plan_id, "planId")
+        .map_err(|e| Error::Mpp(format!("Invalid planId for authenticate: {e}")))?;
+    let program_pubkey = match method_details.program_id.as_deref() {
+        Some(p) => parse_pubkey(p, "programId")
+            .map_err(|e| Error::Mpp(format!("Invalid programId for authenticate: {e}")))?,
+        None => default_program_id(),
+    };
+    let (subscription_pda, _) =
+        find_subscription_pda(&plan_pubkey, &signer.pubkey(), &program_pubkey);
+
+    let header = rt
+        .block_on(solana_mpp::client::build_authenticate_credential_header(
+            signer,
+            challenge,
+            &subscription_pda.to_string(),
+        ))
+        .map_err(|e| Error::Mpp(format!("Failed to build authenticate credential: {e}")))?;
+
+    let request: solana_mpp::AuthenticateRequest = challenge
+        .request
+        .decode()
+        .map_err(|e| Error::Mpp(format!("Decoding authenticate request: {e}")))?;
+    Ok((header, request.expiration_time))
 }
 
 /// Parse a `Payment-Receipt` header into a [`Subscription`] and persist it
@@ -413,16 +504,18 @@ fn subscription_from_built_and_extensions(
         expires_at: parsed.extensions.expires_at.clone(),
         resource_url: built.resource_url.clone(),
         description: built.description.clone(),
+        authenticate_token: built.authenticate_token.clone(),
+        authenticate_expires_at: built.authenticate_expires_at.clone(),
     }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 fn extract_description(challenge: &Challenge) -> Option<String> {
-    if let Some(d) = challenge.description.as_deref() {
-        if !d.is_empty() {
-            return Some(d.to_string());
-        }
+    if let Some(d) = challenge.description.as_deref()
+        && !d.is_empty()
+    {
+        return Some(d.to_string());
     }
     let request: SubscriptionRequest = challenge.request.decode().ok()?;
     request.description
@@ -449,7 +542,7 @@ pub fn persist_local_subscription_after_activation(
     store: &dyn crate::accounts::AccountsStore,
 ) -> Result<()> {
     use solana_mpp::program::subscriptions::{
-        default_program_id, find_subscription_pda, parse_pubkey, SUBSCRIPTIONS_PROGRAM_ID,
+        SUBSCRIPTIONS_PROGRAM_ID, default_program_id, find_subscription_pda, parse_pubkey,
     };
 
     let program_id = match built.decoded.method_details.program_id.as_deref() {
@@ -496,6 +589,8 @@ pub fn persist_local_subscription_after_activation(
         expires_at: built.decoded.request.subscription_expires.clone(),
         resource_url: built.resource_url.clone(),
         description: built.description.clone(),
+        authenticate_token: built.authenticate_token.clone(),
+        authenticate_expires_at: built.authenticate_expires_at.clone(),
     };
 
     let mut file = store.load()?;
@@ -542,9 +637,8 @@ pub fn default_rpc_url_for_network(network: &str) -> String {
 fn resolve_rpc_url(network: &str, embedded_blockhash: Option<&str>) -> String {
     std::env::var("PAY_RPC_URL").unwrap_or_else(|_| {
         if network == "localnet"
-            && embedded_blockhash.is_some_and(|h| {
-                h.starts_with(crate::client::mpp::SURFPOOL_BLOCKHASH_PREFIX)
-            })
+            && embedded_blockhash
+                .is_some_and(|h| h.starts_with(crate::client::mpp::SURFPOOL_BLOCKHASH_PREFIX))
         {
             crate::config::SANDBOX_RPC_URL.to_string()
         } else {
@@ -594,8 +688,8 @@ fn format_amount(base_units: &str, decimals: u8) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
     const PLAN: &str = "8tWbqLkUJoYy7zXc5h2EvCRoaQEv2xnQjUuYhc3rzCgT";
     const MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
@@ -785,7 +879,10 @@ mod tests {
         let parsed = parse_subscription_receipt(&header).expect("parse");
         assert_eq!(parsed.reference, "5J8signature");
         assert_eq!(parsed.timestamp.as_deref(), Some("2026-01-15T12:03:10Z"));
-        assert_eq!(parsed.extensions.subscription_id, "BXQGmO5VwTrl5RfFr6Y8XQZ4nPj9QqMOiKkRn3pZ4ZE");
+        assert_eq!(
+            parsed.extensions.subscription_id,
+            "BXQGmO5VwTrl5RfFr6Y8XQZ4nPj9QqMOiKkRn3pZ4ZE"
+        );
         assert_eq!(parsed.extensions.plan_id, PLAN);
         assert_eq!(parsed.extensions.period_index, "0");
         assert_eq!(

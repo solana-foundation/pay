@@ -34,11 +34,7 @@ const SCHEMA_VERSION: &str = "1";
 /// paths relative to that. `openapi_url`, when supplied, points at the
 /// server's `/openapi.json` route so consumers that prefer the OpenAPI
 /// discovery shape have something to fetch.
-pub fn synthesize_catalog(
-    api: &ApiSpec,
-    base_url: &str,
-    openapi_url: Option<&str>,
-) -> Value {
+pub fn synthesize_catalog(api: &ApiSpec, base_url: &str, openapi_url: Option<&str>) -> Value {
     let fqn = format!("local/{}", api.subdomain);
 
     let endpoints: Vec<Endpoint> = api

@@ -13,8 +13,8 @@
 
 use std::str::FromStr;
 
-use solana_mpp::server::{SubscriptionConfig as SdkSubscriptionConfig, SubscriptionServer};
 use solana_mpp::SubscriptionPeriodUnit;
+use solana_mpp::server::{SubscriptionConfig as SdkSubscriptionConfig, SubscriptionServer};
 #[allow(unused_imports)]
 use solana_pubkey::Pubkey;
 
@@ -41,10 +41,15 @@ pub struct OperatorDefaults<'a> {
     /// pre-fetch hits the configured Helius / Surfnet endpoint rather
     /// than the SDK's fallback to `localhost:8899`.
     pub rpc_url: &'a str,
-    /// HMAC secret shared with the rest of the gateway (defaults to
-    /// `MPP_SECRET_KEY` env var when `None`).
-    pub secret_key: Option<&'a str>,
-    /// Realm string surfaced in the `WWW-Authenticate` header.
+    /// HMAC secret shared by the subscription + authenticate handlers
+    /// to bind each challenge to its server. Sourced from
+    /// `operator.challenge_binding_secret` in the server YAML;
+    /// required when subscription endpoints are present (`pay server
+    /// start` rejects the config at boot otherwise).
+    pub challenge_binding_secret: Option<&'a str>,
+    /// Realm surfaced in `WWW-Authenticate: Payment realm="…"`. Sourced
+    /// from `operator.realm` when set, else falls back to the server
+    /// subdomain so the label is always deterministic and non-empty.
     pub realm: Option<&'a str>,
     /// If set, requests this server to sponsor activation fees.
     pub fee_payer: bool,
@@ -52,8 +57,7 @@ pub struct OperatorDefaults<'a> {
     /// — the SDK's verify path co-signs the activation transaction
     /// with it before broadcasting. The middleware threads it through
     /// from `PaymentState::fee_payer_signer`.
-    pub fee_payer_signer:
-        Option<std::sync::Arc<dyn solana_mpp::solana_keychain::SolanaSigner>>,
+    pub fee_payer_signer: Option<std::sync::Arc<dyn solana_mpp::solana_keychain::SolanaSigner>>,
 }
 
 /// Resolve `(amount_base_units, decimals, mint_b58)` from the endpoint
@@ -109,22 +113,17 @@ pub fn build_handler(
     defaults: OperatorDefaults<'_>,
     description: Option<&str>,
 ) -> Result<SubscriptionServer> {
-    let plan_id = spec
-        .plan_id
-        .clone()
-        .ok_or_else(|| {
-            Error::Config(
-                "subscription endpoint is missing `plan_id`. Run `pay server plans publish` \
+    let plan_id = spec.plan_id.clone().ok_or_else(|| {
+        Error::Config(
+            "subscription endpoint is missing `plan_id`. Run `pay server plans publish` \
                  to publish the on-chain Plan and write its address back into pay-demo.yaml."
-                    .into(),
-            )
-        })?;
+                .into(),
+        )
+    })?;
 
     let (_amount, decimals, mint) = resolve_amount(spec)?;
 
-    let (period_unit, period_count) = spec
-        .parse_period()
-        .map_err(Error::Config)?;
+    let (period_unit, period_count) = spec.parse_period().map_err(Error::Config)?;
     let sdk_period_unit = match period_unit {
         TypesPeriodUnit::Day => SubscriptionPeriodUnit::Day,
         TypesPeriodUnit::Week => SubscriptionPeriodUnit::Week,
@@ -152,8 +151,25 @@ pub fn build_handler(
         network: defaults.network.to_string(),
         program_id: None,
         rpc_url: Some(defaults.rpc_url.to_string()),
-        secret_key: defaults.secret_key.map(str::to_string),
-        realm: defaults.realm.map(str::to_string),
+        // `challenge_binding_secret` and `realm` are required on the SDK side — fall
+        // back loudly when the operator config is incomplete instead
+        // of inheriting a silent SDK default. Boot-time validation in
+        // `pay server start` is supposed to catch a missing secret
+        // before any request lands; this guard is the runtime backstop.
+        challenge_binding_secret: defaults
+            .challenge_binding_secret
+            .map(str::to_string)
+            .ok_or_else(|| {
+                Error::Config(
+                    "subscription handler requires a challenge-binding secret — set \
+                 `operator.challenge_binding_secret` in the server YAML"
+                        .into(),
+                )
+            })?,
+        realm: defaults
+            .realm
+            .map(str::to_string)
+            .ok_or_else(|| Error::Config("subscription handler requires a realm".into()))?,
         fee_payer: defaults.fee_payer,
         fee_payer_signer: defaults.fee_payer_signer.clone(),
         // The signer is preferred when threaded through, but we also
@@ -291,8 +307,8 @@ pub async fn publish_plan(
     plan_id_numeric: u64,
 ) -> Result<PublishedPlan> {
     use solana_mpp::program::subscriptions::{
-        build_create_plan_ix, default_program_id, find_plan_pda, plan_id_seed,
-        CreatePlanAccounts, CreatePlanData, PlanTerms,
+        CreatePlanAccounts, CreatePlanData, PlanTerms, build_create_plan_ix, default_program_id,
+        find_plan_pda, plan_id_seed,
     };
     use solana_pubkey::Pubkey;
 
@@ -324,7 +340,7 @@ pub async fn publish_plan(
             period_hours,
             created_at: 0, // set on-chain by the program
         },
-        0, // no plan-level expiry; HTTP-layer subscription_expires governs
+        0,                      // no plan-level expiry; HTTP-layer subscription_expires governs
         [Pubkey::default(); 4], // open destinations whitelist for v0
         [Pubkey::default(); 4], // owner-only pullers for v0
         "",
@@ -366,10 +382,7 @@ pub async fn publish_plan(
 /// Read just the `created_at` (i64 LE) out of a freshly-published Plan
 /// account at the canonical offset. Avoids vendoring the full Plan
 /// account decoder for the one field `pay server start` actually needs.
-async fn fetch_plan_created_at(
-    rpc_url: &str,
-    plan_pda: &solana_pubkey::Pubkey,
-) -> Result<i64> {
+async fn fetch_plan_created_at(rpc_url: &str, plan_pda: &solana_pubkey::Pubkey) -> Result<i64> {
     let url = rpc_url.to_string();
     let pda = *plan_pda;
     tokio::task::spawn_blocking(move || -> Result<i64> {
@@ -455,8 +468,8 @@ async fn sign_and_broadcast(
     }
     tx.signatures[signer_index] = signature;
 
-    let serialised = bincode::serialize(&tx)
-        .map_err(|e| Error::Mpp(format!("Failed to serialise tx: {e}")))?;
+    let serialised =
+        bincode::serialize(&tx).map_err(|e| Error::Mpp(format!("Failed to serialise tx: {e}")))?;
     let confirmed_sig = tokio::task::spawn_blocking(move || {
         let rpc = RpcClient::new(url);
         let tx: Transaction = bincode::deserialize(&serialised)
@@ -498,7 +511,7 @@ mod tests {
             recipient: "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
             network: "mainnet",
             rpc_url: "https://api.mainnet-beta.solana.com",
-            secret_key: Some("test-secret"),
+            challenge_binding_secret: Some("test-secret"),
             realm: Some("test-realm"),
             fee_payer: false,
             fee_payer_signer: None,

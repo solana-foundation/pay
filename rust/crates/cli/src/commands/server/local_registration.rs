@@ -68,10 +68,7 @@ pub fn sweep_dead_ephemeral_sources() -> Result<usize, pay_core::Error> {
 /// Idempotent — re-adding an existing URL is a no-op. Returns the
 /// `(name, url)` tuple the caller stashes for the matching
 /// `deregister` call.
-pub fn register(
-    subdomain: &str,
-    bind: &str,
-) -> Result<(String, String), pay_core::Error> {
+pub fn register(subdomain: &str, bind: &str) -> Result<(String, String), pay_core::Error> {
     let name = local_source_name(subdomain, bind);
     let url = local_source_url(bind);
     let mut cfg = SkillsConfig::load()?;

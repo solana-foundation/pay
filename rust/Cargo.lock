@@ -5870,6 +5870,7 @@ dependencies = [
 [[package]]
 name = "payment-channels"
 version = "0.1.0"
+source = "git+https://github.com/solana-foundation/pay-kit?branch=main#fbbe4ad801492c90ec20e15b9409a49a7456614e"
 dependencies = [
  "borsh 1.6.1",
  "num-derive",
@@ -9249,6 +9250,7 @@ dependencies = [
 [[package]]
 name = "solana-mpp"
 version = "0.6.0"
+source = "git+https://github.com/solana-foundation/pay-kit?branch=main#fbbe4ad801492c90ec20e15b9409a49a7456614e"
 dependencies = [
  "base64 0.22.1",
  "bincode",
@@ -11323,6 +11325,7 @@ dependencies = [
 [[package]]
 name = "solana-x402"
 version = "0.1.0"
+source = "git+https://github.com/solana-foundation/pay-kit?branch=main#fbbe4ad801492c90ec20e15b9409a49a7456614e"
 dependencies = [
  "base64 0.22.1",
  "bincode",

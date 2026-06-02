@@ -756,7 +756,7 @@ enum SessionCloseResult {
 pub struct SessionMpp {
     server: Arc<SessionServer<MemoryChannelStore>>,
     session_config: SessionConfig,
-    secret_key: String,
+    challenge_binding_secret: String,
     realm: String,
     rpc_url: Option<String>,
     payment_channel_signer: Arc<Mutex<Option<Arc<dyn SolanaSigner>>>>,
@@ -782,7 +782,7 @@ pub enum PullVoucherStrategy {
 
 impl SessionMpp {
     /// Create from a [`SessionConfig`] and an HMAC secret key.
-    pub fn new(config: SessionConfig, secret_key: impl Into<String>) -> Self {
+    pub fn new(config: SessionConfig, challenge_binding_secret: impl Into<String>) -> Self {
         let session_config = config.clone();
         let server = Arc::new(SessionServer::new(config, MemoryChannelStore::new()));
         let payment_channel_signer = Arc::new(Mutex::new(None));
@@ -814,7 +814,7 @@ impl SessionMpp {
             rpc_url: session_config.rpc_url.clone(),
             server,
             session_config,
-            secret_key: secret_key.into(),
+            challenge_binding_secret: challenge_binding_secret.into(),
             realm: DEFAULT_REALM.to_string(),
             payment_channel_signer,
             payment_channel_payer_signer,
@@ -990,8 +990,8 @@ impl SessionMpp {
         request.recent_blockhash = self.prefetch_latest_blockhash();
         let encoded = Base64UrlJson::from_typed(&request)
             .map_err(|e| Error::Mpp(format!("Failed to encode session request: {e}")))?;
-        Ok(PaymentChallenge::with_secret_key(
-            &self.secret_key,
+        Ok(PaymentChallenge::with_challenge_binding_secret(
+            &self.challenge_binding_secret,
             &self.realm,
             METHOD,
             INTENT,
@@ -1962,7 +1962,7 @@ mod tests {
     #[tokio::test]
     async fn process_rejects_non_session_intent() {
         let session = test_session_mpp();
-        let challenge = PaymentChallenge::with_secret_key(
+        let challenge = PaymentChallenge::with_challenge_binding_secret(
             "test-secret",
             "test-realm",
             METHOD,

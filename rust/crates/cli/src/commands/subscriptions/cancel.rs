@@ -26,12 +26,12 @@ use owo_colors::OwoColorize;
 use solana_message::Message;
 use solana_mpp::client::build_credential_header;
 use solana_mpp::program::subscriptions::{
-    build_cancel_subscription_ix, default_program_id, find_event_authority_pda, parse_pubkey,
-    CancelSubscriptionAccounts,
+    CancelSubscriptionAccounts, build_cancel_subscription_ix, default_program_id,
+    find_event_authority_pda, parse_pubkey,
 };
 use solana_mpp::solana_keychain::SolanaSigner;
 use solana_mpp::solana_rpc_client::rpc_client::RpcClient;
-use solana_mpp::{parse_www_authenticate, PaymentChallenge};
+use solana_mpp::{PaymentChallenge, parse_www_authenticate};
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
 use solana_transaction::Transaction;
@@ -114,8 +114,9 @@ impl CancelCommand {
 
         // ── Resolve on-chain accounts ───────────────────────────────────
         let program_id = match subscription.program_id.as_deref() {
-            Some(p) => parse_pubkey(p, "program_id")
-                .map_err(|e| pay_core::Error::Config(e.to_string()))?,
+            Some(p) => {
+                parse_pubkey(p, "program_id").map_err(|e| pay_core::Error::Config(e.to_string()))?
+            }
             None => default_program_id(),
         };
         let subscription_pda = parse_pubkey(&subscription.subscription_id, "subscription_id")
@@ -147,9 +148,7 @@ impl CancelCommand {
             .rpc_url
             .clone()
             .or_else(|| std::env::var("PAY_RPC_URL").ok())
-            .unwrap_or_else(|| {
-                solana_mpp::protocol::solana::default_rpc_url(&network).to_string()
-            });
+            .unwrap_or_else(|| solana_mpp::protocol::solana::default_rpc_url(&network).to_string());
 
         // ── Subscriber pubkey from accounts.yml (no keystore unlock) ────
         //
@@ -197,11 +196,7 @@ impl CancelCommand {
         // instead of "$0". Direct path skips this — there's no
         // gateway involved.
         let gateway_probe = if use_gateway {
-            eprintln!(
-                "{} {}",
-                "Routing via".dimmed(),
-                gateway_url.dimmed()
-            );
+            eprintln!("{} {}", "Routing via".dimmed(), gateway_url.dimmed());
             Some(rt.block_on(probe_gateway_challenge(
                 &gateway_url,
                 &subscription_pda.to_string(),
@@ -294,11 +289,7 @@ impl CancelCommand {
                 },
             );
             rt.block_on(broadcast_direct(&signer, ix, &rpc_url))
-                .map_err(|e| {
-                    pay_core::Error::Mpp(format!(
-                        "Direct cancel broadcast failed: {e}"
-                    ))
-                })?
+                .map_err(|e| pay_core::Error::Mpp(format!("Direct cancel broadcast failed: {e}")))?
         };
 
         // ── Persist local state ─────────────────────────────────────────
@@ -353,9 +344,7 @@ async fn broadcast_direct(
         .account_keys
         .iter()
         .position(|k| *k == pubkey)
-        .ok_or_else(|| {
-            pay_core::Error::Mpp("Subscriber pubkey absent from account_keys".into())
-        })?;
+        .ok_or_else(|| pay_core::Error::Mpp("Subscriber pubkey absent from account_keys".into()))?;
     tx.signatures[signer_index] = signature;
 
     let serialised = bincode::serialize(&tx)
@@ -380,6 +369,7 @@ async fn broadcast_direct(
 // co-signs the user-submitted cancel_subscription tx as fee-payer, and
 // broadcasts.
 
+#[allow(clippy::too_many_arguments)]
 async fn broadcast_via_gateway(
     signer: Arc<solana_mpp::solana_keychain::MemorySigner>,
     instruction: solana_instruction::Instruction,
@@ -413,8 +403,7 @@ async fn broadcast_via_gateway(
     .await
     .map_err(|e| pay_core::Error::Mpp(format!("RPC task join: {e}")))??;
 
-    let message =
-        Message::new_with_blockhash(&[instruction], Some(gateway_fee_payer), &blockhash);
+    let message = Message::new_with_blockhash(&[instruction], Some(gateway_fee_payer), &blockhash);
     let mut tx = Transaction::new_unsigned(message);
     let subscriber = signer.pubkey();
     let subscriber_index = tx
@@ -435,8 +424,7 @@ async fn broadcast_via_gateway(
 
     let tx_bytes = bincode::serialize(&tx)
         .map_err(|e| pay_core::Error::Mpp(format!("Failed to serialise tx: {e}")))?;
-    let tx_b64 =
-        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_bytes);
+    let tx_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_bytes);
 
     // ── Sign the USDC charge credential against the probed challenge ───
     let rpc = RpcClient::new(url.clone());
@@ -469,15 +457,12 @@ async fn broadcast_via_gateway(
     }
 
     // Body shape: `{ "signature": "...", "receipt": {...}, "subscriptionPda": "..." }`
-    let resp_json: serde_json::Value = serde_json::from_str(&resp_text).map_err(|e| {
-        pay_core::Error::Mpp(format!("Could not parse gateway response: {e}"))
-    })?;
+    let resp_json: serde_json::Value = serde_json::from_str(&resp_text)
+        .map_err(|e| pay_core::Error::Mpp(format!("Could not parse gateway response: {e}")))?;
     let signature = resp_json
         .get("signature")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            pay_core::Error::Mpp("Gateway response missing `signature` field".into())
-        })?
+        .ok_or_else(|| pay_core::Error::Mpp("Gateway response missing `signature` field".into()))?
         .to_string();
     Ok(signature)
 }
@@ -526,9 +511,7 @@ async fn probe_gateway_challenge(
         .get(reqwest::header::WWW_AUTHENTICATE)
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| {
-            pay_core::Error::Mpp(
-                "Gateway 402 response missing WWW-Authenticate header".into(),
-            )
+            pay_core::Error::Mpp("Gateway 402 response missing WWW-Authenticate header".into())
         })?
         .to_string();
     let challenge: PaymentChallenge = parse_www_authenticate(&www_auth)
@@ -542,8 +525,8 @@ async fn probe_gateway_challenge(
         .get("feePayer")
         .and_then(|v| v.as_str())
         .ok_or_else(|| pay_core::Error::Mpp("Gateway 402 missing `feePayer`".into()))?;
-    let fee_payer = parse_pubkey(fee_payer_str, "feePayer")
-        .map_err(|e| pay_core::Error::Mpp(e.to_string()))?;
+    let fee_payer =
+        parse_pubkey(fee_payer_str, "feePayer").map_err(|e| pay_core::Error::Mpp(e.to_string()))?;
     let currency = body
         .get("currency")
         .and_then(|v| v.as_str())
@@ -554,9 +537,10 @@ async fn probe_gateway_challenge(
     // it via the standard token-amount formatter so the Touch ID
     // prompt shows "$0.0015" rather than "1500 base units".
     let charge_request: solana_mpp::protocol::intents::ChargeRequest =
-        challenge.request.decode().map_err(|e| {
-            pay_core::Error::Mpp(format!("Gateway challenge request payload: {e}"))
-        })?;
+        challenge
+            .request
+            .decode()
+            .map_err(|e| pay_core::Error::Mpp(format!("Gateway challenge request payload: {e}")))?;
     let amount_raw: u64 = charge_request.amount.parse().map_err(|e| {
         pay_core::Error::Mpp(format!("Gateway challenge amount is not numeric: {e}"))
     })?;

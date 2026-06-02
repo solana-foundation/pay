@@ -285,7 +285,10 @@ fn meaningful_operator(value: &str) -> Option<String> {
         return None;
     }
     let lower = value.to_ascii_lowercase();
-    if matches!(lower.as_str(), "unknown" | "localhost" | "127.0.0.1" | "::1" | "[::1]") {
+    if matches!(
+        lower.as_str(),
+        "unknown" | "localhost" | "127.0.0.1" | "::1" | "[::1]"
+    ) {
         return None;
     }
     Some(truncate_detail(value, 64))

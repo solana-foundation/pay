@@ -668,7 +668,13 @@ mod tests {
 
     fn test_challenge(intent: &str) -> PaymentChallenge {
         let request = Base64UrlJson::from_typed(&test_request()).unwrap();
-        PaymentChallenge::with_secret_key("test-secret", "test-realm", "solana", intent, request)
+        PaymentChallenge::with_challenge_binding_secret(
+            "test-secret",
+            "test-realm",
+            "solana",
+            intent,
+            request,
+        )
     }
 
     fn test_signer() -> Box<dyn SolanaSigner> {

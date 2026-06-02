@@ -54,7 +54,10 @@ impl ListCommand {
                     })
                 })
                 .collect();
-            println!("{}", serde_json::to_string_pretty(&json_rows).unwrap_or_default());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json_rows).unwrap_or_default()
+            );
             return Ok(());
         }
 
@@ -129,6 +132,7 @@ fn print_subscription_row(network: &str, account: &str, sub: &Subscription) {
     }
 }
 
+#[allow(dead_code)]
 fn truncate_id(id: &str) -> String {
     if id.len() <= 12 {
         id.to_string()

@@ -1081,8 +1081,7 @@ async fn fetch_and_merge(cfg: &config::SkillsConfig, cache_bust: bool) -> Result
     let mut successful_sources = 0usize;
     let mut failures = Vec::new();
 
-    let durable: Vec<&config::Source> =
-        cfg.sources.iter().filter(|s| !s.ephemeral).collect();
+    let durable: Vec<&config::Source> = cfg.sources.iter().filter(|s| !s.ephemeral).collect();
     for source in &durable {
         let url = if cache_bust {
             let ts = std::time::SystemTime::now()

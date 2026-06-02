@@ -526,19 +526,19 @@ impl StartCommand {
             }
 
             // ── Create MPP servers ──
-            let secret_key = std::env::var("PAY_MPP_CHALLENGE_SECRET")
+            let challenge_binding_secret = std::env::var("PAY_MPP_CHALLENGE_SECRET")
                 .unwrap_or_else(|_| bs58::encode(rand::random::<[u8; 32]>()).into_string());
 
-            // Mirror the charge HMAC secret into MPP_SECRET_KEY so the
-            // subscription middleware (which lazy-builds a SubscriptionServer
-            // per request, with `secret_key: None`) picks up the same
-            // secret via the SDK's env fallback. Without this, the per-
-            // request `SubscriptionServer::new` errors with "Missing
-            // MPP_SECRET_KEY env var". SAFETY: called before any threads
-            // are spawned (the request handler runs inside the runtime
-            // built below).
+            // Mirror the charge HMAC secret into MPP_CHALLENGE_BINDING_SECRET
+            // so the subscription middleware (which lazy-builds a
+            // SubscriptionServer per request, with `challenge_binding_secret: None`)
+            // picks up the same secret via the SDK's env fallback.
+            // Without this, the per-request `SubscriptionServer::new`
+            // errors with "Missing MPP_CHALLENGE_BINDING_SECRET env var".
+            // SAFETY: called before any threads are spawned (the request
+            // handler runs inside the runtime built below).
             unsafe {
-                std::env::set_var("MPP_SECRET_KEY", &secret_key);
+                std::env::set_var("MPP_CHALLENGE_BINDING_SECRET", &challenge_binding_secret);
             }
 
             let currency_configs: Vec<_> = currencies
@@ -557,7 +557,7 @@ impl StartCommand {
                         decimals: *decimals,
                         network: network.slug().to_string(),
                         rpc_url: Some(rpc_url.clone()),
-                        secret_key: Some(secret_key.clone()),
+                        challenge_binding_secret: Some(challenge_binding_secret.clone()),
                         fee_payer,
                         fee_payer_signer: fee_payer_signer.clone(),
                         html: true,
@@ -584,7 +584,7 @@ impl StartCommand {
 
                 let cap_base = (sess.cap_usdc * 10f64.powi(session_decimals as i32)).round() as u64;
                 let session_secret = std::env::var("PAY_SESSION_SECRET")
-                    .unwrap_or_else(|_| secret_key.clone());
+                    .unwrap_or_else(|_| challenge_binding_secret.clone());
                 let requested_modes: Vec<SessionMode> = if sess.modes.is_empty() {
                     vec![SessionMode::Push]
                 } else {
@@ -849,10 +849,13 @@ impl StartCommand {
             );
             let operator_link = crate::components::link::link_with_arrow(&short_recipient, &operator_url);
 
-            eprintln!("{}\t{}", "network".dimmed(), network_link);
+            // Pad labels to a fixed visible width — tabs land on
+            // terminal-dependent stops, so a 7-char label followed by
+            // a tab aligns differently than an 8-char one.
+            eprintln!("{}  {}", format!("{:<10}", "network").dimmed(), network_link);
             eprintln!(
-                "{}\t{} via {}",
-                "currency".dimmed(),
+                "{}  {} via {}",
+                format!("{:<10}", "currency").dimmed(),
                 "$".green(),
                 currencies.join(", ").green()
             );
@@ -877,7 +880,12 @@ impl StartCommand {
             } else {
                 balance_text.red().to_string()
             };
-            eprintln!("{}\t{}{}", "operator".dimmed(), operator_link, balance_colored);
+            eprintln!(
+                "{}  {}{}",
+                format!("{:<10}", "operator").dimmed(),
+                operator_link,
+                balance_colored
+            );
             eprintln!();
 
             // Loud warning when the wallet is empty. The most common
@@ -1239,10 +1247,10 @@ impl StartCommand {
             // Best-effort cleanup. We run this regardless of how serve
             // exited so even an `Err(...)` return path leaves
             // skills.yaml clean.
-            if let Some(url) = registered_source_url {
-                if let Err(e) = super::local_registration::deregister(&url) {
-                    tracing::warn!(error = %e, "failed to deregister local skills source");
-                }
+            if let Some(url) = registered_source_url
+                && let Err(e) = super::local_registration::deregister(&url)
+            {
+                tracing::warn!(error = %e, "failed to deregister local skills source");
             }
 
             serve_result
@@ -1534,19 +1542,37 @@ async fn ensure_subscription_plans(
     use dialoguer::Confirm;
     use dialoguer::theme::ColorfulTheme;
     use pay_core::server::subscription::{
-        check_plan_exists, compute_plan_id_numeric, publish_plan, PlanStatus,
+        PlanStatus, check_plan_exists, compute_plan_id_numeric, publish_plan,
     };
-    use solana_mpp::program::subscriptions::{find_plan_pda, plan_id_seed, default_program_id};
+    use solana_mpp::program::subscriptions::{default_program_id, find_plan_pda, plan_id_seed};
     use solana_pubkey::Pubkey;
 
     // Bail early when the spec has no subscription endpoints — keeps the
     // common case (charge / session) zero-overhead at startup.
-    if !api
-        .endpoints
-        .iter()
-        .any(|ep| ep.subscription.is_some())
-    {
+    if !api.endpoints.iter().any(|ep| ep.subscription.is_some()) {
         return Ok(api);
+    }
+
+    // Subscription endpoints emit `WWW-Authenticate` challenges with an
+    // HMAC-derived nonce so the `authenticate` verify path stays
+    // stateless. The HMAC secret MUST be supplied by the operator —
+    // there's no safe silent default, and a server-restart that
+    // randomises the secret invalidates every outstanding session
+    // token. Fail at boot so the misconfiguration surfaces before any
+    // subscriber can hit the broken endpoint.
+    if api
+        .operator
+        .as_ref()
+        .and_then(|o| o.challenge_binding_secret.as_deref())
+        .is_none_or(str::is_empty)
+    {
+        return Err(pay_core::Error::Config(format!(
+            "subscription endpoints require `operator.challenge_binding_secret` in {spec_path}. \
+             Generate one with `openssl rand -hex 32` and paste it under the \
+             `operator:` block. The same value must be reused across server \
+             restarts — rotating it invalidates every outstanding SIWMPP \
+             session token."
+        )));
     }
 
     let operator = Pubkey::from_str(operator_pubkey_str).map_err(|e| {
@@ -1574,15 +1600,15 @@ async fn ensure_subscription_plans(
         // Treat a YAML-pinned plan_id that disagrees with our derivation
         // as a configuration error — the operator probably edited the
         // numeric id but not the PDA string (or vice versa).
-        if let Some(yaml_plan_id) = sub_spec.plan_id.as_deref() {
-            if yaml_plan_id != plan_pda.to_string() {
-                return Err(pay_core::Error::Config(format!(
-                    "endpoint `{}` has plan_id `{yaml_plan_id}` but \
-                     plan_id_numeric={plan_id_numeric} derives to `{plan_pda}`. \
-                     Clear plan_id from the YAML and let `pay server start` regenerate it.",
-                    endpoint.path
-                )));
-            }
+        if let Some(yaml_plan_id) = sub_spec.plan_id.as_deref()
+            && yaml_plan_id != plan_pda.to_string()
+        {
+            return Err(pay_core::Error::Config(format!(
+                "endpoint `{}` has plan_id `{yaml_plan_id}` but \
+                 plan_id_numeric={plan_id_numeric} derives to `{plan_pda}`. \
+                 Clear plan_id from the YAML and let `pay server start` regenerate it.",
+                endpoint.path
+            )));
         }
 
         let status = check_plan_exists(rpc_url, &plan_pda).await?;
@@ -1639,7 +1665,9 @@ async fn ensure_subscription_plans(
                 );
                 let theme = ColorfulTheme::default();
                 let confirmed = Confirm::with_theme(&theme)
-                    .with_prompt("Publish create_plan on-chain now? (costs ~0.001 SOL in rent + fees)")
+                    .with_prompt(
+                        "Publish create_plan on-chain now? (costs ~0.001 SOL in rent + fees)",
+                    )
                     .default(false)
                     .interact()
                     .map_err(|e| {

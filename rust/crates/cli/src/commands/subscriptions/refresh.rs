@@ -11,9 +11,7 @@
 use owo_colors::OwoColorize;
 
 use pay_core::accounts::AccountsFile;
-use pay_core::client::subscription::{
-    default_rpc_url_for_network, lookup_activation_signature,
-};
+use pay_core::client::subscription::{default_rpc_url_for_network, lookup_activation_signature};
 
 #[derive(clap::Args)]
 pub struct RefreshCommand {
@@ -110,10 +108,7 @@ impl RefreshCommand {
         }
 
         eprintln!();
-        eprintln!(
-            "{} {updated} refreshed, {failed} failed.",
-            "Done.".bold()
-        );
+        eprintln!("{} {updated} refreshed, {failed} failed.", "Done.".bold());
         Ok(())
     }
 }

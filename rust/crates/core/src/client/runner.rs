@@ -28,8 +28,16 @@ pub enum RunOutcome {
     /// recurring delegation and collects the first-period charge in one
     /// atomic transaction; renewals are server-driven and don't pass back
     /// through this enum.
+    ///
+    /// `authenticate` carries the sibling `intent="authenticate"`
+    /// challenge from the same 402 response when the server emitted one
+    /// (pay-server emits both). The caller signs it in the same Touch ID
+    /// session as the activation tx and caches the resulting token in
+    /// `accounts.yml` so subsequent requests within the billing period
+    /// skip the 402 dance entirely.
     SubscriptionChallenge {
         challenge: Box<mpp::Challenge>,
+        authenticate: Option<Box<mpp::Challenge>>,
         resource_url: String,
     },
     /// The server returned 402 with an x402 challenge.
@@ -82,7 +90,8 @@ pub fn run_curl(user_args: &[String]) -> Result<RunOutcome> {
     }
 
     validate_curl_args_against_catalog(user_args)?;
-    run_curl_inner(user_args, &[])
+    let pre = pre_attach_cached_auth(user_args, ToolKind::Curl);
+    run_curl_inner(user_args, &pre)
 }
 
 /// Run `curl` with extra headers injected (used for retry after payment).
@@ -173,7 +182,8 @@ pub fn run_wget(user_args: &[String]) -> Result<RunOutcome> {
     }
 
     validate_wget_args_against_catalog(user_args)?;
-    run_wget_inner(user_args, &[])
+    let pre = pre_attach_cached_auth(user_args, ToolKind::Wget);
+    run_wget_inner(user_args, &pre)
 }
 
 /// Run `http` (HTTPie) with the given user args, detecting 402 + MPP challenges.
@@ -185,7 +195,8 @@ pub fn run_httpie(user_args: &[String]) -> Result<RunOutcome> {
         return run_plain_command("http", user_args);
     }
 
-    run_httpie_inner(user_args, &[])
+    let pre = pre_attach_cached_auth(user_args, ToolKind::Httpie);
+    run_httpie_inner(user_args, &pre)
 }
 
 /// Run `http` with extra headers injected (used for retry after payment).
@@ -306,7 +317,11 @@ fn run_httpie_inner(user_args: &[String], extra_headers: &[String]) -> Result<Ru
     let exit_code = output.status.code().unwrap_or(1);
     let stdout_text = String::from_utf8_lossy(&output.stdout);
     let stderr_text = String::from_utf8_lossy(&output.stderr);
-    let url = find_url_in_args(user_args).unwrap_or_default();
+    // HTTPie accepts `:port/path` and `host[:port]/path` shorthand;
+    // expand both so the URL persisted alongside an activated
+    // subscription matches what the next request will hit (the SIWMPP
+    // cache lookup is a URL-prefix match).
+    let url = resolve_request_url(user_args, ToolKind::Httpie).unwrap_or_default();
 
     let (status_code, headers, body) = parse_httpie_output(&stdout_text);
 
@@ -524,8 +539,14 @@ pub(crate) fn classify_402_with_preference(
             resource = resource_url,
             "Detected MPP subscription challenge (Solana)"
         );
+        let authenticate = mpp_challenges
+            .iter()
+            .find(|c| c.intent.as_str() == "authenticate" && c.method.as_str() == "solana")
+            .cloned()
+            .map(Box::new);
         return RunOutcome::SubscriptionChallenge {
             challenge: Box::new(challenge.clone()),
+            authenticate,
             resource_url: resource_url.to_string(),
         };
     }
@@ -573,7 +594,9 @@ pub(crate) fn classify_402_with_preference(
     // only offers the other one. Surface that explicitly instead of
     // letting the request loop on an UnknownPaymentRequired.
     match preference {
-        ProtocolPreference::OnlyMpp if x402_challenge.is_some() || x402_siwx_challenge.is_some() => {
+        ProtocolPreference::OnlyMpp
+            if x402_challenge.is_some() || x402_siwx_challenge.is_some() =>
+        {
             return RunOutcome::PaymentRejected {
                 reason: "Server only offers an x402 challenge, but --mpp was requested. \
                          Drop --mpp to settle via x402, or pick a server that advertises MPP."
@@ -721,6 +744,215 @@ fn find_url_in_args(args: &[String]) -> Option<String> {
     args.iter()
         .find(|a| a.starts_with("http://") || a.starts_with("https://"))
         .cloned()
+}
+
+/// Which external HTTP client the runner is feeding. The header
+/// injection format and URL-extraction rules differ per tool.
+#[derive(Debug, Clone, Copy)]
+enum ToolKind {
+    Curl,
+    Wget,
+    Httpie,
+}
+
+/// Best-effort URL extraction across the three CLI tools we wrap.
+///
+/// `curl`/`wget` require a fully-qualified URL on the command line —
+/// `find_url_in_args` already covers that. `httpie` accepts shorthands
+/// like `:1402/path` (host defaults to `localhost`) or `example.com/path`
+/// (scheme defaults to `http://`). We canonicalise both forms so the
+/// SIWMPP cache lookup (URL-prefix match against tracked subscriptions)
+/// sees the same URL the request will actually hit.
+fn resolve_request_url(args: &[String], tool: ToolKind) -> Option<String> {
+    if let Some(u) = find_url_in_args(args) {
+        return Some(u);
+    }
+    if !matches!(tool, ToolKind::Httpie) {
+        return None;
+    }
+    args.iter().find_map(|a| httpie_url_shorthand(a))
+}
+
+/// HTTPie-specific URL shorthand expander.
+///
+/// Skips flags, body items (`field=value`, `field:=jsonvalue`,
+/// `field==query`), headers (`Header:value`), and HTTP method tokens.
+/// Returns `Some(canonical_url)` for `:port[/path]` and bare
+/// `host[:port][/path]` forms.
+fn httpie_url_shorthand(arg: &str) -> Option<String> {
+    if arg.starts_with('-') || arg.is_empty() {
+        return None;
+    }
+    if arg.contains('=') {
+        return None; // body item: key=val, key:=jsonval, key==query
+    }
+    if matches!(
+        arg,
+        "GET" | "HEAD" | "POST" | "PUT" | "DELETE" | "PATCH" | "OPTIONS"
+    ) {
+        return None;
+    }
+
+    // `:port[/path]` — host defaults to localhost.
+    if let Some(rest) = arg.strip_prefix(':') {
+        let first = rest.chars().next()?;
+        if first.is_ascii_digit() {
+            return Some(format!("http://localhost:{rest}"));
+        }
+        return None;
+    }
+
+    // Header item like `Foo:Bar` — colon present, but the part before is
+    // a header name (letters/dashes), not a hostname.
+    if let Some(colon) = arg.find(':') {
+        let host_or_name = &arg[..colon];
+        let after = arg[colon + 1..].chars().next();
+        let port_like = after.is_some_and(|c| c.is_ascii_digit());
+        let looks_hostlike = host_or_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+        if !port_like || !looks_hostlike {
+            return None;
+        }
+        // `host:port[/path]` → assume http://
+        return Some(format!("http://{arg}"));
+    }
+
+    // Bare `host[/path]` — only treat as URL when it looks domain-ish
+    // (contains a `.`), to avoid matching positional non-URL args.
+    if arg.contains('.') {
+        return Some(format!("http://{arg}"));
+    }
+    None
+}
+
+/// Pre-attach a cached SIWMPP `Authorization: Payment …` header to the
+/// CLI command when a tracked subscription covers the request URL.
+///
+/// Returns the formatted header arg(s) to inject into the subprocess,
+/// in the tool's native shape:
+/// - curl/wget: `"Authorization: <token>"`
+/// - httpie: `"Authorization:<token>"` (no space — HTTPie request-item form)
+///
+/// Empty vec when no tracked subscription matches the URL, so callers
+/// pass it through to the existing inner runner unchanged.
+fn pre_attach_cached_auth(args: &[String], tool: ToolKind) -> Vec<String> {
+    let Some(url) = resolve_request_url(args, tool) else {
+        return Vec::new();
+    };
+    // Skip pre-attach when the user already passed their own
+    // Authorization header — their value wins.
+    if user_already_set_auth(args, tool) {
+        return Vec::new();
+    }
+    let store = crate::accounts::FileAccountsStore::default_path();
+    let Some(token) = crate::client::authenticate::cached_header_for_resource(&store, &url) else {
+        return Vec::new();
+    };
+    let formatted = match tool {
+        ToolKind::Curl | ToolKind::Wget => format!("Authorization: {token}"),
+        ToolKind::Httpie => format!("Authorization:{token}"),
+    };
+    vec![formatted]
+}
+
+/// True when the user already passed an Authorization header through
+/// the wrapper's args, so we don't clobber it with a cached token.
+fn user_already_set_auth(args: &[String], tool: ToolKind) -> bool {
+    let mut iter = args.iter().peekable();
+    while let Some(arg) = iter.next() {
+        match tool {
+            ToolKind::Curl => {
+                if (arg == "-H" || arg == "--header")
+                    && let Some(next) = iter.peek()
+                    && next.to_ascii_lowercase().starts_with("authorization:")
+                {
+                    return true;
+                }
+                if let Some(val) = arg
+                    .strip_prefix("-H")
+                    .or_else(|| arg.strip_prefix("--header="))
+                    && val.to_ascii_lowercase().starts_with("authorization:")
+                {
+                    return true;
+                }
+            }
+            ToolKind::Wget => {
+                if let Some(val) = arg.strip_prefix("--header=")
+                    && val.to_ascii_lowercase().starts_with("authorization:")
+                {
+                    return true;
+                }
+                if arg == "--header"
+                    && let Some(next) = iter.peek()
+                    && next.to_ascii_lowercase().starts_with("authorization:")
+                {
+                    return true;
+                }
+            }
+            ToolKind::Httpie => {
+                if arg.to_ascii_lowercase().starts_with("authorization:") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod pre_attach_tests {
+    use super::*;
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn httpie_shorthand_with_port_resolves_to_localhost() {
+        let args = s(&["-v", "POST", ":1402/", "jsonrpc=2.0", "id:=1"]);
+        assert_eq!(
+            resolve_request_url(&args, ToolKind::Httpie),
+            Some("http://localhost:1402/".to_string())
+        );
+    }
+
+    #[test]
+    fn httpie_shorthand_with_host_port_resolves_with_default_scheme() {
+        let args = s(&["GET", "example.com:8080/api"]);
+        assert_eq!(
+            resolve_request_url(&args, ToolKind::Httpie),
+            Some("http://example.com:8080/api".to_string())
+        );
+    }
+
+    #[test]
+    fn httpie_skips_header_items_and_body_fields() {
+        let args = s(&["POST", "Authorization:Bearer x", "field=value", ":1402/"]);
+        assert_eq!(
+            resolve_request_url(&args, ToolKind::Httpie),
+            Some("http://localhost:1402/".to_string())
+        );
+    }
+
+    #[test]
+    fn user_auth_overrides_curl_pre_attach() {
+        let args = s(&["-H", "Authorization: Bearer existing", "http://example.com"]);
+        assert!(user_already_set_auth(&args, ToolKind::Curl));
+    }
+
+    #[test]
+    fn user_auth_overrides_httpie_pre_attach() {
+        let args = s(&["GET", ":1402/", "Authorization:Bearer existing"]);
+        assert!(user_already_set_auth(&args, ToolKind::Httpie));
+    }
+
+    #[test]
+    fn no_url_means_no_pre_attach() {
+        let args = s(&["--help"]);
+        assert_eq!(resolve_request_url(&args, ToolKind::Httpie), None);
+        assert!(pre_attach_cached_auth(&args, ToolKind::Httpie).is_empty());
+    }
 }
 
 fn is_passthrough_metadata_request(args: &[String]) -> bool {

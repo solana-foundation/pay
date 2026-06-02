@@ -780,8 +780,9 @@ mod tests {
 
         assert!(body.contains("Link to receipt"));
         assert!(body.contains("sig123"));
-        assert!(
-            body.contains("https://explorer.solana.com/tx/sig123?cluster=custom&customUrl=http%3A%2F%2Flocalhost%3A8899&view=receipt")
-        );
+        // `solana_transaction_link` now routes receipts through pay.sh
+        // (see `components::link::solana_transaction_link`); localnet
+        // maps to the `?network=sandbox` query.
+        assert!(body.contains("https://pay.sh/receipt/sig123?network=sandbox"));
     }
 }

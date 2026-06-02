@@ -579,6 +579,23 @@ pub struct OperatorConfig {
     /// Whether the operator sponsors transaction fees.
     #[serde(default)]
     pub fee_payer: bool,
+    /// HMAC secret used by the MPP `subscription` + `authenticate`
+    /// handlers to bind each challenge to its server (the secret signs
+    /// the nonce so verify can reject tampered or replayed challenges
+    /// without per-challenge server state). Must be stable across
+    /// restarts — rotating it invalidates every outstanding session
+    /// token. Required when any endpoint declares a `subscription:`
+    /// block.
+    ///
+    /// Generate one with `openssl rand -hex 32`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub challenge_binding_secret: Option<String>,
+    /// Realm string surfaced in `WWW-Authenticate: Payment realm="…"`
+    /// for subscription + authenticate challenges. Pick a stable label
+    /// for your service — clients tag cached SIWMPP tokens by realm.
+    /// Required when any endpoint declares a `subscription:` block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realm: Option<String>,
 }
 
 /// Signing backend configuration.
@@ -928,10 +945,8 @@ impl SubscriptionEndpoint {
         if raw.is_empty() {
             return Err("subscription.period is required (e.g. \"30d\", \"2w\")".into());
         }
-        let (digits, suffix) = raw.split_at(
-            raw.find(|c: char| !c.is_ascii_digit())
-                .unwrap_or(raw.len()),
-        );
+        let (digits, suffix) =
+            raw.split_at(raw.find(|c: char| !c.is_ascii_digit()).unwrap_or(raw.len()));
         let count: u32 = digits.parse().map_err(|_| {
             format!("subscription.period `{raw}` must start with a positive integer")
         })?;
@@ -1850,7 +1865,10 @@ mod tests {
         let back: SubscriptionEndpoint = serde_yml::from_str(&yaml).unwrap();
         assert_eq!(back.period, "30d");
         assert_eq!(back.currency, "USDC");
-        assert_eq!(back.plan_id.as_deref(), Some("8tWbqLkUJoYy7zXc5h2EvCRoaQEv2xnQjUuYhc3rzCgT"));
+        assert_eq!(
+            back.plan_id.as_deref(),
+            Some("8tWbqLkUJoYy7zXc5h2EvCRoaQEv2xnQjUuYhc3rzCgT")
+        );
         // Optional fields stay None and aren't emitted in YAML.
         assert!(!yaml.contains("free_trial_days"));
         assert!(!yaml.contains("puller"));

@@ -362,6 +362,7 @@ fn handle_outcome(
 
         RunOutcome::SubscriptionChallenge {
             challenge,
+            authenticate,
             resource_url,
         } => {
             let decoded = match sub_client::decode(&challenge) {
@@ -407,6 +408,7 @@ fn handle_outcome(
                 }
                 return pay_subscription_and_retry(
                     &challenge,
+                    authenticate.as_deref(),
                     &resource_url,
                     PaymentRetryContext {
                         tool,
@@ -887,6 +889,7 @@ fn pay_mpp_and_retry(
 
 fn pay_subscription_and_retry(
     challenge: &mpp::Challenge,
+    authenticate_challenge: Option<&mpp::Challenge>,
     resource_url: &str,
     ctx: PaymentRetryContext<'_, '_>,
 ) -> pay_core::Result<()> {
@@ -898,8 +901,9 @@ fn pay_subscription_and_retry(
     }
 
     let store = pay_core::accounts::FileAccountsStore::default_path();
-    let built = sub_client::build_credential(
+    let built = sub_client::build_credential_with_authenticate(
         challenge,
+        authenticate_challenge,
         &store,
         ctx.network_override,
         ctx.account_override,
@@ -926,21 +930,21 @@ fn pay_subscription_and_retry(
     // (per spec §"Subscription Identifier"), so we can derive it without
     // round-tripping the Payment-Receipt header — which the curl/wget/httpie
     // wrappers don't preserve today.
-    if let RunOutcome::Completed { exit_code, .. } = &retry_outcome {
-        if *exit_code == 0 {
-            if let Err(e) = persist_local_subscription_after_activation(&built, &store) {
-                tracing::warn!(error = %e, "Activation succeeded but could not persist local record");
-                if !is_json {
-                    eprintln!(
-                        "{} Activation succeeded but the local registry could not be \
-                         updated: {}. Run `pay subscriptions refresh` later to reconcile.",
-                        "Warning:".yellow(),
-                        e
-                    );
-                }
-            } else if ctx.verbose && !is_json {
-                eprintln!("{}", "Subscription recorded locally.".dimmed());
+    if let RunOutcome::Completed { exit_code, .. } = &retry_outcome
+        && *exit_code == 0
+    {
+        if let Err(e) = persist_local_subscription_after_activation(&built, &store) {
+            tracing::warn!(error = %e, "Activation succeeded but could not persist local record");
+            if !is_json {
+                eprintln!(
+                    "{} Activation succeeded but the local registry could not be \
+                     updated: {}. Run `pay subscriptions refresh` later to reconcile.",
+                    "Warning:".yellow(),
+                    e
+                );
             }
+        } else if ctx.verbose && !is_json {
+            eprintln!("{}", "Subscription recorded locally.".dimmed());
         }
     }
 
@@ -953,7 +957,6 @@ fn pay_subscription_and_retry(
 // boilerplate. CLI calls it through the qualified path below.
 use pay_core::client::subscription::persist_local_subscription_after_activation;
 
-
 fn enforce_subscription_cap(
     decoded: &sub_client::DecodedSubscriptionChallenge,
     payment_cap: u64,
@@ -963,9 +966,7 @@ fn enforce_subscription_cap(
     // known stablecoin symbol we can compare base-units directly.
     if Stablecoin::parse_symbol(&decoded.currency_label).is_some() {
         let required = decoded.amount_base_units.parse::<u64>().map_err(|e| {
-            pay_core::Error::Mpp(format!(
-                "Invalid amount in subscription challenge: {e}"
-            ))
+            pay_core::Error::Mpp(format!("Invalid amount in subscription challenge: {e}"))
         })?;
         if required <= payment_cap {
             return Ok(());

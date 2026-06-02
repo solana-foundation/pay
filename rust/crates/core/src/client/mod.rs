@@ -1,3 +1,4 @@
+pub mod authenticate;
 pub mod balance;
 pub mod fetch;
 pub mod mpp;

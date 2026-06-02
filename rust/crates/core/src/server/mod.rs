@@ -1,6 +1,9 @@
 pub mod accounting;
 
 #[cfg(feature = "server")]
+pub mod authenticate;
+
+#[cfg(feature = "server")]
 pub mod metering;
 
 #[cfg(feature = "server")]

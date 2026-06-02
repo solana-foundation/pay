@@ -14,15 +14,15 @@
 //! implemented — when they land, this file is the natural home for a true
 //! Surfpool-backed flow.
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 use pay_core::accounts::{
     Account, AccountsFile, AccountsStore, Keystore, MemoryAccountsStore, Subscription,
     SubscriptionStatus,
 };
 use pay_core::client::subscription as sub_client;
-use pay_core::runner::{classify_402, RunOutcome};
+use pay_core::runner::{RunOutcome, classify_402};
 use pay_core::server::subscription as sub_server;
 use pay_types::metering::SubscriptionEndpoint;
 
@@ -52,7 +52,7 @@ fn defaults<'a>() -> sub_server::OperatorDefaults<'a> {
         recipient: OPERATOR,
         network: "localnet",
         rpc_url: "http://localhost:8899",
-        secret_key: Some("test-secret"),
+        challenge_binding_secret: Some("test-secret"),
         realm: Some("test-realm"),
         fee_payer: false,
         fee_payer_signer: None,
@@ -62,7 +62,7 @@ fn defaults<'a>() -> sub_server::OperatorDefaults<'a> {
 #[test]
 fn server_built_challenge_round_trips_through_client_classify_and_decode() {
     // 1. Server builds the challenge.
-    let challenge = sub_server::build_challenge(&spec(), defaults()).expect("challenge");
+    let challenge = sub_server::build_challenge(&spec(), defaults(), None).expect("challenge");
     let www_auth =
         solana_mpp::format_www_authenticate(&challenge).expect("format WWW-Authenticate");
 
@@ -155,6 +155,8 @@ fn persistence_round_trip_through_memory_store() {
         expires_at: None,
         resource_url: Some("http://localhost:8080/api/v1/pro/feed".to_string()),
         description: Some("Pro feed".to_string()),
+        authenticate_token: None,
+        authenticate_expires_at: None,
     };
 
     let mut file = store.load().unwrap();
@@ -172,7 +174,13 @@ fn persistence_round_trip_through_memory_store() {
     // `all_subscriptions` surfaces the row across the iterator.
     let collected: Vec<_> = loaded
         .all_subscriptions()
-        .map(|(net, name, sub)| (net.to_string(), name.to_string(), sub.subscription_id.clone()))
+        .map(|(net, name, sub)| {
+            (
+                net.to_string(),
+                name.to_string(),
+                sub.subscription_id.clone(),
+            )
+        })
         .collect();
     assert_eq!(collected.len(), 1);
     assert_eq!(collected[0].0, "localnet");
@@ -188,7 +196,7 @@ fn server_subscription_resolve_amount_matches_client_decoded_amount() {
         sub_server::resolve_amount(&spec()).expect("server amount");
     assert_eq!(decimals, 6);
 
-    let challenge = sub_server::build_challenge(&spec(), defaults()).expect("challenge");
+    let challenge = sub_server::build_challenge(&spec(), defaults(), None).expect("challenge");
     let decoded = sub_client::decode(&challenge).expect("decode");
 
     assert_eq!(server_amount, decoded.amount_base_units);
