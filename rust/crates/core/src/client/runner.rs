@@ -546,7 +546,9 @@ pub(crate) fn classify_402_with_preference(
     // only offers the other one. Surface that explicitly instead of
     // letting the request loop on an UnknownPaymentRequired.
     match preference {
-        ProtocolPreference::OnlyMpp if x402_challenge.is_some() || x402_siwx_challenge.is_some() => {
+        ProtocolPreference::OnlyMpp
+            if x402_challenge.is_some() || x402_siwx_challenge.is_some() =>
+        {
             return RunOutcome::PaymentRejected {
                 reason: "Server only offers an x402 challenge, but --mpp was requested. \
                          Drop --mpp to settle via x402, or pick a server that advertises MPP."

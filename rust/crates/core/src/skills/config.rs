@@ -240,7 +240,7 @@ mod tests {
         let cfg = SkillsConfig::default();
         assert_eq!(cfg.sources.len(), 1);
         assert_eq!(cfg.sources[0].name, "pay-skills");
-        assert!(cfg.sources[0].url.contains("pay-skills"));
+        assert_eq!(cfg.sources[0].url, DEFAULT_SOURCE);
     }
 
     #[test]
