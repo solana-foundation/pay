@@ -23,6 +23,17 @@ pub struct ListCommand {
 
 impl ListCommand {
     pub fn run(self) -> pay_core::Result<()> {
+        // Sweep cancelled subscriptions whose paid period has elapsed
+        // (`expires_at` in the past). The on-chain delegation's
+        // `expires_at_ts` is pinned at cancel time, so once we cross
+        // that timestamp the local row is just stale tombstone noise
+        // — the chain agrees the subscription no longer exists.
+        let store = pay_core::accounts::FileAccountsStore::default_path();
+        let removed = sweep_expired_cancellations(&store)?;
+        if removed > 0 {
+            tracing::debug!(removed, "swept expired cancelled subscriptions");
+        }
+
         let accounts = AccountsFile::load()?;
         let rows: Vec<(&str, &str, &Subscription)> = accounts
             .all_subscriptions()
@@ -124,12 +135,60 @@ fn print_subscription_row(network: &str, account: &str, sub: &Subscription) {
     }
     eprintln!("    {}", parts.join(" "));
 
+    // "expires X" for active subscriptions, "active until X" for
+    // cancelled ones — same timestamp, different framing. After cancel
+    // the on-chain delegation keeps serving requests through period
+    // end (`expires_at_ts`), so "active until" is what the user
+    // actually wants to know.
     if let Some(exp) = &sub.expires_at {
-        eprintln!("    expires {}", exp.dimmed());
+        let label = match sub.status {
+            SubscriptionStatus::Cancelled => "active until",
+            _ => "expires",
+        };
+        eprintln!("    {label} {}", exp.dimmed());
     }
     if let Some(url) = &sub.resource_url {
         eprintln!("    {}", url.dimmed());
     }
+}
+
+/// Drop cancelled subscriptions whose paid period has fully elapsed.
+/// Best-effort: rows missing / malformed `expires_at` stay put (we'd
+/// rather keep a stale tombstone than delete a row whose lifecycle we
+/// can't read). Returns the number of removed rows.
+fn sweep_expired_cancellations(
+    store: &dyn pay_core::accounts::AccountsStore,
+) -> pay_core::Result<usize> {
+    let mut file = store.load()?;
+    let now = chrono::Utc::now();
+    let mut to_remove: Vec<(String, String, String)> = Vec::new();
+    for (network, by_account) in file.accounts.iter() {
+        for (account, entry) in by_account.iter() {
+            for (sub_id, sub) in entry.subscriptions.iter() {
+                if !matches!(sub.status, SubscriptionStatus::Cancelled) {
+                    continue;
+                }
+                let Some(expires_at) = sub.expires_at.as_deref() else {
+                    continue;
+                };
+                let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(expires_at) else {
+                    continue;
+                };
+                if parsed.with_timezone(&chrono::Utc) <= now {
+                    to_remove.push((network.clone(), account.clone(), sub_id.clone()));
+                }
+            }
+        }
+    }
+    if to_remove.is_empty() {
+        return Ok(0);
+    }
+    let removed = to_remove.len();
+    for (network, account, sub_id) in to_remove {
+        file.remove_subscription(&network, &account, &sub_id);
+    }
+    store.save(&file)?;
+    Ok(removed)
 }
 
 #[allow(dead_code)]

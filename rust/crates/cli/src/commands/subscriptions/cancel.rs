@@ -144,11 +144,18 @@ impl CancelCommand {
             .clone()
             .or_else(|| std::env::var("PAY_API_FEE_PAYER").ok());
 
+        // Route `localnet`/`surfnet` to the pay sandbox cluster
+        // (`https://402.surfnet.dev:8899`) rather than pay-kit's bare
+        // `http://localhost:8899` default — local validators are the
+        // exception, the surfpool-backed sandbox is the norm. Mainnet
+        // and devnet keep pay-kit's defaults.
         let rpc_url = self
             .rpc_url
             .clone()
             .or_else(|| std::env::var("PAY_RPC_URL").ok())
-            .unwrap_or_else(|| solana_mpp::protocol::solana::default_rpc_url(&network).to_string());
+            .unwrap_or_else(|| {
+                pay_core::client::subscription::default_rpc_url_for_network(&network)
+            });
 
         // ── Subscriber pubkey from accounts.yml (no keystore unlock) ────
         //
@@ -293,6 +300,28 @@ impl CancelCommand {
         };
 
         // ── Persist local state ─────────────────────────────────────────
+        //
+        // On-chain cancel doesn't void the current period — the
+        // subscriber keeps access until `expires_at_ts` (the period
+        // end the on-chain `cancel_subscription` ix pinned). We mark
+        // the row Cancelled so `pay subscriptions ls` can render the
+        // "active until X" hint, and compute the period end from
+        // `activated_at + period` when the row didn't already capture
+        // an `expires_at` (e.g. server YAML omitted `expires_at`). The
+        // next `ls` invocation sweeps the row once that timestamp
+        // elapses.
+        if let Some(sub) = accounts
+            .accounts
+            .get(&network)
+            .and_then(|m| m.get(&account_name))
+            .and_then(|a| a.subscriptions.get(&self.subscription_id))
+            && sub.expires_at.is_none()
+            && let Some(period_end) = compute_period_end(sub)
+        {
+            let mut updated = sub.clone();
+            updated.expires_at = Some(period_end);
+            accounts.upsert_subscription(&network, &account_name, updated)?;
+        }
         accounts.set_subscription_status(
             &network,
             &account_name,
@@ -572,4 +601,22 @@ fn truncate(id: &str) -> String {
     } else {
         format!("{}…{}", &id[..6], &id[id.len() - 4..])
     }
+}
+
+/// Compute the RFC 3339 timestamp at which the current paid period
+/// ends, given a subscription's `activated_at` + period. Mirrors the
+/// on-chain `expires_at_ts` the program pins when `cancel_subscription`
+/// fires. Returns `None` if `activated_at` can't be parsed or the
+/// period unit is unknown — caller treats that as "no estimate".
+fn compute_period_end(sub: &pay_core::accounts::Subscription) -> Option<String> {
+    let activated = chrono::DateTime::parse_from_rfc3339(&sub.activated_at)
+        .ok()?
+        .with_timezone(&chrono::Utc);
+    let count = i64::from(sub.period_count);
+    let delta = match sub.period_unit.as_str() {
+        "day" => chrono::Duration::days(count),
+        "week" => chrono::Duration::weeks(count),
+        _ => return None,
+    };
+    Some((activated + delta).to_rfc3339())
 }

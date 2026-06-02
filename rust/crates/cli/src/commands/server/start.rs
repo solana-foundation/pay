@@ -1589,6 +1589,21 @@ async fn ensure_subscription_plans(
             continue;
         };
 
+        // `free_trial_days` is reserved for a future iteration —
+        // surface that loudly at boot so an operator who set the
+        // field doesn't assume billing will be deferred.
+        if let Some(days) = sub_spec.free_trial_days
+            && days > 0
+        {
+            tracing::warn!(
+                endpoint = %endpoint.path,
+                free_trial_days = days,
+                "`subscription.free_trial_days` is set but not honored in v0 — \
+                 subscribers will be charged on the first period as usual. \
+                 Remove the field from your YAML to silence this warning."
+            );
+        }
+
         // Stable id derived from `(operator, endpoint.path)`. Reuse the
         // value persisted in YAML if present so manual edits stick.
         let plan_id_numeric = sub_spec

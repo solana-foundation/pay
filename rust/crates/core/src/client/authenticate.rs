@@ -172,6 +172,35 @@ pub fn cached_header_for_resource(store: &dyn AccountsStore, resource_url: &str)
     None
 }
 
+/// Decide whether `request_url` is the stored resource or a path
+/// beneath it, with a hard boundary at the end of the stored URL.
+///
+/// Raw `starts_with` would treat `https://api.example.com.attacker.com/`
+/// as a sub-resource of `https://api.example.com`, which would leak the
+/// SIWMPP token to an attacker-controlled host. We require the byte
+/// immediately following the stored URL to be a path/query/fragment
+/// boundary (or end-of-string) so the host stays bound to what the
+/// activation actually paid for.
+fn url_is_sub_resource(request_url: &str, stored_url: &str) -> bool {
+    let Some(suffix) = request_url.strip_prefix(stored_url) else {
+        return false;
+    };
+    // Stored URL already ends with a boundary character → safe.
+    if let Some(last) = stored_url.chars().last()
+        && matches!(last, '/' | '?' | '#')
+    {
+        return true;
+    }
+    // Otherwise the FIRST char of the request URL past the stored
+    // prefix must itself be a boundary, or there's no suffix at all
+    // (exact match).
+    match suffix.chars().next() {
+        None => true,
+        Some('/' | '?' | '#') => true,
+        Some(_) => false,
+    }
+}
+
 fn is_token_usable_for(
     sub: &Subscription,
     resource_url: &str,
@@ -189,7 +218,7 @@ fn is_token_usable_for(
     let Some(stored_url) = sub.resource_url.as_deref() else {
         return false;
     };
-    if !resource_url.starts_with(stored_url) {
+    if !url_is_sub_resource(resource_url, stored_url) {
         return false;
     }
     let Some(expires_at) = sub.authenticate_expires_at.as_deref() else {
@@ -322,6 +351,36 @@ mod tests {
         );
         let store = store_with(sub);
         assert!(cached_header_for_resource(&store, "https://other.example.com/v1").is_none());
+    }
+
+    #[test]
+    fn cached_header_rejects_hostname_suffix_attack() {
+        // PR #374 security review: raw `starts_with` matches
+        // `https://api.example.com.attacker.com/x` against stored
+        // `https://api.example.com`. The boundary fix MUST reject
+        // these even though the byte prefix matches.
+        let expires = (chrono::Utc::now() + chrono::Duration::hours(2)).to_rfc3339();
+        let sub = make_sub(
+            "DerivedPda",
+            Some("https://api.example.com"),
+            Some("Payment ok"),
+            Some(&expires),
+            SubscriptionStatus::Active,
+        );
+        let store = store_with(sub);
+        assert!(
+            cached_header_for_resource(&store, "https://api.example.com.attacker.com/x").is_none(),
+            "hostname-suffix attack must be rejected"
+        );
+        // But a real sub-resource still matches.
+        assert!(
+            cached_header_for_resource(&store, "https://api.example.com/v1/resource").is_some()
+        );
+        // Exact match also OK.
+        assert!(cached_header_for_resource(&store, "https://api.example.com").is_some());
+        // Query / fragment past the host also OK.
+        assert!(cached_header_for_resource(&store, "https://api.example.com?a=1").is_some());
+        assert!(cached_header_for_resource(&store, "https://api.example.com#frag").is_some());
     }
 
     #[test]

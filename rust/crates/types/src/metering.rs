@@ -1251,6 +1251,20 @@ pub fn validate_api_spec(spec: &ApiSpec) -> Vec<String> {
             validate_routing_auth(routing, &context, &mut errs);
         }
 
+        // `metering` and `subscription` are mutually exclusive per the
+        // v0 design — the middleware picks the subscription path
+        // unconditionally when both are set and silently drops the
+        // metering config. Reject the combo at validation so the
+        // operator notices before runtime instead of being surprised
+        // by missing per-call metering.
+        if ep.metering.is_some() && ep.subscription.is_some() {
+            errs.push(format!(
+                "endpoint `{}` declares both `metering` and `subscription` blocks; \
+                 these are mutually exclusive in v0 — pick one",
+                ep.path
+            ));
+        }
+
         let Some(metering) = &ep.metering else {
             continue;
         };

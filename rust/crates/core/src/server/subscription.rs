@@ -178,7 +178,19 @@ pub fn build_handler(
         // emit `methodDetails.feePayerKey`. The SDK prefers the
         // explicit pubkey over the signer-derived one.
         fee_payer_pubkey: if defaults.fee_payer {
-            Some(puller.clone())
+            // Prefer the actual signer's pubkey when an explicit
+            // fee-payer signer was configured — the SDK serialises
+            // this into `methodDetails.feePayerKey`, which the client
+            // uses to allocate the payer slot in the activation tx.
+            // Falling back to the puller is only safe when the
+            // operator runs both roles from one wallet; the moment the
+            // fee-payer wallet diverges, this mismatch would cause the
+            // client tx to allocate the wrong payer account.
+            let signer_derived = defaults
+                .fee_payer_signer
+                .as_ref()
+                .map(|s| s.pubkey().to_string());
+            signer_derived.or_else(|| Some(puller.clone()))
         } else {
             None
         },
@@ -261,6 +273,12 @@ pub fn compute_plan_id_numeric(operator: &str, endpoint_path: &str) -> u64 {
 }
 
 /// Check whether the expected Plan PDA exists on-chain.
+///
+/// Distinguishes "account genuinely missing" (returns
+/// [`PlanStatus::Missing`]) from "RPC transport failure" (returns
+/// `Err`). Conflating the two would let a transient network blip at
+/// startup prompt the operator to broadcast a duplicate
+/// `create_plan`, wasting SOL and failing on duplicate-PDA error.
 pub async fn check_plan_exists(
     rpc_url: &str,
     plan_pda: &solana_pubkey::Pubkey,
@@ -268,28 +286,40 @@ pub async fn check_plan_exists(
     use solana_mpp::program::subscriptions::default_program_id;
     let url = rpc_url.to_string();
     let pda = *plan_pda;
-    let outcome = tokio::task::spawn_blocking(move || {
+    let outcome = tokio::task::spawn_blocking(move || -> Result<PlanStatus> {
         use solana_mpp::solana_rpc_client::rpc_client::RpcClient;
+        // `get_account_with_commitment` returns `Ok(Response { value:
+        // None })` when the account doesn't exist, vs `Err(...)` for
+        // any transport / parse / RPC-level failure. That's the
+        // distinction we need; the legacy `get_account` collapses both
+        // into `Err`, which is why the old impl conflated them.
         let rpc = RpcClient::new(url);
-        match rpc.get_account(&pda) {
-            Ok(account) => {
-                let expected_owner = default_program_id();
-                if account.owner == expected_owner {
-                    PlanStatus::Exists
-                } else {
-                    PlanStatus::WrongOwner {
-                        actual_owner: account.owner.to_string(),
+        let commitment = solana_commitment_config::CommitmentConfig::confirmed();
+        match rpc.get_account_with_commitment(&pda, commitment) {
+            Ok(response) => match response.value {
+                Some(account) => {
+                    let expected_owner = default_program_id();
+                    if account.owner == expected_owner {
+                        Ok(PlanStatus::Exists)
+                    } else {
+                        Ok(PlanStatus::WrongOwner {
+                            actual_owner: account.owner.to_string(),
+                        })
                     }
                 }
-            }
-            // get_account returns Err for missing accounts on most RPCs;
-            // anything else (including network failures) we also treat as
-            // missing so the caller can decide whether to prompt.
-            Err(_) => PlanStatus::Missing,
+                None => Ok(PlanStatus::Missing),
+            },
+            Err(e) => Err(Error::Mpp(format!(
+                "Failed to fetch Plan PDA {pda} from {}: {e}. \
+                 Retry once the RPC is reachable — refusing to assume the \
+                 plan is missing on a transport error (would risk an \
+                 accidental duplicate-create broadcast).",
+                rpc.url()
+            ))),
         }
     })
     .await
-    .map_err(|e| Error::Mpp(format!("RPC task join: {e}")))?;
+    .map_err(|e| Error::Mpp(format!("RPC task join: {e}")))??;
     Ok(outcome)
 }
 
