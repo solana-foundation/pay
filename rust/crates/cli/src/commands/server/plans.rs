@@ -13,7 +13,8 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use owo_colors::OwoColorize;
-use solana_mpp::program::subscriptions::{default_program_id, find_plan_pda};
+use pay_core::server::subscription::compute_plan_id_numeric;
+use solana_mpp::program::subscriptions::{default_program_id, find_plan_pda, plan_id_seed};
 use solana_pubkey::Pubkey;
 
 #[derive(clap::Args)]
@@ -73,17 +74,18 @@ impl PublishCommand {
             let Some(sub) = endpoint.subscription.as_ref() else {
                 continue;
             };
-            // Stable plan-id seed: zero-padded path bytes truncated to 32
-            // bytes. The canonical seed layout allows up to 32 bytes per
-            // segment; for the v0 CLI we use the endpoint path directly so
-            // re-running `plans publish` against the same YAML always
-            // derives the same Plan PDA without pulling in a hasher just
-            // for this. A follow-up may swap this for a `blake3` seed once
-            // the rest of the on-chain wire-up needs a richer identifier.
-            let mut seed = [0u8; 32];
-            let path_bytes = endpoint.path.as_bytes();
-            let len = path_bytes.len().min(32);
-            seed[..len].copy_from_slice(&path_bytes[..len]);
+            // Stable plan-id derivation: must match `pay server start`
+            // (see `pay_core::server::subscription::compute_plan_id_numeric`
+            // + `solana_mpp::program::subscriptions::plan_id_seed`) so the
+            // PDA this command writes back to the YAML is the same one
+            // the running server expects to find on-chain.
+            //
+            // Reuse a YAML-pinned `plan_id_numeric` when present so an
+            // operator who hand-edited the value keeps a stable PDA.
+            let plan_id_numeric = sub
+                .plan_id_numeric
+                .unwrap_or_else(|| compute_plan_id_numeric(&owner_str, &endpoint.path));
+            let seed = plan_id_seed(plan_id_numeric);
             let (plan_pda, _) = find_plan_pda(&owner, &seed, &program_id);
             rows.push(PlanRow {
                 method: format!("{:?}", endpoint.method).to_uppercase(),
