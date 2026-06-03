@@ -125,3 +125,9 @@ solana-pubkey = "3.0"
 solana-signature = "3.2"
 solana-system-interface = "2.0"
 solana-transaction = "3.1"
+
+# Local override for end-to-end testing of unreleased pay-kit changes.
+# Uncomment to redirect both crates to a local pay-kit checkout.
+# [patch."https://github.com/solana-foundation/pay-kit"]
+# solana-x402 = { path = "/Users/ludo/Coding/pay-kit/rust/crates/x402" }
+# solana-mpp = { path = "/Users/ludo/Coding/pay-kit/rust/crates/mpp" }

@@ -13,8 +13,8 @@ use solana_x402::{
         parse_x402_challenge_for_network,
     },
     exact::{
-        PaymentRequiredEnvelope, PaymentRequirements, SOLANA_DEVNET, SOLANA_MAINNET,
-        SOLANA_TESTNET, default_rpc_url,
+        PaymentExtensions, PaymentRequiredEnvelope, PaymentRequirements, SOLANA_DEVNET,
+        SOLANA_MAINNET, SOLANA_TESTNET, default_rpc_url, generate_payment_identifier_id,
     },
     siwx::{
         SiwxChainSelectionOptions, SiwxExtension, create_siwx_header,
@@ -33,6 +33,10 @@ pub struct Challenge {
     pub x402_version: u64,
     pub requirements: PaymentRequirements,
     pub siwx: Option<SiwxExtension>,
+    /// Raw `extensions` blob from the server's PAYMENT-REQUIRED envelope.
+    /// Stored verbatim so `build_payment` can echo it back per x402 v2
+    /// §5.1.2 ("client must include at least the info received").
+    pub extensions: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -51,10 +55,13 @@ pub struct BuiltPayment {
 pub fn parse(headers: &[(String, String)], body: Option<&str>) -> Option<Challenge> {
     let requirements = parse_x402_challenge_for_network(headers, body, Some(SOLANA_MAINNET))?;
     let siwx = parse_siwx_extension(headers, body).ok().flatten();
+    let extensions =
+        parse_payment_required_envelope(headers, body).and_then(|envelope| envelope.extensions);
     Some(Challenge {
         x402_version: detect_x402_version(headers, body),
         requirements,
         siwx,
+        extensions,
     })
 }
 
@@ -190,8 +197,14 @@ pub fn build_payment(
             (X402_V1_PAYMENT_HEADER, header)
         }
         _ => {
+            let extensions = build_outbound_extensions(challenge.extensions.as_ref())?;
             let header = rt
-                .block_on(build_payment_header_v2(&signer, &rpc, requirements))
+                .block_on(build_payment_header_v2(
+                    &signer,
+                    &rpc,
+                    requirements,
+                    extensions,
+                ))
                 .map_err(|e| Error::Mpp(format!("Failed to build x402 payment: {e}")))?;
             (X402_V2_PAYMENT_HEADER, header)
         }
@@ -312,6 +325,29 @@ fn parse_siwx_extension(
     };
     siwx_extension_from_payment_required(&envelope)
         .map_err(|e| Error::Mpp(format!("Failed to parse x402 sign-in challenge: {e}")))
+}
+
+/// Build the `extensions` blob to include on the outbound
+/// `PAYMENT-SIGNATURE` from the server's inbound `PAYMENT-REQUIRED`
+/// extensions. Echoes the server payload verbatim per x402 v2 §5.1.2,
+/// and appends a fresh `payment-identifier.info.id` when the server
+/// flagged that extension `info.required = true`.
+///
+/// TODO: cache the generated id keyed on `(resource_url, body_hash)`
+/// so HTTP-level retries of the same logical request reuse the same
+/// idempotency key and benefit from server-side cached 200s.
+fn build_outbound_extensions(
+    inbound: Option<&serde_json::Value>,
+) -> Result<Option<PaymentExtensions>> {
+    let Some(mut ext) = PaymentExtensions::echoing(inbound)
+        .map_err(|e| Error::Mpp(format!("malformed PAYMENT-REQUIRED extensions: {e}")))?
+    else {
+        return Ok(None);
+    };
+    if ext.requires_payment_identifier() {
+        ext = ext.with_payment_identifier_id(generate_payment_identifier_id());
+    }
+    Ok(Some(ext))
 }
 
 fn parse_payment_required_envelope(
@@ -657,6 +693,85 @@ mod tests {
     }
 
     #[test]
+    fn parse_captures_payment_identifier_extension_for_echo() {
+        // Birdeye-style challenge — payment-identifier marked
+        // info.required:true. The parser must surface this so
+        // build_outbound_extensions can append a client-side id.
+        let selected = serde_json::json!({
+            "scheme": EXACT_SCHEME,
+            "network": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+            "amount": "3000",
+            "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            "payTo": "6cvgmdrsVxyiuPzqMCSBnS7fAmA5Mk2VG4BcfVhC8jdC",
+            "maxTimeoutSeconds": 60,
+            "extra": { "feePayer": "AepWpq3GQwL8CeKMtZyKtKPa7W91Coygh3ropAJapVdU" }
+        });
+        let payment_required = serde_json::json!({
+            X402_VERSION_FIELD: X402_VERSION_V2,
+            "accepts": [selected],
+            "extensions": {
+                "payment-identifier": {
+                    "info": { "required": true },
+                    "schema": { "type": "object", "required": ["id"] }
+                }
+            }
+        });
+        let encoded = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            payment_required.to_string().as_bytes(),
+        );
+        let headers = vec![(PAYMENT_REQUIRED_HEADER.to_string(), encoded)];
+
+        let challenge = parse(&headers, None).unwrap();
+        let raw = challenge.extensions.as_ref().expect("extensions captured");
+        assert_eq!(
+            raw["payment-identifier"]["info"]["required"],
+            serde_json::json!(true)
+        );
+
+        let outbound = build_outbound_extensions(challenge.extensions.as_ref())
+            .unwrap()
+            .expect("outbound extensions produced");
+        let pid = outbound
+            .payment_identifier
+            .as_ref()
+            .expect("payment-identifier echoed");
+        // Echoed server fields preserved.
+        assert_eq!(pid.info.required, Some(true));
+        assert!(pid.schema.is_some());
+        // Client-side id appended, matching the spec pattern.
+        let id = pid.info.id.as_deref().expect("id appended");
+        assert!(id.starts_with("pay_"));
+        assert!(id.len() >= 16 && id.len() <= 128);
+    }
+
+    #[test]
+    fn build_outbound_extensions_returns_none_when_inbound_absent() {
+        assert!(build_outbound_extensions(None).unwrap().is_none());
+    }
+
+    #[test]
+    fn build_outbound_extensions_echoes_without_appending_when_not_required() {
+        // payment-identifier with info.required=false should be echoed
+        // but the client should NOT generate an id (avoids polluting
+        // idempotency state when the server doesn't need it).
+        let inbound = serde_json::json!({
+            "payment-identifier": { "info": { "required": false } }
+        });
+        let outbound = build_outbound_extensions(Some(&inbound))
+            .unwrap()
+            .expect("echoed");
+        assert!(!outbound.requires_payment_identifier());
+        assert!(
+            outbound
+                .payment_identifier
+                .as_ref()
+                .and_then(|p| p.info.id.as_deref())
+                .is_none()
+        );
+    }
+
+    #[test]
     fn parse_siwx_auth_reads_auth_only_challenge() {
         let payment_required = serde_json::json!({
             X402_VERSION_FIELD: X402_VERSION_V2,
@@ -856,6 +971,7 @@ mod tests {
             x402_version: X402_VERSION_V2,
             requirements: sample_requirements(),
             siwx: Some(extension),
+            extensions: None,
         };
 
         let (header_name, header_value) = build_siwx_header(&challenge, &signer, "devnet", &rt)
@@ -967,6 +1083,7 @@ mod tests {
             x402_version: X402_VERSION_V2,
             requirements: sample_requirements(),
             siwx: None,
+            extensions: None,
         };
 
         let err = build_payment(&challenge, &store, Some("localnet"), None, None).unwrap_err();
@@ -988,6 +1105,7 @@ mod tests {
             x402_version: X402_VERSION_V2,
             requirements: sample_requirements(),
             siwx: None,
+            extensions: None,
         };
 
         let err = build_payment(&challenge, &store, None, None, None).unwrap_err();
@@ -1006,6 +1124,7 @@ mod tests {
             x402_version: X402_VERSION_V2,
             requirements,
             siwx: None,
+            extensions: None,
         };
         let err = build_payment(&challenge, &store, None, Some("alice"), None).unwrap_err();
         let msg = err.to_string();
@@ -1036,6 +1155,7 @@ mod tests {
             x402_version: X402_VERSION_V2,
             requirements,
             siwx: None,
+            extensions: None,
         };
 
         // We can't exercise the full build path here (it needs a live
