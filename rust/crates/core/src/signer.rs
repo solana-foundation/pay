@@ -7,8 +7,21 @@ use crate::accounts::{
     load_or_create_ephemeral_for_network, load_or_create_ephemeral_for_network_as,
     resolve_account_for_network,
 };
-use crate::keystore::AuthIntent;
+use crate::keystore::{AuthGate, AuthIntent};
 use crate::{Error, Result};
+
+/// Optional auth-gate override threaded through the signing path.
+///
+/// When present, the override replaces the platform's biometric gate
+/// (Touch ID / Windows Hello / polkit) for accounts that require auth.
+/// Used by `pay-mcp` to redirect approval prompts through MCP
+/// elicitation when the connected client supports it. `None` keeps the
+/// platform default, which is what every non-MCP caller passes.
+///
+/// The override is consumed (`Box`) because it is built per-request: a
+/// fresh `ElicitationAuth` is constructed at the top of each MCP tool
+/// call and threaded down through one signing operation.
+pub type AuthOverride = Option<Box<dyn AuthGate>>;
 
 /// Load a `MemorySigner` from the given source.
 ///
@@ -86,10 +99,28 @@ pub fn load_signer_for_network_with_intent(
     account_override: Option<&str>,
     intent: &AuthIntent,
 ) -> Result<(MemorySigner, Option<ResolvedEphemeral>)> {
+    load_signer_for_network_with_intent_and_override(network, store, account_override, intent, None)
+}
+
+/// Variant of [`load_signer_for_network_with_intent`] that accepts an
+/// optional auth-gate override.
+pub fn load_signer_for_network_with_intent_and_override(
+    network: &str,
+    store: &dyn AccountsStore,
+    account_override: Option<&str>,
+    intent: &AuthIntent,
+    auth_override: AuthOverride,
+) -> Result<(MemorySigner, Option<ResolvedEphemeral>)> {
     let file = store.load()?;
     if let Some(name) = account_override {
         if let Some(account) = file.named_account_for_network(network, name).cloned() {
-            let signer = load_signer_from_account_with_intent(&account, name, network, intent)?;
+            let signer = load_signer_from_account_with_intent_and_override(
+                &account,
+                name,
+                network,
+                intent,
+                auth_override,
+            )?;
             return Ok((signer, None));
         }
         if is_lazy_ephemeral_network(network) {
@@ -103,7 +134,13 @@ pub fn load_signer_for_network_with_intent(
     }
     match resolve_account_for_network(network, &file) {
         AccountChoice::Resolved { name, account } => {
-            let signer = load_signer_from_account_with_intent(&account, &name, network, intent)?;
+            let signer = load_signer_from_account_with_intent_and_override(
+                &account,
+                &name,
+                network,
+                intent,
+                auth_override,
+            )?;
             Ok((signer, None))
         }
         AccountChoice::Missing => {
@@ -141,13 +178,38 @@ pub fn load_signer_for_network_payment_with_intent(
     amount: &str,
     intent: &AuthIntent,
 ) -> Result<(MemorySigner, Option<ResolvedEphemeral>)> {
-    load_signer_for_network_with_intent(network, store, account_override, intent).map_err(|e| {
-        match e {
-            Error::PaymentRejected(where_) => {
-                Error::PaymentRejected(format!("{amount} payment authorization was {where_}"))
-            }
-            other => other,
+    load_signer_for_network_payment_with_intent_and_override(
+        network,
+        store,
+        account_override,
+        amount,
+        intent,
+        None,
+    )
+}
+
+/// Variant of [`load_signer_for_network_payment_with_intent`] that accepts
+/// an optional auth-gate override.
+pub fn load_signer_for_network_payment_with_intent_and_override(
+    network: &str,
+    store: &dyn AccountsStore,
+    account_override: Option<&str>,
+    amount: &str,
+    intent: &AuthIntent,
+    auth_override: AuthOverride,
+) -> Result<(MemorySigner, Option<ResolvedEphemeral>)> {
+    load_signer_for_network_with_intent_and_override(
+        network,
+        store,
+        account_override,
+        intent,
+        auth_override,
+    )
+    .map_err(|e| match e {
+        Error::PaymentRejected(where_) => {
+            Error::PaymentRejected(format!("{amount} payment authorization was {where_}"))
         }
+        other => other,
     })
 }
 
@@ -178,9 +240,21 @@ pub fn load_keypair_bytes_from_account_with_intent(
     network: &str,
     intent: &AuthIntent,
 ) -> Result<crate::keystore::Zeroizing<Vec<u8>>> {
+    load_keypair_bytes_from_account_with_intent_and_override(account, name, network, intent, None)
+}
+
+/// Variant of [`load_keypair_bytes_from_account_with_intent`] that accepts an
+/// optional auth-gate override. See [`AuthOverride`] for the rationale.
+pub fn load_keypair_bytes_from_account_with_intent_and_override(
+    account: &Account,
+    name: &str,
+    network: &str,
+    intent: &AuthIntent,
+    auth_override: AuthOverride,
+) -> Result<crate::keystore::Zeroizing<Vec<u8>>> {
     let account_intent = intent.with_account_context(name);
     if account.keystore == Keystore::Ephemeral {
-        maybe_authenticate_ephemeral_account(account, network, &account_intent)?;
+        maybe_authenticate_ephemeral_account(account, network, &account_intent, auth_override)?;
         return account
             .ephemeral_keypair_bytes()
             .map(crate::keystore::Zeroizing::new)
@@ -200,7 +274,14 @@ pub fn load_keypair_bytes_from_account_with_intent(
             #[cfg(target_os = "macos")]
             {
                 let ks = if account.auth_required_for_network(network) {
-                    crate::keystore::Keystore::apple_keychain()
+                    match auth_override {
+                        Some(gate) => crate::keystore::Keystore::from_boxed_auth(
+                            gate,
+                            Box::new(crate::keystore::macos::AppleKeychainStore),
+                            true,
+                        ),
+                        None => crate::keystore::Keystore::apple_keychain(),
+                    }
                 } else {
                     crate::keystore::Keystore::new(
                         crate::keystore::auth::NoAuth,
@@ -213,6 +294,7 @@ pub fn load_keypair_bytes_from_account_with_intent(
             }
             #[cfg(not(target_os = "macos"))]
             {
+                let _ = auth_override;
                 Err(Error::Config(
                     "Keychain not available on this platform".to_string(),
                 ))
@@ -222,7 +304,14 @@ pub fn load_keypair_bytes_from_account_with_intent(
             #[cfg(target_os = "linux")]
             {
                 let ks = if account.auth_required_for_network(network) {
-                    crate::keystore::Keystore::gnome_keyring()
+                    match auth_override {
+                        Some(gate) => crate::keystore::Keystore::from_boxed_auth(
+                            gate,
+                            Box::new(crate::keystore::linux::SecretServiceStore),
+                            true,
+                        ),
+                        None => crate::keystore::Keystore::gnome_keyring(),
+                    }
                 } else {
                     crate::keystore::Keystore::new(
                         crate::keystore::auth::NoAuth,
@@ -236,6 +325,7 @@ pub fn load_keypair_bytes_from_account_with_intent(
             #[cfg(not(target_os = "linux"))]
             {
                 let _ = source;
+                let _ = auth_override;
                 Err(Error::Config(
                     "GNOME Keyring not available on this platform".to_string(),
                 ))
@@ -245,7 +335,14 @@ pub fn load_keypair_bytes_from_account_with_intent(
             #[cfg(target_os = "windows")]
             {
                 let ks = if account.auth_required_for_network(network) {
-                    crate::keystore::Keystore::windows_hello()
+                    match auth_override {
+                        Some(gate) => crate::keystore::Keystore::from_boxed_auth(
+                            gate,
+                            Box::new(crate::keystore::windows::WindowsCredentialStore),
+                            true,
+                        ),
+                        None => crate::keystore::Keystore::windows_hello(),
+                    }
                 } else {
                     crate::keystore::Keystore::new(
                         crate::keystore::auth::NoAuth,
@@ -259,12 +356,16 @@ pub fn load_keypair_bytes_from_account_with_intent(
             #[cfg(not(target_os = "windows"))]
             {
                 let _ = source;
+                let _ = auth_override;
                 Err(Error::Config(
                     "Windows Hello not available on this platform".to_string(),
                 ))
             }
         }
         Keystore::OnePassword => {
+            // 1Password manages its own auth via the `op` CLI; the
+            // MCP-elicitation override does not apply.
+            let _ = auth_override;
             let op_account = account.account.clone();
             let ks = if let Some(vault) = &account.vault {
                 crate::keystore::Keystore::onepassword_with_vault(vault.clone(), op_account)
@@ -274,7 +375,10 @@ pub fn load_keypair_bytes_from_account_with_intent(
             ks.load_keypair_with_intent(name, &account_intent)
                 .map_err(|e| map_keystore_backend_error("1password", e))
         }
-        Keystore::File => load_signer_keypair_bytes_with_intent(&source, &account_intent),
+        Keystore::File => {
+            let _ = auth_override;
+            load_signer_keypair_bytes_with_intent(&source, &account_intent)
+        }
         Keystore::Ephemeral => unreachable!("handled above"),
     }
 }
@@ -305,7 +409,25 @@ pub fn load_signer_from_account_with_intent(
     network: &str,
     intent: &AuthIntent,
 ) -> Result<MemorySigner> {
-    let bytes = load_keypair_bytes_from_account_with_intent(account, name, network, intent)?;
+    load_signer_from_account_with_intent_and_override(account, name, network, intent, None)
+}
+
+/// Variant of [`load_signer_from_account_with_intent`] that accepts an
+/// optional auth-gate override.
+pub fn load_signer_from_account_with_intent_and_override(
+    account: &Account,
+    name: &str,
+    network: &str,
+    intent: &AuthIntent,
+    auth_override: AuthOverride,
+) -> Result<MemorySigner> {
+    let bytes = load_keypair_bytes_from_account_with_intent_and_override(
+        account,
+        name,
+        network,
+        intent,
+        auth_override,
+    )?;
     MemorySigner::from_bytes(&bytes).map_err(|e| {
         Error::Config(format!(
             "Storage corrupted: keypair for account `{name}` on `{network}` failed to decode ({e}). \
@@ -326,9 +448,46 @@ fn maybe_authenticate_ephemeral_account(
     account: &Account,
     network: &str,
     intent: &AuthIntent,
+    auth_override: AuthOverride,
 ) -> Result<()> {
     if !account.auth_required_for_network(network) {
         return Ok(());
+    }
+
+    // When an override is provided, prefer it over the platform gate.
+    // Ephemeral accounts have no on-disk secret to load, so we just need
+    // to drive the auth prompt — for that, any backing store works.
+    if let Some(gate) = auth_override {
+        #[cfg(target_os = "macos")]
+        let ks = crate::keystore::Keystore::from_boxed_auth(
+            gate,
+            Box::new(crate::keystore::macos::AppleKeychainStore),
+            true,
+        );
+        #[cfg(target_os = "linux")]
+        let ks = crate::keystore::Keystore::from_boxed_auth(
+            gate,
+            Box::new(crate::keystore::linux::SecretServiceStore),
+            true,
+        );
+        #[cfg(target_os = "windows")]
+        let ks = crate::keystore::Keystore::from_boxed_auth(
+            gate,
+            Box::new(crate::keystore::windows::WindowsCredentialStore),
+            true,
+        );
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+        {
+            let _ = gate;
+            let _ = intent;
+            return Err(Error::Config(
+                "Ephemeral account auth gating is not available on this platform".to_string(),
+            ));
+        }
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+        return ks
+            .authenticate_intent(intent)
+            .map_err(map_ephemeral_auth_error);
     }
 
     #[cfg(target_os = "macos")]

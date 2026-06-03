@@ -130,6 +130,24 @@ impl Keystore {
         windows::WindowsHelloAuth::is_available()
     }
 
+    /// Construct a keystore from already-boxed auth and store implementations.
+    ///
+    /// Useful when callers hold a `Box<dyn AuthGate + Send + Sync>` (e.g. an
+    /// auth-gate override threaded down from a higher layer) and need to pair
+    /// it with a platform-specific store without re-boxing through
+    /// [`Keystore::new`]'s `impl AuthGate + 'static` parameter.
+    pub fn from_boxed_auth(
+        auth: Box<dyn AuthGate>,
+        store: Box<dyn SecretStore>,
+        auth_on_write: bool,
+    ) -> Self {
+        Self {
+            auth,
+            store,
+            auth_on_write,
+        }
+    }
+
     // ── Public API ──────────────────────────────────────────────────────
 
     /// Import a 64-byte keypair (32 secret + 32 public).

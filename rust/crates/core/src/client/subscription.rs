@@ -219,6 +219,30 @@ pub fn build_credential_with_authenticate(
     account_override: Option<&str>,
     resource_url: Option<&str>,
 ) -> Result<BuiltCredential> {
+    build_credential_with_authenticate_and_override(
+        challenge,
+        authenticate_challenge,
+        store,
+        network_override,
+        account_override,
+        resource_url,
+        None,
+    )
+}
+
+/// Variant of [`build_credential_with_authenticate`] that accepts an
+/// optional auth-gate override threaded down to the signer. Used by
+/// `pay-mcp` to route the keystore prompt through MCP elicitation when
+/// the connected client supports it.
+pub fn build_credential_with_authenticate_and_override(
+    challenge: &Challenge,
+    authenticate_challenge: Option<&Challenge>,
+    store: &dyn AccountsStore,
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+    resource_url: Option<&str>,
+    auth_override: crate::signer::AuthOverride,
+) -> Result<BuiltCredential> {
     let decoded = decode(challenge)?;
 
     let amount_label = format_amount(&decoded.amount_base_units, decoded.decimals);
@@ -264,13 +288,15 @@ pub fn build_credential_with_authenticate(
         .map(str::to_string)
         .unwrap_or_else(|| decoded.network.clone());
 
-    let (signer, ephemeral_notice) = crate::signer::load_signer_for_network_payment_with_intent(
-        &network,
-        store,
-        account_override,
-        &amount_label,
-        &auth_intent,
-    )?;
+    let (signer, ephemeral_notice) =
+        crate::signer::load_signer_for_network_payment_with_intent_and_override(
+            &network,
+            store,
+            account_override,
+            &amount_label,
+            &auth_intent,
+            auth_override,
+        )?;
     let subscriber = signer.pubkey().to_string();
 
     let rpc_url = resolve_rpc_url(&network, embedded_blockhash);
