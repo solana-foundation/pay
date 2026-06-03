@@ -28,6 +28,18 @@ pub struct PaymentAmount {
     pub ui_amount: f64,
 }
 
+/// Periodic-probe failures are demoted to debug after this many
+/// consecutive failures elapse without intermediate success — until that
+/// threshold we only emit at debug. Request-driven failures (any reason
+/// other than `"periodic"`) always warn so they surface for the
+/// in-flight request that just lost telemetry.
+const PERIODIC_WARN_AFTER_CONSECUTIVE_FAILURES: u64 = 5;
+
+/// Timeout for a single `getBalance` round-trip. Without this, a stalled
+/// RPC connection can hang the periodic probe forever and accumulate
+/// warning noise on the next interval tick.
+const RPC_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
 #[derive(Clone)]
 pub struct FeePayerWallet {
     rpc_url: String,
@@ -35,16 +47,22 @@ pub struct FeePayerWallet {
     client: reqwest::Client,
     last_lamports: Arc<AtomicU64>,
     has_observation: Arc<AtomicBool>,
+    consecutive_failures: Arc<AtomicU64>,
 }
 
 impl FeePayerWallet {
     pub fn new(rpc_url: impl Into<String>, address: impl Into<String>) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(RPC_REQUEST_TIMEOUT)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             rpc_url: rpc_url.into(),
             address: address.into(),
-            client: reqwest::Client::new(),
+            client,
             last_lamports: Arc::new(AtomicU64::new(0)),
             has_observation: Arc::new(AtomicBool::new(false)),
+            consecutive_failures: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -53,6 +71,7 @@ impl FeePayerWallet {
             Ok(lamports) => {
                 let previous = self.last_lamports.swap(lamports, Ordering::Relaxed);
                 let had_previous = self.has_observation.swap(true, Ordering::Relaxed);
+                self.consecutive_failures.store(0, Ordering::Relaxed);
                 let sol = lamports_to_sol(lamports);
 
                 tracing::info!(
@@ -79,16 +98,43 @@ impl FeePayerWallet {
                 }
             }
             Err(error) => {
-                tracing::warn!(
-                    monotonic_counter.pay_fee_payer_balance_errors_total = 1_u64,
-                    reason,
-                    subdomain = %subdomain,
-                    path = %path,
-                    wallet = %self.address,
-                    error = %error,
-                    metric = METRIC_FEE_PAYER_BALANCE_ERRORS,
-                    "failed to observe fee payer wallet balance",
-                );
+                // Periodic background polls hitting a flaky RPC are not
+                // actionable noise — debug-log them until a sustained
+                // outage crosses the warn threshold. Request-driven
+                // observes (post-verify) always warn since they reflect
+                // an actual in-flight request that just lost telemetry.
+                let failures = self
+                    .consecutive_failures
+                    .fetch_add(1, Ordering::Relaxed)
+                    .saturating_add(1);
+                let is_periodic = reason == "periodic";
+                let should_warn =
+                    !is_periodic || failures >= PERIODIC_WARN_AFTER_CONSECUTIVE_FAILURES;
+                if should_warn {
+                    tracing::warn!(
+                        monotonic_counter.pay_fee_payer_balance_errors_total = 1_u64,
+                        reason,
+                        subdomain = %subdomain,
+                        path = %path,
+                        wallet = %self.address,
+                        consecutive_failures = failures,
+                        error = %error,
+                        metric = METRIC_FEE_PAYER_BALANCE_ERRORS,
+                        "failed to observe fee payer wallet balance",
+                    );
+                } else {
+                    tracing::debug!(
+                        monotonic_counter.pay_fee_payer_balance_errors_total = 1_u64,
+                        reason,
+                        subdomain = %subdomain,
+                        path = %path,
+                        wallet = %self.address,
+                        consecutive_failures = failures,
+                        error = %error,
+                        metric = METRIC_FEE_PAYER_BALANCE_ERRORS,
+                        "failed to observe fee payer wallet balance (transient)",
+                    );
+                }
             }
         }
     }

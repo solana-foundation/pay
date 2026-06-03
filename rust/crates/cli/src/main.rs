@@ -55,6 +55,18 @@ struct Opts {
     #[arg(long, conflicts_with = "mainnet")]
     local: bool,
 
+    /// Force the x402 protocol for 402 challenges. Refuses to fall back
+    /// to MPP if the server only advertises MPP — surfaces a clear
+    /// error instead. Mutually exclusive with `--mpp`.
+    #[arg(long, conflicts_with = "mpp")]
+    x402: bool,
+
+    /// Force the MPP protocol for 402 challenges. Refuses to fall back
+    /// to x402 if the server only advertises x402 — surfaces a clear
+    /// error instead. Mutually exclusive with `--x402`.
+    #[arg(long, conflicts_with = "x402")]
+    mpp: bool,
+
     /// Force NO_DNA mode for machine-readable output and non-interactive
     /// defaults.
     #[arg(long)]
@@ -193,6 +205,19 @@ fn main() {
         None
     };
 
+    // `--x402` / `--mpp` pin the 402 protocol selection. We propagate
+    // via env var so the choice survives across MCP invocations and so
+    // the runner doesn't need to thread an extra parameter through
+    // every command's execute() path. Read by
+    // `ProtocolPreference::from_env()` inside `classify_402`.
+    if opts.x402 {
+        // SAFETY: called before any threads are spawned.
+        unsafe { std::env::set_var("PAY_PROTOCOL_ENFORCED", "x402") };
+    } else if opts.mpp {
+        // SAFETY: called before any threads are spawned.
+        unsafe { std::env::set_var("PAY_PROTOCOL_ENFORCED", "mpp") };
+    }
+
     // ── Legacy keypair source for non-payment commands ─────────────────────
     //
     // `pay topup` and server commands still use the original
@@ -213,6 +238,7 @@ fn main() {
                 | Command::Account { .. }
                 | Command::Whoami(_)
                 | Command::Skills { .. }
+                | Command::Subscriptions { .. }
                 | Command::Catalog { .. }
                 | Command::Install(_)
                 | Command::Send(_)

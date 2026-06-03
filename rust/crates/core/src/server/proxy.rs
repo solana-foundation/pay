@@ -448,7 +448,22 @@ fn apply_prepared_request_auth(
             prefix,
             value_from_env,
         } => {
-            let secret = std::env::var(value_from_env).unwrap_or_default();
+            // Same loud-failure rule as QueryParam — silently sending an
+            // empty header value masks the real config problem behind a
+            // confusing upstream 401/403.
+            let secret = std::env::var(value_from_env).map_err(|_| {
+                format!(
+                    "Proxy auth misconfigured: env var `{value_from_env}` is not set, \
+                     can't inject the `{key}` header into the upstream request. \
+                     Export it in the shell that runs `pay server start`."
+                )
+            })?;
+            if secret.trim().is_empty() {
+                return Err(format!(
+                    "Proxy auth misconfigured: env var `{value_from_env}` is set but empty, \
+                     can't inject the `{key}` header into the upstream request."
+                ));
+            }
             let value = match prefix {
                 Some(p) => format!("{p}{secret}"),
                 None => secret,
@@ -460,7 +475,24 @@ fn apply_prepared_request_auth(
             key,
             value_from_env,
         } => {
-            let secret = std::env::var(value_from_env).unwrap_or_default();
+            // Silently appending `?{key}=` (empty) when the env var is
+            // unset trips upstream auth checks with cryptic errors like
+            // Helius's `"missing api key"`. Fail loudly so operators
+            // notice the missing config at the first request instead of
+            // chasing it through upstream logs.
+            let secret = std::env::var(value_from_env).map_err(|_| {
+                format!(
+                    "Proxy auth misconfigured: env var `{value_from_env}` is not set, \
+                     can't inject `?{key}=...` into the upstream request. \
+                     Export it in the shell that runs `pay server start`."
+                )
+            })?;
+            if secret.trim().is_empty() {
+                return Err(format!(
+                    "Proxy auth misconfigured: env var `{value_from_env}` is set but empty, \
+                     can't inject `?{key}=...` into the upstream request."
+                ));
+            }
             prepared.append_query_param(key, &secret);
             Ok(())
         }
@@ -2493,6 +2525,7 @@ mod tests {
             resource: None,
             routing: Some(RoutingConfig::Respond {}),
             metering: None,
+            subscription: None,
         });
         // Endpoint with override → Respond
         let r = resolve_routing(&api, "/v1/pay");
@@ -2512,6 +2545,7 @@ mod tests {
             resource: None,
             routing: None, // no override
             metering: None,
+            subscription: None,
         });
         let r = resolve_routing(&api, "/v1/health");
         assert!(r.is_proxy());
@@ -2527,6 +2561,7 @@ mod tests {
             resource: None,
             routing: Some(RoutingConfig::Respond {}),
             metering: None,
+            subscription: None,
         });
         api.endpoints.push(pay_types::metering::Endpoint {
             method: pay_types::metering::HttpMethod::Get,
@@ -2535,6 +2570,7 @@ mod tests {
             resource: None,
             routing: None,
             metering: None,
+            subscription: None,
         });
 
         assert!(resolve_routing(&api, "/v1/shared").is_respond());
@@ -2553,6 +2589,7 @@ mod tests {
             resource: None,
             routing: None,
             metering: None,
+            subscription: None,
         });
 
         let uri: Uri = "/v1/test".parse().unwrap();
@@ -2601,6 +2638,7 @@ mod tests {
             resource: None,
             routing: Some(RoutingConfig::Respond {}),
             metering: None,
+            subscription: None,
         });
 
         // Respond endpoint returns 200 directly

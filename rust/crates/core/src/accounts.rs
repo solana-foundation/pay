@@ -139,6 +139,143 @@ pub struct Account {
     /// ephemerals may have less SOL because faucets reset).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
+
+    /// Active MPP subscriptions held by this account, keyed by
+    /// `subscription_id` (the base58 `SubscriptionDelegation` PDA from the
+    /// `Payment-Receipt` header). Omitted from YAML when empty so the
+    /// `accounts.yml` shape stays unchanged for accounts without
+    /// subscriptions.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub subscriptions: BTreeMap<String, Subscription>,
+}
+
+/// On-disk lifecycle marker for a stored subscription. Mirrors the spec's
+/// state machine: a delegation is active until cancelled or expired, after
+/// which it cannot be used to gate access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SubscriptionStatus {
+    /// Activation settled and the on-chain `SubscriptionDelegation` is
+    /// usable for renewals.
+    Active,
+    /// Cancellation has been scheduled or has taken effect on-chain.
+    Cancelled,
+    /// Either the HTTP-layer `subscription_expires` has been reached or
+    /// the on-chain delegation was otherwise invalidated.
+    Expired,
+}
+
+impl SubscriptionStatus {
+    /// True when the subscription is in a state where the server should
+    /// still be able to honour or renew it.
+    pub fn is_active(self) -> bool {
+        matches!(self, SubscriptionStatus::Active)
+    }
+}
+
+impl std::fmt::Display for SubscriptionStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SubscriptionStatus::Active => write!(f, "active"),
+            SubscriptionStatus::Cancelled => write!(f, "cancelled"),
+            SubscriptionStatus::Expired => write!(f, "expired"),
+        }
+    }
+}
+
+/// An MPP `subscription`-intent delegation owned by an account.
+///
+/// All amounts and periods are stored exactly as the spec wire form so we
+/// can round-trip them into the SDK's `SubscriptionRequest` /
+/// `SubscriptionReceiptExtensions` without lossy reformatting.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Subscription {
+    /// Base58 of the on-chain `SubscriptionDelegation` PDA — the stable
+    /// identifier returned in `Payment-Receipt.subscriptionId`.
+    pub subscription_id: String,
+
+    /// Base58 of the on-chain `Plan` PDA (the spec's `externalId`).
+    pub plan_id: String,
+
+    /// Subscriptions program ID. Omitted from YAML when it's the canonical
+    /// mainnet deployment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub program_id: Option<String>,
+
+    /// SPL Token / Token-2022 mint (base58).
+    pub mint: String,
+
+    /// Display-only symbolic currency (e.g. "USDC"). Kept for `pay
+    /// subscriptions list` and never relied on for routing decisions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
+
+    /// Per-period charge amount in mint base units, decimal string (per spec).
+    pub amount_per_period: String,
+
+    /// Billing period unit: `"day"` or `"week"` (the Solana profile rejects
+    /// `month`).
+    pub period_unit: String,
+
+    /// Positive integer count of `period_unit` values per billing period.
+    pub period_count: u32,
+
+    /// Recipient wallet pubkey bound at activation time.
+    pub recipient: String,
+
+    /// Server's puller pubkey (`plan.owner` or in `plan.pullers`).
+    pub puller: String,
+
+    /// Solana network slug, normalised the same way as `Account`'s parent
+    /// network key (`mainnet`, `devnet`, `sandbox`, `localnet`).
+    pub network: String,
+
+    /// Lifecycle state.
+    pub status: SubscriptionStatus,
+
+    /// RFC 3339 timestamp of successful activation.
+    pub activated_at: String,
+
+    /// Base58 of the activation transaction signature.
+    pub activation_signature: String,
+
+    /// Most recent billing-period index the server has reported a successful
+    /// renewal for. `0` corresponds to the activation charge.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_charged_period: Option<u64>,
+
+    /// HTTP-layer subscription expiry, mirroring the challenge's optional
+    /// `subscriptionExpires` field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+
+    /// Resource URL the subscription was activated against. Set when the
+    /// activation came from a 402 negotiation; unset for flag-driven
+    /// `pay subscriptions new`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_url: Option<String>,
+
+    /// Human-readable description echoed from the challenge.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
+    /// Cached `authenticate`-intent credential. When present and unexpired,
+    /// the client attaches it as `Authorization: Payment <token>` to
+    /// subscription-gated requests so the server can authorise without
+    /// the wallet re-signing. Generated once per billing period during
+    /// activation (or lazily on the first 402 of the period).
+    ///
+    /// The token shape is the full `Payment <base64url(credential)>`
+    /// header value — callers MAY attach it verbatim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authenticate_token: Option<String>,
+
+    /// RFC 3339 expiry timestamp on the cached authenticate token. Used
+    /// to gate attachment: the client MUST treat the token as missing
+    /// once the wall clock crosses this value. Typically equal to the
+    /// current billing period's end.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authenticate_expires_at: Option<String>,
 }
 
 impl Account {
@@ -280,6 +417,99 @@ impl AccountsFile {
                 acct.active = acct_name == name;
             }
         }
+    }
+
+    /// Insert or update a `Subscription` under an existing account.
+    ///
+    /// Returns `Ok(())` on success and an error if the network or account is
+    /// not registered. We refuse to lazily create the account here because
+    /// subscriptions inherit the keystore + auth gate of an existing wallet;
+    /// silently creating a placeholder account would leave a half-initialised
+    /// entry on disk.
+    pub fn upsert_subscription(
+        &mut self,
+        network: &str,
+        account_name: &str,
+        subscription: Subscription,
+    ) -> Result<()> {
+        let network_accounts = self.accounts.get_mut(network).ok_or_else(|| {
+            Error::Config(format!(
+                "Cannot attach subscription: no accounts registered for network `{network}`"
+            ))
+        })?;
+        let account = network_accounts.get_mut(account_name).ok_or_else(|| {
+            Error::Config(format!(
+                "Cannot attach subscription: no account `{account_name}` on network `{network}`"
+            ))
+        })?;
+        account
+            .subscriptions
+            .insert(subscription.subscription_id.clone(), subscription);
+        Ok(())
+    }
+
+    /// Remove a subscription from an account by id, returning the previous
+    /// entry if it existed.
+    pub fn remove_subscription(
+        &mut self,
+        network: &str,
+        account_name: &str,
+        subscription_id: &str,
+    ) -> Option<Subscription> {
+        self.accounts
+            .get_mut(network)?
+            .get_mut(account_name)?
+            .subscriptions
+            .remove(subscription_id)
+    }
+
+    /// Mutate a subscription's status in place. No-op when the subscription
+    /// isn't tracked locally — the on-chain delegation remains the source of
+    /// truth and a missing local entry just means we never recorded it.
+    pub fn set_subscription_status(
+        &mut self,
+        network: &str,
+        account_name: &str,
+        subscription_id: &str,
+        status: SubscriptionStatus,
+    ) {
+        let Some(network_accounts) = self.accounts.get_mut(network) else {
+            return;
+        };
+        let Some(account) = network_accounts.get_mut(account_name) else {
+            return;
+        };
+        if let Some(sub) = account.subscriptions.get_mut(subscription_id) {
+            sub.status = status;
+        }
+    }
+
+    /// Look up a subscription by id within an account.
+    pub fn find_subscription(
+        &self,
+        network: &str,
+        account_name: &str,
+        subscription_id: &str,
+    ) -> Option<&Subscription> {
+        self.accounts
+            .get(network)?
+            .get(account_name)?
+            .subscriptions
+            .get(subscription_id)
+    }
+
+    /// Iterate every subscription tracked across the whole file, yielding
+    /// `(network, account_name, &Subscription)`. Used by
+    /// `pay subscriptions list` when no filter is provided.
+    pub fn all_subscriptions(&self) -> impl Iterator<Item = (&str, &str, &Subscription)> {
+        self.accounts.iter().flat_map(|(network, accounts)| {
+            accounts.iter().flat_map(move |(name, account)| {
+                account
+                    .subscriptions
+                    .values()
+                    .map(move |sub| (network.as_str(), name.as_str(), sub))
+            })
+        })
     }
 }
 
@@ -570,6 +800,7 @@ fn generate_ephemeral_account() -> Account {
         path: None,
         secret_key_b58: Some(bs58::encode(&full).into_string()),
         created_at: Some(now_rfc3339()),
+        subscriptions: BTreeMap::new(),
     }
 }
 
@@ -642,6 +873,7 @@ mod tests {
             account: None,
             secret_key_b58: None,
             created_at: None,
+            subscriptions: BTreeMap::new(),
         }
     }
 
@@ -656,6 +888,32 @@ mod tests {
             path: None,
             secret_key_b58: Some("test-secret-bytes-base58".to_string()),
             created_at: Some("2026-04-10T00:00:00Z".to_string()),
+            subscriptions: BTreeMap::new(),
+        }
+    }
+
+    fn fake_subscription(id: &str, plan: &str) -> Subscription {
+        Subscription {
+            subscription_id: id.to_string(),
+            plan_id: plan.to_string(),
+            program_id: None,
+            mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),
+            currency: Some("USDC".to_string()),
+            amount_per_period: "10000000".to_string(),
+            period_unit: "day".to_string(),
+            period_count: 30,
+            recipient: "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin".to_string(),
+            puller: "5fKb5cF22cFybZB1H4hLDydFhwoQy9JzKzRWaSbMkB6h".to_string(),
+            network: "mainnet".to_string(),
+            status: SubscriptionStatus::Active,
+            activated_at: "2026-05-29T12:00:00Z".to_string(),
+            activation_signature: "5J8Activation".to_string(),
+            last_charged_period: Some(0),
+            expires_at: None,
+            resource_url: None,
+            description: None,
+            authenticate_token: None,
+            authenticate_expires_at: None,
         }
     }
 
@@ -710,6 +968,7 @@ mod tests {
             account: None,
             secret_key_b58: None,
             created_at: None,
+            subscriptions: BTreeMap::new(),
         };
         assert_eq!(
             acct.signer_source("legacy"),
@@ -729,6 +988,7 @@ mod tests {
             account: None,
             secret_key_b58: None,
             created_at: None,
+            subscriptions: BTreeMap::new(),
         };
         assert_eq!(
             acct.signer_source("myacct"),
@@ -749,6 +1009,7 @@ mod tests {
             path: None,
             secret_key_b58: Some(bs58::encode(&raw_bytes).into_string()),
             created_at: Some("2026-04-10T00:00:00Z".to_string()),
+            subscriptions: BTreeMap::new(),
         };
         assert_eq!(acct.ephemeral_keypair_bytes(), Some(raw_bytes));
     }
@@ -1150,5 +1411,211 @@ mod tests {
         assert!(yaml.contains("ephemeral"));
         assert!(yaml.contains("secret_key_b58"));
         assert!(yaml.contains("created_at"));
+    }
+
+    // ── Subscriptions ──────────────────────────────────────────────────────
+
+    #[test]
+    fn yaml_skips_subscriptions_when_empty() {
+        let acct = keychain_account("pk");
+        let yaml = serde_yml::to_string(&acct).unwrap();
+        assert!(
+            !yaml.contains("subscriptions"),
+            "empty subscriptions map should be omitted: {yaml}"
+        );
+    }
+
+    #[test]
+    fn yaml_round_trip_with_subscription() {
+        let mut acct = keychain_account("pk");
+        acct.subscriptions.insert(
+            "BXQGmO5VwTrl5RfFr6Y8XQZ4nPj9QqMOiKkRn3pZ4ZE".to_string(),
+            fake_subscription("BXQGmO5VwTrl5RfFr6Y8XQZ4nPj9QqMOiKkRn3pZ4ZE", "PlanPDAa"),
+        );
+        let yaml = serde_yml::to_string(&acct).unwrap();
+        assert!(yaml.contains("subscriptions:"));
+        assert!(yaml.contains("BXQGmO5VwTrl5RfFr6Y8XQZ4nPj9QqMOiKkRn3pZ4ZE"));
+        assert!(yaml.contains("status: active"));
+        // Optional `program_id` is omitted when None.
+        assert!(!yaml.contains("program_id:"));
+
+        let back: Account = serde_yml::from_str(&yaml).unwrap();
+        assert_eq!(back.subscriptions.len(), 1);
+        let sub = back.subscriptions.values().next().unwrap();
+        assert_eq!(sub.status, SubscriptionStatus::Active);
+        assert_eq!(sub.period_unit, "day");
+        assert_eq!(sub.period_count, 30);
+    }
+
+    #[test]
+    fn upsert_subscription_attaches_to_named_account() {
+        let mut f = AccountsFile::default();
+        f.upsert(MAINNET_NETWORK, "default", keychain_account("pk"));
+
+        f.upsert_subscription(
+            MAINNET_NETWORK,
+            "default",
+            fake_subscription("Sub1", "Plan1"),
+        )
+        .unwrap();
+
+        let stored = f
+            .find_subscription(MAINNET_NETWORK, "default", "Sub1")
+            .unwrap();
+        assert_eq!(stored.plan_id, "Plan1");
+    }
+
+    #[test]
+    fn upsert_subscription_overwrites_existing_id() {
+        let mut f = AccountsFile::default();
+        f.upsert(MAINNET_NETWORK, "default", keychain_account("pk"));
+
+        let mut sub = fake_subscription("Sub1", "Plan1");
+        f.upsert_subscription(MAINNET_NETWORK, "default", sub.clone())
+            .unwrap();
+
+        sub.last_charged_period = Some(3);
+        f.upsert_subscription(MAINNET_NETWORK, "default", sub.clone())
+            .unwrap();
+
+        let stored = f
+            .find_subscription(MAINNET_NETWORK, "default", "Sub1")
+            .unwrap();
+        assert_eq!(stored.last_charged_period, Some(3));
+        // Still exactly one entry, not duplicated.
+        let acct = f
+            .accounts
+            .get(MAINNET_NETWORK)
+            .unwrap()
+            .get("default")
+            .unwrap();
+        assert_eq!(acct.subscriptions.len(), 1);
+    }
+
+    #[test]
+    fn upsert_subscription_errors_when_account_missing() {
+        let mut f = AccountsFile::default();
+        f.upsert(MAINNET_NETWORK, "default", keychain_account("pk"));
+
+        let err = f
+            .upsert_subscription(MAINNET_NETWORK, "ghost", fake_subscription("Sub1", "Plan1"))
+            .unwrap_err();
+        assert!(format!("{err}").contains("ghost"));
+
+        let err = f
+            .upsert_subscription("devnet", "default", fake_subscription("Sub1", "Plan1"))
+            .unwrap_err();
+        assert!(format!("{err}").contains("devnet"));
+    }
+
+    #[test]
+    fn remove_subscription_returns_previous_entry() {
+        let mut f = AccountsFile::default();
+        f.upsert(MAINNET_NETWORK, "default", keychain_account("pk"));
+        f.upsert_subscription(
+            MAINNET_NETWORK,
+            "default",
+            fake_subscription("Sub1", "Plan1"),
+        )
+        .unwrap();
+
+        let removed = f
+            .remove_subscription(MAINNET_NETWORK, "default", "Sub1")
+            .unwrap();
+        assert_eq!(removed.plan_id, "Plan1");
+        assert!(
+            f.find_subscription(MAINNET_NETWORK, "default", "Sub1")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn set_subscription_status_flips_lifecycle() {
+        let mut f = AccountsFile::default();
+        f.upsert(MAINNET_NETWORK, "default", keychain_account("pk"));
+        f.upsert_subscription(
+            MAINNET_NETWORK,
+            "default",
+            fake_subscription("Sub1", "Plan1"),
+        )
+        .unwrap();
+
+        f.set_subscription_status(
+            MAINNET_NETWORK,
+            "default",
+            "Sub1",
+            SubscriptionStatus::Cancelled,
+        );
+        let s = f
+            .find_subscription(MAINNET_NETWORK, "default", "Sub1")
+            .unwrap();
+        assert_eq!(s.status, SubscriptionStatus::Cancelled);
+        assert!(!s.status.is_active());
+    }
+
+    #[test]
+    fn set_subscription_status_is_noop_for_unknown_id() {
+        let mut f = AccountsFile::default();
+        f.upsert(MAINNET_NETWORK, "default", keychain_account("pk"));
+        f.set_subscription_status(
+            MAINNET_NETWORK,
+            "default",
+            "Ghost",
+            SubscriptionStatus::Cancelled,
+        );
+        // Nothing to assert besides "did not panic".
+        let acct = f
+            .accounts
+            .get(MAINNET_NETWORK)
+            .unwrap()
+            .get("default")
+            .unwrap();
+        assert!(acct.subscriptions.is_empty());
+    }
+
+    #[test]
+    fn all_subscriptions_flattens_across_networks_and_accounts() {
+        let mut f = AccountsFile::default();
+        f.upsert(MAINNET_NETWORK, "default", keychain_account("pk1"));
+        f.upsert(MAINNET_NETWORK, "work", keychain_account("pk2"));
+        f.upsert("devnet", "default", fake_ephemeral("pk3"));
+
+        f.upsert_subscription(
+            MAINNET_NETWORK,
+            "default",
+            fake_subscription("SubA", "PlanA"),
+        )
+        .unwrap();
+        f.upsert_subscription(MAINNET_NETWORK, "work", fake_subscription("SubB", "PlanB"))
+            .unwrap();
+        f.upsert_subscription("devnet", "default", fake_subscription("SubC", "PlanC"))
+            .unwrap();
+
+        let mut seen: Vec<(&str, &str, &str)> = f
+            .all_subscriptions()
+            .map(|(net, name, sub)| (net, name, sub.subscription_id.as_str()))
+            .collect();
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                ("devnet", "default", "SubC"),
+                ("mainnet", "default", "SubA"),
+                ("mainnet", "work", "SubB"),
+            ]
+        );
+    }
+
+    #[test]
+    fn subscription_status_kebab_case_serializes_round_trip() {
+        for s in [
+            SubscriptionStatus::Active,
+            SubscriptionStatus::Cancelled,
+            SubscriptionStatus::Expired,
+        ] {
+            let yaml = serde_yml::to_string(&s).unwrap();
+            let back: SubscriptionStatus = serde_yml::from_str(&yaml).unwrap();
+            assert_eq!(back, s);
+        }
     }
 }

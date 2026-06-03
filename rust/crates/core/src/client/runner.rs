@@ -4,6 +4,7 @@ use tempfile::NamedTempFile;
 use tracing::{debug, info};
 
 use crate::client::mpp;
+use crate::client::subscription;
 use crate::client::x402;
 use crate::{Error, Result};
 
@@ -20,6 +21,23 @@ pub enum RunOutcome {
     /// Session payments require a stateful client with a Fiber channel.
     SessionChallenge {
         challenge: Box<mpp::Challenge>,
+        resource_url: String,
+    },
+    /// The server returned 402 with an MPP subscription challenge
+    /// (intent="subscription"). The activation transaction creates the
+    /// recurring delegation and collects the first-period charge in one
+    /// atomic transaction; renewals are server-driven and don't pass back
+    /// through this enum.
+    ///
+    /// `authenticate` carries the sibling `intent="authenticate"`
+    /// challenge from the same 402 response when the server emitted one
+    /// (pay-server emits both). The caller signs it in the same Touch ID
+    /// session as the activation tx and caches the resulting token in
+    /// `accounts.yml` so subsequent requests within the billing period
+    /// skip the 402 dance entirely.
+    SubscriptionChallenge {
+        challenge: Box<mpp::Challenge>,
+        authenticate: Option<Box<mpp::Challenge>>,
         resource_url: String,
     },
     /// The server returned 402 with an x402 challenge.
@@ -72,7 +90,8 @@ pub fn run_curl(user_args: &[String]) -> Result<RunOutcome> {
     }
 
     validate_curl_args_against_catalog(user_args)?;
-    run_curl_inner(user_args, &[])
+    let pre = pre_attach_cached_auth(user_args, ToolKind::Curl);
+    run_curl_inner(user_args, &pre)
 }
 
 /// Run `curl` with extra headers injected (used for retry after payment).
@@ -163,7 +182,8 @@ pub fn run_wget(user_args: &[String]) -> Result<RunOutcome> {
     }
 
     validate_wget_args_against_catalog(user_args)?;
-    run_wget_inner(user_args, &[])
+    let pre = pre_attach_cached_auth(user_args, ToolKind::Wget);
+    run_wget_inner(user_args, &pre)
 }
 
 /// Run `http` (HTTPie) with the given user args, detecting 402 + MPP challenges.
@@ -175,7 +195,8 @@ pub fn run_httpie(user_args: &[String]) -> Result<RunOutcome> {
         return run_plain_command("http", user_args);
     }
 
-    run_httpie_inner(user_args, &[])
+    let pre = pre_attach_cached_auth(user_args, ToolKind::Httpie);
+    run_httpie_inner(user_args, &pre)
 }
 
 /// Run `http` with extra headers injected (used for retry after payment).
@@ -296,7 +317,11 @@ fn run_httpie_inner(user_args: &[String], extra_headers: &[String]) -> Result<Ru
     let exit_code = output.status.code().unwrap_or(1);
     let stdout_text = String::from_utf8_lossy(&output.stdout);
     let stderr_text = String::from_utf8_lossy(&output.stderr);
-    let url = find_url_in_args(user_args).unwrap_or_default();
+    // HTTPie accepts `:port/path` and `host[:port]/path` shorthand;
+    // expand both so the URL persisted alongside an activated
+    // subscription matches what the next request will hit (the SIWMPP
+    // cache lookup is a URL-prefix match).
+    let url = resolve_request_url(user_args, ToolKind::Httpie).unwrap_or_default();
 
     let (status_code, headers, body) = parse_httpie_output(&stdout_text);
 
@@ -395,11 +420,56 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
+/// Caller's preference for which payment protocol to use when a 402
+/// advertises more than one. `Auto` mirrors the historical defaults
+/// (MPP first for one-shot Solana charges, fall back to x402). The
+/// `Only*` variants come from the user passing `--mpp` or `--x402` on
+/// the CLI (or any wrapper that sets `PAY_PROTOCOL_ENFORCED`) and turn
+/// "fall back" into "error" so the operator gets explicit feedback
+/// instead of a silent switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolPreference {
+    Auto,
+    OnlyMpp,
+    OnlyX402,
+}
+
+impl ProtocolPreference {
+    /// Read the preference from `PAY_PROTOCOL_ENFORCED`. The CLI sets
+    /// this from `--mpp` / `--x402`; the MCP launchers (`pay claude`,
+    /// `pay codex`) forward it so nested invocations stay consistent.
+    pub fn from_env() -> Self {
+        match std::env::var("PAY_PROTOCOL_ENFORCED").ok().as_deref() {
+            Some("mpp") => Self::OnlyMpp,
+            Some("x402") => Self::OnlyX402,
+            _ => Self::Auto,
+        }
+    }
+}
+
 /// Given 402 headers (and optional body), determine the payment protocol.
-pub(crate) fn classify_402(
+///
+/// Reads the user's protocol preference from the environment. Internal
+/// callers in tests should prefer [`classify_402_with_preference`] so
+/// they don't have to mutate process-global state.
+pub fn classify_402(
     headers: &[(String, String)],
     body: Option<&str>,
     resource_url: &str,
+) -> RunOutcome {
+    classify_402_with_preference(headers, body, resource_url, ProtocolPreference::from_env())
+}
+
+/// Variant of [`classify_402`] that takes an explicit
+/// [`ProtocolPreference`] rather than reading the env var. The `--mpp`
+/// and `--x402` CLI flags map to `OnlyMpp` / `OnlyX402`; if the server
+/// only offers the other protocol the function returns
+/// `RunOutcome::PaymentRejected` rather than silently switching.
+pub(crate) fn classify_402_with_preference(
+    headers: &[(String, String)],
+    body: Option<&str>,
+    resource_url: &str,
+    preference: ProtocolPreference,
 ) -> RunOutcome {
     // A `verification_failed` body wins over a fresh challenge: it means the
     // server saw our payment header and rejected it. We must surface the
@@ -458,13 +528,39 @@ pub(crate) fn classify_402(
         // Non-Solana session — fall through to x402 or error.
     }
 
-    // Prefer MPP for one-shot Solana payments (native protocol).
+    // Subscription challenge: checked before generic charge because the
+    // intent is more specific. Solana is the only method profile pay
+    // implements today, so we filter by both.
+    if let Some(challenge) = mpp_challenges
+        .iter()
+        .find(|c| subscription::is_subscription_challenge(c))
+    {
+        info!(
+            resource = resource_url,
+            "Detected MPP subscription challenge (Solana)"
+        );
+        let authenticate = mpp_challenges
+            .iter()
+            .find(|c| c.intent.as_str() == "authenticate" && c.method.as_str() == "solana")
+            .cloned()
+            .map(Box::new);
+        return RunOutcome::SubscriptionChallenge {
+            challenge: Box::new(challenge.clone()),
+            authenticate,
+            resource_url: resource_url.to_string(),
+        };
+    }
+
+    // Default policy: prefer MPP for one-shot Solana payments (native
+    // protocol), fall back to x402. `--mpp` keeps MPP and refuses the
+    // x402 fallback; `--x402` skips the MPP selection entirely so we
+    // land on x402 even when MPP is also offered.
     let mut charge_challenges: Vec<mpp::Challenge> = mpp_challenges
         .iter()
         .filter(|challenge| solana_mpp::client::is_solana_charge_challenge(challenge))
         .cloned()
         .collect();
-    if !charge_challenges.is_empty() {
+    if !charge_challenges.is_empty() && preference != ProtocolPreference::OnlyX402 {
         let challenge = charge_challenges.remove(0);
         info!(resource = resource_url, "Detected MPP challenge (Solana)");
         return RunOutcome::MppChallenge {
@@ -474,21 +570,51 @@ pub(crate) fn classify_402(
         };
     }
 
-    // Fall back to x402 if it has a Solana path.
-    if let Some(challenge) = x402_challenge {
-        info!(resource = resource_url, "Detected x402 challenge (Solana)");
-        return RunOutcome::X402Challenge {
-            challenge: Box::new(challenge),
-            resource_url: resource_url.to_string(),
-        };
+    // Fall back to x402 if it has a Solana path. Skip when the user
+    // pinned MPP via `--mpp`.
+    if preference != ProtocolPreference::OnlyMpp {
+        if let Some(challenge) = x402_challenge {
+            info!(resource = resource_url, "Detected x402 challenge (Solana)");
+            return RunOutcome::X402Challenge {
+                challenge: Box::new(challenge),
+                resource_url: resource_url.to_string(),
+            };
+        }
+
+        if let Some(challenge) = x402_siwx_challenge {
+            info!(resource = resource_url, "Detected x402 sign-in challenge");
+            return RunOutcome::X402SignInChallenge {
+                challenge: Box::new(challenge),
+                resource_url: resource_url.to_string(),
+            };
+        }
     }
 
-    if let Some(challenge) = x402_siwx_challenge {
-        info!(resource = resource_url, "Detected x402 sign-in challenge");
-        return RunOutcome::X402SignInChallenge {
-            challenge: Box::new(challenge),
-            resource_url: resource_url.to_string(),
-        };
+    // The user forced a protocol via `--mpp` / `--x402` but the server
+    // only offers the other one. Surface that explicitly instead of
+    // letting the request loop on an UnknownPaymentRequired.
+    match preference {
+        ProtocolPreference::OnlyMpp
+            if x402_challenge.is_some() || x402_siwx_challenge.is_some() =>
+        {
+            return RunOutcome::PaymentRejected {
+                reason: "Server only offers an x402 challenge, but --mpp was requested. \
+                         Drop --mpp to settle via x402, or pick a server that advertises MPP."
+                    .to_string(),
+                retryable: false,
+                resource_url: resource_url.to_string(),
+            };
+        }
+        ProtocolPreference::OnlyX402 if !charge_challenges.is_empty() => {
+            return RunOutcome::PaymentRejected {
+                reason: "Server only offers an MPP challenge, but --x402 was requested. \
+                         Drop --x402 to settle via MPP, or pick a server that advertises x402."
+                    .to_string(),
+                retryable: false,
+                resource_url: resource_url.to_string(),
+            };
+        }
+        _ => {}
     }
 
     // Neither protocol supports Solana — tell the user clearly.
@@ -618,6 +744,215 @@ fn find_url_in_args(args: &[String]) -> Option<String> {
     args.iter()
         .find(|a| a.starts_with("http://") || a.starts_with("https://"))
         .cloned()
+}
+
+/// Which external HTTP client the runner is feeding. The header
+/// injection format and URL-extraction rules differ per tool.
+#[derive(Debug, Clone, Copy)]
+enum ToolKind {
+    Curl,
+    Wget,
+    Httpie,
+}
+
+/// Best-effort URL extraction across the three CLI tools we wrap.
+///
+/// `curl`/`wget` require a fully-qualified URL on the command line —
+/// `find_url_in_args` already covers that. `httpie` accepts shorthands
+/// like `:1402/path` (host defaults to `localhost`) or `example.com/path`
+/// (scheme defaults to `http://`). We canonicalise both forms so the
+/// SIWMPP cache lookup (URL-prefix match against tracked subscriptions)
+/// sees the same URL the request will actually hit.
+fn resolve_request_url(args: &[String], tool: ToolKind) -> Option<String> {
+    if let Some(u) = find_url_in_args(args) {
+        return Some(u);
+    }
+    if !matches!(tool, ToolKind::Httpie) {
+        return None;
+    }
+    args.iter().find_map(|a| httpie_url_shorthand(a))
+}
+
+/// HTTPie-specific URL shorthand expander.
+///
+/// Skips flags, body items (`field=value`, `field:=jsonvalue`,
+/// `field==query`), headers (`Header:value`), and HTTP method tokens.
+/// Returns `Some(canonical_url)` for `:port[/path]` and bare
+/// `host[:port][/path]` forms.
+fn httpie_url_shorthand(arg: &str) -> Option<String> {
+    if arg.starts_with('-') || arg.is_empty() {
+        return None;
+    }
+    if arg.contains('=') {
+        return None; // body item: key=val, key:=jsonval, key==query
+    }
+    if matches!(
+        arg,
+        "GET" | "HEAD" | "POST" | "PUT" | "DELETE" | "PATCH" | "OPTIONS"
+    ) {
+        return None;
+    }
+
+    // `:port[/path]` — host defaults to localhost.
+    if let Some(rest) = arg.strip_prefix(':') {
+        let first = rest.chars().next()?;
+        if first.is_ascii_digit() {
+            return Some(format!("http://localhost:{rest}"));
+        }
+        return None;
+    }
+
+    // Header item like `Foo:Bar` — colon present, but the part before is
+    // a header name (letters/dashes), not a hostname.
+    if let Some(colon) = arg.find(':') {
+        let host_or_name = &arg[..colon];
+        let after = arg[colon + 1..].chars().next();
+        let port_like = after.is_some_and(|c| c.is_ascii_digit());
+        let looks_hostlike = host_or_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+        if !port_like || !looks_hostlike {
+            return None;
+        }
+        // `host:port[/path]` → assume http://
+        return Some(format!("http://{arg}"));
+    }
+
+    // Bare `host[/path]` — only treat as URL when it looks domain-ish
+    // (contains a `.`), to avoid matching positional non-URL args.
+    if arg.contains('.') {
+        return Some(format!("http://{arg}"));
+    }
+    None
+}
+
+/// Pre-attach a cached SIWMPP `Authorization: Payment …` header to the
+/// CLI command when a tracked subscription covers the request URL.
+///
+/// Returns the formatted header arg(s) to inject into the subprocess,
+/// in the tool's native shape:
+/// - curl/wget: `"Authorization: <token>"`
+/// - httpie: `"Authorization:<token>"` (no space — HTTPie request-item form)
+///
+/// Empty vec when no tracked subscription matches the URL, so callers
+/// pass it through to the existing inner runner unchanged.
+fn pre_attach_cached_auth(args: &[String], tool: ToolKind) -> Vec<String> {
+    let Some(url) = resolve_request_url(args, tool) else {
+        return Vec::new();
+    };
+    // Skip pre-attach when the user already passed their own
+    // Authorization header — their value wins.
+    if user_already_set_auth(args, tool) {
+        return Vec::new();
+    }
+    let store = crate::accounts::FileAccountsStore::default_path();
+    let Some(token) = crate::client::authenticate::cached_header_for_resource(&store, &url) else {
+        return Vec::new();
+    };
+    let formatted = match tool {
+        ToolKind::Curl | ToolKind::Wget => format!("Authorization: {token}"),
+        ToolKind::Httpie => format!("Authorization:{token}"),
+    };
+    vec![formatted]
+}
+
+/// True when the user already passed an Authorization header through
+/// the wrapper's args, so we don't clobber it with a cached token.
+fn user_already_set_auth(args: &[String], tool: ToolKind) -> bool {
+    let mut iter = args.iter().peekable();
+    while let Some(arg) = iter.next() {
+        match tool {
+            ToolKind::Curl => {
+                if (arg == "-H" || arg == "--header")
+                    && let Some(next) = iter.peek()
+                    && next.to_ascii_lowercase().starts_with("authorization:")
+                {
+                    return true;
+                }
+                if let Some(val) = arg
+                    .strip_prefix("-H")
+                    .or_else(|| arg.strip_prefix("--header="))
+                    && val.to_ascii_lowercase().starts_with("authorization:")
+                {
+                    return true;
+                }
+            }
+            ToolKind::Wget => {
+                if let Some(val) = arg.strip_prefix("--header=")
+                    && val.to_ascii_lowercase().starts_with("authorization:")
+                {
+                    return true;
+                }
+                if arg == "--header"
+                    && let Some(next) = iter.peek()
+                    && next.to_ascii_lowercase().starts_with("authorization:")
+                {
+                    return true;
+                }
+            }
+            ToolKind::Httpie => {
+                if arg.to_ascii_lowercase().starts_with("authorization:") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod pre_attach_tests {
+    use super::*;
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn httpie_shorthand_with_port_resolves_to_localhost() {
+        let args = s(&["-v", "POST", ":1402/", "jsonrpc=2.0", "id:=1"]);
+        assert_eq!(
+            resolve_request_url(&args, ToolKind::Httpie),
+            Some("http://localhost:1402/".to_string())
+        );
+    }
+
+    #[test]
+    fn httpie_shorthand_with_host_port_resolves_with_default_scheme() {
+        let args = s(&["GET", "example.com:8080/api"]);
+        assert_eq!(
+            resolve_request_url(&args, ToolKind::Httpie),
+            Some("http://example.com:8080/api".to_string())
+        );
+    }
+
+    #[test]
+    fn httpie_skips_header_items_and_body_fields() {
+        let args = s(&["POST", "Authorization:Bearer x", "field=value", ":1402/"]);
+        assert_eq!(
+            resolve_request_url(&args, ToolKind::Httpie),
+            Some("http://localhost:1402/".to_string())
+        );
+    }
+
+    #[test]
+    fn user_auth_overrides_curl_pre_attach() {
+        let args = s(&["-H", "Authorization: Bearer existing", "http://example.com"]);
+        assert!(user_already_set_auth(&args, ToolKind::Curl));
+    }
+
+    #[test]
+    fn user_auth_overrides_httpie_pre_attach() {
+        let args = s(&["GET", ":1402/", "Authorization:Bearer existing"]);
+        assert!(user_already_set_auth(&args, ToolKind::Httpie));
+    }
+
+    #[test]
+    fn no_url_means_no_pre_attach() {
+        let args = s(&["--help"]);
+        assert_eq!(resolve_request_url(&args, ToolKind::Httpie), None);
+        assert!(pre_attach_cached_auth(&args, ToolKind::Httpie).is_empty());
+    }
 }
 
 fn is_passthrough_metadata_request(args: &[String]) -> bool {
@@ -951,6 +1286,94 @@ HTTP request sent, awaiting response...
     }
 
     #[test]
+    fn classify_402_with_subscription_intent() {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        let request_json = serde_json::json!({
+            "amount": "10000000",
+            "currency": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            "periodUnit": "day",
+            "periodCount": "30",
+            "recipient": "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
+            "methodDetails": {
+                "planId": "8tWbqLkUJoYy7zXc5h2EvCRoaQEv2xnQjUuYhc3rzCgT",
+                "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                "puller": "5fKb5cF22cFybZB1H4hLDydFhwoQy9JzKzRWaSbMkB6h",
+                "decimals": 6,
+                "network": "mainnet"
+            }
+        });
+        let b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&request_json).unwrap());
+        let headers = vec![(
+            "www-authenticate".to_string(),
+            format!(
+                "Payment id=\"sub-1\", realm=\"test\", method=\"solana\", \
+                 intent=\"subscription\", request=\"{b64}\""
+            ),
+        )];
+
+        let outcome = classify_402(&headers, None, "https://example.com/resource");
+        assert!(
+            matches!(outcome, RunOutcome::SubscriptionChallenge { .. }),
+            "expected SubscriptionChallenge, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn classify_402_prefers_subscription_over_charge_when_both_present() {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        // Charge challenge first.
+        let charge = serde_json::json!({
+            "amount": "1000000",
+            "currency": "USDC",
+            "recipient": "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
+            "methodDetails": {"network": "mainnet"}
+        });
+        let charge_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&charge).unwrap());
+        let charge_header = format!(
+            "Payment id=\"c\", realm=\"r\", method=\"solana\", intent=\"charge\", \
+             request=\"{charge_b64}\""
+        );
+
+        // Subscription challenge second.
+        let sub = serde_json::json!({
+            "amount": "10000000",
+            "currency": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            "periodUnit": "day",
+            "periodCount": "30",
+            "recipient": "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
+            "methodDetails": {
+                "planId": "8tWbqLkUJoYy7zXc5h2EvCRoaQEv2xnQjUuYhc3rzCgT",
+                "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                "puller": "5fKb5cF22cFybZB1H4hLDydFhwoQy9JzKzRWaSbMkB6h",
+                "decimals": 6,
+                "network": "mainnet"
+            }
+        });
+        let sub_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&sub).unwrap());
+        let sub_header = format!(
+            "Payment id=\"s\", realm=\"r\", method=\"solana\", intent=\"subscription\", \
+             request=\"{sub_b64}\""
+        );
+
+        let headers = vec![
+            ("www-authenticate".to_string(), charge_header),
+            ("www-authenticate".to_string(), sub_header),
+        ];
+
+        let outcome = classify_402(&headers, None, "https://example.com/resource");
+        assert!(
+            matches!(outcome, RunOutcome::SubscriptionChallenge { .. }),
+            "subscription must win over charge: {outcome:?}"
+        );
+    }
+
+    #[test]
     fn classify_402_with_session_mpp() {
         use base64::Engine;
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -992,6 +1415,141 @@ HTTP request sent, awaiting response...
 
         let outcome = classify_402(&headers, None, "https://example.com/resource");
         assert!(matches!(outcome, RunOutcome::X402Challenge { .. }));
+    }
+
+    /// Build a 402 with BOTH an MPP charge challenge AND an x402 header,
+    /// so `classify_402_with_preference` has a real choice between the
+    /// two protocols. Shared by the `--mpp` / `--x402` preference tests.
+    fn dual_protocol_402() -> Vec<(String, String)> {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        let mpp_request = serde_json::json!({
+            "amount": "1000000",
+            "currency": "USDC",
+            "recipient": "So11111111111111111111111111111111111111112",
+            "methodDetails": { "network": "devnet" }
+        });
+        let mpp_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&mpp_request).unwrap());
+
+        let x402_requirements = serde_json::json!({
+            "network": "solana",
+            "cluster": "devnet",
+            "recipient": "So11111111111111111111111111111111111111112",
+            "amount": "1000000",
+            "currency": "USDC",
+            "resource": "https://example.com/resource"
+        });
+
+        vec![
+            (
+                "www-authenticate".to_string(),
+                format!(
+                    "Payment id=\"dual\", realm=\"test\", method=\"solana\", intent=\"charge\", request=\"{mpp_b64}\""
+                ),
+            ),
+            (
+                solana_x402::X402_V1_PAYMENT_REQUIRED_HEADER.to_string(),
+                x402_requirements.to_string(),
+            ),
+        ]
+    }
+
+    #[test]
+    fn preference_auto_prefers_mpp_when_both_offered() {
+        let outcome = classify_402_with_preference(
+            &dual_protocol_402(),
+            None,
+            "https://example.com/resource",
+            ProtocolPreference::Auto,
+        );
+        assert!(matches!(outcome, RunOutcome::MppChallenge { .. }));
+    }
+
+    #[test]
+    fn preference_only_x402_picks_x402_when_both_offered() {
+        let outcome = classify_402_with_preference(
+            &dual_protocol_402(),
+            None,
+            "https://example.com/resource",
+            ProtocolPreference::OnlyX402,
+        );
+        assert!(matches!(outcome, RunOutcome::X402Challenge { .. }));
+    }
+
+    #[test]
+    fn preference_only_mpp_keeps_mpp_when_both_offered() {
+        let outcome = classify_402_with_preference(
+            &dual_protocol_402(),
+            None,
+            "https://example.com/resource",
+            ProtocolPreference::OnlyMpp,
+        );
+        assert!(matches!(outcome, RunOutcome::MppChallenge { .. }));
+    }
+
+    #[test]
+    fn preference_only_x402_rejects_when_server_only_offers_mpp() {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        let request_json = serde_json::json!({
+            "amount": "1000000",
+            "currency": "USDC",
+            "recipient": "So11111111111111111111111111111111111111112",
+            "methodDetails": { "network": "devnet" }
+        });
+        let b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&request_json).unwrap());
+        let headers = vec![(
+            "www-authenticate".to_string(),
+            format!(
+                "Payment id=\"mpp-only\", realm=\"test\", method=\"solana\", intent=\"charge\", request=\"{b64}\""
+            ),
+        )];
+
+        let outcome = classify_402_with_preference(
+            &headers,
+            None,
+            "https://example.com/resource",
+            ProtocolPreference::OnlyX402,
+        );
+        match outcome {
+            RunOutcome::PaymentRejected { reason, .. } => {
+                assert!(reason.contains("--x402"), "reason was {reason:?}");
+                assert!(reason.contains("MPP"), "reason was {reason:?}");
+            }
+            other => panic!("expected PaymentRejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn preference_only_mpp_rejects_when_server_only_offers_x402() {
+        let requirements = serde_json::json!({
+            "network": "solana",
+            "cluster": "devnet",
+            "recipient": "So11111111111111111111111111111111111111112",
+            "amount": "1000000",
+            "currency": "USDC",
+            "resource": "https://example.com/resource"
+        });
+        let headers = vec![(
+            solana_x402::X402_V1_PAYMENT_REQUIRED_HEADER.to_string(),
+            requirements.to_string(),
+        )];
+
+        let outcome = classify_402_with_preference(
+            &headers,
+            None,
+            "https://example.com/resource",
+            ProtocolPreference::OnlyMpp,
+        );
+        match outcome {
+            RunOutcome::PaymentRejected { reason, .. } => {
+                assert!(reason.contains("--mpp"), "reason was {reason:?}");
+                assert!(reason.contains("x402"), "reason was {reason:?}");
+            }
+            other => panic!("expected PaymentRejected, got {other:?}"),
+        }
     }
 
     #[test]

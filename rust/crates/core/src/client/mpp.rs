@@ -368,7 +368,7 @@ fn normalize_network(network: &str) -> &str {
     }
 }
 
-fn should_auto_fund_surfpool(
+pub(crate) fn should_auto_fund_surfpool(
     network_override: Option<&str>,
     embedded_blockhash: Option<&str>,
 ) -> bool {

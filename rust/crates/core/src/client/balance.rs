@@ -16,7 +16,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 
 /// Default pay-api host. Override with `PAY_API_URL`.
-pub const DEFAULT_PAY_API_URL: &str = "https://api.gateway-402.com";
+pub const DEFAULT_PAY_API_URL: &str = "https://api.pay.sh";
 
 /// Default mainnet RPC URL. Override with `PAY_MAINNET_RPC_URL`.
 pub fn mainnet_rpc_url() -> String {
@@ -187,6 +187,21 @@ async fn fetch_stablecoins_via_api(
 }
 
 // ── public API ──────────────────────────────────────────────────────────────
+
+/// Fetch a wallet's SOL balance in lamports via the standard
+/// `getBalance` RPC. Returns the raw u64 — callers that need
+/// stablecoin balances too should call [`get_balances`].
+pub async fn get_sol_balance(rpc_url: &str, pubkey: &str) -> crate::Result<u64> {
+    let client = balance_client()?;
+    let resp = rpc_call(
+        &client,
+        rpc_url,
+        "getBalance",
+        serde_json::json!([pubkey, { "commitment": "confirmed" }]),
+    )
+    .await?;
+    Ok(resp["result"]["value"].as_u64().unwrap_or(0))
+}
 
 /// Fetch SOL (direct RPC) and stablecoin balances (via pay-api) for a single pubkey.
 pub async fn get_balances(rpc_url: &str, pubkey: &str) -> crate::Result<AccountBalances> {

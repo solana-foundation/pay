@@ -10,12 +10,14 @@ pub mod send;
 pub mod server;
 pub mod setup;
 pub mod skills;
+pub mod subscriptions;
 pub mod topup;
 pub mod wget;
 pub mod whoami;
 
 use clap::Subcommand;
 use owo_colors::OwoColorize;
+use pay_core::client::subscription as sub_client;
 use pay_core::mpp;
 use pay_core::runner::RunOutcome;
 use pay_core::x402;
@@ -67,6 +69,14 @@ pub enum Command {
     Skills {
         #[command(subcommand)]
         command: skills::SkillsCommand,
+    },
+    /// Manage MPP `subscription`-intent delegations (list, new, cancel,
+    /// status). With no subcommand, lists all subscriptions and prints the
+    /// available verbs so the user discovers them.
+    #[command(alias = "subscription", alias = "subs")]
+    Subscriptions {
+        #[command(subcommand)]
+        command: Option<subscriptions::SubscriptionCommand>,
     },
     /// Make your API discoverable in pay's public catalog.
     Catalog {
@@ -123,6 +133,7 @@ impl Command {
             | Command::Account { .. }
             | Command::Whoami(_)
             | Command::Skills { .. }
+            | Command::Subscriptions { .. }
             | Command::Catalog { .. }
             | Command::Install(_)
             | Command::Server { .. }
@@ -143,6 +154,7 @@ impl Command {
             Command::Account { .. }
             | Command::Whoami(_)
             | Command::Skills { .. }
+            | Command::Subscriptions { .. }
             | Command::Catalog { .. }
             | Command::Install(_)
             | Command::Send(_)
@@ -186,6 +198,10 @@ impl Command {
             },
             Command::Whoami(cmd) => return cmd.run(network_override, account_override),
             Command::Skills { command } => return command.run(),
+            Command::Subscriptions { command } => match command {
+                Some(cmd) => return cmd.run(),
+                None => return subscriptions::run_default(),
+            },
             Command::Catalog { command } => return command.run(),
             Command::Install(cmd) => return cmd.run(),
             Command::Send(cmd) => {
@@ -338,6 +354,107 @@ fn handle_outcome(
                     format!(
                         "402 Payment Required (MPP) — {} {}",
                         req.amount, req.currency
+                    )
+                    .dimmed()
+                );
+            }
+        }
+
+        RunOutcome::SubscriptionChallenge {
+            challenge,
+            authenticate,
+            resource_url,
+        } => {
+            let decoded = match sub_client::decode(&challenge) {
+                Ok(d) => d,
+                Err(e) => {
+                    if is_json {
+                        output::print_json(&serde_json::json!({
+                            "status": 402,
+                            "error": "subscription_decode_failed",
+                            "message": e.to_string(),
+                        }))?;
+                    } else {
+                        eprintln!(
+                            "{} {}",
+                            "Subscription challenge could not be decoded:".red(),
+                            e
+                        );
+                    }
+                    std::process::exit(1);
+                }
+            };
+
+            if auto_pay {
+                if let Some(cap) = payment_cap {
+                    enforce_subscription_cap(&decoded, cap)?;
+                }
+                if verbose && !is_json {
+                    eprintln!(
+                        "{}",
+                        format!(
+                            "402 Payment Required (MPP subscription) — {} {} every {} {}{}",
+                            decoded.amount_base_units,
+                            decoded.currency_label,
+                            decoded.period_count,
+                            match decoded.period_unit {
+                                solana_mpp::SubscriptionPeriodUnit::Day => "day",
+                                solana_mpp::SubscriptionPeriodUnit::Week => "week",
+                            },
+                            if decoded.period_count == 1 { "" } else { "s" }
+                        )
+                        .dimmed()
+                    );
+                }
+                return pay_subscription_and_retry(
+                    &challenge,
+                    authenticate.as_deref(),
+                    &resource_url,
+                    PaymentRetryContext {
+                        tool,
+                        output_fmt,
+                        fetch_headers,
+                        network_override,
+                        account_override,
+                        verbose,
+                    },
+                );
+            }
+
+            if is_json {
+                output::print_json(&serde_json::json!({
+                    "status": 402,
+                    "protocol": "mpp-subscription",
+                    "challenge": {
+                        "amount_base_units": decoded.amount_base_units,
+                        "currency": decoded.currency_label,
+                        "mint": decoded.method_details.mint,
+                        "plan": decoded.method_details.plan_id,
+                        "puller": decoded.method_details.puller,
+                        "recipient": decoded.request.recipient,
+                        "period_unit": match decoded.period_unit {
+                            solana_mpp::SubscriptionPeriodUnit::Day => "day",
+                            solana_mpp::SubscriptionPeriodUnit::Week => "week",
+                        },
+                        "period_count": decoded.period_count,
+                        "network": decoded.network,
+                        "expires_at": decoded.request.subscription_expires,
+                    },
+                    "resource": resource_url,
+                }))?;
+            } else {
+                eprintln!(
+                    "{}",
+                    format!(
+                        "402 Payment Required (MPP subscription) — {} {} every {} {}{}",
+                        decoded.amount_base_units,
+                        decoded.currency_label,
+                        decoded.period_count,
+                        match decoded.period_unit {
+                            solana_mpp::SubscriptionPeriodUnit::Day => "day",
+                            solana_mpp::SubscriptionPeriodUnit::Week => "week",
+                        },
+                        if decoded.period_count == 1 { "" } else { "s" }
                     )
                     .dimmed()
                 );
@@ -768,6 +885,105 @@ fn pay_mpp_and_retry(
     let retry_outcome =
         retry_with_header(ctx.tool, "Authorization", &auth_header, ctx.fetch_headers)?;
     handle_retry_outcome(retry_outcome, is_json)
+}
+
+fn pay_subscription_and_retry(
+    challenge: &mpp::Challenge,
+    authenticate_challenge: Option<&mpp::Challenge>,
+    resource_url: &str,
+    ctx: PaymentRetryContext<'_, '_>,
+) -> pay_core::Result<()> {
+    let is_json = no_dna::should_json(ctx.output_fmt);
+    validate_tool_request_before_signing(ctx.tool)?;
+
+    if ctx.verbose && !is_json {
+        eprintln!("{}", "Activating subscription...".dimmed());
+    }
+
+    let store = pay_core::accounts::FileAccountsStore::default_path();
+    let built = sub_client::build_credential_with_authenticate(
+        challenge,
+        authenticate_challenge,
+        &store,
+        ctx.network_override,
+        ctx.account_override,
+        Some(resource_url),
+    )?;
+
+    if let Some(resolved) = built.ephemeral_notice.clone() {
+        render_generated_wallet_notice(&resolved, is_json)?;
+    }
+
+    if ctx.verbose && !is_json {
+        eprintln!("{}", "Activation signed, retrying...\n".dimmed());
+    }
+
+    let retry_outcome = retry_with_header(
+        ctx.tool,
+        "Authorization",
+        &built.authorization,
+        ctx.fetch_headers,
+    )?;
+
+    // On any 2xx outcome, persist a best-effort local record. The
+    // `subscription_id` is the deterministic SubscriptionDelegation PDA
+    // (per spec §"Subscription Identifier"), so we can derive it without
+    // round-tripping the Payment-Receipt header — which the curl/wget/httpie
+    // wrappers don't preserve today.
+    if let RunOutcome::Completed { exit_code, .. } = &retry_outcome
+        && *exit_code == 0
+    {
+        if let Err(e) = persist_local_subscription_after_activation(&built, &store) {
+            tracing::warn!(error = %e, "Activation succeeded but could not persist local record");
+            if !is_json {
+                eprintln!(
+                    "{} Activation succeeded but the local registry could not be \
+                     updated: {}. Run `pay subscriptions refresh` later to reconcile.",
+                    "Warning:".yellow(),
+                    e
+                );
+            }
+        } else if ctx.verbose && !is_json {
+            eprintln!("{}", "Subscription recorded locally.".dimmed());
+        }
+    }
+
+    handle_retry_outcome(retry_outcome, is_json)
+}
+
+// `persist_local_subscription_after_activation` lives in
+// `pay_core::client::subscription` so the MCP curl tool can reuse the
+// same flow without duplicating the pubkey-derivation + RPC-backfill
+// boilerplate. CLI calls it through the qualified path below.
+use pay_core::client::subscription::persist_local_subscription_after_activation;
+
+fn enforce_subscription_cap(
+    decoded: &sub_client::DecodedSubscriptionChallenge,
+    payment_cap: u64,
+) -> pay_core::Result<()> {
+    // Currency is the mint b58 in the wire form; the symbolic label gates
+    // whether we can price it against a stablecoin cap. If the label is a
+    // known stablecoin symbol we can compare base-units directly.
+    if Stablecoin::parse_symbol(&decoded.currency_label).is_some() {
+        let required = decoded.amount_base_units.parse::<u64>().map_err(|e| {
+            pay_core::Error::Mpp(format!("Invalid amount in subscription challenge: {e}"))
+        })?;
+        if required <= payment_cap {
+            return Ok(());
+        }
+        return Err(payment_cap_error(
+            "MPP subscription",
+            &decoded.currency_label,
+            required,
+            payment_cap,
+        ));
+    }
+    Err(pay_core::Error::PaymentRejected(format!(
+        "The automatic payment cap is stablecoin-denominated and cannot price \
+         subscription currency `{}` automatically. Re-run without --yolo-upto \
+         and approve interactively, or restrict to stablecoin-denominated plans.",
+        decoded.currency_label
+    )))
 }
 
 fn mpp_challenge_currencies(challenges: &[mpp::Challenge]) -> Vec<String> {

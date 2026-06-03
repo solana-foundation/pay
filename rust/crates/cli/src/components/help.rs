@@ -10,7 +10,8 @@ pub const SUPPORTED_PASS_THROUGH_COMMANDS: &[&str] =
     &["curl", "wget", "http", "claude", "codex", "whoami"];
 pub const DEVELOPER_COMMANDS: &[&str] = &["server", "catalog"];
 pub const AGENT_COMMANDS: &[&str] = &["mcp", "skills"];
-pub const ACCOUNT_MANAGEMENT_COMMANDS: &[&str] = &["topup", "account", "setup", "send"];
+pub const ACCOUNT_MANAGEMENT_COMMANDS: &[&str] =
+    &["topup", "account", "setup", "send", "subscriptions"];
 pub const OTHER_COMMANDS: &[&str] = &["fetch", "install"];
 
 pub const ROOT_COMMAND_SUMMARY: &str = "\
@@ -26,8 +27,13 @@ Agents:
   \x1b[1mskills\x1b[0m: Browse, search, and inspect API providers from the skills catalog
 
 Account management:
-  \x1b[1mtopup\x1b[0m:   Import funds from Venmo, PayPal, or a mobile wallet.
-  \x1b[1maccount\x1b[0m: Manage accounts (new, import, list, default, remove, export)
-  \x1b[1msetup\x1b[0m:   Generate a keypair, store it, and fund your account
-  \x1b[1msend\x1b[0m:    Send stablecoins to a recipient address
+  \x1b[1mtopup\x1b[0m:         Import funds from Venmo, PayPal, or a mobile wallet.
+  \x1b[1maccount\x1b[0m:       Manage accounts (new, import, list, default, remove, export)
+  \x1b[1msetup\x1b[0m:         Generate a keypair, store it, and fund your account
+  \x1b[1msend\x1b[0m:          Send stablecoins to a recipient address
+  \x1b[1msubscriptions\x1b[0m: Manage MPP subscription delegations (list, new, cancel, status)
+
+Other:
+  \x1b[1mfetch\x1b[0m:   Fetch a URL using the built-in HTTP client (no external tool required)
+  \x1b[1minstall\x1b[0m: Add a provider source (shorthand for `skills add`)
 ";

@@ -1,6 +1,9 @@
 pub mod accounting;
 
 #[cfg(feature = "server")]
+pub mod authenticate;
+
+#[cfg(feature = "server")]
 pub mod metering;
 
 #[cfg(feature = "server")]
@@ -20,6 +23,9 @@ pub mod session_metering;
 
 #[cfg(feature = "server")]
 pub mod session_stream;
+
+#[cfg(feature = "server")]
+pub mod subscription;
 
 #[cfg(feature = "server")]
 pub mod telemetry;

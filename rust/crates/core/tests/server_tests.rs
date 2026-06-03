@@ -94,7 +94,7 @@ async fn start_test_server(with_mpp: bool) -> (String, tokio::task::JoinHandle<(
             decimals: 9,
             network: "localnet".to_string(),
             rpc_url: Some("http://localhost:8899".to_string()),
-            secret_key: Some("test-secret".to_string()),
+            challenge_binding_secret: Some("test-secret".to_string()),
             ..Default::default()
         })
         .ok()
@@ -137,7 +137,7 @@ async fn start_multi_currency_server() -> (String, tokio::task::JoinHandle<()>) 
                 decimals: 6,
                 network: "localnet".to_string(),
                 rpc_url: Some("http://localhost:8899".to_string()),
-                secret_key: Some("test-secret".to_string()),
+                challenge_binding_secret: Some("test-secret".to_string()),
                 ..Default::default()
             })
             .unwrap()
@@ -183,7 +183,7 @@ async fn start_respond_server() -> (String, tokio::task::JoinHandle<()>) {
         decimals: 6,
         network: "localnet".to_string(),
         rpc_url: Some("http://localhost:8899".to_string()),
-        secret_key: Some("test-secret".to_string()),
+        challenge_binding_secret: Some("test-secret".to_string()),
         ..Default::default()
     })
     .ok();
@@ -699,7 +699,7 @@ async fn root_redirects_to_pdb_with_html_accept() {
         decimals: 6,
         network: "localnet".to_string(),
         rpc_url: Some("http://localhost:8899".to_string()),
-        secret_key: Some("test-secret".to_string()),
+        challenge_binding_secret: Some("test-secret".to_string()),
         ..Default::default()
     })
     .ok();

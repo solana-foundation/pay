@@ -203,11 +203,32 @@ fn do_paid_fetch(
 
     pay_core::skills::validate_cached_catalog_request(method, url, body.as_deref())?;
 
-    let outcome =
-        pay_core::client::fetch::fetch_request(method, url, extra_headers, body.as_deref())?;
     let store = pay_core::accounts::FileAccountsStore::default_path();
     let network_override = std::env::var("PAY_NETWORK_ENFORCED").ok();
     let account_override = std::env::var("PAY_ACTIVE_ACCOUNT").ok();
+
+    // SIWMPP pre-attach: if a cached authenticate token covers this URL
+    // (URL-prefix match against a tracked Active subscription with a
+    // non-expired token), attach it BEFORE the first fetch. On hit the
+    // server validates the token and skips the 402 entirely — no Touch
+    // ID prompt, no extra round trip. On miss this is a no-op.
+    let cached_auth_header =
+        pay_core::client::authenticate::cached_header_for_resource(&store, url);
+    let initial_headers: Vec<(String, String)> = match cached_auth_header.as_deref() {
+        Some(token)
+            if !extra_headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("authorization")) =>
+        {
+            let mut h = extra_headers.to_vec();
+            h.push(("Authorization".to_string(), token.to_string()));
+            h
+        }
+        _ => extra_headers.to_vec(),
+    };
+
+    let outcome =
+        pay_core::client::fetch::fetch_request(method, url, &initial_headers, body.as_deref())?;
 
     match outcome {
         RunOutcome::MppChallenge {
@@ -288,6 +309,52 @@ fn do_paid_fetch(
         RunOutcome::SessionChallenge { .. } => Err(pay_core::Error::Mpp(
             "402 Payment Required (MPP session) — session payments require a stateful client with a Fiber channel".to_string(),
         )),
+        RunOutcome::SubscriptionChallenge {
+            challenge,
+            authenticate,
+            ..
+        } => {
+            // Build + send the activation credential, same flow as
+            // `pay http`. Touch ID (or whatever keystore the active
+            // account uses) gates the signature, so an agent invocation
+            // can't silently commit a recurring on-chain delegation —
+            // the user still has to approve in the system prompt. On
+            // success we persist a local record to accounts.yml via
+            // pay-core's shared helper so the MCP path stays in sync
+            // with `pay subscriptions list`. When the server bundled an
+            // `authenticate` challenge in the 402, we sign it with the
+            // same unlocked signer and cache the resulting token so
+            // subsequent requests in the period skip the prompt.
+            let built = pay_core::client::subscription::build_credential_with_authenticate(
+                &challenge,
+                authenticate.as_deref(),
+                &store,
+                network_override.as_deref(),
+                account_override.as_deref(),
+                Some(url),
+            )?;
+            let mut headers = extra_headers.to_vec();
+            headers.push(("Authorization".to_string(), built.authorization.clone()));
+            let retry = pay_core::client::fetch::fetch_request(
+                method,
+                url,
+                &headers,
+                body.as_deref(),
+            )?;
+            if let RunOutcome::Completed { exit_code, .. } = &retry
+                && *exit_code == 0
+                && let Err(e) =
+                    pay_core::client::subscription::persist_local_subscription_after_activation(
+                        &built, &store,
+                    )
+            {
+                tracing::warn!(
+                    error = %e,
+                    "Subscription activation succeeded but local persistence failed"
+                );
+            }
+            interpret_retry(retry)
+        }
         RunOutcome::PaymentRejected { reason, .. } => Err(pay_core::Error::PaymentRejected(reason)),
         RunOutcome::UnknownPaymentRequired { .. } => Err(pay_core::Error::Mpp(
             "402 Payment Required but no recognized protocol".to_string(),

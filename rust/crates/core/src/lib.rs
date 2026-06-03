@@ -2,6 +2,7 @@
 pub mod accounts;
 pub mod config;
 pub mod error;
+pub mod explorer;
 pub mod instructions;
 pub mod keystore;
 pub mod signer;
@@ -58,6 +59,13 @@ pub trait PaymentState: Clone + Send + Sync + 'static {
         None
     }
     fn fee_payer_wallet(&self) -> Option<&server::telemetry::FeePayerWallet> {
+        None
+    }
+    /// Operator's fee-payer signer, when configured. The subscription
+    /// middleware needs it at verify time to co-sign the activation
+    /// transaction; charge / session paths construct their own MPP
+    /// instances at startup and don't ask for it through this trait.
+    fn fee_payer_signer(&self) -> Option<Arc<dyn solana_mpp::solana_keychain::SolanaSigner>> {
         None
     }
 }

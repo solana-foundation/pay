@@ -610,6 +610,7 @@ mod tests {
             resource: None,
             metering: None,
             routing: None,
+            subscription: None,
         }
     }
 

@@ -1,0 +1,44 @@
+  auth:
+    method: query_param
+    key: "api-key"
+    value_from_env: HELIUS_API_KEY
+
+operator:
+  # Mainnet — real USDC, real SOL fees. The operator's signer is
+  # resolved from accounts.yml's active mainnet account unless an
+  # `operator.signer:` block overrides it (see pdb/proxy/README for
+  # GCP KMS / file-keypair variants).
+  currencies:
+    usd: ["USDC"]
+  network: "localnet"
+  fee_payer: true
+  # `recipient` defaults to the operator signer's pubkey when omitted —
+  # the same wallet that pays activation fees collects subscription
+  # USDC. Set explicitly if you'd rather route revenue elsewhere.
+  #
+  # SIWMPP challenge-binding HMAC secret. Generate with
+  # `openssl rand -hex 32`. Keep stable across server restarts —
+  # rotating it invalidates every outstanding subscriber session token
+  # (they'll auto-re-authenticate on next request, but you'll see a
+  # 402 storm). Move to a secret manager / KMS reference before going
+  # to production.
+  challenge_binding_secret: "REPLACE_ME_WITH_openssl_rand_hex_32"
+
+endpoints:
+  # ── JSON-RPC root ─────────────────────────────────────────────────
+  #
+  # Solana's JSON-RPC and Helius DAS extensions all POST to the same
+  # URL with the method name in the request body. We gate the single
+  # entry point on an active subscription; all RPC methods (getBalance,
+  # getTransaction, getAsset, getProgramAccounts, …) are unlocked once
+  # the activation lands on-chain.
+  - method: POST
+    path: ""
+    resource: "rpc"
+    description: >
+      Solana JSON-RPC + Helius DAS. Unlimited calls per billing period
+      after subscription activation.
+    subscription:
+      period: "30d"
+      price_usd: 9.99
+      currency: USDC

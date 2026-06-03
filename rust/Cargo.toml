@@ -102,14 +102,16 @@ blake3 = "1"
 qrcode = { version = "0.14", default-features = false }
 mime_guess = { version = "2.0", default-features = false, features = ["rev-mappings"] }
 
-# Solana MPP (includes keypair loading + charge building)
-solana-mpp = { git = "https://github.com/solana-foundation/mpp-sdk", branch = "main", default-features = false, features = [
+# Solana MPP (includes keypair loading + charge + subscription + authenticate
+# builders). Tracks pay-kit `main`; PR #154 merged the SIWMPP work so the
+# stable branch is the source of truth again.
+solana-mpp = { git = "https://github.com/solana-foundation/pay-kit", branch = "main", default-features = false, features = [
     "client",
     "server",
 ] }
 
-# Solana x402
-solana-x402 = { git = "https://github.com/solana-foundation/x402-sdk", branch = "main", package = "solana-x402", default-features = false, features = [
+# Solana x402 (lives in the pay-kit workspace alongside solana-mpp)
+solana-x402 = { git = "https://github.com/solana-foundation/pay-kit", branch = "main", package = "solana-x402", default-features = false, features = [
     "client",
 ] }
 
@@ -123,3 +125,9 @@ solana-pubkey = "3.0"
 solana-signature = "3.2"
 solana-system-interface = "2.0"
 solana-transaction = "3.1"
+
+# Local override for end-to-end testing of unreleased pay-kit changes.
+# Uncomment to redirect both crates to a local pay-kit checkout.
+# [patch."https://github.com/solana-foundation/pay-kit"]
+# solana-x402 = { path = "/Users/ludo/Coding/pay-kit/rust/crates/x402" }
+# solana-mpp = { path = "/Users/ludo/Coding/pay-kit/rust/crates/mpp" }

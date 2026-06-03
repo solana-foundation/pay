@@ -1,3 +1,4 @@
+pub mod authenticate;
 pub mod balance;
 pub mod fetch;
 pub mod mpp;
@@ -6,4 +7,5 @@ pub mod runner;
 pub mod sandbox;
 pub mod send;
 pub mod session;
+pub mod subscription;
 pub mod x402;

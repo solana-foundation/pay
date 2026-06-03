@@ -234,7 +234,7 @@ async fn full_payment_flow_with_surfnet() {
         // are valid).
         network: "localnet".to_string(),
         rpc_url: Some(surfnet.rpc_url().to_string()),
-        secret_key: Some("test-secret".to_string()),
+        challenge_binding_secret: Some("test-secret".to_string()),
         ..Default::default()
     })
     .unwrap();
@@ -360,7 +360,7 @@ async fn replayed_authorization_is_rejected() {
         decimals: 9,
         network: "localnet".to_string(),
         rpc_url: Some(surfnet.rpc_url().to_string()),
-        secret_key: Some("test-secret".to_string()),
+        challenge_binding_secret: Some("test-secret".to_string()),
         ..Default::default()
     })
     .unwrap();
@@ -1420,7 +1420,7 @@ async fn mpp_build_credential_with_surfnet() {
         // are valid).
         network: "localnet".to_string(),
         rpc_url: Some(surfnet.rpc_url().to_string()),
-        secret_key: Some("test-secret".to_string()),
+        challenge_binding_secret: Some("test-secret".to_string()),
         ..Default::default()
     })
     .unwrap();
@@ -1504,6 +1504,7 @@ async fn mpp_build_credential_with_surfnet() {
                 path: None,
                 secret_key_b58: Some(bs58::encode(&payer_bytes).into_string()),
                 created_at: Some("2026-04-10T00:00:00Z".to_string()),
+                subscriptions: std::collections::BTreeMap::new(),
             },
         );
         let store = pay_core::accounts::MemoryAccountsStore::with_file(file);

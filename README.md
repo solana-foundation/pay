@@ -15,7 +15,7 @@ Wrap a selected set of command line tools (`curl`, `claude`, `codex`, `whoami`, 
 curl https://debugger.pay.sh/mpp/quote/AAPL
 
 # With pay -- it handles the 402 challenge and returns the response
-pay --sandbox curl https://debugger.pay.sh/mpp/quote/AAPL
+pay curl https://debugger.pay.sh/mpp/quote/AAPL
 ```
 
 ## Key Features

@@ -668,7 +668,13 @@ mod tests {
 
     fn test_challenge(intent: &str) -> PaymentChallenge {
         let request = Base64UrlJson::from_typed(&test_request()).unwrap();
-        PaymentChallenge::with_secret_key("test-secret", "test-realm", "solana", intent, request)
+        PaymentChallenge::with_challenge_binding_secret(
+            "test-secret",
+            "test-realm",
+            "solana",
+            intent,
+            request,
+        )
     }
 
     fn test_signer() -> Box<dyn SolanaSigner> {
@@ -703,6 +709,7 @@ mod tests {
                 path: None,
                 secret_key_b58: Some(bs58::encode(keypair.to_bytes()).into_string()),
                 created_at: Some("2026-04-19T00:00:00Z".to_string()),
+                subscriptions: std::collections::BTreeMap::new(),
             },
         );
         MemoryAccountsStore::with_file(file)

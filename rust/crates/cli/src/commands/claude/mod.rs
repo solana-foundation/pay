@@ -40,6 +40,12 @@ impl ClaudeCommand {
                 serde_json::Value::String(network),
             );
         }
+        if let Ok(protocol) = std::env::var("PAY_PROTOCOL_ENFORCED") {
+            env.insert(
+                "PAY_PROTOCOL_ENFORCED".to_string(),
+                serde_json::Value::String(protocol),
+            );
+        }
         if let Ok(proxy) = std::env::var("PAY_DEBUGGER_PROXY") {
             env.insert(
                 "PAY_DEBUGGER_PROXY".to_string(),

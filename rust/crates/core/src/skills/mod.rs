@@ -14,6 +14,7 @@
 
 pub mod build;
 pub mod config;
+pub mod local;
 pub mod openapi;
 pub mod probe;
 
@@ -974,15 +975,26 @@ fn parse_detail(raw: &str) -> Result<ProviderDetailFile> {
 
 /// Load the skills catalog. Uses cache if fresh, otherwise fetches from
 /// configured sources.
+///
+/// When the config has any ephemeral sources (auto-registered
+/// `pay server start` instances on this host), the durable cached
+/// catalog is augmented with a fresh fetch of just those ephemeral
+/// sources on every call. Ephemeral specs change as the developer
+/// edits + restarts their server; the 30 min TTL would otherwise hide
+/// those edits from agents running in the same shell.
 pub async fn load_skills() -> Result<Catalog> {
     let cfg = config::SkillsConfig::load()?;
 
-    // Cache hit?
+    // Cache hit? Ephemeral sources are merged in separately below so a
+    // cache hit on the durable catalog is still useful.
     if let Some(path) = cfg.valid_cache_path() {
         let raw = std::fs::read_to_string(&path)
             .map_err(|e| Error::Config(format!("read cache: {e}")))?;
-        let catalog = parse_catalog(&raw)?;
+        let mut catalog = parse_catalog(&raw)?;
         if !catalog.providers.is_empty() {
+            if cfg.has_ephemeral_sources() {
+                merge_ephemeral_into(&mut catalog, &cfg).await;
+            }
             return Ok(catalog);
         }
         tracing::warn!(path = %path.display(), "Ignoring empty skills cache");
@@ -990,11 +1002,16 @@ pub async fn load_skills() -> Result<Catalog> {
 
     // Cache miss — fetch, merge, cache.
     match fetch_and_merge(&cfg, false).await {
-        Ok(catalog) => {
+        Ok(mut catalog) => {
+            // Cache only the durable catalog (ephemerals fold in fresh
+            // on every load).
             if let Ok(written) = write_cache(&cfg, &catalog) {
                 cfg.clean_stale_caches(&written);
             }
             clean_stale_detail_cache(&catalog);
+            if cfg.has_ephemeral_sources() {
+                merge_ephemeral_into(&mut catalog, &cfg).await;
+            }
             Ok(catalog)
         }
         Err(fetch_err) => {
@@ -1036,14 +1053,23 @@ pub fn load_cached_skills() -> Result<Catalog> {
 /// to bypass CDN edge caches, and purge all local detail caches.
 pub async fn update_skills(cache_bust: bool) -> Result<Catalog> {
     let cfg = config::SkillsConfig::load()?;
-    let catalog = fetch_and_merge(&cfg, cache_bust).await?;
+    let mut catalog = fetch_and_merge(&cfg, cache_bust).await?;
     let written = write_cache(&cfg, &catalog)?;
     cfg.clean_stale_caches(&written);
     clean_stale_detail_cache(&catalog);
+    if cfg.has_ephemeral_sources() {
+        merge_ephemeral_into(&mut catalog, &cfg).await;
+    }
     Ok(catalog)
 }
 
 /// Fetch each source URL and merge all providers into one Catalog.
+///
+/// Returns the merged catalog covering DURABLE (non-ephemeral) sources
+/// only. Ephemeral providers are folded in by [`merge_ephemeral_into`]
+/// on top of either the cached or the freshly-fetched durable catalog —
+/// they're never persisted to disk so a crashed `pay server` doesn't
+/// leave stale entries in the cache.
 async fn fetch_and_merge(cfg: &config::SkillsConfig, cache_bust: bool) -> Result<Catalog> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
@@ -1055,7 +1081,8 @@ async fn fetch_and_merge(cfg: &config::SkillsConfig, cache_bust: bool) -> Result
     let mut successful_sources = 0usize;
     let mut failures = Vec::new();
 
-    for source in &cfg.sources {
+    let durable: Vec<&config::Source> = cfg.sources.iter().filter(|s| !s.ephemeral).collect();
+    for source in &durable {
         let url = if cache_bust {
             let ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1084,6 +1111,8 @@ async fn fetch_and_merge(cfg: &config::SkillsConfig, cache_bust: bool) -> Result
     if successful_sources == 0 {
         let reason = if cfg.sources.is_empty() {
             "no skills sources configured".to_string()
+        } else if durable.is_empty() {
+            "no durable skills sources configured".to_string()
         } else {
             format!("all skills sources failed: {}", failures.join("; "))
         };
@@ -1106,6 +1135,40 @@ async fn fetch_and_merge(cfg: &config::SkillsConfig, cache_bust: bool) -> Result
         provider_count: all_providers.len() as u32,
         providers: all_providers,
     })
+}
+
+/// Append providers from every ephemeral source onto `catalog`,
+/// dedup'd by FQN against what's already there. Failures are logged
+/// at debug — a crashed `pay server` is the common case and we don't
+/// want to clobber every `list_catalog` invocation with warnings.
+async fn merge_ephemeral_into(catalog: &mut Catalog, cfg: &config::SkillsConfig) {
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+    else {
+        return;
+    };
+    let mut seen: std::collections::HashSet<String> =
+        catalog.providers.iter().map(|s| s.fqn.clone()).collect();
+    for source in cfg.ephemeral_sources() {
+        match fetch_one_async(&client, &source.url).await {
+            Ok(cat) => {
+                for svc in cat.providers {
+                    if seen.insert(svc.fqn.clone()) {
+                        catalog.providers.push(svc);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    url = %source.url,
+                    error = %e,
+                    "Ephemeral skills source unreachable (likely a stopped pay server)"
+                );
+            }
+        }
+    }
+    catalog.provider_count = catalog.providers.len() as u32;
 }
 
 async fn fetch_one_async(client: &reqwest::Client, url: &str) -> Result<Catalog> {

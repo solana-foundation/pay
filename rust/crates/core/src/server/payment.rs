@@ -10,14 +10,15 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 use solana_mpp::{
-    AUTHORIZATION_HEADER, PAYMENT_RECEIPT_HEADER, WWW_AUTHENTICATE_HEADER, format_receipt,
-    format_www_authenticate_many, parse_authorization, server::html as mpp_html,
+    AUTHORIZATION_HEADER, PAYMENT_RECEIPT_HEADER, ReceiptKind, WWW_AUTHENTICATE_HEADER,
+    format_receipt, format_www_authenticate_many, parse_authorization, server::html as mpp_html,
 };
 use std::sync::Arc;
 
 use crate::PaymentState;
 use crate::server::metering::{self, RequestProperties};
 use crate::server::session_stream::SessionStreamContext;
+use crate::server::subscription as server_subscription;
 use crate::server::telemetry;
 
 /// Small non-generic helpers keep the middleware readable and, importantly for
@@ -52,6 +53,15 @@ pub async fn payment_middleware<S: PaymentState>(
     let path = uri.path().trim_start_matches('/').to_string();
 
     if path.starts_with("__402/") {
+        return next.run(req).await;
+    }
+
+    // Discovery surfaces — must stay unauthenticated so local agents and
+    // tooling can read them without paying. `/openapi.json` and
+    // `/.well-known/pay-skills.json` are pay's discovery contract; the
+    // RFC 8615 `.well-known/` prefix is reserved for unauthenticated
+    // metadata so we exempt the whole subtree.
+    if path == "openapi.json" || path.starts_with(".well-known/") {
         return next.run(req).await;
     }
 
@@ -114,8 +124,9 @@ pub async fn payment_middleware<S: PaymentState>(
         }
     });
     let metering_config = endpoint.and_then(|ep| ep.metering.as_ref());
+    let subscription_config = endpoint.and_then(|ep| ep.subscription.as_ref());
 
-    if metering_config.is_none() {
+    if metering_config.is_none() && subscription_config.is_none() {
         // For respond routing with no method match: if the path exists but
         // the method is wrong, return 404 (not pass-through, since there's
         // no upstream to handle it).
@@ -132,6 +143,47 @@ pub async fn payment_middleware<S: PaymentState>(
                 .unwrap();
         }
         return next.run(req).await;
+    }
+
+    // Subscription endpoints branch off before any of the charge / session
+    // plumbing — they speak `intent=subscription` end-to-end and reuse none
+    // of the per-call metering machinery.
+    if let Some(sub_spec) = subscription_config {
+        let auth_header = headers
+            .get(AUTHORIZATION_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        // Fall back to the first MPP's recipient + rpc_url when
+        // `operator.recipient` is omitted — at startup pay-server
+        // resolves both into the MPP config (via the same chain that
+        // honours `--rpc-url`, `operator.rpc_url`, or the sandbox URL).
+        // Surfacing them here keeps the subscription middleware
+        // RPC-config-aware without duplicating the resolver.
+        let mpps = state.mpps();
+        let operator_recipient_fallback = mpps.first().map(|m| m.recipient().to_string());
+        let operator_rpc_url = mpps
+            .first()
+            .map(|m| m.rpc_url().to_string())
+            .unwrap_or_else(|| {
+                solana_mpp::protocol::solana::default_rpc_url("mainnet").to_string()
+            });
+        let fee_payer_signer = state.fee_payer_signer();
+        let endpoint_description = endpoint.and_then(|ep| ep.description.as_deref());
+        return handle_subscription_endpoint(
+            api,
+            sub_spec,
+            endpoint_description,
+            auth_header.as_deref(),
+            operator_recipient_fallback.as_deref(),
+            &operator_rpc_url,
+            fee_payer_signer,
+            req,
+            next,
+            &method,
+            &path,
+            subdomain,
+        )
+        .await;
     }
 
     let meter = metering_config.unwrap();
@@ -371,6 +423,464 @@ fn attach_session_stream_context(
     ));
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn handle_subscription_endpoint(
+    api: &pay_types::metering::ApiSpec,
+    spec: &pay_types::metering::SubscriptionEndpoint,
+    endpoint_description: Option<&str>,
+    auth_header: Option<&str>,
+    operator_recipient_fallback: Option<&str>,
+    operator_rpc_url: &str,
+    fee_payer_signer: Option<std::sync::Arc<dyn solana_mpp::solana_keychain::SolanaSigner>>,
+    req: Request<Body>,
+    next: Next,
+    method: &Method,
+    path: &str,
+    subdomain: &str,
+) -> Response {
+    // No Authorization → emit a 402 with the subscription challenge.
+    let Some(auth_value) = auth_header else {
+        return subscription_challenge_response(
+            api,
+            spec,
+            endpoint_description,
+            operator_recipient_fallback,
+            operator_rpc_url,
+            fee_payer_signer.clone(),
+            method,
+            path,
+            subdomain,
+        );
+    };
+
+    let credential = match parse_authorization(auth_value) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(json!({
+                    "error": "malformed_credential",
+                    "message": e.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // ── authenticate-intent path: stateless SIWMPP verify, no broadcast ──
+    //
+    // Subscribers within a paid period present a cached authenticate
+    // credential on every request; the server verifies the ed25519
+    // signature + HMAC nonce + resource binding without touching chain
+    // state, then passes the request upstream. Failure falls through
+    // to the 402 path with a fresh authenticate challenge so the client
+    // can re-sign on period rollover or after the realm secret rotates.
+    if credential.challenge.intent.as_str() == "authenticate" {
+        let operator = api.operator.as_ref();
+        let puller = operator
+            .and_then(|o| o.recipient.clone())
+            .or_else(|| operator_recipient_fallback.map(str::to_string));
+        let network = operator
+            .and_then(|o| o.network.clone())
+            .unwrap_or_else(|| "mainnet".to_string());
+        let fee_payer = operator.map(|o| o.fee_payer).unwrap_or(false);
+
+        if let Some(puller) = puller {
+            let recipient = spec.recipient.clone().unwrap_or_else(|| puller.clone());
+            let defaults = crate::server::subscription::OperatorDefaults {
+                puller: &puller,
+                recipient: &recipient,
+                network: &network,
+                rpc_url: operator_rpc_url,
+                challenge_binding_secret: operator
+                    .and_then(|o| o.challenge_binding_secret.as_deref()),
+                realm: operator
+                    .and_then(|o| o.realm.as_deref())
+                    .or(Some(subdomain)),
+                fee_payer,
+                fee_payer_signer: fee_payer_signer.clone(),
+            };
+            let canonical_uri = format!("https://{subdomain}/");
+            match crate::server::authenticate::build_handler(
+                spec,
+                defaults,
+                subdomain,
+                &canonical_uri,
+            ) {
+                Ok(Some(server)) => match server.verify(&credential) {
+                    Ok(subscriber) => {
+                        tracing::debug!(
+                            subdomain = %subdomain,
+                            path = %path,
+                            subscriber = %subscriber,
+                            "authenticate credential verified"
+                        );
+                        return next.run(req).await;
+                    }
+                    Err(e) => {
+                        tracing::info!(
+                            subdomain = %subdomain,
+                            path = %path,
+                            error = %e,
+                            "authenticate verify failed — re-challenging"
+                        );
+                    }
+                },
+                Ok(None) => {
+                    tracing::debug!(
+                        subdomain = %subdomain,
+                        "authenticate not configured (plan not published yet)"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to build AuthenticateServer");
+                }
+            }
+        }
+        // Fall through to the 402 with both challenges.
+        return subscription_challenge_response(
+            api,
+            spec,
+            endpoint_description,
+            operator_recipient_fallback,
+            operator_rpc_url,
+            fee_payer_signer.clone(),
+            method,
+            path,
+            subdomain,
+        );
+    }
+
+    if credential.challenge.intent.as_str() != "subscription" {
+        // Wrong intent — re-emit the 402 with the subscription challenge.
+        tracing::info!(
+            subdomain = %subdomain,
+            path = %path,
+            "Credential intent mismatch on subscription endpoint — re-challenging"
+        );
+        return subscription_challenge_response(
+            api,
+            spec,
+            endpoint_description,
+            operator_recipient_fallback,
+            operator_rpc_url,
+            fee_payer_signer.clone(),
+            method,
+            path,
+            subdomain,
+        );
+    }
+
+    // Rebuild the SDK SubscriptionServer for the endpoint and verify.
+    let operator = api.operator.as_ref();
+    let puller = match operator
+        .and_then(|o| o.recipient.clone())
+        .or_else(|| operator_recipient_fallback.map(str::to_string))
+    {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({
+                    "error": "subscription_misconfigured",
+                    "message": "Server is missing operator.recipient; configure it in pay-demo.yaml.",
+                })),
+            )
+                .into_response();
+        }
+    };
+    let recipient = spec.recipient.clone().unwrap_or_else(|| puller.clone());
+    let network = operator
+        .and_then(|o| o.network.clone())
+        .unwrap_or_else(|| "mainnet".to_string());
+    let fee_payer = operator.map(|o| o.fee_payer).unwrap_or(false);
+
+    let defaults = crate::server::subscription::OperatorDefaults {
+        puller: &puller,
+        recipient: &recipient,
+        network: &network,
+        rpc_url: operator_rpc_url,
+        challenge_binding_secret: operator.and_then(|o| o.challenge_binding_secret.as_deref()),
+        realm: operator
+            .and_then(|o| o.realm.as_deref())
+            .or(Some(subdomain)),
+        fee_payer,
+        fee_payer_signer: fee_payer_signer.clone(),
+    };
+    let server =
+        match crate::server::subscription::build_handler(spec, defaults, endpoint_description) {
+            Ok(s) => s,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(json!({
+                        "error": "subscription_misconfigured",
+                        "message": e.to_string(),
+                    })),
+                )
+                    .into_response();
+            }
+        };
+
+    match server.verify_credential(&credential).await {
+        Ok(receipt_kind) => {
+            // Attach the Payment-Receipt header and forward upstream.
+            tracing::info!(
+                subdomain = %subdomain,
+                path = %path,
+                reference = %receipt_kind.base().reference,
+                "Subscription activation verified — forwarding"
+            );
+            let mut response = next.run(req).await;
+            if let Ok(receipt_str) = format_receipt(&receipt_kind)
+                && let Ok(v) = axum::http::HeaderValue::from_str(&receipt_str)
+            {
+                response.headers_mut().insert(PAYMENT_RECEIPT_HEADER, v);
+            }
+            // Also include a fresh authenticate challenge in the 200
+            // response as a "for next time" hint — the client signs it
+            // during the same Touch ID session as activation and caches
+            // the resulting credential. Avoids an extra 402 round-trip
+            // on the first post-activation request.
+            let canonical_uri = format!("https://{subdomain}/");
+            let defaults = crate::server::subscription::OperatorDefaults {
+                puller: &puller,
+                recipient: &recipient,
+                network: &network,
+                rpc_url: operator_rpc_url,
+                challenge_binding_secret: operator
+                    .and_then(|o| o.challenge_binding_secret.as_deref()),
+                realm: operator
+                    .and_then(|o| o.realm.as_deref())
+                    .or(Some(subdomain)),
+                fee_payer,
+                fee_payer_signer: fee_payer_signer.clone(),
+            };
+            if let Ok(Some(authsrv)) = crate::server::authenticate::build_handler(
+                spec,
+                defaults,
+                subdomain,
+                &canonical_uri,
+            ) && let Ok(auth_challenge) = authsrv.challenge()
+                && let Ok(www_auth) = solana_mpp::format_www_authenticate(&auth_challenge)
+                && let Ok(v) = axum::http::HeaderValue::from_str(&www_auth)
+            {
+                // RFC 7235 allows multiple WWW-Authenticate headers;
+                // clients harvest the one whose intent matches the
+                // cached subscription.
+                response.headers_mut().append(WWW_AUTHENTICATE_HEADER, v);
+            }
+            response
+        }
+        Err(e) => {
+            telemetry::record_settlement_error(
+                "mpp-subscription",
+                subdomain,
+                path,
+                &e.message,
+                e.retryable,
+            );
+            tracing::warn!(
+                subdomain = %subdomain,
+                path = %path,
+                error = %e.message,
+                "Subscription activation verification failed"
+            );
+            // Emit a fresh subscription challenge so the client can retry.
+            let mut response = (
+                StatusCode::PAYMENT_REQUIRED,
+                axum::Json(json!({
+                    "error": "verification_failed",
+                    "message": e.message,
+                    "retryable": e.retryable,
+                })),
+            )
+                .into_response();
+            if let Ok(challenge) = crate::server::subscription::build_challenge(
+                spec,
+                crate::server::subscription::OperatorDefaults {
+                    puller: &puller,
+                    recipient: &recipient,
+                    network: &network,
+                    rpc_url: operator_rpc_url,
+                    challenge_binding_secret: operator
+                        .and_then(|o| o.challenge_binding_secret.as_deref()),
+                    realm: operator
+                        .and_then(|o| o.realm.as_deref())
+                        .or(Some(subdomain)),
+                    fee_payer,
+                    fee_payer_signer: fee_payer_signer.clone(),
+                },
+                endpoint_description,
+            ) && let Ok(www_auth) = solana_mpp::format_www_authenticate(&challenge)
+                && let Ok(v) = axum::http::HeaderValue::from_str(&www_auth)
+            {
+                response.headers_mut().insert(WWW_AUTHENTICATE_HEADER, v);
+            }
+            response
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn subscription_challenge_response(
+    api: &pay_types::metering::ApiSpec,
+    spec: &pay_types::metering::SubscriptionEndpoint,
+    endpoint_description: Option<&str>,
+    operator_recipient_fallback: Option<&str>,
+    operator_rpc_url: &str,
+    fee_payer_signer: Option<std::sync::Arc<dyn solana_mpp::solana_keychain::SolanaSigner>>,
+    method: &Method,
+    path: &str,
+    subdomain: &str,
+) -> Response {
+    let operator = api.operator.as_ref();
+
+    let puller = match operator
+        .and_then(|o| o.recipient.clone())
+        .or_else(|| operator_recipient_fallback.map(str::to_string))
+    {
+        Some(p) => p,
+        None => {
+            tracing::error!(
+                "Subscription endpoint requires `operator.recipient` to derive the puller pubkey"
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({
+                    "error": "subscription_misconfigured",
+                    "message": "Server is missing operator.recipient; configure it in pay-demo.yaml.",
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let recipient = spec.recipient.clone().unwrap_or_else(|| puller.clone());
+    let network = operator
+        .and_then(|o| o.network.clone())
+        .unwrap_or_else(|| "mainnet".to_string());
+    let fee_payer = operator.map(|o| o.fee_payer).unwrap_or(false);
+
+    let defaults = server_subscription::OperatorDefaults {
+        puller: &puller,
+        recipient: &recipient,
+        network: &network,
+        rpc_url: operator_rpc_url,
+        challenge_binding_secret: operator.and_then(|o| o.challenge_binding_secret.as_deref()),
+        realm: operator
+            .and_then(|o| o.realm.as_deref())
+            .or(Some(subdomain)),
+        fee_payer,
+        fee_payer_signer: fee_payer_signer.clone(),
+    };
+
+    let subscription_challenge =
+        match server_subscription::build_challenge(spec, defaults.clone(), endpoint_description) {
+            Ok(c) => c,
+            Err(e) => {
+                telemetry::record_challenge_error(
+                    "mpp-subscription",
+                    "subscription",
+                    &e.to_string(),
+                );
+                tracing::error!(error = %e, "Failed to build subscription challenge");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(json!({
+                        "error": "subscription_challenge_failed",
+                        "message": e.to_string(),
+                    })),
+                )
+                    .into_response();
+            }
+        };
+
+    // Authenticate challenge — optional, depends on the spec having a
+    // published plan. Failure is non-fatal: a 402 with only the
+    // subscription challenge is still a valid response.
+    let canonical_uri = format!("https://{subdomain}/");
+    let authenticate_challenge =
+        match crate::server::authenticate::build_handler(spec, defaults, subdomain, &canonical_uri)
+        {
+            Ok(Some(server)) => match server.challenge() {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::debug!(error = %e, "Skipping authenticate challenge");
+                    None
+                }
+            },
+            Ok(None) => None,
+            Err(e) => {
+                tracing::debug!(error = %e, "Skipping authenticate challenge");
+                None
+            }
+        };
+
+    let www_auth_sub = match solana_mpp::format_www_authenticate(&subscription_challenge) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to format subscription challenge");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"error": "internal_error"})),
+            )
+                .into_response();
+        }
+    };
+
+    let mut www_auths: Vec<String> = vec![www_auth_sub];
+    if let Some(auth_challenge) = authenticate_challenge
+        && let Ok(h) = solana_mpp::format_www_authenticate(&auth_challenge)
+    {
+        www_auths.push(h);
+    }
+
+    let amount = match server_subscription::resolve_amount(spec) {
+        Ok((amt, _, _)) => amt,
+        Err(e) => {
+            telemetry::record_challenge_error("mpp-subscription", "subscription", &e.to_string());
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({
+                    "error": "subscription_misconfigured",
+                    "message": e.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let body = json!({
+        "error": "payment_required",
+        "message": "This endpoint requires an active subscription.",
+        "endpoint": { "method": method.as_str(), "path": path },
+        "subscription": {
+            "period": spec.period,
+            "amount_base_units": amount,
+            "currency": spec.currency,
+            "plan_id": spec.plan_id,
+            "expires_at": spec.expires_at,
+        },
+        "payment": {
+            "protocol": "mpp",
+            "intent": "subscription",
+        },
+    });
+
+    telemetry::record_402_challenge_sent(
+        "mpp-subscription",
+        subdomain,
+        path,
+        method.as_str(),
+        amount.parse::<f64>().ok(),
+        &spec.currency,
+        1,
+    );
+
+    challenge_json_response(body, &www_auths)
+}
+
 fn charge_challenge_response(
     mpps: &[&solana_mpp::server::Mpp],
     meter: &pay_types::metering::Metering,
@@ -560,7 +1070,8 @@ async fn handle_charge_authorization(
                         wallet.observe("payment_verified", &subdomain, &path).await;
                     });
                 }
-                if let Ok(receipt_str) = format_receipt(&receipt)
+                let kind = ReceiptKind::Charge(receipt);
+                if let Ok(receipt_str) = format_receipt(&kind)
                     && let Ok(v) = axum::http::HeaderValue::from_str(&receipt_str)
                 {
                     response.headers_mut().insert(PAYMENT_RECEIPT_HEADER, v);
@@ -715,7 +1226,7 @@ mod tests {
             decimals: 6,
             network: "localnet".to_string(),
             rpc_url: Some("http://localhost:8899".to_string()),
-            secret_key: Some("test-secret".to_string()),
+            challenge_binding_secret: Some("test-secret".to_string()),
             ..Default::default()
         })
         .expect("test MPP config should be valid")

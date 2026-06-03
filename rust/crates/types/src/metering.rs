@@ -579,6 +579,23 @@ pub struct OperatorConfig {
     /// Whether the operator sponsors transaction fees.
     #[serde(default)]
     pub fee_payer: bool,
+    /// HMAC secret used by the MPP `subscription` + `authenticate`
+    /// handlers to bind each challenge to its server (the secret signs
+    /// the nonce so verify can reject tampered or replayed challenges
+    /// without per-challenge server state). Must be stable across
+    /// restarts — rotating it invalidates every outstanding session
+    /// token. Required when any endpoint declares a `subscription:`
+    /// block.
+    ///
+    /// Generate one with `openssl rand -hex 32`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub challenge_binding_secret: Option<String>,
+    /// Realm string surfaced in `WWW-Authenticate: Payment realm="…"`
+    /// for subscription + authenticate challenges. Pick a stable label
+    /// for your service — clients tag cached SIWMPP tokens by realm.
+    /// Required when any endpoint declares a `subscription:` block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realm: Option<String>,
 }
 
 /// Signing backend configuration.
@@ -817,6 +834,155 @@ pub struct Endpoint {
     /// Billing config for this endpoint. None = free / not billed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metering: Option<Metering>,
+    /// Recurring subscription gating for this endpoint. Mutually exclusive
+    /// with `metering` per the v0 design (one endpoint exposes either a
+    /// per-call charge OR a recurring subscription, never both).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription: Option<SubscriptionEndpoint>,
+}
+
+/// Server-side subscription pricing declaration for an endpoint. Maps to
+/// the `subscription` payment intent (`draft-solana-subscription-00`) when
+/// the payment middleware emits a 402 challenge.
+///
+/// The shape is deliberately small: it captures only what a developer can
+/// reasonably write by hand. The on-chain `Plan` PDA is published
+/// separately by `pay server plans publish`, which writes its address back
+/// into `plan_id` once it exists.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SubscriptionEndpoint {
+    /// Billing period, written as a count + unit (`"30d"` or `"2w"`).
+    /// The Solana profile of the subscription intent rejects `month`, so
+    /// only `d` (day) and `w` (week) suffixes are accepted at parse time.
+    pub period: String,
+
+    /// Per-period price in USD. Converted to mint base units at challenge
+    /// time using the configured mint's decimals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_usd: Option<f64>,
+
+    /// Explicit base-unit override. Wins over `price_usd` when both are set;
+    /// useful for pricing in a non-pegged token where USD conversion would be
+    /// misleading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amount_base_units: Option<String>,
+
+    /// Stablecoin symbol (e.g. `"USDC"`) or mint address (base58). Resolved
+    /// against the operator's network at challenge time.
+    pub currency: String,
+
+    /// HTTP-layer subscription expiry. Mirrors the spec's optional
+    /// `subscriptionExpires` field; after this timestamp the server refuses
+    /// to renew and serves a fresh challenge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+
+    /// Base58 of the on-chain `Plan` PDA (the spec's `externalId`). Empty
+    /// at author time; populated in place by `pay server plans publish`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_id: Option<String>,
+
+    /// The numeric `plan_id` (u64) the on-chain program reads from
+    /// `SubscribeData`. The string `plan_id` above is the PDA derived
+    /// from this number + the operator wallet. `pay server plans publish`
+    /// writes both at the same time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_id_numeric: Option<u64>,
+
+    /// Plan PDA bump seed. Saves the on-chain `Subscribe` instruction a
+    /// `find_program_address` call. Written by `pay server plans publish`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_bump: Option<u8>,
+
+    /// Plan's on-chain `created_at` unix timestamp. Set by the program
+    /// when the Plan account is created; written into the YAML after
+    /// `pay server plans publish` broadcasts and reads back the new
+    /// account. Must be passed verbatim into `SubscribeData` or the
+    /// program rejects with a terms mismatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_created_at: Option<i64>,
+
+    /// Server's puller pubkey. Defaults to the operator-level account if
+    /// unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub puller: Option<String>,
+
+    /// Recipient wallet for the per-period charge. Must appear in the
+    /// on-chain `plan.destinations` whitelist. Defaults to the operator-level
+    /// recipient when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipient: Option<String>,
+
+    /// Free-trial length in days. Reserved for a future iteration —
+    /// `pay server` ignores this in v0 and surfaces a warning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_trial_days: Option<u32>,
+}
+
+/// Billing period unit parsed from [`SubscriptionEndpoint::period`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubscriptionPeriodUnit {
+    Day,
+    Week,
+}
+
+impl SubscriptionPeriodUnit {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SubscriptionPeriodUnit::Day => "day",
+            SubscriptionPeriodUnit::Week => "week",
+        }
+    }
+}
+
+impl SubscriptionEndpoint {
+    /// Parse `period` (e.g. `"30d"`, `"2w"`) into `(unit, count)`.
+    ///
+    /// Enforces the Solana profile's mapped-period bounds (`1..=8760` hours)
+    /// so misconfigured server specs fail at boot rather than at 402 time.
+    pub fn parse_period(&self) -> Result<(SubscriptionPeriodUnit, u32), String> {
+        let raw = self.period.trim();
+        if raw.is_empty() {
+            return Err("subscription.period is required (e.g. \"30d\", \"2w\")".into());
+        }
+        let (digits, suffix) =
+            raw.split_at(raw.find(|c: char| !c.is_ascii_digit()).unwrap_or(raw.len()));
+        let count: u32 = digits.parse().map_err(|_| {
+            format!("subscription.period `{raw}` must start with a positive integer")
+        })?;
+        if count == 0 {
+            return Err(format!(
+                "subscription.period `{raw}` must have a positive count"
+            ));
+        }
+        let unit = match suffix {
+            "d" | "day" | "days" => SubscriptionPeriodUnit::Day,
+            "w" | "week" | "weeks" => SubscriptionPeriodUnit::Week,
+            "m" | "month" | "months" => {
+                return Err(format!(
+                    "subscription.period `{raw}` uses `month`, which the Solana subscription \
+                     profile rejects (period_hours must be a fixed elapsed-time value). \
+                     Use day or week instead."
+                ));
+            }
+            other => {
+                return Err(format!(
+                    "subscription.period `{raw}` has unknown unit `{other}`. \
+                     Use `d` (day) or `w` (week)."
+                ));
+            }
+        };
+        let hours = match unit {
+            SubscriptionPeriodUnit::Day => count as u64 * 24,
+            SubscriptionPeriodUnit::Week => count as u64 * 168,
+        };
+        if !(1..=8760).contains(&hours) {
+            return Err(format!(
+                "subscription.period `{raw}` maps to {hours}h, outside the allowed [1, 8760] range"
+            ));
+        }
+        Ok((unit, count))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1083,6 +1249,20 @@ pub fn validate_api_spec(spec: &ApiSpec) -> Vec<String> {
         if let Some(routing) = &ep.routing {
             let context = format!("endpoint `{}` routing auth", ep.path);
             validate_routing_auth(routing, &context, &mut errs);
+        }
+
+        // `metering` and `subscription` are mutually exclusive per the
+        // v0 design — the middleware picks the subscription path
+        // unconditionally when both are set and silently drops the
+        // metering config. Reject the combo at validation so the
+        // operator notices before runtime instead of being surprised
+        // by missing per-call metering.
+        if ep.metering.is_some() && ep.subscription.is_some() {
+            errs.push(format!(
+                "endpoint `{}` declares both `metering` and `subscription` blocks; \
+                 these are mutually exclusive in v0 — pick one",
+                ep.path
+            ));
         }
 
         let Some(metering) = &ep.metering else {
@@ -1617,6 +1797,138 @@ fn min_nonzero_per_unit_price(dimensions: &[MeterDimension]) -> f64 {
 mod tests {
     use super::*;
 
+    fn make_subscription_endpoint(period: &str) -> SubscriptionEndpoint {
+        SubscriptionEndpoint {
+            period: period.to_string(),
+            price_usd: Some(9.99),
+            amount_base_units: None,
+            currency: "USDC".to_string(),
+            expires_at: None,
+            plan_id: None,
+            plan_id_numeric: None,
+            plan_bump: None,
+            plan_created_at: None,
+            puller: None,
+            recipient: None,
+            free_trial_days: None,
+        }
+    }
+
+    #[test]
+    fn subscription_period_parses_days_and_weeks() {
+        assert_eq!(
+            make_subscription_endpoint("30d").parse_period().unwrap(),
+            (SubscriptionPeriodUnit::Day, 30)
+        );
+        assert_eq!(
+            make_subscription_endpoint("2w").parse_period().unwrap(),
+            (SubscriptionPeriodUnit::Week, 2)
+        );
+        // Long-form suffixes are accepted too.
+        assert_eq!(
+            make_subscription_endpoint("7days").parse_period().unwrap(),
+            (SubscriptionPeriodUnit::Day, 7)
+        );
+        assert_eq!(
+            make_subscription_endpoint("1week").parse_period().unwrap(),
+            (SubscriptionPeriodUnit::Week, 1)
+        );
+    }
+
+    #[test]
+    fn subscription_period_rejects_month() {
+        let err = make_subscription_endpoint("1m").parse_period().unwrap_err();
+        assert!(err.contains("month"), "expected month rejection: {err}");
+    }
+
+    #[test]
+    fn subscription_period_rejects_zero_or_bad_unit() {
+        assert!(make_subscription_endpoint("0d").parse_period().is_err());
+        assert!(make_subscription_endpoint("5y").parse_period().is_err());
+        assert!(make_subscription_endpoint("").parse_period().is_err());
+        assert!(make_subscription_endpoint("abc").parse_period().is_err());
+    }
+
+    #[test]
+    fn subscription_period_rejects_out_of_range_hours() {
+        // 366 days > 8760 hours upper bound.
+        assert!(make_subscription_endpoint("366d").parse_period().is_err());
+        // 53 weeks > 8760 hours upper bound.
+        assert!(make_subscription_endpoint("53w").parse_period().is_err());
+        // 365 days == 8760 is at the bound, accepted.
+        assert!(make_subscription_endpoint("365d").parse_period().is_ok());
+    }
+
+    #[test]
+    fn subscription_endpoint_yaml_round_trip() {
+        let ep = SubscriptionEndpoint {
+            period: "30d".into(),
+            price_usd: Some(9.99),
+            amount_base_units: None,
+            currency: "USDC".into(),
+            expires_at: Some("2027-01-01T00:00:00Z".into()),
+            plan_id: Some("8tWbqLkUJoYy7zXc5h2EvCRoaQEv2xnQjUuYhc3rzCgT".into()),
+            plan_id_numeric: None,
+            plan_bump: None,
+            plan_created_at: None,
+            puller: None,
+            recipient: None,
+            free_trial_days: None,
+        };
+        let yaml = serde_yml::to_string(&ep).unwrap();
+        let back: SubscriptionEndpoint = serde_yml::from_str(&yaml).unwrap();
+        assert_eq!(back.period, "30d");
+        assert_eq!(back.currency, "USDC");
+        assert_eq!(
+            back.plan_id.as_deref(),
+            Some("8tWbqLkUJoYy7zXc5h2EvCRoaQEv2xnQjUuYhc3rzCgT")
+        );
+        // Optional fields stay None and aren't emitted in YAML.
+        assert!(!yaml.contains("free_trial_days"));
+        assert!(!yaml.contains("puller"));
+    }
+
+    #[test]
+    fn endpoint_with_subscription_skips_field_when_none() {
+        let ep = Endpoint {
+            method: HttpMethod::Get,
+            path: "api/v1/pro".to_string(),
+            description: None,
+            resource: None,
+            routing: None,
+            metering: None,
+            subscription: None,
+        };
+        let json = serde_json::to_string(&ep).unwrap();
+        assert!(!json.contains("subscription"));
+    }
+
+    #[test]
+    fn endpoint_with_subscription_serializes_block() {
+        let ep = Endpoint {
+            method: HttpMethod::Get,
+            path: "api/v1/pro".to_string(),
+            description: None,
+            resource: None,
+            routing: None,
+            metering: None,
+            subscription: Some(make_subscription_endpoint("30d")),
+        };
+        let yaml = serde_yml::to_string(&ep).unwrap();
+        assert!(yaml.contains("subscription:"), "yaml was: {yaml}");
+        // serde_yml quotes scalars that look like numbers-with-suffix to
+        // disambiguate from plain integers, so the period may render with
+        // or without quotes — both are valid YAML.
+        assert!(
+            yaml.contains("period: 30d") || yaml.contains("period: '30d'"),
+            "period missing in: {yaml}"
+        );
+        assert!(
+            yaml.contains("currency: USDC") || yaml.contains("currency: 'USDC'"),
+            "currency missing in: {yaml}"
+        );
+    }
+
     #[test]
     fn http_method_serde_roundtrip() {
         for method in [
@@ -1804,6 +2116,7 @@ mod tests {
             resource: None,
             routing: None,
             metering: None,
+            subscription: None,
         };
         let json = serde_json::to_string(&ep).unwrap();
         let back: Endpoint = serde_json::from_str(&json).unwrap();
@@ -1898,6 +2211,7 @@ mod tests {
                     sku_tiers: vec![],
                     splits: vec![],
                 }),
+                subscription: None,
             }],
             free_tier: Some(FreeTier {
                 amount: Some(1000),
@@ -2234,6 +2548,7 @@ mod tests {
                     memo: None,
                 }],
             }),
+            subscription: None,
         }]);
         let errs = validate_api_spec(&spec);
         assert_eq!(errs.len(), 1);
@@ -2271,6 +2586,7 @@ mod tests {
                     memo: None,
                 }],
             }),
+            subscription: None,
         }]);
         let errs = validate_api_spec(&spec);
         assert_eq!(errs.len(), 1);
@@ -2308,6 +2624,7 @@ mod tests {
                     memo: None,
                 }],
             }),
+            subscription: None,
         }]);
         let errs = validate_api_spec(&spec);
         assert_eq!(errs.len(), 1);
@@ -2345,6 +2662,7 @@ mod tests {
                     memo: None,
                 }],
             }),
+            subscription: None,
         }]);
         let errs = validate_api_spec(&spec);
         assert!(errs.iter().any(|e| e.contains("both amount and percent")));
@@ -2381,6 +2699,7 @@ mod tests {
                     memo: None,
                 }],
             }),
+            subscription: None,
         }]);
         let errs = validate_api_spec(&spec);
         assert!(
@@ -2428,6 +2747,7 @@ mod tests {
                     },
                 ],
             }),
+            subscription: None,
         }]);
         let errs = validate_api_spec(&spec);
         assert!(errs.is_empty(), "expected no errors, got: {errs:?}");
@@ -2442,6 +2762,7 @@ mod tests {
             resource: None,
             routing: None,
             metering: None,
+            subscription: None,
         }]);
         let errs = validate_api_spec(&spec);
         assert!(errs.is_empty());
@@ -2478,6 +2799,7 @@ mod tests {
                 sku_tiers: vec![],
                 splits: vec![],
             }),
+            subscription: None,
         }]);
         let errs = validate_api_spec(&spec);
         assert_eq!(errs.len(), 1);
@@ -2529,6 +2851,7 @@ mod tests {
                 sku_tiers: vec![],
                 splits: vec![],
             }),
+            subscription: None,
         }]);
         let errs = validate_api_spec(&spec);
         assert!(

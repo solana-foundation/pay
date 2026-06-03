@@ -137,11 +137,9 @@ fn send_success_title(result: &pay_core::client::send::SendResult) -> String {
 }
 
 fn send_success_body(result: &pay_core::client::send::SendResult) -> String {
-    let explorer_cluster =
-        crate::network::SolanaNetwork::from_slug(&result.network).explorer_cluster(&result.rpc_url);
     format!(
         "{} {}",
-        crate::components::solana_transaction_link(&result.signature, &explorer_cluster),
+        crate::components::solana_transaction_link(&result.signature, &result.network),
         result.signature
     )
 }
@@ -511,6 +509,7 @@ mod tests {
             path: None,
             secret_key_b58: None,
             created_at: None,
+            subscriptions: std::collections::BTreeMap::new(),
         }
     }
 
@@ -781,8 +780,9 @@ mod tests {
 
         assert!(body.contains("Link to receipt"));
         assert!(body.contains("sig123"));
-        assert!(
-            body.contains("https://explorer.solana.com/tx/sig123?cluster=custom&customUrl=http%3A%2F%2Flocalhost%3A8899&view=receipt")
-        );
+        // `solana_transaction_link` now routes receipts through pay.sh
+        // (see `components::link::solana_transaction_link`); localnet
+        // maps to the `?network=sandbox` query.
+        assert!(body.contains("https://pay.sh/receipt/sig123?network=sandbox"));
     }
 }

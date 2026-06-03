@@ -8,7 +8,7 @@
 //! the explicit "expected X, received Y" context.
 //!
 //! This is the cross-repo integration test for the change in
-//! `solana-mpp-sdk/rust/src/server/mod.rs::check_network_blockhash` —
+//! `pay-kit/rust/crates/mpp/src/server/mod.rs::check_network_blockhash` —
 //! exercising it through pay-core's HTTP middleware (not just the SDK
 //! function in isolation, which is unit-tested in the SDK itself).
 //!
@@ -75,7 +75,7 @@ async fn start_server_with_network(network: &str) -> (String, tokio::task::JoinH
         network: network.to_string(),
         // Unreachable RPC — the test must error before any RPC call.
         rpc_url: Some("http://127.0.0.1:1/never".to_string()),
-        secret_key: Some("test-secret-key-do-not-use".to_string()),
+        challenge_binding_secret: Some("test-secret-key-do-not-use".to_string()),
         ..Default::default()
     })
     .unwrap();

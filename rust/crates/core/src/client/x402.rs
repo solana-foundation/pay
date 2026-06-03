@@ -13,8 +13,8 @@ use solana_x402::{
         parse_x402_challenge_for_network,
     },
     exact::{
-        PaymentRequiredEnvelope, PaymentRequirements, SOLANA_DEVNET, SOLANA_MAINNET,
-        SOLANA_TESTNET, default_rpc_url,
+        PaymentExtensions, PaymentRequiredEnvelope, PaymentRequirements, SOLANA_DEVNET,
+        SOLANA_MAINNET, SOLANA_TESTNET, default_rpc_url, generate_payment_identifier_id,
     },
     siwx::{
         SiwxChainSelectionOptions, SiwxExtension, create_siwx_header,
@@ -33,6 +33,10 @@ pub struct Challenge {
     pub x402_version: u64,
     pub requirements: PaymentRequirements,
     pub siwx: Option<SiwxExtension>,
+    /// Raw `extensions` blob from the server's PAYMENT-REQUIRED envelope.
+    /// Stored verbatim so `build_payment` can echo it back per x402 v2
+    /// §5.1.2 ("client must include at least the info received").
+    pub extensions: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -51,10 +55,13 @@ pub struct BuiltPayment {
 pub fn parse(headers: &[(String, String)], body: Option<&str>) -> Option<Challenge> {
     let requirements = parse_x402_challenge_for_network(headers, body, Some(SOLANA_MAINNET))?;
     let siwx = parse_siwx_extension(headers, body).ok().flatten();
+    let extensions =
+        parse_payment_required_envelope(headers, body).and_then(|envelope| envelope.extensions);
     Some(Challenge {
         x402_version: detect_x402_version(headers, body),
         requirements,
         siwx,
+        extensions,
     })
 }
 
@@ -102,12 +109,28 @@ pub fn build_payment(
         &prompt_context.operator,
     );
 
-    let cluster = normalize_network(
+    let cluster_raw = normalize_network(
         requirements
             .cluster
             .as_deref()
             .unwrap_or(requirements.network.as_str()),
     );
+
+    // Surfpool embeds a base58 sentinel prefix in every blockhash it
+    // issues (`SURFNETxSAFEHASH…`). When the server's challenge carries
+    // such a blockhash, the server is on a Surfpool / surfnet fork even
+    // if the wire CAIP-2 says devnet — the x402 spec has no localnet
+    // sentinel of its own, so the blockhash itself self-identifies the
+    // ledger. Mirrors the MPP client's auto-sandbox detection in
+    // `mpp.rs::resolve_rpc_url` / `should_auto_fund_surfpool`.
+    let embedded_blockhash = requirements.recent_blockhash.as_deref();
+    let surfpool_detected = embedded_blockhash
+        .is_some_and(|h| h.starts_with(crate::client::mpp::SURFPOOL_BLOCKHASH_PREFIX));
+    let cluster = if surfpool_detected {
+        "localnet".to_string()
+    } else {
+        cluster_raw
+    };
 
     // x402 may carry a recent blockhash, but the current pay-side guard only
     // compares the selected account network against the challenge network.
@@ -126,8 +149,19 @@ pub fn build_payment(
         &intent,
     )?;
 
-    let rpc_url =
-        std::env::var("PAY_RPC_URL").unwrap_or_else(|_| default_rpc_url(&network).to_string());
+    let rpc_url = std::env::var("PAY_RPC_URL").unwrap_or_else(|_| {
+        if surfpool_detected {
+            // `default_rpc_url("localnet")` is `http://localhost:8899`
+            // (the in-process test-validator default). For an
+            // auto-detected Surfpool server, route to the hosted
+            // sandbox at `https://402.surfnet.dev:8899` instead so
+            // signing + funding land on the same ledger the server
+            // settles against.
+            crate::config::SANDBOX_RPC_URL.to_string()
+        } else {
+            default_rpc_url(&network).to_string()
+        }
+    });
     let rpc = RpcClient::new(rpc_url.clone());
 
     info!(
@@ -163,8 +197,14 @@ pub fn build_payment(
             (X402_V1_PAYMENT_HEADER, header)
         }
         _ => {
+            let extensions = build_outbound_extensions(challenge.extensions.as_ref())?;
             let header = rt
-                .block_on(build_payment_header_v2(&signer, &rpc, requirements))
+                .block_on(build_payment_header_v2(
+                    &signer,
+                    &rpc,
+                    requirements,
+                    extensions,
+                ))
                 .map_err(|e| Error::Mpp(format!("Failed to build x402 payment: {e}")))?;
             (X402_V2_PAYMENT_HEADER, header)
         }
@@ -285,6 +325,29 @@ fn parse_siwx_extension(
     };
     siwx_extension_from_payment_required(&envelope)
         .map_err(|e| Error::Mpp(format!("Failed to parse x402 sign-in challenge: {e}")))
+}
+
+/// Build the `extensions` blob to include on the outbound
+/// `PAYMENT-SIGNATURE` from the server's inbound `PAYMENT-REQUIRED`
+/// extensions. Echoes the server payload verbatim per x402 v2 §5.1.2,
+/// and appends a fresh `payment-identifier.info.id` when the server
+/// flagged that extension `info.required = true`.
+///
+/// TODO: cache the generated id keyed on `(resource_url, body_hash)`
+/// so HTTP-level retries of the same logical request reuse the same
+/// idempotency key and benefit from server-side cached 200s.
+fn build_outbound_extensions(
+    inbound: Option<&serde_json::Value>,
+) -> Result<Option<PaymentExtensions>> {
+    let Some(mut ext) = PaymentExtensions::echoing(inbound)
+        .map_err(|e| Error::Mpp(format!("malformed PAYMENT-REQUIRED extensions: {e}")))?
+    else {
+        return Ok(None);
+    };
+    if ext.requires_payment_identifier() {
+        ext = ext.with_payment_identifier_id(generate_payment_identifier_id());
+    }
+    Ok(Some(ext))
 }
 
 fn parse_payment_required_envelope(
@@ -630,6 +693,85 @@ mod tests {
     }
 
     #[test]
+    fn parse_captures_payment_identifier_extension_for_echo() {
+        // Birdeye-style challenge — payment-identifier marked
+        // info.required:true. The parser must surface this so
+        // build_outbound_extensions can append a client-side id.
+        let selected = serde_json::json!({
+            "scheme": EXACT_SCHEME,
+            "network": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+            "amount": "3000",
+            "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            "payTo": "6cvgmdrsVxyiuPzqMCSBnS7fAmA5Mk2VG4BcfVhC8jdC",
+            "maxTimeoutSeconds": 60,
+            "extra": { "feePayer": "AepWpq3GQwL8CeKMtZyKtKPa7W91Coygh3ropAJapVdU" }
+        });
+        let payment_required = serde_json::json!({
+            X402_VERSION_FIELD: X402_VERSION_V2,
+            "accepts": [selected],
+            "extensions": {
+                "payment-identifier": {
+                    "info": { "required": true },
+                    "schema": { "type": "object", "required": ["id"] }
+                }
+            }
+        });
+        let encoded = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            payment_required.to_string().as_bytes(),
+        );
+        let headers = vec![(PAYMENT_REQUIRED_HEADER.to_string(), encoded)];
+
+        let challenge = parse(&headers, None).unwrap();
+        let raw = challenge.extensions.as_ref().expect("extensions captured");
+        assert_eq!(
+            raw["payment-identifier"]["info"]["required"],
+            serde_json::json!(true)
+        );
+
+        let outbound = build_outbound_extensions(challenge.extensions.as_ref())
+            .unwrap()
+            .expect("outbound extensions produced");
+        let pid = outbound
+            .payment_identifier
+            .as_ref()
+            .expect("payment-identifier echoed");
+        // Echoed server fields preserved.
+        assert_eq!(pid.info.required, Some(true));
+        assert!(pid.schema.is_some());
+        // Client-side id appended, matching the spec pattern.
+        let id = pid.info.id.as_deref().expect("id appended");
+        assert!(id.starts_with("pay_"));
+        assert!(id.len() >= 16 && id.len() <= 128);
+    }
+
+    #[test]
+    fn build_outbound_extensions_returns_none_when_inbound_absent() {
+        assert!(build_outbound_extensions(None).unwrap().is_none());
+    }
+
+    #[test]
+    fn build_outbound_extensions_echoes_without_appending_when_not_required() {
+        // payment-identifier with info.required=false should be echoed
+        // but the client should NOT generate an id (avoids polluting
+        // idempotency state when the server doesn't need it).
+        let inbound = serde_json::json!({
+            "payment-identifier": { "info": { "required": false } }
+        });
+        let outbound = build_outbound_extensions(Some(&inbound))
+            .unwrap()
+            .expect("echoed");
+        assert!(!outbound.requires_payment_identifier());
+        assert!(
+            outbound
+                .payment_identifier
+                .as_ref()
+                .and_then(|p| p.info.id.as_deref())
+                .is_none()
+        );
+    }
+
+    #[test]
     fn parse_siwx_auth_reads_auth_only_challenge() {
         let payment_required = serde_json::json!({
             X402_VERSION_FIELD: X402_VERSION_V2,
@@ -829,6 +971,7 @@ mod tests {
             x402_version: X402_VERSION_V2,
             requirements: sample_requirements(),
             siwx: Some(extension),
+            extensions: None,
         };
 
         let (header_name, header_value) = build_siwx_header(&challenge, &signer, "devnet", &rt)
@@ -860,6 +1003,7 @@ mod tests {
             path: None,
             secret_key_b58: Some(bs58::encode(TEST_KEYPAIR_BYTES).into_string()),
             created_at: Some("2026-04-27T00:00:00Z".to_string()),
+            subscriptions: std::collections::BTreeMap::new(),
         };
         let mut file = AccountsFile::default();
         file.upsert("devnet", "default", account);
@@ -939,6 +1083,7 @@ mod tests {
             x402_version: X402_VERSION_V2,
             requirements: sample_requirements(),
             siwx: None,
+            extensions: None,
         };
 
         let err = build_payment(&challenge, &store, Some("localnet"), None, None).unwrap_err();
@@ -960,6 +1105,7 @@ mod tests {
             x402_version: X402_VERSION_V2,
             requirements: sample_requirements(),
             siwx: None,
+            extensions: None,
         };
 
         let err = build_payment(&challenge, &store, None, None, None).unwrap_err();
@@ -978,6 +1124,7 @@ mod tests {
             x402_version: X402_VERSION_V2,
             requirements,
             siwx: None,
+            extensions: None,
         };
         let err = build_payment(&challenge, &store, None, Some("alice"), None).unwrap_err();
         let msg = err.to_string();
@@ -987,6 +1134,47 @@ mod tests {
             store.save_count(),
             0,
             "named-account miss must not lazily create"
+        );
+    }
+
+    #[test]
+    fn surfpool_blockhash_promotes_cluster_to_localnet() {
+        // Server advertises devnet CAIP-2 (no localnet sentinel exists
+        // in the x402 spec) but the recentBlockhash carries the
+        // Surfpool prefix. The client should treat this as
+        // localnet/sandbox — same auto-detection the MPP client does.
+        let mut requirements = sample_requirements();
+        requirements.network = solana_x402::exact::SOLANA_DEVNET.to_string();
+        requirements.cluster = Some("devnet".to_string());
+        requirements.recent_blockhash = Some(format!(
+            "{}xxxxxxxxxxxxxxxxxxx1892bcad",
+            crate::client::mpp::SURFPOOL_BLOCKHASH_PREFIX
+        ));
+
+        let challenge = Challenge {
+            x402_version: X402_VERSION_V2,
+            requirements,
+            siwx: None,
+            extensions: None,
+        };
+
+        // We can't exercise the full build path here (it needs a live
+        // RPC for funding + signing) — but the network-intent check
+        // fires before any I/O. Without the surfpool promotion the
+        // check would compare a hypothetical `--mainnet` override
+        // against `devnet`; with the promotion in place it compares
+        // against `localnet` instead.
+        let store = MemoryAccountsStore::new();
+        let err = build_payment(&challenge, &store, Some("mainnet"), None, None).unwrap_err();
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("localnet"),
+            "expected promoted cluster `localnet` in error, got: {msg}"
+        );
+        assert!(
+            !msg.contains("devnet"),
+            "cluster should be promoted away from devnet, got: {msg}"
         );
     }
 }

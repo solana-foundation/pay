@@ -1,4 +1,4 @@
-use crate::{components, network::SolanaNetwork};
+use crate::components;
 
 /// Import funds from Venmo, PayPal, or a mobile wallet.
 #[derive(clap::Args)]
@@ -95,17 +95,16 @@ pub(crate) fn topup_retry_command(account_name: &str) -> String {
 pub(crate) fn topup_success_body(
     completion: &crate::tui::TopupCompletion,
     network: &str,
-    rpc_url: &str,
+    _rpc_url: &str,
 ) -> String {
     let mut lines = Vec::new();
     if let Some(amount) = topup_received_amount(&completion.received) {
         lines.push(format!("Received {amount}"));
     }
     if let Some(hash) = &completion.tx_hash {
-        let cluster = SolanaNetwork::from_slug(network).explorer_cluster(rpc_url);
         lines.push(format!(
             "{} {hash}",
-            components::solana_transaction_link(hash, &cluster)
+            components::solana_transaction_link(hash, network)
         ));
     }
     if lines.is_empty() {
