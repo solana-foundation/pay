@@ -31,7 +31,20 @@ pub struct SetupCommand {
     /// Re-install MCP configs and agent skill without creating a new account.
     #[arg(long)]
     pub update: bool,
+
+    /// Redeem an activation campaign code. Skips the MoonPay/onramp
+    /// topup TUI and asks the pay-api gateway to fund this account
+    /// from its hot wallet. Reuses an existing account when present.
+    #[arg(long, value_name = "CODE")]
+    pub redeem: Option<String>,
 }
+
+/// Default pay-api gateway used by `pay setup --redeem`. Override with
+/// `PAY_API_URL` (no trailing slash) for local testing or staging.
+const DEFAULT_PAY_API_URL: &str = "https://api.pay.sh";
+
+/// Per-request timeout for the redemption POST.
+const REDEEM_TIMEOUT_SECS: u64 = 30;
 
 impl SetupCommand {
     pub fn run(self) -> pay_core::Result<()> {
@@ -43,6 +56,16 @@ impl SetupCommand {
         // `whoami`), sanitised. Cross-platform — works on Windows, macOS,
         // Linux. Falls back to "default" if nothing is resolvable.
         let account_name = crate::system::current_user_account_name();
+
+        // Activation-campaign path. Reuses an existing account when one is
+        // already configured for `account_name` on mainnet; otherwise
+        // creates the keypair and registers it the same way the plain
+        // setup flow does, then asks the pay-api to fund it from its hot
+        // wallet. The MoonPay/onramp TUI is intentionally skipped — the
+        // code is the funding source.
+        if let Some(code) = &self.redeem {
+            return self.run_redeem(&account_name, code);
+        }
 
         // Abort before any prompts if this user already has an account.
         if !self.force
@@ -91,6 +114,47 @@ impl SetupCommand {
         } else {
             print_setup_aborted(&account_name, backend_name);
         }
+        Ok(())
+    }
+
+    fn run_redeem(&self, account_name: &str, code: &str) -> pay_core::Result<()> {
+        // 1. Resolve the destination pubkey. Reuse an existing mainnet
+        //    account if present; otherwise create one. `--force` still
+        //    forces a fresh keypair (e.g. for testing).
+        let existing = pay_core::accounts::AccountsFile::load().ok().and_then(|f| {
+            f.accounts
+                .get(pay_core::accounts::MAINNET_NETWORK)
+                .and_then(|net| net.get(account_name).cloned())
+        });
+
+        let (pubkey, used_existing): (String, bool) = if !self.force
+            && let Some(account) = existing
+            && let Some(pk) = account.pubkey.clone()
+        {
+            (pk, true)
+        } else {
+            maybe_install_skill();
+            install_mcp_configs();
+            let (pk, _backend_name) = super::account::new::create_account(
+                account_name,
+                self.backend.as_deref(),
+                self.vault.as_deref(),
+                self.force,
+            )?;
+            (pk, false)
+        };
+
+        // 2. POST to pay-api's `/v1/redeem`.
+        let api_url = std::env::var("PAY_API_URL")
+            .ok()
+            .map(|v| v.trim().trim_end_matches('/').to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| DEFAULT_PAY_API_URL.to_string());
+
+        let response = post_redeem(&api_url, code, &pubkey)?;
+
+        // 3. Surface the result.
+        print_redeem_success(account_name, &pubkey, &response, used_existing);
         Ok(())
     }
 }
@@ -144,6 +208,98 @@ fn setup_aborted_body(account_name: &str, backend_name: &str) -> String {
     format!(
         "Account secured in {backend_name}\nA top-up is required before making paid requests.\n$ {topup_cmd}"
     )
+}
+
+// ── Activation-campaign redemption ─────────────────────────────────────────
+
+#[derive(serde::Deserialize, Debug)]
+struct RedeemSuccess {
+    signature: String,
+    destination: String,
+}
+
+/// Pay-api may return a non-2xx with `{ "error": "...", "signature": "..." }`
+/// (the 409-already-redeemed case carries the prior signature). Capture
+/// both fields so we can route the user appropriately.
+#[derive(serde::Deserialize, Debug, Default)]
+struct RedeemErrorBody {
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    signature: Option<String>,
+}
+
+fn post_redeem(api_url: &str, code: &str, destination: &str) -> pay_core::Result<RedeemSuccess> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(REDEEM_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| pay_core::Error::Config(format!("Failed to build HTTP client: {e}")))?;
+
+    let body = serde_json::json!({ "code": code, "destination": destination });
+    let resp = client
+        .post(format!("{api_url}/v1/redeem"))
+        .json(&body)
+        .send()
+        .map_err(|e| pay_core::Error::Config(format!("pay-api {api_url} unreachable: {e}")))?;
+
+    let status = resp.status();
+    if status.is_success() {
+        let parsed: RedeemSuccess = resp
+            .json()
+            .map_err(|e| pay_core::Error::Config(format!("pay-api returned malformed JSON: {e}")))?;
+        return Ok(parsed);
+    }
+
+    // Best-effort decode of the error body so the user sees the real reason.
+    let err_body: RedeemErrorBody = resp.json().unwrap_or_default();
+    let msg = err_body.error.unwrap_or_else(|| status.to_string());
+    if status.as_u16() == 409
+        && let Some(prior_sig) = err_body.signature
+    {
+        return Err(pay_core::Error::Config(format!(
+            "Code already redeemed. Prior transaction: {prior_sig}"
+        )));
+    }
+    Err(pay_core::Error::Config(format!(
+        "pay-api redemption failed ({status}): {msg}"
+    )))
+}
+
+fn print_redeem_success(
+    account_name: &str,
+    pubkey: &str,
+    response: &RedeemSuccess,
+    used_existing: bool,
+) {
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "Account `{account_name}` ({short}) {verb} from the pay-api gateway.",
+        short = shorten_pubkey(pubkey),
+        verb = if used_existing { "funded (existing keypair)" } else { "funded" },
+    ));
+    lines.push(format!(
+        "{} {sig}",
+        crate::components::solana_transaction_link(&response.signature, "mainnet"),
+        sig = response.signature,
+    ));
+    let _ = &response.destination; // already implied by `account_name`
+    lines.push(String::new());
+    lines.push("Ready to go. Time to make HTTP pay for itself.".to_string());
+    lines.push("$ pay claude".to_string());
+    lines.push("$ pay codex".to_string());
+
+    crate::components::print_notice(
+        crate::components::NoticeLevel::Success,
+        "Activation complete",
+        &lines.join("\n"),
+    );
+}
+
+fn shorten_pubkey(pk: &str) -> String {
+    if pk.len() <= 8 {
+        return pk.to_string();
+    }
+    format!("{}…{}", &pk[..4], &pk[pk.len() - 4..])
 }
 
 /// `pay setup --update`: re-install MCP configs and agent skill.
