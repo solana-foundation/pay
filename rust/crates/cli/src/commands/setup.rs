@@ -79,7 +79,10 @@ impl SetupCommand {
                 crate::components::NoticeLevel::Info,
                 "Account already exists",
                 &format!(
-                    "`{account_name}` is already configured.\nUse --force to replace it, or `pay account new <NAME>` to add another."
+                    "`{account_name}` is already configured.\n\
+                     Use --force to replace it, or `pay account new <NAME>` to add another.\n\
+                     To fund this existing keypair with a campaign code, run \
+                     `pay setup --redeem <CODE>`."
                 ),
             );
             eprintln!();
@@ -146,7 +149,20 @@ impl SetupCommand {
         let api_url = pay_core::client::balance::pay_api_url();
         let api_url = api_url.trim().trim_end_matches('/');
 
-        let response = post_redeem(api_url, code, &pubkey)?;
+        let response = match post_redeem(api_url, code, &pubkey) {
+            Ok(r) => r,
+            Err(e) if !used_existing => {
+                // The keypair was created moments ago and is now
+                // persisted but unfunded. Surface a recovery hint so
+                // the user isn't stuck behind the "Account already
+                // exists" guard on the next `pay setup` run.
+                return Err(pay_core::Error::Config(format!(
+                    "{e}\n\nYour keypair was created and is preserved. Once you have a valid \
+                     code, retry with `pay setup --redeem <CODE>` to fund this same keypair."
+                )));
+            }
+            Err(e) => return Err(e),
+        };
 
         // 3. Surface the result.
         print_redeem_success(account_name, &pubkey, &response, used_existing);
@@ -266,32 +282,58 @@ fn print_redeem_success(
     response: &RedeemSuccess,
     used_existing: bool,
 ) {
+    // If the gateway funded a different address than the one we
+    // submitted (API bug, misconfiguration, tampered response), surface
+    // the mismatch and drop the success framing so the user isn't told
+    // the local account is funded when it isn't.
+    let destination_matches = response.destination == pubkey;
+
     let mut lines = Vec::new();
-    lines.push(format!(
-        "Account `{account_name}` ({short}) {verb} from the pay-api gateway.",
-        short = shorten_pubkey(pubkey),
-        verb = if used_existing {
-            "funded (existing keypair)"
-        } else {
-            "funded"
-        },
-    ));
+    if destination_matches {
+        lines.push(format!(
+            "Account `{account_name}` ({short}) {verb} from the pay-api gateway.",
+            short = shorten_pubkey(pubkey),
+            verb = if used_existing {
+                "funded (existing keypair)"
+            } else {
+                "funded"
+            },
+        ));
+    } else {
+        lines.push(format!(
+            "Gateway funded {gateway_dest}, not local pubkey {local_pk}.",
+            gateway_dest = response.destination,
+            local_pk = pubkey,
+        ));
+        lines.push(format!(
+            "Investigate before assuming `{account_name}` is usable — the funds did not land on \
+             this device's keypair."
+        ));
+    }
     lines.push(format!(
         "{} {sig}",
         crate::components::solana_transaction_link(&response.signature, "mainnet"),
         sig = response.signature,
     ));
-    let _ = &response.destination; // already implied by `account_name`
-    lines.push(String::new());
-    lines.push("Ready to go. Time to make HTTP pay for itself.".to_string());
-    lines.push("$ pay claude".to_string());
-    lines.push("$ pay codex".to_string());
+    if destination_matches {
+        lines.push(String::new());
+        lines.push("Ready to go. Time to make HTTP pay for itself.".to_string());
+        lines.push("$ pay claude".to_string());
+        lines.push("$ pay codex".to_string());
+    }
 
-    crate::components::print_notice(
-        crate::components::NoticeLevel::Success,
-        "Activation complete",
-        &lines.join("\n"),
-    );
+    let (level, title) = if destination_matches {
+        (
+            crate::components::NoticeLevel::Success,
+            "Activation complete",
+        )
+    } else {
+        (
+            crate::components::NoticeLevel::Warning,
+            "Activation funded the wrong address",
+        )
+    };
+    crate::components::print_notice(level, title, &lines.join("\n"));
 }
 
 fn shorten_pubkey(pk: &str) -> String {
