@@ -137,12 +137,34 @@ fn build_keystore(
 )> {
     match backend_id {
         #[cfg(target_os = "macos")]
-        "keychain" => Ok((
-            Keystore::apple_keychain(),
-            pay_core::accounts::Keystore::AppleKeychain,
-            "Apple Keychain",
-            None,
-        )),
+        "keychain" => {
+            // When Touch ID is unavailable (no enrolled biometry — common
+            // on VMs, CI runners, headless servers), the keychain store is
+            // still usable, but the biometric gate has nothing to gate
+            // with. Fall back to NoAuth so account setup can proceed.
+            // Runtime signing still routes through the platform gate
+            // (or the MCP elicitation override when invoked through
+            // pay-mcp), so security at use-time is unchanged — only the
+            // initial setup step relaxes when biometry is missing.
+            let ks = if Keystore::apple_touchid_available() {
+                Keystore::apple_keychain()
+            } else {
+                eprintln!(
+                    "Note: Touch ID is not enrolled on this Mac; storing the new account in Apple Keychain without a biometric gate. Runtime signing will still require approval via the configured auth path."
+                );
+                Keystore::new(
+                    pay_core::keystore::auth::NoAuth,
+                    pay_core::keystore::macos::AppleKeychainStore,
+                    false,
+                )
+            };
+            Ok((
+                ks,
+                pay_core::accounts::Keystore::AppleKeychain,
+                "Apple Keychain",
+                None,
+            ))
+        }
         #[cfg(not(target_os = "macos"))]
         "keychain" => Err(pay_core::Error::Config(
             "Keychain is only available on macOS".to_string(),
