@@ -39,10 +39,6 @@ pub struct SetupCommand {
     pub redeem: Option<String>,
 }
 
-/// Default pay-api gateway used by `pay setup --redeem`. Override with
-/// `PAY_API_URL` (no trailing slash) for local testing or staging.
-const DEFAULT_PAY_API_URL: &str = "https://api.pay.sh";
-
 /// Per-request timeout for the redemption POST.
 const REDEEM_TIMEOUT_SECS: u64 = 30;
 
@@ -144,14 +140,13 @@ impl SetupCommand {
             (pk, false)
         };
 
-        // 2. POST to pay-api's `/v1/redeem`.
-        let api_url = std::env::var("PAY_API_URL")
-            .ok()
-            .map(|v| v.trim().trim_end_matches('/').to_string())
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| DEFAULT_PAY_API_URL.to_string());
+        // 2. POST to pay-api's `/v1/redeem`. Honors `PAY_API_URL` via
+        //    the same helper the `/v1/send` client uses, so override
+        //    semantics match the rest of the CLI.
+        let api_url = pay_core::client::balance::pay_api_url();
+        let api_url = api_url.trim().trim_end_matches('/');
 
-        let response = post_redeem(&api_url, code, &pubkey)?;
+        let response = post_redeem(api_url, code, &pubkey)?;
 
         // 3. Surface the result.
         print_redeem_success(account_name, &pubkey, &response, used_existing);
