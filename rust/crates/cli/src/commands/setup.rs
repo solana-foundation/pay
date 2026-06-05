@@ -244,9 +244,9 @@ fn post_redeem(api_url: &str, code: &str, destination: &str) -> pay_core::Result
 
     let status = resp.status();
     if status.is_success() {
-        let parsed: RedeemSuccess = resp
-            .json()
-            .map_err(|e| pay_core::Error::Config(format!("pay-api returned malformed JSON: {e}")))?;
+        let parsed: RedeemSuccess = resp.json().map_err(|e| {
+            pay_core::Error::Config(format!("pay-api returned malformed JSON: {e}"))
+        })?;
         return Ok(parsed);
     }
 
@@ -275,7 +275,11 @@ fn print_redeem_success(
     lines.push(format!(
         "Account `{account_name}` ({short}) {verb} from the pay-api gateway.",
         short = shorten_pubkey(pubkey),
-        verb = if used_existing { "funded (existing keypair)" } else { "funded" },
+        verb = if used_existing {
+            "funded (existing keypair)"
+        } else {
+            "funded"
+        },
     ));
     lines.push(format!(
         "{} {sig}",
