@@ -4,20 +4,20 @@ How CLAWD token balances map to subscription tiers and unlock agent auth feature
 
 ## Tier Thresholds
 
-| Tier | CLAWD Required | Cumulative |
-|------|---------------|------------|
-| Free | 0 | 0 |
-| Bronze | 100,000 | 100,000 |
-| Silver | 500,000 | 500,000 |
-| Gold | 1,000,000 | 1,000,000 |
-| Diamond | 5,000,000 | 5,000,000 |
+| Tier | CLAWD Required |
+|------|---------------|
+| Free | 0 |
+| Bronze | 100,000 |
+| Silver | 500,000 |
+| Gold | 1,000,000 |
+| Diamond | 5,000,000 |
 
 ## Tier Features
 
 ### Free (0 CLAWD)
+- Protocol discovery endpoint access (`/caap/discovery`)
 - Basic SIWS sign-in
-- Discovery endpoint access
-- Cannot run full attestation (status checks only)
+- Status checks and full attestation require Bronze+
 
 ### Bronze (100,000 CLAWD)
 - Everything in Free
@@ -63,7 +63,7 @@ const tier = computeTier(clawdBalance);
 //     clawdRequired: 5000000,
 //   },
 //   clawdToNextTier?: 4000000, // CLAWD needed to reach next tier (undefined for Diamond)
-//   percentToNext?: 80,        // 0-100 progress to next tier (undefined for Diamond)
+//   percentToNext?: 0,         // 0-100 progress to next tier (undefined for Diamond); at exactly 1M CLAWD = Gold minimum, so 0% to Diamond
 // }
 ```
 
@@ -77,7 +77,7 @@ The `/api/caap/attest` response includes a `tier` field:
     "tier": "gold",
     "clawdRequired": 1000000,
     "clawdToNextTier": 3500000,
-    "percentToNext": 70
+    "percentToNext": 12.5
   }
 }
 ```

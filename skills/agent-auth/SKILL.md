@@ -76,7 +76,7 @@ The `clerk-caap` package bridges Clerk session tokens with CAAP/1.0:
 ```ts
 import { verifyClerkToken, fetchPhalaAttestation } from "@clawd/clerk-caap";
 
-// 1. Verify Clerk session token (relaxing-collie-65)
+// 1. Verify Clerk session token
 const claims = await verifyClerkToken(sessionToken);
 
 // 2. Run CAAP attestation via relay

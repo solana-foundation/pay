@@ -5,7 +5,7 @@ Step-by-step guide for running a CAAP/1.0 agent attestation through the relay.
 ## Prerequisites
 
 - A Solana wallet (keypair or browser extension)
-- A Clerk session token from `relaxing-collie-65.accounts.dev` (optional, for Clerk-bridged flows)
+- A Clerk session token from `<your-clerk-instance>.accounts.dev` (optional, for Clerk-bridged flows)
 - The relay URL: `https://relay.clawd.xyz`
 
 ## Flow 1: SIWS-Only (No Clerk)
@@ -60,7 +60,7 @@ Returns `{ verified, attestation?, tee?, tier? }`.
 
 ## Flow 2: Full CAAP Attestation (With Clerk)
 
-Use this when the agent already has a Clerk session from `relaxing-collie-65.accounts.dev`.
+Use this when the agent already has a Clerk session from `<your-clerk-instance>.accounts.dev`.
 
 ### Step 1: Get Clerk Session Token
 
@@ -109,7 +109,7 @@ Returns:
     "tier": "gold",
     "clawdRequired": 1000000,
     "clawdToNextTier": 3500000,
-    "percentToNext": 70
+    "percentToNext": 12.5
   }
 }
 ```
