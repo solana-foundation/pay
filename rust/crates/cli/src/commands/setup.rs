@@ -180,6 +180,7 @@ fn print_setup_success(
         "Setup complete",
         &setup_success_body(backend_name, completion, rpc_url),
     );
+    print_ready_hint();
 }
 
 fn setup_success_body(
@@ -199,10 +200,6 @@ fn setup_success_body(
             crate::components::solana_transaction_link(hash, "mainnet")
         ));
     }
-    lines.push(String::new());
-    lines.push("Ready to go. Time to make HTTP pay for itself.".to_string());
-    lines.push("$ pay claude".to_string());
-    lines.push("$ pay codex".to_string());
     lines.join("\n")
 }
 
@@ -227,6 +224,12 @@ fn setup_aborted_body(account_name: &str, backend_name: &str) -> String {
 struct RedeemSuccess {
     signature: String,
     destination: String,
+    /// USDC funded by the activation campaign, formatted by pay-api
+    /// (e.g. `"$0.10"`). Optional so older API versions still
+    /// deserialize cleanly — the success notice just elides the
+    /// amount when missing.
+    #[serde(default)]
+    amount: Option<String>,
 }
 
 /// Pay-api may return a non-2xx with `{ "error": "...", "signature": "..." }`
@@ -288,16 +291,22 @@ fn print_redeem_success(
     // the local account is funded when it isn't.
     let destination_matches = response.destination == pubkey;
 
+    use owo_colors::OwoColorize;
+
     let mut lines = Vec::new();
     if destination_matches {
+        let suffix = match response.amount.as_deref() {
+            Some(amount) => format!(" 🎉 {}", amount.green().bold()),
+            None => " 🎉".to_string(),
+        };
+        let verb = if used_existing {
+            "funded (existing keypair)"
+        } else {
+            "funded"
+        };
         lines.push(format!(
-            "Account `{account_name}` ({short}) {verb} from the pay-api gateway.",
+            "Account `{account_name}` ({short}) {verb}{suffix}",
             short = shorten_pubkey(pubkey),
-            verb = if used_existing {
-                "funded (existing keypair)"
-            } else {
-                "funded"
-            },
         ));
     } else {
         lines.push(format!(
@@ -315,12 +324,6 @@ fn print_redeem_success(
         crate::components::solana_transaction_link(&response.signature, "mainnet"),
         sig = response.signature,
     ));
-    if destination_matches {
-        lines.push(String::new());
-        lines.push("Ready to go. Time to make HTTP pay for itself.".to_string());
-        lines.push("$ pay claude".to_string());
-        lines.push("$ pay codex".to_string());
-    }
 
     let (level, title) = if destination_matches {
         (
@@ -334,6 +337,22 @@ fn print_redeem_success(
         )
     };
     crate::components::print_notice(level, title, &lines.join("\n"));
+
+    if destination_matches {
+        print_ready_hint();
+    }
+}
+
+/// Emit the "next step" hint as its own info notice (blue rail) so the
+/// callout reads as guidance, not a continuation of the success body.
+/// The title carries the white, non-dimmed copy; the body shows the
+/// command the user should try.
+fn print_ready_hint() {
+    crate::components::print_notice(
+        crate::components::NoticeLevel::Info,
+        "Ready to go. Time to make HTTP pay for itself.",
+        "$ claude -p \"what can i do with pay?\"",
+    );
 }
 
 fn shorten_pubkey(pk: &str) -> String {
