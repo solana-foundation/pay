@@ -288,6 +288,7 @@ fn main() {
             backend: None,
             vault: None,
             update: false,
+            redeem: None,
         })
         .run()
         {
