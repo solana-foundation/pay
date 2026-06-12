@@ -2291,6 +2291,18 @@ fn render_card_panel(
             )));
             lines
         }
+        ToolKind::Qodercli => {
+            let qc = Color::Rgb(39, 189, 81); // Qoder green
+            vec![
+                Line::default(),
+                Line::from(Span::styled("    ██████", Style::default().fg(qc))),
+                Line::from(Span::styled("  ██      ██", Style::default().fg(qc))),
+                Line::from(Span::styled("  ██  ██  ██  qoder", Style::default().fg(qc))),
+                Line::from(Span::styled("  ██    ██", Style::default().fg(qc))),
+                Line::from(Span::styled("    ████  ██", Style::default().fg(qc))),
+                Line::default(),
+            ]
+        }
         _ => {
             let tool_label = match tool {
                 ToolKind::Curl => "curl",
@@ -2298,7 +2310,7 @@ fn render_card_panel(
                 ToolKind::Http => "http",
                 ToolKind::Fetch => "fetch",
                 ToolKind::Mcp => "mcp",
-                ToolKind::Claude | ToolKind::Codex => unreachable!(),
+                ToolKind::Claude | ToolKind::Codex | ToolKind::Qodercli => unreachable!(),
             };
             vec![
                 Line::default(),
