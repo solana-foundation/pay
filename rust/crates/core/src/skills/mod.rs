@@ -14,8 +14,10 @@
 
 pub mod build;
 pub mod config;
+pub mod github;
 pub mod local;
 pub mod openapi;
+pub mod pin;
 pub mod probe;
 
 use std::collections::BTreeMap;
