@@ -130,6 +130,32 @@ impl Keystore {
         windows::WindowsHelloAuth::is_available()
     }
 
+    /// True when any platform biometric gate (Touch ID / Windows Hello /
+    /// polkit) is usable on this machine. Cross-platform; used by
+    /// callers that want to fall back to a remote approval channel
+    /// (e.g. MCP elicitation) only when no local biometric exists.
+    pub fn any_biometric_available() -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            if Self::apple_touchid_available() {
+                return true;
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if Self::gnome_keyring_available() {
+                return true;
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            if Self::windows_hello_available() {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Construct a keystore from already-boxed auth and store implementations.
     ///
     /// Useful when callers hold a `Box<dyn AuthGate + Send + Sync>` (e.g. an
@@ -329,6 +355,14 @@ mod tests {
         let mut bytes = vec![0xAA; 32];
         bytes.extend_from_slice(&[0xBB; 32]);
         bytes
+    }
+
+    #[test]
+    fn any_biometric_available_returns_bool() {
+        // Smoke check: function must produce SOME bool on whatever
+        // platform the suite runs on, without panicking. The exact
+        // value depends on the host (CI has no Touch ID; dev laptops do).
+        let _: bool = Keystore::any_biometric_available();
     }
 
     #[test]

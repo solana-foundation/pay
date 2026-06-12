@@ -1,9 +1,17 @@
 //! [`AuthGate`] backed by MCP elicitation.
 //!
-//! When the connected MCP client advertises the `elicitation` capability,
-//! pay-mcp can install this gate so signing confirmations flow through the
-//! LLM client's UI (Claude Desktop dialog, Hermes approval prompt, Telegram
-//! message, etc.) instead of the platform's biometric prompt.
+//! When the connected MCP client advertises the `elicitation` capability
+//! AND no local platform biometric is available, pay-mcp installs this
+//! gate so signing confirmations flow through the LLM client's UI (Claude
+//! Desktop dialog, Hermes approval prompt, Telegram message, etc.) instead
+//! of the (missing) platform biometric prompt.
+//!
+//! When a local biometric IS available (Touch ID, Windows Hello, polkit),
+//! the platform gate is preferred — a native prompt is faster and more
+//! familiar than a round-trip through the MCP client UI. The install-site
+//! check lives in `mcp/src/tools/curl.rs::make_auth_override`; set
+//! `PAY_FORCE_ELICITATION=1` to override and route every approval through
+//! the MCP client anyway.
 //!
 //! The [`AuthGate`] trait is synchronous, but rmcp's elicitation call is
 //! `async`. We bridge with [`tokio::task::block_in_place`] + the current

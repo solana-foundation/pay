@@ -209,12 +209,26 @@ fn do_paid_fetch(
     pay_core::skills::validate_cached_catalog_request(method, url, body.as_deref())?;
 
     // Build a fresh elicitation-backed AuthGate per signing operation when
-    // we have a peer. When None (e.g. unit tests), each `_with_override`
-    // call gets `None` and falls back to the platform default gate. The
-    // peer is cheap to clone (it wraps an Arc).
+    // we have a peer AND no local biometric is available. A local Touch ID /
+    // Windows Hello / polkit prompt is faster and more familiar than a
+    // round-trip through the MCP client UI, so we prefer it whenever the
+    // platform offers it. `PAY_FORCE_ELICITATION=1` opts back into the
+    // elicitation path for users who want approvals in the MCP client
+    // anyway (remote MCP, screen-sharing demos, etc.).
+    //
+    // When None (e.g. unit tests, or biometrics-available path), each
+    // `_with_override` call gets `None` and falls back to the platform
+    // default gate. The peer is cheap to clone (it wraps an Arc).
     let make_auth_override = || -> pay_core::signer::AuthOverride {
-        peer.as_ref()
-            .map(|p| Box::new(crate::ElicitationAuth::new(p.clone())) as Box<dyn pay_keystore::AuthGate>)
+        let peer = peer.as_ref()?;
+        let force = std::env::var("PAY_FORCE_ELICITATION")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if !force && pay_keystore::Keystore::any_biometric_available() {
+            return None;
+        }
+        Some(Box::new(crate::ElicitationAuth::new(peer.clone())) as Box<dyn pay_keystore::AuthGate>)
     };
 
     let store = pay_core::accounts::FileAccountsStore::default_path();
