@@ -72,7 +72,7 @@ async fn run_with_action(
 ) {
     let (server_transport, client_transport) = tokio::io::duplex(8192);
 
-    let server = BareServer::default()
+    let server = BareServer
         .serve(server_transport)
         .await
         .expect("server should serve");
@@ -84,7 +84,11 @@ async fn run_with_action(
         .expect("client should serve");
 
     // Let the initialize handshake finish before we send elicitation.
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // 1s is generous enough for CI runners under load — rmcp 0.9's
+    // server-side `on_initialized` hook is unreliable under this duplex
+    // setup, so we fall back to a fixed delay. The outer 30s timeout in
+    // each test wraps this so a stuck handshake fails loudly.
+    tokio::time::sleep(Duration::from_secs(1)).await;
 
     let server_peer = server.peer().clone();
     let auth = ElicitationAuth::new(server_peer);

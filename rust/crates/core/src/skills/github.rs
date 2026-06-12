@@ -266,9 +266,9 @@ fn validate_tree_path(path: &str) -> Result<()> {
         )));
     }
     for segment in path.split('/') {
-        if segment == "." || segment == ".." {
+        if segment.is_empty() || segment == "." || segment == ".." {
             return Err(Error::Config(format!(
-                "tree path traversal rejected: {path}"
+                "tree path has empty or traversal segment: {path}"
             )));
         }
     }
@@ -366,6 +366,11 @@ mod tests {
         assert!(validate_tree_path("/abs").is_err());
         assert!(validate_tree_path("../escape").is_err());
         assert!(validate_tree_path("ok/../bad").is_err());
+        // Reject empty segments — otherwise a path like "a//b" or "a/b/"
+        // would slip through here but trip the stricter `validate_relative_path`
+        // later, producing a confusing error deep in PinStore::upsert.
+        assert!(validate_tree_path("a//b").is_err());
+        assert!(validate_tree_path("a/b/").is_err());
     }
 
     #[test]

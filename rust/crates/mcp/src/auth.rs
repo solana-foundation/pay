@@ -81,7 +81,28 @@ impl AuthGate for ElicitationAuth {
 
         match outcome {
             Ok(res) => match res.action {
-                ElicitationAction::Accept => Ok(()),
+                ElicitationAction::Accept => {
+                    // The action being `Accept` is the primary authoritative
+                    // signal. We also honor an explicit `approved: false` in
+                    // the content payload — that combination shouldn't happen
+                    // (the schema declares `approved` as required-bool, so
+                    // form-rendering clients can't produce `Accept` with a
+                    // negative answer) but a buggy or hostile client might,
+                    // and we'd rather deny than admit on conflicting input.
+                    let explicitly_denied = res
+                        .content
+                        .as_ref()
+                        .and_then(|v| v.get("approved"))
+                        .and_then(|v| v.as_bool())
+                        .map(|b| !b)
+                        .unwrap_or(false);
+                    if explicitly_denied {
+                        return Err(KeystoreError::AuthDenied(
+                            "MCP client returned Accept but content.approved=false".to_string(),
+                        ));
+                    }
+                    Ok(())
+                }
                 ElicitationAction::Decline => Err(KeystoreError::AuthDenied(
                     "user declined the request via the MCP client".to_string(),
                 )),

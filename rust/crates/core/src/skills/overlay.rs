@@ -87,7 +87,7 @@ fn synthesize_pin_service(manifest: &PinManifest, dir: &Path) -> Result<Service,
         .get(&format!("providers/{}.json", entry.fqn))
         .cloned()
         .unwrap_or_default();
-    let endpoints = parse_endpoints(&detail_json);
+    let endpoints = parse_endpoints(&detail_json, &entry.meta.service_url);
 
     Ok(Service {
         fqn: entry.fqn,
@@ -106,7 +106,13 @@ fn synthesize_pin_service(manifest: &PinManifest, dir: &Path) -> Result<Service,
 /// Extract just the lightweight `Endpoint` view from the detail JSON
 /// `build_single_provider` emits. Failures are non-fatal — the pin
 /// still shows up in `list`/`search`, just without endpoint detail.
-fn parse_endpoints(detail_json: &str) -> Vec<Endpoint> {
+///
+/// `service_url` is the provider's base URL; used to populate
+/// `Endpoint::full_path` (the same form `local::synthesize_catalog`
+/// produces for self-advertised running servers). Empty when the
+/// provider doesn't declare a service_url — `full_path` then matches
+/// `path` so downstream string-only consumers still get a usable value.
+fn parse_endpoints(detail_json: &str, service_url: &str) -> Vec<Endpoint> {
     if detail_json.is_empty() {
         return Vec::new();
     }
@@ -138,16 +144,25 @@ fn parse_endpoints(detail_json: &str) -> Vec<Endpoint> {
             return Vec::new();
         }
     };
+    let base = service_url.trim_end_matches('/');
     parsed
         .endpoints
         .into_iter()
-        .map(|e| Endpoint {
-            method: e.spec.method,
-            path: e.spec.path,
-            full_path: String::new(),
-            resource: e.spec.resource,
-            description: e.spec.description,
-            pricing: e.spec.pricing,
+        .map(|e| {
+            let rel = e.spec.path.trim_start_matches('/');
+            let full_path = if base.is_empty() {
+                rel.to_string()
+            } else {
+                format!("{base}/{rel}")
+            };
+            Endpoint {
+                method: e.spec.method,
+                path: e.spec.path,
+                full_path,
+                resource: e.spec.resource,
+                description: e.spec.description,
+                pricing: e.spec.pricing,
+            }
         })
         .collect()
 }

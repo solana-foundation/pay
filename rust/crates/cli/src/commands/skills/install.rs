@@ -49,8 +49,9 @@ pub struct InstallCommand {
     pub sha: Option<String>,
 
     /// Pin: override the catalog repo. Defaults to
-    /// `solana-foundation/pay-skills`.
-    #[arg(long, requires_ifs = [("Some(_)", "pr"), ("Some(_)", "branch"), ("Some(_)", "sha")])]
+    /// `solana-foundation/pay-skills`. Requires one of `--pr` / `--branch` /
+    /// `--sha`; in source mode the positional `source` is already the repo.
+    #[arg(long)]
     pub repo: Option<String>,
 
     /// Pin: overwrite any conflicting pin without prompting. Required
@@ -71,6 +72,15 @@ impl InstallCommand {
 
     /// Original behavior — append a catalog source to skills.yaml.
     fn run_source(self) -> pay_core::Result<()> {
+        // `--repo` only makes sense in pin mode where it selects which
+        // GitHub repo to fetch from. In source mode the positional arg
+        // IS the repo, so a stray `--repo` here is almost certainly a
+        // mistake — surface it rather than silently dropping it.
+        if self.repo.is_some() {
+            return Err(pay_core::Error::Config(
+                "--repo requires one of --pr / --branch / --sha (it selects the source repo for the pin)".to_string(),
+            ));
+        }
         let mut cfg = pay_core::skills::config::SkillsConfig::load()?;
         if cfg.add_source(&self.source) {
             cfg.save()?;
