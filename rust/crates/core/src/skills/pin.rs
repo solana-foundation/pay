@@ -162,8 +162,7 @@ impl PinStore {
         let manifest_path = dir.join(PIN_MANIFEST_FILE);
         if manifest_path.is_file() {
             match fs::read_to_string(&manifest_path).and_then(|raw| {
-                serde_json::from_str::<PinManifest>(&raw)
-                    .map_err(std::io::Error::other)
+                serde_json::from_str::<PinManifest>(&raw).map_err(std::io::Error::other)
             }) {
                 Ok(m) => out.push((m, dir.to_path_buf())),
                 Err(e) => {
@@ -382,7 +381,9 @@ fn sweep_temp_dirs(root: &Path) {
 
 /// Public utility: pretty BTreeMap helper for tests / debug dumps.
 pub fn pins_by_fqn(pins: Vec<(PinManifest, PathBuf)>) -> BTreeMap<String, (PinManifest, PathBuf)> {
-    pins.into_iter().map(|(m, p)| (m.fqn.clone(), (m, p))).collect()
+    pins.into_iter()
+        .map(|(m, p)| (m.fqn.clone(), (m, p)))
+        .collect()
 }
 
 #[cfg(test)]
@@ -471,7 +472,10 @@ mod tests {
             .upsert(&mut m, &[("PAY.md".to_string(), b"x".to_vec())])
             .unwrap();
         assert!(store.remove("acme/billing").unwrap());
-        assert!(!dir.path().join("acme").exists(), "empty parent should be pruned");
+        assert!(
+            !dir.path().join("acme").exists(),
+            "empty parent should be pruned"
+        );
         assert!(!store.remove("acme/billing").unwrap());
     }
 
@@ -480,13 +484,17 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = PinStore::open_at(dir.path());
         let mut m = manifest("../escape");
-        assert!(store
-            .upsert(&mut m, &[("PAY.md".to_string(), b"x".to_vec())])
-            .is_err());
+        assert!(
+            store
+                .upsert(&mut m, &[("PAY.md".to_string(), b"x".to_vec())])
+                .is_err()
+        );
         let mut m = manifest("a//b");
-        assert!(store
-            .upsert(&mut m, &[("PAY.md".to_string(), b"x".to_vec())])
-            .is_err());
+        assert!(
+            store
+                .upsert(&mut m, &[("PAY.md".to_string(), b"x".to_vec())])
+                .is_err()
+        );
     }
 
     #[test]
@@ -494,12 +502,16 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = PinStore::open_at(dir.path());
         let mut m = manifest("venice/ai");
-        assert!(store
-            .upsert(&mut m, &[("../escape".to_string(), b"x".to_vec())])
-            .is_err());
-        assert!(store
-            .upsert(&mut m, &[("/abs".to_string(), b"x".to_vec())])
-            .is_err());
+        assert!(
+            store
+                .upsert(&mut m, &[("../escape".to_string(), b"x".to_vec())])
+                .is_err()
+        );
+        assert!(
+            store
+                .upsert(&mut m, &[("/abs".to_string(), b"x".to_vec())])
+                .is_err()
+        );
     }
 
     #[test]

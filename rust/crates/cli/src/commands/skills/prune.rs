@@ -7,8 +7,8 @@
 
 use std::io::IsTerminal;
 
-use dialoguer::theme::ColorfulTheme;
 use dialoguer::Confirm;
+use dialoguer::theme::ColorfulTheme;
 use owo_colors::OwoColorize;
 
 use pay_core::skills::github;
@@ -51,11 +51,7 @@ impl PruneMergedCommand {
             return Ok(());
         }
 
-        eprintln!(
-            "  {} {} pinned providers...",
-            "Checking".cyan(),
-            pins.len()
-        );
+        eprintln!("  {} {} pinned providers...", "Checking".cyan(), pins.len());
         let classified: Vec<Classified> = pins
             .into_iter()
             .map(|(manifest, _)| {
@@ -84,7 +80,12 @@ impl PruneMergedCommand {
             if to_prune.len() == 1 { "pin" } else { "pins" }
         );
         for m in &to_prune {
-            eprintln!("    - {} ({}, {})", m.fqn.bold(), m.anchor_label(), m.short_sha().dimmed());
+            eprintln!(
+                "    - {} ({}, {})",
+                m.fqn.bold(),
+                m.anchor_label(),
+                m.short_sha().dimmed()
+            );
         }
 
         if self.dry_run {
@@ -136,11 +137,7 @@ fn classify(manifest: &PinManifest) -> Verdict {
 }
 
 fn format_row(manifest: &PinManifest, verdict: &Verdict) -> String {
-    let head = format!(
-        "{:<32} {}",
-        manifest.fqn,
-        manifest.anchor_label(),
-    );
+    let head = format!("{:<32} {}", manifest.fqn, manifest.anchor_label(),);
     match verdict {
         Verdict::Merged => format!("{}  {} {}", head, "→".dimmed(), "merged ✓".green()),
         Verdict::Open => format!("{}  {} {}", head, "→".dimmed(), "open".dimmed()),

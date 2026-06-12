@@ -18,8 +18,8 @@
 
 use std::io::IsTerminal;
 
-use dialoguer::theme::ColorfulTheme;
 use dialoguer::Confirm;
+use dialoguer::theme::ColorfulTheme;
 use owo_colors::OwoColorize;
 
 use pay_core::skills::github::{self, PrInfo};
@@ -90,7 +90,10 @@ impl InstallCommand {
 
     /// Pin a single provider FQN from a PR/branch/SHA.
     fn run_pin(self) -> pay_core::Result<()> {
-        let repo = self.repo.clone().unwrap_or_else(|| DEFAULT_REPO.to_string());
+        let repo = self
+            .repo
+            .clone()
+            .unwrap_or_else(|| DEFAULT_REPO.to_string());
         let fqn = self.source.clone();
         let store = PinStore::open_default();
         let existing = store.get(&fqn)?;
@@ -137,12 +140,7 @@ impl InstallCommand {
             && let Ok(catalog) = pay_core::skills::load_cached_skills()
             && catalog.providers.iter().any(|p| p.fqn == fqn)
         {
-            eprintln!(
-                "  {} shadowing canonical {} from {}",
-                "ℹ".cyan(),
-                fqn,
-                repo,
-            );
+            eprintln!("  {} shadowing canonical {} from {}", "ℹ".cyan(), fqn, repo,);
         }
 
         // Fetch the directory tree + every blob.
@@ -327,11 +325,7 @@ fn anchor_label(anchor: &PinAnchor) -> String {
 }
 
 fn short_sha(sha: &str) -> &str {
-    if sha.len() >= 7 {
-        &sha[..7]
-    } else {
-        sha
-    }
+    if sha.len() >= 7 { &sha[..7] } else { sha }
 }
 
 #[cfg(test)]

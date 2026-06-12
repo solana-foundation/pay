@@ -31,8 +31,7 @@ use std::time::Duration;
 use pay_keystore::{AuthGate, AuthIntent, Error as KeystoreError};
 use rmcp::Peer;
 use rmcp::model::{
-    CreateElicitationRequestParam, CreateElicitationResult, ElicitationAction,
-    ElicitationSchema,
+    CreateElicitationRequestParam, CreateElicitationResult, ElicitationAction, ElicitationSchema,
 };
 use rmcp::service::RoleServer;
 use tokio::runtime::Handle;
@@ -74,10 +73,8 @@ impl AuthGate for ElicitationAuth {
                 Handle::current().block_on(async move {
                     tokio::time::timeout(ELICITATION_TIMEOUT, peer.create_elicitation(params))
                         .await
-                        .map_err(|_| {
-                            rmcp::ServiceError::Timeout {
-                                timeout: ELICITATION_TIMEOUT,
-                            }
+                        .map_err(|_| rmcp::ServiceError::Timeout {
+                            timeout: ELICITATION_TIMEOUT,
                         })?
                 })
             });
@@ -154,8 +151,7 @@ mod tests {
         let req = build_request(&intent);
         // The schema must include an `approved` property so even
         // form-rendering clients have a concrete confirmation field.
-        let json = serde_json::to_value(&req.requested_schema)
-            .expect("schema should serialize");
+        let json = serde_json::to_value(&req.requested_schema).expect("schema should serialize");
         let props = json.get("properties").expect("schema has properties");
         assert!(
             props.get("approved").is_some(),

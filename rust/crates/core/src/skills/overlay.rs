@@ -64,8 +64,10 @@ fn synthesize_pin_service(manifest: &PinManifest, dir: &Path) -> Result<Service,
         [op, origin, name] => (*op, *origin, *name),
         _ => return Err(format!("unsupported fqn shape: {}", manifest.fqn)),
     };
-    let mut options = BuildOptions::default();
-    options.probe = false; // overlay is offline
+    let options = BuildOptions {
+        probe: false, // overlay is offline
+        ..BuildOptions::default()
+    };
 
     let result = build_single_provider(&pay_md, &manifest.fqn, name, operator, origin, &options);
     if !result.errors.is_empty() {

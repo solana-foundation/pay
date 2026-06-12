@@ -17,7 +17,7 @@
 
 use std::time::Duration;
 
-use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::Deserialize;
 
 use crate::{Error, Result};
@@ -117,10 +117,7 @@ pub fn resolve_pr(repo: &str, pr: u32) -> Result<PrInfo> {
 pub fn resolve_branch(repo: &str, ref_name: &str) -> Result<String> {
     validate_repo(repo)?;
     let client = blocking_client()?;
-    let url = format!(
-        "{API_BASE}/repos/{repo}/branches/{}",
-        url_encode(ref_name)
-    );
+    let url = format!("{API_BASE}/repos/{repo}/branches/{}", url_encode(ref_name));
     let resp = client
         .get(&url)
         .send()
@@ -176,10 +173,8 @@ pub fn list_directory(repo: &str, tree_ish: &str, path: &str) -> Result<Vec<Tree
         // Filter to entries under the requested subtree.
         let rel = if prefix.is_empty() {
             Some(entry.path.as_str())
-        } else if let Some(rest) = entry.path.strip_prefix(&prefix) {
-            Some(rest)
         } else {
-            None
+            entry.path.strip_prefix(&prefix)
         };
         let Some(rel) = rel else { continue };
         if rel.is_empty() {
@@ -227,7 +222,11 @@ pub fn fetch_blob(repo: &str, blob_sha: &str) -> Result<Vec<u8>> {
     match body.encoding.as_str() {
         "base64" => {
             use base64::Engine as _;
-            let cleaned: String = body.content.chars().filter(|c| !c.is_whitespace()).collect();
+            let cleaned: String = body
+                .content
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
             base64::engine::general_purpose::STANDARD
                 .decode(&cleaned)
                 .map_err(|e| Error::Config(format!("decode blob: {e}")))
@@ -277,10 +276,7 @@ fn validate_tree_path(path: &str) -> Result<()> {
 }
 
 fn validate_blob_sha(sha: &str) -> Result<()> {
-    if sha.len() < 7
-        || sha.len() > 64
-        || !sha.chars().all(|c| c.is_ascii_hexdigit())
-    {
+    if sha.len() < 7 || sha.len() > 64 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(Error::Config(format!("invalid blob sha: {sha}")));
     }
     Ok(())
