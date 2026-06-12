@@ -388,6 +388,11 @@ fn mcp_config_targets() -> Vec<(&'static str, std::path::PathBuf)> {
         targets.push(("Claude Desktop", path));
     }
 
+    // Qoder IDE
+    if let Some(path) = qoder_ide_config_path() {
+        targets.push(("Qoder IDE", path));
+    }
+
     targets
 }
 
@@ -421,6 +426,42 @@ fn claude_desktop_config_path() -> Option<std::path::PathBuf> {
 
 fn codex_config_path() -> Option<std::path::PathBuf> {
     home_dir().map(|h| h.join(".codex").join("config.toml"))
+}
+
+/// Qoder IDE (the desktop app) reads its MCP server list from a shared
+/// client cache directory.
+fn qoder_ide_config_path() -> Option<std::path::PathBuf> {
+    qoder_ide_data_dir().map(|d| d.join("mcp.json"))
+}
+
+/// Shared client cache directory used by Qoder IDE.
+fn qoder_ide_data_dir() -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        home_dir().map(|h| {
+            h.join("Library")
+                .join("Application Support")
+                .join("Qoder")
+                .join("SharedClientCache")
+        })
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var("APPDATA").ok().map(|d| {
+            std::path::PathBuf::from(d)
+                .join("Qoder")
+                .join("SharedClientCache")
+        })
+    }
+    #[cfg(target_os = "linux")]
+    {
+        home_dir().map(|h| h.join(".config").join("Qoder").join("SharedClientCache"))
+    }
+}
+
+/// Path to qodercli's user-level settings file.
+fn qodercli_settings_path() -> Option<std::path::PathBuf> {
+    home_dir().map(|h| h.join(".qoder").join("settings.json"))
 }
 
 fn home_dir() -> Option<std::path::PathBuf> {
@@ -488,6 +529,34 @@ fn install_mcp_configs() {
             }
             Err(e) => {
                 eprintln!("  {} Failed to configure Codex: {e}", "!".yellow());
+            }
+        }
+    }
+
+    // Qoder CLI (`qodercli`): write pay MCP entry into
+    // ~/.qoder/settings.json so users who launch `qodercli` directly
+    // (without `pay qodercli`) also get pay MCP available.
+    if let Some(settings_path) = qodercli_settings_path()
+        && (settings_path.exists() || settings_path.parent().is_some_and(|d| d.exists()))
+    {
+        match add_qodercli_mcp_entry(&settings_path, &pay_bin) {
+            Ok(McpInstallResult::Added) => {
+                eprintln!("  {} pay MCP added to Qoder CLI", "\u{2714}".green());
+                installed_any = true;
+            }
+            Ok(McpInstallResult::AlreadyPresent) => {
+                eprintln!(
+                    "  {} pay MCP already configured in Qoder CLI",
+                    "\u{2714}".green()
+                );
+                installed_any = true;
+            }
+            Ok(McpInstallResult::Updated) => {
+                eprintln!("  {} pay MCP updated in Qoder CLI", "\u{2714}".green());
+                installed_any = true;
+            }
+            Err(e) => {
+                eprintln!("  {} Failed to configure Qoder CLI: {e}", "!".yellow());
             }
         }
     }
@@ -562,6 +631,65 @@ fn add_mcp_entry(config_path: &std::path::Path, pay_bin: &str) -> Result<McpInst
         let json = serde_json::to_string_pretty(&config).map_err(|e| format!("serialize: {e}"))?;
         std::fs::write(config_path, json + "\n")
             .map_err(|e| format!("write {}: {e}", config_path.display()))?;
+    }
+
+    Ok(result)
+}
+
+/// Add or update the `pay` MCP server entry in qodercli's settings.json.
+fn add_qodercli_mcp_entry(
+    settings_path: &std::path::Path,
+    pay_bin: &str,
+) -> Result<McpInstallResult, String> {
+    let mut config: serde_json::Value = if settings_path.exists() {
+        let raw = std::fs::read_to_string(settings_path)
+            .map_err(|e| format!("read {}: {e}", settings_path.display()))?;
+        if raw.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(&raw)
+                .map_err(|e| format!("parse {}: {e}", settings_path.display()))?
+        }
+    } else {
+        serde_json::json!({})
+    };
+
+    let servers = config
+        .as_object_mut()
+        .ok_or("settings is not a JSON object")?
+        .entry("mcpServers")
+        .or_insert_with(|| serde_json::json!({}));
+
+    let new_entry = serde_json::json!({
+        "command": pay_bin,
+        "args": ["mcp"]
+    });
+
+    let result = if let Some(existing) = servers.get("pay") {
+        let matches = existing.get("command").and_then(|v| v.as_str()) == Some(pay_bin)
+            && existing.get("args") == Some(&serde_json::json!(["mcp"]));
+        if matches {
+            McpInstallResult::AlreadyPresent
+        } else {
+            servers["pay"] = new_entry;
+            McpInstallResult::Updated
+        }
+    } else {
+        servers
+            .as_object_mut()
+            .ok_or("mcpServers is not an object")?
+            .insert("pay".to_string(), new_entry);
+        McpInstallResult::Added
+    };
+
+    if !matches!(result, McpInstallResult::AlreadyPresent) {
+        if let Some(parent) = settings_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create dir {}: {e}", parent.display()))?;
+        }
+        let json = serde_json::to_string_pretty(&config).map_err(|e| format!("serialize: {e}"))?;
+        std::fs::write(settings_path, json + "\n")
+            .map_err(|e| format!("write {}: {e}", settings_path.display()))?;
     }
 
     Ok(result)
@@ -848,5 +976,77 @@ enabled = true
             add_codex_mcp_entry(&config_path, "pay").unwrap(),
             McpInstallResult::AlreadyPresent
         ));
+    }
+
+    #[test]
+    fn mcp_entry_creates_new_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("mcp.json");
+
+        let result = add_mcp_entry(&config_path, "/usr/local/bin/pay").unwrap();
+
+        assert!(matches!(result, McpInstallResult::Added));
+        let raw = std::fs::read_to_string(&config_path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["mcpServers"]["pay"]["command"], "/usr/local/bin/pay");
+        assert_eq!(v["mcpServers"]["pay"]["args"][0], "mcp");
+    }
+
+    #[test]
+    fn mcp_entry_already_present() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("mcp.json");
+
+        add_mcp_entry(&config_path, "/usr/local/bin/pay").unwrap();
+        let result = add_mcp_entry(&config_path, "/usr/local/bin/pay").unwrap();
+
+        assert!(matches!(result, McpInstallResult::AlreadyPresent));
+    }
+
+    #[test]
+    fn mcp_entry_updates_when_command_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("mcp.json");
+
+        add_mcp_entry(&config_path, "/old/path/pay").unwrap();
+        let result = add_mcp_entry(&config_path, "/new/path/pay").unwrap();
+
+        assert!(matches!(result, McpInstallResult::Updated));
+        let raw = std::fs::read_to_string(&config_path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["mcpServers"]["pay"]["command"], "/new/path/pay");
+    }
+
+    #[test]
+    fn qodercli_mcp_entry_creates_new_settings() {
+        let temp = tempfile::tempdir().unwrap();
+        let settings_path = temp.path().join("settings.json");
+
+        let result = add_qodercli_mcp_entry(&settings_path, "/usr/local/bin/pay").unwrap();
+
+        assert!(matches!(result, McpInstallResult::Added));
+        let raw = std::fs::read_to_string(&settings_path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["mcpServers"]["pay"]["command"], "/usr/local/bin/pay");
+        assert_eq!(v["mcpServers"]["pay"]["args"][0], "mcp");
+    }
+
+    #[test]
+    fn qodercli_mcp_entry_preserves_existing_servers() {
+        let temp = tempfile::tempdir().unwrap();
+        let settings_path = temp.path().join("settings.json");
+        std::fs::write(
+            &settings_path,
+            r#"{"mcpServers":{"other":{"command":"other-cmd","args":[]}}}"#,
+        )
+        .unwrap();
+
+        let result = add_qodercli_mcp_entry(&settings_path, "pay").unwrap();
+
+        assert!(matches!(result, McpInstallResult::Added));
+        let raw = std::fs::read_to_string(&settings_path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["mcpServers"]["other"]["command"], "other-cmd");
+        assert_eq!(v["mcpServers"]["pay"]["command"], "pay");
     }
 }
