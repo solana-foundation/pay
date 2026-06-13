@@ -107,7 +107,19 @@ impl SetupCommand {
             .rpc_url
             .clone()
             .unwrap_or_else(pay_core::balance::mainnet_rpc_url);
-        let completion = crate::tui::run_topup_flow(&pubkey, &rpc_url, &account_name)?;
+
+        // Headless setup path: when there's no biometric backend available
+        // on this platform (VM / CI / server), we already fell back to
+        // NoAuth in `create_account`, and the interactive top-up TUI has
+        // nothing useful to render. Skip it and print the aborted-style
+        // notice instead — the user can fund the account later via
+        // `pay topup` once they have a TTY.
+        let skip_tui = !has_biometric_backend();
+        let completion = if skip_tui {
+            None
+        } else {
+            crate::tui::run_topup_flow(&pubkey, &rpc_url, &account_name)?
+        };
         if let Some(completion) = completion {
             print_setup_success(backend_name, &completion, &rpc_url);
         } else {
@@ -167,6 +179,29 @@ impl SetupCommand {
         // 3. Surface the result.
         print_redeem_success(account_name, &pubkey, &response, used_existing);
         Ok(())
+    }
+}
+
+/// Returns true if the current platform exposes a biometric auth backend
+/// that pay can drive. Mirrors the check used in
+/// [`crate::commands::account::new::build_keystore`] so the TUI is skipped
+/// on the same hosts where biometric account creation is unavailable.
+fn has_biometric_backend() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        pay_core::keystore::Keystore::apple_touchid_available()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        pay_core::keystore::Keystore::gnome_keyring_available()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        pay_core::keystore::Keystore::windows_hello_available()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        false
     }
 }
 
