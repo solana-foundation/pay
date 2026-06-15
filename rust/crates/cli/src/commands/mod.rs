@@ -6,6 +6,7 @@ pub mod curl;
 pub mod fetch;
 pub mod help;
 pub mod http;
+pub mod qodercli;
 pub mod send;
 pub mod server;
 pub mod setup;
@@ -43,6 +44,8 @@ pub enum Command {
     Claude(claude::ClaudeCommand),
     /// Run Codex with 402 payment support.
     Codex(codex::CodexCommand),
+    /// Run Qoder CLI (qodercli) with 402 payment support.
+    Qodercli(qodercli::QodercliCommand),
     /// Manage accounts (new, import, list, default, remove, export).
     /// With no subcommand, lists accounts and prints the available subcommands.
     #[command(alias = "accounts")]
@@ -99,6 +102,7 @@ pub enum ToolKind {
     Fetch,
     Claude,
     Codex,
+    Qodercli,
     Mcp,
 }
 
@@ -127,6 +131,7 @@ impl Command {
             | Command::Fetch(_)
             | Command::Claude(_)
             | Command::Codex(_)
+            | Command::Qodercli(_)
             | Command::Send(_)
             | Command::Topup(_) => true,
             Command::Setup(_)
@@ -151,6 +156,7 @@ impl Command {
             Command::Fetch(_) => ToolKind::Fetch,
             Command::Claude(_) => ToolKind::Claude,
             Command::Codex(_) => ToolKind::Codex,
+            Command::Qodercli(_) => ToolKind::Qodercli,
             Command::Account { .. }
             | Command::Whoami(_)
             | Command::Skills { .. }
@@ -223,6 +229,7 @@ impl Command {
             }
             Command::Claude(cmd) => std::process::exit(cmd.run(&pay_bin, account_override)?),
             Command::Codex(cmd) => std::process::exit(cmd.run(&pay_bin, account_override)?),
+            Command::Qodercli(cmd) => std::process::exit(cmd.run(&pay_bin, account_override)?),
             _ => {}
         }
 

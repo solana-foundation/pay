@@ -31,7 +31,16 @@ pub struct SetupCommand {
     /// Re-install MCP configs and agent skill without creating a new account.
     #[arg(long)]
     pub update: bool,
+
+    /// Redeem an activation campaign code. Skips the MoonPay/onramp
+    /// topup TUI and asks the pay-api gateway to fund this account
+    /// from its hot wallet. Reuses an existing account when present.
+    #[arg(long, value_name = "CODE")]
+    pub redeem: Option<String>,
 }
+
+/// Per-request timeout for the redemption POST.
+const REDEEM_TIMEOUT_SECS: u64 = 30;
 
 impl SetupCommand {
     pub fn run(self) -> pay_core::Result<()> {
@@ -43,6 +52,16 @@ impl SetupCommand {
         // `whoami`), sanitised. Cross-platform — works on Windows, macOS,
         // Linux. Falls back to "default" if nothing is resolvable.
         let account_name = crate::system::current_user_account_name();
+
+        // Activation-campaign path. Reuses an existing account when one is
+        // already configured for `account_name` on mainnet; otherwise
+        // creates the keypair and registers it the same way the plain
+        // setup flow does, then asks the pay-api to fund it from its hot
+        // wallet. The MoonPay/onramp TUI is intentionally skipped — the
+        // code is the funding source.
+        if let Some(code) = &self.redeem {
+            return self.run_redeem(&account_name, code);
+        }
 
         // Abort before any prompts if this user already has an account.
         if !self.force
@@ -60,7 +79,10 @@ impl SetupCommand {
                 crate::components::NoticeLevel::Info,
                 "Account already exists",
                 &format!(
-                    "`{account_name}` is already configured.\nUse --force to replace it, or `pay account new <NAME>` to add another."
+                    "`{account_name}` is already configured.\n\
+                     Use --force to replace it, or `pay account new <NAME>` to add another.\n\
+                     To fund this existing keypair with a campaign code, run \
+                     `pay setup --redeem <CODE>`."
                 ),
             );
             eprintln!();
@@ -105,6 +127,59 @@ impl SetupCommand {
         }
         Ok(())
     }
+
+    fn run_redeem(&self, account_name: &str, code: &str) -> pay_core::Result<()> {
+        // 1. Resolve the destination pubkey. Reuse an existing mainnet
+        //    account if present; otherwise create one. `--force` still
+        //    forces a fresh keypair (e.g. for testing).
+        let existing = pay_core::accounts::AccountsFile::load().ok().and_then(|f| {
+            f.accounts
+                .get(pay_core::accounts::MAINNET_NETWORK)
+                .and_then(|net| net.get(account_name).cloned())
+        });
+
+        let (pubkey, used_existing): (String, bool) = if !self.force
+            && let Some(account) = existing
+            && let Some(pk) = account.pubkey.clone()
+        {
+            (pk, true)
+        } else {
+            maybe_install_skill();
+            install_mcp_configs();
+            let (pk, _backend_name) = super::account::new::create_account(
+                account_name,
+                self.backend.as_deref(),
+                self.vault.as_deref(),
+                self.force,
+            )?;
+            (pk, false)
+        };
+
+        // 2. POST to pay-api's `/v1/redeem`. Honors `PAY_API_URL` via
+        //    the same helper the `/v1/send` client uses, so override
+        //    semantics match the rest of the CLI.
+        let api_url = pay_core::client::balance::pay_api_url();
+        let api_url = api_url.trim().trim_end_matches('/');
+
+        let response = match post_redeem(api_url, code, &pubkey) {
+            Ok(r) => r,
+            Err(e) if !used_existing => {
+                // The keypair was created moments ago and is now
+                // persisted but unfunded. Surface a recovery hint so
+                // the user isn't stuck behind the "Account already
+                // exists" guard on the next `pay setup` run.
+                return Err(pay_core::Error::Config(format!(
+                    "{e}\n\nYour keypair was created and is preserved. Once you have a valid \
+                     code, retry with `pay setup --redeem <CODE>` to fund this same keypair."
+                )));
+            }
+            Err(e) => return Err(e),
+        };
+
+        // 3. Surface the result.
+        print_redeem_success(account_name, &pubkey, &response, used_existing);
+        Ok(())
+    }
 }
 
 /// Returns true if the current platform exposes a biometric auth backend
@@ -140,6 +215,7 @@ fn print_setup_success(
         "Setup complete",
         &setup_success_body(backend_name, completion, rpc_url),
     );
+    print_ready_hint();
 }
 
 fn setup_success_body(
@@ -159,10 +235,6 @@ fn setup_success_body(
             crate::components::solana_transaction_link(hash, "mainnet")
         ));
     }
-    lines.push(String::new());
-    lines.push("Ready to go. Time to make HTTP pay for itself.".to_string());
-    lines.push("$ pay claude".to_string());
-    lines.push("$ pay codex".to_string());
     lines.join("\n")
 }
 
@@ -179,6 +251,150 @@ fn setup_aborted_body(account_name: &str, backend_name: &str) -> String {
     format!(
         "Account secured in {backend_name}\nA top-up is required before making paid requests.\n$ {topup_cmd}"
     )
+}
+
+// ── Activation-campaign redemption ─────────────────────────────────────────
+
+#[derive(serde::Deserialize, Debug)]
+struct RedeemSuccess {
+    signature: String,
+    destination: String,
+    /// USDC funded by the activation campaign, formatted by pay-api
+    /// (e.g. `"$0.10"`). Optional so older API versions still
+    /// deserialize cleanly — the success notice just elides the
+    /// amount when missing.
+    #[serde(default)]
+    amount: Option<String>,
+}
+
+/// Pay-api may return a non-2xx with `{ "error": "...", "signature": "..." }`
+/// (the 409-already-redeemed case carries the prior signature). Capture
+/// both fields so we can route the user appropriately.
+#[derive(serde::Deserialize, Debug, Default)]
+struct RedeemErrorBody {
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    signature: Option<String>,
+}
+
+fn post_redeem(api_url: &str, code: &str, destination: &str) -> pay_core::Result<RedeemSuccess> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(REDEEM_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| pay_core::Error::Config(format!("Failed to build HTTP client: {e}")))?;
+
+    let body = serde_json::json!({ "code": code, "destination": destination });
+    let resp = client
+        .post(format!("{api_url}/v1/redeem"))
+        .json(&body)
+        .send()
+        .map_err(|e| pay_core::Error::Config(format!("pay-api {api_url} unreachable: {e}")))?;
+
+    let status = resp.status();
+    if status.is_success() {
+        let parsed: RedeemSuccess = resp.json().map_err(|e| {
+            pay_core::Error::Config(format!("pay-api returned malformed JSON: {e}"))
+        })?;
+        return Ok(parsed);
+    }
+
+    // Best-effort decode of the error body so the user sees the real reason.
+    let err_body: RedeemErrorBody = resp.json().unwrap_or_default();
+    let msg = err_body.error.unwrap_or_else(|| status.to_string());
+    if status.as_u16() == 409
+        && let Some(prior_sig) = err_body.signature
+    {
+        return Err(pay_core::Error::Config(format!(
+            "Code already redeemed. Prior transaction: {prior_sig}"
+        )));
+    }
+    Err(pay_core::Error::Config(format!(
+        "pay-api redemption failed ({status}): {msg}"
+    )))
+}
+
+fn print_redeem_success(
+    account_name: &str,
+    pubkey: &str,
+    response: &RedeemSuccess,
+    used_existing: bool,
+) {
+    // If the gateway funded a different address than the one we
+    // submitted (API bug, misconfiguration, tampered response), surface
+    // the mismatch and drop the success framing so the user isn't told
+    // the local account is funded when it isn't.
+    let destination_matches = response.destination == pubkey;
+
+    use owo_colors::OwoColorize;
+
+    let mut lines = Vec::new();
+    if destination_matches {
+        let suffix = match response.amount.as_deref() {
+            Some(amount) => format!(" 🎉 {}", amount.green().bold()),
+            None => " 🎉".to_string(),
+        };
+        let verb = if used_existing {
+            "funded (existing keypair)"
+        } else {
+            "funded"
+        };
+        lines.push(format!(
+            "Account `{account_name}` ({short}) {verb}{suffix}",
+            short = shorten_pubkey(pubkey),
+        ));
+    } else {
+        lines.push(format!(
+            "Gateway funded {gateway_dest}, not local pubkey {local_pk}.",
+            gateway_dest = response.destination,
+            local_pk = pubkey,
+        ));
+        lines.push(format!(
+            "Investigate before assuming `{account_name}` is usable — the funds did not land on \
+             this device's keypair."
+        ));
+    }
+    lines.push(format!(
+        "{} {sig}",
+        crate::components::solana_transaction_link(&response.signature, "mainnet"),
+        sig = response.signature,
+    ));
+
+    let (level, title) = if destination_matches {
+        (
+            crate::components::NoticeLevel::Success,
+            "Activation complete",
+        )
+    } else {
+        (
+            crate::components::NoticeLevel::Warning,
+            "Activation funded the wrong address",
+        )
+    };
+    crate::components::print_notice(level, title, &lines.join("\n"));
+
+    if destination_matches {
+        print_ready_hint();
+    }
+}
+
+/// Emit the "next step" hint as its own info notice (blue rail) so the
+/// callout reads as guidance, not a continuation of the success body.
+/// The title carries the white, non-dimmed copy; the body shows the
+/// command the user should try.
+fn print_ready_hint() {
+    crate::components::print_notice(
+        crate::components::NoticeLevel::Info,
+        "Ready to go. Time to make HTTP pay for itself.",
+        "$ claude -p \"what can i do with pay?\"",
+    );
+}
+
+fn shorten_pubkey(pk: &str) -> String {
+    if pk.len() <= 8 {
+        return pk.to_string();
+    }
+    format!("{}…{}", &pk[..4], &pk[pk.len() - 4..])
 }
 
 /// `pay setup --update`: re-install MCP configs and agent skill.
@@ -205,6 +421,11 @@ fn mcp_config_targets() -> Vec<(&'static str, std::path::PathBuf)> {
     // Claude Desktop
     if let Some(path) = claude_desktop_config_path() {
         targets.push(("Claude Desktop", path));
+    }
+
+    // Qoder IDE
+    if let Some(path) = qoder_ide_config_path() {
+        targets.push(("Qoder IDE", path));
     }
 
     targets
@@ -240,6 +461,42 @@ fn claude_desktop_config_path() -> Option<std::path::PathBuf> {
 
 fn codex_config_path() -> Option<std::path::PathBuf> {
     home_dir().map(|h| h.join(".codex").join("config.toml"))
+}
+
+/// Qoder IDE (the desktop app) reads its MCP server list from a shared
+/// client cache directory.
+fn qoder_ide_config_path() -> Option<std::path::PathBuf> {
+    qoder_ide_data_dir().map(|d| d.join("mcp.json"))
+}
+
+/// Shared client cache directory used by Qoder IDE.
+fn qoder_ide_data_dir() -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        home_dir().map(|h| {
+            h.join("Library")
+                .join("Application Support")
+                .join("Qoder")
+                .join("SharedClientCache")
+        })
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var("APPDATA").ok().map(|d| {
+            std::path::PathBuf::from(d)
+                .join("Qoder")
+                .join("SharedClientCache")
+        })
+    }
+    #[cfg(target_os = "linux")]
+    {
+        home_dir().map(|h| h.join(".config").join("Qoder").join("SharedClientCache"))
+    }
+}
+
+/// Path to qodercli's user-level settings file.
+fn qodercli_settings_path() -> Option<std::path::PathBuf> {
+    home_dir().map(|h| h.join(".qoder").join("settings.json"))
 }
 
 fn home_dir() -> Option<std::path::PathBuf> {
@@ -307,6 +564,34 @@ fn install_mcp_configs() {
             }
             Err(e) => {
                 eprintln!("  {} Failed to configure Codex: {e}", "!".yellow());
+            }
+        }
+    }
+
+    // Qoder CLI (`qodercli`): write pay MCP entry into
+    // ~/.qoder/settings.json so users who launch `qodercli` directly
+    // (without `pay qodercli`) also get pay MCP available.
+    if let Some(settings_path) = qodercli_settings_path()
+        && (settings_path.exists() || settings_path.parent().is_some_and(|d| d.exists()))
+    {
+        match add_qodercli_mcp_entry(&settings_path, &pay_bin) {
+            Ok(McpInstallResult::Added) => {
+                eprintln!("  {} pay MCP added to Qoder CLI", "\u{2714}".green());
+                installed_any = true;
+            }
+            Ok(McpInstallResult::AlreadyPresent) => {
+                eprintln!(
+                    "  {} pay MCP already configured in Qoder CLI",
+                    "\u{2714}".green()
+                );
+                installed_any = true;
+            }
+            Ok(McpInstallResult::Updated) => {
+                eprintln!("  {} pay MCP updated in Qoder CLI", "\u{2714}".green());
+                installed_any = true;
+            }
+            Err(e) => {
+                eprintln!("  {} Failed to configure Qoder CLI: {e}", "!".yellow());
             }
         }
     }
@@ -381,6 +666,65 @@ fn add_mcp_entry(config_path: &std::path::Path, pay_bin: &str) -> Result<McpInst
         let json = serde_json::to_string_pretty(&config).map_err(|e| format!("serialize: {e}"))?;
         std::fs::write(config_path, json + "\n")
             .map_err(|e| format!("write {}: {e}", config_path.display()))?;
+    }
+
+    Ok(result)
+}
+
+/// Add or update the `pay` MCP server entry in qodercli's settings.json.
+fn add_qodercli_mcp_entry(
+    settings_path: &std::path::Path,
+    pay_bin: &str,
+) -> Result<McpInstallResult, String> {
+    let mut config: serde_json::Value = if settings_path.exists() {
+        let raw = std::fs::read_to_string(settings_path)
+            .map_err(|e| format!("read {}: {e}", settings_path.display()))?;
+        if raw.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(&raw)
+                .map_err(|e| format!("parse {}: {e}", settings_path.display()))?
+        }
+    } else {
+        serde_json::json!({})
+    };
+
+    let servers = config
+        .as_object_mut()
+        .ok_or("settings is not a JSON object")?
+        .entry("mcpServers")
+        .or_insert_with(|| serde_json::json!({}));
+
+    let new_entry = serde_json::json!({
+        "command": pay_bin,
+        "args": ["mcp"]
+    });
+
+    let result = if let Some(existing) = servers.get("pay") {
+        let matches = existing.get("command").and_then(|v| v.as_str()) == Some(pay_bin)
+            && existing.get("args") == Some(&serde_json::json!(["mcp"]));
+        if matches {
+            McpInstallResult::AlreadyPresent
+        } else {
+            servers["pay"] = new_entry;
+            McpInstallResult::Updated
+        }
+    } else {
+        servers
+            .as_object_mut()
+            .ok_or("mcpServers is not an object")?
+            .insert("pay".to_string(), new_entry);
+        McpInstallResult::Added
+    };
+
+    if !matches!(result, McpInstallResult::AlreadyPresent) {
+        if let Some(parent) = settings_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create dir {}: {e}", parent.display()))?;
+        }
+        let json = serde_json::to_string_pretty(&config).map_err(|e| format!("serialize: {e}"))?;
+        std::fs::write(settings_path, json + "\n")
+            .map_err(|e| format!("write {}: {e}", settings_path.display()))?;
     }
 
     Ok(result)
@@ -667,5 +1011,77 @@ enabled = true
             add_codex_mcp_entry(&config_path, "pay").unwrap(),
             McpInstallResult::AlreadyPresent
         ));
+    }
+
+    #[test]
+    fn mcp_entry_creates_new_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("mcp.json");
+
+        let result = add_mcp_entry(&config_path, "/usr/local/bin/pay").unwrap();
+
+        assert!(matches!(result, McpInstallResult::Added));
+        let raw = std::fs::read_to_string(&config_path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["mcpServers"]["pay"]["command"], "/usr/local/bin/pay");
+        assert_eq!(v["mcpServers"]["pay"]["args"][0], "mcp");
+    }
+
+    #[test]
+    fn mcp_entry_already_present() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("mcp.json");
+
+        add_mcp_entry(&config_path, "/usr/local/bin/pay").unwrap();
+        let result = add_mcp_entry(&config_path, "/usr/local/bin/pay").unwrap();
+
+        assert!(matches!(result, McpInstallResult::AlreadyPresent));
+    }
+
+    #[test]
+    fn mcp_entry_updates_when_command_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("mcp.json");
+
+        add_mcp_entry(&config_path, "/old/path/pay").unwrap();
+        let result = add_mcp_entry(&config_path, "/new/path/pay").unwrap();
+
+        assert!(matches!(result, McpInstallResult::Updated));
+        let raw = std::fs::read_to_string(&config_path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["mcpServers"]["pay"]["command"], "/new/path/pay");
+    }
+
+    #[test]
+    fn qodercli_mcp_entry_creates_new_settings() {
+        let temp = tempfile::tempdir().unwrap();
+        let settings_path = temp.path().join("settings.json");
+
+        let result = add_qodercli_mcp_entry(&settings_path, "/usr/local/bin/pay").unwrap();
+
+        assert!(matches!(result, McpInstallResult::Added));
+        let raw = std::fs::read_to_string(&settings_path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["mcpServers"]["pay"]["command"], "/usr/local/bin/pay");
+        assert_eq!(v["mcpServers"]["pay"]["args"][0], "mcp");
+    }
+
+    #[test]
+    fn qodercli_mcp_entry_preserves_existing_servers() {
+        let temp = tempfile::tempdir().unwrap();
+        let settings_path = temp.path().join("settings.json");
+        std::fs::write(
+            &settings_path,
+            r#"{"mcpServers":{"other":{"command":"other-cmd","args":[]}}}"#,
+        )
+        .unwrap();
+
+        let result = add_qodercli_mcp_entry(&settings_path, "pay").unwrap();
+
+        assert!(matches!(result, McpInstallResult::Added));
+        let raw = std::fs::read_to_string(&settings_path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["mcpServers"]["other"]["command"], "other-cmd");
+        assert_eq!(v["mcpServers"]["pay"]["command"], "pay");
     }
 }

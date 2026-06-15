@@ -414,13 +414,11 @@ pub fn print_next_steps(
             eprintln!("  {} Account funded with {}", "✔".green(), amount.green());
         }
         eprintln!();
-        eprintln!(
-            "  {}",
-            "Ready to go. Time to make HTTP pay for itself.".dimmed()
+        crate::components::print_notice(
+            crate::components::NoticeLevel::Info,
+            "Ready to go. Time to make HTTP pay for itself.",
+            "$ claude -p \"what can i do with pay?\"",
         );
-        eprintln!();
-        eprintln!("  {}", "$ pay claude".bold());
-        eprintln!("  {}", "$ pay codex".bold());
     } else {
         eprintln!();
         crate::components::print_notice(
