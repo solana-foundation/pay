@@ -244,6 +244,7 @@ fn main() {
                 | Command::Send(_)
                 | Command::Claude(_)
                 | Command::Codex(_)
+                | Command::Qodercli(_)
                 | Command::Curl(_)
                 | Command::Wget(_)
                 | Command::Http(_)
