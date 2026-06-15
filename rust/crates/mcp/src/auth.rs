@@ -79,41 +79,7 @@ impl AuthGate for ElicitationAuth {
                 })
             });
 
-        match outcome {
-            Ok(res) => match res.action {
-                ElicitationAction::Accept => {
-                    // The action being `Accept` is the primary authoritative
-                    // signal. We also honor an explicit `approved: false` in
-                    // the content payload — that combination shouldn't happen
-                    // (the schema declares `approved` as required-bool, so
-                    // form-rendering clients can't produce `Accept` with a
-                    // negative answer) but a buggy or hostile client might,
-                    // and we'd rather deny than admit on conflicting input.
-                    let explicitly_denied = res
-                        .content
-                        .as_ref()
-                        .and_then(|v| v.get("approved"))
-                        .and_then(|v| v.as_bool())
-                        .map(|b| !b)
-                        .unwrap_or(false);
-                    if explicitly_denied {
-                        return Err(KeystoreError::AuthDenied(
-                            "MCP client returned Accept but content.approved=false".to_string(),
-                        ));
-                    }
-                    Ok(())
-                }
-                ElicitationAction::Decline => Err(KeystoreError::AuthDenied(
-                    "user declined the request via the MCP client".to_string(),
-                )),
-                ElicitationAction::Cancel => Err(KeystoreError::AuthDenied(
-                    "user cancelled the request via the MCP client".to_string(),
-                )),
-            },
-            Err(err) => Err(KeystoreError::AuthDenied(format!(
-                "elicitation transport failed: {err}"
-            ))),
-        }
+        interpret_elicitation_outcome(outcome)
     }
 
     fn is_available(&self) -> bool {
@@ -121,6 +87,53 @@ impl AuthGate for ElicitationAuth {
         // transport failure as AuthDenied anyway, and is_available() is
         // called from contexts where blocking is undesirable.
         true
+    }
+}
+
+/// Map the result of an elicitation round-trip to an auth decision.
+///
+/// Pure and transport-free so the decision logic can be unit-tested without
+/// a live rmcp peer (the full round-trip is covered by `tests/elicitation_e2e`).
+/// Any non-`Accept` outcome is treated as "user did not approve":
+/// - `Decline` / `Cancel` → [`KeystoreError::AuthDenied`],
+/// - a transport/timeout error → `AuthDenied`,
+/// - even an `Accept` that carries `content.approved=false` → `AuthDenied`.
+///
+/// `Accept` is the primary authoritative signal. The explicit
+/// `approved=false` guard shouldn't trigger (the schema declares `approved`
+/// as a required bool, so a form-rendering client can't produce `Accept`
+/// with a negative answer), but a buggy or hostile client might — and we'd
+/// rather deny than admit on conflicting input.
+fn interpret_elicitation_outcome(
+    outcome: Result<CreateElicitationResult, rmcp::ServiceError>,
+) -> Result<(), KeystoreError> {
+    match outcome {
+        Ok(res) => match res.action {
+            ElicitationAction::Accept => {
+                let explicitly_denied = res
+                    .content
+                    .as_ref()
+                    .and_then(|v| v.get("approved"))
+                    .and_then(|v| v.as_bool())
+                    .map(|b| !b)
+                    .unwrap_or(false);
+                if explicitly_denied {
+                    return Err(KeystoreError::AuthDenied(
+                        "MCP client returned Accept but content.approved=false".to_string(),
+                    ));
+                }
+                Ok(())
+            }
+            ElicitationAction::Decline => Err(KeystoreError::AuthDenied(
+                "user declined the request via the MCP client".to_string(),
+            )),
+            ElicitationAction::Cancel => Err(KeystoreError::AuthDenied(
+                "user cancelled the request via the MCP client".to_string(),
+            )),
+        },
+        Err(err) => Err(KeystoreError::AuthDenied(format!(
+            "elicitation transport failed: {err}"
+        ))),
     }
 }
 
@@ -178,5 +191,65 @@ mod tests {
             props.get("approved").is_some(),
             "schema should expose `approved` boolean: {json}",
         );
+    }
+
+    fn result(
+        action: ElicitationAction,
+        content: Option<serde_json::Value>,
+    ) -> CreateElicitationResult {
+        CreateElicitationResult { action, content }
+    }
+
+    #[test]
+    fn accept_without_content_is_approved() {
+        let out = interpret_elicitation_outcome(Ok(result(ElicitationAction::Accept, None)));
+        assert!(out.is_ok());
+    }
+
+    #[test]
+    fn accept_with_approved_true_is_approved() {
+        let res = result(
+            ElicitationAction::Accept,
+            Some(serde_json::json!({ "approved": true })),
+        );
+        assert!(interpret_elicitation_outcome(Ok(res)).is_ok());
+    }
+
+    #[test]
+    fn accept_with_approved_false_is_denied() {
+        // Defense-in-depth: an Accept that nonetheless carries approved=false
+        // must be denied, not admitted.
+        let res = result(
+            ElicitationAction::Accept,
+            Some(serde_json::json!({ "approved": false })),
+        );
+        assert!(matches!(
+            interpret_elicitation_outcome(Ok(res)),
+            Err(KeystoreError::AuthDenied(_))
+        ));
+    }
+
+    #[test]
+    fn decline_is_denied() {
+        assert!(matches!(
+            interpret_elicitation_outcome(Ok(result(ElicitationAction::Decline, None))),
+            Err(KeystoreError::AuthDenied(_))
+        ));
+    }
+
+    #[test]
+    fn cancel_is_denied() {
+        assert!(matches!(
+            interpret_elicitation_outcome(Ok(result(ElicitationAction::Cancel, None))),
+            Err(KeystoreError::AuthDenied(_))
+        ));
+    }
+
+    #[test]
+    fn transport_error_is_denied() {
+        let out = interpret_elicitation_outcome(Err(rmcp::ServiceError::Timeout {
+            timeout: Duration::from_secs(1),
+        }));
+        assert!(matches!(out, Err(KeystoreError::AuthDenied(_))));
     }
 }
