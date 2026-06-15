@@ -222,8 +222,30 @@ pub async fn payment_middleware<S: PaymentState>(
 
     let mpps = state.mpps();
     if mpps.is_empty() {
-        tracing::warn!("Metered endpoint hit but MPP not configured — passing through");
-        return next.run(req).await;
+        // Fail closed (issue #373): this endpoint declares a price, but the
+        // server has no MPP payment backend configured, so we can neither
+        // issue a 402 challenge nor verify a credential. Forwarding to the
+        // protected upstream would serve a paid resource for free, turning a
+        // misconfiguration into a silent fail-open. Reject with a server error
+        // and an error-level event instead.
+        //
+        // This does not affect local development: `pay --sandbox server start`
+        // auto-configures an ephemeral MPP, and a non-sandbox boot without a
+        // resolvable signer/recipient already fails at startup.
+        tracing::error!(
+            subdomain = %subdomain,
+            path = %path,
+            "Metered endpoint hit but no MPP payment backend is configured — failing closed",
+        );
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({
+                "error": "payment_backend_unconfigured",
+                "message": "This endpoint requires payment, but the server has no payment backend \
+                    configured. Failing closed instead of serving the resource without payment.",
+            })),
+        )
+            .into_response();
     }
 
     match auth_header {

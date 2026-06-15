@@ -619,10 +619,12 @@ async fn middleware_garbage_auth_includes_message() {
 // =============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn middleware_passes_through_without_mpp() {
+async fn middleware_fails_closed_without_mpp() {
     let (url, _h) = start_test_server(false).await;
     let client = reqwest::Client::new();
-    // Metered endpoint but no MPP → pass through
+    // Metered endpoint but no MPP configured → fail closed (issue #373).
+    // Forwarding here would serve a paid resource for free, so the
+    // middleware must reject rather than pass through.
     let resp = client
         .post(format!("{url}/v1/simple/echo"))
         .headers(client_with_host("testapi"))
@@ -630,7 +632,13 @@ async fn middleware_passes_through_without_mpp() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.status(),
+        500,
+        "metered endpoint with no payment backend must fail closed, not pass through"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"], "payment_backend_unconfigured");
 }
 
 // =============================================================================
