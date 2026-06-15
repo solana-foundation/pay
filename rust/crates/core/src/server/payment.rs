@@ -247,6 +247,12 @@ pub async fn payment_middleware<S: PaymentState>(
             handle_charge_authorization(
                 &mpps,
                 auth_value,
+                meter,
+                api,
+                &props,
+                variant_hint.as_deref(),
+                &uri,
+                endpoint.and_then(|ep| ep.description.as_deref()),
                 subdomain,
                 &path,
                 state.fee_payer_wallet().cloned(),
@@ -881,6 +887,20 @@ fn subscription_challenge_response(
     challenge_json_response(body, &www_auths)
 }
 
+/// Per-unit charge amount (USD, as a decimal string) derived from the
+/// resolved price; falls back to "0.01" when no price is configured. Shared
+/// by the 402-issuing and verify paths so the advertised and expected amounts
+/// always match.
+fn charge_amount_from_price(price: Option<&metering::ResolvedPrice>) -> String {
+    price
+        .and_then(|p| p.dimensions.first())
+        .map(|d| {
+            let per_unit = d.price_usd / d.scale.max(1) as f64;
+            format!("{}", per_unit)
+        })
+        .unwrap_or_else(|| "0.01".to_string())
+}
+
 fn charge_challenge_response(
     mpps: &[&solana_mpp::server::Mpp],
     meter: &pay_types::metering::Metering,
@@ -891,14 +911,7 @@ fn charge_challenge_response(
     description: Option<&str>,
 ) -> Response {
     let price = metering::resolve_price(meter, props, variant_hint, None);
-    let amount = price
-        .as_ref()
-        .and_then(|p| p.dimensions.first())
-        .map(|d| {
-            let per_unit = d.price_usd / d.scale.max(1) as f64;
-            format!("{}", per_unit)
-        })
-        .unwrap_or_else(|| "0.01".to_string());
+    let amount = charge_amount_from_price(price.as_ref());
     let mut challenges = Vec::with_capacity(mpps.len());
     for mpp in mpps {
         let splits = resolve_charge_splits(mpp, meter, api, request.uri, &amount);
@@ -1020,9 +1033,16 @@ fn resolve_charge_splits(
     skip(mpps, auth_value, fee_payer_wallet, req, next),
     fields(subdomain = %subdomain, path = %path)
 )]
+#[allow(clippy::too_many_arguments)]
 async fn handle_charge_authorization(
     mpps: &[&solana_mpp::server::Mpp],
     auth_value: &str,
+    meter: &pay_types::metering::Metering,
+    api: &pay_types::metering::ApiSpec,
+    props: &RequestProperties,
+    variant_hint: Option<&str>,
+    uri: &axum::http::Uri,
+    description: Option<&str>,
     subdomain: &str,
     path: &str,
     fee_payer_wallet: Option<telemetry::FeePayerWallet>,
@@ -1041,9 +1061,43 @@ async fn handle_charge_authorization(
         }
     };
 
+    let amount = charge_amount_from_price(
+        metering::resolve_price(meter, props, variant_hint, None).as_ref(),
+    );
+
     let mut last_error = None;
     for mpp in mpps {
-        match mpp.verify_credential(&credential).await {
+        // Audit #2: verify the credential against the request WE would issue
+        // for this route — rebuilt from our own price + splits config — rather
+        // than trusting the values echoed back in the client's credential.
+        let expected: solana_mpp::ChargeRequest = match mpp.charge_with_options(
+            &amount,
+            solana_mpp::server::ChargeOptions {
+                description,
+                splits: resolve_charge_splits(mpp, meter, api, uri, &amount),
+                ..Default::default()
+            },
+        ) {
+            Ok(challenge) => match challenge.request.decode() {
+                Ok(req) => req,
+                Err(e) => {
+                    last_error = Some(solana_mpp::server::VerificationError::new(format!(
+                        "failed to decode expected charge request: {e}"
+                    )));
+                    continue;
+                }
+            },
+            Err(e) => {
+                last_error = Some(solana_mpp::server::VerificationError::new(format!(
+                    "failed to rebuild expected charge challenge: {e}"
+                )));
+                continue;
+            }
+        };
+        match mpp
+            .verify_credential_with_expected(&credential, &expected)
+            .await
+        {
             Ok(receipt) => {
                 let payment = decode_payment_amount(&credential, mpp.decimals() as u8);
                 telemetry::record_payment_collected(
@@ -1226,7 +1280,7 @@ mod tests {
             decimals: 6,
             network: "localnet".to_string(),
             rpc_url: Some("http://localhost:8899".to_string()),
-            challenge_binding_secret: Some("test-secret".to_string()),
+            challenge_binding_secret: Some("test-secret-key-do-not-use-32b-pad".to_string()),
             ..Default::default()
         })
         .expect("test MPP config should be valid")
@@ -1243,7 +1297,7 @@ mod tests {
                 modes: vec![solana_mpp::SessionMode::Push, solana_mpp::SessionMode::Pull],
                 ..SessionConfig::default()
             },
-            "test-secret",
+            "test-secret-key-do-not-use-32b-pad",
         )
     }
 

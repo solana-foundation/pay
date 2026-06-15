@@ -707,11 +707,13 @@ mod tests {
             "accepts": [selected],
             "extensions": {
                 "sign-in-with-x": {
-                    "domain": "api.example.com",
-                    "uri": "https://api.example.com",
-                    "version": "1",
-                    "nonce": "nonce-123",
-                    "issuedAt": "2026-04-27T00:00:00Z",
+                    "info": {
+                        "domain": "api.example.com",
+                        "uri": "https://api.example.com",
+                        "version": "1",
+                        "nonce": "nonce-123",
+                        "issuedAt": "2026-04-27T00:00:00Z"
+                    },
                     "supportedChains": [{
                         "chainId": SOLANA_MAINNET,
                         "type": "ed25519",
@@ -827,11 +829,13 @@ mod tests {
             "accepts": [],
             "extensions": {
                 "sign-in-with-x": {
-                    "domain": "api.example.com",
-                    "uri": "https://api.example.com",
-                    "version": "1",
-                    "nonce": "nonce-123",
-                    "issuedAt": "2026-04-27T00:00:00Z",
+                    "info": {
+                        "domain": "api.example.com",
+                        "uri": "https://api.example.com",
+                        "version": "1",
+                        "nonce": "nonce-123",
+                        "issuedAt": "2026-04-27T00:00:00Z"
+                    },
                     "supportedChains": [{
                         "chainId": SOLANA_MAINNET,
                         "type": "ed25519",
@@ -859,11 +863,13 @@ mod tests {
             "accepts": [],
             "extensions": {
                 "sign-in-with-x": {
-                    "domain": "api.example.com",
-                    "uri": "https://api.example.com",
-                    "version": "1",
-                    "nonce": "nonce-from-body",
-                    "issuedAt": "2026-04-27T00:00:00Z",
+                    "info": {
+                        "domain": "api.example.com",
+                        "uri": "https://api.example.com",
+                        "version": "1",
+                        "nonce": "nonce-from-body",
+                        "issuedAt": "2026-04-27T00:00:00Z"
+                    },
                     "supportedChains": [{
                         "chainId": SOLANA_DEVNET,
                         "type": "ed25519",
@@ -894,11 +900,13 @@ mod tests {
             "accepts": [selected],
             "extensions": {
                 "sign-in-with-x": {
-                    "domain": "api.example.com",
-                    "uri": "https://api.example.com",
-                    "version": "1",
-                    "nonce": "nonce-123",
-                    "issuedAt": "2026-04-27T00:00:00Z",
+                    "info": {
+                        "domain": "api.example.com",
+                        "uri": "https://api.example.com",
+                        "version": "1",
+                        "nonce": "nonce-123",
+                        "issuedAt": "2026-04-27T00:00:00Z"
+                    },
                     "supportedChains": [{
                         "chainId": SOLANA_MAINNET,
                         "type": "ed25519",
@@ -932,10 +940,12 @@ mod tests {
             "accepts": [selected],
             "extensions": {
                 "sign-in-with-x": {
-                    "domain": "api.example.com",
-                    "uri": "https://api.example.com",
-                    "version": "1",
-                    "issuedAt": "2026-04-27T00:00:00Z",
+                    "info": {
+                        "domain": "api.example.com",
+                        "uri": "https://api.example.com",
+                        "version": "1",
+                        "issuedAt": "2026-04-27T00:00:00Z"
+                    },
                     "supportedChains": []
                 }
             }

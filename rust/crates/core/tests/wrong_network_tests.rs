@@ -75,7 +75,7 @@ async fn start_server_with_network(network: &str) -> (String, tokio::task::JoinH
         network: network.to_string(),
         // Unreachable RPC — the test must error before any RPC call.
         rpc_url: Some("http://127.0.0.1:1/never".to_string()),
-        challenge_binding_secret: Some("test-secret-key-do-not-use".to_string()),
+        challenge_binding_secret: Some("test-secret-key-do-not-use-32b-pad".to_string()),
         ..Default::default()
     })
     .unwrap();
