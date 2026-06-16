@@ -241,8 +241,7 @@ pub async fn payment_middleware<S: PaymentState>(
             StatusCode::INTERNAL_SERVER_ERROR,
             axum::Json(json!({
                 "error": "payment_backend_unconfigured",
-                "message": "This endpoint requires payment, but the server has no payment backend \
-                    configured. Failing closed instead of serving the resource without payment.",
+                "message": "This endpoint requires payment, but the server has no payment backend configured. Failing closed instead of serving the resource without payment.",
             })),
         )
             .into_response();
