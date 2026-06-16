@@ -105,8 +105,16 @@ pub fn resolve_pr(repo: &str, pr: u32) -> Result<PrInfo> {
     let body: PrResponse = resp
         .json()
         .map_err(|e| Error::Config(format!("parse pr response: {e}")))?;
+    // GitHub returns `head.repo: null` once the PR's source fork is
+    // deleted. The commit is still reachable through the base repo's
+    // refs/pull/<N>/head, so fall back rather than failing on parse.
+    let head_repo = body
+        .head
+        .repo
+        .map(|r| r.full_name)
+        .unwrap_or_else(|| repo.to_string());
     Ok(PrInfo {
-        head_repo: body.head.repo.full_name,
+        head_repo,
         head_sha: body.head.sha,
         head_ref: body.head.r#ref,
         merged: body.merged,
@@ -303,7 +311,11 @@ struct PrResponse {
 struct PrHead {
     sha: String,
     r#ref: String,
-    repo: PrHeadRepo,
+    /// `head.repo` is `null` when the PR's source fork has been deleted.
+    /// The base repo still serves the head SHA via `refs/pull/<N>/head`,
+    /// so we fall back to the base repo in `resolve_pr`.
+    #[serde(default)]
+    repo: Option<PrHeadRepo>,
 }
 
 #[derive(Deserialize)]
@@ -379,5 +391,32 @@ mod tests {
         assert!(validate_blob_sha("a".repeat(40).as_str()).is_ok());
         assert!(validate_blob_sha("zzz1234").is_err());
         assert!(validate_blob_sha("short").is_err());
+    }
+
+    #[test]
+    fn pr_head_deserializes_with_null_repo() {
+        // GitHub returns `head.repo: null` after the source fork is
+        // deleted. The deserializer must accept it so `resolve_pr`
+        // can fall back to the base repo for blob fetches.
+        let raw = r#"{
+            "merged": false,
+            "head": { "sha": "abc1234", "ref": "feat/x", "repo": null }
+        }"#;
+        let pr: PrResponse = serde_json::from_str(raw).expect("null head.repo must parse");
+        assert!(pr.head.repo.is_none());
+        assert_eq!(pr.head.sha, "abc1234");
+
+        // …and when `head.repo` is missing entirely, same fallback.
+        let raw = r#"{ "merged": true, "head": { "sha": "def5678", "ref": "feat/y" } }"#;
+        let pr: PrResponse = serde_json::from_str(raw).expect("missing head.repo must parse");
+        assert!(pr.head.repo.is_none());
+
+        // Populated repo still parses through.
+        let raw = r#"{
+            "merged": false,
+            "head": { "sha": "1", "ref": "x", "repo": { "full_name": "fork/repo" } }
+        }"#;
+        let pr: PrResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(pr.head.repo.unwrap().full_name, "fork/repo");
     }
 }
