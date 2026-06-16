@@ -2,6 +2,7 @@ pub mod endpoints;
 pub mod install;
 pub mod list;
 pub mod provider;
+pub mod prune;
 pub mod remove;
 pub mod search;
 pub mod update;
@@ -24,6 +25,8 @@ pub enum SkillsCommand {
     List,
     /// Refresh the local skills cache from all sources.
     Update(update::UpdateCommand),
+    /// Drop pinned providers whose PRs have been merged upstream.
+    PruneMerged(prune::PruneMergedCommand),
     /// Manage providers in the registry.
     Provider {
         #[command(subcommand)]
@@ -40,6 +43,7 @@ impl SkillsCommand {
             Self::Remove(cmd) => cmd.run(),
             Self::List => list::run(),
             Self::Update(cmd) => cmd.run(),
+            Self::PruneMerged(cmd) => cmd.run(),
             Self::Provider { command } => command.run(),
         }
     }

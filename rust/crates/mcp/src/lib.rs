@@ -1,7 +1,10 @@
 //! MCP server for pay — exposes HTTP tools with 402 payment support.
 
+mod auth;
 mod server;
 mod tools;
+
+pub use auth::ElicitationAuth;
 
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;

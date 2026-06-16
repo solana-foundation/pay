@@ -61,6 +61,26 @@ pub fn build_credential(
     account_override: Option<&str>,
     resource_url: Option<&str>,
 ) -> Result<(String, Option<ResolvedEphemeral>)> {
+    build_credential_with_override(
+        challenge,
+        store,
+        network_override,
+        account_override,
+        resource_url,
+        None,
+    )
+}
+
+/// Variant of [`build_credential`] that accepts an optional auth-gate
+/// override threaded down to the signer.
+pub fn build_credential_with_override(
+    challenge: &Challenge,
+    store: &dyn AccountsStore,
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+    resource_url: Option<&str>,
+    auth_override: crate::signer::AuthOverride,
+) -> Result<(String, Option<ResolvedEphemeral>)> {
     let request: ChargeRequest = challenge
         .request
         .decode()
@@ -113,13 +133,15 @@ pub fn build_credential(
         .map(str::to_string)
         .unwrap_or(challenge_network);
 
-    let (signer, ephemeral_notice) = crate::signer::load_signer_for_network_payment_with_intent(
-        &network,
-        store,
-        account_override,
-        &amount,
-        &intent,
-    )?;
+    let (signer, ephemeral_notice) =
+        crate::signer::load_signer_for_network_payment_with_intent_and_override(
+            &network,
+            store,
+            account_override,
+            &amount,
+            &intent,
+            auth_override,
+        )?;
 
     let rpc_url = resolve_rpc_url(&network, embedded_blockhash);
     let rpc = RpcClient::new(rpc_url.clone());

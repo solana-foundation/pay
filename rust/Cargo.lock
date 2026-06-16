@@ -5363,7 +5363,7 @@ version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "680998035259dcfcafe653688bf2aa6d3e2dc05e98be6ab46afb089dc84f1df8"
 dependencies = [
- "proc-macro-crate 3.5.0",
+ "proc-macro-crate 1.3.1",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -5686,7 +5686,7 @@ checksum = "b867cad97c0791bbd3aaa6472142568c6c9e8f71937e98379f584cfb0cf35bec"
 
 [[package]]
 name = "pay"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -5736,7 +5736,7 @@ dependencies = [
 
 [[package]]
 name = "pay-core"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -5787,7 +5787,7 @@ dependencies = [
 
 [[package]]
 name = "pay-integration"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "base64 0.22.1",
  "pay-core",
@@ -5798,7 +5798,7 @@ dependencies = [
 
 [[package]]
 name = "pay-keystore"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "bs58",
  "secret-service",
@@ -5815,7 +5815,7 @@ dependencies = [
 
 [[package]]
 name = "pay-mcp"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "base64 0.22.1",
  "crc32fast",
@@ -5837,7 +5837,7 @@ dependencies = [
 
 [[package]]
 name = "pay-pdb"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -5859,7 +5859,7 @@ dependencies = [
 
 [[package]]
 name = "pay-types"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "schemars 0.8.22",
  "serde",
@@ -5870,7 +5870,7 @@ dependencies = [
 [[package]]
 name = "payment-channels-client"
 version = "0.1.0"
-source = "git+https://github.com/solana-foundation/pay-kit?branch=main#9023539292da427206cf4ccbd06798e55c9a1233"
+source = "git+https://github.com/solana-foundation/pay-kit?branch=main#7dcccfd9bfae7bed223666af31211ea586348953"
 dependencies = [
  "borsh 1.6.1",
  "num-derive",
@@ -6905,6 +6905,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
  "tokio-util 0.7.18",
  "tracing",
 ]
@@ -9250,7 +9251,7 @@ dependencies = [
 [[package]]
 name = "solana-mpp"
 version = "0.6.0"
-source = "git+https://github.com/solana-foundation/pay-kit?branch=main#9023539292da427206cf4ccbd06798e55c9a1233"
+source = "git+https://github.com/solana-foundation/pay-kit?branch=main#7dcccfd9bfae7bed223666af31211ea586348953"
 dependencies = [
  "base64 0.22.1",
  "bincode",
@@ -11325,7 +11326,7 @@ dependencies = [
 [[package]]
 name = "solana-x402"
 version = "0.1.0"
-source = "git+https://github.com/solana-foundation/pay-kit?branch=main#9023539292da427206cf4ccbd06798e55c9a1233"
+source = "git+https://github.com/solana-foundation/pay-kit?branch=main#7dcccfd9bfae7bed223666af31211ea586348953"
 dependencies = [
  "base64 0.22.1",
  "bincode",
@@ -13274,7 +13275,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

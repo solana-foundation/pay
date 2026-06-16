@@ -97,6 +97,26 @@ pub fn build_payment(
     account_override: Option<&str>,
     resource_url: Option<&str>,
 ) -> Result<BuiltPayment> {
+    build_payment_with_override(
+        challenge,
+        store,
+        network_override,
+        account_override,
+        resource_url,
+        None,
+    )
+}
+
+/// Variant of [`build_payment`] that accepts an optional auth-gate override
+/// threaded down to the signer.
+pub fn build_payment_with_override(
+    challenge: &Challenge,
+    store: &dyn AccountsStore,
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+    resource_url: Option<&str>,
+    auth_override: crate::signer::AuthOverride,
+) -> Result<BuiltPayment> {
     let requirements = &challenge.requirements;
     let amount = format_amount(&requirements.amount, &requirements.currency);
     let prompt_context = crate::client::prompt::payment_prompt_context(
@@ -141,13 +161,15 @@ pub fn build_payment(
     let user_opted_into_sandbox = network_override.is_some() || cluster == "localnet";
     let network = network_override.map(str::to_string).unwrap_or(cluster);
 
-    let (signer, ephemeral_notice) = crate::signer::load_signer_for_network_payment_with_intent(
-        &network,
-        store,
-        account_override,
-        &amount,
-        &intent,
-    )?;
+    let (signer, ephemeral_notice) =
+        crate::signer::load_signer_for_network_payment_with_intent_and_override(
+            &network,
+            store,
+            account_override,
+            &amount,
+            &intent,
+            auth_override,
+        )?;
 
     let rpc_url = std::env::var("PAY_RPC_URL").unwrap_or_else(|_| {
         if surfpool_detected {
@@ -230,6 +252,26 @@ pub fn build_siwx_auth_header(
     account_override: Option<&str>,
     resource_url: Option<&str>,
 ) -> Result<BuiltPayment> {
+    build_siwx_auth_header_with_override(
+        challenge,
+        store,
+        network_override,
+        account_override,
+        resource_url,
+        None,
+    )
+}
+
+/// Variant of [`build_siwx_auth_header`] that accepts an optional auth-gate
+/// override threaded down to the signer.
+pub fn build_siwx_auth_header_with_override(
+    challenge: &SiwxAuthChallenge,
+    store: &dyn AccountsStore,
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+    resource_url: Option<&str>,
+    auth_override: crate::signer::AuthOverride,
+) -> Result<BuiltPayment> {
     let preferred_chain_id = network_override.and_then(siwx_chain_id_for_network);
     let chain = solana_x402::siwx::select_siwx_chain(
         &challenge.extension,
@@ -244,12 +286,15 @@ pub fn build_siwx_auth_header(
         .unwrap_or_else(|| normalize_network(&chain.chain_id));
     let desc = crate::client::prompt::payment_description(None, &[resource_url]);
     let reason = format!("authorize sign-in for {desc}");
-    let (signer, ephemeral_notice) = crate::signer::load_signer_for_network_with_reason(
-        &network,
-        store,
-        account_override,
-        &reason,
-    )?;
+    let intent = crate::keystore::AuthIntent::from_reason(&reason);
+    let (signer, ephemeral_notice) =
+        crate::signer::load_signer_for_network_with_intent_and_override(
+            &network,
+            store,
+            account_override,
+            &intent,
+            auth_override,
+        )?;
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -662,11 +707,13 @@ mod tests {
             "accepts": [selected],
             "extensions": {
                 "sign-in-with-x": {
-                    "domain": "api.example.com",
-                    "uri": "https://api.example.com",
-                    "version": "1",
-                    "nonce": "nonce-123",
-                    "issuedAt": "2026-04-27T00:00:00Z",
+                    "info": {
+                        "domain": "api.example.com",
+                        "uri": "https://api.example.com",
+                        "version": "1",
+                        "nonce": "nonce-123",
+                        "issuedAt": "2026-04-27T00:00:00Z"
+                    },
                     "supportedChains": [{
                         "chainId": SOLANA_MAINNET,
                         "type": "ed25519",
@@ -782,11 +829,13 @@ mod tests {
             "accepts": [],
             "extensions": {
                 "sign-in-with-x": {
-                    "domain": "api.example.com",
-                    "uri": "https://api.example.com",
-                    "version": "1",
-                    "nonce": "nonce-123",
-                    "issuedAt": "2026-04-27T00:00:00Z",
+                    "info": {
+                        "domain": "api.example.com",
+                        "uri": "https://api.example.com",
+                        "version": "1",
+                        "nonce": "nonce-123",
+                        "issuedAt": "2026-04-27T00:00:00Z"
+                    },
                     "supportedChains": [{
                         "chainId": SOLANA_MAINNET,
                         "type": "ed25519",
@@ -814,11 +863,13 @@ mod tests {
             "accepts": [],
             "extensions": {
                 "sign-in-with-x": {
-                    "domain": "api.example.com",
-                    "uri": "https://api.example.com",
-                    "version": "1",
-                    "nonce": "nonce-from-body",
-                    "issuedAt": "2026-04-27T00:00:00Z",
+                    "info": {
+                        "domain": "api.example.com",
+                        "uri": "https://api.example.com",
+                        "version": "1",
+                        "nonce": "nonce-from-body",
+                        "issuedAt": "2026-04-27T00:00:00Z"
+                    },
                     "supportedChains": [{
                         "chainId": SOLANA_DEVNET,
                         "type": "ed25519",
@@ -849,11 +900,13 @@ mod tests {
             "accepts": [selected],
             "extensions": {
                 "sign-in-with-x": {
-                    "domain": "api.example.com",
-                    "uri": "https://api.example.com",
-                    "version": "1",
-                    "nonce": "nonce-123",
-                    "issuedAt": "2026-04-27T00:00:00Z",
+                    "info": {
+                        "domain": "api.example.com",
+                        "uri": "https://api.example.com",
+                        "version": "1",
+                        "nonce": "nonce-123",
+                        "issuedAt": "2026-04-27T00:00:00Z"
+                    },
                     "supportedChains": [{
                         "chainId": SOLANA_MAINNET,
                         "type": "ed25519",
@@ -887,10 +940,12 @@ mod tests {
             "accepts": [selected],
             "extensions": {
                 "sign-in-with-x": {
-                    "domain": "api.example.com",
-                    "uri": "https://api.example.com",
-                    "version": "1",
-                    "issuedAt": "2026-04-27T00:00:00Z",
+                    "info": {
+                        "domain": "api.example.com",
+                        "uri": "https://api.example.com",
+                        "version": "1",
+                        "issuedAt": "2026-04-27T00:00:00Z"
+                    },
                     "supportedChains": []
                 }
             }

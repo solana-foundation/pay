@@ -5,7 +5,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2024"
-version = "0.18.0"
+version = "0.19.0"
 license = "MIT"
 
 [workspace.dependencies]
@@ -42,7 +42,7 @@ dialoguer = "0.12"
 chrono = "0.4"
 
 # MCP
-rmcp = { version = "0.9", features = ["server", "transport-io"] }
+rmcp = { version = "0.9", features = ["server", "transport-io", "elicitation", "schemars"] }
 schemars = "0.8"
 
 # TUI

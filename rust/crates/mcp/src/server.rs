@@ -52,8 +52,9 @@ and does not submit the request or payment.
     async fn curl(
         &self,
         Parameters(params): Parameters<tools::curl::Params>,
+        peer: rmcp::Peer<rmcp::service::RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        tools::curl::run(params).await
+        tools::curl::run(params, peer).await
     }
 
     #[tool(

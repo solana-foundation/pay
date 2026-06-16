@@ -52,7 +52,7 @@ fn defaults<'a>() -> sub_server::OperatorDefaults<'a> {
         recipient: OPERATOR,
         network: "localnet",
         rpc_url: "http://localhost:8899",
-        challenge_binding_secret: Some("test-secret"),
+        challenge_binding_secret: Some("test-secret-key-do-not-use-32b-pad"),
         realm: Some("test-realm"),
         fee_payer: false,
         fee_payer_signer: None,

@@ -14,8 +14,11 @@
 
 pub mod build;
 pub mod config;
+pub mod github;
 pub mod local;
 pub mod openapi;
+pub mod overlay;
+pub mod pin;
 pub mod probe;
 
 use std::collections::BTreeMap;
@@ -995,6 +998,7 @@ pub async fn load_skills() -> Result<Catalog> {
             if cfg.has_ephemeral_sources() {
                 merge_ephemeral_into(&mut catalog, &cfg).await;
             }
+            overlay::merge_pins_into(&mut catalog);
             return Ok(catalog);
         }
         tracing::warn!(path = %path.display(), "Ignoring empty skills cache");
@@ -1012,6 +1016,7 @@ pub async fn load_skills() -> Result<Catalog> {
             if cfg.has_ephemeral_sources() {
                 merge_ephemeral_into(&mut catalog, &cfg).await;
             }
+            overlay::merge_pins_into(&mut catalog);
             Ok(catalog)
         }
         Err(fetch_err) => {
@@ -1060,6 +1065,7 @@ pub async fn update_skills(cache_bust: bool) -> Result<Catalog> {
     if cfg.has_ephemeral_sources() {
         merge_ephemeral_into(&mut catalog, &cfg).await;
     }
+    overlay::merge_pins_into(&mut catalog);
     Ok(catalog)
 }
 

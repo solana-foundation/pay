@@ -541,7 +541,7 @@ mod tests {
             recipient: "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
             network: "mainnet",
             rpc_url: "https://api.mainnet-beta.solana.com",
-            challenge_binding_secret: Some("test-secret"),
+            challenge_binding_secret: Some("test-secret-key-do-not-use-32b-pad"),
             realm: Some("test-realm"),
             fee_payer: false,
             fee_payer_signer: None,

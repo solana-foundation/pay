@@ -130,6 +130,50 @@ impl Keystore {
         windows::WindowsHelloAuth::is_available()
     }
 
+    /// True when any platform biometric gate (Touch ID / Windows Hello /
+    /// polkit) is usable on this machine. Cross-platform; used by
+    /// callers that want to fall back to a remote approval channel
+    /// (e.g. MCP elicitation) only when no local biometric exists.
+    pub fn any_biometric_available() -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            if Self::apple_touchid_available() {
+                return true;
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if Self::gnome_keyring_available() {
+                return true;
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            if Self::windows_hello_available() {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Construct a keystore from already-boxed auth and store implementations.
+    ///
+    /// Useful when callers hold a `Box<dyn AuthGate + Send + Sync>` (e.g. an
+    /// auth-gate override threaded down from a higher layer) and need to pair
+    /// it with a platform-specific store without re-boxing through
+    /// [`Keystore::new`]'s `impl AuthGate + 'static` parameter.
+    pub fn from_boxed_auth(
+        auth: Box<dyn AuthGate>,
+        store: Box<dyn SecretStore>,
+        auth_on_write: bool,
+    ) -> Self {
+        Self {
+            auth,
+            store,
+            auth_on_write,
+        }
+    }
+
     // ── Public API ──────────────────────────────────────────────────────
 
     /// Import a 64-byte keypair (32 secret + 32 public).

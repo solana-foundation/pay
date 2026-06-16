@@ -2373,7 +2373,38 @@ async fn gateway_verify(
             };
             let mut last_error = None;
             for mpp in &mpps {
-                match mpp.verify_credential(&credential).await {
+                // Audit #2: verify against the request this route would issue
+                // (rebuilt from the gateway's own price + splits), not the
+                // values echoed in the client's credential.
+                let expected: solana_mpp::ChargeRequest = match mpp.charge_with_options(
+                    &req.price,
+                    solana_mpp::server::ChargeOptions {
+                        description: req.description.as_deref(),
+                        external_id: req.external_id.as_deref(),
+                        splits: splits.clone(),
+                        ..Default::default()
+                    },
+                ) {
+                    Ok(challenge) => match challenge.request.decode() {
+                        Ok(r) => r,
+                        Err(e) => {
+                            last_error = Some(solana_mpp::server::VerificationError::new(format!(
+                                "failed to decode expected charge request: {e}"
+                            )));
+                            continue;
+                        }
+                    },
+                    Err(e) => {
+                        last_error = Some(solana_mpp::server::VerificationError::new(format!(
+                            "failed to rebuild expected charge challenge: {e}"
+                        )));
+                        continue;
+                    }
+                };
+                match mpp
+                    .verify_credential_with_expected(&credential, &expected)
+                    .await
+                {
                     Ok(receipt) => {
                         let kind = solana_mpp::ReceiptKind::Charge(receipt);
                         let encoded = format_receipt(&kind).unwrap_or_default();
