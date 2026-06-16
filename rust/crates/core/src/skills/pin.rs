@@ -149,7 +149,13 @@ impl PinStore {
 
     /// Read every pin currently installed. Pins with a malformed manifest
     /// are skipped with a warning rather than failing the whole load.
+    ///
+    /// Best-effort sweep of any `.staging-*` / `.trash-*` directories left
+    /// behind by a previously-crashed `upsert`. Without this, every read
+    /// path would observe the cleanup obligation, but only `upsert` would
+    /// discharge it.
     pub fn read_all(&self) -> Vec<(PinManifest, PathBuf)> {
+        sweep_temp_dirs(&self.root);
         let mut out = Vec::new();
         self.walk(&self.root.clone(), &mut Vec::new(), &mut out);
         out
@@ -172,10 +178,15 @@ impl PinStore {
             return;
         }
         for entry in entries.flatten() {
-            // Skip the staging directory if a partially-installed pin
-            // crashed; the renamer cleans up but we don't want to scan it.
+            // Skip transient directories left by a partially-completed
+            // upsert that died between renames: `.staging-*` holds the
+            // new pin while it's being assembled, `.trash-*` holds the
+            // previous pin between the park rename and the publish
+            // rename. Both contain real `.pin.json` files; without this
+            // guard a crashed install could surface a stale (or
+            // duplicate-FQN) pin until the next upsert sweeps them.
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with(".staging-") {
+            if name.starts_with(".staging-") || name.starts_with(".trash-") {
                 continue;
             }
             let path = entry.path();
@@ -424,6 +435,45 @@ mod tests {
         assert_eq!(read.files.len(), 1);
         assert_eq!(read.files[0].path, "PAY.md");
         assert_eq!(read.files[0].size, 19);
+    }
+
+    #[test]
+    fn read_all_ignores_orphan_trash_and_staging_dirs() {
+        // Simulate a crash mid-`upsert`: the old pin has been parked
+        // under `.trash-<rand>/old/`, and a fresh `.staging-<rand>/`
+        // is half-built. Both have valid `.pin.json` payloads, so a
+        // naive `walk()` would surface them. Verify `read_all()`
+        // skips them and the on-disk pin is the only one returned.
+        let dir = tempdir().unwrap();
+        let store = PinStore::open_at(dir.path());
+        let mut m = manifest("venice/ai");
+        store
+            .upsert(&mut m, &[("PAY.md".to_string(), b"live".to_vec())])
+            .unwrap();
+
+        let trash_root = dir.path().join(".trash-deadbeef");
+        let trash_old = trash_root.join("old");
+        std::fs::create_dir_all(&trash_old).unwrap();
+        std::fs::write(
+            trash_old.join(".pin.json"),
+            serde_json::to_vec(&manifest("venice/ai")).unwrap(),
+        )
+        .unwrap();
+
+        let staging = dir.path().join(".staging-cafebabe");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(
+            staging.join(".pin.json"),
+            serde_json::to_vec(&manifest("venice/ai")).unwrap(),
+        )
+        .unwrap();
+
+        let pins = store.read_all();
+        assert_eq!(pins.len(), 1, "trash and staging dirs must not surface");
+        assert_eq!(pins[0].0.fqn, "venice/ai");
+        // read_all also sweeps the orphans so they don't accumulate.
+        assert!(!trash_root.exists(), "trash dir should be swept");
+        assert!(!staging.exists(), "staging dir should be swept");
     }
 
     #[test]
