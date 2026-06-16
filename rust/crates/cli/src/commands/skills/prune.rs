@@ -17,9 +17,10 @@ use pay_core::skills::pin::{PinAnchor, PinManifest, PinStore};
 /// Prune pinned providers whose PRs are merged upstream.
 #[derive(clap::Args)]
 pub struct PruneMergedCommand {
-    /// Don't prompt — assume yes. Required in non-TTY contexts (CI).
-    #[arg(long, short = 'y')]
-    pub yes: bool,
+    /// Skip the confirmation prompt. Required in non-TTY contexts (CI).
+    /// Matches the `--force` semantics of `pay skills add`.
+    #[arg(long)]
+    pub force: bool,
     /// Only print what would be pruned; make no changes.
     #[arg(long)]
     pub dry_run: bool,
@@ -94,7 +95,7 @@ impl PruneMergedCommand {
             return Ok(());
         }
 
-        if !self.yes && !confirm(to_prune.len())? {
+        if !self.force && !confirm(to_prune.len())? {
             eprintln!("{}", "  Cancelled.".dimmed());
             return Ok(());
         }
@@ -150,7 +151,7 @@ fn confirm(n: usize) -> pay_core::Result<bool> {
     let tty = std::io::stderr().is_terminal() && std::io::stdin().is_terminal();
     if !tty {
         return Err(pay_core::Error::Config(format!(
-            "refusing to prune {n} pin(s) in non-TTY context; pass --yes or --dry-run"
+            "refusing to prune {n} pin(s) in non-TTY context; pass --force or --dry-run"
         )));
     }
     Confirm::with_theme(&ColorfulTheme::default())

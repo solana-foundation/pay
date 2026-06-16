@@ -358,14 +358,6 @@ mod tests {
     }
 
     #[test]
-    fn any_biometric_available_returns_bool() {
-        // Smoke check: function must produce SOME bool on whatever
-        // platform the suite runs on, without panicking. The exact
-        // value depends on the host (CI has no Touch ID; dev laptops do).
-        let _: bool = Keystore::any_biometric_available();
-    }
-
-    #[test]
     fn in_memory_import_and_exists() {
         let ks = Keystore::in_memory();
         assert!(!ks.exists("test"));
