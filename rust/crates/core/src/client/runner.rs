@@ -45,9 +45,15 @@ pub enum RunOutcome {
         challenge: Box<x402::Challenge>,
         resource_url: String,
     },
-    /// The server returned 402 with an auth-only x402 SIWX challenge.
+    /// The server returned 402 with an x402 `sign-in-with-x` challenge.
+    ///
+    /// When the same 402 also offered a payment option, `payment_fallback`
+    /// carries it: the client prefers signing in (to spend existing credits)
+    /// but can fall back to paying if sign-in doesn't grant access (e.g. the
+    /// wallet hasn't paid / has no credits yet).
     X402SignInChallenge {
         challenge: Box<x402::SiwxAuthChallenge>,
+        payment_fallback: Option<Box<x402::Challenge>>,
         resource_url: String,
     },
     /// The server returned 402 but without a recognized payment protocol.
@@ -573,17 +579,26 @@ pub(crate) fn classify_402_with_preference(
     // Fall back to x402 if it has a Solana path. Skip when the user
     // pinned MPP via `--mpp`.
     if preference != ProtocolPreference::OnlyMpp {
-        if let Some(challenge) = x402_challenge {
-            info!(resource = resource_url, "Detected x402 challenge (Solana)");
-            return RunOutcome::X402Challenge {
-                challenge: Box::new(challenge),
+        // Prefer `sign-in-with-x` when the server offers it: a wallet that
+        // already holds credits (or has previously paid) should authenticate
+        // and spend those rather than pay again. If the same 402 also
+        // advertised a payment option, carry it as `payment_fallback` so the
+        // caller can still pay when sign-in doesn't grant access (no credits).
+        if let Some(siwx) = x402_siwx_challenge {
+            info!(
+                resource = resource_url,
+                "Detected x402 sign-in challenge (preferring credits over payment)"
+            );
+            return RunOutcome::X402SignInChallenge {
+                challenge: Box::new(siwx),
+                payment_fallback: x402_challenge.map(Box::new),
                 resource_url: resource_url.to_string(),
             };
         }
 
-        if let Some(challenge) = x402_siwx_challenge {
-            info!(resource = resource_url, "Detected x402 sign-in challenge");
-            return RunOutcome::X402SignInChallenge {
+        if let Some(challenge) = x402_challenge {
+            info!(resource = resource_url, "Detected x402 challenge (Solana)");
+            return RunOutcome::X402Challenge {
                 challenge: Box::new(challenge),
                 resource_url: resource_url.to_string(),
             };
@@ -1590,6 +1605,7 @@ HTTP request sent, awaiting response...
             RunOutcome::X402SignInChallenge {
                 challenge,
                 resource_url,
+                ..
             } => {
                 assert_eq!(challenge.extension.nonce, "nonce-123");
                 assert_eq!(resource_url, "https://example.com/resource");
@@ -1599,7 +1615,7 @@ HTTP request sent, awaiting response...
     }
 
     #[test]
-    fn classify_402_prefers_payment_when_siwx_extends_payment_challenge() {
+    fn classify_402_prefers_signin_with_payment_fallback() {
         use base64::Engine;
 
         let selected = serde_json::json!({
@@ -1636,12 +1652,19 @@ HTTP request sent, awaiting response...
 
         let outcome = classify_402(&headers, None, "https://example.com/resource");
 
+        // Prefer sign-in (spend credits) over paying when both are offered,
+        // but keep the payment option as a fallback for the no-credits case.
         match outcome {
-            RunOutcome::X402Challenge { challenge, .. } => {
-                assert_eq!(challenge.requirements.amount, "10000");
-                assert!(challenge.siwx.is_some());
+            RunOutcome::X402SignInChallenge {
+                challenge,
+                payment_fallback,
+                ..
+            } => {
+                assert_eq!(challenge.extension.nonce, "nonce-123");
+                let pay = payment_fallback.expect("payment option preserved as fallback");
+                assert_eq!(pay.requirements.amount, "10000");
             }
-            other => panic!("expected X402Challenge, got {other:?}"),
+            other => panic!("expected X402SignInChallenge, got {other:?}"),
         }
     }
 

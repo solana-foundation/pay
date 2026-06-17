@@ -314,8 +314,14 @@ fn do_paid_fetch(
                 body.as_deref(),
             )?)
         }
-        RunOutcome::X402SignInChallenge { challenge, .. } => {
-            let built_payment = pay_core::client::x402::build_siwx_auth_header_with_override(
+        RunOutcome::X402SignInChallenge {
+            challenge,
+            payment_fallback,
+            ..
+        } => {
+            // Prefer spending existing credits: sign in with the wallet and
+            // retry. Only one Touch ID / approval is needed for the signature.
+            let built = pay_core::client::x402::build_siwx_auth_header_with_override(
                 &challenge,
                 &store,
                 network_override.as_deref(),
@@ -325,17 +331,45 @@ fn do_paid_fetch(
             )?;
             let mut headers = extra_headers.to_vec();
             headers.extend(
-                built_payment
+                built
                     .headers
                     .into_iter()
                     .map(|(name, value)| (name.to_string(), value)),
             );
-            interpret_retry(pay_core::client::fetch::fetch_request(
-                method,
-                url,
-                &headers,
-                body.as_deref(),
-            )?)
+            let retry =
+                pay_core::client::fetch::fetch_request(method, url, &headers, body.as_deref())?;
+
+            // If sign-in granted access, we're done — credits were spent, no
+            // payment made. If the server still refuses (e.g. the wallet has
+            // no credits yet) and the same 402 also offered a payment option,
+            // fall back to paying so the call can still go through.
+            if matches!(retry, RunOutcome::Completed { .. }) {
+                interpret_retry(retry)
+            } else if let Some(pay_challenge) = payment_fallback {
+                let built_payment = pay_core::client::x402::build_payment_with_override(
+                    &pay_challenge,
+                    &store,
+                    network_override.as_deref(),
+                    account_override.as_deref(),
+                    Some(url),
+                    make_auth_override(),
+                )?;
+                let mut headers = extra_headers.to_vec();
+                headers.extend(
+                    built_payment
+                        .headers
+                        .into_iter()
+                        .map(|(name, value)| (name.to_string(), value)),
+                );
+                interpret_retry(pay_core::client::fetch::fetch_request(
+                    method,
+                    url,
+                    &headers,
+                    body.as_deref(),
+                )?)
+            } else {
+                interpret_retry(retry)
+            }
         }
         RunOutcome::SessionChallenge { .. } => Err(pay_core::Error::Mpp(
             "402 Payment Required (MPP session) — session payments require a stateful client with a Fiber channel".to_string(),

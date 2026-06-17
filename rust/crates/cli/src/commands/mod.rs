@@ -585,6 +585,7 @@ fn handle_outcome(
         RunOutcome::X402SignInChallenge {
             challenge,
             resource_url,
+            ..
         } => {
             if auto_pay {
                 if verbose && !is_json {

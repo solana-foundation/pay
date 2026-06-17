@@ -65,15 +65,18 @@ pub fn parse(headers: &[(String, String)], body: Option<&str>) -> Option<Challen
     })
 }
 
-/// Try to parse an auth-only x402 SIWX challenge.
+/// Try to parse an x402 `sign-in-with-x` challenge.
+///
+/// Unlike a pure auth gate, this is returned even when the same 402 also
+/// advertises payment options in `accepts` — a wallet that already holds
+/// credits (or has previously paid) should be able to sign in and spend
+/// those instead of paying again. The caller decides preference + fallback
+/// (see `classify_402`).
 pub fn parse_siwx_auth(
     headers: &[(String, String)],
     body: Option<&str>,
 ) -> Option<SiwxAuthChallenge> {
     let envelope = parse_payment_required_envelope(headers, body)?;
-    if !envelope.accepts.is_empty() {
-        return None;
-    }
     let extension = siwx_extension_from_payment_required(&envelope)
         .ok()
         .flatten()?;
@@ -886,7 +889,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_siwx_auth_ignores_payment_challenges() {
+    fn parse_siwx_auth_reads_siwx_even_with_payment() {
         let selected = serde_json::json!({
             "scheme": EXACT_SCHEME,
             "network": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
@@ -921,7 +924,10 @@ mod tests {
         );
         let headers = vec![(PAYMENT_REQUIRED_HEADER.to_string(), encoded)];
 
-        assert!(parse_siwx_auth(&headers, None).is_none());
+        // sign-in-with-x is surfaced even when payment options coexist, so a
+        // funded wallet can prefer spending credits over paying.
+        let siwx = parse_siwx_auth(&headers, None).expect("siwx challenge present");
+        assert_eq!(siwx.extension.nonce, "nonce-123");
         assert!(parse(&headers, None).unwrap().siwx.is_some());
     }
 
