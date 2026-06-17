@@ -320,7 +320,9 @@ fn do_paid_fetch(
             ..
         } => {
             // Prefer spending existing credits: sign in with the wallet and
-            // retry. Only one Touch ID / approval is needed for the signature.
+            // retry. The sign-in signature takes one Touch ID / approval; if
+            // sign-in doesn't grant access and we fall back to paying below,
+            // the payment signature requires a second approval.
             let built = pay_core::client::x402::build_siwx_auth_header_with_override(
                 &challenge,
                 &store,
@@ -367,8 +369,17 @@ fn do_paid_fetch(
                     &headers,
                     body.as_deref(),
                 )?)
+            } else if let RunOutcome::PaymentRejected { reason, .. } = retry {
+                Err(pay_core::Error::PaymentRejected(reason))
             } else {
-                interpret_retry(retry)
+                // Sign-in didn't grant access and the 402 offered no payment
+                // option to fall back to — typically the wallet has no credits
+                // yet. Don't claim a payment was made/rejected here.
+                Err(pay_core::Error::Mpp(
+                    "Server returned 402 again after sign-in — the wallet has no usable credits \
+                     and the endpoint offered no payment option"
+                        .to_string(),
+                ))
             }
         }
         RunOutcome::SessionChallenge { .. } => Err(pay_core::Error::Mpp(
