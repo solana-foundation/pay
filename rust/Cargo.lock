@@ -6043,6 +6043,7 @@ dependencies = [
 [[package]]
 name = "payment-channels-client"
 version = "0.1.0"
+source = "git+https://github.com/solana-foundation/pay-kit?branch=feat%2Fconfidential-transfers#d4c617aab249b26b68dd854d4bebf17939ce3362"
 dependencies = [
  "borsh 1.7.0",
  "num-derive",
@@ -9662,6 +9663,7 @@ dependencies = [
 [[package]]
 name = "solana-mpp"
 version = "0.6.0"
+source = "git+https://github.com/solana-foundation/pay-kit?branch=feat%2Fconfidential-transfers#d4c617aab249b26b68dd854d4bebf17939ce3362"
 dependencies = [
  "base64 0.22.1",
  "bincode",
@@ -9883,6 +9885,7 @@ dependencies = [
 [[package]]
 name = "solana-pay-core"
 version = "0.1.0"
+source = "git+https://github.com/solana-foundation/pay-kit?branch=feat%2Fconfidential-transfers#d4c617aab249b26b68dd854d4bebf17939ce3362"
 dependencies = [
  "base64 0.22.1",
  "bincode",
@@ -12267,6 +12270,7 @@ dependencies = [
 [[package]]
 name = "solana-x402"
 version = "0.1.0"
+source = "git+https://github.com/solana-foundation/pay-kit?branch=feat%2Fconfidential-transfers#d4c617aab249b26b68dd854d4bebf17939ce3362"
 dependencies = [
  "base64 0.22.1",
  "bincode",
@@ -12979,6 +12983,7 @@ dependencies = [
 [[package]]
 name = "subscriptions-client"
 version = "0.1.0"
+source = "git+https://github.com/solana-foundation/pay-kit?branch=feat%2Fconfidential-transfers#d4c617aab249b26b68dd854d4bebf17939ce3362"
 dependencies = [
  "borsh 1.7.0",
  "num-derive",
