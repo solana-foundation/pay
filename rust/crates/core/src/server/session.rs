@@ -16,12 +16,6 @@
 //! Server records channel state; the client signs vouchers for that channel
 //! ```
 //!
-//! Multi-delegator accounts are **long-lived**: most returning clients take the
-//! "already sufficient" path with zero on-chain overhead.
-
-use solana_mpp::program::multi_delegator::{
-    MultiDelegateOnChainState, MultiDelegateSetupAction, assess_multi_delegate_setup,
-};
 use solana_mpp::server::session::{FinalizeParams, SessionConfig, SessionServer};
 use solana_mpp::solana_keychain::SolanaSigner;
 use solana_mpp::store::{ChannelState, MemoryChannelStore};
@@ -30,8 +24,6 @@ use solana_mpp::{
     SessionPullVoucherStrategy, parse_authorization,
 };
 use std::collections::{HashMap, HashSet};
-use std::future::Future;
-use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -42,278 +34,12 @@ use crate::{Error, Result};
 const INTENT: &str = "session";
 const METHOD: &str = "solana";
 const DEFAULT_REALM: &str = "MPP Session";
-const DEFAULT_BATCH_OPEN_INTERVAL_MS: u64 = 400;
-const FIXED_DELEGATION_CAP_OFFSET: usize = 107;
-const FIXED_DELEGATION_CAP_LEN: usize = 8;
-
-// ── Multi-delegate chain interface ─────────────────────────────────────────
-
-/// Async interface for querying and updating multi-delegator on-chain state.
-///
-/// Abstracting this out makes the session logic unit-testable without a live
-/// Solana cluster.  In production, wire up a concrete implementation backed
-/// by `solana-rpc-client`.
-pub trait MultiDelegateChain: Send + Sync {
-    /// Fetch the current `MultiDelegate` + `FixedDelegation` state for
-    /// `owner` (client's wallet pubkey, base58).
-    fn fetch_state<'a>(
-        &'a self,
-        owner: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<MultiDelegateOnChainState>> + Send + 'a>>;
-
-    /// Submit a base64-encoded Solana transaction and return its signature.
-    ///
-    /// The implementation should block until the transaction is confirmed
-    /// (or return an error if it fails / times out).
-    fn submit_tx<'a>(
-        &'a self,
-        tx_base64: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>>;
-}
-
-// ── Pull-mode setup outcome ────────────────────────────────────────────────
-
-/// Outcome of the multi-delegator pre-flight check for a pull-mode `open`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PullSetupOutcome {
-    /// Existing delegation already covered the cap — no tx was submitted.
-    AlreadySufficient,
-    /// `initDelegationTx` was submitted successfully.
-    InitSubmitted { signature: String },
-    /// `updateDelegationTx` was submitted successfully.
-    UpdateSubmitted { signature: String },
-}
-
-/// Run the multi-delegator pre-flight check for a pull-mode `open` action.
-///
-/// 1. Fetches on-chain state via `chain.fetch_state(owner)`.
-/// 2. Calls [`assess_multi_delegate_setup`] to decide what (if anything)
-///    needs to happen.
-/// 3. Submits the appropriate transaction or returns an error if a required
-///    payload is missing.
-///
-/// This is a **free function** (not a method on `SessionMpp`) so it can be
-/// called directly in unit tests with a mock chain.
-pub async fn handle_pull_setup(
-    payload: &OpenPayload,
-    required_cap: u64,
-    chain: &dyn MultiDelegateChain,
-) -> Result<PullSetupOutcome> {
-    let owner = payload
-        .owner
-        .as_deref()
-        .ok_or_else(|| Error::Mpp("pull open missing owner".to_string()))?;
-
-    tracing::debug!(
-        owner,
-        required_cap,
-        "pull open: fetching multi-delegate on-chain state"
-    );
-
-    let on_chain = chain.fetch_state(owner).await.map_err(|e| {
-        tracing::error!(owner, %e, "failed to fetch multi-delegate state");
-        e
-    })?;
-
-    tracing::debug!(
-        multi_delegate_exists = on_chain.multi_delegate_exists,
-        existing_cap = ?on_chain.existing_delegation_cap,
-        "multi-delegate on-chain state retrieved"
-    );
-
-    let action = assess_multi_delegate_setup(
-        &on_chain,
-        required_cap,
-        payload.init_multi_delegate_tx.is_some(),
-        payload.update_delegation_tx.is_some(),
-    );
-
-    tracing::info!(
-        owner,
-        required_cap,
-        action = %action,
-        "multi-delegate setup assessment"
-    );
-
-    match action {
-        MultiDelegateSetupAction::AlreadySufficient => {
-            tracing::debug!(owner, "multi-delegate already sufficient — skipping tx");
-            Ok(PullSetupOutcome::AlreadySufficient)
-        }
-
-        MultiDelegateSetupAction::SubmitInit => {
-            // SAFETY: `has_init_tx` was true → field is Some.
-            let tx = payload.init_multi_delegate_tx.as_deref().unwrap();
-            tracing::info!(owner, "submitting initDelegationTx");
-            let sig = chain.submit_tx(tx).await.map_err(|e| {
-                tracing::error!(owner, %e, "initDelegationTx failed");
-                e
-            })?;
-            tracing::info!(owner, signature = %sig, "initDelegationTx confirmed");
-            Ok(PullSetupOutcome::InitSubmitted { signature: sig })
-        }
-
-        MultiDelegateSetupAction::SubmitUpdate => {
-            // SAFETY: `has_update_tx` was true → field is Some.
-            let tx = payload.update_delegation_tx.as_deref().unwrap();
-            tracing::info!(owner, "submitting UpdateDelegation tx");
-            let sig = chain.submit_tx(tx).await.map_err(|e| {
-                tracing::error!(owner, %e, "UpdateDelegation tx failed");
-                e
-            })?;
-            tracing::info!(owner, signature = %sig, "UpdateDelegation tx confirmed");
-            Ok(PullSetupOutcome::UpdateSubmitted { signature: sig })
-        }
-
-        MultiDelegateSetupAction::MissingPayload(reason) => {
-            let reason = normalize_pull_setup_reason(&reason.to_string());
-            tracing::warn!(owner, %reason, "pull open rejected: missing tx payload");
-            Err(Error::Mpp(format!(
-                "pull open requires on-chain setup: {reason}"
-            )))
-        }
-    }
-}
-
-fn normalize_pull_setup_reason(reason: &str) -> String {
-    reason.replace("initMultiDelegateTx", "initDelegationTx")
-}
-
 fn session_close_already_requested(error: &solana_mpp::Error) -> bool {
     error.to_string().contains("Close already requested")
 }
 
 fn session_close_already_finalized(error: &solana_mpp::Error) -> bool {
     error.to_string().contains("already finalized")
-}
-
-fn parse_fixed_delegation_cap(data: &[u8]) -> Option<u64> {
-    let bytes = data
-        .get(FIXED_DELEGATION_CAP_OFFSET..FIXED_DELEGATION_CAP_OFFSET + FIXED_DELEGATION_CAP_LEN)?;
-    let bytes: [u8; FIXED_DELEGATION_CAP_LEN] = bytes.try_into().ok()?;
-    Some(u64::from_le_bytes(bytes))
-}
-
-// ── RPC-backed multi-delegate chain ───────────────────────────────────────────
-
-/// [`MultiDelegateChain`] implementation backed by a live Solana RPC endpoint.
-///
-/// Fetches `MultiDelegate` + `FixedDelegation` account state and submits
-/// pre-signed base64 transactions.  Blocking RPC calls run on tokio's
-/// blocking-thread pool so they don't starve the async executor.
-pub struct RpcMultiDelegateChain {
-    /// Solana RPC endpoint URL.
-    pub rpc_url: String,
-    /// Multi-delegator program address.
-    pub program_id: solana_pubkey::Pubkey,
-    /// SPL token mint (e.g. USDC).
-    pub mint: solana_pubkey::Pubkey,
-    /// Operator public key — the `delegatee` in every `FixedDelegation`.
-    pub operator: solana_pubkey::Pubkey,
-    /// Nonce used to derive the `FixedDelegation` PDA.
-    pub delegation_nonce: u64,
-}
-
-impl MultiDelegateChain for RpcMultiDelegateChain {
-    fn fetch_state<'a>(
-        &'a self,
-        owner: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<MultiDelegateOnChainState>> + Send + 'a>> {
-        use solana_mpp::program::multi_delegator::{
-            find_fixed_delegation_pda, find_multi_delegate_pda,
-        };
-
-        let owner_str = owner.to_string();
-        let rpc_url = self.rpc_url.clone();
-        let program_id = self.program_id;
-        let mint = self.mint;
-        let operator = self.operator;
-        let nonce = self.delegation_nonce;
-
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || -> Result<MultiDelegateOnChainState> {
-                use solana_mpp::solana_rpc_client::rpc_client::RpcClient;
-                use std::str::FromStr;
-
-                let owner_pk = solana_pubkey::Pubkey::from_str(&owner_str)
-                    .map_err(|e| Error::Mpp(format!("invalid owner pubkey: {e}")))?;
-
-                let (multi_delegate_pda, _) =
-                    find_multi_delegate_pda(&owner_pk, &mint, &program_id);
-                let (delegation_pda, _) = find_fixed_delegation_pda(
-                    &multi_delegate_pda,
-                    &owner_pk,
-                    &operator,
-                    nonce,
-                    &program_id,
-                );
-
-                let rpc = RpcClient::new(rpc_url);
-                let accounts = rpc
-                    .get_multiple_accounts(&[multi_delegate_pda, delegation_pda])
-                    .map_err(|e| {
-                        Error::Mpp(format!("RPC error fetching delegation accounts: {e}"))
-                    })?;
-
-                let multi_delegate_exists = accounts[0].is_some();
-
-                // FixedDelegation account layout:
-                //   [0..107]   header
-                //   [107..115] delegated amount: u64
-                // RPC account data is untrusted here, so malformed or short
-                // accounts must not panic the gateway.
-                let existing_delegation_cap = accounts[1]
-                    .as_ref()
-                    .and_then(|acct| parse_fixed_delegation_cap(&acct.data));
-
-                tracing::info!(
-                    %owner_str,
-                    %multi_delegate_exists,
-                    ?existing_delegation_cap,
-                    "RPC multi-delegate state fetched"
-                );
-
-                Ok(MultiDelegateOnChainState {
-                    multi_delegate_exists,
-                    existing_delegation_cap,
-                })
-            })
-            .await
-            .map_err(|e| Error::Mpp(format!("spawn_blocking join error: {e}")))?
-        })
-    }
-
-    fn submit_tx<'a>(
-        &'a self,
-        tx_base64: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
-        let rpc_url = self.rpc_url.clone();
-        let tx_b64 = tx_base64.to_string();
-
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || -> Result<String> {
-                use base64::Engine;
-                use solana_mpp::solana_rpc_client::rpc_client::RpcClient;
-                use solana_transaction::Transaction;
-
-                let bytes = base64::engine::general_purpose::STANDARD
-                    .decode(&tx_b64)
-                    .map_err(|e| Error::Mpp(format!("invalid base64 tx: {e}")))?;
-                let tx: Transaction = bincode::deserialize(&bytes)
-                    .map_err(|e| Error::Mpp(format!("tx deserialization failed: {e}")))?;
-
-                let rpc = RpcClient::new(rpc_url);
-                let sig = rpc
-                    .send_and_confirm_transaction(&tx)
-                    .map_err(|e| Error::Mpp(format!("tx submission failed: {e}")))?;
-
-                tracing::info!(signature = %sig, "multi-delegate tx confirmed on-chain");
-                Ok(sig.to_string())
-            })
-            .await
-            .map_err(|e| Error::Mpp(format!("spawn_blocking join error: {e}")))?
-        })
-    }
 }
 
 // ── Session outcome ────────────────────────────────────────────────────────
@@ -335,11 +61,6 @@ pub enum SessionOutcome {
     },
 }
 
-pub type OpenChannelBatch = Vec<(String, String, u64)>;
-type OpenChannelBatchFuture = Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>;
-type OpenChannelBatchSubmitter =
-    Arc<dyn Fn(OpenChannelBatch) -> OpenChannelBatchFuture + Send + Sync>;
-
 #[derive(Clone)]
 struct SessionOperatorRuntime {
     server: Arc<SessionServer<MemoryChannelStore>>,
@@ -347,7 +68,6 @@ struct SessionOperatorRuntime {
     payment_channel_signer: Arc<Mutex<Option<Arc<dyn SolanaSigner>>>>,
     payment_channel_payer_signer: Arc<Mutex<Option<Arc<dyn SolanaSigner>>>>,
     committed_watermarks: Arc<Mutex<HashMap<String, u64>>>,
-    open_channel_batcher: Arc<Mutex<Option<OpenChannelBatchSubmitter>>>,
 }
 
 impl SessionOperatorRuntime {
@@ -372,13 +92,6 @@ impl SessionOperatorRuntime {
             .ok()
             .and_then(|signer| signer.clone())
             .or_else(|| self.payment_channel_signer())
-    }
-
-    fn open_channel_batcher(&self) -> Option<OpenChannelBatchSubmitter> {
-        self.open_channel_batcher
-            .lock()
-            .ok()
-            .and_then(|batcher| batcher.clone())
     }
 
     async fn operator_close_channel(&self, channel_id: &str) -> Result<SessionCloseResult> {
@@ -540,13 +253,6 @@ impl SessionOperatorRuntime {
         .await
         .map(Some)
     }
-
-    async fn flush_open_channel_batch(&self, batch: OpenChannelBatch) -> Result<()> {
-        let Some(submitter) = self.open_channel_batcher() else {
-            return Ok(());
-        };
-        submitter(batch).await
-    }
 }
 
 #[derive(Clone)]
@@ -567,14 +273,6 @@ enum SessionLifecycleCommand {
     ConfigureCloseDelay {
         close_delay: Option<Duration>,
     },
-    ConfigureOpenBatchInterval {
-        interval: Duration,
-    },
-    RecordOpen {
-        owner: String,
-        token_account: String,
-        cap: u64,
-    },
     Touch {
         channel_id: String,
     },
@@ -586,27 +284,20 @@ enum SessionLifecycleCommand {
 struct SessionLifecycleRunloop {
     runtime: SessionOperatorRuntime,
     close_delay: Option<Duration>,
-    open_batch_interval: Duration,
     rx: mpsc::UnboundedReceiver<SessionLifecycleCommand>,
     deadlines: HashMap<String, Instant>,
-    next_open_flush: Option<Instant>,
-    pending_opens: OpenChannelBatch,
 }
 
 impl SessionLifecycleRunloop {
     fn new(
         runtime: SessionOperatorRuntime,
-        open_batch_interval: Duration,
         rx: mpsc::UnboundedReceiver<SessionLifecycleCommand>,
     ) -> Self {
         Self {
             runtime,
             close_delay: None,
-            open_batch_interval,
             rx,
             deadlines: HashMap::new(),
-            next_open_flush: None,
-            pending_opens: Vec::new(),
         }
     }
 
@@ -620,7 +311,6 @@ impl SessionLifecycleRunloop {
                         }
                     }
                     _ = tokio::time::sleep_until(deadline) => {
-                        self.flush_due_open_batch().await;
                         self.close_due_channels().await;
                     }
                 }
@@ -642,21 +332,6 @@ impl SessionLifecycleRunloop {
                 }
                 true
             }
-            Some(SessionLifecycleCommand::ConfigureOpenBatchInterval { interval }) => {
-                self.open_batch_interval = interval;
-                true
-            }
-            Some(SessionLifecycleCommand::RecordOpen {
-                owner,
-                token_account,
-                cap,
-            }) => {
-                self.pending_opens.push((owner, token_account, cap));
-                if self.next_open_flush.is_none() {
-                    self.next_open_flush = Some(Instant::now() + self.open_batch_interval);
-                }
-                true
-            }
             Some(SessionLifecycleCommand::Touch { channel_id }) => {
                 if let Some(close_delay) = self.close_delay {
                     let deadline = Instant::now() + close_delay;
@@ -673,35 +348,7 @@ impl SessionLifecycleRunloop {
     }
 
     fn next_wakeup(&self) -> Option<Instant> {
-        self.deadlines
-            .values()
-            .copied()
-            .chain(self.next_open_flush)
-            .min()
-    }
-
-    async fn flush_due_open_batch(&mut self) {
-        let Some(deadline) = self.next_open_flush else {
-            return;
-        };
-        if deadline > Instant::now() {
-            return;
-        }
-
-        self.next_open_flush = None;
-        if self.pending_opens.is_empty() {
-            return;
-        }
-
-        let batch = std::mem::take(&mut self.pending_opens);
-        let batch_len = batch.len();
-        if let Err(error) = self.runtime.flush_open_channel_batch(batch).await {
-            tracing::warn!(
-                error = %error,
-                batch_len,
-                "operator open-channel batch failed"
-            );
-        }
+        self.deadlines.values().copied().min()
     }
 
     async fn close_due_channels(&mut self) {
@@ -763,13 +410,9 @@ pub struct SessionMpp {
     payment_channel_payer_signer: Arc<Mutex<Option<Arc<dyn SolanaSigner>>>>,
     committed_watermarks: Arc<Mutex<HashMap<String, u64>>>,
     pull_sessions: Arc<Mutex<HashSet<String>>>,
-    open_channel_batcher: Arc<Mutex<Option<OpenChannelBatchSubmitter>>>,
     lifecycle: SessionLifecycleHandle,
     operator_runtime: SessionOperatorRuntime,
     pull_voucher_strategy: PullVoucherStrategy,
-    /// Interface to on-chain multi-delegate state (optional; pull-mode setup
-    /// is required for operated-voucher pull setup).
-    multi_delegate_chain: Option<Box<dyn MultiDelegateChain>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -777,7 +420,6 @@ pub enum PullVoucherStrategy {
     #[default]
     Disabled,
     ClientVoucher,
-    OperatedVoucher,
 }
 
 impl SessionMpp {
@@ -789,21 +431,15 @@ impl SessionMpp {
         let payment_channel_payer_signer = Arc::new(Mutex::new(None));
         let committed_watermarks = Arc::new(Mutex::new(HashMap::new()));
         let pull_sessions = Arc::new(Mutex::new(HashSet::new()));
-        let open_channel_batcher = Arc::new(Mutex::new(None));
         let operator_runtime = SessionOperatorRuntime {
             server: Arc::clone(&server),
             rpc_url: session_config.rpc_url.clone(),
             payment_channel_signer: Arc::clone(&payment_channel_signer),
             payment_channel_payer_signer: Arc::clone(&payment_channel_payer_signer),
             committed_watermarks: Arc::clone(&committed_watermarks),
-            open_channel_batcher: Arc::clone(&open_channel_batcher),
         };
         let (tx, rx) = mpsc::unbounded_channel();
-        let runloop = SessionLifecycleRunloop::new(
-            operator_runtime.clone(),
-            Duration::from_millis(DEFAULT_BATCH_OPEN_INTERVAL_MS),
-            rx,
-        );
+        let runloop = SessionLifecycleRunloop::new(operator_runtime.clone(), rx);
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(runloop.run());
         } else {
@@ -820,28 +456,14 @@ impl SessionMpp {
             payment_channel_payer_signer,
             committed_watermarks,
             pull_sessions,
-            open_channel_batcher,
             lifecycle: SessionLifecycleHandle { tx },
             operator_runtime,
             pull_voucher_strategy: PullVoucherStrategy::Disabled,
-            multi_delegate_chain: None,
         }
     }
 
     pub fn with_realm(mut self, realm: impl Into<String>) -> Self {
         self.realm = realm.into();
-        self
-    }
-
-    /// Wire up on-chain multi-delegate state resolution for pull-mode sessions.
-    ///
-    /// This enables the operated-voucher pull path. When set, every
-    /// operated-voucher pull-mode `open` will:
-    /// 1. Fetch the client's `MultiDelegate` + `FixedDelegation` state.
-    /// 2. Submit a setup tx if the delegation is missing or insufficient.
-    pub fn with_multi_delegate_chain(mut self, chain: Box<dyn MultiDelegateChain>) -> Self {
-        self.pull_voucher_strategy = PullVoucherStrategy::OperatedVoucher;
-        self.multi_delegate_chain = Some(chain);
         self
     }
 
@@ -894,43 +516,6 @@ impl SessionMpp {
         );
     }
 
-    pub fn set_open_channel_batch_interval(&self, interval: Duration) {
-        self.lifecycle
-            .send(SessionLifecycleCommand::ConfigureOpenBatchInterval { interval });
-    }
-
-    pub fn with_test_open_channel_batcher<F, Fut>(self, batcher: F) -> Self
-    where
-        F: Fn(OpenChannelBatch) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<()>> + Send + 'static,
-    {
-        self.with_test_open_channel_batcher_interval(DEFAULT_BATCH_OPEN_INTERVAL_MS, batcher)
-    }
-
-    pub fn with_test_open_channel_batcher_interval<F, Fut>(
-        self,
-        batch_open_interval_ms: u64,
-        batcher: F,
-    ) -> Self
-    where
-        F: Fn(OpenChannelBatch) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<()>> + Send + 'static,
-    {
-        let batcher = Arc::new(batcher);
-        let submitter: OpenChannelBatchSubmitter = Arc::new(move |batch| {
-            let batcher = Arc::clone(&batcher);
-            Box::pin(async move { batcher(batch).await })
-        });
-        if let Ok(mut open_channel_batcher) = self.open_channel_batcher.lock() {
-            *open_channel_batcher = Some(submitter);
-        }
-        self.lifecycle
-            .send(SessionLifecycleCommand::ConfigureOpenBatchInterval {
-                interval: Duration::from_millis(batch_open_interval_ms),
-            });
-        self
-    }
-
     /// Token decimals for base-unit settlement amounts.
     pub fn decimals(&self) -> u8 {
         self.session_config.decimals
@@ -975,12 +560,6 @@ impl SessionMpp {
             PullVoucherStrategy::ClientVoucher => {
                 if request.modes.contains(&SessionMode::Pull) {
                     request.pull_voucher_strategy = Some(SessionPullVoucherStrategy::ClientVoucher);
-                }
-            }
-            PullVoucherStrategy::OperatedVoucher => {
-                if request.modes.contains(&SessionMode::Pull) {
-                    request.pull_voucher_strategy =
-                        Some(SessionPullVoucherStrategy::OperatedVoucher);
                 }
             }
         }
@@ -1071,7 +650,6 @@ impl SessionMpp {
                     self.record_pull_session(state.channel_id.clone());
                 }
                 self.record_committed_watermark(state.channel_id.clone(), state.cumulative);
-                self.record_open_channel_batch(p);
                 self.touch_channel(state.channel_id.clone());
                 Ok(SessionOutcome::Active(state))
             }
@@ -1188,33 +766,6 @@ impl SessionMpp {
         });
     }
 
-    fn record_open_channel_batch(&self, payload: &OpenPayload) {
-        if payload.mode != SessionMode::Pull
-            || self.pull_voucher_strategy != PullVoucherStrategy::OperatedVoucher
-        {
-            return;
-        }
-
-        let Some(owner) = payload.owner.clone() else {
-            tracing::debug!("pull open missing owner; skipping open-channel batch record");
-            return;
-        };
-        let Some(token_account) = payload.token_account.clone() else {
-            tracing::debug!("pull open missing token account; skipping open-channel batch record");
-            return;
-        };
-        let Ok(cap) = payload.deposit_amount() else {
-            tracing::debug!("pull open missing cap; skipping open-channel batch record");
-            return;
-        };
-
-        self.lifecycle.send(SessionLifecycleCommand::RecordOpen {
-            owner,
-            token_account,
-            cap,
-        });
-    }
-
     fn record_committed_watermark(&self, session_id: impl Into<String>, cumulative: u64) {
         self.operator_runtime
             .record_committed_watermark(session_id, cumulative);
@@ -1234,7 +785,6 @@ impl SessionMpp {
                     .to_string(),
             )),
             PullVoucherStrategy::ClientVoucher => self.validate_client_voucher_pull_open(payload),
-            PullVoucherStrategy::OperatedVoucher => self.run_pull_setup(payload).await,
         }
     }
 
@@ -1247,29 +797,10 @@ impl SessionMpp {
         }
         if payload.token_account.is_some() || payload.approved_amount.is_some() {
             return Err(Error::Mpp(
-                "client-voucher pull sessions do not use token-account delegation; use operated_voucher"
+                "token-account delegation pull sessions are no longer supported; use client-voucher payment channels"
                     .to_string(),
             ));
         }
-        Ok(())
-    }
-
-    /// Run the multi-delegator pre-flight for an operated-voucher pull-mode open.
-    async fn run_pull_setup(&self, payload: &OpenPayload) -> Result<()> {
-        let chain = match &self.multi_delegate_chain {
-            Some(c) => c.as_ref(),
-            None => {
-                return Err(Error::Mpp(
-                    "operated-voucher pull sessions require a multi-delegate chain".to_string(),
-                ));
-            }
-        };
-
-        let required_cap = payload
-            .deposit_amount()
-            .map_err(|e| Error::Mpp(format!("pull open: {e}")))?;
-
-        handle_pull_setup(payload, required_cap, chain).await?;
         Ok(())
     }
 
@@ -1557,117 +1088,9 @@ fn wait_for_transaction_confirmation(
 mod tests {
     use super::*;
     use crate::client::session::SessionHandle;
-    use solana_mpp::program::multi_delegator::MultiDelegateOnChainState;
     use solana_mpp::solana_keychain::{SolanaSigner, memory::MemorySigner};
     use solana_mpp::{PaymentCredential, format_authorization};
-    use std::sync::{Arc, Mutex};
-
-    // ── Mock MultiDelegateChain ───────────────────────────────────────────────
-
-    struct MockChain {
-        state: MultiDelegateOnChainState,
-        submitted: Arc<Mutex<Vec<String>>>,
-        submit_error: Option<String>,
-    }
-
-    impl MockChain {
-        fn with_state(state: MultiDelegateOnChainState) -> Self {
-            Self {
-                state,
-                submitted: Arc::new(Mutex::new(vec![])),
-                submit_error: None,
-            }
-        }
-
-        fn with_submit_error(mut self, msg: &str) -> Self {
-            self.submit_error = Some(msg.to_string());
-            self
-        }
-
-        fn submitted_txs(&self) -> Vec<String> {
-            self.submitted.lock().unwrap().clone()
-        }
-    }
-
-    impl MultiDelegateChain for MockChain {
-        fn fetch_state<'a>(
-            &'a self,
-            _owner: &'a str,
-        ) -> Pin<Box<dyn Future<Output = Result<MultiDelegateOnChainState>> + Send + 'a>> {
-            let state = self.state.clone();
-            Box::pin(async move { Ok(state) })
-        }
-
-        fn submit_tx<'a>(
-            &'a self,
-            tx_base64: &'a str,
-        ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
-            if let Some(ref err) = self.submit_error {
-                let e = err.clone();
-                return Box::pin(async move { Err(Error::Mpp(e)) });
-            }
-            let submitted = Arc::clone(&self.submitted);
-            let tx = tx_base64.to_string();
-            Box::pin(async move {
-                submitted.lock().unwrap().push(tx);
-                Ok("mock_sig_abc123".to_string())
-            })
-        }
-    }
-
-    // ── Payload helpers ───────────────────────────────────────────────────────
-
-    fn no_tx_payload(required_cap: u64) -> OpenPayload {
-        OpenPayload::pull(
-            "tokacct111".to_string(),
-            required_cap.to_string(),
-            "walletABC".to_string(),
-            "signer1".to_string(),
-            "sig1".to_string(),
-        )
-    }
-
-    fn init_tx_payload(required_cap: u64) -> OpenPayload {
-        no_tx_payload(required_cap).with_init_tx("init_tx_base64".to_string())
-    }
-
-    fn update_tx_payload(required_cap: u64) -> OpenPayload {
-        no_tx_payload(required_cap).with_update_tx("update_tx_base64".to_string())
-    }
-
-    fn both_tx_payload(required_cap: u64) -> OpenPayload {
-        no_tx_payload(required_cap)
-            .with_init_tx("init_tx_base64".to_string())
-            .with_update_tx("update_tx_base64".to_string())
-    }
-
-    fn chain_no_pda() -> MockChain {
-        MockChain::with_state(MultiDelegateOnChainState {
-            multi_delegate_exists: false,
-            existing_delegation_cap: None,
-        })
-    }
-
-    fn chain_pda_no_delegation() -> MockChain {
-        MockChain::with_state(MultiDelegateOnChainState {
-            multi_delegate_exists: true,
-            existing_delegation_cap: None,
-        })
-    }
-
-    fn chain_insufficient(cap: u64) -> MockChain {
-        MockChain::with_state(MultiDelegateOnChainState {
-            multi_delegate_exists: true,
-            existing_delegation_cap: Some(cap),
-        })
-    }
-
-    fn chain_sufficient(cap: u64) -> MockChain {
-        MockChain::with_state(MultiDelegateOnChainState {
-            multi_delegate_exists: true,
-            existing_delegation_cap: Some(cap),
-        })
-    }
+    use std::sync::Arc;
 
     const CAP: u64 = 1_000_000;
 
@@ -1696,255 +1119,6 @@ mod tests {
         kp[..32].copy_from_slice(sk.as_bytes());
         kp[32..].copy_from_slice(vk.as_bytes());
         Box::new(MemorySigner::from_bytes(&kp).unwrap())
-    }
-
-    // ── handle_pull_setup: AlreadySufficient path ─────────────────────────────
-
-    #[tokio::test]
-    async fn already_sufficient_returns_ok_no_tx_submitted() {
-        let chain = chain_sufficient(5 * CAP);
-        let outcome = handle_pull_setup(&no_tx_payload(CAP), CAP, &chain)
-            .await
-            .unwrap();
-        assert_eq!(outcome, PullSetupOutcome::AlreadySufficient);
-        assert!(
-            chain.submitted_txs().is_empty(),
-            "no tx should be submitted"
-        );
-    }
-
-    #[tokio::test]
-    async fn exact_cap_returns_already_sufficient() {
-        let chain = chain_sufficient(CAP);
-        let outcome = handle_pull_setup(&no_tx_payload(CAP), CAP, &chain)
-            .await
-            .unwrap();
-        assert_eq!(outcome, PullSetupOutcome::AlreadySufficient);
-    }
-
-    #[tokio::test]
-    async fn already_sufficient_ignores_provided_update_tx() {
-        let chain = chain_sufficient(5 * CAP);
-        let outcome = handle_pull_setup(&update_tx_payload(CAP), CAP, &chain)
-            .await
-            .unwrap();
-        assert_eq!(outcome, PullSetupOutcome::AlreadySufficient);
-        assert!(
-            chain.submitted_txs().is_empty(),
-            "update tx must not be submitted when cap sufficient"
-        );
-    }
-
-    // ── handle_pull_setup: SubmitInit path ────────────────────────────────────
-
-    #[tokio::test]
-    async fn no_multi_delegate_with_init_tx_submits_init() {
-        let chain = chain_no_pda();
-        let outcome = handle_pull_setup(&init_tx_payload(CAP), CAP, &chain)
-            .await
-            .unwrap();
-        assert_eq!(
-            outcome,
-            PullSetupOutcome::InitSubmitted {
-                signature: "mock_sig_abc123".to_string()
-            }
-        );
-        assert_eq!(chain.submitted_txs(), vec!["init_tx_base64"]);
-    }
-
-    #[tokio::test]
-    async fn no_multi_delegate_with_both_txs_submits_only_init() {
-        let chain = chain_no_pda();
-        let outcome = handle_pull_setup(&both_tx_payload(CAP), CAP, &chain)
-            .await
-            .unwrap();
-        assert_eq!(
-            outcome,
-            PullSetupOutcome::InitSubmitted {
-                signature: "mock_sig_abc123".to_string()
-            }
-        );
-        // Only init_tx was submitted, not update_tx
-        assert_eq!(chain.submitted_txs(), vec!["init_tx_base64"]);
-    }
-
-    // ── handle_pull_setup: SubmitUpdate path ──────────────────────────────────
-
-    #[tokio::test]
-    async fn pda_exists_no_delegation_with_update_tx_submits_update() {
-        let chain = chain_pda_no_delegation();
-        let outcome = handle_pull_setup(&update_tx_payload(CAP), CAP, &chain)
-            .await
-            .unwrap();
-        assert_eq!(
-            outcome,
-            PullSetupOutcome::UpdateSubmitted {
-                signature: "mock_sig_abc123".to_string()
-            }
-        );
-        assert_eq!(chain.submitted_txs(), vec!["update_tx_base64"]);
-    }
-
-    #[tokio::test]
-    async fn pda_exists_insufficient_cap_with_update_tx_submits_update() {
-        let chain = chain_insufficient(CAP / 2);
-        let outcome = handle_pull_setup(&update_tx_payload(CAP), CAP, &chain)
-            .await
-            .unwrap();
-        assert_eq!(
-            outcome,
-            PullSetupOutcome::UpdateSubmitted {
-                signature: "mock_sig_abc123".to_string()
-            }
-        );
-        assert_eq!(chain.submitted_txs(), vec!["update_tx_base64"]);
-    }
-
-    #[tokio::test]
-    async fn pda_exists_insufficient_with_both_txs_submits_only_update() {
-        let chain = chain_insufficient(CAP / 2);
-        let outcome = handle_pull_setup(&both_tx_payload(CAP), CAP, &chain)
-            .await
-            .unwrap();
-        assert_eq!(
-            outcome,
-            PullSetupOutcome::UpdateSubmitted {
-                signature: "mock_sig_abc123".to_string()
-            }
-        );
-        // Only update_tx was submitted, not init_tx
-        assert_eq!(chain.submitted_txs(), vec!["update_tx_base64"]);
-    }
-
-    // ── handle_pull_setup: MissingPayload errors ──────────────────────────────
-
-    #[tokio::test]
-    async fn no_multi_delegate_without_init_tx_returns_error() {
-        let chain = chain_no_pda();
-        let err = handle_pull_setup(&no_tx_payload(CAP), CAP, &chain)
-            .await
-            .unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("initDelegationTx"),
-            "expected init tx mention, got: {msg}"
-        );
-        assert!(chain.submitted_txs().is_empty());
-    }
-
-    #[tokio::test]
-    async fn pda_exists_no_delegation_without_update_tx_returns_error() {
-        let chain = chain_pda_no_delegation();
-        let err = handle_pull_setup(&no_tx_payload(CAP), CAP, &chain)
-            .await
-            .unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("updateDelegationTx"),
-            "expected update tx mention, got: {msg}"
-        );
-        assert!(chain.submitted_txs().is_empty());
-    }
-
-    #[tokio::test]
-    async fn no_multi_delegate_with_update_tx_only_returns_error() {
-        // update_tx alone is not enough when MultiDelegate doesn't exist yet.
-        let chain = chain_no_pda();
-        let err = handle_pull_setup(&update_tx_payload(CAP), CAP, &chain)
-            .await
-            .unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("initDelegationTx"),
-            "expected init tx mention, got: {msg}"
-        );
-        assert!(chain.submitted_txs().is_empty());
-    }
-
-    // ── handle_pull_setup: tx submission failures ─────────────────────────────
-
-    #[tokio::test]
-    async fn init_tx_submission_failure_propagates_error() {
-        let chain = chain_no_pda().with_submit_error("RPC timeout");
-        let err = handle_pull_setup(&init_tx_payload(CAP), CAP, &chain)
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("RPC timeout"), "got: {err}");
-    }
-
-    #[tokio::test]
-    async fn update_tx_submission_failure_propagates_error() {
-        let chain = chain_pda_no_delegation().with_submit_error("network error");
-        let err = handle_pull_setup(&update_tx_payload(CAP), CAP, &chain)
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("network error"), "got: {err}");
-    }
-
-    // ── handle_pull_setup: missing owner field ────────────────────────────────
-
-    #[tokio::test]
-    async fn missing_owner_returns_error() {
-        let chain = chain_no_pda();
-        // Manually construct a pull payload without owner
-        let payload = OpenPayload {
-            mode: solana_mpp::SessionMode::Pull,
-            channel_id: None,
-            deposit: None,
-            payer: None,
-            payee: None,
-            mint: None,
-            salt: None,
-            grace_period: None,
-            transaction: None,
-            token_account: Some("tok".to_string()),
-            approved_amount: Some("1000000".to_string()),
-            owner: None, // <-- missing
-            init_multi_delegate_tx: Some("init_tx".to_string()),
-            update_delegation_tx: None,
-            authorized_signer: "signer".to_string(),
-            signature: "sig".to_string(),
-        };
-        let err = handle_pull_setup(&payload, CAP, &chain).await.unwrap_err();
-        assert!(err.to_string().contains("owner"), "got: {err}");
-    }
-
-    // ── PullSetupOutcome display ──────────────────────────────────────────────
-
-    #[test]
-    fn pull_setup_outcomes_are_distinguishable() {
-        let already = PullSetupOutcome::AlreadySufficient;
-        let init = PullSetupOutcome::InitSubmitted {
-            signature: "sig1".to_string(),
-        };
-        let update = PullSetupOutcome::UpdateSubmitted {
-            signature: "sig2".to_string(),
-        };
-        assert_ne!(already, init);
-        assert_ne!(already, update);
-        assert_ne!(init, update);
-    }
-
-    #[test]
-    fn normalize_pull_setup_reason_renames_init_payload() {
-        assert_eq!(
-            normalize_pull_setup_reason("missing initMultiDelegateTx"),
-            "missing initDelegationTx"
-        );
-    }
-
-    #[test]
-    fn parse_fixed_delegation_cap_reads_expected_offset() {
-        let mut data = vec![0u8; FIXED_DELEGATION_CAP_OFFSET + FIXED_DELEGATION_CAP_LEN];
-        data[FIXED_DELEGATION_CAP_OFFSET..FIXED_DELEGATION_CAP_OFFSET + FIXED_DELEGATION_CAP_LEN]
-            .copy_from_slice(&CAP.to_le_bytes());
-        assert_eq!(parse_fixed_delegation_cap(&data), Some(CAP));
-    }
-
-    #[test]
-    fn parse_fixed_delegation_cap_rejects_short_data() {
-        let data = vec![0u8; FIXED_DELEGATION_CAP_OFFSET + FIXED_DELEGATION_CAP_LEN - 1];
-        assert_eq!(parse_fixed_delegation_cap(&data), None);
     }
 
     #[test]
@@ -2062,49 +1236,6 @@ mod tests {
         assert_eq!(params.settled, 100);
         assert_eq!(signature, None);
         assert_eq!(session.committed_watermark(&opened.channel_id), Some(100));
-    }
-
-    #[tokio::test]
-    async fn lifecycle_runloop_batches_pull_channel_opens() {
-        let batches: Arc<Mutex<Vec<OpenChannelBatch>>> = Arc::new(Mutex::new(Vec::new()));
-        let session = test_session_mpp()
-            .with_multi_delegate_chain(Box::new(chain_sufficient(CAP)))
-            .with_test_open_channel_batcher_interval(10, {
-                let batches = Arc::clone(&batches);
-                move |batch| {
-                    let batches = Arc::clone(&batches);
-                    async move {
-                        batches.lock().unwrap().push(batch);
-                        Ok(())
-                    }
-                }
-            });
-
-        let challenge = session.challenge(CAP).unwrap();
-        let owner = solana_pubkey::Pubkey::new_unique().to_string();
-        let token_account = solana_pubkey::Pubkey::new_unique().to_string();
-        let payload = OpenPayload::pull(
-            token_account.clone(),
-            CAP.to_string(),
-            owner.clone(),
-            solana_pubkey::Pubkey::new_unique().to_string(),
-            "open_sig".to_string(),
-        );
-        let credential = PaymentCredential::new(
-            challenge.to_echo(),
-            serde_json::to_value(SessionAction::Open(payload)).unwrap(),
-        );
-        let auth_header = format_authorization(&credential).unwrap();
-
-        let SessionOutcome::Active(_) = session.process(&auth_header).await.unwrap() else {
-            panic!("expected pull open to return active session");
-        };
-        tokio::time::sleep(Duration::from_millis(40)).await;
-
-        assert_eq!(
-            batches.lock().unwrap().clone(),
-            vec![vec![(owner, token_account, CAP)]]
-        );
     }
 
     #[tokio::test]
@@ -2273,28 +1404,6 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("Failed to get finalize params"));
-    }
-
-    #[tokio::test]
-    async fn run_pull_setup_rejects_when_chain_not_configured() {
-        let session = test_session_mpp();
-        let err = session
-            .run_pull_setup(&no_tx_payload(CAP))
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("operated-voucher pull sessions require a multi-delegate chain")
-        );
-    }
-
-    #[tokio::test]
-    async fn run_pull_setup_rejects_invalid_pull_deposit() {
-        let session = test_session_mpp().with_multi_delegate_chain(Box::new(chain_no_pda()));
-        let mut payload = init_tx_payload(CAP);
-        payload.approved_amount = Some("not-a-number".to_string());
-        let err = session.run_pull_setup(&payload).await.unwrap_err();
-        assert!(err.to_string().contains("pull open"));
     }
 
     fn payment_channel_payload(
