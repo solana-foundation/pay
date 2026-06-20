@@ -53,6 +53,12 @@ pub struct SendCommand {
     /// This is implied when AMOUNT is "max".
     #[arg(long)]
     pub fee_within: bool,
+
+    /// Send as a confidential transfer (amount hidden on-chain). Requires a
+    /// Token-2022 mint with the Confidential Transfer extension; the gateway
+    /// issues a confidential challenge and the payment settles as a bundle.
+    #[arg(long)]
+    pub confidential: bool,
 }
 
 impl SendCommand {
@@ -101,6 +107,7 @@ impl SendCommand {
                 account_override,
                 memo: memo.as_deref(),
                 fee_within,
+                confidential: self.confidential,
                 rpc_url,
             },
         )?;

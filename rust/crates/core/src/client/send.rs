@@ -49,6 +49,10 @@ pub struct StablecoinSendRequest<'a> {
     pub account_override: Option<&'a str>,
     pub memo: Option<&'a str>,
     pub fee_within: bool,
+    /// Request a confidential (amount-hidden) transfer. The gateway issues a
+    /// confidential MPP challenge for CT-capable mints; the client then settles
+    /// it as a Token-2022 confidential transfer bundle.
+    pub confidential: bool,
     pub rpc_url: Option<&'a str>,
 }
 
@@ -62,6 +66,8 @@ struct ApiSendRequest<'a> {
     memo: Option<&'a str>,
     #[serde(rename = "feeWithin", skip_serializing_if = "is_false")]
     fee_within: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    confidential: bool,
 }
 
 #[derive(Deserialize)]
@@ -110,6 +116,7 @@ pub fn send_stablecoin(request: StablecoinSendRequest<'_>) -> Result<SendResult>
         account_override,
         memo,
         fee_within,
+        confidential,
         rpc_url,
     } = request;
 
@@ -154,6 +161,7 @@ pub fn send_stablecoin(request: StablecoinSendRequest<'_>) -> Result<SendResult>
         network: api_network,
         memo: memo.map(str::trim).filter(|value| !value.is_empty()),
         fee_within,
+        confidential,
     };
     let body = serde_json::to_string(&request)?;
     let headers = vec![("content-type".to_string(), "application/json".to_string())];
