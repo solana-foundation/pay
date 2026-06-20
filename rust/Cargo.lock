@@ -4873,6 +4873,7 @@ checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 [[package]]
 name = "litesvm"
 version = "0.13.0"
+source = "git+https://github.com/lgalabru/litesvm.git?branch=loosen-solana-address-constraint#9178c65ba4209d4c20e5d86277fb2e6f48ad1d01"
 dependencies = [
  "agave-feature-set 4.0.0",
  "agave-precompiles",
@@ -4939,6 +4940,7 @@ dependencies = [
 [[package]]
 name = "litesvm-token"
 version = "0.13.0"
+source = "git+https://github.com/lgalabru/litesvm.git?branch=loosen-solana-address-constraint#9178c65ba4209d4c20e5d86277fb2e6f48ad1d01"
 dependencies = [
  "litesvm",
  "smallvec",
