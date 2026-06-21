@@ -444,6 +444,27 @@ mod tests {
         assert_eq!(parse_token_amount("10", 6).unwrap(), 10_000_000);
     }
 
+    fn api_send(confidential: bool) -> ApiSendRequest<'static> {
+        ApiSendRequest {
+            recipient: "rcpt",
+            amount: "1000000",
+            currency: "USDC",
+            network: "mainnet",
+            memo: None,
+            fee_within: false,
+            confidential,
+        }
+    }
+
+    #[test]
+    fn api_send_request_emits_confidential_flag_only_when_set() {
+        let on = serde_json::to_string(&api_send(true)).unwrap();
+        assert!(on.contains("\"confidential\":true"), "got: {on}");
+        // Skipped when false (default), so non-confidential sends are unchanged.
+        let off = serde_json::to_string(&api_send(false)).unwrap();
+        assert!(!off.contains("confidential"), "got: {off}");
+    }
+
     #[test]
     fn parse_token_amount_fractional() {
         assert_eq!(parse_token_amount("0.5", 6).unwrap(), 500_000);
