@@ -270,15 +270,9 @@ impl SessionLifecycleHandle {
 
 #[derive(Debug)]
 enum SessionLifecycleCommand {
-    ConfigureCloseDelay {
-        close_delay: Option<Duration>,
-    },
-    Touch {
-        channel_id: String,
-    },
-    Remove {
-        channel_id: String,
-    },
+    ConfigureCloseDelay { close_delay: Option<Duration> },
+    Touch { channel_id: String },
+    Remove { channel_id: String },
 }
 
 struct SessionLifecycleRunloop {
