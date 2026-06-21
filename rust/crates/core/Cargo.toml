@@ -57,6 +57,12 @@ solana-pubkey = { workspace = true }
 solana-signature = { workspace = true }
 solana-system-interface = { workspace = true }
 solana-transaction = { workspace = true }
+# Force five8_core 0.1.2's `std` feature ON. It gates `impl Error for
+# DecodeError`, which solana-keypair/solana-signature rely on; feature
+# unification otherwise drops it on re-resolve, breaking the build with
+# "DecodeError: std::error::Error is not satisfied". Pinned to the transitive
+# version already in the tree.
+five8_core = { version = "=0.1.2", features = ["std"] }
 
 [dev-dependencies]
 serde_yml = { workspace = true }
