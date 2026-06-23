@@ -481,7 +481,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.2",
  "rustls 0.23.40",
- "socket2 0.5.10",
+ "socket2 0.6.4",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -2423,7 +2423,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2750,7 +2750,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2901,7 +2901,7 @@ version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23f76610e969fa1784327ded240f1e28a3fd9520c9cec93b636fcf62dd37f772"
 dependencies = [
- "five8_core 0.1.2",
+ "five8_core 1.0.0",
 ]
 
 [[package]]
@@ -2919,7 +2919,7 @@ version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1a0f1728185f277989ca573a402716ae0beaaea3f76a8ff87ef9dd8fb19436c5"
 dependencies = [
- "five8_core 0.1.2",
+ "five8_core 1.0.0",
 ]
 
 [[package]]
@@ -3830,7 +3830,7 @@ dependencies = [
  "httpdate",
  "itoa",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.4.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -3935,7 +3935,7 @@ dependencies = [
  "libc",
  "percent-encoding 2.3.2",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.4",
  "system-configuration 0.7.0",
  "tokio",
  "tower-service",
@@ -4873,7 +4873,7 @@ checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 [[package]]
 name = "litesvm"
 version = "0.13.0"
-source = "git+https://github.com/lgalabru/litesvm.git?branch=loosen-solana-address-constraint#9178c65ba4209d4c20e5d86277fb2e6f48ad1d01"
+source = "git+https://github.com/LiteSVM/litesvm.git?branch=master#b097465bc66ba6033b5118b8a2d5bc2ecb9f00e1"
 dependencies = [
  "agave-feature-set 4.0.0",
  "agave-precompiles",
@@ -4940,7 +4940,7 @@ dependencies = [
 [[package]]
 name = "litesvm-token"
 version = "0.13.0"
-source = "git+https://github.com/lgalabru/litesvm.git?branch=loosen-solana-address-constraint#9178c65ba4209d4c20e5d86277fb2e6f48ad1d01"
+source = "git+https://github.com/LiteSVM/litesvm.git?branch=master#b097465bc66ba6033b5118b8a2d5bc2ecb9f00e1"
 dependencies = [
  "litesvm",
  "smallvec",
@@ -5326,7 +5326,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6044,7 +6044,7 @@ dependencies = [
 [[package]]
 name = "payment-channels-client"
 version = "0.1.0"
-source = "git+https://github.com/solana-foundation/pay-kit?branch=feat%2Fconfidential-transfers#12d41e8348c410150e2c638fdec805da3c0759ce"
+source = "git+https://github.com/solana-foundation/pay-kit?branch=main#9ed8b2e4be33632f6098c0c2989c7b46cab12ae5"
 dependencies = [
  "borsh 1.7.0",
  "num-derive",
@@ -6502,7 +6502,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.2",
  "rustls 0.23.40",
- "socket2 0.5.10",
+ "socket2 0.6.4",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -6542,7 +6542,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.4",
  "tracing",
  "windows-sys 0.59.0",
 ]
@@ -7143,7 +7143,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7223,7 +7223,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7244,7 +7244,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7927,16 +7927,6 @@ checksum = "9f7916fc008ca5542385b89a3d3ce689953c143e9304a9bf8beec1de48994c0d"
 dependencies = [
  "libc",
  "winapi 0.3.9",
-]
-
-[[package]]
-name = "socket2"
-version = "0.5.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e22376abed350d73dd1cd119b57ffccad95b4e585a7cda43e286245ce23c0678"
-dependencies = [
- "libc",
- "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -9664,7 +9654,7 @@ dependencies = [
 [[package]]
 name = "solana-mpp"
 version = "0.6.0"
-source = "git+https://github.com/solana-foundation/pay-kit?branch=feat%2Fconfidential-transfers#12d41e8348c410150e2c638fdec805da3c0759ce"
+source = "git+https://github.com/solana-foundation/pay-kit?branch=main#9ed8b2e4be33632f6098c0c2989c7b46cab12ae5"
 dependencies = [
  "base64 0.22.1",
  "bincode",
@@ -9673,6 +9663,7 @@ dependencies = [
  "bs58",
  "bytemuck",
  "ed25519-dalek 2.2.0",
+ "five8_core 0.1.2",
  "hmac 0.12.1",
  "reqwest 0.12.28",
  "serde",
@@ -9886,15 +9877,18 @@ dependencies = [
 [[package]]
 name = "solana-pay-core"
 version = "0.1.0"
-source = "git+https://github.com/solana-foundation/pay-kit?branch=feat%2Fconfidential-transfers#12d41e8348c410150e2c638fdec805da3c0759ce"
+source = "git+https://github.com/solana-foundation/pay-kit?branch=main#9ed8b2e4be33632f6098c0c2989c7b46cab12ae5"
 dependencies = [
  "base64 0.22.1",
  "bincode",
  "blake3",
  "borsh 1.7.0",
  "bs58",
+ "ed25519-dalek 2.2.0",
  "getrandom 0.3.4",
  "payment-channels-client",
+ "serde",
+ "serde_json",
  "solana-address 2.5.0",
  "solana-hash 3.1.0",
  "solana-instruction 3.2.0",
@@ -12271,7 +12265,7 @@ dependencies = [
 [[package]]
 name = "solana-x402"
 version = "0.1.0"
-source = "git+https://github.com/solana-foundation/pay-kit?branch=feat%2Fconfidential-transfers#12d41e8348c410150e2c638fdec805da3c0759ce"
+source = "git+https://github.com/solana-foundation/pay-kit?branch=main#9ed8b2e4be33632f6098c0c2989c7b46cab12ae5"
 dependencies = [
  "base64 0.22.1",
  "bincode",
@@ -12984,7 +12978,7 @@ dependencies = [
 [[package]]
 name = "subscriptions-client"
 version = "0.1.0"
-source = "git+https://github.com/solana-foundation/pay-kit?branch=feat%2Fconfidential-transfers#12d41e8348c410150e2c638fdec805da3c0759ce"
+source = "git+https://github.com/solana-foundation/pay-kit?branch=main#9ed8b2e4be33632f6098c0c2989c7b46cab12ae5"
 dependencies = [
  "borsh 1.7.0",
  "num-derive",
@@ -13306,7 +13300,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -13316,7 +13310,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "230a1b821ccbd75b185820a1f1ff7b14d21da1e442e22c0863ea5f08771a8874"
 dependencies = [
  "rustix 1.1.4",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -14464,7 +14458,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
