@@ -7,9 +7,7 @@
 </div>
 
 <p align="center">
-  <a href="https://skills.sh/solana-foundation/pay">
-    <img alt="skills.sh" src="https://skills.sh/b/solana-foundation/pay">
-  </a>
+  <a href="https://skills.sh/solana-foundation/pay"><img alt="skills.sh" src="https://skills.sh/b/solana-foundation/pay"></a>
   <a href="https://x402.org"><img alt="x402" src="https://img.shields.io/badge/protocol-x402-black"></a>
   <a href="https://paymentauth.org"><img alt="MPP" src="https://img.shields.io/badge/protocol-MPP-black"></a>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-green"></a>
