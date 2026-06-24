@@ -1,12 +1,29 @@
-# pay
-
-**The missing payment layer for HTTP. `pay` handles x402 and MPP payment challenges with user-authorized stablecoin signing.**
-
-Wrap a selected set of command line tools (`curl`, `claude`, `codex`, `whoami`, etc.) -- when a stablecoin-gated API returns 402, `pay` detects the payment protocol, prepares the stablecoin transaction, asks the local wallet to authorize and sign it, then retries with the payment proof.
-
-[Install](#installation) · [Quick Start](#quick-start) · [Docs](https://docs.solanapay.com)
-
+<div align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://github.com/solana-foundation/pay/raw/main/docs/assets/banner-main-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="https://github.com/solana-foundation/pay/raw/main/docs/assets/banner-main-light.png">
+    <img alt="pay.sh" width="100%" src="https://github.com/solana-foundation/pay/raw/main/docs/assets/banner-main-light.png">
+  </picture>
 </div>
+
+<p align="center">
+  <a href="https://skills.sh/solana-foundation/pay">
+    <img alt="skills.sh" src="https://skills.sh/b/solana-foundation/pay">
+  </a>
+  <a href="https://x402.org"><img alt="x402" src="https://img.shields.io/badge/protocol-x402-black"></a>
+  <a href="https://paymentauth.org"><img alt="MPP" src="https://img.shields.io/badge/protocol-MPP-black"></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-green"></a>
+</p>
+
+<p align="center">
+  <b>The missing payment layer for HTTP — x402 &amp; MPP payment challenges with user-authorized stablecoin signing.</b>
+</p>
+
+<p align="center">
+  <a href="#installation">Install</a> ·
+  <a href="#quick-start">Quick Start</a> ·
+  <a href="https://docs.solanapay.com">Docs</a>
+</p>
 
 ---
 
