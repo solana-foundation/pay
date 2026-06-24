@@ -116,30 +116,6 @@ impl SessionHandle {
         build_header(&self.challenge, &action)
     }
 
-    /// Build an `Authorization` header for a pull-mode `open` action.
-    ///
-    /// The two pre-signed delegation transactions (`init_tx`, `update_tx`) are
-    /// built by [`open_pull_session_header`] and attached here. The server will
-    /// submit whichever transaction is appropriate for the current on-chain state.
-    pub async fn open_pull_header(
-        &self,
-        approved_amount: u64,
-        owner: &str,
-        approve_sig: &str,
-        init_tx: String,
-        update_tx: String,
-    ) -> Result<String> {
-        use solana_mpp::SessionAction;
-        let session = self.inner.lock().await;
-        let SessionAction::Open(payload) =
-            session.open_pull_action(approved_amount, owner, approve_sig)
-        else {
-            unreachable!("open_pull_action always returns SessionAction::Open")
-        };
-        let payload = payload.with_init_tx(init_tx).with_update_tx(update_tx);
-        build_header(&self.challenge, &SessionAction::Open(payload))
-    }
-
     /// Build an `Authorization` header for a payment-channel `open` action.
     #[allow(clippy::too_many_arguments)]
     pub async fn open_payment_channel_header(
@@ -303,9 +279,12 @@ pub fn open_payment_channel_session_header_with_mode(
     sandbox: bool,
 ) -> Result<(SessionHandle, String)> {
     use solana_hash::Hash;
-    use solana_mpp::client::build_open_payment_channel_tx;
-    use solana_mpp::program::payment_channels::{self, Distribution};
-    use solana_mpp::protocol::solana::{default_rpc_url, programs};
+    use solana_mpp::client::{
+        BuildOpenPaymentChannelTransactionParams, DerivePaymentChannelOpenParams,
+        PaymentChannelOpenOptions, build_open_payment_channel_transaction,
+        derive_payment_channel_open,
+    };
+    use solana_mpp::protocol::solana::default_rpc_url;
     use solana_mpp::solana_keychain::MemorySigner;
     use solana_pubkey::Pubkey;
     use std::str::FromStr;
@@ -329,36 +308,14 @@ pub fn open_payment_channel_session_header_with_mode(
 
     let fee_payer = Pubkey::from_str(&request.operator)
         .map_err(|_| Error::Mpp(format!("invalid operator pubkey: {}", request.operator)))?;
-    let payee = Pubkey::from_str(&request.recipient)
-        .map_err(|_| Error::Mpp(format!("invalid recipient pubkey: {}", request.recipient)))?;
-    let mint = Pubkey::from_str(&request.currency).map_err(|_| {
-        Error::Mpp(format!(
-            "invalid mint address in challenge: {}",
-            request.currency
-        ))
-    })?;
-    let program_id = request
-        .program_id
-        .as_deref()
-        .map(Pubkey::from_str)
-        .transpose()
-        .map_err(|e| Error::Mpp(format!("invalid channel program id: {e}")))?
-        .unwrap_or_else(payment_channels::default_program_id);
-    let token_program = Pubkey::from_str(programs::TOKEN_PROGRAM).unwrap();
-    let recipients = request
-        .splits
-        .iter()
-        .map(|split| {
-            Ok(Distribution {
-                recipient: Pubkey::from_str(&split.recipient).map_err(|e| {
-                    Error::Mpp(format!("invalid split recipient {}: {e}", split.recipient))
-                })?,
-                bps: split.bps,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
     let salt = rand::random::<u64>();
-    let grace_period = 900;
+    let grace_period = 900u32;
+    let open_options = PaymentChannelOpenOptions {
+        deposit: Some(deposit),
+        grace_period: Some(grace_period),
+        salt: Some(salt),
+        ..PaymentChannelOpenOptions::default()
+    };
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -392,22 +349,28 @@ pub fn open_payment_channel_session_header_with_mode(
         Box::new(MemorySigner::from_bytes(&kp_bytes).map_err(|e| Error::Mpp(e.to_string()))?);
     let authorized_signer = session_signer.pubkey();
 
+    let open = derive_payment_channel_open(DerivePaymentChannelOpenParams {
+        request,
+        payer,
+        authorized_signer,
+        options: open_options.clone(),
+    })
+    .map_err(|e| Error::Mpp(format!("derive_payment_channel_open: {e}")))?;
+    let payee = open.payee;
+    let mint = open.mint;
+
     let open_tx = rt
-        .block_on(build_open_payment_channel_tx(
-            &signer,
-            &payee,
-            &mint,
-            &authorized_signer,
-            salt,
-            deposit,
-            grace_period,
-            recipients,
-            &token_program,
-            &program_id,
-            &fee_payer,
-            recent_blockhash,
+        .block_on(build_open_payment_channel_transaction(
+            BuildOpenPaymentChannelTransactionParams {
+                request,
+                signer: &signer,
+                authorized_signer,
+                fee_payer: Some(fee_payer),
+                recent_blockhash,
+                options: open_options,
+            },
         ))
-        .map_err(|e| Error::Mpp(format!("build_open_payment_channel_tx: {e}")))?;
+        .map_err(|e| Error::Mpp(format!("build_open_payment_channel_transaction: {e}")))?;
 
     let handle = SessionHandle::new(open_tx.channel_id, session_signer, challenge.clone());
     let auth_header = rt.block_on(handle.open_payment_channel_header_with_mode(
@@ -427,191 +390,6 @@ pub fn open_payment_channel_session_header_with_mode(
         deposit,
         mode = ?submission_mode,
         "payment-channel session authorization header ready"
-    );
-
-    Ok((handle, auth_header))
-}
-
-/// Open a pull-mode session: loads the user's wallet, derives the USDC ATA,
-/// builds both delegation transactions (init + update), and returns an
-/// `Authorization` header carrying the `open` action with both txs attached.
-///
-/// # Parameters
-/// - `challenge` — the 402 session challenge from the server
-/// - `request` — the decoded `SessionRequest` (contains operator pubkey, mint, etc.)
-/// - `store` — accounts store used to load the user's signing keypair
-/// - `network_override` — `Some("localnet")` for `--sandbox`, `None` to trust challenge
-/// - `deposit` — amount to approve (µUSDC)
-/// - `sandbox` — when `true`, auto-funds the wallet via Surfpool before building txs
-pub fn open_pull_session_header(
-    challenge: &PaymentChallenge,
-    request: &solana_mpp::SessionRequest,
-    store: &dyn crate::accounts::AccountsStore,
-    network_override: Option<&str>,
-    account_override: Option<&str>,
-    deposit: u64,
-    sandbox: bool,
-) -> Result<(SessionHandle, String)> {
-    use solana_hash::Hash;
-    use solana_mpp::client::multi_delegate::{
-        build_init_multi_delegate_tx, build_update_delegation_tx,
-    };
-    use solana_mpp::program::multi_delegator::MULTI_DELEGATOR_PROGRAM_ID;
-    use solana_mpp::protocol::solana::{default_rpc_url, programs};
-    use solana_mpp::solana_keychain::MemorySigner;
-    use solana_pubkey::Pubkey;
-    use std::str::FromStr;
-
-    let network = network_override.map(str::to_string).unwrap_or_else(|| {
-        request
-            .network
-            .clone()
-            .unwrap_or_else(|| "mainnet".to_string())
-    });
-
-    // Load the user's wallet keypair
-    let intent = crate::keystore::AuthIntent::open_session();
-    let (signer, ephemeral_notice) = crate::signer::load_signer_for_network_with_intent(
-        &network,
-        store,
-        account_override,
-        &intent,
-    )?;
-    let user_pubkey = signer.pubkey();
-
-    // Resolve RPC endpoint
-    let rpc_url =
-        std::env::var("PAY_RPC_URL").unwrap_or_else(|_| default_rpc_url(&network).to_string());
-
-    // Operator pubkey (delegatee in every FixedDelegation)
-    let operator_pk = Pubkey::from_str(&request.operator)
-        .map_err(|_| Error::Mpp(format!("invalid operator pubkey: {}", request.operator)))?;
-
-    // Mint and token program (currency field carries the resolved mint address)
-    let mint_pk = Pubkey::from_str(&request.currency).map_err(|_| {
-        Error::Mpp(format!(
-            "invalid mint address in challenge: {}",
-            request.currency
-        ))
-    })?;
-    let token_program_pk = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap();
-
-    // Derive the user's ATA: find_program_address([owner, token_program, mint], ata_program)
-    let ata_program_pk = Pubkey::from_str(programs::ASSOCIATED_TOKEN_PROGRAM).unwrap();
-    let (user_ata, _) = Pubkey::find_program_address(
-        &[
-            user_pubkey.as_ref(),
-            token_program_pk.as_ref(),
-            mint_pk.as_ref(),
-        ],
-        &ata_program_pk,
-    );
-
-    let program_id_pk = Pubkey::from_str(MULTI_DELEGATOR_PROGRAM_ID).unwrap();
-
-    tracing::info!(
-        user = %user_pubkey,
-        operator = %operator_pk,
-        mint = %mint_pk,
-        token_account = %user_ata,
-        deposit,
-        network,
-        "building pull-mode session payloads"
-    );
-
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| Error::Mpp(format!("Failed to create async runtime: {e}")))?;
-
-    // Step 1 (optional): auto-fund user wallet in sandbox mode
-    if sandbox && ephemeral_notice.is_some() {
-        let pubkey = user_pubkey.to_string();
-        let rpc = rpc_url.clone();
-        if let Err(e) = rt.block_on(crate::client::sandbox::fund_via_surfpool(&rpc, &pubkey)) {
-            tracing::warn!(error = %e, "Surfpool auto-fund failed — USDC balance may be 0");
-        }
-    }
-
-    // Prefer the server-provided blockhash to avoid a redundant client-side
-    // RPC call. Fall back to the cluster only when the challenge omitted it.
-    let recent_blockhash = if let Some(blockhash) = request.recent_blockhash.as_deref() {
-        Hash::from_str(blockhash)
-            .map_err(|e| Error::Mpp(format!("invalid recentBlockhash in challenge: {e}")))?
-    } else {
-        use solana_mpp::solana_rpc_client::rpc_client::RpcClient;
-        RpcClient::new(rpc_url.clone())
-            .get_latest_blockhash()
-            .map_err(|e| Error::Mpp(format!("failed to get recent blockhash: {e}")))?
-    };
-
-    // Step 3: build both delegation transactions (async signers)
-    let expiry_ts = 9_999_999_999i64; // far-future expiry
-
-    let (init_tx_b64, update_tx_b64) = rt.block_on(async {
-        let signer_ref: &dyn solana_mpp::solana_keychain::SolanaSigner = &signer;
-        let init = build_init_multi_delegate_tx(
-            signer_ref,
-            &mint_pk,
-            &user_ata,
-            &operator_pk,
-            &program_id_pk,
-            &token_program_pk,
-            0, // nonce
-            deposit,
-            expiry_ts,
-            recent_blockhash,
-        )
-        .await
-        .map_err(|e| Error::Mpp(format!("build_init_multi_delegate_tx: {e}")))?;
-
-        let update = build_update_delegation_tx(
-            signer_ref,
-            &mint_pk,
-            &operator_pk,
-            &program_id_pk,
-            0, // nonce
-            deposit,
-            expiry_ts,
-            recent_blockhash,
-        )
-        .await
-        .map_err(|e| Error::Mpp(format!("build_update_delegation_tx: {e}")))?;
-
-        Ok::<_, Error>((init, update))
-    })?;
-
-    tracing::info!(
-        init_tx_preview = %&init_tx_b64[..40.min(init_tx_b64.len())],
-        update_tx_preview = %&update_tx_b64[..40.min(update_tx_b64.len())],
-        "built pull-mode delegation transactions"
-    );
-
-    // Step 4: build session handle with a fresh ephemeral session keypair
-    let sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
-    let vk = sk.verifying_key();
-    let mut kp_bytes = [0u8; 64];
-    kp_bytes[..32].copy_from_slice(sk.as_bytes());
-    kp_bytes[32..].copy_from_slice(vk.as_bytes());
-    let session_signer: Box<dyn solana_mpp::solana_keychain::SolanaSigner> =
-        Box::new(MemorySigner::from_bytes(&kp_bytes).map_err(|e| Error::Mpp(e.to_string()))?);
-
-    // For pull-mode, the channel_id IS the user's token account
-    let handle = SessionHandle::new(user_ata, session_signer, challenge.clone());
-
-    let auth_header = rt.block_on(handle.open_pull_header(
-        deposit,
-        &user_pubkey.to_string(),
-        "pull_delegation_setup",
-        init_tx_b64,
-        update_tx_b64,
-    ))?;
-
-    tracing::info!(
-        user = %user_pubkey,
-        token_account = %user_ata,
-        deposit,
-        "pull-mode session authorization header ready"
     );
 
     Ok((handle, auth_header))
@@ -637,12 +415,9 @@ fn build_header(challenge: &PaymentChallenge, action: &SessionAction) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::accounts::{Account, AccountsFile, Keystore, MemoryAccountsStore};
-    use serial_test::serial;
     use solana_mpp::{
         Base64UrlJson, SessionMode, SessionPullVoucherStrategy, SessionSplit, parse_authorization,
     };
-    use surfpool_sdk::{Keypair, Signer};
 
     fn test_request() -> SessionRequest {
         SessionRequest {
@@ -692,27 +467,6 @@ mod tests {
     fn parse_action(header: &str) -> SessionAction {
         let credential = parse_authorization(header).expect("parse authorization");
         serde_json::from_value(credential.payload).expect("decode session action")
-    }
-
-    fn memory_store_for_keypair(keypair: &Keypair) -> MemoryAccountsStore {
-        let mut file = AccountsFile::default();
-        file.upsert(
-            "localnet",
-            "default",
-            Account {
-                keystore: Keystore::Ephemeral,
-                active: false,
-                auth_required: Some(false),
-                pubkey: Some(keypair.pubkey().to_string()),
-                vault: None,
-                account: None,
-                path: None,
-                secret_key_b58: Some(bs58::encode(keypair.to_bytes()).into_string()),
-                created_at: Some("2026-04-19T00:00:00Z".to_string()),
-                subscriptions: std::collections::BTreeMap::new(),
-            },
-        );
-        MemoryAccountsStore::with_file(file)
     }
 
     #[test]
@@ -781,47 +535,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn open_pull_header_attaches_both_delegation_payloads() {
-        let token_account = Pubkey::new_unique();
-        let token_account_str = token_account.to_string();
-        let owner = Pubkey::new_unique().to_string();
-        let handle = SessionHandle::new(token_account, test_signer(), test_challenge("session"));
-
-        let action = parse_action(
-            &handle
-                .open_pull_header(
-                    1_000_000,
-                    &owner,
-                    "approve_sig",
-                    "init_tx_b64".to_string(),
-                    "update_tx_b64".to_string(),
-                )
-                .await
-                .unwrap(),
-        );
-        match action {
-            SessionAction::Open(payload) => {
-                assert_eq!(payload.mode, SessionMode::Pull);
-                assert_eq!(
-                    payload.token_account.as_deref(),
-                    Some(token_account_str.as_str())
-                );
-                assert_eq!(payload.approved_amount.as_deref(), Some("1000000"));
-                assert_eq!(payload.owner.as_deref(), Some(owner.as_str()));
-                assert_eq!(
-                    payload.init_multi_delegate_tx.as_deref(),
-                    Some("init_tx_b64")
-                );
-                assert_eq!(
-                    payload.update_delegation_tx.as_deref(),
-                    Some("update_tx_b64")
-                );
-            }
-            _ => panic!("expected pull open action"),
-        }
-    }
-
     #[test]
     fn open_session_header_returns_parseable_header() {
         let challenge = test_challenge("session");
@@ -853,91 +566,5 @@ mod tests {
             }
             _ => panic!("expected voucher action"),
         }
-    }
-
-    #[test]
-    #[serial]
-    fn open_pull_session_header_rejects_invalid_operator() {
-        let user = Keypair::new();
-        let store = memory_store_for_keypair(&user);
-        let mut request = test_request();
-        request.operator = "not-a-pubkey".to_string();
-
-        let err = open_pull_session_header(
-            &test_challenge("session"),
-            &request,
-            &store,
-            Some("localnet"),
-            None,
-            1_000_000,
-            false,
-        )
-        .err()
-        .expect("invalid operator should error");
-
-        assert!(
-            err.to_string().contains("invalid operator pubkey"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn open_pull_session_header_rejects_invalid_mint() {
-        let user = Keypair::new();
-        let store = memory_store_for_keypair(&user);
-        let mut request = test_request();
-        request.currency = "not-a-mint".to_string();
-
-        let err = open_pull_session_header(
-            &test_challenge("session"),
-            &request,
-            &store,
-            Some("localnet"),
-            None,
-            1_000_000,
-            false,
-        )
-        .err()
-        .expect("invalid mint should error");
-
-        assert!(
-            err.to_string().contains("invalid mint address"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn open_pull_session_header_reports_rpc_failures() {
-        let user = Keypair::new();
-        let store = memory_store_for_keypair(&user);
-        let original = std::env::var("PAY_RPC_URL").ok();
-        // SAFETY: this test is `serial`, so no concurrent env access occurs.
-        unsafe { std::env::set_var("PAY_RPC_URL", "http://127.0.0.1:1") };
-
-        let err = open_pull_session_header(
-            &test_challenge("session"),
-            &test_request(),
-            &store,
-            Some("localnet"),
-            None,
-            1_000_000,
-            false,
-        )
-        .err()
-        .expect("rpc lookup should fail");
-
-        match original {
-            // SAFETY: this test is `serial`, so no concurrent env access occurs.
-            Some(value) => unsafe { std::env::set_var("PAY_RPC_URL", value) },
-            // SAFETY: this test is `serial`, so no concurrent env access occurs.
-            None => unsafe { std::env::remove_var("PAY_RPC_URL") },
-        }
-
-        assert!(
-            err.to_string().contains("failed to get recent blockhash"),
-            "got: {err}"
-        );
     }
 }

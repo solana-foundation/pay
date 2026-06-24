@@ -57,13 +57,19 @@ solana-pubkey = { workspace = true }
 solana-signature = { workspace = true }
 solana-system-interface = { workspace = true }
 solana-transaction = { workspace = true }
+# Force five8_core 0.1.2's `std` feature ON. It gates `impl Error for
+# DecodeError`, which solana-keypair/solana-signature rely on; feature
+# unification otherwise drops it on re-resolve, breaking the build with
+# "DecodeError: std::error::Error is not satisfied". Pinned to the transitive
+# version already in the tree.
+five8_core = { version = "=0.1.2", features = ["std"] }
 
 [dev-dependencies]
 serde_yml = { workspace = true }
 toml = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
-surfpool-sdk = { git = "https://github.com/solana-foundation/surfpool", branch = "feat/sdk" }
+surfpool-sdk = { git = "https://github.com/solana-foundation/surfpool", rev = "b46c47e06c28ed1aa31e119215b479b70e72d4c3" }
 serde_json = { workspace = true }
 tower = "0.5"
 serial_test = "3"
@@ -79,8 +85,4 @@ required-features = ["server"]
 
 [[test]]
 name = "surfpool_tests"
-required-features = ["server"]
-
-[[test]]
-name = "session_surfpool_sdk_tests"
 required-features = ["server"]

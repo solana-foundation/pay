@@ -1196,36 +1196,11 @@ fn pay_session_and_retry(
                 header
             }
             Some(SessionPullVoucherStrategy::OperatedVoucher) => {
-                if verbose && !is_json {
-                    eprintln!(
-                        "{}",
-                        format!(
-                            "Opening pull operated-voucher session (deposit {} µUSDC, operator {})…",
-                            deposit,
-                            &request.operator[..8.min(request.operator.len())]
-                        )
-                        .dimmed()
-                    );
-                }
-
-                let (_handle, header) = pay_core::session::open_pull_session_header(
-                    challenge,
-                    request,
-                    &store,
-                    network_override,
-                    account_override,
-                    deposit,
-                    sandbox,
-                )?;
-
-                if verbose && !is_json {
-                    eprintln!(
-                        "{}",
-                        "Pull operated-voucher session ready — delegation txs built, sending request…\n"
-                            .dimmed()
-                    );
-                }
-                header
+                return Err(pay_core::Error::Mpp(
+                    "operated-voucher pull sessions are no longer supported; \
+                     use a client-voucher payment-channel session instead"
+                        .to_string(),
+                ));
             }
             None => {
                 return Err(pay_core::Error::Mpp(

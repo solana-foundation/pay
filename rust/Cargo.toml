@@ -103,11 +103,11 @@ qrcode = { version = "0.14", default-features = false }
 mime_guess = { version = "2.0", default-features = false, features = ["rev-mappings"] }
 
 # Solana MPP (includes keypair loading + charge + subscription + authenticate
-# builders). Tracks pay-kit `main`; PR #154 merged the SIWMPP work so the
-# stable branch is the source of truth again.
+# builders).
 solana-mpp = { git = "https://github.com/solana-foundation/pay-kit", branch = "main", default-features = false, features = [
     "client",
     "server",
+    "confidential",
 ] }
 
 # Solana x402 (lives in the pay-kit workspace alongside solana-mpp)
@@ -126,8 +126,10 @@ solana-signature = "3.2"
 solana-system-interface = "2.0"
 solana-transaction = "3.1"
 
-# Local override for end-to-end testing of unreleased pay-kit changes.
-# Uncomment to redirect both crates to a local pay-kit checkout.
-# [patch."https://github.com/solana-foundation/pay-kit"]
-# solana-x402 = { path = "/Users/ludo/Coding/pay-kit/rust/crates/x402" }
-# solana-mpp = { path = "/Users/ludo/Coding/pay-kit/rust/crates/mpp" }
+# litesvm (solana-address pin loosened) so litesvm 0.13 — pulled by surfpool-sdk
+# 1.4 — can coexist with the confidential proof crates (zk-sdk 7). The fix is
+# merged upstream (now `solana-address = ">=2.2, <3"`) but not yet in a crates.io
+# release (0.13.0 still pins `=2.2.0`), so pin upstream master.
+[patch.crates-io]
+litesvm = { git = "https://github.com/LiteSVM/litesvm.git", branch = "master" }
+litesvm-token = { git = "https://github.com/LiteSVM/litesvm.git", branch = "master" }
