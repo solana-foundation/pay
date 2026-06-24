@@ -2,7 +2,7 @@
 //!
 //! Bridges between pay's developer-facing endpoint config
 //! (`pay_types::metering::SubscriptionEndpoint`) and the SDK's
-//! `solana_mpp::server::SubscriptionServer`.
+//! `pay_kit::mpp::server::SubscriptionServer`.
 //!
 //! v0 covers challenge emission. The activation-credential verification
 //! path is delegated to a follow-up because pay-kit's Rust SDK does not yet
@@ -13,8 +13,8 @@
 
 use std::str::FromStr;
 
-use solana_mpp::SubscriptionPeriodUnit;
-use solana_mpp::server::{SubscriptionConfig as SdkSubscriptionConfig, SubscriptionServer};
+use pay_kit::mpp::SubscriptionPeriodUnit;
+use pay_kit::mpp::server::{SubscriptionConfig as SdkSubscriptionConfig, SubscriptionServer};
 #[allow(unused_imports)]
 use solana_pubkey::Pubkey;
 
@@ -57,7 +57,7 @@ pub struct OperatorDefaults<'a> {
     /// — the SDK's verify path co-signs the activation transaction
     /// with it before broadcasting. The middleware threads it through
     /// from `PaymentState::fee_payer_signer`.
-    pub fee_payer_signer: Option<std::sync::Arc<dyn solana_mpp::solana_keychain::SolanaSigner>>,
+    pub fee_payer_signer: Option<std::sync::Arc<dyn pay_kit::mpp::solana_keychain::SolanaSigner>>,
 }
 
 /// Resolve `(amount_base_units, decimals, mint_b58)` from the endpoint
@@ -142,7 +142,7 @@ pub fn build_handler(
         plan_id,
         mint,
         decimals,
-        token_program: solana_mpp::protocol::solana::programs::TOKEN_PROGRAM.to_string(),
+        token_program: pay_kit::mpp::protocol::solana::programs::TOKEN_PROGRAM.to_string(),
         puller: puller.clone(),
         recipient,
         period_unit: sdk_period_unit,
@@ -213,7 +213,7 @@ pub fn build_challenge(
     spec: &SubscriptionEndpoint,
     defaults: OperatorDefaults<'_>,
     description: Option<&str>,
-) -> Result<solana_mpp::PaymentChallenge> {
+) -> Result<pay_kit::mpp::PaymentChallenge> {
     let server = build_handler(spec, defaults, description)?;
     let (amount_base_units, _decimals, _mint) = resolve_amount(spec)?;
     server
@@ -283,11 +283,11 @@ pub async fn check_plan_exists(
     rpc_url: &str,
     plan_pda: &solana_pubkey::Pubkey,
 ) -> Result<PlanStatus> {
-    use solana_mpp::program::subscriptions::default_program_id;
+    use pay_kit::mpp::program::subscriptions::default_program_id;
     let url = rpc_url.to_string();
     let pda = *plan_pda;
     let outcome = tokio::task::spawn_blocking(move || -> Result<PlanStatus> {
-        use solana_mpp::solana_rpc_client::rpc_client::RpcClient;
+        use pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient;
         // `get_account_with_commitment` returns `Ok(Response { value:
         // None })` when the account doesn't exist, vs `Err(...)` for
         // any transport / parse / RPC-level failure. That's the
@@ -332,11 +332,11 @@ pub async fn check_plan_exists(
 pub async fn publish_plan(
     spec: &SubscriptionEndpoint,
     operator: &solana_pubkey::Pubkey,
-    operator_signer: std::sync::Arc<dyn solana_mpp::solana_keychain::SolanaSigner>,
+    operator_signer: std::sync::Arc<dyn pay_kit::mpp::solana_keychain::SolanaSigner>,
     rpc_url: &str,
     plan_id_numeric: u64,
 ) -> Result<PublishedPlan> {
-    use solana_mpp::program::subscriptions::{
+    use pay_kit::mpp::program::subscriptions::{
         CreatePlanAccounts, CreatePlanData, PlanTerms, build_create_plan_ix, default_program_id,
         find_plan_pda, plan_id_seed,
     };
@@ -377,7 +377,7 @@ pub async fn publish_plan(
     )
     .map_err(|e| Error::Config(format!("Failed to build CreatePlanData: {e}")))?;
 
-    let token_program = Pubkey::from_str(solana_mpp::protocol::solana::programs::TOKEN_PROGRAM)
+    let token_program = Pubkey::from_str(pay_kit::mpp::protocol::solana::programs::TOKEN_PROGRAM)
         .map_err(|e| Error::Config(format!("invalid token program id: {e}")))?;
     let _ = decimals;
 
@@ -416,7 +416,7 @@ async fn fetch_plan_created_at(rpc_url: &str, plan_pda: &solana_pubkey::Pubkey) 
     let url = rpc_url.to_string();
     let pda = *plan_pda;
     tokio::task::spawn_blocking(move || -> Result<i64> {
-        use solana_mpp::solana_rpc_client::rpc_client::RpcClient;
+        use pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient;
         let rpc = RpcClient::new(url);
         let account = rpc
             .get_account(&pda)
@@ -451,12 +451,12 @@ async fn fetch_plan_created_at(rpc_url: &str, plan_pda: &solana_pubkey::Pubkey) 
 /// and broadcast through `send_and_confirm_transaction`. Returns the
 /// settlement signature as base58.
 async fn sign_and_broadcast(
-    signer: std::sync::Arc<dyn solana_mpp::solana_keychain::SolanaSigner>,
+    signer: std::sync::Arc<dyn pay_kit::mpp::solana_keychain::SolanaSigner>,
     instructions: Vec<solana_instruction::Instruction>,
     rpc_url: &str,
 ) -> Result<String> {
+    use pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient;
     use solana_message::Message;
-    use solana_mpp::solana_rpc_client::rpc_client::RpcClient;
     use solana_signature::Signature;
     use solana_transaction::Transaction;
 
@@ -516,14 +516,14 @@ async fn sign_and_broadcast(
 ///
 /// Thin wrapper around [`SubscriptionServer::verify_credential`] that
 /// parses the `Authorization: Payment <…>` header into a credential first.
-/// Returns a [`solana_mpp::ReceiptKind::Subscription`] on success — the
+/// Returns a [`pay_kit::mpp::ReceiptKind::Subscription`] on success — the
 /// activation transaction has been broadcast, confirmed, and the on-chain
 /// `SubscriptionDelegation` has been validated against the challenge.
 pub async fn verify_activation(
     server: &SubscriptionServer,
     auth_header: &str,
-) -> Result<solana_mpp::ReceiptKind> {
-    let credential = solana_mpp::parse_authorization(auth_header)
+) -> Result<pay_kit::mpp::ReceiptKind> {
+    let credential = pay_kit::mpp::parse_authorization(auth_header)
         .map_err(|e| Error::Mpp(format!("Failed to parse Authorization header: {e}")))?;
     server
         .verify_credential(&credential)
@@ -613,7 +613,7 @@ mod tests {
     #[test]
     fn build_challenge_emits_subscription_intent_header() {
         let challenge = build_challenge(&make_spec(), operator_defaults(), None).unwrap();
-        let header = solana_mpp::format_www_authenticate(&challenge).unwrap();
+        let header = pay_kit::mpp::format_www_authenticate(&challenge).unwrap();
         assert!(header.contains("intent=\"subscription\""));
         assert!(header.contains("method=\"solana\""));
         assert!(header.contains("realm=\"test-realm\""));

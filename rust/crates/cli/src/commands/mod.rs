@@ -24,8 +24,8 @@ use pay_core::runner::RunOutcome;
 use pay_core::x402;
 use pay_core::x402::Challenge as X402Challenge;
 use pay_core::{run_curl_with_headers, run_httpie_with_headers, run_wget_with_headers};
+use pay_kit::mpp::{ChargeRequest, SessionRequest};
 use pay_types::Stablecoin;
-use solana_mpp::{ChargeRequest, SessionRequest};
 
 use crate::no_dna;
 use crate::output::{self, OutputFormat};
@@ -405,8 +405,8 @@ fn handle_outcome(
                             decoded.currency_label,
                             decoded.period_count,
                             match decoded.period_unit {
-                                solana_mpp::SubscriptionPeriodUnit::Day => "day",
-                                solana_mpp::SubscriptionPeriodUnit::Week => "week",
+                                pay_kit::mpp::SubscriptionPeriodUnit::Day => "day",
+                                pay_kit::mpp::SubscriptionPeriodUnit::Week => "week",
                             },
                             if decoded.period_count == 1 { "" } else { "s" }
                         )
@@ -440,8 +440,8 @@ fn handle_outcome(
                         "puller": decoded.method_details.puller,
                         "recipient": decoded.request.recipient,
                         "period_unit": match decoded.period_unit {
-                            solana_mpp::SubscriptionPeriodUnit::Day => "day",
-                            solana_mpp::SubscriptionPeriodUnit::Week => "week",
+                            pay_kit::mpp::SubscriptionPeriodUnit::Day => "day",
+                            pay_kit::mpp::SubscriptionPeriodUnit::Week => "week",
                         },
                         "period_count": decoded.period_count,
                         "network": decoded.network,
@@ -458,8 +458,8 @@ fn handle_outcome(
                         decoded.currency_label,
                         decoded.period_count,
                         match decoded.period_unit {
-                            solana_mpp::SubscriptionPeriodUnit::Day => "day",
-                            solana_mpp::SubscriptionPeriodUnit::Week => "week",
+                            pay_kit::mpp::SubscriptionPeriodUnit::Day => "day",
+                            pay_kit::mpp::SubscriptionPeriodUnit::Week => "week",
                         },
                         if decoded.period_count == 1 { "" } else { "s" }
                     )
@@ -1125,7 +1125,7 @@ fn pay_session_and_retry(
     sandbox: bool,
     verbose: bool,
 ) -> pay_core::Result<()> {
-    use solana_mpp::{SessionMode, SessionPullVoucherStrategy};
+    use pay_kit::mpp::{SessionMode, SessionPullVoucherStrategy};
 
     let is_json = no_dna::should_json(output_fmt);
     validate_tool_request_before_signing(tool)?;
@@ -1512,7 +1512,7 @@ mod tests {
             "test",
             "solana",
             "charge",
-            solana_mpp::Base64UrlJson::from_value(&request).unwrap(),
+            pay_kit::mpp::Base64UrlJson::from_value(&request).unwrap(),
         )
     }
 

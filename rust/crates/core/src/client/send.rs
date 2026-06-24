@@ -2,9 +2,9 @@
 
 use std::str::FromStr;
 
+use pay_kit::mpp::protocol::solana::default_rpc_url;
 use pay_types::Stablecoin;
 use serde::{Deserialize, Serialize};
-use solana_mpp::protocol::solana::default_rpc_url;
 use solana_pubkey::Pubkey;
 
 use crate::accounts::{AccountChoice, AccountsFile, resolve_account_for_network};
@@ -198,7 +198,7 @@ pub fn send_stablecoin(request: StablecoinSendRequest<'_>) -> Result<SendResult>
     let challenge =
         mpp::select_challenge_by_balance(&challenges, &store, Some(network), account_override)?
             .ok_or_else(|| Error::InvalidChallenge("No usable MPP send challenge".to_string()))?;
-    let request_for_result: solana_mpp::ChargeRequest = challenge
+    let request_for_result: pay_kit::mpp::ChargeRequest = challenge
         .request
         .decode()
         .map_err(|e| Error::InvalidChallenge(format!("Failed to decode send challenge: {e}")))?;
@@ -343,9 +343,9 @@ fn stablecoin_raw_balance_for_sender(
         .ok_or_else(|| Error::Config(format!("No {currency} balance available to send")))
 }
 
-fn recipient_amount_from_challenge(request: &solana_mpp::ChargeRequest, recipient: &str) -> u64 {
+fn recipient_amount_from_challenge(request: &pay_kit::mpp::ChargeRequest, recipient: &str) -> u64 {
     let total = request.amount.parse::<u64>().unwrap_or(0);
-    let details: solana_mpp::protocol::solana::MethodDetails = request
+    let details: pay_kit::mpp::protocol::solana::MethodDetails = request
         .method_details
         .as_ref()
         .and_then(|value| serde_json::from_value(value.clone()).ok())

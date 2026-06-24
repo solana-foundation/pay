@@ -4,6 +4,9 @@ pub mod accounting;
 pub mod authenticate;
 
 #[cfg(feature = "server")]
+pub mod gate;
+
+#[cfg(feature = "server")]
 pub mod metering;
 
 #[cfg(feature = "server")]
@@ -29,5 +32,8 @@ pub mod subscription;
 
 #[cfg(feature = "server")]
 pub mod telemetry;
+
+#[cfg(all(feature = "server", feature = "otel"))]
+pub mod otel;
 
 pub use accounting::{AccountingKey, AccountingStore, InMemoryStore, current_period};

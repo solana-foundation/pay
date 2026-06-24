@@ -102,143 +102,10 @@ pub async fn forward_request_with_session_metering(
     body: Bytes,
     session_context: Option<SessionStreamContext>,
 ) -> Result<Response, Response> {
-    let path_and_query = uri
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or(uri.path());
-
-    let routing = resolve_routing(api, uri.path());
-
-    // Respond mode — no upstream call.
-    if routing.is_respond() {
-        use crate::server::metering::find_endpoint_by_path;
-        let path_trimmed = uri.path().trim_start_matches('/');
-        if find_endpoint_by_path(api, path_trimmed).is_some() {
-            return Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"status":"ok"}"#))
-                .unwrap());
-        }
-        return Ok(Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"error":"not_found"}"#))
-            .unwrap());
-    }
-
-    // Build the upstream URL (with path rewrites) and prepare the forwarded
-    // request state before converting it into a reqwest request.
-    let upstream_url = routing
-        .upstream_url(path_and_query)
-        .expect("Proxy routing must have a URL");
-    let mut prepared = PreparedUpstreamRequest::new(&upstream_url).map_err(|e| {
-        telemetry::record_upstream_error(&api.subdomain, uri.path(), &upstream_url, &e);
-        error_response(StatusCode::BAD_GATEWAY, &e)
-    })?;
-
-    tracing::debug!(
-        subdomain = %api.subdomain,
-        upstream = %prepared.url,
-        "Forwarding request"
-    );
-
-    // Forward headers.
-    for (name, value) in headers.iter() {
-        let name_str = name.as_str();
-        if STRIP_HEADERS.contains(&name_str) {
-            continue;
-        }
-        if let Ok(v) = value.to_str() {
-            prepared.add_forwarded_header(name_str, v);
-        }
-    }
-
-    // Inject auth into the prepared upstream request.
-    match routing.auth() {
-        Some(
-            AuthConfig::Header { .. } | AuthConfig::QueryParam { .. } | AuthConfig::Hmac { .. },
-        ) => {
-            apply_prepared_request_auth(
-                &mut prepared,
-                &method,
-                body.as_ref(),
-                routing.auth().expect("routing auth checked above"),
-            )
-            .map_err(|e| {
-                telemetry::record_upstream_error(
-                    &api.subdomain,
-                    uri.path(),
-                    prepared.url.as_str(),
-                    &e,
-                );
-                error_response(StatusCode::BAD_GATEWAY, &e)
-            })?;
-        }
-        Some(AuthConfig::Oauth2 {
-            token_url,
-            scopes,
-            client_id_from_env,
-            client_secret_from_env,
-            headers,
-        }) => {
-            match oauth2_token(
-                token_url,
-                scopes,
-                client_id_from_env.as_deref(),
-                client_secret_from_env.as_deref(),
-            )
-            .await
-            {
-                Ok(token) => {
-                    prepared.set_header("authorization", format!("Bearer {token}"));
-                    for (header_name, env_ref) in headers {
-                        if let Ok(val) = std::env::var(&env_ref.from_env) {
-                            prepared.set_header(header_name, val);
-                        }
-                    }
-                }
-                Err(e) => {
-                    telemetry::record_upstream_error(
-                        &api.subdomain,
-                        uri.path(),
-                        prepared.url.as_str(),
-                        &format!("OAuth2 token error: {e}"),
-                    );
-                    tracing::error!(error = %e, "Failed to fetch OAuth2 token");
-                    return Err(error_response(
-                        StatusCode::BAD_GATEWAY,
-                        &format!("OAuth2 token error: {e}"),
-                    ));
-                }
-            }
-        }
-        Some(AuthConfig::AccessToken {
-            prepare,
-            fetch,
-            inject,
-        }) => {
-            apply_access_token_auth(
-                &mut prepared,
-                &method,
-                body.as_ref(),
-                prepare,
-                fetch,
-                inject,
-            )
-            .await
-            .map_err(|e| {
-                telemetry::record_upstream_error(
-                    &api.subdomain,
-                    uri.path(),
-                    prepared.url.as_str(),
-                    &e,
-                );
-                error_response(StatusCode::BAD_GATEWAY, &e)
-            })?;
-        }
-        _ => {}
-    }
+    let prepared = match prepare_upstream(api, &method, uri, headers, body.as_ref()).await? {
+        UpstreamPlan::Respond(resp) => return Ok(resp),
+        UpstreamPlan::Forward(prepared) => prepared,
+    };
 
     let client = reqwest::Client::new();
     let mut upstream_req = client.request(
@@ -316,6 +183,163 @@ pub async fn forward_request_with_session_metering(
     Ok(resp.body(Body::from_stream(stream)).unwrap())
 }
 
+/// Outcome of preparing an upstream request: either a locally-built response
+/// (respond-mode / not-found) or a fully-prepared upstream request ready to be
+/// sent (reqwest by axum) or proxied natively (pingora).
+pub enum UpstreamPlan {
+    Respond(Response),
+    Forward(PreparedUpstreamRequest),
+}
+
+/// Resolve routing, build the upstream URL (with path rewrites), forward+strip
+/// headers, and inject auth — everything up to (but not including) sending the
+/// request. Framework-neutral: the result is consumed by axum's reqwest send and
+/// by the pingora gate's native proxying alike.
+pub async fn prepare_upstream(
+    api: &ApiSpec,
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<UpstreamPlan, Response> {
+    let path_and_query = uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or(uri.path());
+
+    let routing = resolve_routing(api, uri.path());
+
+    // Respond mode — no upstream call.
+    if routing.is_respond() {
+        use crate::server::metering::find_endpoint_by_path;
+        let path_trimmed = uri.path().trim_start_matches('/');
+        if find_endpoint_by_path(api, path_trimmed).is_some() {
+            return Ok(UpstreamPlan::Respond(
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"status":"ok"}"#))
+                    .unwrap(),
+            ));
+        }
+        return Ok(UpstreamPlan::Respond(
+            Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"error":"not_found"}"#))
+                .unwrap(),
+        ));
+    }
+
+    // Build the upstream URL (with path rewrites) and prepare the forwarded
+    // request state before converting it into a reqwest request.
+    let upstream_url = routing
+        .upstream_url(path_and_query)
+        .expect("Proxy routing must have a URL");
+    let mut prepared = PreparedUpstreamRequest::new(&upstream_url).map_err(|e| {
+        telemetry::record_upstream_error(&api.subdomain, uri.path(), &upstream_url, &e);
+        error_response(StatusCode::BAD_GATEWAY, &e)
+    })?;
+
+    tracing::debug!(
+        subdomain = %api.subdomain,
+        upstream = %prepared.url,
+        "Forwarding request"
+    );
+
+    // Forward headers.
+    for (name, value) in headers.iter() {
+        let name_str = name.as_str();
+        if STRIP_HEADERS.contains(&name_str) {
+            continue;
+        }
+        if let Ok(v) = value.to_str() {
+            prepared.add_forwarded_header(name_str, v);
+        }
+    }
+
+    // Inject auth into the prepared upstream request.
+    match routing.auth() {
+        Some(
+            AuthConfig::Header { .. } | AuthConfig::QueryParam { .. } | AuthConfig::Hmac { .. },
+        ) => {
+            apply_prepared_request_auth(
+                &mut prepared,
+                method,
+                body,
+                routing.auth().expect("routing auth checked above"),
+            )
+            .map_err(|e| {
+                telemetry::record_upstream_error(
+                    &api.subdomain,
+                    uri.path(),
+                    prepared.url.as_str(),
+                    &e,
+                );
+                error_response(StatusCode::BAD_GATEWAY, &e)
+            })?;
+        }
+        Some(AuthConfig::Oauth2 {
+            token_url,
+            scopes,
+            client_id_from_env,
+            client_secret_from_env,
+            headers,
+        }) => {
+            match oauth2_token(
+                token_url,
+                scopes,
+                client_id_from_env.as_deref(),
+                client_secret_from_env.as_deref(),
+            )
+            .await
+            {
+                Ok(token) => {
+                    prepared.set_header("authorization", format!("Bearer {token}"));
+                    for (header_name, env_ref) in headers {
+                        if let Ok(val) = std::env::var(&env_ref.from_env) {
+                            prepared.set_header(header_name, val);
+                        }
+                    }
+                }
+                Err(e) => {
+                    telemetry::record_upstream_error(
+                        &api.subdomain,
+                        uri.path(),
+                        prepared.url.as_str(),
+                        &format!("OAuth2 token error: {e}"),
+                    );
+                    tracing::error!(error = %e, "Failed to fetch OAuth2 token");
+                    return Err(error_response(
+                        StatusCode::BAD_GATEWAY,
+                        &format!("OAuth2 token error: {e}"),
+                    ));
+                }
+            }
+        }
+        Some(AuthConfig::AccessToken {
+            prepare,
+            fetch,
+            inject,
+        }) => {
+            apply_access_token_auth(&mut prepared, method, body, prepare, fetch, inject)
+                .await
+                .map_err(|e| {
+                    telemetry::record_upstream_error(
+                        &api.subdomain,
+                        uri.path(),
+                        prepared.url.as_str(),
+                        &e,
+                    );
+                    error_response(StatusCode::BAD_GATEWAY, &e)
+                })?;
+        }
+        _ => {}
+    }
+
+    Ok(UpstreamPlan::Forward(prepared))
+}
+
 fn build_session_stream_meter(
     api: &ApiSpec,
     method: &Method,
@@ -365,9 +389,9 @@ pub fn error_response(status: StatusCode, message: &str) -> Response {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PreparedUpstreamRequest {
-    url: reqwest::Url,
-    headers: Vec<(String, String)>,
+pub struct PreparedUpstreamRequest {
+    pub url: reqwest::Url,
+    pub headers: Vec<(String, String)>,
 }
 
 impl PreparedUpstreamRequest {

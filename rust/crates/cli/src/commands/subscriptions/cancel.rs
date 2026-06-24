@@ -23,15 +23,15 @@
 use std::sync::Arc;
 
 use owo_colors::OwoColorize;
-use solana_message::Message;
-use solana_mpp::client::build_credential_header;
-use solana_mpp::program::subscriptions::{
+use pay_kit::mpp::client::build_credential_header;
+use pay_kit::mpp::program::subscriptions::{
     CancelSubscriptionAccounts, build_cancel_subscription_ix, default_program_id,
     find_event_authority_pda, parse_pubkey,
 };
-use solana_mpp::solana_keychain::SolanaSigner;
-use solana_mpp::solana_rpc_client::rpc_client::RpcClient;
-use solana_mpp::{PaymentChallenge, parse_www_authenticate};
+use pay_kit::mpp::solana_keychain::SolanaSigner;
+use pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient;
+use pay_kit::mpp::{PaymentChallenge, parse_www_authenticate};
+use solana_message::Message;
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
 use solana_transaction::Transaction;
@@ -400,7 +400,7 @@ async fn broadcast_direct(
 
 #[allow(clippy::too_many_arguments)]
 async fn broadcast_via_gateway(
-    signer: Arc<solana_mpp::solana_keychain::MemorySigner>,
+    signer: Arc<pay_kit::mpp::solana_keychain::MemorySigner>,
     instruction: solana_instruction::Instruction,
     gateway_fee_payer: &Pubkey,
     gateway_url: &str,
@@ -565,11 +565,10 @@ async fn probe_gateway_challenge(
     // request payload, not the convenience `feeRaw` field. We render
     // it via the standard token-amount formatter so the Touch ID
     // prompt shows "$0.0015" rather than "1500 base units".
-    let charge_request: solana_mpp::protocol::intents::ChargeRequest =
-        challenge
-            .request
-            .decode()
-            .map_err(|e| pay_core::Error::Mpp(format!("Gateway challenge request payload: {e}")))?;
+    let charge_request: pay_kit::mpp::protocol::intents::ChargeRequest = challenge
+        .request
+        .decode()
+        .map_err(|e| pay_core::Error::Mpp(format!("Gateway challenge request payload: {e}")))?;
     let amount_raw: u64 = charge_request.amount.parse().map_err(|e| {
         pay_core::Error::Mpp(format!("Gateway challenge amount is not numeric: {e}"))
     })?;

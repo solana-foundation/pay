@@ -1,11 +1,11 @@
 //! x402 protocol support.
 //!
-//! Thin wrapper around `solana_x402::client::exact` for challenge detection
+//! Thin wrapper around `pay_kit::x402::client::exact` for challenge detection
 //! and payment building.
 
-use solana_x402::solana_keychain::SolanaSigner;
-use solana_x402::solana_rpc_client::rpc_client::RpcClient;
-use solana_x402::{
+use pay_kit::x402::solana_keychain::SolanaSigner;
+use pay_kit::x402::solana_rpc_client::rpc_client::RpcClient;
+use pay_kit::x402::{
     PAYMENT_REQUIRED_HEADER, X402_V1_PAYMENT_REQUIRED_HEADER, X402_VERSION_FIELD, X402_VERSION_V1,
     X402_VERSION_V2,
     client::exact::{
@@ -26,7 +26,7 @@ use tracing::{info, warn};
 use crate::accounts::{AccountsStore, ResolvedEphemeral};
 use crate::{Error, Result};
 
-pub use solana_x402::{SIGN_IN_WITH_X_HEADER, X402_V1_PAYMENT_HEADER, X402_V2_PAYMENT_HEADER};
+pub use pay_kit::x402::{SIGN_IN_WITH_X_HEADER, X402_V1_PAYMENT_HEADER, X402_V2_PAYMENT_HEADER};
 
 #[derive(Debug, Clone)]
 pub struct Challenge {
@@ -276,7 +276,7 @@ pub fn build_siwx_auth_header_with_override(
     auth_override: crate::signer::AuthOverride,
 ) -> Result<BuiltPayment> {
     let preferred_chain_id = network_override.and_then(siwx_chain_id_for_network);
-    let chain = solana_x402::siwx::select_siwx_chain(
+    let chain = pay_kit::x402::siwx::select_siwx_chain(
         &challenge.extension,
         &SiwxChainSelectionOptions {
             preferred_chain_id,
@@ -322,7 +322,7 @@ fn build_siwx_header(
         return Ok(None);
     };
     let preferred_chain_id = siwx_chain_id_for_network(network);
-    let chain = solana_x402::siwx::select_siwx_chain(
+    let chain = pay_kit::x402::siwx::select_siwx_chain(
         extension,
         &SiwxChainSelectionOptions {
             preferred_chain_id,
@@ -504,7 +504,7 @@ fn x402_version_from_json(body: &str) -> Option<u64> {
 mod tests {
     use super::*;
     use crate::accounts::{Account, AccountsFile, Keystore, MemoryAccountsStore};
-    use solana_x402::exact::EXACT_SCHEME;
+    use pay_kit::x402::exact::EXACT_SCHEME;
 
     fn sample_requirements() -> PaymentRequirements {
         PaymentRequirements {
@@ -1007,14 +1007,14 @@ mod tests {
             246, 17, 170, 104, 17, 151, 48,
         ];
         let signer =
-            solana_x402::solana_keychain::memory::MemorySigner::from_bytes(&TEST_KEYPAIR_BYTES)
+            pay_kit::x402::solana_keychain::memory::MemorySigner::from_bytes(&TEST_KEYPAIR_BYTES)
                 .unwrap();
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .unwrap();
-        let extension = solana_x402::siwx::SiwxExtension::new(
-            solana_x402::siwx::SiwxExtensionInfo {
+        let extension = pay_kit::x402::siwx::SiwxExtension::new(
+            pay_kit::x402::siwx::SiwxExtensionInfo {
                 domain: "api.example.com".to_string(),
                 uri: "https://api.example.com".to_string(),
                 statement: Some("Sign in to pay.".to_string()),
@@ -1026,7 +1026,7 @@ mod tests {
                 request_id: None,
                 resources: None,
             },
-            solana_x402::siwx::default_solana_siwx_chains(),
+            pay_kit::x402::siwx::default_solana_siwx_chains(),
         );
         let challenge = Challenge {
             x402_version: X402_VERSION_V2,
@@ -1038,11 +1038,11 @@ mod tests {
         let (header_name, header_value) = build_siwx_header(&challenge, &signer, "devnet", &rt)
             .unwrap()
             .unwrap();
-        let payload = solana_x402::siwx::parse_siwx_header(&header_value).unwrap();
+        let payload = pay_kit::x402::siwx::parse_siwx_header(&header_value).unwrap();
 
         assert_eq!(header_name, SIGN_IN_WITH_X_HEADER);
         assert_eq!(payload.chain_id, SOLANA_DEVNET);
-        assert!(solana_x402::siwx::verify_siwx_payload(&payload).unwrap());
+        assert!(pay_kit::x402::siwx::verify_siwx_payload(&payload).unwrap());
     }
 
     #[test]
@@ -1070,8 +1070,8 @@ mod tests {
         file.upsert("devnet", "default", account);
         let store = MemoryAccountsStore::with_file(file);
         let challenge = SiwxAuthChallenge {
-            extension: solana_x402::siwx::SiwxExtension::new(
-                solana_x402::siwx::SiwxExtensionInfo {
+            extension: pay_kit::x402::siwx::SiwxExtension::new(
+                pay_kit::x402::siwx::SiwxExtensionInfo {
                     domain: "api.example.com".to_string(),
                     uri: "https://api.example.com".to_string(),
                     statement: Some("Sign in.".to_string()),
@@ -1083,24 +1083,24 @@ mod tests {
                     request_id: None,
                     resources: None,
                 },
-                solana_x402::siwx::default_solana_siwx_chains(),
+                pay_kit::x402::siwx::default_solana_siwx_chains(),
             ),
         };
 
         let built = build_siwx_auth_header(&challenge, &store, Some("devnet"), None, None).unwrap();
-        let payload = solana_x402::siwx::parse_siwx_header(&built.headers[0].1).unwrap();
+        let payload = pay_kit::x402::siwx::parse_siwx_header(&built.headers[0].1).unwrap();
 
         assert_eq!(built.headers.len(), 1);
         assert_eq!(built.headers[0].0, SIGN_IN_WITH_X_HEADER);
         assert_eq!(payload.address, pubkey);
         assert_eq!(payload.chain_id, SOLANA_DEVNET);
-        assert!(solana_x402::siwx::verify_siwx_payload(&payload).unwrap());
+        assert!(pay_kit::x402::siwx::verify_siwx_payload(&payload).unwrap());
     }
 
     #[test]
     fn build_siwx_auth_header_rejects_unsupported_preferred_chain() {
-        let extension = solana_x402::siwx::SiwxExtension::new(
-            solana_x402::siwx::SiwxExtensionInfo {
+        let extension = pay_kit::x402::siwx::SiwxExtension::new(
+            pay_kit::x402::siwx::SiwxExtensionInfo {
                 domain: "api.example.com".to_string(),
                 uri: "https://api.example.com".to_string(),
                 statement: Some("Sign in.".to_string()),
@@ -1112,7 +1112,7 @@ mod tests {
                 request_id: None,
                 resources: None,
             },
-            vec![solana_x402::siwx::SupportedChain::solana(SOLANA_MAINNET)],
+            vec![pay_kit::x402::siwx::SupportedChain::solana(SOLANA_MAINNET)],
         );
         let challenge = SiwxAuthChallenge { extension };
         let store = MemoryAccountsStore::new();
@@ -1205,7 +1205,7 @@ mod tests {
         // Surfpool prefix. The client should treat this as
         // localnet/sandbox — same auto-detection the MPP client does.
         let mut requirements = sample_requirements();
-        requirements.network = solana_x402::exact::SOLANA_DEVNET.to_string();
+        requirements.network = pay_kit::x402::exact::SOLANA_DEVNET.to_string();
         requirements.cluster = Some("devnet".to_string());
         requirements.recent_blockhash = Some(format!(
             "{}xxxxxxxxxxxxxxxxxxx1892bcad",

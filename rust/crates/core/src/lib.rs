@@ -33,11 +33,11 @@ pub use error::{Error, Result};
 pub use server::{AccountingKey, AccountingStore, InMemoryStore, current_period};
 
 #[cfg(feature = "server")]
+pub use pay_kit::mpp as solana_mpp;
+#[cfg(feature = "server")]
+use pay_kit::mpp::server::Mpp;
+#[cfg(feature = "server")]
 use pay_types::metering::ApiSpec;
-#[cfg(feature = "server")]
-pub use solana_mpp;
-#[cfg(feature = "server")]
-use solana_mpp::server::Mpp;
 #[cfg(feature = "server")]
 use std::sync::Arc;
 
@@ -65,7 +65,20 @@ pub trait PaymentState: Clone + Send + Sync + 'static {
     /// middleware needs it at verify time to co-sign the activation
     /// transaction; charge / session paths construct their own MPP
     /// instances at startup and don't ask for it through this trait.
-    fn fee_payer_signer(&self) -> Option<Arc<dyn solana_mpp::solana_keychain::SolanaSigner>> {
+    fn fee_payer_signer(&self) -> Option<Arc<dyn pay_kit::mpp::solana_keychain::SolanaSigner>> {
+        None
+    }
+
+    /// x402 `exact` handler, when the server accepts x402 payments.
+    fn x402(&self) -> Option<&pay_kit::x402::server::X402> {
+        None
+    }
+    /// x402 `upto` (usage-based) handler, when configured with an operator signer.
+    fn x402_upto(&self) -> Option<&pay_kit::x402::server::X402Upto> {
+        None
+    }
+    /// x402 `batch-settlement` handler, when configured with an operator signer.
+    fn x402_batch(&self) -> Option<&pay_kit::x402::server::X402BatchSettlement> {
         None
     }
 }

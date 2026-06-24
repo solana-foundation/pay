@@ -1,3 +1,12 @@
+name: helius
+subdomain: helius
+title: "Helius RPC"
+description: "Solana JSON-RPC + Helius DAS, gated by a Solana subscription."
+category: data
+version: v1
+routing:
+  type: proxy
+  url: https://mainnet.helius-rpc.com/
   auth:
     method: query_param
     key: "api-key"

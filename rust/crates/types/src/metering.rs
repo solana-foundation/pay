@@ -985,7 +985,30 @@ impl SubscriptionEndpoint {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+/// A per-call payment scheme a metered endpoint can accept. The endpoint opts
+/// into specific schemes via [`Metering::schemes`]; the gate advertises a 402
+/// challenge for each accepted scheme that the server has a backend for, and
+/// verifies a presented credential against the matching scheme.
+///
+/// `subscription` is intentionally absent — it is a distinct recurring-billing
+/// model declared via [`Endpoint::subscription`], mutually exclusive with
+/// per-call metering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum Scheme {
+    /// MPP `intent=charge` — one settled credential per request.
+    MppCharge,
+    /// MPP `intent=session` — open a channel, stream off-chain vouchers.
+    MppSession,
+    /// x402 `exact` — pay an exact amount per request.
+    X402Exact,
+    /// x402 `upto` — usage-based, operator settles a voucher up to a cap.
+    X402Upto,
+    /// x402 `batch-settlement` — high-throughput batched channel settlement.
+    X402BatchSettlement,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct Metering {
     /// Direct pricing dimensions (when there's a single pricing model).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1001,6 +1024,19 @@ pub struct Metering {
     /// Applied to all tiers unless overridden at the tier level.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub splits: Vec<SplitRule>,
+    /// Per-call schemes this endpoint accepts. `None` defaults to charge-only
+    /// (`[mpp-charge]`); session and the x402 schemes must be listed explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schemes: Option<Vec<Scheme>>,
+}
+
+impl Metering {
+    /// Schemes this endpoint accepts, defaulting to charge-only when unset.
+    pub fn accepted_schemes(&self) -> Vec<Scheme> {
+        self.schemes
+            .clone()
+            .unwrap_or_else(|| vec![Scheme::MppCharge])
+    }
 }
 
 /// A variant represents a pricing path selected by a request parameter.
@@ -2147,6 +2183,7 @@ mod tests {
             }],
             sku_tiers: vec![],
             splits: vec![],
+            schemes: None,
         };
         let json = serde_json::to_string(&metering).unwrap();
         let back: Metering = serde_json::from_str(&json).unwrap();
@@ -2210,6 +2247,7 @@ mod tests {
                     variants: vec![],
                     sku_tiers: vec![],
                     splits: vec![],
+                    schemes: None,
                 }),
                 subscription: None,
             }],
@@ -2547,6 +2585,7 @@ mod tests {
                     percent: None,
                     memo: None,
                 }],
+                schemes: None,
             }),
             subscription: None,
         }]);
@@ -2585,6 +2624,7 @@ mod tests {
                     percent: None,
                     memo: None,
                 }],
+                schemes: None,
             }),
             subscription: None,
         }]);
@@ -2623,6 +2663,7 @@ mod tests {
                     percent: None,
                     memo: None,
                 }],
+                schemes: None,
             }),
             subscription: None,
         }]);
@@ -2661,6 +2702,7 @@ mod tests {
                     percent: Some(5.0),
                     memo: None,
                 }],
+                schemes: None,
             }),
             subscription: None,
         }]);
@@ -2698,6 +2740,7 @@ mod tests {
                     percent: None,
                     memo: None,
                 }],
+                schemes: None,
             }),
             subscription: None,
         }]);
@@ -2746,6 +2789,7 @@ mod tests {
                         memo: None,
                     },
                 ],
+                schemes: None,
             }),
             subscription: None,
         }]);
@@ -2798,6 +2842,7 @@ mod tests {
                 variants: vec![],
                 sku_tiers: vec![],
                 splits: vec![],
+                schemes: None,
             }),
             subscription: None,
         }]);
@@ -2850,6 +2895,7 @@ mod tests {
                 variants: vec![],
                 sku_tiers: vec![],
                 splits: vec![],
+                schemes: None,
             }),
             subscription: None,
         }]);

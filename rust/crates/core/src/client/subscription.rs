@@ -2,7 +2,7 @@
 //!
 //! Mirrors [`crate::client::mpp`] but specialised to `intent="subscription"`:
 //! parses the 402 challenge, builds the activation transaction via
-//! `solana_mpp::client::build_subscription_activation_transaction`, formats
+//! `pay_kit::mpp::client::build_subscription_activation_transaction`, formats
 //! the `Authorization: Payment` header, and persists the resulting
 //! `Subscription` into `~/.config/pay/accounts.yml` when activation settles.
 //!
@@ -13,17 +13,17 @@
 //! `mpp-specs/specs/methods/solana/draft-solana-subscription-00.md` for the
 //! authoritative wire shapes.
 
-use solana_mpp::client::{
+use pay_kit::mpp::client::{
     BuildSubscriptionActivationOptions, SubscriptionMethodDetails,
     build_subscription_activation_transaction_with_options,
 };
-use solana_mpp::format_authorization;
-use solana_mpp::protocol::core::PaymentCredential;
-use solana_mpp::protocol::intents::{
+use pay_kit::mpp::format_authorization;
+use pay_kit::mpp::protocol::core::PaymentCredential;
+use pay_kit::mpp::protocol::intents::{
     SubscriptionPeriodUnit, SubscriptionReceiptExtensions, SubscriptionRequest,
 };
-use solana_mpp::solana_keychain::SolanaSigner;
-use solana_mpp::solana_rpc_client::rpc_client::RpcClient;
+use pay_kit::mpp::solana_keychain::SolanaSigner;
+use pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient;
 use tracing::{info, warn};
 
 use crate::accounts::{
@@ -399,7 +399,7 @@ fn sign_authenticate(
     challenge: &Challenge,
     method_details: &SubscriptionMethodDetails,
 ) -> Result<(String, String)> {
-    use solana_mpp::program::subscriptions::{
+    use pay_kit::mpp::program::subscriptions::{
         default_program_id, find_subscription_pda, parse_pubkey,
     };
 
@@ -414,14 +414,14 @@ fn sign_authenticate(
         find_subscription_pda(&plan_pubkey, &signer.pubkey(), &program_pubkey);
 
     let header = rt
-        .block_on(solana_mpp::client::build_authenticate_credential_header(
+        .block_on(pay_kit::mpp::client::build_authenticate_credential_header(
             signer,
             challenge,
             &subscription_pda.to_string(),
         ))
         .map_err(|e| Error::Mpp(format!("Failed to build authenticate credential: {e}")))?;
 
-    let request: solana_mpp::AuthenticateRequest = challenge
+    let request: pay_kit::mpp::AuthenticateRequest = challenge
         .request
         .decode()
         .map_err(|e| Error::Mpp(format!("Decoding authenticate request: {e}")))?;
@@ -440,7 +440,7 @@ fn sign_authenticate(
 /// `periodEndTs`, `expiresAt`). We therefore parse the base64url-encoded
 /// receipt JSON directly here, extracting both the standard fields and the
 /// subscription-extension fields the spec adds. A follow-up should widen
-/// `solana_mpp::Receipt` to include a `metadata` map and drop this local
+/// `pay_kit::mpp::Receipt` to include a `metadata` map and drop this local
 /// parsing.
 pub fn persist_from_receipt(
     built: &BuiltCredential,
@@ -477,17 +477,17 @@ pub struct ParsedSubscriptionReceipt {
 /// fields. Delegates to the SDK's new `ReceiptKind`-aware parser so the
 /// wire shape stays in lock-step with whatever pay-kit emits.
 pub fn parse_subscription_receipt(header: &str) -> Result<ParsedSubscriptionReceipt> {
-    let kind = solana_mpp::parse_receipt(header.trim())
+    let kind = pay_kit::mpp::parse_receipt(header.trim())
         .map_err(|e| Error::Mpp(format!("Could not parse Payment-Receipt: {e}")))?;
     match kind {
-        solana_mpp::ReceiptKind::Subscription { base, extensions } => {
+        pay_kit::mpp::ReceiptKind::Subscription { base, extensions } => {
             Ok(ParsedSubscriptionReceipt {
                 reference: base.reference,
                 timestamp: Some(base.timestamp),
                 extensions,
             })
         }
-        solana_mpp::ReceiptKind::Charge(_) => Err(Error::Mpp(
+        pay_kit::mpp::ReceiptKind::Charge(_) => Err(Error::Mpp(
             "Receipt is a charge receipt, not subscription".into(),
         )),
     }
@@ -501,7 +501,7 @@ fn subscription_from_built_and_extensions(
         subscription_id: parsed.extensions.subscription_id.clone(),
         plan_id: parsed.extensions.plan_id.clone(),
         program_id: if built.decoded.method_details.program_id.as_deref()
-            == Some(solana_mpp::program::subscriptions::SUBSCRIPTIONS_PROGRAM_ID)
+            == Some(pay_kit::mpp::program::subscriptions::SUBSCRIPTIONS_PROGRAM_ID)
             || built.decoded.method_details.program_id.is_none()
         {
             None
@@ -567,7 +567,7 @@ pub fn persist_local_subscription_after_activation(
     built: &BuiltCredential,
     store: &dyn crate::accounts::AccountsStore,
 ) -> Result<()> {
-    use solana_mpp::program::subscriptions::{
+    use pay_kit::mpp::program::subscriptions::{
         SUBSCRIPTIONS_PROGRAM_ID, default_program_id, find_subscription_pda, parse_pubkey,
     };
 
@@ -601,8 +601,8 @@ pub fn persist_local_subscription_after_activation(
         currency: Some(built.decoded.currency_label.clone()),
         amount_per_period: built.decoded.amount_base_units.clone(),
         period_unit: match built.decoded.period_unit {
-            solana_mpp::SubscriptionPeriodUnit::Day => "day".to_string(),
-            solana_mpp::SubscriptionPeriodUnit::Week => "week".to_string(),
+            pay_kit::mpp::SubscriptionPeriodUnit::Day => "day".to_string(),
+            pay_kit::mpp::SubscriptionPeriodUnit::Week => "week".to_string(),
         },
         period_count: u32::try_from(built.decoded.period_count).unwrap_or(u32::MAX),
         recipient: built.decoded.request.recipient.clone(),
@@ -656,7 +656,7 @@ pub fn lookup_activation_signature(
 pub fn default_rpc_url_for_network(network: &str) -> String {
     match network {
         "localnet" | "surfnet" => crate::config::SANDBOX_RPC_URL.to_string(),
-        other => solana_mpp::protocol::solana::default_rpc_url(other).to_string(),
+        other => pay_kit::mpp::protocol::solana::default_rpc_url(other).to_string(),
     }
 }
 
@@ -668,7 +668,7 @@ fn resolve_rpc_url(network: &str, embedded_blockhash: Option<&str>) -> String {
         {
             crate::config::SANDBOX_RPC_URL.to_string()
         } else {
-            solana_mpp::protocol::solana::default_rpc_url(network).to_string()
+            pay_kit::mpp::protocol::solana::default_rpc_url(network).to_string()
         }
     })
 }
@@ -943,7 +943,8 @@ mod tests {
 
     #[test]
     fn parse_headers_filters_to_subscription_only() {
-        let sub = solana_mpp::format_www_authenticate(&subscription_challenge("mainnet")).unwrap();
+        let sub =
+            pay_kit::mpp::format_www_authenticate(&subscription_challenge("mainnet")).unwrap();
         let charge_request = serde_json::json!({
             "amount": "1",
             "currency": "USDC",

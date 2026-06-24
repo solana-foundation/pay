@@ -36,6 +36,10 @@ impl Drop for OtelGuard {
 }
 
 pub(crate) fn init_otlp(sidecar: &str, filter: EnvFilter) -> Result<OtelGuard, String> {
+    // Install the W3C trace-context propagator so the proxy can parent its
+    // spans to a calling client's trace (e.g. pay-bench) — one shared trace.
+    global::set_text_map_propagator(opentelemetry_sdk::propagation::TraceContextPropagator::new());
+
     let endpoints = endpoints_from_sidecar(sidecar);
     let tracer_provider = init_tracer_provider(&endpoints)?;
     let meter_provider = init_meter_provider(&endpoints)?;

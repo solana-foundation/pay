@@ -1,6 +1,6 @@
 //! Resolve a signer from a keypair source — file path, Keychain, or 1Password.
 
-use solana_mpp::solana_keychain::MemorySigner;
+use pay_kit::mpp::solana_keychain::MemorySigner;
 
 use crate::accounts::{
     Account, AccountChoice, AccountsStore, Keystore, ResolvedEphemeral,
@@ -726,7 +726,7 @@ mod tests {
 
     #[test]
     fn load_signer_with_valid_keypair_file() {
-        use solana_mpp::solana_keychain::SolanaSigner;
+        use pay_kit::mpp::solana_keychain::SolanaSigner;
 
         let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
         let verifying_key = signing_key.verifying_key();
@@ -756,7 +756,7 @@ mod tests {
 
     #[test]
     fn load_signer_accepts_inline_private_key_string() {
-        use solana_mpp::solana_keychain::SolanaSigner;
+        use pay_kit::mpp::solana_keychain::SolanaSigner;
 
         let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
         let verifying_key = signing_key.verifying_key();
@@ -820,7 +820,7 @@ mod tests {
         let store = MemoryAccountsStore::with_file(file);
 
         let (signer, ephemeral) = load_signer_for_network("localnet", &store).unwrap();
-        use solana_mpp::solana_keychain::SolanaSigner;
+        use pay_kit::mpp::solana_keychain::SolanaSigner;
         assert_eq!(signer.pubkey().to_string(), expected_pubkey);
         assert!(
             ephemeral.is_none(),
@@ -834,7 +834,7 @@ mod tests {
         // No mapping → auto-create + persist + return Some(ResolvedEphemeral).
         let store = MemoryAccountsStore::new();
         let (signer, ephemeral) = load_signer_for_network("localnet", &store).unwrap();
-        use solana_mpp::solana_keychain::SolanaSigner;
+        use pay_kit::mpp::solana_keychain::SolanaSigner;
 
         let resolved = ephemeral.expect("ephemeral creation must be reported");
         assert!(resolved.created);
@@ -896,7 +896,7 @@ mod tests {
         let (signer1, e1) = load_signer_for_network("localnet", &store).unwrap();
         let (signer2, e2) = load_signer_for_network("localnet", &store).unwrap();
 
-        use solana_mpp::solana_keychain::SolanaSigner;
+        use pay_kit::mpp::solana_keychain::SolanaSigner;
         assert_eq!(signer1.pubkey().to_string(), signer2.pubkey().to_string());
         assert!(e1.is_some(), "first call should report creation");
         assert!(e2.is_none(), "second call must be a cache hit");
@@ -914,7 +914,7 @@ mod tests {
         let (signer, ephemeral) =
             load_signer_for_network_with_reason("localnet", &store, Some("alice"), "test").unwrap();
 
-        use solana_mpp::solana_keychain::SolanaSigner;
+        use pay_kit::mpp::solana_keychain::SolanaSigner;
         assert_eq!(signer.pubkey().to_string(), expected_pubkey);
         assert!(
             ephemeral.is_none(),
@@ -933,7 +933,7 @@ mod tests {
         let (signer, ephemeral) =
             load_signer_for_network_with_reason("localnet", &store, Some("alice"), "test").unwrap();
 
-        use solana_mpp::solana_keychain::SolanaSigner;
+        use pay_kit::mpp::solana_keychain::SolanaSigner;
         let resolved = ephemeral.expect("named localnet miss must create");
         assert!(resolved.created);
         assert_eq!(resolved.account_name, "alice");

@@ -79,6 +79,12 @@ pub fn register(subdomain: &str, bind: &str) -> Result<(String, String), pay_cor
 }
 
 /// Remove the ephemeral entry written by `register`. Idempotent.
+///
+/// Currently unused: Pingora's `run_forever` owns the process exit so the
+/// shutdown hook doesn't fire; stale entries are reaped by
+/// `sweep_dead_ephemeral_sources()` on the next start. Retained for the planned
+/// graceful-shutdown path.
+#[allow(dead_code)]
 pub fn deregister(url: &str) -> Result<bool, pay_core::Error> {
     let mut cfg = SkillsConfig::load()?;
     if cfg.remove_source_by_url(url) {

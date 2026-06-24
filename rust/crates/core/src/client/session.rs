@@ -16,9 +16,9 @@
 
 use std::sync::Arc;
 
-use solana_mpp::client::session::ActiveSession;
-use solana_mpp::solana_keychain::SolanaSigner;
-use solana_mpp::{
+use pay_kit::mpp::client::session::ActiveSession;
+use pay_kit::mpp::solana_keychain::SolanaSigner;
+use pay_kit::mpp::{
     PaymentChallenge, PaymentCredential, SessionAction, SessionMode, SessionRequest,
     format_authorization, parse_www_authenticate,
 };
@@ -28,8 +28,8 @@ use tokio::sync::Mutex;
 use crate::{Error, Result};
 
 // Re-export so callers can construct their own sessions without depending on
-// solana_mpp directly.
-pub use solana_mpp::client::session::ActiveSession as RawSession;
+// pay_kit::mpp directly.
+pub use pay_kit::mpp::client::session::ActiveSession as RawSession;
 
 /// A live session: wraps an [`ActiveSession`] and the original challenge so
 /// voucher authorization headers can be produced without re-parsing the
@@ -214,7 +214,7 @@ pub fn open_session_header(
     deposit: u64,
 ) -> Result<(SessionHandle, String)> {
     use ed25519_dalek::SigningKey;
-    use solana_mpp::solana_keychain::MemorySigner;
+    use pay_kit::mpp::solana_keychain::MemorySigner;
     use solana_pubkey::Pubkey;
 
     // Generate a fresh ephemeral session keypair.
@@ -223,7 +223,7 @@ pub fn open_session_header(
     let mut kp = [0u8; 64];
     kp[..32].copy_from_slice(sk.as_bytes());
     kp[32..].copy_from_slice(vk.as_bytes());
-    let signer: Box<dyn solana_mpp::solana_keychain::SolanaSigner> =
+    let signer: Box<dyn pay_kit::mpp::solana_keychain::SolanaSigner> =
         Box::new(MemorySigner::from_bytes(&kp).map_err(|e| Error::Mpp(e.to_string()))?);
 
     // Random channel ID — server stores it keyed by this string.
@@ -247,7 +247,7 @@ pub fn open_session_header(
 /// when it processes the `open` action.
 pub fn open_payment_channel_session_header(
     challenge: &PaymentChallenge,
-    request: &solana_mpp::SessionRequest,
+    request: &pay_kit::mpp::SessionRequest,
     store: &dyn crate::accounts::AccountsStore,
     network_override: Option<&str>,
     account_override: Option<&str>,
@@ -261,7 +261,7 @@ pub fn open_payment_channel_session_header(
         network_override,
         account_override,
         deposit,
-        solana_mpp::SessionMode::Push,
+        pay_kit::mpp::SessionMode::Push,
         sandbox,
     )
 }
@@ -270,22 +270,22 @@ pub fn open_payment_channel_session_header(
 #[allow(clippy::too_many_arguments)]
 pub fn open_payment_channel_session_header_with_mode(
     challenge: &PaymentChallenge,
-    request: &solana_mpp::SessionRequest,
+    request: &pay_kit::mpp::SessionRequest,
     store: &dyn crate::accounts::AccountsStore,
     network_override: Option<&str>,
     account_override: Option<&str>,
     deposit: u64,
-    submission_mode: solana_mpp::SessionMode,
+    submission_mode: pay_kit::mpp::SessionMode,
     sandbox: bool,
 ) -> Result<(SessionHandle, String)> {
-    use solana_hash::Hash;
-    use solana_mpp::client::{
+    use pay_kit::mpp::client::{
         BuildOpenPaymentChannelTransactionParams, DerivePaymentChannelOpenParams,
         PaymentChannelOpenOptions, build_open_payment_channel_transaction,
         derive_payment_channel_open,
     };
-    use solana_mpp::protocol::solana::default_rpc_url;
-    use solana_mpp::solana_keychain::MemorySigner;
+    use pay_kit::mpp::protocol::solana::default_rpc_url;
+    use pay_kit::mpp::solana_keychain::MemorySigner;
+    use solana_hash::Hash;
     use solana_pubkey::Pubkey;
     use std::str::FromStr;
 
@@ -334,7 +334,7 @@ pub fn open_payment_channel_session_header_with_mode(
         Hash::from_str(blockhash)
             .map_err(|e| Error::Mpp(format!("invalid recentBlockhash in challenge: {e}")))?
     } else {
-        use solana_mpp::solana_rpc_client::rpc_client::RpcClient;
+        use pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient;
         RpcClient::new(rpc_url.clone())
             .get_latest_blockhash()
             .map_err(|e| Error::Mpp(format!("failed to get recent blockhash: {e}")))?
@@ -345,7 +345,7 @@ pub fn open_payment_channel_session_header_with_mode(
     let mut kp_bytes = [0u8; 64];
     kp_bytes[..32].copy_from_slice(sk.as_bytes());
     kp_bytes[32..].copy_from_slice(vk.as_bytes());
-    let session_signer: Box<dyn solana_mpp::solana_keychain::SolanaSigner> =
+    let session_signer: Box<dyn pay_kit::mpp::solana_keychain::SolanaSigner> =
         Box::new(MemorySigner::from_bytes(&kp_bytes).map_err(|e| Error::Mpp(e.to_string()))?);
     let authorized_signer = session_signer.pubkey();
 
@@ -415,7 +415,7 @@ fn build_header(challenge: &PaymentChallenge, action: &SessionAction) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solana_mpp::{
+    use pay_kit::mpp::{
         Base64UrlJson, SessionMode, SessionPullVoucherStrategy, SessionSplit, parse_authorization,
     };
 
@@ -454,7 +454,7 @@ mod tests {
 
     fn test_signer() -> Box<dyn SolanaSigner> {
         use ed25519_dalek::SigningKey;
-        use solana_mpp::solana_keychain::MemorySigner;
+        use pay_kit::mpp::solana_keychain::MemorySigner;
 
         let sk = SigningKey::generate(&mut rand::thread_rng());
         let vk = sk.verifying_key();

@@ -64,7 +64,7 @@ fn server_built_challenge_round_trips_through_client_classify_and_decode() {
     // 1. Server builds the challenge.
     let challenge = sub_server::build_challenge(&spec(), defaults(), None).expect("challenge");
     let www_auth =
-        solana_mpp::format_www_authenticate(&challenge).expect("format WWW-Authenticate");
+        pay_kit::mpp::format_www_authenticate(&challenge).expect("format WWW-Authenticate");
 
     // 2. Classify the 402 — it must route to SubscriptionChallenge.
     let headers = vec![("www-authenticate".to_string(), www_auth)];

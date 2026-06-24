@@ -10,12 +10,13 @@ path = "src/main.rs"
 
 [features]
 default = []
-gcp_kms = ["solana-mpp/gcp_kms"]
+gcp_kms = ["pay-kit/gcp_kms"]
 vendored-openssl = ["pay-core/vendored-openssl"]
 
 [dependencies]
 axum = { workspace = true }
-pay-core = { workspace = true, features = ["server"] }
+pay-core = { workspace = true, features = ["server", "otel"] }
+pay-proxy = { path = "../proxy" }
 pay-keystore = { workspace = true }
 pay-types = { workspace = true }
 clap = { workspace = true }
@@ -33,7 +34,7 @@ opentelemetry-semantic-conventions = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 pay-mcp = { workspace = true }
 reqwest = { workspace = true }
-solana-mpp = { workspace = true }
+pay-kit = { workspace = true }
 solana-pubkey = { workspace = true }
 # Solana SDK atomic crates used by `pay subscriptions cancel` to build
 # and broadcast the cancel_subscription transaction directly.

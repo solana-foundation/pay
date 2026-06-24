@@ -20,7 +20,7 @@
 
 use std::sync::Arc;
 
-use solana_mpp::{
+use pay_kit::mpp::{
     PaymentChallenge, parse_www_authenticate,
     program::subscriptions::{default_program_id, find_subscription_pda, parse_pubkey},
     solana_keychain::SolanaSigner,
@@ -88,7 +88,7 @@ pub async fn sign_and_persist(
         )));
     }
 
-    let header = solana_mpp::client::build_authenticate_credential_header(
+    let header = pay_kit::mpp::client::build_authenticate_credential_header(
         signer.as_ref(),
         challenge,
         subscription_id,
@@ -99,7 +99,7 @@ pub async fn sign_and_persist(
     // Read the server-set expiration time straight off the challenge
     // request payload so the cache TTL matches the server's
     // `period_end` exactly.
-    let request: solana_mpp::AuthenticateRequest = challenge
+    let request: pay_kit::mpp::AuthenticateRequest = challenge
         .request
         .decode()
         .map_err(|e| Error::Mpp(format!("Decoding authenticate request: {e}")))?;
@@ -400,30 +400,30 @@ mod tests {
     fn pick_authenticate_challenge_skips_subscription_challenge() {
         // Build two challenges via the SDK; pick should grab the
         // authenticate one regardless of header order.
-        let sub_challenge = solana_mpp::PaymentChallenge::with_challenge_binding_secret(
+        let sub_challenge = pay_kit::mpp::PaymentChallenge::with_challenge_binding_secret(
             "test-secret",
             "test-realm",
             "solana",
             "subscription",
-            solana_mpp::Base64UrlJson::from_typed(&solana_mpp::SubscriptionRequest {
+            pay_kit::mpp::Base64UrlJson::from_typed(&pay_kit::mpp::SubscriptionRequest {
                 amount: "1".into(),
                 currency: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into(),
-                period_unit: solana_mpp::SubscriptionPeriodUnit::Day,
+                period_unit: pay_kit::mpp::SubscriptionPeriodUnit::Day,
                 period_count: "30".into(),
                 recipient: "6ayEJCQB7gwzwdbWLi65DR9RTRTrS3QunK6j9h2WjQjW".into(),
                 ..Default::default()
             })
             .unwrap(),
         );
-        let auth_challenge = solana_mpp::PaymentChallenge::with_challenge_binding_secret(
+        let auth_challenge = pay_kit::mpp::PaymentChallenge::with_challenge_binding_secret(
             "test-secret",
             "test-realm",
             "solana",
             "authenticate",
-            solana_mpp::Base64UrlJson::from_typed(&solana_mpp::AuthenticateRequest {
+            pay_kit::mpp::Base64UrlJson::from_typed(&pay_kit::mpp::AuthenticateRequest {
                 domain: "api.example.com".into(),
                 uri: "https://api.example.com/v1".into(),
-                version: solana_mpp::SIWMPP_VERSION.into(),
+                version: pay_kit::mpp::SIWMPP_VERSION.into(),
                 nonce: "abc".into(),
                 issued_at: "2026-06-01T00:00:00Z".into(),
                 expiration_time: "2026-07-01T00:00:00Z".into(),
@@ -432,8 +432,8 @@ mod tests {
             .unwrap(),
         );
 
-        let sub_h = solana_mpp::format_www_authenticate(&sub_challenge).unwrap();
-        let auth_h = solana_mpp::format_www_authenticate(&auth_challenge).unwrap();
+        let sub_h = pay_kit::mpp::format_www_authenticate(&sub_challenge).unwrap();
+        let auth_h = pay_kit::mpp::format_www_authenticate(&auth_challenge).unwrap();
 
         let hit = pick_authenticate_challenge(vec![sub_h.clone(), auth_h.clone()])
             .expect("authenticate present");
@@ -446,36 +446,36 @@ mod tests {
 
     #[test]
     fn pick_authenticate_challenge_returns_none_when_only_subscription_present() {
-        let sub_challenge = solana_mpp::PaymentChallenge::with_challenge_binding_secret(
+        let sub_challenge = pay_kit::mpp::PaymentChallenge::with_challenge_binding_secret(
             "test-secret",
             "test-realm",
             "solana",
             "subscription",
-            solana_mpp::Base64UrlJson::from_typed(&solana_mpp::SubscriptionRequest {
+            pay_kit::mpp::Base64UrlJson::from_typed(&pay_kit::mpp::SubscriptionRequest {
                 amount: "1".into(),
                 currency: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into(),
-                period_unit: solana_mpp::SubscriptionPeriodUnit::Day,
+                period_unit: pay_kit::mpp::SubscriptionPeriodUnit::Day,
                 period_count: "30".into(),
                 recipient: "6ayEJCQB7gwzwdbWLi65DR9RTRTrS3QunK6j9h2WjQjW".into(),
                 ..Default::default()
             })
             .unwrap(),
         );
-        let h = solana_mpp::format_www_authenticate(&sub_challenge).unwrap();
+        let h = pay_kit::mpp::format_www_authenticate(&sub_challenge).unwrap();
         assert!(pick_authenticate_challenge(vec![h]).is_none());
     }
 
     #[test]
     fn pick_authenticate_challenge_skips_malformed_entries() {
-        let auth_challenge = solana_mpp::PaymentChallenge::with_challenge_binding_secret(
+        let auth_challenge = pay_kit::mpp::PaymentChallenge::with_challenge_binding_secret(
             "test-secret",
             "test-realm",
             "solana",
             "authenticate",
-            solana_mpp::Base64UrlJson::from_typed(&solana_mpp::AuthenticateRequest {
+            pay_kit::mpp::Base64UrlJson::from_typed(&pay_kit::mpp::AuthenticateRequest {
                 domain: "api.example.com".into(),
                 uri: "https://api.example.com/v1".into(),
-                version: solana_mpp::SIWMPP_VERSION.into(),
+                version: pay_kit::mpp::SIWMPP_VERSION.into(),
                 nonce: "abc".into(),
                 issued_at: "2026-06-01T00:00:00Z".into(),
                 expiration_time: "2026-07-01T00:00:00Z".into(),
@@ -483,7 +483,7 @@ mod tests {
             })
             .unwrap(),
         );
-        let auth_h = solana_mpp::format_www_authenticate(&auth_challenge).unwrap();
+        let auth_h = pay_kit::mpp::format_www_authenticate(&auth_challenge).unwrap();
 
         let hit =
             pick_authenticate_challenge(vec!["not a www-authenticate header".to_string(), auth_h])

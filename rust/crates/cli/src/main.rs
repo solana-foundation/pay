@@ -114,8 +114,13 @@ fn main() {
 
     // MCP server — needs its own runtime, exit early
     if matches!(command, Command::Mcp) {
+        let mcp_seq = std::sync::atomic::AtomicUsize::new(0);
         let rt = match tokio::runtime::Builder::new_multi_thread()
             .enable_all()
+            .thread_name_fn(move || {
+                let n = mcp_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                format!("pay-mcp-worker-{n}")
+            })
             .build()
         {
             Ok(rt) => rt,

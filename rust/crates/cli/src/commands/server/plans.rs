@@ -14,7 +14,7 @@ use std::str::FromStr;
 
 use owo_colors::OwoColorize;
 use pay_core::server::subscription::compute_plan_id_numeric;
-use solana_mpp::program::subscriptions::{default_program_id, find_plan_pda, plan_id_seed};
+use pay_kit::mpp::program::subscriptions::{default_program_id, find_plan_pda, plan_id_seed};
 use solana_pubkey::Pubkey;
 
 #[derive(clap::Args)]
@@ -76,7 +76,7 @@ impl PublishCommand {
             };
             // Stable plan-id derivation: must match `pay server start`
             // (see `pay_core::server::subscription::compute_plan_id_numeric`
-            // + `solana_mpp::program::subscriptions::plan_id_seed`) so the
+            // + `pay_kit::mpp::program::subscriptions::plan_id_seed`) so the
             // PDA this command writes back to the YAML is the same one
             // the running server expects to find on-chain.
             //
