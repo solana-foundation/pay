@@ -32,8 +32,9 @@ use uuid::Uuid;
 use crate::server::session_stream::{self, SessionStreamContext};
 use crate::server::{metering, payment, telemetry};
 
-/// Headers to strip when forwarding to upstream.
-const STRIP_HEADERS: &[&str] = &[
+/// Headers to strip when forwarding to upstream. `pub` so the pingora data plane
+/// (`pay-proxy`) shares the exact same list rather than duplicating it.
+pub const STRIP_HEADERS: &[&str] = &[
     "host",
     "connection",
     "transfer-encoding",
@@ -66,6 +67,25 @@ pub fn resolve_routing<'a>(api: &'a ApiSpec, path: &str) -> &'a RoutingConfig {
         }
     }
     &api.routing
+}
+
+/// Does the endpoint's upstream auth digest the **request body** (an HMAC /
+/// AccessToken `prepare` binding with `body_digest`)? Such schemes can only be
+/// signed correctly when the full body is available before the upstream connect.
+///
+/// The axum path always has the buffered body, so it's fine there. The pingora
+/// data plane streams the body unbuffered and signs against an empty placeholder,
+/// which would silently produce a wrong signature — it uses this to refuse such
+/// requests loudly instead.
+pub fn routing_signs_request_body(api: &ApiSpec, path: &str) -> bool {
+    use pay_types::metering::{AuthConfig, HmacPrepareValue};
+    let prepares = match resolve_routing(api, path).auth() {
+        Some(AuthConfig::Hmac { prepare, .. } | AuthConfig::AccessToken { prepare, .. }) => prepare,
+        _ => return false,
+    };
+    prepares
+        .iter()
+        .any(|b| matches!(b.value, HmacPrepareValue::BodyDigest { .. }))
 }
 
 /// Forward a request to the upstream API defined in the spec.
@@ -1334,6 +1354,38 @@ mod tests {
             session: None,
             recipients: std::collections::HashMap::new(),
         }
+    }
+
+    fn api_with_auth(auth: Option<AuthConfig>) -> ApiSpec {
+        let mut api = make_api("test");
+        if let RoutingConfig::Proxy { auth: a, .. } = &mut api.routing {
+            *a = auth.map(Box::new);
+        }
+        api
+    }
+
+    #[test]
+    fn routing_signs_request_body_detects_body_digest() {
+        // Alibaba-style HMAC includes a Content-MD5 `BodyDigest` prepare binding,
+        // so it signs the request body → unsupported on the streaming data plane.
+        let api = api_with_auth(Some(alibaba_hmac_auth_config(true)));
+        assert!(routing_signs_request_body(&api, "v1/anything"));
+    }
+
+    #[test]
+    fn routing_signs_request_body_false_when_body_untouched() {
+        // No upstream auth at all.
+        assert!(!routing_signs_request_body(
+            &make_api("test"),
+            "v1/anything"
+        ));
+        // Header auth never reads the body.
+        let header = api_with_auth(Some(AuthConfig::Header {
+            key: "Authorization".to_string(),
+            prefix: Some("Bearer ".to_string()),
+            value_from_env: "_TEST_KEY".to_string(),
+        }));
+        assert!(!routing_signs_request_body(&header, "v1/anything"));
     }
 
     fn alibaba_hmac_auth_config(fixed_values: bool) -> AuthConfig {

@@ -12,36 +12,30 @@
 //!
 //! ## Deferred (documented)
 //! - **Body-signing auth**: request bodies stream to the upstream unbuffered, so
-//!   auth schemes that sign the body (HMAC canonical, some `AccessToken` prepare)
-//!   are not yet supported here — they need request-body buffering before the
-//!   upstream connect. Header / Bearer / OAuth2 / QueryParam auth all work.
+//!   auth schemes that digest the body (HMAC / `AccessToken` `body_digest`) can't
+//!   be signed here — those requests are **refused with 501** in
+//!   [`Http402Gate::plan_upstream`] (loud + logged) rather than silently forwarded
+//!   with a signature computed over an empty body. Header / Bearer / OAuth2 /
+//!   QueryParam auth, and HMAC that doesn't digest the body, all work. Lifting
+//!   this needs request-body buffering before the upstream connect.
 //! - **Response-side session metering**: debiting a push channel as bytes flow
 //!   back ([`upstream_response_body_filter`]) is not wired yet; session
 //!   open/voucher/close (all request-side, in the gate) work.
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use http::Uri;
+use http::{StatusCode, Uri};
 use pay_core::PaymentState;
 use pay_core::server::gate::{
     GateDecision, GateRequest, GateResponse, PaymentGate, ReceiptAnnotation,
 };
-use pay_core::server::proxy::{UpstreamPlan, prepare_upstream};
+use pay_core::server::proxy::{
+    STRIP_HEADERS, UpstreamPlan, prepare_upstream, routing_signs_request_body,
+};
 use pay_types::metering::ApiSpec;
 use pingora::http::{RequestHeader, ResponseHeader};
 use pingora::proxy::{ProxyHttp, Session};
 use pingora::upstreams::peer::HttpPeer;
-
-/// Hop-by-hop + payment headers dropped before forwarding upstream. Mirrors
-/// `proxy::STRIP_HEADERS` (kept local to avoid widening that crate's API).
-const STRIP_HEADERS: &[&str] = &[
-    "host",
-    "connection",
-    "transfer-encoding",
-    "authorization",
-    "payment-signature",
-    "payment-required",
-];
 
 /// Where a non-`Respond` request should be proxied.
 enum Target {
@@ -116,7 +110,31 @@ impl<S: PaymentState> Http402Gate<S> {
                 .await;
             return Ok(true);
         };
-        // Body is streamed unbuffered (see module docs) → empty body for prep.
+        // The body is streamed unbuffered (see module docs), so we can't compute
+        // a body-digest signature here. Refuse loudly rather than forward a
+        // request signed over an empty body (which the upstream would reject with
+        // an opaque 401/403). Header / Bearer / OAuth2 / QueryParam auth, and
+        // HMAC that doesn't digest the body, are unaffected.
+        if routing_signs_request_body(api, path) {
+            tracing::error!(
+                path,
+                "refusing request: upstream auth signs the request body, which the pingora data \
+                 plane does not support (body is streamed, not buffered)"
+            );
+            write_gate_response(
+                session,
+                GateResponse::json(
+                    StatusCode::NOT_IMPLEMENTED,
+                    Bytes::from_static(
+                        b"{\"error\":\"unsupported_auth\",\"message\":\"This endpoint's upstream \
+                          auth signs the request body, which the gateway does not yet support.\"}",
+                    ),
+                ),
+            )
+            .await?;
+            return Ok(true);
+        }
+        // No body-signing auth → an empty placeholder body is safe for prep.
         match prepare_upstream(api, method, uri, headers, &[]).await {
             Ok(UpstreamPlan::Forward(prepared)) => {
                 ctx.target = Some(target_from_prepared(prepared));
@@ -348,9 +366,13 @@ async fn write_axum_response(
                 .map(|v| (n.as_str().to_string(), v.to_string()))
         })
         .collect();
-    let body = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
-        .await
-        .unwrap_or_default();
+    let body = match axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "write_axum_response: failed to read response body");
+            Bytes::new()
+        }
+    };
     let mut out = ResponseHeader::build(status, None)?;
     for (n, v) in headers {
         if n.eq_ignore_ascii_case("content-length") {
