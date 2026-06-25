@@ -80,6 +80,32 @@ pub(crate) fn wrap(s: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// Color `label` by provider `category` — a stable one-color-per-category map
+/// so the same category always reads the same hue across the listing. Unknown
+/// categories fall back to white. Returns the styled string; its display width
+/// is unchanged (`label.chars().count()`).
+pub(crate) fn category_color(category: &str, label: &str) -> String {
+    match category {
+        "ai_ml" => label.magenta().to_string(),
+        "data" => label.blue().to_string(),
+        "finance" => label.green().to_string(),
+        "maps" => label.cyan().to_string(),
+        "media" => label.red().to_string(),
+        "messaging" => label.yellow().to_string(),
+        "search" => label.bright_blue().to_string(),
+        "translation" => label.bright_green().to_string(),
+        "shopping" => label.bright_yellow().to_string(),
+        "security" => label.bright_red().to_string(),
+        "compute" => label.bright_cyan().to_string(),
+        "storage" => label.bright_magenta().to_string(),
+        "identity" => label.bright_white().to_string(),
+        "productivity" => label.bright_magenta().to_string(),
+        "cloud" => label.bright_cyan().to_string(),
+        "devtools" => label.bright_white().to_string(),
+        _ => label.white().to_string(),
+    }
+}
+
 /// Indent every line by `n` spaces.
 pub(crate) fn indent(s: &str, n: usize) -> String {
     let pad = " ".repeat(n);

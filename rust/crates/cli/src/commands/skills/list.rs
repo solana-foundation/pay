@@ -19,36 +19,72 @@ pub fn run() -> pay_core::Result<()> {
     let pinned_fqns: std::collections::HashSet<&str> =
         pins.iter().map(|(m, _)| m.fqn.as_str()).collect();
 
-    // One boxed section per provider: title + endpoint count, then the dimmed
-    // fqn (and a pinned marker) — the same framed look as `pay skills search`.
-    let sections: Vec<Vec<(String, usize)>> = catalog
-        .providers
-        .iter()
-        .map(|svc| {
-            let ep = format!("{} endpoints", svc.endpoint_count);
-            let ep_colored = if svc.has_metering {
-                ep.yellow().to_string()
-            } else {
-                ep.dimmed().to_string()
-            };
-            let line1 = format!("{}  ·  {ep_colored}", svc.meta.title.bold());
-            let line1_visible = svc.meta.title.chars().count() + 5 + ep.chars().count();
+    // NO_DNA / agent mode → machine-readable JSON.
+    if crate::no_dna::is_agent() {
+        let items: Vec<serde_json::Value> = catalog
+            .providers
+            .iter()
+            .map(|svc| {
+                serde_json::json!({
+                    "fqn": svc.fqn,
+                    "title": svc.meta.title,
+                    "description": svc.meta.description,
+                    "category": svc.meta.category,
+                    "service_url": svc.meta.service_url,
+                    "endpoint_count": svc.endpoint_count,
+                    "metered": svc.has_metering,
+                    "free_tier": svc.has_free_tier,
+                    "pinned": pinned_fqns.contains(svc.fqn.as_str()),
+                })
+            })
+            .collect();
+        let json = serde_json::to_string_pretty(&items)
+            .map_err(|e| pay_core::Error::Config(format!("json: {e}")))?;
+        println!("{json}");
+        return Ok(());
+    }
 
-            let (line2, line2_visible) = if pinned_fqns.contains(svc.fqn.as_str()) {
-                (
-                    format!("{}  {}", svc.fqn.dimmed(), "(pinned)".cyan()),
-                    svc.fqn.chars().count() + 2 + "(pinned)".len(),
-                )
-            } else {
-                (svc.fqn.dimmed().to_string(), svc.fqn.chars().count())
-            };
-
-            vec![(line1, line1_visible), (line2, line2_visible)]
-        })
-        .collect();
-
+    // One bordered box per provider: title + endpoint count, the wrapped
+    // description, then the dimmed fqn (and a pinned marker) — same framed
+    // look as `pay skills search`.
     eprintln!();
-    eprintln!("{}", boxed::frame(&sections));
+    for svc in &catalog.providers {
+        let ep = format!("{} endpoints", svc.endpoint_count);
+        let ep_colored = if svc.has_metering {
+            ep.yellow().to_string()
+        } else {
+            ep.dimmed().to_string()
+        };
+        let mut lines: Vec<(String, usize)> = vec![(
+            format!("{}  ·  {ep_colored}", svc.meta.title.bold()),
+            svc.meta.title.chars().count() + 5 + ep.chars().count(),
+        )];
+
+        if !svc.meta.category.is_empty() {
+            lines.push((
+                boxed::category_color(&svc.meta.category, &svc.meta.category),
+                svc.meta.category.chars().count(),
+            ));
+        }
+
+        if !svc.meta.description.is_empty() {
+            for seg in boxed::wrap(&svc.meta.description, boxed::INNER) {
+                let visible = seg.chars().count();
+                lines.push((seg.dimmed().to_string(), visible));
+            }
+        }
+
+        if pinned_fqns.contains(svc.fqn.as_str()) {
+            lines.push((
+                format!("{}  {}", svc.fqn.dimmed(), "(pinned)".cyan()),
+                svc.fqn.chars().count() + 2 + "(pinned)".len(),
+            ));
+        } else {
+            lines.push((svc.fqn.dimmed().to_string(), svc.fqn.chars().count()));
+        }
+
+        eprintln!("{}", boxed::frame(&[lines]));
+    }
 
     if !pins.is_empty() {
         eprintln!();
