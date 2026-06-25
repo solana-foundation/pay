@@ -211,10 +211,9 @@ fn print_full_service(hits: &[SearchHit]) {
 
 /// Condensed view: multiple services, top metered + a few free per service.
 fn print_condensed(hits: &[SearchHit], services: &[String]) {
-    for (i, svc_name) in services.iter().enumerate() {
-        if i > 0 {
-            eprintln!();
-        }
+    for svc_name in services.iter() {
+        // `print_service_header` already opens with a blank line, so every
+        // service — including the first — is preceded by exactly one.
         let svc_hits: Vec<&SearchHit> = hits.iter().filter(|h| &h.service == svc_name).collect();
         let first = svc_hits[0];
         print_service_header(&first.service, &first.service_title, &first.service_url);
@@ -297,10 +296,12 @@ fn render_endpoint_table(hits: &[&SearchHit]) -> String {
         if i > 0 {
             out.push(rule('├', '┤'));
         }
-        // Line 1: colored method (6-col) + price.
+        // Line 1: colored method (6-col) + price. Color from the formatted
+        // string, not `hit.metered`: a metered endpoint with a $0 tier renders
+        // as "free", which should read dim — not green.
         let price = format_price(hit.pricing.as_ref(), hit.metered);
         let price_visible = price.chars().count();
-        let price = if hit.metered {
+        let price = if price.starts_with('$') {
             price.green().to_string()
         } else {
             price.dimmed().to_string()
@@ -481,8 +482,12 @@ fn fmt_usd(n: f64) -> String {
     if n <= 0.0 {
         return "$0".to_string();
     }
-    let s = if n >= 0.01 {
+    // Three decimals for sub-dollar amounts so prices like $0.015 don't round
+    // to $0.02; full six only for micro-cent prices below $0.01.
+    let s = if n >= 1.0 {
         format!("{n:.2}")
+    } else if n >= 0.01 {
+        format!("{n:.3}")
     } else {
         format!("{n:.6}")
     };
@@ -511,6 +516,9 @@ mod tests {
         assert_eq!(fmt_usd(5.0), "$5");
         assert_eq!(fmt_usd(9.99), "$9.99");
         assert_eq!(fmt_usd(0.0), "$0");
+        // Sub-dollar amounts keep 3 decimals instead of rounding to 2.
+        assert_eq!(fmt_usd(0.015), "$0.015");
+        assert_eq!(fmt_usd(0.05), "$0.05");
     }
 
     #[test]
