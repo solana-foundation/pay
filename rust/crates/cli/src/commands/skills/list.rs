@@ -2,6 +2,8 @@ use owo_colors::OwoColorize;
 
 use pay_core::skills::pin::PinStore;
 
+use super::boxed;
+
 pub fn run() -> pay_core::Result<()> {
     let catalog = pay_core::skills::blocking::load_skills()?;
     let pins = PinStore::open_default().read_all();
@@ -14,32 +16,39 @@ pub fn run() -> pay_core::Result<()> {
         return Ok(());
     }
 
-    eprintln!();
     let pinned_fqns: std::collections::HashSet<&str> =
         pins.iter().map(|(m, _)| m.fqn.as_str()).collect();
-    for svc in &catalog.providers {
-        let stats = if svc.has_metering {
-            format!("{} endpoints", svc.endpoint_count)
-                .yellow()
-                .to_string()
-        } else {
-            format!("{} endpoints", svc.endpoint_count)
-                .dimmed()
-                .to_string()
-        };
-        let pinned_tag = if pinned_fqns.contains(svc.fqn.as_str()) {
-            " (pinned)".cyan().to_string()
-        } else {
-            String::new()
-        };
-        eprintln!(
-            "  {:<45} {:<38} {}{}",
-            svc.fqn.bold(),
-            svc.meta.title.dimmed(),
-            stats,
-            pinned_tag,
-        );
-    }
+
+    // One boxed section per provider: title + endpoint count, then the dimmed
+    // fqn (and a pinned marker) — the same framed look as `pay skills search`.
+    let sections: Vec<Vec<(String, usize)>> = catalog
+        .providers
+        .iter()
+        .map(|svc| {
+            let ep = format!("{} endpoints", svc.endpoint_count);
+            let ep_colored = if svc.has_metering {
+                ep.yellow().to_string()
+            } else {
+                ep.dimmed().to_string()
+            };
+            let line1 = format!("{}  ·  {ep_colored}", svc.meta.title.bold());
+            let line1_visible = svc.meta.title.chars().count() + 5 + ep.chars().count();
+
+            let (line2, line2_visible) = if pinned_fqns.contains(svc.fqn.as_str()) {
+                (
+                    format!("{}  {}", svc.fqn.dimmed(), "(pinned)".cyan()),
+                    svc.fqn.chars().count() + 2 + "(pinned)".len(),
+                )
+            } else {
+                (svc.fqn.dimmed().to_string(), svc.fqn.chars().count())
+            };
+
+            vec![(line1, line1_visible), (line2, line2_visible)]
+        })
+        .collect();
+
+    eprintln!();
+    eprintln!("{}", boxed::frame(&sections));
 
     if !pins.is_empty() {
         eprintln!();

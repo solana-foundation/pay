@@ -3,15 +3,12 @@ use std::collections::BTreeSet;
 use owo_colors::OwoColorize;
 use pay_core::skills::{self, SearchHit, blocking::ensure_endpoints};
 
+use super::boxed;
+
 /// Max metered endpoints to show per service in condensed mode.
 const CONDENSED_METERED_LIMIT: usize = 5;
 /// Max total endpoints to show per service in condensed mode.
 const CONDENSED_TOTAL_LIMIT: usize = 8;
-
-/// Endpoint-table render width. With the 2-space indent under the service
-/// header this caps the table at 80 columns; comfy-table wraps long cells to
-/// fit rather than truncating.
-const TABLE_WIDTH: u16 = 78;
 
 /// Search for API providers and endpoints.
 ///
@@ -272,57 +269,41 @@ fn print_service_header(slug: &str, title: &str, url: &str) {
 /// Render endpoints as a single-column bordered box — no columns. Each endpoint
 /// is its own section (divided by `├───┤` rules); inside a section the fields
 /// stack on their own lines: `METHOD  price`, then the full path, then the
-/// description. Long lines wrap (never truncate) to the inner width, so the box
-/// stays within [`TABLE_WIDTH`] + 2-space indent = 80 columns.
+/// description. Long lines wrap (never truncate) to the inner width. Framing,
+/// wrapping, and the 80-column cap live in [`super::boxed`].
 fn render_endpoint_table(hits: &[&SearchHit]) -> String {
-    // Box width = inner + "│ " + " │" (4). Inner content wraps to INNER cols.
-    let inner = (TABLE_WIDTH as usize).saturating_sub(4);
-    let bar = "│".dimmed().to_string();
-    let rule = |left: char, right: char| {
-        format!("{left}{}{right}", "─".repeat(inner + 2))
-            .dimmed()
-            .to_string()
-    };
-    // One framed content line: "│ <content padded to `inner`> │". `visible` is
-    // the display width of `content` (computed from the plain text before
-    // coloring), so the right border still lines up under ANSI styling.
-    let framed = |content: String, visible: usize| {
-        let pad = " ".repeat(inner.saturating_sub(visible.min(inner)));
-        format!("{bar} {content}{pad} {bar}")
-    };
-
-    let mut out: Vec<String> = vec![rule('┌', '┐')];
-    for (i, hit) in hits.iter().enumerate() {
-        if i > 0 {
-            out.push(rule('├', '┤'));
-        }
-        // Line 1: colored method (6-col) + price. Color from the formatted
-        // string, not `hit.metered`: a metered endpoint with a $0 tier renders
-        // as "free", which should read dim — not green.
-        let price = format_price(hit.pricing.as_ref(), hit.metered);
-        let price_visible = price.chars().count();
-        let price = if price.starts_with('$') {
-            price.green().to_string()
-        } else {
-            price.dimmed().to_string()
-        };
-        out.push(framed(
-            format!("{}  {price}", color_method(&hit.method)),
-            METHOD_CELL + 2 + price_visible,
-        ));
-        // Full endpoint path (bold), wrapped.
-        for seg in wrap(&hit.path, inner) {
-            let visible = seg.chars().count();
-            out.push(framed(seg.bold().to_string(), visible));
-        }
-        // Description (dimmed), wrapped.
-        for seg in wrap(&hit.description, inner) {
-            let visible = seg.chars().count();
-            out.push(framed(seg.dimmed().to_string(), visible));
-        }
-    }
-    out.push(rule('└', '┘'));
-    indent(&out.join("\n"), 2)
+    let sections: Vec<Vec<(String, usize)>> = hits
+        .iter()
+        .map(|hit| {
+            let mut lines: Vec<(String, usize)> = Vec::new();
+            // Line 1: colored method (6-col) + price. Color from the formatted
+            // string, not `hit.metered`: a metered endpoint with a $0 tier
+            // renders as "free", which should read dim — not green.
+            let price = format_price(hit.pricing.as_ref(), hit.metered);
+            let price_visible = price.chars().count();
+            let price = if price.starts_with('$') {
+                price.green().to_string()
+            } else {
+                price.dimmed().to_string()
+            };
+            lines.push((
+                format!("{}  {price}", color_method(&hit.method)),
+                METHOD_CELL + 2 + price_visible,
+            ));
+            // Full endpoint path (bold), wrapped.
+            for seg in boxed::wrap(&hit.path, boxed::INNER) {
+                let visible = seg.chars().count();
+                lines.push((seg.bold().to_string(), visible));
+            }
+            // Description (dimmed), wrapped.
+            for seg in boxed::wrap(&hit.description, boxed::INNER) {
+                let visible = seg.chars().count();
+                lines.push((seg.dimmed().to_string(), visible));
+            }
+            lines
+        })
+        .collect();
+    boxed::frame(&sections)
 }
 
 /// Fixed display width of the method cell on a section's first line.
@@ -334,59 +315,6 @@ fn color_method(method: &str) -> String {
     format!("{method:<width$}", width = METHOD_CELL)
         .cyan()
         .to_string()
-}
-
-/// Greedy word-wrap to `width` columns (by char count). Over-long tokens are
-/// hard-split rather than truncated, so no content is ever lost.
-fn wrap(s: &str, width: usize) -> Vec<String> {
-    if width == 0 {
-        return vec![s.to_string()];
-    }
-    let mut lines: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    for word in s.split_whitespace() {
-        if word.chars().count() > width {
-            if !cur.is_empty() {
-                lines.push(std::mem::take(&mut cur));
-            }
-            let chars: Vec<char> = word.chars().collect();
-            let mut idx = 0;
-            while chars.len() - idx > width {
-                lines.push(chars[idx..idx + width].iter().collect());
-                idx += width;
-            }
-            cur = chars[idx..].iter().collect();
-            continue;
-        }
-        let clen = cur.chars().count();
-        let need = if clen == 0 {
-            word.chars().count()
-        } else {
-            clen + 1 + word.chars().count()
-        };
-        if need > width {
-            lines.push(std::mem::take(&mut cur));
-            cur = word.to_string();
-        } else {
-            if !cur.is_empty() {
-                cur.push(' ');
-            }
-            cur.push_str(word);
-        }
-    }
-    if !cur.is_empty() || lines.is_empty() {
-        lines.push(cur);
-    }
-    lines
-}
-
-/// Indent every line by `n` spaces.
-fn indent(s: &str, n: usize) -> String {
-    let pad = " ".repeat(n);
-    s.lines()
-        .map(|l| format!("{pad}{l}"))
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 /// Compact price string from the endpoint's `pricing` JSON. Handles the public
