@@ -289,10 +289,20 @@ impl<S: PaymentState> PaymentGate<S> {
             if accepted.contains(&Scheme::X402Upto) {
                 // `upto` is verify-open → meter-usage → settle-after: a
                 // post-handler lifecycle that lands with the adapter phase
-                // (alongside session-stream metering).
-                unimplemented!(
-                    "PaymentGate::evaluate: x402 upto (adapter-phase settlement lifecycle)"
+                // (alongside session-stream metering). Not implemented yet —
+                // return a clean 501 rather than `unimplemented!()`, which would
+                // panic the request worker for an operator-configured scheme +
+                // client x402 header (a crash on untrusted input).
+                tracing::error!(
+                    path,
+                    "x402 `upto` scheme is configured on this endpoint but not yet implemented by the gate"
                 );
+                return GateDecision::Respond(GateResponse::json(
+                    StatusCode::NOT_IMPLEMENTED,
+                    Bytes::from_static(
+                        b"{\"error\":\"unsupported_scheme\",\"message\":\"x402 upto is not yet supported by this gateway.\"}",
+                    ),
+                ));
             }
         }
 
