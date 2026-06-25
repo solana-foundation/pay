@@ -6,16 +6,16 @@ pub mod registry;
 pub mod splits;
 
 /// Well-known mint addresses for supported Solana stablecoins.
+///
+/// Re-exported from pay-kit's shared base crate (`solana_pay_core::mints`) so
+/// there is a single source of truth for mint addresses across the client and
+/// both protocol SDKs. Do not hard-code addresses here — add them upstream in
+/// pay-kit's core crate instead.
 pub mod stablecoin_mints {
-    pub const USDC_MAINNET: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-    pub const USDC_DEVNET: &str = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU";
-    pub const USDC_TESTNET: &str = USDC_DEVNET;
-    pub const USDT_MAINNET: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
-    pub const PYUSD_MAINNET: &str = "2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo";
-    pub const PYUSD_DEVNET: &str = "CXk2AMBfi3TwaEL2468s6zP8xq9NxTXjp9gjMgzeUynM";
-    pub const PYUSD_TESTNET: &str = PYUSD_DEVNET;
-    pub const CASH_MAINNET: &str = "CASHx9KJUStyftLFWGvEVf59SGeG9sh5FfcnZMVPCASH";
-    pub const USDG_MAINNET: &str = "2u1tszSeqZ3qBWF3uNGPFc8TzMk2tdiwknnRMWGWjGWH";
+    pub use solana_pay_core::mints::{
+        CASH_MAINNET, PYUSD_DEVNET, PYUSD_MAINNET, PYUSD_TESTNET, USDC_DEVNET, USDC_MAINNET,
+        USDC_TESTNET, USDG_MAINNET, USDT_MAINNET,
+    };
 }
 
 /// Stablecoins supported by `pay send`.

@@ -1,5 +1,5 @@
 use base64::{Engine, engine::general_purpose};
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, Content, RawResource};
 use rmcp::schemars;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -102,8 +102,10 @@ pub async fn run(
 /// - other binary (`application/pdf`, `application/octet-stream`, etc.) →
 ///   spilled to a tempfile, response carries the path as `Content::text`
 ///   (the JSON-RPC transport mangles raw bytes; tempfile keeps them intact)
-/// - text-typed (`text/*`, `application/json`, `application/xml`) →
-///   `Content::text` with UTF-8 lossy decode
+/// - text-typed (`text/*`, `application/json`, `application/xml`) → handed to
+///   [`text_body_to_content`], which extracts base64-embedded media (Gemini
+///   `inlineData`, OpenAI `b64_json`, data: URLs) into files and caps the
+///   inline size so a multi-megabyte JSON envelope never floods the context
 /// - empty body → `Content::text(empty_message)`
 fn body_to_mcp_content(
     body: Vec<u8>,
@@ -122,19 +124,31 @@ fn body_to_mcp_content(
     }
 
     if is_binary_content_type(&mime) {
-        match write_body_to_tempfile(&body, &mime) {
-            Ok(path) => vec![Content::text(format!(
-                "Binary response ({} bytes, {mime}) written to {path}",
-                body.len()
-            ))],
+        return match write_body_to_tempfile(&body, &mime) {
+            Ok(path) => {
+                let note = Content::text(format!(
+                    "Binary response ({} bytes, {mime}) written to {path}",
+                    body.len()
+                ));
+                // Media types get a native resource link the client can open;
+                // generic binary (zip, octet-stream, …) just gets the path.
+                if mime.starts_with("audio/")
+                    || mime.starts_with("video/")
+                    || mime == "application/pdf"
+                {
+                    vec![note, resource_link_for_file(&path, &mime, body.len())]
+                } else {
+                    vec![note]
+                }
+            }
             Err(err) => vec![Content::text(format!(
                 "Binary response ({} bytes, {mime}) — failed to spill to tempfile: {err}",
                 body.len()
             ))],
-        }
-    } else {
-        vec![Content::text(String::from_utf8_lossy(&body).into_owned())]
+        };
     }
+
+    text_body_to_content(String::from_utf8_lossy(&body).into_owned())
 }
 
 fn mime_from_content_type(content_type: Option<&str>) -> String {
@@ -190,6 +204,289 @@ fn extension_for_mime(mime: &str) -> String {
         .and_then(|exts| exts.first())
         .map(|ext| format!(".{ext}"))
         .unwrap_or_else(|| ".bin".to_string())
+}
+
+/// Largest text/JSON body we embed inline before spilling it to a tempfile.
+/// Above this the context-window cost outweighs the convenience.
+const MAX_TEXT_INLINE_BYTES: usize = 256 * 1024;
+/// How much of an over-cap text body to keep inline as a preview.
+const TEXT_PREVIEW_BYTES: usize = 4 * 1024;
+/// Minimum *decoded* size for a base64 string embedded in JSON to be worth
+/// extracting to a file. Smaller blobs (icons, thumbnails) stay inline.
+const MIN_BASE64_EXTRACT_BYTES: usize = 8 * 1024;
+
+/// Media decoded out of a JSON envelope and written to disk.
+struct ExtractedMedia {
+    mime: String,
+    path: String,
+    /// Standard-base64 re-encoding of the decoded bytes, for `Content::image`.
+    encoded: String,
+    bytes: usize,
+}
+
+/// Turn a text-typed response into MCP content.
+///
+/// If the body is JSON, base64-embedded media (Gemini `inlineData.data`,
+/// OpenAI `b64_json`, data: URLs, or any large base64 string that sniffs as a
+/// known media type) is decoded, written to a tempfile, and replaced in the
+/// JSON with a `<mime, N bytes → /path>` placeholder. Images are additionally
+/// surfaced as `Content::image` so the model can see them. Whatever text
+/// remains is size-capped by [`text_content_capped`].
+fn text_body_to_content(text: String) -> Vec<Content> {
+    if let Ok(mut value) = serde_json::from_str::<Value>(&text) {
+        let mut extracted = Vec::new();
+        extract_media_from_json(&mut value, &mut extracted);
+        if !extracted.is_empty() {
+            let slimmed = serde_json::to_string(&value).unwrap_or(text);
+            let mut content = vec![text_content_capped(slimmed)];
+            for media in &extracted {
+                if let Some(block) = media_as_content_block(media) {
+                    content.push(block);
+                }
+            }
+            return content;
+        }
+    }
+    vec![text_content_capped(text)]
+}
+
+/// Surface extracted media as a native MCP content block.
+///
+/// - `image/*` → `Content::image` (base64 inline, so the model can see it)
+/// - `audio/*`, `video/*`, `application/pdf` → `Content::resource_link`
+///   pointing at the file on disk. A resource link is the native MCP primitive
+///   for handing a client a file by reference — clients that support these
+///   types can open/play them, and we avoid inlining multi-megabyte base64
+///   that would flood the context.
+fn media_as_content_block(media: &ExtractedMedia) -> Option<Content> {
+    if media.mime.starts_with("image/") {
+        return Some(Content::image(media.encoded.clone(), media.mime.clone()));
+    }
+    if media.mime.starts_with("audio/")
+        || media.mime.starts_with("video/")
+        || media.mime == "application/pdf"
+    {
+        return Some(resource_link_for_file(
+            &media.path,
+            &media.mime,
+            media.bytes,
+        ));
+    }
+    None
+}
+
+/// Build a `resource_link` content block referencing a media file on disk.
+fn resource_link_for_file(path: &str, mime: &str, bytes: usize) -> Content {
+    let name = path
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(path)
+        .to_string();
+    let mut resource = RawResource::new(format!("file://{path}"), name);
+    resource.mime_type = Some(mime.to_string());
+    resource.size = u32::try_from(bytes).ok();
+    Content::resource_link(resource)
+}
+
+/// Return the text as inline `Content::text`, or — when it exceeds
+/// [`MAX_TEXT_INLINE_BYTES`] — spill the full body to a tempfile and return a
+/// short preview plus the path, so a huge response can't flood the context.
+fn text_content_capped(text: String) -> Content {
+    if text.len() <= MAX_TEXT_INLINE_BYTES {
+        return Content::text(text);
+    }
+    let preview: String = text.chars().take(TEXT_PREVIEW_BYTES).collect();
+    match write_body_to_tempfile(text.as_bytes(), "text/plain") {
+        Ok(path) => Content::text(format!(
+            "Large text response ({} bytes) written to {path}. First {} chars:\n{preview}",
+            text.len(),
+            preview.len()
+        )),
+        Err(err) => Content::text(format!(
+            "Large text response ({} bytes) — failed to spill to tempfile: {err}. First {} chars:\n{preview}",
+            text.len(),
+            preview.len()
+        )),
+    }
+}
+
+/// Recursively walk a JSON value, extracting large base64 media strings to
+/// files and replacing each with a `<mime, N bytes → /path>` placeholder.
+fn extract_media_from_json(value: &mut Value, out: &mut Vec<ExtractedMedia>) {
+    match value {
+        Value::Object(map) => {
+            let sibling_mime = mime_hint_from_object(map);
+            let keys: Vec<String> = map.keys().cloned().collect();
+            for key in keys {
+                let Some(slot) = map.get_mut(&key) else {
+                    continue;
+                };
+                if let Value::String(s) = slot
+                    && let Some(media) =
+                        try_extract_base64_media(s.as_str(), sibling_mime.as_deref())
+                {
+                    *slot = Value::String(format!(
+                        "<{}, {} bytes → {}>",
+                        media.mime, media.bytes, media.path
+                    ));
+                    out.push(media);
+                    continue;
+                }
+                extract_media_from_json(slot, out);
+            }
+        }
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                extract_media_from_json(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Find a MIME-type hint among an object's own keys (e.g. Gemini's
+/// `inlineData` carries a sibling `mimeType` next to `data`).
+fn mime_hint_from_object(map: &serde_json::Map<String, Value>) -> Option<String> {
+    for key in [
+        "mimeType",
+        "mime_type",
+        "contentType",
+        "content_type",
+        "mime",
+    ] {
+        if let Some(Value::String(s)) = map.get(key) {
+            let s = s.trim();
+            if !s.is_empty() {
+                return Some(s.to_ascii_lowercase());
+            }
+        }
+    }
+    None
+}
+
+/// Try to interpret a JSON string as base64-encoded media worth spilling to a
+/// file. Returns `None` for ordinary strings — only large blobs that decode as
+/// base64 *and* are identifiable as media (by magic bytes, a data: URL prefix,
+/// or a sibling MIME hint) are extracted.
+fn try_extract_base64_media(s: &str, hint: Option<&str>) -> Option<ExtractedMedia> {
+    // Cheap length gate: decoded ≈ 3/4 of encoded, so a sub-threshold string
+    // can't possibly yield enough bytes. Avoids decoding every short field.
+    if s.len() < MIN_BASE64_EXTRACT_BYTES {
+        return None;
+    }
+
+    let (data_url_mime, payload) = match strip_data_url(s) {
+        Some((mime, payload)) => (Some(mime), payload),
+        None => (None, s),
+    };
+
+    let decoded = decode_base64_relaxed(payload)?;
+    if decoded.len() < MIN_BASE64_EXTRACT_BYTES {
+        return None;
+    }
+
+    let sniffed = sniff_media_mime(&decoded);
+    let hint_is_media = hint.map(mime_is_media).unwrap_or(false);
+    // Require positive media evidence — never extract opaque base64 (tokens,
+    // signatures, arbitrary blobs) that merely happens to be large.
+    if data_url_mime.is_none() && sniffed.is_none() && !hint_is_media {
+        return None;
+    }
+
+    // Prefer bytes-derived MIME (magic) over a data: URL label over a sibling
+    // hint — the bytes don't lie.
+    let mime = sniffed
+        .map(str::to_string)
+        .or(data_url_mime)
+        .or_else(|| hint.map(str::to_string))
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+
+    let path = write_body_to_tempfile(&decoded, &mime).ok()?;
+    Some(ExtractedMedia {
+        encoded: general_purpose::STANDARD.encode(&decoded),
+        bytes: decoded.len(),
+        mime,
+        path,
+    })
+}
+
+/// Split a `data:<mime>;base64,<payload>` URL into its MIME type and payload.
+fn strip_data_url(s: &str) -> Option<(String, &str)> {
+    let rest = s.strip_prefix("data:")?;
+    let (meta, payload) = rest.split_once(',')?;
+    let meta = meta.strip_suffix(";base64")?;
+    let mime = meta
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if mime.is_empty() {
+        return None;
+    }
+    Some((mime, payload))
+}
+
+/// Decode base64 tolerantly across the common variants APIs emit (standard,
+/// unpadded, URL-safe).
+fn decode_base64_relaxed(s: &str) -> Option<Vec<u8>> {
+    general_purpose::STANDARD
+        .decode(s)
+        .or_else(|_| general_purpose::STANDARD_NO_PAD.decode(s))
+        .or_else(|_| general_purpose::URL_SAFE.decode(s))
+        .or_else(|_| general_purpose::URL_SAFE_NO_PAD.decode(s))
+        .ok()
+}
+
+/// True for MIME types that name real media we'd want materialized as a file.
+fn mime_is_media(mime: &str) -> bool {
+    let mime = mime.trim();
+    mime.starts_with("image/")
+        || mime.starts_with("audio/")
+        || mime.starts_with("video/")
+        || mime == "application/pdf"
+}
+
+/// Identify common media formats by their leading magic bytes. Returns a
+/// canonical MIME type, or `None` when the bytes aren't a recognized format.
+fn sniff_media_mime(bytes: &[u8]) -> Option<&'static str> {
+    const PNG: &[u8] = &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    if bytes.starts_with(PNG) {
+        return Some("image/png");
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WAVE" {
+        return Some("audio/wav");
+    }
+    if bytes.starts_with(b"OggS") {
+        return Some("audio/ogg");
+    }
+    if bytes.starts_with(b"fLaC") {
+        return Some("audio/flac");
+    }
+    if bytes.starts_with(b"%PDF") {
+        return Some("application/pdf");
+    }
+    // MP3: ID3 tag or an MPEG audio frame sync (11 set bits).
+    if bytes.starts_with(b"ID3")
+        || (bytes.len() >= 2 && bytes[0] == 0xFF && (bytes[1] & 0xE0) == 0xE0)
+    {
+        return Some("audio/mpeg");
+    }
+    // ISO base media (MP4/M4V/MOV): `....ftyp` box at offset 4.
+    if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        return Some("video/mp4");
+    }
+    None
 }
 
 /// Result of a paid fetch: raw response body bytes and the content-type the
@@ -262,28 +559,53 @@ fn do_paid_fetch(
         RunOutcome::MppChallenge {
             challenge,
             alternatives,
+            x402_alternative,
             ..
         } => {
+            use pay_core::client::mpp::ChosenPayment;
             let mut challenges = Vec::with_capacity(1 + alternatives.len());
             challenges.push((*challenge).clone());
             challenges.extend(alternatives);
-            let selected = pay_core::client::mpp::select_challenge_by_balance(
+            // Balance-aware, cross-protocol pick: settle the MPP charge the
+            // wallet can fund, or fall back to an x402 offer it can fund.
+            let chosen = pay_core::client::mpp::choose_payment(
                 &challenges,
+                x402_alternative.as_deref(),
                 &store,
                 network_override.as_deref(),
                 account_override.as_deref(),
-            )?
-            .ok_or_else(|| pay_core::Error::Mpp("No compatible MPP challenge found".to_string()))?;
-            let (auth_header, _ephemeral) = pay_core::client::mpp::build_credential_with_override(
-                selected,
-                &store,
-                network_override.as_deref(),
-                account_override.as_deref(),
-                Some(url),
-                make_auth_override(),
             )?;
             let mut headers = extra_headers.to_vec();
-            headers.push(("Authorization".to_string(), auth_header));
+            match chosen {
+                ChosenPayment::Mpp(ch) => {
+                    let (auth_header, _ephemeral) =
+                        pay_core::client::mpp::build_credential_with_override(
+                            ch.as_ref(),
+                            &store,
+                            network_override.as_deref(),
+                            account_override.as_deref(),
+                            Some(url),
+                            make_auth_override(),
+                        )?;
+                    headers.push(("Authorization".to_string(), auth_header));
+                }
+                ChosenPayment::X402(challenge) => {
+                    let built_payment = pay_core::client::x402::build_payment_with_override(
+                        challenge.as_ref(),
+                        &store,
+                        network_override.as_deref(),
+                        account_override.as_deref(),
+                        Some(url),
+                        make_auth_override(),
+                    )?;
+                    headers.extend(
+                        built_payment
+                            .headers
+                            .into_iter()
+                            .map(|(name, value)| (name.to_string(), value)),
+                    );
+                }
+            }
             interpret_retry(pay_core::client::fetch::fetch_request(
                 method,
                 url,
@@ -850,5 +1172,187 @@ mod tests {
     fn extension_for_mime_unknown_falls_back_to_bin() {
         assert_eq!(extension_for_mime("application/x-totally-made-up"), ".bin");
         assert_eq!(extension_for_mime(""), ".bin");
+    }
+
+    // ── JSON-embedded base64 media extraction ─────────────────────────
+    //
+    // AI media APIs (Gemini, OpenAI, TTS) return binary as base64 *inside*
+    // an application/json envelope. The MIME router sees "json" and would
+    // otherwise dump the whole multi-megabyte blob as text. These cover the
+    // extraction-to-file path that keeps the context small.
+
+    /// Build a base64 string whose decoded bytes start with `sig`, padded to
+    /// `total` bytes — large enough to clear MIN_BASE64_EXTRACT_BYTES.
+    fn media_b64(sig: &[u8], total: usize) -> (Vec<u8>, String) {
+        let mut bytes = sig.to_vec();
+        bytes.resize(total, 0xAB);
+        let encoded = general_purpose::STANDARD.encode(&bytes);
+        (bytes, encoded)
+    }
+
+    const PNG_SIG: &[u8] = &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+
+    /// Pull the on-disk path out of a `<mime, N bytes → /path>` placeholder.
+    fn path_from_placeholder(text: &str) -> String {
+        let after = text.split("→ ").nth(1).expect("arrow in placeholder");
+        after
+            .split('>')
+            .next()
+            .expect("closing >")
+            .trim()
+            .to_string()
+    }
+
+    #[test]
+    fn json_gemini_inline_data_extracts_image() {
+        let (raw, b64) = media_b64(PNG_SIG, 9000);
+        let body = serde_json::json!({
+            "candidates": [{
+                "content": { "parts": [
+                    { "inlineData": { "mimeType": "image/png", "data": b64 } }
+                ]}
+            }]
+        });
+        let content = text_body_to_content(serde_json::to_string(&body).unwrap());
+
+        // Slimmed JSON text + an inline image the model can see.
+        assert!(content.len() >= 2);
+        let text = content[0].as_text().expect("text").text.clone();
+        assert!(!text.contains(&b64), "raw base64 removed from JSON");
+        assert!(text.contains("image/png") && text.contains("bytes →"));
+
+        let image = content[1].as_image().expect("image block");
+        assert_eq!(image.mime_type, "image/png");
+        assert_eq!(general_purpose::STANDARD.decode(&image.data).unwrap(), raw);
+
+        let path = path_from_placeholder(&text);
+        assert_eq!(std::fs::read(&path).expect("file on disk"), raw);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn json_openai_b64_json_extracts_via_magic_bytes() {
+        // No mime hint — extraction must rely on PNG magic bytes.
+        let (raw, b64) = media_b64(PNG_SIG, 9000);
+        let body = serde_json::json!({ "data": [{ "b64_json": b64 }] });
+        let content = text_body_to_content(serde_json::to_string(&body).unwrap());
+
+        let text = content[0].as_text().expect("text").text.clone();
+        assert!(text.contains("image/png") && !text.contains(&b64));
+        assert!(content.iter().any(|c| c.as_image().is_some()));
+        let _ = std::fs::remove_file(path_from_placeholder(&text));
+        let _ = raw;
+    }
+
+    #[test]
+    fn json_data_url_image_extracts() {
+        let (_, b64) = media_b64(PNG_SIG, 9000);
+        let body = serde_json::json!({ "image": format!("data:image/png;base64,{b64}") });
+        let content = text_body_to_content(serde_json::to_string(&body).unwrap());
+
+        let text = content[0].as_text().expect("text").text.clone();
+        assert!(text.contains("image/png"));
+        assert!(content.iter().any(|c| c.as_image().is_some()));
+        let _ = std::fs::remove_file(path_from_placeholder(&text));
+    }
+
+    #[test]
+    fn json_audio_extracts_as_resource_link() {
+        // MP3 ID3 header → audio/mpeg, surfaced as a resource_link (not inline).
+        let (_, b64) = media_b64(b"ID3\x03\x00\x00\x00", 9000);
+        let body = serde_json::json!({ "audio": { "mimeType": "audio/mpeg", "data": b64 } });
+        let content = text_body_to_content(serde_json::to_string(&body).unwrap());
+
+        let text = content[0].as_text().expect("text").text.clone();
+        assert!(text.contains("audio/mpeg"));
+        let link = content
+            .iter()
+            .find_map(|c| c.as_resource_link())
+            .expect("resource_link block");
+        assert_eq!(link.mime_type.as_deref(), Some("audio/mpeg"));
+        assert!(link.uri.starts_with("file://"));
+        // Audio is referenced, never inlined as base64.
+        assert!(content.iter().all(|c| c.as_image().is_none()));
+        let _ = std::fs::remove_file(path_from_placeholder(&text));
+    }
+
+    #[test]
+    fn json_small_base64_stays_inline() {
+        // Below MIN_BASE64_EXTRACT_BYTES → left untouched in the JSON.
+        let small = general_purpose::STANDARD.encode(PNG_SIG);
+        let body = serde_json::json!({ "inlineData": { "mimeType": "image/png", "data": small } });
+        let content = text_body_to_content(serde_json::to_string(&body).unwrap());
+        assert_eq!(content.len(), 1);
+        assert!(content[0].as_text().unwrap().text.contains(&small));
+    }
+
+    #[test]
+    fn json_large_opaque_base64_not_extracted() {
+        // 9 KB of base64 with no media signature and no mime hint — must NOT
+        // be written to a file (could be a signature, token, opaque blob).
+        let b64 = general_purpose::STANDARD.encode(vec![0x01u8; 9000]);
+        let body = serde_json::json!({ "signature": b64 });
+        let content = text_body_to_content(serde_json::to_string(&body).unwrap());
+        assert_eq!(content.len(), 1);
+        assert!(content[0].as_text().unwrap().text.contains(&b64));
+    }
+
+    #[test]
+    fn large_plain_text_spills_with_preview() {
+        let big = "x".repeat(MAX_TEXT_INLINE_BYTES + 100);
+        let content = text_body_to_content(big.clone());
+        assert_eq!(content.len(), 1);
+        let text = content[0].as_text().unwrap().text.clone();
+        assert!(text.contains("Large text response"));
+        assert!(text.len() < big.len(), "only a preview is inlined");
+        let path = text
+            .split(" written to ")
+            .nth(1)
+            .and_then(|s| s.split(". First").next())
+            .expect("path in message");
+        assert_eq!(std::fs::read(path).unwrap().len(), big.len());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn top_level_pdf_gets_resource_link() {
+        let mut body = b"%PDF-1.4".to_vec();
+        body.resize(64, 0x20);
+        let content = body_to_mcp_content(body.clone(), Some("application/pdf"), "empty");
+        let note = content[0].as_text().expect("text note").text.clone();
+        let path = note.split(" written to ").nth(1).expect("path").to_string();
+        let link = content
+            .iter()
+            .find_map(|c| c.as_resource_link())
+            .expect("resource_link");
+        assert_eq!(link.mime_type.as_deref(), Some("application/pdf"));
+        assert_eq!(link.size, Some(body.len() as u32));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sniff_media_mime_detects_common_formats() {
+        assert_eq!(sniff_media_mime(PNG_SIG), Some("image/png"));
+        assert_eq!(
+            sniff_media_mime(&[0xFF, 0xD8, 0xFF, 0xE0]),
+            Some("image/jpeg")
+        );
+        assert_eq!(sniff_media_mime(b"GIF89a...."), Some("image/gif"));
+        assert_eq!(sniff_media_mime(b"%PDF-1.7"), Some("application/pdf"));
+        assert_eq!(sniff_media_mime(b"ID3\x03\x00\x00\x00"), Some("audio/mpeg"));
+        assert_eq!(sniff_media_mime(b"OggS\x00\x02\x00\x00"), Some("audio/ogg"));
+        assert_eq!(
+            sniff_media_mime(b"RIFF\x00\x00\x00\x00WEBP"),
+            Some("image/webp")
+        );
+        assert_eq!(
+            sniff_media_mime(b"RIFF\x00\x00\x00\x00WAVE"),
+            Some("audio/wav")
+        );
+        assert_eq!(
+            sniff_media_mime(b"\x00\x00\x00\x18ftypmp42"),
+            Some("video/mp4")
+        );
+        assert_eq!(sniff_media_mime(b"just some plain text here"), None);
     }
 }

@@ -1,3 +1,4 @@
+mod boxed;
 pub mod endpoints;
 pub mod install;
 pub mod list;

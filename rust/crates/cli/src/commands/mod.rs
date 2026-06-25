@@ -293,6 +293,10 @@ fn handle_outcome(
             challenge,
             alternatives,
             resource_url,
+            // TODO(step2): route `x402_alternative` through
+            // `mpp::choose_payment` so CLI auto-pay also falls back to a
+            // fundable x402 offer. The MCP `curl` path already does this.
+            ..
         } => {
             let req: ChargeRequest = challenge.request.decode().unwrap_or_default();
             let mut challenges = Vec::with_capacity(1 + alternatives.len());

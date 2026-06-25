@@ -12,9 +12,16 @@ use crate::{Error, Result};
 #[derive(Debug)]
 pub enum RunOutcome {
     /// The server returned 402 with an MPP charge challenge.
+    ///
+    /// `x402_alternative` carries an x402 charge option advertised on the same
+    /// 402, when present. MPP is preferred by default, but a balance-aware
+    /// selector may settle the x402 option instead when the wallet can't fund
+    /// any MPP challenge (e.g. MPP wants USDG, wallet holds only USDC offered
+    /// via x402). See [`mpp::choose_payment`](crate::client::mpp::choose_payment).
     MppChallenge {
         challenge: Box<mpp::Challenge>,
         alternatives: Vec<mpp::Challenge>,
+        x402_alternative: Option<Box<x402::Challenge>>,
         resource_url: String,
     },
     /// The server returned 402 with an MPP session challenge (intent="session").
@@ -572,6 +579,9 @@ pub(crate) fn classify_402_with_preference(
         return RunOutcome::MppChallenge {
             challenge: Box::new(challenge),
             alternatives: charge_challenges,
+            // Carry any x402 charge from the same 402 so a balance-aware
+            // selector can fall back to it when no MPP challenge is fundable.
+            x402_alternative: x402_challenge.clone().map(Box::new),
             resource_url: resource_url.to_string(),
         };
     }

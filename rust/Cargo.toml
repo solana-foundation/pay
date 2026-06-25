@@ -115,6 +115,18 @@ solana-x402 = { git = "https://github.com/solana-foundation/pay-kit", branch = "
     "client",
 ] }
 
+# Unified pay-kit SDK — cross-protocol, balance-aware payment selection
+# (kit::select_payment over MPP charge + x402 accepts).
+solana-pay-kit = { git = "https://github.com/solana-foundation/pay-kit", branch = "main", default-features = false, features = [
+    "mpp",
+    "x402",
+    "client",
+] }
+
+# Shared pay-kit base crate — canonical stablecoin mint registry lives here
+# (re-exported by solana-mpp / solana-x402). pay-types reads it directly.
+solana-pay-core = { git = "https://github.com/solana-foundation/pay-kit", branch = "main", default-features = false }
+
 # Solana primitives (pinned to versions used by solana-mpp)
 bincode = "1"
 solana-commitment-config = "3.1"
