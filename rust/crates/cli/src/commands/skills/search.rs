@@ -57,7 +57,9 @@ impl SearchCommand {
             );
         }
 
-        if self.json {
+        // Emit JSON when explicitly requested (`--json`) or under NO_DNA /
+        // agent mode (machine-readable output).
+        if self.json || crate::no_dna::is_agent() {
             let grouped = skills::group_search_results(&hits);
             let json = serde_json::to_string_pretty(&grouped)
                 .map_err(|e| pay_core::Error::Config(format!("json: {e}")))?;
