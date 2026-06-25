@@ -99,8 +99,14 @@ impl<S: PaymentState> Http402Gate<S> {
         uri: &Uri,
         headers: &http::HeaderMap,
         session: &mut Session,
+        // Whether this request may be served by the internal control-plane axum.
+        // Only `Passthrough` (free / discovery) requests qualify; a `Forward`
+        // (verified payment) for a root (`path: ""`) endpoint must reach the real
+        // upstream, else the client paid but axum re-checks the stripped auth and
+        // returns a 402.
+        control_plane_ok: bool,
     ) -> pingora::Result<bool> {
-        if is_control_plane(path) {
+        if control_plane_ok && is_control_plane(path) {
             ctx.target = Some(Target::ControlPlane);
             return Ok(false);
         }
@@ -200,6 +206,9 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
             }
             GateDecision::Forward { receipt, .. } => {
                 ctx.receipt = receipt;
+                // A verified payment must reach the real upstream — never the
+                // control-plane axum (`control_plane_ok = false`), even for a
+                // root (`path: ""`) endpoint.
                 self.plan_upstream(
                     ctx,
                     &path,
@@ -208,10 +217,12 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                     &uri,
                     &headers,
                     session,
+                    false,
                 )
                 .await
             }
             GateDecision::Passthrough => {
+                // Free / discovery requests may be served by the control plane.
                 self.plan_upstream(
                     ctx,
                     &path,
@@ -220,6 +231,7 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                     &uri,
                     &headers,
                     session,
+                    true,
                 )
                 .await
             }
