@@ -358,7 +358,11 @@ fn wrap(s: &str, width: usize) -> Vec<String> {
             continue;
         }
         let clen = cur.chars().count();
-        let need = if clen == 0 { word.chars().count() } else { clen + 1 + word.chars().count() };
+        let need = if clen == 0 {
+            word.chars().count()
+        } else {
+            clen + 1 + word.chars().count()
+        };
         if need > width {
             lines.push(std::mem::take(&mut cur));
             cur = word.to_string();

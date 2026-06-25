@@ -441,9 +441,7 @@ impl<W: io::Write> Backend for DowngradeBackend<W> {
     }
 }
 
-fn with_terminal<T>(
-    f: impl FnOnce(&mut Terminal<TuiBackend>) -> io::Result<T>,
-) -> io::Result<T> {
+fn with_terminal<T>(f: impl FnOnce(&mut Terminal<TuiBackend>) -> io::Result<T>) -> io::Result<T> {
     terminal::enable_raw_mode()?;
     let mut stderr = io::stderr();
     execute!(stderr, EnterAlternateScreen)?;
@@ -2758,10 +2756,16 @@ mod tests {
             Color::Indexed(i) => i,
             other => panic!("expected Indexed, got {other:?}"),
         };
-        assert!((16..=231).contains(&idx), "expected a cube color, got {idx}");
+        assert!(
+            (16..=231).contains(&idx),
+            "expected a cube color, got {idx}"
+        );
         let c = idx - 16;
         let (r, g, b) = (c / 36, (c / 6) % 6, c % 6);
-        assert!(g > r && g > b, "expected green-dominant cube cell, got ({r},{g},{b})");
+        assert!(
+            g > r && g > b,
+            "expected green-dominant cube cell, got ({r},{g},{b})"
+        );
     }
 
     // ── PollState tests ─────────────────────────────────────────────────
