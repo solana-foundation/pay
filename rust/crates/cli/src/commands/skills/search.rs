@@ -193,49 +193,27 @@ fn format_empty_warning(services: &[String]) -> String {
     }
 }
 
-/// Full view: one service, all endpoints grouped by resource.
+/// Full view: one service, all endpoints in a table.
 fn print_full_service(hits: &[SearchHit]) {
     let first = &hits[0];
-    eprintln!(
-        "  {} — {}",
-        first.service.bold(),
-        first.service_title.dimmed()
-    );
-    if !first.service_url.is_empty() {
-        eprintln!("  {}", first.service_url.dimmed());
-    }
-    eprintln!();
-
+    print_service_header(&first.service, &first.service_title, &first.service_url);
     let refs: Vec<&SearchHit> = hits.iter().collect();
-    print_resource_groups(&refs);
-    eprintln!();
+    eprintln!("{}", render_endpoint_table(&refs));
     eprintln!("  {}", format!("{} endpoints", hits.len()).dimmed());
 }
 
-/// Condensed view: multiple services, show top metered + a few free per service.
+/// Condensed view: multiple services, top metered + a few free per service.
 fn print_condensed(hits: &[SearchHit], services: &[String]) {
     for (i, svc_name) in services.iter().enumerate() {
         if i > 0 {
             eprintln!();
         }
-
         let svc_hits: Vec<&SearchHit> = hits.iter().filter(|h| &h.service == svc_name).collect();
         let first = svc_hits[0];
+        print_service_header(&first.service, &first.service_title, &first.service_url);
 
-        eprintln!(
-            "  {} — {}",
-            first.service.bold(),
-            first.service_title.dimmed()
-        );
-        if !first.service_url.is_empty() {
-            eprintln!("  {}", first.service_url.dimmed());
-        }
-        eprintln!();
-
-        // Show metered first, capped
         let metered: Vec<&&SearchHit> = svc_hits.iter().filter(|h| h.metered).collect();
         let free: Vec<&&SearchHit> = svc_hits.iter().filter(|h| !h.metered).collect();
-
         let shown_metered = metered.len().min(CONDENSED_METERED_LIMIT);
         let remaining_budget = CONDENSED_TOTAL_LIMIT.saturating_sub(shown_metered);
         let shown_free = free.len().min(remaining_budget);
@@ -247,13 +225,13 @@ fn print_condensed(hits: &[SearchHit], services: &[String]) {
             .copied()
             .collect();
 
-        print_resource_groups(&shown_hits);
+        eprintln!("{}", render_endpoint_table(&shown_hits));
 
         let total = svc_hits.len();
         let shown = shown_metered + shown_free;
         if total > shown {
             eprintln!(
-                "    {}",
+                "  {}",
                 format!(
                     "... {} more — `pay skills endpoints {}`",
                     total - shown,
@@ -276,62 +254,184 @@ fn print_condensed(hits: &[SearchHit], services: &[String]) {
     );
 }
 
-fn print_resource_groups(hits: &[&SearchHit]) {
-    let mut current_resource = String::new();
-    for hit in hits {
-        if let Some(hit_resource) = hit.resource.as_deref()
-            && hit_resource != current_resource
-            && !hit_resource.is_empty()
-        {
-            if !current_resource.is_empty() {
-                eprintln!();
-            }
-            current_resource = hit_resource.to_string();
-            eprintln!("  {} {}", "resource:".dimmed(), current_resource.bold());
-        }
-        print_endpoint(hit);
+fn print_service_header(slug: &str, title: &str, url: &str) {
+    eprintln!();
+    eprintln!("  {} {}", slug.bold(), format!("— {title}").dimmed());
+    if !url.is_empty() {
+        eprintln!("  {}", url.dimmed());
     }
 }
 
-fn print_endpoint(hit: &SearchHit) {
-    let method_colored = match hit.method.as_str() {
-        "GET" => format!("{:<7}", hit.method).green().to_string(),
-        "POST" => format!("{:<7}", hit.method).blue().to_string(),
-        "PUT" | "PATCH" => format!("{:<7}", hit.method).yellow().to_string(),
-        "DELETE" => format!("{:<7}", hit.method).red().to_string(),
-        _ => format!("{:<7}", hit.method).dimmed().to_string(),
+/// A comfy-table of endpoints — `Method | Endpoint | Price | Description` —
+/// indented to line up under the service header.
+fn render_endpoint_table(hits: &[&SearchHit]) -> String {
+    use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table, presets};
+
+    let mut table = Table::new();
+    table.load_preset(presets::UTF8_BORDERS_ONLY);
+    table.set_content_arrangement(ContentArrangement::Dynamic);
+    let header = |s: &str| {
+        Cell::new(s)
+            .add_attribute(Attribute::Bold)
+            .fg(Color::DarkGrey)
     };
+    table.set_header(vec![
+        header("METHOD"),
+        header("ENDPOINT"),
+        header("PRICE"),
+        header("DESCRIPTION"),
+    ]);
 
-    let path = &hit.path;
-
-    let metered_indicator = if hit.metered { "$" } else { "" };
-    eprintln!(
-        "    {} {} {}",
-        method_colored,
-        path,
-        metered_indicator.yellow()
-    );
-
-    if !hit.description.is_empty() {
-        let desc = if hit.description.len() > 72 {
-            format!("{}...", &hit.description[..69])
-        } else {
-            hit.description.clone()
+    for hit in hits {
+        let method_color = match hit.method.as_str() {
+            "GET" => Color::Green,
+            "POST" => Color::Blue,
+            "PUT" | "PATCH" => Color::Yellow,
+            "DELETE" => Color::Red,
+            _ => Color::Grey,
         };
-        eprintln!("            {}", desc.dimmed());
+        let price = format_price(hit.pricing.as_ref(), hit.metered);
+        let price_color = if hit.metered {
+            Color::Green
+        } else {
+            Color::DarkGrey
+        };
+        table.add_row(vec![
+            Cell::new(&hit.method).fg(method_color),
+            Cell::new(&hit.path),
+            Cell::new(price).fg(price_color),
+            Cell::new(truncate(&hit.description, 64)).fg(Color::DarkGrey),
+        ]);
     }
+
+    indent(&table.to_string(), 2)
+}
+
+/// Indent every line by `n` spaces (the table preset draws flush-left).
+fn indent(s: &str, n: usize) -> String {
+    let pad = " ".repeat(n);
+    s.lines()
+        .map(|l| format!("{pad}{l}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() > max {
+        let head: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{head}…")
+    } else {
+        s.to_string()
+    }
+}
+
+/// Compact price string from the endpoint's `pricing` JSON. Handles the public
+/// catalog `dimensions` shape, the local `{"usd"}` flat shape, and
+/// `{"subscription"}` gating; falls back to `metered` / `free`.
+fn format_price(pricing: Option<&serde_json::Value>, metered: bool) -> String {
+    let Some(p) = pricing else {
+        return if metered {
+            "metered".into()
+        } else {
+            "free".into()
+        };
+    };
+    if let Some(sub) = p.get("subscription") {
+        let price = sub.get("price_usd").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let period = sub
+            .get("period")
+            .and_then(|v| v.as_str())
+            .unwrap_or("period");
+        return format!("{} / {period}", fmt_usd(price));
+    }
+    if let Some(dims) = p.get("dimensions").and_then(|d| d.as_array()) {
+        let parts: Vec<String> = dims.iter().filter_map(format_dimension).collect();
+        if !parts.is_empty() {
+            return parts.join("  +  ");
+        }
+    }
+    if let Some(usd) = p.get("usd").and_then(|v| v.as_f64()) {
+        return if usd <= 0.0 {
+            "free".into()
+        } else {
+            fmt_usd(usd)
+        };
+    }
+    if metered {
+        "metered".into()
+    } else {
+        "free".into()
+    }
+}
+
+/// One metering dimension → e.g. `$0.001 / req`, `$5 in / 1M tok`, `$1–2 / req`.
+fn format_dimension(d: &serde_json::Value) -> Option<String> {
+    let unit = d.get("unit").and_then(|v| v.as_str()).unwrap_or("unit");
+    let scale = d.get("scale").and_then(|v| v.as_u64()).unwrap_or(1);
+    let direction = d.get("direction").and_then(|v| v.as_str());
+    let tiers = d.get("tiers").and_then(|v| v.as_array())?;
+    let prices: Vec<f64> = tiers
+        .iter()
+        .filter_map(|t| t.get("price_usd").and_then(|v| v.as_f64()))
+        .collect();
+    if prices.is_empty() {
+        return None;
+    }
+    let dir = match direction {
+        Some("input") => " in",
+        Some("output") => " out",
+        _ => "",
+    };
+    let label = unit_label(unit, scale);
+    let min = prices.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max = prices.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    if (max - min).abs() < f64::EPSILON {
+        Some(format!("{}{dir} / {label}", fmt_usd(min)))
+    } else {
+        Some(format!("{}–{}{dir} / {label}", fmt_usd(min), fmt_usd(max)))
+    }
+}
+
+/// Human unit label: `scale` is the number of `unit`s one `price_usd` covers.
+fn unit_label(unit: &str, scale: u64) -> String {
+    let u = match unit {
+        "requests" => "req",
+        "tokens" => "tok",
+        "characters" => "char",
+        "minutes" => "min",
+        "pages" => "page",
+        "images" => "image",
+        other => other,
+    };
+    let prefix = match scale {
+        1 => String::new(),
+        1_000 => "1K ".to_string(),
+        1_000_000 => "1M ".to_string(),
+        1_000_000_000 => "1B ".to_string(),
+        n => format!("{n} "),
+    };
+    format!("{prefix}{u}")
+}
+
+/// Format a USD amount compactly: `$0.001`, `$1.50`, `$5`, `$0`.
+fn fmt_usd(n: f64) -> String {
+    if n <= 0.0 {
+        return "$0".to_string();
+    }
+    let s = if n >= 0.01 {
+        format!("{n:.2}")
+    } else {
+        format!("{n:.6}")
+    };
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    format!("${s}")
 }
 
 fn print_endpoints_tip() {
     eprintln!();
     eprintln!(
         "  {}",
-        "use `pay skills endpoints <fqn> <resource>` to inspect a provider.".dimmed()
-    );
-    eprintln!(
-        "  {}",
-        "The bold service slug above is the <fqn>; each `resource:` heading names the <resource>."
-            .dimmed()
+        "drill into a provider: `pay skills endpoints <fqn>` (the bold slug above).".dimmed()
     );
 }
 
@@ -340,6 +440,71 @@ mod tests {
     use super::*;
 
     use serde_json::json;
+
+    #[test]
+    fn fmt_usd_compact() {
+        assert_eq!(fmt_usd(0.001), "$0.001");
+        assert_eq!(fmt_usd(1.5), "$1.5");
+        assert_eq!(fmt_usd(5.0), "$5");
+        assert_eq!(fmt_usd(9.99), "$9.99");
+        assert_eq!(fmt_usd(0.0), "$0");
+    }
+
+    #[test]
+    fn format_price_shapes() {
+        assert_eq!(format_price(None, false), "free");
+        assert_eq!(format_price(None, true), "metered");
+        assert_eq!(format_price(Some(&json!({"usd": 0.001})), true), "$0.001");
+        assert_eq!(format_price(Some(&json!({"usd": 0.0})), true), "free");
+        assert_eq!(
+            format_price(
+                Some(&json!({"subscription": {"period": "30d", "price_usd": 9.99}})),
+                true
+            ),
+            "$9.99 / 30d"
+        );
+        // public catalog flat-per-request shape
+        assert_eq!(
+            format_price(
+                Some(
+                    &json!({"dimensions":[{"unit":"requests","scale":1,"tiers":[{"price_usd":0.001}]}]})
+                ),
+                true
+            ),
+            "$0.001 / req"
+        );
+        // tokens with scale + direction
+        assert_eq!(
+            format_price(
+                Some(
+                    &json!({"dimensions":[{"unit":"tokens","scale":1000000,"direction":"input","tiers":[{"price_usd":5.0}]}]})
+                ),
+                true
+            ),
+            "$5 in / 1M tok"
+        );
+        // tiered → price range
+        assert_eq!(
+            format_price(
+                Some(
+                    &json!({"dimensions":[{"unit":"requests","scale":1,"tiers":[{"price_usd":1.0},{"price_usd":2.0}]}]})
+                ),
+                true
+            ),
+            "$1–$2 / req"
+        );
+        // multi-dimension (input + output) joined
+        assert_eq!(
+            format_price(
+                Some(&json!({"dimensions":[
+                    {"unit":"tokens","scale":1000000,"direction":"input","tiers":[{"price_usd":0.5}]},
+                    {"unit":"tokens","scale":1000000,"direction":"output","tiers":[{"price_usd":1.5}]}
+                ]})),
+                true
+            ),
+            "$0.5 in / 1M tok  +  $1.5 out / 1M tok"
+        );
+    }
 
     fn catalog_index_only() -> skills::Catalog {
         let json = r#"{
