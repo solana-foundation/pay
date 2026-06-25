@@ -44,34 +44,37 @@ pub fn run() -> pay_core::Result<()> {
         return Ok(());
     }
 
-    // One bordered box per provider: title + endpoint count, the wrapped
+    // One bordered box per provider: title + colored category, the wrapped
     // description, then the dimmed fqn (and a pinned marker) — same framed
     // look as `pay skills search`.
     eprintln!();
     for svc in &catalog.providers {
-        let ep = format!("{} endpoints", svc.endpoint_count);
-        let ep_colored = if svc.has_metering {
-            ep.yellow().to_string()
+        // Title line: bold title + the colored category (in place of an
+        // endpoint count).
+        let (line1, line1_visible) = if svc.meta.category.is_empty() {
+            (
+                svc.meta.title.bold().to_string(),
+                svc.meta.title.chars().count(),
+            )
         } else {
-            ep.dimmed().to_string()
+            (
+                format!(
+                    "{}  ·  {}",
+                    svc.meta.title.bold(),
+                    boxed::category_color(&svc.meta.category, &svc.meta.category)
+                ),
+                svc.meta.title.chars().count() + 5 + svc.meta.category.chars().count(),
+            )
         };
-        let mut lines: Vec<(String, usize)> = vec![(
-            format!("{}  ·  {ep_colored}", svc.meta.title.bold()),
-            svc.meta.title.chars().count() + 5 + ep.chars().count(),
-        )];
-
-        if !svc.meta.category.is_empty() {
-            lines.push((
-                boxed::category_color(&svc.meta.category, &svc.meta.category),
-                svc.meta.category.chars().count(),
-            ));
-        }
+        let mut lines: Vec<(String, usize)> = vec![(line1, line1_visible)];
 
         if !svc.meta.description.is_empty() {
             for seg in boxed::wrap(&svc.meta.description, boxed::INNER) {
                 let visible = seg.chars().count();
                 lines.push((seg.dimmed().to_string(), visible));
             }
+            // Blank line separating the description from the fqn.
+            lines.push((String::new(), 0));
         }
 
         if pinned_fqns.contains(svc.fqn.as_str()) {
