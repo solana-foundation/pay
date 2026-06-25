@@ -8,6 +8,11 @@ const CONDENSED_METERED_LIMIT: usize = 5;
 /// Max total endpoints to show per service in condensed mode.
 const CONDENSED_TOTAL_LIMIT: usize = 8;
 
+/// Endpoint-table render width. With the 2-space indent under the service
+/// header this caps the table at 80 columns; comfy-table wraps long cells to
+/// fit rather than truncating.
+const TABLE_WIDTH: u16 = 78;
+
 /// Search for API providers and endpoints.
 ///
 /// Adaptive output:
@@ -256,73 +261,125 @@ fn print_condensed(hits: &[SearchHit], services: &[String]) {
 
 fn print_service_header(slug: &str, title: &str, url: &str) {
     eprintln!();
-    eprintln!("  {} {}", slug.bold(), format!("— {title}").dimmed());
+    eprintln!("  {}", title.bold());
+    eprintln!("  {}", format!("fqn: {slug}").dimmed());
     if !url.is_empty() {
-        eprintln!("  {}", url.dimmed());
+        eprintln!("  {}", format!("url: {url}").dimmed());
     }
 }
 
-/// A comfy-table of endpoints — `Method | Endpoint | Price | Description` —
-/// indented to line up under the service header.
+/// Render endpoints as a single-column bordered box — no columns. Each endpoint
+/// is its own section (divided by `├───┤` rules); inside a section the fields
+/// stack on their own lines: `METHOD  price`, then the full path, then the
+/// description. Long lines wrap (never truncate) to the inner width, so the box
+/// stays within [`TABLE_WIDTH`] + 2-space indent = 80 columns.
 fn render_endpoint_table(hits: &[&SearchHit]) -> String {
-    use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table, presets};
-
-    let mut table = Table::new();
-    table.load_preset(presets::UTF8_BORDERS_ONLY);
-    table.set_content_arrangement(ContentArrangement::Dynamic);
-    let header = |s: &str| {
-        Cell::new(s)
-            .add_attribute(Attribute::Bold)
-            .fg(Color::DarkGrey)
+    // Box width = inner + "│ " + " │" (4). Inner content wraps to INNER cols.
+    let inner = (TABLE_WIDTH as usize).saturating_sub(4);
+    let bar = "│".dimmed().to_string();
+    let rule = |left: char, right: char| {
+        format!("{left}{}{right}", "─".repeat(inner + 2))
+            .dimmed()
+            .to_string()
     };
-    table.set_header(vec![
-        header("METHOD"),
-        header("ENDPOINT"),
-        header("PRICE"),
-        header("DESCRIPTION"),
-    ]);
+    // One framed content line: "│ <content padded to `inner`> │". `visible` is
+    // the display width of `content` (computed from the plain text before
+    // coloring), so the right border still lines up under ANSI styling.
+    let framed = |content: String, visible: usize| {
+        let pad = " ".repeat(inner.saturating_sub(visible.min(inner)));
+        format!("{bar} {content}{pad} {bar}")
+    };
 
-    for hit in hits {
-        let method_color = match hit.method.as_str() {
-            "GET" => Color::Green,
-            "POST" => Color::Blue,
-            "PUT" | "PATCH" => Color::Yellow,
-            "DELETE" => Color::Red,
-            _ => Color::Grey,
-        };
+    let mut out: Vec<String> = vec![rule('┌', '┐')];
+    for (i, hit) in hits.iter().enumerate() {
+        if i > 0 {
+            out.push(rule('├', '┤'));
+        }
+        // Line 1: colored method (6-col) + price.
         let price = format_price(hit.pricing.as_ref(), hit.metered);
-        let price_color = if hit.metered {
-            Color::Green
+        let price_visible = price.chars().count();
+        let price = if hit.metered {
+            price.green().to_string()
         } else {
-            Color::DarkGrey
+            price.dimmed().to_string()
         };
-        table.add_row(vec![
-            Cell::new(&hit.method).fg(method_color),
-            Cell::new(&hit.path),
-            Cell::new(price).fg(price_color),
-            Cell::new(truncate(&hit.description, 64)).fg(Color::DarkGrey),
-        ]);
+        out.push(framed(
+            format!("{}  {price}", color_method(&hit.method)),
+            METHOD_CELL + 2 + price_visible,
+        ));
+        // Full endpoint path (bold), wrapped.
+        for seg in wrap(&hit.path, inner) {
+            let visible = seg.chars().count();
+            out.push(framed(seg.bold().to_string(), visible));
+        }
+        // Description (dimmed), wrapped.
+        for seg in wrap(&hit.description, inner) {
+            let visible = seg.chars().count();
+            out.push(framed(seg.dimmed().to_string(), visible));
+        }
     }
-
-    indent(&table.to_string(), 2)
+    out.push(rule('└', '┘'));
+    indent(&out.join("\n"), 2)
 }
 
-/// Indent every line by `n` spaces (the table preset draws flush-left).
+/// Fixed display width of the method cell on a section's first line.
+const METHOD_CELL: usize = 6;
+
+/// Color + left-pad an HTTP method to [`METHOD_CELL`] columns. Pad before
+/// coloring so the ANSI codes don't count toward the cell's display width.
+fn color_method(method: &str) -> String {
+    format!("{method:<width$}", width = METHOD_CELL)
+        .cyan()
+        .to_string()
+}
+
+/// Greedy word-wrap to `width` columns (by char count). Over-long tokens are
+/// hard-split rather than truncated, so no content is ever lost.
+fn wrap(s: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![s.to_string()];
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for word in s.split_whitespace() {
+        if word.chars().count() > width {
+            if !cur.is_empty() {
+                lines.push(std::mem::take(&mut cur));
+            }
+            let chars: Vec<char> = word.chars().collect();
+            let mut idx = 0;
+            while chars.len() - idx > width {
+                lines.push(chars[idx..idx + width].iter().collect());
+                idx += width;
+            }
+            cur = chars[idx..].iter().collect();
+            continue;
+        }
+        let clen = cur.chars().count();
+        let need = if clen == 0 { word.chars().count() } else { clen + 1 + word.chars().count() };
+        if need > width {
+            lines.push(std::mem::take(&mut cur));
+            cur = word.to_string();
+        } else {
+            if !cur.is_empty() {
+                cur.push(' ');
+            }
+            cur.push_str(word);
+        }
+    }
+    if !cur.is_empty() || lines.is_empty() {
+        lines.push(cur);
+    }
+    lines
+}
+
+/// Indent every line by `n` spaces.
 fn indent(s: &str, n: usize) -> String {
     let pad = " ".repeat(n);
     s.lines()
         .map(|l| format!("{pad}{l}"))
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() > max {
-        let head: String = s.chars().take(max.saturating_sub(1)).collect();
-        format!("{head}…")
-    } else {
-        s.to_string()
-    }
 }
 
 /// Compact price string from the endpoint's `pricing` JSON. Handles the public
@@ -431,7 +488,7 @@ fn print_endpoints_tip() {
     eprintln!();
     eprintln!(
         "  {}",
-        "drill into a provider: `pay skills endpoints <fqn>` (the bold slug above).".dimmed()
+        "drill into a provider: `pay skills endpoints <fqn>` (the fqn shown above).".dimmed()
     );
 }
 

@@ -559,28 +559,53 @@ fn do_paid_fetch(
         RunOutcome::MppChallenge {
             challenge,
             alternatives,
+            x402_alternative,
             ..
         } => {
+            use pay_core::client::mpp::ChosenPayment;
             let mut challenges = Vec::with_capacity(1 + alternatives.len());
             challenges.push((*challenge).clone());
             challenges.extend(alternatives);
-            let selected = pay_core::client::mpp::select_challenge_by_balance(
+            // Balance-aware, cross-protocol pick: settle the MPP charge the
+            // wallet can fund, or fall back to an x402 offer it can fund.
+            let chosen = pay_core::client::mpp::choose_payment(
                 &challenges,
+                x402_alternative.as_deref(),
                 &store,
                 network_override.as_deref(),
                 account_override.as_deref(),
-            )?
-            .ok_or_else(|| pay_core::Error::Mpp("No compatible MPP challenge found".to_string()))?;
-            let (auth_header, _ephemeral) = pay_core::client::mpp::build_credential_with_override(
-                selected,
-                &store,
-                network_override.as_deref(),
-                account_override.as_deref(),
-                Some(url),
-                make_auth_override(),
             )?;
             let mut headers = extra_headers.to_vec();
-            headers.push(("Authorization".to_string(), auth_header));
+            match chosen {
+                ChosenPayment::Mpp(ch) => {
+                    let (auth_header, _ephemeral) =
+                        pay_core::client::mpp::build_credential_with_override(
+                            ch.as_ref(),
+                            &store,
+                            network_override.as_deref(),
+                            account_override.as_deref(),
+                            Some(url),
+                            make_auth_override(),
+                        )?;
+                    headers.push(("Authorization".to_string(), auth_header));
+                }
+                ChosenPayment::X402(challenge) => {
+                    let built_payment = pay_core::client::x402::build_payment_with_override(
+                        challenge.as_ref(),
+                        &store,
+                        network_override.as_deref(),
+                        account_override.as_deref(),
+                        Some(url),
+                        make_auth_override(),
+                    )?;
+                    headers.extend(
+                        built_payment
+                            .headers
+                            .into_iter()
+                            .map(|(name, value)| (name.to_string(), value)),
+                    );
+                }
+            }
             interpret_retry(pay_core::client::fetch::fetch_request(
                 method,
                 url,
