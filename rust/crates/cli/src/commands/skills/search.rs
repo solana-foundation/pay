@@ -13,9 +13,9 @@ const CONDENSED_TOTAL_LIMIT: usize = 8;
 /// Search for API providers and endpoints.
 ///
 /// Adaptive output:
-/// - **Single service match**: shows all endpoints (like `skills endpoints`)
+/// - **Single service match**: shows all endpoints (like `skills show`)
 /// - **Multiple services**: condensed view — metered endpoints first, capped,
-///   with a hint to drill down via `pay skills endpoints <service>`
+///   with a hint to drill down via `pay skills show <service>`
 #[derive(clap::Args)]
 pub struct SearchCommand {
     /// Keyword to search for (matches service names, endpoint paths, descriptions).
@@ -83,7 +83,7 @@ impl SearchCommand {
         let services = distinct_services(&hits);
 
         if services.len() == 1 {
-            // Single service — show everything (like `skills endpoints`)
+            // Single service — show everything (like `skills show`)
             print_full_service(&hits);
         } else {
             // Multiple services — condensed per service
@@ -236,7 +236,7 @@ fn print_condensed(hits: &[SearchHit], services: &[String]) {
             eprintln!(
                 "  {}",
                 format!(
-                    "... {} more — `pay skills endpoints {}`",
+                    "... {} more — `pay skills show {}`",
                     total - shown,
                     svc_name
                 )
@@ -266,168 +266,27 @@ fn print_service_header(slug: &str, title: &str, url: &str) {
     }
 }
 
-/// Render endpoints as a single-column bordered box — no columns. Each endpoint
-/// is its own section (divided by `├───┤` rules); inside a section the fields
-/// stack on their own lines: `METHOD  price`, then the full path, then the
-/// description. Long lines wrap (never truncate) to the inner width. Framing,
-/// wrapping, and the 80-column cap live in [`super::boxed`].
+/// Render endpoints as a single-column bordered box. Framing, wrapping,
+/// pricing, and the 80-column cap live in [`super::boxed`].
 fn render_endpoint_table(hits: &[&SearchHit]) -> String {
-    let sections: Vec<Vec<(String, usize)>> = hits
+    let rows: Vec<boxed::EndpointRow> = hits
         .iter()
-        .map(|hit| {
-            let mut lines: Vec<(String, usize)> = Vec::new();
-            // Line 1: colored method (6-col) + price. Color from the formatted
-            // string, not `hit.metered`: a metered endpoint with a $0 tier
-            // renders as "free", which should read dim — not green.
-            let price = format_price(hit.pricing.as_ref(), hit.metered);
-            let price_visible = price.chars().count();
-            let price = if price.starts_with('$') {
-                price.green().to_string()
-            } else {
-                price.dimmed().to_string()
-            };
-            lines.push((
-                format!("{}  {price}", color_method(&hit.method)),
-                METHOD_CELL + 2 + price_visible,
-            ));
-            // Full endpoint path (bold), wrapped.
-            for seg in boxed::wrap(&hit.path, boxed::INNER) {
-                let visible = seg.chars().count();
-                lines.push((seg.bold().to_string(), visible));
-            }
-            // Description (dimmed), wrapped.
-            for seg in boxed::wrap(&hit.description, boxed::INNER) {
-                let visible = seg.chars().count();
-                lines.push((seg.dimmed().to_string(), visible));
-            }
-            lines
+        .map(|hit| boxed::EndpointRow {
+            method: &hit.method,
+            path: &hit.path,
+            description: &hit.description,
+            pricing: hit.pricing.as_ref(),
+            metered: hit.metered,
         })
         .collect();
-    boxed::frame(&sections)
-}
-
-/// Fixed display width of the method cell on a section's first line.
-const METHOD_CELL: usize = 6;
-
-/// Color + left-pad an HTTP method to [`METHOD_CELL`] columns. Pad before
-/// coloring so the ANSI codes don't count toward the cell's display width.
-fn color_method(method: &str) -> String {
-    format!("{method:<width$}", width = METHOD_CELL)
-        .cyan()
-        .to_string()
-}
-
-/// Compact price string from the endpoint's `pricing` JSON. Handles the public
-/// catalog `dimensions` shape, the local `{"usd"}` flat shape, and
-/// `{"subscription"}` gating; falls back to `metered` / `free`.
-fn format_price(pricing: Option<&serde_json::Value>, metered: bool) -> String {
-    let Some(p) = pricing else {
-        return if metered {
-            "metered".into()
-        } else {
-            "free".into()
-        };
-    };
-    if let Some(sub) = p.get("subscription") {
-        let price = sub.get("price_usd").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let period = sub
-            .get("period")
-            .and_then(|v| v.as_str())
-            .unwrap_or("period");
-        return format!("{} / {period}", fmt_usd(price));
-    }
-    if let Some(dims) = p.get("dimensions").and_then(|d| d.as_array()) {
-        let parts: Vec<String> = dims.iter().filter_map(format_dimension).collect();
-        if !parts.is_empty() {
-            return parts.join("  +  ");
-        }
-    }
-    if let Some(usd) = p.get("usd").and_then(|v| v.as_f64()) {
-        return if usd <= 0.0 {
-            "free".into()
-        } else {
-            fmt_usd(usd)
-        };
-    }
-    if metered {
-        "metered".into()
-    } else {
-        "free".into()
-    }
-}
-
-/// One metering dimension → e.g. `$0.001 / req`, `$5 in / 1M tok`, `$1–2 / req`.
-fn format_dimension(d: &serde_json::Value) -> Option<String> {
-    let unit = d.get("unit").and_then(|v| v.as_str()).unwrap_or("unit");
-    let scale = d.get("scale").and_then(|v| v.as_u64()).unwrap_or(1);
-    let direction = d.get("direction").and_then(|v| v.as_str());
-    let tiers = d.get("tiers").and_then(|v| v.as_array())?;
-    let prices: Vec<f64> = tiers
-        .iter()
-        .filter_map(|t| t.get("price_usd").and_then(|v| v.as_f64()))
-        .collect();
-    if prices.is_empty() {
-        return None;
-    }
-    let dir = match direction {
-        Some("input") => " in",
-        Some("output") => " out",
-        _ => "",
-    };
-    let label = unit_label(unit, scale);
-    let min = prices.iter().cloned().fold(f64::INFINITY, f64::min);
-    let max = prices.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    if (max - min).abs() < f64::EPSILON {
-        Some(format!("{}{dir} / {label}", fmt_usd(min)))
-    } else {
-        Some(format!("{}–{}{dir} / {label}", fmt_usd(min), fmt_usd(max)))
-    }
-}
-
-/// Human unit label: `scale` is the number of `unit`s one `price_usd` covers.
-fn unit_label(unit: &str, scale: u64) -> String {
-    let u = match unit {
-        "requests" => "req",
-        "tokens" => "tok",
-        "characters" => "char",
-        "minutes" => "min",
-        "pages" => "page",
-        "images" => "image",
-        other => other,
-    };
-    let prefix = match scale {
-        1 => String::new(),
-        1_000 => "1K ".to_string(),
-        1_000_000 => "1M ".to_string(),
-        1_000_000_000 => "1B ".to_string(),
-        n => format!("{n} "),
-    };
-    format!("{prefix}{u}")
-}
-
-/// Format a USD amount compactly: `$0.001`, `$1.50`, `$5`, `$0`.
-fn fmt_usd(n: f64) -> String {
-    if n <= 0.0 {
-        return "$0".to_string();
-    }
-    // Three decimals for sub-dollar amounts so prices like $0.015 don't round
-    // to $0.02; full six only for micro-cent prices below $0.01.
-    let s = if n >= 1.0 {
-        format!("{n:.2}")
-    } else if n >= 0.01 {
-        format!("{n:.3}")
-    } else {
-        format!("{n:.6}")
-    };
-    let s = s.trim_end_matches('0').trim_end_matches('.');
-    format!("${s}")
+    boxed::render_endpoint_table(&rows)
 }
 
 fn print_endpoints_tip() {
     eprintln!();
     eprintln!(
         "  {}",
-        "drill into a provider: `pay skills endpoints <fqn>` (the fqn shown above).".dimmed()
+        "drill into a provider: `pay skills show <fqn>` (the fqn shown above).".dimmed()
     );
 }
 
@@ -436,74 +295,6 @@ mod tests {
     use super::*;
 
     use serde_json::json;
-
-    #[test]
-    fn fmt_usd_compact() {
-        assert_eq!(fmt_usd(0.001), "$0.001");
-        assert_eq!(fmt_usd(1.5), "$1.5");
-        assert_eq!(fmt_usd(5.0), "$5");
-        assert_eq!(fmt_usd(9.99), "$9.99");
-        assert_eq!(fmt_usd(0.0), "$0");
-        // Sub-dollar amounts keep 3 decimals instead of rounding to 2.
-        assert_eq!(fmt_usd(0.015), "$0.015");
-        assert_eq!(fmt_usd(0.05), "$0.05");
-    }
-
-    #[test]
-    fn format_price_shapes() {
-        assert_eq!(format_price(None, false), "free");
-        assert_eq!(format_price(None, true), "metered");
-        assert_eq!(format_price(Some(&json!({"usd": 0.001})), true), "$0.001");
-        assert_eq!(format_price(Some(&json!({"usd": 0.0})), true), "free");
-        assert_eq!(
-            format_price(
-                Some(&json!({"subscription": {"period": "30d", "price_usd": 9.99}})),
-                true
-            ),
-            "$9.99 / 30d"
-        );
-        // public catalog flat-per-request shape
-        assert_eq!(
-            format_price(
-                Some(
-                    &json!({"dimensions":[{"unit":"requests","scale":1,"tiers":[{"price_usd":0.001}]}]})
-                ),
-                true
-            ),
-            "$0.001 / req"
-        );
-        // tokens with scale + direction
-        assert_eq!(
-            format_price(
-                Some(
-                    &json!({"dimensions":[{"unit":"tokens","scale":1000000,"direction":"input","tiers":[{"price_usd":5.0}]}]})
-                ),
-                true
-            ),
-            "$5 in / 1M tok"
-        );
-        // tiered → price range
-        assert_eq!(
-            format_price(
-                Some(
-                    &json!({"dimensions":[{"unit":"requests","scale":1,"tiers":[{"price_usd":1.0},{"price_usd":2.0}]}]})
-                ),
-                true
-            ),
-            "$1–$2 / req"
-        );
-        // multi-dimension (input + output) joined
-        assert_eq!(
-            format_price(
-                Some(&json!({"dimensions":[
-                    {"unit":"tokens","scale":1000000,"direction":"input","tiers":[{"price_usd":0.5}]},
-                    {"unit":"tokens","scale":1000000,"direction":"output","tiers":[{"price_usd":1.5}]}
-                ]})),
-                true
-            ),
-            "$0.5 in / 1M tok  +  $1.5 out / 1M tok"
-        );
-    }
 
     fn catalog_index_only() -> skills::Catalog {
         let json = r#"{

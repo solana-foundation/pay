@@ -870,22 +870,26 @@ impl StartCommand {
                     "PATCH" => method_padded.cyan().to_string(),
                     _ => method_padded.dimmed().to_string(),
                 };
+                // Variant-priced endpoints list each variant on its own
+                // row below the path (see loop after the main line), so
+                // the price column here flags the count instead of
+                // collapsing to a single (misleading) variant price.
+                let variants = ep
+                    .metering
+                    .as_ref()
+                    .map(|m| m.variants.as_slice())
+                    .unwrap_or(&[]);
                 let price_tag = if let Some(ref m) = ep.metering {
-                    let price = m
-                        .dimensions
-                        .first()
-                        .map(|d| d.tiers.first().map(|t| t.price_usd).unwrap_or(0.0))
-                        .or_else(|| {
-                            m.variants
-                                .first()
-                                .and_then(|v| v.dimensions.first())
-                                .and_then(|d| d.tiers.first())
-                                .map(|t| t.price_usd)
-                        })
-                        .unwrap_or(0.0);
-                    format!("{:>14}", format!("${}", format_price(price)))
-                        .yellow()
-                        .to_string()
+                    if !m.variants.is_empty() {
+                        format!("{:>14}", format!("{} variants", m.variants.len()))
+                            .yellow()
+                            .to_string()
+                    } else {
+                        let price = first_tier_price(&m.dimensions);
+                        format!("{:>14}", format!("${}", format_price(price)))
+                            .yellow()
+                            .to_string()
+                    }
                 } else if let Some(ref sub) = ep.subscription {
                     // Show `$9.99/30d` for subscription endpoints. Falls
                     // back to bare period when neither `price_usd` nor
@@ -916,6 +920,30 @@ impl StartCommand {
                     padding,
                     price_tag,
                 );
+
+                // One row per pricing variant, e.g.
+                //   model=gemini-3.1-pro-preview              $0.000002
+                // The `param=value` label sits in the path column and the
+                // price right-aligns under the main price column. Width:
+                // the 2-space indent eats into the 8-col method gutter
+                // (−6), and `link_with_arrow` adds a 2-col ` ↗` suffix to
+                // the path that the main-line padding doesn't count (+2),
+                // so the label field is `max_path_len + 8`.
+                let label_field_width = max_path_len + 8;
+                for variant in variants {
+                    let label = format!("{}={}", variant.param, variant.value);
+                    let label_pad =
+                        " ".repeat(label_field_width.saturating_sub(label.len()));
+                    let price = first_tier_price(&variant.dimensions);
+                    let variant_price =
+                        format!("{:>14}", format!("${}", format_price(price)));
+                    eprintln!(
+                        "  {}{} {}",
+                        label.dimmed(),
+                        label_pad,
+                        variant_price.yellow(),
+                    );
+                }
             }
 
             eprintln!("{}", rule.dimmed());
@@ -1979,6 +2007,16 @@ async fn fetch_lamports(client: &reqwest::Client, rpc_url: &str, pubkey: &str) -
 async fn fetch_sol_balance(rpc_url: &str, pubkey: &str) -> f64 {
     let client = reqwest::Client::new();
     fetch_lamports(&client, rpc_url, pubkey).await as f64 / 1_000_000_000.0
+}
+
+/// Representative price for a set of pricing dimensions: the first
+/// tier of the first dimension. Mirrors the single-price heuristic used
+/// for direct-metered endpoints so variant rows read consistently.
+fn first_tier_price(dims: &[pay_types::metering::MeterDimension]) -> f64 {
+    dims.first()
+        .and_then(|d| d.tiers.first())
+        .map(|t| t.price_usd)
+        .unwrap_or(0.0)
 }
 
 fn format_price(price: f64) -> String {
