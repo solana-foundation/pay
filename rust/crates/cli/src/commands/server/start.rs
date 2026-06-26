@@ -909,7 +909,14 @@ impl StartCommand {
                     format!("{:>14}", "free").green().to_string()
                 };
 
-                let path_url = format!("http://{}/{}", self.bind.replace("0.0.0.0", "127.0.0.1"), ep.path.trim_start_matches('/'));
+                // Link target uses a concrete example path so it's
+                // clickable (no brace-encoding) and selects a real
+                // variant; the visible label keeps the `{…}` template.
+                let path_url = format!(
+                    "http://{}/{}",
+                    self.bind.replace("0.0.0.0", "127.0.0.1"),
+                    example_path(ep).trim_start_matches('/')
+                );
                 let path_linked = crate::components::link::link_with_arrow(&ep.path, &path_url);
                 // Pad after the link (padding itself is not clickable)
                 let padding = " ".repeat(max_path_len.saturating_sub(ep.path.len()));
@@ -1328,6 +1335,7 @@ fn build_pdb_config(
             serde_json::json!({
                 "method": format!("{:?}", e.method).to_uppercase(),
                 "path": e.path,
+                "example": example_path(e),
                 "price": price,
                 "description": e.description.as_deref().unwrap_or(""),
             })
@@ -1342,6 +1350,7 @@ fn build_pdb_config(
             serde_json::json!({
                 "method": format!("{:?}", e.method).to_uppercase(),
                 "path": e.path,
+                "example": example_path(e),
                 "price": "free",
                 "description": e.description.as_deref().unwrap_or(""),
             })
@@ -2007,6 +2016,50 @@ async fn fetch_lamports(client: &reqwest::Client, rpc_url: &str, pubkey: &str) -
 async fn fetch_sol_balance(rpc_url: &str, pubkey: &str) -> f64 {
     let client = reqwest::Client::new();
     fetch_lamports(&client, rpc_url, pubkey).await as f64 / 1_000_000_000.0
+}
+
+/// Build a concrete, clickable example path for an endpoint whose `path`
+/// may contain `{placeholder}` segments.
+///
+/// Browsers percent-encode `{` and `}`, so a templated link like
+/// `/v1/models/{model}/infer` arrives as `/v1/models/%7Bmodel%7D/infer`
+/// and shows up mangled in the debugger (and never matches a real
+/// variant). We substitute each placeholder with a concrete sample:
+///   - the first variant's `value` for the segment that follows a
+///     `models`/`voices` selector (the variant-selection convention), else
+///   - the placeholder's own name with the braces stripped, as a neutral
+///     URL-safe sample.
+/// Partial segments such as `{model}:infer` keep their suffix (→
+/// `fast:infer`). Endpoints with no placeholders are returned unchanged.
+fn example_path(ep: &pay_types::metering::Endpoint) -> String {
+    let first_variant_value = ep
+        .metering
+        .as_ref()
+        .and_then(|m| m.variants.first())
+        .map(|v| v.value.as_str());
+
+    let segs: Vec<&str> = ep.path.split('/').collect();
+    let mut out: Vec<String> = Vec::with_capacity(segs.len());
+    for (i, seg) in segs.iter().enumerate() {
+        if !seg.contains('{') {
+            out.push((*seg).to_string());
+            continue;
+        }
+        let open = seg.find('{').unwrap();
+        let prefix = &seg[..open];
+        let rest = &seg[open + 1..];
+        let (name, suffix) = match rest.find('}') {
+            Some(close) => (&rest[..close], &rest[close + 1..]),
+            None => (rest, ""),
+        };
+        let follows_selector = i > 0 && matches!(segs[i - 1], "models" | "voices");
+        let sample = match (follows_selector, first_variant_value) {
+            (true, Some(value)) => value.to_string(),
+            _ => name.to_string(),
+        };
+        out.push(format!("{prefix}{sample}{suffix}"));
+    }
+    out.join("/")
 }
 
 /// Representative price for a set of pricing dimensions: the first
