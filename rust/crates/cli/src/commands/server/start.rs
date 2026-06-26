@@ -321,21 +321,44 @@ impl StartCommand {
         // Resolve config that doesn't need async.
         let currencies = resolve_operator_currencies(op, &self.currency);
 
-        let network = SolanaNetwork::from_slug(
-            op.and_then(|o| o.network.clone())
-                .unwrap_or_else(|| "mainnet".to_string()),
-        );
+        // `--sandbox` is an authoritative local-dev switch: pin the
+        // network to localnet regardless of the spec's `operator.network`.
+        // Otherwise `pay --sandbox server start <spec with network:
+        // devnet>` would derive `auto_network = "devnet"` below and
+        // silently mint (and persist) an `accounts.devnet.gateway`
+        // ephemeral while talking to real devnet — the opposite of what
+        // `--sandbox` implies.
+        let network = if sandbox {
+            SolanaNetwork::Localnet
+        } else {
+            SolanaNetwork::from_slug(
+                op.and_then(|o| o.network.clone())
+                    .unwrap_or_else(|| "mainnet".to_string()),
+            )
+        };
 
         // RPC URL fallback chain. Network-aware so that `localnet`
         // defaults to the hosted Surfpool sandbox (where ephemeral
         // wallets can be auto-created and auto-funded). Users running
         // a real `solana-test-validator` should set `operator.rpc_url`
         // explicitly or pass `--rpc-url`.
-        let rpc_url = op
-            .and_then(|o| o.rpc_url.clone())
-            .or(self.rpc_url.clone())
-            .or_else(|| std::env::var("PAY_RPC_URL").ok())
-            .unwrap_or_else(|| network.default_rpc_url(sandbox));
+        //
+        // In sandbox we deliberately drop the spec's `operator.rpc_url`
+        // from the chain — a devnet/mainnet URL in the YAML must not be
+        // able to pull the pinned-localnet sandbox onto a real cluster.
+        // Explicit `--rpc-url` / `PAY_RPC_URL` are still honored so a
+        // local `solana-test-validator` works.
+        let rpc_url = if sandbox {
+            self.rpc_url
+                .clone()
+                .or_else(|| std::env::var("PAY_RPC_URL").ok())
+                .unwrap_or_else(|| network.default_rpc_url(sandbox))
+        } else {
+            op.and_then(|o| o.rpc_url.clone())
+                .or(self.rpc_url.clone())
+                .or_else(|| std::env::var("PAY_RPC_URL").ok())
+                .unwrap_or_else(|| network.default_rpc_url(sandbox))
+        };
 
         let fee_payer = op.map(|o| o.fee_payer).unwrap_or(false);
         let signer_cfg = op.and_then(|o| o.signer.clone());
@@ -717,11 +740,14 @@ impl StartCommand {
                 }
             }
             if let Some((account_name, pubkey)) = &generated_gateway_account {
+                // Name the network — auto-minting a persisted ephemeral on a
+                // real cluster (devnet) should never look like a silent no-op.
                 eprintln!(
-                    "{} account {} {}",
+                    "{} account {} {} on {}",
                     "Generating".green(),
                     account_name,
-                    pubkey
+                    pubkey,
+                    network.slug().dimmed(),
                 );
             }
             if let Some(scaffolded_spec) = &self.scaffolded_spec {

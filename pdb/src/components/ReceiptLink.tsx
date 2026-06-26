@@ -2,10 +2,17 @@ import type { PaymentFlow } from "../types";
 import { useConfig, receiptUrl } from "../hooks/useConfig";
 import { parseReceipt, receiptSignature } from "../utils/receipt";
 
-/** "View receipt ↗" link to the flow's settlement transaction on pay.sh.
- *  Renders nothing when the flow has no receipt signature. Works for every
- *  payment pattern (per-call charge, x402, session, subscription). */
-export function ReceiptLink({ flow }: { flow: PaymentFlow }) {
+/** Link to the flow's settlement transaction on pay.sh. Renders nothing
+ *  when the flow has no receipt signature. Works for every payment pattern
+ *  (per-call charge, x402, session, subscription). The label defaults to
+ *  "View receipt"; subscriptions pass "View activation transaction". */
+export function ReceiptLink({
+  flow,
+  label = "View receipt",
+}: {
+  flow: PaymentFlow;
+  label?: string;
+}) {
   const config = useConfig();
   const href = receiptUrl(receiptSignature(parseReceipt(flow)), config);
   if (!href) return null;
@@ -17,7 +24,7 @@ export function ReceiptLink({ flow }: { flow: PaymentFlow }) {
         target="_blank"
         rel="noopener"
       >
-        View receipt ↗
+        {label} ↗
       </a>
     </div>
   );

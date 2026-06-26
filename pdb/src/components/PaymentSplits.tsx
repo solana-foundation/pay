@@ -1,9 +1,9 @@
 import { useRef, useEffect, useState } from "react";
 import type { PaymentFlow } from "../types";
 import { Amount, formatUsd } from "./Amount";
-import { useConfig, explorerTokenUrl, receiptUrl } from "../hooks/useConfig";
+import { useConfig, explorerTokenUrl } from "../hooks/useConfig";
 import { ReceiptLink } from "./ReceiptLink";
-import { parseReceipt, receiptSignature } from "../utils/receipt";
+import { parseReceipt } from "../utils/receipt";
 
 function fmtDate(ts?: string): string | null {
   if (!ts) return null;
@@ -227,8 +227,6 @@ export function PaymentSplits({ flow, success }: { flow: PaymentFlow; success: b
   // activation transaction instead of a misleading $0 flow.
   if (parsed.kind === "authenticate") {
     const receipt = parseReceipt(flow);
-    const txSig = receiptSignature(receipt);
-    const txHref = receiptUrl(txSig, config);
     const periodStart = fmtDate(receipt?.periodStartTs);
     const periodEnd = fmtDate(receipt?.periodEndTs);
     const isSubscription = !!(
@@ -277,27 +275,13 @@ export function PaymentSplits({ flow, success }: { flow: PaymentFlow; success: b
                 </span>
               </div>
             )}
-            {txSig && (
-              <div className="signin-row">
-                <span className="signin-row-label">Activation tx</span>
-                {txHref ? (
-                  <a
-                    className="signin-row-value splits-addr-link"
-                    href={txHref}
-                    target="_blank"
-                    rel="noopener"
-                    title={txSig}
-                  >
-                    {shortAddr(txSig)} ↗
-                  </a>
-                ) : (
-                  <span className="signin-row-value" title={txSig}>
-                    {shortAddr(txSig)}
-                  </span>
-                )}
-              </div>
-            )}
           </div>
+          <ReceiptLink
+            flow={flow}
+            label={
+              isSubscription ? "View activation transaction" : "View receipt"
+            }
+          />
         </div>
       </div>
     );
