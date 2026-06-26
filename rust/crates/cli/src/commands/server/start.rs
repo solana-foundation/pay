@@ -1146,10 +1146,29 @@ impl StartCommand {
                 }
             };
 
-            let serve_result = axum::serve(listener, app)
-                .with_graceful_shutdown(shutdown_signal())
-                .await
-                .map_err(|e| pay_core::Error::Config(format!("Server error: {e}")));
+            // Bound the graceful drain. `with_graceful_shutdown` stops
+            // accepting new connections on the first SIGINT/SIGTERM but
+            // then waits for every in-flight connection to close before
+            // returning. Long-lived connections — most notably the
+            // debugger's `/logs/stream` SSE (an infinite stream that only
+            // ends when the browser tab closes) — never drain, so a
+            // single Ctrl+C would wedge the process with no way out: the
+            // first signal is already consumed by the drain, so further
+            // presses are ignored. Race the drain against a force-exit
+            // watcher that fires on a second signal or after a short
+            // grace period, so Ctrl+C is always responsive.
+            let serve_fut =
+                axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
+            let serve_result = tokio::select! {
+                res = serve_fut => {
+                    res.map_err(|e| pay_core::Error::Config(format!("Server error: {e}")))
+                }
+                _ = force_shutdown_signal() => {
+                    eprintln!();
+                    eprintln!("  {}", "shutting down…".dimmed());
+                    Ok(())
+                }
+            };
 
             // Best-effort cleanup. We run this regardless of how serve
             // exited so even an `Err(...)` return path leaves
@@ -1184,6 +1203,30 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     let term = std::future::pending::<()>();
     tokio::select! { _ = ctrl_c => {}, _ = term => {} }
+}
+
+/// Grace period to let axum's graceful shutdown drain in-flight
+/// connections before we force the process down. Short enough that a
+/// single Ctrl+C feels responsive even when a streaming connection
+/// (e.g. the debugger SSE) would otherwise hold the drain open forever.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+
+/// Resolves once it's time to stop waiting for the graceful drain.
+///
+/// Waits for the first shutdown signal, then races a *second* signal
+/// against a short grace timeout — whichever comes first wins. This is
+/// the escape hatch for connections that never close on their own
+/// (notably the debugger's infinite SSE stream): the drain started by
+/// `with_graceful_shutdown` would otherwise hang indefinitely.
+async fn force_shutdown_signal() {
+    // First signal: a graceful drain is now in progress.
+    shutdown_signal().await;
+    // Give in-flight connections a moment to finish; bail early if the
+    // user presses Ctrl+C again.
+    tokio::select! {
+        _ = shutdown_signal() => {}
+        _ = tokio::time::sleep(SHUTDOWN_GRACE) => {}
+    }
 }
 
 fn spawn_fee_payer_balance_observer(wallet: FeePayerWallet, subdomain: String) {
