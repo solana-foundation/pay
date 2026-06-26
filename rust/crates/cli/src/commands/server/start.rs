@@ -2055,6 +2055,7 @@ async fn fetch_sol_balance(rpc_url: &str, pubkey: &str) -> f64 {
 ///     `models`/`voices` selector (the variant-selection convention), else
 ///   - the placeholder's own name with the braces stripped, as a neutral
 ///     URL-safe sample.
+///
 /// Partial segments such as `{model}:infer` keep their suffix (→
 /// `fast:infer`). Endpoints with no placeholders are returned unchanged.
 fn example_path(ep: &pay_types::metering::Endpoint) -> String {

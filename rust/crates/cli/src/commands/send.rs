@@ -408,7 +408,7 @@ fn eligible_stablecoins(
         .iter()
         .filter(|token| token.raw_amount >= required_balance_raw)
         .filter_map(|token| {
-            let currency = token.symbol.and_then(Stablecoin::parse_symbol)?;
+            let currency = token.currency()?;
             Some(EligibleStablecoin {
                 currency,
                 balance: format_token_amount(token.raw_amount, STABLECOIN_DECIMALS),
@@ -485,7 +485,7 @@ fn stablecoin_balance_summary(balances: &AccountBalances) -> String {
         .tokens
         .iter()
         .filter_map(|token| {
-            let currency = token.symbol.and_then(Stablecoin::parse_symbol)?;
+            let currency = token.currency()?;
             Some(format!(
                 "{} {}",
                 currency,
@@ -529,7 +529,7 @@ mod tests {
                     mint: format!("{symbol}_mint"),
                     raw_amount,
                     ui_amount: raw_amount as f64 / 1_000_000.0,
-                    symbol: Some(symbol),
+                    symbol: Some(symbol.to_string()),
                 })
                 .collect(),
             tokens_unavailable: false,

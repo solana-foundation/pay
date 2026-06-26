@@ -333,12 +333,7 @@ fn stablecoin_raw_balance_for_sender(
     balances
         .tokens
         .iter()
-        .find(|token| {
-            token
-                .symbol
-                .is_some_and(|symbol| symbol.eq_ignore_ascii_case(currency))
-                || token.mint == expected_mint
-        })
+        .find(|token| token.is_symbol(currency) || token.mint == expected_mint)
         .map(|token| token.raw_amount)
         .ok_or_else(|| Error::Config(format!("No {currency} balance available to send")))
 }

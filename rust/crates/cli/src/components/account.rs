@@ -24,7 +24,7 @@ pub fn print_balances(balances: &AccountBalances, indent: &str) -> bool {
         return false;
     }
     for t in &balances.tokens {
-        let symbol = t.symbol.unwrap_or("?");
+        let symbol = t.symbol_or("?");
         eprintln!(
             "{indent}- {:<6} {}",
             symbol,
