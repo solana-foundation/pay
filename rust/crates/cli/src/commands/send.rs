@@ -10,6 +10,7 @@ use pay_core::accounts::{
     resolve_account_for_network,
 };
 use pay_core::balance::AccountBalances;
+use pay_core::client::send::ResolvedCurrency;
 use pay_core::send::{STABLECOIN_DECIMALS, format_token_amount, parse_token_amount};
 use pay_types::Stablecoin;
 use solana_pubkey::Pubkey;
@@ -77,7 +78,7 @@ impl SendCommand {
         let recipient = resolve_recipient_pubkey(&recipient_input, network)?;
         let memo = resolve_memo(self.memo.as_deref(), self.memo_hex.as_deref())?;
 
-        let stablecoin = resolve_send_currency(
+        let currency = resolve_send_currency(
             &amount,
             self.currency.as_deref(),
             network,
@@ -86,9 +87,9 @@ impl SendCommand {
         )?;
 
         let amount_display = if sends_entire_balance(&amount) {
-            format!("max {stablecoin}")
+            format!("max {currency}")
         } else {
-            format!("{amount} {stablecoin}")
+            format!("{amount} {currency}")
         };
 
         if verbose {
@@ -102,7 +103,7 @@ impl SendCommand {
             pay_core::client::send::StablecoinSendRequest {
                 amount: &amount,
                 recipient: &recipient,
-                stablecoin,
+                currency,
                 network,
                 account_override,
                 memo: memo.as_deref(),
@@ -271,18 +272,46 @@ fn resolve_send_currency(
     network: &str,
     account_override: Option<&str>,
     rpc_url_override: Option<&str>,
-) -> pay_core::Result<Stablecoin> {
-    if let Some(currency) = requested_currency {
-        return normalize_requested_currency(currency);
+) -> pay_core::Result<ResolvedCurrency> {
+    let sender = sender_pubkey_for_network(network, account_override)?;
+
+    if let Some(requested) = requested_currency {
+        let requested = requested.trim();
+        if requested.is_empty() {
+            return Err(pay_core::Error::Config(
+                "Currency must not be empty".to_string(),
+            ));
+        }
+        // Prefer the remote supported set: resolve the symbol against the
+        // sender's stablecoin balances (the mint comes straight from pay-api).
+        if let Some(sender) = &sender {
+            let rpc_url = balance_rpc_url(network, rpc_url_override);
+            if let Ok(balances) = balances_for_sender(network, &rpc_url, sender)
+                && !balances.tokens_unavailable
+                && let Some(token) = balances.tokens.iter().find(|t| t.is_symbol(requested))
+                && let Some(symbol) = token.symbol.clone()
+            {
+                return Ok(ResolvedCurrency {
+                    symbol,
+                    mint: token.mint.clone(),
+                });
+            }
+        }
+        // Offline / not held / unknown to the API for this wallet: fall back to
+        // the local enum registry.
+        return normalize_requested_currency(requested, network);
     }
 
-    let Some(sender) = sender_pubkey_for_network(network, account_override)? else {
+    let Some(sender) = sender else {
         if sends_entire_balance(amount) {
             return Err(pay_core::Error::Config(format!(
                 "Cannot choose a stablecoin for `pay send max` without a configured {network} account"
             )));
         }
-        return Ok(DEFAULT_STABLECOIN);
+        return Ok(ResolvedCurrency::from_stablecoin(
+            DEFAULT_STABLECOIN,
+            network,
+        ));
     };
 
     let rpc_url = balance_rpc_url(network, rpc_url_override);
@@ -294,7 +323,10 @@ fn resolve_send_currency(
                     .to_string(),
             ));
         }
-        return Ok(DEFAULT_STABLECOIN);
+        return Ok(ResolvedCurrency::from_stablecoin(
+            DEFAULT_STABLECOIN,
+            network,
+        ));
     }
 
     let eligible = eligible_stablecoins(&balances, amount)?;
@@ -302,7 +334,7 @@ fn resolve_send_currency(
         [] => Err(pay_core::Error::Config(no_eligible_stablecoin_message(
             amount, &balances,
         ))),
-        [only] => Ok(only.currency),
+        [only] => Ok(only.currency.clone()),
         many => {
             if !can_prompt() {
                 return Err(pay_core::Error::Config(
@@ -381,7 +413,7 @@ fn balances_for_sender(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EligibleStablecoin {
-    currency: Stablecoin,
+    currency: ResolvedCurrency,
     balance: String,
 }
 
@@ -408,31 +440,39 @@ fn eligible_stablecoins(
         .iter()
         .filter(|token| token.raw_amount >= required_balance_raw)
         .filter_map(|token| {
-            let currency = token.currency()?;
+            let symbol = token.symbol.clone()?;
             Some(EligibleStablecoin {
-                currency,
+                currency: ResolvedCurrency {
+                    symbol,
+                    mint: token.mint.clone(),
+                },
                 balance: format_token_amount(token.raw_amount, STABLECOIN_DECIMALS),
             })
         })
         .collect::<Vec<_>>();
-    eligible.sort_by(|left, right| left.currency.symbol().cmp(right.currency.symbol()));
+    eligible.sort_by(|left, right| left.currency.symbol.cmp(&right.currency.symbol));
     Ok(eligible)
 }
 
-fn normalize_requested_currency(currency: &str) -> pay_core::Result<Stablecoin> {
+fn normalize_requested_currency(
+    currency: &str,
+    network: &str,
+) -> pay_core::Result<ResolvedCurrency> {
     if currency.trim().is_empty() {
         return Err(pay_core::Error::Config(
             "Currency must not be empty".to_string(),
         ));
     }
-    Stablecoin::from_str(currency).map_err(pay_core::Error::Config)
+    Stablecoin::from_str(currency)
+        .map(|stablecoin| ResolvedCurrency::from_stablecoin(stablecoin, network))
+        .map_err(pay_core::Error::Config)
 }
 
 fn can_prompt() -> bool {
     !no_dna::is_agent() && std::io::IsTerminal::is_terminal(&std::io::stderr())
 }
 
-fn prompt_for_stablecoin(eligible: &[EligibleStablecoin]) -> pay_core::Result<Stablecoin> {
+fn prompt_for_stablecoin(eligible: &[EligibleStablecoin]) -> pay_core::Result<ResolvedCurrency> {
     let labels = eligible
         .iter()
         .map(|token| format!("{}  {} available", token.currency, token.balance))
@@ -443,7 +483,7 @@ fn prompt_for_stablecoin(eligible: &[EligibleStablecoin]) -> pay_core::Result<St
         .default(0)
         .interact()
         .map_err(|e| pay_core::Error::Config(format!("Prompt error: {e}")))?;
-    Ok(eligible[selection].currency)
+    Ok(eligible[selection].currency.clone())
 }
 
 fn eligible_summary(eligible: &[EligibleStablecoin]) -> String {
@@ -596,11 +636,17 @@ mod tests {
             eligible,
             vec![
                 EligibleStablecoin {
-                    currency: Stablecoin::Pyusd,
+                    currency: ResolvedCurrency {
+                        symbol: "PYUSD".to_string(),
+                        mint: "PYUSD_mint".to_string(),
+                    },
                     balance: "2.5".to_string(),
                 },
                 EligibleStablecoin {
-                    currency: Stablecoin::Usdt,
+                    currency: ResolvedCurrency {
+                        symbol: "USDT".to_string(),
+                        mint: "USDT_mint".to_string(),
+                    },
                     balance: "1".to_string(),
                 },
             ]
@@ -616,7 +662,10 @@ mod tests {
         assert_eq!(
             eligible,
             vec![EligibleStablecoin {
-                currency: Stablecoin::Usdt,
+                currency: ResolvedCurrency {
+                    symbol: "USDT".to_string(),
+                    mint: "USDT_mint".to_string(),
+                },
                 balance: "0.5".to_string(),
             }]
         );
@@ -644,7 +693,10 @@ mod tests {
         assert_eq!(
             eligible,
             vec![EligibleStablecoin {
-                currency: Stablecoin::Usdt,
+                currency: ResolvedCurrency {
+                    symbol: "USDT".to_string(),
+                    mint: "USDT_mint".to_string(),
+                },
                 balance: "0.000001".to_string(),
             }]
         );
