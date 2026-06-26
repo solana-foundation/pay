@@ -231,15 +231,21 @@ export function PaymentSplits({ flow, success }: { flow: PaymentFlow; success: b
     const txHref = receiptUrl(txSig, config);
     const periodStart = fmtDate(receipt?.periodStartTs);
     const periodEnd = fmtDate(receipt?.periodEndTs);
+    const isSubscription = !!(
+      receipt?.subscriptionId ||
+      receipt?.planId ||
+      receipt?.periodEndTs
+    );
+    const title = isSubscription ? "Subscription Access" : "Wallet Sign-In";
+    const note = isSubscription
+      ? "Verified via a signed message — no charge. The subscription was paid on activation; this request unlocks it."
+      : "Verified via a signed message — no charge. Authenticates an existing credit balance.";
     return (
       <div className="splits">
-        <h3>Sign-In</h3>
+        <h3>{title}</h3>
         <div className="signin-card">
           <p className="signin-statement">{parsed.statement}</p>
-          <p className="signin-note">
-            SIWX authentication — no payment. Authenticates an existing
-            subscription or credit balance.
-          </p>
+          <p className="signin-note">{note}</p>
           <div className="signin-details">
             {parsed.payerAddress && (
               <div className="signin-row">
