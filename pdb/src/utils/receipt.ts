@@ -42,7 +42,10 @@ export function parseReceipt(flow: PaymentFlow): Receipt | null {
   }
 }
 
-/** Best settlement transaction signature for a receipt, across patterns. */
+/** Best settlement transaction signature for a receipt, across patterns.
+ *  Per-call charges put the settlement signature in `reference`; that's the
+ *  last fallback so subscriptions (whose `reference` is the subscriptionId,
+ *  not a tx) still resolve to `activationSignature` first. */
 export function receiptSignature(receipt: Receipt | null): string | null {
   if (!receipt) return null;
   return (
@@ -50,6 +53,7 @@ export function receiptSignature(receipt: Receipt | null): string | null {
     receipt.signature ||
     receipt.txSignature ||
     receipt.activationSignature ||
+    receipt.reference ||
     null
   );
 }
