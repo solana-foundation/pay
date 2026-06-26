@@ -14,7 +14,7 @@ pub mod splits;
 pub mod stablecoin_mints {
     pub use solana_pay_core::mints::{
         CASH_MAINNET, PYUSD_DEVNET, PYUSD_MAINNET, PYUSD_TESTNET, USDC_DEVNET, USDC_MAINNET,
-        USDC_TESTNET, USDG_MAINNET, USDT_MAINNET,
+        USDC_TESTNET, USDG_MAINNET, USDPT_MAINNET, USDT_MAINNET,
     };
 }
 
@@ -26,11 +26,20 @@ pub enum Stablecoin {
     Pyusd,
     Cash,
     Usdg,
+    /// USDPT (Anchorage) — Token-2022 confidential-capable stablecoin.
+    Usdpt,
 }
 
 impl Stablecoin {
-    pub const ALL: [Self; 5] = [Self::Usdc, Self::Usdt, Self::Pyusd, Self::Cash, Self::Usdg];
-    pub const SYMBOL_LIST: &'static str = "USDC, USDT, PYUSD, CASH, or USDG";
+    pub const ALL: [Self; 6] = [
+        Self::Usdc,
+        Self::Usdt,
+        Self::Pyusd,
+        Self::Cash,
+        Self::Usdg,
+        Self::Usdpt,
+    ];
+    pub const SYMBOL_LIST: &'static str = "USDC, USDT, PYUSD, CASH, USDG, or USDPT";
 
     pub fn symbol(self) -> &'static str {
         match self {
@@ -39,6 +48,7 @@ impl Stablecoin {
             Self::Pyusd => "PYUSD",
             Self::Cash => "CASH",
             Self::Usdg => "USDG",
+            Self::Usdpt => "USDPT",
         }
     }
 
@@ -46,7 +56,7 @@ impl Stablecoin {
     /// per-variant for forward-compat when a non-6 stablecoin lands.
     pub fn decimals(self) -> u8 {
         match self {
-            Self::Usdc | Self::Usdt | Self::Pyusd | Self::Cash | Self::Usdg => 6,
+            Self::Usdc | Self::Usdt | Self::Pyusd | Self::Cash | Self::Usdg | Self::Usdpt => 6,
         }
     }
 
@@ -72,6 +82,7 @@ impl Stablecoin {
             },
             Self::Cash => stablecoin_mints::CASH_MAINNET,
             Self::Usdg => stablecoin_mints::USDG_MAINNET,
+            Self::Usdpt => stablecoin_mints::USDPT_MAINNET,
         }
     }
 
@@ -86,6 +97,7 @@ impl Stablecoin {
             stablecoin_mints::PYUSD_MAINNET | stablecoin_mints::PYUSD_DEVNET => Some(Self::Pyusd),
             stablecoin_mints::CASH_MAINNET => Some(Self::Cash),
             stablecoin_mints::USDG_MAINNET => Some(Self::Usdg),
+            stablecoin_mints::USDPT_MAINNET => Some(Self::Usdpt),
             _ => None,
         }
     }
@@ -97,6 +109,7 @@ impl Stablecoin {
             "PYUSD" => Some(Self::Pyusd),
             "CASH" => Some(Self::Cash),
             "USDG" => Some(Self::Usdg),
+            "USDPT" => Some(Self::Usdpt),
             _ => None,
         }
     }
@@ -200,5 +213,21 @@ mod tests {
             Stablecoin::from_mint(stablecoin_mints::USDG_MAINNET),
             Some(Stablecoin::Usdg)
         );
+    }
+
+    #[test]
+    fn usdpt_round_trips_via_paykit_registry() {
+        assert_eq!(Stablecoin::parse_symbol("usdpt"), Some(Stablecoin::Usdpt));
+        assert_eq!(Stablecoin::Usdpt.symbol(), "USDPT");
+        assert_eq!(Stablecoin::Usdpt.decimals(), 6);
+        assert_eq!(
+            Stablecoin::Usdpt.mint(Some("mainnet")),
+            stablecoin_mints::USDPT_MAINNET
+        );
+        assert_eq!(
+            Stablecoin::from_mint(stablecoin_mints::USDPT_MAINNET),
+            Some(Stablecoin::Usdpt)
+        );
+        assert!(Stablecoin::ALL.contains(&Stablecoin::Usdpt));
     }
 }
