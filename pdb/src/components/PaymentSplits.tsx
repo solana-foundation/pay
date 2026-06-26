@@ -26,60 +26,89 @@ interface Recipient {
   memo?: string;
 }
 
-interface ParsedChallenge {
+interface PaymentChallenge {
+  kind: "payment";
   totalAmount: number;
   recipients: Recipient[];
   feePayerKey?: string;
   payerAddress?: string;
 }
 
+// Sign-In-With-X / SIWMPP challenge — authenticates an existing
+// subscription or credit balance with a signed message, no per-call
+// payment. Has no amount/recipient/splits, so it must not be rendered as
+// a money split.
+interface AuthenticateChallenge {
+  kind: "authenticate";
+  statement: string;
+  payerAddress?: string;
+}
+
+type ParsedChallenge = PaymentChallenge | AuthenticateChallenge;
+
 function parseChallenge(flow: PaymentFlow): ParsedChallenge | null {
   const wwwAuth = flow.challengeHeaders?.["www-authenticate"];
   if (!wwwAuth) return null;
+  const intent = wwwAuth.match(/intent="([^"]*)"/)?.[1];
   const match = wwwAuth.match(/request="([^"]+)"/);
   if (!match) return null;
   const decoded = base64urlDecode(match[1]);
   if (!decoded) return null;
 
+  let req: any;
   try {
-    const req = JSON.parse(decoded);
-    const decimals = req.methodDetails?.decimals ?? 6;
-    const divisor = Math.pow(10, decimals);
-    const rawTotal = parseInt(req.amount ?? "0", 10);
-    const rawSplits = (req.methodDetails?.splits ?? []) as Array<{
-      recipient: string;
-      amount: string;
-      label?: string;
-      memo?: string;
-    }>;
-    const splitsTotal = rawSplits.reduce(
-      (sum, s) => sum + parseInt(s.amount, 10),
-      0,
-    );
-
-    const recipients: Recipient[] = [
-      {
-        label: rawSplits.length > 0 ? "Primary" : "Recipient",
-        address: req.recipient,
-        amount: (rawTotal - splitsTotal) / divisor,
-      },
-      ...rawSplits.map((s) => ({
-        label: s.label || shortAddr(s.recipient),
-        address: s.recipient,
-        amount: parseInt(s.amount, 10) / divisor,
-        memo: s.memo,
-      })),
-    ];
-
-    return {
-      totalAmount: rawTotal / divisor,
-      recipients,
-      feePayerKey: req.methodDetails?.feePayerKey,
-      payerAddress: flow.payer,
-    };
+    req = JSON.parse(decoded);
   } catch {
     return null;
   }
+
+  // Distinguish a sign-in (authenticate) challenge from a payment.
+  // Subscriptions and credit spend advertise `intent="authenticate"` and
+  // carry no amount — rendering "$0 → Recipient" for them is misleading.
+  const hasPayment = req.amount != null || req.methodDetails?.amount != null;
+  if (intent === "authenticate" || !hasPayment) {
+    const statement =
+      req.statement ||
+      wwwAuth.match(/description="([^"]*)"/)?.[1] ||
+      "Sign in to authenticate.";
+    return { kind: "authenticate", statement, payerAddress: flow.payer };
+  }
+
+  const decimals = req.methodDetails?.decimals ?? 6;
+  const divisor = Math.pow(10, decimals);
+  const rawTotal = parseInt(req.amount ?? req.methodDetails?.amount ?? "0", 10);
+  const rawSplits = (req.methodDetails?.splits ?? []) as Array<{
+    recipient: string;
+    amount: string;
+    label?: string;
+    memo?: string;
+  }>;
+  const splitsTotal = rawSplits.reduce(
+    (sum, s) => sum + parseInt(s.amount, 10),
+    0,
+  );
+
+  const recipients: Recipient[] = [
+    {
+      label: rawSplits.length > 0 ? "Primary" : "Recipient",
+      address: req.recipient,
+      amount: (rawTotal - splitsTotal) / divisor,
+    },
+    ...rawSplits.map((s) => ({
+      label: s.label || shortAddr(s.recipient),
+      address: s.recipient,
+      amount: parseInt(s.amount, 10) / divisor,
+      memo: s.memo,
+    })),
+  ];
+
+  return {
+    kind: "payment",
+    totalAmount: rawTotal / divisor,
+    recipients,
+    feePayerKey: req.methodDetails?.feePayerKey,
+    payerAddress: flow.payer,
+  };
 }
 
 const COLORS = [
@@ -180,8 +209,39 @@ export function PaymentSplits({ flow, success }: { flow: PaymentFlow; success: b
     );
   }
 
+  // Sign-in / subscription activation: no payment split to draw. Show the
+  // signed statement and who authenticated instead of a misleading $0 flow.
+  if (parsed.kind === "authenticate") {
+    return (
+      <div className="splits">
+        <h3>Sign-In</h3>
+        <div className="signin-card">
+          <p className="signin-statement">{parsed.statement}</p>
+          <p className="signin-note">
+            SIWX authentication — no payment. Authenticates an existing
+            subscription or credit balance.
+          </p>
+          {parsed.payerAddress && (
+            <a
+              className="splits-label-name splits-addr-link"
+              href={explorerTokenUrl(parsed.payerAddress, config)}
+              target="_blank"
+              rel="noopener"
+              title={parsed.payerAddress}
+            >
+              {shortAddr(parsed.payerAddress)}
+            </a>
+          )}
+        </div>
+      </div>
+    );
+  }
+
   const N = parsed.recipients.length;
   const total = parsed.totalAmount;
+  // Guard every share computation: a zero total (e.g. a no-charge
+  // sign-in/credit challenge) would otherwise yield `NaN%` in the UI.
+  const hasTotal = total > 0;
 
   // Dimensions
   const RECIP_BAR_H = 56;
@@ -192,7 +252,7 @@ export function PaymentSplits({ flow, success }: { flow: PaymentFlow; success: b
 
   // 1) Compute thickness for each flow
   const flows = parsed.recipients.map((r) => {
-    const pct = r.amount / total;
+    const pct = hasTotal ? r.amount / total : 1 / N;
     const thickness = pct >= 0.5 ? RECIP_BAR_H : pct >= 0.25 ? RECIP_BAR_H / 2 : pct >= 0.1 ? RECIP_BAR_H / 3 : RECIP_BAR_H / 6;
     return { recipient: r, thickness };
   });
@@ -271,7 +331,9 @@ export function PaymentSplits({ flow, success }: { flow: PaymentFlow; success: b
         {/* Right labels */}
         <div className="splits-right-info" style={{ height: TOTAL_H }}>
           {ribbons.map((rib, i) => {
-            const pct = ((rib.recipient.amount / total) * 100).toFixed(1);
+            const pct = hasTotal
+              ? ((rib.recipient.amount / total) * 100).toFixed(1)
+              : null;
             return (
               <div key={i} className="splits-recip-label" style={{ top: recipBars[i].center }}>
                 <a
@@ -284,7 +346,8 @@ export function PaymentSplits({ flow, success }: { flow: PaymentFlow; success: b
                   {rib.recipient.label}
                 </a>
                 <div className="splits-label-amount">
-                  <Amount value={rib.recipient.amount} /> <span className="splits-pct">({pct}%)</span>
+                  <Amount value={rib.recipient.amount} />
+                  {pct !== null && <span className="splits-pct"> ({pct}%)</span>}
                 </div>
                 {rib.recipient.memo && (
                   <div className="splits-label-memo">{rib.recipient.memo}</div>
