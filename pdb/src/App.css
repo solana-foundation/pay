@@ -743,7 +743,7 @@ body {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
-  gap: 6px;
+  gap: 8px;
   padding: 12px 14px;
 }
 
@@ -759,11 +759,36 @@ body {
   color: var(--fg-muted);
 }
 
-/* Receipt link shown under the flow's payment/sign-in panel. */
-.flow-receipt {
+.signin-details {
   display: flex;
-  justify-content: center;
-  padding: 8px 0 2px;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 4px;
+  width: 100%;
+}
+
+.signin-row {
+  display: flex;
+  gap: 12px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.signin-row-label {
+  flex: 0 0 84px;
+  color: var(--fg-muted);
+}
+
+.signin-row-value {
+  color: var(--fg);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Receipt link shown beneath the flow's payment / sign-in / session panel.
+   Lives inside the panel (which flows top-down), so it hugs the content
+   rather than floating to the bottom of the column. */
+.flow-receipt {
+  padding: 12px 0 2px;
 }
 
 .flow-receipt-link {

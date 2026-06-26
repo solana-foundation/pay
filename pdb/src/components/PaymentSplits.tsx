@@ -1,7 +1,20 @@
 import { useRef, useEffect, useState } from "react";
 import type { PaymentFlow } from "../types";
 import { Amount, formatUsd } from "./Amount";
-import { useConfig, explorerTokenUrl } from "../hooks/useConfig";
+import { useConfig, explorerTokenUrl, receiptUrl } from "../hooks/useConfig";
+import { ReceiptLink } from "./ReceiptLink";
+import { parseReceipt, receiptSignature } from "../utils/receipt";
+
+function fmtDate(ts?: string): string | null {
+  if (!ts) return null;
+  const d = new Date(ts);
+  if (isNaN(d.getTime())) return null;
+  return d.toLocaleDateString(undefined, {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  });
+}
 
 function shortAddr(addr: string | undefined): string {
   if (!addr) return "";
@@ -210,8 +223,14 @@ export function PaymentSplits({ flow, success }: { flow: PaymentFlow; success: b
   }
 
   // Sign-in / subscription activation: no payment split to draw. Show the
-  // signed statement and who authenticated instead of a misleading $0 flow.
+  // signed statement, the active period, and a link to the on-chain
+  // activation transaction instead of a misleading $0 flow.
   if (parsed.kind === "authenticate") {
+    const receipt = parseReceipt(flow);
+    const txSig = receiptSignature(receipt);
+    const txHref = receiptUrl(txSig, config);
+    const periodStart = fmtDate(receipt?.periodStartTs);
+    const periodEnd = fmtDate(receipt?.periodEndTs);
     return (
       <div className="splits">
         <h3>Sign-In</h3>
@@ -221,17 +240,58 @@ export function PaymentSplits({ flow, success }: { flow: PaymentFlow; success: b
             SIWX authentication — no payment. Authenticates an existing
             subscription or credit balance.
           </p>
-          {parsed.payerAddress && (
-            <a
-              className="splits-label-name splits-addr-link"
-              href={explorerTokenUrl(parsed.payerAddress, config)}
-              target="_blank"
-              rel="noopener"
-              title={parsed.payerAddress}
-            >
-              {shortAddr(parsed.payerAddress)}
-            </a>
-          )}
+          <div className="signin-details">
+            {parsed.payerAddress && (
+              <div className="signin-row">
+                <span className="signin-row-label">Payer</span>
+                <a
+                  className="signin-row-value splits-addr-link"
+                  href={explorerTokenUrl(parsed.payerAddress, config)}
+                  target="_blank"
+                  rel="noopener"
+                  title={parsed.payerAddress}
+                >
+                  {shortAddr(parsed.payerAddress)}
+                </a>
+              </div>
+            )}
+            {receipt?.planId && (
+              <div className="signin-row">
+                <span className="signin-row-label">Plan</span>
+                <span className="signin-row-value" title={receipt.planId}>
+                  {shortAddr(receipt.planId)}
+                </span>
+              </div>
+            )}
+            {periodStart && periodEnd && (
+              <div className="signin-row">
+                <span className="signin-row-label">Active</span>
+                <span className="signin-row-value">
+                  {periodStart} – {periodEnd}
+                </span>
+              </div>
+            )}
+            {txSig && (
+              <div className="signin-row">
+                <span className="signin-row-label">Activation tx</span>
+                {txHref ? (
+                  <a
+                    className="signin-row-value splits-addr-link"
+                    href={txHref}
+                    target="_blank"
+                    rel="noopener"
+                    title={txSig}
+                  >
+                    {shortAddr(txSig)} ↗
+                  </a>
+                ) : (
+                  <span className="signin-row-value" title={txSig}>
+                    {shortAddr(txSig)}
+                  </span>
+                )}
+              </div>
+            )}
+          </div>
         </div>
       </div>
     );
@@ -372,6 +432,8 @@ export function PaymentSplits({ flow, success }: { flow: PaymentFlow; success: b
           </a>
         </div>
       )}
+
+      <ReceiptLink flow={flow} />
     </div>
   );
 }
