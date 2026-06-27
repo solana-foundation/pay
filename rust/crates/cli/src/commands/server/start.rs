@@ -2081,7 +2081,10 @@ fn example_path(ep: &pay_types::metering::Endpoint) -> String {
         };
         let follows_selector = i > 0 && matches!(segs[i - 1], "models" | "voices");
         let sample = match (follows_selector, first_variant_value) {
-            (true, Some(value)) => value.to_string(),
+            // Variant values come from config and may contain reserved URL
+            // characters (`/`, `?`, `#`, ` `, `%`); encode as a single path
+            // segment so the link/curl target the intended route.
+            (true, Some(value)) => urlencoding::encode(value).into_owned(),
             _ => name.to_string(),
         };
         out.push(format!("{prefix}{sample}{suffix}"));
