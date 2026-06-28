@@ -1,0 +1,192 @@
+# PayKit Playground — pay-server edition
+# =============================================================================
+# A faithful port of pay-kit's TypeScript `playground-api`
+# (~/Coding/pay-kit/typescript/examples/playground-api/index.ts) to a pay-server
+# YAML spec. One file declares the priced routes; `pay server start` stands up
+# the same 402-gated surface the Express demo exposes — one endpoint per gate /
+# scheme — so you can drive the pay client against every payment path and build
+# confidence the gateway (pingora front + axum control-plane) behaves.
+#
+# Run it self-contained against the hosted Surfpool sandbox (no real funds, the
+# operator + recipient are auto-funded, MPP challenges are sandbox-compatible):
+#
+#   cargo run -p pay -- --sandbox server start playground-api.yaml
+#   # serves on 0.0.0.0:1402
+#
+# Then exercise it with the client, e.g.:
+#   cargo run -p pay -- --sandbox curl http://localhost:1402/api/v1/fortune
+#   cargo run -p pay -- --sandbox curl http://localhost:1402/api/v1/quote/SOL
+#
+# `routing: respond` makes this self-contained — the gate runs the full
+# 402 -> pay -> verify -> 200 cycle without needing a real upstream, which is
+# exactly what you want for exercising the gate/proxy in isolation. Swap to
+# `routing: { type: proxy, url: ... }` to put a real upstream behind the gate.
+
+name: playground-api
+subdomain: playground
+title: "PayKit Playground"
+description: "Showcase of every pay gate/scheme: charge, x402 exact, x402 upto, subscription, session."
+category: ai_ml
+version: v1
+
+routing:
+  type: respond
+accounting: pooled
+
+# ── Operator: fee-payer + settlement signer ──
+# In `--sandbox` mode the signer + recipient are generated and funded for you;
+# no keys to supply. `challenge_binding_secret` + `realm` are required because
+# the subscription gate (feed) binds its challenges to this server.
+operator:
+  currencies:
+    usd: ["USDC"]
+  network: "localnet"
+  fee_payer: true
+  # Stable across restarts — rotating it invalidates outstanding session tokens.
+  # Generate one with: openssl rand -hex 32
+  challenge_binding_secret: "${MPP_SECRET_KEY}"
+  realm: "playground"
+
+# ── Named recipients for splits ──
+# `account` accepts a literal base58 pubkey or `${ENV_VAR}` resolved at runtime.
+# In sandbox mode, set PLATFORM_WALLET to any funded address (or a generated one).
+recipients:
+  platform:
+    account: "${PLATFORM_WALLET}"
+    label: "Platform"
+
+# ── Session channel parameters (used by the `stream` endpoint) ──
+# Mirrors the TS `session(usd('1.00'), { closeDelayMs: 2000, unitPrice: 0.0001 })`.
+# cap_usdc is the channel deposit ceiling; per-delivery price lives on the
+# endpoint metering below. close_delay_ms is the idle delay before the operator
+# settles and closes the channel.
+session:
+  cap_usdc: 1.0
+  close_delay_ms: 2000
+  modes: [push]
+
+endpoints:
+  # ===========================================================================
+  # CHARGE — fixed price, settled over MPP *or* x402 (client's choice)
+  # TS: quote → { amount: usd('0.01') }, accept x402 + mpp
+  # ===========================================================================
+  - method: GET
+    path: "api/v1/quote/{symbol}"
+    resource: "quote"
+    description: "Stock quote — fixed charge, settled over MPP or x402 (client picks)."
+    metering:
+      schemes: [mpp-charge, x402-exact]
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 0.01
+
+  # The canonical paid endpoint the cross-language harnesses drive
+  # (GET /api/v1/fortune → 402 → { "fortune": ... }).
+  - method: GET
+    path: "api/v1/fortune"
+    resource: "fortune"
+    description: "A fortune cookie — fixed charge, settled over MPP or x402."
+    metering:
+      schemes: [mpp-charge, x402-exact]
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 0.01
+
+  # ===========================================================================
+  # CHARGE + SPLIT — MPP-only (multi-recipient splits aren't expressible in
+  # x402 `exact`, so this gate auto-narrows to mpp-charge).
+  # TS: joke → usd('0.01'), feeWithin platform 0.003 (the seller nets 0.007).
+  # ===========================================================================
+  - method: GET
+    path: "api/v1/joke"
+    resource: "joke"
+    description: "A programmer joke — MPP charge split 70/30 between seller and platform."
+    metering:
+      schemes: [mpp-charge]
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 0.01
+      splits:
+        # 0.003 of 0.01 == 30%; the operator (seller) nets the remaining 0.007.
+        - recipient: platform
+          percent: 30
+          memo: "paykit/joke: platform fee"
+
+  # ===========================================================================
+  # x402 UPTO — usage-metered: authorize a ceiling, bill metered usage.
+  # TS: summarize → usage(usd('0.10')), billed per token.
+  #
+  # NOTE: the pay gate does not implement x402 `upto` yet — this endpoint
+  # currently returns a clean HTTP 501 (`unsupported_scheme`). It's included so
+  # the surface matches the playground 1:1 and to track the gap; switch
+  # `schemes` to [x402-exact] or [mpp-charge] if you want it to settle today.
+  # ===========================================================================
+  - method: POST
+    path: "api/v1/summarize"
+    resource: "summarize"
+    description: "Summarize text, billed per token (x402 upto). Ceiling $0.10. [501: not yet implemented]"
+    metering:
+      schemes: [x402-upto]
+      dimensions:
+        # $0.0001 per token (TS PRICE_PER_TOKEN = 100 base units, 6-dp USDC).
+        - direction: input
+          unit: tokens
+          scale: 1
+          tiers:
+            - price_usd: 0.0001
+
+  # ===========================================================================
+  # SUBSCRIPTION — recurring on-chain plan, activated on first call.
+  # TS: feed → subscription(usd('0.10'), { periodCount: 1, periodUnit: 'day' }).
+  #
+  # OPT-IN: a subscription endpoint requires an on-chain `Plan` account, so the
+  # server refuses to start until the `plan_id*` fields below are populated. The
+  # TS playground bootstraps the plan on the sandbox first; here you publish it
+  # once, which fills these fields in place:
+  #
+  #   pay --sandbox server plans publish playground-api.yaml --write
+  #
+  # Then uncomment this endpoint to serve it. (Left commented so the spec runs
+  # out-of-the-box, mirroring the TS demo where feed mounts only with a plan.)
+  #
+  # - method: GET
+  #   path: "api/v1/feed"
+  #   resource: "feed"
+  #   description: "News feed — recurring subscription, $0.10/day."
+  #   subscription:
+  #     period: "1d"
+  #     price_usd: 0.10
+  #     currency: "USDC"
+  #     # Filled in place by `pay server plans publish --write`:
+  #     # plan_id: ...
+  #     # plan_id_numeric: ...
+  #     # plan_bump: ...
+  #     # plan_created_at: ...
+
+  # ===========================================================================
+  # SESSION — open a payment channel, stream metered deliveries, settle on
+  # idle-close. TS: stream → session(usd('1.00'), { unitPrice: usd('0.0001') }).
+  # Channel cap + close delay come from the top-level `session:` block above;
+  # the per-delivery price is the metering dimension here.
+  # ===========================================================================
+  - method: GET
+    path: "api/v1/stream"
+    resource: "stream"
+    description: "Metered token stream over an MPP session channel; $0.0001 per delivery."
+    metering:
+      schemes: [mpp-session]
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 0.0001
