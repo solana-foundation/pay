@@ -24,7 +24,7 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use http::{HeaderMap, StatusCode, Uri};
+use http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use pay_core::PaymentState;
 use pay_core::server::gate::{
     GateDecision, GateRequest, GateResponse, PaymentGate, ReceiptAnnotation, settle_upto,
@@ -165,11 +165,30 @@ impl<S: PaymentState> Http402Gate<S> {
                 Ok(false)
             }
             Ok(UpstreamPlan::Respond(resp)) => {
-                write_axum_response(session, resp).await?;
+                // Respond-mode short-circuit: there's no upstream, so
+                // `response_filter` never runs. Do the post-serve work here —
+                // settle an x402 `upto` channel (the resource was served) and
+                // attach the verified-payment receipt — then write. Without this
+                // the on-chain settlement succeeds but the client + PDB never see
+                // the receipt (the entire playground is respond-mode).
+                let served_ok = resp.status().is_success();
+                let mut extra: Vec<(HeaderName, HeaderValue)> = Vec::new();
+                if let Some(open) = ctx.upto.take()
+                    && let Some((n, v)) = settle_upto(&self.state, open, served_ok).await
+                {
+                    extra.push((n, v));
+                }
+                if let Some(receipt) = ctx.receipt.take() {
+                    extra.extend(receipt.headers);
+                    if let Some(reference) = &receipt.reference {
+                        tracing::Span::current().record("tx_sig", reference.as_str());
+                    }
+                }
+                write_axum_response(session, resp, extra).await?;
                 Ok(true)
             }
             Err(resp) => {
-                write_axum_response(session, resp).await?;
+                write_axum_response(session, resp, Vec::new()).await?;
                 Ok(true)
             }
         }
@@ -462,10 +481,13 @@ async fn write_gate_response(session: &mut Session, r: GateResponse) -> pingora:
 }
 
 /// Collect an axum [`Response`](axum::response::Response) (respond-mode body or
-/// an upstream-prep error) and write it to the downstream.
+/// an upstream-prep error) and write it to the downstream, appending `extra`
+/// headers (e.g. the verified-payment receipt — respond-mode responses never
+/// reach `response_filter`, so the receipt is attached here instead).
 async fn write_axum_response(
     session: &mut Session,
     resp: axum::response::Response,
+    extra: Vec<(HeaderName, HeaderValue)>,
 ) -> pingora::Result<()> {
     let _ = session.drain_request_body().await;
     let status = resp.status().as_u16();
@@ -491,6 +513,10 @@ async fn write_axum_response(
             continue;
         }
         out.append_header(n, v)?;
+    }
+    // Receipt / settlement headers (HeaderValue passed through unchanged).
+    for (n, v) in extra {
+        let _ = out.append_header(n, v);
     }
     out.insert_header("content-length", body.len().to_string())?;
     session.write_response_header(Box::new(out), false).await?;
