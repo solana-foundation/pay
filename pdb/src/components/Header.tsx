@@ -9,13 +9,13 @@ export function Header({ theme, onToggleTheme, sidebarOpen, onToggleSidebar }: P
   return (
     <div className="header">
       <svg
-        width="24"
-        height="24"
+        width="22"
+        height="22"
         viewBox="0 0 12 12"
         fill="none"
         xmlns="http://www.w3.org/2000/svg"
         aria-hidden="true"
-        style={{ flexShrink: 0 }}
+        style={{ flexShrink: 0, color: "var(--accent)" }}
       >
         <path
           d="M2.3546 8.4557C2.4215 8.3889 2.5123 8.3507 2.6079 8.3507H11.8035C11.9566 8.3507 12.0331 8.5373 11.9231 8.6473L9.7933 10.7771C9.7264 10.844 9.6356 10.8821 9.54 10.8821H0.344353C0.191253 10.8821 0.114753 10.6955 0.224753 10.5855L2.3546 8.4557Z"
@@ -31,7 +31,7 @@ export function Header({ theme, onToggleTheme, sidebarOpen, onToggleSidebar }: P
         />
       </svg>
       <h1>
-        payment <span className="debugger">debugger</span>
+        Pay <span className="debugger">Debugger</span>
       </h1>
       <div style={{ flex: 1 }} />
       <button
