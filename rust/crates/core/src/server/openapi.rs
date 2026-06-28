@@ -19,9 +19,9 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use pay_types::metering::Endpoint;
+use pay_types::metering::{ApiSpec, Endpoint, HttpMethod, Metering, Scheme};
 use pay_types::registry::OpenapiSource;
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::{Error, Result};
 
@@ -61,6 +61,281 @@ pub fn load_document(source: &OpenapiSource, spec_dir: &Path) -> Result<Value> {
     };
     serde_json::from_str(&raw)
         .map_err(|e| Error::Config(format!("openapi: document is not valid JSON: {e}")))
+}
+
+/// Runtime operator identity for [`synthesize_from_spec`] — the bits the static
+/// spec doesn't carry (resolved signer/recipient pubkeys + network).
+pub struct DiscoveryContext<'a> {
+    /// Network slug (`mainnet`/`devnet`/`testnet`/`localnet`). Used verbatim on
+    /// MPP offers; mapped to a CAIP-2 chain id on x402 offers.
+    pub network_slug: &'a str,
+    /// Operator payment recipient (base58) → offer `payTo`.
+    pub pay_to: Option<&'a str>,
+    /// Operator fee-payer pubkey (base58) → x402 offer `feePayer`.
+    pub fee_payer: Option<&'a str>,
+}
+
+/// Synthesize an OpenAPI 3.1 document from the provider spec itself, for when
+/// the operator did not supply an upstream doc (`--openapi` / `openapi:`).
+///
+/// Mirrors pay-kit's TS `openapiFromExpress`: each declared endpoint becomes an
+/// operation carrying an `x-payment-info` extension whose `offers[]` are derived
+/// from the metering / subscription pricing. Each offer follows the
+/// payment-discovery draft shape (`intent`/`method`/`scheme`/`amount`/`network`/
+/// `payTo`, plus `feePayer` on x402, `unitPrice` on session, `planId` on
+/// subscription). x402 offers carry a CAIP-2 `network`; MPP offers carry the
+/// plain network slug.
+pub fn synthesize_from_spec(api: &ApiSpec, ctx: &DiscoveryContext) -> Value {
+    // All supported stablecoins are 6-decimal; offers price in base units.
+    const USDC_DECIMALS: u32 = 6;
+    // Primary display currency = the operator's first configured `usd` currency.
+    let currency = api
+        .operator
+        .as_ref()
+        .and_then(|o| o.currencies.get("usd"))
+        .and_then(|list| list.first())
+        .cloned()
+        .unwrap_or_else(|| "USDC".to_string());
+
+    let caip2 = solana_caip2(ctx.network_slug);
+    // Session channel cap (the per-call price is the unit price for streaming).
+    let session_cap_usd = api.session.as_ref().map(|s| s.cap_usdc);
+
+    let mut paths: Map<String, Value> = Map::new();
+    for ep in &api.endpoints {
+        let oas_path = format!("/{}", ep.path.trim_start_matches('/'));
+
+        let mut offers: Vec<Value> = Vec::new();
+        if let Some(sub) = &ep.subscription {
+            offers.push(build_offer(&OfferSpec {
+                intent: "subscription",
+                method: "mpp",
+                scheme: "subscription",
+                amount_usd: sub.price_usd,
+                capped: false,
+                network: ctx.network_slug,
+                currency: &currency,
+                decimals: USDC_DECIMALS,
+                pay_to: ctx.pay_to,
+                fee_payer: None,
+                unit_price_usd: None,
+                plan_id: sub.plan_id.as_deref(),
+            }));
+        } else if let Some(metering) = &ep.metering {
+            let flat = flat_price_usd(metering);
+            for scheme in metering.accepted_schemes() {
+                let info = scheme_offer_info(scheme);
+                // `upto` (a ceiling) and `session` (a channel cap) advertise a
+                // capped amount; session also carries the per-delivery unit price.
+                let (amount_usd, capped, unit_price_usd) = match scheme {
+                    Scheme::MppSession => (session_cap_usd, true, flat),
+                    Scheme::X402Upto => (flat, true, None),
+                    _ => (flat, false, None),
+                };
+                offers.push(build_offer(&OfferSpec {
+                    intent: info.intent,
+                    method: info.method,
+                    scheme: info.scheme,
+                    amount_usd,
+                    capped,
+                    network: if info.is_x402 {
+                        caip2.as_str()
+                    } else {
+                        ctx.network_slug
+                    },
+                    currency: &currency,
+                    decimals: USDC_DECIMALS,
+                    pay_to: ctx.pay_to,
+                    fee_payer: if info.is_x402 { ctx.fee_payer } else { None },
+                    unit_price_usd,
+                    plan_id: None,
+                }));
+            }
+            // x402 offers first, matching pay-kit's discovery ordering.
+            offers.sort_by_key(|o| o.get("method").and_then(Value::as_str) != Some("x402"));
+        }
+
+        let mut op = Map::new();
+        op.insert(
+            "responses".to_string(),
+            json!({
+                "200": { "description": "Successful response" },
+                "402": { "description": "Payment Required" },
+            }),
+        );
+        if let Some(desc) = &ep.description {
+            op.insert("summary".to_string(), json!(desc));
+        }
+        if !offers.is_empty() {
+            op.insert(
+                "x-payment-info".to_string(),
+                json!({ "offers": Value::Array(offers) }),
+            );
+        }
+
+        // Multiple methods can share a path — merge into the same path item.
+        let item = paths
+            .entry(oas_path)
+            .or_insert_with(|| Value::Object(Map::new()));
+        if let Some(obj) = item.as_object_mut() {
+            obj.insert(http_method_key(&ep.method).to_string(), Value::Object(op));
+        }
+    }
+
+    json!({
+        "openapi": "3.1.0",
+        "info": { "title": api.title, "version": api.version },
+        "paths": Value::Object(paths),
+    })
+}
+
+/// Lowercase OpenAPI key for an HTTP method.
+fn http_method_key(method: &HttpMethod) -> &'static str {
+    match method {
+        HttpMethod::Get => "get",
+        HttpMethod::Post => "post",
+        HttpMethod::Put => "put",
+        HttpMethod::Patch => "patch",
+        HttpMethod::Delete => "delete",
+    }
+}
+
+/// Flat per-call USD price: the first tier of the first pricing dimension
+/// (falling back to the first variant's first dimension). `None` for free or
+/// purely usage-shaped endpoints with no leading flat tier.
+fn flat_price_usd(metering: &Metering) -> Option<f64> {
+    metering
+        .dimensions
+        .iter()
+        .find_map(|d| d.tiers.first().map(|t| t.price_usd))
+        .or_else(|| {
+            metering.variants.iter().find_map(|v| {
+                v.dimensions
+                    .iter()
+                    .find_map(|d| d.tiers.first().map(|t| t.price_usd))
+            })
+        })
+}
+
+/// Discovery facets of a per-call [`Scheme`].
+struct OfferInfo {
+    intent: &'static str,
+    method: &'static str,
+    scheme: &'static str,
+    is_x402: bool,
+}
+
+fn scheme_offer_info(scheme: Scheme) -> OfferInfo {
+    match scheme {
+        Scheme::MppCharge => OfferInfo {
+            intent: "charge",
+            method: "mpp",
+            scheme: "charge",
+            is_x402: false,
+        },
+        Scheme::X402Exact => OfferInfo {
+            intent: "charge",
+            method: "x402",
+            scheme: "exact",
+            is_x402: true,
+        },
+        Scheme::X402Upto => OfferInfo {
+            intent: "charge",
+            method: "x402",
+            scheme: "upto",
+            is_x402: true,
+        },
+        Scheme::MppSession => OfferInfo {
+            intent: "session",
+            method: "mpp",
+            scheme: "session",
+            is_x402: false,
+        },
+        Scheme::X402BatchSettlement => OfferInfo {
+            intent: "session",
+            method: "x402",
+            scheme: "batch-settlement",
+            is_x402: true,
+        },
+    }
+}
+
+/// Inputs for [`build_offer`].
+struct OfferSpec<'a> {
+    intent: &'a str,
+    method: &'a str,
+    scheme: &'a str,
+    amount_usd: Option<f64>,
+    /// `true` → render `description` as "up to N USDC" (ceilings / channel caps).
+    capped: bool,
+    network: &'a str,
+    currency: &'a str,
+    decimals: u32,
+    pay_to: Option<&'a str>,
+    fee_payer: Option<&'a str>,
+    unit_price_usd: Option<f64>,
+    plan_id: Option<&'a str>,
+}
+
+/// Build one `x-payment-info` offer matching pay-kit's discovery shape.
+fn build_offer(spec: &OfferSpec) -> Value {
+    let mut offer = Map::new();
+    offer.insert("intent".to_string(), json!(spec.intent));
+    offer.insert("method".to_string(), json!(spec.method));
+    offer.insert("scheme".to_string(), json!(spec.scheme));
+    offer.insert("network".to_string(), json!(spec.network));
+    offer.insert("currency".to_string(), json!(spec.currency));
+    if let Some(usd) = spec.amount_usd {
+        offer.insert(
+            "amount".to_string(),
+            json!(to_base_units(usd, spec.decimals)),
+        );
+        let human = format!("{} {}", fmt_usd(usd), spec.currency);
+        let description = if spec.capped {
+            format!("up to {human}")
+        } else {
+            human
+        };
+        offer.insert("description".to_string(), json!(description));
+    }
+    if let Some(pt) = spec.pay_to {
+        offer.insert("payTo".to_string(), json!(pt));
+    }
+    if let Some(fp) = spec.fee_payer {
+        offer.insert("feePayer".to_string(), json!(fp));
+    }
+    if let Some(up) = spec.unit_price_usd {
+        offer.insert(
+            "unitPrice".to_string(),
+            json!(to_base_units(up, spec.decimals)),
+        );
+    }
+    if let Some(pid) = spec.plan_id {
+        offer.insert("planId".to_string(), json!(pid));
+    }
+    Value::Object(offer)
+}
+
+/// USD → integer base-unit string (e.g. `0.01` USDC, 6dp → `"10000"`).
+fn to_base_units(usd: f64, decimals: u32) -> String {
+    ((usd * 10f64.powi(decimals as i32)).round() as u64).to_string()
+}
+
+/// Format a USD amount with minimal digits, no trailing zeros — `1.0` → "1",
+/// `0.10` → "0.1", `0.0001` → "0.0001" (matches the TS playground's labels).
+fn fmt_usd(usd: f64) -> String {
+    format!("{usd}")
+}
+
+/// CAIP-2 chain id for a Solana network slug. localnet/surfnet (a mainnet fork)
+/// and mainnet both resolve to the mainnet genesis hash.
+fn solana_caip2(slug: &str) -> String {
+    let genesis = match slug {
+        "devnet" => "EtWTRABZaYq6iMfeYKouRu166VU2xqa1",
+        "testnet" => "4uhcVJyU9pJkvQyS88uRDiswHXSCkY3z",
+        _ => "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+    };
+    format!("solana:{genesis}")
 }
 
 /// Strip every operation whose `(METHOD, path)` is not declared in

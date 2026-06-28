@@ -137,12 +137,12 @@ endpoints:
     metering:
       schemes: [x402-upto]
       dimensions:
-        # $0.0001 per token (TS PRICE_PER_TOKEN = 100 base units, 6-dp USDC).
-        - direction: input
-          unit: tokens
+        # The authorized ceiling ($0.10) — the offer advertises "up to 0.1 USDC".
+        - direction: usage
+          unit: requests
           scale: 1
           tiers:
-            - price_usd: 0.0001
+            - price_usd: 0.10
 
   # ===========================================================================
   # SUBSCRIPTION — recurring on-chain plan, activated on first call.

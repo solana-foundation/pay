@@ -91,6 +91,7 @@ struct AppState {
     browser_rpc_url: Option<String>,
     fee_payer_wallet: Option<FeePayerWallet>,
     fee_payer_signer: Option<Arc<dyn SolanaSigner>>,
+    x402: Option<pay_kit::x402::server::X402>,
 }
 
 impl PaymentState for AppState {
@@ -117,6 +118,9 @@ impl PaymentState for AppState {
     }
     fn fee_payer_signer(&self) -> Option<Arc<dyn SolanaSigner>> {
         self.fee_payer_signer.clone()
+    }
+    fn x402(&self) -> Option<&pay_kit::x402::server::X402> {
+        self.x402.as_ref()
     }
 }
 
@@ -263,7 +267,7 @@ impl StartCommand {
         // YAML's `endpoints[]` allow-list, and exposed at `GET /openapi.json`
         // with `rootUrl` / `servers[].url` rewritten per-request from the
         // `Host` header (or `--public-url` when set).
-        let openapi_doc: Option<Arc<serde_json::Value>> = match &self.openapi {
+        let upstream_openapi: Option<Arc<serde_json::Value>> = match &self.openapi {
             Some(input) => {
                 let source = if input.starts_with("http://") || input.starts_with("https://") {
                     pay_types::registry::OpenapiSource::Url {
@@ -291,6 +295,9 @@ impl StartCommand {
                 pay_core::server::openapi::strip_upstream_auth(&mut doc);
                 Some(Arc::new(doc))
             }
+            // No upstream doc — synthesized later (after the operator identity
+            // resolves) from the spec itself, like pay-kit's TS
+            // `openapiFromExpress`. See the `openapi_doc` binding below.
             None => None,
         };
         let openapi_proxy_mode = matches!(api.routing, RoutingConfig::Proxy { .. });
@@ -325,6 +332,8 @@ impl StartCommand {
             op.and_then(|o| o.network.clone())
                 .unwrap_or_else(|| "mainnet".to_string()),
         );
+        // Captured into the async block below for synthesized-openapi offers.
+        let network_slug = network.slug().to_string();
 
         // RPC URL fallback chain. Network-aware so that `localnet`
         // defaults to the hosted Surfpool sandbox (where ephemeral
@@ -499,6 +508,25 @@ impl StartCommand {
                 &rpc_url,
             )
             .await?;
+
+            // Discovery doc served at `/openapi.json`: prefer the operator's
+            // upstream OpenAPI; otherwise synthesize one from the spec + the
+            // now-resolved operator identity (recipient → `payTo`, fee-payer →
+            // x402 `feePayer`), mirroring pay-kit's TS `openapiFromExpress`.
+            let openapi_doc: Option<Arc<serde_json::Value>> = match upstream_openapi.clone() {
+                Some(doc) => Some(doc),
+                None => {
+                    let fee_payer_pk = fee_payer_signer.as_ref().map(|s| s.pubkey().to_string());
+                    let ctx = pay_core::server::openapi::DiscoveryContext {
+                        network_slug: &network_slug,
+                        pay_to: Some(recipient.as_str()),
+                        fee_payer: fee_payer_pk.as_deref(),
+                    };
+                    Some(Arc::new(pay_core::server::openapi::synthesize_from_spec(
+                        &api, &ctx,
+                    )))
+                }
+            };
 
             // ── Auto-fund the operator wallet on Surfpool ──
             //
@@ -936,6 +964,72 @@ impl StartCommand {
 
             let verify_mpps = mpps.clone();
 
+            // x402 `exact` backend — enables x402 challenges + verification for
+            // any endpoint that accepts an x402 scheme (mirrors the MPP wiring;
+            // without it the gate silently drops x402 from challenges).
+            let wants_x402 = api.endpoints.iter().any(|e| {
+                e.metering.as_ref().is_some_and(|m| {
+                    m.accepted_schemes().iter().any(|s| {
+                        matches!(
+                            s,
+                            pay_types::metering::Scheme::X402Exact
+                                | pay_types::metering::Scheme::X402Upto
+                                | pay_types::metering::Scheme::X402BatchSettlement
+                        )
+                    })
+                })
+            });
+            let x402 = if wants_x402 {
+                // Primary currency = the operator's first configured currency,
+                // resolved (symbol → MINT + decimals) exactly like the MPP path
+                // (`currency_configs`). The x402 settle path feeds `currency`
+                // straight into RPC calls, so it must be the mint, not "USDC".
+                let (primary_mint, primary_decimals) = currency_configs
+                    .first()
+                    .map(|(_, mint, decimals)| (mint.clone(), *decimals))
+                    .unwrap_or_else(|| {
+                        (
+                            pay_types::Stablecoin::Usdc
+                                .mint(Some(network.slug()))
+                                .to_string(),
+                            6,
+                        )
+                    });
+                // Advertise every configured currency when more than one.
+                let accepted_currencies = if currencies.len() > 1 {
+                    Some(currencies.clone())
+                } else {
+                    None
+                };
+                let cfg = pay_kit::x402::server::Config {
+                    recipient: recipient.clone(),
+                    currency: primary_mint,
+                    decimals: primary_decimals,
+                    network: network.slug().to_string(),
+                    rpc_url: Some(rpc_url.clone()),
+                    resource: api.subdomain.clone(),
+                    description: None,
+                    max_age: Some(300),
+                    token_program: None,
+                    accepted_currencies,
+                    // The operator co-signs fees only when configured to.
+                    fee_payer_key: if fee_payer {
+                        fee_payer_signer.as_ref().map(|s| s.pubkey().to_string())
+                    } else {
+                        None
+                    },
+                };
+                match pay_kit::x402::server::X402::new(cfg) {
+                    Ok(x) => Some(x),
+                    Err(e) => {
+                        eprintln!("x402 backend disabled ({e}); x402 schemes won't be offered");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
             let state = AppState {
                 apis: Arc::new(vec![api.clone()]),
                 mpps,
@@ -943,6 +1037,7 @@ impl StartCommand {
                 browser_rpc_url: Some(BROWSER_RPC_PROXY_PATH.to_string()),
                 fee_payer_wallet,
                 fee_payer_signer: fee_payer_signer.clone(),
+                x402,
             };
 
             let pdb_state = if debugger {
@@ -1324,12 +1419,15 @@ fn serve_openapi(
     headers: &axum::http::HeaderMap,
 ) -> Response {
     let mut out = (*doc).clone();
-    if proxy_mode {
-        let public_url = public_override
-            .map(str::to_string)
-            .unwrap_or_else(|| derive_public_url_from_host(headers));
-        pay_core::server::openapi::rewrite_urls(&mut out, &public_url);
-    }
+    // Rewrite `servers[].url` to point at the gateway. In proxy mode this
+    // retargets the upstream doc's servers; for a synthesized doc (respond mode)
+    // it turns the placeholder `/` into the absolute gateway URL. Harmless when
+    // there are no rewritable URLs.
+    let _ = proxy_mode;
+    let public_url = public_override
+        .map(str::to_string)
+        .unwrap_or_else(|| derive_public_url_from_host(headers));
+    pay_core::server::openapi::rewrite_urls(&mut out, &public_url);
     axum::Json(out).into_response()
 }
 
