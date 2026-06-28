@@ -243,6 +243,111 @@ pub fn select_challenge_by_balance<'a>(
     )))
 }
 
+/// A payment option chosen across both protocols by [`choose_payment`].
+pub enum ChosenPayment {
+    /// Settle via an MPP charge challenge.
+    Mpp(Box<Challenge>),
+    /// Settle via the x402 alternative advertised on the same 402.
+    X402(Box<crate::client::x402::Challenge>),
+}
+
+/// Choose how to pay a 402, across *both* MPP charge challenges and an x402
+/// alternative, by what the wallet can actually fund.
+///
+/// This is the balance-aware, cross-protocol replacement for
+/// [`select_challenge_by_balance`]: it builds the funded-token set from the
+/// wallet's on-chain stablecoin balances and delegates ranking to
+/// [`pay_kit::select_payment_parsed`] (default strategy:
+/// [`HighestBalance`](pay_kit::OrderingStrategy::HighestBalance)). This
+/// is what lets a wallet holding only USDC settle a USDC x402 offer even when
+/// the server's MPP challenge is denominated in a coin the wallet doesn't hold.
+///
+/// Falls back to the first MPP challenge (legacy behavior) when balances can't
+/// be fetched or no wallet exists for the network, so older paths keep working.
+pub fn choose_payment(
+    mpp_challenges: &[Challenge],
+    x402_alternative: Option<&crate::client::x402::Challenge>,
+    store: &dyn AccountsStore,
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+) -> Result<ChosenPayment> {
+    let candidates = decoded_charge_candidates(mpp_challenges, network_override)?;
+
+    // Network/RPC come from the first decodable MPP charge. With no decodable
+    // MPP candidate, the only thing left to honor is the x402 alternative.
+    let Some(first) = candidates.first() else {
+        return x402_alternative
+            .cloned()
+            .map(|c| ChosenPayment::X402(Box::new(c)))
+            .ok_or_else(|| Error::Mpp("No usable payment challenge".to_string()));
+    };
+
+    let legacy_first_mpp =
+        || ChosenPayment::Mpp(Box::new(mpp_challenges[candidates[0].index].clone()));
+
+    let network = normalize_network(&first.network);
+    let pubkey = match account_pubkey_for_network(store, network, account_override)? {
+        Some(pubkey) => pubkey,
+        None => return Ok(legacy_first_mpp()),
+    };
+
+    let rpc_url = resolve_rpc_url(&first.network, first.embedded_blockhash.as_deref());
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| Error::Mpp(format!("Failed to create runtime: {e}")))?;
+
+    if first.user_opted_into_sandbox
+        && let Err(e) = rt.block_on(crate::client::sandbox::fund_via_surfpool(&rpc_url, &pubkey))
+    {
+        warn!(error = %e, "Could not auto-fund wallet via Surfpool before payment selection");
+    }
+
+    let balances = match rt.block_on(crate::client::balance::get_stablecoin_balances(
+        &rpc_url, &pubkey,
+    )) {
+        Ok(balances) => balances,
+        Err(e) => {
+            warn!(error = %e, %rpc_url, %pubkey, "Could not fetch balances for payment selection");
+            return Ok(legacy_first_mpp());
+        }
+    };
+
+    // The wallet's spendable stablecoins become the (mint, network, available)
+    // preference set. pay-kit normalizes advertised currencies to mints with
+    // the same registry, so both sides speak mint addresses.
+    let funded: Vec<pay_kit::AcceptableToken> = balances
+        .tokens
+        .iter()
+        .map(|t| pay_kit::AcceptableToken {
+            mint: t.mint.clone(),
+            network: network.to_string(),
+            available: t.raw_amount,
+        })
+        .collect();
+
+    let x402_accepts: Vec<pay_kit::x402::exact::PaymentRequirements> = x402_alternative
+        .map(|c| c.requirements.clone())
+        .into_iter()
+        .collect();
+
+    match pay_kit::select_payment_parsed(
+        mpp_challenges,
+        &x402_accepts,
+        &funded,
+        &pay_kit::OrderingStrategy::HighestBalance,
+    ) {
+        Ok(pay_kit::SelectedPayment::Mpp { challenge, .. }) => {
+            Ok(ChosenPayment::Mpp(challenge))
+        }
+        Ok(pay_kit::SelectedPayment::X402 { .. }) => x402_alternative
+            .cloned()
+            .map(|c| ChosenPayment::X402(Box::new(c)))
+            .ok_or_else(|| Error::Mpp("x402 selected but no challenge available".to_string())),
+        Err(e) => Err(Error::PaymentRejected(e.to_string())),
+    }
+}
+
 #[derive(Debug, Clone)]
 struct DecodedChargeCandidate {
     index: usize,

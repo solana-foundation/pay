@@ -4120,7 +4120,7 @@ dependencies = [
  "httpdate",
  "itoa",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.4.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -6507,12 +6507,13 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yml",
+ "solana-pay-core",
 ]
 
 [[package]]
 name = "payment-channels-client"
 version = "0.1.0"
-source = "git+https://github.com/solana-foundation/pay-kit?branch=feat%2Fpayment-channel-refactor#8ae383288b17f9552091edb02aea1c6cb3a3d6ff"
+source = "git+https://github.com/solana-foundation/pay-kit?branch=main#dfeed3d93baef99212271740decba6f012db6018"
 dependencies = [
  "borsh 1.7.0",
  "num-derive",
@@ -6830,7 +6831,7 @@ dependencies = [
  "async-trait",
  "derivative",
  "fnv",
- "futures 0.1.31",
+ "futures 0.3.32",
  "http 1.4.2",
  "log",
  "pingora-core",
@@ -8786,16 +8787,6 @@ dependencies = [
 
 [[package]]
 name = "socket2"
-version = "0.5.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e22376abed350d73dd1cd119b57ffccad95b4e585a7cda43e286245ce23c0678"
-dependencies = [
- "libc",
- "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "socket2"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
@@ -10519,7 +10510,7 @@ dependencies = [
 [[package]]
 name = "solana-mpp"
 version = "0.6.0"
-source = "git+https://github.com/solana-foundation/pay-kit?branch=feat%2Fpayment-channel-refactor#8ae383288b17f9552091edb02aea1c6cb3a3d6ff"
+source = "git+https://github.com/solana-foundation/pay-kit?branch=main#798f0893ab8c5e8ec03ce77a9325e98cbf376fbf"
 dependencies = [
  "base64 0.22.1",
  "bincode",
@@ -10742,12 +10733,11 @@ dependencies = [
 [[package]]
 name = "solana-pay-core"
 version = "0.1.0"
-source = "git+https://github.com/solana-foundation/pay-kit?branch=feat%2Fpayment-channel-refactor#8ae383288b17f9552091edb02aea1c6cb3a3d6ff"
+source = "git+https://github.com/solana-foundation/pay-kit?branch=main#dfeed3d93baef99212271740decba6f012db6018"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bincode",
- "blake3",
  "borsh 1.7.0",
  "bs58",
  "ed25519-dalek 2.2.0",
@@ -10762,6 +10752,7 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "solana-address 2.5.0",
  "solana-hash 3.1.0",
  "solana-instruction 3.2.0",
@@ -10781,8 +10772,9 @@ dependencies = [
 [[package]]
 name = "solana-pay-kit"
 version = "0.1.0"
-source = "git+https://github.com/solana-foundation/pay-kit?branch=feat%2Fpayment-channel-refactor#8ae383288b17f9552091edb02aea1c6cb3a3d6ff"
+source = "git+https://github.com/solana-foundation/pay-kit?branch=main#798f0893ab8c5e8ec03ce77a9325e98cbf376fbf"
 dependencies = [
+ "serde_json",
  "solana-mpp",
  "solana-x402",
 ]
@@ -13153,7 +13145,7 @@ dependencies = [
 [[package]]
 name = "solana-x402"
 version = "0.1.0"
-source = "git+https://github.com/solana-foundation/pay-kit?branch=feat%2Fpayment-channel-refactor#8ae383288b17f9552091edb02aea1c6cb3a3d6ff"
+source = "git+https://github.com/solana-foundation/pay-kit?branch=main#798f0893ab8c5e8ec03ce77a9325e98cbf376fbf"
 dependencies = [
  "base64 0.22.1",
  "bincode",
@@ -13873,7 +13865,7 @@ dependencies = [
 [[package]]
 name = "subscriptions-client"
 version = "0.1.0"
-source = "git+https://github.com/solana-foundation/pay-kit?branch=feat%2Fpayment-channel-refactor#8ae383288b17f9552091edb02aea1c6cb3a3d6ff"
+source = "git+https://github.com/solana-foundation/pay-kit?branch=main#798f0893ab8c5e8ec03ce77a9325e98cbf376fbf"
 dependencies = [
  "borsh 1.7.0",
  "num-derive",

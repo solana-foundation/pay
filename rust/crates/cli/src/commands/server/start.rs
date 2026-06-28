@@ -676,6 +676,8 @@ impl StartCommand {
                     min_voucher_delta: sess.min_voucher_delta,
                     modes: modes.clone(),
                     pull_voucher_strategy: sdk_pull_voucher_strategy,
+                    grace_period_seconds:
+                        pay_kit::mpp::program::payment_channels::DEFAULT_GRACE_PERIOD_SECONDS,
                     rpc_url: Some(rpc_url.clone()),
                     program_id: Some(channel_program_id),
                 };

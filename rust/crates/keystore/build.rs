@@ -37,9 +37,16 @@ fn main() {
         // Match the helper's CPU arch to the crate's target arch — otherwise
         // an arm64 build host produces an arm64 helper even when cross-compiling
         // for x86_64-apple-darwin, which fails with EBADARCH at runtime on Intel.
+        // `CARGO_CFG_TARGET_ARCH` uses the LLVM name `aarch64`; swiftc's target
+        // triple expects Apple's `arm64`, so remap before building the triple.
         let target_arch =
             std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| "x86_64".to_string());
-        let swift_target = format!("{target_arch}-apple-macos11");
+        let swift_arch = if target_arch == "aarch64" {
+            "arm64"
+        } else {
+            &target_arch
+        };
+        let swift_target = format!("{swift_arch}-apple-macos11");
 
         let status = std::process::Command::new(SWIFTC)
             .args(["-O", "-target", &swift_target, "-o"])
