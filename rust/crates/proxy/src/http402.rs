@@ -27,11 +27,12 @@ use bytes::Bytes;
 use http::{HeaderMap, StatusCode, Uri};
 use pay_core::PaymentState;
 use pay_core::server::gate::{
-    GateDecision, GateRequest, GateResponse, PaymentGate, ReceiptAnnotation,
+    GateDecision, GateRequest, GateResponse, PaymentGate, ReceiptAnnotation, settle_upto,
 };
 use pay_core::server::proxy::{
     STRIP_HEADERS, UpstreamPlan, prepare_upstream, routing_signs_request_body,
 };
+use pay_kit::x402::server::VerifiedUptoOpen;
 use pay_types::metering::ApiSpec;
 use pingora::http::{RequestHeader, ResponseHeader};
 use pingora::proxy::{ProxyHttp, Session};
@@ -57,6 +58,10 @@ enum Target {
 pub struct Ctx {
     target: Option<Target>,
     receipt: Option<ReceiptAnnotation>,
+    /// An x402 `upto` channel opened pre-serve, settled in `response_filter`
+    /// (debit on success) or `logging` (refund when the upstream never
+    /// responded). Taken when settled, so it's never double-settled.
+    upto: Option<VerifiedUptoOpen>,
     /// Captured at `request_filter` for the Payment Debugger exchange emitted
     /// in `logging` (the data plane is Pingora, so the old axum logging
     /// middleware never sees proxied traffic).
@@ -178,6 +183,7 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
         Ctx {
             target: None,
             receipt: None,
+            upto: None,
             log: None,
         }
     }
@@ -236,8 +242,11 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                 write_gate_response(session, r).await?;
                 Ok(true)
             }
-            GateDecision::Forward { receipt, .. } => {
+            GateDecision::Forward { receipt, upto, .. } => {
                 ctx.receipt = receipt;
+                // x402 `upto`: the channel is open; hold it for post-response
+                // settlement (response_filter on success, logging on failure).
+                ctx.upto = upto.map(|u| *u.open);
                 // A verified payment must reach the real upstream — never the
                 // control-plane axum (`control_plane_ok = false`), even for a
                 // root (`path: ""`) endpoint.
@@ -334,6 +343,16 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                 tracing::Span::current().record("tx_sig", reference.as_str());
             }
         }
+        // x402 `upto`: the upstream responded, so settle the channel now (debit
+        // on a 2xx, refund otherwise) and attach the PAYMENT-RESPONSE receipt
+        // before the response streams downstream. `take` so `logging` won't
+        // double-settle.
+        if let Some(open) = ctx.upto.take() {
+            let served_ok = upstream_response.status.is_success();
+            if let Some((name, value)) = settle_upto(&self.state, open, served_ok).await {
+                let _ = upstream_response.insert_header(name, value);
+            }
+        }
         Ok(())
     }
 
@@ -345,6 +364,12 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
     where
         Self::CTX: Send + Sync,
     {
+        // An x402 `upto` channel still held here means `response_filter` never
+        // ran (the upstream connect/response failed) — refund the full deposit
+        // so the client's funds aren't stranded in an open channel.
+        if let Some(open) = ctx.upto.take() {
+            let _ = settle_upto(&self.state, open, false).await;
+        }
         let Some(log) = ctx.log.take() else {
             return;
         };

@@ -92,6 +92,7 @@ struct AppState {
     fee_payer_wallet: Option<FeePayerWallet>,
     fee_payer_signer: Option<Arc<dyn SolanaSigner>>,
     x402: Option<pay_kit::x402::server::X402>,
+    x402_upto: Option<pay_kit::x402::server::X402Upto>,
     pdb: Option<pay_pdb::PdbState>,
 }
 
@@ -122,6 +123,9 @@ impl PaymentState for AppState {
     }
     fn x402(&self) -> Option<&pay_kit::x402::server::X402> {
         self.x402.as_ref()
+    }
+    fn x402_upto(&self) -> Option<&pay_kit::x402::server::X402Upto> {
+        self.x402_upto.as_ref()
     }
     fn record_exchange(&self, exchange: pay_core::HttpExchange) {
         let Some(pdb) = &self.pdb else {
@@ -1000,22 +1004,23 @@ impl StartCommand {
                     })
                 })
             });
+            // Primary currency = the operator's first configured currency,
+            // resolved (symbol → MINT + decimals) exactly like the MPP path
+            // (`currency_configs`). The x402 settle path feeds `currency`
+            // straight into RPC calls, so it must be the mint, not "USDC".
+            // Shared by the `exact` and `upto` backends.
+            let (x402_mint, x402_decimals) = currency_configs
+                .first()
+                .map(|(_, mint, decimals)| (mint.clone(), *decimals))
+                .unwrap_or_else(|| {
+                    (
+                        pay_types::Stablecoin::Usdc
+                            .mint(Some(network.slug()))
+                            .to_string(),
+                        6,
+                    )
+                });
             let x402 = if wants_x402 {
-                // Primary currency = the operator's first configured currency,
-                // resolved (symbol → MINT + decimals) exactly like the MPP path
-                // (`currency_configs`). The x402 settle path feeds `currency`
-                // straight into RPC calls, so it must be the mint, not "USDC".
-                let (primary_mint, primary_decimals) = currency_configs
-                    .first()
-                    .map(|(_, mint, decimals)| (mint.clone(), *decimals))
-                    .unwrap_or_else(|| {
-                        (
-                            pay_types::Stablecoin::Usdc
-                                .mint(Some(network.slug()))
-                                .to_string(),
-                            6,
-                        )
-                    });
                 // Advertise every configured currency when more than one.
                 let accepted_currencies = if currencies.len() > 1 {
                     Some(currencies.clone())
@@ -1024,8 +1029,8 @@ impl StartCommand {
                 };
                 let cfg = pay_kit::x402::server::Config {
                     recipient: recipient.clone(),
-                    currency: primary_mint,
-                    decimals: primary_decimals,
+                    currency: x402_mint.clone(),
+                    decimals: x402_decimals,
                     network: network.slug().to_string(),
                     rpc_url: Some(rpc_url.clone()),
                     resource: api.subdomain.clone(),
@@ -1051,6 +1056,35 @@ impl StartCommand {
                 None
             };
 
+            // x402 `upto` backend — open-before-serve, settle-after. Requires the
+            // operator signer (it co-signs the channel open as fee payer and signs
+            // settlement vouchers), so it's only available with a fee-payer signer.
+            let x402_upto = match (wants_x402, fee_payer_signer.clone()) {
+                (true, Some(signer)) => {
+                    let cfg = pay_kit::x402::server::UptoConfig {
+                        recipient: recipient.clone(),
+                        currency: x402_mint.clone(),
+                        decimals: x402_decimals,
+                        cluster: network.slug().to_string(),
+                        rpc_url: Some(rpc_url.clone()),
+                        resource: api.subdomain.clone(),
+                        description: None,
+                        max_timeout_seconds: 300,
+                        token_program: None,
+                        program_id: None,
+                        operator_signer: signer,
+                    };
+                    match pay_kit::x402::server::X402Upto::new(cfg) {
+                        Ok(u) => Some(u),
+                        Err(e) => {
+                            eprintln!("x402 upto backend disabled ({e})");
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            };
+
             let pdb_state = if debugger {
                 let pdb_config = build_pdb_config(&api, &recipient, network.slug(), &rpc_url);
                 let pdb = pay_pdb::PdbState::new(pdb_config);
@@ -1068,6 +1102,7 @@ impl StartCommand {
                 fee_payer_wallet,
                 fee_payer_signer: fee_payer_signer.clone(),
                 x402,
+                x402_upto,
                 // The gate calls `record_exchange` per proxied request to feed PDB.
                 pdb: pdb_state.clone(),
             };

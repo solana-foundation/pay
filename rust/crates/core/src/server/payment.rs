@@ -74,7 +74,7 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
         query: query.as_deref(),
         x402_payment: x402_payment.as_deref(),
     };
-    let gate = PaymentGate::new(state);
+    let gate = PaymentGate::new(state.clone());
     match gate.evaluate(&gate_req).await {
         GateDecision::Respond(r) => {
             let mut builder = Response::builder().status(r.status);
@@ -85,7 +85,11 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
                 .body(Body::from(r.body))
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
-        GateDecision::Forward { session, receipt } => {
+        GateDecision::Forward {
+            session,
+            receipt,
+            upto,
+        } => {
             let mut req = req;
             if let Some(sf) = session {
                 req.extensions_mut().insert(SessionStreamContext::new(
@@ -95,6 +99,16 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
                 ));
             }
             let mut response = next.run(req).await;
+            // x402 `upto`: settle the opened channel *after* serving — debit the
+            // metered amount on success, refund on failure.
+            if let Some(uf) = upto {
+                let served_ok = response.status().is_success();
+                if let Some((n, v)) =
+                    crate::server::gate::settle_upto(&state, *uf.open, served_ok).await
+                {
+                    response.headers_mut().append(n, v);
+                }
+            }
             if let Some(ann) = receipt {
                 for (n, v) in ann.headers {
                     response.headers_mut().append(n, v);

@@ -23,7 +23,9 @@ use pay_kit::mpp::{
     format_www_authenticate_many, parse_authorization,
 };
 use pay_kit::x402::PAYMENT_RESPONSE_HEADER;
-use pay_kit::x402::server::{ExactOptions, VerifiedExactPayment, X402, X402BatchSettlement};
+use pay_kit::x402::server::{
+    ExactOptions, VerifiedExactPayment, VerifiedUptoOpen, X402, X402BatchSettlement, X402Upto,
+};
 use pay_types::metering::Scheme;
 use serde_json::json;
 
@@ -113,6 +115,19 @@ pub struct SessionForward {
     pub committed_base_units: u64,
 }
 
+/// An x402 `upto` channel opened (and confirmed on-chain) before the resource
+/// is served, carried to the adapter's post-response hook for settlement.
+///
+/// `upto` is settle-after-serve: the adapter forwards, then settles the metered
+/// amount on success (`open.max_amount`) or refunds (`0`) on failure. The
+/// settlement runs `state.x402_upto().settle_actual(&open, amount)`. Holds the
+/// `!Clone` [`VerifiedUptoOpen`] (with its in-flight guard) until settled.
+pub struct UptoForward {
+    /// Boxed — `VerifiedUptoOpen` is large, and boxing keeps the common
+    /// `GateDecision` variants small (clippy `large_enum_variant`).
+    pub open: Box<VerifiedUptoOpen>,
+}
+
 /// The outcome of gating a request.
 pub enum GateDecision {
     /// Send this response now and stop (402 challenge, service-worker JS, 404,
@@ -121,10 +136,12 @@ pub enum GateDecision {
     /// Payment verified — forward to the endpoint's configured upstream. When a
     /// session credential opened/advanced a channel, `session` carries the
     /// stream-metering context the adapter attaches to the upstream request;
-    /// `receipt` is applied to the response.
+    /// `receipt` is applied to the response. For x402 `upto`, `upto` carries the
+    /// opened channel the adapter settles *after* the response.
     Forward {
         session: Option<SessionForward>,
         receipt: Option<ReceiptAnnotation>,
+        upto: Option<UptoForward>,
     },
     /// Not gated (discovery / free / unknown) — let normal routing handle it
     /// (forward to the default upstream, or serve a control-plane route).
@@ -286,23 +303,12 @@ impl<S: PaymentState> PaymentGate<S> {
                     .x402_batch_verify(batch, meter, req, path, pay_header, subdomain)
                     .await;
             }
-            if accepted.contains(&Scheme::X402Upto) {
-                // `upto` is verify-open → meter-usage → settle-after: a
-                // post-handler lifecycle that lands with the adapter phase
-                // (alongside session-stream metering). Not implemented yet —
-                // return a clean 501 rather than `unimplemented!()`, which would
-                // panic the request worker for an operator-configured scheme +
-                // client x402 header (a crash on untrusted input).
-                tracing::error!(
-                    path,
-                    "x402 `upto` scheme is configured on this endpoint but not yet implemented by the gate"
-                );
-                return GateDecision::Respond(GateResponse::json(
-                    StatusCode::NOT_IMPLEMENTED,
-                    Bytes::from_static(
-                        b"{\"error\":\"unsupported_scheme\",\"message\":\"x402 upto is not yet supported by this gateway.\"}",
-                    ),
-                ));
+            if accepted.contains(&Scheme::X402Upto)
+                && let Some(upto) = self.state.x402_upto()
+            {
+                return self
+                    .x402_upto_verify(upto, meter, req, path, pay_header, subdomain)
+                    .await;
             }
         }
 
@@ -445,6 +451,27 @@ impl<S: PaymentState> PaymentGate<S> {
             }
         }
 
+        if accepted.contains(&Scheme::X402Upto)
+            && let Some(upto) = self.state.x402_upto()
+        {
+            // The advertised ceiling: the metered charge for this request. The
+            // client funds a channel with this as the deposit; settlement debits
+            // the actual (== ceiling on success, 0 → full refund on failure).
+            let amount = crate::server::payment::charge_amount_from_price(price.as_ref());
+            match upto.payment_required_header(&amount) {
+                Ok((name, value)) => {
+                    if let (Ok(n), Ok(v)) = (
+                        HeaderName::from_bytes(name.as_bytes()),
+                        HeaderValue::from_str(&value),
+                    ) {
+                        challenge_headers.push((n, v));
+                        advertised.push("x402-upto");
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "x402 upto challenge generation failed"),
+            }
+        }
+
         if accepted.contains(&Scheme::X402BatchSettlement)
             && let Some(batch) = self.state.x402_batch()
         {
@@ -561,11 +588,55 @@ impl<S: PaymentState> PaymentGate<S> {
                             headers,
                             reference: Some(reference),
                         }),
+                        upto: None,
                     }
                 }
                 None => reject("x402 payment carried no settlement reference".to_string()),
             },
             Err(e) => reject(e.to_string()),
+        }
+    }
+
+    /// Verify an x402 `upto` authorization: broadcast + confirm the channel
+    /// `open` on-chain (deposit = the advertised ceiling), then forward. The
+    /// channel is settled *after* the response by the adapter ([`UptoForward`]) —
+    /// the metered amount on a successful serve, `0` (full refund) on failure.
+    /// On a verification failure, re-challenge with 402.
+    async fn x402_upto_verify(
+        &self,
+        upto: &X402Upto,
+        meter: &pay_types::metering::Metering,
+        req: &GateRequest<'_>,
+        path: &str,
+        pay_header: &str,
+        subdomain: &str,
+    ) -> GateDecision {
+        let props = metering::RequestProperties {
+            body_size: req.content_length,
+            ..Default::default()
+        };
+        let variant = variant_hint_from_path(path);
+        let amount = crate::server::payment::charge_amount_from_price(
+            metering::resolve_price(meter, &props, variant.as_deref(), None).as_ref(),
+        );
+        match upto.verify_open(pay_header, &amount).await {
+            Ok(open) => GateDecision::Forward {
+                session: None,
+                receipt: None,
+                upto: Some(UptoForward {
+                    open: Box::new(open),
+                }),
+            },
+            Err(e) => {
+                telemetry::record_settlement_error("x402", subdomain, path, &e.to_string(), true);
+                GateDecision::Respond(GateResponse::json(
+                    StatusCode::PAYMENT_REQUIRED,
+                    serde_json::to_vec(
+                        &json!({"error":"verification_failed","message":e.to_string()}),
+                    )
+                    .unwrap_or_default(),
+                ))
+            }
         }
     }
 
@@ -613,6 +684,7 @@ impl<S: PaymentState> PaymentGate<S> {
                     GateDecision::Forward {
                         session: None,
                         receipt: Some(ReceiptAnnotation { headers, reference }),
+                        upto: None,
                     }
                 } else {
                     // Cooperative refund / channel close — acknowledge, don't serve.
@@ -772,6 +844,7 @@ impl<S: PaymentState> PaymentGate<S> {
                 return GateDecision::Forward {
                     session: None,
                     receipt: None,
+                    upto: None,
                 };
             }
             return challenge_402(None);
@@ -815,6 +888,7 @@ impl<S: PaymentState> PaymentGate<S> {
                         headers,
                         reference: Some(receipt_kind.base().reference.clone()),
                     }),
+                    upto: None,
                 }
             }
             Err(e) => {
@@ -954,6 +1028,7 @@ impl<S: PaymentState> PaymentGate<S> {
                             headers,
                             reference: Some(reference),
                         }),
+                        upto: None,
                     };
                 }
                 Err(e) => last_error = Some(e),
@@ -972,6 +1047,41 @@ impl<S: PaymentState> PaymentGate<S> {
             }))
             .unwrap_or_default(),
         ))
+    }
+}
+
+/// Settle an x402 `upto` channel after the resource was served (the adapter's
+/// post-response hook). Debits the metered ceiling (`open.max_amount`) on a
+/// successful serve, refunds the full deposit (settle `0`) on failure, and
+/// finalizes the channel on-chain. Returns the `PAYMENT-RESPONSE` receipt header
+/// to set on the response. Settlement errors are logged, not surfaced — the
+/// resource was already served, so a failed settle is an operator/on-chain retry
+/// concern (the channel store sweeps it), not a client error.
+pub async fn settle_upto<S: PaymentState>(
+    state: &S,
+    open: VerifiedUptoOpen,
+    served_ok: bool,
+) -> Option<(HeaderName, HeaderValue)> {
+    let upto = state.x402_upto()?;
+    let amount = if served_ok { open.max_amount } else { 0 };
+    match upto.settle_actual(&open, amount).await {
+        Ok(settlement) => {
+            tracing::Span::current().record("tx_sig", settlement.transaction.as_str());
+            match upto.settlement_header(&settlement) {
+                Ok((name, value)) => Some((
+                    HeaderName::from_bytes(name.as_bytes()).ok()?,
+                    HeaderValue::from_str(&value).ok()?,
+                )),
+                Err(e) => {
+                    tracing::warn!(error = %e, "x402 upto settlement header generation failed");
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "x402 upto settle_actual failed; channel left for sweep");
+            None
+        }
     }
 }
 
@@ -1028,6 +1138,7 @@ async fn session_authorized(
                 committed_base_units: state.cumulative,
             }),
             receipt: None,
+            upto: None,
         },
         Ok(SessionOutcome::Voucher {
             channel_id,
@@ -1039,6 +1150,7 @@ async fn session_authorized(
                 committed_base_units: cumulative,
             }),
             receipt: None,
+            upto: None,
         },
         Ok(SessionOutcome::Commit(receipt)) => {
             telemetry::record_paid_request_completed(
