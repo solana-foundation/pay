@@ -135,7 +135,9 @@ fn warn_on_unmatched_endpoints(doc: &Value, endpoints: &[Endpoint]) {
         let canon = canonical_path(&e.path);
         let endpoint_loose = loose_path_key(&canon);
         let hit = served.iter().any(|(m, p)| {
-            *m == method && (*p == canon || (endpoint_loose.is_some() && loose_path_key(p) == endpoint_loose))
+            *m == method
+                && (*p == canon
+                    || (endpoint_loose.is_some() && loose_path_key(p) == endpoint_loose))
         });
         if hit {
             covered += 1;
@@ -394,9 +396,7 @@ fn op_matches(
         return true;
     }
     match loose_path_key(canon) {
-        Some((version, anchor)) => {
-            allowed_loose.contains(&(method.to_string(), version, anchor))
-        }
+        Some((version, anchor)) => allowed_loose.contains(&(method.to_string(), version, anchor)),
         None => false,
     }
 }
@@ -1483,9 +1483,18 @@ mod tests {
         });
         // Gateway YAML declares the *expanded* paths.
         let endpoints = vec![
-            ep(Post, "v3/projects/{projectsId}/locations/{locationsId}:translateText"),
-            ep(Post, "v3/projects/{projectsId}/locations/{locationsId}:detectLanguage"),
-            ep(Get, "v3/projects/{projectsId}/locations/{locationsId}/supportedLanguages"),
+            ep(
+                Post,
+                "v3/projects/{projectsId}/locations/{locationsId}:translateText",
+            ),
+            ep(
+                Post,
+                "v3/projects/{projectsId}/locations/{locationsId}:detectLanguage",
+            ),
+            ep(
+                Get,
+                "v3/projects/{projectsId}/locations/{locationsId}/supportedLanguages",
+            ),
         ];
         filter_to_endpoints(&mut doc, &endpoints);
 
@@ -1736,8 +1745,14 @@ mod tests {
         assert_eq!(
             ops,
             vec![
-                ("GET".to_string(), "bigquery/v2/projects/{*}/queries".to_string()),
-                ("POST".to_string(), "bigquery/v2/projects/{*}/queries".to_string()),
+                (
+                    "GET".to_string(),
+                    "bigquery/v2/projects/{*}/queries".to_string()
+                ),
+                (
+                    "POST".to_string(),
+                    "bigquery/v2/projects/{*}/queries".to_string()
+                ),
             ]
         );
     }
@@ -1761,7 +1776,10 @@ mod tests {
         let ops = collect_doc_operations(&doc);
         assert_eq!(
             ops,
-            vec![("POST".to_string(), "v3/projects/{*}:translateText".to_string())]
+            vec![(
+                "POST".to_string(),
+                "v3/projects/{*}:translateText".to_string()
+            )]
         );
     }
 

@@ -337,9 +337,7 @@ pub fn choose_payment(
         &funded,
         &pay_kit::OrderingStrategy::HighestBalance,
     ) {
-        Ok(pay_kit::SelectedPayment::Mpp { challenge, .. }) => {
-            Ok(ChosenPayment::Mpp(challenge))
-        }
+        Ok(pay_kit::SelectedPayment::Mpp { challenge, .. }) => Ok(ChosenPayment::Mpp(challenge)),
         Ok(pay_kit::SelectedPayment::X402 { .. }) => x402_alternative
             .cloned()
             .map(|c| ChosenPayment::X402(Box::new(c)))
