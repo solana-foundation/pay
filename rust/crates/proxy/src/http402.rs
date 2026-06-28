@@ -406,6 +406,13 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
             client_ip: log.client_ip,
         });
     }
+
+    /// Don't log downstream disconnects as proxy errors — a client closing a
+    /// long-lived stream (e.g. the PDB `/__402/pdb/logs/stream` SSE on a tab
+    /// close/refresh) is benign, not a gateway failure.
+    fn suppress_error_log(&self, _session: &Session, _ctx: &Ctx, e: &pingora::Error) -> bool {
+        matches!(e.esource(), pingora::ErrorSource::Downstream)
+    }
 }
 
 /// Collect an `http::HeaderMap` into `(name, value)` string pairs for PDB.
