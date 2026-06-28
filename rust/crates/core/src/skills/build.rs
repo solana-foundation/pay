@@ -906,7 +906,14 @@ fn build_detail_endpoints(
             .iter()
             .map(|r| pay_types::registry::ProbeEndpoint {
                 method: r.spec.method.clone(),
-                path: r.spec.path.clone(),
+                // Append the example query string for probing only; the
+                // published `spec.path` (below) stays clean. Without the query,
+                // GETs that require parameters 4xx/5xx before the paywall and
+                // get pruned.
+                path: match &r.query_example {
+                    Some(q) => format!("{}?{}", r.spec.path, q),
+                    None => r.spec.path.clone(),
+                },
                 metered: true,
                 body: r.body_example.clone(),
             })
@@ -1049,6 +1056,7 @@ mod tests {
                 pricing,
             },
             body_example: None,
+            query_example: None,
         }
     }
 
@@ -1097,6 +1105,18 @@ mod tests {
                 x402_body("solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"),
             ),
             "/free" => ("200 OK", r#"{"items":[]}"#.to_string()),
+            // Returns 200 only when the required query param is present —
+            // simulates an endpoint that 400s when probed bare.
+            p if p.starts_with("/needs-query") => {
+                if p.contains("country_code=us") {
+                    ("200 OK", r#"{"items":[]}"#.to_string())
+                } else {
+                    (
+                        "400 Bad Request",
+                        r#"{"error":"country_code required"}"#.to_string(),
+                    )
+                }
+            }
             "/wrong-chain" => ("402 Payment Required", x402_body("eip155:8453")),
             "/auth" => (
                 "401 Unauthorized",
@@ -1177,5 +1197,41 @@ mod tests {
         assert!(free.protocol.is_empty());
         assert!(free.supported_usd.is_empty());
         assert!(free.spec.pricing.is_none());
+    }
+
+    #[test]
+    fn build_appends_query_example_to_probe_keeping_spec_path_clean() {
+        let (service_url, handle) = start_probe_server(1);
+        // GET /needs-query 400s when probed bare; with the example query it 200s
+        // and is published as free. The published spec.path must stay clean.
+        let endpoints = vec![crate::skills::openapi::ResolvedEndpoint {
+            spec: EndpointSpec {
+                method: "GET".to_string(),
+                path: "/needs-query".to_string(),
+                description: "List things in a country".to_string(),
+                resource: None,
+                pricing: None,
+            },
+            body_example: None,
+            query_example: Some("country_code=us".to_string()),
+        }];
+        let options = BuildOptions {
+            probe: true,
+            probe_config: crate::skills::probe::ProbeConfig {
+                timeout_secs: 2,
+                concurrency: 1,
+                ..Default::default()
+            },
+            only: None,
+            previous_dist: None,
+        };
+
+        let detail = build_detail_endpoints("test/provider", &service_url, endpoints, &options);
+        handle.join().expect("server thread");
+
+        assert_eq!(detail.len(), 1, "query-bearing GET should be kept");
+        assert_eq!(detail[0].probe_status.as_deref(), Some("free"));
+        // Published path is clean — the query was probe-only.
+        assert_eq!(detail[0].spec.path, "/needs-query");
     }
 }

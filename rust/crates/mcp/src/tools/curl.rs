@@ -19,6 +19,10 @@ pub struct Params {
         description = "Request body for POST/PUT/PATCH. Pass either a string or a JSON value; JSON values are serialized before sending and validated locally against cached Pay catalog OpenAPI schemas when available."
     )]
     pub body: Option<BodyParam>,
+    #[schemars(
+        description = "Path to a local file whose contents become the request body. Use this instead of `body` for large payloads you can't inline into the tool call — e.g. a JSON request embedding a base64-encoded image for an image-to-image model. Mutually exclusive with `body`."
+    )]
+    pub body_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -34,6 +38,27 @@ impl BodyParam {
             Self::Text(body) => Ok(body),
             Self::Json(value) => serde_json::to_string(&value),
         }
+    }
+}
+
+/// Resolve the outgoing request body from the mutually-exclusive `body`
+/// (inline) and `body_file` (path read from disk) params. `body_file` lets the
+/// caller send a payload too large to inline into a tool call — e.g. a JSON
+/// request embedding a base64-encoded image — by assembling it on disk first.
+fn resolve_body(
+    body: Option<BodyParam>,
+    body_file: Option<String>,
+) -> Result<Option<String>, String> {
+    match (body, body_file) {
+        (Some(_), Some(_)) => Err("Pass either `body` or `body_file`, not both.".to_string()),
+        (Some(inline), None) => inline
+            .into_string()
+            .map(Some)
+            .map_err(|err| format!("Failed to serialize request body: {err}")),
+        (None, Some(path)) => std::fs::read_to_string(&path)
+            .map(Some)
+            .map_err(|err| format!("Failed to read body_file '{path}': {err}")),
+        (None, None) => Ok(None),
     }
 }
 
@@ -68,16 +93,14 @@ pub async fn run(
     params: Params,
     peer: rmcp::Peer<rmcp::service::RoleServer>,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
-    let headers = prepare_headers(&params.headers, params.body.is_some());
-    let method = params.method.clone().unwrap_or_else(|| "GET".to_string());
-    let body = match params.body.clone().map(BodyParam::into_string).transpose() {
+    // Resolve the request body from either the inline `body` or `body_file`
+    // (a path read from disk, for payloads too large to inline into a tool call).
+    let body: Option<String> = match resolve_body(params.body.clone(), params.body_file.clone()) {
         Ok(body) => body,
-        Err(err) => {
-            return Ok(super::tool_error(format!(
-                "Failed to serialize request body: {err}"
-            )));
-        }
+        Err(message) => return Ok(super::tool_error(message)),
     };
+    let headers = prepare_headers(&params.headers, body.is_some());
+    let method = params.method.clone().unwrap_or_else(|| "GET".to_string());
     let url = params.url.clone();
 
     let response = tokio::task::spawn_blocking(move || {
@@ -860,6 +883,60 @@ mod tests {
         let params: Params = serde_json::from_str(json).unwrap();
         let body = params.body.unwrap().into_string().unwrap();
         assert_eq!(body, r#"["a","b"]"#);
+    }
+
+    #[test]
+    fn resolve_body_inline_text() {
+        let out = resolve_body(Some(BodyParam::Text("hello".to_string())), None).unwrap();
+        assert_eq!(out.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn resolve_body_inline_json_serialized() {
+        let out = resolve_body(
+            Some(BodyParam::Json(serde_json::json!({"q": 1}))),
+            None,
+        )
+        .unwrap();
+        assert_eq!(out.as_deref(), Some(r#"{"q":1}"#));
+    }
+
+    #[test]
+    fn resolve_body_none() {
+        assert_eq!(resolve_body(None, None).unwrap(), None);
+    }
+
+    #[test]
+    fn resolve_body_rejects_both() {
+        let err = resolve_body(
+            Some(BodyParam::Text("x".to_string())),
+            Some("/tmp/x".to_string()),
+        )
+        .unwrap_err();
+        assert!(err.contains("not both"));
+    }
+
+    #[test]
+    fn resolve_body_reads_file() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "pay-curl-bodyfile-test-{}.json",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&path, r#"{"from":"file"}"#).unwrap();
+        let out = resolve_body(None, Some(path.to_string_lossy().into_owned())).unwrap();
+        assert_eq!(out.as_deref(), Some(r#"{"from":"file"}"#));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn resolve_body_missing_file_errors() {
+        let err = resolve_body(None, Some("/no/such/file.json".to_string()))
+            .unwrap_err();
+        assert!(err.contains("Failed to read body_file"));
     }
 
     #[test]

@@ -19,6 +19,7 @@
 use std::time::Duration;
 
 use pay_types::registry::{EndpointSpec, OpenapiSource, ProviderFrontmatter};
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::blocking::Client;
 use serde_json::{Map, Value, json};
 use tracing::debug;
@@ -39,6 +40,14 @@ pub struct ResolvedEndpoint {
     /// Serialized JSON body. `None` for GET/DELETE or when the OpenAPI doc
     /// does not declare a request body for the operation.
     pub body_example: Option<String>,
+    /// Example query string (without a leading `?`) assembled from the
+    /// operation's `in: query` parameters that carry an example value, e.g.
+    /// `country_code=us&brand_name=Amazon.com`. Appended to the probe URL only
+    /// — `spec.path` stays clean for publishing. `None` when the operation
+    /// declares no example-bearing query parameters. Without this, any GET that
+    /// requires a query string is probed bare, 4xx/5xx's before reaching the
+    /// paywall, and gets pruned from the published catalog.
+    pub query_example: Option<String>,
 }
 
 /// Fetch / read the document referenced by `source` and synthesize an
@@ -141,10 +150,104 @@ fn parse_openapi3_endpoints(doc: &Value) -> Result<Vec<ResolvedEndpoint>> {
                 None
             };
 
-            endpoints.push(ResolvedEndpoint { spec, body_example });
+            let query_example = extract_query_example(item_obj, op);
+
+            endpoints.push(ResolvedEndpoint {
+                spec,
+                body_example,
+                query_example,
+            });
         }
     }
     Ok(endpoints)
+}
+
+/// Assemble an example query string from an operation's `in: query`
+/// parameters. Parameters are merged from the path-item level and the
+/// operation level (operation wins on `name` collisions, per OpenAPI), and a
+/// parameter is included only when it carries a resolvable example value.
+/// Returns `None` when no query parameter has an example. `$ref` parameters
+/// are skipped — committed specs are expected to inline their parameters.
+fn extract_query_example(item_obj: &Map<String, Value>, op: &Value) -> Option<String> {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // Operation-level first so it shadows path-item params of the same name.
+    let sources = [op.get("parameters"), item_obj.get("parameters")];
+    for params in sources.into_iter().flatten() {
+        let Some(arr) = params.as_array() else {
+            continue;
+        };
+        for param in arr {
+            if param.get("in").and_then(Value::as_str) != Some("query") {
+                continue;
+            }
+            let Some(name) = param.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            if !seen.insert(name.to_string()) {
+                continue; // already taken from a higher-precedence source
+            }
+            if let Some(value) = param_example_value(param) {
+                pairs.push((name.to_string(), value));
+            }
+        }
+    }
+
+    if pairs.is_empty() {
+        return None;
+    }
+    // Keep RFC3986 unreserved characters (`-._~`) literal so common key names
+    // like `country_code` and values like `Amazon.com` aren't mangled into
+    // `country%5Fcode` / `Amazon%2Ecom`; encode everything else.
+    const QUERY_SET: &AsciiSet = &NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'.')
+        .remove(b'_')
+        .remove(b'~');
+    let encode = |s: &str| utf8_percent_encode(s, QUERY_SET).to_string();
+    Some(
+        pairs
+            .iter()
+            .map(|(k, v)| format!("{}={}", encode(k), encode(v)))
+            .collect::<Vec<_>>()
+            .join("&"),
+    )
+}
+
+/// Resolve a single parameter's example to a query-string value. Priority:
+/// `example`, then `schema.example`, then the first `examples.<name>.value`
+/// (OpenAPI object form), then `schema.examples[0]` (3.1 array form). Only
+/// scalar JSON (string/number/bool) is usable in a query string.
+fn param_example_value(param: &Value) -> Option<String> {
+    let candidate = param
+        .get("example")
+        .or_else(|| param.pointer("/schema/example"))
+        .or_else(|| {
+            param
+                .get("examples")
+                .and_then(Value::as_object)
+                .and_then(|m| m.values().next())
+                .and_then(|first| first.get("value"))
+        })
+        .or_else(|| {
+            param
+                .pointer("/schema/examples")
+                .and_then(Value::as_array)
+                .and_then(|a| a.first())
+        })?;
+    scalar_to_query_value(candidate)
+}
+
+/// Stringify a scalar JSON value for use in a query string. Returns `None` for
+/// objects, arrays, and null — those can't be represented as a flat query param.
+fn scalar_to_query_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
 }
 
 /// Length window for the reason text shown on the OS biometric prompt.
@@ -772,6 +875,9 @@ fn emit_discovery_methods(
                 pricing: None,
             },
             body_example,
+            // Discovery endpoints carry their query inputs in the request body
+            // shape, not OpenAPI-style `in: query` parameters.
+            query_example: None,
         });
     }
 }
@@ -893,6 +999,9 @@ pub fn effective_openapi_relative_to(
                 .map(|spec| ResolvedEndpoint {
                     spec,
                     body_example: None,
+                    // Inline `endpoints:` declare a clean path; no query
+                    // examples to synthesize.
+                    query_example: None,
                 })
                 .collect(),
             document: None,
@@ -958,9 +1067,23 @@ fn validate_openapi3_request(
     let Some(paths) = doc.get("paths").and_then(|v| v.as_object()) else {
         return RequestValidationOutcome::NotInSpec;
     };
+    // Multiple templates can match one URL — notably Google-style custom verbs
+    // (`/models/{modelsId}` GET vs `/models/{modelsId}:generateContent` POST)
+    // where the generic template also matches the `:verb` URL. Prefer the
+    // template that declares the requested method, then the most specific
+    // (most literal, non-placeholder characters), so we validate against the
+    // right operation instead of the first one in iteration order.
+    let method_key = method.to_ascii_lowercase();
     let Some((spec_path, item)) = paths
         .iter()
-        .find(|(path, _)| path_template_matches(&normalize_path(path), relative_path))
+        .filter(|(path, _)| path_template_matches(&normalize_path(path), relative_path))
+        .max_by_key(|(path, item)| {
+            let declares_method = item
+                .as_object()
+                .map(|obj| obj.contains_key(&method_key))
+                .unwrap_or(false);
+            (declares_method, path_literal_len(&normalize_path(path)))
+        })
     else {
         return RequestValidationOutcome::NotInSpec;
     };
@@ -969,7 +1092,6 @@ fn validate_openapi3_request(
         return RequestValidationOutcome::NotInSpec;
     };
     let allowed_methods = allowed_methods(item_obj);
-    let method_key = method.to_ascii_lowercase();
     let Some(operation) = item_obj.get(&method_key) else {
         return RequestValidationOutcome::Invalid(RequestValidationFailure {
             method: method.to_string(),
@@ -1687,6 +1809,24 @@ fn path_template_matches(template: &str, target: &str) -> bool {
             .all(|(template, target)| path_segment_matches(template, target))
 }
 
+/// Count the literal (non-placeholder) characters in a path template — a
+/// specificity score used to break ties when several templates match one URL.
+/// `/models/{id}:generateContent` scores higher than `/models/{id}` because its
+/// `:generateContent` literal makes it the more specific match.
+fn path_literal_len(template: &str) -> usize {
+    let mut count = 0usize;
+    let mut in_placeholder = false;
+    for ch in template.chars() {
+        match ch {
+            '{' => in_placeholder = true,
+            '}' => in_placeholder = false,
+            _ if !in_placeholder => count += 1,
+            _ => {}
+        }
+    }
+    count
+}
+
 fn path_segment_matches(template: &str, target: &str) -> bool {
     if template.starts_with('{') && template.ends_with('}') {
         return !target.is_empty();
@@ -2399,6 +2539,66 @@ fn is_pretty_printed(body: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_literal_len_scores_specificity() {
+        // The custom-verb template has more literal characters, so it's the
+        // more specific match.
+        assert!(
+            path_literal_len("v1beta/models/{modelsId}:generateContent")
+                > path_literal_len("v1beta/models/{modelsId}")
+        );
+        // A bare placeholder contributes no literal characters.
+        assert_eq!(path_literal_len("{modelsId}"), 0);
+        assert_eq!(path_literal_len("a/{x}/b"), 4); // 'a','/','/','b'
+    }
+
+    #[test]
+    fn validate_request_prefers_custom_verb_post_over_generic_get() {
+        // Mirrors the Gemini gateway: a generic GET template and a custom-verb
+        // POST template both match `…/{modelsId}:generateContent`.
+        let doc = serde_json::json!({
+            "openapi": "3.0.0",
+            "paths": {
+                "/v1beta/models/{modelsId}": { "get": {} },
+                "/v1beta/models/{modelsId}:generateContent": { "post": {} }
+            }
+        });
+
+        // POST to the custom-verb URL must validate against the POST template,
+        // not be rejected by the generic GET-only one (the bug we fixed).
+        let out = validate_request(
+            &doc,
+            "POST",
+            "v1beta/models/gemini-2.5-flash-image:generateContent",
+            &[],
+            None,
+        );
+        assert_eq!(out, RequestValidationOutcome::Valid, "POST custom verb");
+
+        // The bare model URL still validates against the GET template.
+        let out = validate_request(
+            &doc,
+            "GET",
+            "v1beta/models/gemini-2.5-flash-image",
+            &[],
+            None,
+        );
+        assert_eq!(out, RequestValidationOutcome::Valid, "GET bare model");
+
+        // A genuinely undeclared method on the bare URL is still rejected.
+        let out = validate_request(
+            &doc,
+            "POST",
+            "v1beta/models/gemini-2.5-flash-image",
+            &[],
+            None,
+        );
+        assert!(
+            matches!(out, RequestValidationOutcome::Invalid(_)),
+            "POST bare model should be invalid, got {out:?}"
+        );
+    }
 
     #[test]
     fn parse_endpoints_walks_paths_and_methods() {
@@ -3444,5 +3644,95 @@ mod tests {
         let doc = r#"{ "paths": { "/x": { "post": {} } } }"#;
         let endpoints = parse_endpoints(doc).unwrap();
         assert!(endpoints[0].body_example.is_none());
+    }
+
+    #[test]
+    fn query_example_assembled_from_param_examples() {
+        // Mirrors the cryptorefills catalog endpoint: required + optional query
+        // params, each with an example. Both are emitted; spec.path stays clean.
+        let doc = r#"{
+            "paths": {
+                "/v1/catalog": {
+                    "get": {
+                        "parameters": [
+                            {"name": "country_code", "in": "query", "required": true, "example": "us"},
+                            {"name": "brand_name", "in": "query", "required": false, "schema": {"example": "Amazon.com"}}
+                        ]
+                    }
+                }
+            }
+        }"#;
+        let endpoints = parse_endpoints(doc).unwrap();
+        // `normalize_path` strips the leading slash for the published path.
+        assert_eq!(endpoints[0].spec.path, "v1/catalog");
+        assert_eq!(
+            endpoints[0].query_example.as_deref(),
+            Some("country_code=us&brand_name=Amazon.com")
+        );
+    }
+
+    #[test]
+    fn query_example_is_none_without_examples_or_query_params() {
+        // A required query param with no example is skipped; a path param with
+        // an example is not a query param. Result: no query string.
+        let doc = r#"{
+            "paths": {
+                "/v1/items/{id}": {
+                    "get": {
+                        "parameters": [
+                            {"name": "filter", "in": "query", "required": true},
+                            {"name": "id", "in": "path", "required": true, "example": "abc"}
+                        ]
+                    }
+                }
+            }
+        }"#;
+        let endpoints = parse_endpoints(doc).unwrap();
+        assert!(endpoints[0].query_example.is_none());
+    }
+
+    #[test]
+    fn query_example_operation_param_shadows_path_item_param() {
+        // OpenAPI lets parameters live at the path-item level; an operation
+        // param of the same name overrides it. The operation's example wins.
+        let doc = r#"{
+            "paths": {
+                "/v1/brands": {
+                    "parameters": [
+                        {"name": "country_code", "in": "query", "example": "it"}
+                    ],
+                    "get": {
+                        "parameters": [
+                            {"name": "country_code", "in": "query", "example": "us"}
+                        ]
+                    }
+                }
+            }
+        }"#;
+        let endpoints = parse_endpoints(doc).unwrap();
+        assert_eq!(endpoints[0].query_example.as_deref(), Some("country_code=us"));
+    }
+
+    #[test]
+    fn query_example_uses_examples_object_and_scalar_number() {
+        // `examples.<name>.value` form, plus a numeric example coerced to text.
+        let doc = r#"{
+            "paths": {
+                "/v1/price": {
+                    "get": {
+                        "parameters": [
+                            {"name": "country_code", "in": "query",
+                             "examples": {"default": {"value": "us"}}},
+                            {"name": "product_value", "in": "query", "example": 50}
+                        ]
+                    }
+                }
+            }
+        }"#;
+        let endpoints = parse_endpoints(doc).unwrap();
+        assert_eq!(
+            endpoints[0].query_example.as_deref(),
+            Some("country_code=us&product_value=50")
+        );
     }
 }

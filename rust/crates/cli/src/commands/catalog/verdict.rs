@@ -4,11 +4,15 @@
 //!
 //! - **Warning** for every gated endpoint that doesn't accept Solana
 //!   stablecoin payment (e.g. Base-only).
-//! - **Error** when a provider has zero gated endpoints that accept Solana,
-//!   i.e. nothing in the diff actually works through pay's wallet.
-//! - Indeterminate statuses (`siwx_required`, `auth_required`,
-//!   `unprobeable_needs_body`, `not_found`, …) neither warn nor error — they
-//!   pass through silently because the probe couldn't classify them.
+//! - **Error** when a provider has no endpoint that pays through pay's wallet
+//!   (`ok`) *and* none whose gate is sign-in/auth (`siwx_required` /
+//!   `auth_required`). A provider that probes as only free / broken
+//!   (`unprobeable_needs_body`, `not_found`, `error`, …) blocks — it has
+//!   nothing usable in the catalog.
+//! - `siwx_required` / `auth_required` exempt a provider from that rule:
+//!   payment sits behind credentials the probe can't satisfy, so we can
+//!   neither prove nor disprove a Solana 402. Other indeterminate statuses no
+//!   longer pass a provider on their own.
 
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -57,8 +61,9 @@ pub struct ProviderVerdict {
     pub ok_count: usize,
     /// Total number of `not_solana` endpoints.
     pub non_solana_count: usize,
-    /// Whether the provider blocks the PR (zero ok endpoints, or
-    /// `--strict` and any non-Solana endpoint).
+    /// Whether the provider blocks the PR: zero `ok` endpoints and none
+    /// credential-gated (`siwx_required` / `auth_required`), or `--strict`
+    /// and any non-Solana endpoint.
     pub block: bool,
 }
 
@@ -101,15 +106,26 @@ fn verdict_for_provider(provider: &ProviderProbeResult, strict: bool) -> Provide
         .filter(|e| e.verdict == EndpointVerdict::NotSolana)
         .count();
 
-    // Total of Solana-relevant endpoints (gated, classifiable). If zero such
-    // endpoints exist, we can't make a verdict — pass through.
-    let total_classified = ok_count + non_solana_count;
-    let block = if total_classified == 0 {
-        false
-    } else if strict {
-        non_solana_count > 0
+    // Endpoints whose payment gate the probe legitimately can't reach —
+    // payment sits behind sign-in (SIWX) or credentials (auth). These exempt a
+    // provider from the "must have a working Solana 402" rule, since we can't
+    // see the challenge without those credentials.
+    let credential_gated_count = endpoints
+        .iter()
+        .filter(|e| matches!(e.probe_status.as_str(), "siwx_required" | "auth_required"))
+        .count();
+
+    // A provider must expose at least one endpoint that actually pays through
+    // pay's wallet (`ok`) — or be entirely credential-gated. A provider that
+    // probes as only free / broken (`unprobeable_needs_body`, `not_found`,
+    // `error`, …) has nothing usable in the catalog and blocks: otherwise a
+    // provider whose paid endpoints never produce a 402 (e.g. one that reserves
+    // upstream before issuing the challenge) would publish with zero payable
+    // endpoints. `--strict` additionally blocks on any non-Solana gate.
+    let block = if strict {
+        non_solana_count > 0 || (ok_count == 0 && credential_gated_count == 0)
     } else {
-        ok_count == 0
+        ok_count == 0 && credential_gated_count == 0
     };
 
     ProviderVerdict {
@@ -343,12 +359,20 @@ pub fn render_verdict_github(report: &ValidationReport) {
             }
         }
         if provider.block {
-            let msg = format!(
-                "{}: 0 of {} classifiable endpoints accept Solana stablecoins. \
-                 At least one Solana-compatible endpoint is required.",
-                provider.fqn,
-                provider.ok_count + provider.non_solana_count,
-            );
+            let classifiable = provider.ok_count + provider.non_solana_count;
+            let msg = if classifiable == 0 {
+                format!(
+                    "{}: no endpoint returned a Solana 402 challenge, and none are \
+                     sign-in/auth gated. At least one Solana-payable endpoint is required.",
+                    provider.fqn,
+                )
+            } else {
+                format!(
+                    "{}: 0 of {classifiable} classifiable endpoints accept Solana stablecoins. \
+                     At least one Solana-compatible endpoint is required.",
+                    provider.fqn,
+                )
+            };
             println!(
                 "::error file={file},title={title}::{msg}",
                 file = provider.file,
@@ -452,8 +476,9 @@ mod tests {
     }
 
     #[test]
-    fn pass_when_only_indeterminate_endpoints() {
-        // siwx/auth/needs-body don't count either way — provider is not blocked.
+    fn pass_when_only_credential_gated_endpoints() {
+        // siwx/auth gate payment behind credentials the probe can't satisfy —
+        // they exempt the provider from the "needs a Solana 402" rule.
         let report = ProbeReport {
             providers: vec![provider_result(
                 "foo/bar",
@@ -470,6 +495,78 @@ mod tests {
         assert!(!v.providers[0].block);
         assert_eq!(v.providers[0].ok_count, 0);
         assert_eq!(v.providers[0].non_solana_count, 0);
+    }
+
+    #[test]
+    fn block_when_only_free_and_broken_endpoints() {
+        // The cryptorefills case after query-param probing: free discovery
+        // endpoints plus a 404 quote and a 5xx order that never reaches a 402.
+        // Zero payable, zero credential-gated → block.
+        let report = ProbeReport {
+            providers: vec![provider_result(
+                "foo/bar",
+                vec![
+                    ep_result("free", vec![]),
+                    ep_result("free", vec![]),
+                    ep_result("not_found", vec![]),
+                    ep_result("unprobeable_needs_body", vec![]),
+                ],
+            )],
+            total_endpoints: 4,
+            passed: 0,
+            failed: 2,
+        };
+        let v = validate_report(&report, false);
+        assert!(v.providers[0].block);
+        assert_eq!(v.providers[0].ok_count, 0);
+        assert_eq!(v.providers[0].non_solana_count, 0);
+    }
+
+    #[test]
+    fn block_when_only_free_endpoints() {
+        // A provider with nothing but free endpoints has nothing to pay for.
+        let report = ProbeReport {
+            providers: vec![provider_result("foo/bar", vec![ep_result("free", vec![])])],
+            total_endpoints: 1,
+            passed: 0,
+            failed: 0,
+        };
+        let v = validate_report(&report, false);
+        assert!(v.providers[0].block);
+    }
+
+    #[test]
+    fn credential_gate_exempts_even_alongside_broken_endpoints() {
+        // One auth-gated endpoint is enough to exempt the provider, even if the
+        // rest probe as free/broken.
+        let report = ProbeReport {
+            providers: vec![provider_result(
+                "foo/bar",
+                vec![
+                    ep_result("auth_required", vec![]),
+                    ep_result("not_found", vec![]),
+                    ep_result("free", vec![]),
+                ],
+            )],
+            total_endpoints: 3,
+            passed: 0,
+            failed: 1,
+        };
+        let v = validate_report(&report, false);
+        assert!(!v.providers[0].block);
+    }
+
+    #[test]
+    fn strict_blocks_when_no_payable_or_credential_gated() {
+        // Under --strict an all-free provider still blocks (no Solana 402).
+        let report = ProbeReport {
+            providers: vec![provider_result("foo/bar", vec![ep_result("free", vec![])])],
+            total_endpoints: 1,
+            passed: 0,
+            failed: 0,
+        };
+        let v = validate_report(&report, true);
+        assert!(v.providers[0].block);
     }
 
     #[test]
