@@ -227,6 +227,8 @@ impl SessionOperatorRuntime {
             solana_mpp::program::payment_channels::build_distribute_instruction(
                 &params.channel_id,
                 &payer,
+                // rent_payer: the operator / fee payer funds any recipient ATAs.
+                &signer.pubkey(),
                 &params.recipient,
                 &solana_mpp::program::payment_channels::treasury_owner(),
                 &mint,
@@ -653,7 +655,8 @@ impl SessionMpp {
                     .server
                     .verify_voucher(p)
                     .await
-                    .map_err(|e| Error::PaymentRejected(e.to_string()))?;
+                    .map_err(|e| Error::PaymentRejected(e.to_string()))?
+                    .cumulative;
                 let channel_id = p.voucher.data.channel_id.clone();
                 self.record_committed_watermark(channel_id.clone(), cumulative);
                 self.touch_channel(channel_id.clone());
@@ -1417,6 +1420,7 @@ mod tests {
         let token_program = spl_token_program();
         let params = solana_mpp::program::payment_channels::OpenChannelParams {
             payer,
+            rent_payer: payer,
             payee,
             mint,
             authorized_signer,
@@ -1487,6 +1491,7 @@ mod tests {
             .unwrap_or_else(solana_mpp::program::payment_channels::default_program_id);
         let params = solana_mpp::program::payment_channels::OpenChannelParams {
             payer,
+            rent_payer: payer,
             payee,
             mint,
             authorized_signer,

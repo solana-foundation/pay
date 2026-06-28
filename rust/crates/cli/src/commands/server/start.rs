@@ -694,6 +694,8 @@ impl StartCommand {
                     pull_voucher_strategy: sdk_pull_voucher_strategy,
                     rpc_url: Some(rpc_url.clone()),
                     program_id: Some(channel_program_id),
+                    grace_period_seconds:
+                        solana_mpp::program::payment_channels::DEFAULT_GRACE_PERIOD_SECONDS,
                 };
 
                 let mut smpp = SessionMpp::new(config, session_secret)
