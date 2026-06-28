@@ -350,10 +350,10 @@ async fn write_gate_response(session: &mut Session, r: GateResponse) -> pingora:
     let _ = session.drain_request_body().await;
     let mut resp = ResponseHeader::build(r.status.as_u16(), None)?;
     for (name, value) in &r.headers {
-        resp.append_header(
-            name.as_str().to_string(),
-            value.to_str().unwrap_or("").to_string(),
-        )?;
+        // Pass the `http::HeaderValue` through unchanged. The previous
+        // `value.to_str().unwrap_or("")` silently blanked any value `to_str()`
+        // rejected — dropping the `WWW-Authenticate` challenge on the floor.
+        resp.append_header(name.clone(), value.clone())?;
     }
     resp.insert_header("content-length", r.body.len().to_string())?;
     session.write_response_header(Box::new(resp), false).await?;

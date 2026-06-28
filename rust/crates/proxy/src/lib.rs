@@ -30,6 +30,13 @@ pub fn run<S: PaymentState>(
     control_plane: String,
     threads: Option<usize>,
 ) -> anyhow::Result<()> {
+    // rustls 0.23 requires a process-default CryptoProvider. The dependency tree
+    // enables BOTH ring (pingora) and aws-lc-rs (reqwest), so rustls can't pick
+    // one automatically and pingora's TLS init panics. Install ring (what
+    // pingora-rustls uses) once, before any pingora TLS setup. Idempotent — the
+    // Err just means a provider is already installed, which is fine.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let mut server = Server::new(None).map_err(|e| anyhow::anyhow!("pingora server: {e}"))?;
     server.bootstrap();
     let gate = Http402Gate::new(state, control_plane);
