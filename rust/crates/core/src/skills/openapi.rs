@@ -3710,7 +3710,10 @@ mod tests {
             }
         }"#;
         let endpoints = parse_endpoints(doc).unwrap();
-        assert_eq!(endpoints[0].query_example.as_deref(), Some("country_code=us"));
+        assert_eq!(
+            endpoints[0].query_example.as_deref(),
+            Some("country_code=us")
+        );
     }
 
     #[test]

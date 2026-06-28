@@ -1,0 +1,65 @@
+name: splits-demo
+subdomain: splits-demo
+title: "Splits Demo"
+description: "Revenue splits across named recipients — percentage and fixed."
+category: finance
+version: v1
+
+routing:
+  type: respond
+
+operator:
+  currencies:
+    usd: ["USDC", "USDT", "CASH"]
+  network: localnet
+  fee_payer: true
+
+# Named recipients used by `splits:` below. Naming them keeps the spec
+# readable and auditable — a raw pubkey is a guessing game.
+recipients:
+  partner:
+    account: "F1BnHedMutiWEVYukn5hhc96Jx6f7KEFqDtMpnkWkdqZ"
+    label: "Partner"
+  tax_authority:
+    account: "F1BnHedMutiWEVYukn5hhc96Jx6f7KEFqDtMpnkWkdqB"
+    label: "Tax withholding"
+
+endpoints:
+  # Percentage split: 20% to partner, remainder to the operator.
+  - method: POST
+    path: "v1/report"
+    resource: "report"
+    description: "Paid report. $0.10/call, 20% revenue share to partner."
+    metering:
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 0.10
+      splits:
+        - recipient: partner
+          percent: 20
+          memo: "Partner revenue share"
+
+  # Mixed: a fixed amount to tax withholding plus a percentage to partner.
+  # Use exactly one of `amount` or `percent` per split entry. Keep the total
+  # below the per-unit price so the operator still nets a positive amount.
+  - method: POST
+    path: "v1/invoice"
+    resource: "invoice"
+    description: "Invoice settlement. $1.00/call with fixed + percentage splits."
+    metering:
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 1.00
+      splits:
+        - recipient: tax_authority
+          amount: 0.20
+          memo: "Sales tax withholding"
+        - recipient: partner
+          percent: 10
+          memo: "Affiliate share"

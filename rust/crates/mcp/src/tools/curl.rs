@@ -893,11 +893,7 @@ mod tests {
 
     #[test]
     fn resolve_body_inline_json_serialized() {
-        let out = resolve_body(
-            Some(BodyParam::Json(serde_json::json!({"q": 1}))),
-            None,
-        )
-        .unwrap();
+        let out = resolve_body(Some(BodyParam::Json(serde_json::json!({"q": 1}))), None).unwrap();
         assert_eq!(out.as_deref(), Some(r#"{"q":1}"#));
     }
 
@@ -934,8 +930,7 @@ mod tests {
 
     #[test]
     fn resolve_body_missing_file_errors() {
-        let err = resolve_body(None, Some("/no/such/file.json".to_string()))
-            .unwrap_err();
+        let err = resolve_body(None, Some("/no/such/file.json".to_string())).unwrap_err();
         assert!(err.contains("Failed to read body_file"));
     }
 
