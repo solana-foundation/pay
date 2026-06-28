@@ -24,7 +24,7 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use http::{StatusCode, Uri};
+use http::{HeaderMap, StatusCode, Uri};
 use pay_core::PaymentState;
 use pay_core::server::gate::{
     GateDecision, GateRequest, GateResponse, PaymentGate, ReceiptAnnotation,
@@ -57,6 +57,19 @@ enum Target {
 pub struct Ctx {
     target: Option<Target>,
     receipt: Option<ReceiptAnnotation>,
+    /// Captured at `request_filter` for the Payment Debugger exchange emitted
+    /// in `logging` (the data plane is Pingora, so the old axum logging
+    /// middleware never sees proxied traffic).
+    log: Option<LogStart>,
+}
+
+/// Request-side facts captured up front for the PDB exchange.
+struct LogStart {
+    method: String,
+    path: String,
+    req_headers: Vec<(String, String)>,
+    client_ip: String,
+    start: std::time::Instant,
 }
 
 /// Pingora payment gate over [`PaymentGate`], parameterized over the host's
@@ -165,6 +178,7 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
         Ctx {
             target: None,
             receipt: None,
+            log: None,
         }
     }
 
@@ -177,6 +191,24 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
         let path = uri.path().trim_start_matches('/').to_string();
         let str_h = |n: &str| headers.get(n).and_then(|v| v.to_str().ok());
         let host = str_h("host").map(str::to_string);
+
+        // Capture request-side facts for the PDB exchange emitted in `logging`.
+        // Skip the control plane's own paths (`/__402/*`) — same as the old
+        // axum logging middleware — so the debugger only shows real traffic.
+        if !path.starts_with("__402") {
+            let client_ip = str_h("x-forwarded-for")
+                .and_then(|v| v.split(',').next())
+                .map(|s| s.trim().to_string())
+                .or_else(|| host.clone())
+                .unwrap_or_else(|| "unknown".to_string());
+            ctx.log = Some(LogStart {
+                method: method.to_string(),
+                path: format!("/{path}"),
+                req_headers: header_pairs(&headers),
+                client_ip,
+                start: std::time::Instant::now(),
+            });
+        }
         let accept = str_h("accept").map(str::to_string);
         let authorization = str_h("authorization").map(str::to_string);
         let content_length = str_h("content-length").and_then(|v| v.parse::<u64>().ok());
@@ -294,10 +326,9 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
     ) -> pingora::Result<()> {
         if let Some(receipt) = &ctx.receipt {
             for (name, value) in &receipt.headers {
-                let _ = upstream_response.insert_header(
-                    name.as_str().to_string(),
-                    value.to_str().unwrap_or("").to_string(),
-                );
+                // Pass the HeaderValue through unchanged (a receipt can carry
+                // non-ASCII bytes that `to_str()` would blank).
+                let _ = upstream_response.insert_header(name.clone(), value.clone());
             }
             if let Some(reference) = &receipt.reference {
                 tracing::Span::current().record("tx_sig", reference.as_str());
@@ -305,6 +336,50 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
         }
         Ok(())
     }
+
+    /// Emit the completed exchange to the Payment Debugger. Pingora is the data
+    /// plane, so the old axum `logging_middleware` never sees proxied traffic —
+    /// this is what keeps PDB populated. Fires for every request (short-circuit
+    /// 402s included); control-plane paths were filtered out at capture time.
+    async fn logging(&self, session: &mut Session, _e: Option<&pingora::Error>, ctx: &mut Ctx)
+    where
+        Self::CTX: Send + Sync,
+    {
+        let Some(log) = ctx.log.take() else {
+            return;
+        };
+        let (status, res_headers) = match session.response_written() {
+            Some(resp) => (resp.status.as_u16(), header_pairs(&resp.headers)),
+            None => (0, Vec::new()),
+        };
+        self.state.record_exchange(pay_core::HttpExchange {
+            method: log.method,
+            path: log.path,
+            status,
+            ms: log.start.elapsed().as_millis() as u64,
+            req_headers: log.req_headers,
+            res_headers,
+            client_ip: log.client_ip,
+        });
+    }
+}
+
+/// Collect an `http::HeaderMap` into `(name, value)` string pairs for PDB.
+///
+/// Uses lossy UTF-8 rather than `to_str()` — the latter rejects any non-visible-
+/// ASCII byte, which would silently drop a `WWW-Authenticate` whose challenge
+/// description carries a non-ASCII char (e.g. an em-dash). PDB's correlation
+/// engine keys on that header, so dropping it means the flow never appears.
+fn header_pairs(headers: &HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.as_str().to_string(),
+                String::from_utf8_lossy(v.as_bytes()).into_owned(),
+            )
+        })
+        .collect()
 }
 
 fn is_control_plane(path: &str) -> bool {

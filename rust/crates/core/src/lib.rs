@@ -81,4 +81,24 @@ pub trait PaymentState: Clone + Send + Sync + 'static {
     fn x402_batch(&self) -> Option<&pay_kit::x402::server::X402BatchSettlement> {
         None
     }
+
+    /// Record a completed proxied HTTP exchange for the Payment Debugger.
+    ///
+    /// Default no-op. The gate calls this once per proxied request; hosts with
+    /// the debugger enabled ingest it into the PDB correlation engine. This is
+    /// how proxied traffic reaches PDB now that the data plane is Pingora (which
+    /// bypasses the old axum `logging_middleware`).
+    fn record_exchange(&self, _exchange: HttpExchange) {}
+}
+
+/// A completed HTTP exchange handed to [`PaymentState::record_exchange`].
+#[derive(Debug, Clone)]
+pub struct HttpExchange {
+    pub method: String,
+    pub path: String,
+    pub status: u16,
+    pub ms: u64,
+    pub req_headers: Vec<(String, String)>,
+    pub res_headers: Vec<(String, String)>,
+    pub client_ip: String,
 }

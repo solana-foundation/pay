@@ -92,6 +92,7 @@ struct AppState {
     fee_payer_wallet: Option<FeePayerWallet>,
     fee_payer_signer: Option<Arc<dyn SolanaSigner>>,
     x402: Option<pay_kit::x402::server::X402>,
+    pdb: Option<pay_pdb::PdbState>,
 }
 
 impl PaymentState for AppState {
@@ -121,6 +122,26 @@ impl PaymentState for AppState {
     }
     fn x402(&self) -> Option<&pay_kit::x402::server::X402> {
         self.x402.as_ref()
+    }
+    fn record_exchange(&self, exchange: pay_core::HttpExchange) {
+        let Some(pdb) = &self.pdb else {
+            return;
+        };
+        let entry = pay_pdb::types::LogEntry {
+            id: pdb.next_log_id(),
+            ts: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            method: exchange.method,
+            path: exchange.path,
+            status: exchange.status,
+            ms: exchange.ms,
+            req_headers: exchange.req_headers.into_iter().collect(),
+            res_headers: exchange.res_headers.into_iter().collect(),
+            res_body: None,
+            client_ip: exchange.client_ip,
+        };
+        if let Ok(mut engine) = pdb.correlation.lock() {
+            engine.ingest(entry);
+        }
     }
 }
 
@@ -1030,6 +1051,15 @@ impl StartCommand {
                 None
             };
 
+            let pdb_state = if debugger {
+                let pdb_config = build_pdb_config(&api, &recipient, network.slug(), &rpc_url);
+                let pdb = pay_pdb::PdbState::new(pdb_config);
+                pdb.spawn_cleanup();
+                Some(pdb)
+            } else {
+                None
+            };
+
             let state = AppState {
                 apis: Arc::new(vec![api.clone()]),
                 mpps,
@@ -1038,15 +1068,8 @@ impl StartCommand {
                 fee_payer_wallet,
                 fee_payer_signer: fee_payer_signer.clone(),
                 x402,
-            };
-
-            let pdb_state = if debugger {
-                let pdb_config = build_pdb_config(&api, &recipient, network.slug(), &rpc_url);
-                let pdb = pay_pdb::PdbState::new(pdb_config);
-                pdb.spawn_cleanup();
-                Some(pdb)
-            } else {
-                None
+                // The gate calls `record_exchange` per proxied request to feed PDB.
+                pdb: pdb_state.clone(),
             };
 
             let verify_pdb = pdb_state.clone();
