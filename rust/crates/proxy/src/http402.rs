@@ -146,17 +146,20 @@ impl<S: PaymentState> Http402Gate<S> {
                 "refusing request: upstream auth signs the request body, which the pingora data \
                  plane does not support (body is streamed, not buffered)"
             );
-            write_gate_response(
-                session,
-                GateResponse::json(
-                    StatusCode::NOT_IMPLEMENTED,
-                    Bytes::from_static(
-                        b"{\"error\":\"unsupported_auth\",\"message\":\"This endpoint's upstream \
-                          auth signs the request body, which the gateway does not yet support.\"}",
-                    ),
+            // On a `Forward` the x402 `exact` payment already settled on-chain
+            // (the gate settles in verify), so this 501 must still carry the
+            // PAYMENT-RESPONSE receipt — otherwise the client is charged with no
+            // proof. Drain it (and refund any `upto` channel) onto the response.
+            let mut resp = GateResponse::json(
+                StatusCode::NOT_IMPLEMENTED,
+                Bytes::from_static(
+                    b"{\"error\":\"unsupported_auth\",\"message\":\"This endpoint's upstream \
+                      auth signs the request body, which the gateway does not yet support.\"}",
                 ),
-            )
-            .await?;
+            );
+            resp.headers
+                .extend(self.drain_payment_headers(ctx, false).await);
+            write_gate_response(session, resp).await?;
             return Ok(true);
         }
         // No body-signing auth → an empty placeholder body is safe for prep.
@@ -198,6 +201,21 @@ impl<S: PaymentState> Http402Gate<S> {
         resp: axum::response::Response,
     ) -> pingora::Result<()> {
         let served_ok = resp.status().is_success();
+        let extra = self.drain_payment_headers(ctx, served_ok).await;
+        write_axum_response(session, resp, extra).await
+    }
+
+    /// Settle/refund pending payment side-effects and collect the headers that
+    /// must ride the response: refund an open `upto` channel and surface the
+    /// x402 `exact` `PAYMENT-RESPONSE` receipt. Used by every terminal path that
+    /// `response_filter` doesn't reach (respond-mode, the body-signing 501
+    /// refusal, and connect/proxy failures) so a settled payment always returns
+    /// its proof. `served_ok` decides debit vs full refund for `upto`.
+    async fn drain_payment_headers(
+        &self,
+        ctx: &mut Ctx,
+        served_ok: bool,
+    ) -> Vec<(HeaderName, HeaderValue)> {
         let mut extra: Vec<(HeaderName, HeaderValue)> = Vec::new();
         if let Some((open, amt)) = ctx.upto.take()
             && let Some((n, v)) = settle_upto(&self.state, open, amt, served_ok).await
@@ -210,7 +228,7 @@ impl<S: PaymentState> Http402Gate<S> {
                 tracing::Span::current().record("tx_sig", reference.as_str());
             }
         }
-        write_axum_response(session, resp, extra).await
+        extra
     }
 }
 
@@ -450,18 +468,7 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
     where
         Self::CTX: Send + Sync,
     {
-        let mut extra: Vec<(HeaderName, HeaderValue)> = Vec::new();
-        if let Some((open, amt)) = ctx.upto.take()
-            && let Some((n, v)) = settle_upto(&self.state, open, amt, false).await
-        {
-            extra.push((n, v));
-        }
-        if let Some(receipt) = ctx.receipt.take() {
-            extra.extend(receipt.headers);
-            if let Some(reference) = &receipt.reference {
-                tracing::Span::current().record("tx_sig", reference.as_str());
-            }
-        }
+        let extra = self.drain_payment_headers(ctx, false).await;
 
         // Mirror Pingora's default downstream error-code derivation so behavior
         // is unchanged except for the preserved payment headers.
