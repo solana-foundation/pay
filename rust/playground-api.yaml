@@ -52,18 +52,31 @@ operator:
 # In sandbox mode, set PLATFORM_WALLET to any funded address (or a generated one).
 recipients:
   platform:
-    account: "${PLATFORM_WALLET}"
-    label: "Platform"
+    account: F82JMeQmD7Lfbh6vCJWsz2ABJ5AAthhVjUyqzgHyUtog
+    label: Platform
 
 # ── Session channel parameters (used by the `stream` endpoint) ──
 # Mirrors the TS `session(usd('1.00'), { closeDelayMs: 2000, unitPrice: 0.0001 })`.
 # cap_usdc is the channel deposit ceiling; per-delivery price lives on the
 # endpoint metering below. close_delay_ms is the idle delay before the operator
 # settles and closes the channel.
+#
+# The canonical pay-kit `session()` adapter (and the JS playground client) opens
+# a payment-channel session in pull + clientVoucher mode — the client signs each
+# voucher, the operator only fee-pays/settles. Advertise that so the playground's
+# payment-channel session opener has the challenge it requires (a push-only
+# challenge makes it fail with "requires a pull-mode session challenge").
 session:
   cap_usdc: 1.0
   close_delay_ms: 2000
-  modes: [push]
+  modes: [pull]
+  pull_voucher_strategy: client_voucher
+  # Settlement split: the platform takes 30% of the settled session total at
+  # idle-close, the seller (operator) nets the remaining 70%. Session splits are
+  # percentage-only (the channel settles a single cumulative amount).
+  splits:
+    - recipient: platform
+      percent: 30
 
 endpoints:
   # ===========================================================================
@@ -125,17 +138,21 @@ endpoints:
   # x402 UPTO — usage-metered: authorize a ceiling, bill metered usage.
   # TS: summarize → usage(usd('0.10')), billed per token.
   #
-  # NOTE: the pay gate does not implement x402 `upto` yet — this endpoint
-  # currently returns a clean HTTP 501 (`unsupported_scheme`). It's included so
-  # the surface matches the playground 1:1 and to track the gap; switch
-  # `schemes` to [x402-exact] or [mpp-charge] if you want it to settle today.
+  # The client authorizes the ceiling ($0.10); the operator opens the channel,
+  # serves, then settles a voucher and refunds the rest. Until a real per-token
+  # meter is wired, `min_usd` is the default voucher settled on a successful
+  # serve — set below to $0.01 so settlement is visibly *partial* (a $0.01
+  # voucher against the $0.10 ceiling, $0.09 refunded), which exercises the
+  # upto settle/refund path end-to-end rather than always billing the full cap.
   # ===========================================================================
   - method: POST
     path: "api/v1/summarize"
     resource: "summarize"
-    description: "Summarize text, billed per token (x402 upto). Ceiling $0.10. [501: not yet implemented]"
+    description: "Summarize text, billed per token (x402 upto). Ceiling $0.10, default voucher $0.01."
     metering:
       schemes: [x402-upto]
+      # Default settled voucher (USD) — clamped to the ceiling below.
+      min_usd: 0.01
       dimensions:
         # The authorized ceiling ($0.10) — the offer advertises "up to 0.1 USDC".
         - direction: usage
