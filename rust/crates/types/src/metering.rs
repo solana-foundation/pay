@@ -50,6 +50,36 @@ pub struct ApiSpec {
     pub session: Option<SessionSpec>,
 }
 
+impl ApiSpec {
+    /// Fill in per-endpoint scheme defaults for endpoints that omit `schemes`.
+    ///
+    /// The base default is `[MppCharge]`. A spec that declares a top-level
+    /// `session:` block additionally gets `MppSession`, so existing session
+    /// deployments keep accepting `intent=session` credentials without having
+    /// to enumerate `schemes` on every endpoint — otherwise the charge-only
+    /// fallback in [`Metering::accepted_schemes`] would silently re-challenge
+    /// session clients with charge-only options. Endpoints that set `schemes`
+    /// explicitly are left untouched (explicit config is a restriction).
+    ///
+    /// Resolving here (once, at load) keeps every consumer — the payment gate,
+    /// the OpenAPI offer builder, and the x402-backend probe in `server start` —
+    /// reading the same scheme set.
+    pub fn apply_scheme_defaults(&mut self) {
+        let has_session = self.session.is_some();
+        for endpoint in &mut self.endpoints {
+            if let Some(metering) = endpoint.metering.as_mut()
+                && metering.schemes.is_none()
+            {
+                let mut schemes = vec![Scheme::MppCharge];
+                if has_session {
+                    schemes.push(Scheme::MppSession);
+                }
+                metering.schemes = Some(schemes);
+            }
+        }
+    }
+}
+
 /// How a request is handled after payment verification.
 ///
 /// ```yaml
@@ -2570,6 +2600,56 @@ mod tests {
             recipients,
             session: None,
         }
+    }
+
+    fn metered_endpoint(schemes: Option<Vec<Scheme>>) -> Endpoint {
+        Endpoint {
+            method: HttpMethod::Get,
+            path: "v1/x".into(),
+            description: None,
+            resource: None,
+            routing: None,
+            metering: Some(Metering {
+                dimensions: vec![],
+                variants: vec![],
+                sku_tiers: vec![],
+                splits: vec![],
+                schemes,
+                min_usd: None,
+            }),
+            subscription: None,
+        }
+    }
+
+    #[test]
+    fn apply_scheme_defaults_charge_only_without_session() {
+        let mut api = test_spec(vec![metered_endpoint(None)]);
+        api.apply_scheme_defaults();
+        assert_eq!(
+            api.endpoints[0].metering.as_ref().unwrap().schemes,
+            Some(vec![Scheme::MppCharge]),
+        );
+    }
+
+    #[test]
+    fn apply_scheme_defaults_adds_session_when_session_configured() {
+        let mut api = test_spec(vec![
+            metered_endpoint(None),
+            metered_endpoint(Some(vec![Scheme::X402Exact])),
+        ]);
+        api.session = Some(serde_json::from_value(serde_json::json!({ "cap_usdc": 1.0 })).unwrap());
+        api.apply_scheme_defaults();
+
+        // Omitted schemes pick up both MPP schemes in a session-enabled spec.
+        assert_eq!(
+            api.endpoints[0].metering.as_ref().unwrap().schemes,
+            Some(vec![Scheme::MppCharge, Scheme::MppSession]),
+        );
+        // Explicit `schemes` are a restriction and must be left untouched.
+        assert_eq!(
+            api.endpoints[1].metering.as_ref().unwrap().schemes,
+            Some(vec![Scheme::X402Exact]),
+        );
     }
 
     #[test]

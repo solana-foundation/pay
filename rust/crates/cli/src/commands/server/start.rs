@@ -285,8 +285,13 @@ impl StartCommand {
         let contents = std::fs::read_to_string(expanded.as_ref())
             .map_err(|e| pay_core::Error::Config(format!("Failed to read {}: {e}", self.spec)))?;
 
-        let api: ApiSpec = serde_yml::from_str(&contents)
+        let mut api: ApiSpec = serde_yml::from_str(&contents)
             .map_err(|e| pay_core::Error::Config(format!("Invalid spec: {e}")))?;
+        // Resolve per-endpoint `schemes` defaults once, before the gate, the
+        // OpenAPI builder, and the x402-backend probe read them — a session
+        // spec that omits `schemes` keeps accepting `intent=session` instead of
+        // silently regressing to charge-only.
+        api.apply_scheme_defaults();
 
         // Optional OpenAPI / Discovery doc — loaded once, filtered to the
         // YAML's `endpoints[]` allow-list, and exposed at `GET /openapi.json`
@@ -1351,7 +1356,9 @@ impl StartCommand {
             // reaped by `sweep_dead_ephemeral_sources()` on the next start.
             let _ = &registered_source_url;
             tokio::spawn(async move {
-                let _ = axum::serve(listener, app).await;
+                if let Err(e) = axum::serve(listener, app).await {
+                    tracing::error!(error = %e, "control-plane axum server exited unexpectedly");
+                }
             });
 
             Ok::<(std::net::SocketAddr, AppState), pay_core::Error>((internal_addr, state))
