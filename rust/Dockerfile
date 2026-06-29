@@ -7,6 +7,7 @@ RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
     libclang-dev \
+    cmake \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
