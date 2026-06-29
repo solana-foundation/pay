@@ -285,8 +285,12 @@ pub fn build_upto_payment(
     // `UptoRequirements` carries only the CAIP-2 `network` (no `cluster`), so map
     // it to a cluster; a Surfpool blockhash overrides to `localnet` (see the
     // exact path for the rationale).
+    // Normalize the mapped cluster to a pay slug ("mainnet-beta" -> "mainnet"):
+    // `cluster_for_caip2_network` returns the SDK cluster name, and the bare
+    // `to_string` arm used to win, so `check_client_network_intent` rejected
+    // `--mainnet` and `account_for_network` missed wallets keyed under "mainnet".
     let cluster_raw = pay_kit::x402::exact::cluster_for_caip2_network(&requirements.network)
-        .map(str::to_string)
+        .map(normalize_network)
         .unwrap_or_else(|| normalize_network(&requirements.network));
     let embedded_blockhash = requirements.extra.recent_blockhash.as_deref();
     let surfpool_detected = embedded_blockhash
