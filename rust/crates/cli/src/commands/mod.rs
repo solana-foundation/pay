@@ -3,6 +3,7 @@ pub mod catalog;
 pub mod claude;
 pub mod codex;
 pub mod curl;
+pub mod docs;
 pub mod fetch;
 pub mod help;
 pub mod http;
@@ -91,6 +92,11 @@ pub enum Command {
     Install(skills::install::InstallCommand),
     /// Start the MCP server (for Claude Code, Cursor, etc.)
     Mcp,
+    /// Generate documentation artifacts (e.g. the provider-spec JSON Schema).
+    Docs {
+        #[command(subcommand)]
+        command: docs::DocsCommand,
+    },
 }
 
 /// Identifies which tool is being wrapped.
@@ -142,6 +148,7 @@ impl Command {
             | Command::Catalog { .. }
             | Command::Install(_)
             | Command::Server { .. }
+            | Command::Docs { .. }
             | Command::Mcp => false,
         }
     }
@@ -166,7 +173,8 @@ impl Command {
             | Command::Send(_)
             | Command::Setup(_)
             | Command::Topup(_)
-            | Command::Server { .. } => ToolKind::Mcp,
+            | Command::Server { .. }
+            | Command::Docs { .. } => ToolKind::Mcp,
             Command::Mcp => ToolKind::Mcp,
         }
     }
@@ -230,6 +238,7 @@ impl Command {
             Command::Claude(cmd) => std::process::exit(cmd.run(&pay_bin, account_override)?),
             Command::Codex(cmd) => std::process::exit(cmd.run(&pay_bin, account_override)?),
             Command::Qodercli(cmd) => std::process::exit(cmd.run(&pay_bin, account_override)?),
+            Command::Docs { command } => return command.run(),
             _ => {}
         }
 

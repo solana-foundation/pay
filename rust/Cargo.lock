@@ -6334,6 +6334,7 @@ dependencies = [
  "rand 0.8.6",
  "ratatui",
  "reqwest 0.12.28",
+ "schemars 0.8.22",
  "serde",
  "serde_json",
  "serde_yml",
