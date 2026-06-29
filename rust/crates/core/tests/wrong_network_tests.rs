@@ -25,13 +25,13 @@ use axum::routing::any;
 use base64::Engine;
 use ed25519_dalek::{Signer as _, SigningKey};
 use pay_core::PaymentState;
+use pay_kit::mpp::server::Mpp;
+use pay_kit::mpp::{ChargeRequest, format_authorization, parse_www_authenticate};
 use pay_types::metering::ApiSpec;
 use serde_json::Value;
 use solana_hash::Hash;
 use solana_instruction::{AccountMeta, Instruction};
 use solana_message::Message;
-use solana_mpp::server::Mpp;
-use solana_mpp::{ChargeRequest, format_authorization, parse_www_authenticate};
 use solana_pubkey::Pubkey;
 use solana_transaction::Transaction;
 use std::str::FromStr;
@@ -68,7 +68,7 @@ async fn start_server_with_network(network: &str) -> (String, tokio::task::JoinH
         serde_yml::from_str(&std::fs::read_to_string("tests/fixtures/test-provider.yml").unwrap())
             .unwrap();
 
-    let mpp = Mpp::new(solana_mpp::server::Config {
+    let mpp = Mpp::new(pay_kit::mpp::server::Config {
         recipient: "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY".to_string(),
         currency: "SOL".to_string(),
         decimals: 9,
@@ -110,7 +110,7 @@ async fn start_server_with_network(network: &str) -> (String, tokio::task::JoinH
 /// rejects it on the network/blockhash mismatch before doing any
 /// instruction inspection or RPC simulation.
 fn build_credential_with_blockhash(
-    challenge: &solana_mpp::PaymentChallenge,
+    challenge: &pay_kit::mpp::PaymentChallenge,
     payer: &SigningKey,
     recent_blockhash: Hash,
 ) -> String {
@@ -149,7 +149,7 @@ fn build_credential_with_blockhash(
         "type": "transaction",
         "transaction": tx_b64,
     });
-    let credential = solana_mpp::PaymentCredential::new(challenge.to_echo(), payload);
+    let credential = pay_kit::mpp::PaymentCredential::new(challenge.to_echo(), payload);
     format_authorization(&credential).unwrap()
 }
 

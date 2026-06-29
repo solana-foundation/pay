@@ -36,6 +36,7 @@ endpoints:
     resource: "simple"
     description: "Flat rate per request"
     metering:
+      schemes: [mpp-charge, mpp-session]
       dimensions:
         - direction: usage
           unit: requests

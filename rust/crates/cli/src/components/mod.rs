@@ -4,6 +4,7 @@ pub mod account;
 pub mod banner;
 pub mod help;
 pub mod link;
+pub mod log_format;
 pub mod notice;
 
 pub use account::{

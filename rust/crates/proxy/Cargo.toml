@@ -1,0 +1,34 @@
+[package]
+name = "pay-proxy"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish = false
+
+# The production data plane: a Pingora `ProxyHttp` (`Http402Gate`) over the
+# framework-agnostic `pay_core` payment gate. Kept as its own crate so the heavy
+# pingora/boringssl tree stays out of `pay-core` and its many dependents.
+[lib]
+name = "pay_proxy"
+path = "src/lib.rs"
+
+[dependencies]
+# rustls TLS backend: pure-Rust (no C build), supports HTTPS upstreams, and
+# coexists with the OpenSSL that solana-rpc-client pulls via native-tls. Pingora's
+# boringssl backend can NOT coexist with that OpenSSL (duplicate symbols → linker
+# error), so rustls is the sole backend.
+pingora = { version = "0.5", default-features = false, features = ["proxy", "rustls"] }
+# rustls 0.23 needs a process-default CryptoProvider installed at startup. The
+# dep tree pulls BOTH ring (via pingora) and aws-lc-rs (via reqwest), so rustls
+# can't auto-pick — we install ring explicitly in `run()`. `ring` matches what
+# pingora-rustls uses.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+pay-core = { workspace = true, features = ["server"] }
+pay-types = { workspace = true }
+pay-kit = { workspace = true }
+axum = { workspace = true }
+http = "1"
+async-trait = "0.1"
+bytes = "1"
+anyhow = "1"
+tracing = { workspace = true }

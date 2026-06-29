@@ -127,6 +127,11 @@ pub struct SessionInfo {
 pub struct PaymentFlow {
     pub id: String,
     pub protocol: Protocol,
+    /// Sub-scheme within the protocol — e.g. `charge`/`session`/`subscription`
+    /// for MPP, `exact`/`upto`/`batch-settlement` for x402. Rendered as the
+    /// `PROTOCOL:SCHEME` label (`MPP:CHARGE`). `None` falls back to the protocol.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scheme: Option<String>,
     pub resource: String,
     pub status: FlowStatus,
     pub client_ip: String,

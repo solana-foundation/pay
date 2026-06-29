@@ -11,10 +11,10 @@ use pay_core::PaymentState;
 use pay_core::accounts::AccountsStore;
 use pay_core::server::session::SessionMpp;
 use pay_core::server::telemetry::FeePayerWallet;
+use pay_kit::mpp::server::Mpp;
+use pay_kit::mpp::solana_keychain::SolanaSigner;
 use pay_types::Stablecoin;
 use pay_types::metering::{ApiSpec, OperatorConfig, RoutingConfig, SignerConfig};
-use solana_mpp::server::Mpp;
-use solana_mpp::solana_keychain::SolanaSigner;
 use tokio::time::{Duration, Instant};
 
 use crate::components::{PAY_SH_TAGLINE, render_pay_banner, solana_explorer_cluster_query};
@@ -91,6 +91,9 @@ struct AppState {
     browser_rpc_url: Option<String>,
     fee_payer_wallet: Option<FeePayerWallet>,
     fee_payer_signer: Option<Arc<dyn SolanaSigner>>,
+    x402: Option<pay_kit::x402::server::X402>,
+    x402_upto: Option<pay_kit::x402::server::X402Upto>,
+    pdb: Option<pay_pdb::PdbState>,
 }
 
 impl PaymentState for AppState {
@@ -118,6 +121,32 @@ impl PaymentState for AppState {
     fn fee_payer_signer(&self) -> Option<Arc<dyn SolanaSigner>> {
         self.fee_payer_signer.clone()
     }
+    fn x402(&self) -> Option<&pay_kit::x402::server::X402> {
+        self.x402.as_ref()
+    }
+    fn x402_upto(&self) -> Option<&pay_kit::x402::server::X402Upto> {
+        self.x402_upto.as_ref()
+    }
+    fn record_exchange(&self, exchange: pay_core::HttpExchange) {
+        let Some(pdb) = &self.pdb else {
+            return;
+        };
+        let entry = pay_pdb::types::LogEntry {
+            id: pdb.next_log_id(),
+            ts: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            method: exchange.method,
+            path: exchange.path,
+            status: exchange.status,
+            ms: exchange.ms,
+            req_headers: exchange.req_headers.into_iter().collect(),
+            res_headers: exchange.res_headers.into_iter().collect(),
+            res_body: None,
+            client_ip: exchange.client_ip,
+        };
+        if let Ok(mut engine) = pdb.correlation.lock() {
+            engine.ingest(entry);
+        }
+    }
 }
 
 fn should_use_auto_fee_payer_signer(
@@ -131,7 +160,7 @@ fn should_use_auto_fee_payer_signer(
 fn resolve_session_splits(
     api: &ApiSpec,
     session: &pay_types::metering::SessionSpec,
-) -> pay_core::Result<Vec<solana_mpp::server::session::Split>> {
+) -> pay_core::Result<Vec<pay_kit::mpp::server::session::Split>> {
     let mut splits = Vec::with_capacity(session.splits.len());
     let mut total_bps: u16 = 0;
 
@@ -191,7 +220,7 @@ fn resolve_session_splits(
             ))
         })?;
 
-        splits.push(solana_mpp::server::session::Split { recipient, bps });
+        splits.push(pay_kit::mpp::server::session::Split { recipient, bps });
     }
 
     Ok(splits)
@@ -215,7 +244,7 @@ async fn create_surfpool_payment_channel_payer(
     rpc_url: &str,
 ) -> pay_core::Result<Arc<dyn SolanaSigner>> {
     use ed25519_dalek::SigningKey;
-    use solana_mpp::solana_keychain::MemorySigner;
+    use pay_kit::mpp::solana_keychain::MemorySigner;
 
     let sk = SigningKey::generate(&mut rand::rngs::OsRng);
     let vk = sk.verifying_key();
@@ -234,9 +263,9 @@ async fn create_surfpool_payment_channel_payer(
 
 async fn ensure_surfpool_session_distribution_accounts(
     rpc_url: &str,
-    splits: &[solana_mpp::server::session::Split],
+    splits: &[pay_kit::mpp::server::session::Split],
 ) -> pay_core::Result<()> {
-    let treasury = solana_mpp::program::payment_channels::treasury_owner().to_string();
+    let treasury = pay_kit::mpp::program::payment_channels::treasury_owner().to_string();
     pay_core::client::sandbox::set_surfpool_usdc_token_account(rpc_url, &treasury, 0).await?;
     for split in splits {
         pay_core::client::sandbox::set_surfpool_usdc_token_account(
@@ -256,14 +285,19 @@ impl StartCommand {
         let contents = std::fs::read_to_string(expanded.as_ref())
             .map_err(|e| pay_core::Error::Config(format!("Failed to read {}: {e}", self.spec)))?;
 
-        let api: ApiSpec = serde_yml::from_str(&contents)
+        let mut api: ApiSpec = serde_yml::from_str(&contents)
             .map_err(|e| pay_core::Error::Config(format!("Invalid spec: {e}")))?;
+        // Resolve per-endpoint `schemes` defaults once, before the gate, the
+        // OpenAPI builder, and the x402-backend probe read them — a session
+        // spec that omits `schemes` keeps accepting `intent=session` instead of
+        // silently regressing to charge-only.
+        api.apply_scheme_defaults();
 
         // Optional OpenAPI / Discovery doc — loaded once, filtered to the
         // YAML's `endpoints[]` allow-list, and exposed at `GET /openapi.json`
         // with `rootUrl` / `servers[].url` rewritten per-request from the
         // `Host` header (or `--public-url` when set).
-        let openapi_doc: Option<Arc<serde_json::Value>> = match &self.openapi {
+        let upstream_openapi: Option<Arc<serde_json::Value>> = match &self.openapi {
             Some(input) => {
                 let source = if input.starts_with("http://") || input.starts_with("https://") {
                     pay_types::registry::OpenapiSource::Url {
@@ -291,6 +325,9 @@ impl StartCommand {
                 pay_core::server::openapi::strip_upstream_auth(&mut doc);
                 Some(Arc::new(doc))
             }
+            // No upstream doc — synthesized later (after the operator identity
+            // resolves) from the spec itself, like pay-kit's TS
+            // `openapiFromExpress`. See the `openapi_doc` binding below.
             None => None,
         };
         let openapi_proxy_mode = matches!(api.routing, RoutingConfig::Proxy { .. });
@@ -336,6 +373,8 @@ impl StartCommand {
                     .unwrap_or_else(|| "mainnet".to_string()),
             )
         };
+        // Captured into the async block below for synthesized-openapi offers.
+        let network_slug = network.slug().to_string();
 
         // RPC URL fallback chain. Network-aware so that `localnet`
         // defaults to the hosted Surfpool sandbox (where ephemeral
@@ -365,13 +404,20 @@ impl StartCommand {
         let active_account_name_owned = active_account_name.map(|s| s.to_string());
 
         // Create the runtime first — everything async runs inside it so
-        // background tasks (like GCP auth token refresh) stay alive.
+        // background tasks (like GCP auth token refresh) stay alive. Worker
+        // threads are named `pay-server-worker-N` so logs/profilers/span thread
+        // attributes show which thread is doing what.
+        let worker_seq = std::sync::atomic::AtomicUsize::new(0);
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
+            .thread_name_fn(move || {
+                let n = worker_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                format!("pay-server-worker-{n}")
+            })
             .build()
             .map_err(|e| pay_core::Error::Config(format!("Failed to create runtime: {e}")))?;
 
-        rt.block_on(async {
+        let gateway = rt.block_on(async {
             // ── Resolve fee-payer signer (async — needs the runtime) ──
             //
             // Lookup order, first match wins:
@@ -516,6 +562,25 @@ impl StartCommand {
             )
             .await?;
 
+            // Discovery doc served at `/openapi.json`: prefer the operator's
+            // upstream OpenAPI; otherwise synthesize one from the spec + the
+            // now-resolved operator identity (recipient → `payTo`, fee-payer →
+            // x402 `feePayer`), mirroring pay-kit's TS `openapiFromExpress`.
+            let openapi_doc: Option<Arc<serde_json::Value>> = match upstream_openapi.clone() {
+                Some(doc) => Some(doc),
+                None => {
+                    let fee_payer_pk = fee_payer_signer.as_ref().map(|s| s.pubkey().to_string());
+                    let ctx = pay_core::server::openapi::DiscoveryContext {
+                        network_slug: &network_slug,
+                        pay_to: Some(recipient.as_str()),
+                        fee_payer: fee_payer_pk.as_deref(),
+                    };
+                    Some(Arc::new(pay_core::server::openapi::synthesize_from_spec(
+                        &api, &ctx,
+                    )))
+                }
+            };
+
             // ── Auto-fund the operator wallet on Surfpool ──
             //
             // Trigger when EITHER:
@@ -573,7 +638,7 @@ impl StartCommand {
             let mpps: Vec<Mpp> = currency_configs
                 .iter()
                 .map(|(_, mpp_currency, decimals)| {
-                    Mpp::new(solana_mpp::server::Config {
+                    Mpp::new(pay_kit::mpp::server::Config {
                         recipient: recipient.clone(),
                         currency: mpp_currency.clone(),
                         decimals: *decimals,
@@ -599,15 +664,19 @@ impl StartCommand {
             let session_mpp: Option<Arc<SessionMpp>> = if let Some(ref sess) = api.session {
                 use pay_core::server::session::PullVoucherStrategy;
                 use pay_types::metering::SessionPullVoucherStrategy as ConfigPullVoucherStrategy;
-                use solana_mpp::server::session::SessionConfig;
-                use solana_mpp::{SessionMode, SessionPullVoucherStrategy};
+                use pay_kit::mpp::server::session::SessionConfig;
+                use pay_kit::mpp::{SessionMode, SessionPullVoucherStrategy};
                 use std::str::FromStr;
 
                 let cap_base = (sess.cap_usdc * 10f64.powi(session_decimals as i32)).round() as u64;
                 let session_secret = std::env::var("PAY_SESSION_SECRET")
                     .unwrap_or_else(|_| challenge_binding_secret.clone());
-                let requested_modes: Vec<SessionMode> = if sess.modes.is_empty() {
-                    vec![SessionMode::Push]
+                // Default to pull + clientVoucher (payment-channel) when `modes`
+                // is omitted — matches the canonical pay-kit `session()` adapter
+                // and the JS playground client. Explicit `modes:` is respected.
+                let modes_omitted = sess.modes.is_empty();
+                let requested_modes: Vec<SessionMode> = if modes_omitted {
+                    vec![SessionMode::Pull]
                 } else {
                     sess.modes
                         .iter()
@@ -618,6 +687,11 @@ impl StartCommand {
                         .collect()
                 };
                 let pull_voucher_strategy = match sess.pull_voucher_strategy {
+                    // Omitting `modes` opts into the pull default, so also enable
+                    // clientVoucher (otherwise pull gets stripped back to push).
+                    ConfigPullVoucherStrategy::Disabled if modes_omitted => {
+                        PullVoucherStrategy::ClientVoucher
+                    }
                     ConfigPullVoucherStrategy::Disabled => PullVoucherStrategy::Disabled,
                     ConfigPullVoucherStrategy::ClientVoucher => PullVoucherStrategy::ClientVoucher,
                     ConfigPullVoucherStrategy::OperatedVoucher => {
@@ -654,7 +728,7 @@ impl StartCommand {
                     .or_else(|_| std::env::var("PAY_FIBER_PROGRAM_ID"))
                     .ok()
                     .and_then(|value| solana_pubkey::Pubkey::from_str(&value).ok())
-                    .unwrap_or_else(solana_mpp::program::payment_channels::default_program_id);
+                    .unwrap_or_else(pay_kit::mpp::program::payment_channels::default_program_id);
                 let session_splits = resolve_session_splits(&api, sess)?;
                 let client_voucher_pull = modes.contains(&SessionMode::Pull)
                     && pull_voucher_strategy == PullVoucherStrategy::ClientVoucher;
@@ -692,10 +766,10 @@ impl StartCommand {
                     min_voucher_delta: sess.min_voucher_delta,
                     modes: modes.clone(),
                     pull_voucher_strategy: sdk_pull_voucher_strategy,
+                    grace_period_seconds:
+                        pay_kit::mpp::program::payment_channels::DEFAULT_GRACE_PERIOD_SECONDS,
                     rpc_url: Some(rpc_url.clone()),
                     program_id: Some(channel_program_id),
-                    grace_period_seconds:
-                        solana_mpp::program::payment_channels::DEFAULT_GRACE_PERIOD_SECONDS,
                 };
 
                 let mut smpp = SessionMpp::new(config, session_secret)
@@ -714,6 +788,11 @@ impl StartCommand {
             } else {
                 None
             };
+
+            // Abort launch if a split recipient won't resolve — an env-var
+            // (`${VAR}`) recipient whose variable isn't set is silently dropped
+            // from the charge at request time, so fail fast instead.
+            ensure_split_recipients_resolved(&api)?;
 
             // ── Banner ──
             let metered_count = api
@@ -990,13 +1069,100 @@ impl StartCommand {
 
             let verify_mpps = mpps.clone();
 
-            let state = AppState {
-                apis: Arc::new(vec![api.clone()]),
-                mpps,
-                session_mpp,
-                browser_rpc_url: Some(BROWSER_RPC_PROXY_PATH.to_string()),
-                fee_payer_wallet,
-                fee_payer_signer: fee_payer_signer.clone(),
+            // x402 `exact` backend — enables x402 challenges + verification for
+            // any endpoint that accepts an x402 scheme (mirrors the MPP wiring;
+            // without it the gate silently drops x402 from challenges).
+            let wants_x402 = api.endpoints.iter().any(|e| {
+                e.metering.as_ref().is_some_and(|m| {
+                    m.accepted_schemes().iter().any(|s| {
+                        matches!(
+                            s,
+                            pay_types::metering::Scheme::X402Exact
+                                | pay_types::metering::Scheme::X402Upto
+                                | pay_types::metering::Scheme::X402BatchSettlement
+                        )
+                    })
+                })
+            });
+            // Primary currency = the operator's first configured currency,
+            // resolved (symbol → MINT + decimals) exactly like the MPP path
+            // (`currency_configs`). The x402 settle path feeds `currency`
+            // straight into RPC calls, so it must be the mint, not "USDC".
+            // Shared by the `exact` and `upto` backends.
+            let (x402_mint, x402_decimals) = currency_configs
+                .first()
+                .map(|(_, mint, decimals)| (mint.clone(), *decimals))
+                .unwrap_or_else(|| {
+                    (
+                        pay_types::Stablecoin::Usdc
+                            .mint(Some(network.slug()))
+                            .to_string(),
+                        6,
+                    )
+                });
+            let x402 = if wants_x402 {
+                // Advertise every configured currency when more than one.
+                let accepted_currencies = if currencies.len() > 1 {
+                    Some(currencies.clone())
+                } else {
+                    None
+                };
+                let cfg = pay_kit::x402::server::Config {
+                    recipient: recipient.clone(),
+                    currency: x402_mint.clone(),
+                    decimals: x402_decimals,
+                    network: network.slug().to_string(),
+                    rpc_url: Some(rpc_url.clone()),
+                    resource: api.subdomain.clone(),
+                    description: None,
+                    max_age: Some(300),
+                    token_program: None,
+                    accepted_currencies,
+                    // The operator co-signs fees only when configured to.
+                    fee_payer_key: if fee_payer {
+                        fee_payer_signer.as_ref().map(|s| s.pubkey().to_string())
+                    } else {
+                        None
+                    },
+                };
+                match pay_kit::x402::server::X402::new(cfg) {
+                    Ok(x) => Some(x),
+                    Err(e) => {
+                        eprintln!("x402 backend disabled ({e}); x402 schemes won't be offered");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            // x402 `upto` backend — open-before-serve, settle-after. Requires the
+            // operator signer (it co-signs the channel open as fee payer and signs
+            // settlement vouchers), so it's only available with a fee-payer signer.
+            let x402_upto = match (wants_x402, fee_payer_signer.clone()) {
+                (true, Some(signer)) => {
+                    let cfg = pay_kit::x402::server::UptoConfig {
+                        recipient: recipient.clone(),
+                        currency: x402_mint.clone(),
+                        decimals: x402_decimals,
+                        cluster: network.slug().to_string(),
+                        rpc_url: Some(rpc_url.clone()),
+                        resource: api.subdomain.clone(),
+                        description: None,
+                        max_timeout_seconds: 300,
+                        token_program: None,
+                        program_id: None,
+                        operator_signer: signer,
+                    };
+                    match pay_kit::x402::server::X402Upto::new(cfg) {
+                        Ok(u) => Some(u),
+                        Err(e) => {
+                            eprintln!("x402 upto backend disabled ({e})");
+                            None
+                        }
+                    }
+                }
+                _ => None,
             };
 
             let pdb_state = if debugger {
@@ -1006,6 +1172,19 @@ impl StartCommand {
                 Some(pdb)
             } else {
                 None
+            };
+
+            let state = AppState {
+                apis: Arc::new(vec![api.clone()]),
+                mpps,
+                session_mpp,
+                browser_rpc_url: Some(BROWSER_RPC_PROXY_PATH.to_string()),
+                fee_payer_wallet,
+                fee_payer_signer: fee_payer_signer.clone(),
+                x402,
+                x402_upto,
+                // The gate calls `record_exchange` per proxied request to feed PDB.
+                pdb: pdb_state.clone(),
             };
 
             let verify_pdb = pdb_state.clone();
@@ -1036,6 +1215,20 @@ impl StartCommand {
                     "/__402/session/deliveries",
                     post(move |body: axum::Json<SessionDeliveryRequest>| {
                         reserve_session_delivery(delivery_state.clone(), body.0)
+                    }),
+                )
+                // Payment-channel settle-receipt poll. Payment-channel sessions
+                // settle out-of-band at idle-close, so (unlike x402) there's no
+                // per-request settlement header — clients poll this for the
+                // on-chain signature to build the receipt URL.
+                .route(
+                    "/__402/payment-channels/receipt/{channel_id}",
+                    get({
+                        let receipt_state = state.clone();
+                        move |axum::extract::Path(channel_id): axum::extract::Path<String>| {
+                            let state = receipt_state.clone();
+                            async move { session_receipt(state, channel_id) }
+                        }
                     }),
                 );
 
@@ -1154,18 +1347,24 @@ impl StartCommand {
                     state.clone(),
                     pay_core::server::payment::payment_middleware::<AppState>,
                 ))
-                .with_state(state)
+                .with_state(state.clone())
                 // Logging layer (outermost — executes first).
                 // Extension must be added AFTER the middleware layer (LIFO order)
                 // so the extension is available when the middleware runs.
                 .layer(middleware::from_fn(pay_pdb::logging::logging_middleware))
                 .layer(axum::Extension(pdb_state));
 
-            let listener = tokio::net::TcpListener::bind(&self.bind)
+            // axum serves the control plane on an internal port; Pingora
+            // (`Http402Gate`) fronts the public `self.bind` below, after
+            // `block_on` returns (Pingora owns its own runtimes).
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .map_err(|e| {
-                    pay_core::Error::Config(format!("Failed to bind {}: {e}", self.bind))
+                    pay_core::Error::Config(format!("Failed to bind control-plane: {e}"))
                 })?;
+            let internal_addr = listener.local_addr().map_err(|e| {
+                pay_core::Error::Config(format!("control-plane local_addr: {e}"))
+            })?;
             let display_addr = self.bind.replace("0.0.0.0", "127.0.0.1");
             let url = format!("http://{}", display_addr);
             if debugger {
@@ -1209,47 +1408,37 @@ impl StartCommand {
                 }
             };
 
-            // Bound the graceful drain. `with_graceful_shutdown` stops
-            // accepting new connections on the first SIGINT/SIGTERM but
-            // then waits for every in-flight connection to close before
-            // returning. Long-lived connections — most notably the
-            // debugger's `/logs/stream` SSE (an infinite stream that only
-            // ends when the browser tab closes) — never drain, so a
-            // single Ctrl+C would wedge the process with no way out: the
-            // first signal is already consumed by the drain, so further
-            // presses are ignored. Race the drain against a force-exit
-            // watcher that fires on a second signal or after a short
-            // grace period, so Ctrl+C is always responsive.
-            let serve_fut =
-                axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
-            let serve_result = tokio::select! {
-                res = serve_fut => {
-                    res.map_err(|e| pay_core::Error::Config(format!("Server error: {e}")))
+            // Serve the control-plane axum on the runtime's workers; Pingora
+            // fronts the public hot path after `block_on` returns. `rt` stays in
+            // scope (alive) while Pingora runs, so these workers keep running.
+            //
+            // NOTE: the local-skills deregister hook no longer fires on shutdown
+            // (Pingora's `run_forever` owns the process exit); stale entries are
+            // reaped by `sweep_dead_ephemeral_sources()` on the next start.
+            let _ = &registered_source_url;
+            tokio::spawn(async move {
+                if let Err(e) = axum::serve(listener, app).await {
+                    tracing::error!(error = %e, "control-plane axum server exited unexpectedly");
                 }
-                _ = force_shutdown_signal() => {
-                    eprintln!();
-                    eprintln!("  {}", "shutting down…".dimmed());
-                    Ok(())
-                }
-            };
+            });
 
-            // Best-effort cleanup. We run this regardless of how serve
-            // exited so even an `Err(...)` return path leaves
-            // skills.yaml clean.
-            if let Some(url) = registered_source_url
-                && let Err(e) = super::local_registration::deregister(&url)
-            {
-                tracing::warn!(error = %e, "failed to deregister local skills source");
-            }
+            Ok::<(std::net::SocketAddr, AppState), pay_core::Error>((internal_addr, state))
+        })?;
 
-            serve_result
-        })
+        // Pingora owns the public port + the hot path. It manages its own
+        // runtimes, so it must run on a thread with no ambient tokio runtime —
+        // the main thread, now that `block_on` has returned.
+        let (internal_addr, gate_state) = gateway;
+        let cores = std::thread::available_parallelism().map(|n| n.get()).ok();
+        pay_proxy::run(gate_state, &self.bind, internal_addr.to_string(), cores)
+            .map_err(|e| pay_core::Error::Config(format!("gateway: {e}")))
     }
 }
 
-/// Wait for the first SIGINT or SIGTERM. Used to drive axum's
-/// `with_graceful_shutdown` so the local-skills cleanup hook gets a
-/// chance to run before the process exits.
+/// Wait for the first SIGINT or SIGTERM. Retained for the planned control-plane
+/// graceful-shutdown path; Pingora currently owns the process exit, so axum's
+/// `with_graceful_shutdown` is no longer wired.
+#[allow(dead_code)]
 async fn shutdown_signal() {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
@@ -1266,30 +1455,6 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     let term = std::future::pending::<()>();
     tokio::select! { _ = ctrl_c => {}, _ = term => {} }
-}
-
-/// Grace period to let axum's graceful shutdown drain in-flight
-/// connections before we force the process down. Short enough that a
-/// single Ctrl+C feels responsive even when a streaming connection
-/// (e.g. the debugger SSE) would otherwise hold the drain open forever.
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
-
-/// Resolves once it's time to stop waiting for the graceful drain.
-///
-/// Waits for the first shutdown signal, then races a *second* signal
-/// against a short grace timeout — whichever comes first wins. This is
-/// the escape hatch for connections that never close on their own
-/// (notably the debugger's infinite SSE stream): the drain started by
-/// `with_graceful_shutdown` would otherwise hang indefinitely.
-async fn force_shutdown_signal() {
-    // First signal: a graceful drain is now in progress.
-    shutdown_signal().await;
-    // Give in-flight connections a moment to finish; bail early if the
-    // user presses Ctrl+C again.
-    tokio::select! {
-        _ = shutdown_signal() => {}
-        _ = tokio::time::sleep(SHUTDOWN_GRACE) => {}
-    }
 }
 
 fn spawn_fee_payer_balance_observer(wallet: FeePayerWallet, subdomain: String) {
@@ -1410,12 +1575,15 @@ fn serve_openapi(
     headers: &axum::http::HeaderMap,
 ) -> Response {
     let mut out = (*doc).clone();
-    if proxy_mode {
-        let public_url = public_override
-            .map(str::to_string)
-            .unwrap_or_else(|| derive_public_url_from_host(headers));
-        pay_core::server::openapi::rewrite_urls(&mut out, &public_url);
-    }
+    // Rewrite `servers[].url` to point at the gateway. In proxy mode this
+    // retargets the upstream doc's servers; for a synthesized doc (respond mode)
+    // it turns the placeholder `/` into the absolute gateway URL. Harmless when
+    // there are no rewritable URLs.
+    let _ = proxy_mode;
+    let public_url = public_override
+        .map(str::to_string)
+        .unwrap_or_else(|| derive_public_url_from_host(headers));
+    pay_core::server::openapi::rewrite_urls(&mut out, &public_url);
     axum::Json(out).into_response()
 }
 
@@ -1559,7 +1727,7 @@ async fn ensure_subscription_plans(
     use pay_core::server::subscription::{
         PlanStatus, check_plan_exists, compute_plan_id_numeric, publish_plan,
     };
-    use solana_mpp::program::subscriptions::{default_program_id, find_plan_pda, plan_id_seed};
+    use pay_kit::mpp::program::subscriptions::{default_program_id, find_plan_pda, plan_id_seed};
     use solana_pubkey::Pubkey;
 
     // Bail early when the spec has no subscription endpoints — keeps the
@@ -1940,7 +2108,7 @@ async fn resolve_signer_with_store(
         #[cfg(feature = "gcp_kms")]
         SignerConfig::GcpKms { key_name, pubkey } => {
             let signer =
-                solana_mpp::solana_keychain::GcpKmsSigner::new(key_name.clone(), pubkey.clone())
+                pay_kit::mpp::solana_keychain::GcpKmsSigner::new(key_name.clone(), pubkey.clone())
                     .await
                     .map_err(|e| {
                         pay_core::Error::Config(format!("Failed to create GCP KMS signer: {e}"))
@@ -1989,7 +2157,7 @@ async fn resolve_signer_with_store(
                         "Account `{name}` is ephemeral but has no inline secret_key_b58"
                     ))
                 })?;
-                solana_mpp::solana_keychain::MemorySigner::from_bytes(&bytes).map_err(|e| {
+                pay_kit::mpp::solana_keychain::MemorySigner::from_bytes(&bytes).map_err(|e| {
                     pay_core::Error::Config(format!("Invalid keypair bytes for `{name}`: {e}"))
                 })?
             } else {
@@ -2173,12 +2341,63 @@ struct SessionDeliveryRequest {
     expires_at: Option<i64>,
 }
 
+/// Payment-channel settle-receipt poll
+/// (`GET /__402/payment-channels/receipt/:channelId`): `{ settledSignature,
+/// finalized }` for a channel. Clients poll this until `settledSignature` is
+/// non-null to render the on-chain receipt URL (payment-channel sessions settle
+/// out-of-band at idle-close, so there's no per-request header).
+fn session_receipt(state: AppState, channel_id: String) -> axum::response::Response {
+    let signature = state
+        .session_mpp
+        .as_ref()
+        .and_then(|sm| sm.settlement_signature(&channel_id));
+    axum::Json(serde_json::json!({
+        "settledSignature": signature,
+        "finalized": signature.is_some(),
+    }))
+    .into_response()
+}
+
+/// Abort launch if a split recipient won't resolve to an address. A `${VAR}`
+/// recipient resolves from environment variable `VAR` (or a per-request query
+/// param); if neither is available the split is silently dropped from the
+/// charge, so fail fast at startup instead.
+fn ensure_split_recipients_resolved(
+    api: &pay_types::metering::ApiSpec,
+) -> Result<(), pay_core::Error> {
+    for ep in &api.endpoints {
+        let Some(meter) = ep.metering.as_ref() else {
+            continue;
+        };
+        for rule in pay_core::server::metering::resolve_split_rules(meter) {
+            let endpoint = ep.path.as_str();
+            let recipient = rule.recipient.as_str();
+            let Some(alias) = api.recipients.get(recipient) else {
+                return Err(pay_core::Error::Config(format!(
+                    "{endpoint}: split recipient '{recipient}' not declared"
+                )));
+            };
+            if let Some(var) = alias
+                .account
+                .strip_prefix("${")
+                .and_then(|rest| rest.strip_suffix('}'))
+                && std::env::var(var).map(|v| v.is_empty()).unwrap_or(true)
+            {
+                return Err(pay_core::Error::Config(format!(
+                    "{endpoint}: split recipient '{recipient}' unresolved (set ${var})"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn reserve_session_delivery(
     state: AppState,
     req: SessionDeliveryRequest,
 ) -> axum::response::Response {
     use axum::http::StatusCode;
-    use solana_mpp::server::session::DeliveryRequest;
+    use pay_kit::mpp::server::session::DeliveryRequest;
 
     let Some(session_mpp) = state.session_mpp.as_ref() else {
         return (
@@ -2230,7 +2449,7 @@ async fn gateway_verify(
     pdb: Option<&pay_pdb::PdbState>,
 ) -> axum::response::Response {
     use axum::http::StatusCode;
-    use solana_mpp::{format_receipt, format_www_authenticate_many, parse_authorization};
+    use pay_kit::mpp::{format_receipt, format_www_authenticate_many, parse_authorization};
 
     let auth = req
         .authorization
@@ -2239,7 +2458,7 @@ async fn gateway_verify(
         .filter(|v| !v.is_empty());
 
     // Parse splits from JSON string (assembled by Apigee JS policy).
-    let splits: Vec<solana_mpp::protocol::solana::Split> = req
+    let splits: Vec<pay_kit::mpp::protocol::solana::Split> = req
         .splits_json
         .as_deref()
         .filter(|s| !s.is_empty() && *s != "[]")
@@ -2313,9 +2532,9 @@ async fn gateway_verify(
                 // Audit #2: verify against the request this route would issue
                 // (rebuilt from the gateway's own price + splits), not the
                 // values echoed in the client's credential.
-                let expected: solana_mpp::ChargeRequest = match mpp.charge_with_options(
+                let expected: pay_kit::mpp::ChargeRequest = match mpp.charge_with_options(
                     &req.price,
-                    solana_mpp::server::ChargeOptions {
+                    pay_kit::mpp::server::ChargeOptions {
                         description: req.description.as_deref(),
                         external_id: req.external_id.as_deref(),
                         splits: splits.clone(),
@@ -2325,14 +2544,14 @@ async fn gateway_verify(
                     Ok(challenge) => match challenge.request.decode() {
                         Ok(r) => r,
                         Err(e) => {
-                            last_error = Some(solana_mpp::server::VerificationError::new(format!(
-                                "failed to decode expected charge request: {e}"
-                            )));
+                            last_error = Some(pay_kit::mpp::server::VerificationError::new(
+                                format!("failed to decode expected charge request: {e}"),
+                            ));
                             continue;
                         }
                     },
                     Err(e) => {
-                        last_error = Some(solana_mpp::server::VerificationError::new(format!(
+                        last_error = Some(pay_kit::mpp::server::VerificationError::new(format!(
                             "failed to rebuild expected charge challenge: {e}"
                         )));
                         continue;
@@ -2343,16 +2562,16 @@ async fn gateway_verify(
                     .await
                 {
                     Ok(receipt) => {
-                        let kind = solana_mpp::ReceiptKind::Charge(receipt);
+                        let kind = pay_kit::mpp::ReceiptKind::Charge(receipt);
                         let encoded = format_receipt(&kind).unwrap_or_default();
                         // Pull the underlying Receipt out for the legacy
                         // PDB logging path that still operates on the
                         // intent-agnostic shape.
                         let receipt = match &kind {
-                            solana_mpp::ReceiptKind::Charge(r) => r.clone(),
+                            pay_kit::mpp::ReceiptKind::Charge(r) => r.clone(),
                             // The charge verify path never produces a
                             // Subscription kind; this arm is unreachable.
-                            solana_mpp::ReceiptKind::Subscription { base, .. } => base.clone(),
+                            pay_kit::mpp::ReceiptKind::Subscription { base, .. } => base.clone(),
                         };
 
                         // Log successful payment to PDB
@@ -2397,7 +2616,7 @@ async fn gateway_verify(
             }
 
             let error = last_error.unwrap_or_else(|| {
-                solana_mpp::server::VerificationError::new("MPP not configured")
+                pay_kit::mpp::server::VerificationError::new("MPP not configured")
             });
             let message = pay_core::server::payment::readable_verification_message(&error);
             // Re-issue challenge on failure
@@ -2427,13 +2646,13 @@ async fn gateway_verify(
 fn gateway_charge_challenges(
     mpps: &[Mpp],
     req: &GatewayVerifyRequest,
-    splits: Vec<solana_mpp::protocol::solana::Split>,
-) -> Result<Vec<solana_mpp::PaymentChallenge>, solana_mpp::Error> {
+    splits: Vec<pay_kit::mpp::protocol::solana::Split>,
+) -> Result<Vec<pay_kit::mpp::PaymentChallenge>, pay_kit::mpp::Error> {
     mpps.iter()
         .map(|mpp| {
             mpp.charge_with_options(
                 &req.price,
-                solana_mpp::server::ChargeOptions {
+                pay_kit::mpp::server::ChargeOptions {
                     description: req.description.as_deref(),
                     external_id: req.external_id.as_deref(),
                     splits: splits.clone(),
@@ -2622,7 +2841,7 @@ endpoints:
     };
     use pay_types::metering::SignerConfig;
     // SolanaSigner trait is brought into scope by the parent module's
-    // `use solana_mpp::solana_keychain::SolanaSigner;` so calls like
+    // `use pay_kit::mpp::solana_keychain::SolanaSigner;` so calls like
     // `signer.pubkey()` resolve through the trait method.
 
     /// A real ed25519 keypair (sk[32] || pk[32]) lifted from the

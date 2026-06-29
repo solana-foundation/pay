@@ -628,6 +628,8 @@ mod tests {
             variants: vec![],
             sku_tiers: vec![],
             splits: vec![],
+            schemes: None,
+            min_usd: None,
         };
         assert!(resolve_price(&metering, &RequestProperties::default(), None, None).is_none());
     }
@@ -651,6 +653,8 @@ mod tests {
             variants: vec![],
             sku_tiers: vec![],
             splits: vec![],
+            schemes: None,
+            min_usd: None,
         };
         let price = resolve_price(&metering, &RequestProperties::default(), None, None);
         assert!(price.is_some());
@@ -669,6 +673,8 @@ mod tests {
                 level: pay_types::metering::SkuLevel::Essentials,
             }],
             splits: vec![],
+            schemes: None,
+            min_usd: None,
         };
         let price = resolve_price(&metering, &RequestProperties::default(), None, None);
         assert!(price.is_some());
@@ -717,6 +723,8 @@ mod tests {
             ],
             sku_tiers: vec![],
             splits: vec![],
+            schemes: None,
+            min_usd: None,
         };
         // Match second variant
         let price = resolve_price(
@@ -752,6 +760,8 @@ mod tests {
             }],
             sku_tiers: vec![],
             splits: vec![],
+            schemes: None,
+            min_usd: None,
         };
         // No variant hint match → uses first variant as default
         let price = resolve_price(
@@ -795,6 +805,8 @@ mod tests {
             variants: vec![],
             sku_tiers: vec![],
             splits: vec![],
+            schemes: None,
+            min_usd: None,
         };
 
         // Within condition
@@ -845,6 +857,8 @@ mod tests {
             variants: vec![],
             sku_tiers: vec![],
             splits: vec![],
+            schemes: None,
+            min_usd: None,
         };
 
         let ctx = MeteringContext {

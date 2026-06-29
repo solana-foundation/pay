@@ -102,30 +102,30 @@ blake3 = "1"
 qrcode = { version = "0.14", default-features = false }
 mime_guess = { version = "2.0", default-features = false, features = ["rev-mappings"] }
 
-# Solana MPP (includes keypair loading + charge + subscription + authenticate
-# builders).
-solana-mpp = { git = "https://github.com/solana-foundation/pay-kit", branch = "main", default-features = false, features = [
-    "client",
-    "server",
-    "confidential",
-] }
-
-# Solana x402 (lives in the pay-kit workspace alongside solana-mpp)
-solana-x402 = { git = "https://github.com/solana-foundation/pay-kit", branch = "main", package = "solana-x402", default-features = false, features = [
-    "client",
-] }
-
-# Unified pay-kit SDK — cross-protocol, balance-aware payment selection
-# (kit::select_payment over MPP charge + x402 accepts).
-solana-pay-kit = { git = "https://github.com/solana-foundation/pay-kit", branch = "main", default-features = false, features = [
+# Solana payment SDK umbrella — one dep that re-exports MPP (`pay_kit::mpp`),
+# x402 (`pay_kit::x402`), and the cross-protocol, balance-aware selection API
+# (`pay_kit::select_payment`), replacing the granular solana-mpp/solana-x402
+# deps. The `axum` feature (kit's own gate) is intentionally OFF — pay has its
+# own gate (pay-core + pay-proxy).
+#
+# Pinned to a rev, NOT `branch = "main"`: a moving branch lets the lock drift
+# (and split the pay-kit packages across two revs, which breaks the build), and
+# is not reproducible across machines/CI. Bump this rev deliberately.
+pay-kit = { package = "solana-pay-kit", git = "https://github.com/solana-foundation/pay-kit", rev = "e3d4d933a1fca84ff9c3a1eb2c1292f1113228be", default-features = false, features = [
     "mpp",
     "x402",
     "client",
+    "server",
+    "confidential",
+    "settlement",
+    "otel",
+    "testkit",
 ] }
 
 # Shared pay-kit base crate — canonical stablecoin mint registry lives here
-# (re-exported by solana-mpp / solana-x402). pay-types reads it directly.
-solana-pay-core = { git = "https://github.com/solana-foundation/pay-kit", branch = "main", default-features = false }
+# (re-exported by solana-mpp / solana-x402). pay-types reads it directly. Pinned
+# to the SAME rev as pay-kit so all pay-kit packages resolve to one rev.
+solana-pay-core = { git = "https://github.com/solana-foundation/pay-kit", rev = "e3d4d933a1fca84ff9c3a1eb2c1292f1113228be", default-features = false }
 
 # Solana primitives (pinned to versions used by solana-mpp)
 bincode = "1"
@@ -141,7 +141,10 @@ solana-transaction = "3.1"
 # litesvm (solana-address pin loosened) so litesvm 0.13 — pulled by surfpool-sdk
 # 1.4 — can coexist with the confidential proof crates (zk-sdk 7). The fix is
 # merged upstream (now `solana-address = ">=2.2, <3"`) but not yet in a crates.io
-# release (0.13.0 still pins `=2.2.0`), so pin upstream master.
+# release (0.13.0 still pins `=2.2.0`), so pin a specific upstream rev for
+# reproducibility (a moving `branch = "master"` is not reproducible across builds).
+# TODO(remove): drop this patch once a litesvm > 0.13.0 carrying the loosened
+# `solana-address = ">=2.2, <3"` constraint lands on crates.io.
 [patch.crates-io]
-litesvm = { git = "https://github.com/LiteSVM/litesvm.git", branch = "master" }
-litesvm-token = { git = "https://github.com/LiteSVM/litesvm.git", branch = "master" }
+litesvm = { git = "https://github.com/LiteSVM/litesvm.git", rev = "b097465bc66ba6033b5118b8a2d5bc2ecb9f00e1" }
+litesvm-token = { git = "https://github.com/LiteSVM/litesvm.git", rev = "b097465bc66ba6033b5118b8a2d5bc2ecb9f00e1" }

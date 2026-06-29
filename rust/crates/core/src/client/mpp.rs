@@ -1,13 +1,13 @@
 //! MPP (Machine Payments Protocol) support.
 //!
-//! Thin wrapper around `solana_mpp` for challenge detection and credential building.
+//! Thin wrapper around `pay_kit::mpp` for challenge detection and credential building.
 
+use pay_kit::mpp::client::build_credential_header;
+use pay_kit::mpp::protocol::solana::default_rpc_url;
+use pay_kit::mpp::solana_keychain::SolanaSigner;
+use pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient;
+use pay_kit::mpp::{ChargeRequest, parse_www_authenticate_all};
 use pay_types::Stablecoin;
-use solana_mpp::client::build_credential_header;
-use solana_mpp::protocol::solana::default_rpc_url;
-use solana_mpp::solana_keychain::SolanaSigner;
-use solana_mpp::solana_rpc_client::rpc_client::RpcClient;
-use solana_mpp::{ChargeRequest, parse_www_authenticate_all};
 use tracing::{info, warn};
 
 use crate::accounts::{
@@ -16,7 +16,7 @@ use crate::accounts::{
 use crate::{Error, Result};
 
 // Re-export the challenge type for the runner/CLI.
-pub use solana_mpp::PaymentChallenge as Challenge;
+pub use pay_kit::mpp::PaymentChallenge as Challenge;
 
 /// Try to extract an MPP challenge from the `www-authenticate` header value.
 pub fn parse(header_value: &str) -> Option<Challenge> {
@@ -257,8 +257,8 @@ pub enum ChosenPayment {
 /// This is the balance-aware, cross-protocol replacement for
 /// [`select_challenge_by_balance`]: it builds the funded-token set from the
 /// wallet's on-chain stablecoin balances and delegates ranking to
-/// [`solana_pay_kit::select_payment_parsed`] (default strategy:
-/// [`HighestBalance`](solana_pay_kit::OrderingStrategy::HighestBalance)). This
+/// [`pay_kit::select_payment_parsed`] (default strategy:
+/// [`HighestBalance`](pay_kit::OrderingStrategy::HighestBalance)). This
 /// is what lets a wallet holding only USDC settle a USDC x402 offer even when
 /// the server's MPP challenge is denominated in a coin the wallet doesn't hold.
 ///
@@ -316,31 +316,29 @@ pub fn choose_payment(
     // The wallet's spendable stablecoins become the (mint, network, available)
     // preference set. pay-kit normalizes advertised currencies to mints with
     // the same registry, so both sides speak mint addresses.
-    let funded: Vec<solana_pay_kit::AcceptableToken> = balances
+    let funded: Vec<pay_kit::AcceptableToken> = balances
         .tokens
         .iter()
-        .map(|t| solana_pay_kit::AcceptableToken {
+        .map(|t| pay_kit::AcceptableToken {
             mint: t.mint.clone(),
             network: network.to_string(),
             available: t.raw_amount,
         })
         .collect();
 
-    let x402_accepts: Vec<solana_x402::exact::PaymentRequirements> = x402_alternative
+    let x402_accepts: Vec<pay_kit::x402::exact::PaymentRequirements> = x402_alternative
         .map(|c| c.requirements.clone())
         .into_iter()
         .collect();
 
-    match solana_pay_kit::select_payment_parsed(
+    match pay_kit::select_payment_parsed(
         mpp_challenges,
         &x402_accepts,
         &funded,
-        &solana_pay_kit::OrderingStrategy::HighestBalance,
+        &pay_kit::OrderingStrategy::HighestBalance,
     ) {
-        Ok(solana_pay_kit::SelectedPayment::Mpp { challenge, .. }) => {
-            Ok(ChosenPayment::Mpp(challenge))
-        }
-        Ok(solana_pay_kit::SelectedPayment::X402 { .. }) => x402_alternative
+        Ok(pay_kit::SelectedPayment::Mpp { challenge, .. }) => Ok(ChosenPayment::Mpp(challenge)),
+        Ok(pay_kit::SelectedPayment::X402 { .. }) => x402_alternative
             .cloned()
             .map(|c| ChosenPayment::X402(Box::new(c)))
             .ok_or_else(|| Error::Mpp("x402 selected but no challenge available".to_string())),
@@ -366,7 +364,7 @@ fn decoded_charge_candidates(
     let mut candidates = Vec::new();
 
     for (index, challenge) in challenges.iter().enumerate() {
-        if !solana_mpp::client::is_solana_charge_challenge(challenge) {
+        if !pay_kit::mpp::client::is_solana_charge_challenge(challenge) {
             continue;
         }
 
@@ -374,7 +372,7 @@ fn decoded_charge_candidates(
             .request
             .decode()
             .map_err(|e| Error::Mpp(format!("Failed to decode challenge request: {e}")))?;
-        let details: solana_mpp::protocol::solana::MethodDetails = request
+        let details: pay_kit::mpp::protocol::solana::MethodDetails = request
             .method_details
             .clone()
             .map(serde_json::from_value)
@@ -435,7 +433,7 @@ fn resolve_challenge_mint(currency: &str, network: &str) -> Option<String> {
     if Stablecoin::from_mint(currency).is_some() {
         return Some(currency.to_string());
     }
-    solana_mpp::protocol::solana::resolve_stablecoin_mint(currency, Some(network))
+    pay_kit::mpp::protocol::solana::resolve_stablecoin_mint(currency, Some(network))
         .map(str::to_string)
 }
 
@@ -707,12 +705,15 @@ mod tests {
 
     #[test]
     fn parse_all_extracts_repeated_stablecoin_payment_challenges() {
-        let usdc = solana_mpp::format_www_authenticate(&challenge_for_currency("USDC", "1000000"))
-            .unwrap();
-        let cash = solana_mpp::format_www_authenticate(&challenge_for_currency("CASH", "1000000"))
-            .unwrap();
-        let usdt = solana_mpp::format_www_authenticate(&challenge_for_currency("USDT", "1000000"))
-            .unwrap();
+        let usdc =
+            pay_kit::mpp::format_www_authenticate(&challenge_for_currency("USDC", "1000000"))
+                .unwrap();
+        let cash =
+            pay_kit::mpp::format_www_authenticate(&challenge_for_currency("CASH", "1000000"))
+                .unwrap();
+        let usdt =
+            pay_kit::mpp::format_www_authenticate(&challenge_for_currency("USDT", "1000000"))
+                .unwrap();
 
         let parsed = parse_all([usdc.as_str(), cash.as_str(), usdt.as_str()]);
         assert_eq!(parsed.len(), 3);
@@ -751,7 +752,7 @@ mod tests {
         assert_eq!(candidates[0].currency, "USDC");
         assert_eq!(
             candidates[0].mint.as_str(),
-            solana_mpp::protocol::solana::mints::USDC_MAINNET
+            pay_kit::mpp::protocol::solana::mints::USDC_MAINNET
         );
     }
 
@@ -765,7 +766,7 @@ mod tests {
         let balances = crate::client::balance::AccountBalances {
             sol_lamports: 0,
             tokens: vec![token_balance(
-                solana_mpp::protocol::solana::mints::USDT_MAINNET,
+                pay_kit::mpp::protocol::solana::mints::USDT_MAINNET,
                 2_000_000,
                 "USDT",
             )],
@@ -810,17 +811,17 @@ mod tests {
             sol_lamports: 0,
             tokens: vec![
                 token_balance(
-                    solana_mpp::protocol::solana::mints::USDC_MAINNET,
+                    pay_kit::mpp::protocol::solana::mints::USDC_MAINNET,
                     999_999,
                     "USDC",
                 ),
                 token_balance(
-                    solana_mpp::protocol::solana::mints::CASH_MAINNET,
+                    pay_kit::mpp::protocol::solana::mints::CASH_MAINNET,
                     1_000_000,
                     "CASH",
                 ),
                 token_balance(
-                    solana_mpp::protocol::solana::mints::USDT_MAINNET,
+                    pay_kit::mpp::protocol::solana::mints::USDT_MAINNET,
                     5_000_000,
                     "USDT",
                 ),
@@ -844,17 +845,17 @@ mod tests {
             sol_lamports: 0,
             tokens: vec![
                 token_balance(
-                    solana_mpp::protocol::solana::mints::USDC_MAINNET,
+                    pay_kit::mpp::protocol::solana::mints::USDC_MAINNET,
                     999_999,
                     "USDC",
                 ),
                 token_balance(
-                    solana_mpp::protocol::solana::mints::CASH_MAINNET,
+                    pay_kit::mpp::protocol::solana::mints::CASH_MAINNET,
                     999_999,
                     "CASH",
                 ),
                 token_balance(
-                    solana_mpp::protocol::solana::mints::USDT_MAINNET,
+                    pay_kit::mpp::protocol::solana::mints::USDT_MAINNET,
                     1_000_000,
                     "USDT",
                 ),
@@ -876,7 +877,7 @@ mod tests {
         let balances = crate::client::balance::AccountBalances {
             sol_lamports: 0,
             tokens: vec![token_balance(
-                solana_mpp::protocol::solana::mints::USDT_MAINNET,
+                pay_kit::mpp::protocol::solana::mints::USDT_MAINNET,
                 999_999,
                 "USDT",
             )],

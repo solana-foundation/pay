@@ -66,6 +66,9 @@ export interface SessionInfo {
 export interface PaymentFlow {
   id: string; // "flow-1", "flow-2", …
   protocol: Protocol;
+  // Sub-scheme within the protocol: "charge"/"session"/"subscription" (mpp),
+  // "exact"/"upto"/"batch-settlement" (x402). Rendered as "PROTOCOL:SCHEME".
+  scheme?: string;
   resource: string; // URL path, e.g. "/mpp/quote/GOOG"
   status: FlowStatus;
   clientIp: string;

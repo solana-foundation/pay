@@ -46,7 +46,7 @@ export function FlowRow({ flow, selected, onClick }: Props) {
       className={`flow-row${selected ? " selected" : ""}${channelOpen ? " channel-open" : ""}`}
       onClick={onClick}
     >
-      <ProtocolBadge protocol={flow.protocol} />
+      <ProtocolBadge protocol={flow.protocol} scheme={flow.scheme} />
       <span className="resource">{flow.resource}</span>
       {channelOpen && (
         <span className="session-inline session-inline-status">

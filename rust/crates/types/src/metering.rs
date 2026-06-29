@@ -50,6 +50,36 @@ pub struct ApiSpec {
     pub session: Option<SessionSpec>,
 }
 
+impl ApiSpec {
+    /// Fill in per-endpoint scheme defaults for endpoints that omit `schemes`.
+    ///
+    /// The base default is `[MppCharge]`. A spec that declares a top-level
+    /// `session:` block additionally gets `MppSession`, so existing session
+    /// deployments keep accepting `intent=session` credentials without having
+    /// to enumerate `schemes` on every endpoint — otherwise the charge-only
+    /// fallback in [`Metering::accepted_schemes`] would silently re-challenge
+    /// session clients with charge-only options. Endpoints that set `schemes`
+    /// explicitly are left untouched (explicit config is a restriction).
+    ///
+    /// Resolving here (once, at load) keeps every consumer — the payment gate,
+    /// the OpenAPI offer builder, and the x402-backend probe in `server start` —
+    /// reading the same scheme set.
+    pub fn apply_scheme_defaults(&mut self) {
+        let has_session = self.session.is_some();
+        for endpoint in &mut self.endpoints {
+            if let Some(metering) = endpoint.metering.as_mut()
+                && metering.schemes.is_none()
+            {
+                let mut schemes = vec![Scheme::MppCharge];
+                if has_session {
+                    schemes.push(Scheme::MppSession);
+                }
+                metering.schemes = Some(schemes);
+            }
+        }
+    }
+}
+
 /// How a request is handled after payment verification.
 ///
 /// ```yaml
@@ -985,7 +1015,30 @@ impl SubscriptionEndpoint {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+/// A per-call payment scheme a metered endpoint can accept. The endpoint opts
+/// into specific schemes via [`Metering::schemes`]; the gate advertises a 402
+/// challenge for each accepted scheme that the server has a backend for, and
+/// verifies a presented credential against the matching scheme.
+///
+/// `subscription` is intentionally absent — it is a distinct recurring-billing
+/// model declared via [`Endpoint::subscription`], mutually exclusive with
+/// per-call metering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum Scheme {
+    /// MPP `intent=charge` — one settled credential per request.
+    MppCharge,
+    /// MPP `intent=session` — open a channel, stream off-chain vouchers.
+    MppSession,
+    /// x402 `exact` — pay an exact amount per request.
+    X402Exact,
+    /// x402 `upto` — usage-based, operator settles a voucher up to a cap.
+    X402Upto,
+    /// x402 `batch-settlement` — high-throughput batched channel settlement.
+    X402BatchSettlement,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct Metering {
     /// Direct pricing dimensions (when there's a single pricing model).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1001,6 +1054,25 @@ pub struct Metering {
     /// Applied to all tiers unless overridden at the tier level.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub splits: Vec<SplitRule>,
+    /// Per-call schemes this endpoint accepts. `None` defaults to charge-only
+    /// (`[mpp-charge]`); session and the x402 schemes must be listed explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schemes: Option<Vec<Scheme>>,
+    /// Minimum settled amount (USD) for usage-metered `x402-upto`. The tier
+    /// price is the *ceiling* the client authorizes; absent a real usage meter,
+    /// the operator settles a voucher for this `min` (clamped to the ceiling) on
+    /// a successful serve, refunding the rest. `None` settles the full ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_usd: Option<f64>,
+}
+
+impl Metering {
+    /// Schemes this endpoint accepts, defaulting to charge-only when unset.
+    pub fn accepted_schemes(&self) -> Vec<Scheme> {
+        self.schemes
+            .clone()
+            .unwrap_or_else(|| vec![Scheme::MppCharge])
+    }
 }
 
 /// A variant represents a pricing path selected by a request parameter.
@@ -2147,6 +2219,8 @@ mod tests {
             }],
             sku_tiers: vec![],
             splits: vec![],
+            schemes: None,
+            min_usd: None,
         };
         let json = serde_json::to_string(&metering).unwrap();
         let back: Metering = serde_json::from_str(&json).unwrap();
@@ -2210,6 +2284,8 @@ mod tests {
                     variants: vec![],
                     sku_tiers: vec![],
                     splits: vec![],
+                    schemes: None,
+                    min_usd: None,
                 }),
                 subscription: None,
             }],
@@ -2526,6 +2602,56 @@ mod tests {
         }
     }
 
+    fn metered_endpoint(schemes: Option<Vec<Scheme>>) -> Endpoint {
+        Endpoint {
+            method: HttpMethod::Get,
+            path: "v1/x".into(),
+            description: None,
+            resource: None,
+            routing: None,
+            metering: Some(Metering {
+                dimensions: vec![],
+                variants: vec![],
+                sku_tiers: vec![],
+                splits: vec![],
+                schemes,
+                min_usd: None,
+            }),
+            subscription: None,
+        }
+    }
+
+    #[test]
+    fn apply_scheme_defaults_charge_only_without_session() {
+        let mut api = test_spec(vec![metered_endpoint(None)]);
+        api.apply_scheme_defaults();
+        assert_eq!(
+            api.endpoints[0].metering.as_ref().unwrap().schemes,
+            Some(vec![Scheme::MppCharge]),
+        );
+    }
+
+    #[test]
+    fn apply_scheme_defaults_adds_session_when_session_configured() {
+        let mut api = test_spec(vec![
+            metered_endpoint(None),
+            metered_endpoint(Some(vec![Scheme::X402Exact])),
+        ]);
+        api.session = Some(serde_json::from_value(serde_json::json!({ "cap_usdc": 1.0 })).unwrap());
+        api.apply_scheme_defaults();
+
+        // Omitted schemes pick up both MPP schemes in a session-enabled spec.
+        assert_eq!(
+            api.endpoints[0].metering.as_ref().unwrap().schemes,
+            Some(vec![Scheme::MppCharge, Scheme::MppSession]),
+        );
+        // Explicit `schemes` are a restriction and must be left untouched.
+        assert_eq!(
+            api.endpoints[1].metering.as_ref().unwrap().schemes,
+            Some(vec![Scheme::X402Exact]),
+        );
+    }
+
     #[test]
     fn validate_splits_without_dimensions() {
         let spec = test_spec(vec![Endpoint {
@@ -2547,6 +2673,8 @@ mod tests {
                     percent: None,
                     memo: None,
                 }],
+                schemes: None,
+                min_usd: None,
             }),
             subscription: None,
         }]);
@@ -2585,6 +2713,8 @@ mod tests {
                     percent: None,
                     memo: None,
                 }],
+                schemes: None,
+                min_usd: None,
             }),
             subscription: None,
         }]);
@@ -2623,6 +2753,8 @@ mod tests {
                     percent: None,
                     memo: None,
                 }],
+                schemes: None,
+                min_usd: None,
             }),
             subscription: None,
         }]);
@@ -2661,6 +2793,8 @@ mod tests {
                     percent: Some(5.0),
                     memo: None,
                 }],
+                schemes: None,
+                min_usd: None,
             }),
             subscription: None,
         }]);
@@ -2698,6 +2832,8 @@ mod tests {
                     percent: None,
                     memo: None,
                 }],
+                schemes: None,
+                min_usd: None,
             }),
             subscription: None,
         }]);
@@ -2746,6 +2882,8 @@ mod tests {
                         memo: None,
                     },
                 ],
+                schemes: None,
+                min_usd: None,
             }),
             subscription: None,
         }]);
@@ -2798,6 +2936,8 @@ mod tests {
                 variants: vec![],
                 sku_tiers: vec![],
                 splits: vec![],
+                schemes: None,
+                min_usd: None,
             }),
             subscription: None,
         }]);
@@ -2850,6 +2990,8 @@ mod tests {
                 variants: vec![],
                 sku_tiers: vec![],
                 splits: vec![],
+                schemes: None,
+                min_usd: None,
             }),
             subscription: None,
         }]);

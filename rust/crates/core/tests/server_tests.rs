@@ -14,10 +14,10 @@ use pay_core::PaymentState;
 use pay_core::server::accounting::{AccountingKey, AccountingStore, InMemoryStore};
 use pay_core::server::proxy;
 use pay_core::server::session::SessionMpp;
+use pay_kit::mpp::server::Mpp;
+use pay_kit::mpp::server::session::SessionConfig;
 use pay_types::metering::ApiSpec;
 use serde_json::json;
-use solana_mpp::server::Mpp;
-use solana_mpp::server::session::SessionConfig;
 use std::sync::Arc;
 
 // ── Test app state ──
@@ -88,7 +88,7 @@ async fn echo_handler(req: Request<Body>) -> impl IntoResponse {
 async fn start_test_server(with_mpp: bool) -> (String, tokio::task::JoinHandle<()>) {
     let api = load_test_api();
     let mpp = if with_mpp {
-        Mpp::new(solana_mpp::server::Config {
+        Mpp::new(pay_kit::mpp::server::Config {
             recipient: "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY".to_string(),
             currency: "SOL".to_string(),
             decimals: 9,
@@ -131,7 +131,7 @@ async fn start_multi_currency_server() -> (String, tokio::task::JoinHandle<()>) 
     let mpps = ["USDC", "CASH", "USDT"]
         .into_iter()
         .map(|currency| {
-            Mpp::new(solana_mpp::server::Config {
+            Mpp::new(pay_kit::mpp::server::Config {
                 recipient: "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY".to_string(),
                 currency: currency.to_string(),
                 decimals: 6,
@@ -177,7 +177,7 @@ fn client_with_host(subdomain: &str) -> reqwest::header::HeaderMap {
 
 async fn start_respond_server() -> (String, tokio::task::JoinHandle<()>) {
     let api = load_respond_api();
-    let mpp = Mpp::new(solana_mpp::server::Config {
+    let mpp = Mpp::new(pay_kit::mpp::server::Config {
         recipient: "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY".to_string(),
         currency: "USDC".to_string(),
         decimals: 6,
@@ -228,7 +228,10 @@ fn test_session_mpp() -> SessionMpp {
             max_cap: 5_000_000,
             currency: solana_pubkey::Pubkey::new_unique().to_string(),
             network: "localnet".to_string(),
-            modes: vec![solana_mpp::SessionMode::Push, solana_mpp::SessionMode::Pull],
+            modes: vec![
+                pay_kit::mpp::SessionMode::Push,
+                pay_kit::mpp::SessionMode::Pull,
+            ],
             ..SessionConfig::default()
         },
         "test-secret-key-do-not-use-32b-pad",
@@ -407,7 +410,7 @@ async fn middleware_402_challenge_parseable() {
         .unwrap()
         .to_str()
         .unwrap();
-    let challenge = solana_mpp::parse_www_authenticate(www_auth).unwrap();
+    let challenge = pay_kit::mpp::parse_www_authenticate(www_auth).unwrap();
     assert_eq!(challenge.method.as_str(), "solana");
     assert_eq!(challenge.intent.as_str(), "charge");
 }
@@ -431,14 +434,14 @@ async fn middleware_returns_one_challenge_per_configured_currency() {
         .iter()
         .map(|value| value.to_str().unwrap())
         .collect();
-    let challenges = solana_mpp::parse_www_authenticate_all(headers)
+    let challenges = pay_kit::mpp::parse_www_authenticate_all(headers)
         .into_iter()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     let currencies: Vec<String> = challenges
         .into_iter()
         .map(|challenge| {
-            let request: solana_mpp::ChargeRequest = challenge.request.decode().unwrap();
+            let request: pay_kit::mpp::ChargeRequest = challenge.request.decode().unwrap();
             request.currency
         })
         .collect();
@@ -528,7 +531,7 @@ async fn middleware_returns_session_challenge_when_session_mpp_configured() {
         .unwrap()
         .to_str()
         .unwrap();
-    let challenge = solana_mpp::parse_www_authenticate(www_auth).unwrap();
+    let challenge = pay_kit::mpp::parse_www_authenticate(www_auth).unwrap();
     assert_eq!(challenge.intent.as_str(), "session");
 }
 
@@ -551,7 +554,7 @@ async fn middleware_accepts_session_open_and_voucher_then_close() {
         .to_str()
         .unwrap()
         .to_string();
-    let challenge = solana_mpp::parse_www_authenticate(&www_auth).unwrap();
+    let challenge = pay_kit::mpp::parse_www_authenticate(&www_auth).unwrap();
 
     let challenge_for_open = challenge.clone();
     let (handle, open_header) = tokio::task::spawn_blocking(move || {
@@ -701,7 +704,7 @@ async fn root_redirects_to_pdb_with_html_accept() {
     // Unlisted paths (e.g. /favicon.ico) must return 404, not forward to upstream
     // (which would trigger spurious OAuth2 fetches).
     let api = load_respond_api();
-    let mpp = Mpp::new(solana_mpp::server::Config {
+    let mpp = Mpp::new(pay_kit::mpp::server::Config {
         recipient: "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY".to_string(),
         currency: "USDC".to_string(),
         decimals: 6,

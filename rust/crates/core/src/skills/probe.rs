@@ -281,10 +281,10 @@ pub fn extract_paid_endpoint(headers: &[(String, String)], body: Option<&str>) -
     let mut found_mpp_solana = false;
     let mut mpp_description: Option<String> = None;
     for challenge in crate::client::mpp::parse_headers(headers) {
-        if !solana_mpp::client::is_solana_charge_challenge(&challenge) {
+        if !pay_kit::mpp::client::is_solana_charge_challenge(&challenge) {
             continue;
         }
-        let request: solana_mpp::ChargeRequest = match challenge.request.decode() {
+        let request: pay_kit::mpp::ChargeRequest = match challenge.request.decode() {
             Ok(r) => r,
             Err(_) => continue,
         };
@@ -472,7 +472,7 @@ fn probe_endpoint(
 fn classify_outcome(outcome: RunOutcome, accepted: &[String]) -> ProbeStatus {
     match outcome {
         RunOutcome::MppChallenge { challenge, .. } => {
-            let request: solana_mpp::ChargeRequest = match challenge.request.decode() {
+            let request: pay_kit::mpp::ChargeRequest = match challenge.request.decode() {
                 Ok(r) => r,
                 Err(e) => {
                     return ProbeStatus::Error {
@@ -522,7 +522,7 @@ fn classify_outcome(outcome: RunOutcome, accepted: &[String]) -> ProbeStatus {
             // distinct protocol so catalog probes don't lump them in with
             // one-shot charges. We still want the currency and recipient
             // out of the request so the catalog row stays useful.
-            let request: solana_mpp::SubscriptionRequest = match challenge.request.decode() {
+            let request: pay_kit::mpp::SubscriptionRequest = match challenge.request.decode() {
                 Ok(r) => r,
                 Err(e) => {
                     return ProbeStatus::Error {
@@ -562,6 +562,30 @@ fn classify_outcome(outcome: RunOutcome, accepted: &[String]) -> ProbeStatus {
 
             ProbeStatus::Ok {
                 protocol: "x402".into(),
+                currency,
+                network,
+                recipient,
+            }
+        }
+
+        RunOutcome::X402UptoChallenge { challenge, .. } => {
+            let currency = normalize_currency(&challenge.requirements.asset);
+            // upto carries only the CAIP-2 network; map it to a cluster label.
+            let network =
+                pay_kit::x402::exact::cluster_for_caip2_network(&challenge.requirements.network)
+                    .unwrap_or("mainnet")
+                    .to_string();
+            let recipient = challenge.requirements.pay_to.clone();
+
+            if !accepted.iter().any(|a| a.eq_ignore_ascii_case(&currency)) {
+                return ProbeStatus::WrongCurrency {
+                    got: currency,
+                    accepted: accepted.to_vec(),
+                };
+            }
+
+            ProbeStatus::Ok {
+                protocol: "x402-upto".into(),
                 currency,
                 network,
                 recipient,

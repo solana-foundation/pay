@@ -52,6 +52,13 @@ pub enum RunOutcome {
         challenge: Box<x402::Challenge>,
         resource_url: String,
     },
+    /// The server returned 402 with an x402 `upto` (usage-metered) challenge —
+    /// authorize a ceiling via a payment channel; the operator settles the
+    /// actual amount after serving.
+    X402UptoChallenge {
+        challenge: Box<x402::UptoChallenge>,
+        resource_url: String,
+    },
     /// The server returned 402 with an x402 `sign-in-with-x` challenge.
     ///
     /// When the same 402 also offered a payment option, `payment_fallback`
@@ -505,7 +512,7 @@ pub(crate) fn classify_402_with_preference(
     let x402_challenge = x402::parse(headers, body).or_else(|| {
         headers
             .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(solana_x402::PAYMENT_REQUIRED_HEADER))
+            .find(|(k, _)| k.eq_ignore_ascii_case(pay_kit::x402::PAYMENT_REQUIRED_HEADER))
             .and_then(|(_, v)| {
                 use base64::Engine;
                 let decoded = base64::engine::general_purpose::STANDARD.decode(v).ok()?;
@@ -517,7 +524,7 @@ pub(crate) fn classify_402_with_preference(
     let mpp_challenges = mpp::parse_headers(headers);
     let x402_siwx_challenge = x402::parse_siwx_auth(headers, body);
 
-    // x402::parse (from solana_x402) only returns Some when a Solana-
+    // x402::parse (from pay_kit::x402) only returns Some when a Solana-
     // compatible `accepts` entry exists — it's already a Solana filter.
     // MPP is chain-agnostic at the parse level, so we need to validate
     // the recipient is a valid Solana pubkey.
@@ -570,7 +577,7 @@ pub(crate) fn classify_402_with_preference(
     // land on x402 even when MPP is also offered.
     let mut charge_challenges: Vec<mpp::Challenge> = mpp_challenges
         .iter()
-        .filter(|challenge| solana_mpp::client::is_solana_charge_challenge(challenge))
+        .filter(|challenge| pay_kit::mpp::client::is_solana_charge_challenge(challenge))
         .cloned()
         .collect();
     if !charge_challenges.is_empty() && preference != ProtocolPreference::OnlyX402 {
@@ -602,6 +609,20 @@ pub(crate) fn classify_402_with_preference(
             return RunOutcome::X402SignInChallenge {
                 challenge: Box::new(siwx),
                 payment_fallback: x402_challenge.map(Box::new),
+                resource_url: resource_url.to_string(),
+            };
+        }
+
+        // x402 `upto` (usage-metered) — checked before exact: an upto-only
+        // challenge also parses leniently as exact, so prefer the upto reading
+        // when the server advertises the `upto` scheme.
+        if let Some(upto) = x402::parse_upto(headers, body) {
+            info!(
+                resource = resource_url,
+                "Detected x402 upto challenge (Solana)"
+            );
+            return RunOutcome::X402UptoChallenge {
+                challenge: Box::new(upto),
                 resource_url: resource_url.to_string(),
             };
         }
@@ -1302,7 +1323,7 @@ HTTP request sent, awaiting response...
                 alternatives,
                 ..
             } => {
-                let first: solana_mpp::ChargeRequest = challenge.request.decode().unwrap();
+                let first: pay_kit::mpp::ChargeRequest = challenge.request.decode().unwrap();
                 assert_eq!(first.currency, "USDC");
                 assert_eq!(alternatives.len(), 2);
             }
@@ -1434,7 +1455,7 @@ HTTP request sent, awaiting response...
             "resource": "https://example.com/resource"
         });
         let headers = vec![(
-            solana_x402::X402_V1_PAYMENT_REQUIRED_HEADER.to_string(),
+            pay_kit::x402::X402_V1_PAYMENT_REQUIRED_HEADER.to_string(),
             requirements.to_string(),
         )];
 
@@ -1474,7 +1495,7 @@ HTTP request sent, awaiting response...
                 ),
             ),
             (
-                solana_x402::X402_V1_PAYMENT_REQUIRED_HEADER.to_string(),
+                pay_kit::x402::X402_V1_PAYMENT_REQUIRED_HEADER.to_string(),
                 x402_requirements.to_string(),
             ),
         ]
@@ -1558,7 +1579,7 @@ HTTP request sent, awaiting response...
             "resource": "https://example.com/resource"
         });
         let headers = vec![(
-            solana_x402::X402_V1_PAYMENT_REQUIRED_HEADER.to_string(),
+            pay_kit::x402::X402_V1_PAYMENT_REQUIRED_HEADER.to_string(),
             requirements.to_string(),
         )];
 
@@ -1582,7 +1603,7 @@ HTTP request sent, awaiting response...
         use base64::Engine;
 
         let payment_required = serde_json::json!({
-            solana_x402::X402_VERSION_FIELD: solana_x402::X402_VERSION_V2,
+            pay_kit::x402::X402_VERSION_FIELD: pay_kit::x402::X402_VERSION_V2,
             "resource": {
                 "url": "https://example.com/resource",
                 "description": "API access"
@@ -1598,7 +1619,7 @@ HTTP request sent, awaiting response...
                         "issuedAt": "2026-04-27T00:00:00Z"
                     },
                     "supportedChains": [{
-                        "chainId": solana_x402::exact::SOLANA_MAINNET,
+                        "chainId": pay_kit::x402::exact::SOLANA_MAINNET,
                         "type": "ed25519",
                         "signatureScheme": "siws"
                     }]
@@ -1607,7 +1628,7 @@ HTTP request sent, awaiting response...
         });
         let encoded = base64::engine::general_purpose::STANDARD
             .encode(payment_required.to_string().as_bytes());
-        let headers = vec![(solana_x402::PAYMENT_REQUIRED_HEADER.to_string(), encoded)];
+        let headers = vec![(pay_kit::x402::PAYMENT_REQUIRED_HEADER.to_string(), encoded)];
 
         let outcome = classify_402(&headers, None, "https://example.com/resource");
 
@@ -1629,15 +1650,15 @@ HTTP request sent, awaiting response...
         use base64::Engine;
 
         let selected = serde_json::json!({
-            "scheme": solana_x402::exact::EXACT_SCHEME,
-            "network": solana_x402::exact::SOLANA_MAINNET,
+            "scheme": pay_kit::x402::exact::EXACT_SCHEME,
+            "network": pay_kit::x402::exact::SOLANA_MAINNET,
             "amount": "10000",
             "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
             "payTo": "6cvgmdrsVxyiuPzqMCSBnS7fAmA5Mk2VG4BcfVhC8jdC",
             "maxTimeoutSeconds": 300
         });
         let payment_required = serde_json::json!({
-            solana_x402::X402_VERSION_FIELD: solana_x402::X402_VERSION_V2,
+            pay_kit::x402::X402_VERSION_FIELD: pay_kit::x402::X402_VERSION_V2,
             "accepts": [selected],
             "extensions": {
                 "sign-in-with-x": {
@@ -1649,7 +1670,7 @@ HTTP request sent, awaiting response...
                         "issuedAt": "2026-04-27T00:00:00Z"
                     },
                     "supportedChains": [{
-                        "chainId": solana_x402::exact::SOLANA_MAINNET,
+                        "chainId": pay_kit::x402::exact::SOLANA_MAINNET,
                         "type": "ed25519",
                         "signatureScheme": "siws"
                     }]
@@ -1658,7 +1679,7 @@ HTTP request sent, awaiting response...
         });
         let encoded = base64::engine::general_purpose::STANDARD
             .encode(payment_required.to_string().as_bytes());
-        let headers = vec![(solana_x402::PAYMENT_REQUIRED_HEADER.to_string(), encoded)];
+        let headers = vec![(pay_kit::x402::PAYMENT_REQUIRED_HEADER.to_string(), encoded)];
 
         let outcome = classify_402(&headers, None, "https://example.com/resource");
 

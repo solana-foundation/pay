@@ -37,10 +37,10 @@ async fn submit_sol_transfer(
     recipient: &str,
     lamports: u64,
 ) -> String {
+    use pay_kit::mpp::solana_keychain::SolanaSigner;
+    use pay_kit::mpp::solana_keychain::memory::MemorySigner;
+    use pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient;
     use solana_message::Message;
-    use solana_mpp::solana_keychain::SolanaSigner;
-    use solana_mpp::solana_keychain::memory::MemorySigner;
-    use solana_mpp::solana_rpc_client::rpc_client::RpcClient;
     use solana_pubkey::Pubkey;
     use solana_signature::Signature;
     use solana_system_interface::instruction as system_instruction;
@@ -178,9 +178,9 @@ async fn full_payment_flow_with_surfnet() {
     use axum::middleware;
     use axum::routing::any;
     use pay_core::PaymentState;
+    use pay_kit::mpp::server::Mpp;
+    use pay_kit::mpp::solana_keychain::memory::MemorySigner;
     use pay_types::metering::ApiSpec;
-    use solana_mpp::server::Mpp;
-    use solana_mpp::solana_keychain::memory::MemorySigner;
     use std::sync::Arc;
 
     #[derive(Clone)]
@@ -208,7 +208,7 @@ async fn full_payment_flow_with_surfnet() {
         serde_yml::from_str(&std::fs::read_to_string("tests/fixtures/test-provider.yml").unwrap())
             .unwrap();
 
-    let mpp = Mpp::new(solana_mpp::server::Config {
+    let mpp = Mpp::new(pay_kit::mpp::server::Config {
         recipient: recipient.pubkey().to_string(),
         currency: "SOL".to_string(),
         decimals: 9,
@@ -261,7 +261,7 @@ async fn full_payment_flow_with_surfnet() {
         .to_str()
         .unwrap()
         .to_string();
-    let challenge = solana_mpp::parse_www_authenticate(&www_auth).unwrap();
+    let challenge = pay_kit::mpp::parse_www_authenticate(&www_auth).unwrap();
 
     // Step 2: Build payment
     let payer = Keypair::new();
@@ -271,8 +271,8 @@ async fn full_payment_flow_with_surfnet() {
         .unwrap();
     let signer = MemorySigner::from_bytes(&payer.to_bytes()).unwrap();
     let rpc =
-        solana_mpp::solana_rpc_client::rpc_client::RpcClient::new(surfnet.rpc_url().to_string());
-    let auth = solana_mpp::client::build_credential_header(&signer, &rpc, &challenge)
+        pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient::new(surfnet.rpc_url().to_string());
+    let auth = pay_kit::mpp::client::build_credential_header(&signer, &rpc, &challenge)
         .await
         .unwrap();
 
@@ -308,9 +308,9 @@ async fn replayed_authorization_is_rejected() {
     use axum::middleware;
     use axum::routing::any;
     use pay_core::PaymentState;
+    use pay_kit::mpp::server::Mpp;
+    use pay_kit::mpp::solana_keychain::memory::MemorySigner;
     use pay_types::metering::ApiSpec;
-    use solana_mpp::server::Mpp;
-    use solana_mpp::solana_keychain::memory::MemorySigner;
     use std::sync::Arc;
 
     #[derive(Clone)]
@@ -338,7 +338,7 @@ async fn replayed_authorization_is_rejected() {
         serde_yml::from_str(&std::fs::read_to_string("tests/fixtures/test-provider.yml").unwrap())
             .unwrap();
 
-    let mpp = Mpp::new(solana_mpp::server::Config {
+    let mpp = Mpp::new(pay_kit::mpp::server::Config {
         recipient: recipient.pubkey().to_string(),
         currency: "SOL".to_string(),
         decimals: 9,
@@ -387,7 +387,7 @@ async fn replayed_authorization_is_rejected() {
         .to_str()
         .unwrap()
         .to_string();
-    let challenge = solana_mpp::parse_www_authenticate(&www_auth).unwrap();
+    let challenge = pay_kit::mpp::parse_www_authenticate(&www_auth).unwrap();
 
     // Step 2: Build a payment credential.
     let payer = Keypair::new();
@@ -397,8 +397,8 @@ async fn replayed_authorization_is_rejected() {
         .unwrap();
     let signer = MemorySigner::from_bytes(&payer.to_bytes()).unwrap();
     let rpc =
-        solana_mpp::solana_rpc_client::rpc_client::RpcClient::new(surfnet.rpc_url().to_string());
-    let auth = solana_mpp::client::build_credential_header(&signer, &rpc, &challenge)
+        pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient::new(surfnet.rpc_url().to_string());
+    let auth = pay_kit::mpp::client::build_credential_header(&signer, &rpc, &challenge)
         .await
         .unwrap();
 
@@ -469,13 +469,13 @@ async fn push_session_full_flow() {
     use axum::routing::any;
     use pay_core::PaymentState;
     use pay_core::server::session::SessionMpp;
-    use pay_types::metering::ApiSpec;
-    use solana_mpp::client::session::ActiveSession;
-    use solana_mpp::server::session::SessionConfig;
-    use solana_mpp::solana_keychain::memory::MemorySigner;
-    use solana_mpp::{
+    use pay_kit::mpp::client::session::ActiveSession;
+    use pay_kit::mpp::server::session::SessionConfig;
+    use pay_kit::mpp::solana_keychain::memory::MemorySigner;
+    use pay_kit::mpp::{
         PaymentCredential, SessionMode, format_authorization, parse_www_authenticate,
     };
+    use pay_types::metering::ApiSpec;
     use std::sync::Arc;
 
     // ── App state ──────────────────────────────────────────────────────────
@@ -488,7 +488,7 @@ async fn push_session_full_flow() {
         fn apis(&self) -> &[ApiSpec] {
             &self.apis
         }
-        fn mpp(&self) -> Option<&solana_mpp::server::Mpp> {
+        fn mpp(&self) -> Option<&pay_kit::mpp::server::Mpp> {
             None
         }
         fn session_mpp(&self) -> Option<&SessionMpp> {
@@ -581,7 +581,7 @@ async fn push_session_full_flow() {
     // ── Step 2: Open session ───────────────────────────────────────────────
     // Session key: any Ed25519 keypair — signs vouchers, never touches chain.
     let session_kp = Keypair::new();
-    let session_signer: Box<dyn solana_mpp::solana_keychain::SolanaSigner> =
+    let session_signer: Box<dyn pay_kit::mpp::solana_keychain::SolanaSigner> =
         Box::new(MemorySigner::from_bytes(&session_kp.to_bytes()).unwrap());
 
     // Submit a real SOL transfer to surfpool as a stand-in for the Fiber
@@ -694,8 +694,8 @@ async fn mpp_build_credential_with_surfnet() {
     use axum::routing::any;
     use pay_core::PaymentState;
 
+    use pay_kit::mpp::server::Mpp;
     use pay_types::metering::ApiSpec;
-    use solana_mpp::server::Mpp;
     use std::sync::Arc;
 
     #[derive(Clone)]
@@ -723,7 +723,7 @@ async fn mpp_build_credential_with_surfnet() {
         serde_yml::from_str(&std::fs::read_to_string("tests/fixtures/test-provider.yml").unwrap())
             .unwrap();
 
-    let mpp = Mpp::new(solana_mpp::server::Config {
+    let mpp = Mpp::new(pay_kit::mpp::server::Config {
         recipient: recipient.pubkey().to_string(),
         currency: "SOL".to_string(),
         decimals: 9,

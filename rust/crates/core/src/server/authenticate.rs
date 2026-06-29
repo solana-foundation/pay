@@ -1,6 +1,6 @@
 //! Server-side bridge to the MPP `authenticate` intent.
 //!
-//! Builds a [`solana_mpp::AuthenticateServer`] from pay's endpoint
+//! Builds a [`pay_kit::mpp::AuthenticateServer`] from pay's endpoint
 //! config so the middleware can emit / verify SIWS-style identity
 //! tokens that gate subscription endpoints between billing periods
 //! without re-prompting the wallet.
@@ -9,7 +9,7 @@
 //! endpoint also accepts authenticate-intent credentials on
 //! subsequent requests within the period.
 
-use solana_mpp::server::{AuthenticateConfig, AuthenticateServer};
+use pay_kit::mpp::server::{AuthenticateConfig, AuthenticateServer};
 
 use crate::{Error, Result};
 use pay_types::metering::{SubscriptionEndpoint, SubscriptionPeriodUnit as TypesPeriodUnit};

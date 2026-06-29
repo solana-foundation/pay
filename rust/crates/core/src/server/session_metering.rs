@@ -715,6 +715,8 @@ mod tests {
             variants: vec![],
             sku_tiers: vec![],
             splits: vec![],
+            schemes: None,
+            min_usd: None,
         }
     }
 
@@ -819,6 +821,8 @@ endpoints:
             ],
             sku_tiers: vec![],
             splits: vec![],
+            schemes: None,
+            min_usd: None,
         };
 
         let spec = spec_from_metering(
@@ -847,6 +851,8 @@ endpoints:
             }],
             sku_tiers: vec![],
             splits: vec![],
+            schemes: None,
+            min_usd: None,
         };
 
         let spec = spec_from_metering(
@@ -956,6 +962,8 @@ endpoints:
                 level: pay_types::metering::SkuLevel::Essentials,
             }],
             splits: vec![],
+            schemes: None,
+            min_usd: None,
         };
 
         let err = spec_from_metering(&metering, SessionMeteringContext::new()).unwrap_err();

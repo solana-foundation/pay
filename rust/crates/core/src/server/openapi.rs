@@ -19,9 +19,9 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use pay_types::metering::Endpoint;
+use pay_types::metering::{ApiSpec, Endpoint, HttpMethod, Metering, Scheme};
 use pay_types::registry::OpenapiSource;
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::{Error, Result};
 
@@ -63,6 +63,281 @@ pub fn load_document(source: &OpenapiSource, spec_dir: &Path) -> Result<Value> {
         .map_err(|e| Error::Config(format!("openapi: document is not valid JSON: {e}")))
 }
 
+/// Runtime operator identity for [`synthesize_from_spec`] — the bits the static
+/// spec doesn't carry (resolved signer/recipient pubkeys + network).
+pub struct DiscoveryContext<'a> {
+    /// Network slug (`mainnet`/`devnet`/`testnet`/`localnet`). Used verbatim on
+    /// MPP offers; mapped to a CAIP-2 chain id on x402 offers.
+    pub network_slug: &'a str,
+    /// Operator payment recipient (base58) → offer `payTo`.
+    pub pay_to: Option<&'a str>,
+    /// Operator fee-payer pubkey (base58) → x402 offer `feePayer`.
+    pub fee_payer: Option<&'a str>,
+}
+
+/// Synthesize an OpenAPI 3.1 document from the provider spec itself, for when
+/// the operator did not supply an upstream doc (`--openapi` / `openapi:`).
+///
+/// Mirrors pay-kit's TS `openapiFromExpress`: each declared endpoint becomes an
+/// operation carrying an `x-payment-info` extension whose `offers[]` are derived
+/// from the metering / subscription pricing. Each offer follows the
+/// payment-discovery draft shape (`intent`/`method`/`scheme`/`amount`/`network`/
+/// `payTo`, plus `feePayer` on x402, `unitPrice` on session, `planId` on
+/// subscription). x402 offers carry a CAIP-2 `network`; MPP offers carry the
+/// plain network slug.
+pub fn synthesize_from_spec(api: &ApiSpec, ctx: &DiscoveryContext) -> Value {
+    // All supported stablecoins are 6-decimal; offers price in base units.
+    const USDC_DECIMALS: u32 = 6;
+    // Primary display currency = the operator's first configured `usd` currency.
+    let currency = api
+        .operator
+        .as_ref()
+        .and_then(|o| o.currencies.get("usd"))
+        .and_then(|list| list.first())
+        .cloned()
+        .unwrap_or_else(|| "USDC".to_string());
+
+    let caip2 = solana_caip2(ctx.network_slug);
+    // Session channel cap (the per-call price is the unit price for streaming).
+    let session_cap_usd = api.session.as_ref().map(|s| s.cap_usdc);
+
+    let mut paths: Map<String, Value> = Map::new();
+    for ep in &api.endpoints {
+        let oas_path = format!("/{}", ep.path.trim_start_matches('/'));
+
+        let mut offers: Vec<Value> = Vec::new();
+        if let Some(sub) = &ep.subscription {
+            offers.push(build_offer(&OfferSpec {
+                intent: "subscription",
+                method: "mpp",
+                scheme: "subscription",
+                amount_usd: sub.price_usd,
+                capped: false,
+                network: ctx.network_slug,
+                currency: &currency,
+                decimals: USDC_DECIMALS,
+                pay_to: ctx.pay_to,
+                fee_payer: None,
+                unit_price_usd: None,
+                plan_id: sub.plan_id.as_deref(),
+            }));
+        } else if let Some(metering) = &ep.metering {
+            let flat = flat_price_usd(metering);
+            for scheme in metering.accepted_schemes() {
+                let info = scheme_offer_info(scheme);
+                // `upto` (a ceiling) and `session` (a channel cap) advertise a
+                // capped amount; session also carries the per-delivery unit price.
+                let (amount_usd, capped, unit_price_usd) = match scheme {
+                    Scheme::MppSession => (session_cap_usd, true, flat),
+                    Scheme::X402Upto => (flat, true, None),
+                    _ => (flat, false, None),
+                };
+                offers.push(build_offer(&OfferSpec {
+                    intent: info.intent,
+                    method: info.method,
+                    scheme: info.scheme,
+                    amount_usd,
+                    capped,
+                    network: if info.is_x402 {
+                        caip2.as_str()
+                    } else {
+                        ctx.network_slug
+                    },
+                    currency: &currency,
+                    decimals: USDC_DECIMALS,
+                    pay_to: ctx.pay_to,
+                    fee_payer: if info.is_x402 { ctx.fee_payer } else { None },
+                    unit_price_usd,
+                    plan_id: None,
+                }));
+            }
+            // x402 offers first, matching pay-kit's discovery ordering.
+            offers.sort_by_key(|o| o.get("method").and_then(Value::as_str) != Some("x402"));
+        }
+
+        let mut op = Map::new();
+        op.insert(
+            "responses".to_string(),
+            json!({
+                "200": { "description": "Successful response" },
+                "402": { "description": "Payment Required" },
+            }),
+        );
+        if let Some(desc) = &ep.description {
+            op.insert("summary".to_string(), json!(desc));
+        }
+        if !offers.is_empty() {
+            op.insert(
+                "x-payment-info".to_string(),
+                json!({ "offers": Value::Array(offers) }),
+            );
+        }
+
+        // Multiple methods can share a path — merge into the same path item.
+        let item = paths
+            .entry(oas_path)
+            .or_insert_with(|| Value::Object(Map::new()));
+        if let Some(obj) = item.as_object_mut() {
+            obj.insert(http_method_key(&ep.method).to_string(), Value::Object(op));
+        }
+    }
+
+    json!({
+        "openapi": "3.1.0",
+        "info": { "title": api.title, "version": api.version },
+        "paths": Value::Object(paths),
+    })
+}
+
+/// Lowercase OpenAPI key for an HTTP method.
+fn http_method_key(method: &HttpMethod) -> &'static str {
+    match method {
+        HttpMethod::Get => "get",
+        HttpMethod::Post => "post",
+        HttpMethod::Put => "put",
+        HttpMethod::Patch => "patch",
+        HttpMethod::Delete => "delete",
+    }
+}
+
+/// Flat per-call USD price: the first tier of the first pricing dimension
+/// (falling back to the first variant's first dimension). `None` for free or
+/// purely usage-shaped endpoints with no leading flat tier.
+fn flat_price_usd(metering: &Metering) -> Option<f64> {
+    metering
+        .dimensions
+        .iter()
+        .find_map(|d| d.tiers.first().map(|t| t.price_usd))
+        .or_else(|| {
+            metering.variants.iter().find_map(|v| {
+                v.dimensions
+                    .iter()
+                    .find_map(|d| d.tiers.first().map(|t| t.price_usd))
+            })
+        })
+}
+
+/// Discovery facets of a per-call [`Scheme`].
+struct OfferInfo {
+    intent: &'static str,
+    method: &'static str,
+    scheme: &'static str,
+    is_x402: bool,
+}
+
+fn scheme_offer_info(scheme: Scheme) -> OfferInfo {
+    match scheme {
+        Scheme::MppCharge => OfferInfo {
+            intent: "charge",
+            method: "mpp",
+            scheme: "charge",
+            is_x402: false,
+        },
+        Scheme::X402Exact => OfferInfo {
+            intent: "charge",
+            method: "x402",
+            scheme: "exact",
+            is_x402: true,
+        },
+        Scheme::X402Upto => OfferInfo {
+            intent: "charge",
+            method: "x402",
+            scheme: "upto",
+            is_x402: true,
+        },
+        Scheme::MppSession => OfferInfo {
+            intent: "session",
+            method: "mpp",
+            scheme: "session",
+            is_x402: false,
+        },
+        Scheme::X402BatchSettlement => OfferInfo {
+            intent: "session",
+            method: "x402",
+            scheme: "batch-settlement",
+            is_x402: true,
+        },
+    }
+}
+
+/// Inputs for [`build_offer`].
+struct OfferSpec<'a> {
+    intent: &'a str,
+    method: &'a str,
+    scheme: &'a str,
+    amount_usd: Option<f64>,
+    /// `true` → render `description` as "up to N USDC" (ceilings / channel caps).
+    capped: bool,
+    network: &'a str,
+    currency: &'a str,
+    decimals: u32,
+    pay_to: Option<&'a str>,
+    fee_payer: Option<&'a str>,
+    unit_price_usd: Option<f64>,
+    plan_id: Option<&'a str>,
+}
+
+/// Build one `x-payment-info` offer matching pay-kit's discovery shape.
+fn build_offer(spec: &OfferSpec) -> Value {
+    let mut offer = Map::new();
+    offer.insert("intent".to_string(), json!(spec.intent));
+    offer.insert("method".to_string(), json!(spec.method));
+    offer.insert("scheme".to_string(), json!(spec.scheme));
+    offer.insert("network".to_string(), json!(spec.network));
+    offer.insert("currency".to_string(), json!(spec.currency));
+    if let Some(usd) = spec.amount_usd {
+        offer.insert(
+            "amount".to_string(),
+            json!(to_base_units(usd, spec.decimals)),
+        );
+        let human = format!("{} {}", fmt_usd(usd), spec.currency);
+        let description = if spec.capped {
+            format!("up to {human}")
+        } else {
+            human
+        };
+        offer.insert("description".to_string(), json!(description));
+    }
+    if let Some(pt) = spec.pay_to {
+        offer.insert("payTo".to_string(), json!(pt));
+    }
+    if let Some(fp) = spec.fee_payer {
+        offer.insert("feePayer".to_string(), json!(fp));
+    }
+    if let Some(up) = spec.unit_price_usd {
+        offer.insert(
+            "unitPrice".to_string(),
+            json!(to_base_units(up, spec.decimals)),
+        );
+    }
+    if let Some(pid) = spec.plan_id {
+        offer.insert("planId".to_string(), json!(pid));
+    }
+    Value::Object(offer)
+}
+
+/// USD → integer base-unit string (e.g. `0.01` USDC, 6dp → `"10000"`).
+fn to_base_units(usd: f64, decimals: u32) -> String {
+    ((usd * 10f64.powi(decimals as i32)).round() as u64).to_string()
+}
+
+/// Format a USD amount with minimal digits, no trailing zeros — `1.0` → "1",
+/// `0.10` → "0.1", `0.0001` → "0.0001" (matches the TS playground's labels).
+fn fmt_usd(usd: f64) -> String {
+    format!("{usd}")
+}
+
+/// CAIP-2 chain id for a Solana network slug. localnet/surfnet (a mainnet fork)
+/// and mainnet both resolve to the mainnet genesis hash.
+fn solana_caip2(slug: &str) -> String {
+    let genesis = match slug {
+        "devnet" => "EtWTRABZaYq6iMfeYKouRu166VU2xqa1",
+        "testnet" => "4uhcVJyU9pJkvQyS88uRDiswHXSCkY3z",
+        _ => "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+    };
+    format!("solana:{genesis}")
+}
+
 /// Strip every operation whose `(METHOD, path)` is not declared in
 /// `endpoints`. Mutates the document in place.
 ///
@@ -86,24 +361,151 @@ pub fn filter_to_endpoints(doc: &mut Value, endpoints: &[Endpoint]) {
             )
         })
         .collect();
+    // Loose fallback keys (see `loose_path_key`) so Google's collapsed
+    // `{+parent}` paths still match the YAML's expanded ones.
+    let allowed_loose: HashSet<(String, String, String)> = endpoints
+        .iter()
+        .filter_map(|e| {
+            loose_path_key(&canonical_path(&e.path))
+                .map(|(version, anchor)| (http_method_str(&e.method).to_string(), version, anchor))
+        })
+        .collect();
 
     if doc.get("openapi").is_some() || doc.get("swagger").is_some() {
-        filter_openapi3(doc, &allowed);
+        filter_openapi3(doc, &allowed, &allowed_loose);
     } else if doc
         .get("kind")
         .and_then(|v| v.as_str())
         .is_some_and(|k| k.starts_with("discovery#"))
     {
-        filter_discovery(doc, &allowed);
+        filter_discovery(doc, &allowed, &allowed_loose);
     } else {
         // Unknown shape — best effort: try OpenAPI 3 if `paths` is present,
         // otherwise try Discovery if `resources` is present, else leave alone.
         if doc.get("paths").is_some() {
-            filter_openapi3(doc, &allowed);
+            filter_openapi3(doc, &allowed, &allowed_loose);
         } else if doc.get("resources").is_some() {
-            filter_discovery(doc, &allowed);
+            filter_discovery(doc, &allowed, &allowed_loose);
         }
     }
+
+    warn_on_unmatched_endpoints(doc, endpoints);
+}
+
+/// Loud guardrail: after filtering, flag any YAML-declared endpoint that has
+/// no surviving operation in the served document. A silent drop here is what
+/// produced empty `/openapi.json` specs in the first place — a path-shape
+/// mismatch (or a stale/empty upstream) leaves the endpoint uncallable while
+/// every check still passes. Warn per endpoint, and escalate when the filter
+/// wiped out *every* declared endpoint (almost always a spec/match bug, not an
+/// intentional empty gateway).
+fn warn_on_unmatched_endpoints(doc: &Value, endpoints: &[Endpoint]) {
+    if endpoints.is_empty() {
+        return;
+    }
+    let served: HashSet<(String, String)> = collect_doc_operations(doc).into_iter().collect();
+    let mut covered = 0usize;
+    for e in endpoints {
+        let method = http_method_str(&e.method).to_string();
+        let canon = canonical_path(&e.path);
+        let endpoint_loose = loose_path_key(&canon);
+        let hit = served.iter().any(|(m, p)| {
+            *m == method
+                && (*p == canon
+                    || (endpoint_loose.is_some() && loose_path_key(p) == endpoint_loose))
+        });
+        if hit {
+            covered += 1;
+        } else {
+            tracing::warn!(
+                method = %method,
+                path = %e.path,
+                "openapi filter: declared endpoint has no matching operation in the upstream spec; \
+                 it will be absent from /openapi.json (check the upstream path shape or that the \
+                 spec actually defines this operation)"
+            );
+        }
+    }
+    if covered == 0 {
+        tracing::warn!(
+            declared = endpoints.len(),
+            "openapi filter: NO declared endpoint matched the upstream spec — /openapi.json will \
+             expose zero endpoints. This usually means the upstream uses Google's collapsed \
+             `{{+parent}}` paths or has an empty `paths` object."
+        );
+    }
+}
+
+/// Enumerate every operation surviving in `doc` as `(METHOD, canonical_path)`,
+/// in the same path space the allow-list uses (OpenAPI 3 paths are prefixed
+/// with the `servers[0].url` base path; Discovery prefers the expanded
+/// `flatPath`). Used only by the post-filter coverage guardrail.
+fn collect_doc_operations(doc: &Value) -> Vec<(String, String)> {
+    let mut ops = Vec::new();
+    if let Some(paths) = doc.get("paths").and_then(|v| v.as_object()) {
+        let base_path = openapi3_base_path(doc);
+        for (path, item) in paths {
+            let Some(item_obj) = item.as_object() else {
+                continue;
+            };
+            let combined = if base_path.is_empty() {
+                normalize_path(path)
+            } else {
+                format!("{}/{}", base_path, path.trim_start_matches('/'))
+            };
+            let canon = canonical_path(&combined);
+            for &method in HTTP_METHODS {
+                if item_obj.contains_key(method) {
+                    ops.push((method.to_uppercase(), canon.clone()));
+                }
+            }
+        }
+    }
+    if let Some(resources) = doc.get("resources").and_then(|v| v.as_object()) {
+        collect_discovery_operations(resources, &mut ops);
+    }
+    if let Some(methods) = doc.get("methods").and_then(|v| v.as_object()) {
+        collect_discovery_methods(methods, &mut ops);
+    }
+    ops
+}
+
+fn collect_discovery_operations(resources: &Map<String, Value>, ops: &mut Vec<(String, String)>) {
+    for (_, resource) in resources {
+        let Some(robj) = resource.as_object() else {
+            continue;
+        };
+        if let Some(methods) = robj.get("methods").and_then(|v| v.as_object()) {
+            collect_discovery_methods(methods, ops);
+        }
+        if let Some(nested) = robj.get("resources").and_then(|v| v.as_object()) {
+            collect_discovery_operations(nested, ops);
+        }
+    }
+}
+
+fn collect_discovery_methods(methods: &Map<String, Value>, ops: &mut Vec<(String, String)>) {
+    for (_, m) in methods {
+        let http_method = m
+            .get("httpMethod")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_uppercase();
+        let path = discovery_method_path(m);
+        if !http_method.is_empty() {
+            ops.push((http_method, canonical_path(path)));
+        }
+    }
+}
+
+/// Prefer Discovery's expanded `flatPath` over the collapsed `path` so it
+/// lines up with the gateway YAML's expanded allow-list. Falls back to `path`.
+fn discovery_method_path(method: &Value) -> &str {
+    method
+        .get("flatPath")
+        .and_then(|v| v.as_str())
+        .or_else(|| method.get("path").and_then(|v| v.as_str()))
+        .unwrap_or("")
 }
 
 /// Rewrite the document's base-URL fields to `public_url`, preserving the
@@ -210,6 +612,70 @@ fn canonical_path(path: &str) -> String {
     out
 }
 
+/// A looser match key for bridging Google's collapsed `{+parent}` / `{+name}`
+/// resource templates against the gateway YAML's *expanded* paths.
+///
+/// Google's discovery-derived OpenAPI keys an operation under a single
+/// variable that stands in for a whole resource hierarchy, e.g.
+/// `/v3/{parent}:translateText`. The proxy YAML, by contrast, must declare the
+/// fully-expanded path (`v3/projects/{id}/locations/{id}:translateText`)
+/// because the gateway's request allow-list matches real, expanded URLs. Exact
+/// [`canonical_path`] matching can't bridge the two: after `{x}` → `{*}`
+/// collapse the segment counts still differ (`v3/{*}:translateText` vs
+/// `v3/projects/{*}/locations/{*}:translateText`), so every Google "custom
+/// verb" endpoint gets silently dropped and the served `/openapi.json` ends up
+/// with an empty `paths`.
+///
+/// The key anchors on the parts that survive both spellings: the leading
+/// segment (API version / service prefix) and the **full trailing segment** —
+/// the resource plus any Google custom verb (`{*}:translateText`,
+/// `currentConditions:lookup`, `supportedLanguages`). Only the *intermediate*
+/// hierarchy is discarded, which is exactly the part `{+parent}` collapses.
+///
+/// Keeping the whole final segment (not just the `:verb`) matters: a generic
+/// verb like `:lookup` is shared by many resources, so anchoring on the verb
+/// alone would let `history:lookup` masquerade as `currentConditions:lookup`.
+///
+/// Returns `None` when the trailing segment is a bare placeholder (e.g. a
+/// get-by-id `v3/{name}`) or the leading segment is a placeholder, so those
+/// fall back to exact matching only and can't be loosely over-matched.
+fn loose_path_key(canonical: &str) -> Option<(String, String)> {
+    let trimmed = canonical.trim_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let first = trimmed.split('/').next().unwrap_or("");
+    if first.is_empty() || first.contains('{') {
+        return None;
+    }
+    let last = trimmed.rsplit('/').next().unwrap_or("");
+    // A placeholder-only final segment (`{*}`, no custom verb) has no stable
+    // literal to anchor on — require an exact match for those.
+    if last.contains('{') && !last.contains(':') {
+        return None;
+    }
+    Some((first.to_string(), last.to_string()))
+}
+
+/// Whether an upstream operation `(method, canon)` is one of the endpoints the
+/// gateway exposes. Tries an exact canonical match first, then falls back to
+/// the [`loose_path_key`] anchor so Google's collapsed `{+parent}` paths match
+/// the YAML's expanded ones.
+fn op_matches(
+    method: &str,
+    canon: &str,
+    allowed: &HashSet<(String, String)>,
+    allowed_loose: &HashSet<(String, String, String)>,
+) -> bool {
+    if allowed.contains(&(method.to_string(), canon.to_string())) {
+        return true;
+    }
+    match loose_path_key(canon) {
+        Some((version, anchor)) => allowed_loose.contains(&(method.to_string(), version, anchor)),
+        None => false,
+    }
+}
+
 /// Extract the path component of `servers[0].url` in OpenAPI 3 docs.
 /// Returns the prefix (without leading/trailing slash) so we can prepend it
 /// to each `paths.<path>` key for matching against YAML allowlist entries.
@@ -254,7 +720,11 @@ const HTTP_METHODS: &[&str] = &[
     "get", "post", "put", "patch", "delete", "head", "options", "trace",
 ];
 
-fn filter_openapi3(doc: &mut Value, allowed: &HashSet<(String, String)>) {
+fn filter_openapi3(
+    doc: &mut Value,
+    allowed: &HashSet<(String, String)>,
+    allowed_loose: &HashSet<(String, String, String)>,
+) {
     // Compute the base path from servers[0].url so we can match the YAML's
     // proxy-relative paths (e.g. `bigquery/v2/projects/...`) against the
     // openapi's server-relative paths (e.g. `/projects/...`). For bigquery:
@@ -280,7 +750,7 @@ fn filter_openapi3(doc: &mut Value, allowed: &HashSet<(String, String)>) {
         let methods_to_remove: Vec<String> = HTTP_METHODS
             .iter()
             .filter(|m| item_obj.contains_key(**m))
-            .filter(|m| !allowed.contains(&(m.to_uppercase(), canon.clone())))
+            .filter(|m| !op_matches(&m.to_uppercase(), &canon, allowed, allowed_loose))
             .map(|m| (*m).to_string())
             .collect();
         for m in methods_to_remove {
@@ -295,9 +765,13 @@ fn filter_openapi3(doc: &mut Value, allowed: &HashSet<(String, String)>) {
     }
 }
 
-fn filter_discovery(doc: &mut Value, allowed: &HashSet<(String, String)>) {
+fn filter_discovery(
+    doc: &mut Value,
+    allowed: &HashSet<(String, String)>,
+    allowed_loose: &HashSet<(String, String, String)>,
+) {
     if let Some(root_obj) = doc.as_object_mut() {
-        prune_resources(root_obj, allowed);
+        prune_resources(root_obj, allowed, allowed_loose);
     }
 }
 
@@ -546,6 +1020,7 @@ fn prune_discovery_schemas(doc: &mut Value) {
 fn prune_resources(
     container: &mut Map<String, Value>,
     allowed: &HashSet<(String, String)>,
+    allowed_loose: &HashSet<(String, String, String)>,
 ) -> bool {
     // Prune methods.
     if let Some(methods) = container.get_mut("methods").and_then(|v| v.as_object_mut()) {
@@ -557,8 +1032,10 @@ fn prune_resources(
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_uppercase();
-                let path = m.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                if allowed.contains(&(http_method, canonical_path(path))) {
+                // Prefer the expanded `flatPath` over the collapsed `path` so
+                // it matches the gateway YAML's expanded allow-list.
+                let path = discovery_method_path(m);
+                if op_matches(&http_method, &canonical_path(path), allowed, allowed_loose) {
                     None
                 } else {
                     Some(name.clone())
@@ -581,7 +1058,7 @@ fn prune_resources(
         let names: Vec<String> = resources.keys().cloned().collect();
         for name in names {
             let keep = if let Some(r) = resources.get_mut(&name).and_then(|v| v.as_object_mut()) {
-                prune_resources(r, allowed)
+                prune_resources(r, allowed, allowed_loose)
             } else {
                 false
             };
@@ -1190,5 +1667,440 @@ mod tests {
         let endpoints = vec![ep(Get, "v1/x")];
         filter_to_endpoints(&mut doc, &endpoints);
         assert!(doc["paths"].as_object().unwrap().contains_key("/v1/x"));
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // loose_path_key — bridging Google's collapsed `{+parent}` templates
+    // ───────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn loose_key_anchors_on_version_and_custom_verb() {
+        // Both the collapsed upstream form and the expanded YAML form reduce
+        // to the same (version, final-segment) anchor — only the intermediate
+        // hierarchy (`projects/{*}/locations/{*}`) is discarded.
+        assert_eq!(
+            loose_path_key("v3/{*}:translateText"),
+            Some(("v3".into(), "{*}:translateText".into()))
+        );
+        assert_eq!(
+            loose_path_key("v3/projects/{*}/locations/{*}:translateText"),
+            Some(("v3".into(), "{*}:translateText".into()))
+        );
+    }
+
+    #[test]
+    fn loose_key_keeps_literal_resource_so_generic_verbs_dont_collide() {
+        // `:lookup` is shared by many resources; the resource name must stay
+        // in the anchor so they don't masquerade as one another.
+        assert_eq!(
+            loose_path_key("v1/currentConditions:lookup"),
+            Some(("v1".into(), "currentConditions:lookup".into()))
+        );
+        assert_eq!(
+            loose_path_key("v1/history:lookup"),
+            Some(("v1".into(), "history:lookup".into()))
+        );
+        assert_ne!(
+            loose_path_key("v1/currentConditions:lookup"),
+            loose_path_key("v1/history:lookup")
+        );
+    }
+
+    #[test]
+    fn loose_key_anchors_on_literal_trailing_segment() {
+        assert_eq!(
+            loose_path_key("v3/{*}/supportedLanguages"),
+            Some(("v3".into(), "supportedLanguages".into()))
+        );
+        assert_eq!(
+            loose_path_key("v3/projects/{*}/locations/{*}/supportedLanguages"),
+            Some(("v3".into(), "supportedLanguages".into()))
+        );
+    }
+
+    #[test]
+    fn loose_key_is_none_without_a_stable_anchor() {
+        // Bare get-by-id: trailing segment is a pure placeholder.
+        assert_eq!(loose_path_key("v3/{*}"), None);
+        // Leading placeholder: no version/service anchor.
+        assert_eq!(loose_path_key("{*}/locations/{*}"), None);
+        // Empty.
+        assert_eq!(loose_path_key(""), None);
+        assert_eq!(loose_path_key("/"), None);
+    }
+
+    #[test]
+    fn loose_key_tolerates_leading_slash() {
+        assert_eq!(
+            loose_path_key("/v1/text:synthesize"),
+            Some(("v1".into(), "text:synthesize".into()))
+        );
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // The Google-Translate regression: collapsed `{+parent}` upstream vs
+    // expanded YAML. This is the exact shape that shipped empty `paths`.
+    // ───────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn filter_openapi3_matches_collapsed_parent_against_expanded_yaml() {
+        // Upstream (apis.guru / discovery-derived OpenAPI 3): single `{parent}`
+        // variable standing in for the whole resource hierarchy.
+        let mut doc = json!({
+            "openapi": "3.0.0",
+            "servers": [{"url": "https://translation.googleapis.com/"}],
+            "paths": {
+                "/v3/{parent}:translateText":   { "post": {"summary": "Translate input text."} },
+                "/v3/{parent}:detectLanguage":  { "post": {"summary": "Detect the source language."} },
+                "/v3/{parent}:batchTranslateText": { "post": {"summary": "Batch translate (not exposed)."} },
+                "/v3/{parent}/supportedLanguages": { "get": {"summary": "List supported languages."} }
+            }
+        });
+        // Gateway YAML declares the *expanded* paths.
+        let endpoints = vec![
+            ep(
+                Post,
+                "v3/projects/{projectsId}/locations/{locationsId}:translateText",
+            ),
+            ep(
+                Post,
+                "v3/projects/{projectsId}/locations/{locationsId}:detectLanguage",
+            ),
+            ep(
+                Get,
+                "v3/projects/{projectsId}/locations/{locationsId}/supportedLanguages",
+            ),
+        ];
+        filter_to_endpoints(&mut doc, &endpoints);
+
+        let paths = doc["paths"].as_object().unwrap();
+        // The three declared endpoints survive despite the path-shape gap…
+        assert!(paths.contains_key("/v3/{parent}:translateText"));
+        assert!(paths.contains_key("/v3/{parent}:detectLanguage"));
+        assert!(paths.contains_key("/v3/{parent}/supportedLanguages"));
+        // …and the undeclared batch endpoint is still dropped.
+        assert!(!paths.contains_key("/v3/{parent}:batchTranslateText"));
+        assert_eq!(paths.len(), 3);
+    }
+
+    #[test]
+    fn filter_openapi3_does_not_empty_paths_for_translate_shape() {
+        // Guards the original bug directly: a non-empty upstream must not
+        // filter down to `{}` when every endpoint is declared.
+        let mut doc = json!({
+            "openapi": "3.0.0",
+            "servers": [{"url": "https://translation.googleapis.com/"}],
+            "paths": { "/v3/{parent}:translateText": { "post": {"summary": "Translate."} } }
+        });
+        let endpoints = vec![ep(
+            Post,
+            "v3/projects/{projectsId}/locations/{locationsId}:translateText",
+        )];
+        filter_to_endpoints(&mut doc, &endpoints);
+        assert!(
+            !doc["paths"].as_object().unwrap().is_empty(),
+            "translate-shaped spec must not filter down to empty paths"
+        );
+    }
+
+    #[test]
+    fn filter_discovery_prefers_flatpath_over_collapsed_path() {
+        // Discovery ships both `path` (collapsed `{+parent}`) and `flatPath`
+        // (expanded). Matching must use the expanded `flatPath`.
+        let mut doc = json!({
+            "kind": "discovery#restDescription",
+            "rootUrl": "https://translation.googleapis.com/",
+            "resources": {
+                "projects": {
+                    "resources": {
+                        "locations": {
+                            "methods": {
+                                "translateText": {
+                                    "httpMethod": "POST",
+                                    "path": "v3/{+parent}:translateText",
+                                    "flatPath": "v3/projects/{projectsId}/locations/{locationsId}:translateText"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let endpoints = vec![ep(
+            Post,
+            "v3/projects/{projectsId}/locations/{locationsId}:translateText",
+        )];
+        filter_to_endpoints(&mut doc, &endpoints);
+        assert!(
+            doc["resources"]["projects"]["resources"]["locations"]["methods"]
+                .as_object()
+                .unwrap()
+                .contains_key("translateText"),
+            "flatPath should let the expanded YAML path match"
+        );
+    }
+
+    #[test]
+    fn filter_discovery_loose_matches_when_only_collapsed_path_present() {
+        // Some discovery docs omit `flatPath`; the loose anchor still bridges
+        // the collapsed `{+name}` to the expanded YAML path.
+        let mut doc = json!({
+            "kind": "discovery#restDescription",
+            "rootUrl": "https://generativelanguage.googleapis.com/",
+            "resources": {
+                "models": {
+                    "methods": {
+                        "generateContent": {
+                            "httpMethod": "POST",
+                            "path": "v1beta/{+model}:generateContent"
+                        }
+                    }
+                }
+            }
+        });
+        let endpoints = vec![ep(Post, "v1beta/models/{modelsId}:generateContent")];
+        filter_to_endpoints(&mut doc, &endpoints);
+        assert!(
+            doc["resources"]["models"]["methods"]
+                .as_object()
+                .unwrap()
+                .contains_key("generateContent")
+        );
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // Loose matching must not over-expose: different verbs / versions stay
+    // distinct, and undeclared operations are still dropped.
+    // ───────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn loose_match_does_not_keep_different_custom_verb() {
+        let mut doc = json!({
+            "openapi": "3.0.0",
+            "servers": [{"url": "https://translation.googleapis.com/"}],
+            "paths": {
+                "/v3/{parent}:translateText":  { "post": {} },
+                "/v3/{parent}:romanizeText":   { "post": {} }
+            }
+        });
+        // Only translateText declared.
+        let endpoints = vec![ep(
+            Post,
+            "v3/projects/{projectsId}/locations/{locationsId}:translateText",
+        )];
+        filter_to_endpoints(&mut doc, &endpoints);
+        let paths = doc["paths"].as_object().unwrap();
+        assert!(paths.contains_key("/v3/{parent}:translateText"));
+        assert!(!paths.contains_key("/v3/{parent}:romanizeText"));
+    }
+
+    #[test]
+    fn loose_match_respects_http_method() {
+        let mut doc = json!({
+            "openapi": "3.0.0",
+            "servers": [{"url": "https://x.googleapis.com/"}],
+            "paths": { "/v3/{parent}:translateText": { "post": {}, "get": {} } }
+        });
+        // Declared as POST only; the GET on the same path must be stripped.
+        let endpoints = vec![ep(
+            Post,
+            "v3/projects/{projectsId}/locations/{locationsId}:translateText",
+        )];
+        filter_to_endpoints(&mut doc, &endpoints);
+        let item = doc["paths"]["/v3/{parent}:translateText"]
+            .as_object()
+            .unwrap();
+        assert!(item.contains_key("post"));
+        assert!(!item.contains_key("get"));
+    }
+
+    #[test]
+    fn loose_match_keeps_versions_distinct() {
+        let mut doc = json!({
+            "openapi": "3.0.0",
+            "servers": [{"url": "https://x.googleapis.com/"}],
+            "paths": {
+                "/v3/{parent}:translateText": { "post": {} },
+                "/v2/{parent}:translateText": { "post": {} }
+            }
+        });
+        // Only the v3 endpoint is declared.
+        let endpoints = vec![ep(Post, "v3/projects/{p}/locations/{l}:translateText")];
+        filter_to_endpoints(&mut doc, &endpoints);
+        let paths = doc["paths"].as_object().unwrap();
+        assert!(paths.contains_key("/v3/{parent}:translateText"));
+        assert!(!paths.contains_key("/v2/{parent}:translateText"));
+    }
+
+    #[test]
+    fn bare_get_by_id_requires_exact_match_no_loose() {
+        // `/v3/{name}` has no literal anchor → loose key is None, so it must
+        // NOT be kept just because some other endpoint shares the version.
+        let mut doc = json!({
+            "openapi": "3.0.0",
+            "servers": [{"url": "https://x.googleapis.com/"}],
+            "paths": {
+                "/v3/{name}": { "get": {} },
+                "/v3/{parent}:translateText": { "post": {} }
+            }
+        });
+        let endpoints = vec![ep(Post, "v3/projects/{p}/locations/{l}:translateText")];
+        filter_to_endpoints(&mut doc, &endpoints);
+        let paths = doc["paths"].as_object().unwrap();
+        assert!(!paths.contains_key("/v3/{name}"));
+        assert!(paths.contains_key("/v3/{parent}:translateText"));
+    }
+
+    #[test]
+    fn bare_get_by_id_still_matches_exactly() {
+        // When the YAML declares the same collapsed shape, exact match keeps it.
+        let mut doc = json!({
+            "openapi": "3.0.0",
+            "servers": [{"url": "https://x.googleapis.com/"}],
+            "paths": { "/v3/{name}": { "get": {} } }
+        });
+        let endpoints = vec![ep(Get, "v3/{name}")];
+        filter_to_endpoints(&mut doc, &endpoints);
+        assert!(doc["paths"].as_object().unwrap().contains_key("/v3/{name}"));
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // Existing exact-match behavior must be preserved (no regressions).
+    // ───────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn bigquery_base_path_exact_match_still_works() {
+        // servers[0].url carries `/bigquery/v2`; the YAML path includes it.
+        let mut doc = json!({
+            "openapi": "3.0.0",
+            "servers": [{"url": "https://bigquery.googleapis.com/bigquery/v2"}],
+            "paths": {
+                "/projects/{projectId}/queries": { "post": {} },
+                "/projects/{projectId}/jobs": { "get": {} }
+            }
+        });
+        let endpoints = vec![ep(Post, "bigquery/v2/projects/{projectsId}/queries")];
+        filter_to_endpoints(&mut doc, &endpoints);
+        let paths = doc["paths"].as_object().unwrap();
+        assert!(paths.contains_key("/projects/{projectId}/queries"));
+        assert!(!paths.contains_key("/projects/{projectId}/jobs"));
+    }
+
+    #[test]
+    fn singular_plural_placeholder_names_still_match() {
+        let mut doc = json!({
+            "openapi": "3.0.0",
+            "servers": [{"url": "https://x.googleapis.com/"}],
+            "paths": { "/v2/documents:analyzeSentiment": { "post": {} } }
+        });
+        // Identical shape, no `{parent}` collapse — exact path stays exact.
+        let endpoints = vec![ep(Post, "v2/documents:analyzeSentiment")];
+        filter_to_endpoints(&mut doc, &endpoints);
+        assert!(
+            doc["paths"]
+                .as_object()
+                .unwrap()
+                .contains_key("/v2/documents:analyzeSentiment")
+        );
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // collect_doc_operations — the coverage guardrail's view of the doc.
+    // ───────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn collect_ops_openapi3_applies_base_path() {
+        let doc = json!({
+            "openapi": "3.0.0",
+            "servers": [{"url": "https://bigquery.googleapis.com/bigquery/v2"}],
+            "paths": { "/projects/{projectId}/queries": { "post": {}, "get": {} } }
+        });
+        let mut ops = collect_doc_operations(&doc);
+        ops.sort();
+        assert_eq!(
+            ops,
+            vec![
+                (
+                    "GET".to_string(),
+                    "bigquery/v2/projects/{*}/queries".to_string()
+                ),
+                (
+                    "POST".to_string(),
+                    "bigquery/v2/projects/{*}/queries".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_ops_discovery_uses_flatpath() {
+        let doc = json!({
+            "kind": "discovery#restDescription",
+            "resources": {
+                "projects": {
+                    "methods": {
+                        "translate": {
+                            "httpMethod": "POST",
+                            "path": "v3/{+parent}:translateText",
+                            "flatPath": "v3/projects/{projectsId}:translateText"
+                        }
+                    }
+                }
+            }
+        });
+        let ops = collect_doc_operations(&doc);
+        assert_eq!(
+            ops,
+            vec![(
+                "POST".to_string(),
+                "v3/projects/{*}:translateText".to_string()
+            )]
+        );
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // Guardrail: warn_on_unmatched_endpoints must not panic and must leave
+    // the document untouched. (It only logs.)
+    // ───────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn guardrail_is_noop_on_document_when_all_covered() {
+        let mut doc = json!({
+            "openapi": "3.0.0",
+            "servers": [{"url": "https://x.googleapis.com/"}],
+            "paths": { "/v3/{parent}:translateText": { "post": {} } }
+        });
+        let endpoints = vec![ep(Post, "v3/projects/{p}/locations/{l}:translateText")];
+        // Whole pipeline (filter + guardrail) runs without panicking and keeps
+        // the matched endpoint.
+        filter_to_endpoints(&mut doc, &endpoints);
+        assert_eq!(doc["paths"].as_object().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn guardrail_tolerates_empty_upstream_paths() {
+        // The other failure mode: upstream shipped `paths: {}`. Filtering must
+        // not panic; the served doc stays empty (nothing to keep).
+        let mut doc = json!({
+            "openapi": "3.0.0",
+            "servers": [{"url": "https://generativelanguage.googleapis.com/"}],
+            "paths": {}
+        });
+        let endpoints = vec![ep(Post, "v1beta/models/{modelsId}:generateContent")];
+        filter_to_endpoints(&mut doc, &endpoints);
+        assert!(doc["paths"].as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn empty_endpoints_list_leaves_paths_alone_but_filters_all() {
+        // No declared endpoints → allow-list empty → everything is stripped
+        // (and the guardrail short-circuits without warning).
+        let mut doc = json!({
+            "openapi": "3.0.0",
+            "servers": [{"url": "https://x.googleapis.com/"}],
+            "paths": { "/v1/x": { "get": {} } }
+        });
+        filter_to_endpoints(&mut doc, &[]);
+        assert!(doc["paths"].as_object().unwrap().is_empty());
     }
 }

@@ -99,7 +99,10 @@ impl FlowCorrelation {
                 return Some((protocol, Phase::Challenge));
             }
             if entry.path.starts_with("/x402/")
+                // v1 (`X-PAYMENT-REQUIRED`) and v2 (`PAYMENT-REQUIRED`); header
+                // keys are normalized to lowercase.
                 || entry.res_headers.contains_key("x-payment-required")
+                || entry.res_headers.contains_key("payment-required")
                 || is_x402_body(&entry.res_body)
             {
                 return Some((Protocol::X402, Phase::Challenge));
@@ -114,8 +117,12 @@ impl FlowCorrelation {
         if entry.res_headers.contains_key("payment-receipt") {
             return Some((Protocol::Mpp, Phase::Retry));
         }
+        // v1 (`X-PAYMENT`) and v2 (`PAYMENT-SIGNATURE` request / `PAYMENT-RESPONSE`
+        // settlement); header keys are normalized to lowercase.
         if entry.req_headers.contains_key("x-payment")
             || entry.req_headers.contains_key("x-payment-response")
+            || entry.req_headers.contains_key("payment-signature")
+            || entry.res_headers.contains_key("payment-response")
         {
             return Some((Protocol::X402, Phase::Retry));
         }
@@ -126,6 +133,18 @@ impl FlowCorrelation {
     // ── Flow creation ──
 
     fn create_flow(&mut self, entry: &LogEntry, protocol: Protocol) {
+        // Dedup re-issued challenges: clients (and the playground UI) often probe
+        // an endpoint, get a 402, then probe again before paying. Without this
+        // each 402 spawns its own `payment-required` row, and the eventual
+        // payment merges only the most recent — orphaning the earlier orange
+        // rows. Refresh the existing pending flow instead of creating a duplicate.
+        if let Some(idx) = self.find_pending_flow(&entry.client_ip, &entry.path) {
+            let flow = &mut self.flows[idx];
+            flow.updated_at = entry.ts.clone();
+            let _ = self.tx.send(SseMessage::FlowUpdated { flow: flow.clone() });
+            return;
+        }
+
         self.flow_id_counter += 1;
         let id = format!("flow-{}", self.flow_id_counter);
         let now = &entry.ts;
@@ -187,6 +206,7 @@ impl FlowCorrelation {
         let flow = PaymentFlow {
             id,
             protocol,
+            scheme: flow_scheme(entry, protocol, None),
             resource: entry.path.clone(),
             status: FlowStatus::PaymentRequired,
             client_ip: entry.client_ip.clone(),
@@ -222,17 +242,8 @@ impl FlowCorrelation {
     // ── Payment retry ──
 
     fn handle_retry(&mut self, entry: &LogEntry, protocol: Protocol) {
-        // Try exact match (IP + path), then path-only fallback
-        let idx = self
-            .flow_index
-            .get(&flow_key(&entry.client_ip, &entry.path))
-            .copied()
-            .filter(|&i| self.flows[i].status == FlowStatus::PaymentRequired)
-            .or_else(|| {
-                self.flows.iter().rposition(|f| {
-                    f.resource == entry.path && f.status == FlowStatus::PaymentRequired
-                })
-            });
+        // Exact match (IP + path), then path-only fallback.
+        let idx = self.find_pending_flow(&entry.client_ip, &entry.path);
 
         let Some(idx) = idx else {
             if matches!(protocol, Protocol::Session) && self.merge_session_delivery(entry) {
@@ -250,6 +261,15 @@ impl FlowCorrelation {
             self.create_standalone_delivery(entry, protocol);
             return;
         }
+
+        // The challenge for a dual-scheme endpoint (e.g. mpp + x402) is created
+        // from whichever offer header detect() saw first (www-authenticate →
+        // mpp). The retry reveals the scheme the client actually used, so adopt
+        // it — otherwise an x402 payment shows under the mpp challenge's label.
+        let scheme = flow_scheme(entry, protocol, self.flows[idx].challenge_headers.as_ref());
+        let flow = &mut self.flows[idx];
+        flow.protocol = protocol;
+        flow.scheme = scheme;
 
         let now = &entry.ts;
         let session_update = if matches!(protocol, Protocol::Session) {
@@ -343,6 +363,7 @@ impl FlowCorrelation {
         let flow = PaymentFlow {
             id,
             protocol,
+            scheme: flow_scheme(entry, protocol, None),
             resource: entry.path.clone(),
             status: FlowStatus::ResourceDelivered,
             client_ip: entry.client_ip.clone(),
@@ -449,6 +470,21 @@ impl FlowCorrelation {
 
     // ── Helpers ──
 
+    /// Index of the open (`payment-required`) flow for this client+path —
+    /// exact `ip::path` match first, then the most recent path-only match.
+    /// Shared by retry correlation and challenge dedup.
+    fn find_pending_flow(&self, client_ip: &str, path: &str) -> Option<usize> {
+        self.flow_index
+            .get(&flow_key(client_ip, path))
+            .copied()
+            .filter(|&i| self.flows[i].status == FlowStatus::PaymentRequired)
+            .or_else(|| {
+                self.flows
+                    .iter()
+                    .rposition(|f| f.resource == path && f.status == FlowStatus::PaymentRequired)
+            })
+    }
+
     fn add_flow(&mut self, flow: PaymentFlow) {
         let key = flow_key(&flow.client_ip, &flow.resource);
         let idx = self.flows.len();
@@ -471,6 +507,87 @@ impl FlowCorrelation {
 
 fn flow_key(client_ip: &str, path: &str) -> String {
     format!("{client_ip}::{path}")
+}
+
+/// Sub-scheme label for a flow, derived from the entry's headers (and the
+/// stored challenge headers for a retry). Drives the `PROTOCOL:SCHEME` label.
+fn flow_scheme(
+    entry: &LogEntry,
+    protocol: Protocol,
+    challenge_headers: Option<&HashMap<String, String>>,
+) -> Option<String> {
+    match protocol {
+        Protocol::Session => Some("session".to_string()),
+        Protocol::Mpp => Some(mpp_intent(entry).unwrap_or_else(|| "charge".to_string())),
+        Protocol::X402 => {
+            Some(x402_scheme(entry, challenge_headers).unwrap_or_else(|| "exact".to_string()))
+        }
+    }
+}
+
+/// MPP intent (`charge`/`session`/`subscription`) from the challenge
+/// `www-authenticate` header or the retry `authorization` credential.
+fn mpp_intent(entry: &LogEntry) -> Option<String> {
+    if let Some(header) = entry.res_headers.get("www-authenticate") {
+        let params = parse_header_params(header.trim_start_matches("Payment").trim());
+        if let Some(intent) = params.get("intent") {
+            return Some(intent.clone());
+        }
+    }
+    payment_credential_from_authorization(entry.req_headers.get("authorization"))
+        .and_then(|c| value_string(c.get("challenge").and_then(|ch| ch.get("intent"))))
+}
+
+/// x402 scheme (`exact`/`upto`/`batch-settlement`) from the retry
+/// `payment-signature` payload or the (this/stored) challenge `payment-required`
+/// offer.
+fn x402_scheme(
+    entry: &LogEntry,
+    challenge_headers: Option<&HashMap<String, String>>,
+) -> Option<String> {
+    for key in ["payment-signature", "x-payment"] {
+        if let Some(value) = entry.req_headers.get(key)
+            && let Some(scheme) = x402_scheme_from_payment(value)
+        {
+            return Some(scheme);
+        }
+    }
+    for headers in [Some(&entry.res_headers), challenge_headers]
+        .into_iter()
+        .flatten()
+    {
+        for key in ["payment-required", "x-payment-required"] {
+            if let Some(value) = headers.get(key)
+                && let Some(scheme) = x402_scheme_from_required(value)
+            {
+                return Some(scheme);
+            }
+        }
+    }
+    None
+}
+
+/// `accepts[0].scheme` from a base64 `PAYMENT-REQUIRED` challenge envelope.
+fn x402_scheme_from_required(encoded: &str) -> Option<String> {
+    let json = decode_json_value(encoded)?;
+    let offers = json.get("accepts").or_else(|| json.get("offers"))?;
+    value_string(offers.as_array()?.first()?.get("scheme"))
+}
+
+/// Scheme from a base64 `PAYMENT-SIGNATURE` payment envelope — `accepted.scheme`
+/// (canonical x402 v2), a top-level `scheme`, or `upto` inferred from a
+/// payment-channel payload (`channelId`/`profile`).
+fn x402_scheme_from_payment(encoded: &str) -> Option<String> {
+    let json = decode_json_value(encoded)?;
+    if let Some(scheme) = value_string(json.get("accepted").and_then(|a| a.get("scheme"))) {
+        return Some(scheme);
+    }
+    if let Some(scheme) = value_string(json.get("scheme")).filter(|s| !s.is_empty()) {
+        return Some(scheme);
+    }
+    let payload = json.get("payload")?;
+    (payload.get("channelId").is_some() || payload.get("profile").is_some())
+        .then(|| "upto".to_string())
 }
 
 fn is_internal_path(path: &str) -> bool {
@@ -1234,6 +1351,116 @@ mod tests {
         let flows = engine.snapshot();
         assert_eq!(flows.len(), 1);
         assert_eq!(flows[0].status, FlowStatus::ResourceDelivered);
+    }
+
+    #[test]
+    fn duplicate_challenges_dedup_into_one_flow() {
+        let (tx, _rx) = broadcast::channel(16);
+        let mut engine = FlowCorrelation::new(tx);
+
+        // Three 402 probes for the same endpoint before paying.
+        for _ in 0..3 {
+            let mut e = make_entry("GET", "/api/v1/joke", 402);
+            e.res_headers.insert(
+                "www-authenticate".into(),
+                "Payment realm=\"t\", intent=\"charge\"".into(),
+            );
+            engine.ingest(e);
+        }
+
+        let flows = engine.snapshot();
+        assert_eq!(flows.len(), 1, "re-issued challenges must not orphan rows");
+        assert_eq!(flows[0].status, FlowStatus::PaymentRequired);
+        assert_eq!(flows[0].scheme.as_deref(), Some("charge"));
+    }
+
+    #[test]
+    fn mpp_charge_then_pay_is_one_flow_labeled_charge() {
+        let (tx, _rx) = broadcast::channel(16);
+        let mut engine = FlowCorrelation::new(tx);
+
+        let mut ch = make_entry("GET", "/api/v1/joke", 402);
+        ch.res_headers.insert(
+            "www-authenticate".into(),
+            "Payment realm=\"t\", intent=\"charge\"".into(),
+        );
+        engine.ingest(ch);
+
+        let mut rt = make_entry("GET", "/api/v1/joke", 200);
+        rt.req_headers
+            .insert("authorization".into(), "Payment abc".into());
+        rt.res_headers
+            .insert("payment-receipt".into(), "receipt".into());
+        engine.ingest(rt);
+
+        let flows = engine.snapshot();
+        assert_eq!(flows.len(), 1);
+        assert_eq!(flows[0].status, FlowStatus::ResourceDelivered);
+        assert!(matches!(flows[0].protocol, Protocol::Mpp));
+        assert_eq!(flows[0].scheme.as_deref(), Some("charge"));
+    }
+
+    #[test]
+    fn retry_adopts_actual_x402_scheme_over_mpp_challenge() {
+        let (tx, _rx) = broadcast::channel(16);
+        let mut engine = FlowCorrelation::new(tx);
+
+        // Dual-scheme endpoint: the 402 carries both www-authenticate (mpp) and
+        // payment-required (x402); detect() labels the challenge mpp.
+        let mut ch = make_entry("GET", "/api/v1/fortune", 402);
+        ch.res_headers.insert(
+            "www-authenticate".into(),
+            "Payment realm=\"t\", intent=\"charge\"".into(),
+        );
+        ch.res_headers.insert(
+            "payment-required".into(),
+            encode_json(serde_json::json!({
+                "x402Version": 1,
+                "accepts": [{ "scheme": "exact", "amount": "10000" }]
+            })),
+        );
+        engine.ingest(ch);
+        assert!(matches!(engine.snapshot()[0].protocol, Protocol::Mpp));
+
+        // The client pays with x402 → the flow must adopt x402:exact, not stay mpp.
+        let mut rt = make_entry("GET", "/api/v1/fortune", 200);
+        rt.req_headers.insert(
+            "payment-signature".into(),
+            encode_json(serde_json::json!({
+                "x402Version": 2,
+                "payload": {},
+                "accepted": { "scheme": "exact" }
+            })),
+        );
+        rt.res_headers
+            .insert("payment-response".into(), "sig".into());
+        engine.ingest(rt);
+
+        let flows = engine.snapshot();
+        assert_eq!(flows.len(), 1, "x402 retry merges, not standalone");
+        assert!(matches!(flows[0].protocol, Protocol::X402));
+        assert_eq!(flows[0].scheme.as_deref(), Some("exact"));
+        assert_eq!(flows[0].status, FlowStatus::ResourceDelivered);
+    }
+
+    #[test]
+    fn x402_upto_scheme_inferred_from_channel_payload() {
+        let (tx, _rx) = broadcast::channel(16);
+        let mut engine = FlowCorrelation::new(tx);
+
+        let mut ch = make_entry("POST", "/api/v1/summarize", 402);
+        ch.res_headers.insert(
+            "payment-required".into(),
+            encode_json(serde_json::json!({
+                "x402Version": 2,
+                "accepts": [{ "scheme": "upto", "amount": "100000" }]
+            })),
+        );
+        engine.ingest(ch);
+
+        let flows = engine.snapshot();
+        assert!(matches!(flows[0].protocol, Protocol::X402));
+        assert_eq!(flows[0].scheme.as_deref(), Some("upto"));
     }
 
     #[test]

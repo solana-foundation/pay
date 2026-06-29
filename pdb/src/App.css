@@ -96,12 +96,13 @@ body {
 
 .header {
   border-bottom: 1px solid var(--border);
-  padding: 12px 24px;
+  padding: 10px 20px;
   display: flex;
   align-items: center;
   gap: 12px;
   flex-shrink: 0;
   background: var(--surface);
+  height: 52px;
 }
 
 .header h1 {

@@ -3,6 +3,7 @@ pub mod catalog;
 pub mod claude;
 pub mod codex;
 pub mod curl;
+pub mod docs;
 pub mod fetch;
 pub mod help;
 pub mod http;
@@ -24,8 +25,8 @@ use pay_core::runner::RunOutcome;
 use pay_core::x402;
 use pay_core::x402::Challenge as X402Challenge;
 use pay_core::{run_curl_with_headers, run_httpie_with_headers, run_wget_with_headers};
+use pay_kit::mpp::{ChargeRequest, SessionRequest};
 use pay_types::Stablecoin;
-use solana_mpp::{ChargeRequest, SessionRequest};
 
 use crate::no_dna;
 use crate::output::{self, OutputFormat};
@@ -91,6 +92,11 @@ pub enum Command {
     Install(skills::install::InstallCommand),
     /// Start the MCP server (for Claude Code, Cursor, etc.)
     Mcp,
+    /// Generate documentation artifacts (e.g. the provider-spec JSON Schema).
+    Docs {
+        #[command(subcommand)]
+        command: docs::DocsCommand,
+    },
 }
 
 /// Identifies which tool is being wrapped.
@@ -142,6 +148,7 @@ impl Command {
             | Command::Catalog { .. }
             | Command::Install(_)
             | Command::Server { .. }
+            | Command::Docs { .. }
             | Command::Mcp => false,
         }
     }
@@ -166,7 +173,8 @@ impl Command {
             | Command::Send(_)
             | Command::Setup(_)
             | Command::Topup(_)
-            | Command::Server { .. } => ToolKind::Mcp,
+            | Command::Server { .. }
+            | Command::Docs { .. } => ToolKind::Mcp,
             Command::Mcp => ToolKind::Mcp,
         }
     }
@@ -230,6 +238,7 @@ impl Command {
             Command::Claude(cmd) => std::process::exit(cmd.run(&pay_bin, account_override)?),
             Command::Codex(cmd) => std::process::exit(cmd.run(&pay_bin, account_override)?),
             Command::Qodercli(cmd) => std::process::exit(cmd.run(&pay_bin, account_override)?),
+            Command::Docs { command } => return command.run(),
             _ => {}
         }
 
@@ -409,8 +418,8 @@ fn handle_outcome(
                             decoded.currency_label,
                             decoded.period_count,
                             match decoded.period_unit {
-                                solana_mpp::SubscriptionPeriodUnit::Day => "day",
-                                solana_mpp::SubscriptionPeriodUnit::Week => "week",
+                                pay_kit::mpp::SubscriptionPeriodUnit::Day => "day",
+                                pay_kit::mpp::SubscriptionPeriodUnit::Week => "week",
                             },
                             if decoded.period_count == 1 { "" } else { "s" }
                         )
@@ -444,8 +453,8 @@ fn handle_outcome(
                         "puller": decoded.method_details.puller,
                         "recipient": decoded.request.recipient,
                         "period_unit": match decoded.period_unit {
-                            solana_mpp::SubscriptionPeriodUnit::Day => "day",
-                            solana_mpp::SubscriptionPeriodUnit::Week => "week",
+                            pay_kit::mpp::SubscriptionPeriodUnit::Day => "day",
+                            pay_kit::mpp::SubscriptionPeriodUnit::Week => "week",
                         },
                         "period_count": decoded.period_count,
                         "network": decoded.network,
@@ -462,8 +471,8 @@ fn handle_outcome(
                         decoded.currency_label,
                         decoded.period_count,
                         match decoded.period_unit {
-                            solana_mpp::SubscriptionPeriodUnit::Day => "day",
-                            solana_mpp::SubscriptionPeriodUnit::Week => "week",
+                            pay_kit::mpp::SubscriptionPeriodUnit::Day => "day",
+                            pay_kit::mpp::SubscriptionPeriodUnit::Week => "week",
                         },
                         if decoded.period_count == 1 { "" } else { "s" }
                     )
@@ -580,6 +589,65 @@ fn handle_outcome(
                     format!(
                         "402 Payment Required (x402) — {} {}",
                         challenge.requirements.amount, challenge.requirements.currency
+                    )
+                    .dimmed()
+                );
+            }
+        }
+
+        RunOutcome::X402UptoChallenge {
+            challenge,
+            resource_url,
+        } => {
+            if auto_pay {
+                // The cap is the authorized ceiling (the channel deposit).
+                enforce_payment_cap(
+                    &challenge.requirements.amount,
+                    &challenge.requirements.asset,
+                    payment_cap,
+                    "x402",
+                )?;
+                if verbose && !is_json {
+                    eprintln!(
+                        "{}",
+                        format!(
+                            "402 Payment Required (x402 upto) — up to {} {}",
+                            challenge.requirements.amount, challenge.requirements.asset
+                        )
+                        .dimmed()
+                    );
+                }
+                return pay_upto_and_retry(
+                    &challenge,
+                    &resource_url,
+                    PaymentRetryContext {
+                        tool,
+                        output_fmt,
+                        fetch_headers,
+                        network_override,
+                        account_override,
+                        verbose,
+                    },
+                );
+            }
+
+            if is_json {
+                output::print_json(&serde_json::json!({
+                    "status": 402,
+                    "protocol": "x402-upto",
+                    "challenge": {
+                        "amount": challenge.requirements.amount,
+                        "currency": challenge.requirements.asset,
+                        "recipient": challenge.requirements.pay_to,
+                    },
+                    "resource": resource_url,
+                }))?;
+            } else {
+                eprintln!(
+                    "{}",
+                    format!(
+                        "402 Payment Required (x402 upto) — up to {} {}",
+                        challenge.requirements.amount, challenge.requirements.asset
                     )
                     .dimmed()
                 );
@@ -1084,6 +1152,39 @@ fn pay_x402_and_retry(
     handle_retry_outcome(retry_outcome, is_json)
 }
 
+fn pay_upto_and_retry(
+    challenge: &x402::UptoChallenge,
+    resource_url: &str,
+    ctx: PaymentRetryContext<'_, '_>,
+) -> pay_core::Result<()> {
+    let is_json = no_dna::should_json(ctx.output_fmt);
+    validate_tool_request_before_signing(ctx.tool)?;
+
+    if ctx.verbose && !is_json {
+        eprintln!("{}", "Paying (x402 upto)...".dimmed());
+    }
+
+    let store = pay_core::accounts::FileAccountsStore::default_path();
+    let built_payment = x402::build_upto_payment(
+        challenge,
+        &store,
+        ctx.network_override,
+        ctx.account_override,
+        Some(resource_url),
+    )?;
+
+    if let Some(resolved) = built_payment.ephemeral_notice {
+        render_generated_wallet_notice(&resolved, is_json)?;
+    }
+
+    if ctx.verbose && !is_json {
+        eprintln!("{}", "Payment signed, retrying...\n".dimmed());
+    }
+
+    let retry_outcome = retry_with_headers(ctx.tool, &built_payment.headers, ctx.fetch_headers)?;
+    handle_retry_outcome(retry_outcome, is_json)
+}
+
 fn pay_x402_siwx_and_retry(
     challenge: &x402::SiwxAuthChallenge,
     resource_url: &str,
@@ -1129,7 +1230,7 @@ fn pay_session_and_retry(
     sandbox: bool,
     verbose: bool,
 ) -> pay_core::Result<()> {
-    use solana_mpp::{SessionMode, SessionPullVoucherStrategy};
+    use pay_kit::mpp::{SessionMode, SessionPullVoucherStrategy};
 
     let is_json = no_dna::should_json(output_fmt);
     validate_tool_request_before_signing(tool)?;
@@ -1516,7 +1617,7 @@ mod tests {
             "test",
             "solana",
             "charge",
-            solana_mpp::Base64UrlJson::from_value(&request).unwrap(),
+            pay_kit::mpp::Base64UrlJson::from_value(&request).unwrap(),
         )
     }
 
