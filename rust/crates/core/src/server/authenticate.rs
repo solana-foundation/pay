@@ -70,7 +70,7 @@ pub fn build_handler(
         program_id: None,
         challenge_binding_secret,
         realm,
-        statement: Some("Sign in to use your active subscription.".to_string()),
+        statement: Some("Signed message to use active subscription.".to_string()),
         store: None,
     };
 

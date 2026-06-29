@@ -758,6 +758,19 @@ pub fn resource_endpoints(
     })
 }
 
+/// All endpoints for a service, across every resource. Returns `None` if the
+/// service isn't in the catalog. The `resource` field is left empty to signal
+/// "all resources".
+pub fn service_endpoints(catalog: &Catalog, service_name: &str) -> Option<ResourceEndpoints> {
+    let svc = find_service(catalog, service_name)?;
+    Some(ResourceEndpoints {
+        service: svc.fqn.clone(),
+        resource: String::new(),
+        meta: svc.meta.clone(),
+        endpoints: svc.endpoints.clone(),
+    })
+}
+
 /// Find a service by FQN or short name (case-insensitive).
 fn find_service<'a>(catalog: &'a Catalog, name: &str) -> Option<&'a Service> {
     catalog

@@ -439,11 +439,11 @@ fn topup_required_body(name: &str) -> String {
 }
 
 pub fn format_received(r: &pay_core::client::balance::ReceivedFunds) -> String {
-    if let Some(usdc) = r.tokens.iter().find(|t| t.symbol == Some("USDC")) {
+    if let Some(usdc) = r.tokens.iter().find(|t| t.is_symbol("USDC")) {
         return format!("${:.2}", usdc.ui_amount);
     }
     if let Some(token) = r.tokens.first() {
-        let sym = token.symbol.unwrap_or("tokens");
+        let sym = token.symbol_or("tokens");
         return format!("{:.2} {sym}", token.ui_amount);
     }
     if r.sol_lamports > 0 {

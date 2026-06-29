@@ -52,7 +52,28 @@ pub struct TokenBalance {
     pub mint: String,
     pub raw_amount: u64,
     pub ui_amount: f64,
-    pub symbol: Option<&'static str>,
+    pub symbol: Option<String>,
+}
+
+impl TokenBalance {
+    /// Display symbol, falling back to `fallback` when the mint is unknown.
+    pub fn symbol_or<'a>(&'a self, fallback: &'a str) -> &'a str {
+        self.symbol.as_deref().unwrap_or(fallback)
+    }
+
+    /// Case-insensitive symbol match, e.g. `token.is_symbol("USDC")`.
+    pub fn is_symbol(&self, symbol: &str) -> bool {
+        self.symbol
+            .as_deref()
+            .is_some_and(|s| s.eq_ignore_ascii_case(symbol))
+    }
+
+    /// Parse the symbol into a known [`Stablecoin`](pay_types::Stablecoin).
+    pub fn currency(&self) -> Option<pay_types::Stablecoin> {
+        self.symbol
+            .as_deref()
+            .and_then(pay_types::Stablecoin::parse_symbol)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -87,7 +108,7 @@ impl AccountBalances {
                     tokens.push(ReceivedToken {
                         mint: current.mint.clone(),
                         ui_amount: gained,
-                        symbol: current.symbol,
+                        symbol: current.symbol.clone(),
                     });
                 }
             }
@@ -109,7 +130,21 @@ pub struct ReceivedFunds {
 pub struct ReceivedToken {
     pub mint: String,
     pub ui_amount: f64,
-    pub symbol: Option<&'static str>,
+    pub symbol: Option<String>,
+}
+
+impl ReceivedToken {
+    /// Display symbol, falling back to `fallback` when the mint is unknown.
+    pub fn symbol_or<'a>(&'a self, fallback: &'a str) -> &'a str {
+        self.symbol.as_deref().unwrap_or(fallback)
+    }
+
+    /// Case-insensitive symbol match, e.g. `token.is_symbol("USDC")`.
+    pub fn is_symbol(&self, symbol: &str) -> bool {
+        self.symbol
+            .as_deref()
+            .is_some_and(|s| s.eq_ignore_ascii_case(symbol))
+    }
 }
 
 impl ReceivedFunds {
@@ -130,8 +165,11 @@ struct ApiBalance {
     mint: String,
     raw_amount: String,
     ui_amount: f64,
-    // symbol & decimals are also returned but we recompute the symbol locally
-    // so the rest of pay keeps a stable `Option<&'static str>`.
+    /// Symbol resolved by the stablecoin API — authoritative, and knows mints
+    /// the local `Stablecoin` list doesn't (e.g. USDPT). `decimals` is also
+    /// returned but unused here.
+    #[serde(default)]
+    symbol: Option<String>,
 }
 
 async fn fetch_stablecoins_via_api(
@@ -175,7 +213,13 @@ async fn fetch_stablecoins_via_api(
             if raw == 0 {
                 return None;
             }
-            let symbol = mint_symbol(&b.mint);
+            // Prefer the symbol the stablecoin API returned (it knows mints
+            // our local list doesn't, e.g. USDPT); fall back to the local list
+            // only when the API omitted one.
+            let symbol = b
+                .symbol
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| mint_symbol(&b.mint).map(str::to_string));
             Some(TokenBalance {
                 mint: b.mint,
                 raw_amount: raw,
@@ -557,7 +601,7 @@ mod tests {
                 mint: "USDC_MINT".to_string(),
                 raw_amount: 10_000_000,
                 ui_amount: 10.0,
-                symbol: Some("USDC"),
+                symbol: Some("USDC".to_string()),
             }],
             tokens_unavailable: false,
         };
@@ -567,14 +611,14 @@ mod tests {
                 mint: "USDC_MINT".to_string(),
                 raw_amount: 25_500_000,
                 ui_amount: 25.5,
-                symbol: Some("USDC"),
+                symbol: Some("USDC".to_string()),
             }],
             tokens_unavailable: false,
         };
         let diff = current.diff_received(&baseline);
         assert_eq!(diff.tokens.len(), 1);
         assert!((diff.tokens[0].ui_amount - 15.5).abs() < f64::EPSILON);
-        assert_eq!(diff.tokens[0].symbol, Some("USDC"));
+        assert_eq!(diff.tokens[0].symbol.as_deref(), Some("USDC"));
     }
 
     #[test]
@@ -607,7 +651,7 @@ mod tests {
                 mint: "USDC".to_string(),
                 raw_amount: 50_000_000,
                 ui_amount: 50.0,
-                symbol: Some("USDC"),
+                symbol: Some("USDC".to_string()),
             }],
             tokens_unavailable: false,
         };
@@ -632,7 +676,7 @@ mod tests {
                 mint: "USDC".to_string(),
                 raw_amount: 5_000_000,
                 ui_amount: 5.0,
-                symbol: Some("USDC"),
+                symbol: Some("USDC".to_string()),
             }],
             tokens_unavailable: false,
         };
@@ -650,7 +694,7 @@ mod tests {
                 mint: "USDC".to_string(),
                 raw_amount: 5_000_000,
                 ui_amount: 5.0,
-                symbol: Some("USDC"),
+                symbol: Some("USDC".to_string()),
             }],
             tokens_unavailable: false,
         };

@@ -736,7 +736,7 @@ mod tests {
             mint: mint.to_string(),
             raw_amount,
             ui_amount: raw_amount as f64 / 1_000_000.0,
-            symbol: Some(symbol),
+            symbol: Some(symbol.to_string()),
         }
     }
 

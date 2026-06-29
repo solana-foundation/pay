@@ -54,7 +54,7 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
     let mut lines = vec![];
 
     for token in &balances.tokens {
-        let label = token.symbol.unwrap_or("unknown");
+        let label = token.symbol_or("unknown");
         lines.push(format!("{label}: {:.2}", token.ui_amount));
     }
 
