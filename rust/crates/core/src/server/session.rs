@@ -69,6 +69,11 @@ struct SessionOperatorRuntime {
     payment_channel_signer: Arc<Mutex<Option<Arc<dyn SolanaSigner>>>>,
     payment_channel_payer_signer: Arc<Mutex<Option<Arc<dyn SolanaSigner>>>>,
     committed_watermarks: Arc<Mutex<HashMap<String, u64>>>,
+    /// Channel id → on-chain settlement signature, recorded when the channel
+    /// finalizes. Surfaced via the `/sessions/receipt/:channelId` poll so the
+    /// playground can show the settle receipt URL (sessions settle out-of-band
+    /// at idle-close, so there's no per-request settlement header like x402).
+    settlement_signatures: Arc<Mutex<HashMap<String, String>>>,
     /// Batched settlement worker, spawned lazily on first close (the signer is
     /// set after construction). Concurrent closes pack into shared txs.
     settlement_worker: Arc<tokio::sync::OnceCell<SettlementHandle>>,
@@ -81,6 +86,19 @@ impl SessionOperatorRuntime {
             let entry = watermarks.entry(session_id).or_default();
             *entry = (*entry).max(cumulative);
         }
+    }
+
+    fn record_settlement_signature(&self, channel_id: impl Into<String>, signature: String) {
+        if let Ok(mut sigs) = self.settlement_signatures.lock() {
+            sigs.insert(channel_id.into(), signature);
+        }
+    }
+
+    fn settlement_signature(&self, channel_id: &str) -> Option<String> {
+        self.settlement_signatures
+            .lock()
+            .ok()
+            .and_then(|sigs| sigs.get(channel_id).cloned())
     }
 
     fn payment_channel_signer(&self) -> Option<Arc<dyn SolanaSigner>> {
@@ -146,6 +164,9 @@ impl SessionOperatorRuntime {
                 .mark_finalized(&params.channel_id.to_string())
                 .await
                 .map_err(|e| Error::Mpp(format!("Failed to mark session finalized: {e}")))?;
+            // Retain the settle signature so `/sessions/receipt/:channelId` can
+            // surface the on-chain receipt URL (sessions settle out-of-band).
+            self.record_settlement_signature(params.channel_id.to_string(), signature.clone());
             tracing::info!(
                 %signature,
                 channel = %params.channel_id,
@@ -178,9 +199,20 @@ impl SessionOperatorRuntime {
         &self,
         params: &FinalizeParams,
     ) -> Result<Option<String>> {
+        // `settle_and_finalize` requires the **merchant** (recipient) to sign,
+        // and for client-voucher pull the recipient is pinned to the settlement
+        // signer — so the worker must sign with that. The channel's `rent_payer`
+        // (the advertised operator / channel payer, distinct in sandbox) is a
+        // *non-signer* account on `distribute`; it only has to equal the
+        // channel's stored rent_payer (else 0xA InvalidChannelRentPayer). Keeping
+        // these separate fixes both the rent-payer check and the merchant sig.
         let Some(signer) = self.payment_channel_signer() else {
             return Ok(None);
         };
+        let rent_payer = self
+            .payment_channel_payer_signer()
+            .map(|s| s.pubkey())
+            .unwrap_or_else(|| signer.pubkey());
         let rpc_url = self.rpc_url.clone().ok_or_else(|| {
             Error::Mpp("payment-channel settlement requires an RPC URL".to_string())
         })?;
@@ -231,9 +263,10 @@ impl SessionOperatorRuntime {
             pay_kit::mpp::program::payment_channels::build_distribute_instruction(
                 &params.channel_id,
                 &payer,
-                // rentPayer is pinned to the operator (the settlement fee payer) —
-                // the only tx signer able to fund any ATA creation.
-                &signer.pubkey(),
+                // rentPayer must match the channel's stored rent_payer (the
+                // advertised operator / channel payer), NOT the settlement
+                // signer — it's a non-signer account here, so they can differ.
+                &rent_payer,
                 &params.recipient,
                 &pay_kit::mpp::program::payment_channels::treasury_owner(),
                 &mint,
@@ -442,6 +475,7 @@ impl SessionMpp {
         let payment_channel_signer = Arc::new(Mutex::new(None));
         let payment_channel_payer_signer = Arc::new(Mutex::new(None));
         let committed_watermarks = Arc::new(Mutex::new(HashMap::new()));
+        let settlement_signatures = Arc::new(Mutex::new(HashMap::new()));
         let pull_sessions = Arc::new(Mutex::new(HashSet::new()));
         let operator_runtime = SessionOperatorRuntime {
             server: Arc::clone(&server),
@@ -449,6 +483,7 @@ impl SessionMpp {
             payment_channel_signer: Arc::clone(&payment_channel_signer),
             payment_channel_payer_signer: Arc::clone(&payment_channel_payer_signer),
             committed_watermarks: Arc::clone(&committed_watermarks),
+            settlement_signatures: Arc::clone(&settlement_signatures),
             settlement_worker: Arc::new(tokio::sync::OnceCell::new()),
         };
         let (tx, rx) = mpsc::unbounded_channel();
@@ -560,6 +595,14 @@ impl SessionMpp {
             .lock()
             .ok()
             .and_then(|watermarks| watermarks.get(session_id).copied())
+    }
+
+    /// On-chain settle signature for a finalized session channel, if recorded.
+    /// Powers `/sessions/receipt/:channelId` — the playground polls it to show
+    /// the settle receipt URL (sessions settle out-of-band at idle-close, so
+    /// there's no per-request settlement header like x402 has).
+    pub fn settlement_signature(&self, channel_id: &str) -> Option<String> {
+        self.operator_runtime.settlement_signature(channel_id)
     }
 
     /// Build a [`PaymentChallenge`] for a new session with the given cap.
@@ -741,6 +784,8 @@ impl SessionMpp {
                         .map_err(|e| {
                             Error::Mpp(format!("Failed to mark session finalized: {e}"))
                         })?;
+                    self.operator_runtime
+                        .record_settlement_signature(params.channel_id.to_string(), signature.clone());
                     tracing::info!(%signature, channel = %params.channel_id, "payment-channel settlement confirmed");
                 }
                 self.unschedule_channel_close(params.channel_id.to_string());
@@ -823,9 +868,14 @@ impl SessionMpp {
         let Some(transaction) = payload.transaction.as_deref() else {
             return Ok(None);
         };
+        // The client builds the open with `fee_payer = challenge.operator`, which
+        // is the channel payer (a dedicated, funded signer in sandbox; the main
+        // settlement signer otherwise). Co-sign and validate against *that* payer
+        // — not the settlement signer, which may differ from the advertised
+        // operator and would trip the fee-payer check.
         let signer = self
             .operator_runtime
-            .payment_channel_signer()
+            .payment_channel_payer_signer()
             .ok_or_else(|| {
                 Error::Mpp(
                     "payment-channel open transaction requires an operator signer".to_string(),
@@ -837,16 +887,22 @@ impl SessionMpp {
 
         let mut tx = decode_base64_transaction(transaction)?;
         let expected = self.expected_payment_channel_open_instruction(payload)?;
-        validate_payment_channel_open_transaction(&tx, &expected, &signer.pubkey())?;
+        let operator = signer.pubkey();
+        validate_payment_channel_open_transaction(&tx, &expected, &operator)?;
 
-        sign_and_submit_transaction(
-            Arc::clone(&signer),
-            rpc_url,
+        // Co-sign the operator's fee-payer slot via the shared payment-channels
+        // helper (handles both legacy and v0 transactions), then broadcast.
+        pay_kit::mpp::program::payment_channels::cosign_fee_payer(
+            signer.as_ref(),
+            &operator,
             &mut tx,
-            "payment-channel open",
         )
         .await
-        .map(Some)
+        .map_err(|e| Error::Mpp(e.to_string()))?;
+
+        submit_versioned_transaction(rpc_url, tx, "payment-channel open")
+            .await
+            .map(Some)
     }
 
     async fn submit_server_payment_channel_open(&self, payload: &OpenPayload) -> Result<String> {
@@ -935,14 +991,14 @@ fn spl_token_program() -> solana_pubkey::Pubkey {
     solana_pubkey::Pubkey::from_str(programs::TOKEN_PROGRAM).expect("valid SPL token program id")
 }
 
-fn decode_base64_transaction(tx_base64: &str) -> Result<solana_transaction::Transaction> {
-    use base64::Engine;
-
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(tx_base64)
-        .map_err(|e| Error::Mpp(format!("invalid base64 transaction: {e}")))?;
-    bincode::deserialize(&bytes)
-        .map_err(|e| Error::Mpp(format!("transaction deserialization failed: {e}")))
+/// Decode a client-built open transaction. Delegates to the shared
+/// payment-channels decoder, which accepts both legacy (pay Rust client) and v0
+/// versioned (canonical pay-kit JS client) wire formats.
+fn decode_base64_transaction(
+    tx_base64: &str,
+) -> Result<solana_transaction::versioned::VersionedTransaction> {
+    pay_kit::mpp::program::payment_channels::decode_transaction(tx_base64)
+        .map_err(|e| Error::Mpp(e.to_string()))
 }
 
 fn decode_voucher_signature(signature: &str) -> Result<[u8; 64]> {
@@ -955,15 +1011,12 @@ fn decode_voucher_signature(signature: &str) -> Result<[u8; 64]> {
 }
 
 fn transaction_contains_instruction(
-    tx: &solana_transaction::Transaction,
+    tx: &solana_transaction::versioned::VersionedTransaction,
     expected: &solana_instruction::Instruction,
 ) -> bool {
-    tx.message.instructions.iter().any(|compiled| {
-        let Some(program_id) = tx
-            .message
-            .account_keys
-            .get(compiled.program_id_index as usize)
-        else {
+    let keys = tx.message.static_account_keys();
+    tx.message.instructions().iter().any(|compiled| {
+        let Some(program_id) = keys.get(compiled.program_id_index as usize) else {
             return false;
         };
         if program_id != &expected.program_id || compiled.data != expected.data {
@@ -973,7 +1026,7 @@ fn transaction_contains_instruction(
         let accounts = compiled
             .accounts
             .iter()
-            .filter_map(|index| tx.message.account_keys.get(*index as usize).copied())
+            .filter_map(|index| keys.get(*index as usize).copied())
             .collect::<Vec<_>>();
         let expected_accounts = expected
             .accounts
@@ -985,17 +1038,17 @@ fn transaction_contains_instruction(
 }
 
 fn validate_payment_channel_open_transaction(
-    tx: &solana_transaction::Transaction,
+    tx: &solana_transaction::versioned::VersionedTransaction,
     expected: &solana_instruction::Instruction,
     fee_payer: &solana_pubkey::Pubkey,
 ) -> Result<()> {
-    if tx.message.account_keys.first() != Some(fee_payer) {
+    if tx.message.static_account_keys().first() != Some(fee_payer) {
         return Err(Error::Mpp(
             "payment-channel open transaction fee payer does not match operator".to_string(),
         ));
     }
 
-    if tx.message.instructions.len() != 1 {
+    if tx.message.instructions().len() != 1 {
         return Err(Error::Mpp(
             "payment-channel open transaction must contain exactly one instruction".to_string(),
         ));
@@ -1028,8 +1081,22 @@ async fn sign_and_submit_transaction(
         .sign_transaction(tx)
         .await
         .map_err(|e| Error::Mpp(format!("failed to sign {context} transaction: {e}")))?;
-    let tx = tx.clone();
 
+    submit_versioned_transaction(
+        rpc_url,
+        solana_transaction::versioned::VersionedTransaction::from(tx.clone()),
+        context,
+    )
+    .await
+}
+
+/// Broadcast an already-signed transaction (legacy or v0) and confirm it.
+/// Shared by the legacy server-opened path and the client-built open path.
+async fn submit_versioned_transaction(
+    rpc_url: String,
+    tx: solana_transaction::versioned::VersionedTransaction,
+    context: &'static str,
+) -> Result<String> {
     tokio::task::spawn_blocking(move || {
         use pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient;
         use solana_commitment_config::CommitmentConfig;
@@ -1564,7 +1631,9 @@ mod tests {
             Some(&fee_payer),
             &solana_hash::Hash::default(),
         );
-        let tx = solana_transaction::Transaction::new_unsigned(message);
+        let tx = solana_transaction::versioned::VersionedTransaction::from(
+            solana_transaction::Transaction::new_unsigned(message),
+        );
         assert!(transaction_contains_instruction(&tx, &expected));
 
         let mut tampered = expected.clone();
@@ -1595,7 +1664,9 @@ mod tests {
             Some(&fee_payer),
             &solana_hash::Hash::default(),
         );
-        let tx = solana_transaction::Transaction::new_unsigned(message);
+        let tx = solana_transaction::versioned::VersionedTransaction::from(
+            solana_transaction::Transaction::new_unsigned(message),
+        );
 
         let err =
             validate_payment_channel_open_transaction(&tx, &expected, &fee_payer).unwrap_err();
@@ -1620,7 +1691,9 @@ mod tests {
             Some(&fee_payer),
             &solana_hash::Hash::default(),
         );
-        let tx = solana_transaction::Transaction::new_unsigned(message);
+        let tx = solana_transaction::versioned::VersionedTransaction::from(
+            solana_transaction::Transaction::new_unsigned(message),
+        );
 
         let wrong_fee_payer = solana_pubkey::Pubkey::new_unique();
         let err = validate_payment_channel_open_transaction(&tx, &expected, &wrong_fee_payer)

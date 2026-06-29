@@ -1028,6 +1028,12 @@ pub struct Metering {
     /// (`[mpp-charge]`); session and the x402 schemes must be listed explicitly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schemes: Option<Vec<Scheme>>,
+    /// Minimum settled amount (USD) for usage-metered `x402-upto`. The tier
+    /// price is the *ceiling* the client authorizes; absent a real usage meter,
+    /// the operator settles a voucher for this `min` (clamped to the ceiling) on
+    /// a successful serve, refunding the rest. `None` settles the full ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_usd: Option<f64>,
 }
 
 impl Metering {
@@ -2184,6 +2190,7 @@ mod tests {
             sku_tiers: vec![],
             splits: vec![],
             schemes: None,
+            min_usd: None,
         };
         let json = serde_json::to_string(&metering).unwrap();
         let back: Metering = serde_json::from_str(&json).unwrap();
@@ -2248,6 +2255,7 @@ mod tests {
                     sku_tiers: vec![],
                     splits: vec![],
                     schemes: None,
+                    min_usd: None,
                 }),
                 subscription: None,
             }],
@@ -2586,6 +2594,7 @@ mod tests {
                     memo: None,
                 }],
                 schemes: None,
+                min_usd: None,
             }),
             subscription: None,
         }]);
@@ -2625,6 +2634,7 @@ mod tests {
                     memo: None,
                 }],
                 schemes: None,
+                min_usd: None,
             }),
             subscription: None,
         }]);
@@ -2664,6 +2674,7 @@ mod tests {
                     memo: None,
                 }],
                 schemes: None,
+                min_usd: None,
             }),
             subscription: None,
         }]);
@@ -2703,6 +2714,7 @@ mod tests {
                     memo: None,
                 }],
                 schemes: None,
+                min_usd: None,
             }),
             subscription: None,
         }]);
@@ -2741,6 +2753,7 @@ mod tests {
                     memo: None,
                 }],
                 schemes: None,
+                min_usd: None,
             }),
             subscription: None,
         }]);
@@ -2790,6 +2803,7 @@ mod tests {
                     },
                 ],
                 schemes: None,
+                min_usd: None,
             }),
             subscription: None,
         }]);
@@ -2843,6 +2857,7 @@ mod tests {
                 sku_tiers: vec![],
                 splits: vec![],
                 schemes: None,
+                min_usd: None,
             }),
             subscription: None,
         }]);
@@ -2896,6 +2911,7 @@ mod tests {
                 sku_tiers: vec![],
                 splits: vec![],
                 schemes: None,
+                min_usd: None,
             }),
             subscription: None,
         }]);

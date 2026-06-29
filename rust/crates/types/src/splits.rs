@@ -165,12 +165,16 @@ pub fn resolve_splits(
     Ok(resolved)
 }
 
-/// Resolve an account string. If it starts with `${`, treat it as a runtime variable
-/// and look it up in `query_params`.
+/// Resolve an account string. If it starts with `${`, treat it as a variable:
+/// first an environment variable (static per-deployment recipients, e.g. a
+/// platform fee wallet), then a request query parameter (per-request runtime
+/// recipients).
 ///
 /// Resolution strategy for `${SOME_WALLET}`:
-/// 1. Try `some_wallet` (full lowercase)
-/// 2. Try stripping `_wallet`/`_account` suffix → `some`
+/// 1. Environment variable `SOME_WALLET` (exact case)
+/// 2. Query param `some_wallet` (full lowercase)
+/// 3. Query param with `_wallet`/`_account`/`_address` suffix stripped → `some`
+/// 4. Query param named after the recipient alias
 fn resolve_account(
     account: &str,
     recipient_name: &str,
@@ -181,6 +185,15 @@ fn resolve_account(
     }
 
     let var_name = &account[2..account.len() - 1]; // e.g. "AFFILIATE_WALLET"
+
+    // Environment variable first — lets a static recipient (e.g. a platform fee
+    // wallet) be configured per deployment without a per-request query param.
+    if let Ok(val) = std::env::var(var_name)
+        && !val.is_empty()
+    {
+        return Ok(val);
+    }
+
     let lower = var_name.to_lowercase(); // e.g. "affiliate_wallet"
 
     // Try exact lowercase match first.

@@ -52,6 +52,13 @@ pub enum RunOutcome {
         challenge: Box<x402::Challenge>,
         resource_url: String,
     },
+    /// The server returned 402 with an x402 `upto` (usage-metered) challenge —
+    /// authorize a ceiling via a payment channel; the operator settles the
+    /// actual amount after serving.
+    X402UptoChallenge {
+        challenge: Box<x402::UptoChallenge>,
+        resource_url: String,
+    },
     /// The server returned 402 with an x402 `sign-in-with-x` challenge.
     ///
     /// When the same 402 also offered a payment option, `payment_fallback`
@@ -602,6 +609,20 @@ pub(crate) fn classify_402_with_preference(
             return RunOutcome::X402SignInChallenge {
                 challenge: Box::new(siwx),
                 payment_fallback: x402_challenge.map(Box::new),
+                resource_url: resource_url.to_string(),
+            };
+        }
+
+        // x402 `upto` (usage-metered) — checked before exact: an upto-only
+        // challenge also parses leniently as exact, so prefer the upto reading
+        // when the server advertises the `upto` scheme.
+        if let Some(upto) = x402::parse_upto(headers, body) {
+            info!(
+                resource = resource_url,
+                "Detected x402 upto challenge (Solana)"
+            );
+            return RunOutcome::X402UptoChallenge {
+                challenge: Box::new(upto),
                 resource_url: resource_url.to_string(),
             };
         }

@@ -71,6 +71,7 @@ endpoints:
       0.000001 USDC settlement increments where sub-µUSDC token prices require
       batching.
     metering:
+      schemes: [mpp-session]
       variants: &official_gemini_generation_metering
         - param: model
           value: gemini-3.1-pro-preview
@@ -203,6 +204,7 @@ endpoints:
       to 0.000001 USDC settlement increments where sub-µUSDC token prices
       require batching.
     metering:
+      schemes: [mpp-session]
       variants: *official_gemini_generation_metering
 
   - method: POST
@@ -210,6 +212,7 @@ endpoints:
     resource: "models"
     description: "Count tokens in a prompt. Flat fee."
     metering:
+      schemes: [mpp-session]
       dimensions:
         - direction: usage
           unit: requests
@@ -222,6 +225,7 @@ endpoints:
     resource: "models"
     description: "Generate text embeddings. Flat fee per call."
     metering:
+      schemes: [mpp-session]
       dimensions:
         - direction: usage
           unit: requests

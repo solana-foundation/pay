@@ -586,6 +586,65 @@ fn handle_outcome(
             }
         }
 
+        RunOutcome::X402UptoChallenge {
+            challenge,
+            resource_url,
+        } => {
+            if auto_pay {
+                // The cap is the authorized ceiling (the channel deposit).
+                enforce_payment_cap(
+                    &challenge.requirements.amount,
+                    &challenge.requirements.asset,
+                    payment_cap,
+                    "x402",
+                )?;
+                if verbose && !is_json {
+                    eprintln!(
+                        "{}",
+                        format!(
+                            "402 Payment Required (x402 upto) — up to {} {}",
+                            challenge.requirements.amount, challenge.requirements.asset
+                        )
+                        .dimmed()
+                    );
+                }
+                return pay_upto_and_retry(
+                    &challenge,
+                    &resource_url,
+                    PaymentRetryContext {
+                        tool,
+                        output_fmt,
+                        fetch_headers,
+                        network_override,
+                        account_override,
+                        verbose,
+                    },
+                );
+            }
+
+            if is_json {
+                output::print_json(&serde_json::json!({
+                    "status": 402,
+                    "protocol": "x402-upto",
+                    "challenge": {
+                        "amount": challenge.requirements.amount,
+                        "currency": challenge.requirements.asset,
+                        "recipient": challenge.requirements.pay_to,
+                    },
+                    "resource": resource_url,
+                }))?;
+            } else {
+                eprintln!(
+                    "{}",
+                    format!(
+                        "402 Payment Required (x402 upto) — up to {} {}",
+                        challenge.requirements.amount, challenge.requirements.asset
+                    )
+                    .dimmed()
+                );
+            }
+        }
+
         RunOutcome::X402SignInChallenge {
             challenge,
             resource_url,
@@ -1065,6 +1124,39 @@ fn pay_x402_and_retry(
 
     let store = pay_core::accounts::FileAccountsStore::default_path();
     let built_payment = x402::build_payment(
+        challenge,
+        &store,
+        ctx.network_override,
+        ctx.account_override,
+        Some(resource_url),
+    )?;
+
+    if let Some(resolved) = built_payment.ephemeral_notice {
+        render_generated_wallet_notice(&resolved, is_json)?;
+    }
+
+    if ctx.verbose && !is_json {
+        eprintln!("{}", "Payment signed, retrying...\n".dimmed());
+    }
+
+    let retry_outcome = retry_with_headers(ctx.tool, &built_payment.headers, ctx.fetch_headers)?;
+    handle_retry_outcome(retry_outcome, is_json)
+}
+
+fn pay_upto_and_retry(
+    challenge: &x402::UptoChallenge,
+    resource_url: &str,
+    ctx: PaymentRetryContext<'_, '_>,
+) -> pay_core::Result<()> {
+    let is_json = no_dna::should_json(ctx.output_fmt);
+    validate_tool_request_before_signing(ctx.tool)?;
+
+    if ctx.verbose && !is_json {
+        eprintln!("{}", "Paying (x402 upto)...".dimmed());
+    }
+
+    let store = pay_core::accounts::FileAccountsStore::default_path();
+    let built_payment = x402::build_upto_payment(
         challenge,
         &store,
         ctx.network_override,

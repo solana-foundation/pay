@@ -103,8 +103,10 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
             // metered amount on success, refund on failure.
             if let Some(uf) = upto {
                 let served_ok = response.status().is_success();
+                let settle_amount = uf.settle_amount;
                 if let Some((n, v)) =
-                    crate::server::gate::settle_upto(&state, *uf.open, served_ok).await
+                    crate::server::gate::settle_upto(&state, *uf.open, settle_amount, served_ok)
+                        .await
                 {
                     response.headers_mut().append(n, v);
                 }

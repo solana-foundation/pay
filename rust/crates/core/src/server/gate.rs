@@ -23,9 +23,7 @@ use pay_kit::mpp::{
     format_www_authenticate_many, parse_authorization,
 };
 use pay_kit::x402::PAYMENT_RESPONSE_HEADER;
-use pay_kit::x402::server::{
-    ExactOptions, VerifiedExactPayment, VerifiedUptoOpen, X402, X402BatchSettlement, X402Upto,
-};
+use pay_kit::x402::server::{ExactOptions, VerifiedUptoOpen, X402, X402BatchSettlement, X402Upto};
 use pay_types::metering::Scheme;
 use serde_json::json;
 
@@ -126,6 +124,10 @@ pub struct UptoForward {
     /// Boxed — `VerifiedUptoOpen` is large, and boxing keeps the common
     /// `GateDecision` variants small (clippy `large_enum_variant`).
     pub open: Box<VerifiedUptoOpen>,
+    /// Voucher amount (base units) to settle on a successful serve — the
+    /// configured `min` (clamped to the ceiling), or the full ceiling when no
+    /// `min` is set. Failures always settle `0` (full refund).
+    pub settle_amount: u64,
 }
 
 /// The outcome of gating a request.
@@ -203,11 +205,22 @@ impl<S: PaymentState> PaymentGate<S> {
         } else {
             req.method.as_str()
         };
+        // Session commits/closes are POSTed to the *opened resource* regardless
+        // of its declared method (the canonical client commits to the resource
+        // URL by default), so a `POST` voucher commit lands on a `GET` stream
+        // endpoint. Detect a session credential up front so we can resolve the
+        // endpoint by path — otherwise the method mismatch 404s before the
+        // session handler ever runs.
+        let is_session_credential = req
+            .authorization
+            .and_then(|a| parse_authorization(a).ok())
+            .is_some_and(|c| c.challenge.intent.as_str() == "session");
         let exact_match = metering::find_endpoint(api, match_method, path);
         let endpoint = exact_match.or_else(|| {
             // Browsers often GET a POST-only paid endpoint via a payment link;
             // fall back to path-only resolution so we can render the 402 page.
-            if accepts_html {
+            // Session commits likewise need path-only resolution (see above).
+            if accepts_html || is_session_credential {
                 metering::find_endpoint_by_path(api, path)
             } else {
                 None
@@ -269,8 +282,11 @@ impl<S: PaymentState> PaymentGate<S> {
                     }
                     if intent == "charge" && accepted.contains(&Scheme::MppCharge) {
                         let description = endpoint.and_then(|e| e.description.as_deref());
+                        let resource = endpoint.and_then(|e| e.resource.as_deref());
                         return self
-                            .charge_verify(api, meter, description, auth, subdomain, path, req)
+                            .charge_verify(
+                                api, meter, description, resource, auth, subdomain, path, req,
+                            )
                             .await;
                     }
                     // Parseable but not an accepted scheme → fall through to re-challenge.
@@ -292,8 +308,9 @@ impl<S: PaymentState> PaymentGate<S> {
             if accepted.contains(&Scheme::X402Exact)
                 && let Some(x402) = self.state.x402()
             {
+                let resource = endpoint.and_then(|e| e.resource.as_deref());
                 return self
-                    .x402_exact_verify(x402, meter, req, path, pay_header, subdomain)
+                    .x402_exact_verify(x402, meter, req, path, pay_header, subdomain, resource)
                     .await;
             }
             if accepted.contains(&Scheme::X402BatchSettlement)
@@ -314,6 +331,7 @@ impl<S: PaymentState> PaymentGate<S> {
 
         // No (matching) credential → advertise every accepted + available scheme.
         let description = endpoint.and_then(|e| e.description.as_deref());
+        let resource = endpoint.and_then(|e| e.resource.as_deref());
         self.build_challenge(
             api,
             meter,
@@ -323,6 +341,7 @@ impl<S: PaymentState> PaymentGate<S> {
             subdomain,
             path,
             description,
+            resource,
             accepts_html,
         )
     }
@@ -342,6 +361,7 @@ impl<S: PaymentState> PaymentGate<S> {
         subdomain: &str,
         path: &str,
         description: Option<&str>,
+        resource: Option<&str>,
         accepts_html: bool,
     ) -> GateDecision {
         // When set, render the browser HTML 402 page from this charge challenge.
@@ -390,6 +410,10 @@ impl<S: PaymentState> PaymentGate<S> {
                         &amount,
                         ChargeOptions {
                             description,
+                            // Default the main recipient's settlement memo to the
+                            // endpoint resource so the seller's payout is itemized
+                            // on-chain / in receipts (splits carry their own memo).
+                            external_id: resource,
                             splits: crate::server::payment::resolve_charge_splits(
                                 mpp, meter, api, &uri, &amount,
                             ),
@@ -436,7 +460,15 @@ impl<S: PaymentState> PaymentGate<S> {
             && let Some(x402) = self.state.x402()
         {
             let amount = crate::server::payment::charge_amount_from_price(price.as_ref());
-            match x402.payment_required_header(&amount, ExactOptions::default()) {
+            // Stamp the endpoint resource as the on-chain memo (parity with the
+            // MPP charge external_id) instead of the client's random nonce.
+            match x402.payment_required_header(
+                &amount,
+                ExactOptions {
+                    memo: resource,
+                    ..Default::default()
+                },
+            ) {
                 Ok((name, value)) => {
                     if let (Ok(n), Ok(v)) = (
                         HeaderName::from_bytes(name.as_bytes()),
@@ -544,6 +576,7 @@ impl<S: PaymentState> PaymentGate<S> {
 
     /// Verify an x402 `exact` payment. On success, forward with a `PAYMENT-RESPONSE`
     /// receipt; on failure or a referenceless payment, re-challenge with 402.
+    #[allow(clippy::too_many_arguments)]
     async fn x402_exact_verify(
         &self,
         x402: &X402,
@@ -552,6 +585,7 @@ impl<S: PaymentState> PaymentGate<S> {
         path: &str,
         pay_header: &str,
         subdomain: &str,
+        resource: Option<&str>,
     ) -> GateDecision {
         let props = metering::RequestProperties {
             body_size: req.content_length,
@@ -569,30 +603,49 @@ impl<S: PaymentState> PaymentGate<S> {
                     .unwrap_or_default(),
             ))
         };
-        match x402
-            .process_payment(pay_header, &amount, ExactOptions::default())
+        let verified = match x402
+            .process_payment(
+                pay_header,
+                &amount,
+                ExactOptions {
+                    memo: resource,
+                    ..Default::default()
+                },
+            )
             .await
         {
-            Ok(verified) => match x402_reference(&verified) {
-                Some(reference) => {
-                    telemetry::record_payment_collected("x402", subdomain, path, None, &reference);
-                    let mut headers = Vec::new();
-                    if let Ok(n) = HeaderName::from_bytes(PAYMENT_RESPONSE_HEADER.as_bytes())
-                        && let Ok(v) = HeaderValue::from_str(&reference)
-                    {
-                        headers.push((n, v));
-                    }
-                    GateDecision::Forward {
-                        session: None,
-                        receipt: Some(ReceiptAnnotation {
-                            headers,
-                            reference: Some(reference),
-                        }),
-                        upto: None,
-                    }
+            Ok(verified) => verified,
+            Err(e) => return reject(e.to_string()),
+        };
+        // `process_payment` only *verified* the credential — it did not move
+        // funds. Settle on-chain BEFORE serving: co-sign the sponsor's fee-payer
+        // slot, broadcast, and await confirmation (mirrors the MPP charge path).
+        // Without this the resource would be served against an unbroadcast
+        // transaction (the receipt would carry the null signature).
+        let Some(signer) = self.state.fee_payer_signer() else {
+            return reject(
+                "x402 exact settlement requires a fee-payer signer (set operator.fee_payer)"
+                    .to_string(),
+            );
+        };
+        match x402.settle_exact(verified, signer.as_ref()).await {
+            Ok(reference) => {
+                telemetry::record_payment_collected("x402", subdomain, path, None, &reference);
+                let mut headers = Vec::new();
+                if let Ok(n) = HeaderName::from_bytes(PAYMENT_RESPONSE_HEADER.as_bytes())
+                    && let Ok(v) = HeaderValue::from_str(&reference)
+                {
+                    headers.push((n, v));
                 }
-                None => reject("x402 payment carried no settlement reference".to_string()),
-            },
+                GateDecision::Forward {
+                    session: None,
+                    receipt: Some(ReceiptAnnotation {
+                        headers,
+                        reference: Some(reference),
+                    }),
+                    upto: None,
+                }
+            }
             Err(e) => reject(e.to_string()),
         }
     }
@@ -620,13 +673,19 @@ impl<S: PaymentState> PaymentGate<S> {
             metering::resolve_price(meter, &props, variant.as_deref(), None).as_ref(),
         );
         match upto.verify_open(pay_header, &amount).await {
-            Ok(open) => GateDecision::Forward {
-                session: None,
-                receipt: None,
-                upto: Some(UptoForward {
-                    open: Box::new(open),
-                }),
-            },
+            Ok(open) => {
+                let ceiling_usd: f64 = amount.parse().unwrap_or(0.0);
+                let settle_amount =
+                    upto_settle_amount(meter.min_usd, ceiling_usd, open.max_amount);
+                GateDecision::Forward {
+                    session: None,
+                    receipt: None,
+                    upto: Some(UptoForward {
+                        open: Box::new(open),
+                        settle_amount,
+                    }),
+                }
+            }
             Err(e) => {
                 telemetry::record_settlement_error("x402", subdomain, path, &e.to_string(), true);
                 GateDecision::Respond(GateResponse::json(
@@ -907,11 +966,13 @@ impl<S: PaymentState> PaymentGate<S> {
     /// Verify an MPP `charge` credential across the configured MPPs. On success,
     /// forward with a receipt; on failure, re-challenge with 402.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     async fn charge_verify(
         &self,
         api: &pay_types::metering::ApiSpec,
         meter: &pay_types::metering::Metering,
         description: Option<&str>,
+        resource: Option<&str>,
         auth: &str,
         subdomain: &str,
         path: &str,
@@ -966,6 +1027,9 @@ impl<S: PaymentState> PaymentGate<S> {
                 &amount,
                 ChargeOptions {
                     description,
+                    // Must match the challenge (external_id = resource), else the
+                    // echoed credential trips the externalId-mismatch check.
+                    external_id: resource,
                     splits: crate::server::payment::resolve_charge_splits(
                         mpp, meter, api, &uri, &amount,
                     ),
@@ -1050,20 +1114,44 @@ impl<S: PaymentState> PaymentGate<S> {
     }
 }
 
+/// Resolve the default `upto` voucher (base units) settled on a successful
+/// serve. With a configured `min` (USD) and a positive ceiling, convert via the
+/// ceiling's own scale — `max_amount / ceiling_usd` is base-units-per-USD, so
+/// `min_usd * that` equals `parse_units(min_usd, decimals)` without re-deriving
+/// the mint decimals — clamped to the ceiling. No `min` (or a degenerate
+/// ceiling) settles the full ceiling, preserving the prior behavior.
+fn upto_settle_amount(min_usd: Option<f64>, ceiling_usd: f64, max_amount: u64) -> u64 {
+    match min_usd {
+        Some(min_usd) if min_usd >= 0.0 && ceiling_usd > 0.0 => {
+            let units_per_usd = max_amount as f64 / ceiling_usd;
+            ((min_usd * units_per_usd).round() as u64).min(max_amount)
+        }
+        _ => max_amount,
+    }
+}
+
 /// Settle an x402 `upto` channel after the resource was served (the adapter's
-/// post-response hook). Debits the metered ceiling (`open.max_amount`) on a
-/// successful serve, refunds the full deposit (settle `0`) on failure, and
-/// finalizes the channel on-chain. Returns the `PAYMENT-RESPONSE` receipt header
+/// post-response hook). Debits `settle_amount` (the configured `min`, or the
+/// full ceiling when unset — clamped to `open.max_amount`) on a successful
+/// serve, refunds the full deposit (settle `0`) on failure, and finalizes the
+/// channel on-chain. Returns the `PAYMENT-RESPONSE` receipt header
 /// to set on the response. Settlement errors are logged, not surfaced — the
 /// resource was already served, so a failed settle is an operator/on-chain retry
 /// concern (the channel store sweeps it), not a client error.
 pub async fn settle_upto<S: PaymentState>(
     state: &S,
     open: VerifiedUptoOpen,
+    settle_amount: u64,
     served_ok: bool,
 ) -> Option<(HeaderName, HeaderValue)> {
     let upto = state.x402_upto()?;
-    let amount = if served_ok { open.max_amount } else { 0 };
+    // Settle the configured voucher (clamped to the ceiling) on success, full
+    // refund (`0`) on failure.
+    let amount = if served_ok {
+        settle_amount.min(open.max_amount)
+    } else {
+        0
+    };
     match upto.settle_actual(&open, amount).await {
         Ok(settlement) => {
             tracing::Span::current().record("tx_sig", settlement.transaction.as_str());
@@ -1094,19 +1182,6 @@ fn reconstruct_uri(path: &str, query: Option<&str>) -> http::Uri {
     )
     .parse()
     .unwrap_or_default()
-}
-
-/// Settlement reference from a verified x402 payment (`None` if unsigned).
-fn x402_reference(verified: &VerifiedExactPayment) -> Option<String> {
-    let reference = match verified {
-        VerifiedExactPayment::Signature(sig) => sig.clone(),
-        VerifiedExactPayment::Transaction(tx) => tx
-            .signatures
-            .first()
-            .map(|s| s.to_string())
-            .unwrap_or_default(),
-    };
-    (!reference.is_empty()).then_some(reference)
 }
 
 /// Path-only variant hint (e.g. `/models/{name}:action` → `name`).
@@ -1201,6 +1276,48 @@ async fn session_authorized(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Ceiling $0.10 at 6 decimals == 100_000 base units (USDC).
+    const CEILING_USD: f64 = 0.10;
+    const CEILING_BASE: u64 = 100_000;
+
+    #[test]
+    fn upto_voucher_defaults_to_full_ceiling_without_min() {
+        assert_eq!(
+            upto_settle_amount(None, CEILING_USD, CEILING_BASE),
+            CEILING_BASE
+        );
+    }
+
+    #[test]
+    fn upto_voucher_uses_configured_min() {
+        // $0.01 of a $0.10 ceiling -> 10_000 base units (exactly parse_units).
+        assert_eq!(
+            upto_settle_amount(Some(0.01), CEILING_USD, CEILING_BASE),
+            10_000
+        );
+        // $0.037 -> 37_000.
+        assert_eq!(
+            upto_settle_amount(Some(0.037), CEILING_USD, CEILING_BASE),
+            37_000
+        );
+    }
+
+    #[test]
+    fn upto_voucher_clamps_min_to_ceiling() {
+        // A min above the ceiling never over-debits the channel.
+        assert_eq!(
+            upto_settle_amount(Some(0.50), CEILING_USD, CEILING_BASE),
+            CEILING_BASE
+        );
+    }
+
+    #[test]
+    fn upto_voucher_handles_zero_min_and_degenerate_ceiling() {
+        assert_eq!(upto_settle_amount(Some(0.0), CEILING_USD, CEILING_BASE), 0);
+        // A non-positive ceiling can't scale a min -> fall back to the ceiling.
+        assert_eq!(upto_settle_amount(Some(0.01), 0.0, CEILING_BASE), CEILING_BASE);
+    }
 
     fn req<'a>(method: &'a Method, path: &'a str) -> GateRequest<'a> {
         GateRequest {

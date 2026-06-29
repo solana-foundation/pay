@@ -44,6 +44,13 @@ pub struct SiwxAuthChallenge {
     pub extension: SiwxExtension,
 }
 
+/// An x402 `upto` (usage-metered) challenge: authorize a ceiling now, the
+/// operator settles the actual amount after serving.
+#[derive(Debug, Clone)]
+pub struct UptoChallenge {
+    pub requirements: pay_kit::x402::upto::UptoRequirements,
+}
+
 #[derive(Debug)]
 pub struct BuiltPayment {
     pub headers: Vec<(&'static str, String)>,
@@ -243,6 +250,121 @@ pub fn build_payment_with_override(
 
     Ok(BuiltPayment {
         headers,
+        ephemeral_notice,
+    })
+}
+
+/// Try to parse an x402 `upto` challenge from headers and/or body.
+pub fn parse_upto(headers: &[(String, String)], body: Option<&str>) -> Option<UptoChallenge> {
+    pay_kit::x402::client::upto::parse_upto_challenge(headers, body)
+        .map(|requirements| UptoChallenge { requirements })
+}
+
+/// Build a signed x402 `upto` payment: a payment-channel `open` authorization
+/// whose deposit is the authorized ceiling, with the operator as the voucher
+/// signer. The client signs only the open; the operator broadcasts it and
+/// settles the actual metered amount. Mirrors [`build_payment`] — same signer
+/// resolution, surfpool detection, network check and auto-fund — but uses the
+/// server-provided `extra.recentBlockhash`, so no RPC round-trip is needed.
+pub fn build_upto_payment(
+    challenge: &UptoChallenge,
+    store: &dyn AccountsStore,
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+    resource_url: Option<&str>,
+) -> Result<BuiltPayment> {
+    let requirements = &challenge.requirements;
+    let amount = format_amount(&requirements.amount, &requirements.asset);
+    let prompt_context = crate::client::prompt::payment_prompt_context(None, &[resource_url]);
+    let intent = crate::keystore::AuthIntent::authorize_payment_details(
+        &amount,
+        &prompt_context.reason,
+        &prompt_context.operator,
+    );
+
+    // `UptoRequirements` carries only the CAIP-2 `network` (no `cluster`), so map
+    // it to a cluster; a Surfpool blockhash overrides to `localnet` (see the
+    // exact path for the rationale).
+    let cluster_raw = pay_kit::x402::exact::cluster_for_caip2_network(&requirements.network)
+        .map(str::to_string)
+        .unwrap_or_else(|| normalize_network(&requirements.network));
+    let embedded_blockhash = requirements.extra.recent_blockhash.as_deref();
+    let surfpool_detected = embedded_blockhash
+        .is_some_and(|h| h.starts_with(crate::client::mpp::SURFPOOL_BLOCKHASH_PREFIX));
+    let cluster = if surfpool_detected {
+        "localnet".to_string()
+    } else {
+        cluster_raw
+    };
+    crate::client::mpp::check_client_network_intent(network_override, &cluster, None)?;
+
+    let user_opted_into_sandbox = network_override.is_some() || cluster == "localnet";
+    let network = network_override.map(str::to_string).unwrap_or(cluster);
+
+    let (signer, ephemeral_notice) =
+        crate::signer::load_signer_for_network_payment_with_intent_and_override(
+            &network,
+            store,
+            account_override,
+            &amount,
+            &intent,
+            None,
+        )?;
+
+    let rpc_url = std::env::var("PAY_RPC_URL").unwrap_or_else(|_| {
+        if surfpool_detected {
+            crate::config::SANDBOX_RPC_URL.to_string()
+        } else {
+            default_rpc_url(&network).to_string()
+        }
+    });
+
+    info!(
+        amount = %requirements.amount,
+        currency = %requirements.asset,
+        cluster = %network,
+        recipient = %requirements.pay_to,
+        signer = %signer.pubkey(),
+        "Building x402 upto payment"
+    );
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| Error::Mpp(format!("Failed to create runtime: {e}")))?;
+
+    if user_opted_into_sandbox {
+        let pubkey = signer.pubkey().to_string();
+        let fund_url = rpc_url.clone();
+        if let Err(e) = rt.block_on(crate::client::sandbox::fund_via_surfpool(
+            &fund_url, &pubkey,
+        )) {
+            warn!(error = %e, "Could not auto-fund ephemeral via Surfpool — channel open may fail if wallet is empty");
+        }
+    }
+
+    // Authorization window + a unique nonce.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let expires_at = now + requirements.max_timeout_seconds as i64;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos().to_string())
+        .unwrap_or_else(|_| "0".to_string());
+
+    let header = rt
+        .block_on(pay_kit::x402::client::upto::build_upto_header(
+            &signer,
+            requirements,
+            expires_at,
+            nonce,
+        ))
+        .map_err(|e| Error::Mpp(format!("Failed to build x402 upto payment: {e}")))?;
+
+    Ok(BuiltPayment {
+        headers: vec![(X402_V2_PAYMENT_HEADER, header)],
         ephemeral_notice,
     })
 }

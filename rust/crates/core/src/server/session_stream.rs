@@ -609,6 +609,7 @@ mod tests {
             sku_tiers: vec![],
             splits: vec![],
             schemes: None,
+            min_usd: None,
         }
     }
 

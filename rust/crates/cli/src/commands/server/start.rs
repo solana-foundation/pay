@@ -643,8 +643,12 @@ impl StartCommand {
                 let cap_base = (sess.cap_usdc * 10f64.powi(session_decimals as i32)).round() as u64;
                 let session_secret = std::env::var("PAY_SESSION_SECRET")
                     .unwrap_or_else(|_| challenge_binding_secret.clone());
-                let requested_modes: Vec<SessionMode> = if sess.modes.is_empty() {
-                    vec![SessionMode::Push]
+                // Default to pull + clientVoucher (payment-channel) when `modes`
+                // is omitted — matches the canonical pay-kit `session()` adapter
+                // and the JS playground client. Explicit `modes:` is respected.
+                let modes_omitted = sess.modes.is_empty();
+                let requested_modes: Vec<SessionMode> = if modes_omitted {
+                    vec![SessionMode::Pull]
                 } else {
                     sess.modes
                         .iter()
@@ -655,6 +659,11 @@ impl StartCommand {
                         .collect()
                 };
                 let pull_voucher_strategy = match sess.pull_voucher_strategy {
+                    // Omitting `modes` opts into the pull default, so also enable
+                    // clientVoucher (otherwise pull gets stripped back to push).
+                    ConfigPullVoucherStrategy::Disabled if modes_omitted => {
+                        PullVoucherStrategy::ClientVoucher
+                    }
                     ConfigPullVoucherStrategy::Disabled => PullVoucherStrategy::Disabled,
                     ConfigPullVoucherStrategy::ClientVoucher => PullVoucherStrategy::ClientVoucher,
                     ConfigPullVoucherStrategy::OperatedVoucher => {
@@ -751,6 +760,11 @@ impl StartCommand {
             } else {
                 None
             };
+
+            // Abort launch if a split recipient won't resolve — an env-var
+            // (`${VAR}`) recipient whose variable isn't set is silently dropped
+            // from the charge at request time, so fail fast instead.
+            ensure_split_recipients_resolved(&api)?;
 
             // ── Banner ──
             let metered_count = api
@@ -1135,6 +1149,20 @@ impl StartCommand {
                     "/__402/session/deliveries",
                     post(move |body: axum::Json<SessionDeliveryRequest>| {
                         reserve_session_delivery(delivery_state.clone(), body.0)
+                    }),
+                )
+                // Payment-channel settle-receipt poll. Payment-channel sessions
+                // settle out-of-band at idle-close, so (unlike x402) there's no
+                // per-request settlement header — clients poll this for the
+                // on-chain signature to build the receipt URL.
+                .route(
+                    "/__402/payment-channels/receipt/{channel_id}",
+                    get({
+                        let receipt_state = state.clone();
+                        move |axum::extract::Path(channel_id): axum::extract::Path<String>| {
+                            let state = receipt_state.clone();
+                            async move { session_receipt(state, channel_id) }
+                        }
                     }),
                 );
 
@@ -2183,6 +2211,55 @@ struct SessionDeliveryRequest {
     proof: Option<String>,
     #[serde(default)]
     expires_at: Option<i64>,
+}
+
+/// Payment-channel settle-receipt poll
+/// (`GET /__402/payment-channels/receipt/:channelId`): `{ settledSignature,
+/// finalized }` for a channel. Clients poll this until `settledSignature` is
+/// non-null to render the on-chain receipt URL (payment-channel sessions settle
+/// out-of-band at idle-close, so there's no per-request header).
+fn session_receipt(state: AppState, channel_id: String) -> axum::response::Response {
+    let signature = state
+        .session_mpp
+        .as_ref()
+        .and_then(|sm| sm.settlement_signature(&channel_id));
+    axum::Json(serde_json::json!({
+        "settledSignature": signature,
+        "finalized": signature.is_some(),
+    }))
+    .into_response()
+}
+
+/// Abort launch if a split recipient won't resolve to an address. A `${VAR}`
+/// recipient resolves from environment variable `VAR` (or a per-request query
+/// param); if neither is available the split is silently dropped from the
+/// charge, so fail fast at startup instead.
+fn ensure_split_recipients_resolved(api: &pay_types::metering::ApiSpec) -> Result<(), pay_core::Error> {
+    for ep in &api.endpoints {
+        let Some(meter) = ep.metering.as_ref() else {
+            continue;
+        };
+        for rule in pay_core::server::metering::resolve_split_rules(meter) {
+            let endpoint = ep.path.as_str();
+            let recipient = rule.recipient.as_str();
+            let Some(alias) = api.recipients.get(recipient) else {
+                return Err(pay_core::Error::Config(format!(
+                    "{endpoint}: split recipient '{recipient}' not declared"
+                )));
+            };
+            if let Some(var) = alias
+                .account
+                .strip_prefix("${")
+                .and_then(|rest| rest.strip_suffix('}'))
+                && std::env::var(var).map(|v| v.is_empty()).unwrap_or(true)
+            {
+                return Err(pay_core::Error::Config(format!(
+                    "{endpoint}: split recipient '{recipient}' unresolved (set ${var})"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn reserve_session_delivery(

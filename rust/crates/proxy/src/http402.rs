@@ -60,8 +60,9 @@ pub struct Ctx {
     receipt: Option<ReceiptAnnotation>,
     /// An x402 `upto` channel opened pre-serve, settled in `response_filter`
     /// (debit on success) or `logging` (refund when the upstream never
-    /// responded). Taken when settled, so it's never double-settled.
-    upto: Option<VerifiedUptoOpen>,
+    /// responded). Taken when settled, so it's never double-settled. The `u64`
+    /// is the success voucher amount (configured `min`, or full ceiling).
+    upto: Option<(VerifiedUptoOpen, u64)>,
     /// Captured at `request_filter` for the Payment Debugger exchange emitted
     /// in `logging` (the data plane is Pingora, so the old axum logging
     /// middleware never sees proxied traffic).
@@ -173,8 +174,8 @@ impl<S: PaymentState> Http402Gate<S> {
                 // the receipt (the entire playground is respond-mode).
                 let served_ok = resp.status().is_success();
                 let mut extra: Vec<(HeaderName, HeaderValue)> = Vec::new();
-                if let Some(open) = ctx.upto.take()
-                    && let Some((n, v)) = settle_upto(&self.state, open, served_ok).await
+                if let Some((open, amt)) = ctx.upto.take()
+                    && let Some((n, v)) = settle_upto(&self.state, open, amt, served_ok).await
                 {
                     extra.push((n, v));
                 }
@@ -265,7 +266,7 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                 ctx.receipt = receipt;
                 // x402 `upto`: the channel is open; hold it for post-response
                 // settlement (response_filter on success, logging on failure).
-                ctx.upto = upto.map(|u| *u.open);
+                ctx.upto = upto.map(|u| (*u.open, u.settle_amount));
                 // A verified payment must reach the real upstream — never the
                 // control-plane axum (`control_plane_ok = false`), even for a
                 // root (`path: ""`) endpoint.
@@ -366,9 +367,9 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
         // on a 2xx, refund otherwise) and attach the PAYMENT-RESPONSE receipt
         // before the response streams downstream. `take` so `logging` won't
         // double-settle.
-        if let Some(open) = ctx.upto.take() {
+        if let Some((open, amt)) = ctx.upto.take() {
             let served_ok = upstream_response.status.is_success();
-            if let Some((name, value)) = settle_upto(&self.state, open, served_ok).await {
+            if let Some((name, value)) = settle_upto(&self.state, open, amt, served_ok).await {
                 let _ = upstream_response.insert_header(name, value);
             }
         }
@@ -386,8 +387,8 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
         // An x402 `upto` channel still held here means `response_filter` never
         // ran (the upstream connect/response failed) — refund the full deposit
         // so the client's funds aren't stranded in an open channel.
-        if let Some(open) = ctx.upto.take() {
-            let _ = settle_upto(&self.state, open, false).await;
+        if let Some((open, amt)) = ctx.upto.take() {
+            let _ = settle_upto(&self.state, open, amt, false).await;
         }
         let Some(log) = ctx.log.take() else {
             return;

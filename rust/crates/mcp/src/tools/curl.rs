@@ -636,6 +636,28 @@ fn do_paid_fetch(
                 body.as_deref(),
             )?)
         }
+        RunOutcome::X402UptoChallenge { challenge, .. } => {
+            let built_payment = pay_core::client::x402::build_upto_payment(
+                &challenge,
+                &store,
+                network_override.as_deref(),
+                account_override.as_deref(),
+                Some(url),
+            )?;
+            let mut headers = extra_headers.to_vec();
+            headers.extend(
+                built_payment
+                    .headers
+                    .into_iter()
+                    .map(|(name, value)| (name.to_string(), value)),
+            );
+            interpret_retry(pay_core::client::fetch::fetch_request(
+                method,
+                url,
+                &headers,
+                body.as_deref(),
+            )?)
+        }
         RunOutcome::X402SignInChallenge {
             challenge,
             payment_fallback,

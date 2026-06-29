@@ -39,19 +39,44 @@ where
         let mut visitor = NoticeVisitor::default();
         event.record(&mut visitor);
 
-        write!(writer, "{rail} {}", visitor.message)?;
-        if !visitor.fields.is_empty() {
-            write!(writer, " {}", visitor.fields.dimmed())?;
+        // Headline: Title-Cased message + the request location (`subdomain/path`)
+        // when present, e.g. `Payment Settlement Failed - localhost:1402/api/v1/x`.
+        // Raw structured fields are intentionally omitted from the human log —
+        // they're carried in the OTLP/JSON layers for machines.
+        write!(writer, "{rail} {}", titleize(&visitor.message))?;
+        if let Some(location) = visitor.location() {
+            write!(writer, " - {}", location.dimmed())?;
         }
-        writeln!(writer)
+        writeln!(writer)?;
+
+        // The error detail, if any, on its own line beneath the headline.
+        if let Some(error) = &visitor.error {
+            writeln!(writer, "{rail} {}", error.dimmed())?;
+        }
+        Ok(())
     }
 }
 
-/// Collects the `message` field plus non-metric structured fields.
+/// Collects the `message`, the request location (`subdomain`/`path`), the
+/// `error` detail, and any remaining non-metric structured fields.
 #[derive(Default)]
 struct NoticeVisitor {
     message: String,
-    fields: String,
+    subdomain: Option<String>,
+    path: Option<String>,
+    error: Option<String>,
+}
+
+impl NoticeVisitor {
+    /// `subdomain/path` breadcrumb for the headline, if a path was logged.
+    fn location(&self) -> Option<String> {
+        let path = self.path.as_ref()?;
+        let path = path.trim_start_matches('/');
+        Some(match &self.subdomain {
+            Some(sub) => format!("{sub}/{path}"),
+            None => path.to_string(),
+        })
+    }
 }
 
 impl Visit for NoticeVisitor {
@@ -67,15 +92,40 @@ impl Visit for NoticeVisitor {
         {
             return;
         }
-        if name == "message" {
-            // The message is recorded as `fmt::Arguments`, whose Debug is the
-            // formatted text (no surrounding quotes).
-            self.message = format!("{value:?}");
-        } else {
-            if !self.fields.is_empty() {
-                self.fields.push(' ');
-            }
-            self.fields.push_str(&format!("{name}={value:?}"));
+        // The message is recorded as `fmt::Arguments` (Debug == the formatted
+        // text); structured values may arrive quoted, so unquote the ones we
+        // surface specially.
+        let rendered = format!("{value:?}");
+        match name {
+            "message" => self.message = rendered,
+            "subdomain" => self.subdomain = Some(unquote(&rendered)),
+            "path" => self.path = Some(unquote(&rendered)),
+            "error" => self.error = Some(unquote(&rendered)),
+            // Other structured fields are dropped from the human log.
+            _ => {}
         }
     }
+}
+
+/// Title-Case a message: uppercase the first character of each word, leaving the
+/// rest untouched (so `Http402Gate`-style casing survives).
+fn titleize(s: &str) -> String {
+    s.split(' ')
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Strip one layer of surrounding double quotes from a Debug-rendered value.
+fn unquote(s: &str) -> String {
+    s.strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(s)
+        .to_string()
 }
