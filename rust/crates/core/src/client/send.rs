@@ -40,11 +40,37 @@ pub struct SendResult {
     pub rpc_url: String,
 }
 
+/// A send currency resolved to its on-chain identity. Sourced from the remote
+/// stablecoin set (`/v1/balance/stablecoins`) when reachable, with the local
+/// `Stablecoin` enum as an offline fallback — so any stablecoin pay-api supports
+/// works without a pay code change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedCurrency {
+    pub symbol: String,
+    pub mint: String,
+}
+
+impl ResolvedCurrency {
+    /// Build from the local enum (offline fallback / known coins).
+    pub fn from_stablecoin(stablecoin: Stablecoin, network: &str) -> Self {
+        Self {
+            symbol: stablecoin.symbol().to_string(),
+            mint: stablecoin.mint(Some(network)).to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for ResolvedCurrency {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.symbol)
+    }
+}
+
 /// Parameters for a fee-payer-backed stablecoin send.
 pub struct StablecoinSendRequest<'a> {
     pub amount: &'a str,
     pub recipient: &'a str,
-    pub stablecoin: Stablecoin,
+    pub currency: ResolvedCurrency,
     pub network: &'a str,
     pub account_override: Option<&'a str>,
     pub memo: Option<&'a str>,
@@ -111,7 +137,7 @@ pub fn send_stablecoin(request: StablecoinSendRequest<'_>) -> Result<SendResult>
     let StablecoinSendRequest {
         amount: amount_str,
         recipient,
-        stablecoin,
+        currency,
         network,
         account_override,
         memo,
@@ -120,7 +146,7 @@ pub fn send_stablecoin(request: StablecoinSendRequest<'_>) -> Result<SendResult>
         rpc_url,
     } = request;
 
-    let normalized_currency = stablecoin.symbol();
+    let normalized_currency = currency.symbol.as_str();
 
     Pubkey::from_str(recipient)
         .map_err(|e| Error::Config(format!("Invalid recipient address: {e}")))?;
@@ -140,8 +166,7 @@ pub fn send_stablecoin(request: StablecoinSendRequest<'_>) -> Result<SendResult>
                 "No {network} account found. Run `pay setup` first."
             ))
         })?;
-        let raw_balance =
-            stablecoin_raw_balance_for_sender(&rpc_url, &sender, stablecoin, network)?;
+        let raw_balance = stablecoin_raw_balance_for_sender(&rpc_url, &sender, &currency)?;
         if raw_balance == 0 {
             return Err(Error::Config(format!(
                 "No {normalized_currency} balance available to send"
@@ -176,7 +201,7 @@ pub fn send_stablecoin(request: StablecoinSendRequest<'_>) -> Result<SendResult>
             fee_refund_raw: 0,
             decimals: STABLECOIN_DECIMALS,
             currency: normalized_currency.to_string(),
-            mint: stablecoin.mint(Some(network)).to_string(),
+            mint: currency.mint.clone(),
             from: account_pubkey_for_network(network, account_override)?
                 .unwrap_or_else(|| String::from("(unknown)")),
             to: recipient.to_string(),
@@ -233,9 +258,6 @@ pub fn send_stablecoin(request: StablecoinSendRequest<'_>) -> Result<SendResult>
         .as_ref()
         .and_then(|response| response.fee_refund_raw.parse::<u64>().ok())
         .unwrap_or_else(|| total_amount_raw.saturating_sub(amount_raw));
-    let result_mint = Stablecoin::parse_symbol(&request_for_result.currency)
-        .map(|stablecoin| stablecoin.mint(Some(network)).to_string())
-        .unwrap_or_else(|| request_for_result.currency.clone());
 
     Ok(SendResult {
         signature: receipt.signature,
@@ -244,7 +266,7 @@ pub fn send_stablecoin(request: StablecoinSendRequest<'_>) -> Result<SendResult>
         fee_refund_raw,
         decimals: STABLECOIN_DECIMALS,
         currency: normalized_currency.to_string(),
-        mint: result_mint,
+        mint: currency.mint.clone(),
         from: sender,
         to: recipient.to_string(),
         network: network.to_string(),
@@ -320,11 +342,8 @@ fn account_pubkey_for_network(
 fn stablecoin_raw_balance_for_sender(
     rpc_url: &str,
     sender: &str,
-    stablecoin: Stablecoin,
-    network: &str,
+    currency: &ResolvedCurrency,
 ) -> Result<u64> {
-    let currency = stablecoin.symbol();
-    let expected_mint = stablecoin.mint(Some(network));
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -333,14 +352,9 @@ fn stablecoin_raw_balance_for_sender(
     balances
         .tokens
         .iter()
-        .find(|token| {
-            token
-                .symbol
-                .is_some_and(|symbol| symbol.eq_ignore_ascii_case(currency))
-                || token.mint == expected_mint
-        })
+        .find(|token| token.is_symbol(&currency.symbol) || token.mint == currency.mint)
         .map(|token| token.raw_amount)
-        .ok_or_else(|| Error::Config(format!("No {currency} balance available to send")))
+        .ok_or_else(|| Error::Config(format!("No {} balance available to send", currency.symbol)))
 }
 
 fn recipient_amount_from_challenge(request: &solana_mpp::ChargeRequest, recipient: &str) -> u64 {

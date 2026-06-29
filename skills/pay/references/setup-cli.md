@@ -33,7 +33,7 @@ pay codex                         # launch Codex with pay
 pay curl <url>                    # HTTP request with user-authorized 402 handling
 pay --sandbox curl <url>          # use an ephemeral devnet wallet
 pay skills list                   # browse the API registry
-pay skills endpoints <provider>   # list provider endpoints
+pay skills show <provider>        # show a provider's endpoints
 pay account list                  # list accounts
 pay topup                         # fund account
 pay server start                  # run a payment gateway for your API

@@ -321,21 +321,44 @@ impl StartCommand {
         // Resolve config that doesn't need async.
         let currencies = resolve_operator_currencies(op, &self.currency);
 
-        let network = SolanaNetwork::from_slug(
-            op.and_then(|o| o.network.clone())
-                .unwrap_or_else(|| "mainnet".to_string()),
-        );
+        // `--sandbox` is an authoritative local-dev switch: pin the
+        // network to localnet regardless of the spec's `operator.network`.
+        // Otherwise `pay --sandbox server start <spec with network:
+        // devnet>` would derive `auto_network = "devnet"` below and
+        // silently mint (and persist) an `accounts.devnet.gateway`
+        // ephemeral while talking to real devnet — the opposite of what
+        // `--sandbox` implies.
+        let network = if sandbox {
+            SolanaNetwork::Localnet
+        } else {
+            SolanaNetwork::from_slug(
+                op.and_then(|o| o.network.clone())
+                    .unwrap_or_else(|| "mainnet".to_string()),
+            )
+        };
 
         // RPC URL fallback chain. Network-aware so that `localnet`
         // defaults to the hosted Surfpool sandbox (where ephemeral
         // wallets can be auto-created and auto-funded). Users running
         // a real `solana-test-validator` should set `operator.rpc_url`
         // explicitly or pass `--rpc-url`.
-        let rpc_url = op
-            .and_then(|o| o.rpc_url.clone())
-            .or(self.rpc_url.clone())
-            .or_else(|| std::env::var("PAY_RPC_URL").ok())
-            .unwrap_or_else(|| network.default_rpc_url(sandbox));
+        //
+        // In sandbox we deliberately drop the spec's `operator.rpc_url`
+        // from the chain — a devnet/mainnet URL in the YAML must not be
+        // able to pull the pinned-localnet sandbox onto a real cluster.
+        // Explicit `--rpc-url` / `PAY_RPC_URL` are still honored so a
+        // local `solana-test-validator` works.
+        let rpc_url = if sandbox {
+            self.rpc_url
+                .clone()
+                .or_else(|| std::env::var("PAY_RPC_URL").ok())
+                .unwrap_or_else(|| network.default_rpc_url(sandbox))
+        } else {
+            op.and_then(|o| o.rpc_url.clone())
+                .or(self.rpc_url.clone())
+                .or_else(|| std::env::var("PAY_RPC_URL").ok())
+                .unwrap_or_else(|| network.default_rpc_url(sandbox))
+        };
 
         let fee_payer = op.map(|o| o.fee_payer).unwrap_or(false);
         let signer_cfg = op.and_then(|o| o.signer.clone());
@@ -671,6 +694,8 @@ impl StartCommand {
                     pull_voucher_strategy: sdk_pull_voucher_strategy,
                     rpc_url: Some(rpc_url.clone()),
                     program_id: Some(channel_program_id),
+                    grace_period_seconds:
+                        solana_mpp::program::payment_channels::DEFAULT_GRACE_PERIOD_SECONDS,
                 };
 
                 let mut smpp = SessionMpp::new(config, session_secret)
@@ -717,11 +742,14 @@ impl StartCommand {
                 }
             }
             if let Some((account_name, pubkey)) = &generated_gateway_account {
+                // Name the network — auto-minting a persisted ephemeral on a
+                // real cluster (devnet) should never look like a silent no-op.
                 eprintln!(
-                    "{} account {} {}",
+                    "{} account {} {} on {}",
                     "Generating".green(),
                     account_name,
-                    pubkey
+                    pubkey,
+                    network.slug().dimmed(),
                 );
             }
             if let Some(scaffolded_spec) = &self.scaffolded_spec {
@@ -870,22 +898,26 @@ impl StartCommand {
                     "PATCH" => method_padded.cyan().to_string(),
                     _ => method_padded.dimmed().to_string(),
                 };
+                // Variant-priced endpoints list each variant on its own
+                // row below the path (see loop after the main line), so
+                // the price column here flags the count instead of
+                // collapsing to a single (misleading) variant price.
+                let variants = ep
+                    .metering
+                    .as_ref()
+                    .map(|m| m.variants.as_slice())
+                    .unwrap_or(&[]);
                 let price_tag = if let Some(ref m) = ep.metering {
-                    let price = m
-                        .dimensions
-                        .first()
-                        .map(|d| d.tiers.first().map(|t| t.price_usd).unwrap_or(0.0))
-                        .or_else(|| {
-                            m.variants
-                                .first()
-                                .and_then(|v| v.dimensions.first())
-                                .and_then(|d| d.tiers.first())
-                                .map(|t| t.price_usd)
-                        })
-                        .unwrap_or(0.0);
-                    format!("{:>14}", format!("${}", format_price(price)))
-                        .yellow()
-                        .to_string()
+                    if !m.variants.is_empty() {
+                        format!("{:>14}", format!("{} variants", m.variants.len()))
+                            .yellow()
+                            .to_string()
+                    } else {
+                        let price = first_tier_price(&m.dimensions);
+                        format!("{:>14}", format!("${}", format_price(price)))
+                            .yellow()
+                            .to_string()
+                    }
                 } else if let Some(ref sub) = ep.subscription {
                     // Show `$9.99/30d` for subscription endpoints. Falls
                     // back to bare period when neither `price_usd` nor
@@ -905,7 +937,14 @@ impl StartCommand {
                     format!("{:>14}", "free").green().to_string()
                 };
 
-                let path_url = format!("http://{}/{}", self.bind.replace("0.0.0.0", "127.0.0.1"), ep.path.trim_start_matches('/'));
+                // Link target uses a concrete example path so it's
+                // clickable (no brace-encoding) and selects a real
+                // variant; the visible label keeps the `{…}` template.
+                let path_url = format!(
+                    "http://{}/{}",
+                    self.bind.replace("0.0.0.0", "127.0.0.1"),
+                    example_path(ep).trim_start_matches('/')
+                );
                 let path_linked = crate::components::link::link_with_arrow(&ep.path, &path_url);
                 // Pad after the link (padding itself is not clickable)
                 let padding = " ".repeat(max_path_len.saturating_sub(ep.path.len()));
@@ -916,6 +955,30 @@ impl StartCommand {
                     padding,
                     price_tag,
                 );
+
+                // One row per pricing variant, e.g.
+                //   model=gemini-3.1-pro-preview              $0.000002
+                // The `param=value` label sits in the path column and the
+                // price right-aligns under the main price column. Width:
+                // the 2-space indent eats into the 8-col method gutter
+                // (−6), and `link_with_arrow` adds a 2-col ` ↗` suffix to
+                // the path that the main-line padding doesn't count (+2),
+                // so the label field is `max_path_len + 8`.
+                let label_field_width = max_path_len + 8;
+                for variant in variants {
+                    let label = format!("{}={}", variant.param, variant.value);
+                    let label_pad =
+                        " ".repeat(label_field_width.saturating_sub(label.len()));
+                    let price = first_tier_price(&variant.dimensions);
+                    let variant_price =
+                        format!("{:>14}", format!("${}", format_price(price)));
+                    eprintln!(
+                        "  {}{} {}",
+                        label.dimmed(),
+                        label_pad,
+                        variant_price.yellow(),
+                    );
+                }
             }
 
             eprintln!("{}", rule.dimmed());
@@ -1146,10 +1209,29 @@ impl StartCommand {
                 }
             };
 
-            let serve_result = axum::serve(listener, app)
-                .with_graceful_shutdown(shutdown_signal())
-                .await
-                .map_err(|e| pay_core::Error::Config(format!("Server error: {e}")));
+            // Bound the graceful drain. `with_graceful_shutdown` stops
+            // accepting new connections on the first SIGINT/SIGTERM but
+            // then waits for every in-flight connection to close before
+            // returning. Long-lived connections — most notably the
+            // debugger's `/logs/stream` SSE (an infinite stream that only
+            // ends when the browser tab closes) — never drain, so a
+            // single Ctrl+C would wedge the process with no way out: the
+            // first signal is already consumed by the drain, so further
+            // presses are ignored. Race the drain against a force-exit
+            // watcher that fires on a second signal or after a short
+            // grace period, so Ctrl+C is always responsive.
+            let serve_fut =
+                axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
+            let serve_result = tokio::select! {
+                res = serve_fut => {
+                    res.map_err(|e| pay_core::Error::Config(format!("Server error: {e}")))
+                }
+                _ = force_shutdown_signal() => {
+                    eprintln!();
+                    eprintln!("  {}", "shutting down…".dimmed());
+                    Ok(())
+                }
+            };
 
             // Best-effort cleanup. We run this regardless of how serve
             // exited so even an `Err(...)` return path leaves
@@ -1184,6 +1266,30 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     let term = std::future::pending::<()>();
     tokio::select! { _ = ctrl_c => {}, _ = term => {} }
+}
+
+/// Grace period to let axum's graceful shutdown drain in-flight
+/// connections before we force the process down. Short enough that a
+/// single Ctrl+C feels responsive even when a streaming connection
+/// (e.g. the debugger SSE) would otherwise hold the drain open forever.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+
+/// Resolves once it's time to stop waiting for the graceful drain.
+///
+/// Waits for the first shutdown signal, then races a *second* signal
+/// against a short grace timeout — whichever comes first wins. This is
+/// the escape hatch for connections that never close on their own
+/// (notably the debugger's infinite SSE stream): the drain started by
+/// `with_graceful_shutdown` would otherwise hang indefinitely.
+async fn force_shutdown_signal() {
+    // First signal: a graceful drain is now in progress.
+    shutdown_signal().await;
+    // Give in-flight connections a moment to finish; bail early if the
+    // user presses Ctrl+C again.
+    tokio::select! {
+        _ = shutdown_signal() => {}
+        _ = tokio::time::sleep(SHUTDOWN_GRACE) => {}
+    }
 }
 
 fn spawn_fee_payer_balance_observer(wallet: FeePayerWallet, subdomain: String) {
@@ -1257,6 +1363,7 @@ fn build_pdb_config(
             serde_json::json!({
                 "method": format!("{:?}", e.method).to_uppercase(),
                 "path": e.path,
+                "example": example_path(e),
                 "price": price,
                 "description": e.description.as_deref().unwrap_or(""),
             })
@@ -1271,6 +1378,7 @@ fn build_pdb_config(
             serde_json::json!({
                 "method": format!("{:?}", e.method).to_uppercase(),
                 "path": e.path,
+                "example": example_path(e),
                 "price": "free",
                 "description": e.description.as_deref().unwrap_or(""),
             })
@@ -1936,6 +2044,64 @@ async fn fetch_lamports(client: &reqwest::Client, rpc_url: &str, pubkey: &str) -
 async fn fetch_sol_balance(rpc_url: &str, pubkey: &str) -> f64 {
     let client = reqwest::Client::new();
     fetch_lamports(&client, rpc_url, pubkey).await as f64 / 1_000_000_000.0
+}
+
+/// Build a concrete, clickable example path for an endpoint whose `path`
+/// may contain `{placeholder}` segments.
+///
+/// Browsers percent-encode `{` and `}`, so a templated link like
+/// `/v1/models/{model}/infer` arrives as `/v1/models/%7Bmodel%7D/infer`
+/// and shows up mangled in the debugger (and never matches a real
+/// variant). We substitute each placeholder with a concrete sample:
+///   - the first variant's `value` for the segment that follows a
+///     `models`/`voices` selector (the variant-selection convention), else
+///   - the placeholder's own name with the braces stripped, as a neutral
+///     URL-safe sample.
+///
+/// Partial segments such as `{model}:infer` keep their suffix (→
+/// `fast:infer`). Endpoints with no placeholders are returned unchanged.
+fn example_path(ep: &pay_types::metering::Endpoint) -> String {
+    let first_variant_value = ep
+        .metering
+        .as_ref()
+        .and_then(|m| m.variants.first())
+        .map(|v| v.value.as_str());
+
+    let segs: Vec<&str> = ep.path.split('/').collect();
+    let mut out: Vec<String> = Vec::with_capacity(segs.len());
+    for (i, seg) in segs.iter().enumerate() {
+        if !seg.contains('{') {
+            out.push((*seg).to_string());
+            continue;
+        }
+        let open = seg.find('{').unwrap();
+        let prefix = &seg[..open];
+        let rest = &seg[open + 1..];
+        let (name, suffix) = match rest.find('}') {
+            Some(close) => (&rest[..close], &rest[close + 1..]),
+            None => (rest, ""),
+        };
+        let follows_selector = i > 0 && matches!(segs[i - 1], "models" | "voices");
+        let sample = match (follows_selector, first_variant_value) {
+            // Variant values come from config and may contain reserved URL
+            // characters (`/`, `?`, `#`, ` `, `%`); encode as a single path
+            // segment so the link/curl target the intended route.
+            (true, Some(value)) => urlencoding::encode(value).into_owned(),
+            _ => name.to_string(),
+        };
+        out.push(format!("{prefix}{sample}{suffix}"));
+    }
+    out.join("/")
+}
+
+/// Representative price for a set of pricing dimensions: the first
+/// tier of the first dimension. Mirrors the single-price heuristic used
+/// for direct-metered endpoints so variant rows read consistently.
+fn first_tier_price(dims: &[pay_types::metering::MeterDimension]) -> f64 {
+    dims.first()
+        .and_then(|d| d.tiers.first())
+        .map(|t| t.price_usd)
+        .unwrap_or(0.0)
 }
 
 fn format_price(price: f64) -> String {

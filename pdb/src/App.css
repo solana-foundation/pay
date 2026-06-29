@@ -738,6 +738,69 @@ body {
   font-style: italic;
 }
 
+/* Sign-in / subscription-activation card (no payment split to draw). */
+.signin-card {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 12px 14px;
+}
+
+.signin-statement {
+  margin: 0;
+  font-size: 13px;
+  color: var(--fg);
+}
+
+.signin-note {
+  margin: 0;
+  font-size: 11px;
+  color: var(--fg-muted);
+}
+
+.signin-details {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 4px;
+  width: 100%;
+}
+
+.signin-row {
+  display: flex;
+  gap: 12px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.signin-row-label {
+  flex: 0 0 84px;
+  color: var(--fg-muted);
+}
+
+.signin-row-value {
+  color: var(--fg);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Receipt link shown beneath the flow's payment / sign-in / session panel.
+   Lives inside the panel (which flows top-down), so it hugs the content
+   rather than floating to the bottom of the column. */
+.flow-receipt {
+  padding: 12px 0 2px;
+}
+
+.flow-receipt-link {
+  font-size: 12px;
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.flow-receipt-link:hover {
+  text-decoration: underline;
+}
+
 .splits-layout {
   display: flex;
   align-items: flex-start;

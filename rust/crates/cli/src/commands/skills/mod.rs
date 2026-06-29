@@ -1,11 +1,11 @@
 mod boxed;
-pub mod endpoints;
 pub mod install;
 pub mod list;
 pub mod provider;
 pub mod prune;
 pub mod remove;
 pub mod search;
+pub mod show;
 pub mod update;
 
 use clap::Subcommand;
@@ -14,8 +14,9 @@ use clap::Subcommand;
 pub enum SkillsCommand {
     /// Search for API providers and endpoints.
     Search(search::SearchCommand),
-    /// List all endpoints for a specific service.
-    Endpoints(endpoints::EndpointsCommand),
+    /// Show a provider's endpoints, with descriptions and pricing.
+    #[command(alias = "endpoints")]
+    Show(show::ShowCommand),
     /// Add a provider source (GitHub org/repo or catalog URL).
     Add(install::InstallCommand),
     /// Remove a provider source.
@@ -39,7 +40,7 @@ impl SkillsCommand {
     pub fn run(self) -> pay_core::Result<()> {
         match self {
             Self::Search(cmd) => cmd.run(),
-            Self::Endpoints(cmd) => cmd.run(),
+            Self::Show(cmd) => cmd.run(),
             Self::Add(cmd) => cmd.run(),
             Self::Remove(cmd) => cmd.run(),
             Self::List => list::run(),

@@ -216,7 +216,7 @@ pub fn format_balance_display(
             let usdc = bal
                 .tokens
                 .iter()
-                .find(|t| t.symbol == Some("USDC"))
+                .find(|t| t.is_symbol("USDC"))
                 .map(|t| t.ui_amount);
 
             let mut parts = Vec::new();
@@ -224,10 +224,10 @@ pub fn format_balance_display(
                 parts.push(format!("{:.2} USDC", amount).green().to_string());
             }
             for token in &bal.tokens {
-                if token.symbol == Some("USDC") {
+                if token.is_symbol("USDC") {
                     continue;
                 }
-                let label = token.symbol.unwrap_or(&token.mint[..8]);
+                let label = token.symbol_or(&token.mint[..8]);
                 parts.push(format!("{:.2} {label}", token.ui_amount));
             }
             if parts.is_empty() {

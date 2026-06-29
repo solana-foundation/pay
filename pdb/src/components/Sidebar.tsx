@@ -4,6 +4,9 @@ import { explorerTokenUrl } from "../hooks/useConfig";
 interface EndpointInfo {
   method: string;
   path: string;
+  // Concrete, clickable path with `{…}` template segments filled in
+  // (e.g. `v1/models/fast/infer`). Falls back to `path` when absent.
+  example?: string;
   price: string;
   description: string;
 }
@@ -69,7 +72,10 @@ export function Sidebar() {
             </div>
             <span className="pr">{ep.price}</span>
             <a
-              href={`${baseUrl}/${ep.path.startsWith("/") ? ep.path.slice(1) : ep.path}`}
+              href={`${baseUrl}/${(() => {
+                const p = ep.example ?? ep.path;
+                return p.startsWith("/") ? p.slice(1) : p;
+              })()}`}
               target="_blank"
               rel="noopener"
               className="ep-link"
@@ -166,7 +172,8 @@ export function Sidebar() {
               <div className="code-block">
                 {(() => {
                   const methodFlag = firstMetered.method !== "GET" ? `-X ${firstMetered.method} ` : "";
-                  const path = firstMetered.path.startsWith("/") ? firstMetered.path : `/${firstMetered.path}`;
+                  const rawPath = firstMetered.example ?? firstMetered.path;
+                  const path = rawPath.startsWith("/") ? rawPath : `/${rawPath}`;
                   const cmd = `pay --sandbox curl ${methodFlag}${baseUrl}${path}`;
                   const display = `pay --sandbox curl ${methodFlag}\\\n  ${baseUrl}${path}`;
                   return (
