@@ -166,33 +166,51 @@ impl<S: PaymentState> Http402Gate<S> {
                 Ok(false)
             }
             Ok(UpstreamPlan::Respond(resp)) => {
-                // Respond-mode short-circuit: there's no upstream, so
-                // `response_filter` never runs. Do the post-serve work here —
-                // settle an x402 `upto` channel (the resource was served) and
-                // attach the verified-payment receipt — then write. Without this
-                // the on-chain settlement succeeds but the client + PDB never see
-                // the receipt (the entire playground is respond-mode).
-                let served_ok = resp.status().is_success();
-                let mut extra: Vec<(HeaderName, HeaderValue)> = Vec::new();
-                if let Some((open, amt)) = ctx.upto.take()
-                    && let Some((n, v)) = settle_upto(&self.state, open, amt, served_ok).await
-                {
-                    extra.push((n, v));
-                }
-                if let Some(receipt) = ctx.receipt.take() {
-                    extra.extend(receipt.headers);
-                    if let Some(reference) = &receipt.reference {
-                        tracing::Span::current().record("tx_sig", reference.as_str());
-                    }
-                }
-                write_axum_response(session, resp, extra).await?;
+                self.finish_inline(session, ctx, resp).await?;
                 Ok(true)
             }
+            // Upstream-prep failure (bad URL, OAuth2 token fetch, body-prep): the
+            // request ends here too, so run the same post-payment bookkeeping. An
+            // x402 `exact` payment already settled on-chain before `Forward`, so
+            // the client must still get its PAYMENT-RESPONSE receipt; any `upto`
+            // channel is refunded since the resource was never served.
             Err(resp) => {
-                write_axum_response(session, resp, Vec::new()).await?;
+                self.finish_inline(session, ctx, resp).await?;
                 Ok(true)
             }
         }
+    }
+
+    /// Finish a request that ends in `plan_upstream` (respond-mode response or an
+    /// upstream-prep error) — `response_filter` never runs for these. Settle or
+    /// refund any x402 `upto` channel (refund when the resource wasn't served)
+    /// and attach the verified-payment receipt, then write the response.
+    ///
+    /// Draining `ctx.receipt` here matters on the error path: an x402 `exact`
+    /// payment settles on-chain before the gate returns `Forward`, so a client
+    /// that then hits an upstream-prep failure must still receive its
+    /// PAYMENT-RESPONSE header to prove the charge (mirrors the axum gate, which
+    /// appends receipt headers regardless of handler outcome).
+    async fn finish_inline(
+        &self,
+        session: &mut Session,
+        ctx: &mut Ctx,
+        resp: axum::response::Response,
+    ) -> pingora::Result<()> {
+        let served_ok = resp.status().is_success();
+        let mut extra: Vec<(HeaderName, HeaderValue)> = Vec::new();
+        if let Some((open, amt)) = ctx.upto.take()
+            && let Some((n, v)) = settle_upto(&self.state, open, amt, served_ok).await
+        {
+            extra.push((n, v));
+        }
+        if let Some(receipt) = ctx.receipt.take() {
+            extra.extend(receipt.headers);
+            if let Some(reference) = &receipt.reference {
+                tracing::Span::current().record("tx_sig", reference.as_str());
+            }
+        }
+        write_axum_response(session, resp, extra).await
     }
 }
 
