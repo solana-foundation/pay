@@ -293,6 +293,28 @@ impl StartCommand {
         // silently regressing to charge-only.
         api.apply_scheme_defaults();
 
+        // Validate the resolved spec once at boot — after `apply_scheme_defaults`
+        // — so configuration errors (unknown or duplicate split recipients,
+        // splits exceeding the price, malformed tiers, …) abort startup instead
+        // of surfacing as a runtime `challenge_generation_failed` 500 (charge) or
+        // an on-chain channel `open` rejection (session) on the first paid
+        // request. Aborting via `Error::Config` reuses the single notice the CLI
+        // already renders for every config check (`main::print_command_error`),
+        // consolidating these checks behind one boot-time gate.
+        let spec_issues = pay_types::metering::validate_api_spec(&api);
+        if !spec_issues.is_empty() {
+            let detail = spec_issues
+                .iter()
+                .map(|issue| format!("  • {issue}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Err(pay_core::Error::Config(format!(
+                "{} configuration error(s) in spec `{}`:\n{detail}",
+                spec_issues.len(),
+                self.spec,
+            )));
+        }
+
         // Optional OpenAPI / Discovery doc — loaded once, filtered to the
         // YAML's `endpoints[]` allow-list, and exposed at `GET /openapi.json`
         // with `rootUrl` / `servers[].url` rewritten per-request from the
