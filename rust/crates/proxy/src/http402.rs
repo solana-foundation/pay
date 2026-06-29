@@ -432,6 +432,86 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
     fn suppress_error_log(&self, _session: &Session, _ctx: &Ctx, e: &pingora::Error) -> bool {
         matches!(e.esource(), pingora::ErrorSource::Downstream)
     }
+
+    /// Write the downstream error response when proxying fails. `response_filter`
+    /// only runs on a real upstream response, so a connect/TLS failure (or any
+    /// pre-response proxy error) skips it. Recover the pending payment
+    /// side-effects here — refund an open `upto` channel and re-attach the x402
+    /// `exact` receipt — so a client whose payment already settled on-chain
+    /// still receives its PAYMENT-RESPONSE instead of a bare 502 (mirrors
+    /// `finish_inline` and `response_filter`). Falls back to Pingora's canned
+    /// error when there is no receipt to preserve.
+    async fn fail_to_proxy(
+        &self,
+        session: &mut Session,
+        e: &pingora::Error,
+        ctx: &mut Ctx,
+    ) -> pingora::proxy::FailToProxy
+    where
+        Self::CTX: Send + Sync,
+    {
+        let mut extra: Vec<(HeaderName, HeaderValue)> = Vec::new();
+        if let Some((open, amt)) = ctx.upto.take()
+            && let Some((n, v)) = settle_upto(&self.state, open, amt, false).await
+        {
+            extra.push((n, v));
+        }
+        if let Some(receipt) = ctx.receipt.take() {
+            extra.extend(receipt.headers);
+            if let Some(reference) = &receipt.reference {
+                tracing::Span::current().record("tx_sig", reference.as_str());
+            }
+        }
+
+        // Mirror Pingora's default downstream error-code derivation so behavior
+        // is unchanged except for the preserved payment headers.
+        let code = match e.etype() {
+            pingora::ErrorType::HTTPStatus(code) => *code,
+            _ => match e.esource() {
+                pingora::ErrorSource::Upstream => 502,
+                pingora::ErrorSource::Downstream => match e.etype() {
+                    pingora::ErrorType::WriteError
+                    | pingora::ErrorType::ReadError
+                    | pingora::ErrorType::ConnectionClosed => 0, // conn already dead
+                    _ => 400,
+                },
+                pingora::ErrorSource::Internal | pingora::ErrorSource::Unset => 500,
+            },
+        };
+
+        if code > 0 {
+            if extra.is_empty() {
+                let _ = session.respond_error(code).await;
+            } else {
+                let body = Bytes::from_static(b"{\"error\":\"upstream_unavailable\"}");
+                match ResponseHeader::build(code, None) {
+                    Ok(mut resp) => {
+                        for (n, v) in extra {
+                            let _ = resp.insert_header(n, v);
+                        }
+                        let _ = resp.insert_header("content-type", "application/json");
+                        let _ = resp.insert_header("content-length", body.len().to_string());
+                        if session
+                            .write_response_header(Box::new(resp), false)
+                            .await
+                            .is_ok()
+                        {
+                            let _ = session.write_response_body(Some(body), true).await;
+                        }
+                    }
+                    Err(err) => {
+                        tracing::error!(error = %err, "failed to build payment-preserving error response");
+                        let _ = session.respond_error(code).await;
+                    }
+                }
+            }
+        }
+
+        pingora::proxy::FailToProxy {
+            error_code: code,
+            can_reuse_downstream: false,
+        }
+    }
 }
 
 /// Collect an `http::HeaderMap` into `(name, value)` string pairs for PDB.
