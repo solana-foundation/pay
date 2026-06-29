@@ -41,6 +41,10 @@ pub const STRIP_HEADERS: &[&str] = &[
     "authorization",
     "payment-signature",
     "payment-required",
+    // x402 v1 payment credential — must never reach a third-party upstream,
+    // which could log or leak it (the gate accepts the credential via either
+    // `PAYMENT-SIGNATURE` or `X-PAYMENT`).
+    "x-payment",
 ];
 
 /// Percent-encode every ASCII byte except RFC 3986 unreserved characters.
@@ -1701,6 +1705,9 @@ mod tests {
         assert!(STRIP_HEADERS.contains(&"host"));
         assert!(STRIP_HEADERS.contains(&"authorization"));
         assert!(STRIP_HEADERS.contains(&"connection"));
+        // x402 credential headers must never be forwarded upstream.
+        assert!(STRIP_HEADERS.contains(&"payment-signature"));
+        assert!(STRIP_HEADERS.contains(&"x-payment"));
     }
 
     #[test]
