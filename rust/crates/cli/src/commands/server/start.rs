@@ -2241,7 +2241,9 @@ fn session_receipt(state: AppState, channel_id: String) -> axum::response::Respo
 /// recipient resolves from environment variable `VAR` (or a per-request query
 /// param); if neither is available the split is silently dropped from the
 /// charge, so fail fast at startup instead.
-fn ensure_split_recipients_resolved(api: &pay_types::metering::ApiSpec) -> Result<(), pay_core::Error> {
+fn ensure_split_recipients_resolved(
+    api: &pay_types::metering::ApiSpec,
+) -> Result<(), pay_core::Error> {
     for ep in &api.endpoints {
         let Some(meter) = ep.metering.as_ref() else {
             continue;

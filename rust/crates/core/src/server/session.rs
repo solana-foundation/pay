@@ -784,8 +784,10 @@ impl SessionMpp {
                         .map_err(|e| {
                             Error::Mpp(format!("Failed to mark session finalized: {e}"))
                         })?;
-                    self.operator_runtime
-                        .record_settlement_signature(params.channel_id.to_string(), signature.clone());
+                    self.operator_runtime.record_settlement_signature(
+                        params.channel_id.to_string(),
+                        signature.clone(),
+                    );
                     tracing::info!(%signature, channel = %params.channel_id, "payment-channel settlement confirmed");
                 }
                 self.unschedule_channel_close(params.channel_id.to_string());

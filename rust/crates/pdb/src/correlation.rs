@@ -552,7 +552,10 @@ fn x402_scheme(
             return Some(scheme);
         }
     }
-    for headers in [Some(&entry.res_headers), challenge_headers].into_iter().flatten() {
+    for headers in [Some(&entry.res_headers), challenge_headers]
+        .into_iter()
+        .flatten()
+    {
         for key in ["payment-required", "x-payment-required"] {
             if let Some(value) = headers.get(key)
                 && let Some(scheme) = x402_scheme_from_required(value)

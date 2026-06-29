@@ -5863,7 +5863,7 @@ version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "680998035259dcfcafe653688bf2aa6d3e2dc05e98be6ab46afb089dc84f1df8"
 dependencies = [
- "proc-macro-crate 1.3.1",
+ "proc-macro-crate 3.5.0",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
@@ -6323,6 +6323,7 @@ dependencies = [
  "rand 0.8.6",
  "ratatui",
  "reqwest 0.12.28",
+ "schemars 0.8.22",
  "serde",
  "serde_json",
  "serde_yml",
@@ -6503,7 +6504,7 @@ dependencies = [
 [[package]]
 name = "payment-channels-client"
 version = "0.1.0"
-source = "git+https://github.com/solana-foundation/pay-kit?rev=798f0893ab8c5e8ec03ce77a9325e98cbf376fbf#798f0893ab8c5e8ec03ce77a9325e98cbf376fbf"
+source = "git+https://github.com/solana-foundation/pay-kit?rev=66506aed7ad66bee88703a3e4126d10aa499efb1#66506aed7ad66bee88703a3e4126d10aa499efb1"
 dependencies = [
  "borsh 1.7.0",
  "num-derive",
@@ -7195,7 +7196,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.10.5",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
@@ -10500,7 +10501,7 @@ dependencies = [
 [[package]]
 name = "solana-mpp"
 version = "0.6.0"
-source = "git+https://github.com/solana-foundation/pay-kit?rev=798f0893ab8c5e8ec03ce77a9325e98cbf376fbf#798f0893ab8c5e8ec03ce77a9325e98cbf376fbf"
+source = "git+https://github.com/solana-foundation/pay-kit?rev=66506aed7ad66bee88703a3e4126d10aa499efb1#66506aed7ad66bee88703a3e4126d10aa499efb1"
 dependencies = [
  "base64 0.22.1",
  "bincode",
@@ -10723,7 +10724,7 @@ dependencies = [
 [[package]]
 name = "solana-pay-core"
 version = "0.1.0"
-source = "git+https://github.com/solana-foundation/pay-kit?rev=798f0893ab8c5e8ec03ce77a9325e98cbf376fbf#798f0893ab8c5e8ec03ce77a9325e98cbf376fbf"
+source = "git+https://github.com/solana-foundation/pay-kit?rev=66506aed7ad66bee88703a3e4126d10aa499efb1#66506aed7ad66bee88703a3e4126d10aa499efb1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -10762,7 +10763,7 @@ dependencies = [
 [[package]]
 name = "solana-pay-kit"
 version = "0.1.0"
-source = "git+https://github.com/solana-foundation/pay-kit?rev=798f0893ab8c5e8ec03ce77a9325e98cbf376fbf#798f0893ab8c5e8ec03ce77a9325e98cbf376fbf"
+source = "git+https://github.com/solana-foundation/pay-kit?rev=66506aed7ad66bee88703a3e4126d10aa499efb1#66506aed7ad66bee88703a3e4126d10aa499efb1"
 dependencies = [
  "serde_json",
  "solana-mpp",
@@ -13135,7 +13136,7 @@ dependencies = [
 [[package]]
 name = "solana-x402"
 version = "0.1.0"
-source = "git+https://github.com/solana-foundation/pay-kit?rev=798f0893ab8c5e8ec03ce77a9325e98cbf376fbf#798f0893ab8c5e8ec03ce77a9325e98cbf376fbf"
+source = "git+https://github.com/solana-foundation/pay-kit?rev=66506aed7ad66bee88703a3e4126d10aa499efb1#66506aed7ad66bee88703a3e4126d10aa499efb1"
 dependencies = [
  "base64 0.22.1",
  "bincode",
@@ -13145,6 +13146,7 @@ dependencies = [
  "serde",
  "serde_json",
  "solana-address 1.1.0",
+ "solana-commitment-config",
  "solana-hash 3.1.0",
  "solana-instruction 3.2.0",
  "solana-keychain",
@@ -13855,7 +13857,7 @@ dependencies = [
 [[package]]
 name = "subscriptions-client"
 version = "0.1.0"
-source = "git+https://github.com/solana-foundation/pay-kit?rev=798f0893ab8c5e8ec03ce77a9325e98cbf376fbf#798f0893ab8c5e8ec03ce77a9325e98cbf376fbf"
+source = "git+https://github.com/solana-foundation/pay-kit?rev=66506aed7ad66bee88703a3e4126d10aa499efb1#66506aed7ad66bee88703a3e4126d10aa499efb1"
 dependencies = [
  "borsh 1.7.0",
  "num-derive",
@@ -15390,7 +15392,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

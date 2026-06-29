@@ -285,7 +285,14 @@ impl<S: PaymentState> PaymentGate<S> {
                         let resource = endpoint.and_then(|e| e.resource.as_deref());
                         return self
                             .charge_verify(
-                                api, meter, description, resource, auth, subdomain, path, req,
+                                api,
+                                meter,
+                                description,
+                                resource,
+                                auth,
+                                subdomain,
+                                path,
+                                req,
                             )
                             .await;
                     }
@@ -675,8 +682,7 @@ impl<S: PaymentState> PaymentGate<S> {
         match upto.verify_open(pay_header, &amount).await {
             Ok(open) => {
                 let ceiling_usd: f64 = amount.parse().unwrap_or(0.0);
-                let settle_amount =
-                    upto_settle_amount(meter.min_usd, ceiling_usd, open.max_amount);
+                let settle_amount = upto_settle_amount(meter.min_usd, ceiling_usd, open.max_amount);
                 GateDecision::Forward {
                     session: None,
                     receipt: None,
@@ -1316,7 +1322,10 @@ mod tests {
     fn upto_voucher_handles_zero_min_and_degenerate_ceiling() {
         assert_eq!(upto_settle_amount(Some(0.0), CEILING_USD, CEILING_BASE), 0);
         // A non-positive ceiling can't scale a min -> fall back to the ceiling.
-        assert_eq!(upto_settle_amount(Some(0.01), 0.0, CEILING_BASE), CEILING_BASE);
+        assert_eq!(
+            upto_settle_amount(Some(0.01), 0.0, CEILING_BASE),
+            CEILING_BASE
+        );
     }
 
     fn req<'a>(method: &'a Method, path: &'a str) -> GateRequest<'a> {
