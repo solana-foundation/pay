@@ -1140,40 +1140,39 @@ impl StartCommand {
                     })
                 })
             });
-            // Primary currency = the operator's first configured currency,
-            // resolved (symbol → MINT + decimals) exactly like the MPP path
-            // (`currency_configs`). The x402 settle path feeds `currency`
-            // straight into RPC calls, so it must be the mint, not "USDC".
-            // Shared by the `exact` and `upto` backends.
-            let (x402_mint, x402_decimals) = currency_configs
-                .first()
-                .map(|(_, mint, decimals)| (mint.clone(), *decimals))
-                .unwrap_or_else(|| {
-                    (
-                        pay_types::Stablecoin::Usdc
-                            .mint(Some(network.slug()))
-                            .to_string(),
-                        6,
-                    )
-                });
+            // x402 currency descriptors — one per configured operator currency.
+            // pay-kit resolves each currency's mint + token program from the
+            // SYMBOL (token program is independent of the mint), advertises one
+            // `accepts[]` entry per currency, and on verify binds the
+            // channel/transfer to the client's chosen one. `currencies[0]` is the
+            // primary/default. Shared by the exact + upto backends.
+            let x402_currencies: Vec<pay_kit::x402::server::CurrencyConfig> = {
+                let mut cs: Vec<_> = currency_configs
+                    .iter()
+                    .map(|(symbol, _mint, decimals)| pay_kit::x402::server::CurrencyConfig {
+                        currency: symbol.clone(),
+                        decimals: *decimals,
+                        token_program: None,
+                    })
+                    .collect();
+                if cs.is_empty() {
+                    cs.push(pay_kit::x402::server::CurrencyConfig {
+                        currency: "USDC".to_string(),
+                        decimals: 6,
+                        token_program: None,
+                    });
+                }
+                cs
+            };
             let x402 = if wants_x402 {
-                // Advertise every configured currency when more than one.
-                let accepted_currencies = if currencies.len() > 1 {
-                    Some(currencies.clone())
-                } else {
-                    None
-                };
                 let cfg = pay_kit::x402::server::Config {
                     recipient: recipient.clone(),
-                    currency: x402_mint.clone(),
-                    decimals: x402_decimals,
+                    currencies: x402_currencies.clone(),
                     network: network.slug().to_string(),
                     rpc_url: Some(rpc_url.clone()),
                     resource: api.subdomain.clone(),
                     description: None,
                     max_age: Some(300),
-                    token_program: None,
-                    accepted_currencies,
                     // The operator co-signs fees only when configured to.
                     fee_payer_key: if fee_payer {
                         fee_payer_signer.as_ref().map(|s| s.pubkey().to_string())
@@ -1199,14 +1198,12 @@ impl StartCommand {
                 (true, Some(signer)) => {
                     let cfg = pay_kit::x402::server::UptoConfig {
                         recipient: recipient.clone(),
-                        currency: x402_mint.clone(),
-                        decimals: x402_decimals,
+                        currencies: x402_currencies.clone(),
                         cluster: network.slug().to_string(),
                         rpc_url: Some(rpc_url.clone()),
                         resource: api.subdomain.clone(),
                         description: None,
                         max_timeout_seconds: 300,
-                        token_program: None,
                         program_id: None,
                         operator_signer: signer,
                     };
