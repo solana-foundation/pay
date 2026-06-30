@@ -22,6 +22,10 @@ pub enum RunOutcome {
         challenge: Box<mpp::Challenge>,
         alternatives: Vec<mpp::Challenge>,
         x402_alternative: Option<Box<x402::Challenge>>,
+        /// x402 `upto` advertised on the same 402, carried so the balance- and
+        /// cost-aware selector can settle it when it's the cheaper (or only
+        /// fundable) option. See [`mpp::choose_payment`].
+        x402_upto_alternative: Option<Box<x402::UptoChallenge>>,
         resource_url: String,
     },
     /// The server returned 402 with an MPP session challenge (intent="session").
@@ -583,12 +587,24 @@ pub(crate) fn classify_402_with_preference(
     if !charge_challenges.is_empty() && preference != ProtocolPreference::OnlyX402 {
         let challenge = charge_challenges.remove(0);
         info!(resource = resource_url, "Detected MPP challenge (Solana)");
+        // An `upto`-only x402 offer also parses leniently as `exact`, so when a
+        // real `upto` is present prefer that reading and drop the (bogus) exact
+        // alternative — otherwise the selector could pick an `exact` the server
+        // never advertised and the payment would be rejected.
+        let upto_alternative = x402::parse_upto(headers, body).map(Box::new);
+        let x402_alternative = if upto_alternative.is_some() {
+            None
+        } else {
+            x402_challenge.clone().map(Box::new)
+        };
         return RunOutcome::MppChallenge {
             challenge: Box::new(challenge),
             alternatives: charge_challenges,
-            // Carry any x402 charge from the same 402 so a balance-aware
-            // selector can fall back to it when no MPP challenge is fundable.
-            x402_alternative: x402_challenge.clone().map(Box::new),
+            // Carry any x402 charge from the same 402 so the balance- and
+            // cost-aware selector can settle it when it's cheaper or the only
+            // fundable option.
+            x402_alternative,
+            x402_upto_alternative: upto_alternative,
             resource_url: resource_url.to_string(),
         };
     }
