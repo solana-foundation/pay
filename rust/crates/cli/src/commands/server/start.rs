@@ -329,6 +329,12 @@ struct SurfpoolFundingTarget {
     address: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PayoutRecipientTarget {
+    label: String,
+    pubkey: solana_pubkey::Pubkey,
+}
+
 fn surfpool_funding_targets(
     recipient: &str,
     operator_pubkey: Option<&str>,
@@ -352,7 +358,7 @@ fn surfpool_funding_targets(
 fn surfpool_prep_notice_body(
     rpc_url: &str,
     targets: &[SurfpoolFundingTarget],
-    payout_recipient_count: usize,
+    payout_recipients: &[PayoutRecipientTarget],
     stable_requirements: &[StableTokenAccountRequirement],
     auto_fund: bool,
 ) -> String {
@@ -364,7 +370,7 @@ fn surfpool_prep_notice_body(
             target.label, target.address
         ));
     }
-    if payout_recipient_count > 0 && !stable_requirements.is_empty() {
+    if !payout_recipients.is_empty() && !stable_requirements.is_empty() {
         let ata_action = if auto_fund {
             "creating missing"
         } else {
@@ -376,8 +382,12 @@ fn surfpool_prep_notice_body(
             .collect::<Vec<_>>()
             .join(", ");
         lines.push(format!(
-            "{ata_action} ATAs for all configured stable tokens ({tokens}) across {payout_recipient_count} payout recipient(s)"
+            "{ata_action} ATAs for all configured stable tokens ({tokens}) across {} payout recipient(s):",
+            payout_recipients.len()
         ));
+        for recipient in payout_recipients {
+            lines.push(format!("  {}: {}", recipient.label, recipient.pubkey));
+        }
     }
     lines.join("\n")
 }
@@ -605,21 +615,42 @@ fn stable_token_account_requirements(
     Ok(requirements)
 }
 
-fn payout_recipient_pubkeys(
+fn add_payout_recipient_target(
+    targets: &mut Vec<PayoutRecipientTarget>,
+    label: impl Into<String>,
+    pubkey: solana_pubkey::Pubkey,
+) {
+    let label = label.into();
+    if let Some(existing) = targets.iter_mut().find(|target| target.pubkey == pubkey) {
+        if !existing.label.split(" + ").any(|part| part == label) {
+            existing.label.push_str(" + ");
+            existing.label.push_str(&label);
+        }
+    } else {
+        targets.push(PayoutRecipientTarget { label, pubkey });
+    }
+}
+
+fn payout_recipient_targets(
     api: &ApiSpec,
     x402_upto_beneficiary: Option<solana_pubkey::Pubkey>,
-) -> pay_core::Result<Vec<solana_pubkey::Pubkey>> {
-    let mut recipients = charge_split_recipient_pubkeys(api)?;
+) -> pay_core::Result<Vec<PayoutRecipientTarget>> {
+    let mut recipients = Vec::new();
     if let Some(beneficiary) = x402_upto_beneficiary {
-        recipients.push(beneficiary);
+        add_payout_recipient_target(&mut recipients, "x402-upto beneficiary", beneficiary);
     }
-    recipients.sort();
-    recipients.dedup();
+    for target in charge_split_recipient_targets(api)? {
+        add_payout_recipient_target(&mut recipients, target.label, target.pubkey);
+    }
     Ok(recipients)
 }
 
-fn charge_split_recipient_pubkeys(api: &ApiSpec) -> pay_core::Result<Vec<solana_pubkey::Pubkey>> {
-    let mut recipients = std::collections::BTreeSet::new();
+fn payout_recipient_pubkeys(targets: &[PayoutRecipientTarget]) -> Vec<solana_pubkey::Pubkey> {
+    targets.iter().map(|target| target.pubkey).collect()
+}
+
+fn charge_split_recipient_targets(api: &ApiSpec) -> pay_core::Result<Vec<PayoutRecipientTarget>> {
+    let mut recipients = Vec::new();
     for ep in &api.endpoints {
         let Some(meter) = ep.metering.as_ref() else {
             continue;
@@ -645,10 +676,15 @@ fn charge_split_recipient_pubkeys(api: &ApiSpec) -> pay_core::Result<Vec<solana_
                     ep.path, rule.recipient
                 ))
             })?;
-            recipients.insert(recipient);
+            let label = alias
+                .label
+                .as_ref()
+                .map(|display| format!("split recipient {} ({display})", rule.recipient))
+                .unwrap_or_else(|| format!("split recipient {}", rule.recipient));
+            add_payout_recipient_target(&mut recipients, label, recipient);
         }
     }
-    Ok(recipients.into_iter().collect())
+    Ok(recipients)
 }
 
 fn api_accepts_x402_upto(api: &ApiSpec) -> bool {
@@ -1019,7 +1055,9 @@ impl StartCommand {
                 .map(|signer| signer.pubkey().to_string());
             let x402_upto_beneficiary =
                 x402_upto_beneficiary_pubkey(&api, &recipient, operator_pubkey.as_deref())?;
-            let payout_recipients = payout_recipient_pubkeys(&api, x402_upto_beneficiary)?;
+            let payout_recipient_targets =
+                payout_recipient_targets(&api, x402_upto_beneficiary)?;
+            let payout_recipients = payout_recipient_pubkeys(&payout_recipient_targets);
             let stable_requirements =
                 stable_token_account_requirements(&currency_configs, network.slug())?;
 
@@ -1050,7 +1088,7 @@ impl StartCommand {
                     &surfpool_prep_notice_body(
                         &rpc_url,
                         &surfpool_targets,
-                        payout_recipients.len(),
+                        &payout_recipient_targets,
                         &stable_requirements,
                         true,
                     ),
@@ -1084,7 +1122,7 @@ impl StartCommand {
                     &surfpool_prep_notice_body(
                         &rpc_url,
                         &surfpool_targets,
-                        payout_recipients.len(),
+                        &payout_recipient_targets,
                         &stable_requirements,
                         false,
                     ),
@@ -3163,8 +3201,9 @@ fn gateway_charge_challenges(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_pdb_config, create_associated_token_account_idempotent_ix, payout_recipient_pubkeys,
-        resolve_currency, resolve_operator_currencies, should_use_auto_fee_payer_signer,
+        PayoutRecipientTarget, build_pdb_config, create_associated_token_account_idempotent_ix,
+        payout_recipient_pubkeys, payout_recipient_targets, resolve_currency,
+        resolve_operator_currencies, should_use_auto_fee_payer_signer,
         stable_token_account_requirements, surfpool_funding_targets, surfpool_prep_notice_body,
         validate_browser_rpc_request, x402_currency_configs, x402_upto_beneficiary_pubkey,
         x402_upto_payout_for_recipient,
@@ -3225,6 +3264,16 @@ currencies:
     fn surfpool_prep_notice_body_names_wallet_and_ata_work() {
         let targets =
             surfpool_funding_targets("CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY", None);
+        let payout_recipients = vec![
+            PayoutRecipientTarget {
+                label: "x402-upto beneficiary".to_string(),
+                pubkey: Pubkey::from_str("CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY").unwrap(),
+            },
+            PayoutRecipientTarget {
+                label: "split recipient partner (Partner)".to_string(),
+                pubkey: Pubkey::from_str("mandyRKj8mvxhuk9Np7pJEXd7BjoEZZNRFxUTpDFeAp").unwrap(),
+            },
+        ];
         let stable_requirements = stable_token_account_requirements(
             &[
                 (
@@ -3249,7 +3298,7 @@ currencies:
         let body = surfpool_prep_notice_body(
             "https://402.surfnet.dev:8899",
             &targets,
-            2,
+            &payout_recipients,
             &stable_requirements,
             true,
         );
@@ -3258,6 +3307,12 @@ currencies:
         assert!(body.contains("funding payment recipient"));
         assert!(body.contains(
             "creating missing ATAs for all configured stable tokens (USDC, PYUSD) across 2 payout recipient(s)"
+        ));
+        assert!(
+            body.contains("x402-upto beneficiary: CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY")
+        );
+        assert!(body.contains(
+            "split recipient partner (Partner): mandyRKj8mvxhuk9Np7pJEXd7BjoEZZNRFxUTpDFeAp"
         ));
     }
 
@@ -3334,13 +3389,15 @@ endpoints:
         )
         .unwrap();
 
-        let recipients = payout_recipient_pubkeys(&api, None).unwrap();
+        let targets = payout_recipient_targets(&api, None).unwrap();
+        let recipients = payout_recipient_pubkeys(&targets);
 
         assert_eq!(recipients.len(), 1);
         assert_eq!(
             recipients[0].to_string(),
             "mandyRKj8mvxhuk9Np7pJEXd7BjoEZZNRFxUTpDFeAp"
         );
+        assert_eq!(targets[0].label, "split recipient partner");
     }
 
     #[test]
@@ -3378,13 +3435,16 @@ endpoints:
         let x402_recipient =
             Pubkey::from_str("CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY").unwrap();
 
-        let recipients = payout_recipient_pubkeys(&api, Some(x402_recipient)).unwrap();
+        let targets = payout_recipient_targets(&api, Some(x402_recipient)).unwrap();
+        let recipients = payout_recipient_pubkeys(&targets);
 
         assert_eq!(recipients.len(), 2);
         assert!(recipients.contains(&x402_recipient));
         assert!(recipients.iter().any(
             |recipient| recipient.to_string() == "mandyRKj8mvxhuk9Np7pJEXd7BjoEZZNRFxUTpDFeAp"
         ));
+        assert_eq!(targets[0].label, "x402-upto beneficiary");
+        assert_eq!(targets[1].label, "split recipient partner");
     }
 
     #[test]
