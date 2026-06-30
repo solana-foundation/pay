@@ -171,6 +171,30 @@ fn x402_upto_payout_for_recipient(
     }
 }
 
+fn x402_currency_configs(
+    currency_configs: &[(String, String, u8)],
+    network: &str,
+) -> Vec<pay_kit::x402::server::CurrencyConfig> {
+    let mut configs: Vec<_> = currency_configs
+        .iter()
+        .map(
+            |(_symbol, mint, decimals)| pay_kit::x402::server::CurrencyConfig {
+                currency: mint.clone(),
+                decimals: *decimals,
+                token_program: None,
+            },
+        )
+        .collect();
+    if configs.is_empty() {
+        configs.push(pay_kit::x402::server::CurrencyConfig {
+            currency: Stablecoin::Usdc.mint(Some(network)).to_string(),
+            decimals: 6,
+            token_program: None,
+        });
+    }
+    configs
+}
+
 fn resolve_session_splits(
     api: &ApiSpec,
     session: &pay_types::metering::SessionSpec,
@@ -1155,29 +1179,11 @@ impl StartCommand {
                 })
             });
             // x402 currency descriptors — one per configured operator currency.
-            // pay-kit resolves each currency's mint + token program from the
-            // SYMBOL (token program is independent of the mint), advertises one
-            // `accepts[]` entry per currency, and on verify binds the
-            // channel/transfer to the client's chosen one. `currencies[0]` is the
-            // primary/default. Shared by the exact + upto backends.
-            let x402_currencies: Vec<pay_kit::x402::server::CurrencyConfig> = {
-                let mut cs: Vec<_> = currency_configs
-                    .iter()
-                    .map(|(symbol, _mint, decimals)| pay_kit::x402::server::CurrencyConfig {
-                        currency: symbol.clone(),
-                        decimals: *decimals,
-                        token_program: None,
-                    })
-                    .collect();
-                if cs.is_empty() {
-                    cs.push(pay_kit::x402::server::CurrencyConfig {
-                        currency: "USDC".to_string(),
-                        decimals: 6,
-                        token_program: None,
-                    });
-                }
-                cs
-            };
+            // `CurrencyConfig.currency` is serialized as x402 `asset`, so it
+            // must be the resolved mint (or native SOL marker), not the display
+            // symbol. Passing "USDC" leaks into client RPC calls as an invalid
+            // pubkey.
+            let x402_currencies = x402_currency_configs(&currency_configs, network.slug());
             let x402 = if wants_x402 {
                 let cfg = pay_kit::x402::server::Config {
                     recipient: recipient.clone(),
@@ -2738,7 +2744,7 @@ fn gateway_charge_challenges(
 mod tests {
     use super::{
         build_pdb_config, resolve_currency, resolve_operator_currencies,
-        should_use_auto_fee_payer_signer, validate_browser_rpc_request,
+        should_use_auto_fee_payer_signer, validate_browser_rpc_request, x402_currency_configs,
         x402_upto_payout_for_recipient,
     };
     use crate::network::SolanaNetwork;
@@ -2789,6 +2795,36 @@ currencies:
             resolve_currency("USDG", "mainnet").0,
             pay_types::stablecoin_mints::USDG_MAINNET
         );
+    }
+
+    #[test]
+    fn x402_currency_configs_use_resolved_mints_not_symbols() {
+        let currency_configs = vec![(
+            "USDC".to_string(),
+            pay_types::stablecoin_mints::USDC_DEVNET.to_string(),
+            6,
+        )];
+
+        let configs = x402_currency_configs(&currency_configs, "devnet");
+
+        assert_eq!(configs.len(), 1);
+        assert_eq!(
+            configs[0].currency,
+            pay_types::stablecoin_mints::USDC_DEVNET
+        );
+        assert_eq!(configs[0].decimals, 6);
+    }
+
+    #[test]
+    fn x402_currency_configs_default_to_network_usdc_mint() {
+        let configs = x402_currency_configs(&[], "devnet");
+
+        assert_eq!(configs.len(), 1);
+        assert_eq!(
+            configs[0].currency,
+            pay_types::stablecoin_mints::USDC_DEVNET
+        );
+        assert_eq!(configs[0].decimals, 6);
     }
 
     #[test]
