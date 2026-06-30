@@ -3211,12 +3211,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
-name = "foldhash"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
-
-[[package]]
 name = "foreign-types"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3851,7 +3845,7 @@ checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
  "allocator-api2",
  "equivalent",
- "foldhash 0.1.5",
+ "foldhash",
 ]
 
 [[package]]
@@ -3859,11 +3853,6 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
-dependencies = [
- "allocator-api2",
- "equivalent",
- "foldhash 0.2.0",
-]
 
 [[package]]
 name = "hcl-edit"
@@ -6753,7 +6742,7 @@ dependencies = [
  "serde",
  "serde_yaml 0.8.26",
  "sfv",
- "socket2 0.6.4",
+ "socket2 0.4.10",
  "strum 0.26.3",
  "strum_macros 0.26.4",
  "tokio",
@@ -6835,8 +6824,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32f1c33f6ce9ca9b8e81190796f7d4d543d1ab2a310097d884ebe48ce5d33c4d"
 dependencies = [
  "arrayvec",
- "hashbrown 0.17.1",
- "parking_lot 0.12.5",
+ "hashbrown 0.13.2",
+ "parking_lot 0.11.2",
  "rand 0.8.6",
 ]
 
@@ -7190,7 +7179,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
@@ -10669,7 +10658,7 @@ dependencies = [
 [[package]]
 name = "solana-pay-kit"
 version = "0.1.0"
-source = "git+https://github.com/solana-foundation/pay-kit?branch=feat%2Fblockhash-cache-main#14cff5e7deddb6cfedb705f5ba894b1d3816ebad"
+source = "git+https://github.com/solana-foundation/pay-kit?branch=feat%2Fblockhash-cache-main#a44c4cae88fdff9091d8493c78f47881b4e948e8"
 dependencies = [
  "async-trait",
  "base64 0.22.1",

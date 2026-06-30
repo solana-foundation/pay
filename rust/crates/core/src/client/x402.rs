@@ -254,10 +254,20 @@ pub fn build_payment_with_override(
     })
 }
 
-/// Try to parse an x402 `upto` challenge from headers and/or body.
+/// Try to parse an x402 `upto` challenge from headers and/or body — the first
+/// advertised `upto` currency, used to build the channel open.
 pub fn parse_upto(headers: &[(String, String)], body: Option<&str>) -> Option<UptoChallenge> {
     pay_kit::x402::client::upto::parse_upto_challenge(headers, body)
         .map(|requirements| UptoChallenge { requirements })
+}
+
+/// Every advertised x402 `upto` requirement, so the balance- and cost-aware
+/// selector can choose among the offered currencies (not just the first).
+pub fn parse_upto_accepts(
+    headers: &[(String, String)],
+    body: Option<&str>,
+) -> Vec<pay_kit::x402::upto::UptoRequirements> {
+    pay_kit::x402::client::upto::parse_upto_accepts(headers, body)
 }
 
 /// Build a signed x402 `upto` payment: a payment-channel `open` authorization

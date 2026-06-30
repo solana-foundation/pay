@@ -22,10 +22,10 @@ pub enum RunOutcome {
         challenge: Box<mpp::Challenge>,
         alternatives: Vec<mpp::Challenge>,
         x402_alternative: Option<Box<x402::Challenge>>,
-        /// x402 `upto` advertised on the same 402, carried so the balance- and
-        /// cost-aware selector can settle it when it's the cheaper (or only
-        /// fundable) option. See [`mpp::choose_payment`].
-        x402_upto_alternative: Option<Box<x402::UptoChallenge>>,
+        /// Every x402 `upto` currency advertised on the same 402, carried so the
+        /// balance- and cost-aware selector can settle whichever is cheapest (or
+        /// the only fundable one) — not just the first. See [`mpp::choose_payment`].
+        x402_upto_accepts: Vec<pay_kit::x402::upto::UptoRequirements>,
         resource_url: String,
     },
     /// The server returned 402 with an MPP session challenge (intent="session").
@@ -591,11 +591,11 @@ pub(crate) fn classify_402_with_preference(
         // real `upto` is present prefer that reading and drop the (bogus) exact
         // alternative — otherwise the selector could pick an `exact` the server
         // never advertised and the payment would be rejected.
-        let upto_alternative = x402::parse_upto(headers, body).map(Box::new);
-        let x402_alternative = if upto_alternative.is_some() {
-            None
-        } else {
+        let x402_upto_accepts = x402::parse_upto_accepts(headers, body);
+        let x402_alternative = if x402_upto_accepts.is_empty() {
             x402_challenge.clone().map(Box::new)
+        } else {
+            None
         };
         return RunOutcome::MppChallenge {
             challenge: Box::new(challenge),
@@ -604,7 +604,7 @@ pub(crate) fn classify_402_with_preference(
             // cost-aware selector can settle it when it's cheaper or the only
             // fundable option.
             x402_alternative,
-            x402_upto_alternative: upto_alternative,
+            x402_upto_accepts,
             resource_url: resource_url.to_string(),
         };
     }

@@ -583,7 +583,7 @@ fn do_paid_fetch(
             challenge,
             alternatives,
             x402_alternative,
-            x402_upto_alternative,
+            x402_upto_accepts,
             ..
         } => {
             use pay_core::client::mpp::ChosenPayment;
@@ -592,11 +592,11 @@ fn do_paid_fetch(
             challenges.extend(alternatives);
             // Balance- and cost-aware, cross-scheme pick: settle the cheapest
             // option the wallet can fund across MPP charge, x402 exact, and
-            // x402 upto.
+            // every advertised x402 upto currency.
             let chosen = pay_core::client::mpp::choose_payment(
                 &challenges,
                 x402_alternative.as_deref(),
-                x402_upto_alternative.as_deref(),
+                &x402_upto_accepts,
                 &store,
                 network_override.as_deref(),
                 account_override.as_deref(),
