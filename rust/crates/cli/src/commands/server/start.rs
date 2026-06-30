@@ -327,6 +327,7 @@ struct StableTokenAccountRequirement {
 struct SurfpoolFundingTarget {
     label: &'static str,
     address: String,
+    requires_sol: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -344,12 +345,14 @@ fn surfpool_funding_targets(
         targets.push(SurfpoolFundingTarget {
             label: "operator signer",
             address: operator_pubkey.to_string(),
+            requires_sol: true,
         });
     }
     if !targets.iter().any(|target| target.address == recipient) {
         targets.push(SurfpoolFundingTarget {
             label: "payment recipient",
             address: recipient.to_string(),
+            requires_sol: false,
         });
     }
     targets
@@ -408,13 +411,25 @@ async fn validate_funding_target_balances(
     for target in targets {
         let lamports = fetch_lamports(&client, rpc_url, &target.address).await?;
         if lamports == 0 {
-            return Err(pay_core::Error::Config(format!(
-                "{} wallet has 0 SOL\n{}\non `{network}` via {rpc_url}\n\n\
-                 Startup aborted because payment configuration is not usable \
-                 until this wallet exists on chain. Fund this address and \
-                 restart the server.",
-                target.label, target.address
-            )));
+            if target.requires_sol {
+                return Err(pay_core::Error::Config(format!(
+                    "{} wallet has 0 SOL\n{}\non `{network}` via {rpc_url}\n\n\
+                     Startup aborted because payment configuration is not usable \
+                     until this wallet exists on chain. Fund this address and \
+                     restart the server.",
+                    target.label, target.address
+                )));
+            }
+            crate::components::print_notice(
+                crate::components::NoticeLevel::Warning,
+                "Payment recipient has 0 SOL",
+                &format!(
+                    "{}\non `{network}` via {rpc_url}\n\n\
+                     Startup will continue because recipients do not sign or pay \
+                     rent for stable token account creation.",
+                    target.address
+                ),
+            );
         }
         balances.push(FundingTargetBalance {
             address: target.address.clone(),
@@ -3246,8 +3261,10 @@ currencies:
         assert_eq!(targets.len(), 2);
         assert_eq!(targets[0].label, "operator signer");
         assert_eq!(targets[0].address, operator);
+        assert!(targets[0].requires_sol);
         assert_eq!(targets[1].label, "payment recipient");
         assert_eq!(targets[1].address, recipient);
+        assert!(!targets[1].requires_sol);
     }
 
     #[test]
@@ -3258,6 +3275,7 @@ currencies:
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].label, "operator signer");
         assert_eq!(targets[0].address, VALID_TEST_KEYPAIR_PUBKEY);
+        assert!(targets[0].requires_sol);
     }
 
     #[test]

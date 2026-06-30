@@ -116,10 +116,9 @@ pub struct SessionForward {
 /// An x402 `upto` channel opened (and confirmed on-chain) before the resource
 /// is served, carried to the adapter's post-response hook for settlement.
 ///
-/// `upto` is settle-after-serve: the adapter forwards, then settles the metered
-/// amount on success (`open.max_amount`) or refunds (`0`) on failure. The
-/// settlement runs `state.x402_upto().settle_actual(&open, amount)`. Holds the
-/// `!Clone` [`VerifiedUptoOpen`] (with its in-flight guard) until settled.
+/// `upto` is settle-after-serve: the adapter forwards, then settles the actual
+/// amount on success or refunds (`0`) on failure. Holds the `!Clone`
+/// [`VerifiedUptoOpen`] (with its in-flight guard) until settled.
 pub struct UptoForward {
     /// Boxed — `VerifiedUptoOpen` is large, and boxing keeps the common
     /// `GateDecision` variants small (clippy `large_enum_variant`).
@@ -128,6 +127,9 @@ pub struct UptoForward {
     /// configured `min` (clamped to the ceiling), or the full ceiling when no
     /// `min` is set. Failures always settle `0` (full refund).
     pub settle_amount: u64,
+    /// Response-metered settlement plan. `None` preserves the legacy fixed
+    /// success amount above.
+    pub settlement: Option<metering::UptoSettlementPlan>,
 }
 
 /// The outcome of gating a request.
@@ -493,10 +495,11 @@ impl<S: PaymentState> PaymentGate<S> {
         if accepted.contains(&Scheme::X402Upto)
             && let Some(upto) = self.state.x402_upto()
         {
-            // The advertised ceiling: the metered charge for this request. The
-            // client funds a channel with this as the deposit; settlement debits
-            // the actual (== ceiling on success, 0 → full refund on failure).
-            let amount = crate::server::payment::charge_amount_from_price(price.as_ref());
+            // The advertised ceiling: `metering.upto.max_usd` for usage-metered
+            // configs, or the legacy metered charge for older configs. The
+            // client funds a channel with this as the deposit; settlement later
+            // debits actual usage and refunds the rest.
+            let amount = format!("{}", metering::upto_max_usd(meter, price.as_ref()));
             match upto.payment_required_header(&amount) {
                 Ok((name, value)) => {
                     if let (Ok(n), Ok(v)) = (
@@ -676,19 +679,27 @@ impl<S: PaymentState> PaymentGate<S> {
             ..Default::default()
         };
         let variant = variant_hint_from_path(path);
-        let amount = crate::server::payment::charge_amount_from_price(
-            metering::resolve_price(meter, &props, variant.as_deref(), None).as_ref(),
-        );
+        let price = metering::resolve_price(meter, &props, variant.as_deref(), None);
+        let amount = format!("{}", metering::upto_max_usd(meter, price.as_ref()));
         match upto.verify_open(pay_header, &amount).await {
             Ok(open) => {
                 let ceiling_usd: f64 = amount.parse().unwrap_or(0.0);
-                let settle_amount = upto_settle_amount(meter.min_usd, ceiling_usd, open.max_amount);
+                let settle_amount =
+                    upto_settle_amount(metering::upto_min_usd(meter), ceiling_usd, open.max_amount);
+                let settlement = metering::upto_uses_response_usage(meter, variant.as_deref())
+                    .then(|| metering::UptoSettlementPlan {
+                        metering: meter.clone(),
+                        variant_hint: variant.clone(),
+                        request_properties: props,
+                        ceiling_usd,
+                    });
                 GateDecision::Forward {
                     session: None,
                     receipt: None,
                     upto: Some(UptoForward {
                         open: Box::new(open),
                         settle_amount,
+                        settlement,
                     }),
                 }
             }
@@ -1183,6 +1194,39 @@ pub async fn settle_upto<S: PaymentState>(
             None
         }
     }
+}
+
+/// Settle an x402 `upto` channel using post-response usage extraction.
+///
+/// When the response did not successfully serve, this always settles `0`
+/// (refund). When usage extraction fails under `missing_usage: error`, it also
+/// refunds so funds are not stranded.
+pub async fn settle_upto_metered<S: PaymentState>(
+    state: &S,
+    open: VerifiedUptoOpen,
+    plan: metering::UptoSettlementPlan,
+    served_ok: bool,
+    response_headers: &http::HeaderMap,
+    response_body: Option<&[u8]>,
+) -> Option<(HeaderName, HeaderValue)> {
+    if !served_ok {
+        return settle_upto(state, open, 0, false).await;
+    }
+
+    let amount = match metering::upto_actual_amount_from_response(
+        &plan,
+        open.max_amount,
+        response_headers,
+        response_body,
+    ) {
+        Ok(actual) => actual.base_units,
+        Err(e) => {
+            tracing::warn!(error = %e, "x402 upto response-metered settlement failed; refunding");
+            0
+        }
+    };
+
+    settle_upto(state, open, amount, true).await
 }
 
 /// Reconstruct a minimal URI from path + query for split-rule resolution.

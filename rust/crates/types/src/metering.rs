@@ -1079,8 +1079,70 @@ pub struct Metering {
     /// price is the *ceiling* the client authorizes; absent a real usage meter,
     /// the operator settles a voucher for this `min` (clamped to the ceiling) on
     /// a successful serve, refunding the rest. `None` settles the full ceiling.
+    ///
+    /// Deprecated for new configs: prefer `upto.min_usd`, which lives with the
+    /// rest of the `x402-upto` settlement policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_usd: Option<f64>,
+    /// Settlement policy for `x402-upto` endpoints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upto: Option<UptoMetering>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct UptoMetering {
+    /// Authorized ceiling in USD. The client opens the channel for this amount;
+    /// settlement later debits the measured usage and refunds the remainder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_usd: Option<f64>,
+    /// Minimum amount to settle on a successful response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_usd: Option<f64>,
+    /// What to do when the upstream response succeeds but configured usage
+    /// fields cannot be extracted.
+    #[serde(default, skip_serializing_if = "is_default_missing_usage_policy")]
+    pub missing_usage: MissingUsagePolicy,
+    /// Response-body handling for usage extraction. The first supported mode is
+    /// buffered JSON, which lets the gateway compute the settlement before it
+    /// writes the final response headers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_body: Option<UptoResponseBody>,
+    /// Provider preset for common usage JSON layouts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_preset: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MissingUsagePolicy {
+    /// Close the channel with a zero voucher, refunding the full deposit.
+    #[default]
+    Refund,
+    /// Settle the configured minimum, or refund when no minimum is set.
+    Min,
+    /// Settle the full authorized ceiling.
+    Ceiling,
+    /// Treat missing usage as a settlement error. The gateway still refunds to
+    /// avoid stranding funds after the upstream has already responded.
+    Error,
+}
+
+fn is_default_missing_usage_policy(policy: &MissingUsagePolicy) -> bool {
+    matches!(policy, MissingUsagePolicy::Refund)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct UptoResponseBody {
+    pub mode: UptoResponseBodyMode,
+    /// Maximum response body bytes the gateway will buffer for usage extraction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UptoResponseBodyMode {
+    Buffer,
 }
 
 impl Metering {
@@ -1115,6 +1177,27 @@ pub struct MeterDimension {
     pub period: Option<BillingPeriod>,
     /// Volume tiers. Evaluated in order — first matching tier applies.
     pub tiers: Vec<PriceTier>,
+    /// Optional usage source for post-response settlement, used by `x402-upto`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meter: Option<UsageMeter>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct UsageMeter {
+    pub source: UsageMeterSource,
+    /// RFC 6901 JSON pointer, e.g. `/usageMetadata/promptTokenCount`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Response header name for `response_header` meters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageMeterSource {
+    ResponseJson,
+    ResponseHeader,
 }
 
 /// A volume-based price tier. `up_to: None` means "and above" (final tier).
@@ -2412,12 +2495,14 @@ mod tests {
                         notes: None,
                         splits: vec![],
                     }],
+                    meter: None,
                 }],
             }],
             sku_tiers: vec![],
             splits: vec![],
             schemes: None,
             min_usd: None,
+            upto: None,
         };
         let json = serde_json::to_string(&metering).unwrap();
         let back: Metering = serde_json::from_str(&json).unwrap();
@@ -2477,12 +2562,14 @@ mod tests {
                             notes: Some("Free tier".to_string()),
                             splits: vec![],
                         }],
+                        meter: None,
                     }],
                     variants: vec![],
                     sku_tiers: vec![],
                     splits: vec![],
                     schemes: None,
                     min_usd: None,
+                    upto: None,
                 }),
                 subscription: None,
             }],
@@ -2813,6 +2900,7 @@ mod tests {
                 splits: vec![],
                 schemes,
                 min_usd: None,
+                upto: None,
             }),
             subscription: None,
         }
@@ -2872,6 +2960,7 @@ mod tests {
                 }],
                 schemes: None,
                 min_usd: None,
+                upto: None,
             }),
             subscription: None,
         }]);
@@ -2901,6 +2990,7 @@ mod tests {
                         notes: None,
                         splits: vec![],
                     }],
+                    meter: None,
                 }],
                 variants: vec![],
                 sku_tiers: vec![],
@@ -2912,6 +3002,7 @@ mod tests {
                 }],
                 schemes: None,
                 min_usd: None,
+                upto: None,
             }),
             subscription: None,
         }]);
@@ -2941,6 +3032,7 @@ mod tests {
                         notes: None,
                         splits: vec![],
                     }],
+                    meter: None,
                 }],
                 variants: vec![],
                 sku_tiers: vec![],
@@ -2952,6 +3044,7 @@ mod tests {
                 }],
                 schemes: None,
                 min_usd: None,
+                upto: None,
             }),
             subscription: None,
         }]);
@@ -2981,6 +3074,7 @@ mod tests {
                         notes: None,
                         splits: vec![],
                     }],
+                    meter: None,
                 }],
                 variants: vec![],
                 sku_tiers: vec![],
@@ -2992,6 +3086,7 @@ mod tests {
                 }],
                 schemes: None,
                 min_usd: None,
+                upto: None,
             }),
             subscription: None,
         }]);
@@ -3020,6 +3115,7 @@ mod tests {
                         notes: None,
                         splits: vec![],
                     }],
+                    meter: None,
                 }],
                 variants: vec![],
                 sku_tiers: vec![],
@@ -3031,6 +3127,7 @@ mod tests {
                 }],
                 schemes: None,
                 min_usd: None,
+                upto: None,
             }),
             subscription: None,
         }]);
@@ -3062,6 +3159,7 @@ mod tests {
                         notes: None,
                         splits: vec![],
                     }],
+                    meter: None,
                 }],
                 variants: vec![],
                 sku_tiers: vec![],
@@ -3081,6 +3179,7 @@ mod tests {
                 ],
                 schemes: None,
                 min_usd: None,
+                upto: None,
             }),
             subscription: None,
         }]);
@@ -3129,12 +3228,14 @@ mod tests {
                             memo: None,
                         }],
                     }],
+                    meter: None,
                 }],
                 variants: vec![],
                 sku_tiers: vec![],
                 splits: vec![],
                 schemes: None,
                 min_usd: None,
+                upto: None,
             }),
             subscription: None,
         }]);
@@ -3165,12 +3266,14 @@ mod tests {
                         notes: None,
                         splits: vec![],
                     }],
+                    meter: None,
                 }],
                 variants: vec![],
                 sku_tiers: vec![],
                 splits,
                 schemes,
                 min_usd: None,
+                upto: None,
             }),
             subscription: None,
         }])
@@ -3436,12 +3539,14 @@ mod tests {
                             },
                         ],
                     }],
+                    meter: None,
                 }],
                 variants: vec![],
                 sku_tiers: vec![],
                 splits: vec![],
                 schemes: None,
                 min_usd: None,
+                upto: None,
             }),
             subscription: None,
         }]);
@@ -4018,6 +4123,80 @@ endpoints:
             errs.iter()
                 .any(|e| e.contains("does not support nested oauth2 auth")),
             "expected nested oauth2 validation error, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn parses_x402_upto_response_metering_yaml() {
+        let spec: ApiSpec = serde_yml::from_str(
+            r#"
+name: usage-demo
+subdomain: usage-demo
+title: Usage Demo
+description: Usage Demo
+category: finance
+version: v1
+routing:
+  type: respond
+operator:
+  currencies:
+    usd: ["USDC"]
+  network: localnet
+  fee_payer: true
+endpoints:
+  - method: POST
+    path: v1/generate
+    resource: generate
+    description: Usage-metered generation
+    metering:
+      schemes: [x402-upto]
+      upto:
+        max_usd: 0.10
+        min_usd: 0.001
+        missing_usage: refund
+        usage_preset: google-generativelanguage
+        response_body:
+          mode: buffer
+          max_bytes: 4096
+      dimensions:
+        - direction: input
+          unit: tokens
+          scale: 1000
+          meter:
+            source: response_json
+            path: /usageMetadata/promptTokenCount
+          tiers:
+            - price_usd: 0.000075
+        - direction: output
+          unit: tokens
+          scale: 1000
+          meter:
+            source: response_json
+            path: /usageMetadata/candidatesTokenCount
+          tiers:
+            - price_usd: 0.00030
+"#,
+        )
+        .unwrap();
+
+        let metering = spec.endpoints[0].metering.as_ref().unwrap();
+        let upto = metering.upto.as_ref().unwrap();
+        assert_eq!(upto.max_usd, Some(0.10));
+        assert_eq!(upto.min_usd, Some(0.001));
+        assert!(matches!(upto.missing_usage, MissingUsagePolicy::Refund));
+        assert_eq!(
+            upto.usage_preset.as_deref(),
+            Some("google-generativelanguage")
+        );
+        assert_eq!(upto.response_body.as_ref().unwrap().max_bytes, Some(4096));
+        assert_eq!(
+            metering.dimensions[0]
+                .meter
+                .as_ref()
+                .unwrap()
+                .path
+                .as_deref(),
+            Some("/usageMetadata/promptTokenCount")
         );
     }
 }
