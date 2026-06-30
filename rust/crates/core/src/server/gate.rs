@@ -145,7 +145,7 @@ pub enum GateDecision {
     Forward {
         session: Option<SessionForward>,
         receipt: Option<ReceiptAnnotation>,
-        upto: Option<UptoForward>,
+        upto: Option<Box<UptoForward>>,
     },
     /// Not gated (discovery / free / unknown) — let normal routing handle it
     /// (forward to the default upstream, or serve a control-plane route).
@@ -696,11 +696,11 @@ impl<S: PaymentState> PaymentGate<S> {
                 GateDecision::Forward {
                     session: None,
                     receipt: None,
-                    upto: Some(UptoForward {
+                    upto: Some(Box::new(UptoForward {
                         open: Box::new(open),
                         settle_amount,
                         settlement,
-                    }),
+                    })),
                 }
             }
             Err(e) => {

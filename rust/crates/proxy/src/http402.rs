@@ -499,10 +499,13 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                 ctx.receipt = receipt;
                 // x402 `upto`: the channel is open; hold it for post-response
                 // settlement (response_filter on success, logging on failure).
-                ctx.upto = upto.map(|u| PendingUpto {
-                    open: *u.open,
-                    settle_amount: u.settle_amount,
-                    settlement: u.settlement,
+                ctx.upto = upto.map(|u| {
+                    let u = *u;
+                    PendingUpto {
+                        open: *u.open,
+                        settle_amount: u.settle_amount,
+                        settlement: u.settlement,
+                    }
                 });
                 if ctx.upto.as_ref().is_some_and(|pending| {
                     pending.settlement.as_ref().is_some_and(|plan| {
