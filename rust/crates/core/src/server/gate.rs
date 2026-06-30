@@ -1139,11 +1139,17 @@ fn upto_settle_amount(min_usd: Option<f64>, ceiling_usd: f64, max_amount: u64) -
 /// Settle an x402 `upto` channel after the resource was served (the adapter's
 /// post-response hook). Debits `settle_amount` (the configured `min`, or the
 /// full ceiling when unset — clamped to `open.max_amount`) on a successful
-/// serve, refunds the full deposit (settle `0`) on failure, and finalizes the
-/// channel on-chain. Returns the `PAYMENT-RESPONSE` receipt header
-/// to set on the response. Settlement errors are logged, not surfaced — the
-/// resource was already served, so a failed settle is an operator/on-chain retry
-/// concern (the channel store sweeps it), not a client error.
+/// serve, refunds the full deposit (settle `0`) on failure, and returns the
+/// `PAYMENT-RESPONSE` receipt header to set on the response.
+///
+/// Routes through the shared batched-settlement worker (`settle_actual_deferred`):
+/// concurrent settlements pack into one operator-signed tx that is **sent
+/// without waiting for confirmation**, with the background worker confirming +
+/// retrying. This takes the multi-second confirm poll off the response path —
+/// the client's funds are locked by the confirmed `open`, so a late or failed
+/// background confirm is an operator-retry concern (the channel store sweeps
+/// it), not a client error. Settlement errors are logged, not surfaced (the
+/// resource was already served).
 pub async fn settle_upto<S: PaymentState>(
     state: &S,
     open: VerifiedUptoOpen,
@@ -1158,7 +1164,7 @@ pub async fn settle_upto<S: PaymentState>(
     } else {
         0
     };
-    match upto.settle_actual(&open, amount).await {
+    match upto.settle_actual_deferred(&open, amount).await {
         Ok(settlement) => {
             tracing::Span::current().record("tx_sig", settlement.transaction.as_str());
             match upto.settlement_header(&settlement) {
@@ -1173,7 +1179,7 @@ pub async fn settle_upto<S: PaymentState>(
             }
         }
         Err(e) => {
-            tracing::error!(error = %e, "x402 upto settle_actual failed; channel left for sweep");
+            tracing::error!(error = %e, "x402 upto settlement failed; channel left for sweep");
             None
         }
     }

@@ -1366,14 +1366,16 @@ pub fn validate_api_spec(spec: &ApiSpec) -> Vec<String> {
         validate_tier_splits(metering, &spec.recipients, path, &mut errs);
         // Session-capable endpoints settle through a channel that forbids
         // duplicate split recipients; charge endpoints allow a repeated
-        // recipient only when each leg carries a distinct memo. A top-level
-        // `session:` block (or any session scheme) makes the endpoint
-        // session-capable.
-        let has_session_scheme = spec.session.is_some()
-            || metering
-                .schemes
-                .as_ref()
-                .is_some_and(|schemes| schemes.iter().any(|s| s.is_session()));
+        // recipient only when each leg carries a distinct memo. When endpoint
+        // schemes are omitted, a top-level `session:` block makes the endpoint
+        // session-capable via defaults; explicit schemes can still opt into
+        // charge-only routing.
+        let has_session_scheme = metering
+            .schemes
+            .as_ref()
+            .map_or(spec.session.is_some(), |schemes| {
+                schemes.iter().any(|s| s.is_session())
+            });
         validate_split_recipient_uniqueness(
             metering,
             &spec.recipients,
@@ -1952,13 +1954,15 @@ fn validate_session_splits(
     for rule in &session.splits {
         let ctx = format!("session split `{}`", rule.recipient);
 
-        if rule.amount.is_some() {
+        let amount_set = rule.amount.is_some();
+        if amount_set {
             errs.push(format!(
                 "{ctx}: session channel splits must use `percent`, not `amount`"
             ));
         }
         match rule.percent {
-            None => errs.push(format!("{ctx}: must set `percent`")),
+            None if !amount_set => errs.push(format!("{ctx}: must set `percent`")),
+            None => {}
             Some(p) if !p.is_finite() || p <= 0.0 => {
                 errs.push(format!(
                     "{ctx}: `percent` must be a positive, finite number"
@@ -3254,6 +3258,39 @@ mod tests {
     }
 
     #[test]
+    fn validate_charge_only_endpoint_uses_charge_rules_with_top_level_session() {
+        let mut spec = spec_with_splits(
+            Some(vec![Scheme::MppCharge]),
+            vec![
+                SplitRule {
+                    recipient: "operator".into(),
+                    amount: Some(0.001),
+                    percent: None,
+                    memo: Some("platform fee".into()),
+                },
+                SplitRule {
+                    recipient: "operator".into(),
+                    amount: Some(0.001),
+                    percent: None,
+                    memo: Some("referral".into()),
+                },
+            ],
+        );
+        spec.session = Some(SessionSpec {
+            cap_usdc: 10.0,
+            min_voucher_delta: 0,
+            modes: vec![],
+            pull_voucher_strategy: SessionPullVoucherStrategy::Disabled,
+            batch_open_interval_ms: 400,
+            close_delay_ms: 15_000,
+            splits: vec![],
+        });
+
+        let errs = validate_api_spec(&spec);
+        assert!(errs.is_empty(), "expected charge-only rules, got: {errs:?}");
+    }
+
+    #[test]
     fn validate_charge_rejects_duplicate_recipient_same_memo() {
         // Charge scheme + same recipient AND same memo → reject (indistinguishable legs).
         let spec = spec_with_splits(
@@ -3307,6 +3344,10 @@ mod tests {
         assert!(
             errs.iter().any(|e| e.contains("must use `percent`")),
             "got: {errs:?}"
+        );
+        assert!(
+            !errs.iter().any(|e| e.contains("must set `percent`")),
+            "amount-only split should not emit a redundant missing-percent error: {errs:?}"
         );
     }
 
