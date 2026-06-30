@@ -316,6 +316,372 @@ async fn ensure_surfpool_session_distribution_accounts(
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct StableTokenAccountRequirement {
+    label: String,
+    mint: String,
+    token_program: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SurfpoolFundingTarget {
+    label: &'static str,
+    address: String,
+}
+
+fn surfpool_funding_targets(
+    recipient: &str,
+    operator_pubkey: Option<&str>,
+) -> Vec<SurfpoolFundingTarget> {
+    let mut targets = Vec::new();
+    if let Some(operator_pubkey) = operator_pubkey {
+        targets.push(SurfpoolFundingTarget {
+            label: "operator signer",
+            address: operator_pubkey.to_string(),
+        });
+    }
+    if !targets.iter().any(|target| target.address == recipient) {
+        targets.push(SurfpoolFundingTarget {
+            label: "payment recipient",
+            address: recipient.to_string(),
+        });
+    }
+    targets
+}
+
+fn surfpool_prep_notice_body(
+    rpc_url: &str,
+    targets: &[SurfpoolFundingTarget],
+    payout_recipient_count: usize,
+    stable_requirements: &[StableTokenAccountRequirement],
+    auto_fund: bool,
+) -> String {
+    let mut lines = vec![format!("rpc: {rpc_url}")];
+    let wallet_action = if auto_fund { "funding" } else { "checking" };
+    for target in targets {
+        lines.push(format!(
+            "{wallet_action} {}: {}",
+            target.label, target.address
+        ));
+    }
+    if payout_recipient_count > 0 && !stable_requirements.is_empty() {
+        let ata_action = if auto_fund {
+            "creating missing"
+        } else {
+            "checking"
+        };
+        let tokens = stable_requirements
+            .iter()
+            .map(|requirement| requirement.label.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(format!(
+            "{ata_action} ATAs for all configured stable tokens ({tokens}) across {payout_recipient_count} payout recipient(s)"
+        ));
+    }
+    lines.join("\n")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FundingTargetBalance {
+    address: String,
+    lamports: u64,
+}
+
+async fn validate_funding_target_balances(
+    rpc_url: &str,
+    network: &SolanaNetwork,
+    targets: &[SurfpoolFundingTarget],
+) -> pay_core::Result<Vec<FundingTargetBalance>> {
+    let client = reqwest::Client::new();
+    let mut balances = Vec::with_capacity(targets.len());
+    for target in targets {
+        let lamports = fetch_lamports(&client, rpc_url, &target.address).await?;
+        if lamports == 0 {
+            return Err(pay_core::Error::Config(format!(
+                "{} wallet has 0 SOL\n{}\non `{network}` via {rpc_url}\n\n\
+                 Startup aborted because payment configuration is not usable \
+                 until this wallet exists on chain. Fund this address and \
+                 restart the server.",
+                target.label, target.address
+            )));
+        }
+        balances.push(FundingTargetBalance {
+            address: target.address.clone(),
+            lamports,
+        });
+    }
+    Ok(balances)
+}
+
+fn lamports_to_sol(lamports: u64) -> f64 {
+    lamports as f64 / 1_000_000_000.0
+}
+
+async fn ensure_payout_recipient_token_accounts(
+    recipients: &[solana_pubkey::Pubkey],
+    stable_requirements: &[StableTokenAccountRequirement],
+    network: &str,
+    rpc_url: &str,
+    allow_startup_creation: bool,
+    fee_payer_signer: Option<Arc<dyn SolanaSigner>>,
+) -> pay_core::Result<()> {
+    if recipients.is_empty() || stable_requirements.is_empty() {
+        return Ok(());
+    }
+
+    let signer = if allow_startup_creation {
+        Some(fee_payer_signer.ok_or_else(|| {
+            pay_core::Error::Config(
+                "stable payout recipient ATA setup requires an operator signer".to_string(),
+            )
+        })?)
+    } else {
+        None
+    };
+    let payer = signer.as_ref().map(|signer| signer.pubkey());
+    let rpc = pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient::new(rpc_url.to_string());
+    for recipient in recipients {
+        for requirement in stable_requirements {
+            let mint = solana_pubkey::Pubkey::from_str(&requirement.mint).map_err(|e| {
+                pay_core::Error::Config(format!(
+                    "stable mint `{}` is not a valid Solana pubkey: {e}",
+                    requirement.mint
+                ))
+            })?;
+            let token_program = solana_pubkey::Pubkey::from_str(&requirement.token_program)
+                .map_err(|e| {
+                    pay_core::Error::Config(format!(
+                        "token program `{}` is not a valid Solana pubkey: {e}",
+                        requirement.token_program
+                    ))
+                })?;
+            let (ata, _) = pay_kit::mpp::program::payment_channels::find_associated_token_address(
+                recipient,
+                &mint,
+                &token_program,
+            );
+            if rpc.get_account(&ata).is_ok() {
+                continue;
+            }
+
+            if !allow_startup_creation {
+                // TODO(mainnet): add an operator-funded creation command for
+                // production clusters. Startup still aborts so no traffic is
+                // served before payment config is fully usable.
+                return Err(pay_core::Error::Config(format!(
+                    "Missing stable token account for payout recipient\n\
+                     recipient: {recipient}\n\
+                     mint: {}\n\
+                     ata: {ata}\n\
+                     network: {network}\n\
+                     rpc: {rpc_url}\n\n\
+                     Create this associated token account, or use the Surfpool \
+                     localnet sandbox where pay can create it automatically.",
+                    requirement.mint
+                )));
+            }
+
+            let signer = signer
+                .as_ref()
+                .expect("signer is present when startup creation is enabled");
+            let payer = payer.expect("payer is present when startup creation is enabled");
+            let ix = create_associated_token_account_idempotent_ix(
+                &payer,
+                recipient,
+                &mint,
+                &token_program,
+            );
+            sign_and_broadcast_gateway(signer.clone(), vec![ix], rpc_url).await?;
+        }
+    }
+
+    Ok(())
+}
+
+fn create_associated_token_account_idempotent_ix(
+    payer: &solana_pubkey::Pubkey,
+    owner: &solana_pubkey::Pubkey,
+    mint: &solana_pubkey::Pubkey,
+    token_program: &solana_pubkey::Pubkey,
+) -> solana_instruction::Instruction {
+    pay_kit::mpp::program::payment_channels::build_create_associated_token_account_instruction(
+        payer,
+        owner,
+        mint,
+        token_program,
+    )
+}
+
+async fn sign_and_broadcast_gateway(
+    signer: Arc<dyn SolanaSigner>,
+    instructions: Vec<solana_instruction::Instruction>,
+    rpc_url: &str,
+) -> pay_core::Result<String> {
+    use pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient;
+    use solana_message::Message;
+    use solana_signature::Signature;
+    use solana_transaction::Transaction;
+
+    let url = rpc_url.to_string();
+    let signer_pubkey = signer.pubkey();
+    let blockhash = tokio::task::spawn_blocking({
+        let url = url.clone();
+        move || {
+            let rpc = RpcClient::new(url);
+            rpc.get_latest_blockhash()
+                .map_err(|e| pay_core::Error::Mpp(format!("Failed to fetch blockhash: {e}")))
+        }
+    })
+    .await
+    .map_err(|e| pay_core::Error::Mpp(format!("RPC task join: {e}")))??;
+
+    let message = Message::new_with_blockhash(&instructions, Some(&signer_pubkey), &blockhash);
+    let mut tx = Transaction::new_unsigned(message);
+    let msg_bytes = tx.message_data();
+    let sig_bytes = signer
+        .sign_message(&msg_bytes)
+        .await
+        .map_err(|e| pay_core::Error::Mpp(format!("Operator signing failed: {e}")))?;
+    let signature = Signature::from(<[u8; 64]>::from(sig_bytes));
+
+    let signer_index = tx
+        .message
+        .account_keys
+        .iter()
+        .position(|key| *key == signer_pubkey)
+        .ok_or_else(|| pay_core::Error::Mpp("Operator pubkey absent from account_keys".into()))?;
+    if tx.signatures.len() <= signer_index {
+        return Err(pay_core::Error::Mpp(
+            "Transaction signatures vec is shorter than account_keys".into(),
+        ));
+    }
+    tx.signatures[signer_index] = signature;
+
+    let serialized = bincode::serialize(&tx)
+        .map_err(|e| pay_core::Error::Mpp(format!("Failed to serialise tx: {e}")))?;
+    let confirmed_sig = tokio::task::spawn_blocking(move || {
+        let rpc = RpcClient::new(url);
+        let tx: Transaction = bincode::deserialize(&serialized)
+            .map_err(|e| pay_core::Error::Mpp(format!("tx round-trip: {e}")))?;
+        rpc.send_and_confirm_transaction(&tx)
+            .map_err(|e| pay_core::Error::Mpp(format!("Broadcast failed: {e}")))
+    })
+    .await
+    .map_err(|e| pay_core::Error::Mpp(format!("RPC task join: {e}")))??;
+
+    Ok(confirmed_sig.to_string())
+}
+
+fn stable_token_account_requirements(
+    currency_configs: &[(String, String, u8)],
+    network: &str,
+) -> pay_core::Result<Vec<StableTokenAccountRequirement>> {
+    let mut requirements = Vec::new();
+    for (label, mint, _decimals) in currency_configs {
+        if Stablecoin::parse_symbol(label).is_none() && Stablecoin::from_mint(mint).is_none() {
+            continue;
+        }
+
+        solana_pubkey::Pubkey::from_str(mint).map_err(|e| {
+            pay_core::Error::Config(format!(
+                "stable currency `{label}` resolved to invalid mint `{mint}`: {e}"
+            ))
+        })?;
+        let token_program = pay_kit::mpp::protocol::solana::default_token_program_for_currency(
+            label,
+            Some(network),
+        )
+        .to_string();
+        let requirement = StableTokenAccountRequirement {
+            label: label.clone(),
+            mint: mint.clone(),
+            token_program,
+        };
+        if !requirements.contains(&requirement) {
+            requirements.push(requirement);
+        }
+    }
+    Ok(requirements)
+}
+
+fn payout_recipient_pubkeys(
+    api: &ApiSpec,
+    x402_upto_beneficiary: Option<solana_pubkey::Pubkey>,
+) -> pay_core::Result<Vec<solana_pubkey::Pubkey>> {
+    let mut recipients = charge_split_recipient_pubkeys(api)?;
+    if let Some(beneficiary) = x402_upto_beneficiary {
+        recipients.push(beneficiary);
+    }
+    recipients.sort();
+    recipients.dedup();
+    Ok(recipients)
+}
+
+fn charge_split_recipient_pubkeys(api: &ApiSpec) -> pay_core::Result<Vec<solana_pubkey::Pubkey>> {
+    let mut recipients = std::collections::BTreeSet::new();
+    for ep in &api.endpoints {
+        let Some(meter) = ep.metering.as_ref() else {
+            continue;
+        };
+        if !meter
+            .accepted_schemes()
+            .contains(&pay_types::metering::Scheme::MppCharge)
+        {
+            continue;
+        }
+
+        for rule in pay_core::server::metering::resolve_split_rules(meter) {
+            let Some(alias) = api.recipients.get(&rule.recipient) else {
+                return Err(pay_core::Error::Config(format!(
+                    "{}: split recipient '{}' not declared",
+                    ep.path, rule.recipient
+                )));
+            };
+            let account = resolve_static_account(&alias.account)?;
+            let recipient = solana_pubkey::Pubkey::from_str(&account).map_err(|e| {
+                pay_core::Error::Config(format!(
+                    "{}: split recipient '{}' account is not a valid Solana pubkey: {e}",
+                    ep.path, rule.recipient
+                ))
+            })?;
+            recipients.insert(recipient);
+        }
+    }
+    Ok(recipients.into_iter().collect())
+}
+
+fn api_accepts_x402_upto(api: &ApiSpec) -> bool {
+    api.endpoints.iter().any(|ep| {
+        ep.metering.as_ref().is_some_and(|meter| {
+            meter
+                .accepted_schemes()
+                .contains(&pay_types::metering::Scheme::X402Upto)
+        })
+    })
+}
+
+fn x402_upto_beneficiary_pubkey(
+    api: &ApiSpec,
+    recipient: &str,
+    operator: Option<&str>,
+) -> pay_core::Result<Option<solana_pubkey::Pubkey>> {
+    let Some(operator) = operator else {
+        return Ok(None);
+    };
+    if !api_accepts_x402_upto(api) || recipient == operator {
+        return Ok(None);
+    }
+
+    solana_pubkey::Pubkey::from_str(recipient)
+        .map(Some)
+        .map_err(|e| {
+            pay_core::Error::Config(format!(
+                "x402 upto recipient `{recipient}` is not a valid Solana pubkey: {e}"
+            ))
+        })
+}
+
 impl StartCommand {
     pub fn run(self, active_account_name: Option<&str>, sandbox: bool) -> pay_core::Result<()> {
         let debugger = self.debugger || sandbox;
@@ -641,7 +1007,23 @@ impl StartCommand {
                 }
             };
 
-            // ── Auto-fund the operator wallet on Surfpool ──
+            let currency_configs: Vec<_> = currencies
+                .iter()
+                .map(|currency| {
+                    let (mpp_currency, decimals) = resolve_currency(currency, network.slug());
+                    (currency.clone(), mpp_currency, decimals)
+                })
+                .collect();
+            let operator_pubkey = fee_payer_signer
+                .as_ref()
+                .map(|signer| signer.pubkey().to_string());
+            let x402_upto_beneficiary =
+                x402_upto_beneficiary_pubkey(&api, &recipient, operator_pubkey.as_deref())?;
+            let payout_recipients = payout_recipient_pubkeys(&api, x402_upto_beneficiary)?;
+            let stable_requirements =
+                stable_token_account_requirements(&currency_configs, network.slug())?;
+
+            // ── Auto-fund local Surfpool wallets ──
             //
             // Trigger when EITHER:
             //   - the user passed `--sandbox` (explicit opt-in), or
@@ -659,18 +1041,67 @@ impl StartCommand {
             let looks_like_surfpool =
                 rpc_url.contains("surfnet") || rpc_url.contains("surfpool");
             let should_fund = sandbox || looks_like_surfpool;
-            if should_fund && let Some(ref signer) = fee_payer_signer {
-                let pubkey = signer.pubkey().to_string();
-                if let Err(e) =
-                    pay_core::client::sandbox::fund_via_surfpool(&rpc_url, &pubkey).await
-                {
-                    eprintln!(
-                        "  {} {}",
-                        "Sandbox funding failed:".red(),
-                        e.to_string().dimmed()
-                    );
+            let surfpool_targets =
+                surfpool_funding_targets(&recipient, operator_pubkey.as_deref());
+            if should_fund {
+                crate::components::print_notice(
+                    crate::components::NoticeLevel::Info,
+                    "Preparing sandbox wallets",
+                    &surfpool_prep_notice_body(
+                        &rpc_url,
+                        &surfpool_targets,
+                        payout_recipients.len(),
+                        &stable_requirements,
+                        true,
+                    ),
+                );
+                for target in &surfpool_targets {
+                    if let Err(e) =
+                        pay_core::client::sandbox::fund_via_surfpool(&rpc_url, &target.address)
+                            .await
+                    {
+                        if looks_like_surfpool {
+                            return Err(pay_core::Error::Config(format!(
+                                "Sandbox funding failed\n{} {}\n{}\n\n\
+                                 Startup aborted before accepting traffic.",
+                                target.label, target.address, e
+                            )));
+                        }
+                        crate::components::print_notice(
+                            crate::components::NoticeLevel::Warning,
+                            "Sandbox funding unavailable",
+                            &format!(
+                                "{} {}\n{}\n\nValidating existing balances instead.",
+                                target.label, target.address, e
+                            ),
+                        );
+                    }
                 }
+            } else {
+                crate::components::print_notice(
+                    crate::components::NoticeLevel::Info,
+                    "Validating payment configuration",
+                    &surfpool_prep_notice_body(
+                        &rpc_url,
+                        &surfpool_targets,
+                        payout_recipients.len(),
+                        &stable_requirements,
+                        false,
+                    ),
+                );
             }
+
+            let funding_balances =
+                validate_funding_target_balances(&rpc_url, &network, &surfpool_targets).await?;
+            let operator_sol = funding_balances
+                .iter()
+                .find(|balance| balance.address == recipient)
+                .map(|balance| lamports_to_sol(balance.lamports))
+                .ok_or_else(|| {
+                    pay_core::Error::Config(
+                        "internal error: payment recipient was not validated".to_string(),
+                    )
+                })?;
 
             // ── Create MPP servers ──
             let challenge_binding_secret = std::env::var("PAY_MPP_CHALLENGE_SECRET")
@@ -688,13 +1119,15 @@ impl StartCommand {
                 std::env::set_var("MPP_CHALLENGE_BINDING_SECRET", &challenge_binding_secret);
             }
 
-            let currency_configs: Vec<_> = currencies
-                .iter()
-                .map(|currency| {
-                    let (mpp_currency, decimals) = resolve_currency(currency, network.slug());
-                    (currency.clone(), mpp_currency, decimals)
-                })
-                .collect();
+            ensure_payout_recipient_token_accounts(
+                &payout_recipients,
+                &stable_requirements,
+                network.slug(),
+                &rpc_url,
+                should_fund,
+                fee_payer_signer.clone(),
+            )
+            .await?;
             // Shared recent-blockhash cache, refreshed by a background thread.
             // Issuing a 402 embeds a `recentBlockhash` per advertised currency
             // and scheme; fetching it inline turned one 402 into N blocking RPC
@@ -968,18 +1401,10 @@ impl StartCommand {
                 currencies.join(", ").green()
             );
 
-            // Fetch the operator wallet's SOL balance for the banner.
-            // We do this in BOTH sandbox and mainnet modes — in sandbox
-            // it confirms the auto-fund worked; on mainnet it's a quick
-            // sanity check that the wallet actually exists on chain so
-            // the user doesn't waste time hitting the gateway with a
-            // wallet that has zero SOL.
-            //
             // Color thresholds (covers all networks):
             //   ≥ 0.10 SOL  → green   (comfortable runway)
             //   ≥ 0.05 SOL  → yellow  (top up soon)
             //    < 0.05 SOL → red     (next tx may fail)
-            let operator_sol = fetch_sol_balance(&rpc_url, &recipient).await;
             let balance_text = format!(" ({} SOL)", format_price(operator_sol));
             let balance_colored = if operator_sol >= 0.10 {
                 balance_text.green().to_string()
@@ -995,26 +1420,6 @@ impl StartCommand {
                 balance_colored
             );
             eprintln!();
-
-            // Loud warning when the wallet is empty. The most common
-            // first-run failure mode on mainnet is "Attempt to debit an
-            // account but found no record of a prior credit" — a Solana
-            // runtime error that means the wallet has zero SOL on the
-            // configured cluster. Tell the user upfront instead of
-            // letting every payment fail at simulation time.
-            if operator_sol == 0.0 {
-                crate::components::print_notice(
-                    crate::components::NoticeLevel::Warning,
-                    "Operator wallet has 0 SOL",
-                    &format!(
-                        "{recipient}\non `{network}` via {rpc_url}\n\n\
-                         Even with operator.fee_payer = true, the wallet must \
-                         exist on chain (any prior credit) for SPL token \
-                         transfers to derive an ATA. Send a small amount of \
-                         SOL to the address above and restart the server."
-                    ),
-                );
-            }
 
             let fee_payer_wallet = if fee_payer {
                 fee_payer_signer.as_ref().map(|signer| {
@@ -2262,9 +2667,12 @@ async fn resolve_signer_with_store(
     }
 }
 
-/// Fetch a wallet's lamport balance via JSON-RPC. Returns 0 on any error
-/// — used by the banner only, where a missing balance is harmless.
-async fn fetch_lamports(client: &reqwest::Client, rpc_url: &str, pubkey: &str) -> u64 {
+/// Fetch a wallet's lamport balance via JSON-RPC.
+async fn fetch_lamports(
+    client: &reqwest::Client,
+    rpc_url: &str,
+    pubkey: &str,
+) -> pay_core::Result<u64> {
     let resp = client
         .post(rpc_url)
         .json(&serde_json::json!({
@@ -2274,21 +2682,33 @@ async fn fetch_lamports(client: &reqwest::Client, rpc_url: &str, pubkey: &str) -
             "params": [pubkey]
         }))
         .send()
-        .await;
-    match resp {
-        Ok(r) => r
-            .json::<serde_json::Value>()
-            .await
-            .ok()
-            .and_then(|v| v["result"]["value"].as_u64())
-            .unwrap_or(0),
-        Err(_) => 0,
+        .await
+        .map_err(|e| {
+            pay_core::Error::Config(format!(
+                "Failed to fetch SOL balance for `{pubkey}` via {rpc_url}: {e}"
+            ))
+        })?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(pay_core::Error::Config(format!(
+            "Failed to fetch SOL balance for `{pubkey}` via {rpc_url}: HTTP {status}"
+        )));
     }
-}
-
-async fn fetch_sol_balance(rpc_url: &str, pubkey: &str) -> f64 {
-    let client = reqwest::Client::new();
-    fetch_lamports(&client, rpc_url, pubkey).await as f64 / 1_000_000_000.0
+    let value = resp.json::<serde_json::Value>().await.map_err(|e| {
+        pay_core::Error::Config(format!(
+            "Invalid getBalance response for `{pubkey}` via {rpc_url}: {e}"
+        ))
+    })?;
+    if let Some(err) = value.get("error") {
+        return Err(pay_core::Error::Config(format!(
+            "getBalance failed for `{pubkey}` via {rpc_url}: {err}"
+        )));
+    }
+    value["result"]["value"].as_u64().ok_or_else(|| {
+        pay_core::Error::Config(format!(
+            "getBalance response for `{pubkey}` via {rpc_url} did not include result.value"
+        ))
+    })
 }
 
 /// Build a concrete, clickable example path for an endpoint whose `path`
@@ -2743,11 +3163,15 @@ fn gateway_charge_challenges(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_pdb_config, resolve_currency, resolve_operator_currencies,
-        should_use_auto_fee_payer_signer, validate_browser_rpc_request, x402_currency_configs,
+        build_pdb_config, create_associated_token_account_idempotent_ix, payout_recipient_pubkeys,
+        resolve_currency, resolve_operator_currencies, should_use_auto_fee_payer_signer,
+        stable_token_account_requirements, surfpool_funding_targets, surfpool_prep_notice_body,
+        validate_browser_rpc_request, x402_currency_configs, x402_upto_beneficiary_pubkey,
         x402_upto_payout_for_recipient,
     };
     use crate::network::SolanaNetwork;
+    use solana_pubkey::Pubkey;
+    use std::str::FromStr;
 
     #[test]
     fn resolve_operator_currencies_prefers_usd_group() {
@@ -2771,6 +3195,262 @@ currencies:
             serde_yml::from_str(r#"network: "devnet""#).unwrap();
 
         assert_eq!(resolve_operator_currencies(Some(&op), "USDC"), ["USDC"]);
+    }
+
+    #[test]
+    fn surfpool_funding_targets_include_distinct_operator_and_recipient() {
+        let operator = VALID_TEST_KEYPAIR_PUBKEY;
+        let recipient = "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY";
+
+        let targets = surfpool_funding_targets(recipient, Some(operator));
+
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].label, "operator signer");
+        assert_eq!(targets[0].address, operator);
+        assert_eq!(targets[1].label, "payment recipient");
+        assert_eq!(targets[1].address, recipient);
+    }
+
+    #[test]
+    fn surfpool_funding_targets_dedupes_operator_recipient() {
+        let targets =
+            surfpool_funding_targets(VALID_TEST_KEYPAIR_PUBKEY, Some(VALID_TEST_KEYPAIR_PUBKEY));
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].label, "operator signer");
+        assert_eq!(targets[0].address, VALID_TEST_KEYPAIR_PUBKEY);
+    }
+
+    #[test]
+    fn surfpool_prep_notice_body_names_wallet_and_ata_work() {
+        let targets =
+            surfpool_funding_targets("CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY", None);
+        let stable_requirements = stable_token_account_requirements(
+            &[
+                (
+                    "USDC".to_string(),
+                    pay_types::Stablecoin::Usdc
+                        .mint(Some("localnet"))
+                        .to_string(),
+                    6,
+                ),
+                (
+                    "PYUSD".to_string(),
+                    pay_types::Stablecoin::Pyusd
+                        .mint(Some("localnet"))
+                        .to_string(),
+                    6,
+                ),
+            ],
+            "localnet",
+        )
+        .unwrap();
+
+        let body = surfpool_prep_notice_body(
+            "https://402.surfnet.dev:8899",
+            &targets,
+            2,
+            &stable_requirements,
+            true,
+        );
+
+        assert!(body.contains("rpc: https://402.surfnet.dev:8899"));
+        assert!(body.contains("funding payment recipient"));
+        assert!(body.contains(
+            "creating missing ATAs for all configured stable tokens (USDC, PYUSD) across 2 payout recipient(s)"
+        ));
+    }
+
+    #[test]
+    fn stable_token_account_requirements_resolve_stable_mints_and_programs() {
+        let configs = vec![
+            resolve_currency("USDC", "localnet"),
+            resolve_currency("PYUSD", "localnet"),
+            resolve_currency("SOL", "localnet"),
+        ]
+        .into_iter()
+        .zip(["USDC", "PYUSD", "SOL"])
+        .map(|((mint, decimals), label)| (label.to_string(), mint, decimals))
+        .collect::<Vec<_>>();
+
+        let requirements = stable_token_account_requirements(&configs, "localnet").unwrap();
+
+        assert_eq!(requirements.len(), 2);
+        assert!(requirements.iter().any(|req| {
+            req.label == "USDC"
+                && req.mint == pay_types::Stablecoin::Usdc.mint(Some("localnet"))
+                && req.token_program == pay_kit::mpp::protocol::solana::programs::TOKEN_PROGRAM
+        }));
+        assert!(requirements.iter().any(|req| {
+            req.label == "PYUSD"
+                && req.mint == pay_types::Stablecoin::Pyusd.mint(Some("localnet"))
+                && req.token_program == pay_kit::mpp::protocol::solana::programs::TOKEN_2022_PROGRAM
+        }));
+    }
+
+    #[test]
+    fn payout_recipient_pubkeys_collects_mpp_charge_splits() {
+        let api: pay_types::metering::ApiSpec = serde_yml::from_str(
+            r#"
+name: splits-demo
+subdomain: splits-demo
+title: Splits Demo
+description: Splits Demo
+category: finance
+version: v1
+routing:
+  type: respond
+recipients:
+  partner:
+    account: mandyRKj8mvxhuk9Np7pJEXd7BjoEZZNRFxUTpDFeAp
+endpoints:
+  - method: POST
+    path: v1/report
+    metering:
+      schemes: [mpp-charge]
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 0.10
+      splits:
+        - recipient: partner
+          percent: 20
+  - method: POST
+    path: v1/exact
+    metering:
+      schemes: [x402-exact]
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 0.10
+      splits:
+        - recipient: partner
+          percent: 20
+"#,
+        )
+        .unwrap();
+
+        let recipients = payout_recipient_pubkeys(&api, None).unwrap();
+
+        assert_eq!(recipients.len(), 1);
+        assert_eq!(
+            recipients[0].to_string(),
+            "mandyRKj8mvxhuk9Np7pJEXd7BjoEZZNRFxUTpDFeAp"
+        );
+    }
+
+    #[test]
+    fn payout_recipient_pubkeys_includes_x402_upto_beneficiary() {
+        let api: pay_types::metering::ApiSpec = serde_yml::from_str(
+            r#"
+name: upto-demo
+subdomain: upto-demo
+title: Upto Demo
+description: Upto Demo
+category: finance
+version: v1
+routing:
+  type: respond
+recipients:
+  partner:
+    account: mandyRKj8mvxhuk9Np7pJEXd7BjoEZZNRFxUTpDFeAp
+endpoints:
+  - method: POST
+    path: v1/report
+    metering:
+      schemes: [mpp-charge, x402-upto]
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 0.10
+      splits:
+        - recipient: partner
+          percent: 20
+"#,
+        )
+        .unwrap();
+        let x402_recipient =
+            Pubkey::from_str("CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY").unwrap();
+
+        let recipients = payout_recipient_pubkeys(&api, Some(x402_recipient)).unwrap();
+
+        assert_eq!(recipients.len(), 2);
+        assert!(recipients.contains(&x402_recipient));
+        assert!(recipients.iter().any(
+            |recipient| recipient.to_string() == "mandyRKj8mvxhuk9Np7pJEXd7BjoEZZNRFxUTpDFeAp"
+        ));
+    }
+
+    #[test]
+    fn x402_upto_beneficiary_pubkey_only_for_distinct_recipient() {
+        let api: pay_types::metering::ApiSpec = serde_yml::from_str(
+            r#"
+name: upto-demo
+subdomain: upto-demo
+title: Upto Demo
+description: Upto Demo
+category: finance
+version: v1
+routing:
+  type: respond
+endpoints:
+  - method: POST
+    path: v1/report
+    metering:
+      schemes: [x402-upto]
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 0.10
+"#,
+        )
+        .unwrap();
+        let recipient = "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY";
+        let operator = VALID_TEST_KEYPAIR_PUBKEY;
+
+        let beneficiary = x402_upto_beneficiary_pubkey(&api, recipient, Some(operator)).unwrap();
+        let same_as_operator =
+            x402_upto_beneficiary_pubkey(&api, operator, Some(operator)).unwrap();
+
+        assert_eq!(beneficiary.unwrap().to_string(), recipient);
+        assert_eq!(same_as_operator, None);
+    }
+
+    #[test]
+    fn create_associated_token_account_ix_is_idempotent_shape() {
+        let payer = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let mint = Pubkey::from_str(pay_types::Stablecoin::Usdc.mint(Some("localnet"))).unwrap();
+        let token_program =
+            Pubkey::from_str(pay_kit::mpp::protocol::solana::programs::TOKEN_PROGRAM).unwrap();
+        let (ata, _) = pay_kit::mpp::program::payment_channels::find_associated_token_address(
+            &owner,
+            &mint,
+            &token_program,
+        );
+
+        let ix =
+            create_associated_token_account_idempotent_ix(&payer, &owner, &mint, &token_program);
+
+        assert_eq!(
+            ix.program_id.to_string(),
+            pay_kit::mpp::protocol::solana::programs::ASSOCIATED_TOKEN_PROGRAM
+        );
+        assert_eq!(ix.data, vec![1]);
+        assert_eq!(ix.accounts[0].pubkey, payer);
+        assert!(ix.accounts[0].is_signer);
+        assert_eq!(ix.accounts[1].pubkey, ata);
+        assert_eq!(ix.accounts[2].pubkey, owner);
+        assert_eq!(ix.accounts[3].pubkey, mint);
+        assert_eq!(ix.accounts[5].pubkey, token_program);
     }
 
     #[test]
