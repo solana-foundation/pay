@@ -657,6 +657,39 @@ impl StartCommand {
                     (currency.clone(), mpp_currency, decimals)
                 })
                 .collect();
+            // Shared recent-blockhash cache, refreshed by a background thread.
+            // Issuing a 402 embeds a `recentBlockhash` per advertised currency
+            // and scheme; fetching it inline turned one 402 into N blocking RPC
+            // round-trips (the dominant challenge latency). The handlers read
+            // this cache and only fall back to a direct fetch when it's empty or
+            // stale, so it's purely a latency optimization — the wire payload is
+            // unchanged.
+            let blockhash_cache = pay_kit::mpp::blockhash::BlockhashCache::new();
+            {
+                use pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient;
+                let cache = blockhash_cache.clone();
+                let worker_rpc_url = rpc_url.clone();
+                let refresh = move || {
+                    let rpc = RpcClient::new(worker_rpc_url.clone());
+                    match rpc.get_latest_blockhash_with_commitment(rpc.commitment()) {
+                        Ok((blockhash, last_valid_block_height)) => {
+                            cache.set(blockhash.to_string(), last_valid_block_height);
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "blockhash cache refresh failed");
+                        }
+                    }
+                };
+                // Prime once so the first 402 is already fast, then refresh on a
+                // 10s interval — far inside the ~60-90s blockhash validity window
+                // and the cache's 45s staleness cap.
+                refresh();
+                std::thread::spawn(move || loop {
+                    std::thread::sleep(std::time::Duration::from_secs(10));
+                    refresh();
+                });
+            }
+
             let mpps: Vec<Mpp> = currency_configs
                 .iter()
                 .map(|(_, mpp_currency, decimals)| {
@@ -672,6 +705,7 @@ impl StartCommand {
                         html: true,
                         ..Default::default()
                     })
+                    .map(|m| m.with_blockhash_cache(blockhash_cache.clone()))
                 })
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| pay_core::Error::Config(format!("Failed to create MPP server: {e}")))?;
@@ -1148,7 +1182,7 @@ impl StartCommand {
                     },
                 };
                 match pay_kit::x402::server::X402::new(cfg) {
-                    Ok(x) => Some(x),
+                    Ok(x) => Some(x.with_blockhash_cache(blockhash_cache.clone())),
                     Err(e) => {
                         eprintln!("x402 backend disabled ({e}); x402 schemes won't be offered");
                         None
@@ -1177,7 +1211,7 @@ impl StartCommand {
                         operator_signer: signer,
                     };
                     match pay_kit::x402::server::X402Upto::new(cfg) {
-                        Ok(u) => Some(u),
+                        Ok(u) => Some(u.with_blockhash_cache(blockhash_cache.clone())),
                         Err(e) => {
                             eprintln!("x402 upto backend disabled ({e})");
                             None
