@@ -162,13 +162,14 @@ pub fn build_payment_with_override(
         cluster_raw
     };
 
-    // x402 may carry a recent blockhash, but the current pay-side guard only
-    // compares the selected account network against the challenge network.
-    crate::client::mpp::check_client_network_intent(network_override, &cluster, None)?;
+    crate::client::mpp::check_client_network_intent(
+        network_override,
+        &cluster,
+        embedded_blockhash,
+    )?;
 
-    // Auto-fund when the user opted into sandbox or the challenge
-    // advertises localnet (likely a sandbox gateway without --sandbox).
-    let user_opted_into_sandbox = network_override.is_some() || cluster == "localnet";
+    let should_auto_fund_surfpool =
+        should_auto_fund_surfpool_for_x402(network_override, embedded_blockhash);
     let network = network_override.map(str::to_string).unwrap_or(cluster);
 
     let (signer, ephemeral_notice) =
@@ -211,7 +212,7 @@ pub fn build_payment_with_override(
         .build()
         .map_err(|e| Error::Mpp(format!("Failed to create runtime: {e}")))?;
 
-    if user_opted_into_sandbox {
+    if should_auto_fund_surfpool {
         let pubkey = signer.pubkey().to_string();
         let fund_url = rpc_url.clone();
         if let Err(e) = rt.block_on(crate::client::sandbox::fund_via_surfpool(
@@ -310,9 +311,14 @@ pub fn build_upto_payment(
     } else {
         cluster_raw
     };
-    crate::client::mpp::check_client_network_intent(network_override, &cluster, None)?;
+    crate::client::mpp::check_client_network_intent(
+        network_override,
+        &cluster,
+        embedded_blockhash,
+    )?;
 
-    let user_opted_into_sandbox = network_override.is_some() || cluster == "localnet";
+    let should_auto_fund_surfpool =
+        should_auto_fund_surfpool_for_x402(network_override, embedded_blockhash);
     let network = network_override.map(str::to_string).unwrap_or(cluster);
 
     let (signer, ephemeral_notice) =
@@ -347,7 +353,7 @@ pub fn build_upto_payment(
         .build()
         .map_err(|e| Error::Mpp(format!("Failed to create runtime: {e}")))?;
 
-    if user_opted_into_sandbox {
+    if should_auto_fund_surfpool {
         let pubkey = signer.pubkey().to_string();
         let fund_url = rpc_url.clone();
         if let Err(e) = rt.block_on(crate::client::sandbox::fund_via_surfpool(
@@ -622,6 +628,13 @@ fn detect_x402_version(headers: &[(String, String)], body: Option<&str>) -> u64 
     X402_VERSION_V2
 }
 
+fn should_auto_fund_surfpool_for_x402(
+    network_override: Option<&str>,
+    embedded_blockhash: Option<&str>,
+) -> bool {
+    crate::client::mpp::should_auto_fund_surfpool(network_override, embedded_blockhash)
+}
+
 fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
     headers
         .iter()
@@ -661,6 +674,37 @@ mod tests {
             accepted: None,
             resource_info: None,
         }
+    }
+
+    fn surfpool_hash() -> &'static str {
+        "SURFNETxSAFEHASHxxxxxxxxxxxxxxxxxxx18b8dc98"
+    }
+
+    #[test]
+    fn x402_auto_fund_skips_mainnet_override() {
+        assert!(!should_auto_fund_surfpool_for_x402(Some("mainnet"), None));
+        assert!(!should_auto_fund_surfpool_for_x402(
+            Some("mainnet"),
+            Some("9zrUHnA1nCByPksy3aL8tQ47vqdaG2vnFs4HrxgcZj4F")
+        ));
+    }
+
+    #[test]
+    fn x402_auto_fund_runs_for_sandbox_override_or_surfpool_blockhash() {
+        assert!(should_auto_fund_surfpool_for_x402(Some("localnet"), None));
+        assert!(should_auto_fund_surfpool_for_x402(Some("sandbox"), None));
+        assert!(should_auto_fund_surfpool_for_x402(
+            None,
+            Some(surfpool_hash())
+        ));
+    }
+
+    #[test]
+    fn x402_auto_fund_skips_plain_localnet_without_override_or_surfpool_hash() {
+        assert!(!should_auto_fund_surfpool_for_x402(
+            None,
+            Some("9zrUHnA1nCByPksy3aL8tQ47vqdaG2vnFs4HrxgcZj4F")
+        ));
     }
 
     #[test]
