@@ -157,6 +157,20 @@ fn should_use_auto_fee_payer_signer(
     sandbox || (signer_cfg.is_none() && network.is_throwaway())
 }
 
+fn x402_upto_payout_for_recipient(
+    recipient: &str,
+    operator: &str,
+) -> pay_kit::x402::server::UptoPayout {
+    if recipient == operator {
+        pay_kit::x402::server::UptoPayout::OperatorKeepsAll
+    } else {
+        pay_kit::x402::server::UptoPayout::Beneficiary {
+            address: recipient.to_string(),
+            operator_fee_bps: 0,
+        }
+    }
+}
+
 fn resolve_session_splits(
     api: &ApiSpec,
     session: &pay_types::metering::SessionSpec,
@@ -1196,8 +1210,12 @@ impl StartCommand {
             // settlement vouchers), so it's only available with a fee-payer signer.
             let x402_upto = match (wants_x402, fee_payer_signer.clone()) {
                 (true, Some(signer)) => {
+                    let operator = signer.pubkey().to_string();
                     let cfg = pay_kit::x402::server::UptoConfig {
-                        recipient: recipient.clone(),
+                        // If the YAML recipient differs from the operator signer,
+                        // pay the recipient through a bound 100% distribution
+                        // split; otherwise the operator keeps the channel payout.
+                        payout: x402_upto_payout_for_recipient(&recipient, &operator),
                         currencies: x402_currencies.clone(),
                         cluster: network.slug().to_string(),
                         rpc_url: Some(rpc_url.clone()),
@@ -2721,6 +2739,7 @@ mod tests {
     use super::{
         build_pdb_config, resolve_currency, resolve_operator_currencies,
         should_use_auto_fee_payer_signer, validate_browser_rpc_request,
+        x402_upto_payout_for_recipient,
     };
     use crate::network::SolanaNetwork;
 
@@ -2770,6 +2789,36 @@ currencies:
             resolve_currency("USDG", "mainnet").0,
             pay_types::stablecoin_mints::USDG_MAINNET
         );
+    }
+
+    #[test]
+    fn x402_upto_payout_keeps_all_when_recipient_is_operator() {
+        let payout =
+            x402_upto_payout_for_recipient(VALID_TEST_KEYPAIR_PUBKEY, VALID_TEST_KEYPAIR_PUBKEY);
+
+        assert!(matches!(
+            payout,
+            pay_kit::x402::server::UptoPayout::OperatorKeepsAll
+        ));
+    }
+
+    #[test]
+    fn x402_upto_payout_splits_100_percent_to_distinct_recipient() {
+        let recipient = "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY";
+        let payout = x402_upto_payout_for_recipient(recipient, VALID_TEST_KEYPAIR_PUBKEY);
+
+        match payout {
+            pay_kit::x402::server::UptoPayout::Beneficiary {
+                address,
+                operator_fee_bps,
+            } => {
+                assert_eq!(address, recipient);
+                assert_eq!(operator_fee_bps, 0);
+            }
+            pay_kit::x402::server::UptoPayout::OperatorKeepsAll => {
+                panic!("distinct recipient should be configured as beneficiary")
+            }
+        }
     }
 
     #[test]
