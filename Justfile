@@ -38,6 +38,7 @@ install *args:
 
     case "${target}" in
         pay)
+            {{ just_executable() }} _check-native-build-deps
             build_pdb
             if [ "$#" -gt 0 ]; then
                 cargo install "$@"
@@ -107,10 +108,12 @@ build target='all':
     case "{{ target }}" in
         all)
             cd typescript && pnpm --filter @solana/pay build && cd ..
+            {{ just_executable() }} _check-native-build-deps
             build_pdb
             cd rust && cargo build --release
             ;;
         pay)
+            {{ just_executable() }} _check-native-build-deps
             build_pdb
             cd rust && cargo build --release
             ;;
@@ -118,6 +121,7 @@ build target='all':
             build_pdb
             ;;
         rust)
+            {{ just_executable() }} _check-native-build-deps
             cd rust && cargo build --release
             ;;
         typescript|ts)
@@ -129,6 +133,43 @@ build target='all':
             exit 1
             ;;
     esac
+
+_check-native-build-deps:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    missing=()
+    for tool in cc make cmake; do
+        if ! command -v "${tool}" >/dev/null 2>&1; then
+            missing+=("${tool}")
+        fi
+    done
+
+    if [ "${#missing[@]}" -eq 0 ]; then
+        exit 0
+    fi
+
+    echo "Missing native build tool(s): ${missing[*]}"
+    echo
+    echo "pay currently builds native TLS/compression dependencies through Pingora/rustls."
+    case "$(uname -s)" in
+        Darwin)
+            echo "Install Xcode Command Line Tools for cc/make:"
+            echo "  xcode-select --install"
+            echo "Install CMake with Homebrew:"
+            echo "  brew install cmake"
+            ;;
+        Linux)
+            echo "Debian/Ubuntu:"
+            echo "  sudo apt-get install build-essential cmake pkg-config"
+            echo "Fedora:"
+            echo "  sudo dnf install gcc gcc-c++ make cmake pkgconf-pkg-config"
+            ;;
+        *)
+            echo "Install a C compiler, make, and cmake for your platform."
+            ;;
+    esac
+    exit 1
 
 # Format everything
 fmt:

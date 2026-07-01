@@ -6296,7 +6296,7 @@ checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
 
 [[package]]
 name = "pay"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -6348,7 +6348,7 @@ dependencies = [
 
 [[package]]
 name = "pay-core"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -6403,7 +6403,7 @@ dependencies = [
 
 [[package]]
 name = "pay-integration"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "base64 0.22.1",
  "pay-core",
@@ -6414,7 +6414,7 @@ dependencies = [
 
 [[package]]
 name = "pay-keystore"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "bs58",
  "secret-service",
@@ -6431,7 +6431,7 @@ dependencies = [
 
 [[package]]
 name = "pay-mcp"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "base64 0.22.1",
  "crc32fast",
@@ -6453,7 +6453,7 @@ dependencies = [
 
 [[package]]
 name = "pay-pdb"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -6475,7 +6475,7 @@ dependencies = [
 
 [[package]]
 name = "pay-proxy"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6494,7 +6494,7 @@ dependencies = [
 
 [[package]]
 name = "pay-types"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "schemars 0.8.22",
  "serde",
@@ -10660,7 +10660,7 @@ dependencies = [
 [[package]]
 name = "solana-pay-kit"
 version = "0.2.0"
-source = "git+https://github.com/solana-foundation/pay-kit?branch=main#b8b2fd467ec363dd715a0523cf95e679a7169a69"
+source = "git+https://github.com/solana-foundation/pay-kit?rev=b8b2fd467ec363dd715a0523cf95e679a7169a69#b8b2fd467ec363dd715a0523cf95e679a7169a69"
 dependencies = [
  "async-trait",
  "base64 0.22.1",

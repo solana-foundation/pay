@@ -345,7 +345,7 @@ impl<S: PaymentState> Http402Gate<S> {
             reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap(),
             prepared.url.clone(),
         );
-        for (name, value) in &prepared.headers {
+        for (name, value) in buffered_upstream_headers(&prepared.headers) {
             upstream_req = upstream_req.header(name.as_str(), value);
         }
         if !body.is_empty() {
@@ -803,6 +803,18 @@ fn target_from_prepared(prepared: pay_core::server::proxy::PreparedUpstreamReque
     }
 }
 
+fn buffered_upstream_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
+    let mut out = Vec::with_capacity(headers.len() + 1);
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("accept-encoding") {
+            continue;
+        }
+        out.push((name.clone(), value.clone()));
+    }
+    out.push(("accept-encoding".to_string(), "identity".to_string()));
+    out
+}
+
 async fn read_downstream_body(session: &mut Session, limit: usize) -> pingora::Result<Bytes> {
     let mut buf = BytesMut::new();
     while let Some(chunk) = session.read_request_body().await? {
@@ -840,10 +852,7 @@ fn filtered_response_headers(headers: &reqwest::header::HeaderMap) -> HeaderMap 
     let mut out = HeaderMap::new();
     for (name, value) in headers {
         let name_lower = name.as_str();
-        if matches!(
-            name_lower,
-            "content-encoding" | "content-length" | "transfer-encoding"
-        ) {
+        if matches!(name_lower, "content-length" | "transfer-encoding") {
             continue;
         }
         if let (Ok(n), Ok(v)) = (
@@ -880,6 +889,61 @@ async fn write_buffered_response(
     session.write_response_header(Box::new(out), false).await?;
     session.write_response_body(Some(body), true).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{buffered_upstream_headers, filtered_response_headers};
+
+    #[test]
+    fn buffered_upstream_headers_force_identity_encoding() {
+        let headers = buffered_upstream_headers(&[
+            ("accept-encoding".to_string(), "br, gzip".to_string()),
+            ("content-type".to_string(), "application/json".to_string()),
+        ]);
+
+        assert_eq!(
+            headers
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("accept-encoding"))
+                .count(),
+            1
+        );
+        assert!(headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("accept-encoding") && value == "identity"
+        }));
+        assert!(headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("content-type") && value == "application/json"
+        }));
+    }
+
+    #[test]
+    fn filtered_response_headers_preserve_content_encoding() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_ENCODING,
+            reqwest::header::HeaderValue::from_static("gzip"),
+        );
+        headers.insert(
+            reqwest::header::CONTENT_LENGTH,
+            reqwest::header::HeaderValue::from_static("123"),
+        );
+        headers.insert(
+            reqwest::header::TRANSFER_ENCODING,
+            reqwest::header::HeaderValue::from_static("chunked"),
+        );
+
+        let filtered = filtered_response_headers(&headers);
+
+        assert_eq!(
+            filtered
+                .get(http::header::CONTENT_ENCODING)
+                .and_then(|value| value.to_str().ok()),
+            Some("gzip")
+        );
+        assert!(!filtered.contains_key(http::header::CONTENT_LENGTH));
+        assert!(!filtered.contains_key(http::header::TRANSFER_ENCODING));
+    }
 }
 
 /// Write a gate-produced [`GateResponse`] (402 challenge, 404, receipt JSON, …)

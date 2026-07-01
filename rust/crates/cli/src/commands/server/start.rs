@@ -366,12 +366,18 @@ fn surfpool_prep_notice_body(
     auto_fund: bool,
 ) -> String {
     let mut lines = vec![format!("rpc: {rpc_url}")];
-    let wallet_action = if auto_fund { "funding" } else { "checking" };
     for target in targets {
-        lines.push(format!(
-            "{wallet_action} {}: {}",
-            target.label, target.address
-        ));
+        let wallet_action = if auto_fund && target.requires_sol {
+            "funding"
+        } else {
+            "checking"
+        };
+        let label = if target.requires_sol {
+            target.label.to_string()
+        } else {
+            format!("{} (SOL optional)", target.label)
+        };
+        lines.push(format!("{wallet_action} {}: {}", label, target.address));
     }
     if !payout_recipients.is_empty() && !stable_requirements.is_empty() {
         let ata_action = if auto_fund {
@@ -1068,6 +1074,7 @@ impl StartCommand {
             let operator_pubkey = fee_payer_signer
                 .as_ref()
                 .map(|signer| signer.pubkey().to_string());
+            let operator_balance_address = operator_pubkey.as_deref().unwrap_or(&recipient);
             let x402_upto_beneficiary =
                 x402_upto_beneficiary_pubkey(&api, &recipient, operator_pubkey.as_deref())?;
             let payout_recipient_targets =
@@ -1108,7 +1115,7 @@ impl StartCommand {
                         true,
                     ),
                 );
-                for target in &surfpool_targets {
+                for target in surfpool_targets.iter().filter(|target| target.requires_sol) {
                     if let Err(e) =
                         pay_core::client::sandbox::fund_via_surfpool(&rpc_url, &target.address)
                             .await
@@ -1148,11 +1155,11 @@ impl StartCommand {
                 validate_funding_target_balances(&rpc_url, &network, &surfpool_targets).await?;
             let operator_sol = funding_balances
                 .iter()
-                .find(|balance| balance.address == recipient)
+                .find(|balance| balance.address == operator_balance_address)
                 .map(|balance| lamports_to_sol(balance.lamports))
                 .ok_or_else(|| {
                     pay_core::Error::Config(
-                        "internal error: payment recipient was not validated".to_string(),
+                        "internal error: operator signer was not validated".to_string(),
                     )
                 })?;
 
@@ -1430,18 +1437,23 @@ impl StartCommand {
             let network_link = crate::components::link::link_with_arrow(network_label, &network_url);
 
             // Operator link (explorer token page).
-            let short_recipient = if recipient.len() > 8 {
-                format!("{}...{}", &recipient[..4], &recipient[recipient.len() - 4..])
+            let operator_display = operator_balance_address;
+            let short_operator = if operator_display.len() > 8 {
+                format!(
+                    "{}...{}",
+                    &operator_display[..4],
+                    &operator_display[operator_display.len() - 4..]
+                )
             } else {
-                recipient.clone()
+                operator_display.to_string()
             };
             let explorer_cluster = network.explorer_cluster(&rpc_url);
             let cluster_query = solana_explorer_cluster_query(&explorer_cluster);
             let operator_url = format!(
                 "https://explorer.solana.com/address/{}/tokens{}",
-                recipient, cluster_query
+                operator_display, cluster_query
             );
-            let operator_link = crate::components::link::link_with_arrow(&short_recipient, &operator_url);
+            let operator_link = crate::components::link::link_with_arrow(&short_operator, &operator_url);
 
             // Pad labels to a fixed visible width — tabs land on
             // terminal-dependent stops, so a 7-char label followed by
@@ -3322,7 +3334,7 @@ currencies:
         );
 
         assert!(body.contains("rpc: https://402.surfnet.dev:8899"));
-        assert!(body.contains("funding payment recipient"));
+        assert!(body.contains("checking payment recipient (SOL optional)"));
         assert!(body.contains(
             "creating missing ATAs for all configured stable tokens (USDC, PYUSD) across 2 payout recipient(s)"
         ));

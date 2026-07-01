@@ -1975,6 +1975,24 @@ fn validate_split_recipient_uniqueness(
             }
         }
     }
+    for variant in &metering.variants {
+        for dim in &variant.dimensions {
+            let scale = dim.scale.max(1) as f64;
+            for tier in &dim.tiers {
+                if !tier.splits.is_empty() {
+                    split_sets.push((
+                        format!(
+                            " (variant {}={}, tier ${:.6}/unit)",
+                            variant.param,
+                            variant.value,
+                            tier.price_usd / scale
+                        ),
+                        tier.splits.as_slice(),
+                    ));
+                }
+            }
+        }
+    }
 
     for (label, splits) in split_sets {
         if has_session_scheme {
@@ -3416,6 +3434,124 @@ mod tests {
         let errs = validate_api_spec(&spec);
         assert!(
             errs.iter().any(|e| e.contains("distinct memo")),
+            "got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_session_rejects_duplicate_variant_tier_recipients() {
+        let mut spec = test_spec(vec![Endpoint {
+            method: HttpMethod::Post,
+            path: "v1/models".into(),
+            description: None,
+            resource: None,
+            routing: None,
+            metering: Some(Metering {
+                dimensions: vec![],
+                variants: vec![MeterVariant {
+                    param: "model".into(),
+                    value: "gemini".into(),
+                    dimensions: vec![MeterDimension {
+                        direction: MeterDirection::Usage,
+                        unit: BillingUnit::Requests,
+                        scale: 1,
+                        period: None,
+                        tiers: vec![PriceTier {
+                            up_to: None,
+                            price_usd: 0.10,
+                            condition: None,
+                            notes: None,
+                            splits: vec![
+                                SplitRule {
+                                    recipient: "operator".into(),
+                                    amount: Some(0.001),
+                                    percent: None,
+                                    memo: Some("platform fee".into()),
+                                },
+                                SplitRule {
+                                    recipient: "platform".into(),
+                                    amount: Some(0.001),
+                                    percent: None,
+                                    memo: Some("referral".into()),
+                                },
+                            ],
+                        }],
+                        meter: None,
+                    }],
+                }],
+                sku_tiers: vec![],
+                splits: vec![],
+                schemes: Some(vec![Scheme::X402Upto]),
+                min_usd: None,
+                upto: None,
+            }),
+            subscription: None,
+        }]);
+        let operator_account = spec.recipients["operator"].account.clone();
+        spec.recipients.get_mut("platform").unwrap().account = operator_account;
+
+        let errs = validate_api_spec(&spec);
+        assert!(
+            errs.iter().any(|e| e.contains("variant model=gemini"))
+                && errs.iter().any(|e| e.contains("unique split recipients")),
+            "got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_charge_rejects_duplicate_variant_tier_recipient_same_memo() {
+        let spec = test_spec(vec![Endpoint {
+            method: HttpMethod::Post,
+            path: "v1/models".into(),
+            description: None,
+            resource: None,
+            routing: None,
+            metering: Some(Metering {
+                dimensions: vec![],
+                variants: vec![MeterVariant {
+                    param: "model".into(),
+                    value: "gemini".into(),
+                    dimensions: vec![MeterDimension {
+                        direction: MeterDirection::Usage,
+                        unit: BillingUnit::Requests,
+                        scale: 1,
+                        period: None,
+                        tiers: vec![PriceTier {
+                            up_to: None,
+                            price_usd: 0.10,
+                            condition: None,
+                            notes: None,
+                            splits: vec![
+                                SplitRule {
+                                    recipient: "operator".into(),
+                                    amount: Some(0.001),
+                                    percent: None,
+                                    memo: Some("fee".into()),
+                                },
+                                SplitRule {
+                                    recipient: "operator".into(),
+                                    amount: Some(0.001),
+                                    percent: None,
+                                    memo: Some("fee".into()),
+                                },
+                            ],
+                        }],
+                        meter: None,
+                    }],
+                }],
+                sku_tiers: vec![],
+                splits: vec![],
+                schemes: Some(vec![Scheme::MppCharge]),
+                min_usd: None,
+                upto: None,
+            }),
+            subscription: None,
+        }]);
+
+        let errs = validate_api_spec(&spec);
+        assert!(
+            errs.iter().any(|e| e.contains("variant model=gemini"))
+                && errs.iter().any(|e| e.contains("distinct memo")),
             "got: {errs:?}"
         );
     }
