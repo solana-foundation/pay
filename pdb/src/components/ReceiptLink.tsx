@@ -5,6 +5,10 @@ import { parseReceipt, receiptSignature } from "../utils/receipt";
 /** Link to the flow's settlement transaction on pay.sh. Renders nothing
  *  when the flow has no receipt signature. Works for every payment pattern
  *  (per-call charge, x402, session, subscription). */
+export function hasReceiptLink(flow: PaymentFlow): boolean {
+  return !!receiptSignature(parseReceipt(flow));
+}
+
 export function ReceiptLink({
   flow,
   label = "View receipt",

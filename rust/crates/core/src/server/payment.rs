@@ -258,24 +258,46 @@ pub(crate) fn resource_memo_with_nonce(resource: Option<&str>, max_bytes: usize)
     if memo.len() <= max_bytes {
         Some(memo)
     } else {
-        // Preserve the pre-existing resource memo behavior for unusually long
-        // resources instead of silently truncating the identifier.
-        Some(resource.to_string())
+        let prefix_len = max_bytes.checked_sub(1 + RESOURCE_MEMO_NONCE_HEX_LEN)?;
+        let prefix = truncate_to_char_boundary(resource, prefix_len);
+        if prefix.is_empty() {
+            None
+        } else {
+            Some(format!("{prefix}#{nonce}"))
+        }
     }
 }
 
-pub(crate) fn resource_memo_matches(memo: &str, resource: &str) -> bool {
+pub(crate) fn resource_memo_matches(memo: &str, resource: &str, max_bytes: usize) -> bool {
     if memo == resource {
         return true;
     }
-    let Some(suffix) = memo
-        .strip_prefix(resource)
-        .and_then(|rest| rest.strip_prefix('#'))
+    let Some((prefix, _suffix)) = memo
+        .rsplit_once('#')
+        .filter(|(_, suffix)| suffix.len() == RESOURCE_MEMO_NONCE_HEX_LEN)
+        .filter(|(_, suffix)| suffix.as_bytes().iter().all(u8::is_ascii_hexdigit))
     else {
         return false;
     };
-    suffix.len() == RESOURCE_MEMO_NONCE_HEX_LEN
-        && suffix.as_bytes().iter().all(u8::is_ascii_hexdigit)
+    if prefix == resource {
+        return true;
+    }
+    let Some(expected_prefix_len) = max_bytes.checked_sub(1 + RESOURCE_MEMO_NONCE_HEX_LEN) else {
+        return false;
+    };
+    let expected_prefix = truncate_to_char_boundary(resource, expected_prefix_len);
+    !expected_prefix.is_empty() && prefix == expected_prefix && memo.len() <= max_bytes
+}
+
+fn truncate_to_char_boundary(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
 }
 
 pub fn readable_verification_message(error: &pay_kit::mpp::server::VerificationError) -> String {
@@ -412,22 +434,27 @@ mod tests {
         let memo = resource_memo_with_nonce(Some("fortune"), 566).unwrap();
         assert!(memo.starts_with("fortune#"));
         assert_eq!(memo.len(), "fortune#".len() + 3);
-        assert!(resource_memo_matches(&memo, "fortune"));
+        assert!(resource_memo_matches(&memo, "fortune", 566));
     }
 
     #[test]
     fn resource_memo_matcher_accepts_legacy_static_resource() {
-        assert!(resource_memo_matches("fortune", "fortune"));
-        assert!(!resource_memo_matches("fortune#not-hex", "fortune"));
-        assert!(!resource_memo_matches("other#012", "fortune"));
+        assert!(resource_memo_matches("fortune", "fortune", 566));
+        assert!(!resource_memo_matches("fortune#not-hex", "fortune", 566));
+        assert!(!resource_memo_matches("other#012", "fortune", 566));
     }
 
     #[test]
-    fn resource_memo_falls_back_when_nonce_would_exceed_limit() {
-        assert_eq!(
-            resource_memo_with_nonce(Some("fortune"), "fortune".len()).as_deref(),
-            Some("fortune")
-        );
+    fn resource_memo_truncates_resource_to_keep_nonce_within_limit() {
+        let memo = resource_memo_with_nonce(Some("fortune"), "fortune".len()).unwrap();
+        assert!(memo.starts_with("for#"));
+        assert_eq!(memo.len(), "fortune".len());
+        assert!(resource_memo_matches(&memo, "fortune", "fortune".len()));
+        assert!(!resource_memo_matches(
+            &memo,
+            "fortune",
+            pay_kit::mpp::protocol::solana::MAX_MEMO_BYTES
+        ));
     }
 
     #[test]

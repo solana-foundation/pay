@@ -1270,17 +1270,24 @@ fn x402_exact_payment_memo(
     let Some(resource) = resource.map(str::trim).filter(|r| !r.is_empty()) else {
         return Ok(None);
     };
-    let envelope = x402
-        .parse_payment_signature(pay_header)
-        .map_err(|e| e.to_string())?;
-    let memo = envelope
+    let envelope = match x402.parse_payment_signature(pay_header) {
+        Ok(envelope) => envelope,
+        Err(_) => return Ok(None),
+    };
+    let Some(memo) = envelope
         .accepted
         .as_ref()
         .and_then(|accepted| accepted.get("extra"))
         .and_then(|extra| extra.get("memo"))
         .and_then(|memo| memo.as_str())
-        .ok_or_else(|| "x402 exact payment missing expected resource memo".to_string())?;
-    if crate::server::payment::resource_memo_matches(memo, resource) {
+    else {
+        return Ok(None);
+    };
+    if crate::server::payment::resource_memo_matches(
+        memo,
+        resource,
+        pay_kit::x402::exact::MAX_MEMO_BYTES,
+    ) {
         Ok(Some(memo.to_string()))
     } else {
         Err("x402 exact payment memo does not match endpoint resource".to_string())
@@ -1303,7 +1310,11 @@ fn mpp_charge_payment_external_id(
         .external_id
         .as_deref()
         .ok_or_else(|| "MPP charge credential missing expected resource externalId".to_string())?;
-    if crate::server::payment::resource_memo_matches(external_id, resource) {
+    if crate::server::payment::resource_memo_matches(
+        external_id,
+        resource,
+        pay_kit::mpp::protocol::solana::MAX_MEMO_BYTES,
+    ) {
         Ok(Some(external_id.to_string()))
     } else {
         Err("MPP charge credential externalId does not match endpoint resource".to_string())
@@ -1449,6 +1460,56 @@ mod tests {
     }
 
     #[test]
+    fn x402_exact_payment_memo_accepts_resource_nonce_memo() {
+        let x402 = x402_test_server();
+        let accepted = x402_accepted_with_memo(&x402, Some("fortune#012"));
+        let header = x402_signature_header(Some(accepted));
+
+        assert_eq!(
+            x402_exact_payment_memo(&x402, &header, Some("fortune"))
+                .unwrap()
+                .as_deref(),
+            Some("fortune#012")
+        );
+    }
+
+    #[test]
+    fn x402_exact_payment_memo_rejects_wrong_resource() {
+        let x402 = x402_test_server();
+        let accepted = x402_accepted_with_memo(&x402, Some("other#012"));
+        let header = x402_signature_header(Some(accepted));
+
+        assert!(
+            x402_exact_payment_memo(&x402, &header, Some("fortune"))
+                .unwrap_err()
+                .contains("does not match")
+        );
+    }
+
+    #[test]
+    fn x402_exact_payment_memo_falls_back_when_accepted_memo_is_absent() {
+        let x402 = x402_test_server();
+        let accepted = x402_accepted_with_memo(&x402, None);
+        let header = x402_signature_header(Some(accepted));
+
+        assert_eq!(
+            x402_exact_payment_memo(&x402, &header, Some("fortune")).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn x402_exact_payment_memo_falls_back_to_process_payment_for_missing_accepted() {
+        let x402 = x402_test_server();
+        let header = x402_signature_header(None);
+
+        assert_eq!(
+            x402_exact_payment_memo(&x402, &header, Some("fortune")).unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn mpp_charge_payment_external_id_accepts_resource_nonce_memo() {
         let credential = mpp_credential_with_external_id(Some("fortune#012"));
 
@@ -1500,6 +1561,61 @@ mod tests {
         PaymentCredential::new(
             challenge.to_echo(),
             json!({"type": "transaction", "transaction": "deadbeef"}),
+        )
+    }
+
+    fn x402_test_server() -> X402 {
+        X402::new(pay_kit::x402::server::Config {
+            recipient: "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY".to_string(),
+            currencies: vec![pay_kit::x402::server::CurrencyConfig {
+                currency: "USDC".to_string(),
+                decimals: 6,
+                token_program: None,
+            }],
+            network: "devnet".to_string(),
+            rpc_url: Some("http://localhost:8899".to_string()),
+            resource: "fortune".to_string(),
+            description: Some("Fortune".to_string()),
+            max_age: Some(60),
+            fee_payer_key: None,
+        })
+        .unwrap()
+    }
+
+    fn x402_accepted_with_memo(x402: &X402, memo: Option<&str>) -> serde_json::Value {
+        let (_, required) = x402
+            .payment_required_header(
+                "1",
+                ExactOptions {
+                    memo,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let decoded =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, required).unwrap();
+        let envelope: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+        envelope
+            .get("accepts")
+            .and_then(|accepts| accepts.as_array())
+            .and_then(|accepts| accepts.first())
+            .cloned()
+            .unwrap()
+    }
+
+    fn x402_signature_header(accepted: Option<serde_json::Value>) -> String {
+        let mut envelope = json!({
+            "x402Version": pay_kit::x402::X402_VERSION_V2,
+            "payload": {
+                "signature": "5UfDuX6nSqMzMR8W7n6K3b1GKLmaqEisBFCcYPRLjNHrCbVQJF3BVjkE7aQJMQ2Kx"
+            }
+        });
+        if let Some(accepted) = accepted {
+            envelope["accepted"] = accepted;
+        }
+        base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            serde_json::to_vec(&envelope).unwrap(),
         )
     }
 
