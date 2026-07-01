@@ -891,61 +891,6 @@ async fn write_buffered_response(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{buffered_upstream_headers, filtered_response_headers};
-
-    #[test]
-    fn buffered_upstream_headers_force_identity_encoding() {
-        let headers = buffered_upstream_headers(&[
-            ("accept-encoding".to_string(), "br, gzip".to_string()),
-            ("content-type".to_string(), "application/json".to_string()),
-        ]);
-
-        assert_eq!(
-            headers
-                .iter()
-                .filter(|(name, _)| name.eq_ignore_ascii_case("accept-encoding"))
-                .count(),
-            1
-        );
-        assert!(headers.iter().any(|(name, value)| {
-            name.eq_ignore_ascii_case("accept-encoding") && value == "identity"
-        }));
-        assert!(headers.iter().any(|(name, value)| {
-            name.eq_ignore_ascii_case("content-type") && value == "application/json"
-        }));
-    }
-
-    #[test]
-    fn filtered_response_headers_preserve_content_encoding() {
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(
-            reqwest::header::CONTENT_ENCODING,
-            reqwest::header::HeaderValue::from_static("gzip"),
-        );
-        headers.insert(
-            reqwest::header::CONTENT_LENGTH,
-            reqwest::header::HeaderValue::from_static("123"),
-        );
-        headers.insert(
-            reqwest::header::TRANSFER_ENCODING,
-            reqwest::header::HeaderValue::from_static("chunked"),
-        );
-
-        let filtered = filtered_response_headers(&headers);
-
-        assert_eq!(
-            filtered
-                .get(http::header::CONTENT_ENCODING)
-                .and_then(|value| value.to_str().ok()),
-            Some("gzip")
-        );
-        assert!(!filtered.contains_key(http::header::CONTENT_LENGTH));
-        assert!(!filtered.contains_key(http::header::TRANSFER_ENCODING));
-    }
-}
-
 /// Write a gate-produced [`GateResponse`] (402 challenge, 404, receipt JSON, …)
 /// directly to the downstream and stop. Duplicate `WWW-Authenticate` lines are
 /// preserved via `append_header`.
@@ -1007,4 +952,59 @@ async fn write_axum_response(
     session.write_response_header(Box::new(out), false).await?;
     session.write_response_body(Some(body), true).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{buffered_upstream_headers, filtered_response_headers};
+
+    #[test]
+    fn buffered_upstream_headers_force_identity_encoding() {
+        let headers = buffered_upstream_headers(&[
+            ("accept-encoding".to_string(), "br, gzip".to_string()),
+            ("content-type".to_string(), "application/json".to_string()),
+        ]);
+
+        assert_eq!(
+            headers
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("accept-encoding"))
+                .count(),
+            1
+        );
+        assert!(headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("accept-encoding") && value == "identity"
+        }));
+        assert!(headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("content-type") && value == "application/json"
+        }));
+    }
+
+    #[test]
+    fn filtered_response_headers_preserve_content_encoding() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_ENCODING,
+            reqwest::header::HeaderValue::from_static("gzip"),
+        );
+        headers.insert(
+            reqwest::header::CONTENT_LENGTH,
+            reqwest::header::HeaderValue::from_static("123"),
+        );
+        headers.insert(
+            reqwest::header::TRANSFER_ENCODING,
+            reqwest::header::HeaderValue::from_static("chunked"),
+        );
+
+        let filtered = filtered_response_headers(&headers);
+
+        assert_eq!(
+            filtered
+                .get(http::header::CONTENT_ENCODING)
+                .and_then(|value| value.to_str().ok()),
+            Some("gzip")
+        );
+        assert!(!filtered.contains_key(http::header::CONTENT_LENGTH));
+        assert!(!filtered.contains_key(http::header::TRANSFER_ENCODING));
+    }
 }
