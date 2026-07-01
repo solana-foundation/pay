@@ -244,6 +244,9 @@ pub(crate) fn decode_payment_amount(
 }
 
 const RESOURCE_MEMO_NONCE_HEX_LEN: usize = 3;
+const RESOURCE_MEMO_TRUNC_HASH_HEX_LEN: usize = 6;
+const RESOURCE_MEMO_TRUNC_SUFFIX_LEN: usize =
+    1 + 1 + RESOURCE_MEMO_TRUNC_HASH_HEX_LEN + RESOURCE_MEMO_NONCE_HEX_LEN;
 
 pub(crate) fn resource_memo_with_nonce(resource: Option<&str>, max_bytes: usize) -> Option<String> {
     let resource = resource.map(str::trim).filter(|r| !r.is_empty())?;
@@ -258,12 +261,13 @@ pub(crate) fn resource_memo_with_nonce(resource: Option<&str>, max_bytes: usize)
     if memo.len() <= max_bytes {
         Some(memo)
     } else {
-        let prefix_len = max_bytes.checked_sub(1 + RESOURCE_MEMO_NONCE_HEX_LEN)?;
+        let prefix_len = max_bytes.checked_sub(RESOURCE_MEMO_TRUNC_SUFFIX_LEN)?;
         let prefix = truncate_to_char_boundary(resource, prefix_len);
         if prefix.is_empty() {
             None
         } else {
-            Some(format!("{prefix}#{nonce}"))
+            let hash = resource_memo_hash(resource);
+            Some(format!("{prefix}#t{hash}{nonce}"))
         }
     }
 }
@@ -272,21 +276,36 @@ pub(crate) fn resource_memo_matches(memo: &str, resource: &str, max_bytes: usize
     if memo == resource {
         return true;
     }
-    let Some((prefix, _suffix)) = memo
-        .rsplit_once('#')
-        .filter(|(_, suffix)| suffix.len() == RESOURCE_MEMO_NONCE_HEX_LEN)
-        .filter(|(_, suffix)| suffix.as_bytes().iter().all(u8::is_ascii_hexdigit))
-    else {
+    let Some((prefix, suffix)) = memo.rsplit_once('#') else {
         return false;
     };
-    if prefix == resource {
+    if suffix.len() == RESOURCE_MEMO_NONCE_HEX_LEN
+        && suffix.as_bytes().iter().all(u8::is_ascii_hexdigit)
+        && prefix == resource
+    {
         return true;
     }
-    let Some(expected_prefix_len) = max_bytes.checked_sub(1 + RESOURCE_MEMO_NONCE_HEX_LEN) else {
+    let Some(binding) = suffix.strip_prefix('t') else {
+        return false;
+    };
+    if binding.len() != RESOURCE_MEMO_TRUNC_HASH_HEX_LEN + RESOURCE_MEMO_NONCE_HEX_LEN
+        || !binding.as_bytes().iter().all(u8::is_ascii_hexdigit)
+        || !binding.starts_with(&resource_memo_hash(resource))
+    {
+        return false;
+    }
+    let Some(expected_prefix_len) = max_bytes.checked_sub(RESOURCE_MEMO_TRUNC_SUFFIX_LEN) else {
         return false;
     };
     let expected_prefix = truncate_to_char_boundary(resource, expected_prefix_len);
-    resource.len() > expected_prefix_len && !expected_prefix.is_empty() && prefix == expected_prefix && memo.len() <= max_bytes
+    resource.len() > expected_prefix_len
+        && !expected_prefix.is_empty()
+        && prefix == expected_prefix
+        && memo.len() <= max_bytes
+}
+
+fn resource_memo_hash(resource: &str) -> String {
+    blake3::hash(resource.as_bytes()).to_hex()[..RESOURCE_MEMO_TRUNC_HASH_HEX_LEN].to_string()
 }
 
 fn truncate_to_char_boundary(value: &str, max_bytes: usize) -> &str {
@@ -446,15 +465,21 @@ mod tests {
 
     #[test]
     fn resource_memo_truncates_resource_to_keep_nonce_within_limit() {
-        let memo = resource_memo_with_nonce(Some("fortune"), "fortune".len()).unwrap();
-        assert!(memo.starts_with("for#"));
-        assert_eq!(memo.len(), "fortune".len());
-        assert!(resource_memo_matches(&memo, "fortune", "fortune".len()));
+        let resource = "fortune/very/long";
+        let memo = resource_memo_with_nonce(Some(resource), 12).unwrap();
+        assert!(memo.starts_with("f#t"));
+        assert_eq!(memo.len(), 12);
+        assert!(resource_memo_matches(&memo, resource, 12));
         assert!(!resource_memo_matches(
             &memo,
-            "fortune",
+            resource,
             pay_kit::mpp::protocol::solana::MAX_MEMO_BYTES
         ));
+    }
+
+    #[test]
+    fn resource_memo_matcher_rejects_short_resource_memo_for_longer_resource() {
+        assert!(!resource_memo_matches("api/path#abc", "api/path/extra", 12));
     }
 
     #[test]
