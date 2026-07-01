@@ -14,6 +14,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=PAY_PDB_DIST");
     println!("cargo:rerun-if-env-changed=PAY_PDB_ALLOW_PLACEHOLDER");
     println!("cargo:rerun-if-changed={}", repo_dist.display());
+    print_rerun_if_changed_recursive(&repo_dist);
 
     let pdb_dist = resolve_pdb_dist(&repo_dist);
     let Some(pdb_dist) = pdb_dist else {
@@ -43,6 +44,7 @@ fn main() {
         fs::remove_dir_all(&asset_dir).unwrap();
     }
     copy_dir_recursive(&pdb_dist, &asset_dir);
+    print_rerun_if_changed_recursive(&pdb_dist);
 
     println!(
         "cargo:warning=Embedded pdb/dist from {}",
@@ -58,6 +60,7 @@ fn resolve_pdb_dist(repo_dist: &Path) -> Option<PathBuf> {
         let explicit = PathBuf::from(explicit);
         if explicit.join("index.html").is_file() {
             println!("cargo:rerun-if-changed={}", explicit.display());
+            print_rerun_if_changed_recursive(&explicit);
             return Some(explicit);
         }
         panic!(
@@ -70,6 +73,24 @@ fn resolve_pdb_dist(repo_dist: &Path) -> Option<PathBuf> {
         .join("index.html")
         .is_file()
         .then(|| repo_dist.to_path_buf())
+}
+
+fn print_rerun_if_changed_recursive(path: &Path) {
+    let Ok(metadata) = fs::metadata(path) else {
+        return;
+    };
+
+    if metadata.is_file() {
+        println!("cargo:rerun-if-changed={}", path.display());
+        return;
+    }
+
+    let Ok(entries) = fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        print_rerun_if_changed_recursive(&entry.path());
+    }
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) {

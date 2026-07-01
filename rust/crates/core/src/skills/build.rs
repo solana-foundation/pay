@@ -951,6 +951,7 @@ fn build_detail_endpoints(
 
 fn should_publish_probed_endpoint(probe: &crate::skills::probe::EndpointProbeResult) -> bool {
     matches!(probe.probe_status.as_str(), "ok" | "free")
+        || crate::skills::probe::is_parameterized_not_found(probe)
 }
 
 // ── Public API ─────────────────────────────────────────────────────────────
@@ -1117,6 +1118,10 @@ mod tests {
                     )
                 }
             }
+            p if p.starts_with("/missing-resource") => (
+                "404 Not Found",
+                r#"{"error":"product_not_found"}"#.to_string(),
+            ),
             "/wrong-chain" => ("402 Payment Required", x402_body("eip155:8453")),
             "/auth" => (
                 "401 Unauthorized",
@@ -1233,5 +1238,43 @@ mod tests {
         assert_eq!(detail[0].probe_status.as_deref(), Some("free"));
         // Published path is clean — the query was probe-only.
         assert_eq!(detail[0].spec.path, "/needs-query");
+    }
+
+    #[test]
+    fn build_keeps_parameterized_404_as_warning_endpoint() {
+        let (service_url, handle) = start_probe_server(1);
+        let endpoints = vec![crate::skills::openapi::ResolvedEndpoint {
+            spec: EndpointSpec {
+                method: "GET".to_string(),
+                path: "/missing-resource".to_string(),
+                description: "Fetch a quote for a product".to_string(),
+                resource: None,
+                pricing: None,
+            },
+            body_example: None,
+            query_example: Some("product_id=stale".to_string()),
+        }];
+        let options = BuildOptions {
+            probe: true,
+            probe_config: crate::skills::probe::ProbeConfig {
+                timeout_secs: 2,
+                concurrency: 1,
+                ..Default::default()
+            },
+            only: None,
+            previous_dist: None,
+        };
+
+        let detail = build_detail_endpoints("test/provider", &service_url, endpoints, &options);
+        handle.join().expect("server thread");
+
+        assert_eq!(detail.len(), 1, "parameterized 404 should be retained");
+        assert_eq!(
+            detail[0].probe_status.as_deref(),
+            Some("parameterized_not_found")
+        );
+        assert_eq!(detail[0].spec.path, "/missing-resource");
+        assert!(detail[0].protocol.is_empty());
+        assert!(detail[0].supported_usd.is_empty());
     }
 }

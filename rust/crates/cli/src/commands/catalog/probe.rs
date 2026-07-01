@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use owo_colors::OwoColorize;
 
 use pay_core::skills::build::parse_frontmatter;
+use pay_core::skills::openapi::ResolvedEndpoint;
 use pay_core::skills::probe::{ProbeReport, ProbeStatus};
 
 /// Parse a single PAY.md / .md file into a `ProbeProvider`. The FQN is derived
@@ -27,12 +28,7 @@ pub fn parse_single_provider(
     let openapi_driven = spec.openapi.is_some();
     let endpoints = resolved
         .into_iter()
-        .map(|r| pay_types::registry::ProbeEndpoint {
-            method: r.spec.method,
-            path: r.spec.path,
-            metered: openapi_driven || r.spec.pricing.is_some(),
-            body: r.body_example,
-        })
+        .map(|r| resolved_endpoint_to_probe_endpoint(r, openapi_driven))
         .collect();
 
     Ok(pay_types::registry::ProbeProvider {
@@ -153,12 +149,7 @@ fn parse_provider_file(
     let openapi_driven = spec.openapi.is_some();
     let endpoints = resolved
         .into_iter()
-        .map(|r| pay_types::registry::ProbeEndpoint {
-            method: r.spec.method,
-            path: r.spec.path,
-            metered: openapi_driven || r.spec.pricing.is_some(),
-            body: r.body_example,
-        })
+        .map(|r| resolved_endpoint_to_probe_endpoint(r, openapi_driven))
         .collect();
 
     Ok(Some(pay_types::registry::ProbeProvider {
@@ -166,6 +157,22 @@ fn parse_provider_file(
         service_url: spec.meta.service_url,
         endpoints,
     }))
+}
+
+fn resolved_endpoint_to_probe_endpoint(
+    r: ResolvedEndpoint,
+    openapi_driven: bool,
+) -> pay_types::registry::ProbeEndpoint {
+    let path = match &r.query_example {
+        Some(q) => format!("{}?{}", r.spec.path, q),
+        None => r.spec.path.clone(),
+    };
+    pay_types::registry::ProbeEndpoint {
+        method: r.spec.method,
+        path,
+        metered: openapi_driven || r.spec.pricing.is_some(),
+        body: r.body_example,
+    }
 }
 
 /// Render results as a colored table.
