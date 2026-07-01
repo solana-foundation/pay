@@ -1,7 +1,6 @@
 import type { PaymentFlow, SessionInfo } from "../types";
 import { explorerTokenUrl, useConfig } from "../hooks/useConfig";
 import { formatUnits, shortAddr } from "../lib/format";
-import { ReceiptLink } from "./ReceiptLink";
 
 const U64_MAX = "18446744073709551615";
 const SESSION_COLORS = [
@@ -523,8 +522,6 @@ export function SessionChannel({ flow }: { flow: PaymentFlow }) {
           </span>
         </div>
       </div>
-
-      <ReceiptLink flow={flow} />
     </div>
   );
 }

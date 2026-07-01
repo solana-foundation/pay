@@ -171,7 +171,7 @@ export class FlowCorrelation {
         },
         {
           ts: now,
-          message: `402 Payment Required`,
+          message: `402 Payment Gate`,
           detail:
             protocol === "mpp" || protocol === "session"
               ? `www-authenticate: ${truncate(resHeader(entry, "www-authenticate"), 120)}`
@@ -382,12 +382,12 @@ function flowKey(clientIp: string, path: string): string {
 
 function buildSteps(protocol: Protocol): FlowStep[] {
   const challengeLabel =
-    protocol === "session" ? "402 Session Intent" : "402 Payment Required";
+    protocol === "session" ? "402 Session Intent" : "402 Payment Gate";
   const paymentLabel =
-    protocol === "session" ? "Open / Voucher" : "Payment Retry";
+    protocol === "session" ? "Open / Voucher" : "Paid Request";
 
   return [
-    { key: "request", label: "Client Request", status: "pending", ts: null },
+    { key: "request", label: "Initial Request", status: "pending", ts: null },
     {
       key: "challenge",
       label: challengeLabel,

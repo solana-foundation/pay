@@ -243,6 +243,41 @@ pub(crate) fn decode_payment_amount(
     telemetry::payment_amount_from_raw(&request.amount, decimals, request.currency)
 }
 
+const RESOURCE_MEMO_NONCE_HEX_LEN: usize = 3;
+
+pub(crate) fn resource_memo_with_nonce(resource: Option<&str>, max_bytes: usize) -> Option<String> {
+    let resource = resource.map(str::trim).filter(|r| !r.is_empty())?;
+    let nonce = rand::random::<[u8; 2]>()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
+        .chars()
+        .take(RESOURCE_MEMO_NONCE_HEX_LEN)
+        .collect::<String>();
+    let memo = format!("{resource}#{nonce}");
+    if memo.len() <= max_bytes {
+        Some(memo)
+    } else {
+        // Preserve the pre-existing resource memo behavior for unusually long
+        // resources instead of silently truncating the identifier.
+        Some(resource.to_string())
+    }
+}
+
+pub(crate) fn resource_memo_matches(memo: &str, resource: &str) -> bool {
+    if memo == resource {
+        return true;
+    }
+    let Some(suffix) = memo
+        .strip_prefix(resource)
+        .and_then(|rest| rest.strip_prefix('#'))
+    else {
+        return false;
+    };
+    suffix.len() == RESOURCE_MEMO_NONCE_HEX_LEN
+        && suffix.as_bytes().iter().all(u8::is_ascii_hexdigit)
+}
+
 pub fn readable_verification_message(error: &pay_kit::mpp::server::VerificationError) -> String {
     let message = error.to_string();
     if message.contains("Fee payer cannot authorize the SPL payment transfer") {
@@ -370,6 +405,29 @@ mod tests {
         assert_eq!(params.get("foo"), Some(&"bar".to_string()));
         assert_eq!(params.get("empty"), Some(&"".to_string()));
         assert_eq!(params.get("baz"), Some(&"qux".to_string()));
+    }
+
+    #[test]
+    fn resource_memo_keeps_resource_and_adds_3_hex_char_nonce() {
+        let memo = resource_memo_with_nonce(Some("fortune"), 566).unwrap();
+        assert!(memo.starts_with("fortune#"));
+        assert_eq!(memo.len(), "fortune#".len() + 3);
+        assert!(resource_memo_matches(&memo, "fortune"));
+    }
+
+    #[test]
+    fn resource_memo_matcher_accepts_legacy_static_resource() {
+        assert!(resource_memo_matches("fortune", "fortune"));
+        assert!(!resource_memo_matches("fortune#not-hex", "fortune"));
+        assert!(!resource_memo_matches("other#012", "fortune"));
+    }
+
+    #[test]
+    fn resource_memo_falls_back_when_nonce_would_exceed_limit() {
+        assert_eq!(
+            resource_memo_with_nonce(Some("fortune"), "fortune".len()).as_deref(),
+            Some("fortune")
+        );
     }
 
     #[test]

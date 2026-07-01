@@ -2,6 +2,7 @@ import type { PaymentFlow } from "../types";
 import { SequenceDiagram } from "./SequenceDiagram";
 import { EventLog } from "./EventLog";
 import { PaymentSplits } from "./PaymentSplits";
+import { ReceiptLink } from "./ReceiptLink";
 import { SessionChannel } from "./SessionChannel";
 
 interface Props {
@@ -12,7 +13,12 @@ export function FlowDetail({ flow }: Props) {
   const success = flow.status === "resource-delivered";
   return (
     <div className={`flow-detail${flow.session ? " has-session" : ""}`}>
-      <SequenceDiagram steps={flow.steps} failed={flow.status === "failed"} success={success} />
+      <SequenceDiagram
+        steps={flow.steps}
+        failed={flow.status === "failed"}
+        success={success}
+        deliveredContent={success ? <ReceiptLink flow={flow} /> : null}
+      />
       <div className="flow-middle">
         {flow.session ? (
           <SessionChannel flow={flow} />

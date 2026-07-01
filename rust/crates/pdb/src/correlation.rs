@@ -225,7 +225,7 @@ impl FlowCorrelation {
                 },
                 FlowEvent {
                     ts: now.clone(),
-                    message: "402 Payment Required".into(),
+                    message: "402 Payment Gate".into(),
                     detail: Some(challenge_detail),
                 },
             ],
@@ -601,18 +601,18 @@ fn is_x402_body(body: &Option<String>) -> bool {
 
 fn build_steps(protocol: &Protocol) -> Vec<FlowStep> {
     let payment_label = match protocol {
-        Protocol::Mpp => "Payment Retry",
+        Protocol::Mpp => "Paid Request",
         Protocol::Session => "Open / Voucher",
-        Protocol::X402 => "Payment Retry",
+        Protocol::X402 => "Paid Request",
     };
     let challenge_label = match protocol {
         Protocol::Session => "402 Session Intent",
-        Protocol::Mpp | Protocol::X402 => "402 Payment Required",
+        Protocol::Mpp | Protocol::X402 => "402 Payment Gate",
     };
     vec![
         FlowStep {
             key: "request".into(),
-            label: "Client Request".into(),
+            label: "Initial Request".into(),
             status: StepStatus::Pending,
             ts: None,
         },

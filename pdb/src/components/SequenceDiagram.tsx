@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import type { FlowStep } from "../types";
 
 function fmtTime(iso: string): string {
@@ -13,14 +14,22 @@ interface Props {
   steps: FlowStep[];
   failed?: boolean;
   success?: boolean;
+  deliveredContent?: ReactNode;
 }
 
 const ROW_H = 52;
+const DELIVERED_CONTENT_H = 28;
 const R = 7;
 const CX = 10;
 
-export function SequenceDiagram({ steps, failed, success }: Props) {
-  const totalH = steps.length * ROW_H;
+export function SequenceDiagram({ steps, failed, success, deliveredContent }: Props) {
+  const rowHeights = steps.map((step) =>
+    step.key === "delivery" && deliveredContent ? ROW_H + DELIVERED_CONTENT_H : ROW_H,
+  );
+  const rowOffsets = rowHeights.map((_, i) =>
+    rowHeights.slice(0, i).reduce((sum, height) => sum + height, 0),
+  );
+  const totalH = rowHeights.reduce((sum, height) => sum + height, 0);
 
   // Find the first non-completed step index (where failure icon goes)
   const failedIdx = failed
@@ -33,7 +42,7 @@ export function SequenceDiagram({ steps, failed, success }: Props) {
       <div className="seq-container">
         <svg width={CX * 2} height={totalH} className="seq-track">
           {steps.map((step, i) => {
-            const cy = i * ROW_H + R + 1;
+            const cy = rowOffsets[i] + R + 1;
             const isLast = i === steps.length - 1;
             const completed = step.status === "completed";
             const isFailed = i === failedIdx;
@@ -60,7 +69,7 @@ export function SequenceDiagram({ steps, failed, success }: Props) {
                 {!isLast && (
                   <line
                     x1={CX} y1={cy + R}
-                    x2={CX} y2={(i + 1) * ROW_H + 1}
+                    x2={CX} y2={rowOffsets[i + 1] + 1}
                     stroke={lineColor}
                     strokeWidth={3}
                   />
@@ -88,11 +97,12 @@ export function SequenceDiagram({ steps, failed, success }: Props) {
         </svg>
         <div className="seq-labels">
           {steps.map((step, i) => (
-            <div className="seq-row" key={step.key} style={{ height: ROW_H }}>
+            <div className="seq-row" key={step.key} style={{ height: rowHeights[i] }}>
               <div className={`step-label${step.status === "pending" ? " pending" : ""}${i === failedIdx ? " failed" : ""}`}>
                 {step.label}
               </div>
               {step.ts && <div className="step-ts">{fmtTime(step.ts)}</div>}
+              {step.key === "delivery" && deliveredContent}
             </div>
           ))}
         </div>

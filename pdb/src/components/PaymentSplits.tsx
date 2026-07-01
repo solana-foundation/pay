@@ -2,7 +2,6 @@ import { useRef, useEffect, useState } from "react";
 import type { PaymentFlow } from "../types";
 import { Amount, formatUsd } from "./Amount";
 import { useConfig, explorerTokenUrl } from "../hooks/useConfig";
-import { ReceiptLink } from "./ReceiptLink";
 import { parseReceipt } from "../utils/receipt";
 
 function fmtDate(ts?: string): string | null {
@@ -276,12 +275,6 @@ export function PaymentSplits({ flow, success }: { flow: PaymentFlow; success: b
               </div>
             )}
           </div>
-          <ReceiptLink
-            flow={flow}
-            label={
-              isSubscription ? "View activation transaction" : "View receipt"
-            }
-          />
         </div>
       </div>
     );
@@ -422,8 +415,6 @@ export function PaymentSplits({ flow, success }: { flow: PaymentFlow; success: b
           </a>
         </div>
       )}
-
-      <ReceiptLink flow={flow} />
     </div>
   );
 }
