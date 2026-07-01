@@ -22,6 +22,10 @@ pub enum RunOutcome {
         challenge: Box<mpp::Challenge>,
         alternatives: Vec<mpp::Challenge>,
         x402_alternative: Option<Box<x402::Challenge>>,
+        /// Every x402 `upto` currency advertised on the same 402, carried so the
+        /// balance- and cost-aware selector can settle whichever is cheapest (or
+        /// the only fundable one) — not just the first. See [`mpp::choose_payment`].
+        x402_upto_accepts: Vec<pay_kit::x402::upto::UptoRequirements>,
         resource_url: String,
     },
     /// The server returned 402 with an MPP session challenge (intent="session").
@@ -583,12 +587,24 @@ pub(crate) fn classify_402_with_preference(
     if !charge_challenges.is_empty() && preference != ProtocolPreference::OnlyX402 {
         let challenge = charge_challenges.remove(0);
         info!(resource = resource_url, "Detected MPP challenge (Solana)");
+        // An `upto`-only x402 offer also parses leniently as `exact`, so when a
+        // real `upto` is present prefer that reading and drop the (bogus) exact
+        // alternative — otherwise the selector could pick an `exact` the server
+        // never advertised and the payment would be rejected.
+        let x402_upto_accepts = x402::parse_upto_accepts(headers, body);
+        let x402_alternative = if x402_upto_accepts.is_empty() {
+            x402_challenge.clone().map(Box::new)
+        } else {
+            None
+        };
         return RunOutcome::MppChallenge {
             challenge: Box::new(challenge),
             alternatives: charge_challenges,
-            // Carry any x402 charge from the same 402 so a balance-aware
-            // selector can fall back to it when no MPP challenge is fundable.
-            x402_alternative: x402_challenge.clone().map(Box::new),
+            // Carry any x402 charge from the same 402 so the balance- and
+            // cost-aware selector can settle it when it's cheaper or the only
+            // fundable option.
+            x402_alternative,
+            x402_upto_accepts,
             resource_url: resource_url.to_string(),
         };
     }

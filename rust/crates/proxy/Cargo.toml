@@ -27,8 +27,10 @@ pay-core = { workspace = true, features = ["server"] }
 pay-types = { workspace = true }
 pay-kit = { workspace = true }
 axum = { workspace = true }
+reqwest = { workspace = true }
 http = "1"
 async-trait = "0.1"
 bytes = "1"
 anyhow = "1"
+futures-util = "0.3"
 tracing = { workspace = true }

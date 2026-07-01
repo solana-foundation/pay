@@ -3211,12 +3211,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
-name = "foldhash"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
-
-[[package]]
 name = "foreign-types"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3851,7 +3845,7 @@ checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
  "allocator-api2",
  "equivalent",
- "foldhash 0.1.5",
+ "foldhash",
 ]
 
 [[package]]
@@ -3859,11 +3853,6 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
-dependencies = [
- "allocator-api2",
- "equivalent",
- "foldhash 0.2.0",
-]
 
 [[package]]
 name = "hcl-edit"
@@ -5874,7 +5863,7 @@ version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "680998035259dcfcafe653688bf2aa6d3e2dc05e98be6ab46afb089dc84f1df8"
 dependencies = [
- "proc-macro-crate 3.5.0",
+ "proc-macro-crate 1.3.1",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
@@ -6307,7 +6296,7 @@ checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
 
 [[package]]
 name = "pay"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -6359,7 +6348,7 @@ dependencies = [
 
 [[package]]
 name = "pay-core"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -6414,7 +6403,7 @@ dependencies = [
 
 [[package]]
 name = "pay-integration"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "base64 0.22.1",
  "pay-core",
@@ -6425,7 +6414,7 @@ dependencies = [
 
 [[package]]
 name = "pay-keystore"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "bs58",
  "secret-service",
@@ -6442,7 +6431,7 @@ dependencies = [
 
 [[package]]
 name = "pay-mcp"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "base64 0.22.1",
  "crc32fast",
@@ -6464,7 +6453,7 @@ dependencies = [
 
 [[package]]
 name = "pay-pdb"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -6486,16 +6475,18 @@ dependencies = [
 
 [[package]]
 name = "pay-proxy"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "axum",
  "bytes 1.12.0",
+ "futures-util",
  "http 1.4.2",
  "pay-core",
  "pay-types",
  "pingora",
+ "reqwest 0.12.28",
  "rustls 0.23.40",
  "solana-pay-kit",
  "tracing",
@@ -6503,30 +6494,13 @@ dependencies = [
 
 [[package]]
 name = "pay-types"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "schemars 0.8.22",
  "serde",
  "serde_json",
  "serde_yml",
- "solana-pay-core",
-]
-
-[[package]]
-name = "payment-channels-client"
-version = "0.1.0"
-source = "git+https://github.com/solana-foundation/pay-kit?rev=e3d4d933a1fca84ff9c3a1eb2c1292f1113228be#e3d4d933a1fca84ff9c3a1eb2c1292f1113228be"
-dependencies = [
- "borsh 1.7.0",
- "num-derive",
- "num-traits",
- "solana-account-info 3.1.1",
- "solana-address 2.5.0",
- "solana-client 4.0.0",
- "solana-cpi 3.1.0",
- "solana-instruction 3.2.0",
- "solana-program-error 3.0.1",
- "thiserror 2.0.18",
+ "solana-pay-kit",
 ]
 
 [[package]]
@@ -6770,7 +6744,7 @@ dependencies = [
  "serde",
  "serde_yaml 0.8.26",
  "sfv",
- "socket2 0.6.4",
+ "socket2 0.4.10",
  "strum 0.26.3",
  "strum_macros 0.26.4",
  "tokio",
@@ -6852,8 +6826,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32f1c33f6ce9ca9b8e81190796f7d4d543d1ab2a310097d884ebe48ce5d33c4d"
 dependencies = [
  "arrayvec",
- "hashbrown 0.17.1",
- "parking_lot 0.12.5",
+ "hashbrown 0.13.2",
+ "parking_lot 0.11.2",
  "rand 0.8.6",
 ]
 
@@ -7207,7 +7181,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
@@ -10207,8 +10181,9 @@ dependencies = [
 
 [[package]]
 name = "solana-keychain"
-version = "1.3.0"
-source = "git+https://github.com/solana-foundation/solana-keychain?rev=d788028edbe02a94ef5eee7585d0230ad771296e#d788028edbe02a94ef5eee7585d0230ad771296e"
+version = "1.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6faefd705bf8e950cf15d7ab0690246abfaf3b898b556e8be3482b21ed2f95a"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -10510,56 +10485,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "solana-mpp"
-version = "0.6.0"
-source = "git+https://github.com/solana-foundation/pay-kit?rev=e3d4d933a1fca84ff9c3a1eb2c1292f1113228be#e3d4d933a1fca84ff9c3a1eb2c1292f1113228be"
-dependencies = [
- "base64 0.22.1",
- "bincode",
- "blake3",
- "borsh 1.7.0",
- "bs58",
- "bytemuck",
- "ed25519-dalek 2.2.0",
- "five8_core 0.1.2",
- "hmac 0.12.1",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "serde_json_canonicalizer",
- "sha2 0.10.9",
- "solana-address 2.5.0",
- "solana-commitment-config",
- "solana-hash 3.1.0",
- "solana-instruction 3.2.0",
- "solana-keychain",
- "solana-keypair",
- "solana-message 3.1.0",
- "solana-pay-core",
- "solana-pubkey 3.0.0",
- "solana-rpc-client 4.0.0",
- "solana-signature",
- "solana-signer",
- "solana-system-interface 2.0.0",
- "solana-transaction",
- "solana-transaction-status-client-types 4.0.0",
- "solana-zero-copy",
- "solana-zk-elgamal-proof-interface",
- "solana-zk-sdk 7.0.1",
- "solana-zk-sdk-pod",
- "spl-associated-token-account",
- "spl-record",
- "spl-token-2022",
- "spl-token-confidential-transfer-proof-extraction",
- "spl-token-confidential-transfer-proof-generation 0.6.1",
- "subscriptions-client",
- "thiserror 2.0.18",
- "time",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "solana-msg"
 version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10733,52 +10658,67 @@ dependencies = [
 ]
 
 [[package]]
-name = "solana-pay-core"
-version = "0.1.0"
-source = "git+https://github.com/solana-foundation/pay-kit?rev=e3d4d933a1fca84ff9c3a1eb2c1292f1113228be#e3d4d933a1fca84ff9c3a1eb2c1292f1113228be"
+name = "solana-pay-kit"
+version = "0.2.0"
+source = "git+https://github.com/solana-foundation/pay-kit?rev=b8b2fd467ec363dd715a0523cf95e679a7169a69#b8b2fd467ec363dd715a0523cf95e679a7169a69"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bincode",
+ "blake3",
  "borsh 1.7.0",
  "bs58",
+ "bytemuck",
  "ed25519-dalek 2.2.0",
  "five8_core 0.1.2",
  "getrandom 0.3.4",
+ "hmac 0.12.1",
+ "num-derive",
+ "num-traits",
  "opentelemetry 0.31.0",
  "opentelemetry-appender-tracing",
  "opentelemetry-otlp",
  "opentelemetry-semantic-conventions 0.31.0",
  "opentelemetry_sdk 0.31.0",
- "payment-channels-client",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "serde_json_canonicalizer",
  "sha2 0.10.9",
+ "solana-account-info 3.1.1",
  "solana-address 2.5.0",
+ "solana-client 4.0.0",
+ "solana-commitment-config",
+ "solana-cpi 3.1.0",
  "solana-hash 3.1.0",
  "solana-instruction 3.2.0",
  "solana-keychain",
+ "solana-keypair",
  "solana-message 3.1.0",
+ "solana-program-error 3.0.1",
  "solana-pubkey 3.0.0",
  "solana-rpc-client 4.0.0",
  "solana-signature",
+ "solana-signer",
+ "solana-system-interface 2.0.0",
  "solana-transaction",
+ "solana-transaction-status-client-types 4.0.0",
+ "solana-zero-copy",
+ "solana-zk-elgamal-proof-interface",
+ "solana-zk-sdk 7.0.1",
+ "solana-zk-sdk-pod",
+ "spl-associated-token-account",
+ "spl-record",
+ "spl-token-2022",
+ "spl-token-confidential-transfer-proof-extraction",
+ "spl-token-confidential-transfer-proof-generation 0.6.1",
  "thiserror 2.0.18",
+ "time",
  "tokio",
  "tracing",
  "tracing-opentelemetry 0.32.1",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "solana-pay-kit"
-version = "0.1.0"
-source = "git+https://github.com/solana-foundation/pay-kit?rev=e3d4d933a1fca84ff9c3a1eb2c1292f1113228be#e3d4d933a1fca84ff9c3a1eb2c1292f1113228be"
-dependencies = [
- "serde_json",
- "solana-mpp",
- "solana-x402",
+ "url 2.5.8",
 ]
 
 [[package]]
@@ -13145,36 +13085,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "solana-x402"
-version = "0.1.0"
-source = "git+https://github.com/solana-foundation/pay-kit?rev=e3d4d933a1fca84ff9c3a1eb2c1292f1113228be#e3d4d933a1fca84ff9c3a1eb2c1292f1113228be"
-dependencies = [
- "base64 0.22.1",
- "bincode",
- "bs58",
- "getrandom 0.3.4",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "solana-address 1.1.0",
- "solana-commitment-config",
- "solana-hash 3.1.0",
- "solana-instruction 3.2.0",
- "solana-keychain",
- "solana-message 3.1.0",
- "solana-pay-core",
- "solana-pubkey 3.0.0",
- "solana-rpc-client 4.0.0",
- "solana-signature",
- "solana-system-interface 2.0.0",
- "solana-transaction",
- "solana-transaction-status-client-types 4.0.0",
- "thiserror 2.0.18",
- "tokio",
- "url 2.5.8",
-]
-
-[[package]]
 name = "solana-zero-copy"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13863,22 +13773,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
-]
-
-[[package]]
-name = "subscriptions-client"
-version = "0.1.0"
-source = "git+https://github.com/solana-foundation/pay-kit?rev=e3d4d933a1fca84ff9c3a1eb2c1292f1113228be#e3d4d933a1fca84ff9c3a1eb2c1292f1113228be"
-dependencies = [
- "borsh 1.7.0",
- "num-derive",
- "num-traits",
- "solana-account-info 3.1.1",
- "solana-address 2.5.0",
- "solana-cpi 3.1.0",
- "solana-instruction 3.2.0",
- "solana-program-error 3.0.1",
- "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -15403,7 +15297,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

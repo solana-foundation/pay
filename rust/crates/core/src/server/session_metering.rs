@@ -706,6 +706,7 @@ mod tests {
                 notes: None,
                 splits: vec![],
             }],
+            meter: None,
         }
     }
 
@@ -717,6 +718,7 @@ mod tests {
             splits: vec![],
             schemes: None,
             min_usd: None,
+            upto: None,
         }
     }
 
@@ -823,6 +825,7 @@ endpoints:
             splits: vec![],
             schemes: None,
             min_usd: None,
+            upto: None,
         };
 
         let spec = spec_from_metering(
@@ -853,6 +856,7 @@ endpoints:
             splits: vec![],
             schemes: None,
             min_usd: None,
+            upto: None,
         };
 
         let spec = spec_from_metering(
@@ -893,6 +897,7 @@ endpoints:
                     splits: vec![],
                 },
             ],
+            meter: None,
         }]);
         let props = RequestProperties {
             context_length: Some(250_000),
@@ -931,6 +936,7 @@ endpoints:
                     splits: vec![],
                 },
             ],
+            meter: None,
         }]);
 
         let spec = spec_from_metering(&metering, SessionMeteringContext::new()).unwrap();
@@ -964,6 +970,7 @@ endpoints:
             splits: vec![],
             schemes: None,
             min_usd: None,
+            upto: None,
         };
 
         let err = spec_from_metering(&metering, SessionMeteringContext::new()).unwrap_err();

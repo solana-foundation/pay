@@ -7,12 +7,12 @@ pub mod splits;
 
 /// Well-known mint addresses for supported Solana stablecoins.
 ///
-/// Re-exported from pay-kit's shared base crate (`solana_pay_core::mints`) so
+/// Re-exported from pay-kit's shared core module (`pay_kit::core::mints`) so
 /// there is a single source of truth for mint addresses across the client and
 /// both protocol SDKs. Do not hard-code addresses here — add them upstream in
-/// pay-kit's core crate instead.
+/// pay-kit's core module instead.
 pub mod stablecoin_mints {
-    pub use solana_pay_core::mints::{
+    pub use pay_kit::core::mints::{
         CASH_MAINNET, PYUSD_DEVNET, PYUSD_MAINNET, PYUSD_TESTNET, USDC_DEVNET, USDC_MAINNET,
         USDC_TESTNET, USDG_MAINNET, USDPT_MAINNET, USDT_MAINNET,
     };

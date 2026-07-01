@@ -5,7 +5,7 @@
 //! - Payment header → verify with solana-mpp, then forward upstream
 
 use axum::body::Body;
-use axum::http::{HeaderMap, Request, StatusCode};
+use axum::http::{HeaderMap, Request, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use pay_kit::mpp::AUTHORIZATION_HEADER;
@@ -103,9 +103,65 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
             // metered amount on success, refund on failure.
             if let Some(uf) = upto {
                 let served_ok = response.status().is_success();
-                let settle_amount = uf.settle_amount;
-                if let Some((n, v)) =
-                    crate::server::gate::settle_upto(&state, *uf.open, settle_amount, served_ok)
+                if let Some(plan) = uf.settlement {
+                    if metering::upto_requires_response_body(
+                        &plan.metering,
+                        plan.variant_hint.as_deref(),
+                    ) {
+                        let limit = metering::upto_response_body_limit(&plan.metering);
+                        let (mut parts, body) = response.into_parts();
+                        match axum::body::to_bytes(body, limit).await {
+                            Ok(bytes) => {
+                                if let Some((n, v)) = crate::server::gate::settle_upto_metered(
+                                    &state,
+                                    *uf.open,
+                                    plan,
+                                    served_ok,
+                                    &parts.headers,
+                                    Some(&bytes),
+                                )
+                                .await
+                                {
+                                    parts.headers.append(n, v);
+                                }
+                                parts.headers.remove(header::CONTENT_LENGTH);
+                                response = Response::from_parts(parts, Body::from(bytes));
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "failed to buffer x402 upto response body; refunding"
+                                );
+                                let mut builder =
+                                    Response::builder().status(StatusCode::BAD_GATEWAY);
+                                if let Some((n, v)) =
+                                    crate::server::gate::settle_upto(&state, *uf.open, 0, false)
+                                        .await
+                                {
+                                    builder = builder.header(n, v);
+                                }
+                                response = builder
+                                    .header(header::CONTENT_TYPE, "application/json")
+                                    .body(Body::from(r#"{"error":"response_metering_failed"}"#))
+                                    .unwrap_or_else(|_| {
+                                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                                    });
+                            }
+                        }
+                    } else if let Some((n, v)) = crate::server::gate::settle_upto_metered(
+                        &state,
+                        *uf.open,
+                        plan,
+                        served_ok,
+                        response.headers(),
+                        None,
+                    )
+                    .await
+                    {
+                        response.headers_mut().append(n, v);
+                    }
+                } else if let Some((n, v)) =
+                    crate::server::gate::settle_upto(&state, *uf.open, uf.settle_amount, served_ok)
                         .await
                 {
                     response.headers_mut().append(n, v);

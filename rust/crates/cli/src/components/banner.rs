@@ -8,7 +8,7 @@ pub const PAY_SH_BANNER: &[&str] = &[
     "██║     ██║  ██║   ██║   ██╗███████║██║  ██║",
     "╚═╝     ╚═╝  ╚═╝   ╚═╝   ╚═╝╚══════╝╚═╝  ╚═╝",
 ];
-pub const PAY_SH_TAGLINE: &str = "Toolchain for Programmable Money";
+pub const PAY_SH_TAGLINE: &str = "Toolchain for agentic payments";
 
 /// Render the banner used at the top of human help output.
 pub fn help_banner() -> String {
@@ -34,7 +34,7 @@ fn render_banner_art(tagline: impl std::fmt::Display) -> String {
             .collect::<Vec<_>>()
             .join("\n"),
     );
-    output.push_str(&format!("\n  {tagline}"));
+    output.push_str(&format!("\n{tagline}"));
     output
 }
 
@@ -87,5 +87,7 @@ mod tests {
 
         assert!(banner.starts_with("\n\x1b["));
         assert!(!banner.starts_with("\n "));
+        assert!(banner.ends_with(&format!("\n{PAY_SH_TAGLINE}")));
+        assert!(!banner.ends_with(&format!("\n  {PAY_SH_TAGLINE}")));
     }
 }

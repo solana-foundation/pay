@@ -247,8 +247,10 @@ pub fn select_challenge_by_balance<'a>(
 pub enum ChosenPayment {
     /// Settle via an MPP charge challenge.
     Mpp(Box<Challenge>),
-    /// Settle via the x402 alternative advertised on the same 402.
+    /// Settle via the x402 `exact` alternative advertised on the same 402.
     X402(Box<crate::client::x402::Challenge>),
+    /// Settle via the x402 `upto` alternative advertised on the same 402.
+    X402Upto(Box<crate::client::x402::UptoChallenge>),
 }
 
 /// Choose how to pay a 402, across *both* MPP charge challenges and an x402
@@ -267,6 +269,7 @@ pub enum ChosenPayment {
 pub fn choose_payment(
     mpp_challenges: &[Challenge],
     x402_alternative: Option<&crate::client::x402::Challenge>,
+    x402_upto_accepts: &[pay_kit::x402::upto::UptoRequirements],
     store: &dyn AccountsStore,
     network_override: Option<&str>,
     account_override: Option<&str>,
@@ -274,12 +277,21 @@ pub fn choose_payment(
     let candidates = decoded_charge_candidates(mpp_challenges, network_override)?;
 
     // Network/RPC come from the first decodable MPP charge. With no decodable
-    // MPP candidate, the only thing left to honor is the x402 alternative.
+    // MPP candidate, honor an x402 alternative (exact preferred, else the first
+    // advertised upto — balance-aware ranking needs an MPP network to fetch
+    // against, so this degenerate path settles the first offered upto).
     let Some(first) = candidates.first() else {
-        return x402_alternative
-            .cloned()
-            .map(|c| ChosenPayment::X402(Box::new(c)))
-            .ok_or_else(|| Error::Mpp("No usable payment challenge".to_string()));
+        if let Some(c) = x402_alternative.cloned() {
+            return Ok(ChosenPayment::X402(Box::new(c)));
+        }
+        if let Some(requirements) = x402_upto_accepts.first() {
+            return Ok(ChosenPayment::X402Upto(Box::new(
+                crate::client::x402::UptoChallenge {
+                    requirements: requirements.clone(),
+                },
+            )));
+        }
+        return Err(Error::Mpp("No usable payment challenge".to_string()));
     };
 
     let legacy_first_mpp =
@@ -330,18 +342,28 @@ pub fn choose_payment(
         .map(|c| c.requirements.clone())
         .into_iter()
         .collect();
-
-    match pay_kit::select_payment_parsed(
+    // Cost-first across all three schemes; `CheapestPayable` ties break to MPP
+    // (native one-shot), then upto, then exact — see `select`'s `Source::rank`.
+    match pay_kit::select_payment_parsed_all(
         mpp_challenges,
         &x402_accepts,
+        x402_upto_accepts,
         &funded,
-        &pay_kit::OrderingStrategy::HighestBalance,
+        &pay_kit::OrderingStrategy::CheapestPayable,
     ) {
-        Ok(pay_kit::SelectedPayment::Mpp { challenge, .. }) => Ok(ChosenPayment::Mpp(challenge)),
-        Ok(pay_kit::SelectedPayment::X402 { .. }) => x402_alternative
+        Ok(pay_kit::SelectedPayment::MppCharge { challenge, .. }) => {
+            Ok(ChosenPayment::Mpp(challenge))
+        }
+        Ok(pay_kit::SelectedPayment::X402Exact { .. }) => x402_alternative
             .cloned()
             .map(|c| ChosenPayment::X402(Box::new(c)))
-            .ok_or_else(|| Error::Mpp("x402 selected but no challenge available".to_string())),
+            .ok_or_else(|| Error::Mpp("x402 exact selected but no challenge available".into())),
+        // The router picks the specific upto currency; build that one.
+        Ok(pay_kit::SelectedPayment::X402Upto { requirement, .. }) => Ok(ChosenPayment::X402Upto(
+            Box::new(crate::client::x402::UptoChallenge {
+                requirements: *requirement,
+            }),
+        )),
         Err(e) => Err(Error::PaymentRejected(e.to_string())),
     }
 }

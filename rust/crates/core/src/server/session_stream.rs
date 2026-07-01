@@ -599,6 +599,7 @@ mod tests {
                 notes: notes.map(str::to_string),
                 splits: vec![],
             }],
+            meter: None,
         }
     }
 
@@ -610,6 +611,7 @@ mod tests {
             splits: vec![],
             schemes: None,
             min_usd: None,
+            upto: None,
         }
     }
 

@@ -583,17 +583,20 @@ fn do_paid_fetch(
             challenge,
             alternatives,
             x402_alternative,
+            x402_upto_accepts,
             ..
         } => {
             use pay_core::client::mpp::ChosenPayment;
             let mut challenges = Vec::with_capacity(1 + alternatives.len());
             challenges.push((*challenge).clone());
             challenges.extend(alternatives);
-            // Balance-aware, cross-protocol pick: settle the MPP charge the
-            // wallet can fund, or fall back to an x402 offer it can fund.
+            // Balance- and cost-aware, cross-scheme pick: settle the cheapest
+            // option the wallet can fund across MPP charge, x402 exact, and
+            // every advertised x402 upto currency.
             let chosen = pay_core::client::mpp::choose_payment(
                 &challenges,
                 x402_alternative.as_deref(),
+                &x402_upto_accepts,
                 &store,
                 network_override.as_deref(),
                 account_override.as_deref(),
@@ -620,6 +623,21 @@ fn do_paid_fetch(
                         account_override.as_deref(),
                         Some(url),
                         make_auth_override(),
+                    )?;
+                    headers.extend(
+                        built_payment
+                            .headers
+                            .into_iter()
+                            .map(|(name, value)| (name.to_string(), value)),
+                    );
+                }
+                ChosenPayment::X402Upto(challenge) => {
+                    let built_payment = pay_core::client::x402::build_upto_payment(
+                        challenge.as_ref(),
+                        &store,
+                        network_override.as_deref(),
+                        account_override.as_deref(),
+                        Some(url),
                     )?;
                     headers.extend(
                         built_payment

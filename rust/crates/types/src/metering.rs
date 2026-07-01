@@ -1038,6 +1038,23 @@ pub enum Scheme {
     X402BatchSettlement,
 }
 
+impl Scheme {
+    /// Whether this scheme settles through an on-chain payment channel.
+    ///
+    /// Channel/session schemes commit a `distributionSplits` preimage that the
+    /// program rejects when it contains duplicate recipients
+    /// (draft-solana-session-00, § Distribution Splits), so split recipients
+    /// must be unique. Charge schemes emit one transfer leg per split and allow
+    /// a recipient to repeat, disambiguated by memo (draft-solana-charge-00,
+    /// § splits).
+    pub fn is_session(self) -> bool {
+        matches!(
+            self,
+            Self::MppSession | Self::X402Upto | Self::X402BatchSettlement
+        )
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct Metering {
     /// Direct pricing dimensions (when there's a single pricing model).
@@ -1062,8 +1079,70 @@ pub struct Metering {
     /// price is the *ceiling* the client authorizes; absent a real usage meter,
     /// the operator settles a voucher for this `min` (clamped to the ceiling) on
     /// a successful serve, refunding the rest. `None` settles the full ceiling.
+    ///
+    /// Deprecated for new configs: prefer `upto.min_usd`, which lives with the
+    /// rest of the `x402-upto` settlement policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_usd: Option<f64>,
+    /// Settlement policy for `x402-upto` endpoints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upto: Option<UptoMetering>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct UptoMetering {
+    /// Authorized ceiling in USD. The client opens the channel for this amount;
+    /// settlement later debits the measured usage and refunds the remainder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_usd: Option<f64>,
+    /// Minimum amount to settle on a successful response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_usd: Option<f64>,
+    /// What to do when the upstream response succeeds but configured usage
+    /// fields cannot be extracted.
+    #[serde(default, skip_serializing_if = "is_default_missing_usage_policy")]
+    pub missing_usage: MissingUsagePolicy,
+    /// Response-body handling for usage extraction. The first supported mode is
+    /// buffered JSON, which lets the gateway compute the settlement before it
+    /// writes the final response headers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_body: Option<UptoResponseBody>,
+    /// Provider preset for common usage JSON layouts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_preset: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MissingUsagePolicy {
+    /// Close the channel with a zero voucher, refunding the full deposit.
+    #[default]
+    Refund,
+    /// Settle the configured minimum, or refund when no minimum is set.
+    Min,
+    /// Settle the full authorized ceiling.
+    Ceiling,
+    /// Treat missing usage as a settlement error. The gateway still refunds to
+    /// avoid stranding funds after the upstream has already responded.
+    Error,
+}
+
+fn is_default_missing_usage_policy(policy: &MissingUsagePolicy) -> bool {
+    matches!(policy, MissingUsagePolicy::Refund)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct UptoResponseBody {
+    pub mode: UptoResponseBodyMode,
+    /// Maximum response body bytes the gateway will buffer for usage extraction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UptoResponseBodyMode {
+    Buffer,
 }
 
 impl Metering {
@@ -1098,6 +1177,27 @@ pub struct MeterDimension {
     pub period: Option<BillingPeriod>,
     /// Volume tiers. Evaluated in order — first matching tier applies.
     pub tiers: Vec<PriceTier>,
+    /// Optional usage source for post-response settlement, used by `x402-upto`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meter: Option<UsageMeter>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct UsageMeter {
+    pub source: UsageMeterSource,
+    /// RFC 6901 JSON pointer, e.g. `/usageMetadata/promptTokenCount`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Response header name for `response_header` meters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageMeterSource {
+    ResponseJson,
+    ResponseHeader,
 }
 
 /// A volume-based price tier. `up_to: None` means "and above" (final tier).
@@ -1347,7 +1447,31 @@ pub fn validate_api_spec(spec: &ApiSpec) -> Vec<String> {
         validate_split_recipients(metering, &spec.recipients, path, &mut errs);
         validate_split_rules(metering, path, &mut errs);
         validate_tier_splits(metering, &spec.recipients, path, &mut errs);
+        // Session-capable endpoints settle through a channel that forbids
+        // duplicate split recipients; charge endpoints allow a repeated
+        // recipient only when each leg carries a distinct memo. When endpoint
+        // schemes are omitted, a top-level `session:` block makes the endpoint
+        // session-capable via defaults; explicit schemes can still opt into
+        // charge-only routing.
+        let has_session_scheme = metering
+            .schemes
+            .as_ref()
+            .map_or(spec.session.is_some(), |schemes| {
+                schemes.iter().any(|s| s.is_session())
+            });
+        validate_split_recipient_uniqueness(
+            metering,
+            &spec.recipients,
+            has_session_scheme,
+            path,
+            &mut errs,
+        );
         validate_price_precision(metering, path, &mut errs);
+    }
+
+    // Channel distribution splits from a top-level `session:` block.
+    if let Some(session) = &spec.session {
+        validate_session_splits(session, &spec.recipients, &mut errs);
     }
 
     errs
@@ -1807,6 +1931,180 @@ fn validate_tier_splits(
     }
 }
 
+/// Enforce per-method split-recipient uniqueness at load time, so a
+/// misconfigured spec fails fast with a clear message instead of a runtime
+/// `challenge_generation_failed` 500 (charge) or an on-chain channel `open`
+/// rejection (session).
+///
+/// - **Session** endpoints settle through a payment channel whose
+///   `distributionSplits` preimage rejects duplicate recipients
+///   (draft-solana-session-00). Uniqueness key: the **recipient account**.
+/// - **Charge** endpoints emit one transfer leg per split and allow a recipient
+///   to repeat, disambiguated by memo (draft-solana-charge-00). Uniqueness key:
+///   **(recipient account, memo)**.
+///
+/// Recipients are compared by their *resolved account*, not alias name, so two
+/// distinct aliases pointing at the same wallet are treated as one recipient.
+/// `${VAR}` accounts are compared by their literal template (runtime values are
+/// unknown at load time). The metering-level splits and each tier's override
+/// splits are checked independently — only one set is committed per transaction.
+fn validate_split_recipient_uniqueness(
+    metering: &Metering,
+    recipients: &std::collections::HashMap<String, RecipientAlias>,
+    has_session_scheme: bool,
+    path: &str,
+    errs: &mut Vec<String>,
+) {
+    let account_of = |alias: &str| -> String {
+        recipients
+            .get(alias)
+            .map(|a| a.account.clone())
+            .unwrap_or_else(|| alias.to_string())
+    };
+
+    let mut split_sets: Vec<(String, &[SplitRule])> =
+        vec![(String::new(), metering.splits.as_slice())];
+    for dim in &metering.dimensions {
+        let scale = dim.scale.max(1) as f64;
+        for tier in &dim.tiers {
+            if !tier.splits.is_empty() {
+                split_sets.push((
+                    format!(" (tier ${:.6}/unit)", tier.price_usd / scale),
+                    tier.splits.as_slice(),
+                ));
+            }
+        }
+    }
+    for variant in &metering.variants {
+        for dim in &variant.dimensions {
+            let scale = dim.scale.max(1) as f64;
+            for tier in &dim.tiers {
+                if !tier.splits.is_empty() {
+                    split_sets.push((
+                        format!(
+                            " (variant {}={}, tier ${:.6}/unit)",
+                            variant.param,
+                            variant.value,
+                            tier.price_usd / scale
+                        ),
+                        tier.splits.as_slice(),
+                    ));
+                }
+            }
+        }
+    }
+
+    for (label, splits) in split_sets {
+        if has_session_scheme {
+            let mut seen: Vec<String> = Vec::new();
+            for split in splits {
+                let account = account_of(&split.recipient);
+                if seen.contains(&account) {
+                    errs.push(format!(
+                        "endpoint `{path}`{label}: session payments require unique split \
+                         recipients, but account `{account}` (recipient `{}`) appears more than \
+                         once — the on-chain payment channel rejects duplicate `distributionSplits` \
+                         recipients. Aggregate these into a single split.",
+                        split.recipient
+                    ));
+                } else {
+                    seen.push(account);
+                }
+            }
+        } else {
+            let mut seen: Vec<(String, String)> = Vec::new();
+            for split in splits {
+                let account = account_of(&split.recipient);
+                let memo = split.memo.clone().unwrap_or_default();
+                let key = (account.clone(), memo.clone());
+                if seen.contains(&key) {
+                    let memo_desc = if memo.is_empty() {
+                        "no memo".to_string()
+                    } else {
+                        format!("memo `{memo}`")
+                    };
+                    errs.push(format!(
+                        "endpoint `{path}`{label}: charge split recipient `{}` (account \
+                         `{account}`) repeats with the same {memo_desc} — each leg sharing a \
+                         recipient must have a distinct memo so it can be verified separately.",
+                        split.recipient
+                    ));
+                } else {
+                    seen.push(key);
+                }
+            }
+        }
+    }
+}
+
+/// Validate the channel distribution splits in a top-level `session:` block.
+///
+/// These commit to the on-chain channel at `open`, which requires percentage
+/// shares that leave a positive payee remainder and a set of **unique**
+/// recipients (draft-solana-session-00). Centralizing the rules here keeps
+/// [`validate_api_spec`] the single source of truth — the boot-time resolver
+/// then only has to transform already-valid splits.
+fn validate_session_splits(
+    session: &SessionSpec,
+    recipients: &std::collections::HashMap<String, RecipientAlias>,
+    errs: &mut Vec<String>,
+) {
+    let mut total_bps: u32 = 0;
+    let mut seen: Vec<String> = Vec::new();
+
+    for rule in &session.splits {
+        let ctx = format!("session split `{}`", rule.recipient);
+
+        let amount_set = rule.amount.is_some();
+        if amount_set {
+            errs.push(format!(
+                "{ctx}: session channel splits must use `percent`, not `amount`"
+            ));
+        }
+        match rule.percent {
+            None if !amount_set => errs.push(format!("{ctx}: must set `percent`")),
+            None => {}
+            Some(p) if !p.is_finite() || p <= 0.0 => {
+                errs.push(format!(
+                    "{ctx}: `percent` must be a positive, finite number"
+                ));
+            }
+            Some(p) => {
+                let bps = (p * 100.0).round();
+                if !(1.0..10_000.0).contains(&bps) {
+                    errs.push(format!(
+                        "{ctx}: `percent` must convert to 1..9999 basis points"
+                    ));
+                } else {
+                    total_bps += bps as u32;
+                }
+            }
+        }
+
+        match recipients.get(&rule.recipient) {
+            None => errs.push(format!("{ctx}: references unknown recipient")),
+            Some(alias) => {
+                if seen.contains(&alias.account) {
+                    errs.push(format!(
+                        "{ctx}: session payments require unique split recipients, but account \
+                         `{}` appears more than once — aggregate these into a single split.",
+                        alias.account
+                    ));
+                } else {
+                    seen.push(alias.account.clone());
+                }
+            }
+        }
+    }
+
+    if total_bps >= 10_000 {
+        errs.push(
+            "session splits must leave a positive primary recipient share (total < 100%)"
+                .to_string(),
+        );
+    }
+}
+
 /// Per-unit price must be representable with 6 decimal places (USDC/USDT).
 /// `price_usd / scale` values like `0.005 / 1099511627776` produce ~30
 /// decimals, which overflows the token's precision and crashes at runtime.
@@ -2215,12 +2513,14 @@ mod tests {
                         notes: None,
                         splits: vec![],
                     }],
+                    meter: None,
                 }],
             }],
             sku_tiers: vec![],
             splits: vec![],
             schemes: None,
             min_usd: None,
+            upto: None,
         };
         let json = serde_json::to_string(&metering).unwrap();
         let back: Metering = serde_json::from_str(&json).unwrap();
@@ -2280,12 +2580,14 @@ mod tests {
                             notes: Some("Free tier".to_string()),
                             splits: vec![],
                         }],
+                        meter: None,
                     }],
                     variants: vec![],
                     sku_tiers: vec![],
                     splits: vec![],
                     schemes: None,
                     min_usd: None,
+                    upto: None,
                 }),
                 subscription: None,
             }],
@@ -2616,6 +2918,7 @@ mod tests {
                 splits: vec![],
                 schemes,
                 min_usd: None,
+                upto: None,
             }),
             subscription: None,
         }
@@ -2675,6 +2978,7 @@ mod tests {
                 }],
                 schemes: None,
                 min_usd: None,
+                upto: None,
             }),
             subscription: None,
         }]);
@@ -2704,6 +3008,7 @@ mod tests {
                         notes: None,
                         splits: vec![],
                     }],
+                    meter: None,
                 }],
                 variants: vec![],
                 sku_tiers: vec![],
@@ -2715,6 +3020,7 @@ mod tests {
                 }],
                 schemes: None,
                 min_usd: None,
+                upto: None,
             }),
             subscription: None,
         }]);
@@ -2744,6 +3050,7 @@ mod tests {
                         notes: None,
                         splits: vec![],
                     }],
+                    meter: None,
                 }],
                 variants: vec![],
                 sku_tiers: vec![],
@@ -2755,6 +3062,7 @@ mod tests {
                 }],
                 schemes: None,
                 min_usd: None,
+                upto: None,
             }),
             subscription: None,
         }]);
@@ -2784,6 +3092,7 @@ mod tests {
                         notes: None,
                         splits: vec![],
                     }],
+                    meter: None,
                 }],
                 variants: vec![],
                 sku_tiers: vec![],
@@ -2795,6 +3104,7 @@ mod tests {
                 }],
                 schemes: None,
                 min_usd: None,
+                upto: None,
             }),
             subscription: None,
         }]);
@@ -2823,6 +3133,7 @@ mod tests {
                         notes: None,
                         splits: vec![],
                     }],
+                    meter: None,
                 }],
                 variants: vec![],
                 sku_tiers: vec![],
@@ -2834,6 +3145,7 @@ mod tests {
                 }],
                 schemes: None,
                 min_usd: None,
+                upto: None,
             }),
             subscription: None,
         }]);
@@ -2865,6 +3177,7 @@ mod tests {
                         notes: None,
                         splits: vec![],
                     }],
+                    meter: None,
                 }],
                 variants: vec![],
                 sku_tiers: vec![],
@@ -2884,6 +3197,7 @@ mod tests {
                 ],
                 schemes: None,
                 min_usd: None,
+                upto: None,
             }),
             subscription: None,
         }]);
@@ -2932,18 +3246,393 @@ mod tests {
                             memo: None,
                         }],
                     }],
+                    meter: None,
                 }],
                 variants: vec![],
                 sku_tiers: vec![],
                 splits: vec![],
                 schemes: None,
                 min_usd: None,
+                upto: None,
             }),
             subscription: None,
         }]);
         let errs = validate_api_spec(&spec);
         assert_eq!(errs.len(), 1);
         assert!(errs[0].contains("tier splits total"));
+    }
+
+    /// Build a single-endpoint spec with metering-level `splits` and the given
+    /// accepted `schemes`, for split-recipient-uniqueness tests.
+    fn spec_with_splits(schemes: Option<Vec<Scheme>>, splits: Vec<SplitRule>) -> ApiSpec {
+        test_spec(vec![Endpoint {
+            method: HttpMethod::Post,
+            path: "v1/gen".into(),
+            description: None,
+            resource: None,
+            routing: None,
+            metering: Some(Metering {
+                dimensions: vec![MeterDimension {
+                    direction: MeterDirection::Usage,
+                    unit: BillingUnit::Requests,
+                    scale: 1,
+                    period: None,
+                    tiers: vec![PriceTier {
+                        up_to: None,
+                        price_usd: 0.10,
+                        condition: None,
+                        notes: None,
+                        splits: vec![],
+                    }],
+                    meter: None,
+                }],
+                variants: vec![],
+                sku_tiers: vec![],
+                splits,
+                schemes,
+                min_usd: None,
+                upto: None,
+            }),
+            subscription: None,
+        }])
+    }
+
+    #[test]
+    fn validate_session_rejects_duplicate_recipient_same_alias() {
+        // Session scheme + the same alias twice (even with distinct memos) → reject.
+        let spec = spec_with_splits(
+            Some(vec![Scheme::X402Upto]),
+            vec![
+                SplitRule {
+                    recipient: "operator".into(),
+                    amount: Some(0.001),
+                    percent: None,
+                    memo: Some("a".into()),
+                },
+                SplitRule {
+                    recipient: "operator".into(),
+                    amount: Some(0.001),
+                    percent: None,
+                    memo: Some("b".into()),
+                },
+            ],
+        );
+        let errs = validate_api_spec(&spec);
+        assert!(
+            errs.iter().any(|e| e.contains("unique split recipients")),
+            "got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_session_rejects_duplicate_account_via_distinct_aliases() {
+        // The real prod regression: two *distinct* aliases (operator + platform)
+        // resolve to the *same* wallet, and the endpoint advertises x402-upto.
+        let mut spec = spec_with_splits(
+            Some(vec![Scheme::MppCharge, Scheme::X402Upto]),
+            vec![
+                SplitRule {
+                    recipient: "operator".into(),
+                    amount: Some(0.00025),
+                    percent: None,
+                    memo: Some("Operator fee".into()),
+                },
+                SplitRule {
+                    recipient: "platform".into(),
+                    amount: None,
+                    percent: Some(5.0),
+                    memo: Some("Platform fee".into()),
+                },
+            ],
+        );
+        let operator_account = spec.recipients["operator"].account.clone();
+        spec.recipients.get_mut("platform").unwrap().account = operator_account;
+        let errs = validate_api_spec(&spec);
+        assert!(
+            errs.iter().any(|e| e.contains("unique split recipients")),
+            "got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_charge_allows_duplicate_recipient_with_distinct_memos() {
+        // Charge scheme + same recipient, distinct memos → allowed (no errors).
+        let spec = spec_with_splits(
+            Some(vec![Scheme::MppCharge]),
+            vec![
+                SplitRule {
+                    recipient: "operator".into(),
+                    amount: Some(0.001),
+                    percent: None,
+                    memo: Some("platform fee".into()),
+                },
+                SplitRule {
+                    recipient: "operator".into(),
+                    amount: Some(0.001),
+                    percent: None,
+                    memo: Some("referral".into()),
+                },
+            ],
+        );
+        let errs = validate_api_spec(&spec);
+        assert!(errs.is_empty(), "expected no errors, got: {errs:?}");
+    }
+
+    #[test]
+    fn validate_charge_only_endpoint_uses_charge_rules_with_top_level_session() {
+        let mut spec = spec_with_splits(
+            Some(vec![Scheme::MppCharge]),
+            vec![
+                SplitRule {
+                    recipient: "operator".into(),
+                    amount: Some(0.001),
+                    percent: None,
+                    memo: Some("platform fee".into()),
+                },
+                SplitRule {
+                    recipient: "operator".into(),
+                    amount: Some(0.001),
+                    percent: None,
+                    memo: Some("referral".into()),
+                },
+            ],
+        );
+        spec.session = Some(SessionSpec {
+            cap_usdc: 10.0,
+            min_voucher_delta: 0,
+            modes: vec![],
+            pull_voucher_strategy: SessionPullVoucherStrategy::Disabled,
+            batch_open_interval_ms: 400,
+            close_delay_ms: 15_000,
+            splits: vec![],
+        });
+
+        let errs = validate_api_spec(&spec);
+        assert!(errs.is_empty(), "expected charge-only rules, got: {errs:?}");
+    }
+
+    #[test]
+    fn validate_charge_rejects_duplicate_recipient_same_memo() {
+        // Charge scheme + same recipient AND same memo → reject (indistinguishable legs).
+        let spec = spec_with_splits(
+            Some(vec![Scheme::MppCharge]),
+            vec![
+                SplitRule {
+                    recipient: "operator".into(),
+                    amount: Some(0.001),
+                    percent: None,
+                    memo: Some("fee".into()),
+                },
+                SplitRule {
+                    recipient: "operator".into(),
+                    amount: Some(0.001),
+                    percent: None,
+                    memo: Some("fee".into()),
+                },
+            ],
+        );
+        let errs = validate_api_spec(&spec);
+        assert!(
+            errs.iter().any(|e| e.contains("distinct memo")),
+            "got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_session_rejects_duplicate_variant_tier_recipients() {
+        let mut spec = test_spec(vec![Endpoint {
+            method: HttpMethod::Post,
+            path: "v1/models".into(),
+            description: None,
+            resource: None,
+            routing: None,
+            metering: Some(Metering {
+                dimensions: vec![],
+                variants: vec![MeterVariant {
+                    param: "model".into(),
+                    value: "gemini".into(),
+                    dimensions: vec![MeterDimension {
+                        direction: MeterDirection::Usage,
+                        unit: BillingUnit::Requests,
+                        scale: 1,
+                        period: None,
+                        tiers: vec![PriceTier {
+                            up_to: None,
+                            price_usd: 0.10,
+                            condition: None,
+                            notes: None,
+                            splits: vec![
+                                SplitRule {
+                                    recipient: "operator".into(),
+                                    amount: Some(0.001),
+                                    percent: None,
+                                    memo: Some("platform fee".into()),
+                                },
+                                SplitRule {
+                                    recipient: "platform".into(),
+                                    amount: Some(0.001),
+                                    percent: None,
+                                    memo: Some("referral".into()),
+                                },
+                            ],
+                        }],
+                        meter: None,
+                    }],
+                }],
+                sku_tiers: vec![],
+                splits: vec![],
+                schemes: Some(vec![Scheme::X402Upto]),
+                min_usd: None,
+                upto: None,
+            }),
+            subscription: None,
+        }]);
+        let operator_account = spec.recipients["operator"].account.clone();
+        spec.recipients.get_mut("platform").unwrap().account = operator_account;
+
+        let errs = validate_api_spec(&spec);
+        assert!(
+            errs.iter().any(|e| e.contains("variant model=gemini"))
+                && errs.iter().any(|e| e.contains("unique split recipients")),
+            "got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_charge_rejects_duplicate_variant_tier_recipient_same_memo() {
+        let spec = test_spec(vec![Endpoint {
+            method: HttpMethod::Post,
+            path: "v1/models".into(),
+            description: None,
+            resource: None,
+            routing: None,
+            metering: Some(Metering {
+                dimensions: vec![],
+                variants: vec![MeterVariant {
+                    param: "model".into(),
+                    value: "gemini".into(),
+                    dimensions: vec![MeterDimension {
+                        direction: MeterDirection::Usage,
+                        unit: BillingUnit::Requests,
+                        scale: 1,
+                        period: None,
+                        tiers: vec![PriceTier {
+                            up_to: None,
+                            price_usd: 0.10,
+                            condition: None,
+                            notes: None,
+                            splits: vec![
+                                SplitRule {
+                                    recipient: "operator".into(),
+                                    amount: Some(0.001),
+                                    percent: None,
+                                    memo: Some("fee".into()),
+                                },
+                                SplitRule {
+                                    recipient: "operator".into(),
+                                    amount: Some(0.001),
+                                    percent: None,
+                                    memo: Some("fee".into()),
+                                },
+                            ],
+                        }],
+                        meter: None,
+                    }],
+                }],
+                sku_tiers: vec![],
+                splits: vec![],
+                schemes: Some(vec![Scheme::MppCharge]),
+                min_usd: None,
+                upto: None,
+            }),
+            subscription: None,
+        }]);
+
+        let errs = validate_api_spec(&spec);
+        assert!(
+            errs.iter().any(|e| e.contains("variant model=gemini"))
+                && errs.iter().any(|e| e.contains("distinct memo")),
+            "got: {errs:?}"
+        );
+    }
+
+    /// Build a spec whose top-level `session:` block carries the given splits.
+    fn spec_with_session_splits(splits: Vec<SplitRule>) -> ApiSpec {
+        let mut spec = test_spec(vec![]);
+        spec.session = Some(SessionSpec {
+            cap_usdc: 10.0,
+            min_voucher_delta: 0,
+            modes: vec![],
+            pull_voucher_strategy: SessionPullVoucherStrategy::Disabled,
+            batch_open_interval_ms: 400,
+            close_delay_ms: 15_000,
+            splits,
+        });
+        spec
+    }
+
+    #[test]
+    fn validate_session_splits_rejects_amount() {
+        let spec = spec_with_session_splits(vec![SplitRule {
+            recipient: "platform".into(),
+            amount: Some(0.30),
+            percent: None,
+            memo: None,
+        }]);
+        let errs = validate_api_spec(&spec);
+        assert!(
+            errs.iter().any(|e| e.contains("must use `percent`")),
+            "got: {errs:?}"
+        );
+        assert!(
+            !errs.iter().any(|e| e.contains("must set `percent`")),
+            "amount-only split should not emit a redundant missing-percent error: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_session_splits_rejects_duplicate_recipient() {
+        let mut spec = spec_with_session_splits(vec![
+            SplitRule {
+                recipient: "operator".into(),
+                amount: None,
+                percent: Some(10.0),
+                memo: None,
+            },
+            SplitRule {
+                recipient: "platform".into(),
+                amount: None,
+                percent: Some(10.0),
+                memo: None,
+            },
+        ]);
+        let operator_account = spec.recipients["operator"].account.clone();
+        spec.recipients.get_mut("platform").unwrap().account = operator_account;
+        let errs = validate_api_spec(&spec);
+        assert!(
+            errs.iter().any(|e| e.contains("unique split recipients")),
+            "got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_session_splits_valid_passes() {
+        let spec = spec_with_session_splits(vec![
+            SplitRule {
+                recipient: "operator".into(),
+                amount: None,
+                percent: Some(10.0),
+                memo: None,
+            },
+            SplitRule {
+                recipient: "platform".into(),
+                amount: None,
+                percent: Some(5.0),
+                memo: None,
+            },
+        ]);
+        let errs = validate_api_spec(&spec);
+        assert!(errs.is_empty(), "expected no errors, got: {errs:?}");
     }
 
     #[test]
@@ -2986,12 +3675,14 @@ mod tests {
                             },
                         ],
                     }],
+                    meter: None,
                 }],
                 variants: vec![],
                 sku_tiers: vec![],
                 splits: vec![],
                 schemes: None,
                 min_usd: None,
+                upto: None,
             }),
             subscription: None,
         }]);
@@ -3568,6 +4259,80 @@ endpoints:
             errs.iter()
                 .any(|e| e.contains("does not support nested oauth2 auth")),
             "expected nested oauth2 validation error, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn parses_x402_upto_response_metering_yaml() {
+        let spec: ApiSpec = serde_yml::from_str(
+            r#"
+name: usage-demo
+subdomain: usage-demo
+title: Usage Demo
+description: Usage Demo
+category: finance
+version: v1
+routing:
+  type: respond
+operator:
+  currencies:
+    usd: ["USDC"]
+  network: localnet
+  fee_payer: true
+endpoints:
+  - method: POST
+    path: v1/generate
+    resource: generate
+    description: Usage-metered generation
+    metering:
+      schemes: [x402-upto]
+      upto:
+        max_usd: 0.10
+        min_usd: 0.001
+        missing_usage: refund
+        usage_preset: google-generativelanguage
+        response_body:
+          mode: buffer
+          max_bytes: 4096
+      dimensions:
+        - direction: input
+          unit: tokens
+          scale: 1000
+          meter:
+            source: response_json
+            path: /usageMetadata/promptTokenCount
+          tiers:
+            - price_usd: 0.000075
+        - direction: output
+          unit: tokens
+          scale: 1000
+          meter:
+            source: response_json
+            path: /usageMetadata/candidatesTokenCount
+          tiers:
+            - price_usd: 0.00030
+"#,
+        )
+        .unwrap();
+
+        let metering = spec.endpoints[0].metering.as_ref().unwrap();
+        let upto = metering.upto.as_ref().unwrap();
+        assert_eq!(upto.max_usd, Some(0.10));
+        assert_eq!(upto.min_usd, Some(0.001));
+        assert!(matches!(upto.missing_usage, MissingUsagePolicy::Refund));
+        assert_eq!(
+            upto.usage_preset.as_deref(),
+            Some("google-generativelanguage")
+        );
+        assert_eq!(upto.response_body.as_ref().unwrap().max_bytes, Some(4096));
+        assert_eq!(
+            metering.dimensions[0]
+                .meter
+                .as_ref()
+                .unwrap()
+                .path
+                .as_deref(),
+            Some("/usageMetadata/promptTokenCount")
         );
     }
 }

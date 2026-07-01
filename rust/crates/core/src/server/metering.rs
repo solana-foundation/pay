@@ -1,7 +1,9 @@
 use crate::server::accounting::{AccountingKey, AccountingStore};
+use http::HeaderMap;
 use pay_types::metering::{
-    AccountingMode, ApiSpec, CompareOp, Endpoint, MeterCondition, MeterDimension, MeterVariant,
-    Metering, PriceTier,
+    AccountingMode, ApiSpec, BillingUnit, CompareOp, Endpoint, MeterCondition, MeterDimension,
+    MeterDirection, MeterVariant, Metering, MissingUsagePolicy, PriceTier, UsageMeter,
+    UsageMeterSource,
 };
 use serde::{Deserialize, Serialize};
 
@@ -30,6 +32,45 @@ pub struct ResolvedDimension {
     pub scale: u64,
     pub price_usd: f64,
 }
+
+/// Settlement plan carried from x402-upto open verification to the post-response
+/// settlement hook.
+#[derive(Debug, Clone)]
+pub struct UptoSettlementPlan {
+    pub metering: Metering,
+    pub variant_hint: Option<String>,
+    pub request_properties: RequestProperties,
+    pub ceiling_usd: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UptoActualAmount {
+    pub usd: f64,
+    pub base_units: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UptoUsageError {
+    MissingUsage(String),
+    InvalidUsage(String),
+    InvalidJson(String),
+    MissingUsagePolicyError,
+}
+
+impl std::fmt::Display for UptoUsageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingUsage(msg) => write!(f, "missing usage: {msg}"),
+            Self::InvalidUsage(msg) => write!(f, "invalid usage: {msg}"),
+            Self::InvalidJson(msg) => write!(f, "invalid response JSON: {msg}"),
+            Self::MissingUsagePolicyError => {
+                write!(f, "usage missing and missing_usage is set to error")
+            }
+        }
+    }
+}
+
+impl std::error::Error for UptoUsageError {}
 
 /// Find the matching endpoint for a request path and method.
 pub fn find_endpoint<'a>(api: &'a ApiSpec, method: &str, path: &str) -> Option<&'a Endpoint> {
@@ -135,6 +176,299 @@ pub fn resolve_price(
     }
 
     None
+}
+
+pub fn effective_dimensions<'a>(
+    metering: &'a Metering,
+    variant_hint: Option<&str>,
+) -> &'a [MeterDimension] {
+    if !metering.variants.is_empty() {
+        if let Some(variant) = resolve_variant(&metering.variants, variant_hint) {
+            return &variant.dimensions;
+        }
+        if let Some(first) = metering.variants.first() {
+            return &first.dimensions;
+        }
+    }
+
+    &metering.dimensions
+}
+
+pub fn upto_max_usd(metering: &Metering, resolved_price: Option<&ResolvedPrice>) -> f64 {
+    metering
+        .upto
+        .as_ref()
+        .and_then(|upto| upto.max_usd)
+        .or_else(|| {
+            resolved_price
+                .and_then(|p| p.dimensions.first())
+                .map(|d| d.price_usd / d.scale.max(1) as f64)
+        })
+        .unwrap_or(0.01)
+}
+
+pub fn upto_min_usd(metering: &Metering) -> Option<f64> {
+    metering
+        .upto
+        .as_ref()
+        .and_then(|upto| upto.min_usd)
+        .or(metering.min_usd)
+}
+
+pub fn upto_missing_usage_policy(metering: &Metering) -> MissingUsagePolicy {
+    metering
+        .upto
+        .as_ref()
+        .map(|upto| upto.missing_usage)
+        .unwrap_or_default()
+}
+
+pub fn upto_uses_response_usage(metering: &Metering, variant_hint: Option<&str>) -> bool {
+    metering
+        .upto
+        .as_ref()
+        .and_then(|upto| upto.usage_preset.as_deref())
+        .is_some()
+        || effective_dimensions(metering, variant_hint)
+            .iter()
+            .any(|dim| dim.meter.is_some())
+}
+
+pub fn upto_requires_response_body(metering: &Metering, variant_hint: Option<&str>) -> bool {
+    metering
+        .upto
+        .as_ref()
+        .and_then(|upto| upto.usage_preset.as_deref())
+        .is_some()
+        || effective_dimensions(metering, variant_hint)
+            .iter()
+            .any(|dim| {
+                dim.meter
+                    .as_ref()
+                    .is_some_and(|meter| matches!(meter.source, UsageMeterSource::ResponseJson))
+            })
+}
+
+pub fn upto_response_body_limit(metering: &Metering) -> usize {
+    const DEFAULT_LIMIT: usize = 1024 * 1024;
+    metering
+        .upto
+        .as_ref()
+        .and_then(|upto| upto.response_body.as_ref())
+        .and_then(|body| body.max_bytes)
+        .unwrap_or(DEFAULT_LIMIT)
+}
+
+pub fn upto_actual_amount_from_response(
+    plan: &UptoSettlementPlan,
+    max_amount: u64,
+    headers: &HeaderMap,
+    body: Option<&[u8]>,
+) -> Result<UptoActualAmount, UptoUsageError> {
+    if plan.ceiling_usd <= 0.0 || max_amount == 0 {
+        return Ok(UptoActualAmount {
+            usd: 0.0,
+            base_units: 0,
+        });
+    }
+
+    let result = extract_and_price_usage(
+        &plan.metering,
+        plan.variant_hint.as_deref(),
+        &plan.request_properties,
+        headers,
+        body,
+    )
+    .map(|actual_usd| clamp_actual_usd(&plan.metering, actual_usd, plan.ceiling_usd));
+
+    let usd = match result {
+        Ok(usd) => usd,
+        Err(err) => match upto_missing_usage_policy(&plan.metering) {
+            MissingUsagePolicy::Refund => 0.0,
+            MissingUsagePolicy::Min => upto_min_usd(&plan.metering)
+                .unwrap_or(0.0)
+                .min(plan.ceiling_usd),
+            MissingUsagePolicy::Ceiling => plan.ceiling_usd,
+            MissingUsagePolicy::Error => {
+                tracing::warn!(error = %err, "x402 upto response usage extraction failed");
+                return Err(UptoUsageError::MissingUsagePolicyError);
+            }
+        },
+    };
+
+    let units_per_usd = max_amount as f64 / plan.ceiling_usd;
+    Ok(UptoActualAmount {
+        usd,
+        base_units: ((usd * units_per_usd).round() as u64).min(max_amount),
+    })
+}
+
+fn clamp_actual_usd(metering: &Metering, actual_usd: f64, ceiling_usd: f64) -> f64 {
+    let with_min = match upto_min_usd(metering) {
+        Some(min_usd) if min_usd >= 0.0 => actual_usd.max(min_usd),
+        _ => actual_usd,
+    };
+    with_min.clamp(0.0, ceiling_usd)
+}
+
+fn extract_and_price_usage(
+    metering: &Metering,
+    variant_hint: Option<&str>,
+    props: &RequestProperties,
+    headers: &HeaderMap,
+    body: Option<&[u8]>,
+) -> Result<f64, UptoUsageError> {
+    let dimensions = effective_dimensions(metering, variant_hint);
+    if dimensions.is_empty() {
+        return Err(UptoUsageError::MissingUsage(
+            "no metering dimensions configured".to_string(),
+        ));
+    }
+
+    let prices = resolve_price(metering, props, variant_hint, None)
+        .ok_or_else(|| UptoUsageError::MissingUsage("no resolved price".to_string()))?;
+    let json = if upto_requires_response_body(metering, variant_hint) {
+        let body =
+            body.ok_or_else(|| UptoUsageError::MissingUsage("response body unavailable".into()))?;
+        Some(
+            serde_json::from_slice::<serde_json::Value>(body)
+                .map_err(|e| UptoUsageError::InvalidJson(e.to_string()))?,
+        )
+    } else {
+        None
+    };
+
+    let preset = metering
+        .upto
+        .as_ref()
+        .and_then(|upto| upto.usage_preset.as_deref());
+    let mut total = 0.0;
+    for (idx, dim) in dimensions.iter().enumerate() {
+        let price = prices
+            .dimensions
+            .get(idx)
+            .map(|d| d.price_usd)
+            .unwrap_or(0.0);
+        let quantity = extract_dimension_quantity(dim, preset, headers, json.as_ref())?;
+        total += quantity as f64 / dim.scale.max(1) as f64 * price;
+    }
+    Ok(total)
+}
+
+fn extract_dimension_quantity(
+    dim: &MeterDimension,
+    preset: Option<&str>,
+    headers: &HeaderMap,
+    json: Option<&serde_json::Value>,
+) -> Result<u64, UptoUsageError> {
+    if let Some(meter) = &dim.meter {
+        return extract_from_meter(meter, headers, json);
+    }
+
+    if let Some(path) = preset_json_path(preset, dim) {
+        let json =
+            json.ok_or_else(|| UptoUsageError::MissingUsage("response body unavailable".into()))?;
+        return extract_from_json_pointer(json, path);
+    }
+
+    if matches!(dim.direction, MeterDirection::Usage) && matches!(dim.unit, BillingUnit::Requests) {
+        return Ok(1);
+    }
+
+    Err(UptoUsageError::MissingUsage(format!(
+        "no usage meter for {:?} {:?}",
+        dim.direction, dim.unit
+    )))
+}
+
+fn extract_from_meter(
+    meter: &UsageMeter,
+    headers: &HeaderMap,
+    json: Option<&serde_json::Value>,
+) -> Result<u64, UptoUsageError> {
+    match meter.source {
+        UsageMeterSource::ResponseJson => {
+            let json = json
+                .ok_or_else(|| UptoUsageError::MissingUsage("response body unavailable".into()))?;
+            let path = meter.path.as_deref().ok_or_else(|| {
+                UptoUsageError::MissingUsage("response_json meter missing path".into())
+            })?;
+            extract_from_json_pointer(json, path)
+        }
+        UsageMeterSource::ResponseHeader => {
+            let name = meter.header.as_deref().ok_or_else(|| {
+                UptoUsageError::MissingUsage("response_header meter missing header".into())
+            })?;
+            let value = headers
+                .get(name)
+                .ok_or_else(|| UptoUsageError::MissingUsage(format!("header `{name}`")))?;
+            let value = value
+                .to_str()
+                .map_err(|e| UptoUsageError::InvalidUsage(e.to_string()))?;
+            parse_usage_quantity(value)
+        }
+    }
+}
+
+fn preset_json_path(preset: Option<&str>, dim: &MeterDimension) -> Option<&'static str> {
+    let preset = preset?;
+    if !preset.eq_ignore_ascii_case("google-generativelanguage") {
+        return None;
+    }
+    match (dim.direction, dim.unit) {
+        (MeterDirection::Input, BillingUnit::Tokens) => Some("/usageMetadata/promptTokenCount"),
+        (MeterDirection::Output, BillingUnit::Tokens) => {
+            Some("/usageMetadata/candidatesTokenCount")
+        }
+        (MeterDirection::Usage, BillingUnit::Tokens) => Some("/usageMetadata/totalTokenCount"),
+        _ => None,
+    }
+}
+
+fn extract_from_json_pointer(json: &serde_json::Value, path: &str) -> Result<u64, UptoUsageError> {
+    let value = json
+        .pointer(path)
+        .ok_or_else(|| UptoUsageError::MissingUsage(format!("json path `{path}`")))?;
+    match value {
+        serde_json::Value::Number(n) => {
+            if let Some(v) = n.as_u64() {
+                Ok(v)
+            } else if let Some(v) = n.as_f64() {
+                if v.is_finite() && v >= 0.0 {
+                    Ok(v.round() as u64)
+                } else {
+                    Err(UptoUsageError::InvalidUsage(format!(
+                        "json path `{path}` is negative or non-finite"
+                    )))
+                }
+            } else {
+                Err(UptoUsageError::InvalidUsage(format!(
+                    "json path `{path}` is not a supported number"
+                )))
+            }
+        }
+        serde_json::Value::String(s) => parse_usage_quantity(s),
+        _ => Err(UptoUsageError::InvalidUsage(format!(
+            "json path `{path}` is not numeric"
+        ))),
+    }
+}
+
+fn parse_usage_quantity(value: &str) -> Result<u64, UptoUsageError> {
+    let trimmed = value.trim();
+    if let Ok(v) = trimmed.parse::<u64>() {
+        return Ok(v);
+    }
+    let v = trimmed
+        .parse::<f64>()
+        .map_err(|e| UptoUsageError::InvalidUsage(e.to_string()))?;
+    if v.is_finite() && v >= 0.0 {
+        Ok(v.round() as u64)
+    } else {
+        Err(UptoUsageError::InvalidUsage(
+            "usage value is negative or non-finite".to_string(),
+        ))
+    }
 }
 
 /// Resolve the effective split rules for a metering config.
@@ -307,6 +641,7 @@ pub(crate) fn evaluate_condition(condition: &MeterCondition, props: &RequestProp
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http::HeaderValue;
 
     #[test]
     fn test_path_matches_exact() {
@@ -630,6 +965,7 @@ mod tests {
             splits: vec![],
             schemes: None,
             min_usd: None,
+            upto: None,
         };
         assert!(resolve_price(&metering, &RequestProperties::default(), None, None).is_none());
     }
@@ -649,12 +985,14 @@ mod tests {
                     notes: None,
                     splits: vec![],
                 }],
+                meter: None,
             }],
             variants: vec![],
             sku_tiers: vec![],
             splits: vec![],
             schemes: None,
             min_usd: None,
+            upto: None,
         };
         let price = resolve_price(&metering, &RequestProperties::default(), None, None);
         assert!(price.is_some());
@@ -675,6 +1013,7 @@ mod tests {
             splits: vec![],
             schemes: None,
             min_usd: None,
+            upto: None,
         };
         let price = resolve_price(&metering, &RequestProperties::default(), None, None);
         assert!(price.is_some());
@@ -701,6 +1040,7 @@ mod tests {
                             notes: None,
                             splits: vec![],
                         }],
+                        meter: None,
                     }],
                 },
                 MeterVariant {
@@ -718,6 +1058,7 @@ mod tests {
                             notes: None,
                             splits: vec![],
                         }],
+                        meter: None,
                     }],
                 },
             ],
@@ -725,6 +1066,7 @@ mod tests {
             splits: vec![],
             schemes: None,
             min_usd: None,
+            upto: None,
         };
         // Match second variant
         let price = resolve_price(
@@ -756,12 +1098,14 @@ mod tests {
                         notes: None,
                         splits: vec![],
                     }],
+                    meter: None,
                 }],
             }],
             sku_tiers: vec![],
             splits: vec![],
             schemes: None,
             min_usd: None,
+            upto: None,
         };
         // No variant hint match → uses first variant as default
         let price = resolve_price(
@@ -801,12 +1145,14 @@ mod tests {
                         splits: vec![],
                     },
                 ],
+                meter: None,
             }],
             variants: vec![],
             sku_tiers: vec![],
             splits: vec![],
             schemes: None,
             min_usd: None,
+            upto: None,
         };
 
         // Within condition
@@ -853,12 +1199,14 @@ mod tests {
                         splits: vec![],
                     },
                 ],
+                meter: None,
             }],
             variants: vec![],
             sku_tiers: vec![],
             splits: vec![],
             schemes: None,
             min_usd: None,
+            upto: None,
         };
 
         let ctx = MeteringContext {
@@ -878,5 +1226,547 @@ mod tests {
         let price = record_usage(&metering, &RequestProperties::default(), None, &ctx, 60);
         assert!(price.is_some());
         assert_eq!(price.unwrap().dimensions[0].price_usd, 0.01);
+    }
+
+    fn price_tier(price_usd: f64) -> PriceTier {
+        PriceTier {
+            up_to: None,
+            price_usd,
+            condition: None,
+            notes: None,
+            splits: vec![],
+        }
+    }
+
+    fn usage_dim(
+        direction: MeterDirection,
+        unit: BillingUnit,
+        scale: u64,
+        price_usd: f64,
+        meter: Option<UsageMeter>,
+    ) -> MeterDimension {
+        MeterDimension {
+            direction,
+            unit,
+            scale,
+            period: None,
+            tiers: vec![price_tier(price_usd)],
+            meter,
+        }
+    }
+
+    fn upto_metering(
+        dimensions: Vec<MeterDimension>,
+        upto: Option<pay_types::metering::UptoMetering>,
+    ) -> Metering {
+        Metering {
+            dimensions,
+            variants: vec![],
+            sku_tiers: vec![],
+            splits: vec![],
+            schemes: None,
+            min_usd: None,
+            upto,
+        }
+    }
+
+    fn response_json(path: &str) -> UsageMeter {
+        UsageMeter {
+            source: UsageMeterSource::ResponseJson,
+            path: Some(path.to_string()),
+            header: None,
+        }
+    }
+
+    fn response_header(header: &str) -> UsageMeter {
+        UsageMeter {
+            source: UsageMeterSource::ResponseHeader,
+            path: None,
+            header: Some(header.to_string()),
+        }
+    }
+
+    fn settlement_plan(metering: Metering, ceiling_usd: f64) -> UptoSettlementPlan {
+        UptoSettlementPlan {
+            metering,
+            variant_hint: None,
+            request_properties: RequestProperties::default(),
+            ceiling_usd,
+        }
+    }
+
+    #[test]
+    fn upto_max_usd_prefers_explicit_ceiling() {
+        let metering = upto_metering(
+            vec![usage_dim(
+                MeterDirection::Usage,
+                BillingUnit::Requests,
+                1,
+                0.01,
+                None,
+            )],
+            Some(pay_types::metering::UptoMetering {
+                max_usd: Some(0.10),
+                ..Default::default()
+            }),
+        );
+        let price = resolve_price(&metering, &RequestProperties::default(), None, None);
+
+        assert_eq!(upto_max_usd(&metering, price.as_ref()), 0.10);
+    }
+
+    #[test]
+    fn upto_max_usd_keeps_legacy_first_dimension_fallback() {
+        let metering = upto_metering(
+            vec![usage_dim(
+                MeterDirection::Input,
+                BillingUnit::Tokens,
+                1_000,
+                0.02,
+                None,
+            )],
+            None,
+        );
+        let price = resolve_price(&metering, &RequestProperties::default(), None, None);
+
+        assert_eq!(upto_max_usd(&metering, price.as_ref()), 0.00002);
+    }
+
+    #[test]
+    fn upto_actual_amount_prices_response_json_dimensions() {
+        let metering = upto_metering(
+            vec![
+                usage_dim(
+                    MeterDirection::Input,
+                    BillingUnit::Tokens,
+                    1_000,
+                    0.01,
+                    Some(response_json("/usage/input_tokens")),
+                ),
+                usage_dim(
+                    MeterDirection::Output,
+                    BillingUnit::Tokens,
+                    1_000,
+                    0.03,
+                    Some(response_json("/usage/output_tokens")),
+                ),
+            ],
+            Some(pay_types::metering::UptoMetering {
+                max_usd: Some(0.10),
+                response_body: Some(pay_types::metering::UptoResponseBody {
+                    mode: pay_types::metering::UptoResponseBodyMode::Buffer,
+                    max_bytes: Some(4096),
+                }),
+                ..Default::default()
+            }),
+        );
+        let body = br#"{"usage":{"input_tokens":1000,"output_tokens":500}}"#;
+
+        let actual = upto_actual_amount_from_response(
+            &settlement_plan(metering, 0.10),
+            100_000,
+            &HeaderMap::new(),
+            Some(body),
+        )
+        .unwrap();
+
+        assert_eq!(actual.usd, 0.025);
+        assert_eq!(actual.base_units, 25_000);
+    }
+
+    #[test]
+    fn upto_actual_amount_supports_google_generativelanguage_preset() {
+        let metering = upto_metering(
+            vec![
+                usage_dim(
+                    MeterDirection::Input,
+                    BillingUnit::Tokens,
+                    1_000,
+                    0.01,
+                    None,
+                ),
+                usage_dim(
+                    MeterDirection::Output,
+                    BillingUnit::Tokens,
+                    1_000,
+                    0.03,
+                    None,
+                ),
+            ],
+            Some(pay_types::metering::UptoMetering {
+                max_usd: Some(0.10),
+                usage_preset: Some("google-generativelanguage".to_string()),
+                ..Default::default()
+            }),
+        );
+        let body = br#"{"usageMetadata":{"promptTokenCount":2000,"candidatesTokenCount":1000}}"#;
+
+        let actual = upto_actual_amount_from_response(
+            &settlement_plan(metering, 0.10),
+            100_000,
+            &HeaderMap::new(),
+            Some(body),
+        )
+        .unwrap();
+
+        assert_eq!(actual.usd, 0.05);
+        assert_eq!(actual.base_units, 50_000);
+    }
+
+    #[test]
+    fn upto_actual_amount_prices_response_header_meter() {
+        let metering = upto_metering(
+            vec![usage_dim(
+                MeterDirection::Usage,
+                BillingUnit::Tokens,
+                1_000,
+                0.02,
+                Some(response_header("x-usage-tokens")),
+            )],
+            Some(pay_types::metering::UptoMetering {
+                max_usd: Some(0.10),
+                ..Default::default()
+            }),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("x-usage-tokens", HeaderValue::from_static("2500"));
+
+        let actual = upto_actual_amount_from_response(
+            &settlement_plan(metering, 0.10),
+            100_000,
+            &headers,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(actual.usd, 0.05);
+        assert_eq!(actual.base_units, 50_000);
+    }
+
+    #[test]
+    fn upto_actual_amount_applies_minimum_and_ceiling_clamps() {
+        let low = upto_metering(
+            vec![usage_dim(
+                MeterDirection::Usage,
+                BillingUnit::Tokens,
+                1_000,
+                0.001,
+                Some(response_json("/usage/tokens")),
+            )],
+            Some(pay_types::metering::UptoMetering {
+                max_usd: Some(0.10),
+                min_usd: Some(0.01),
+                ..Default::default()
+            }),
+        );
+        let low_actual = upto_actual_amount_from_response(
+            &settlement_plan(low, 0.10),
+            100_000,
+            &HeaderMap::new(),
+            Some(br#"{"usage":{"tokens":100}}"#),
+        )
+        .unwrap();
+        assert_eq!(low_actual.usd, 0.01);
+        assert_eq!(low_actual.base_units, 10_000);
+
+        let high = upto_metering(
+            vec![usage_dim(
+                MeterDirection::Usage,
+                BillingUnit::Tokens,
+                1_000,
+                1.0,
+                Some(response_json("/usage/tokens")),
+            )],
+            Some(pay_types::metering::UptoMetering {
+                max_usd: Some(0.10),
+                ..Default::default()
+            }),
+        );
+        let high_actual = upto_actual_amount_from_response(
+            &settlement_plan(high, 0.10),
+            100_000,
+            &HeaderMap::new(),
+            Some(br#"{"usage":{"tokens":1000}}"#),
+        )
+        .unwrap();
+        assert_eq!(high_actual.usd, 0.10);
+        assert_eq!(high_actual.base_units, 100_000);
+    }
+
+    #[test]
+    fn upto_missing_usage_policy_refunds_by_default() {
+        let metering = upto_metering(
+            vec![usage_dim(
+                MeterDirection::Usage,
+                BillingUnit::Tokens,
+                1_000,
+                0.02,
+                Some(response_json("/usage/tokens")),
+            )],
+            Some(pay_types::metering::UptoMetering {
+                max_usd: Some(0.10),
+                ..Default::default()
+            }),
+        );
+
+        let actual = upto_actual_amount_from_response(
+            &settlement_plan(metering, 0.10),
+            100_000,
+            &HeaderMap::new(),
+            Some(br#"{"usage":{}}"#),
+        )
+        .unwrap();
+
+        assert_eq!(actual.usd, 0.0);
+        assert_eq!(actual.base_units, 0);
+    }
+
+    #[test]
+    fn upto_missing_usage_policy_can_use_min_or_ceiling_or_error() {
+        let base = vec![usage_dim(
+            MeterDirection::Usage,
+            BillingUnit::Tokens,
+            1_000,
+            0.02,
+            Some(response_json("/usage/tokens")),
+        )];
+
+        let min = upto_metering(
+            base.clone(),
+            Some(pay_types::metering::UptoMetering {
+                max_usd: Some(0.10),
+                min_usd: Some(0.01),
+                missing_usage: MissingUsagePolicy::Min,
+                ..Default::default()
+            }),
+        );
+        let min_actual = upto_actual_amount_from_response(
+            &settlement_plan(min, 0.10),
+            100_000,
+            &HeaderMap::new(),
+            Some(br#"{"usage":{}}"#),
+        )
+        .unwrap();
+        assert_eq!(min_actual.usd, 0.01);
+        assert_eq!(min_actual.base_units, 10_000);
+
+        let ceiling = upto_metering(
+            base.clone(),
+            Some(pay_types::metering::UptoMetering {
+                max_usd: Some(0.10),
+                missing_usage: MissingUsagePolicy::Ceiling,
+                ..Default::default()
+            }),
+        );
+        let ceiling_actual = upto_actual_amount_from_response(
+            &settlement_plan(ceiling, 0.10),
+            100_000,
+            &HeaderMap::new(),
+            Some(br#"{"usage":{}}"#),
+        )
+        .unwrap();
+        assert_eq!(ceiling_actual.usd, 0.10);
+        assert_eq!(ceiling_actual.base_units, 100_000);
+
+        let error = upto_metering(
+            base,
+            Some(pay_types::metering::UptoMetering {
+                max_usd: Some(0.10),
+                missing_usage: MissingUsagePolicy::Error,
+                ..Default::default()
+            }),
+        );
+        let err = upto_actual_amount_from_response(
+            &settlement_plan(error, 0.10),
+            100_000,
+            &HeaderMap::new(),
+            Some(br#"{"usage":{}}"#),
+        )
+        .unwrap_err();
+        assert_eq!(err, UptoUsageError::MissingUsagePolicyError);
+    }
+
+    #[test]
+    fn upto_response_usage_detection_distinguishes_body_and_header_meters() {
+        let json = upto_metering(
+            vec![usage_dim(
+                MeterDirection::Usage,
+                BillingUnit::Tokens,
+                1_000,
+                0.02,
+                Some(response_json("/usage/tokens")),
+            )],
+            Some(pay_types::metering::UptoMetering::default()),
+        );
+        assert!(upto_uses_response_usage(&json, None));
+        assert!(upto_requires_response_body(&json, None));
+
+        let header = upto_metering(
+            vec![usage_dim(
+                MeterDirection::Usage,
+                BillingUnit::Tokens,
+                1_000,
+                0.02,
+                Some(response_header("x-usage-tokens")),
+            )],
+            Some(pay_types::metering::UptoMetering::default()),
+        );
+        assert!(upto_uses_response_usage(&header, None));
+        assert!(!upto_requires_response_body(&header, None));
+
+        let preset = upto_metering(
+            vec![usage_dim(
+                MeterDirection::Input,
+                BillingUnit::Tokens,
+                1_000,
+                0.02,
+                None,
+            )],
+            Some(pay_types::metering::UptoMetering {
+                usage_preset: Some("google-generativelanguage".to_string()),
+                ..Default::default()
+            }),
+        );
+        assert!(upto_requires_response_body(&preset, None));
+    }
+
+    #[test]
+    fn upto_actual_amount_supports_request_units_without_meter() {
+        let metering = upto_metering(
+            vec![usage_dim(
+                MeterDirection::Usage,
+                BillingUnit::Requests,
+                1,
+                0.02,
+                None,
+            )],
+            Some(pay_types::metering::UptoMetering {
+                max_usd: Some(0.10),
+                ..Default::default()
+            }),
+        );
+
+        let actual = upto_actual_amount_from_response(
+            &settlement_plan(metering, 0.10),
+            100_000,
+            &HeaderMap::new(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(actual.usd, 0.02);
+        assert_eq!(actual.base_units, 20_000);
+    }
+
+    #[test]
+    fn upto_actual_amount_accepts_numeric_strings() {
+        let metering = upto_metering(
+            vec![usage_dim(
+                MeterDirection::Usage,
+                BillingUnit::Tokens,
+                1_000,
+                0.02,
+                Some(response_json("/usage/tokens")),
+            )],
+            Some(pay_types::metering::UptoMetering {
+                max_usd: Some(0.10),
+                ..Default::default()
+            }),
+        );
+
+        let actual = upto_actual_amount_from_response(
+            &settlement_plan(metering, 0.10),
+            100_000,
+            &HeaderMap::new(),
+            Some(br#"{"usage":{"tokens":"2500"}}"#),
+        )
+        .unwrap();
+
+        assert_eq!(actual.usd, 0.05);
+        assert_eq!(actual.base_units, 50_000);
+    }
+
+    #[test]
+    fn upto_actual_amount_errors_on_bad_json_when_policy_is_error() {
+        let metering = upto_metering(
+            vec![usage_dim(
+                MeterDirection::Usage,
+                BillingUnit::Tokens,
+                1_000,
+                0.02,
+                Some(response_json("/usage/tokens")),
+            )],
+            Some(pay_types::metering::UptoMetering {
+                max_usd: Some(0.10),
+                missing_usage: MissingUsagePolicy::Error,
+                ..Default::default()
+            }),
+        );
+
+        let err = upto_actual_amount_from_response(
+            &settlement_plan(metering, 0.10),
+            100_000,
+            &HeaderMap::new(),
+            Some(br#"{"usage":"#),
+        )
+        .unwrap_err();
+
+        assert_eq!(err, UptoUsageError::MissingUsagePolicyError);
+    }
+
+    #[test]
+    fn upto_actual_amount_uses_variant_specific_dimensions() {
+        let metering = Metering {
+            dimensions: vec![],
+            variants: vec![
+                MeterVariant {
+                    param: "model".to_string(),
+                    value: "pro".to_string(),
+                    dimensions: vec![usage_dim(
+                        MeterDirection::Usage,
+                        BillingUnit::Tokens,
+                        1_000,
+                        0.08,
+                        Some(response_json("/usage/tokens")),
+                    )],
+                },
+                MeterVariant {
+                    param: "model".to_string(),
+                    value: "flash".to_string(),
+                    dimensions: vec![usage_dim(
+                        MeterDirection::Usage,
+                        BillingUnit::Tokens,
+                        1_000,
+                        0.02,
+                        Some(response_json("/usage/tokens")),
+                    )],
+                },
+            ],
+            sku_tiers: vec![],
+            splits: vec![],
+            schemes: None,
+            min_usd: None,
+            upto: Some(pay_types::metering::UptoMetering {
+                max_usd: Some(0.10),
+                ..Default::default()
+            }),
+        };
+        let plan = UptoSettlementPlan {
+            metering,
+            variant_hint: Some("models/gemini-flash".to_string()),
+            request_properties: RequestProperties::default(),
+            ceiling_usd: 0.10,
+        };
+
+        let actual = upto_actual_amount_from_response(
+            &plan,
+            100_000,
+            &HeaderMap::new(),
+            Some(br#"{"usage":{"tokens":1000}}"#),
+        )
+        .unwrap();
+
+        assert_eq!(actual.usd, 0.02);
+        assert_eq!(actual.base_units, 20_000);
     }
 }
