@@ -163,9 +163,10 @@ fn resolved_endpoint_to_probe_endpoint(
     r: ResolvedEndpoint,
     openapi_driven: bool,
 ) -> pay_types::registry::ProbeEndpoint {
+    let probe_path = r.path_example.as_ref().unwrap_or(&r.spec.path);
     let path = match &r.query_example {
-        Some(q) => format!("{}?{}", r.spec.path, q),
-        None => r.spec.path.clone(),
+        Some(q) => format!("{}?{}", probe_path, q),
+        None => probe_path.clone(),
     };
     pay_types::registry::ProbeEndpoint {
         method: r.spec.method,

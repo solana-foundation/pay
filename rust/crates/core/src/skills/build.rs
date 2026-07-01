@@ -910,9 +910,12 @@ fn build_detail_endpoints(
                 // published `spec.path` (below) stays clean. Without the query,
                 // GETs that require parameters 4xx/5xx before the paywall and
                 // get pruned.
-                path: match &r.query_example {
-                    Some(q) => format!("{}?{}", r.spec.path, q),
-                    None => r.spec.path.clone(),
+                path: {
+                    let probe_path = r.path_example.as_ref().unwrap_or(&r.spec.path);
+                    match &r.query_example {
+                        Some(q) => format!("{}?{}", probe_path, q),
+                        None => probe_path.clone(),
+                    }
                 },
                 metered: true,
                 body: r.body_example.clone(),
@@ -1057,6 +1060,7 @@ mod tests {
                 pricing,
             },
             body_example: None,
+            path_example: None,
             query_example: None,
         }
     }
@@ -1218,6 +1222,7 @@ mod tests {
                 pricing: None,
             },
             body_example: None,
+            path_example: None,
             query_example: Some("country_code=us".to_string()),
         }];
         let options = BuildOptions {
@@ -1252,6 +1257,7 @@ mod tests {
                 pricing: None,
             },
             body_example: None,
+            path_example: None,
             query_example: Some("product_id=stale".to_string()),
         }];
         let options = BuildOptions {
