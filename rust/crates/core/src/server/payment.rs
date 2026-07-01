@@ -286,7 +286,7 @@ pub(crate) fn resource_memo_matches(memo: &str, resource: &str, max_bytes: usize
         return false;
     };
     let expected_prefix = truncate_to_char_boundary(resource, expected_prefix_len);
-    !expected_prefix.is_empty() && prefix == expected_prefix && memo.len() <= max_bytes
+    resource.len() > expected_prefix_len && !expected_prefix.is_empty() && prefix == expected_prefix && memo.len() <= max_bytes
 }
 
 fn truncate_to_char_boundary(value: &str, max_bytes: usize) -> &str {
