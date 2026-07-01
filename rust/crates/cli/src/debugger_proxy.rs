@@ -237,6 +237,13 @@ fn chrono_now() -> String {
 mod tests {
     use super::*;
 
+    fn assert_pdb_index_html(html: &str) {
+        assert!(
+            html.contains("<title>Pay Debugger</title>")
+                || html.contains("<h1>Payment Debugger</h1>")
+        );
+    }
+
     fn start_test_proxy() -> std::net::SocketAddr {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -284,7 +291,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
         let html = resp.text().unwrap();
-        assert!(html.contains("Payment Debugger"));
+        assert_pdb_index_html(&html);
         // When the full PDB frontend is built, asset paths are relative.
         // CI may embed a placeholder without assets — skip this check then.
         if html.contains("assets/") {
@@ -307,7 +314,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
         let html = resp.text().unwrap();
-        assert!(html.contains("Payment Debugger"));
+        assert_pdb_index_html(&html);
     }
 
     #[test]

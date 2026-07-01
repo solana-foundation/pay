@@ -578,11 +578,12 @@ struct VerdictStats {
     ok: usize,
     classified: usize,
     non_solana: usize,
+    tolerated: usize,
 }
 
 impl VerdictStats {
     fn is_clean(&self) -> bool {
-        self.blocked == 0 && self.non_solana == 0
+        self.blocked == 0 && self.non_solana == 0 && self.tolerated == 0
     }
 
     fn format(
@@ -612,6 +613,13 @@ impl VerdictStats {
                 if self.non_solana == 1 { "" } else { "s" },
             ));
         }
+        if self.tolerated > 0 {
+            lines.push(format!(
+                "{} parameterized 404 endpoint{} tolerated",
+                self.tolerated,
+                if self.tolerated == 1 { "" } else { "s" },
+            ));
+        }
         if self.blocked > 0 {
             lines.push(format!(
                 "{} provider{} blocked (zero Solana-compatible gates)",
@@ -619,8 +627,11 @@ impl VerdictStats {
                 if self.blocked == 1 { "" } else { "s" },
             ));
         }
-        if probe_failed > 0 && self.classified == 0 {
-            lines.push(format!("{probe_failed} probe failure(s) — see --verbose"));
+        let untolerated_probe_failed = probe_failed.saturating_sub(self.tolerated);
+        if untolerated_probe_failed > 0 && self.classified == 0 {
+            lines.push(format!(
+                "{untolerated_probe_failed} probe failure(s) — see --verbose"
+            ));
         }
         if static_warning_count > 0 {
             lines.push(format!(
@@ -646,14 +657,14 @@ fn render_markdown_summary(validation: &ValidationReport, static_warnings: &[Str
     let warns: usize = validation
         .providers
         .iter()
-        .map(|p| p.non_solana_count)
+        .map(|p| p.non_solana_count + p.tolerated_count)
         .sum();
     let oks: usize = validation.providers.iter().map(|p| p.ok_count).sum();
 
     if blocks > 0 {
         let _ = writeln!(out, ":no_entry: **{blocks}** provider(s) blocked");
     } else if warns > 0 {
-        let _ = writeln!(out, ":warning: {warns} non-Solana endpoint(s) flagged");
+        let _ = writeln!(out, ":warning: {warns} endpoint warning(s)");
     } else {
         let _ = writeln!(
             out,
@@ -661,37 +672,47 @@ fn render_markdown_summary(validation: &ValidationReport, static_warnings: &[Str
         );
     }
     let _ = writeln!(out);
-    let _ = writeln!(out, "| Provider | OK | Non-Solana | Verdict |");
-    let _ = writeln!(out, "|----------|----|------------|---------|");
+    let _ = writeln!(
+        out,
+        "| Provider | OK | Non-Solana | Tolerated 404 | Verdict |"
+    );
+    let _ = writeln!(
+        out,
+        "|----------|----|------------|---------------|---------|"
+    );
     for p in &validation.providers {
         let v = if p.block {
             ":no_entry: BLOCK"
-        } else if p.non_solana_count > 0 {
+        } else if p.non_solana_count > 0 || p.tolerated_count > 0 {
             ":warning: warn"
         } else {
             ":white_check_mark: pass"
         };
         let _ = writeln!(
             out,
-            "| `{}` | {} | {} | {} |",
-            p.fqn, p.ok_count, p.non_solana_count, v
+            "| `{}` | {} | {} | {} | {} |",
+            p.fqn, p.ok_count, p.non_solana_count, p.tolerated_count, v
         );
     }
     for p in &validation.providers {
-        if p.non_solana_count == 0 {
+        if p.non_solana_count == 0 && p.tolerated_count == 0 {
             continue;
         }
         let _ = writeln!(out);
         let _ = writeln!(
             out,
-            "<details><summary>{} — non-Solana endpoints</summary>",
+            "<details><summary>{} — endpoint warnings</summary>",
             p.fqn
         );
         let _ = writeln!(out);
         let _ = writeln!(out, "| Method | Path | Status | Note |");
         let _ = writeln!(out, "|--------|------|--------|------|");
         for ep in &p.endpoints {
-            if !matches!(ep.verdict, super::verdict::EndpointVerdict::NotSolana) {
+            if !matches!(
+                ep.verdict,
+                super::verdict::EndpointVerdict::NotSolana
+                    | super::verdict::EndpointVerdict::ToleratedWarning
+            ) {
                 continue;
             }
             let _ = writeln!(
@@ -728,6 +749,7 @@ fn verdict_stats(validation: &ValidationReport) -> VerdictStats {
         .iter()
         .map(|p| p.non_solana_count)
         .sum();
+    let tolerated: usize = validation.providers.iter().map(|p| p.tolerated_count).sum();
     let classified = ok + non_solana;
     VerdictStats {
         providers,
@@ -735,6 +757,7 @@ fn verdict_stats(validation: &ValidationReport) -> VerdictStats {
         ok,
         classified,
         non_solana,
+        tolerated,
     }
 }
 
@@ -804,6 +827,7 @@ mod tests {
             ok,
             classified: ok + non_solana,
             non_solana,
+            tolerated: 0,
         }
     }
 

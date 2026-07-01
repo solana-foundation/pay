@@ -4,11 +4,14 @@
 //!
 //! - **Warning** for every gated endpoint that doesn't accept Solana
 //!   stablecoin payment (e.g. Base-only).
+//! - **Warning** for 404s from parameterized probes (query strings,
+//!   unresolved `{path}` placeholders, or `/:param` segments). These usually
+//!   mean the example resource is stale rather than the route being absent.
 //! - **Error** when a provider has no endpoint that pays through pay's wallet
 //!   (`ok`) *and* none whose gate is sign-in/auth (`siwx_required` /
-//!   `auth_required`). A provider that probes as only free / broken
-//!   (`unprobeable_needs_body`, `not_found`, `error`, …) blocks — it has
-//!   nothing usable in the catalog.
+//!   `auth_required`) or parameterized 404. A provider that probes as only free
+//!   / broken (`unprobeable_needs_body`, bare `not_found`, `error`, …) blocks
+//!   — it has nothing usable in the catalog.
 //! - `siwx_required` / `auth_required` exempt a provider from that rule:
 //!   payment sits behind credentials the probe can't satisfy, so we can
 //!   neither prove nor disprove a Solana 402. Other indeterminate statuses no
@@ -31,6 +34,9 @@ pub enum EndpointVerdict {
     /// Gated but only accepts non-Solana chains (e.g. Base USDC). Surfaces a
     /// warning by default; an error under `--strict`.
     NotSolana,
+    /// 404 from a probe URL with query/path parameters. Surfaces a warning,
+    /// but does not block by itself because the route may exist for real ids.
+    ToleratedWarning,
     /// Free / not gated.
     Free,
     /// Indeterminate — auth, siwx, body required, 404, etc. Does not count
@@ -61,6 +67,8 @@ pub struct ProviderVerdict {
     pub ok_count: usize,
     /// Total number of `not_solana` endpoints.
     pub non_solana_count: usize,
+    /// Total number of warning-only, tolerated endpoints.
+    pub tolerated_count: usize,
     /// Whether the provider blocks the PR: zero `ok` endpoints and none
     /// credential-gated (`siwx_required` / `auth_required`), or `--strict`
     /// and any non-Solana endpoint.
@@ -105,6 +113,10 @@ fn verdict_for_provider(provider: &ProviderProbeResult, strict: bool) -> Provide
         .iter()
         .filter(|e| e.verdict == EndpointVerdict::NotSolana)
         .count();
+    let tolerated_count = endpoints
+        .iter()
+        .filter(|e| e.verdict == EndpointVerdict::ToleratedWarning)
+        .count();
 
     // Endpoints whose payment gate the probe legitimately can't reach —
     // payment sits behind sign-in (SIWX) or credentials (auth). These exempt a
@@ -116,16 +128,19 @@ fn verdict_for_provider(provider: &ProviderProbeResult, strict: bool) -> Provide
         .count();
 
     // A provider must expose at least one endpoint that actually pays through
-    // pay's wallet (`ok`) — or be entirely credential-gated. A provider that
-    // probes as only free / broken (`unprobeable_needs_body`, `not_found`,
-    // `error`, …) has nothing usable in the catalog and blocks: otherwise a
-    // provider whose paid endpoints never produce a 402 (e.g. one that reserves
-    // upstream before issuing the challenge) would publish with zero payable
-    // endpoints. `--strict` additionally blocks on any non-Solana gate.
+    // pay's wallet (`ok`) — or have a gate/resource the probe can't verify
+    // without external state (credentials or real resource ids). A provider
+    // that probes as only free / broken (`unprobeable_needs_body`, bare
+    // `not_found`, `error`, …) has nothing usable in the catalog and blocks:
+    // otherwise a provider whose paid endpoints never produce a 402 (e.g. one
+    // that reserves upstream before issuing the challenge) would publish with
+    // zero payable endpoints. `--strict` additionally blocks on any
+    // non-Solana gate.
+    let externally_stateful_count = credential_gated_count + tolerated_count;
     let block = if strict {
-        non_solana_count > 0 || (ok_count == 0 && credential_gated_count == 0)
+        non_solana_count > 0 || (ok_count == 0 && externally_stateful_count == 0)
     } else {
-        ok_count == 0 && credential_gated_count == 0
+        ok_count == 0 && externally_stateful_count == 0
     };
 
     ProviderVerdict {
@@ -134,6 +149,7 @@ fn verdict_for_provider(provider: &ProviderProbeResult, strict: bool) -> Provide
         endpoints,
         ok_count,
         non_solana_count,
+        tolerated_count,
         block,
     }
 }
@@ -168,6 +184,10 @@ fn verdict_for_endpoint(ep: &EndpointProbeResult) -> EndpointVerdictRow {
         "not_found" => (
             EndpointVerdict::Indeterminate,
             "404 — endpoint may have been moved or removed".into(),
+        ),
+        "parameterized_not_found" => (
+            EndpointVerdict::ToleratedWarning,
+            "404 from parameterized probe — likely stale example/resource id".into(),
         ),
         "method_not_allowed" => (
             EndpointVerdict::Indeterminate,
@@ -278,7 +298,7 @@ pub fn render_verdict_table(report: &ValidationReport) {
                 provider.ok_count,
                 provider.ok_count + provider.non_solana_count
             )
-        } else if provider.non_solana_count > 0 {
+        } else if provider.non_solana_count > 0 || provider.tolerated_count > 0 {
             format!(
                 "{}   {} ({}/{})",
                 "WARN".yellow().bold(),
@@ -303,6 +323,10 @@ pub fn render_verdict_table(report: &ValidationReport) {
             let icon = match ep.verdict {
                 EndpointVerdict::Ok => "OK".green().to_string(),
                 EndpointVerdict::NotSolana => {
+                    warn_count += 1;
+                    "WARN".yellow().to_string()
+                }
+                EndpointVerdict::ToleratedWarning => {
                     warn_count += 1;
                     "WARN".yellow().to_string()
                 }
@@ -337,13 +361,23 @@ pub fn render_verdict_github(report: &ValidationReport) {
     for provider in &report.providers {
         for ep in &provider.endpoints {
             match ep.verdict {
-                EndpointVerdict::NotSolana => {
+                EndpointVerdict::NotSolana | EndpointVerdict::ToleratedWarning => {
                     let msg = format!("{} {} — {}", ep.method, ep.path, ep.note);
-                    let annotation = if report.strict { "error" } else { "warning" };
+                    let annotation =
+                        if report.strict && matches!(ep.verdict, EndpointVerdict::NotSolana) {
+                            "error"
+                        } else {
+                            "warning"
+                        };
+                    let kind = if matches!(ep.verdict, EndpointVerdict::NotSolana) {
+                        "non-Solana endpoint"
+                    } else {
+                        "parameterized 404 endpoint"
+                    };
                     println!(
                         "::{annotation} file={file},title={title}::{msg}",
                         file = provider.file,
-                        title = encode_actions(&format!("{}: non-Solana endpoint", provider.fqn)),
+                        title = encode_actions(&format!("{}: {kind}", provider.fqn)),
                         msg = encode_actions(&msg),
                     );
                 }
@@ -384,14 +418,18 @@ pub fn render_verdict_github(report: &ValidationReport) {
     }
 
     let total_blocks = report.providers.iter().filter(|p| p.block).count();
-    let total_warns: usize = report.providers.iter().map(|p| p.non_solana_count).sum();
+    let total_warns: usize = report
+        .providers
+        .iter()
+        .map(|p| p.non_solana_count + p.tolerated_count)
+        .sum();
     let summary = if total_blocks > 0 {
         format!(
-            "{} provider(s) blocked, {} non-Solana endpoint(s)",
+            "{} provider(s) blocked, {} endpoint warning(s)",
             total_blocks, total_warns,
         )
     } else if total_warns > 0 {
-        format!("{} non-Solana endpoint(s) flagged", total_warns)
+        format!("{} endpoint warning(s)", total_warns)
     } else {
         "all changed providers Solana-compatible".to_string()
     };
@@ -495,6 +533,44 @@ mod tests {
         assert!(!v.providers[0].block);
         assert_eq!(v.providers[0].ok_count, 0);
         assert_eq!(v.providers[0].non_solana_count, 0);
+    }
+
+    #[test]
+    fn parameterized_404_warns_and_exempts_provider() {
+        let report = ProbeReport {
+            providers: vec![provider_result(
+                "foo/bar",
+                vec![ep_result("parameterized_not_found", vec![])],
+            )],
+            total_endpoints: 1,
+            passed: 0,
+            failed: 1,
+        };
+        let v = validate_report(&report, false);
+        assert!(!v.providers[0].block);
+        assert_eq!(v.providers[0].ok_count, 0);
+        assert_eq!(v.providers[0].non_solana_count, 0);
+        assert_eq!(v.providers[0].tolerated_count, 1);
+        assert_eq!(
+            v.providers[0].endpoints[0].verdict,
+            EndpointVerdict::ToleratedWarning
+        );
+    }
+
+    #[test]
+    fn strict_does_not_block_parameterized_404_warning() {
+        let report = ProbeReport {
+            providers: vec![provider_result(
+                "foo/bar",
+                vec![ep_result("parameterized_not_found", vec![])],
+            )],
+            total_endpoints: 1,
+            passed: 0,
+            failed: 1,
+        };
+        let v = validate_report(&report, true);
+        assert!(!v.providers[0].block);
+        assert_eq!(v.providers[0].tolerated_count, 1);
     }
 
     #[test]

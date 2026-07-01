@@ -192,6 +192,18 @@ pub struct ProbeReport {
     pub failed: usize,
 }
 
+pub fn is_parameterized_not_found(ep: &EndpointProbeResult) -> bool {
+    ep.probe_status == "parameterized_not_found"
+}
+
+fn has_probe_parameters(value: &str) -> bool {
+    value.contains('?')
+        || (value.contains('{') && value.contains('}'))
+        || value
+            .split('/')
+            .any(|segment| segment.starts_with(':') && segment.len() > 1)
+}
+
 // ── Rich extraction ──────────────────────────────────────────────────────────
 
 /// Walk every MPP challenge in `headers` and every x402 `accepts` entry in
@@ -440,7 +452,10 @@ fn probe_endpoint(
                 other => other,
             };
             let paid = extract_paid_endpoint(&raw.headers, Some(&body_text));
-            let label = probe_status_str(&probe_status_kind, raw.status, &paid);
+            let mut label = probe_status_str(&probe_status_kind, raw.status, &paid).to_string();
+            if label == "not_found" && has_probe_parameters(url) {
+                label = "parameterized_not_found".to_string();
+            }
             (probe_status_kind, paid, label.to_string(), raw.status)
         }
         Err(e) => {
