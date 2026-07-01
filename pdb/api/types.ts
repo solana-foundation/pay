@@ -14,7 +14,7 @@ export type StepStatus = "completed" | "in-progress" | "pending";
 
 export interface FlowStep {
   key: string; // "request" | "challenge" | "payment" | "delivery"
-  label: string; // Human-readable, e.g. "Client Request"
+  label: string; // Human-readable, e.g. "Initial Request"
   status: StepStatus;
   ts: string | null; // ISO timestamp when completed
 }

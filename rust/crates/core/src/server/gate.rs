@@ -19,8 +19,8 @@ use bytes::Bytes;
 use http::{HeaderName, HeaderValue, Method, StatusCode, header};
 use pay_kit::mpp::server::{ChargeOptions, VerificationError};
 use pay_kit::mpp::{
-    PAYMENT_RECEIPT_HEADER, ReceiptKind, format_receipt, format_www_authenticate,
-    format_www_authenticate_many, parse_authorization,
+    ChargeRequest, PAYMENT_RECEIPT_HEADER, PaymentCredential, ReceiptKind, format_receipt,
+    format_www_authenticate, format_www_authenticate_many, parse_authorization,
 };
 use pay_kit::x402::PAYMENT_RESPONSE_HEADER;
 use pay_kit::x402::server::{ExactOptions, VerifiedUptoOpen, X402, X402BatchSettlement, X402Upto};
@@ -413,16 +413,20 @@ impl<S: PaymentState> PaymentGate<S> {
             if !mpps.is_empty() {
                 let amount = crate::server::payment::charge_amount_from_price(price.as_ref());
                 let uri = reconstruct_uri(path, req.query);
+                let external_id = crate::server::payment::resource_memo_with_nonce(
+                    resource,
+                    pay_kit::mpp::protocol::solana::MAX_MEMO_BYTES,
+                );
                 let mut challenges = Vec::with_capacity(mpps.len());
                 for mpp in &mpps {
                     match mpp.charge_with_options(
                         &amount,
                         ChargeOptions {
                             description,
-                            // Default the main recipient's settlement memo to the
-                            // endpoint resource so the seller's payout is itemized
-                            // on-chain / in receipts (splits carry their own memo).
-                            external_id: resource,
+                            // The main recipient's settlement memo is the endpoint
+                            // resource plus a per-challenge suffix, so repeated
+                            // same-route payments don't rely on blockhash uniqueness.
+                            external_id: external_id.as_deref(),
                             splits: crate::server::payment::resolve_charge_splits(
                                 mpp, meter, api, &uri, &amount,
                             ),
@@ -469,12 +473,16 @@ impl<S: PaymentState> PaymentGate<S> {
             && let Some(x402) = self.state.x402()
         {
             let amount = crate::server::payment::charge_amount_from_price(price.as_ref());
-            // Stamp the endpoint resource as the on-chain memo (parity with the
-            // MPP charge external_id) instead of the client's random nonce.
+            // Parity with MPP charge external_id: resource plus per-challenge
+            // suffix, so repeated same-route payments are distinct on-chain.
+            let memo = crate::server::payment::resource_memo_with_nonce(
+                resource,
+                pay_kit::x402::exact::MAX_MEMO_BYTES,
+            );
             match x402.payment_required_header(
                 &amount,
                 ExactOptions {
-                    memo: resource,
+                    memo: memo.as_deref(),
                     ..Default::default()
                 },
             ) {
@@ -613,12 +621,16 @@ impl<S: PaymentState> PaymentGate<S> {
                     .unwrap_or_default(),
             ))
         };
+        let memo = match x402_exact_payment_memo(x402, pay_header, resource) {
+            Ok(memo) => memo,
+            Err(e) => return reject(e),
+        };
         let verified = match x402
             .process_payment(
                 pay_header,
                 &amount,
                 ExactOptions {
-                    memo: resource,
+                    memo: memo.as_deref(),
                     ..Default::default()
                 },
             )
@@ -1028,13 +1040,22 @@ impl<S: PaymentState> PaymentGate<S> {
             metering::resolve_price(meter, &props, variant.as_deref(), None).as_ref(),
         );
         // Reconstruct a URI for split-rule query params (splits price off the request).
-        let uri: http::Uri = format!(
-            "/{}{}",
-            path,
-            req.query.map(|q| format!("?{q}")).unwrap_or_default()
-        )
-        .parse()
-        .unwrap_or_default();
+        let uri = reconstruct_uri(path, req.query);
+        let external_id = match mpp_charge_payment_external_id(&credential, resource) {
+            Ok(external_id) => external_id,
+            Err(e) => {
+                telemetry::record_settlement_error("mpp", subdomain, path, &e, false);
+                return GateDecision::Respond(GateResponse::json(
+                    StatusCode::PAYMENT_REQUIRED,
+                    serde_json::to_vec(&json!({
+                        "error": "verification_failed",
+                        "message": e,
+                        "retryable": false,
+                    }))
+                    .unwrap_or_default(),
+                ));
+            }
+        };
 
         let mut last_error = None;
         for mpp in &mpps {
@@ -1044,9 +1065,10 @@ impl<S: PaymentState> PaymentGate<S> {
                 &amount,
                 ChargeOptions {
                     description,
-                    // Must match the challenge (external_id = resource), else the
-                    // echoed credential trips the externalId-mismatch check.
-                    external_id: resource,
+                    // Must match the original challenge; for resource-backed
+                    // routes this is the validated resource memo echoed by the
+                    // credential, including the per-challenge suffix.
+                    external_id: external_id.as_deref(),
                     splits: crate::server::payment::resolve_charge_splits(
                         mpp, meter, api, &uri, &amount,
                     ),
@@ -1240,6 +1262,65 @@ fn reconstruct_uri(path: &str, query: Option<&str>) -> http::Uri {
     .unwrap_or_default()
 }
 
+fn x402_exact_payment_memo(
+    x402: &X402,
+    pay_header: &str,
+    resource: Option<&str>,
+) -> Result<Option<String>, String> {
+    let Some(resource) = resource.map(str::trim).filter(|r| !r.is_empty()) else {
+        return Ok(None);
+    };
+    let envelope = match x402.parse_payment_signature(pay_header) {
+        Ok(envelope) => envelope,
+        Err(_) => return Ok(None),
+    };
+    let Some(memo) = envelope
+        .accepted
+        .as_ref()
+        .and_then(|accepted| accepted.get("extra"))
+        .and_then(|extra| extra.get("memo"))
+        .and_then(|memo| memo.as_str())
+    else {
+        return Ok(None);
+    };
+    if crate::server::payment::resource_memo_matches(
+        memo,
+        resource,
+        pay_kit::x402::exact::MAX_MEMO_BYTES,
+    ) {
+        Ok(Some(memo.to_string()))
+    } else {
+        Err("x402 exact payment memo does not match endpoint resource".to_string())
+    }
+}
+
+fn mpp_charge_payment_external_id(
+    credential: &PaymentCredential,
+    resource: Option<&str>,
+) -> Result<Option<String>, String> {
+    let Some(resource) = resource.map(str::trim).filter(|r| !r.is_empty()) else {
+        return Ok(None);
+    };
+    let request: ChargeRequest = credential
+        .challenge
+        .request
+        .decode()
+        .map_err(|e| format!("MPP charge credential request decode failed: {e}"))?;
+    let external_id = request
+        .external_id
+        .as_deref()
+        .ok_or_else(|| "MPP charge credential missing expected resource externalId".to_string())?;
+    if crate::server::payment::resource_memo_matches(
+        external_id,
+        resource,
+        pay_kit::mpp::protocol::solana::MAX_MEMO_BYTES,
+    ) {
+        Ok(Some(external_id.to_string()))
+    } else {
+        Err("MPP charge credential externalId does not match endpoint resource".to_string())
+    }
+}
+
 /// Path-only variant hint (e.g. `/models/{name}:action` → `name`).
 fn variant_hint_from_path(path: &str) -> Option<String> {
     let parts: Vec<&str> = path.split('/').collect();
@@ -1376,6 +1457,166 @@ mod tests {
             upto_settle_amount(Some(0.01), 0.0, CEILING_BASE),
             CEILING_BASE
         );
+    }
+
+    #[test]
+    fn x402_exact_payment_memo_accepts_resource_nonce_memo() {
+        let x402 = x402_test_server();
+        let accepted = x402_accepted_with_memo(&x402, Some("fortune#012"));
+        let header = x402_signature_header(Some(accepted));
+
+        assert_eq!(
+            x402_exact_payment_memo(&x402, &header, Some("fortune"))
+                .unwrap()
+                .as_deref(),
+            Some("fortune#012")
+        );
+    }
+
+    #[test]
+    fn x402_exact_payment_memo_rejects_wrong_resource() {
+        let x402 = x402_test_server();
+        let accepted = x402_accepted_with_memo(&x402, Some("other#012"));
+        let header = x402_signature_header(Some(accepted));
+
+        assert!(
+            x402_exact_payment_memo(&x402, &header, Some("fortune"))
+                .unwrap_err()
+                .contains("does not match")
+        );
+    }
+
+    #[test]
+    fn x402_exact_payment_memo_falls_back_when_accepted_memo_is_absent() {
+        let x402 = x402_test_server();
+        let accepted = x402_accepted_with_memo(&x402, None);
+        let header = x402_signature_header(Some(accepted));
+
+        assert_eq!(
+            x402_exact_payment_memo(&x402, &header, Some("fortune")).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn x402_exact_payment_memo_falls_back_to_process_payment_for_missing_accepted() {
+        let x402 = x402_test_server();
+        let header = x402_signature_header(None);
+
+        assert_eq!(
+            x402_exact_payment_memo(&x402, &header, Some("fortune")).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn mpp_charge_payment_external_id_accepts_resource_nonce_memo() {
+        let credential = mpp_credential_with_external_id(Some("fortune#012"));
+
+        assert_eq!(
+            mpp_charge_payment_external_id(&credential, Some("fortune"))
+                .unwrap()
+                .as_deref(),
+            Some("fortune#012")
+        );
+    }
+
+    #[test]
+    fn mpp_charge_payment_external_id_accepts_legacy_static_resource() {
+        let credential = mpp_credential_with_external_id(Some("fortune"));
+
+        assert_eq!(
+            mpp_charge_payment_external_id(&credential, Some("fortune"))
+                .unwrap()
+                .as_deref(),
+            Some("fortune")
+        );
+    }
+
+    #[test]
+    fn mpp_charge_payment_external_id_rejects_wrong_resource() {
+        let credential = mpp_credential_with_external_id(Some("other#012"));
+
+        assert!(
+            mpp_charge_payment_external_id(&credential, Some("fortune"))
+                .unwrap_err()
+                .contains("does not match")
+        );
+    }
+
+    fn mpp_credential_with_external_id(external_id: Option<&str>) -> PaymentCredential {
+        let request = ChargeRequest {
+            amount: "1".to_string(),
+            currency: "USDC".to_string(),
+            external_id: external_id.map(str::to_string),
+            ..Default::default()
+        };
+        let challenge = pay_kit::mpp::PaymentChallenge::new(
+            "challenge-id",
+            "pay",
+            "solana",
+            "charge",
+            pay_kit::mpp::Base64UrlJson::from_typed(&request).unwrap(),
+        );
+        PaymentCredential::new(
+            challenge.to_echo(),
+            json!({"type": "transaction", "transaction": "deadbeef"}),
+        )
+    }
+
+    fn x402_test_server() -> X402 {
+        X402::new(pay_kit::x402::server::Config {
+            recipient: "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY".to_string(),
+            currencies: vec![pay_kit::x402::server::CurrencyConfig {
+                currency: "USDC".to_string(),
+                decimals: 6,
+                token_program: None,
+            }],
+            network: "devnet".to_string(),
+            rpc_url: Some("http://localhost:8899".to_string()),
+            resource: "fortune".to_string(),
+            description: Some("Fortune".to_string()),
+            max_age: Some(60),
+            fee_payer_key: None,
+        })
+        .unwrap()
+    }
+
+    fn x402_accepted_with_memo(x402: &X402, memo: Option<&str>) -> serde_json::Value {
+        let (_, required) = x402
+            .payment_required_header(
+                "1",
+                ExactOptions {
+                    memo,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let decoded =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, required).unwrap();
+        let envelope: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+        envelope
+            .get("accepts")
+            .and_then(|accepts| accepts.as_array())
+            .and_then(|accepts| accepts.first())
+            .cloned()
+            .unwrap()
+    }
+
+    fn x402_signature_header(accepted: Option<serde_json::Value>) -> String {
+        let mut envelope = json!({
+            "x402Version": pay_kit::x402::X402_VERSION_V2,
+            "payload": {
+                "signature": "5UfDuX6nSqMzMR8W7n6K3b1GKLmaqEisBFCcYPRLjNHrCbVQJF3BVjkE7aQJMQ2Kx"
+            }
+        });
+        if let Some(accepted) = accepted {
+            envelope["accepted"] = accepted;
+        }
+        base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            serde_json::to_vec(&envelope).unwrap(),
+        )
     }
 
     fn req<'a>(method: &'a Method, path: &'a str) -> GateRequest<'a> {

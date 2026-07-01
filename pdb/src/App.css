@@ -785,11 +785,9 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
-/* Receipt link shown beneath the flow's payment / sign-in / session panel.
-   Lives inside the panel (which flows top-down), so it hugs the content
-   rather than floating to the bottom of the column. */
+/* Receipt link shown beneath the Resource Delivered step in the flow view. */
 .flow-receipt {
-  padding: 12px 0 2px;
+  padding: 6px 0 0;
 }
 
 .flow-receipt-link {

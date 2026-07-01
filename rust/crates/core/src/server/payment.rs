@@ -243,6 +243,82 @@ pub(crate) fn decode_payment_amount(
     telemetry::payment_amount_from_raw(&request.amount, decimals, request.currency)
 }
 
+const RESOURCE_MEMO_NONCE_HEX_LEN: usize = 3;
+const RESOURCE_MEMO_TRUNC_HASH_HEX_LEN: usize = 6;
+const RESOURCE_MEMO_TRUNC_SUFFIX_LEN: usize =
+    1 + 1 + RESOURCE_MEMO_TRUNC_HASH_HEX_LEN + RESOURCE_MEMO_NONCE_HEX_LEN;
+
+pub(crate) fn resource_memo_with_nonce(resource: Option<&str>, max_bytes: usize) -> Option<String> {
+    let resource = resource.map(str::trim).filter(|r| !r.is_empty())?;
+    let nonce = rand::random::<[u8; 2]>()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
+        .chars()
+        .take(RESOURCE_MEMO_NONCE_HEX_LEN)
+        .collect::<String>();
+    let memo = format!("{resource}#{nonce}");
+    if memo.len() <= max_bytes {
+        Some(memo)
+    } else {
+        let prefix_len = max_bytes.checked_sub(RESOURCE_MEMO_TRUNC_SUFFIX_LEN)?;
+        let prefix = truncate_to_char_boundary(resource, prefix_len);
+        if prefix.is_empty() {
+            None
+        } else {
+            let hash = resource_memo_hash(resource);
+            Some(format!("{prefix}#t{hash}{nonce}"))
+        }
+    }
+}
+
+pub(crate) fn resource_memo_matches(memo: &str, resource: &str, max_bytes: usize) -> bool {
+    if memo == resource {
+        return true;
+    }
+    let Some((prefix, suffix)) = memo.rsplit_once('#') else {
+        return false;
+    };
+    if suffix.len() == RESOURCE_MEMO_NONCE_HEX_LEN
+        && suffix.as_bytes().iter().all(u8::is_ascii_hexdigit)
+        && prefix == resource
+    {
+        return true;
+    }
+    let Some(binding) = suffix.strip_prefix('t') else {
+        return false;
+    };
+    if binding.len() != RESOURCE_MEMO_TRUNC_HASH_HEX_LEN + RESOURCE_MEMO_NONCE_HEX_LEN
+        || !binding.as_bytes().iter().all(u8::is_ascii_hexdigit)
+        || !binding.starts_with(&resource_memo_hash(resource))
+    {
+        return false;
+    }
+    let Some(expected_prefix_len) = max_bytes.checked_sub(RESOURCE_MEMO_TRUNC_SUFFIX_LEN) else {
+        return false;
+    };
+    let expected_prefix = truncate_to_char_boundary(resource, expected_prefix_len);
+    resource.len() > expected_prefix_len
+        && !expected_prefix.is_empty()
+        && prefix == expected_prefix
+        && memo.len() <= max_bytes
+}
+
+fn resource_memo_hash(resource: &str) -> String {
+    blake3::hash(resource.as_bytes()).to_hex()[..RESOURCE_MEMO_TRUNC_HASH_HEX_LEN].to_string()
+}
+
+fn truncate_to_char_boundary(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
 pub fn readable_verification_message(error: &pay_kit::mpp::server::VerificationError) -> String {
     let message = error.to_string();
     if message.contains("Fee payer cannot authorize the SPL payment transfer") {
@@ -370,6 +446,40 @@ mod tests {
         assert_eq!(params.get("foo"), Some(&"bar".to_string()));
         assert_eq!(params.get("empty"), Some(&"".to_string()));
         assert_eq!(params.get("baz"), Some(&"qux".to_string()));
+    }
+
+    #[test]
+    fn resource_memo_keeps_resource_and_adds_3_hex_char_nonce() {
+        let memo = resource_memo_with_nonce(Some("fortune"), 566).unwrap();
+        assert!(memo.starts_with("fortune#"));
+        assert_eq!(memo.len(), "fortune#".len() + 3);
+        assert!(resource_memo_matches(&memo, "fortune", 566));
+    }
+
+    #[test]
+    fn resource_memo_matcher_accepts_legacy_static_resource() {
+        assert!(resource_memo_matches("fortune", "fortune", 566));
+        assert!(!resource_memo_matches("fortune#not-hex", "fortune", 566));
+        assert!(!resource_memo_matches("other#012", "fortune", 566));
+    }
+
+    #[test]
+    fn resource_memo_truncates_resource_to_keep_nonce_within_limit() {
+        let resource = "fortune/very/long";
+        let memo = resource_memo_with_nonce(Some(resource), 12).unwrap();
+        assert!(memo.starts_with("f#t"));
+        assert_eq!(memo.len(), 12);
+        assert!(resource_memo_matches(&memo, resource, 12));
+        assert!(!resource_memo_matches(
+            &memo,
+            resource,
+            pay_kit::mpp::protocol::solana::MAX_MEMO_BYTES
+        ));
+    }
+
+    #[test]
+    fn resource_memo_matcher_rejects_short_resource_memo_for_longer_resource() {
+        assert!(!resource_memo_matches("api/path#abc", "api/path/extra", 12));
     }
 
     #[test]
