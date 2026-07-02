@@ -8,7 +8,9 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
-use super::theme::{SOLANA_BLUE, SOLANA_GREEN, SOLANA_PURPLE, TOPUP_CARD_BG, TOPUP_MAIN_BG, TOPUP_SIDEBAR_BG};
+use super::theme::{
+    SOLANA_BLUE, SOLANA_GREEN, SOLANA_PURPLE, TOPUP_CARD_BG, TOPUP_MAIN_BG, TOPUP_SIDEBAR_BG,
+};
 
 /// Cell glyph used to draw slider tracks.
 const SLIDER_CELL: &str = "▐";
@@ -351,7 +353,11 @@ pub(crate) fn sidebar_card(
     accent_color: Color,
     selected: bool,
 ) {
-    let bg = if selected { accent_color } else { TOPUP_CARD_BG };
+    let bg = if selected {
+        accent_color
+    } else {
+        TOPUP_CARD_BG
+    };
     let title_color = if selected { Color::White } else { Color::Gray };
     let block = Block::default().style(Style::default().bg(bg));
     // Card height is 3 — pad a blank line above the title so it lands
@@ -409,11 +415,7 @@ pub(crate) fn controls_bar(
 
     if let Some(status) = right_status {
         let controls_width: usize = spans.iter().map(|span| span.content.len()).sum();
-        let status_width: usize = status
-            .spans
-            .iter()
-            .map(|span| span.content.len())
-            .sum();
+        let status_width: usize = status.spans.iter().map(|span| span.content.len()).sum();
         let total_width = controls_width.saturating_add(status_width);
         let gap = (area.width as usize).saturating_sub(total_width);
         spans.push(Span::raw(" ".repeat(gap.max(1))));

@@ -90,7 +90,12 @@ impl StreamObserver {
         } else if !self.body_buf.is_empty() {
             let body = std::mem::take(&mut self.body_buf);
             if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body) {
-                apply_json(&mut self.usage, &json, &mut self.events, &mut self.authoritative);
+                apply_json(
+                    &mut self.usage,
+                    &json,
+                    &mut self.events,
+                    &mut self.authoritative,
+                );
             }
         }
     }
@@ -135,7 +140,12 @@ impl StreamObserver {
         let Ok(json) = serde_json::from_str::<serde_json::Value>(payload) else {
             return;
         };
-        apply_json(&mut self.usage, &json, &mut self.events, &mut self.authoritative);
+        apply_json(
+            &mut self.usage,
+            &json,
+            &mut self.events,
+            &mut self.authoritative,
+        );
     }
 
     /// tokens/sec over the generation window (first token → now), from the
@@ -338,17 +348,23 @@ mod tests {
     fn garbage_body_yields_no_usage() {
         let mut obs = StreamObserver::new(false);
         feed_all(&mut obs, "<html>definitely not json</html>");
-        assert_eq!(obs.usage, InferenceUsage {
-            streamed: false,
-            ttft_ms: obs.usage.ttft_ms,
-            ..Default::default()
-        });
+        assert_eq!(
+            obs.usage,
+            InferenceUsage {
+                streamed: false,
+                ttft_ms: obs.usage.ttft_ms,
+                ..Default::default()
+            }
+        );
     }
 
     #[test]
     fn emit_throttle_allows_first_then_blocks() {
         let mut obs = StreamObserver::new(true);
         assert!(obs.should_emit());
-        assert!(!obs.should_emit(), "second call within 1s must be throttled");
+        assert!(
+            !obs.should_emit(),
+            "second call within 1s must be throttled"
+        );
     }
 }

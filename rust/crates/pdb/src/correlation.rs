@@ -1766,7 +1766,10 @@ mod tests {
         let flows = engine.snapshot();
         assert_eq!(flows.len(), 1, "completion must not create a second flow");
         assert_eq!(flows[0].status, FlowStatus::ResourceDelivered);
-        assert_eq!(flows[0].duration_ms, 2500, "duration from start ts, not entry.ms");
+        assert_eq!(
+            flows[0].duration_ms, 2500,
+            "duration from start ts, not entry.ms"
+        );
         // Inference survives completion.
         assert_eq!(
             flows[0].inference.as_ref().unwrap().model.as_deref(),

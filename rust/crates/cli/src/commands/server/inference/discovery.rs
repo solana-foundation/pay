@@ -1,7 +1,6 @@
 //! Local inference provider discovery — probes well-known ports with
 //! provider-specific identify endpoints and reads model lists.
 
-use std::collections::HashMap;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -93,69 +92,103 @@ fn merge_registries(embedded: ProviderRegistry, user: ProviderRegistry) -> Provi
     ProviderRegistry { providers }
 }
 
-/// Probe every registry provider concurrently and return those that
-/// identified positively. A port is claimed by the first provider (registry
-/// order) whose identify probe passes on it.
+/// Hard cap on one provider's whole probe pass (all ports + model list) so a
+/// slow-to-accept server can't stall discovery.
+const PROVIDER_PROBE_BUDGET: Duration = Duration::from_secs(1);
+
+/// Progress events emitted by [`discover_with`] as each provider is probed.
+pub enum ProbeEvent<'a> {
+    Started(&'a ProviderSpec),
+    Found(&'a DiscoveredProvider),
+    Missed(&'a ProviderSpec),
+}
+
+/// Probe registry providers in order and return those that identified
+/// positively. A port is claimed by the first provider that identifies on
+/// it, so contested ports (8080) resolve deterministically by registry
+/// order. Each provider gets at most [`PROVIDER_PROBE_BUDGET`].
 pub async fn discover(
     registry: &ProviderRegistry,
     timeout: Duration,
     restrict: Option<&[String]>,
+) -> Vec<DiscoveredProvider> {
+    discover_with(registry, timeout, restrict, |_| {}).await
+}
+
+/// [`discover`] with a per-provider progress callback (drives the startup
+/// spinner).
+pub async fn discover_with(
+    registry: &ProviderRegistry,
+    timeout: Duration,
+    restrict: Option<&[String]>,
+    mut on_event: impl FnMut(ProbeEvent<'_>),
 ) -> Vec<DiscoveredProvider> {
     let client = reqwest::Client::builder()
         .timeout(timeout)
         .build()
         .expect("reqwest client");
 
-    // Group candidate providers per port, preserving registry order so
-    // contested ports resolve deterministically.
-    let mut by_port: HashMap<u16, Vec<&ProviderSpec>> = HashMap::new();
-    for provider in &registry.providers {
+    let mut claimed_ports: std::collections::HashSet<u16> = std::collections::HashSet::new();
+    let mut discovered = Vec::new();
+
+    for spec in &registry.providers {
         if let Some(allowed) = restrict
-            && !allowed.iter().any(|s| s == &provider.slug)
+            && !allowed.iter().any(|s| s == &spec.slug)
         {
             continue;
         }
-        for port in &provider.ports {
-            by_port.entry(*port).or_default().push(provider);
+        on_event(ProbeEvent::Started(spec));
+
+        let found = tokio::time::timeout(
+            PROVIDER_PROBE_BUDGET,
+            probe_provider(&client, spec, &claimed_ports),
+        )
+        .await
+        .ok()
+        .flatten();
+
+        match found {
+            Some((provider, port)) => {
+                claimed_ports.insert(port);
+                on_event(ProbeEvent::Found(&provider));
+                discovered.push(provider);
+            }
+            None => on_event(ProbeEvent::Missed(spec)),
         }
     }
 
-    let mut probes = tokio::task::JoinSet::new();
-    for (port, candidates) in by_port {
-        let client = client.clone();
-        let candidates: Vec<ProviderSpec> = candidates.into_iter().cloned().collect();
-        probes.spawn(async move {
-            let base_url = format!("http://127.0.0.1:{port}");
-            for spec in candidates {
-                if let Some(version) = identify(&client, &base_url, &spec).await {
-                    let models = match &spec.models {
-                        Some(probe) => fetch_models(&client, &base_url, probe).await,
-                        None => Vec::new(),
-                    };
-                    return Some(DiscoveredProvider {
-                        spec,
-                        base_url,
-                        models,
-                        version,
-                    });
-                }
-            }
-            None
-        });
-    }
-
-    let mut discovered: Vec<DiscoveredProvider> = probes
-        .join_all()
-        .await
-        .into_iter()
-        .flatten()
-        .collect();
-    // join_all over a HashMap yields arbitrary order; keep output stable.
-    discovered.sort_by(|a, b| a.spec.slug.cmp(&b.spec.slug));
-
-    // One provider can answer on several ports; keep the first per slug.
-    discovered.dedup_by(|a, b| a.spec.slug == b.spec.slug);
     discovered
+}
+
+/// Try each of the provider's ports (skipping ones already claimed by an
+/// earlier provider); first identify hit wins.
+async fn probe_provider(
+    client: &reqwest::Client,
+    spec: &ProviderSpec,
+    claimed_ports: &std::collections::HashSet<u16>,
+) -> Option<(DiscoveredProvider, u16)> {
+    for port in &spec.ports {
+        if claimed_ports.contains(port) {
+            continue;
+        }
+        let base_url = format!("http://127.0.0.1:{port}");
+        if let Some(version) = identify(client, &base_url, spec).await {
+            let models = match &spec.models {
+                Some(probe) => fetch_models(client, &base_url, probe).await,
+                None => Vec::new(),
+            };
+            return Some((
+                DiscoveredProvider {
+                    spec: spec.clone(),
+                    base_url,
+                    models,
+                    version,
+                },
+                *port,
+            ));
+        }
+    }
+    None
 }
 
 /// Run a provider's identify probes against `base_url`. Returns
@@ -289,7 +322,11 @@ mod tests {
             vec!["ollama", "lm-studio", "llama-cpp", "vllm", "exo"]
         );
         for provider in &registry.providers {
-            assert!(!provider.identify.is_empty(), "{} needs probes", provider.slug);
+            assert!(
+                !provider.identify.is_empty(),
+                "{} needs probes",
+                provider.slug
+            );
             assert!(
                 provider
                     .identify
@@ -393,6 +430,41 @@ mod tests {
     }
 
     #[test]
+    fn probe_events_fire_in_registry_order() {
+        rt().block_on(async {
+            let port = stub(vec![("/api/version", r#"{"version":"0.9.1"}"#)]).await;
+            let registry = registry_with_ports(&[("ollama", port)]);
+
+            let mut events: Vec<String> = Vec::new();
+            let found = discover_with(&registry, Duration::from_millis(400), None, |event| {
+                events.push(match event {
+                    ProbeEvent::Started(spec) => format!("started:{}", spec.slug),
+                    ProbeEvent::Found(provider) => format!("found:{}", provider.spec.slug),
+                    ProbeEvent::Missed(spec) => format!("missed:{}", spec.slug),
+                });
+            })
+            .await;
+
+            assert_eq!(found.len(), 1);
+            assert_eq!(
+                events,
+                vec![
+                    "started:ollama",
+                    "found:ollama",
+                    "started:lm-studio",
+                    "missed:lm-studio",
+                    "started:llama-cpp",
+                    "missed:llama-cpp",
+                    "started:vllm",
+                    "missed:vllm",
+                    "started:exo",
+                    "missed:exo",
+                ]
+            );
+        });
+    }
+
+    #[test]
     fn user_registry_overrides_by_slug_and_appends() {
         let embedded: ProviderRegistry = serde_yml::from_str(EMBEDDED_REGISTRY).unwrap();
         let user: ProviderRegistry = serde_yml::from_str(
@@ -422,7 +494,11 @@ providers:
         assert!(merged.providers.iter().any(|p| p.slug == "jan"));
         // No duplicate ollama entry from the embedded registry.
         assert_eq!(
-            merged.providers.iter().filter(|p| p.slug == "ollama").count(),
+            merged
+                .providers
+                .iter()
+                .filter(|p| p.slug == "ollama")
+                .count(),
             1
         );
     }
