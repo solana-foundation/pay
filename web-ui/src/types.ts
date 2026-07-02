@@ -8,5 +8,7 @@ export type {
   SessionSplit,
   SessionInfo,
   PaymentFlow,
+  ProviderSummary,
+  InferenceInfo,
   SSEMessage,
 } from "../api/types";

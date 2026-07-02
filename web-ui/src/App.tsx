@@ -1,18 +1,25 @@
 import { useState, useMemo, useEffect, useRef } from "react";
 import { useFlows } from "./hooks/useFlows";
 import { useTheme } from "./hooks/useTheme";
-import { ConfigProvider } from "./hooks/useConfig";
+import { ConfigProvider, useAppMode, useConfig } from "./hooks/useConfig";
 import { Header } from "./components/Header";
 import { Toolbar, type FilterMode } from "./components/Toolbar";
 import { FlowList } from "./components/FlowList";
 import { Sidebar } from "./components/Sidebar";
+import { ProviderSidebar } from "./components/ProviderSidebar";
 
-export function App() {
-  const { flows, viewerIp, connected, clear } = useFlows();
+function AppInner() {
+  const config = useConfig();
+  const appMode = useAppMode();
+  const inference = appMode === "inference";
+  const { flows, viewerIp, connected, clear, providers } = useFlows(
+    config?.providers,
+  );
   const { theme, toggle: toggleTheme } = useTheme();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [mode, setMode] = useState<FilterMode>("all");
   const [search, setSearch] = useState("");
+  const [providerFilter, setProviderFilter] = useState<string | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(() => {
     const stored = localStorage.getItem("sidebarOpen");
     return stored === null ? true : stored === "true";
@@ -39,6 +46,8 @@ export function App() {
     return flows.filter((f) => {
       if (mode === "mine" && viewerIp && f.clientIp !== viewerIp) return false;
       if (mode === "errors" && f.status !== "failed") return false;
+      if (inference && providerFilter && f.inference?.provider !== providerFilter)
+        return false;
       if (search) {
         const q = search.toLowerCase();
         if (
@@ -49,10 +58,9 @@ export function App() {
       }
       return true;
     });
-  }, [flows, mode, viewerIp, search]);
+  }, [flows, mode, viewerIp, search, inference, providerFilter]);
 
   return (
-    <ConfigProvider>
     <div className="app">
       <div className="main">
         <Header
@@ -64,6 +72,7 @@ export function App() {
             setSidebarOpen(next);
             localStorage.setItem("sidebarOpen", String(next));
           }}
+          title={config?.title}
         />
         <Toolbar
           mode={mode}
@@ -74,17 +83,28 @@ export function App() {
           total={flows.length}
           onClear={clear}
           connected={connected}
+          providers={inference ? providers : undefined}
+          providerFilter={providerFilter}
+          onProviderFilterChange={inference ? setProviderFilter : undefined}
         />
         <FlowList
           flows={filtered}
           selectedId={selectedId}
           onSelect={handleSelect}
+          providers={inference ? providers : undefined}
         />
       </div>
       <div className={`sidebar${sidebarOpen ? "" : " collapsed"}`}>
-        <Sidebar />
+        {inference ? <ProviderSidebar providers={providers} /> : <Sidebar />}
       </div>
     </div>
+  );
+}
+
+export function App() {
+  return (
+    <ConfigProvider>
+      <AppInner />
     </ConfigProvider>
   );
 }

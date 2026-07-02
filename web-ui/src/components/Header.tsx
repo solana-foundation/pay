@@ -1,11 +1,41 @@
+import { useEffect } from "react";
+
 interface Props {
   theme: "dark" | "light";
   onToggleTheme: () => void;
   sidebarOpen: boolean;
   onToggleSidebar: () => void;
+  // Config-provided title (e.g. "Pay Inference"); absent → classic "Pay Debugger".
+  title?: string;
 }
 
-export function Header({ theme, onToggleTheme, sidebarOpen, onToggleSidebar }: Props) {
+function HeaderTitle({ title }: { title?: string }) {
+  if (!title) {
+    return (
+      <h1>
+        Pay <span className="debugger">Debugger</span>
+      </h1>
+    );
+  }
+  const [first, ...rest] = title.split(" ");
+  return (
+    <h1>
+      {rest.length > 0 ? (
+        <>
+          {first} <span className="debugger">{rest.join(" ")}</span>
+        </>
+      ) : (
+        title
+      )}
+    </h1>
+  );
+}
+
+export function Header({ theme, onToggleTheme, sidebarOpen, onToggleSidebar, title }: Props) {
+  useEffect(() => {
+    if (title) document.title = title;
+  }, [title]);
+
   return (
     <div className="header">
       <svg
@@ -30,9 +60,7 @@ export function Header({ theme, onToggleTheme, sidebarOpen, onToggleSidebar }: P
           fill="currentColor"
         />
       </svg>
-      <h1>
-        Pay <span className="debugger">Debugger</span>
-      </h1>
+      <HeaderTitle title={title} />
       <div style={{ flex: 1 }} />
       <button
         className="theme-toggle"

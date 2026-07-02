@@ -1,5 +1,5 @@
 import { useRef, useEffect } from "react";
-import type { PaymentFlow } from "../types";
+import type { PaymentFlow, ProviderSummary } from "../types";
 import { FlowRow } from "./FlowRow";
 import { FlowDetail } from "./FlowDetail";
 
@@ -7,9 +7,11 @@ interface Props {
   flows: PaymentFlow[];
   selectedId: string | null;
   onSelect: (id: string | null) => void;
+  // Live provider list (inference mode) — for row badge brand colors.
+  providers?: ProviderSummary[];
 }
 
-export function FlowList({ flows, selectedId, onSelect }: Props) {
+export function FlowList({ flows, selectedId, onSelect, providers }: Props) {
   const listRef = useRef<HTMLDivElement>(null);
   const prevCountRef = useRef(flows.length);
 
@@ -39,6 +41,7 @@ export function FlowList({ flows, selectedId, onSelect }: Props) {
             onClick={() =>
               onSelect(selectedId === flow.id ? null : flow.id)
             }
+            providers={providers}
           />
           {selectedId === flow.id && <FlowDetail flow={flow} />}
         </div>

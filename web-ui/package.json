@@ -7,7 +7,8 @@
     "dev": "concurrently \"tsx watch api/index.ts\" \"vite\"",
     "dev:api": "tsx watch api/index.ts",
     "dev:web": "vite",
-    "build": "vite build",
+    "build": "vite build && tsc --noEmit",
+    "test": "vitest run",
     "start": "tsx api/index.ts",
     "proxy": "tsx proxy/server.ts",
     "test:proxy": "tsx proxy/e2e.ts"
@@ -33,7 +34,8 @@
     "concurrently": "^9.1.0",
     "tsx": "^4.0.0",
     "typescript": "^5.8.0",
-    "vite": "^6.3.0"
+    "vite": "^6.3.0",
+    "vitest": "^3.1.0"
   },
   "packageManager": "pnpm@9.15.0"
 }

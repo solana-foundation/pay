@@ -1,21 +1,27 @@
 import { useReducer, useEffect, useRef, useCallback } from "react";
-import type { PaymentFlow, SSEMessage } from "../types";
+import type { PaymentFlow, ProviderSummary, SSEMessage } from "../types";
 
-interface FlowState {
+export interface FlowState {
   flows: PaymentFlow[];
   viewerIp: string | null;
   connected: boolean;
+  providers: ProviderSummary[];
+  // True once a `provider-status` SSE message has arrived; config-seeded
+  // providers never overwrite live data.
+  providersLive: boolean;
 }
 
-type FlowAction =
+export type FlowAction =
   | { type: "init"; viewerIp: string }
   | { type: "snapshot"; flows: PaymentFlow[] }
   | { type: "flow-created"; flow: PaymentFlow }
   | { type: "flow-updated"; flow: PaymentFlow }
+  | { type: "provider-status"; providers: ProviderSummary[] }
+  | { type: "seed-providers"; providers: ProviderSummary[] }
   | { type: "clear" }
   | { type: "connected"; value: boolean };
 
-function reducer(state: FlowState, action: FlowAction): FlowState {
+export function reducer(state: FlowState, action: FlowAction): FlowState {
   switch (action.type) {
     case "init":
       return { ...state, viewerIp: action.viewerIp };
@@ -30,6 +36,13 @@ function reducer(state: FlowState, action: FlowAction): FlowState {
           f.id === action.flow.id ? action.flow : f,
         ),
       };
+    case "provider-status":
+      return { ...state, providers: action.providers, providersLive: true };
+    case "seed-providers":
+      // Initial fill from /api/config; SSE is the source of truth once live.
+      return state.providersLive
+        ? state
+        : { ...state, providers: action.providers };
     case "clear":
       return { ...state, flows: [] };
     case "connected":
@@ -37,11 +50,23 @@ function reducer(state: FlowState, action: FlowAction): FlowState {
   }
 }
 
-const initial: FlowState = { flows: [], viewerIp: null, connected: false };
+export const initialFlowState: FlowState = {
+  flows: [],
+  viewerIp: null,
+  connected: false,
+  providers: [],
+  providersLive: false,
+};
 
-export function useFlows() {
-  const [state, dispatch] = useReducer(reducer, initial);
+export function useFlows(initialProviders?: ProviderSummary[]) {
+  const [state, dispatch] = useReducer(reducer, initialFlowState);
   const esRef = useRef<EventSource | null>(null);
+
+  useEffect(() => {
+    if (initialProviders) {
+      dispatch({ type: "seed-providers", providers: initialProviders });
+    }
+  }, [initialProviders]);
 
   useEffect(() => {
     const es = new EventSource("/__402/pdb/logs/stream");
@@ -68,6 +93,9 @@ export function useFlows() {
           break;
         case "flow-updated":
           dispatch({ type: "flow-updated", flow: msg.flow });
+          break;
+        case "provider-status":
+          dispatch({ type: "provider-status", providers: msg.providers });
           break;
       }
     };

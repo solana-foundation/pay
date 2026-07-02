@@ -1,3 +1,5 @@
+import type { ProviderSummary } from "../types";
+
 type FilterMode = "all" | "mine" | "errors";
 
 interface Props {
@@ -9,6 +11,10 @@ interface Props {
   total: number;
   onClear: () => void;
   connected: boolean;
+  // Per-provider filter (inference mode only; pills hidden when absent)
+  providers?: ProviderSummary[];
+  providerFilter?: string | null;
+  onProviderFilterChange?: (slug: string | null) => void;
 }
 
 export function Toolbar({
@@ -20,6 +26,9 @@ export function Toolbar({
   total,
   onClear,
   connected,
+  providers,
+  providerFilter,
+  onProviderFilterChange,
 }: Props) {
   return (
     <div className="toolbar">
@@ -36,6 +45,24 @@ export function Toolbar({
         onChange={(e) => onSearchChange(e.target.value)}
       />
       <span className="spacer" />
+      {providers && providers.length > 0 && onProviderFilterChange && (
+        <span className="provider-pills">
+          {providers.map((p) => (
+            <button
+              key={p.slug}
+              className={providerFilter === p.slug ? "active" : ""}
+              onClick={() =>
+                onProviderFilterChange(
+                  providerFilter === p.slug ? null : p.slug,
+                )
+              }
+              title={p.title}
+            >
+              {p.slug}
+            </button>
+          ))}
+        </span>
+      )}
       <button
         className={mode === "mine" ? "active" : ""}
         onClick={() => onModeChange("mine")}

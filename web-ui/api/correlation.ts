@@ -411,6 +411,7 @@ function buildSteps(protocol: Protocol): FlowStep[] {
 
 function updateSteps(flow: PaymentFlow): void {
   const statusToSteps: Record<FlowStatus, number> = {
+    "in-progress": 1, // request done, awaiting upstream response
     "payment-required": 2, // request + challenge done
     "payment-received": 3, // + payment done
     "resource-delivered": 4, // all done

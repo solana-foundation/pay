@@ -1,10 +1,17 @@
 import { createContext, useContext, useState, useEffect } from "react";
 import type { ReactNode } from "react";
+import type { ProviderSummary } from "../types";
+
+export type AppMode = "inference" | "debugger";
 
 interface Config {
-  recipient: string;
-  network: string;
-  rpcUrl: string;
+  recipient?: string;
+  network?: string;
+  rpcUrl?: string;
+  // Pay Inference mode (absent in debugger mode; defaults preserve today's UI)
+  mode?: AppMode;
+  title?: string;
+  providers?: ProviderSummary[];
 }
 
 const ConfigContext = createContext<Config | null>(null);
@@ -29,6 +36,11 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
 
 export function useConfig(): Config | null {
   return useContext(ConfigContext);
+}
+
+/** App mode from config; defaults to the classic debugger when absent. */
+export function useAppMode(): AppMode {
+  return useConfig()?.mode ?? "debugger";
 }
 
 /**

@@ -1,9 +1,10 @@
-import type { PaymentFlow } from "../types";
+import type { PaymentFlow, ProviderSummary } from "../types";
 import { Amount } from "./Amount";
 import { ProtocolBadge } from "./ProtocolBadge";
 import { StatusIndicator } from "./StatusIndicator";
 import type { SessionInfo } from "../types";
 import { formatUnits } from "../lib/format";
+import { formatTokPerSec, isHexColor, providerColor } from "../lib/inference";
 
 function fmtTime(iso: string): string {
   const d = new Date(iso);
@@ -35,19 +36,49 @@ interface Props {
   flow: PaymentFlow;
   selected: boolean;
   onClick: () => void;
+  // Live provider list (inference mode) — used for badge brand colors.
+  providers?: ProviderSummary[];
 }
 
-export function FlowRow({ flow, selected, onClick }: Props) {
+function ProviderBadge({
+  slug,
+  providers,
+}: {
+  slug: string;
+  providers?: ProviderSummary[];
+}) {
+  const color = providerColor(slug, providers);
+  const style = isHexColor(color)
+    ? { color, background: `${color}22` }
+    : undefined;
+  return (
+    <span className="badge inference" style={style} title={slug}>
+      {slug.toUpperCase()}
+    </span>
+  );
+}
+
+export function FlowRow({ flow, selected, onClick, providers }: Props) {
   const channelOpen = flow.session?.state === "open";
   const sessionAmount = sessionRowAmount(flow.session);
+  const tokPerSec = formatTokPerSec(flow.inference?.tokensPerSec);
 
   return (
     <div
       className={`flow-row${selected ? " selected" : ""}${channelOpen ? " channel-open" : ""}`}
       onClick={onClick}
     >
-      <ProtocolBadge protocol={flow.protocol} scheme={flow.scheme} />
+      {flow.inference ? (
+        <ProviderBadge slug={flow.inference.provider} providers={providers} />
+      ) : (
+        <ProtocolBadge protocol={flow.protocol} scheme={flow.scheme} />
+      )}
       <span className="resource">{flow.resource}</span>
+      {flow.inference?.model && (
+        <span className="model" title={flow.inference.model}>
+          {flow.inference.model}
+        </span>
+      )}
       {channelOpen && (
         <span className="session-inline session-inline-status">
           <span className="session-inline-dot" />
@@ -56,9 +87,11 @@ export function FlowRow({ flow, selected, onClick }: Props) {
       )}
       {!channelOpen && <StatusIndicator status={flow.status} />}
       <span className="amount-slot">
-        {flow.session
-          ? sessionAmount && <span className="session-row-amount">{sessionAmount}</span>
-          : flow.amount && <Amount value={parseFloat(flow.amount)} />}
+        {flow.inference
+          ? tokPerSec && <span className="toks">{tokPerSec}</span>
+          : flow.session
+            ? sessionAmount && <span className="session-row-amount">{sessionAmount}</span>
+            : flow.amount && <Amount value={parseFloat(flow.amount)} />}
       </span>
       <span className="duration">{fmtDuration(flow.durationMs)}</span>
       <span className="timestamp">{fmtTime(flow.startedAt)}</span>

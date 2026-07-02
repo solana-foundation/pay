@@ -1,8 +1,10 @@
 // ── Protocol & Status ──
 
-export type Protocol = "mpp" | "x402" | "session";
+// "http" = plain passthrough exchange (inference mode); no payment involved.
+export type Protocol = "mpp" | "x402" | "session" | "http";
 
 export type FlowStatus =
+  | "in-progress" // Request forwarded upstream, response not yet complete
   | "payment-required" // 402 sent, awaiting retry
   | "payment-received" // Client retried with payment header
   | "resource-delivered" // 200 with receipt / after settle
@@ -61,6 +63,29 @@ export interface SessionInfo {
   updatedAt?: string | null;
 }
 
+// ── Inference (Pay Inference mode) ──
+
+export interface ProviderSummary {
+  slug: string; // "ollama"
+  title: string; // "Ollama"
+  baseUrl: string; // "http://127.0.0.1:11434"
+  up: boolean;
+  models: string[];
+  version?: string;
+  color?: string; // brand hex, e.g. "#22c55e"
+}
+
+export interface InferenceInfo {
+  provider: string; // slug
+  model?: string;
+  endpointKind?: "chat" | "completion" | "embeddings" | "other";
+  streamed: boolean;
+  tokensPrompt?: number;
+  tokensCompletion?: number;
+  ttftMs?: number;
+  tokensPerSec?: number;
+}
+
 // ── Payment Flow ──
 
 export interface PaymentFlow {
@@ -78,6 +103,7 @@ export interface PaymentFlow {
   amount?: string;
   payer?: string;
   session?: SessionInfo;
+  inference?: InferenceInfo;
   steps: FlowStep[];
   events: FlowEvent[];
   // Raw data for detail inspection
@@ -93,4 +119,5 @@ export type SSEMessage =
   | { type: "init"; viewerIp: string }
   | { type: "snapshot"; flows: PaymentFlow[] }
   | { type: "flow-created"; flow: PaymentFlow }
-  | { type: "flow-updated"; flow: PaymentFlow };
+  | { type: "flow-updated"; flow: PaymentFlow }
+  | { type: "provider-status"; providers: ProviderSummary[] };

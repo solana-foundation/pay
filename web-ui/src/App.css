@@ -209,6 +209,14 @@ body {
   border-color: var(--accent);
 }
 
+.toolbar .provider-pills {
+  display: inline-flex;
+  gap: 8px;
+  margin-right: 8px;
+  padding-right: 8px;
+  border-right: 1px solid var(--border);
+}
+
 .toolbar .filter::placeholder {
   color: var(--fg-muted);
 }
@@ -317,6 +325,27 @@ body {
   text-align: right;
 }
 
+/* ── Inference row columns ── */
+
+.flow-row .model {
+  color: var(--fg-secondary);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  flex-shrink: 0;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.flow-row .toks {
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
 /* ── Protocol Badge ── */
 
 .badge {
@@ -343,6 +372,14 @@ body {
 .badge.session {
   background: var(--green-subtle);
   color: var(--green);
+}
+
+/* Provider badge (inference mode) — brand color set inline; neutral fallback.
+   Plain "http" passthrough flows share the neutral look. */
+.badge.inference,
+.badge.http {
+  background: var(--border-subtle);
+  color: var(--fg-secondary);
 }
 
 /* ── Status Indicator ── */
@@ -382,6 +419,11 @@ body {
   background: var(--red);
 }
 
+.status-dot.in-progress {
+  background: var(--accent);
+  animation: session-dot-pulse 1.25s ease-in-out infinite;
+}
+
 .status-label {
   font-size: 12px;
   white-space: nowrap;
@@ -402,6 +444,10 @@ body {
 
 .status-label.failed {
   color: var(--red);
+}
+
+.status-label.in-progress {
+  color: var(--accent);
 }
 
 /* ── Flow Detail (expanded) ── */
@@ -434,6 +480,74 @@ body {
 
 .flow-middle .splits {
   border-right: 0;
+}
+
+/* ── Inference Panel (middle detail slot, inference mode) ── */
+
+.inference-panel {
+  padding: 16px 20px;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.inference-panel h3 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--fg-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 16px;
+}
+
+.inference-live {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.inference-live-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: session-dot-pulse 1.25s ease-in-out infinite;
+}
+
+.inference-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 13px;
+  padding: 5px 0;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.inference-row:last-child {
+  border-bottom: none;
+}
+
+.inference-label {
+  color: var(--fg-muted);
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.inference-value {
+  color: var(--fg);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* ── Sequence Diagram ── */
@@ -1155,6 +1269,104 @@ a.splits-label-name.splits-addr-link:hover {
   border-color: #39d2e022;
 }
 
+/* ── Provider Sidebar (inference mode) ── */
+
+.sidebar-section h2.providers {
+  color: var(--fg-secondary);
+}
+
+.provider-empty {
+  color: var(--fg-muted);
+  font-size: 13px;
+  padding: 4px 0;
+}
+
+.provider-card {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 8px 12px;
+  margin-bottom: 6px;
+}
+
+.provider-card.down {
+  opacity: 0.65;
+}
+
+.provider-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  font-family: var(--font);
+  font-size: 13px;
+  color: var(--fg);
+  text-align: left;
+}
+
+.provider-head:disabled {
+  cursor: default;
+}
+
+.provider-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.provider-dot.up {
+  background: var(--green);
+}
+
+.provider-dot.down {
+  background: var(--fg-muted);
+}
+
+.provider-title {
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.provider-meta {
+  margin-left: auto;
+  color: var(--fg-muted);
+  font-size: 12px;
+  font-family: var(--font-mono);
+  flex-shrink: 0;
+}
+
+.provider-models {
+  margin-top: 8px;
+  padding-left: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.provider-model {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--fg-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.provider-version {
+  margin-top: 6px;
+  padding-left: 16px;
+  color: var(--fg-muted);
+  font-size: 11px;
+  font-family: var(--font-mono);
+}
+
 /* ── Meta Info ── */
 
 .meta-list {
@@ -1383,7 +1595,9 @@ a.splits-label-name.splits-addr-link:hover {
 @media (prefers-reduced-motion: reduce) {
   .session-inline-dot,
   .session-channel.is-open .session-state-dot,
-  .session-flow-dots {
+  .session-flow-dots,
+  .status-dot.in-progress,
+  .inference-live-dot {
     animation: none;
   }
 

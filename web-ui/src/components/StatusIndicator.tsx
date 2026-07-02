@@ -1,6 +1,7 @@
 import type { FlowStatus } from "../types";
 
-const labels: Record<FlowStatus, string> = {
+export const statusLabels: Record<FlowStatus, string> = {
+  "in-progress": "In Progress",
   "payment-required": "Payment Required",
   "payment-received": "Payment Received",
   "resource-delivered": "Resource Delivered",
@@ -22,7 +23,7 @@ export function StatusIndicator({ status }: { status: FlowStatus }) {
           </svg>
         )}
       </div>
-      <span className={`status-label ${status}`}>{labels[status]}</span>
+      <span className={`status-label ${status}`}>{statusLabels[status]}</span>
     </div>
   );
 }
