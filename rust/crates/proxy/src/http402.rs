@@ -72,6 +72,11 @@ pub struct Ctx {
     /// in `logging` (the data plane is Pingora, so the old axum logging
     /// middleware never sees proxied traffic).
     log: Option<LogStart>,
+    /// Inference telemetry scanner over the upstream response body. Only
+    /// created when the host opted into in-flight tracking
+    /// (`record_request_start` returned a log id) — otherwise the body
+    /// filter is a no-op.
+    observer: Option<crate::observer::StreamObserver>,
 }
 
 struct PendingUpto {
@@ -87,6 +92,8 @@ struct LogStart {
     req_headers: Vec<(String, String)>,
     client_ip: String,
     start: std::time::Instant,
+    /// In-flight tracking id from `PaymentState::record_request_start`.
+    log_id: Option<u64>,
 }
 
 /// Pingora payment gate over [`PaymentGate`], parameterized over the host's
@@ -438,6 +445,7 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
             receipt: None,
             upto: None,
             log: None,
+            observer: None,
         }
     }
 
@@ -460,12 +468,19 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                 .map(|s| s.trim().to_string())
                 .or_else(|| host.clone())
                 .unwrap_or_else(|| "unknown".to_string());
+            let log_id = self.state.record_request_start(&pay_core::RequestStart {
+                method: method.to_string(),
+                path: format!("/{path}"),
+                host: host.clone(),
+                client_ip: client_ip.clone(),
+            });
             ctx.log = Some(LogStart {
                 method: method.to_string(),
                 path: format!("/{path}"),
                 req_headers: header_pairs(&headers),
                 client_ip,
                 start: std::time::Instant::now(),
+                log_id,
             });
         }
         let accept = str_h("accept").map(str::to_string);
@@ -636,6 +651,54 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                 let _ = upstream_response.insert_header(name, value);
             }
         }
+        // Start the inference telemetry observer for hosts that opted into
+        // in-flight tracking. Streamed = SSE/NDJSON content type.
+        if ctx.log.as_ref().is_some_and(|log| log.log_id.is_some()) {
+            let streamed = upstream_response
+                .headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .map(|ct| {
+                    let ct = ct.to_ascii_lowercase();
+                    ct.starts_with("text/event-stream") || ct.starts_with("application/x-ndjson")
+                })
+                .unwrap_or(false);
+            ctx.observer = Some(crate::observer::StreamObserver::new(streamed));
+        }
+        Ok(())
+    }
+
+    /// Scan upstream body chunks for inference telemetry (model, token usage,
+    /// TTFT) without buffering the stream. Emits throttled live updates while
+    /// the response runs. No-op unless `response_filter` armed the observer.
+    fn upstream_response_body_filter(
+        &self,
+        _session: &mut Session,
+        body: &mut Option<bytes::Bytes>,
+        end_of_stream: bool,
+        ctx: &mut Ctx,
+    ) -> pingora::Result<()> {
+        let Some(observer) = ctx.observer.as_mut() else {
+            return Ok(());
+        };
+        let Some(log) = ctx.log.as_ref() else {
+            return Ok(());
+        };
+        let Some(log_id) = log.log_id else {
+            return Ok(());
+        };
+
+        if let Some(chunk) = body.as_ref()
+            && !chunk.is_empty()
+        {
+            observer.on_chunk(chunk, log.start);
+        }
+        if end_of_stream {
+            observer.finish();
+            self.state.record_exchange_update(log_id, &observer.usage);
+        } else if observer.should_emit() {
+            self.state.record_exchange_update(log_id, &observer.usage);
+        }
         Ok(())
     }
 
@@ -662,6 +725,12 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
             Some(resp) => (resp.status.as_u16(), header_pairs(&resp.headers)),
             None => (0, Vec::new()),
         };
+        // Flush the observer if the body filter never saw end_of_stream
+        // (upstream error / client disconnect) so partial telemetry survives.
+        let usage = ctx.observer.take().map(|mut observer| {
+            observer.finish();
+            observer.usage
+        });
         self.state.record_exchange(pay_core::HttpExchange {
             method: log.method,
             path: log.path,
@@ -670,6 +739,8 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
             req_headers: log.req_headers,
             res_headers,
             client_ip: log.client_ip,
+            log_id: log.log_id,
+            usage,
         });
     }
 

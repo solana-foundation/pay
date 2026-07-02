@@ -128,8 +128,10 @@ impl FlowCorrelation {
     }
 
     /// Live telemetry update for an in-flight exchange (running token counts,
-    /// TTFT). Overwrites the flow's inference data with the caller's
-    /// accumulated view. No-op if the exchange already completed.
+    /// TTFT). Merged field-wise onto the flow's existing inference data —
+    /// present incoming fields win, absent ones keep what the flow already
+    /// knows (the request-time update carries provider/endpoint kind, the
+    /// stream observer carries model/tokens). No-op once completed.
     pub fn update_exchange(&mut self, log_id: u64, inference: InferenceInfo) {
         let Some(flow_id) = self.open_exchanges.get(&log_id).cloned() else {
             return;
@@ -137,7 +139,10 @@ impl FlowCorrelation {
         let Some(flow) = self.flows.iter_mut().find(|f| f.id == flow_id) else {
             return;
         };
-        flow.inference = Some(inference);
+        flow.inference = Some(match flow.inference.take() {
+            Some(existing) => merge_inference(existing, inference),
+            None => inference,
+        });
         flow.updated_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         // Keep the row's duration ticking while the request runs — the UI
         // renders durationMs live on each flow-updated.
@@ -683,6 +688,24 @@ impl FlowCorrelation {
 
 fn flow_key(client_ip: &str, path: &str) -> String {
     format!("{client_ip}::{path}")
+}
+
+/// Field-wise merge of inference telemetry: incoming wins where present.
+fn merge_inference(existing: InferenceInfo, incoming: InferenceInfo) -> InferenceInfo {
+    InferenceInfo {
+        provider: if incoming.provider.is_empty() {
+            existing.provider
+        } else {
+            incoming.provider
+        },
+        model: incoming.model.or(existing.model),
+        endpoint_kind: incoming.endpoint_kind.or(existing.endpoint_kind),
+        streamed: incoming.streamed || existing.streamed,
+        tokens_prompt: incoming.tokens_prompt.or(existing.tokens_prompt),
+        tokens_completion: incoming.tokens_completion.or(existing.tokens_completion),
+        ttft_ms: incoming.ttft_ms.or(existing.ttft_ms),
+        tokens_per_sec: incoming.tokens_per_sec.or(existing.tokens_per_sec),
+    }
 }
 
 /// 2xx/3xx delivered, everything else failed. (402 cannot occur on
@@ -1808,6 +1831,41 @@ mod tests {
             engine.snapshot()[0].inference.as_ref().unwrap().provider,
             "ollama"
         );
+    }
+
+    #[test]
+    fn update_exchange_merges_field_wise() {
+        let (tx, _rx) = broadcast::channel(16);
+        let mut engine = FlowCorrelation::with_mode(tx, CorrelationMode::AllExchanges);
+
+        // Request-time info: provider + endpoint kind, nothing else.
+        engine.begin_exchange(ExchangeStart {
+            inference: Some(InferenceInfo {
+                provider: "ollama".into(),
+                endpoint_kind: Some("chat".into()),
+                ..Default::default()
+            }),
+            ..make_start(9, "POST", "/v1/chat/completions")
+        });
+
+        // Stream-observer update: usage only, empty provider.
+        engine.update_exchange(
+            9,
+            InferenceInfo {
+                provider: String::new(),
+                model: Some("llama3.2:3b".into()),
+                streamed: true,
+                tokens_completion: Some(10),
+                ..Default::default()
+            },
+        );
+
+        let inf = engine.snapshot()[0].inference.clone().unwrap();
+        assert_eq!(inf.provider, "ollama", "provider must survive usage merge");
+        assert_eq!(inf.endpoint_kind.as_deref(), Some("chat"));
+        assert_eq!(inf.model.as_deref(), Some("llama3.2:3b"));
+        assert!(inf.streamed);
+        assert_eq!(inf.tokens_completion, Some(10));
     }
 
     #[test]

@@ -34,6 +34,7 @@ async-trait = "0.1"
 # runtimes stay Pingora-owned.
 tokio = { workspace = true, features = ["sync", "signal"] }
 bytes = "1"
+serde_json = { workspace = true }
 anyhow = "1"
 futures-util = "0.3"
 tracing = { workspace = true }

@@ -9,6 +9,7 @@
 //! control-plane service, then hand the public bind to Pingora.
 
 pub mod http402;
+pub mod observer;
 
 pub use http402::Http402Gate;
 
