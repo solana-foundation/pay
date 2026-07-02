@@ -264,18 +264,52 @@ fn resolve_session_splits(
     Ok(splits)
 }
 
-fn resolve_static_account(account: &str) -> pay_core::Result<String> {
-    if let Some(name) = account
+fn account_env_var(account: &str) -> Option<&str> {
+    account
         .strip_prefix("${")
         .and_then(|value| value.strip_suffix('}'))
-    {
-        return std::env::var(name).map_err(|_| {
-            pay_core::Error::Config(format!(
+}
+
+fn resolve_static_account(account: &str) -> pay_core::Result<String> {
+    if let Some(name) = account_env_var(account) {
+        return match std::env::var(name) {
+            Ok(value) if !value.is_empty() => Ok(value),
+            _ => Err(pay_core::Error::Config(format!(
                 "session split account references unset environment variable `{name}`"
-            ))
-        });
+            ))),
+        };
     }
     Ok(account.to_string())
+}
+
+fn resolve_startup_payout_account(account: &str) -> pay_core::Result<Option<String>> {
+    let Some(name) = account_env_var(account) else {
+        return Ok(Some(account.to_string()));
+    };
+
+    match std::env::var(name) {
+        Ok(value) if !value.is_empty() => Ok(Some(value)),
+        Ok(_) | Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(pay_core::Error::Config(format!(
+            "split account environment variable `{name}` is not valid Unicode"
+        ))),
+    }
+}
+
+fn parse_payout_recipient(
+    label: String,
+    account: &str,
+    context: &str,
+) -> pay_core::Result<PayoutRecipientTarget> {
+    let recipient = solana_pubkey::Pubkey::from_str(account).map_err(|e| {
+        pay_core::Error::Config(format!(
+            "{context} account is not a valid Solana pubkey: {e}"
+        ))
+    })?;
+    Ok(PayoutRecipientTarget {
+        label,
+        pubkey: recipient,
+    })
 }
 
 async fn create_surfpool_payment_channel_payer(
@@ -690,19 +724,22 @@ fn charge_split_recipient_targets(api: &ApiSpec) -> pay_core::Result<Vec<PayoutR
                     ep.path, rule.recipient
                 )));
             };
-            let account = resolve_static_account(&alias.account)?;
-            let recipient = solana_pubkey::Pubkey::from_str(&account).map_err(|e| {
-                pay_core::Error::Config(format!(
-                    "{}: split recipient '{}' account is not a valid Solana pubkey: {e}",
-                    ep.path, rule.recipient
-                ))
-            })?;
             let label = alias
                 .label
                 .as_ref()
                 .map(|display| format!("split recipient {} ({display})", rule.recipient))
                 .unwrap_or_else(|| format!("split recipient {}", rule.recipient));
-            add_payout_recipient_target(&mut recipients, label, recipient);
+            let Some(account) = resolve_startup_payout_account(&alias.account)? else {
+                tracing::debug!(
+                    endpoint = %ep.path,
+                    recipient = %rule.recipient,
+                    "skipping runtime split recipient during startup payout preparation"
+                );
+                continue;
+            };
+            let context = format!("{}: split recipient '{}'", ep.path, rule.recipient);
+            let target = parse_payout_recipient(label, &account, &context)?;
+            add_payout_recipient_target(&mut recipients, target.label, target.pubkey);
         }
     }
     Ok(recipients)
@@ -1376,10 +1413,10 @@ impl StartCommand {
                 None
             };
 
-            // Abort launch if a split recipient won't resolve — an env-var
-            // (`${VAR}`) recipient whose variable isn't set is silently dropped
-            // from the charge at request time, so fail fast instead.
-            ensure_split_recipients_resolved(&api)?;
+            // Validate split recipients that are knowable at startup. Runtime
+            // `${VAR}` recipients are allowed to resolve from request query
+            // parameters, so they cannot be treated as launch blockers.
+            ensure_static_split_recipient_accounts_valid(&api)?;
 
             // ── Banner ──
             let metered_count = api
@@ -2920,11 +2957,10 @@ fn session_receipt(state: AppState, channel_id: String) -> axum::response::Respo
     .into_response()
 }
 
-/// Abort launch if a split recipient won't resolve to an address. A `${VAR}`
-/// recipient resolves from environment variable `VAR` (or a per-request query
-/// param); if neither is available the split is silently dropped from the
-/// charge, so fail fast at startup instead.
-fn ensure_split_recipients_resolved(
+/// Abort launch if a statically-known split recipient is not a valid address.
+/// Runtime `${VAR}` recipients may resolve from request query parameters, so an
+/// unset env var here means the account must be checked when a request uses it.
+fn ensure_static_split_recipient_accounts_valid(
     api: &pay_types::metering::ApiSpec,
 ) -> Result<(), pay_core::Error> {
     for ep in &api.endpoints {
@@ -2939,16 +2975,14 @@ fn ensure_split_recipients_resolved(
                     "{endpoint}: split recipient '{recipient}' not declared"
                 )));
             };
-            if let Some(var) = alias
-                .account
-                .strip_prefix("${")
-                .and_then(|rest| rest.strip_suffix('}'))
-                && std::env::var(var).map(|v| v.is_empty()).unwrap_or(true)
-            {
-                return Err(pay_core::Error::Config(format!(
-                    "{endpoint}: split recipient '{recipient}' unresolved (set ${var})"
-                )));
-            }
+            let Some(account) = resolve_startup_payout_account(&alias.account)? else {
+                continue;
+            };
+            solana_pubkey::Pubkey::from_str(&account).map_err(|e| {
+                pay_core::Error::Config(format!(
+                    "{endpoint}: split recipient '{recipient}' account is not a valid Solana pubkey: {e}"
+                ))
+            })?;
         }
     }
     Ok(())
@@ -3418,6 +3452,58 @@ endpoints:
 "#,
         )
         .unwrap();
+
+        let targets = payout_recipient_targets(&api, None).unwrap();
+        let recipients = payout_recipient_pubkeys(&targets);
+
+        assert_eq!(recipients.len(), 1);
+        assert_eq!(
+            recipients[0].to_string(),
+            "mandyRKj8mvxhuk9Np7pJEXd7BjoEZZNRFxUTpDFeAp"
+        );
+        assert_eq!(targets[0].label, "split recipient partner");
+    }
+
+    #[test]
+    fn payout_recipient_pubkeys_skip_unresolved_runtime_split_recipients() {
+        let env_var = format!("PAY_TEST_UNSET_DYNAMIC_SPLIT_WALLET_{}", std::process::id());
+        // SAFETY: this test uses a process-unique variable name and does not
+        // depend on any other environment state.
+        unsafe { std::env::remove_var(&env_var) };
+        let spec = format!(
+            r#"
+name: runtime-splits-demo
+subdomain: runtime-splits-demo
+title: Runtime Splits Demo
+description: Runtime Splits Demo
+category: finance
+version: v1
+routing:
+  type: respond
+recipients:
+  partner:
+    account: mandyRKj8mvxhuk9Np7pJEXd7BjoEZZNRFxUTpDFeAp
+  affiliate:
+    account: "${{{env_var}}}"
+endpoints:
+  - method: POST
+    path: v1/referral
+    metering:
+      schemes: [mpp-charge]
+      dimensions:
+        - direction: usage
+          unit: requests
+          scale: 1
+          tiers:
+            - price_usd: 1.00
+      splits:
+        - recipient: partner
+          percent: 20
+        - recipient: affiliate
+          percent: 10
+"#
+        );
+        let api: pay_types::metering::ApiSpec = serde_yml::from_str(&spec).unwrap();
 
         let targets = payout_recipient_targets(&api, None).unwrap();
         let recipients = payout_recipient_pubkeys(&targets);
