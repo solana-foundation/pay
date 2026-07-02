@@ -139,6 +139,11 @@ impl FlowCorrelation {
         };
         flow.inference = Some(inference);
         flow.updated_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        // Keep the row's duration ticking while the request runs — the UI
+        // renders durationMs live on each flow-updated.
+        if let Some(elapsed) = elapsed_ms(&flow.started_at, &flow.updated_at) {
+            flow.duration_ms = elapsed;
+        }
         let _ = self.tx.send(SseMessage::FlowUpdated { flow: flow.clone() });
     }
 
