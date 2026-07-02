@@ -536,7 +536,33 @@ Each phase lands green and independently revertable:
 - **Manual matrix**: Ollama + LM Studio live on this machine; llama.cpp via
   `llama-server -m …`; vLLM/exo best-effort (record probe transcripts as fixtures).
 
-## 11. Risks & open questions
+## 11. Implementation notes (deviations from the plan above)
+
+Decisions made during implementation — the sections above describe the
+original plan; where they differ, this section wins:
+
+- **No `common.rs` extraction (§4.1/§8).** `start.rs` carries unrelated
+  in-flight work on this branch; instead of extracting `AppState`, the
+  inference command got its own minimal `InferenceState` (`PaymentState` with
+  every payment backend `None` + the PDB `record_exchange` hook) and its own
+  ~20-line control-plane router. Extraction can still happen later when
+  `start.rs` is quiet.
+- **Routes are static at startup (§4.2).** No `ArcSwap`: `PaymentState::apis()`
+  returns `&[ApiSpec]`, which can't hand out a guard from a swap. The `--watch`
+  loop re-probes and broadcasts provider up/down/model changes (a provider
+  restarting on the same port resumes seamlessly since routing is by
+  subdomain → fixed base_url), but a brand-new provider logs a
+  restart-to-route hint instead of hot-registering.
+- **Flag surface (§2.1).** `--watch-interval <SECS>` (0 disables) instead of
+  `--watch`; no `--public-url` (nothing to rewrite — inference serves no
+  OpenAPI in v1); `--spec` is repeatable rather than comma-joined.
+- **AllExchanges mode does not run payment correlation** (§5.2 said it would).
+  Each HTTP exchange is one flow; 402 flows can't occur on v1 passthrough
+  routes anyway. Unifying the two models is Phase-6 work.
+- **Payment Debugger correlation is otherwise untouched**; debugger mode
+  stays pixel-identical in the web UI (verified by leaving mode unset).
+
+## 12. Risks & open questions
 
 - ~~**Pingora off the main thread**~~ — resolved, see §6.4: `Server::run()` is
   thread-agnostic and takes a pluggable `ShutdownSignalWatch`; we add

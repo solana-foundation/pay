@@ -65,6 +65,7 @@ pub enum Command {
     /// Import funds from Venmo, PayPal, or a mobile wallet.
     Topup(topup::TopupCommand),
     /// Gate your API with stablecoin payments.
+    #[command(alias = "serve")]
     Server {
         #[command(subcommand)]
         command: server::ServerCommand,

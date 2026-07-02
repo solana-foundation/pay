@@ -1,0 +1,51 @@
+# Registry of known local inference servers probed by `pay serve inference`.
+#
+# Order matters: when two providers share a port (8080 is contested in the
+# wild), the first entry whose identify probe passes claims it.
+#
+# Users can extend/override this list (matched by slug) via
+# ~/.config/pay/inference-providers.yml.
+providers:
+  - slug: ollama
+    title: Ollama
+    ports: [11434]
+    color: "#22c55e"
+    identify:
+      - { path: /api/version, expect_json_key: version }
+    models: { path: /api/tags, json_pointer: /models, name_key: name }
+
+  - slug: lm-studio
+    title: LM Studio
+    ports: [1234]
+    color: "#6366f1"
+    identify:
+      # /api/v0 is LM Studio's own REST API — unambiguous.
+      - { path: /api/v0/models, expect_json_key: data }
+      - { path: /v1/models, expect_json_key: data }
+    models: { path: /v1/models, json_pointer: /data, name_key: id }
+
+  - slug: llama-cpp
+    title: llama.cpp
+    ports: [8080]
+    color: "#f59e0b"
+    identify:
+      # /props is llama-server-specific; a JSON-key match keeps generic dev
+      # servers on :8080 from false-positiving.
+      - { path: /props, expect_json_key: default_generation_settings }
+    models: { path: /v1/models, json_pointer: /data, name_key: id }
+
+  - slug: vllm
+    title: vLLM
+    ports: [8000]
+    color: "#38bdf8"
+    identify:
+      - { path: /version, expect_json_key: version }
+    models: { path: /v1/models, json_pointer: /data, name_key: id }
+
+  - slug: exo
+    title: exo
+    ports: [52415]
+    color: "#e879f9"
+    identify:
+      - { path: /v1/models, expect_json_key: data }
+    models: { path: /v1/models, json_pointer: /data, name_key: id }

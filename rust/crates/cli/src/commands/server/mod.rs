@@ -1,4 +1,5 @@
 pub mod demo;
+pub mod inference;
 pub mod local_registration;
 pub mod plans;
 pub mod scaffold;
@@ -12,6 +13,9 @@ pub enum ServerCommand {
     Demo(demo::DemoCommand),
     /// Start a proxy that enables stablecoin payments for your API.
     Start(start::StartCommand),
+    /// Discover local AI inference servers (Ollama, LM Studio, llama.cpp,
+    /// vLLM, exo) and proxy them with live request tracking.
+    Inference(inference::InferenceCommand),
     /// Create a YAML file that defines endpoints and payment requirements.
     Scaffold(scaffold::ScaffoldCommand),
     /// Derive (and optionally write back) the on-chain `Plan` PDAs for
@@ -34,6 +38,7 @@ impl ServerCommand {
         match self {
             Self::Demo(cmd) => cmd.otlp_sidecar.as_deref(),
             Self::Start(cmd) => cmd.otlp_sidecar.as_deref(),
+            Self::Inference(_) => None,
             Self::Scaffold(_) => None,
             Self::Plans { .. } => None,
         }
@@ -43,6 +48,7 @@ impl ServerCommand {
         match self {
             Self::Demo(cmd) => cmd.run(active_account_name, sandbox),
             Self::Start(cmd) => cmd.run(active_account_name, sandbox),
+            Self::Inference(cmd) => cmd.run(),
             Self::Scaffold(cmd) => cmd.run(),
             Self::Plans { command } => match command {
                 PlansCommand::Publish(cmd) => cmd.run(),
