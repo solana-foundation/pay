@@ -30,6 +30,9 @@ axum = { workspace = true }
 reqwest = { workspace = true }
 http = "1"
 async-trait = "0.1"
+# sync/signal only: the run_with_shutdown watcher (watch channel + SIGTERM);
+# runtimes stay Pingora-owned.
+tokio = { workspace = true, features = ["sync", "signal"] }
 bytes = "1"
 anyhow = "1"
 futures-util = "0.3"
