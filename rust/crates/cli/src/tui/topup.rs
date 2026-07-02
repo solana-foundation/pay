@@ -1,8 +1,5 @@
-//! Interactive TUI for configuring a payment session.
-//!
-//! Shown before making requests when automatic payment is not pre-approved.
-//! Lets the user set a spending cap and session duration — all 402
-//! challenges within that budget/time are then paid automatically.
+//! Interactive top-up flow: option selection, Solana Pay QR rendering with
+//! stable sizing, MoonPay onramp launch, and stablecoin balance polling.
 
 use std::io;
 use std::io::Write;
@@ -10,20 +7,21 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use crate::commands::ToolKind;
-
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use crossterm::execute;
-use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use pay_core::client::balance::{AccountBalances, ReceivedFunds};
-use qrcode::{Color as QrColor, QrCode, Version as QrVersion};
+use qrcode::{QrCode, Version as QrVersion};
 use ratatui::Terminal;
-use ratatui::backend::{Backend, CrosstermBackend, WindowSize};
-use ratatui::buffer::Cell;
-use ratatui::layout::{Constraint, Layout, Position, Rect, Size};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
+
+use super::term::{SPINNER, TuiBackend, with_terminal};
+use super::theme::{SOLANA_GREEN, SOLANA_PURPLE, TOPUP_CARD_BG, TOPUP_MAIN_BG, TOPUP_SIDEBAR_BG};
+use super::widgets::{
+    RenderedQr, controls_bar, render_money_flow, render_qr, render_qr_code, render_slider,
+    render_success_checkmark, sidebar_card, solana_logo, unavailable_qr,
+};
 
 /// Wait this long after the cycle starts (TUI open or QR recompute) before
 /// the first balance check. Gives the user time to scan & broadcast.
@@ -57,12 +55,6 @@ enum CheckMsg {
     Detected(TopupDetected),
     /// Check finished without anything to report — clear `checking`.
     Done,
-}
-
-struct RenderedQr {
-    lines: Vec<Line<'static>>,
-    width: u16,
-    height: u16,
 }
 
 /// What the status line should show.
@@ -229,242 +221,15 @@ impl PollState {
     }
 }
 
-/// Slider range: $0.00 to $15.00 in $0.50 increments = 30 steps, + 1 no-cap step = 31
-const MAX_STEPS: usize = 31;
-const STEP_AMOUNT: u64 = 500_000; // 0.50 USDC in base units (6 decimals)
-
 /// Topup amount slider: 0 = any amount, 1-25 = $1 to $25 in $1 steps
 const TOPUP_MAX_STEPS: usize = 25;
 const TOPUP_STEP_USDC: f64 = 1.0;
 const TOPUP_AMOUNT_LABEL_WIDTH: usize = 3;
-const TOPUP_SLIDER_CELL: &str = "▐";
 const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 /// Production onramp host — same gateway that serves the pay-api, just a
 /// different path (`/v1/onramp/start`). Reuses `pay_core::balance::DEFAULT_PAY_API_URL`
 /// so the two stay in sync if the host ever moves.
 const DEFAULT_ONRAMP_HOST: &str = pay_core::client::balance::DEFAULT_PAY_API_URL;
-
-const CARD_WIDTH: u16 = 36;
-const CARD_BG: Color = Color::Rgb(35, 40, 50);
-const TOPUP_SIDEBAR_BG: Color = Color::Rgb(24, 24, 27);
-const TOPUP_MAIN_BG: Color = Color::Rgb(9, 9, 11);
-const TOPUP_CARD_BG: Color = Color::Rgb(39, 39, 42);
-const SOLANA_PURPLE: Color = Color::Rgb(153, 69, 255);
-const SOLANA_BLUE: Color = Color::Rgb(80, 120, 255);
-const SOLANA_GREEN: Color = Color::Rgb(20, 241, 149);
-
-/// Expiration presets: (seconds, label)
-const EXPIRY_OPTIONS: &[(u64, &str)] = &[
-    (60, "1m"),
-    (600, "10m"),
-    (1800, "30m"),
-    (3600, "1h"),
-    (10800, "3h"),
-    (21600, "6h"),
-    (43200, "12h"),
-    (86400, "24h"),
-];
-
-/// Which control is active.
-#[derive(PartialEq)]
-enum Focus {
-    Budget,
-    Expiry,
-}
-
-/// The result of the session setup TUI.
-pub enum SessionSetup {
-    /// User approved a session with a spending cap and expiration.
-    Approved { cap: u64, expires_in: u64 },
-    /// User cancelled. Don't make the request.
-    Cancelled,
-}
-
-/// Run a closure with a full-screen terminal, restoring state on exit.
-/// Concrete backend used by every render function: a [`CrosstermBackend`]
-/// wrapped so 24-bit RGB colors degrade gracefully on terminals that can't
-/// render them.
-type TuiBackend = DowngradeBackend<io::Stderr>;
-
-/// True when the terminal advertises 24-bit ("truecolor") support via the
-/// `COLORTERM` environment variable. macOS Terminal.app does NOT set this and
-/// does not support truecolor: it mis-parses `\x1b[48;2;r;g;b` sequences, and
-/// values like `Rgb(39, 39, 42)` leak their trailing `42` as ANSI SGR 42
-/// ("green background"), which then sticks and floods the screen. Defaulting
-/// to `false` when unset is intentional — downgrading to 256-color is always
-/// safe, whereas emitting truecolor to a terminal that can't parse it is not.
-fn supports_truecolor() -> bool {
-    matches!(
-        std::env::var("COLORTERM").as_deref(),
-        Ok("truecolor") | Ok("24bit")
-    )
-}
-
-/// Map an 8-bit color component to the nearest level of the xterm 6×6×6 color
-/// cube, returning `(cube_index, level_value)`.
-fn cube_level(v: u8) -> (u8, u8) {
-    const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
-    let mut best = 0usize;
-    let mut best_dist = i32::MAX;
-    for (i, &level) in LEVELS.iter().enumerate() {
-        let dist = (level as i32 - v as i32).abs();
-        if dist < best_dist {
-            best_dist = dist;
-            best = i;
-        }
-    }
-    (best as u8, LEVELS[best])
-}
-
-/// Nearest xterm-256 palette index for an RGB triple, picking whichever of the
-/// 6×6×6 color cube (16..=231) or the 24-step grayscale ramp (232..=255) is
-/// closest in squared-distance.
-fn rgb_to_ansi256(r: u8, g: u8, b: u8) -> u8 {
-    let sq = |a: u8, b: u8| {
-        let d = a as i32 - b as i32;
-        d * d
-    };
-    let (ri, rv) = cube_level(r);
-    let (gi, gv) = cube_level(g);
-    let (bi, bv) = cube_level(b);
-    let cube_idx = 16 + 36 * ri + 6 * gi + bi;
-    let cube_dist = sq(rv, r) + sq(gv, g) + sq(bv, b);
-
-    // Grayscale ramp: 24 shades at values 8, 18, … 238.
-    let avg = (r as i32 + g as i32 + b as i32) / 3;
-    let gray_i = ((avg - 8).max(0) / 10).min(23) as u8;
-    let gray_v = 8 + 10 * gray_i;
-    let gray_idx = 232 + gray_i;
-    let gray_dist = sq(gray_v, r) + sq(gray_v, g) + sq(gray_v, b);
-
-    if gray_dist < cube_dist {
-        gray_idx
-    } else {
-        cube_idx
-    }
-}
-
-/// Rewrite a 24-bit RGB color to the nearest 256-palette entry; pass every
-/// other color (named, indexed, reset) through untouched.
-fn downgrade_color(color: Color) -> Color {
-    match color {
-        Color::Rgb(r, g, b) => Color::Indexed(rgb_to_ansi256(r, g, b)),
-        other => other,
-    }
-}
-
-/// Backend wrapper that rewrites 24-bit RGB colors to the nearest 256-color
-/// palette entry before they reach the terminal. Only active when `downgrade`
-/// is set (terminal lacks truecolor); otherwise every call forwards unchanged.
-struct DowngradeBackend<W: io::Write> {
-    inner: CrosstermBackend<W>,
-    downgrade: bool,
-}
-
-impl<W: io::Write> DowngradeBackend<W> {
-    fn new(inner: CrosstermBackend<W>, downgrade: bool) -> Self {
-        Self { inner, downgrade }
-    }
-}
-
-// `Terminal` leaves the alternate screen via `execute!(backend_mut(), …)`,
-// which needs the backend to be a `Write`; forward to the inner backend.
-impl<W: io::Write> io::Write for DowngradeBackend<W> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.inner.write(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        io::Write::flush(&mut self.inner)
-    }
-}
-
-impl<W: io::Write> Backend for DowngradeBackend<W> {
-    fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
-    where
-        I: Iterator<Item = (u16, u16, &'a Cell)>,
-    {
-        if !self.downgrade {
-            return self.inner.draw(content);
-        }
-        // Clone each cell, downgrade its colors, then forward owned copies.
-        let cells: Vec<(u16, u16, Cell)> = content
-            .map(|(x, y, cell)| {
-                let mut cell = cell.clone();
-                cell.fg = downgrade_color(cell.fg);
-                cell.bg = downgrade_color(cell.bg);
-                (x, y, cell)
-            })
-            .collect();
-        self.inner
-            .draw(cells.iter().map(|(x, y, cell)| (*x, *y, cell)))
-    }
-
-    fn hide_cursor(&mut self) -> io::Result<()> {
-        self.inner.hide_cursor()
-    }
-
-    fn show_cursor(&mut self) -> io::Result<()> {
-        self.inner.show_cursor()
-    }
-
-    fn get_cursor_position(&mut self) -> io::Result<Position> {
-        self.inner.get_cursor_position()
-    }
-
-    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
-        self.inner.set_cursor_position(position)
-    }
-
-    fn clear(&mut self) -> io::Result<()> {
-        self.inner.clear()
-    }
-
-    fn clear_region(&mut self, clear_type: ratatui::backend::ClearType) -> io::Result<()> {
-        self.inner.clear_region(clear_type)
-    }
-
-    fn append_lines(&mut self, n: u16) -> io::Result<()> {
-        self.inner.append_lines(n)
-    }
-
-    fn size(&self) -> io::Result<Size> {
-        self.inner.size()
-    }
-
-    fn window_size(&mut self) -> io::Result<WindowSize> {
-        self.inner.window_size()
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Backend::flush(&mut self.inner)
-    }
-}
-
-fn with_terminal<T>(f: impl FnOnce(&mut Terminal<TuiBackend>) -> io::Result<T>) -> io::Result<T> {
-    terminal::enable_raw_mode()?;
-    let mut stderr = io::stderr();
-    execute!(stderr, EnterAlternateScreen)?;
-    let backend = DowngradeBackend::new(CrosstermBackend::new(stderr), !supports_truecolor());
-    let mut terminal = Terminal::new(backend)?;
-
-    let result = f(&mut terminal);
-
-    let _ = terminal::disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
-    let _ = terminal.show_cursor();
-
-    result
-}
-
-/// Show the session setup TUI. Returns the user's session config.
-pub fn setup_session(tool: ToolKind, account_name: &str) -> io::Result<SessionSetup> {
-    if !std::io::IsTerminal::is_terminal(&std::io::stderr()) {
-        return Ok(SessionSetup::Cancelled);
-    }
-
-    with_terminal(|terminal| run(terminal, tool, account_name))
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TopupOption {
@@ -986,55 +751,6 @@ fn animate_onramp_launch(
     Ok(())
 }
 
-fn render_success_checkmark(frame: &mut ratatui::Frame, area: Rect, visible: bool) {
-    frame.render_widget(Clear, area);
-
-    let g = Style::default().fg(Color::Green).bold();
-
-    let checkmark: Vec<Line> = if visible {
-        vec![
-            Line::raw(""),
-            Line::styled("                              ████", g),
-            Line::styled("                            ██████", g),
-            Line::styled("                          ████████", g),
-            Line::styled("                        ████████  ", g),
-            Line::styled("                      ████████    ", g),
-            Line::styled("                    ████████      ", g),
-            Line::styled("                  ████████        ", g),
-            Line::styled("                ████████          ", g),
-            Line::styled("  ████        ████████            ", g),
-            Line::styled("  ██████    ████████              ", g),
-            Line::styled("  ████████████████                ", g),
-            Line::styled("    ████████████                  ", g),
-            Line::styled("      ████████                    ", g),
-            Line::styled("        ████                      ", g),
-            Line::raw(""),
-        ]
-    } else {
-        vec![Line::raw(""); 16]
-    };
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Green));
-
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let top_pad = inner.height.saturating_sub(checkmark.len() as u16) / 2;
-    let text_area = Rect {
-        x: inner.x,
-        y: inner.y + top_pad,
-        width: inner.width,
-        height: inner.height.saturating_sub(top_pad),
-    };
-    frame.render_widget(
-        Paragraph::new(checkmark).alignment(ratatui::layout::Alignment::Center),
-        text_area,
-    );
-}
-
 #[allow(clippy::too_many_arguments)]
 fn render_topup_selector(
     frame: &mut ratatui::Frame,
@@ -1120,28 +836,14 @@ fn render_topup_selector(
         let is_active = is_selected && focus == TopupFocus::Methods;
         // Reuse the Solana logo's brand colors so each option has a
         // distinct identity when active. No border — full background fill.
-        let brand = option.brand_color();
-        let bg = if is_active { brand } else { TOPUP_CARD_BG };
-        let title_color = if is_active || is_selected {
-            Color::White
-        } else {
-            Color::Gray
-        };
-        let block = Block::default().style(Style::default().bg(bg));
-        // Card height is 3 — pad a blank line above the title so it lands
-        // on the middle row.
-        let card = Paragraph::new(vec![
-            Line::default(),
-            Line::from(Span::styled(
-                option.title(),
-                Style::default()
-                    .fg(title_color)
-                    .add_modifier(Modifier::BOLD),
-            ))
-            .centered(),
-        ])
-        .block(block);
-        frame.render_widget(card, option_chunks[chunk_idx]);
+        sidebar_card(
+            option_chunks[chunk_idx],
+            frame,
+            option.title(),
+            &[],
+            option.brand_color(),
+            is_active,
+        );
     }
 
     let active = options[selected];
@@ -1271,7 +973,7 @@ fn render_qr_detail(
         width: slider_width,
         height: split[0].height,
     };
-    render_topup_slider(
+    render_slider(
         frame,
         slider_area,
         slider_title_spans(amount_pos),
@@ -1338,55 +1040,6 @@ fn topup_amount_label(amount_pos: usize) -> String {
     } else {
         format!("${:.0}", amount_pos as f64 * TOPUP_STEP_USDC)
     }
-}
-
-/// Borderless slider used in the QR view. Three rows: centered title,
-/// the bar with arrows, and the scale labels. No surrounding box —
-/// the caller positions and sizes `area` to control the visual width.
-fn render_topup_slider<'a>(
-    frame: &mut ratatui::Frame,
-    area: Rect,
-    title_spans: Vec<Span<'a>>,
-    position: usize,
-    max_steps: usize,
-    scale_labels: &[(usize, &str)],
-) {
-    let bar_width = area.width as usize;
-    let track_width = bar_width.saturating_sub(6); // 3 chars per arrow
-    let track_last = track_width.saturating_sub(1);
-    let cursor_pos = (position.min(max_steps) * track_last)
-        .checked_div(max_steps)
-        .unwrap_or(0);
-
-    let arrow_style = Style::default().fg(Color::Cyan).bold();
-    let mut bar_spans = vec![Span::styled(" ◀ ", arrow_style)];
-    for i in 0..track_width {
-        let color = if i == cursor_pos {
-            bar_color(i, track_width, true)
-        } else if i < cursor_pos {
-            bar_color(i, track_width, false)
-        } else {
-            Color::Rgb(50, 55, 60)
-        };
-        bar_spans.push(Span::styled(TOPUP_SLIDER_CELL, Style::default().fg(color)));
-    }
-    bar_spans.push(Span::styled(" ▶ ", arrow_style));
-
-    let lines = vec![
-        Line::from(title_spans).centered(),
-        Line::from(bar_spans),
-        Line::from(render_scale_spans(
-            bar_width,
-            max_steps,
-            track_last,
-            scale_labels,
-        )),
-    ];
-
-    frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(TOPUP_MAIN_BG)),
-        area,
-    );
 }
 
 fn solana_pay_url(pubkey: &str, amount_pos: usize) -> String {
@@ -1778,66 +1431,11 @@ fn render_payment_button(
     frame.render_widget(card, area);
 }
 
-/// Vertical "money is flowing in" animation rendered beneath the active
-/// payment-method button. Each row shows either a bright `▼`, a dim `▽`,
-/// or a blank, with the bright glyph drifting downward as `tick`
-/// advances — giving the impression of falling drops in the brand colour.
-fn render_money_flow(frame: &mut ratatui::Frame, area: Rect, color: Color, tick: usize) {
-    let height = area.height as usize;
-    if height == 0 {
-        return;
-    }
-    // Cycle length controls drop spacing: longer = sparser drops. Adding
-    // a couple of empty phases past the visible rows keeps the column
-    // from looking constantly full.
-    let cycle = (height + 2).max(6) as i32;
-    // Spinner ticks every ~80ms. Slow the drop ~3× so each row dwells
-    // for ~240ms — money trickling in, not raining.
-    const FLOW_DAMPING: i32 = 3;
-    let slow_tick = (tick as i32) / FLOW_DAMPING;
-    let bright = Style::default().fg(color).add_modifier(Modifier::BOLD);
-    let dim = Style::default().fg(color).add_modifier(Modifier::DIM);
-
-    let lines: Vec<Line<'static>> = (0..height)
-        .map(|row| {
-            // phase increases as slow_tick increases; subtracting `row`
-            // makes higher rows lead the cycle, so the drop falls.
-            let phase = ((slow_tick - row as i32).rem_euclid(cycle)) as usize;
-            let span = match phase {
-                0 => Span::styled("▼", bright),
-                1 => Span::styled("▽", dim),
-                _ => Span::raw(" "),
-            };
-            Line::from(span).centered()
-        })
-        .collect();
-
-    frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(TOPUP_MAIN_BG)),
-        area,
-    );
-}
-
-fn unavailable_qr() -> RenderedQr {
-    let lines = ["Make this window larger", "to show the QR code"]
-        .into_iter()
-        .map(|text| Line::from(Span::styled(text, Style::default().fg(Color::DarkGray))).centered())
-        .collect::<Vec<_>>();
-    RenderedQr {
-        width: lines.iter().map(Line::width).max().unwrap_or(0) as u16,
-        height: lines.len() as u16,
-        lines,
-    }
-}
-
-fn render_qr(
-    data: &str,
-    max_width: u16,
-    max_height: u16,
-) -> Result<Option<RenderedQr>, qrcode::types::QrError> {
-    let code = QrCode::with_error_correction_level(data.as_bytes(), qrcode::EcLevel::L)?;
-    Ok(render_qr_code(&code, max_width, max_height))
-}
+// ── QR stable sizing ─────────────────────────────────────────────────────
+//
+// The QR is always rendered at the version needed for the *largest* possible
+// payload (max slider amount), so its on-screen size never jumps as the user
+// adjusts the amount.
 
 fn render_topup_qr(
     data: &str,
@@ -1871,66 +1469,6 @@ fn render_qr_with_version(
     Ok(render_qr_code(&code, max_width, max_height))
 }
 
-fn render_qr_code(code: &QrCode, max_width: u16, max_height: u16) -> Option<RenderedQr> {
-    let modules = code.width();
-    let (module_cols, module_subrows) = choose_qr_module_cells(modules, max_width, max_height)?;
-
-    let scaled_rows = modules * module_subrows;
-    let mut lines = Vec::with_capacity(scaled_rows.div_ceil(2));
-    for top_subrow in (0..scaled_rows).step_by(2) {
-        let mut spans = Vec::with_capacity(modules);
-        for x in 0..modules {
-            let top_dark = qr_subrow_dark(code, x, top_subrow, module_subrows);
-            let bottom_dark = qr_subrow_dark(code, x, top_subrow + 1, module_subrows);
-            spans.push(render_qr_half_block(top_dark, bottom_dark, module_cols));
-        }
-
-        lines.push(Line::from(spans));
-    }
-    let width = lines.first().map(Line::width).unwrap_or(0) as u16;
-    let height = lines.len() as u16;
-
-    Some(RenderedQr {
-        lines,
-        width,
-        height,
-    })
-}
-
-fn qr_subrow_dark(code: &QrCode, x: usize, subrow: usize, module_subrows: usize) -> bool {
-    let y = subrow / module_subrows;
-    y < code.width() && code[(x, y)] != QrColor::Light
-}
-
-fn render_qr_half_block(top_dark: bool, bottom_dark: bool, module_cols: usize) -> Span<'static> {
-    let cells = match (top_dark, bottom_dark) {
-        (true, true) => " ".repeat(module_cols),
-        (true, false) => "▀".repeat(module_cols),
-        (false, true) => "▄".repeat(module_cols),
-        (false, false) => " ".repeat(module_cols),
-    };
-
-    let style = match (top_dark, bottom_dark) {
-        (true, true) => Style::default().bg(Color::White),
-        (true, false) | (false, true) => Style::default().fg(Color::White).bg(TOPUP_MAIN_BG),
-        (false, false) => Style::default().bg(TOPUP_MAIN_BG),
-    };
-
-    Span::styled(cells, style)
-}
-
-fn choose_qr_module_cells(
-    modules: usize,
-    max_width: u16,
-    max_height: u16,
-) -> Option<(usize, usize)> {
-    let max_cols = (usize::from(max_width) / modules).min(8);
-    let max_subrows = ((usize::from(max_height) * 2) / modules).min(8);
-    let module_size = max_cols.min(max_subrows);
-
-    (module_size > 0).then_some((module_size, module_size))
-}
-
 fn render_topup_controls(
     frame: &mut ratatui::Frame,
     area: Rect,
@@ -1939,39 +1477,21 @@ fn render_topup_controls(
     payment_method: OnrampPaymentMethod,
     onramp_active: bool,
 ) {
-    let mut spans = match active {
-        TopupOption::TransferFromExistingAccount => vec![
-            Span::styled("↑ ↓", Style::default().fg(Color::Cyan).bold()),
-            Span::styled(" move  │  ", Style::default().dim()),
-            Span::styled("← →", Style::default().fg(Color::Cyan).bold()),
-            Span::styled(" amount  │  ", Style::default().dim()),
-            Span::styled("Esc", Style::default().fg(Color::Red).bold()),
-            Span::styled(" skip", Style::default().dim()),
-        ],
-        TopupOption::BuyStablecoins if onramp_active => vec![
-            Span::styled("↑ ↓", Style::default().fg(Color::Cyan).bold()),
-            Span::styled(" move  │  ", Style::default().dim()),
-            Span::styled("r", Style::default().fg(Color::Cyan).bold()),
-            Span::styled(" reopen  │  ", Style::default().dim()),
-            Span::styled("Esc", Style::default().fg(Color::Red).bold()),
-            Span::styled(" abort", Style::default().dim()),
-        ],
-        TopupOption::BuyStablecoins => vec![
-            Span::styled("↑ ↓", Style::default().fg(Color::Cyan).bold()),
-            Span::styled(" move  │  ", Style::default().dim()),
-            Span::styled("← →", Style::default().fg(Color::Cyan).bold()),
-            Span::styled(
-                format!(" {}  │  ", payment_method.title()),
-                Style::default().dim(),
-            ),
-            Span::styled("Enter", Style::default().fg(Color::Green).bold()),
-            Span::styled(" copy + open  │  ", Style::default().dim()),
-            Span::styled("Esc", Style::default().fg(Color::Red).bold()),
-            Span::styled(" skip", Style::default().dim()),
+    let entries: &[(&str, &str)] = match active {
+        TopupOption::TransferFromExistingAccount => {
+            &[("↑ ↓", "move"), ("← →", "amount"), ("Esc", "skip")]
+        }
+        TopupOption::BuyStablecoins if onramp_active => {
+            &[("↑ ↓", "move"), ("r", "reopen"), ("Esc", "abort")]
+        }
+        TopupOption::BuyStablecoins => &[
+            ("↑ ↓", "move"),
+            ("← →", payment_method.title()),
+            ("Enter", "copy + open"),
+            ("Esc", "skip"),
         ],
     };
 
-    const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let status_spans = match status {
         PollStatus::Waiting { spinner_idx, .. }
         | PollStatus::Checking { spinner_idx }
@@ -1992,19 +1512,7 @@ fn render_topup_controls(
         ],
     };
 
-    let controls_width: usize = spans.iter().map(|span| span.content.len()).sum();
-    let status_width: usize = status_spans.iter().map(|span| span.content.len()).sum();
-    let total_width = controls_width.saturating_add(status_width);
-    let gap = (area.width as usize).saturating_sub(total_width);
-    spans.push(Span::raw(" ".repeat(gap.max(1))));
-    spans.extend(status_spans);
-
-    let line = Line::from(spans);
-
-    frame.render_widget(
-        Paragraph::new(line).style(Style::default().bg(TOPUP_SIDEBAR_BG)),
-        area,
-    );
+    controls_bar(frame, area, entries, Some(Line::from(status_spans)));
 }
 
 fn print_topup_instructions(pubkey: &str, onramp_host: &str) {
@@ -2120,653 +1628,9 @@ fn copy_to_clipboard(text: &str) -> io::Result<()> {
     ))
 }
 
-fn run(
-    terminal: &mut Terminal<TuiBackend>,
-    tool: ToolKind,
-    account_name: &str,
-) -> io::Result<SessionSetup> {
-    let mut budget_pos: usize = 2; // $1.00
-    let mut expiry_pos: usize = 3; // 1h
-    let mut focus = Focus::Budget;
-
-    loop {
-        terminal.draw(|frame| {
-            let area = frame.area();
-            render_session_setup(
-                frame,
-                area,
-                budget_pos,
-                expiry_pos,
-                &focus,
-                tool,
-                account_name,
-            );
-        })?;
-
-        if event::poll(std::time::Duration::from_millis(50))?
-            && let Event::Key(key) = event::read()?
-        {
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
-            match key.code {
-                KeyCode::Up | KeyCode::Tab => focus = Focus::Budget,
-                KeyCode::Down | KeyCode::BackTab => focus = Focus::Expiry,
-                KeyCode::Left => match focus {
-                    Focus::Budget => {
-                        budget_pos = budget_pos.saturating_sub(1);
-                    }
-                    Focus::Expiry => {
-                        expiry_pos = expiry_pos.saturating_sub(1);
-                    }
-                },
-                KeyCode::Right => match focus {
-                    Focus::Budget => {
-                        if budget_pos < MAX_STEPS {
-                            budget_pos += 1;
-                        }
-                    }
-                    Focus::Expiry => {
-                        if expiry_pos < EXPIRY_OPTIONS.len() - 1 {
-                            expiry_pos += 1;
-                        }
-                    }
-                },
-                KeyCode::Home => match focus {
-                    Focus::Budget => budget_pos = 0,
-                    Focus::Expiry => expiry_pos = 0,
-                },
-                KeyCode::End => match focus {
-                    Focus::Budget => budget_pos = MAX_STEPS,
-                    Focus::Expiry => expiry_pos = EXPIRY_OPTIONS.len() - 1,
-                },
-                KeyCode::Enter => {
-                    let cap = if budget_pos >= MAX_STEPS {
-                        u64::MAX
-                    } else {
-                        (budget_pos as u64) * STEP_AMOUNT
-                    };
-                    let (expires_in, _) = EXPIRY_OPTIONS[expiry_pos];
-                    return Ok(SessionSetup::Approved { cap, expires_in });
-                }
-                KeyCode::Char('q') | KeyCode::Esc => {
-                    return Ok(SessionSetup::Cancelled);
-                }
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    return Ok(SessionSetup::Cancelled);
-                }
-                _ => {}
-            }
-        }
-    }
-}
-
-// ── Left panel: controls ──
-
-fn render_session_setup(
-    frame: &mut ratatui::Frame,
-    area: Rect,
-    budget_pos: usize,
-    expiry_pos: usize,
-    focus: &Focus,
-    tool: ToolKind,
-    account_name: &str,
-) {
-    frame.render_widget(
-        Block::default().style(Style::default().bg(TOPUP_MAIN_BG)),
-        area,
-    );
-
-    let full_columns = Layout::horizontal([Constraint::Min(0), Constraint::Length(44)]).split(area);
-    frame.render_widget(
-        Block::default().style(Style::default().bg(TOPUP_SIDEBAR_BG)),
-        full_columns[0],
-    );
-
-    let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
-    let columns = Layout::horizontal([Constraint::Min(0), Constraint::Length(44)]).split(chunks[0]);
-
-    render_left_panel(
-        frame,
-        columns[0],
-        budget_pos,
-        expiry_pos,
-        focus,
-        account_name,
-    );
-    render_card_panel(frame, columns[1], budget_pos, expiry_pos, tool);
-    render_controls(frame, chunks[1]);
-}
-
-fn render_left_panel(
-    frame: &mut ratatui::Frame,
-    area: Rect,
-    budget_pos: usize,
-    expiry_pos: usize,
-    focus: &Focus,
-    account_name: &str,
-) {
-    let sidebar = Layout::horizontal([
-        Constraint::Length(2),
-        Constraint::Min(0),
-        Constraint::Length(2),
-    ])
-    .split(area);
-    let content = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Length(3),
-        Constraint::Length(1),
-        Constraint::Length(5),
-        Constraint::Length(1),
-        Constraint::Length(5),
-        Constraint::Min(0),
-    ])
-    .split(sidebar[1]);
-
-    frame.render_widget(Paragraph::new(solana_logo("")).centered(), content[1]);
-
-    let max_w = sidebar[1].width.min(40);
-    let center = |r: Rect| -> Rect {
-        let h = Layout::horizontal([
-            Constraint::Min(0),
-            Constraint::Length(max_w),
-            Constraint::Min(0),
-        ])
-        .split(r);
-        h[1]
-    };
-
-    render_budget_box(
-        frame,
-        center(content[3]),
-        budget_pos,
-        max_w,
-        focus,
-        account_name,
-    );
-    render_expiry_box(frame, center(content[5]), expiry_pos, focus);
-}
-
-fn render_budget_box(
-    frame: &mut ratatui::Frame,
-    area: Rect,
-    position: usize,
-    _box_width: u16,
-    focus: &Focus,
-    account_name: &str,
-) {
-    let is_no_cap = position >= MAX_STEPS;
-    let amount_str = if is_no_cap {
-        "No cap".to_string()
-    } else {
-        format!("${:.0}", position as f64 * 0.5)
-    };
-    let title = Line::from(vec![
-        Span::raw(" Send "),
-        Span::styled(
-            amount_str,
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" to account "),
-        Span::styled(
-            format!("@{account_name}"),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" "),
-    ]);
-    render_slider_box(
-        frame,
-        area,
-        title,
-        position,
-        MAX_STEPS,
-        &[
-            (0, "$0"),
-            (10, "$5"),
-            (20, "$10"),
-            (30, "$15"),
-            (31, "No cap"),
-        ],
-        *focus == Focus::Budget,
-    );
-}
-
-fn render_expiry_box(frame: &mut ratatui::Frame, area: Rect, position: usize, focus: &Focus) {
-    let border_color = if *focus == Focus::Expiry {
-        Color::Green
-    } else {
-        Color::DarkGray
-    };
-
-    let block = Block::default()
-        .title(" Expires in ")
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border_color));
-
-    let mut spans = Vec::new();
-    for (i, (_, label)) in EXPIRY_OPTIONS.iter().enumerate() {
-        let style = if i == position {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Green)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        spans.push(Span::styled(format!(" {label} "), style));
-        if i < EXPIRY_OPTIONS.len() - 1 {
-            spans.push(Span::styled(
-                "│",
-                Style::default().fg(Color::Rgb(50, 55, 60)),
-            ));
-        }
-    }
-
-    let lines = vec![Line::default(), Line::from(spans), Line::default()];
-
-    frame.render_widget(Paragraph::new(lines).block(block), area);
-}
-
-// ── Right panel: card column ──
-
-const CARD_BORDER: Color = Color::Rgb(60, 65, 75);
-const CARD_FACE: Color = Color::Rgb(35, 40, 50);
-
-fn render_card_panel(
-    frame: &mut ratatui::Frame,
-    area: Rect,
-    budget_pos: usize,
-    expiry_pos: usize,
-    tool: ToolKind,
-) {
-    // Fill entire column with background
-    let bg = Block::default().style(Style::default().bg(CARD_BG));
-    frame.render_widget(bg, area);
-
-    let is_no_cap = budget_pos >= MAX_STEPS;
-    let dollars = (budget_pos as f64) * 0.50;
-    let budget_str = if is_no_cap {
-        " No cap ".to_string()
-    } else {
-        format!(" ${:.2} ", dollars)
-    };
-    let amount_bg = bar_color(budget_pos, MAX_STEPS, true);
-    let (expiry_secs, _) = EXPIRY_OPTIONS[expiry_pos];
-    let expires_at = std::time::SystemTime::now() + std::time::Duration::from_secs(expiry_secs);
-    let datetime: chrono::DateTime<chrono::Local> = expires_at.into();
-    let expiry_str = datetime.format("Exp %d/%m at %H:%M").to_string();
-
-    let v = Layout::vertical([
-        Constraint::Min(0),
-        Constraint::Length(11),
-        Constraint::Min(0),
-    ])
-    .split(area);
-    let h = Layout::horizontal([
-        Constraint::Min(0),
-        Constraint::Length(CARD_WIDTH),
-        Constraint::Min(0),
-    ])
-    .split(v[1]);
-    let card_area = h[1];
-
-    // Clear behind card for rounded corners
-    frame.render_widget(Clear, card_area);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(CARD_BORDER))
-        .style(Style::default().bg(CARD_FACE));
-
-    // Bottom row: budget (inverted) left, expiry right
-    let inner_w = CARD_WIDTH as usize - 2; // inside borders
-    let left_part = format!("  {budget_str}");
-    let right_part = format!("{expiry_str}  ");
-    let gap = inner_w.saturating_sub(left_part.len() + right_part.len());
-
-    let tool_lines: Vec<Line> = match tool {
-        ToolKind::Claude => {
-            let cc = Color::Rgb(218, 119, 86); // Claude Code orange #DA7756
-            vec![
-                Line::default(),
-                Line::from(Span::styled("   ▐▛███▜▌", Style::default().fg(cc))),
-                Line::from(Span::styled("  ▝▜█████▛▘  claude", Style::default().fg(cc))),
-                Line::from(Span::styled("    ▘▘ ▝▝", Style::default().fg(cc))),
-                Line::default(),
-            ]
-        }
-        ToolKind::Codex => {
-            let mut lines = vec![Line::default()];
-            lines.extend(solana_logo("  "));
-            lines.push(Line::from(Span::styled(
-                "  codex",
-                Style::default().fg(Color::DarkGray),
-            )));
-            lines
-        }
-        ToolKind::Qodercli => {
-            let qc = Color::Rgb(39, 189, 81); // Qoder green
-            vec![
-                Line::default(),
-                Line::from(Span::styled("    ██████", Style::default().fg(qc))),
-                Line::from(Span::styled("  ██      ██", Style::default().fg(qc))),
-                Line::from(Span::styled("  ██  ██  ██  qoder", Style::default().fg(qc))),
-                Line::from(Span::styled("  ██    ██", Style::default().fg(qc))),
-                Line::from(Span::styled("    ████  ██", Style::default().fg(qc))),
-                Line::default(),
-            ]
-        }
-        _ => {
-            let tool_label = match tool {
-                ToolKind::Curl => "curl",
-                ToolKind::Wget => "wget",
-                ToolKind::Http => "http",
-                ToolKind::Fetch => "fetch",
-                ToolKind::Mcp => "mcp",
-                ToolKind::Claude | ToolKind::Codex | ToolKind::Qodercli => unreachable!(),
-            };
-            vec![
-                Line::default(),
-                Line::from(Span::styled(
-                    format!("  {tool_label}"),
-                    Style::default().fg(Color::DarkGray),
-                )),
-                Line::default(),
-                Line::default(),
-            ]
-        }
-    };
-
-    let mut lines = tool_lines;
-    lines.extend([
-        Line::from(Span::styled(
-            "  4402  ****  ****  0402",
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::default(),
-        Line::from(vec![
-            Span::styled("  ", Style::default()),
-            Span::styled(
-                budget_str,
-                Style::default()
-                    .fg(CARD_FACE)
-                    .bg(amount_bg)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" ".repeat(gap), Style::default()),
-            Span::styled(right_part, Style::default().fg(Color::DarkGray)),
-        ]),
-    ]);
-
-    let paragraph = Paragraph::new(lines).block(block);
-    frame.render_widget(paragraph, card_area);
-}
-
-// ── Helpers ──
-
-fn solana_logo(prefix: &'static str) -> Vec<Line<'static>> {
-    vec![
-        solana_logo_line(
-            prefix,
-            "⣠⣶",
-            SOLANA_BLUE,
-            "⣶⣶",
-            SOLANA_GREEN,
-            "⣶⣶⠖",
-            SOLANA_GREEN,
-        ),
-        solana_logo_line(
-            prefix,
-            "⠲⣶",
-            SOLANA_PURPLE,
-            "⣶⣶",
-            SOLANA_BLUE,
-            "⣶⣶⣄",
-            SOLANA_GREEN,
-        ),
-        solana_logo_line(
-            prefix,
-            "⣠⣶",
-            SOLANA_PURPLE,
-            "⣶⣶",
-            SOLANA_PURPLE,
-            "⣶⣶⠖",
-            SOLANA_BLUE,
-        ),
-    ]
-}
-
-fn solana_logo_line(
-    prefix: &'static str,
-    left: &'static str,
-    left_color: Color,
-    middle: &'static str,
-    middle_color: Color,
-    right: &'static str,
-    right_color: Color,
-) -> Line<'static> {
-    Line::from(vec![
-        Span::raw(prefix),
-        Span::styled(left, Style::default().fg(left_color)),
-        Span::styled(middle, Style::default().fg(middle_color)),
-        Span::styled(right, Style::default().fg(right_color)),
-    ])
-}
-
-/// Interpolate bar color from green → yellow → red based on position.
-fn bar_color(index: usize, total: usize, bright: bool) -> Color {
-    if index == 0 {
-        return if bright {
-            Color::Rgb(180, 180, 185)
-        } else {
-            Color::Rgb(110, 110, 115)
-        };
-    }
-
-    let t = index as f64 / total.max(1) as f64;
-
-    let (r, g) = if t < 0.5 {
-        let s = t * 2.0;
-        (s, 1.0)
-    } else {
-        let s = (t - 0.5) * 2.0;
-        (1.0, 1.0 - s)
-    };
-
-    if bright {
-        Color::Rgb((r * 255.0) as u8, (g * 255.0) as u8, 40)
-    } else {
-        Color::Rgb((r * 140.0) as u8, (g * 140.0) as u8, 30)
-    }
-}
-
-fn render_scale_spans(
-    bar_width: usize,
-    max_steps: usize,
-    track_last: usize,
-    labels: &[(usize, &str)],
-) -> Vec<Span<'static>> {
-    let arrow_width = 3usize;
-    let mut chars = vec![' '; bar_width];
-
-    for &(position, label) in labels {
-        let label_width = label.chars().count();
-        let track_pos = (position.min(max_steps) * track_last)
-            .checked_div(max_steps)
-            .unwrap_or(0);
-        let label_center = arrow_width + track_pos;
-        let preferred_start = label_center.saturating_sub(label_width / 2);
-        let label_start = if bar_width <= label_width {
-            0
-        } else {
-            let bar_max_start = bar_width.saturating_sub(label_width);
-            let track_start = arrow_width.min(bar_max_start);
-            let track_end = arrow_width
-                .saturating_add(track_last)
-                .min(bar_width.saturating_sub(1));
-
-            if track_end >= track_start.saturating_add(label_width.saturating_sub(1)) {
-                preferred_start.clamp(
-                    track_start,
-                    track_end.saturating_sub(label_width.saturating_sub(1)),
-                )
-            } else {
-                preferred_start.min(bar_max_start)
-            }
-        };
-
-        for (idx, ch) in label.chars().enumerate() {
-            if let Some(slot) = chars.get_mut(label_start + idx) {
-                *slot = ch;
-            }
-        }
-    }
-
-    vec![Span::styled(
-        chars.into_iter().collect::<String>(),
-        Style::default().fg(Color::DarkGray),
-    )]
-}
-
-/// Generic slider bar used by both the session budget box and the topup amount box.
-fn render_slider_box<'a>(
-    frame: &mut ratatui::Frame,
-    area: Rect,
-    title: impl Into<ratatui::widgets::block::Title<'a>>,
-    position: usize,
-    max_steps: usize,
-    scale_labels: &[(usize, &str)],
-    focused: bool,
-) {
-    let border_color = if focused {
-        Color::Green
-    } else {
-        Color::DarkGray
-    };
-
-    let block = Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border_color));
-
-    let box_width = area.width;
-    let bar_width = (box_width as usize).saturating_sub(4);
-    let track_width = bar_width.saturating_sub(6); // account for arrows
-    let track_last = track_width.saturating_sub(1);
-    let cursor_pos = (position.min(max_steps) * track_last)
-        .checked_div(max_steps)
-        .unwrap_or(0);
-
-    let arrow_style = Style::default().fg(Color::Cyan).bold();
-    let mut bar_spans = vec![Span::styled(" ◀ ", arrow_style)];
-    for i in 0..bar_width.saturating_sub(6) {
-        let color = if i == cursor_pos {
-            bar_color(i, bar_width.saturating_sub(6), true)
-        } else if i < cursor_pos {
-            bar_color(i, bar_width.saturating_sub(6), false)
-        } else {
-            Color::Rgb(50, 55, 60)
-        };
-        bar_spans.push(Span::styled("▐", Style::default().fg(color)));
-    }
-    bar_spans.push(Span::styled(" ▶ ", arrow_style));
-
-    let lines = vec![
-        Line::default(),
-        Line::from(bar_spans),
-        Line::from(render_scale_spans(
-            bar_width,
-            max_steps,
-            track_last,
-            scale_labels,
-        )),
-    ];
-
-    frame.render_widget(Paragraph::new(lines).block(block), area);
-}
-
-fn render_controls(frame: &mut ratatui::Frame, area: Rect) {
-    let line = Line::from(vec![
-        Span::styled("← →", Style::default().fg(Color::Cyan).bold()),
-        Span::styled(" adjust  ", Style::default().dim()),
-        Span::styled("↑ ↓", Style::default().fg(Color::Cyan).bold()),
-        Span::styled(" switch  │  ", Style::default().dim()),
-        Span::styled("Enter", Style::default().fg(Color::Green).bold()),
-        Span::styled(" start  │  ", Style::default().dim()),
-        Span::styled("Esc", Style::default().fg(Color::Red).bold()),
-        Span::styled(" cancel", Style::default().dim()),
-    ]);
-    frame.render_widget(
-        Paragraph::new(line).style(Style::default().bg(TOPUP_SIDEBAR_BG)),
-        area,
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const SAMPLE_SOLANA_PAY_URL: &str = "solana:11111111111111111111111111111111?amount=5&spl-token=\
-         EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-
-    // ── Truecolor downgrade ─────────────────────────────────────────────
-
-    #[test]
-    fn downgrade_maps_rgb_to_256_palette_and_leaves_others_alone() {
-        // RGB collapses to a 256-palette index in the valid 16..=255 range.
-        match downgrade_color(TOPUP_CARD_BG) {
-            Color::Indexed(i) => assert!((16..=255).contains(&i)),
-            other => panic!("expected Indexed, got {other:?}"),
-        }
-        // Named / reset colors pass through untouched — no spurious remap.
-        assert_eq!(downgrade_color(Color::Reset), Color::Reset);
-        assert_eq!(downgrade_color(Color::Yellow), Color::Yellow);
-    }
-
-    #[test]
-    fn dark_card_bg_does_not_downgrade_to_green() {
-        // The original bug: Rgb(39,39,42)'s truecolor SGR leaked a green
-        // background on non-truecolor terminals. The downgraded index must
-        // land in the dark grayscale ramp, never a green cube cell.
-        let idx = match downgrade_color(TOPUP_CARD_BG) {
-            Color::Indexed(i) => i,
-            other => panic!("expected Indexed, got {other:?}"),
-        };
-        // 232..=235 are the darkest grays — where a near-black belongs.
-        assert!(
-            (232..=235).contains(&idx),
-            "near-black card bg downgraded to unexpected palette index {idx}"
-        );
-    }
-
-    #[test]
-    fn solana_green_stays_green_ish_after_downgrade() {
-        // A genuinely green RGB should map into the green region of the
-        // color cube (cube index where the green axis dominates).
-        let idx = match downgrade_color(SOLANA_GREEN) {
-            Color::Indexed(i) => i,
-            other => panic!("expected Indexed, got {other:?}"),
-        };
-        assert!(
-            (16..=231).contains(&idx),
-            "expected a cube color, got {idx}"
-        );
-        let c = idx - 16;
-        let (r, g, b) = (c / 36, (c / 6) % 6, c % 6);
-        assert!(
-            g > r && g > b,
-            "expected green-dominant cube cell, got ({r},{g},{b})"
-        );
-    }
 
     // ── PollState tests ─────────────────────────────────────────────────
     //
@@ -3024,29 +1888,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn topup_slider_cell_is_single_char_slot() {
-        assert_eq!(TOPUP_SLIDER_CELL, "▐");
-        assert_eq!(TOPUP_SLIDER_CELL.chars().count(), 1);
-    }
-
-    #[test]
-    fn render_scale_spans_keeps_edge_labels_inside_track() {
-        let spans = render_scale_spans(
-            40,
-            TOPUP_MAX_STEPS,
-            33,
-            &[(0, "any"), (TOPUP_MAX_STEPS, "$25")],
-        );
-        let line = spans[0].content.as_ref();
-
-        assert_eq!(line.len(), 40);
-        assert_eq!(&line[0..3], "   ");
-        assert_eq!(&line[3..6], "any");
-        assert_eq!(&line[34..37], "$25");
-        assert_eq!(&line[37..40], "   ");
-    }
-
     // ── wrapped_line_count ─────────────────────────────────────────────
 
     #[test]
@@ -3089,40 +1930,7 @@ mod tests {
         assert!(total > 3, "expected growth past 3 lines, got {total}");
     }
 
-    #[test]
-    fn topup_qr_render_keeps_square_physical_geometry() {
-        let qr = render_qr(SAMPLE_SOLANA_PAY_URL, 120, 60)
-            .expect("QR should encode")
-            .expect("QR should fit");
-
-        assert!(qr.width <= 120);
-        assert!(qr.height <= 60);
-
-        let physical_width = usize::from(qr.width);
-        let physical_height = usize::from(qr.height) * 2;
-        assert!(physical_width.abs_diff(physical_height) <= 1);
-    }
-
-    #[test]
-    fn topup_qr_render_defaults_to_two_column_modules() {
-        let qr = render_qr(SAMPLE_SOLANA_PAY_URL, 120, 60)
-            .expect("QR should encode")
-            .expect("QR should fit");
-
-        let physical_width = usize::from(qr.width);
-        let physical_height = usize::from(qr.height) * 2;
-        assert!(physical_width.abs_diff(physical_height) <= 1);
-    }
-
-    #[test]
-    fn topup_qr_render_fits_compact_terminal_area() {
-        let qr = render_qr(SAMPLE_SOLANA_PAY_URL, 120, 30)
-            .expect("QR should encode")
-            .expect("QR should fit");
-
-        assert!(qr.width <= 120);
-        assert!(qr.height <= 30);
-    }
+    // ── QR stable sizing ───────────────────────────────────────────────
 
     #[test]
     fn topup_qr_render_keeps_dimensions_stable_across_amounts() {
@@ -3148,31 +1956,7 @@ mod tests {
         assert_eq!(topup_qr_version(pubkey).unwrap(), max_code.version());
     }
 
-    #[test]
-    fn topup_qr_render_refuses_to_clip() {
-        let qr = render_qr(SAMPLE_SOLANA_PAY_URL, 1, 1).expect("QR should encode");
-
-        assert!(qr.is_none());
-    }
-
-    #[test]
-    fn unavailable_qr_asks_user_to_resize_window() {
-        let qr = unavailable_qr();
-        let text = qr
-            .lines
-            .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(text, vec!["Make this window larger", "to show the QR code"]);
-        assert_eq!(qr.width, "Make this window larger".len() as u16);
-        assert_eq!(qr.height, 2);
-    }
+    // ── onramp URLs ────────────────────────────────────────────────────
 
     #[test]
     fn build_onramp_redirect_url_targets_done_page() {
