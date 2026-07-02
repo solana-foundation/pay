@@ -18,7 +18,7 @@ Runs against the [Solana Payment Sandbox](https://402.surfnet.dev) — no real f
 For source packaging, build or unpack the frontend before compiling Rust:
 
 ```bash
-cd pdb && pnpm install --frozen-lockfile && pnpm build
+cd web-ui && pnpm install --frozen-lockfile && pnpm build
 cd ../rust && cargo build --release
 ```
 

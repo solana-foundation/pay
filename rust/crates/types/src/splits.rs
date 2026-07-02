@@ -633,7 +633,7 @@ percent: 2.9
     fn yaml_full_spec_loads() {
         let yaml = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../../pdb/proxy/payment-debugger.yml"
+            "/../../../web-ui/proxy/payment-debugger.yml"
         ))
         .unwrap();
         let spec: crate::metering::ApiSpec = serde_yml::from_str(&yaml).unwrap();

@@ -67,9 +67,9 @@ jobs:
         with:
           node-version: lts/*
       - name: Build PDB frontend
-        run: cd ../pdb && pnpm install --frozen-lockfile && pnpm build
+        run: cd ../web-ui && pnpm install --frozen-lockfile && pnpm build
       - name: Package PDB frontend
-        run: tar -C ../pdb -czf pay-pdb-dist-${{ steps.resolve.outputs.version }}.tar.gz dist
+        run: tar -C ../web-ui -czf pay-pdb-dist-${{ steps.resolve.outputs.version }}.tar.gz dist
       - uses: actions/upload-artifact@v4
         with:
           name: pay-pdb-dist
@@ -133,11 +133,11 @@ jobs:
         with:
           node-version: lts/*
       - name: Build PDB frontend
-        run: cd ../pdb && pnpm install --frozen-lockfile && pnpm build
+        run: cd ../web-ui && pnpm install --frozen-lockfile && pnpm build
 
       - name: Copy PDB frontend for cross
         if: matrix.use-cross
-        run: cp -R ../pdb/dist pdb-dist
+        run: cp -R ../web-ui/dist pdb-dist
 
       - name: Configure cross env passthrough
         if: matrix.use-cross
