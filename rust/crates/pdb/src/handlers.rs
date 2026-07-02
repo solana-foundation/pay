@@ -21,17 +21,23 @@ pub async fn sse_stream(State(state): State<PdbState>) -> Response {
         let engine = state.correlation.lock().unwrap();
         engine.snapshot()
     };
+    let providers = state.providers();
 
     let init_data = serde_json::to_string(&SseMessage::Init {
         viewer_ip: "unknown".into(),
     })
     .unwrap();
     let snapshot_data = serde_json::to_string(&SseMessage::Snapshot { flows: snapshot }).unwrap();
+    let provider_data = (!providers.is_empty())
+        .then(|| serde_json::to_string(&SseMessage::ProviderStatus { providers }).unwrap());
 
     let stream = async_stream::stream! {
         // Initial events
         yield Ok::<_, std::convert::Infallible>(format!("data: {init_data}\n\n"));
         yield Ok(format!("data: {snapshot_data}\n\n"));
+        if let Some(provider_data) = provider_data {
+            yield Ok(format!("data: {provider_data}\n\n"));
+        }
 
         // Live events
         loop {

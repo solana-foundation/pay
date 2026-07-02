@@ -12,6 +12,9 @@ pub enum Protocol {
     Mpp,
     X402,
     Session,
+    /// Plain HTTP exchange with no payment protocol involved — used by
+    /// `AllExchanges` mode (e.g. `pay serve inference` passthrough traffic).
+    Http,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -21,6 +24,9 @@ pub enum FlowStatus {
     PaymentReceived,
     ResourceDelivered,
     Failed,
+    /// Request forwarded upstream, response not yet complete
+    /// (`AllExchanges` mode only).
+    InProgress,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -120,6 +126,46 @@ pub struct SessionInfo {
     pub updated_at: Option<String>,
 }
 
+// ── Inference (local AI gateway) ──
+
+/// Live inference telemetry attached to a flow by `pay serve inference`.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InferenceInfo {
+    /// Provider slug, e.g. `ollama`.
+    pub provider: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// `chat` | `completion` | `embeddings` | `other`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint_kind: Option<String>,
+    pub streamed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_prompt: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_completion: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttft_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_per_sec: Option<f64>,
+}
+
+/// Discovered local inference provider, broadcast to UIs on (re)probe.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderSummary {
+    pub slug: String,
+    pub title: String,
+    pub base_url: String,
+    pub up: bool,
+    pub models: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Brand color hex, e.g. `#22c55e`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+}
+
 // ── Payment Flow ──
 
 #[derive(Debug, Clone, Serialize)]
@@ -154,6 +200,8 @@ pub struct PaymentFlow {
     pub response_headers: Option<HashMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_body: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inference: Option<InferenceInfo>,
 }
 
 // ── SSE Messages ──
@@ -176,9 +224,26 @@ pub enum SseMessage {
     FlowUpdated {
         flow: PaymentFlow,
     },
+    ProviderStatus {
+        providers: Vec<ProviderSummary>,
+    },
 }
 
 // ── Log Entry (internal, fed to correlation engine) ──
+
+/// Start-of-request notification for `AllExchanges` mode — creates an
+/// `in-progress` flow immediately so long-running requests (LLM generations)
+/// are visible before the response completes. `id` must match the `LogEntry`
+/// ingested at completion.
+#[derive(Debug, Clone)]
+pub struct ExchangeStart {
+    pub id: u64,
+    pub ts: String,
+    pub method: String,
+    pub path: String,
+    pub client_ip: String,
+    pub inference: Option<InferenceInfo>,
+}
 
 #[derive(Debug, Clone)]
 pub struct LogEntry {
@@ -192,4 +257,71 @@ pub struct LogEntry {
     pub res_headers: HashMap<String, String>,
     pub res_body: Option<String>,
     pub client_ip: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The TS mirror (web-ui/api/types.ts) depends on these exact wire shapes.
+
+    #[test]
+    fn provider_status_message_wire_format() {
+        let msg = SseMessage::ProviderStatus {
+            providers: vec![ProviderSummary {
+                slug: "ollama".into(),
+                title: "Ollama".into(),
+                base_url: "http://127.0.0.1:11434".into(),
+                up: true,
+                models: vec!["llama3.2:3b".into()],
+                version: Some("0.9.1".into()),
+                color: Some("#22c55e".into()),
+            }],
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+        assert_eq!(json["type"], "provider-status");
+        let p = &json["providers"][0];
+        assert_eq!(p["slug"], "ollama");
+        assert_eq!(p["baseUrl"], "http://127.0.0.1:11434");
+        assert_eq!(p["up"], true);
+        assert_eq!(p["version"], "0.9.1");
+    }
+
+    #[test]
+    fn inference_info_wire_format() {
+        let info = InferenceInfo {
+            provider: "ollama".into(),
+            model: Some("llama3.2:3b".into()),
+            endpoint_kind: Some("chat".into()),
+            streamed: true,
+            tokens_prompt: Some(12),
+            tokens_completion: Some(214),
+            ttft_ms: Some(182),
+            tokens_per_sec: Some(41.2),
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&info).unwrap()).unwrap();
+        assert_eq!(json["endpointKind"], "chat");
+        assert_eq!(json["tokensPrompt"], 12);
+        assert_eq!(json["tokensCompletion"], 214);
+        assert_eq!(json["ttftMs"], 182);
+        assert_eq!(json["tokensPerSec"], 41.2);
+        // Empty optionals are omitted, not null.
+        let sparse = serde_json::to_string(&InferenceInfo {
+            provider: "x".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(sparse, r#"{"provider":"x","streamed":false}"#);
+    }
+
+    #[test]
+    fn in_progress_status_and_http_protocol_wire_format() {
+        assert_eq!(
+            serde_json::to_string(&FlowStatus::InProgress).unwrap(),
+            r#""in-progress""#
+        );
+        assert_eq!(serde_json::to_string(&Protocol::Http).unwrap(), r#""http""#);
+    }
 }

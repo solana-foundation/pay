@@ -22,8 +22,8 @@ use include_dir::{Dir, include_dir};
 use mime_guess::from_path;
 use tokio::sync::broadcast;
 
-use correlation::FlowCorrelation;
-use types::SseMessage;
+use correlation::{CorrelationMode, FlowCorrelation};
+use types::{ExchangeStart, InferenceInfo, ProviderSummary, SseMessage};
 
 /// Mount path for the PDB debugger UI (no trailing slash).
 pub const PDB_PATH: &str = "/__402/pdb";
@@ -36,23 +36,74 @@ pub struct PdbState {
     pub correlation: Arc<Mutex<FlowCorrelation>>,
     pub tx: broadcast::Sender<SseMessage>,
     pub config: serde_json::Value,
+    /// Last known provider status (`AllExchanges` mode) — replayed to new
+    /// SSE subscribers after the flow snapshot.
+    providers: Arc<Mutex<Vec<ProviderSummary>>>,
     log_id: Arc<AtomicU64>,
 }
 
 impl PdbState {
     pub fn new(config: serde_json::Value) -> Self {
+        Self::with_mode(config, CorrelationMode::PaymentFlows)
+    }
+
+    pub fn with_mode(config: serde_json::Value, mode: CorrelationMode) -> Self {
         let (tx, _) = broadcast::channel(256);
-        let correlation = FlowCorrelation::new(tx.clone());
+        let correlation = FlowCorrelation::with_mode(tx.clone(), mode);
         Self {
             correlation: Arc::new(Mutex::new(correlation)),
             tx,
             config,
+            providers: Arc::new(Mutex::new(Vec::new())),
             log_id: Arc::new(AtomicU64::new(0)),
         }
     }
 
     pub fn next_log_id(&self) -> u64 {
         self.log_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Open an in-flight flow (`AllExchanges` mode). Returns the log id to
+    /// pass back via `update_exchange` and the completing `LogEntry.id`.
+    /// Harmless no-op in `PaymentFlows` mode (the id is still valid).
+    pub fn begin_exchange(
+        &self,
+        method: &str,
+        path: &str,
+        client_ip: &str,
+        inference: Option<InferenceInfo>,
+    ) -> u64 {
+        let id = self.next_log_id();
+        let start = ExchangeStart {
+            id,
+            ts: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            method: method.to_string(),
+            path: path.to_string(),
+            client_ip: client_ip.to_string(),
+            inference,
+        };
+        self.correlation.lock().unwrap().begin_exchange(start);
+        id
+    }
+
+    /// Push live telemetry (running token counts, TTFT) onto an in-flight
+    /// exchange opened by `begin_exchange`.
+    pub fn update_exchange(&self, log_id: u64, inference: InferenceInfo) {
+        self.correlation
+            .lock()
+            .unwrap()
+            .update_exchange(log_id, inference);
+    }
+
+    /// Record and broadcast the current provider fleet (discovery/watch task).
+    pub fn set_providers(&self, providers: Vec<ProviderSummary>) {
+        *self.providers.lock().unwrap() = providers.clone();
+        let _ = self.tx.send(SseMessage::ProviderStatus { providers });
+    }
+
+    /// Current provider fleet (empty outside inference mode).
+    pub fn providers(&self) -> Vec<ProviderSummary> {
+        self.providers.lock().unwrap().clone()
     }
 
     /// Spawn the background cleanup task (call once at startup).

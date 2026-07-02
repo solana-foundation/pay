@@ -19,20 +19,43 @@ enum Phase {
     Retry,
 }
 
+/// What the engine turns log entries into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CorrelationMode {
+    /// Only 402 challenges / payment retries become flows (Payment Debugger).
+    #[default]
+    PaymentFlows,
+    /// Every exchange becomes a flow immediately (`pay serve inference`).
+    /// Payment challenge/retry *correlation* is not applied in this mode —
+    /// each HTTP exchange is one flow; unifying the two models is deferred
+    /// until the inference gateway grows payment gating.
+    AllExchanges,
+}
+
 pub struct FlowCorrelation {
     flows: Vec<PaymentFlow>,
     /// Maps `"clientIp::path"` → index into `flows`.
     flow_index: HashMap<String, usize>,
+    /// `AllExchanges` mode: maps in-flight log id → flow id (stable across
+    /// ring-buffer eviction, unlike indices).
+    open_exchanges: HashMap<u64, String>,
     flow_id_counter: u64,
+    mode: CorrelationMode,
     tx: broadcast::Sender<SseMessage>,
 }
 
 impl FlowCorrelation {
     pub fn new(tx: broadcast::Sender<SseMessage>) -> Self {
+        Self::with_mode(tx, CorrelationMode::PaymentFlows)
+    }
+
+    pub fn with_mode(tx: broadcast::Sender<SseMessage>, mode: CorrelationMode) -> Self {
         Self {
             flows: Vec::new(),
             flow_index: HashMap::new(),
+            open_exchanges: HashMap::new(),
             flow_id_counter: 0,
+            mode,
             tx,
         }
     }
@@ -46,6 +69,11 @@ impl FlowCorrelation {
             return;
         }
 
+        if self.mode == CorrelationMode::AllExchanges {
+            self.ingest_exchange(entry);
+            return;
+        }
+
         let Some((protocol, phase)) = self.detect(&entry) else {
             return;
         };
@@ -54,6 +82,145 @@ impl FlowCorrelation {
             Phase::Challenge => self.create_flow(&entry, protocol),
             Phase::Retry => self.handle_retry(&entry, protocol),
         }
+    }
+
+    // ── AllExchanges mode ──
+
+    /// Open an `in-progress` flow at request time so slow requests are
+    /// visible while they run. No-op in `PaymentFlows` mode.
+    pub fn begin_exchange(&mut self, start: ExchangeStart) {
+        if self.mode != CorrelationMode::AllExchanges || is_internal_path(&start.path) {
+            return;
+        }
+
+        self.flow_id_counter += 1;
+        let id = format!("flow-{}", self.flow_id_counter);
+        self.open_exchanges.insert(start.id, id.clone());
+
+        let flow = PaymentFlow {
+            id,
+            protocol: Protocol::Http,
+            scheme: None,
+            resource: start.path.clone(),
+            status: FlowStatus::InProgress,
+            client_ip: start.client_ip,
+            started_at: start.ts.clone(),
+            updated_at: start.ts.clone(),
+            duration_ms: 0,
+            amount: None,
+            payer: None,
+            session: None,
+            steps: exchange_steps(&start.ts),
+            events: vec![FlowEvent {
+                ts: start.ts,
+                message: format!("{} {}", start.method, start.path),
+                detail: Some("Request forwarded upstream".into()),
+            }],
+            challenge_headers: None,
+            payment_headers: None,
+            response_headers: None,
+            response_body: None,
+            inference: start.inference,
+        };
+
+        self.add_flow(flow.clone());
+        let _ = self.tx.send(SseMessage::FlowCreated { flow });
+    }
+
+    /// Live telemetry update for an in-flight exchange (running token counts,
+    /// TTFT). Overwrites the flow's inference data with the caller's
+    /// accumulated view. No-op if the exchange already completed.
+    pub fn update_exchange(&mut self, log_id: u64, inference: InferenceInfo) {
+        let Some(flow_id) = self.open_exchanges.get(&log_id).cloned() else {
+            return;
+        };
+        let Some(flow) = self.flows.iter_mut().find(|f| f.id == flow_id) else {
+            return;
+        };
+        flow.inference = Some(inference);
+        flow.updated_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let _ = self.tx.send(SseMessage::FlowUpdated { flow: flow.clone() });
+    }
+
+    /// Completion path for `AllExchanges` mode: close the in-flight flow
+    /// opened by `begin_exchange`, or record a completed one-shot flow if no
+    /// start was seen (e.g. traffic that bypassed the start hook).
+    fn ingest_exchange(&mut self, entry: LogEntry) {
+        let open_flow_id = self.open_exchanges.remove(&entry.id);
+
+        let Some(flow_id) = open_flow_id else {
+            self.create_completed_exchange(&entry);
+            return;
+        };
+        let Some(flow) = self.flows.iter_mut().find(|f| f.id == flow_id) else {
+            // Evicted from the ring buffer while in flight.
+            self.create_completed_exchange(&entry);
+            return;
+        };
+
+        let now = &entry.ts;
+        flow.status = exchange_status(entry.status);
+        flow.updated_at = now.clone();
+        flow.duration_ms = elapsed_ms(&flow.started_at, now).unwrap_or(entry.ms);
+        flow.response_headers = Some(entry.res_headers.clone());
+        flow.response_body = entry.res_body.clone();
+        complete_exchange_steps(flow, now);
+        flow.events.push(FlowEvent {
+            ts: now.clone(),
+            message: format!("{} — completed in {}ms", entry.status, flow.duration_ms),
+            detail: entry
+                .res_body
+                .as_deref()
+                .map(|b| truncate(b, 2000).to_string()),
+        });
+
+        let _ = self.tx.send(SseMessage::FlowUpdated { flow: flow.clone() });
+    }
+
+    fn create_completed_exchange(&mut self, entry: &LogEntry) {
+        self.flow_id_counter += 1;
+        let id = format!("flow-{}", self.flow_id_counter);
+        let now = &entry.ts;
+
+        let mut flow = PaymentFlow {
+            id,
+            protocol: Protocol::Http,
+            scheme: None,
+            resource: entry.path.clone(),
+            status: exchange_status(entry.status),
+            client_ip: entry.client_ip.clone(),
+            started_at: now.clone(),
+            updated_at: now.clone(),
+            duration_ms: entry.ms,
+            amount: None,
+            payer: None,
+            session: None,
+            steps: exchange_steps(now),
+            events: vec![
+                FlowEvent {
+                    ts: now.clone(),
+                    message: format!("{} {}", entry.method, entry.path),
+                    detail: Some("Request forwarded upstream".into()),
+                },
+                FlowEvent {
+                    ts: now.clone(),
+                    message: format!("{} — completed in {}ms", entry.status, entry.ms),
+                    detail: entry
+                        .res_body
+                        .as_deref()
+                        .map(|b| truncate(b, 2000).to_string()),
+                },
+            ],
+            challenge_headers: None,
+            payment_headers: None,
+            response_headers: Some(entry.res_headers.clone()),
+            response_body: entry.res_body.clone(),
+            inference: None,
+        };
+        complete_exchange_steps(&mut flow, now);
+
+        self.add_flow(flow.clone());
+        let _ = self.tx.send(SseMessage::FlowCreated { flow });
     }
 
     pub fn cleanup(&mut self) {
@@ -157,7 +324,9 @@ impl FlowCorrelation {
         steps[2].status = StepStatus::InProgress;
 
         let challenge_detail = match protocol {
-            Protocol::Mpp => format!(
+            // Http never reaches create_flow (detect() can't return it);
+            // grouped with Mpp only for exhaustiveness.
+            Protocol::Mpp | Protocol::Http => format!(
                 "www-authenticate: {}",
                 truncate(
                     entry
@@ -233,6 +402,7 @@ impl FlowCorrelation {
             payment_headers: None,
             response_headers: None,
             response_body: None,
+            inference: None,
         };
 
         self.add_flow(flow.clone());
@@ -290,7 +460,7 @@ impl FlowCorrelation {
                 flow.session = session_update.clone();
             }
             let detail = match protocol {
-                Protocol::Mpp => format!(
+                Protocol::Mpp | Protocol::Http => format!(
                     "payment-receipt: {}",
                     truncate(
                         entry
@@ -392,6 +562,7 @@ impl FlowCorrelation {
             payment_headers: None,
             response_headers: Some(entry.res_headers.clone()),
             response_body: entry.res_body.clone(),
+            inference: None,
         };
 
         self.add_flow(flow.clone());
@@ -509,6 +680,44 @@ fn flow_key(client_ip: &str, path: &str) -> String {
     format!("{client_ip}::{path}")
 }
 
+/// 2xx/3xx delivered, everything else failed. (402 cannot occur on
+/// passthrough inference routes in v1 — no metered endpoints.)
+fn exchange_status(status: u16) -> FlowStatus {
+    if (200..400).contains(&status) {
+        FlowStatus::ResourceDelivered
+    } else {
+        FlowStatus::Failed
+    }
+}
+
+/// Two-step diagram for plain exchanges: request → response.
+fn exchange_steps(ts: &str) -> Vec<FlowStep> {
+    vec![
+        FlowStep {
+            key: "request".into(),
+            label: "Request".into(),
+            status: StepStatus::Completed,
+            ts: Some(ts.to_string()),
+        },
+        FlowStep {
+            key: "delivery".into(),
+            label: "Response".into(),
+            status: StepStatus::InProgress,
+            ts: None,
+        },
+    ]
+}
+
+fn complete_exchange_steps(flow: &mut PaymentFlow, ts: &str) {
+    if let Some(step) = flow.steps.iter_mut().find(|s| s.key == "delivery") {
+        step.status = match flow.status {
+            FlowStatus::Failed => StepStatus::Pending,
+            _ => StepStatus::Completed,
+        };
+        step.ts = (!matches!(flow.status, FlowStatus::Failed)).then(|| ts.to_string());
+    }
+}
+
 /// Sub-scheme label for a flow, derived from the entry's headers (and the
 /// stored challenge headers for a retry). Drives the `PROTOCOL:SCHEME` label.
 fn flow_scheme(
@@ -522,6 +731,7 @@ fn flow_scheme(
         Protocol::X402 => {
             Some(x402_scheme(entry, challenge_headers).unwrap_or_else(|| "exact".to_string()))
         }
+        Protocol::Http => None,
     }
 }
 
@@ -601,13 +811,12 @@ fn is_x402_body(body: &Option<String>) -> bool {
 
 fn build_steps(protocol: &Protocol) -> Vec<FlowStep> {
     let payment_label = match protocol {
-        Protocol::Mpp => "Paid Request",
+        Protocol::Mpp | Protocol::X402 | Protocol::Http => "Paid Request",
         Protocol::Session => "Open / Voucher",
-        Protocol::X402 => "Paid Request",
     };
     let challenge_label = match protocol {
         Protocol::Session => "402 Session Intent",
-        Protocol::Mpp | Protocol::X402 => "402 Payment Gate",
+        Protocol::Mpp | Protocol::X402 | Protocol::Http => "402 Payment Gate",
     };
     vec![
         FlowStep {
@@ -639,7 +848,10 @@ fn build_steps(protocol: &Protocol) -> Vec<FlowStep> {
 
 fn update_steps(flow: &mut PaymentFlow) {
     let completed_count = match flow.status {
-        FlowStatus::PaymentRequired => 2,
+        // InProgress only occurs on exchange flows, which manage their own
+        // 2-step diagram via `complete_exchange_steps`; treat like a fresh
+        // payment flow if it ever reaches here.
+        FlowStatus::PaymentRequired | FlowStatus::InProgress => 2,
         FlowStatus::PaymentReceived => 3,
         FlowStatus::ResourceDelivered => 4,
         FlowStatus::Failed => {
@@ -1478,6 +1690,182 @@ mod tests {
         }
 
         assert_eq!(engine.snapshot().len(), MAX_FLOWS);
+    }
+
+    // ── AllExchanges mode ────────────────────────────────────────────────
+
+    fn make_start(id: u64, method: &str, path: &str) -> ExchangeStart {
+        ExchangeStart {
+            id,
+            ts: "2026-04-02T00:00:00.000Z".into(),
+            method: method.into(),
+            path: path.into(),
+            client_ip: "127.0.0.1".into(),
+            inference: Some(InferenceInfo {
+                provider: "ollama".into(),
+                model: Some("llama3.2:3b".into()),
+                streamed: true,
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn all_exchanges_start_then_complete() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut engine = FlowCorrelation::with_mode(tx, CorrelationMode::AllExchanges);
+
+        engine.begin_exchange(make_start(7, "POST", "/v1/chat/completions"));
+
+        let flows = engine.snapshot();
+        assert_eq!(flows.len(), 1);
+        assert_eq!(flows[0].status, FlowStatus::InProgress);
+        assert!(matches!(flows[0].protocol, Protocol::Http));
+        assert_eq!(
+            flows[0].inference.as_ref().unwrap().provider,
+            "ollama".to_string()
+        );
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            SseMessage::FlowCreated { .. }
+        ));
+
+        let mut done = make_entry("POST", "/v1/chat/completions", 200);
+        done.id = 7;
+        done.ts = "2026-04-02T00:00:02.500Z".into();
+        engine.ingest(done);
+
+        let flows = engine.snapshot();
+        assert_eq!(flows.len(), 1, "completion must not create a second flow");
+        assert_eq!(flows[0].status, FlowStatus::ResourceDelivered);
+        assert_eq!(flows[0].duration_ms, 2500, "duration from start ts, not entry.ms");
+        // Inference survives completion.
+        assert_eq!(
+            flows[0].inference.as_ref().unwrap().model.as_deref(),
+            Some("llama3.2:3b")
+        );
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            SseMessage::FlowUpdated { .. }
+        ));
+    }
+
+    #[test]
+    fn all_exchanges_failure_marks_failed() {
+        let (tx, _rx) = broadcast::channel(16);
+        let mut engine = FlowCorrelation::with_mode(tx, CorrelationMode::AllExchanges);
+
+        engine.begin_exchange(make_start(1, "GET", "/v1/models"));
+        let mut done = make_entry("GET", "/v1/models", 500);
+        done.id = 1;
+        engine.ingest(done);
+
+        assert_eq!(engine.snapshot()[0].status, FlowStatus::Failed);
+    }
+
+    #[test]
+    fn all_exchanges_update_streams_telemetry() {
+        let (tx, _rx) = broadcast::channel(16);
+        let mut engine = FlowCorrelation::with_mode(tx, CorrelationMode::AllExchanges);
+
+        engine.begin_exchange(make_start(3, "POST", "/v1/chat/completions"));
+        engine.update_exchange(
+            3,
+            InferenceInfo {
+                provider: "ollama".into(),
+                model: Some("llama3.2:3b".into()),
+                streamed: true,
+                tokens_completion: Some(42),
+                ttft_ms: Some(180),
+                tokens_per_sec: Some(41.2),
+                ..Default::default()
+            },
+        );
+
+        let flow = &engine.snapshot()[0];
+        assert_eq!(flow.status, FlowStatus::InProgress);
+        let inf = flow.inference.as_ref().unwrap();
+        assert_eq!(inf.tokens_completion, Some(42));
+        assert_eq!(inf.ttft_ms, Some(180));
+
+        // After completion the update is a no-op (exchange no longer open).
+        let mut done = make_entry("POST", "/v1/chat/completions", 200);
+        done.id = 3;
+        engine.ingest(done);
+        engine.update_exchange(
+            3,
+            InferenceInfo {
+                provider: "changed".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            engine.snapshot()[0].inference.as_ref().unwrap().provider,
+            "ollama"
+        );
+    }
+
+    #[test]
+    fn all_exchanges_completion_without_start_creates_completed_flow() {
+        let (tx, _rx) = broadcast::channel(16);
+        let mut engine = FlowCorrelation::with_mode(tx, CorrelationMode::AllExchanges);
+
+        engine.ingest(make_entry("GET", "/api/tags", 200));
+
+        let flows = engine.snapshot();
+        assert_eq!(flows.len(), 1);
+        assert_eq!(flows[0].status, FlowStatus::ResourceDelivered);
+        assert!(matches!(flows[0].protocol, Protocol::Http));
+    }
+
+    #[test]
+    fn all_exchanges_internal_paths_skipped() {
+        let (tx, _rx) = broadcast::channel(16);
+        let mut engine = FlowCorrelation::with_mode(tx, CorrelationMode::AllExchanges);
+
+        engine.begin_exchange(make_start(1, "GET", "/__402/pdb/logs"));
+        engine.ingest(make_entry("GET", "/__402/health", 200));
+
+        assert!(engine.snapshot().is_empty());
+    }
+
+    #[test]
+    fn payment_flows_mode_ignores_begin_exchange() {
+        let (tx, _rx) = broadcast::channel(16);
+        let mut engine = FlowCorrelation::new(tx);
+
+        engine.begin_exchange(make_start(1, "GET", "/v1/models"));
+        assert!(engine.snapshot().is_empty());
+
+        // And plain 200s still create nothing (debugger behavior unchanged).
+        engine.ingest(make_entry("GET", "/v1/models", 200));
+        assert!(engine.snapshot().is_empty());
+    }
+
+    #[test]
+    fn all_exchanges_open_flow_survives_eviction_pressure() {
+        let (tx, _rx) = broadcast::channel(16);
+        let mut engine = FlowCorrelation::with_mode(tx, CorrelationMode::AllExchanges);
+
+        engine.begin_exchange(make_start(0, "POST", "/v1/chat/completions"));
+        // Flood the ring buffer past MAX_FLOWS so the open flow is evicted.
+        for i in 1..=(MAX_FLOWS as u64 + 10) {
+            let mut e = make_entry("GET", &format!("/spam/{i}"), 200);
+            e.id = i;
+            engine.ingest(e);
+        }
+
+        // Completing the evicted exchange must not panic or corrupt state —
+        // it falls back to a fresh completed flow.
+        let mut done = make_entry("POST", "/v1/chat/completions", 200);
+        done.id = 0;
+        engine.ingest(done);
+
+        let flows = engine.snapshot();
+        assert_eq!(flows.len(), MAX_FLOWS);
+        let last = flows.last().unwrap();
+        assert_eq!(last.resource, "/v1/chat/completions");
+        assert_eq!(last.status, FlowStatus::ResourceDelivered);
     }
 
     // ── extract_payer ────────────────────────────────────────────────────
