@@ -48,7 +48,7 @@ impl ServerCommand {
         match self {
             Self::Demo(cmd) => cmd.run(active_account_name, sandbox),
             Self::Start(cmd) => cmd.run(active_account_name, sandbox),
-            Self::Inference(cmd) => cmd.run(),
+            Self::Inference(cmd) => cmd.run(sandbox),
             Self::Scaffold(cmd) => cmd.run(),
             Self::Plans { command } => match command {
                 PlansCommand::Publish(cmd) => cmd.run(),

@@ -62,6 +62,12 @@ pub struct InferenceCommand {
     /// providers (escape hatch).
     #[arg(long)]
     pub spec: Vec<String>,
+
+    /// Sandbox guard: refuse any spec whose operator is not explicitly
+    /// `network: localnet`, so no mainnet stablecoins can move through this
+    /// gateway. (Also honored when the global `pay --sandbox` flag is set.)
+    #[arg(short = 's', long)]
+    pub sandbox: bool,
 }
 
 /// Payment state for the inference gateway: no payment backends at all —
@@ -127,6 +133,28 @@ impl PaymentState for InferenceState {
     }
 }
 
+/// The `--sandbox` guard: a spec may only carry an operator that explicitly
+/// declares `network: localnet`. Anything else — mainnet, devnet, or an
+/// unset network (which would fall back to other resolution rules) — is
+/// refused loudly rather than silently rewritten, so no mainnet stablecoins
+/// can move through this gateway.
+fn enforce_sandbox(spec: &ApiSpec, path: &str) -> pay_core::Result<()> {
+    let Some(operator) = &spec.operator else {
+        return Ok(()); // no operator ⇒ no payment backend ⇒ nothing can move
+    };
+    match operator.network.as_deref() {
+        Some("localnet") => Ok(()),
+        Some(other) => Err(pay_core::Error::Config(format!(
+            "--sandbox: spec {path} declares operator network \"{other}\" — only \
+             \"localnet\" is allowed in sandbox mode"
+        ))),
+        None => Err(pay_core::Error::Config(format!(
+            "--sandbox: spec {path} has an operator without an explicit network — \
+             set `operator.network: localnet` to run it in sandbox mode"
+        ))),
+    }
+}
+
 /// Endpoint kind from the request path. `chat` is checked first —
 /// `/v1/chat/completions` contains both markers.
 fn endpoint_kind(path: &str) -> &'static str {
@@ -158,13 +186,14 @@ fn usage_to_info(usage: &pay_core::InferenceUsage) -> InferenceInfo {
 }
 
 impl InferenceCommand {
-    pub fn run(self) -> pay_core::Result<()> {
+    pub fn run(self, global_sandbox: bool) -> pay_core::Result<()> {
+        let sandbox = self.sandbox || global_sandbox;
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .map_err(|e| pay_core::Error::Config(format!("tokio runtime: {e}")))?;
 
-        let (internal_addr, state) = rt.block_on(self.setup())?;
+        let (internal_addr, state) = rt.block_on(self.setup(sandbox))?;
 
         let cores = std::thread::available_parallelism().map(|n| n.get()).ok();
         // `rt` stays alive so the watch/cleanup/axum/bridge tasks keep
@@ -230,7 +259,10 @@ impl InferenceCommand {
         tui_result.map_err(|e| pay_core::Error::Config(format!("tui: {e}")))
     }
 
-    async fn setup(&self) -> pay_core::Result<(std::net::SocketAddr, InferenceState)> {
+    async fn setup(
+        &self,
+        sandbox: bool,
+    ) -> pay_core::Result<(std::net::SocketAddr, InferenceState)> {
         let registry =
             load_registry().map_err(|e| pay_core::Error::Config(format!("registry: {e}")))?;
         let restrict = (!self.providers.is_empty()).then_some(self.providers.as_slice());
@@ -296,8 +328,14 @@ impl InferenceCommand {
                 .map_err(|e| pay_core::Error::Config(format!("read {path}: {e}")))?;
             let mut api: ApiSpec = serde_yml::from_str(&contents)
                 .map_err(|e| pay_core::Error::Config(format!("parse {path}: {e}")))?;
+            if sandbox {
+                enforce_sandbox(&api, path)?;
+            }
             api.apply_scheme_defaults();
             specs.push(api);
+        }
+        if sandbox {
+            eprintln!("⏺ sandbox — localnet only; mainnet stablecoins cannot move");
         }
 
         let summaries = provider_summaries(&registry, restrict, &discovered);
@@ -306,6 +344,7 @@ impl InferenceCommand {
                 "mode": "inference",
                 "title": "Pay Inference",
                 "providers": summaries,
+                "network": if sandbox { "sandbox" } else { "local" },
             }),
             CorrelationMode::AllExchanges,
         );
@@ -489,6 +528,43 @@ mod tests {
             apis: Arc::new(vec![spec::provider_spec(&provider)]),
             pdb: PdbState::with_mode(serde_json::json!({}), CorrelationMode::AllExchanges),
         }
+    }
+
+    #[test]
+    fn sandbox_guard_rejects_non_localnet_operators() {
+        let base = spec::provider_spec(&discovery::DiscoveredProvider {
+            spec: serde_yml::from_str(
+                r#"{ slug: ollama, title: Ollama, ports: [11434],
+                     identify: [{ path: /api/version, expect_json_key: version }] }"#,
+            )
+            .unwrap(),
+            base_url: "http://127.0.0.1:11434".into(),
+            models: vec![],
+            version: None,
+        });
+
+        // No operator: nothing can move, allowed.
+        assert!(enforce_sandbox(&base, "spec.yml").is_ok());
+
+        // OperatorConfig has no Default; build via YAML like real specs do.
+        let with_network = |network: Option<&str>| {
+            let mut spec = base.clone();
+            let yaml = match network {
+                Some(n) => format!("network: \"{n}\""),
+                None => "fee_payer: false".to_string(),
+            };
+            spec.operator = Some(serde_yml::from_str(&yaml).unwrap());
+            spec
+        };
+
+        assert!(enforce_sandbox(&with_network(Some("localnet")), "spec.yml").is_ok());
+        let mainnet_err = enforce_sandbox(&with_network(Some("mainnet")), "spec.yml")
+            .expect_err("mainnet must be refused");
+        assert!(mainnet_err.to_string().contains("mainnet"));
+        assert!(
+            enforce_sandbox(&with_network(None), "spec.yml").is_err(),
+            "unset network must be refused, not defaulted"
+        );
     }
 
     #[test]
