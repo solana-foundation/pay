@@ -3,6 +3,7 @@
 
 use std::io;
 
+use crossterm::event::{DisableFocusChange, EnableFocusChange};
 use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::Terminal;
@@ -180,14 +181,22 @@ pub(crate) fn with_terminal<T>(
 ) -> io::Result<T> {
     terminal::enable_raw_mode()?;
     let mut stderr = io::stderr();
-    execute!(stderr, EnterAlternateScreen)?;
+    // Focus events let the event loops force a full repaint when the user
+    // switches back to this tab — the emulator may have disturbed the
+    // alternate screen while it was hidden, and ratatui only diffs against
+    // its own back-buffer.
+    execute!(stderr, EnterAlternateScreen, EnableFocusChange)?;
     let backend = DowngradeBackend::new(CrosstermBackend::new(stderr), !supports_truecolor());
     let mut terminal = Terminal::new(backend)?;
 
     let result = f(&mut terminal);
 
     let _ = terminal::disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let _ = execute!(
+        terminal.backend_mut(),
+        DisableFocusChange,
+        LeaveAlternateScreen
+    );
     let _ = terminal.show_cursor();
 
     result

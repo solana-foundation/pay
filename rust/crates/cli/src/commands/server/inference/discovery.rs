@@ -28,6 +28,18 @@ pub struct ProviderSpec {
     /// Brand color hex for UI badges.
     #[serde(default)]
     pub color: Option<String>,
+    /// Endpoints that get metered when the gateway runs with `--price-usd`.
+    /// Paths carry no leading slash (gate convention). Anything not listed
+    /// stays free passthrough.
+    #[serde(default)]
+    pub paid: Vec<PaidEndpoint>,
+}
+
+/// One monetizable endpoint of a provider's API surface.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PaidEndpoint {
+    pub method: pay_types::metering::HttpMethod,
+    pub path: String,
 }
 
 /// A probe passes only on a provider-specific positive signal — a bare
@@ -335,6 +347,65 @@ mod tests {
                 "{} has a probe with no positive expectation",
                 provider.slug
             );
+        }
+    }
+
+    #[test]
+    fn embedded_registry_paid_endpoints_parse() {
+        let registry: ProviderRegistry = serde_yml::from_str(EMBEDDED_REGISTRY).unwrap();
+        let paid_paths = |slug: &str| -> Vec<String> {
+            registry
+                .providers
+                .iter()
+                .find(|p| p.slug == slug)
+                .unwrap_or_else(|| panic!("{slug} missing"))
+                .paid
+                .iter()
+                .map(|e| e.path.clone())
+                .collect()
+        };
+
+        let openai_compat = ["v1/chat/completions", "v1/completions", "v1/embeddings"];
+        assert_eq!(
+            paid_paths("ollama"),
+            [
+                "api/chat",
+                "api/generate",
+                "api/embed",
+                "v1/chat/completions",
+                "v1/completions",
+                "v1/embeddings",
+                "v1/messages",
+            ]
+        );
+        assert_eq!(paid_paths("lm-studio"), openai_compat);
+        assert_eq!(paid_paths("vllm"), openai_compat);
+        assert_eq!(paid_paths("exo"), openai_compat);
+        assert_eq!(
+            paid_paths("llama-cpp"),
+            [
+                "v1/chat/completions",
+                "v1/completions",
+                "v1/embeddings",
+                "completion",
+                "infill",
+                "embedding",
+            ]
+        );
+
+        for provider in &registry.providers {
+            for endpoint in &provider.paid {
+                assert!(
+                    matches!(endpoint.method, pay_types::metering::HttpMethod::Post),
+                    "{}: inference calls are POSTs",
+                    provider.slug
+                );
+                assert!(
+                    !endpoint.path.starts_with('/'),
+                    "{}: paid paths follow the gate's no-leading-slash convention",
+                    provider.slug
+                );
+            }
         }
     }
 

@@ -1,6 +1,7 @@
 pub mod demo;
 pub mod inference;
 pub mod local_registration;
+pub(crate) mod payments;
 pub mod plans;
 pub mod scaffold;
 pub mod start;

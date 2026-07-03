@@ -3,6 +3,10 @@
 # Order matters: when two providers share a port (8080 is contested in the
 # wild), the first entry whose identify probe passes claims it.
 #
+# `paid` lists the endpoints that get metered when the gateway runs with
+# `--price-usd` (paths without a leading slash, matching gate conventions).
+# Model-listing/health endpoints stay unlisted and therefore free.
+#
 # Users can extend/override this list (matched by slug) via
 # ~/.config/pay/inference-providers.yml.
 providers:
@@ -13,6 +17,15 @@ providers:
     identify:
       - { path: /api/version, expect_json_key: version }
     models: { path: /api/tags, json_pointer: /models, name_key: name }
+    paid:
+      - { method: POST, path: api/chat }
+      - { method: POST, path: api/generate }
+      - { method: POST, path: api/embed }
+      - { method: POST, path: v1/chat/completions }
+      - { method: POST, path: v1/completions }
+      - { method: POST, path: v1/embeddings }
+      # Anthropic-compat endpoint — what Claude Code (`pay claude`) drives.
+      - { method: POST, path: v1/messages }
 
   - slug: lm-studio
     title: LM Studio
@@ -23,6 +36,10 @@ providers:
       - { path: /api/v0/models, expect_json_key: data }
       - { path: /v1/models, expect_json_key: data }
     models: { path: /v1/models, json_pointer: /data, name_key: id }
+    paid:
+      - { method: POST, path: v1/chat/completions }
+      - { method: POST, path: v1/completions }
+      - { method: POST, path: v1/embeddings }
 
   - slug: llama-cpp
     title: llama.cpp
@@ -33,6 +50,13 @@ providers:
       # servers on :8080 from false-positiving.
       - { path: /props, expect_json_key: default_generation_settings }
     models: { path: /v1/models, json_pointer: /data, name_key: id }
+    paid:
+      - { method: POST, path: v1/chat/completions }
+      - { method: POST, path: v1/completions }
+      - { method: POST, path: v1/embeddings }
+      - { method: POST, path: completion }
+      - { method: POST, path: infill }
+      - { method: POST, path: embedding }
 
   - slug: vllm
     title: vLLM
@@ -41,6 +65,10 @@ providers:
     identify:
       - { path: /version, expect_json_key: version }
     models: { path: /v1/models, json_pointer: /data, name_key: id }
+    paid:
+      - { method: POST, path: v1/chat/completions }
+      - { method: POST, path: v1/completions }
+      - { method: POST, path: v1/embeddings }
 
   - slug: exo
     title: exo
@@ -49,3 +77,7 @@ providers:
     identify:
       - { path: /v1/models, expect_json_key: data }
     models: { path: /v1/models, json_pointer: /data, name_key: id }
+    paid:
+      - { method: POST, path: v1/chat/completions }
+      - { method: POST, path: v1/completions }
+      - { method: POST, path: v1/embeddings }

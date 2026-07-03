@@ -80,20 +80,25 @@ pub fn run_inference_tui(args: InferenceTuiArgs) -> io::Result<()> {
 
             terminal.draw(|frame| render(frame, &app, &gateway_url, web_url.is_some()))?;
 
-            if event::poll(Duration::from_millis(50))?
-                && let Event::Key(key) = event::read()?
-            {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                match app.handle_key(key.code, key.modifiers) {
-                    Action::Quit => return Ok(()),
-                    Action::OpenWeb => {
-                        if let Some(url) = web_url.as_deref() {
-                            let _ = webbrowser::open(url);
+            if event::poll(Duration::from_millis(50))? {
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        match app.handle_key(key.code, key.modifiers) {
+                            Action::Quit => return Ok(()),
+                            Action::OpenWeb => {
+                                if let Some(url) = web_url.as_deref() {
+                                    let _ = webbrowser::open(url);
+                                }
+                            }
+                            Action::None => {}
                         }
                     }
-                    Action::None => {}
+                    // Coming back to the tab (or a resize while hidden) can
+                    // leave the emulator's copy of the alternate screen out
+                    // of sync with ratatui's back-buffer diff — drop the
+                    // buffer and repaint everything on the next draw.
+                    Event::Resize(_, _) | Event::FocusGained => terminal.clear()?,
+                    _ => {}
                 }
             }
         }

@@ -435,6 +435,7 @@ mod tests {
                     name_key: "name".into(),
                 }),
                 color: Some("#22c55e".into()),
+                paid: Vec::new(),
             },
             base_url: "http://127.0.0.1:11434".into(),
             models: models.iter().map(|m| (*m).to_string()).collect(),

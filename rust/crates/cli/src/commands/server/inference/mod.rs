@@ -2,14 +2,20 @@
 //! LM Studio, llama.cpp, vLLM, exo) and front them with the Pingora gateway,
 //! tracking every request live in the TUI and the embedded web UI.
 //!
-//! v1 is free passthrough: synthesized specs have no metered endpoints, so
-//! the payment gate forwards everything while `record_exchange` still feeds
-//! the PDB correlation engine (`AllExchanges` mode). See
-//! docs/serve-inference.md.
+//! By default this is free passthrough: synthesized specs have no metered
+//! endpoints, so the payment gate forwards everything while
+//! `record_exchange` still feeds the PDB correlation engine (`AllExchanges`
+//! mode). With `--sandbox --price-usd <USD>`, the registry's `paid`
+//! endpoints are synthesized as metered charge endpoints and the command
+//! builds the same sandbox charge stack as `pay --sandbox server start`
+//! (localnet + Surfpool, ephemeral fee-payer signer, USDC), so priced
+//! endpoints 402 and verified retries move localnet stablecoins — entirely
+//! in-gate, no extra control-plane routes. See docs/serve-inference.md.
 
 pub mod discovery;
 pub mod spec;
 
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,12 +24,15 @@ use axum::response::Redirect;
 use axum::routing::get;
 use clap::Args;
 use pay_core::PaymentState;
+use pay_core::server::telemetry::FeePayerWallet;
 use pay_kit::mpp::server::Mpp;
+use pay_kit::mpp::solana_keychain::SolanaSigner;
 use pay_pdb::PdbState;
 use pay_pdb::correlation::CorrelationMode;
 use pay_pdb::types::{InferenceInfo, ProviderSummary};
 use pay_types::metering::ApiSpec;
 
+use super::payments;
 use discovery::{DiscoveredProvider, ProviderRegistry, load_registry};
 
 /// Canonical (user-visible) mount of the web UI in inference mode. Must live
@@ -68,14 +77,25 @@ pub struct InferenceCommand {
     /// gateway. (Also honored when the global `pay --sandbox` flag is set.)
     #[arg(short = 's', long)]
     pub sandbox: bool,
+
+    /// Charge this flat USD price per paid inference request (the registry's
+    /// `paid` endpoints; model-listing/health stay free). Sandbox only —
+    /// requires `--sandbox` (or global `pay --sandbox`).
+    #[arg(long, value_name = "USD")]
+    pub price_usd: Option<f64>,
 }
 
-/// Payment state for the inference gateway: no payment backends at all —
-/// every request is `Passthrough` — plus the PDB hook for live tracking.
+/// Payment state for the inference gateway: the PDB hook for live tracking,
+/// plus — only when `--price-usd` is set — the sandbox MPP charge backend.
+/// Unpriced, the backend fields stay empty and every request is
+/// `Passthrough`, exactly as before.
 #[derive(Clone)]
 pub struct InferenceState {
     apis: Arc<Vec<ApiSpec>>,
     pdb: PdbState,
+    mpps: Vec<Mpp>,
+    fee_payer_signer: Option<Arc<dyn SolanaSigner>>,
+    fee_payer_wallet: Option<FeePayerWallet>,
 }
 
 impl PaymentState for InferenceState {
@@ -83,7 +103,16 @@ impl PaymentState for InferenceState {
         &self.apis
     }
     fn mpp(&self) -> Option<&Mpp> {
-        None
+        self.mpps.first()
+    }
+    fn mpps(&self) -> Vec<&Mpp> {
+        self.mpps.iter().collect()
+    }
+    fn fee_payer_signer(&self) -> Option<Arc<dyn SolanaSigner>> {
+        self.fee_payer_signer.clone()
+    }
+    fn fee_payer_wallet(&self) -> Option<&FeePayerWallet> {
+        self.fee_payer_wallet.as_ref()
     }
     fn record_request_start(&self, start: &pay_core::RequestStart) -> Option<u64> {
         // Same host→spec resolution the gate uses; provider slug == spec name.
@@ -155,6 +184,23 @@ fn enforce_sandbox(spec: &ApiSpec, path: &str) -> pay_core::Result<()> {
     }
 }
 
+/// `--price-usd` gate: monetization is sandbox-only for now (localnet
+/// stablecoins via the Surfpool sandbox). No flag ⇒ free passthrough — there
+/// is no default price. A price without sandbox is refused loudly rather
+/// than silently ignored or silently pointed at a real cluster.
+fn validate_pricing(price_usd: Option<f64>, sandbox: bool) -> pay_core::Result<Option<f64>> {
+    match price_usd {
+        None => Ok(None),
+        Some(_) if !sandbox => Err(pay_core::Error::Config(
+            "--price-usd: mainnet monetization is not wired yet — run with --sandbox".into(),
+        )),
+        Some(price) if !price.is_finite() || price <= 0.0 => Err(pay_core::Error::Config(format!(
+            "--price-usd must be a positive USD amount, got {price}"
+        ))),
+        Some(price) => Ok(Some(price)),
+    }
+}
+
 /// Endpoint kind from the request path. `chat` is checked first —
 /// `/v1/chat/completions` contains both markers.
 fn endpoint_kind(path: &str) -> &'static str {
@@ -188,12 +234,13 @@ fn usage_to_info(usage: &pay_core::InferenceUsage) -> InferenceInfo {
 impl InferenceCommand {
     pub fn run(self, global_sandbox: bool) -> pay_core::Result<()> {
         let sandbox = self.sandbox || global_sandbox;
+        let price_usd = validate_pricing(self.price_usd, sandbox)?;
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .map_err(|e| pay_core::Error::Config(format!("tokio runtime: {e}")))?;
 
-        let (internal_addr, state) = rt.block_on(self.setup(sandbox))?;
+        let (internal_addr, state) = rt.block_on(self.setup(sandbox, price_usd))?;
 
         let cores = std::thread::available_parallelism().map(|n| n.get()).ok();
         // `rt` stays alive so the watch/cleanup/axum/bridge tasks keep
@@ -262,6 +309,7 @@ impl InferenceCommand {
     async fn setup(
         &self,
         sandbox: bool,
+        price_usd: Option<f64>,
     ) -> pay_core::Result<(std::net::SocketAddr, InferenceState)> {
         let registry =
             load_registry().map_err(|e| pay_core::Error::Config(format!("registry: {e}")))?;
@@ -321,8 +369,19 @@ impl InferenceCommand {
             ));
         }
 
-        // Synthesized passthrough specs + any --spec extras.
-        let mut specs: Vec<ApiSpec> = discovered.iter().map(spec::provider_spec).collect();
+        // Sandbox charge stack — only when priced. `validate_pricing`
+        // guarantees `price_usd` implies sandbox, so this is localnet-only.
+        let payment = match price_usd {
+            Some(price) => Some(build_sandbox_payments(price).await?),
+            None => None,
+        };
+
+        // Synthesized specs (+ pricing when monetized) + any --spec extras.
+        let pricing = payment.as_ref().map(|p| &p.pricing);
+        let mut specs: Vec<ApiSpec> = discovered
+            .iter()
+            .map(|provider| spec::provider_spec(provider, pricing))
+            .collect();
         for path in &self.spec {
             let contents = std::fs::read_to_string(shellexpand::tilde(path).as_ref())
                 .map_err(|e| pay_core::Error::Config(format!("read {path}: {e}")))?;
@@ -408,13 +467,116 @@ impl InferenceCommand {
                 provider.spec.slug, provider.spec.slug, host_port
             );
         }
+        if let Some(payment) = &payment {
+            eprintln!(
+                "⏺ charging ${:.4}/request → {} (localnet USDC)",
+                payment.pricing.price_usd, payment.pricing.recipient
+            );
+        }
 
+        let (mpps, fee_payer_signer, fee_payer_wallet) = match payment {
+            Some(payment) => (
+                payment.mpps,
+                Some(payment.fee_payer_signer),
+                Some(payment.fee_payer_wallet),
+            ),
+            None => (Vec::new(), None, None),
+        };
         let state = InferenceState {
             apis: Arc::new(specs),
             pdb,
+            mpps,
+            fee_payer_signer,
+            fee_payer_wallet,
         };
         Ok((internal_addr, state))
     }
+}
+
+/// Sandbox charge backends for `--price-usd`: everything the gate needs to
+/// 402 the paid endpoints and verify retried payments in-gate.
+struct SandboxPayments {
+    pricing: spec::SpecPricing,
+    mpps: Vec<Mpp>,
+    fee_payer_signer: Arc<dyn SolanaSigner>,
+    fee_payer_wallet: FeePayerWallet,
+}
+
+/// Build the minimal sandbox charge stack, reusing the `server start`
+/// machinery (`super::payments`): localnet + sandbox RPC, the ephemeral
+/// auto fee-payer signer (payout recipient = the signer's own wallet), USDC
+/// only, Surfpool funding + recipient ATA preparation, the blockhash cache,
+/// the charge HMAC secret env mirror, and a single MPP charge server.
+async fn build_sandbox_payments(price_usd: f64) -> pay_core::Result<SandboxPayments> {
+    let network = crate::network::SolanaNetwork::Localnet;
+    let rpc_url = payments::resolve_sandbox_rpc_url(None);
+
+    let (fee_payer_signer, generated) = payments::load_auto_fee_payer_signer(&network)?;
+    if let Some((account_name, pubkey)) = &generated {
+        eprintln!("⏺ generated gateway account {account_name} ({pubkey}) on localnet");
+    }
+    // Funds land in the gateway's own sandbox wallet — no separate
+    // recipient flag in sandbox monetization.
+    let recipient = fee_payer_signer.pubkey().to_string();
+    let recipient_pubkey = solana_pubkey::Pubkey::from_str(&recipient)
+        .map_err(|e| pay_core::Error::Config(format!("gateway wallet pubkey: {e}")))?;
+
+    let currency_configs = vec![{
+        let (mint, decimals) = payments::resolve_currency("USDC", network.slug());
+        ("USDC".to_string(), mint, decimals)
+    }];
+    let stable_requirements =
+        payments::stable_token_account_requirements(&currency_configs, network.slug())?;
+
+    let surfpool_targets = payments::surfpool_funding_targets(&recipient, Some(&recipient));
+    let payout_targets = vec![payments::PayoutRecipientTarget {
+        label: "gateway wallet".to_string(),
+        pubkey: recipient_pubkey,
+    }];
+    let (should_fund, _balances) = payments::prepare_funding_targets(
+        true,
+        &network,
+        &rpc_url,
+        &surfpool_targets,
+        &payout_targets,
+        &stable_requirements,
+    )
+    .await?;
+
+    let challenge_binding_secret = payments::init_challenge_binding_secret();
+
+    payments::ensure_payout_recipient_token_accounts(
+        &[recipient_pubkey],
+        &stable_requirements,
+        network.slug(),
+        &rpc_url,
+        should_fund,
+        Some(fee_payer_signer.clone()),
+    )
+    .await?;
+
+    let blockhash_cache = payments::spawn_blockhash_cache(&rpc_url);
+    let mpps = payments::build_charge_mpps(
+        &currency_configs,
+        &recipient,
+        network.slug(),
+        &rpc_url,
+        &challenge_binding_secret,
+        true,
+        Some(fee_payer_signer.clone()),
+        &blockhash_cache,
+    )?;
+    let fee_payer_wallet = FeePayerWallet::new(rpc_url, recipient.clone());
+
+    Ok(SandboxPayments {
+        pricing: spec::SpecPricing {
+            price_usd,
+            recipient,
+        },
+        mpps,
+        fee_payer_signer,
+        fee_payer_wallet,
+    })
 }
 
 /// Registry providers in scope for probing (`--providers` filter applied).
@@ -525,23 +687,49 @@ mod tests {
             version: None,
         };
         InferenceState {
-            apis: Arc::new(vec![spec::provider_spec(&provider)]),
+            apis: Arc::new(vec![spec::provider_spec(&provider, None)]),
             pdb: PdbState::with_mode(serde_json::json!({}), CorrelationMode::AllExchanges),
+            mpps: Vec::new(),
+            fee_payer_signer: None,
+            fee_payer_wallet: None,
         }
     }
 
     #[test]
+    fn price_without_sandbox_is_refused() {
+        let err = validate_pricing(Some(0.001), false).expect_err("must refuse");
+        assert!(
+            err.to_string()
+                .contains("mainnet monetization is not wired yet — run with --sandbox"),
+            "unexpected message: {err}"
+        );
+
+        // Non-positive / non-finite prices are refused even in sandbox.
+        assert!(validate_pricing(Some(0.0), true).is_err());
+        assert!(validate_pricing(Some(-1.0), true).is_err());
+        assert!(validate_pricing(Some(f64::NAN), true).is_err());
+
+        // No flag = free passthrough, sandbox or not; valid price + sandbox ok.
+        assert_eq!(validate_pricing(None, false).unwrap(), None);
+        assert_eq!(validate_pricing(None, true).unwrap(), None);
+        assert_eq!(validate_pricing(Some(0.001), true).unwrap(), Some(0.001));
+    }
+
+    #[test]
     fn sandbox_guard_rejects_non_localnet_operators() {
-        let base = spec::provider_spec(&discovery::DiscoveredProvider {
-            spec: serde_yml::from_str(
-                r#"{ slug: ollama, title: Ollama, ports: [11434],
+        let base = spec::provider_spec(
+            &discovery::DiscoveredProvider {
+                spec: serde_yml::from_str(
+                    r#"{ slug: ollama, title: Ollama, ports: [11434],
                      identify: [{ path: /api/version, expect_json_key: version }] }"#,
-            )
-            .unwrap(),
-            base_url: "http://127.0.0.1:11434".into(),
-            models: vec![],
-            version: None,
-        });
+                )
+                .unwrap(),
+                base_url: "http://127.0.0.1:11434".into(),
+                models: vec![],
+                version: None,
+            },
+            None,
+        );
 
         // No operator: nothing can move, allowed.
         assert!(enforce_sandbox(&base, "spec.yml").is_ok());
@@ -655,6 +843,9 @@ mod tests {
         let state = InferenceState {
             apis: Arc::new(apis),
             pdb: state.pdb.clone(),
+            mpps: Vec::new(),
+            fee_payer_signer: None,
+            fee_payer_wallet: None,
         };
 
         let log_id = state.record_request_start(&pay_core::RequestStart {
