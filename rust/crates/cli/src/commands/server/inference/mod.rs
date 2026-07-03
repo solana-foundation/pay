@@ -235,6 +235,29 @@ impl InferenceCommand {
     pub fn run(self, global_sandbox: bool) -> pay_core::Result<()> {
         let sandbox = self.sandbox || global_sandbox;
         let price_usd = validate_pricing(self.price_usd, sandbox)?;
+
+        // Probe the public bind up front: Pingora only discovers a taken port
+        // deep inside its service thread, where the bind failure is a panic.
+        // Fail here with an actionable message instead (a second gateway is
+        // usually another `pay serve inference` or a `pay claude` session).
+        match std::net::TcpListener::bind(&self.bind) {
+            Ok(probe) => drop(probe),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                return Err(pay_core::Error::Config(format!(
+                    "{} is already in use — another gateway is running (pay serve \
+                     inference or a pay claude session). Stop it or pass --bind \
+                     with a free port.",
+                    self.bind
+                )));
+            }
+            Err(e) => {
+                return Err(pay_core::Error::Config(format!(
+                    "cannot bind {}: {e}",
+                    self.bind
+                )));
+            }
+        }
+
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
