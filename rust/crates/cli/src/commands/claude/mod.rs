@@ -1,5 +1,7 @@
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+mod payer;
+
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use clap::Args;
 
@@ -7,10 +9,8 @@ use crate::commands::server::inference::discovery::{self, DiscoveredProvider};
 use crate::tui::{ClaudeProviderSelection, select_claude_provider};
 
 const ALLOWED_TOOLS: &str = "mcp__pay__curl,mcp__pay__search_catalog,mcp__pay__list_catalog,mcp__pay__get_catalog_entry,mcp__pay__get_balance,mcp__pay__topup,mcp__pay__create_skill";
-const GATEWAY_BIND: &str = "127.0.0.1:1402";
 const GATEWAY_BASE_URL: &str = "http://127.0.0.1:1402";
 const PROVIDER_PROBE_TIMEOUT: Duration = Duration::from_millis(400);
-const GATEWAY_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Run Claude Code with 402 payment support.
 ///
@@ -25,8 +25,13 @@ pub struct ClaudeCommand {
 }
 
 impl ClaudeCommand {
-    pub fn run(self, pay_bin: &str, active_account_name: Option<&str>) -> pay_core::Result<i32> {
-        let launch = prepare_claude_launch(pay_bin, &self.args)?;
+    pub fn run(
+        self,
+        pay_bin: &str,
+        active_account_name: Option<&str>,
+        network_override: Option<&str>,
+    ) -> pay_core::Result<i32> {
+        let launch = prepare_claude_launch(&self.args, network_override, active_account_name)?;
 
         let mut mcp_server = serde_json::json!({
             "command": pay_bin,
@@ -110,29 +115,30 @@ impl ClaudeCommand {
 }
 
 struct ClaudeLaunch {
-    _gateway: Option<ClaudeGateway>,
     base_url: Option<String>,
     model: Option<String>,
     args: Vec<String>,
 }
 
-struct ClaudeGateway {
-    child: Child,
-}
-
-impl Drop for ClaudeGateway {
-    fn drop(&mut self) {
-        if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.kill();
-        }
-        let _ = self.child.wait();
-    }
-}
-
-fn prepare_claude_launch(pay_bin: &str, args: &[String]) -> pay_core::Result<ClaudeLaunch> {
+/// Decide where Claude Code's traffic goes and put the 402-paying payer
+/// proxy in front of it.
+///
+/// `pay claude` never spawns a gateway itself — it routes:
+///
+/// 1. **Gateway on 127.0.0.1:1402** (the user ran `pay serve inference`,
+///    possibly priced, in another terminal) → payer proxy targets the
+///    gateway and settles its MPP 402 challenges.
+/// 2. **No gateway** → run local provider discovery and target the
+///    selected provider directly (e.g. Ollama on :11434) — unmetered
+///    passthrough, no 402s.
+/// 3. **Neither** → error with a hint.
+fn prepare_claude_launch(
+    args: &[String],
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+) -> pay_core::Result<ClaudeLaunch> {
     if claude_metadata_requested(args) {
         return Ok(ClaudeLaunch {
-            _gateway: None,
             base_url: None,
             model: None,
             args: args.to_vec(),
@@ -140,27 +146,66 @@ fn prepare_claude_launch(pay_bin: &str, args: &[String]) -> pay_core::Result<Cla
     }
 
     let requested_model = model_arg(args);
+    let gateway_up = gateway_listening();
     let providers = discover_local_providers()?;
-    let choice = match select_claude_provider(providers, requested_model.as_deref())
-        .map_err(|e| pay_core::Error::Config(format!("Provider selection failed: {e}")))?
-    {
-        ClaudeProviderSelection::Selected(choice) => choice,
-        ClaudeProviderSelection::Cancelled => {
-            return Err(pay_core::Error::Config(
-                "Claude provider selection cancelled".to_string(),
-            ));
+
+    let (upstream, model) = if gateway_up {
+        // Direct discovery still supplies the model list for the
+        // ANTHROPIC_DEFAULT_* env vars; the gateway routes by model.
+        let model = if providers.is_empty() {
+            requested_model
+        } else {
+            Some(select_provider_choice(providers, requested_model.as_deref())?.model)
+        };
+        eprintln!("⏺ routing claude → gateway {GATEWAY_BASE_URL}");
+        (GATEWAY_BASE_URL.to_string(), model)
+    } else {
+        if providers.is_empty() {
+            return Err(pay_core::Error::Config(format!(
+                "no gateway on {GATEWAY_BASE_URL} and no local inference provider detected — \
+                 start one, e.g. `ollama serve`, or run `pay serve inference`."
+            )));
         }
+        let choice = select_provider_choice(providers, requested_model.as_deref())?;
+        eprintln!(
+            "⏺ routing claude → {} {} (direct, unmetered)",
+            choice.provider.spec.slug, choice.provider.base_url
+        );
+        (choice.provider.base_url.clone(), Some(choice.model))
     };
 
-    let gateway = start_gateway(pay_bin, &choice.provider)?;
-    let args = claude_args_with_model(args, Some(&choice.model));
+    let payer = payer::start_background(&upstream, network_override, account_override)?;
+    eprintln!(
+        "⏺ payer proxy on {} → {} (paying as {})",
+        payer.base_url,
+        upstream,
+        payer
+            .payer_pubkey
+            .as_deref()
+            .unwrap_or("unresolved account")
+    );
+
+    let args = claude_args_with_model(args, model.as_deref());
 
     Ok(ClaudeLaunch {
-        _gateway: Some(gateway),
-        base_url: Some(GATEWAY_BASE_URL.to_string()),
-        model: Some(choice.model),
+        base_url: Some(payer.base_url),
+        model,
         args,
     })
+}
+
+fn select_provider_choice(
+    providers: Vec<DiscoveredProvider>,
+    requested_model: Option<&str>,
+) -> pay_core::Result<crate::tui::ClaudeProviderChoice> {
+    match select_claude_provider(providers, requested_model)
+        .map_err(|e| pay_core::Error::Config(format!("Provider selection failed: {e}")))?
+    {
+        ClaudeProviderSelection::Selected(choice) => Ok(choice),
+        ClaudeProviderSelection::Cancelled => Err(pay_core::Error::Config(
+            "Claude provider selection cancelled".to_string(),
+        )),
+    }
 }
 
 fn discover_local_providers() -> pay_core::Result<Vec<DiscoveredProvider>> {
@@ -170,89 +215,26 @@ fn discover_local_providers() -> pay_core::Result<Vec<DiscoveredProvider>> {
         .enable_all()
         .build()
         .map_err(|e| pay_core::Error::Config(format!("tokio runtime: {e}")))?;
-    let providers = rt.block_on(discovery::discover(&registry, PROVIDER_PROBE_TIMEOUT, None));
-    if providers.is_empty() {
-        return Err(pay_core::Error::Config(
-            "No local inference providers found. Start Ollama or another supported provider and retry."
-                .to_string(),
-        ));
-    }
-    Ok(providers)
+    Ok(rt.block_on(discovery::discover(&registry, PROVIDER_PROBE_TIMEOUT, None)))
 }
 
-fn start_gateway(pay_bin: &str, provider: &DiscoveredProvider) -> pay_core::Result<ClaudeGateway> {
-    let mut child = Command::new(pay_bin)
-        .args([
-            "server",
-            "inference",
-            "--providers",
-            &provider.spec.slug,
-            "--bind",
-            GATEWAY_BIND,
-            "--no-tui",
-            "--no-web",
-            "--watch-interval",
-            "0",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .map_err(|e| {
-            pay_core::Error::Config(format!("Failed to start pay inference gateway: {e}"))
-        })?;
-
-    match wait_for_gateway(&mut child, provider, GATEWAY_READY_TIMEOUT) {
-        Ok(()) => Ok(ClaudeGateway { child }),
-        Err(err) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            Err(err)
-        }
-    }
-}
-
-fn wait_for_gateway(
-    child: &mut Child,
-    provider: &DiscoveredProvider,
-    timeout: Duration,
-) -> pay_core::Result<()> {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        if provider_gateway_ready(provider) {
-            return Ok(());
-        }
-        if let Some(status) = child.try_wait().map_err(|e| {
-            pay_core::Error::Config(format!("Failed to monitor pay inference gateway: {e}"))
-        })? {
-            return Err(pay_core::Error::Config(format!(
-                "pay inference gateway exited before it was ready: {status}"
-            )));
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-
-    Err(pay_core::Error::Config(format!(
-        "Timed out waiting for pay inference gateway on {GATEWAY_BASE_URL}; is port 1402 available?"
-    )))
-}
-
-fn provider_gateway_ready(provider: &DiscoveredProvider) -> bool {
-    let Some(probe) = provider.spec.identify.first() else {
-        return false;
-    };
-    let path = if probe.path.starts_with('/') {
-        probe.path.clone()
-    } else {
-        format!("/{}", probe.path)
-    };
-    let url = format!("{GATEWAY_BASE_URL}{path}");
+/// Whether an inference gateway is already serving HTTP on 127.0.0.1:1402.
+///
+/// `/` answers with a 307 redirect (to `/__402/ui/`), not a 200, so any
+/// HTTP response at all counts as "gateway present" — only a failed
+/// connection means the port is free. `/__402/pdb/api/config` returns
+/// 200 JSON on a healthy gateway.
+fn gateway_listening() -> bool {
     reqwest::blocking::Client::builder()
-        .timeout(Duration::from_millis(300))
+        .timeout(Duration::from_millis(500))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
-        .and_then(|client| client.get(url).send())
-        .map(|response| response.status().is_success())
-        .unwrap_or(false)
+        .and_then(|client| {
+            client
+                .get(format!("{GATEWAY_BASE_URL}/__402/pdb/api/config"))
+                .send()
+        })
+        .is_ok()
 }
 
 fn claude_metadata_requested(args: &[String]) -> bool {
@@ -263,10 +245,10 @@ fn claude_metadata_requested(args: &[String]) -> bool {
 fn model_arg(args: &[String]) -> Option<String> {
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
-        if let Some(model) = arg.strip_prefix("--model=") {
-            if !model.is_empty() {
-                return Some(model.to_string());
-            }
+        if let Some(model) = arg.strip_prefix("--model=")
+            && !model.is_empty()
+        {
+            return Some(model.to_string());
         }
         if matches!(arg.as_str(), "--model" | "-m")
             && let Some(model) = iter.next()

@@ -64,4 +64,5 @@ uuid = { workspace = true }
 webbrowser = { workspace = true }
 
 [dev-dependencies]
+async-stream = "0.3"
 serial_test = "3"

@@ -236,7 +236,9 @@ impl Command {
                     .block_on(pay_mcp::run_server(&pay_mcp::McpOptions::default()))
                     .map_err(pay_core::Error::Config);
             }
-            Command::Claude(cmd) => std::process::exit(cmd.run(&pay_bin, account_override)?),
+            Command::Claude(cmd) => {
+                std::process::exit(cmd.run(&pay_bin, account_override, network_override)?)
+            }
             Command::Codex(cmd) => std::process::exit(cmd.run(&pay_bin, account_override)?),
             Command::Qodercli(cmd) => std::process::exit(cmd.run(&pay_bin, account_override)?),
             Command::Docs { command } => return command.run(),

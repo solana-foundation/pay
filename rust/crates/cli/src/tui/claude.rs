@@ -24,6 +24,8 @@ pub struct ClaudeProviderChoice {
     pub model: String,
 }
 
+// One short-lived value per TUI invocation — boxing the payload buys nothing.
+#[allow(clippy::large_enum_variant)]
 pub enum ClaudeProviderSelection {
     Selected(ClaudeProviderChoice),
     Cancelled,
