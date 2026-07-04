@@ -70,7 +70,9 @@ impl FlowCorrelation {
         }
 
         if self.mode == CorrelationMode::AllExchanges {
-            self.ingest_exchange(entry);
+            if !is_browser_noise(&entry.path) {
+                self.ingest_exchange(entry);
+            }
             return;
         }
 
@@ -89,7 +91,10 @@ impl FlowCorrelation {
     /// Open an `in-progress` flow at request time so slow requests are
     /// visible while they run. No-op in `PaymentFlows` mode.
     pub fn begin_exchange(&mut self, start: ExchangeStart) {
-        if self.mode != CorrelationMode::AllExchanges || is_internal_path(&start.path) {
+        if self.mode != CorrelationMode::AllExchanges
+            || is_internal_path(&start.path)
+            || is_browser_noise(&start.path)
+        {
             return;
         }
 
@@ -174,6 +179,12 @@ impl FlowCorrelation {
         flow.duration_ms = elapsed_ms(&flow.started_at, now).unwrap_or(entry.ms);
         flow.response_headers = Some(entry.res_headers.clone());
         flow.response_body = entry.res_body.clone();
+        // A settled MPP payment on this exchange — drives the stablecoin
+        // series in the TUI/web charts.
+        if let Some(amount) = paid_exchange_amount(&entry) {
+            flow.amount = Some(amount);
+            flow.payer = extract_payer(&entry.req_headers);
+        }
         complete_exchange_steps(flow, now);
         flow.events.push(FlowEvent {
             ts: now.clone(),
@@ -191,6 +202,11 @@ impl FlowCorrelation {
         self.flow_id_counter += 1;
         let id = format!("flow-{}", self.flow_id_counter);
         let now = &entry.ts;
+        let amount = paid_exchange_amount(entry);
+        let payer = amount
+            .is_some()
+            .then(|| extract_payer(&entry.req_headers))
+            .flatten();
 
         let mut flow = PaymentFlow {
             id,
@@ -202,8 +218,8 @@ impl FlowCorrelation {
             started_at: now.clone(),
             updated_at: now.clone(),
             duration_ms: entry.ms,
-            amount: None,
-            payer: None,
+            amount,
+            payer,
             session: None,
             steps: exchange_steps(now),
             events: vec![
@@ -832,6 +848,17 @@ fn is_internal_path(path: &str) -> bool {
     path.starts_with("/__402")
 }
 
+/// Browser plumbing aimed at the gateway itself (opening the web UI makes
+/// the browser probe these against the root) — not inference traffic, so
+/// `AllExchanges` mode keeps it out of the flow list. The requests still
+/// forward; they're just not recorded.
+fn is_browser_noise(path: &str) -> bool {
+    path == "/"
+        || path == "/favicon.ico"
+        || path == "/robots.txt"
+        || path.starts_with("/apple-touch-icon")
+}
+
 fn is_x402_body(body: &Option<String>) -> bool {
     let Some(body) = body else { return false };
     body.contains("x402Version")
@@ -930,26 +957,10 @@ fn extract_amount(entry: &LogEntry) -> Option<String> {
     {
         let rest = &www_auth[start + 9..];
         if let Some(end) = rest.find('"')
-            && let Ok(decoded) = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(&rest[..end])
-                .or_else(|_| base64::engine::general_purpose::STANDARD.decode(&rest[..end]))
-            && let Ok(json) = serde_json::from_slice::<serde_json::Value>(&decoded)
+            && let Some(json) = decode_json_value(&rest[..end])
+            && let Some(amount) = challenge_request_amount(&json)
         {
-            let amount = json["amount"]
-                .as_str()
-                .or_else(|| json["cap"].as_str())
-                .unwrap_or("0");
-            let decimals = json["methodDetails"]["decimals"]
-                .as_u64()
-                .or_else(|| json["decimals"].as_u64())
-                .unwrap_or(6);
-            if let Ok(raw) = amount.parse::<u64>() {
-                if raw == u64::MAX {
-                    return Some("unbounded".to_string());
-                }
-                let value = raw as f64 / 10f64.powi(decimals as i32);
-                return Some(format!("{:.4} USDC", value));
-            }
+            return Some(amount);
         }
     }
 
@@ -962,6 +973,42 @@ fn extract_amount(entry: &LogEntry) -> Option<String> {
     }
 
     None
+}
+
+/// Human-readable amount from a decoded MPP challenge `request` object.
+fn challenge_request_amount(request: &serde_json::Value) -> Option<String> {
+    let amount = request["amount"]
+        .as_str()
+        .or_else(|| request["cap"].as_str())
+        .unwrap_or("0");
+    let decimals = request["methodDetails"]["decimals"]
+        .as_u64()
+        .or_else(|| request["decimals"].as_u64())
+        .unwrap_or(6);
+    let raw = amount.parse::<u64>().ok()?;
+    if raw == u64::MAX {
+        return Some("unbounded".to_string());
+    }
+    let value = raw as f64 / 10f64.powi(decimals as i32);
+    Some(format!("{:.4} USDC", value))
+}
+
+/// Settled amount for a paid exchange (`AllExchanges` mode): a 2xx response
+/// whose request carried an MPP `Payment` credential. The credential echoes
+/// the full challenge, so amount/decimals come from `challenge.request` —
+/// the same payload `extract_amount` reads from the original 402 header.
+fn paid_exchange_amount(entry: &LogEntry) -> Option<String> {
+    if !(200..300).contains(&entry.status) {
+        return None;
+    }
+    let credential = payment_credential_from_authorization(entry.req_headers.get("authorization"))?;
+    let request = credential.get("challenge")?.get("request")?;
+    let request = match request {
+        serde_json::Value::String(encoded) => decode_json_value(encoded)?,
+        value @ serde_json::Value::Object(_) => value.clone(),
+        _ => return None,
+    };
+    challenge_request_amount(&request)
 }
 
 /// Extract the payer's pubkey from the payment authorization header.
@@ -1871,6 +1918,76 @@ mod tests {
         assert_eq!(inf.tokens_completion, Some(10));
     }
 
+    fn charge_authorization(amount: &str, decimals: u64) -> String {
+        // Mirrors pay-kit's PaymentCredential: the challenge is echoed back
+        // with its base64url `request` payload (amount + methodDetails).
+        let request = encode_json(serde_json::json!({
+            "amount": amount,
+            "currency": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            "methodDetails": {"decimals": decimals, "network": "localnet"},
+            "recipient": "F82JMeQmD7Lfbh6vCJWsz2ABJ5AAthhVjUyqzgHyUtog"
+        }));
+        let credential = encode_json(serde_json::json!({
+            "challenge": {
+                "id": "ch-1", "realm": "test", "method": "solana",
+                "intent": "charge", "request": request
+            },
+            "payload": {"type": "transaction", "transaction": "AA=="}
+        }));
+        format!("Payment {credential}")
+    }
+
+    #[test]
+    fn all_exchanges_paid_completion_sets_amount() {
+        let (tx, _rx) = broadcast::channel(16);
+        let mut engine = FlowCorrelation::with_mode(tx, CorrelationMode::AllExchanges);
+
+        engine.begin_exchange(make_start(4, "POST", "/v1/messages"));
+        let mut done = make_entry("POST", "/v1/messages", 200);
+        done.id = 4;
+        done.req_headers
+            .insert("authorization".into(), charge_authorization("1000", 6));
+        engine.ingest(done);
+
+        let flows = engine.snapshot();
+        assert_eq!(flows[0].status, FlowStatus::ResourceDelivered);
+        assert_eq!(
+            flows[0].amount.as_deref(),
+            Some("0.0010 USDC"),
+            "settled charge must surface as the flow amount (drives the \
+             stablecoin chart)"
+        );
+    }
+
+    #[test]
+    fn all_exchanges_failed_paid_retry_has_no_amount() {
+        let (tx, _rx) = broadcast::channel(16);
+        let mut engine = FlowCorrelation::with_mode(tx, CorrelationMode::AllExchanges);
+
+        engine.begin_exchange(make_start(5, "POST", "/v1/messages"));
+        let mut done = make_entry("POST", "/v1/messages", 500);
+        done.id = 5;
+        done.req_headers
+            .insert("authorization".into(), charge_authorization("1000", 6));
+        engine.ingest(done);
+
+        assert_eq!(engine.snapshot()[0].amount, None, "nothing settled on 5xx");
+    }
+
+    #[test]
+    fn all_exchanges_unpaid_completion_has_no_amount() {
+        let (tx, _rx) = broadcast::channel(16);
+        let mut engine = FlowCorrelation::with_mode(tx, CorrelationMode::AllExchanges);
+
+        // Bearer token (Claude's upstream auth) is not a payment.
+        let mut done = make_entry("POST", "/v1/messages", 200);
+        done.req_headers
+            .insert("authorization".into(), "Bearer ollama".into());
+        engine.ingest(done);
+
+        assert_eq!(engine.snapshot()[0].amount, None);
+    }
+
     #[test]
     fn all_exchanges_completion_without_start_creates_completed_flow() {
         let (tx, _rx) = broadcast::channel(16);
@@ -1882,6 +1999,23 @@ mod tests {
         assert_eq!(flows.len(), 1);
         assert_eq!(flows[0].status, FlowStatus::ResourceDelivered);
         assert!(matches!(flows[0].protocol, Protocol::Http));
+    }
+
+    #[test]
+    fn all_exchanges_browser_noise_skipped() {
+        let (tx, _rx) = broadcast::channel(16);
+        let mut engine = FlowCorrelation::with_mode(tx, CorrelationMode::AllExchanges);
+
+        engine.begin_exchange(make_start(1, "GET", "/favicon.ico"));
+        engine.ingest(make_entry("GET", "/apple-touch-icon.png", 404));
+        engine.ingest(make_entry("GET", "/apple-touch-icon-precomposed.png", 404));
+        engine.ingest(make_entry("GET", "/robots.txt", 404));
+        engine.ingest(make_entry("GET", "/", 307));
+        assert!(engine.snapshot().is_empty(), "browser probes must not chart");
+
+        // Provider-root-adjacent real paths still record.
+        engine.ingest(make_entry("GET", "/api/tags", 200));
+        assert_eq!(engine.snapshot().len(), 1);
     }
 
     #[test]
