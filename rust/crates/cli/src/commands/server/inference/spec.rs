@@ -80,7 +80,12 @@ fn paid_endpoint(paid: &PaidEndpoint, price_usd: f64) -> Endpoint {
         method: paid.method.clone(),
         path: paid.path.clone(),
         description: None,
-        resource: None,
+        // Without a resource the gate issues challenges with NO externalId,
+        // so the settlement memo is empty and every same-price payment in a
+        // blockhash-cache window builds a byte-identical transaction — the
+        // second broadcast fails with "already been processed". The resource
+        // makes each challenge's memo unique (`resource#nonce`).
+        resource: Some(paid.path.clone()),
         routing: None,
         metering: Some(Metering {
             dimensions: vec![MeterDimension {
@@ -213,6 +218,15 @@ mod tests {
             // apply_scheme_defaults ran: charge scheme resolved, not None.
             assert_eq!(meter.accepted_schemes(), [Scheme::MppCharge]);
             assert!(meter.schemes.is_some(), "scheme defaults must be resolved");
+            // The resource drives the per-challenge settlement memo
+            // (`resource#nonce`). Without it, same-price payments within one
+            // blockhash-cache window build byte-identical transactions and
+            // rebroadcasts fail with "already been processed".
+            assert_eq!(
+                endpoint.resource.as_deref(),
+                Some(endpoint.path.as_str()),
+                "paid endpoints must carry a resource for memo uniqueness"
+            );
         }
 
         let operator = spec.operator.as_ref().expect("priced spec has operator");

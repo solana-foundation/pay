@@ -172,18 +172,38 @@ fn apply_json(
     events: &mut u64,
     authoritative: &mut bool,
 ) {
-    if usage.model.is_none()
-        && let Some(model) = json.get("model").and_then(|v| v.as_str())
-    {
-        usage.model = Some(model.to_string());
+    if usage.model.is_none() {
+        // Anthropic `message_start` nests the model under `message`.
+        let model = json
+            .get("model")
+            .or_else(|| json.pointer("/message/model"))
+            .and_then(|v| v.as_str());
+        if let Some(model) = model {
+            usage.model = Some(model.to_string());
+        }
     }
 
-    // OpenAI-compatible usage object (final stream chunk or plain body).
-    if let Some(u) = json.get("usage").filter(|u| !u.is_null()) {
-        if let Some(prompt) = u.get("prompt_tokens").and_then(|v| v.as_u64()) {
+    // Usage objects: OpenAI-compat (`prompt_tokens`/`completion_tokens`),
+    // Anthropic (`input_tokens`/`output_tokens` — top-level on plain bodies
+    // and `message_delta` events, nested under `message` on `message_start`;
+    // output counts are cumulative, so later values overwrite).
+    for u in [json.get("usage"), json.pointer("/message/usage")]
+        .into_iter()
+        .flatten()
+        .filter(|u| !u.is_null())
+    {
+        if let Some(prompt) = u
+            .get("prompt_tokens")
+            .or_else(|| u.get("input_tokens"))
+            .and_then(|v| v.as_u64())
+        {
             usage.tokens_prompt = Some(prompt);
         }
-        if let Some(completion) = u.get("completion_tokens").and_then(|v| v.as_u64()) {
+        if let Some(completion) = u
+            .get("completion_tokens")
+            .or_else(|| u.get("output_tokens"))
+            .and_then(|v| v.as_u64())
+        {
             usage.tokens_completion = Some(completion);
             *authoritative = true;
         }
@@ -199,12 +219,18 @@ fn apply_json(
     }
 
     // Content-bearing stream events approximate completion tokens (~1 token
-    // per delta) until an authoritative count lands.
+    // per delta) until an authoritative count lands. `/message/content` must
+    // be a non-empty string (Ollama NDJSON deltas) — Anthropic's
+    // `message_start` carries an empty content ARRAY that must not count.
     let has_content = json
         .pointer("/choices/0/delta")
         .is_some_and(|d| !d.is_null())
-        || json.pointer("/message/content").is_some()
-        || json.get("response").is_some_and(|r| r.is_string());
+        || json
+            .pointer("/message/content")
+            .and_then(|c| c.as_str())
+            .is_some_and(|c| !c.is_empty())
+        || json.get("response").is_some_and(|r| r.is_string())
+        || json.get("type").and_then(|t| t.as_str()) == Some("content_block_delta");
     if has_content {
         *events += 1;
     }
@@ -290,6 +316,60 @@ mod tests {
 
         assert_eq!(obs.usage.tokens_prompt, Some(7));
         assert_eq!(obs.usage.tokens_completion, Some(9));
+    }
+
+    #[test]
+    fn anthropic_sse_stream_reports_input_output_tokens() {
+        // The shape Claude Code actually drives (`POST /v1/messages`,
+        // stream). Input tokens ride message_start (nested), output tokens
+        // ride message_delta events cumulatively.
+        let mut obs = StreamObserver::new(true);
+        let stream = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"gemma4:latest\",\"content\":[],\"usage\":{\"input_tokens\":17,\"output_tokens\":1}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"!\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":11}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        feed_all(&mut obs, stream);
+
+        assert_eq!(obs.usage.model.as_deref(), Some("gemma4:latest"));
+        assert_eq!(obs.usage.tokens_prompt, Some(17));
+        assert_eq!(
+            obs.usage.tokens_completion,
+            Some(11),
+            "authoritative output_tokens beats the content_block_delta approximation"
+        );
+    }
+
+    #[test]
+    fn non_streamed_anthropic_body() {
+        let mut obs = StreamObserver::new(false);
+        feed_all(
+            &mut obs,
+            r#"{"id":"msg_1","type":"message","role":"assistant","model":"gemma4:latest","content":[{"type":"text","text":"Hi!"}],"stop_reason":"end_turn","usage":{"input_tokens":17,"output_tokens":11}}"#,
+        );
+        assert_eq!(obs.usage.model.as_deref(), Some("gemma4:latest"));
+        assert_eq!(obs.usage.tokens_prompt, Some(17));
+        assert_eq!(obs.usage.tokens_completion, Some(11));
+    }
+
+    #[test]
+    fn anthropic_message_start_empty_content_does_not_count_as_event() {
+        let mut obs = StreamObserver::new(true);
+        // Only a message_start (empty content array) and a stop — no deltas,
+        // no usage. The approximation must stay at zero.
+        let stream = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"model\":\"m\",\"content\":[]}}\n",
+            "data: {\"type\":\"message_stop\"}\n",
+        );
+        feed_all(&mut obs, stream);
+        assert_eq!(obs.usage.tokens_completion, None);
     }
 
     #[test]
