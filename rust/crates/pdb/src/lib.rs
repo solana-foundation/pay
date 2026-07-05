@@ -66,11 +66,16 @@ impl PdbState {
     /// Open an in-flight flow (`AllExchanges` mode). Returns the log id to
     /// pass back via `update_exchange` and the completing `LogEntry.id`.
     /// Harmless no-op in `PaymentFlows` mode (the id is still valid).
+    ///
+    /// `payment_retry`: the request carries a `Payment` Authorization header,
+    /// i.e. it retries an earlier 402 challenge — it attaches to the pending
+    /// challenge flow instead of opening a new row.
     pub fn begin_exchange(
         &self,
         method: &str,
         path: &str,
         client_ip: &str,
+        payment_retry: bool,
         inference: Option<InferenceInfo>,
     ) -> u64 {
         let id = self.next_log_id();
@@ -80,6 +85,7 @@ impl PdbState {
             method: method.to_string(),
             path: path.to_string(),
             client_ip: client_ip.to_string(),
+            payment_retry,
             inference,
         };
         self.correlation.lock().unwrap().begin_exchange(start);

@@ -132,6 +132,10 @@ pub struct RequestStart {
     /// `Host` header — how the host maps the request to an API/provider.
     pub host: Option<String>,
     pub client_ip: String,
+    /// The request carries a `Payment`-scheme Authorization header — i.e.
+    /// it's the paid retry of an earlier 402 challenge. Lets the host merge
+    /// the challenge and its retry into one tracked exchange.
+    pub payment: bool,
 }
 
 /// Inference telemetry accumulated by the gate's response stream observer

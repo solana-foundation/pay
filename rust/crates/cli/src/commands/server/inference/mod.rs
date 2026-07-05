@@ -13,6 +13,7 @@
 //! in-gate, no extra control-plane routes. See docs/serve-inference.md.
 
 pub mod discovery;
+pub mod providers;
 pub mod spec;
 
 use std::str::FromStr;
@@ -34,6 +35,7 @@ use pay_types::metering::ApiSpec;
 
 use super::payments;
 use discovery::{DiscoveredProvider, ProviderRegistry, load_registry};
+use providers::InferenceProvider;
 
 /// Canonical (user-visible) mount of the web UI in inference mode. Must live
 /// under `/__402/` — the gate only forwards that prefix (plus root) to the
@@ -92,10 +94,26 @@ pub struct InferenceCommand {
 #[derive(Clone)]
 pub struct InferenceState {
     apis: Arc<Vec<ApiSpec>>,
+    /// Registry providers, for per-provider endpoint-kind classification
+    /// (spec name == provider slug).
+    providers: Arc<Vec<Arc<dyn InferenceProvider>>>,
     pdb: PdbState,
     mpps: Vec<Mpp>,
     fee_payer_signer: Option<Arc<dyn SolanaSigner>>,
     fee_payer_wallet: Option<FeePayerWallet>,
+}
+
+impl InferenceState {
+    /// `chat` | `completion` | `embeddings` | `other` for a request path,
+    /// asked of the provider that owns the spec; specs without a matching
+    /// provider (`--spec` extras) fall back to the shared default mapping.
+    fn endpoint_kind(&self, provider_slug: &str, path: &str) -> &'static str {
+        self.providers
+            .iter()
+            .find(|p| p.slug() == provider_slug)
+            .map(|p| p.endpoint_kind(path))
+            .unwrap_or_else(|| providers::default_endpoint_kind(path))
+    }
 }
 
 impl PaymentState for InferenceState {
@@ -125,14 +143,17 @@ impl PaymentState for InferenceState {
             .name
             .clone();
         let info = InferenceInfo {
+            endpoint_kind: Some(self.endpoint_kind(&provider, &start.path).to_string()),
             provider,
-            endpoint_kind: Some(endpoint_kind(&start.path).to_string()),
             ..Default::default()
         };
-        Some(
-            self.pdb
-                .begin_exchange(&start.method, &start.path, &start.client_ip, Some(info)),
-        )
+        Some(self.pdb.begin_exchange(
+            &start.method,
+            &start.path,
+            &start.client_ip,
+            start.payment,
+            Some(info),
+        ))
     }
     fn record_exchange_update(&self, log_id: u64, usage: &pay_core::InferenceUsage) {
         self.pdb.update_exchange(log_id, usage_to_info(usage));
@@ -198,21 +219,6 @@ fn validate_pricing(price_usd: Option<f64>, sandbox: bool) -> pay_core::Result<O
             "--price-usd must be a positive USD amount, got {price}"
         ))),
         Some(price) => Ok(Some(price)),
-    }
-}
-
-/// Endpoint kind from the request path. `chat` is checked first —
-/// `/v1/chat/completions` contains both markers.
-fn endpoint_kind(path: &str) -> &'static str {
-    let path = path.to_ascii_lowercase();
-    if path.contains("chat") {
-        "chat"
-    } else if path.contains("embed") {
-        "embeddings"
-    } else if path.contains("completion") || path.contains("generate") || path.contains("infill") {
-        "completion"
-    } else {
-        "other"
     }
 }
 
@@ -362,9 +368,9 @@ impl InferenceCommand {
         };
         let discovered =
             discovery::discover_with(&registry, timeout, restrict, |event| match event {
-                discovery::ProbeEvent::Started(spec) => {
-                    let port = spec.ports.first().copied().unwrap_or_default();
-                    spinner.set_message(format!("probing {} (:{port})…", spec.title));
+                discovery::ProbeEvent::Started(provider) => {
+                    let port = provider.ports().first().copied().unwrap_or_default();
+                    spinner.set_message(format!("probing {} (:{port})…", provider.title()));
                 }
                 discovery::ProbeEvent::Found(provider) => {
                     let version = provider
@@ -374,14 +380,14 @@ impl InferenceCommand {
                         .unwrap_or_default();
                     emit(format!(
                         "  {} ✓  {} · {} model{}{version}",
-                        provider.spec.slug,
+                        provider.slug(),
                         provider.base_url,
                         provider.models.len(),
                         if provider.models.len() == 1 { "" } else { "s" },
                     ));
                 }
-                discovery::ProbeEvent::Missed(spec) => {
-                    emit(format!("  {} — not detected", spec.title));
+                discovery::ProbeEvent::Missed(provider) => {
+                    emit(format!("  {} — not detected", provider.title()));
                 }
             })
             .await;
@@ -489,7 +495,9 @@ impl InferenceCommand {
                 .unwrap_or("1402");
             eprintln!(
                 "  {} → http://{}.localhost:{}/",
-                provider.spec.slug, provider.spec.slug, host_port
+                provider.slug(),
+                provider.slug(),
+                host_port
             );
         }
         if let Some(payment) = &payment {
@@ -509,6 +517,7 @@ impl InferenceCommand {
         };
         let state = InferenceState {
             apis: Arc::new(specs),
+            providers: Arc::new(registry),
             pdb,
             mpps,
             fee_payer_signer,
@@ -608,13 +617,12 @@ async fn build_sandbox_payments(price_usd: f64) -> pay_core::Result<SandboxPayme
 fn registry_scope<'a>(
     registry: &'a ProviderRegistry,
     restrict: Option<&[String]>,
-) -> Vec<&'a discovery::ProviderSpec> {
+) -> Vec<&'a Arc<dyn InferenceProvider>> {
     registry
-        .providers
         .iter()
         .filter(|p| {
             restrict
-                .map(|allowed| allowed.iter().any(|s| s == &p.slug))
+                .map(|allowed| allowed.iter().any(|s| s == p.slug()))
                 .unwrap_or(true)
         })
         .collect()
@@ -630,19 +638,19 @@ fn provider_summaries(
     registry_scope(registry, restrict)
         .into_iter()
         .map(
-            |spec| match discovered.iter().find(|d| d.spec.slug == spec.slug) {
+            |provider| match discovered.iter().find(|d| d.slug() == provider.slug()) {
                 Some(found) => found.summary(true),
                 None => ProviderSummary {
-                    slug: spec.slug.clone(),
-                    title: spec.title.clone(),
+                    slug: provider.slug().to_string(),
+                    title: provider.title().to_string(),
                     base_url: format!(
                         "http://127.0.0.1:{}",
-                        spec.ports.first().copied().unwrap_or_default()
+                        provider.ports().first().copied().unwrap_or_default()
                     ),
                     up: false,
                     models: Vec::new(),
                     version: None,
-                    color: spec.color.clone(),
+                    color: provider.color().map(str::to_string),
                 },
             },
         )
@@ -675,10 +683,10 @@ fn spawn_watch_task(
             ticker.tick().await;
             let discovered = discovery::discover(&registry, timeout, restrict_ref).await;
             for provider in &discovered {
-                if !routed.contains(&provider.spec.slug) {
-                    routed.push(provider.spec.slug.clone());
+                if !routed.iter().any(|slug| slug == provider.slug()) {
+                    routed.push(provider.slug().to_string());
                     tracing::info!(
-                        provider = %provider.spec.slug,
+                        provider = %provider.slug(),
                         "new provider detected — restart `pay serve inference` to route it"
                     );
                 }
@@ -700,19 +708,19 @@ mod tests {
     use super::*;
     use pay_pdb::types::FlowStatus;
 
-    fn state() -> InferenceState {
-        let provider = discovery::DiscoveredProvider {
-            spec: serde_yml::from_str(
-                r#"{ slug: ollama, title: Ollama, ports: [11434],
-                     identify: [{ path: /api/version, expect_json_key: version }] }"#,
-            )
-            .unwrap(),
+    fn discovered_ollama() -> discovery::DiscoveredProvider {
+        discovery::DiscoveredProvider {
+            provider: Arc::new(providers::ollama::Ollama),
             base_url: "http://127.0.0.1:11434".into(),
             models: vec![],
             version: None,
-        };
+        }
+    }
+
+    fn state() -> InferenceState {
         InferenceState {
-            apis: Arc::new(vec![spec::provider_spec(&provider, None)]),
+            apis: Arc::new(vec![spec::provider_spec(&discovered_ollama(), None)]),
+            providers: Arc::new(providers::builtin_providers()),
             pdb: PdbState::with_mode(serde_json::json!({}), CorrelationMode::AllExchanges),
             mpps: Vec::new(),
             fee_payer_signer: None,
@@ -742,19 +750,7 @@ mod tests {
 
     #[test]
     fn sandbox_guard_rejects_non_localnet_operators() {
-        let base = spec::provider_spec(
-            &discovery::DiscoveredProvider {
-                spec: serde_yml::from_str(
-                    r#"{ slug: ollama, title: Ollama, ports: [11434],
-                     identify: [{ path: /api/version, expect_json_key: version }] }"#,
-                )
-                .unwrap(),
-                base_url: "http://127.0.0.1:11434".into(),
-                models: vec![],
-                version: None,
-            },
-            None,
-        );
+        let base = spec::provider_spec(&discovered_ollama(), None);
 
         // No operator: nothing can move, allowed.
         assert!(enforce_sandbox(&base, "spec.yml").is_ok());
@@ -781,14 +777,20 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_kind_mapping() {
-        assert_eq!(endpoint_kind("/v1/chat/completions"), "chat");
-        assert_eq!(endpoint_kind("/api/chat"), "chat");
-        assert_eq!(endpoint_kind("/v1/completions"), "completion");
-        assert_eq!(endpoint_kind("/api/generate"), "completion");
-        assert_eq!(endpoint_kind("/infill"), "completion");
-        assert_eq!(endpoint_kind("/v1/embeddings"), "embeddings");
-        assert_eq!(endpoint_kind("/api/tags"), "other");
+    fn endpoint_kind_resolves_via_provider_with_default_fallback() {
+        let state = state();
+        // Known provider slug: asked of the provider trait impl.
+        assert_eq!(state.endpoint_kind("ollama", "/api/generate"), "completion");
+        assert_eq!(
+            state.endpoint_kind("ollama", "/v1/chat/completions"),
+            "chat"
+        );
+        // Unknown spec (`--spec` extras): shared default mapping.
+        assert_eq!(
+            state.endpoint_kind("hand-written", "/v1/embeddings"),
+            "embeddings"
+        );
+        assert_eq!(state.endpoint_kind("hand-written", "/status"), "other");
     }
 
     #[test]
@@ -800,6 +802,7 @@ mod tests {
             path: "/v1/chat/completions".into(),
             host: Some("ollama.localhost:1402".into()),
             client_ip: "127.0.0.1".into(),
+            payment: false,
         });
         let log_id = log_id.expect("provider-matched request must be tracked");
 
@@ -867,6 +870,7 @@ mod tests {
         });
         let state = InferenceState {
             apis: Arc::new(apis),
+            providers: state.providers.clone(),
             pdb: state.pdb.clone(),
             mpps: Vec::new(),
             fee_payer_signer: None,
@@ -878,6 +882,7 @@ mod tests {
             path: "/whatever".into(),
             host: Some("unknown.localhost:1402".into()),
             client_ip: "127.0.0.1".into(),
+            payment: false,
         });
         assert!(log_id.is_none());
     }

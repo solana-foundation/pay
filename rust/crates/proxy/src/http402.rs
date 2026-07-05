@@ -468,11 +468,15 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                 .map(|s| s.trim().to_string())
                 .or_else(|| host.clone())
                 .unwrap_or_else(|| "unknown".to_string());
+            let payment = str_h("authorization")
+                .map(|a| a.len() >= 8 && a[..8].eq_ignore_ascii_case("payment "))
+                .unwrap_or(false);
             let log_id = self.state.record_request_start(&pay_core::RequestStart {
                 method: method.to_string(),
                 path: format!("/{path}"),
                 host: host.clone(),
                 client_ip: client_ip.clone(),
+                payment,
             });
             ctx.log = Some(LogStart {
                 method: method.to_string(),

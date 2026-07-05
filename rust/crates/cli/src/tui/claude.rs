@@ -224,13 +224,8 @@ fn render_provider_sidebar(frame: &mut ratatui::Frame, area: Rect, app: &ClaudeP
         }
 
         let selected = idx == app.selected_provider;
-        let accent = provider
-            .spec
-            .color
-            .as_deref()
-            .and_then(hex_color)
-            .unwrap_or(SOLANA_GREEN);
-        let title = format!("● {}", provider.spec.title);
+        let accent = provider.color().and_then(hex_color).unwrap_or(SOLANA_GREEN);
+        let title = format!("● {}", provider.title());
         let models = provider.models.len();
         let noun = if models == 1 { "model" } else { "models" };
         let subtitle = format!(
@@ -255,17 +250,12 @@ fn render_provider_detail(frame: &mut ratatui::Frame, area: Rect, app: &ClaudePr
     frame.render_widget(Block::default().style(Style::default().bg(CARD_BG)), area);
 
     let provider = app.selected_provider();
-    let accent = provider
-        .spec
-        .color
-        .as_deref()
-        .and_then(hex_color)
-        .unwrap_or(SOLANA_GREEN);
+    let accent = provider.color().and_then(hex_color).unwrap_or(SOLANA_GREEN);
     let block = Block::default()
         .title(Line::from(vec![
             Span::raw(" Claude Code via "),
             Span::styled(
-                provider.spec.title.clone(),
+                provider.title().to_string(),
                 Style::default().fg(accent).bold(),
             ),
             Span::raw(" "),
@@ -283,7 +273,7 @@ fn render_provider_detail(frame: &mut ratatui::Frame, area: Rect, app: &ClaudePr
 
     let mut lines = vec![
         Line::default(),
-        kv_line("Provider", &provider.spec.title, accent),
+        kv_line("Provider", provider.title(), accent),
         kv_line("Source", &provider.base_url, Color::Gray),
         kv_line("Gateway", "http://127.0.0.1:1402", Color::Gray),
     ];
@@ -358,7 +348,7 @@ fn render_controls(frame: &mut ratatui::Frame, area: Rect, app: &ClaudeProviderA
         Some(model) => Line::from(vec![
             Span::styled(spinner, Style::default().fg(Color::Green).bold()),
             Span::styled(
-                format!(" {} / {}", app.selected_provider().spec.slug, model),
+                format!(" {} / {}", app.selected_provider().slug(), model),
                 Style::default().fg(Color::DarkGray),
             ),
         ]),
@@ -418,27 +408,11 @@ fn truncate_str(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::server::inference::discovery::{IdentifyProbe, ModelsProbe, ProviderSpec};
+    use crate::commands::server::inference::providers::ollama::Ollama;
 
     fn provider(models: &[&str]) -> DiscoveredProvider {
         DiscoveredProvider {
-            spec: ProviderSpec {
-                slug: "ollama".into(),
-                title: "Ollama".into(),
-                ports: vec![11434],
-                identify: vec![IdentifyProbe {
-                    path: "/api/version".into(),
-                    expect_json_key: Some("version".into()),
-                    expect_body_contains: None,
-                }],
-                models: Some(ModelsProbe {
-                    path: "/api/tags".into(),
-                    json_pointer: "/models".into(),
-                    name_key: "name".into(),
-                }),
-                color: Some("#22c55e".into()),
-                paid: Vec::new(),
-            },
+            provider: std::sync::Arc::new(Ollama),
             base_url: "http://127.0.0.1:11434".into(),
             models: models.iter().map(|m| (*m).to_string()).collect(),
             version: Some("0.9.1".into()),

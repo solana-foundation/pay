@@ -15,7 +15,8 @@ use pay_types::metering::{
     OperatorConfig, PriceTier, RoutingConfig,
 };
 
-use super::discovery::{DiscoveredProvider, PaidEndpoint};
+use super::discovery::DiscoveredProvider;
+use super::providers::PaidEndpoint;
 
 /// Pricing input for monetized spec synthesis.
 pub struct SpecPricing {
@@ -33,8 +34,8 @@ pub fn provider_spec(provider: &DiscoveredProvider, pricing: Option<&SpecPricing
     let endpoints = pricing
         .map(|p| {
             provider
-                .spec
-                .paid
+                .provider
+                .paid_endpoints()
                 .iter()
                 .map(|endpoint| paid_endpoint(endpoint, p.price_usd))
                 .collect()
@@ -42,12 +43,12 @@ pub fn provider_spec(provider: &DiscoveredProvider, pricing: Option<&SpecPricing
         .unwrap_or_default();
 
     let mut api = ApiSpec {
-        name: provider.spec.slug.clone(),
-        subdomain: provider.spec.slug.clone(),
-        title: provider.spec.title.clone(),
+        name: provider.slug().to_string(),
+        subdomain: provider.slug().to_string(),
+        title: provider.title().to_string(),
         description: format!(
             "Local {} inference proxied by pay serve inference",
-            provider.spec.title
+            provider.title()
         ),
         category: ApiCategory::AiMl,
         version: provider.version.clone().unwrap_or_else(|| "v1".into()),
@@ -130,33 +131,12 @@ fn sandbox_operator(recipient: &str) -> OperatorConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::server::inference::discovery::{IdentifyProbe, ProviderSpec};
+    use crate::commands::server::inference::providers::ollama::Ollama;
     use pay_types::metering::{HttpMethod, Scheme};
 
     fn discovered() -> DiscoveredProvider {
         DiscoveredProvider {
-            spec: ProviderSpec {
-                slug: "ollama".into(),
-                title: "Ollama".into(),
-                ports: vec![11434],
-                identify: vec![IdentifyProbe {
-                    path: "/api/version".into(),
-                    expect_json_key: Some("version".into()),
-                    expect_body_contains: None,
-                }],
-                models: None,
-                color: Some("#22c55e".into()),
-                paid: vec![
-                    PaidEndpoint {
-                        method: HttpMethod::Post,
-                        path: "api/chat".into(),
-                    },
-                    PaidEndpoint {
-                        method: HttpMethod::Post,
-                        path: "v1/chat/completions".into(),
-                    },
-                ],
-            },
+            provider: std::sync::Arc::new(Ollama),
             base_url: "http://127.0.0.1:11434".into(),
             models: vec!["llama3.2:3b".into()],
             version: Some("0.9.1".into()),
@@ -199,10 +179,21 @@ mod tests {
     fn priced_spec_meters_paid_endpoints_only() {
         let spec = provider_spec(&discovered(), Some(&pricing()));
 
-        // Exactly the registry's `paid` list — nothing else gets an endpoint
-        // entry, so unlisted paths (e.g. /api/tags) stay passthrough.
+        // Exactly the provider's `paid_endpoints` list — nothing else gets an
+        // endpoint entry, so unlisted paths (e.g. /api/tags) stay passthrough.
         let paths: Vec<&str> = spec.endpoints.iter().map(|e| e.path.as_str()).collect();
-        assert_eq!(paths, ["api/chat", "v1/chat/completions"]);
+        assert_eq!(
+            paths,
+            [
+                "api/chat",
+                "api/generate",
+                "api/embed",
+                "v1/chat/completions",
+                "v1/completions",
+                "v1/embeddings",
+                "v1/messages",
+            ]
+        );
 
         for endpoint in &spec.endpoints {
             assert!(matches!(endpoint.method, HttpMethod::Post));

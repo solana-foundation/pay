@@ -42,6 +42,10 @@ pub struct FlowCorrelation {
     /// `AllExchanges` mode: per-connection aggregates, keyed by payer wallet
     /// (paid traffic) or client ip/host (unpaid). Bounded.
     connections: HashMap<String, ConnectionSummary>,
+    /// `AllExchanges` mode: 402-challenged exchanges awaiting their paid
+    /// retry, keyed `"clientIp::path"` → flow id. The retry attaches to the
+    /// challenge flow so one logical request stays one row.
+    pending_challenges: HashMap<String, String>,
     connection_id_counter: u64,
     flow_id_counter: u64,
     mode: CorrelationMode,
@@ -59,6 +63,7 @@ impl FlowCorrelation {
             flow_index: HashMap::new(),
             open_exchanges: HashMap::new(),
             connections: HashMap::new(),
+            pending_challenges: HashMap::new(),
             connection_id_counter: 0,
             flow_id_counter: 0,
             mode,
@@ -103,11 +108,40 @@ impl FlowCorrelation {
 
     /// Open an `in-progress` flow at request time so slow requests are
     /// visible while they run. No-op in `PaymentFlows` mode.
+    ///
+    /// A payment retry of a pending 402 challenge attaches to the existing
+    /// challenge flow (one row per logical request) instead of opening a
+    /// second one.
     pub fn begin_exchange(&mut self, start: ExchangeStart) {
         if self.mode != CorrelationMode::AllExchanges
             || is_internal_path(&start.path)
             || is_browser_noise(&start.path)
         {
+            return;
+        }
+
+        if start.payment_retry
+            && let Some(flow_id) = self
+                .pending_challenges
+                .remove(&flow_key(&start.client_ip, &start.path))
+            && let Some(flow) = self.flows.iter_mut().find(|f| f.id == flow_id)
+        {
+            self.open_exchanges.insert(start.id, flow_id);
+            flow.status = FlowStatus::PaymentReceived;
+            flow.updated_at = start.ts.clone();
+            if let Some(incoming) = start.inference {
+                flow.inference = Some(match flow.inference.take() {
+                    Some(existing) => merge_inference(existing, incoming),
+                    None => incoming,
+                });
+            }
+            flow.events.push(FlowEvent {
+                ts: start.ts,
+                message: "Paid retry".into(),
+                detail: Some("Payment credential attached".into()),
+            });
+            update_steps(flow);
+            let _ = self.tx.send(SseMessage::FlowUpdated { flow: flow.clone() });
             return;
         }
 
@@ -187,6 +221,36 @@ impl FlowCorrelation {
         };
 
         let now = &entry.ts;
+
+        // A 402 with an MPP challenge is not a failure — it's the handshake
+        // half of a paid request. Park the flow as payment-required and let
+        // the paid retry attach to it (`begin_exchange`), so challenge +
+        // retry render as ONE row with the 4-step payment diagram.
+        if entry.status == 402 && has_mpp_challenge(&entry) {
+            let started = flow.started_at.clone();
+            flow.status = FlowStatus::PaymentRequired;
+            flow.updated_at = now.clone();
+            flow.challenge_headers = Some(entry.res_headers.clone());
+            flow.amount = extract_amount(&entry);
+            flow.steps = build_steps(&Protocol::Http);
+            flow.steps[0].ts = Some(started);
+            flow.events.push(FlowEvent {
+                ts: now.clone(),
+                message: "402 Payment Gate".into(),
+                detail: entry
+                    .res_headers
+                    .get("www-authenticate")
+                    .map(|h| format!("www-authenticate: {}", truncate(h, 120))),
+            });
+            update_steps(flow);
+            let key = flow_key(&flow.client_ip, &flow.resource);
+            let flow_id = flow.id.clone();
+            let updated = flow.clone();
+            self.pending_challenges.insert(key, flow_id);
+            let _ = self.tx.send(SseMessage::FlowUpdated { flow: updated });
+            return; // handshake — connections aggregate on the paid retry
+        }
+
         flow.status = exchange_status(entry.status);
         flow.updated_at = now.clone();
         flow.duration_ms = elapsed_ms(&flow.started_at, now).unwrap_or(entry.ms);
@@ -198,7 +262,13 @@ impl FlowCorrelation {
             flow.amount = Some(amount);
             flow.payer = extract_payer(&entry.req_headers);
         }
-        complete_exchange_steps(flow, now);
+        // Merged challenge+retry flows carry the 4-step payment diagram;
+        // plain exchanges keep their 2-step one.
+        if flow.steps.len() == 4 {
+            update_steps(flow);
+        } else {
+            complete_exchange_steps(flow, now);
+        }
         flow.events.push(FlowEvent {
             ts: now.clone(),
             message: format!("{} — completed in {}ms", entry.status, flow.duration_ms),
@@ -367,6 +437,13 @@ impl FlowCorrelation {
                 let _ = self.tx.send(SseMessage::FlowUpdated { flow: flow.clone() });
             }
         }
+        // Timed-out challenges must not accept a (very) late retry.
+        let flows = &self.flows;
+        self.pending_challenges.retain(|_, flow_id| {
+            flows
+                .iter()
+                .any(|f| &f.id == flow_id && f.status == FlowStatus::PaymentRequired)
+        });
     }
 
     // ── Detection ──
@@ -939,6 +1016,14 @@ fn x402_scheme_from_payment(encoded: &str) -> Option<String> {
 
 fn is_internal_path(path: &str) -> bool {
     path.starts_with("/__402")
+}
+
+/// The response is an MPP `Payment` 402 challenge (vs. a plain upstream 402).
+fn has_mpp_challenge(entry: &LogEntry) -> bool {
+    entry
+        .res_headers
+        .get("www-authenticate")
+        .is_some_and(|h| h.starts_with("Payment"))
 }
 
 /// Browser plumbing aimed at the gateway itself (opening the web UI makes
@@ -1892,6 +1977,7 @@ mod tests {
             method: method.into(),
             path: path.into(),
             client_ip: "127.0.0.1".into(),
+            payment_retry: false,
             inference: Some(InferenceInfo {
                 provider: "ollama".into(),
                 model: Some("llama3.2:3b".into()),
@@ -2118,6 +2204,89 @@ mod tests {
         assert_eq!(flows.len(), 1);
         assert_eq!(flows[0].status, FlowStatus::ResourceDelivered);
         assert!(matches!(flows[0].protocol, Protocol::Http));
+    }
+
+    #[test]
+    fn challenge_and_paid_retry_merge_into_one_flow() {
+        let (tx, _rx) = broadcast::channel(64);
+        let mut engine = FlowCorrelation::with_mode(tx, CorrelationMode::AllExchanges);
+
+        // Unpaid request → 402 MPP challenge: one flow, payment-required.
+        engine.begin_exchange(make_start(1, "POST", "/v1/messages"));
+        let mut challenge = make_entry("POST", "/v1/messages", 402);
+        challenge.id = 1;
+        challenge.res_headers.insert(
+            "www-authenticate".into(),
+            "Payment realm=\"t\", intent=\"charge\"".into(),
+        );
+        engine.ingest(challenge);
+
+        let flows = engine.snapshot();
+        assert_eq!(flows.len(), 1);
+        assert_eq!(flows[0].status, FlowStatus::PaymentRequired);
+        assert_eq!(flows[0].steps.len(), 4, "payment diagram from here on");
+
+        // Paid retry: attaches to the SAME flow — no second row.
+        engine.begin_exchange(ExchangeStart {
+            payment_retry: true,
+            ..make_start(2, "POST", "/v1/messages")
+        });
+        assert_eq!(engine.snapshot().len(), 1, "retry must not open a new row");
+        assert_eq!(engine.snapshot()[0].status, FlowStatus::PaymentReceived);
+
+        let mut done = make_entry("POST", "/v1/messages", 200);
+        done.id = 2;
+        done.req_headers
+            .insert("authorization".into(), charge_authorization("1000", 6));
+        engine.ingest(done);
+
+        let flows = engine.snapshot();
+        assert_eq!(flows.len(), 1, "challenge + retry = one merged row");
+        let flow = &flows[0];
+        assert_eq!(flow.status, FlowStatus::ResourceDelivered);
+        assert_eq!(flow.amount.as_deref(), Some("0.0010 USDC"));
+        assert!(flow.payer.is_some());
+        assert!(flow.challenge_headers.is_some());
+        assert!(
+            flow.steps
+                .iter()
+                .all(|s| matches!(s.status, StepStatus::Completed)),
+            "all four payment steps completed"
+        );
+        // One connection aggregate, counted once (the paid completion).
+        let connections = engine.connections_snapshot();
+        assert_eq!(connections.len(), 1);
+        assert_eq!(connections[0].requests, 1);
+        assert!((connections[0].paid_usd - 0.001).abs() < 1e-9);
+    }
+
+    #[test]
+    fn plain_upstream_402_still_fails_without_merge() {
+        let (tx, _rx) = broadcast::channel(16);
+        let mut engine = FlowCorrelation::with_mode(tx, CorrelationMode::AllExchanges);
+
+        // A 402 from the upstream itself (no MPP challenge header).
+        engine.begin_exchange(make_start(1, "POST", "/v1/messages"));
+        let mut done = make_entry("POST", "/v1/messages", 402);
+        done.id = 1;
+        engine.ingest(done);
+
+        assert_eq!(engine.snapshot()[0].status, FlowStatus::Failed);
+    }
+
+    #[test]
+    fn retry_without_pending_challenge_opens_its_own_flow() {
+        let (tx, _rx) = broadcast::channel(16);
+        let mut engine = FlowCorrelation::with_mode(tx, CorrelationMode::AllExchanges);
+
+        // e.g. gateway restarted between challenge and retry.
+        engine.begin_exchange(ExchangeStart {
+            payment_retry: true,
+            ..make_start(1, "POST", "/v1/messages")
+        });
+        let flows = engine.snapshot();
+        assert_eq!(flows.len(), 1);
+        assert_eq!(flows[0].status, FlowStatus::InProgress);
     }
 
     #[test]

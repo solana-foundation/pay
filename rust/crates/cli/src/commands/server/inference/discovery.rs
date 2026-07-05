@@ -1,73 +1,29 @@
 //! Local inference provider discovery — probes well-known ports with
 //! provider-specific identify endpoints and reads model lists.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
 
-/// Embedded registry of known providers (top 5).
-const EMBEDDED_REGISTRY: &str = include_str!("providers.yml");
+use super::providers::{self, CustomProvider, InferenceProvider};
 
-/// User override/extension file, merged over the embedded registry by slug.
+/// User override/extension file, merged over the built-ins by slug.
 const USER_REGISTRY_PATH: &str = "~/.config/pay/inference-providers.yml";
 
+/// Providers in probe priority order: user entries first (they override
+/// built-ins by slug and win contested ports), then the built-ins.
+pub type ProviderRegistry = Vec<Arc<dyn InferenceProvider>>;
+
+/// Schema of the user registry file.
 #[derive(Debug, Clone, Deserialize)]
-pub struct ProviderRegistry {
-    pub providers: Vec<ProviderSpec>,
+struct UserRegistryFile {
+    providers: Vec<CustomProvider>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct ProviderSpec {
-    pub slug: String,
-    pub title: String,
-    pub ports: Vec<u16>,
-    /// Probes tried in order; the first that passes identifies the provider.
-    pub identify: Vec<IdentifyProbe>,
-    #[serde(default)]
-    pub models: Option<ModelsProbe>,
-    /// Brand color hex for UI badges.
-    #[serde(default)]
-    pub color: Option<String>,
-    /// Endpoints that get metered when the gateway runs with `--price-usd`.
-    /// Paths carry no leading slash (gate convention). Anything not listed
-    /// stays free passthrough.
-    #[serde(default)]
-    pub paid: Vec<PaidEndpoint>,
-}
-
-/// One monetizable endpoint of a provider's API surface.
-#[derive(Debug, Clone, Deserialize)]
-pub struct PaidEndpoint {
-    pub method: pay_types::metering::HttpMethod,
-    pub path: String,
-}
-
-/// A probe passes only on a provider-specific positive signal — a bare
-/// `200 OK` never counts, so generic dev servers on contested ports (8080)
-/// don't false-positive.
-#[derive(Debug, Clone, Deserialize)]
-pub struct IdentifyProbe {
-    pub path: String,
-    /// Passes if the response is JSON with this top-level key.
-    #[serde(default)]
-    pub expect_json_key: Option<String>,
-    /// Passes if the response body contains this substring.
-    #[serde(default)]
-    pub expect_body_contains: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ModelsProbe {
-    pub path: String,
-    /// JSON pointer to the model array (e.g. `/models`, `/data`).
-    pub json_pointer: String,
-    /// Key of the model name within each array item (e.g. `name`, `id`).
-    pub name_key: String,
-}
-
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DiscoveredProvider {
-    pub spec: ProviderSpec,
+    pub provider: Arc<dyn InferenceProvider>,
     /// e.g. `http://127.0.0.1:11434`.
     pub base_url: String,
     pub models: Vec<String>,
@@ -75,33 +31,61 @@ pub struct DiscoveredProvider {
     pub version: Option<String>,
 }
 
-/// Load the embedded registry, merged with the user's override file when
-/// present. User entries replace embedded entries with the same slug and
-/// otherwise append (at higher priority for contested ports).
-pub fn load_registry() -> pay_core::Result<ProviderRegistry> {
-    let mut registry: ProviderRegistry = serde_yml::from_str(EMBEDDED_REGISTRY)
-        .map_err(|e| pay_core::Error::Config(format!("embedded providers.yml invalid: {e}")))?;
-
-    let user_path = shellexpand::tilde(USER_REGISTRY_PATH).to_string();
-    if let Ok(contents) = std::fs::read_to_string(&user_path) {
-        let user: ProviderRegistry = serde_yml::from_str(&contents)
-            .map_err(|e| pay_core::Error::Config(format!("{user_path} invalid: {e}")))?;
-        registry = merge_registries(registry, user);
+impl DiscoveredProvider {
+    pub fn slug(&self) -> &str {
+        self.provider.slug()
     }
 
-    Ok(registry)
+    pub fn title(&self) -> &str {
+        self.provider.title()
+    }
+
+    pub fn color(&self) -> Option<&str> {
+        self.provider.color()
+    }
+
+    pub fn summary(&self, up: bool) -> pay_pdb::types::ProviderSummary {
+        pay_pdb::types::ProviderSummary {
+            slug: self.slug().to_string(),
+            title: self.title().to_string(),
+            base_url: self.base_url.clone(),
+            up,
+            models: self.models.clone(),
+            version: self.version.clone(),
+            color: self.color().map(str::to_string),
+        }
+    }
 }
 
-fn merge_registries(embedded: ProviderRegistry, user: ProviderRegistry) -> ProviderRegistry {
-    let user_slugs: Vec<&str> = user.providers.iter().map(|p| p.slug.as_str()).collect();
-    let mut providers = user.providers.clone();
-    providers.extend(
-        embedded
-            .providers
+/// Load the built-in providers, merged with the user's override file when
+/// present. User entries replace built-ins with the same slug and otherwise
+/// append (at higher priority for contested ports).
+pub fn load_registry() -> pay_core::Result<ProviderRegistry> {
+    let user_path = shellexpand::tilde(USER_REGISTRY_PATH).to_string();
+    let user: Vec<Arc<dyn InferenceProvider>> = match std::fs::read_to_string(&user_path) {
+        Ok(contents) => {
+            let file: UserRegistryFile = serde_yml::from_str(&contents)
+                .map_err(|e| pay_core::Error::Config(format!("{user_path} invalid: {e}")))?;
+            file.providers
+                .into_iter()
+                .map(|p| Arc::new(p) as Arc<dyn InferenceProvider>)
+                .collect()
+        }
+        Err(_) => Vec::new(),
+    };
+
+    Ok(merge_registries(providers::builtin_providers(), user))
+}
+
+fn merge_registries(builtin: ProviderRegistry, user: ProviderRegistry) -> ProviderRegistry {
+    let user_slugs: Vec<String> = user.iter().map(|p| p.slug().to_string()).collect();
+    let mut merged = user;
+    merged.extend(
+        builtin
             .into_iter()
-            .filter(|p| !user_slugs.contains(&p.slug.as_str())),
+            .filter(|p| !user_slugs.iter().any(|slug| slug == p.slug())),
     );
-    ProviderRegistry { providers }
+    merged
 }
 
 /// Hard cap on one provider's whole probe pass (all ports + model list) so a
@@ -110,9 +94,9 @@ const PROVIDER_PROBE_BUDGET: Duration = Duration::from_secs(1);
 
 /// Progress events emitted by [`discover_with`] as each provider is probed.
 pub enum ProbeEvent<'a> {
-    Started(&'a ProviderSpec),
+    Started(&'a dyn InferenceProvider),
     Found(&'a DiscoveredProvider),
-    Missed(&'a ProviderSpec),
+    Missed(&'a dyn InferenceProvider),
 }
 
 /// Probe registry providers in order and return those that identified
@@ -143,29 +127,29 @@ pub async fn discover_with(
     let mut claimed_ports: std::collections::HashSet<u16> = std::collections::HashSet::new();
     let mut discovered = Vec::new();
 
-    for spec in &registry.providers {
+    for provider in registry {
         if let Some(allowed) = restrict
-            && !allowed.iter().any(|s| s == &spec.slug)
+            && !allowed.iter().any(|s| s == provider.slug())
         {
             continue;
         }
-        on_event(ProbeEvent::Started(spec));
+        on_event(ProbeEvent::Started(provider.as_ref()));
 
         let found = tokio::time::timeout(
             PROVIDER_PROBE_BUDGET,
-            probe_provider(&client, spec, &claimed_ports),
+            probe_provider(&client, provider, &claimed_ports),
         )
         .await
         .ok()
         .flatten();
 
         match found {
-            Some((provider, port)) => {
+            Some((found, port)) => {
                 claimed_ports.insert(port);
-                on_event(ProbeEvent::Found(&provider));
-                discovered.push(provider);
+                on_event(ProbeEvent::Found(&found));
+                discovered.push(found);
             }
-            None => on_event(ProbeEvent::Missed(spec)),
+            None => on_event(ProbeEvent::Missed(provider.as_ref())),
         }
     }
 
@@ -176,22 +160,19 @@ pub async fn discover_with(
 /// earlier provider); first identify hit wins.
 async fn probe_provider(
     client: &reqwest::Client,
-    spec: &ProviderSpec,
+    provider: &Arc<dyn InferenceProvider>,
     claimed_ports: &std::collections::HashSet<u16>,
 ) -> Option<(DiscoveredProvider, u16)> {
-    for port in &spec.ports {
+    for port in provider.ports() {
         if claimed_ports.contains(port) {
             continue;
         }
         let base_url = format!("http://127.0.0.1:{port}");
-        if let Some(version) = identify(client, &base_url, spec).await {
-            let models = match &spec.models {
-                Some(probe) => fetch_models(client, &base_url, probe).await,
-                None => Vec::new(),
-            };
+        if let Some(version) = provider.identify(client, &base_url).await {
+            let models = provider.list_models(client, &base_url).await;
             return Some((
                 DiscoveredProvider {
-                    spec: spec.clone(),
+                    provider: provider.clone(),
                     base_url,
                     models,
                     version,
@@ -203,94 +184,10 @@ async fn probe_provider(
     None
 }
 
-/// Run a provider's identify probes against `base_url`. Returns
-/// `Some(version)` on a positive match (`Some(None)` when the response
-/// carries no version), `None` when nothing matched.
-async fn identify(
-    client: &reqwest::Client,
-    base_url: &str,
-    spec: &ProviderSpec,
-) -> Option<Option<String>> {
-    for probe in &spec.identify {
-        let url = format!("{base_url}{}", probe.path);
-        let Ok(resp) = client.get(&url).send().await else {
-            continue;
-        };
-        if !resp.status().is_success() {
-            continue;
-        }
-        let Ok(body) = resp.text().await else {
-            continue;
-        };
-
-        if let Some(key) = &probe.expect_json_key {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body)
-                && json.get(key).is_some()
-            {
-                let version = json
-                    .get("version")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                return Some(version);
-            }
-            continue;
-        }
-        if let Some(needle) = &probe.expect_body_contains {
-            if body.contains(needle.as_str()) {
-                return Some(None);
-            }
-            continue;
-        }
-        // A probe with no expectation is a config error; never match on it.
-    }
-    None
-}
-
-async fn fetch_models(
-    client: &reqwest::Client,
-    base_url: &str,
-    probe: &ModelsProbe,
-) -> Vec<String> {
-    let url = format!("{base_url}{}", probe.path);
-    let Ok(resp) = client.get(&url).send().await else {
-        return Vec::new();
-    };
-    let Ok(body) = resp.text().await else {
-        return Vec::new();
-    };
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) else {
-        return Vec::new();
-    };
-    json.pointer(&probe.json_pointer)
-        .and_then(|v| v.as_array())
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.get(&probe.name_key)?.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-impl DiscoveredProvider {
-    pub fn summary(&self, up: bool) -> pay_pdb::types::ProviderSummary {
-        pay_pdb::types::ProviderSummary {
-            slug: self.spec.slug.clone(),
-            title: self.spec.title.clone(),
-            base_url: self.base_url.clone(),
-            up,
-            models: self.models.clone(),
-            version: self.version.clone(),
-            color: self.spec.color.clone(),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use super::super::providers::test_support::stub;
     use super::*;
-    use axum::Router;
-    use axum::routing::get;
 
     fn rt() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
@@ -299,114 +196,59 @@ mod tests {
             .unwrap()
     }
 
-    /// Serve `routes` on an ephemeral port; returns the port.
-    async fn stub(routes: Vec<(&'static str, &'static str)>) -> u16 {
-        let mut router = Router::new();
-        for (path, body) in routes {
-            router = router.route(path, get(move || async move { body.to_string() }));
-        }
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
-        });
-        port
+    /// Delegating wrapper that overrides a built-in's ports so tests can
+    /// point providers at ephemeral stub servers.
+    struct WithPorts {
+        inner: Arc<dyn InferenceProvider>,
+        ports: Vec<u16>,
     }
 
+    #[async_trait::async_trait]
+    impl InferenceProvider for WithPorts {
+        fn slug(&self) -> &str {
+            self.inner.slug()
+        }
+        fn title(&self) -> &str {
+            self.inner.title()
+        }
+        fn ports(&self) -> &[u16] {
+            &self.ports
+        }
+        fn color(&self) -> Option<&str> {
+            self.inner.color()
+        }
+        async fn identify(
+            &self,
+            client: &reqwest::Client,
+            base_url: &str,
+        ) -> Option<Option<String>> {
+            self.inner.identify(client, base_url).await
+        }
+        async fn list_models(&self, client: &reqwest::Client, base_url: &str) -> Vec<String> {
+            self.inner.list_models(client, base_url).await
+        }
+        fn paid_endpoints(&self) -> Vec<providers::PaidEndpoint> {
+            self.inner.paid_endpoints()
+        }
+        fn endpoint_kind(&self, path: &str) -> &'static str {
+            self.inner.endpoint_kind(path)
+        }
+    }
+
+    /// All built-ins, each with its ports replaced by the matching entries
+    /// in `ports` (empty — never probed successfully — when unlisted).
     fn registry_with_ports(ports: &[(&str, u16)]) -> ProviderRegistry {
-        let mut registry: ProviderRegistry = serde_yml::from_str(EMBEDDED_REGISTRY).unwrap();
-        for provider in &mut registry.providers {
-            provider.ports = ports
-                .iter()
-                .filter(|(slug, _)| *slug == provider.slug)
-                .map(|(_, port)| *port)
-                .collect();
-        }
-        registry
-    }
-
-    #[test]
-    fn embedded_registry_parses_with_five_providers() {
-        let registry: ProviderRegistry = serde_yml::from_str(EMBEDDED_REGISTRY).unwrap();
-        let slugs: Vec<_> = registry.providers.iter().map(|p| p.slug.as_str()).collect();
-        assert_eq!(
-            slugs,
-            vec!["ollama", "lm-studio", "llama-cpp", "vllm", "exo"]
-        );
-        for provider in &registry.providers {
-            assert!(
-                !provider.identify.is_empty(),
-                "{} needs probes",
-                provider.slug
-            );
-            assert!(
-                provider
-                    .identify
+        providers::builtin_providers()
+            .into_iter()
+            .map(|inner| {
+                let ports = ports
                     .iter()
-                    .all(|p| p.expect_json_key.is_some() || p.expect_body_contains.is_some()),
-                "{} has a probe with no positive expectation",
-                provider.slug
-            );
-        }
-    }
-
-    #[test]
-    fn embedded_registry_paid_endpoints_parse() {
-        let registry: ProviderRegistry = serde_yml::from_str(EMBEDDED_REGISTRY).unwrap();
-        let paid_paths = |slug: &str| -> Vec<String> {
-            registry
-                .providers
-                .iter()
-                .find(|p| p.slug == slug)
-                .unwrap_or_else(|| panic!("{slug} missing"))
-                .paid
-                .iter()
-                .map(|e| e.path.clone())
-                .collect()
-        };
-
-        let openai_compat = ["v1/chat/completions", "v1/completions", "v1/embeddings"];
-        assert_eq!(
-            paid_paths("ollama"),
-            [
-                "api/chat",
-                "api/generate",
-                "api/embed",
-                "v1/chat/completions",
-                "v1/completions",
-                "v1/embeddings",
-                "v1/messages",
-            ]
-        );
-        assert_eq!(paid_paths("lm-studio"), openai_compat);
-        assert_eq!(paid_paths("vllm"), openai_compat);
-        assert_eq!(paid_paths("exo"), openai_compat);
-        assert_eq!(
-            paid_paths("llama-cpp"),
-            [
-                "v1/chat/completions",
-                "v1/completions",
-                "v1/embeddings",
-                "completion",
-                "infill",
-                "embedding",
-            ]
-        );
-
-        for provider in &registry.providers {
-            for endpoint in &provider.paid {
-                assert!(
-                    matches!(endpoint.method, pay_types::metering::HttpMethod::Post),
-                    "{}: inference calls are POSTs",
-                    provider.slug
-                );
-                assert!(
-                    !endpoint.path.starts_with('/'),
-                    "{}: paid paths follow the gate's no-leading-slash convention",
-                    provider.slug
-                );
-            }
-        }
+                    .filter(|(slug, _)| *slug == inner.slug())
+                    .map(|(_, port)| *port)
+                    .collect();
+                Arc::new(WithPorts { inner, ports }) as Arc<dyn InferenceProvider>
+            })
+            .collect()
     }
 
     #[test]
@@ -425,7 +267,7 @@ mod tests {
             let found = discover(&registry, Duration::from_millis(400), None).await;
 
             assert_eq!(found.len(), 1);
-            assert_eq!(found[0].spec.slug, "ollama");
+            assert_eq!(found[0].slug(), "ollama");
             assert_eq!(found[0].base_url, format!("http://127.0.0.1:{port}"));
             assert_eq!(found[0].version.as_deref(), Some("0.9.1"));
             assert_eq!(found[0].models, vec!["llama3.2:3b", "nomic-embed-text"]);
@@ -465,7 +307,7 @@ mod tests {
             let found = discover(&registry, Duration::from_millis(400), None).await;
 
             assert_eq!(found.len(), 1);
-            assert_eq!(found[0].spec.slug, "llama-cpp");
+            assert_eq!(found[0].slug(), "llama-cpp");
             assert_eq!(found[0].models, vec!["qwen2.5-7b"]);
         });
     }
@@ -509,9 +351,9 @@ mod tests {
             let mut events: Vec<String> = Vec::new();
             let found = discover_with(&registry, Duration::from_millis(400), None, |event| {
                 events.push(match event {
-                    ProbeEvent::Started(spec) => format!("started:{}", spec.slug),
-                    ProbeEvent::Found(provider) => format!("found:{}", provider.spec.slug),
-                    ProbeEvent::Missed(spec) => format!("missed:{}", spec.slug),
+                    ProbeEvent::Started(provider) => format!("started:{}", provider.slug()),
+                    ProbeEvent::Found(found) => format!("found:{}", found.slug()),
+                    ProbeEvent::Missed(provider) => format!("missed:{}", provider.slug()),
                 });
             })
             .await;
@@ -537,8 +379,7 @@ mod tests {
 
     #[test]
     fn user_registry_overrides_by_slug_and_appends() {
-        let embedded: ProviderRegistry = serde_yml::from_str(EMBEDDED_REGISTRY).unwrap();
-        let user: ProviderRegistry = serde_yml::from_str(
+        let user_file: UserRegistryFile = serde_yml::from_str(
             r#"
 providers:
   - slug: ollama
@@ -554,23 +395,25 @@ providers:
 "#,
         )
         .unwrap();
-
-        let merged = merge_registries(embedded, user);
-        let ollama = merged
+        let user: ProviderRegistry = user_file
             .providers
-            .iter()
-            .find(|p| p.slug == "ollama")
-            .unwrap();
-        assert_eq!(ollama.ports, vec![11500]);
-        assert!(merged.providers.iter().any(|p| p.slug == "jan"));
-        // No duplicate ollama entry from the embedded registry.
+            .into_iter()
+            .map(|p| Arc::new(p) as Arc<dyn InferenceProvider>)
+            .collect();
+
+        let merged = merge_registries(providers::builtin_providers(), user);
+        let ollama = merged.iter().find(|p| p.slug() == "ollama").unwrap();
+        assert_eq!(ollama.ports(), [11500]);
+        assert_eq!(ollama.title(), "Ollama (custom port)");
+        assert!(merged.iter().any(|p| p.slug() == "jan"));
+        // No duplicate ollama entry from the built-ins.
+        assert_eq!(merged.iter().filter(|p| p.slug() == "ollama").count(), 1);
+        // User entries come first: they take probe priority on contested
+        // ports; the remaining built-ins keep their relative order.
+        let slugs: Vec<&str> = merged.iter().map(|p| p.slug()).collect();
         assert_eq!(
-            merged
-                .providers
-                .iter()
-                .filter(|p| p.slug == "ollama")
-                .count(),
-            1
+            slugs,
+            vec!["ollama", "jan", "lm-studio", "llama-cpp", "vllm", "exo"]
         );
     }
 }

@@ -169,7 +169,8 @@ fn prepare_claude_launch(
         let choice = select_provider_choice(providers, requested_model.as_deref())?;
         eprintln!(
             "⏺ routing claude → {} {} (direct, unmetered)",
-            choice.provider.spec.slug, choice.provider.base_url
+            choice.provider.slug(),
+            choice.provider.base_url
         );
         (choice.provider.base_url.clone(), Some(choice.model))
     };

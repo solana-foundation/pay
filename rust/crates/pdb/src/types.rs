@@ -282,6 +282,10 @@ pub struct ExchangeStart {
     pub method: String,
     pub path: String,
     pub client_ip: String,
+    /// Carries a `Payment`-scheme Authorization header — the paid retry of
+    /// an earlier 402 challenge; attaches to the pending challenge flow
+    /// instead of opening a new one.
+    pub payment_retry: bool,
     pub inference: Option<InferenceInfo>,
 }
 

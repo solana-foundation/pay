@@ -556,9 +556,18 @@ original plan; where they differ, this section wins:
 - **Flag surface (§2.1).** `--watch-interval <SECS>` (0 disables) instead of
   `--watch`; no `--public-url` (nothing to rewrite — inference serves no
   OpenAPI in v1); `--spec` is repeatable rather than comma-joined.
-- **AllExchanges mode does not run payment correlation** (§5.2 said it would).
-  Each HTTP exchange is one flow; 402 flows can't occur on v1 passthrough
-  routes anyway. Unifying the two models is Phase-6 work.
+- **AllExchanges merges 402 challenges with their paid retries** (Phase-6
+  unification, landed 2026-07-05): a metered exchange that 402s parks as
+  `payment-required`; the retry — spotted by its `Payment` Authorization
+  header, threaded through `RequestStart.payment` — attaches to the same
+  flow, so one logical request is one row with the 4-step payment diagram.
+  Plain upstream 402s still fail; full PaymentFlows-style cross-protocol
+  correlation stays debugger-mode-only.
+- **Built-in providers moved from the embedded providers.yml into code**
+  (2026-07-05): `InferenceProvider` trait with one impl + test module per
+  provider (`inference/providers/`); the user override file
+  `~/.config/pay/inference-providers.yml` keeps its schema via
+  `CustomProvider` and still shadows built-ins by slug.
 - **Payment Debugger correlation is otherwise untouched**; debugger mode
   stays pixel-identical in the web UI (verified by leaving mode unset).
 
