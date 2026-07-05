@@ -18,7 +18,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Clear, Paragraph};
 
 use super::term::{SPINNER, with_terminal};
 use super::theme::{CARD_BG, SOLANA_GREEN, TOPUP_CARD_BG, TOPUP_MAIN_BG, TOPUP_SIDEBAR_BG};
@@ -581,35 +581,47 @@ const COL_MODELS_MIN: usize = 6;
 
 fn render_connections(frame: &mut Frame, area: Rect, app: &InferenceApp) {
     let connections = app.filtered_connections();
-    let mut title = format!(" CONNECTIONS · {} ", app.connections.len());
+    frame.render_widget(
+        Block::default().style(Style::default().bg(TOPUP_MAIN_BG)),
+        area,
+    );
+    // Plain text — no border. One column of horizontal breathing room.
+    let inner = Rect {
+        x: area.x + 1,
+        y: area.y,
+        width: area.width.saturating_sub(2),
+        height: area.height,
+    };
+    if inner.width == 0 || inner.height < 3 {
+        return;
+    }
+
+    let mut title = format!("CONNECTIONS · {}", app.connections.len());
     if app.filter != Filter::All {
         title = format!(
-            " CONNECTIONS · {} · filter {} ",
+            "CONNECTIONS · {} · filter {}",
             app.connections.len(),
             app.filter_label()
         );
     }
-    // Gray borders throughout this TUI: slightly brighter when the pane
-    // has focus, dark otherwise — never green.
-    let border_color = if app.pane == Pane::Requests {
-        Color::Gray
+    // Focus cue without a border: bright title when the pane is focused.
+    let title_color = if app.pane == Pane::Requests {
+        Color::White
     } else {
-        Color::DarkGray
+        Color::Gray
     };
-    let block = Block::default()
-        .title(Span::styled(
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
             title,
-            Style::default().fg(Color::White).bold(),
-        ))
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border_color))
-        .style(Style::default().bg(TOPUP_MAIN_BG));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    if inner.width == 0 || inner.height == 0 {
-        return;
-    }
+            Style::default().fg(title_color).bold(),
+        ))),
+        Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: 1,
+        },
+    );
 
     let fixed =
         COL_MARKER + COL_WHO + COL_PROV + COL_REQS + COL_TOK_IN + COL_TOK_OUT + COL_PAID + COL_LAST;
@@ -647,7 +659,7 @@ fn render_connections(frame: &mut Frame, area: Rect, app: &InferenceApp) {
         ))),
         Rect {
             x: inner.x,
-            y: inner.y,
+            y: inner.y + 1,
             width: inner.width,
             height: 1,
         },
@@ -672,8 +684,9 @@ fn render_connections(frame: &mut Frame, area: Rect, app: &InferenceApp) {
         return;
     }
 
-    // Scroll the window so the selected row stays visible.
-    let visible = inner.height.saturating_sub(1) as usize;
+    // Scroll the window so the selected row stays visible. Two header
+    // rows: the pane title and the column labels.
+    let visible = inner.height.saturating_sub(2) as usize;
     if visible == 0 {
         return;
     }
@@ -692,7 +705,7 @@ fn render_connections(frame: &mut Frame, area: Rect, app: &InferenceApp) {
             Paragraph::new(line),
             Rect {
                 x: inner.x,
-                y: inner.y + 1 + row as u16,
+                y: inner.y + 2 + row as u16,
                 width: inner.width,
                 height: 1,
             },
@@ -1504,6 +1517,11 @@ mod tests {
         assert!(
             !text.contains("DETAIL"),
             "detail panel should be gone:\n{text}"
+        );
+        // The connections table is borderless now.
+        assert!(
+            !text.contains('╭') && !text.contains('┌'),
+            "no border glyphs should render:\n{text}"
         );
     }
 

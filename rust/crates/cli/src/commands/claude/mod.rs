@@ -6,7 +6,7 @@ use std::time::Duration;
 use clap::Args;
 
 use crate::commands::server::inference::discovery::{self, DiscoveredProvider};
-use crate::tui::{ClaudeProviderSelection, select_claude_provider};
+use crate::tui::{ProviderSelection, select_provider};
 
 const ALLOWED_TOOLS: &str = "mcp__pay__curl,mcp__pay__search_catalog,mcp__pay__list_catalog,mcp__pay__get_catalog_entry,mcp__pay__get_balance,mcp__pay__topup,mcp__pay__create_skill";
 const GATEWAY_BASE_URL: &str = "http://127.0.0.1:1402";
@@ -198,12 +198,12 @@ fn prepare_claude_launch(
 fn select_provider_choice(
     providers: Vec<DiscoveredProvider>,
     requested_model: Option<&str>,
-) -> pay_core::Result<crate::tui::ClaudeProviderChoice> {
-    match select_claude_provider(providers, requested_model)
+) -> pay_core::Result<crate::tui::ProviderChoice> {
+    match select_provider("claude", providers, requested_model)
         .map_err(|e| pay_core::Error::Config(format!("Provider selection failed: {e}")))?
     {
-        ClaudeProviderSelection::Selected(choice) => Ok(choice),
-        ClaudeProviderSelection::Cancelled => Err(pay_core::Error::Config(
+        ProviderSelection::Selected(choice) => Ok(choice),
+        ProviderSelection::Cancelled => Err(pay_core::Error::Config(
             "Claude provider selection cancelled".to_string(),
         )),
     }
