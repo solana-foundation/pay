@@ -204,6 +204,38 @@ pub struct PaymentFlow {
     pub inference: Option<InferenceInfo>,
 }
 
+// ── Connections (aggregated activity) ──
+
+/// Aggregated activity for one logical client connection — keyed by payer
+/// wallet when traffic is paid, otherwise by client ip/host. Totals are
+/// folded in at exchange completion; stablecoin amounts aggregate 1:1 into
+/// USD across currencies (USDC/USDT/CASH…).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionSummary {
+    /// Stable id, e.g. `conn-1`.
+    pub id: String,
+    /// Payer wallet pubkey when this connection has paid traffic.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payer: Option<String>,
+    pub client_ip: String,
+    /// Provider slug of the most recent exchange.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Distinct models seen (bounded).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
+    pub requests: u64,
+    pub ok: u64,
+    pub failed: u64,
+    pub tokens_prompt: u64,
+    pub tokens_completion: u64,
+    /// Total settled across all stablecoins, in USD.
+    pub paid_usd: f64,
+    pub started_at: String,
+    pub updated_at: String,
+}
+
 // ── SSE Messages ──
 
 #[derive(Debug, Clone, Serialize)]
@@ -226,6 +258,14 @@ pub enum SseMessage {
     },
     ProviderStatus {
         providers: Vec<ProviderSummary>,
+    },
+    /// One connection's aggregates changed (sent on each completed exchange).
+    ConnectionUpdated {
+        connection: ConnectionSummary,
+    },
+    /// Full connection list — replayed to new SSE subscribers.
+    ConnectionsSnapshot {
+        connections: Vec<ConnectionSummary>,
     },
 }
 

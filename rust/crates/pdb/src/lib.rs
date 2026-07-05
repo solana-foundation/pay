@@ -106,6 +106,11 @@ impl PdbState {
         self.providers.lock().unwrap().clone()
     }
 
+    /// Current connection aggregates (empty outside `AllExchanges` mode).
+    pub fn connections(&self) -> Vec<types::ConnectionSummary> {
+        self.correlation.lock().unwrap().connections_snapshot()
+    }
+
     /// Spawn the background cleanup task (call once at startup).
     pub fn spawn_cleanup(&self) {
         let correlation = self.correlation.clone();

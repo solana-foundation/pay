@@ -17,9 +17,9 @@ use crate::types::{LogEntry, SseMessage};
 pub async fn sse_stream(State(state): State<PdbState>) -> Response {
     let mut rx = state.tx.subscribe();
 
-    let snapshot = {
+    let (snapshot, connections) = {
         let engine = state.correlation.lock().unwrap();
-        engine.snapshot()
+        (engine.snapshot(), engine.connections_snapshot())
     };
     let providers = state.providers();
 
@@ -30,6 +30,8 @@ pub async fn sse_stream(State(state): State<PdbState>) -> Response {
     let snapshot_data = serde_json::to_string(&SseMessage::Snapshot { flows: snapshot }).unwrap();
     let provider_data = (!providers.is_empty())
         .then(|| serde_json::to_string(&SseMessage::ProviderStatus { providers }).unwrap());
+    let connection_data = (!connections.is_empty())
+        .then(|| serde_json::to_string(&SseMessage::ConnectionsSnapshot { connections }).unwrap());
 
     let stream = async_stream::stream! {
         // Initial events
@@ -37,6 +39,9 @@ pub async fn sse_stream(State(state): State<PdbState>) -> Response {
         yield Ok(format!("data: {snapshot_data}\n\n"));
         if let Some(provider_data) = provider_data {
             yield Ok(format!("data: {provider_data}\n\n"));
+        }
+        if let Some(connection_data) = connection_data {
+            yield Ok(format!("data: {connection_data}\n\n"));
         }
 
         // Live events

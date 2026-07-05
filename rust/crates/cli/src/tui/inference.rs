@@ -1,5 +1,5 @@
-//! Live TUI for `pay serve inference`: provider sidebar, scrolling request
-//! table, and per-request detail panel, fed by the PDB event stream
+//! Live TUI for `pay serve inference`: provider sidebar, live rate chart,
+//! and per-connection activity table, fed by the PDB event stream
 //! (bridged from `broadcast::Sender<SseMessage>` to a `std::sync::mpsc`
 //! channel by the caller).
 //!
@@ -13,7 +13,7 @@ use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use pay_pdb::types::{FlowStatus, PaymentFlow, ProviderSummary, SseMessage};
+use pay_pdb::types::{ConnectionSummary, FlowStatus, PaymentFlow, ProviderSummary, SseMessage};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style, Stylize};
@@ -53,6 +53,9 @@ pub struct InferenceTuiArgs {
     pub initial_providers: Vec<ProviderSummary>,
     /// Flows recorded before the TUI opened.
     pub initial_flows: Vec<PaymentFlow>,
+    /// Connection aggregates recorded before the TUI opened
+    /// (`pdb.connections()`).
+    pub initial_connections: Vec<ConnectionSummary>,
     /// Bridged PDB event stream, drained non-blockingly each 50ms tick.
     pub events: Receiver<SseMessage>,
 }
@@ -65,10 +68,11 @@ pub fn run_inference_tui(args: InferenceTuiArgs) -> io::Result<()> {
         web_url,
         initial_providers,
         initial_flows,
+        initial_connections,
         events,
     } = args;
 
-    let mut app = InferenceApp::new(initial_providers, initial_flows);
+    let mut app = InferenceApp::new(initial_providers, initial_flows, initial_connections);
 
     with_terminal(|terminal| {
         loop {
@@ -184,16 +188,19 @@ impl RateHistory {
 
 struct InferenceApp {
     providers: Vec<ProviderSummary>,
-    /// Flows, newest first, capped at [`FLOW_CAP`].
+    /// Flows, newest first, capped at [`FLOW_CAP`] — kept for the chart
+    /// buckets and the in-flight indicator (not rendered as rows).
     flows: VecDeque<PaymentFlow>,
+    /// Aggregated per-connection activity, newest activity first.
+    connections: Vec<ConnectionSummary>,
     pane: Pane,
     /// Index into [`Self::up_providers`] — only up providers are rendered
     /// and selectable.
     selected_provider: usize,
-    /// Pinned flow id when the user moved the selection; `None` while
-    /// following the latest flow.
-    selected_flow_id: Option<String>,
-    /// True while the newest flow is auto-selected as flows arrive.
+    /// Pinned connection id when the user moved the selection; `None`
+    /// while following the newest activity.
+    selected_id: Option<String>,
+    /// True while the newest-activity connection is auto-selected.
     follow: bool,
     filter: Filter,
     /// Render-loop tick (~50ms) driving the spinner glyphs.
@@ -206,19 +213,25 @@ struct InferenceApp {
 }
 
 impl InferenceApp {
-    fn new(providers: Vec<ProviderSummary>, initial_flows: Vec<PaymentFlow>) -> Self {
+    fn new(
+        providers: Vec<ProviderSummary>,
+        initial_flows: Vec<PaymentFlow>,
+        initial_connections: Vec<ConnectionSummary>,
+    ) -> Self {
         let mut app = Self {
             providers,
             flows: VecDeque::new(),
+            connections: initial_connections,
             pane: Pane::Requests,
             selected_provider: 0,
-            selected_flow_id: None,
+            selected_id: None,
             follow: true,
             filter: Filter::All,
             tick: 0,
             rates: RateHistory::new(now_unix_secs()),
             last_tokens: HashMap::new(),
         };
+        app.sort_connections();
         // Initial flows arrive oldest-first (PDB snapshot order); pushing
         // each to the front leaves the newest at the front. Pre-existing
         // token counts are baselines, not new activity — no bucket adds.
@@ -266,7 +279,25 @@ impl InferenceApp {
                 let up_count = self.up_providers().len();
                 self.selected_provider = self.selected_provider.min(up_count.saturating_sub(1));
             }
+            SseMessage::ConnectionsSnapshot { connections } => {
+                self.connections = connections;
+                self.sort_connections();
+            }
+            SseMessage::ConnectionUpdated { connection } => {
+                match self.connections.iter_mut().find(|c| c.id == connection.id) {
+                    Some(existing) => *existing = connection,
+                    None => self.connections.push(connection),
+                }
+                self.sort_connections();
+            }
         }
+    }
+
+    /// Newest activity first (`updated_at` is RFC3339, so lexicographic
+    /// order is chronological). Stable: ties keep their relative order.
+    fn sort_connections(&mut self) {
+        self.connections
+            .sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     }
 
     fn push_flow(&mut self, flow: PaymentFlow) {
@@ -326,74 +357,88 @@ impl InferenceApp {
         self.providers.iter().filter(|p| p.up).collect()
     }
 
-    fn matches_filter(&self, flow: &PaymentFlow) -> bool {
+    fn matches_filter(&self, conn: &ConnectionSummary) -> bool {
         match &self.filter {
             Filter::All => true,
-            Filter::Errors => flow.status == FlowStatus::Failed,
-            Filter::Provider(slug) => flow
-                .inference
-                .as_ref()
-                .is_some_and(|info| info.provider == *slug),
+            Filter::Errors => conn.failed > 0,
+            Filter::Provider(slug) => conn.provider.as_deref() == Some(slug.as_str()),
         }
     }
 
-    /// Flows passing the active filter, newest first.
-    fn filtered_flows(&self) -> Vec<&PaymentFlow> {
-        self.flows
+    /// Connections passing the active filter, newest activity first.
+    fn filtered_connections(&self) -> Vec<&ConnectionSummary> {
+        self.connections
             .iter()
-            .filter(|flow| self.matches_filter(flow))
+            .filter(|conn| self.matches_filter(conn))
             .collect()
     }
 
-    /// Index of the selected flow within [`Self::filtered_flows`].
+    /// Index of the selected connection within
+    /// [`Self::filtered_connections`].
     fn selected_index(&self) -> Option<usize> {
-        let flows = self.filtered_flows();
-        if flows.is_empty() {
+        let connections = self.filtered_connections();
+        if connections.is_empty() {
             return None;
         }
         if self.follow {
             return Some(0);
         }
-        self.selected_flow_id
+        self.selected_id
             .as_ref()
-            .and_then(|id| flows.iter().position(|flow| flow.id == *id))
+            .and_then(|id| connections.iter().position(|conn| conn.id == *id))
             .or(Some(0))
     }
 
-    /// The selected flow (kept for selection tests and future detail
+    /// The selected connection (kept for selection tests and future detail
     /// views — the table highlights via [`Self::selected_index`]).
     #[cfg_attr(not(test), allow(dead_code))]
-    fn selected_flow(&self) -> Option<&PaymentFlow> {
-        let flows = self.filtered_flows();
+    fn selected_connection(&self) -> Option<&ConnectionSummary> {
+        let connections = self.filtered_connections();
         self.selected_index()
-            .and_then(|idx| flows.get(idx).copied())
+            .and_then(|idx| connections.get(idx).copied())
     }
 
-    /// Move the request selection by `delta` rows (positive = older).
-    /// Any manual move pins the selection and stops following the latest.
+    /// Best-effort in-flight indicator: any in-progress flow that plausibly
+    /// belongs to this connection (same client ip, or same provider as a
+    /// fallback). Cosmetic only.
+    fn connection_in_flight(&self, conn: &ConnectionSummary) -> bool {
+        self.flows.iter().any(|flow| {
+            flow.status == FlowStatus::InProgress
+                && (flow.client_ip == conn.client_ip
+                    || (conn.provider.is_some()
+                        && flow.inference.as_ref().map(|i| i.provider.as_str())
+                            == conn.provider.as_deref()))
+        })
+    }
+
+    /// Move the connection selection by `delta` rows (positive = older
+    /// activity). Any manual move pins the selection and stops following.
     fn move_selection(&mut self, delta: isize) {
         let pinned_id = {
-            let flows = self.filtered_flows();
-            if flows.is_empty() {
+            let connections = self.filtered_connections();
+            if connections.is_empty() {
                 return;
             }
             let current = self.selected_index().unwrap_or(0) as isize;
-            let next = (current + delta).clamp(0, flows.len() as isize - 1) as usize;
-            flows[next].id.clone()
+            let next = (current + delta).clamp(0, connections.len() as isize - 1) as usize;
+            connections[next].id.clone()
         };
-        self.selected_flow_id = Some(pinned_id);
+        self.selected_id = Some(pinned_id);
         self.follow = false;
     }
 
     fn toggle_follow(&mut self) {
         if self.follow {
-            // Pin whatever is currently newest.
-            let pinned = self.filtered_flows().first().map(|flow| flow.id.clone());
+            // Pin whatever currently has the newest activity.
+            let pinned = self
+                .filtered_connections()
+                .first()
+                .map(|conn| conn.id.clone());
             self.follow = false;
-            self.selected_flow_id = pinned;
+            self.selected_id = pinned;
         } else {
             self.follow = true;
-            self.selected_flow_id = None;
+            self.selected_id = None;
         }
     }
 
@@ -417,13 +462,14 @@ impl InferenceApp {
                 }
             }
         };
-        // If the pinned flow got filtered out, fall back to following.
-        let pinned_visible = self
-            .selected_flow_id
-            .as_ref()
-            .is_some_and(|id| self.filtered_flows().iter().any(|flow| flow.id == *id));
+        // If the pinned connection got filtered out, fall back to following.
+        let pinned_visible = self.selected_id.as_ref().is_some_and(|id| {
+            self.filtered_connections()
+                .iter()
+                .any(|conn| conn.id == *id)
+        });
         if !pinned_visible {
-            self.selected_flow_id = None;
+            self.selected_id = None;
             self.follow = true;
         }
     }
@@ -436,12 +482,13 @@ impl InferenceApp {
         }
     }
 
-    /// Clear the local flow list (display only — PDB history is untouched;
-    /// chart history is kept, token baselines reset with the list).
-    fn clear_flows(&mut self) {
+    /// Clear the local connection + flow lists (display only — PDB history
+    /// is untouched; chart history is kept, token baselines reset).
+    fn clear_activity(&mut self) {
+        self.connections.clear();
         self.flows.clear();
         self.last_tokens.clear();
-        self.selected_flow_id = None;
+        self.selected_id = None;
         self.follow = true;
     }
 
@@ -475,7 +522,7 @@ impl InferenceApp {
             },
             KeyCode::Enter => self.toggle_follow(),
             KeyCode::Char('f') | KeyCode::Char('F') => self.cycle_filter(),
-            KeyCode::Char('c') | KeyCode::Char('C') => self.clear_flows(),
+            KeyCode::Char('c') | KeyCode::Char('C') => self.clear_activity(),
             KeyCode::Char('w') | KeyCode::Char('W') => return Action::OpenWeb,
             _ => {}
         }
@@ -652,7 +699,7 @@ fn render_providers(frame: &mut Frame, area: Rect, app: &InferenceApp) {
 
 fn render_content(frame: &mut Frame, area: Rect, app: &InferenceApp) {
     // Chart on top (fixed height), hidden when the pane is too small; the
-    // request table fills all remaining height.
+    // connections table fills all remaining height.
     let chart_height = if area.height < CHART_MIN_PANE_HEIGHT {
         0
     } else {
@@ -663,7 +710,7 @@ fn render_content(frame: &mut Frame, area: Rect, app: &InferenceApp) {
     if chart_height > 0 {
         render_chart(frame, split[0], app);
     }
-    render_requests(frame, split[1], app);
+    render_connections(frame, split[1], app);
 }
 
 /// scope-tui-style live chart: braille line plot of completion tokens/s
@@ -740,22 +787,27 @@ fn series_points(buckets: &VecDeque<f64>, window: usize) -> (Vec<(f64, f64)>, f6
     (points, peak)
 }
 
-// Request-table column widths (characters).
-const COL_TIME: usize = 10;
-const COL_PROV: usize = 9;
-const COL_MODEL: usize = 15;
-const COL_STATUS: usize = 5;
-const COL_TOKS: usize = 7;
-/// Selection marker column ("▸ ").
+// Connections-table column widths (characters). `models` takes whatever
+// width remains.
+/// Selection marker / in-flight spinner column ("▸ " / "⠹ ").
 const COL_MARKER: usize = 2;
+const COL_WHO: usize = 12;
+const COL_PROV: usize = 7;
+const COL_REQS: usize = 7;
+const COL_TOK_IN: usize = 8;
+const COL_TOK_OUT: usize = 8;
+const COL_PAID: usize = 10;
+const COL_LAST: usize = 9;
+/// Minimum width of the flexible models column.
+const COL_MODELS_MIN: usize = 6;
 
-fn render_requests(frame: &mut Frame, area: Rect, app: &InferenceApp) {
-    let flows = app.filtered_flows();
-    let mut title = format!(" REQUESTS · {} total ", app.flows.len());
+fn render_connections(frame: &mut Frame, area: Rect, app: &InferenceApp) {
+    let connections = app.filtered_connections();
+    let mut title = format!(" CONNECTIONS · {} ", app.connections.len());
     if app.filter != Filter::All {
         title = format!(
-            " REQUESTS · {} total · filter {} ",
-            app.flows.len(),
+            " CONNECTIONS · {} · filter {} ",
+            app.connections.len(),
             app.filter_label()
         );
     }
@@ -779,27 +831,32 @@ fn render_requests(frame: &mut Frame, area: Rect, app: &InferenceApp) {
         return;
     }
 
-    let width = inner.width as usize;
-    let path_width = width
-        .saturating_sub(COL_MARKER + COL_TIME + COL_PROV + COL_MODEL + COL_STATUS + COL_TOKS)
-        .max(4);
+    let fixed =
+        COL_MARKER + COL_WHO + COL_PROV + COL_REQS + COL_TOK_IN + COL_TOK_OUT + COL_PAID + COL_LAST;
+    let models_width = (inner.width as usize)
+        .saturating_sub(fixed)
+        .max(COL_MODELS_MIN);
 
     // Header row.
     let header = format!(
-        "{marker}{time:<tw$}{prov:<pw$}{model:<mw$}{path:<paw$}{st:<sw$}{tok:>tkw$}",
+        "{marker}{who:<ww$}{prov:<pw$}{models:<mw$}{req:>rw$}{tin:>iw$}{tout:>ow$}{paid:>dw$}{last:>lw$}",
         marker = " ".repeat(COL_MARKER),
-        time = "time",
+        who = "who",
         prov = "prov",
-        model = "model",
-        path = "path",
-        st = "st",
-        tok = "tok/s",
-        tw = COL_TIME,
+        models = "models",
+        req = "req",
+        tin = "tok in",
+        tout = "tok out",
+        paid = "$ paid",
+        last = "last",
+        ww = COL_WHO,
         pw = COL_PROV,
-        mw = COL_MODEL,
-        paw = path_width,
-        sw = COL_STATUS,
-        tkw = COL_TOKS,
+        mw = models_width,
+        rw = COL_REQS,
+        iw = COL_TOK_IN,
+        ow = COL_TOK_OUT,
+        dw = COL_PAID,
+        lw = COL_LAST,
     );
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -814,11 +871,11 @@ fn render_requests(frame: &mut Frame, area: Rect, app: &InferenceApp) {
         },
     );
 
-    if flows.is_empty() {
+    if connections.is_empty() {
         frame.render_widget(
             Paragraph::new(
                 Line::from(Span::styled(
-                    "waiting for requests…",
+                    "waiting for connections…",
                     Style::default().fg(Color::DarkGray),
                 ))
                 .centered(),
@@ -841,14 +898,14 @@ fn render_requests(frame: &mut Frame, area: Rect, app: &InferenceApp) {
     let selected = app.selected_index().unwrap_or(0);
     let offset = selected.saturating_sub(visible.saturating_sub(1));
 
-    for (row, (idx, flow)) in flows
+    for (row, (idx, conn)) in connections
         .iter()
         .enumerate()
         .skip(offset)
         .take(visible)
         .enumerate()
     {
-        let line = flow_row(app, flow, path_width, idx == selected);
+        let line = connection_row(app, conn, models_width, idx == selected);
         frame.render_widget(
             Paragraph::new(line),
             Rect {
@@ -861,54 +918,78 @@ fn render_requests(frame: &mut Frame, area: Rect, app: &InferenceApp) {
     }
 }
 
-/// One request-table row: time, provider, model, path, status, tok/s.
-fn flow_row<'a>(
+/// One connections-table row: who (payer/ip), provider, models, ok/total
+/// requests, prompt/completion token totals, $ paid, last activity.
+fn connection_row(
     app: &InferenceApp,
-    flow: &'a PaymentFlow,
-    path_width: usize,
+    conn: &ConnectionSummary,
+    models_width: usize,
     selected: bool,
-) -> Line<'a> {
-    let provider = flow
-        .inference
-        .as_ref()
-        .map(|info| info.provider.as_str())
-        .unwrap_or("—");
-    let model = flow
-        .inference
-        .as_ref()
-        .and_then(|info| info.model.as_deref())
-        .unwrap_or("—");
-    let (status, status_color) = status_cell(flow, app.tick);
+) -> Line<'static> {
+    // Selection marker wins the first column; otherwise a spinner marks
+    // best-effort in-flight activity on this connection.
+    let marker = if selected {
+        Span::styled("▸ ", Style::default().fg(SOLANA_GREEN).bold())
+    } else if app.connection_in_flight(conn) {
+        Span::styled(
+            format!("{} ", SPINNER[app.tick % SPINNER.len()]),
+            Style::default().fg(Color::Yellow),
+        )
+    } else {
+        Span::raw("  ")
+    };
 
-    let marker = if selected { "▸ " } else { "  " };
+    let who = who_label(conn);
+    let who_color = if conn.payer.is_some() {
+        Color::Cyan
+    } else {
+        Color::Gray
+    };
+    let reqs_color = if conn.failed > 0 {
+        Color::Red
+    } else {
+        Color::Gray
+    };
+
     let mut spans = vec![
-        Span::styled(marker, Style::default().fg(SOLANA_GREEN).bold()),
+        marker,
         Span::styled(
-            pad(&short_time(&flow.started_at), COL_TIME),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::styled(
-            pad(&truncate_str(provider, COL_PROV - 1), COL_PROV),
-            Style::default().fg(Color::Cyan),
-        ),
-        Span::styled(
-            pad(&truncate_str(model, COL_MODEL - 1), COL_MODEL),
-            Style::default().fg(Color::Gray),
+            pad(&truncate_str(&who, COL_WHO - 1), COL_WHO),
+            Style::default().fg(who_color),
         ),
         Span::styled(
             pad(
-                &truncate_str(&flow.resource, path_width.saturating_sub(1)),
-                path_width,
+                &truncate_str(conn.provider.as_deref().unwrap_or("—"), COL_PROV - 1),
+                COL_PROV,
+            ),
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::styled(
+            pad(
+                &truncate_str(&models_label(&conn.models), models_width.saturating_sub(1)),
+                models_width,
             ),
             Style::default().fg(Color::Gray),
         ),
         Span::styled(
-            pad(&status, COL_STATUS),
-            Style::default().fg(status_color).bold(),
+            format!("{:>width$}", reqs_label(conn), width = COL_REQS),
+            Style::default().fg(reqs_color),
         ),
         Span::styled(
-            format!("{:>width$}", tokens_per_sec_label(flow), width = COL_TOKS),
+            format!("{:>width$}", conn.tokens_prompt, width = COL_TOK_IN),
+            Style::default().fg(Color::Gray),
+        ),
+        Span::styled(
+            format!("{:>width$}", conn.tokens_completion, width = COL_TOK_OUT),
             Style::default().fg(Color::White),
+        ),
+        Span::styled(
+            format!("{:>width$}", paid_label(conn.paid_usd), width = COL_PAID),
+            Style::default().fg(SOLANA_GREEN),
+        ),
+        Span::styled(
+            format!("{:>width$}", short_time(&conn.updated_at), width = COL_LAST),
+            Style::default().fg(Color::DarkGray),
         ),
     ];
     if selected {
@@ -962,38 +1043,43 @@ fn render_controls(
 
 // ── Display helpers ───────────────────────────────────────────────────────
 
-/// Table status cell: spinner while in-progress, status code (or ✓) when
-/// done, red on failure.
-fn status_cell(flow: &PaymentFlow, tick: usize) -> (String, Color) {
-    match flow.status {
-        FlowStatus::InProgress => (SPINNER[tick % SPINNER.len()].to_string(), Color::Yellow),
-        FlowStatus::Failed => (
-            flow_status_code(flow).map_or_else(|| "✗".to_string(), |c| c.to_string()),
-            Color::Red,
-        ),
-        _ => (
-            flow_status_code(flow).map_or_else(|| "✓".to_string(), |c| c.to_string()),
-            Color::Green,
-        ),
+/// Who a connection belongs to: shortened payer pubkey for paid traffic,
+/// client ip/host otherwise.
+fn who_label(conn: &ConnectionSummary) -> String {
+    conn.payer
+        .as_deref()
+        .map(short_pubkey)
+        .unwrap_or_else(|| conn.client_ip.clone())
+}
+
+/// `F82JLphK…og` style pubkey shortening: first 4 + `…` + last 4 chars.
+fn short_pubkey(pubkey: &str) -> String {
+    let chars: Vec<char> = pubkey.chars().collect();
+    if chars.len() <= 9 {
+        return pubkey.to_string();
     }
+    let head: String = chars[..4].iter().collect();
+    let tail: String = chars[chars.len() - 4..].iter().collect();
+    format!("{head}…{tail}")
 }
 
-/// Extract the upstream HTTP status code from the completion event that
-/// `AllExchanges` correlation appends (`"200 — completed in 12ms"`).
-fn flow_status_code(flow: &PaymentFlow) -> Option<u16> {
-    flow.events.iter().rev().find_map(|event| {
-        let (code, rest) = event.message.split_once(' ')?;
-        (rest.starts_with("— completed") && code.len() == 3)
-            .then(|| code.parse().ok())
-            .flatten()
-    })
+/// `$0.0120` — settled stablecoin total (USD, 4 decimals).
+fn paid_label(paid_usd: f64) -> String {
+    format!("${paid_usd:.4}")
 }
 
-fn tokens_per_sec_label(flow: &PaymentFlow) -> String {
-    flow.inference
-        .as_ref()
-        .and_then(|info| info.tokens_per_sec)
-        .map_or_else(|| "—".to_string(), |t| format!("{t:.1}"))
+/// `ok/total` request counts.
+fn reqs_label(conn: &ConnectionSummary) -> String {
+    format!("{}/{}", conn.ok, conn.requests)
+}
+
+/// First model plus a `+N` overflow marker (`llama3.2:3b +2`).
+fn models_label(models: &[String]) -> String {
+    match models.split_first() {
+        None => "—".to_string(),
+        Some((first, [])) => first.clone(),
+        Some((first, rest)) => format!("{first} +{}", rest.len()),
+    }
 }
 
 /// RFC3339 timestamp → local `HH:MM:SS`.
@@ -1123,8 +1209,37 @@ mod tests {
         }
     }
 
+    /// Connection aggregate with the given identity/provider and activity
+    /// timestamp (drives newest-first ordering).
+    fn conn(
+        id: &str,
+        payer: Option<&str>,
+        provider: Option<&str>,
+        updated_at: &str,
+    ) -> ConnectionSummary {
+        ConnectionSummary {
+            id: id.to_string(),
+            payer: payer.map(str::to_string),
+            client_ip: "127.0.0.1".to_string(),
+            provider: provider.map(str::to_string),
+            models: vec!["llama3.2:3b".to_string()],
+            requests: 3,
+            ok: 3,
+            failed: 0,
+            tokens_prompt: 120,
+            tokens_completion: 450,
+            paid_usd: 0.012,
+            started_at: "2026-07-01T12:00:00.000Z".to_string(),
+            updated_at: updated_at.to_string(),
+        }
+    }
+
     fn app_with(providers: Vec<ProviderSummary>, flows: Vec<PaymentFlow>) -> InferenceApp {
-        InferenceApp::new(providers, flows)
+        InferenceApp::new(providers, flows, vec![])
+    }
+
+    fn app_with_conns(connections: Vec<ConnectionSummary>) -> InferenceApp {
+        InferenceApp::new(vec![], vec![], connections)
     }
 
     // ── Event application ──
@@ -1219,55 +1334,92 @@ mod tests {
         assert!(app.providers.is_empty());
     }
 
+    // ── Connection events ──
+
+    #[test]
+    fn connections_snapshot_replaces_list_sorted_newest_first() {
+        let mut app = app_with_conns(vec![conn("old", None, None, "2026-07-01T11:00:00.000Z")]);
+        app.apply_event(SseMessage::ConnectionsSnapshot {
+            connections: vec![
+                conn("a", None, None, "2026-07-01T12:00:01.000Z"),
+                conn("b", None, None, "2026-07-01T12:00:05.000Z"),
+            ],
+        });
+        let ids: Vec<&str> = app.connections.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["b", "a"]);
+    }
+
+    #[test]
+    fn connection_updated_upserts_and_resorts_newest_first() {
+        let mut app = app_with_conns(vec![
+            conn("a", None, None, "2026-07-01T12:00:05.000Z"),
+            conn("b", None, None, "2026-07-01T12:00:01.000Z"),
+        ]);
+        // Fresh activity on the older connection moves it to the front and
+        // replaces its aggregates.
+        let mut b = conn("b", None, Some("ollama"), "2026-07-01T12:00:10.000Z");
+        b.requests = 4;
+        b.ok = 4;
+        app.apply_event(SseMessage::ConnectionUpdated { connection: b });
+        let ids: Vec<&str> = app.connections.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["b", "a"]);
+        assert_eq!(app.connections[0].requests, 4);
+        assert_eq!(app.connections[0].provider.as_deref(), Some("ollama"));
+
+        // An unseen id is inserted.
+        app.apply_event(SseMessage::ConnectionUpdated {
+            connection: conn("c", None, None, "2026-07-01T12:00:20.000Z"),
+        });
+        let ids: Vec<&str> = app.connections.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["c", "b", "a"]);
+    }
+
     // ── Follow-latest ──
 
     #[test]
-    fn follow_latest_tracks_new_flows_until_user_moves_selection() {
-        let mut app = app_with(
-            vec![],
-            vec![flow("f1", FlowStatus::ResourceDelivered, None)],
-        );
+    fn follow_latest_tracks_connection_activity_until_user_moves_selection() {
+        let mut app = app_with_conns(vec![
+            conn("a", None, None, "2026-07-01T12:00:05.000Z"),
+            conn("b", None, None, "2026-07-01T12:00:01.000Z"),
+        ]);
         assert!(app.follow);
-        assert_eq!(app.selected_flow().unwrap().id, "f1");
+        assert_eq!(app.selected_connection().unwrap().id, "a");
 
-        // While following, a new flow moves the selection.
-        app.apply_event(SseMessage::FlowCreated {
-            flow: flow("f2", FlowStatus::InProgress, None),
+        // While following, fresh activity moves the selection.
+        app.apply_event(SseMessage::ConnectionUpdated {
+            connection: conn("b", None, None, "2026-07-01T12:00:10.000Z"),
         });
-        assert_eq!(app.selected_flow().unwrap().id, "f2");
+        assert_eq!(app.selected_connection().unwrap().id, "b");
 
         // Moving the selection pins it…
         app.handle_key(KeyCode::Down, KeyModifiers::NONE);
         assert!(!app.follow);
-        assert_eq!(app.selected_flow().unwrap().id, "f1");
+        assert_eq!(app.selected_connection().unwrap().id, "a");
 
-        // …so new flows no longer steal it.
-        app.apply_event(SseMessage::FlowCreated {
-            flow: flow("f3", FlowStatus::InProgress, None),
+        // …so fresh activity no longer steals it.
+        app.apply_event(SseMessage::ConnectionUpdated {
+            connection: conn("c", None, None, "2026-07-01T12:00:20.000Z"),
         });
-        assert_eq!(app.selected_flow().unwrap().id, "f1");
+        assert_eq!(app.selected_connection().unwrap().id, "a");
     }
 
     #[test]
     fn enter_toggles_follow_latest() {
-        let mut app = app_with(
-            vec![],
-            vec![
-                flow("f1", FlowStatus::ResourceDelivered, None),
-                flow("f2", FlowStatus::ResourceDelivered, None),
-            ],
-        );
+        let mut app = app_with_conns(vec![
+            conn("newest", None, None, "2026-07-01T12:00:05.000Z"),
+            conn("older", None, None, "2026-07-01T12:00:01.000Z"),
+        ]);
         // Pin, then re-follow via Enter.
         app.handle_key(KeyCode::Down, KeyModifiers::NONE);
         assert!(!app.follow);
         app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
         assert!(app.follow);
-        assert_eq!(app.selected_flow().unwrap().id, "f2"); // newest
+        assert_eq!(app.selected_connection().unwrap().id, "newest");
 
         // Enter while following pins the current newest.
         app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
         assert!(!app.follow);
-        assert_eq!(app.selected_flow_id.as_deref(), Some("f2"));
+        assert_eq!(app.selected_id.as_deref(), Some("newest"));
     }
 
     // ── Filtering ──
@@ -1304,41 +1456,45 @@ mod tests {
     }
 
     #[test]
-    fn errors_and_provider_filters_narrow_the_flow_list() {
-        let mut app = app_with(
-            vec![provider("ollama", "Ollama", true, &[])],
-            vec![
-                flow("ok", FlowStatus::ResourceDelivered, Some("ollama")),
-                flow("bad", FlowStatus::Failed, None),
-            ],
-        );
-        assert_eq!(app.filtered_flows().len(), 2);
+    fn errors_and_provider_filters_narrow_the_connection_list() {
+        let mut app = app_with_conns(vec![
+            conn("ok", None, Some("ollama"), "2026-07-01T12:00:05.000Z"),
+            conn("bad", None, Some("lm-studio"), "2026-07-01T12:00:01.000Z"),
+        ]);
+        app.connections[1].failed = 2;
+        assert_eq!(app.filtered_connections().len(), 2);
 
         app.filter = Filter::Errors;
-        let ids: Vec<&str> = app.filtered_flows().iter().map(|f| f.id.as_str()).collect();
+        let ids: Vec<&str> = app
+            .filtered_connections()
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect();
         assert_eq!(ids, vec!["bad"]);
 
         app.filter = Filter::Provider("ollama".into());
-        let ids: Vec<&str> = app.filtered_flows().iter().map(|f| f.id.as_str()).collect();
+        let ids: Vec<&str> = app
+            .filtered_connections()
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect();
         assert_eq!(ids, vec!["ok"]);
     }
 
     #[test]
-    fn cycling_filter_releases_pinned_flow_that_gets_filtered_out() {
-        let mut app = app_with(
-            vec![],
-            vec![
-                flow("ok", FlowStatus::ResourceDelivered, None),
-                flow("bad", FlowStatus::Failed, None),
-            ],
-        );
-        // Pin the delivered flow, then switch to the errors filter.
+    fn cycling_filter_releases_pinned_connection_that_gets_filtered_out() {
+        let mut app = app_with_conns(vec![
+            conn("bad", None, None, "2026-07-01T12:00:05.000Z"),
+            conn("ok", None, None, "2026-07-01T12:00:01.000Z"),
+        ]);
+        app.connections[0].failed = 1;
+        // Pin the healthy (older) connection, then switch to errors.
         app.handle_key(KeyCode::Down, KeyModifiers::NONE);
-        assert_eq!(app.selected_flow_id.as_deref(), Some("ok"));
+        assert_eq!(app.selected_id.as_deref(), Some("ok"));
         app.cycle_filter();
         assert_eq!(app.filter, Filter::Errors);
         assert!(app.follow);
-        assert_eq!(app.selected_flow().unwrap().id, "bad");
+        assert_eq!(app.selected_connection().unwrap().id, "bad");
     }
 
     // ── Keys ──
@@ -1370,19 +1526,22 @@ mod tests {
     }
 
     #[test]
-    fn clear_empties_flow_list_and_resumes_follow() {
-        let mut app = app_with(
+    fn clear_empties_connections_and_flows_and_resumes_follow() {
+        let mut app = InferenceApp::new(
             vec![],
+            vec![flow("f1", FlowStatus::ResourceDelivered, None)],
             vec![
-                flow("f1", FlowStatus::ResourceDelivered, None),
-                flow("f2", FlowStatus::ResourceDelivered, None),
+                conn("a", None, None, "2026-07-01T12:00:05.000Z"),
+                conn("b", None, None, "2026-07-01T12:00:01.000Z"),
             ],
         );
         app.handle_key(KeyCode::Down, KeyModifiers::NONE); // pin
         app.handle_key(KeyCode::Char('c'), KeyModifiers::NONE);
+        assert!(app.connections.is_empty());
         assert!(app.flows.is_empty());
+        assert!(app.last_tokens.is_empty());
         assert!(app.follow);
-        assert!(app.selected_flow_id.is_none());
+        assert!(app.selected_id.is_none());
     }
 
     #[test]
@@ -1569,21 +1728,64 @@ mod tests {
     // ── Display helpers ──
 
     #[test]
-    fn status_helpers_extract_code_and_tok_s() {
-        let done = flow("a", FlowStatus::ResourceDelivered, Some("ollama"));
-        assert_eq!(flow_status_code(&done), Some(200));
-        assert_eq!(tokens_per_sec_label(&done), "41.2");
-        assert_eq!(status_cell(&done, 0), ("200".to_string(), Color::Green));
+    fn connection_row_formatting_helpers() {
+        // Pubkey shortening: first 4 + … + last 4; short strings untouched.
+        assert_eq!(short_pubkey("F82JLphK9vCd3mgnUtog"), "F82J…Utog");
+        assert_eq!(short_pubkey("shortkey1"), "shortkey1");
 
-        let mut failed = flow("b", FlowStatus::Failed, None);
-        failed.events.clear();
-        assert_eq!(status_cell(&failed, 0), ("✗".to_string(), Color::Red));
-        assert_eq!(tokens_per_sec_label(&failed), "—");
+        // WHO: payer wins over client ip.
+        let paid = conn(
+            "a",
+            Some("F82JLphK9vCd3mgnUtog"),
+            None,
+            "2026-07-01T12:00:01.000Z",
+        );
+        assert_eq!(who_label(&paid), "F82J…Utog");
+        let anon = conn("b", None, None, "2026-07-01T12:00:01.000Z");
+        assert_eq!(who_label(&anon), "127.0.0.1");
 
-        let in_progress = flow("c", FlowStatus::InProgress, None);
-        let (glyph, color) = status_cell(&in_progress, 3);
-        assert_eq!(glyph, SPINNER[3]);
-        assert_eq!(color, Color::Yellow);
+        // $ paid: 4 decimals; req counts: ok/total.
+        assert_eq!(paid_label(0.012), "$0.0120");
+        assert_eq!(paid_label(0.0), "$0.0000");
+        assert_eq!(reqs_label(&anon), "3/3");
+
+        // Models: first + overflow count.
+        assert_eq!(models_label(&[]), "—");
+        assert_eq!(models_label(&["a".to_string()]), "a");
+        assert_eq!(
+            models_label(&["a".to_string(), "b".to_string(), "c".to_string()]),
+            "a +2"
+        );
+    }
+
+    #[test]
+    fn in_flight_indicator_matches_by_client_ip_or_provider() {
+        let mut app = InferenceApp::new(
+            vec![],
+            vec![flow("f1", FlowStatus::InProgress, Some("ollama"))],
+            vec![
+                conn(
+                    "by-provider",
+                    None,
+                    Some("ollama"),
+                    "2026-07-01T12:00:05.000Z",
+                ),
+                conn("other", None, Some("lm-studio"), "2026-07-01T12:00:01.000Z"),
+            ],
+        );
+        // Flow client_ip is "::1" (helper default); conns use 127.0.0.1 —
+        // so only the provider fallback matches.
+        assert!(app.connection_in_flight(&app.connections[0].clone()));
+        assert!(!app.connection_in_flight(&app.connections[1].clone()));
+
+        // ip match works regardless of provider.
+        app.flows[0].client_ip = "127.0.0.1".to_string();
+        assert!(app.connection_in_flight(&app.connections[1].clone()));
+
+        // Nothing spins once the flow completes.
+        app.flows[0].status = FlowStatus::ResourceDelivered;
+        assert!(!app.connection_in_flight(&app.connections[0].clone()));
+        assert!(!app.connection_in_flight(&app.connections[1].clone()));
     }
 
     #[test]
@@ -1601,23 +1803,11 @@ mod tests {
 
     // ── Render smoke test ──
 
-    #[test]
-    fn render_smoke_test_contains_key_strings() {
-        let app = app_with(
-            vec![
-                provider("ollama", "Ollama", true, &["llama3.2:3b", "nomic-embed"]),
-                provider("llama-cpp", "llama.cpp", false, &[]),
-            ],
-            vec![
-                flow("f1", FlowStatus::ResourceDelivered, Some("ollama")),
-                flow("f2", FlowStatus::InProgress, Some("ollama")),
-            ],
-        );
-
-        let backend = ratatui::backend::TestBackend::new(100, 30);
+    fn render_to_text(app: &InferenceApp, width: u16, has_web: bool) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, 30);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render(frame, &app, "http://127.0.0.1:1402", true))
+            .draw(|frame| render(frame, app, "http://127.0.0.1:1402", has_web))
             .unwrap();
 
         let buffer = terminal.backend().buffer();
@@ -1628,6 +1818,31 @@ mod tests {
             }
             text.push('\n');
         }
+        text
+    }
+
+    #[test]
+    fn render_smoke_test_contains_key_strings() {
+        let app = InferenceApp::new(
+            vec![
+                provider("ollama", "Ollama", true, &["llama3.2:3b", "nomic-embed"]),
+                provider("llama-cpp", "llama.cpp", false, &[]),
+            ],
+            // Flows feed the chart + in-flight spinner only — their paths
+            // must not render as table rows anymore.
+            vec![
+                flow("f1", FlowStatus::ResourceDelivered, Some("ollama")),
+                flow("f2", FlowStatus::InProgress, Some("ollama")),
+            ],
+            vec![conn(
+                "conn-1",
+                Some("F82JLphK9vCd3mgnUtog"),
+                Some("ollama"),
+                "2026-07-01T12:01:24.020Z",
+            )],
+        );
+
+        let text = render_to_text(&app, 120, true);
 
         // Sidebar: Solana logo (braille glyph fragment) + heading + up card.
         assert!(text.contains("⣠⣶"), "missing solana logo:\n{text}");
@@ -1643,8 +1858,28 @@ mod tests {
         );
         assert!(text.contains("Ollama"), "missing provider title:\n{text}");
         assert!(text.contains("llama3.2:3b"), "missing model name:\n{text}");
-        assert!(text.contains("/v1/chat"), "missing request path:\n{text}");
         assert!(text.contains("web ui"), "missing web control:\n{text}");
+        // Connections table: aggregates for the one connection row.
+        assert!(
+            text.contains("CONNECTIONS"),
+            "missing connections table title:\n{text}"
+        );
+        assert!(
+            text.contains("F82J…Utog"),
+            "missing shortened payer:\n{text}"
+        );
+        assert!(text.contains("$0.0120"), "missing paid aggregate:\n{text}");
+        assert!(text.contains("450"), "missing completion tokens:\n{text}");
+        assert!(text.contains("3/3"), "missing ok/total requests:\n{text}");
+        // Per-message rows are gone: flow paths no longer render.
+        assert!(
+            !text.contains("/v1/chat"),
+            "per-message flow rows should be gone:\n{text}"
+        );
+        assert!(
+            !text.contains("REQUESTS"),
+            "requests table should be gone:\n{text}"
+        );
         // No header row, and down providers are not rendered at all.
         assert!(
             !text.contains("Pay Inference"),
@@ -1658,7 +1893,6 @@ mod tests {
             !text.contains("llama.cpp"),
             "down provider card rendered:\n{text}"
         );
-        // The bottom DETAIL panel is gone — the table fills the rest.
         assert!(
             !text.contains("DETAIL"),
             "detail panel should be gone:\n{text}"
@@ -1669,24 +1903,15 @@ mod tests {
     fn render_smoke_test_empty_state_shows_no_providers_detected() {
         let app = app_with(vec![provider("ollama", "Ollama", false, &[])], vec![]);
 
-        let backend = ratatui::backend::TestBackend::new(100, 30);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| render(frame, &app, "http://127.0.0.1:1402", false))
-            .unwrap();
-
-        let buffer = terminal.backend().buffer();
-        let mut text = String::new();
-        for y in 0..buffer.area.height {
-            for x in 0..buffer.area.width {
-                text.push_str(buffer[(x, y)].symbol());
-            }
-            text.push('\n');
-        }
+        let text = render_to_text(&app, 100, false);
 
         assert!(
             text.contains("no providers detected"),
             "missing empty state:\n{text}"
+        );
+        assert!(
+            text.contains("waiting for connections…"),
+            "missing empty connections state:\n{text}"
         );
         assert!(!text.contains("Ollama"), "down provider rendered:\n{text}");
         assert!(

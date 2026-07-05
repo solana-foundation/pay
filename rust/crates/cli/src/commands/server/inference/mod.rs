@@ -300,6 +300,7 @@ impl InferenceCommand {
         });
         let initial_providers = state.pdb.providers();
         let initial_flows = state.pdb.correlation.lock().unwrap().snapshot();
+        let initial_connections = state.pdb.connections();
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let proxy_thread = {
@@ -321,6 +322,7 @@ impl InferenceCommand {
             web_url: (!self.no_web).then(|| format!("http://{display_addr}{UI_PATH}/")),
             initial_providers,
             initial_flows,
+            initial_connections,
             events: event_rx,
         });
 

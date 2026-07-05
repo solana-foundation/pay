@@ -39,6 +39,10 @@ pub struct FlowCorrelation {
     /// `AllExchanges` mode: maps in-flight log id → flow id (stable across
     /// ring-buffer eviction, unlike indices).
     open_exchanges: HashMap<u64, String>,
+    /// `AllExchanges` mode: per-connection aggregates, keyed by payer wallet
+    /// (paid traffic) or client ip/host (unpaid). Bounded.
+    connections: HashMap<String, ConnectionSummary>,
+    connection_id_counter: u64,
     flow_id_counter: u64,
     mode: CorrelationMode,
     tx: broadcast::Sender<SseMessage>,
@@ -54,6 +58,8 @@ impl FlowCorrelation {
             flows: Vec::new(),
             flow_index: HashMap::new(),
             open_exchanges: HashMap::new(),
+            connections: HashMap::new(),
+            connection_id_counter: 0,
             flow_id_counter: 0,
             mode,
             tx,
@@ -62,6 +68,13 @@ impl FlowCorrelation {
 
     pub fn snapshot(&self) -> Vec<PaymentFlow> {
         self.flows.clone()
+    }
+
+    /// Current connection aggregates, most recently active first.
+    pub fn connections_snapshot(&self) -> Vec<ConnectionSummary> {
+        let mut connections: Vec<ConnectionSummary> = self.connections.values().cloned().collect();
+        connections.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        connections
     }
 
     pub fn ingest(&mut self, entry: LogEntry) {
@@ -195,7 +208,86 @@ impl FlowCorrelation {
                 .map(|b| truncate(b, 2000).to_string()),
         });
 
-        let _ = self.tx.send(SseMessage::FlowUpdated { flow: flow.clone() });
+        let completed = flow.clone();
+        let _ = self.tx.send(SseMessage::FlowUpdated {
+            flow: completed.clone(),
+        });
+        self.record_connection(&entry, &completed);
+    }
+
+    /// Fold a completed exchange into its connection's aggregates and
+    /// broadcast the updated summary. 402 challenges are protocol handshake,
+    /// not client activity — skipped entirely (the paid retry is what
+    /// counts). Connection key: payer wallet for paid traffic, client
+    /// ip/host otherwise.
+    fn record_connection(&mut self, entry: &LogEntry, flow: &PaymentFlow) {
+        const MAX_CONNECTIONS: usize = 100;
+        const MAX_MODELS: usize = 8;
+
+        if entry.status == 402 {
+            return;
+        }
+        let key = flow.payer.clone().unwrap_or_else(|| flow.client_ip.clone());
+
+        if !self.connections.contains_key(&key) && self.connections.len() >= MAX_CONNECTIONS {
+            // Evict the least recently active.
+            if let Some(oldest) = self
+                .connections
+                .iter()
+                .min_by(|a, b| a.1.updated_at.cmp(&b.1.updated_at))
+                .map(|(k, _)| k.clone())
+            {
+                self.connections.remove(&oldest);
+            }
+        }
+        self.connection_id_counter += 1;
+        let next_id = format!("conn-{}", self.connection_id_counter);
+        let connection = self
+            .connections
+            .entry(key)
+            .or_insert_with(|| ConnectionSummary {
+                id: next_id,
+                payer: None,
+                client_ip: flow.client_ip.clone(),
+                provider: None,
+                models: Vec::new(),
+                requests: 0,
+                ok: 0,
+                failed: 0,
+                tokens_prompt: 0,
+                tokens_completion: 0,
+                paid_usd: 0.0,
+                started_at: flow.updated_at.clone(),
+                updated_at: flow.updated_at.clone(),
+            });
+
+        connection.requests += 1;
+        if matches!(flow.status, FlowStatus::ResourceDelivered) {
+            connection.ok += 1;
+        } else {
+            connection.failed += 1;
+        }
+        if let Some(payer) = &flow.payer {
+            connection.payer = Some(payer.clone());
+        }
+        if let Some(inference) = &flow.inference {
+            connection.provider = Some(inference.provider.clone());
+            connection.tokens_prompt += inference.tokens_prompt.unwrap_or(0);
+            connection.tokens_completion += inference.tokens_completion.unwrap_or(0);
+            if let Some(model) = &inference.model
+                && !connection.models.contains(model)
+                && connection.models.len() < MAX_MODELS
+            {
+                connection.models.push(model.clone());
+            }
+        }
+        if let Some(usd) = paid_exchange_usd(entry) {
+            connection.paid_usd += usd;
+        }
+        connection.updated_at = flow.updated_at.clone();
+
+        let connection = connection.clone();
+        let _ = self.tx.send(SseMessage::ConnectionUpdated { connection });
     }
 
     fn create_completed_exchange(&mut self, entry: &LogEntry) {
@@ -246,7 +338,8 @@ impl FlowCorrelation {
         complete_exchange_steps(&mut flow, now);
 
         self.add_flow(flow.clone());
-        let _ = self.tx.send(SseMessage::FlowCreated { flow });
+        let _ = self.tx.send(SseMessage::FlowCreated { flow: flow.clone() });
+        self.record_connection(entry, &flow);
     }
 
     pub fn cleanup(&mut self) {
@@ -998,17 +1091,40 @@ fn challenge_request_amount(request: &serde_json::Value) -> Option<String> {
 /// the full challenge, so amount/decimals come from `challenge.request` —
 /// the same payload `extract_amount` reads from the original 402 header.
 fn paid_exchange_amount(entry: &LogEntry) -> Option<String> {
+    challenge_request_amount(&paid_exchange_request(entry)?)
+}
+
+/// Numeric USD value of a paid exchange — stablecoins aggregate 1:1 into USD
+/// across currencies (USDC/USDT/CASH…). `None` for unpaid/unbounded.
+fn paid_exchange_usd(entry: &LogEntry) -> Option<f64> {
+    let request = paid_exchange_request(entry)?;
+    let raw = request["amount"]
+        .as_str()
+        .or_else(|| request["cap"].as_str())?
+        .parse::<u64>()
+        .ok()?;
+    if raw == u64::MAX {
+        return None;
+    }
+    let decimals = request["methodDetails"]["decimals"]
+        .as_u64()
+        .or_else(|| request["decimals"].as_u64())
+        .unwrap_or(6);
+    Some(raw as f64 / 10f64.powi(decimals as i32))
+}
+
+/// Decoded challenge `request` payload from a settled (2xx) paid exchange.
+fn paid_exchange_request(entry: &LogEntry) -> Option<serde_json::Value> {
     if !(200..300).contains(&entry.status) {
         return None;
     }
     let credential = payment_credential_from_authorization(entry.req_headers.get("authorization"))?;
     let request = credential.get("challenge")?.get("request")?;
-    let request = match request {
-        serde_json::Value::String(encoded) => decode_json_value(encoded)?,
-        value @ serde_json::Value::Object(_) => value.clone(),
-        _ => return None,
-    };
-    challenge_request_amount(&request)
+    match request {
+        serde_json::Value::String(encoded) => decode_json_value(encoded),
+        value @ serde_json::Value::Object(_) => Some(value.clone()),
+        _ => None,
+    }
 }
 
 /// Extract the payer's pubkey from the payment authorization header.
@@ -1932,7 +2048,10 @@ mod tests {
                 "id": "ch-1", "realm": "test", "method": "solana",
                 "intent": "charge", "request": request
             },
-            "payload": {"type": "transaction", "transaction": "AA=="}
+            // `source` is extract_payer's fallback when the payload carries
+            // no transaction (a stub one would short-circuit the fallback).
+            "source": "payer-wallet-1",
+            "payload": {"type": "transaction"}
         }));
         format!("Payment {credential}")
     }
@@ -2002,6 +2121,99 @@ mod tests {
     }
 
     #[test]
+    fn connections_aggregate_paid_activity() {
+        let (tx, _rx) = broadcast::channel(64);
+        let mut engine = FlowCorrelation::with_mode(tx, CorrelationMode::AllExchanges);
+
+        // Two paid turns from the same wallet, plus the 402 handshakes.
+        for (id, prompt, completion) in [(1u64, 12, 200), (3, 30, 400)] {
+            // 402 challenge exchange — protocol handshake, must not count.
+            let mut challenge = make_entry("POST", "/v1/messages", 402);
+            challenge.id = id.wrapping_mul(100);
+            engine.ingest(challenge);
+
+            engine.begin_exchange(ExchangeStart {
+                inference: Some(InferenceInfo {
+                    provider: "ollama".into(),
+                    model: Some("gemma4:latest".into()),
+                    tokens_prompt: Some(prompt),
+                    tokens_completion: Some(completion),
+                    ..Default::default()
+                }),
+                ..make_start(id, "POST", "/v1/messages")
+            });
+            let mut done = make_entry("POST", "/v1/messages", 200);
+            done.id = id;
+            done.req_headers
+                .insert("authorization".into(), charge_authorization("1000", 6));
+            engine.ingest(done);
+        }
+
+        let connections = engine.connections_snapshot();
+        assert_eq!(connections.len(), 1, "same payer wallet = one connection");
+        let conn = &connections[0];
+        assert!(conn.payer.is_some(), "paid traffic keys by payer");
+        assert_eq!(conn.requests, 2, "402 handshakes excluded");
+        assert_eq!(conn.ok, 2);
+        assert_eq!(conn.failed, 0);
+        assert_eq!(conn.tokens_prompt, 42);
+        assert_eq!(conn.tokens_completion, 600);
+        assert!((conn.paid_usd - 0.002).abs() < 1e-9, "2 × $0.001 settled");
+        assert_eq!(conn.provider.as_deref(), Some("ollama"));
+        assert_eq!(conn.models, vec!["gemma4:latest"]);
+    }
+
+    #[test]
+    fn connections_unpaid_traffic_groups_by_client() {
+        let (tx, mut rx) = broadcast::channel(64);
+        let mut engine = FlowCorrelation::with_mode(tx, CorrelationMode::AllExchanges);
+
+        engine.ingest(make_entry("GET", "/api/tags", 200));
+        engine.ingest(make_entry("GET", "/api/tags", 500));
+
+        let connections = engine.connections_snapshot();
+        assert_eq!(connections.len(), 1);
+        assert_eq!(connections[0].payer, None);
+        assert_eq!(connections[0].client_ip, "127.0.0.1");
+        assert_eq!(connections[0].requests, 2);
+        assert_eq!(connections[0].ok, 1);
+        assert_eq!(connections[0].failed, 1);
+        assert_eq!(connections[0].paid_usd, 0.0);
+
+        // ConnectionUpdated broadcast after each completion.
+        let mut updates = 0;
+        while let Ok(msg) = rx.try_recv() {
+            if matches!(msg, SseMessage::ConnectionUpdated { .. }) {
+                updates += 1;
+            }
+        }
+        assert_eq!(updates, 2);
+    }
+
+    #[test]
+    fn connection_summary_wire_format() {
+        let (tx, _rx) = broadcast::channel(16);
+        let mut engine = FlowCorrelation::with_mode(tx, CorrelationMode::AllExchanges);
+        let mut done = make_entry("POST", "/v1/messages", 200);
+        done.req_headers
+            .insert("authorization".into(), charge_authorization("1000", 6));
+        engine.ingest(done);
+
+        let msg = SseMessage::ConnectionsSnapshot {
+            connections: engine.connections_snapshot(),
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+        assert_eq!(json["type"], "connections-snapshot");
+        let conn = &json["connections"][0];
+        assert_eq!(conn["clientIp"], "127.0.0.1");
+        assert_eq!(conn["tokensPrompt"], 0);
+        assert_eq!(conn["tokensCompletion"], 0);
+        assert!((conn["paidUsd"].as_f64().unwrap() - 0.001).abs() < 1e-9);
+        assert!(conn["requests"].as_u64() == Some(1));
+    }
+
+    #[test]
     fn all_exchanges_browser_noise_skipped() {
         let (tx, _rx) = broadcast::channel(16);
         let mut engine = FlowCorrelation::with_mode(tx, CorrelationMode::AllExchanges);
@@ -2011,7 +2223,10 @@ mod tests {
         engine.ingest(make_entry("GET", "/apple-touch-icon-precomposed.png", 404));
         engine.ingest(make_entry("GET", "/robots.txt", 404));
         engine.ingest(make_entry("GET", "/", 307));
-        assert!(engine.snapshot().is_empty(), "browser probes must not chart");
+        assert!(
+            engine.snapshot().is_empty(),
+            "browser probes must not chart"
+        );
 
         // Provider-root-adjacent real paths still record.
         engine.ingest(make_entry("GET", "/api/tags", 200));
