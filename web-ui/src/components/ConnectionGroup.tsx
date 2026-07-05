@@ -1,5 +1,5 @@
 import type { ConnectionSummary, ProviderSummary } from "../types";
-import { ProviderBadge } from "./FlowRow";
+import { ModelBadge } from "./ModelBadge";
 import {
   formatPaidUsd,
   formatTokenCount,
@@ -59,14 +59,30 @@ export function ConnectionGroupHeader({
       <span className="conn-who" title={connection.payer ?? connection.clientIp}>
         {who}
       </span>
-      {connection.provider && (
-        <ProviderBadge slug={connection.provider} providers={providers} />
-      )}
-      {connection.models && connection.models.length > 0 && (
-        <span className="conn-models" title={connection.models.join(", ")}>
-          {connection.models.join(", ")}
+      {/* Models are primary (badged, brand-colored); provider is a dim label. */}
+      {connection.models && connection.models.length > 0 ? (
+        <span className="conn-model-badges">
+          {connection.models.map((model) => (
+            <ModelBadge
+              key={model}
+              model={model}
+              provider={connection.provider ?? ""}
+              providers={providers}
+            />
+          ))}
         </span>
+      ) : (
+        connection.provider && (
+          <ModelBadge provider={connection.provider} providers={providers} />
+        )
       )}
+      {connection.models &&
+        connection.models.length > 0 &&
+        connection.provider && (
+          <span className="provider-label" title={connection.provider}>
+            {connection.provider}
+          </span>
+        )}
       <span className="conn-fill" />
       <span className="conn-reqs" title="ok / total requests">
         {connection.ok}/{connection.requests}

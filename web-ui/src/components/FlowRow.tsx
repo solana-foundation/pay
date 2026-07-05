@@ -4,7 +4,8 @@ import { ProtocolBadge } from "./ProtocolBadge";
 import { StatusIndicator } from "./StatusIndicator";
 import type { SessionInfo } from "../types";
 import { formatUnits } from "../lib/format";
-import { formatTokPerSec, isHexColor, providerColor } from "../lib/inference";
+import { formatTokPerSec } from "../lib/inference";
+import { ModelBadge } from "./ModelBadge";
 
 function fmtTime(iso: string): string {
   const d = new Date(iso);
@@ -40,24 +41,6 @@ interface Props {
   providers?: ProviderSummary[];
 }
 
-export function ProviderBadge({
-  slug,
-  providers,
-}: {
-  slug: string;
-  providers?: ProviderSummary[];
-}) {
-  const color = providerColor(slug, providers);
-  const style = isHexColor(color)
-    ? { color, background: `${color}22` }
-    : undefined;
-  return (
-    <span className="badge inference" style={style} title={slug}>
-      {slug.toUpperCase()}
-    </span>
-  );
-}
-
 export function FlowRow({ flow, selected, onClick, providers }: Props) {
   const channelOpen = flow.session?.state === "open";
   const sessionAmount = sessionRowAmount(flow.session);
@@ -69,14 +52,19 @@ export function FlowRow({ flow, selected, onClick, providers }: Props) {
       onClick={onClick}
     >
       {flow.inference ? (
-        <ProviderBadge slug={flow.inference.provider} providers={providers} />
+        // Model is the primary (badged) element; provider is the dim label.
+        <ModelBadge
+          model={flow.inference.model}
+          provider={flow.inference.provider}
+          providers={providers}
+        />
       ) : (
         <ProtocolBadge protocol={flow.protocol} scheme={flow.scheme} />
       )}
       <span className="resource">{flow.resource}</span>
       {flow.inference?.model && (
-        <span className="model" title={flow.inference.model}>
-          {flow.inference.model}
+        <span className="provider-label" title={flow.inference.provider}>
+          {flow.inference.provider}
         </span>
       )}
       {channelOpen && (

@@ -1,11 +1,14 @@
-import type { PaymentFlow } from "../types";
+import type { ReactNode } from "react";
+import type { PaymentFlow, ProviderSummary } from "../types";
 import { formatTokPerSec } from "../lib/inference";
+import { ModelBadge } from "./ModelBadge";
 
 interface Props {
   flow: PaymentFlow;
+  providers?: ProviderSummary[];
 }
 
-function Row({ label, value }: { label: string; value: string }) {
+function Row({ label, value }: { label: string; value: ReactNode }) {
   return (
     <div className="inference-row">
       <span className="inference-label">{label}</span>
@@ -14,7 +17,7 @@ function Row({ label, value }: { label: string; value: string }) {
   );
 }
 
-export function InferencePanel({ flow }: Props) {
+export function InferencePanel({ flow, providers }: Props) {
   const inf = flow.inference;
   if (!inf) return null;
   const live = flow.status === "in-progress";
@@ -35,8 +38,25 @@ export function InferencePanel({ flow }: Props) {
           </span>
         )}
       </h3>
-      <Row label="Provider" value={inf.provider} />
-      <Row label="Model" value={inf.model ?? "—"} />
+      {/* Model is the headline; provider is the muted secondary row. */}
+      <Row
+        label="Model"
+        value={
+          inf.model ? (
+            <ModelBadge
+              model={inf.model}
+              provider={inf.provider}
+              providers={providers}
+            />
+          ) : (
+            "—"
+          )
+        }
+      />
+      <Row
+        label="Provider"
+        value={<span className="inference-muted">{inf.provider}</span>}
+      />
       <Row label="Endpoint" value={inf.endpointKind ?? "other"} />
       <Row label="Streamed" value={inf.streamed ? "yes" : "no"} />
       <Row

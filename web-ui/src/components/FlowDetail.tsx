@@ -1,4 +1,4 @@
-import type { PaymentFlow } from "../types";
+import type { PaymentFlow, ProviderSummary } from "../types";
 import { SequenceDiagram } from "./SequenceDiagram";
 import { EventLog } from "./EventLog";
 import { PaymentSplits } from "./PaymentSplits";
@@ -9,9 +9,11 @@ import { hasPaymentData, inferenceSteps } from "../lib/inference";
 
 interface Props {
   flow: PaymentFlow;
+  // Live provider list (inference mode) — for model badge brand colors.
+  providers?: ProviderSummary[];
 }
 
-export function FlowDetail({ flow }: Props) {
+export function FlowDetail({ flow, providers }: Props) {
   const success = flow.status === "resource-delivered";
   const receiptLink = success && hasReceiptLink(flow) ? <ReceiptLink flow={flow} /> : null;
   // Un-metered inference flows get a simplified request → first token →
@@ -28,7 +30,7 @@ export function FlowDetail({ flow }: Props) {
       />
       <div className="flow-middle">
         {flow.inference ? (
-          <InferencePanel flow={flow} />
+          <InferencePanel flow={flow} providers={providers} />
         ) : flow.session ? (
           <SessionChannel flow={flow} />
         ) : (

@@ -1,13 +1,13 @@
-//! Live TUI for `pay serve inference`: provider sidebar, live rate chart,
-//! and per-connection activity table, fed by the PDB event stream
-//! (bridged from `broadcast::Sender<SseMessage>` to a `std::sync::mpsc`
-//! channel by the caller).
+//! Live TUI for `pay serve inference`: provider sidebar and per-connection
+//! activity table, fed by the PDB event stream (bridged from
+//! `broadcast::Sender<SseMessage>` to a `std::sync::mpsc` channel by the
+//! caller).
 //!
 //! Mirrors the topup TUI's visual language — 38-col dark sidebar, content
 //! window, 1-row controls bar, rounded borders — and its event-loop shape:
 //! 50ms `event::poll` tick, non-blocking channel drain, render, key handling.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::io;
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
@@ -17,28 +17,15 @@ use pay_pdb::types::{ConnectionSummary, FlowStatus, PaymentFlow, ProviderSummary
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style, Stylize};
-use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Axis, Block, BorderType, Borders, Chart, Clear, Dataset, GraphType, Paragraph,
-};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
 use super::term::{SPINNER, with_terminal};
-use super::theme::{
-    CARD_BG, SOLANA_GREEN, SOLANA_PURPLE, TOPUP_CARD_BG, TOPUP_MAIN_BG, TOPUP_SIDEBAR_BG,
-};
+use super::theme::{CARD_BG, SOLANA_GREEN, TOPUP_CARD_BG, TOPUP_MAIN_BG, TOPUP_SIDEBAR_BG};
 use super::widgets::{controls_bar, sidebar_card, solana_logo};
 
 /// Local flow ring-buffer cap — mirrors PDB's 200-flow ring buffer.
 const FLOW_CAP: usize = 200;
-
-/// Maximum per-second rate buckets retained for the live chart; the chart
-/// displays the trailing `max(chart width, 60)` seconds of this history.
-const CHART_WINDOW: usize = 300;
-/// Fixed chart height (1 legend row + plot) at the top of the content pane.
-const CHART_HEIGHT: u16 = 10;
-/// Hide the chart entirely when the content pane is shorter than this.
-const CHART_MIN_PANE_HEIGHT: u16 = 14;
 
 // ── Public API ────────────────────────────────────────────────────────────
 
@@ -76,7 +63,6 @@ pub fn run_inference_tui(args: InferenceTuiArgs) -> io::Result<()> {
 
     with_terminal(|terminal| {
         loop {
-            app.rates.roll_to(now_unix_secs());
             while let Ok(msg) = events.try_recv() {
                 app.apply_event(msg);
             }
@@ -132,64 +118,10 @@ enum Action {
     OpenWeb,
 }
 
-/// Sliding per-second rate buckets feeding the live chart: completion
-/// tokens received per second and stablecoin amounts received per second.
-/// Oldest bucket at the front, current second at the back.
-struct RateHistory {
-    tokens: VecDeque<f64>,
-    stable: VecDeque<f64>,
-    /// Wall-clock second (unix) the back bucket accumulates into.
-    current_sec: u64,
-}
-
-impl RateHistory {
-    fn new(now_sec: u64) -> Self {
-        let mut tokens = VecDeque::with_capacity(CHART_WINDOW);
-        let mut stable = VecDeque::with_capacity(CHART_WINDOW);
-        tokens.push_back(0.0);
-        stable.push_back(0.0);
-        Self {
-            tokens,
-            stable,
-            current_sec: now_sec,
-        }
-    }
-
-    /// Slide the window forward to `sec`: push one fresh bucket per elapsed
-    /// wall-clock second, dropping buckets beyond [`CHART_WINDOW`].
-    fn roll_to(&mut self, sec: u64) {
-        if sec <= self.current_sec {
-            return;
-        }
-        let steps = ((sec - self.current_sec) as usize).min(CHART_WINDOW);
-        for _ in 0..steps {
-            self.tokens.push_back(0.0);
-            self.stable.push_back(0.0);
-        }
-        while self.tokens.len() > CHART_WINDOW {
-            self.tokens.pop_front();
-            self.stable.pop_front();
-        }
-        self.current_sec = sec;
-    }
-
-    fn add_tokens(&mut self, delta: f64) {
-        if let Some(bucket) = self.tokens.back_mut() {
-            *bucket += delta;
-        }
-    }
-
-    fn add_stable(&mut self, amount: f64) {
-        if let Some(bucket) = self.stable.back_mut() {
-            *bucket += amount;
-        }
-    }
-}
-
 struct InferenceApp {
     providers: Vec<ProviderSummary>,
-    /// Flows, newest first, capped at [`FLOW_CAP`] — kept for the chart
-    /// buckets and the in-flight indicator (not rendered as rows).
+    /// Flows, newest first, capped at [`FLOW_CAP`] — kept only for the
+    /// in-flight indicator (not rendered as rows).
     flows: VecDeque<PaymentFlow>,
     /// Aggregated per-connection activity, newest activity first.
     connections: Vec<ConnectionSummary>,
@@ -205,11 +137,6 @@ struct InferenceApp {
     filter: Filter,
     /// Render-loop tick (~50ms) driving the spinner glyphs.
     tick: usize,
-    /// Per-second token/stablecoin rate buckets for the live chart.
-    rates: RateHistory,
-    /// Last-seen `tokens_completion` per flow id, so `FlowUpdated` adds
-    /// only the positive delta. Pruned alongside the flow ring buffer.
-    last_tokens: HashMap<String, u64>,
 }
 
 impl InferenceApp {
@@ -228,15 +155,11 @@ impl InferenceApp {
             follow: true,
             filter: Filter::All,
             tick: 0,
-            rates: RateHistory::new(now_unix_secs()),
-            last_tokens: HashMap::new(),
         };
         app.sort_connections();
         // Initial flows arrive oldest-first (PDB snapshot order); pushing
-        // each to the front leaves the newest at the front. Pre-existing
-        // token counts are baselines, not new activity — no bucket adds.
+        // each to the front leaves the newest at the front.
         for flow in initial_flows {
-            app.seed_token_baseline(&flow);
             app.push_flow(flow);
         }
         app
@@ -247,26 +170,15 @@ impl InferenceApp {
     fn apply_event(&mut self, msg: SseMessage) {
         match msg {
             SseMessage::Init { .. } => {}
+            // Flows are tracked only to drive the in-flight indicator.
             SseMessage::Snapshot { flows } => {
                 self.flows.clear();
-                self.last_tokens.clear();
                 for flow in flows {
-                    // Snapshot totals are history, not fresh activity.
-                    self.seed_token_baseline(&flow);
                     self.push_flow(flow);
                 }
             }
-            SseMessage::FlowCreated { flow } => {
-                self.record_flow_activity(&flow, None);
-                self.push_flow(flow);
-            }
+            SseMessage::FlowCreated { flow } => self.push_flow(flow),
             SseMessage::FlowUpdated { flow } => {
-                let prev_status = self
-                    .flows
-                    .iter()
-                    .find(|f| f.id == flow.id)
-                    .map(|f| f.status.clone());
-                self.record_flow_activity(&flow, prev_status.as_ref());
                 match self.flows.iter_mut().find(|f| f.id == flow.id) {
                     Some(existing) => *existing = flow,
                     // Update for a flow we never saw created (e.g. evicted,
@@ -303,50 +215,7 @@ impl InferenceApp {
     fn push_flow(&mut self, flow: PaymentFlow) {
         self.flows.push_front(flow);
         while self.flows.len() > FLOW_CAP {
-            if let Some(evicted) = self.flows.pop_back() {
-                self.last_tokens.remove(&evicted.id);
-            }
-        }
-    }
-
-    // ── Rate accounting (live chart) ──
-
-    /// Record a flow's token count without charting it — used for snapshot
-    /// and startup flows whose totals predate the TUI.
-    fn seed_token_baseline(&mut self, flow: &PaymentFlow) {
-        let tokens = flow
-            .inference
-            .as_ref()
-            .and_then(|info| info.tokens_completion)
-            .unwrap_or(0);
-        self.last_tokens.insert(flow.id.clone(), tokens);
-    }
-
-    /// Chart accounting for fresh flow activity: adds the positive
-    /// completion-token delta to the current second's bucket, and — when the
-    /// flow transitions to `resource-delivered` with an `amount` — the
-    /// parsed stablecoin amount.
-    fn record_flow_activity(&mut self, flow: &PaymentFlow, prev_status: Option<&FlowStatus>) {
-        let tokens = flow
-            .inference
-            .as_ref()
-            .and_then(|info| info.tokens_completion)
-            .unwrap_or(0);
-        let last = self.last_tokens.entry(flow.id.clone()).or_insert(0);
-        if tokens > *last {
-            let delta = tokens - *last;
-            *last = tokens;
-            self.rates.add_tokens(delta as f64);
-        }
-
-        let delivered_now = flow.status == FlowStatus::ResourceDelivered;
-        let was_delivered = prev_status.is_some_and(|s| *s == FlowStatus::ResourceDelivered);
-        if delivered_now
-            && !was_delivered
-            && let Some(amount) = flow.amount.as_deref()
-            && let Some(value) = parse_stablecoin_amount(amount)
-        {
-            self.rates.add_stable(value);
+            self.flows.pop_back();
         }
     }
 
@@ -483,11 +352,10 @@ impl InferenceApp {
     }
 
     /// Clear the local connection + flow lists (display only — PDB history
-    /// is untouched; chart history is kept, token baselines reset).
+    /// is untouched).
     fn clear_activity(&mut self) {
         self.connections.clear();
         self.flows.clear();
-        self.last_tokens.clear();
         self.selected_id = None;
         self.follow = true;
     }
@@ -544,7 +412,7 @@ fn render(frame: &mut Frame, app: &InferenceApp, gateway_url: &str, has_web: boo
 
     let columns = Layout::horizontal([Constraint::Length(38), Constraint::Min(32)]).split(rows[0]);
     render_providers(frame, columns[0], app);
-    render_content(frame, columns[1], app);
+    render_connections(frame, columns[1], app);
 
     render_controls(frame, rows[1], app, gateway_url, has_web);
 }
@@ -697,96 +565,6 @@ fn render_providers(frame: &mut Frame, area: Rect, app: &InferenceApp) {
     }
 }
 
-fn render_content(frame: &mut Frame, area: Rect, app: &InferenceApp) {
-    // Chart on top (fixed height), hidden when the pane is too small; the
-    // connections table fills all remaining height.
-    let chart_height = if area.height < CHART_MIN_PANE_HEIGHT {
-        0
-    } else {
-        CHART_HEIGHT
-    };
-    let split =
-        Layout::vertical([Constraint::Length(chart_height), Constraint::Min(0)]).split(area);
-    if chart_height > 0 {
-        render_chart(frame, split[0], app);
-    }
-    render_connections(frame, split[1], app);
-}
-
-/// scope-tui-style live chart: braille line plot of completion tokens/s
-/// (purple) and stablecoins/s (green) over a sliding per-second window.
-/// No borders, no axis labels — one legend row with the window peaks, each
-/// series normalized to its own max.
-fn render_chart(frame: &mut Frame, area: Rect, app: &InferenceApp) {
-    if area.height < 2 || area.width == 0 {
-        return;
-    }
-    let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(area);
-    let plot = rows[1];
-
-    // Window = as many seconds as the plot is wide, at least 60.
-    let window = (plot.width as usize).max(60);
-    let (token_points, token_peak) = series_points(&app.rates.tokens, window);
-    let (stable_points, stable_peak) = series_points(&app.rates.stable, window);
-
-    let legend = Line::from(vec![
-        Span::styled("tok/s ▮ ", Style::default().fg(SOLANA_PURPLE)),
-        Span::styled(
-            format!("{token_peak:.0}"),
-            Style::default().fg(SOLANA_PURPLE).bold(),
-        ),
-        Span::raw("   "),
-        Span::styled("usdc/s ▮ ", Style::default().fg(SOLANA_GREEN)),
-        Span::styled(
-            format!("{stable_peak:.2}"),
-            Style::default().fg(SOLANA_GREEN).bold(),
-        ),
-    ]);
-    frame.render_widget(
-        Paragraph::new(legend).style(Style::default().bg(TOPUP_MAIN_BG)),
-        rows[0],
-    );
-
-    let datasets = vec![
-        Dataset::default()
-            .marker(Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(Style::default().fg(SOLANA_PURPLE))
-            .data(&token_points),
-        Dataset::default()
-            .marker(Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(Style::default().fg(SOLANA_GREEN))
-            .data(&stable_points),
-    ];
-    let chart = Chart::new(datasets)
-        .x_axis(Axis::default().bounds([0.0, (window.saturating_sub(1)) as f64]))
-        // Series are normalized to their own peaks; small headroom keeps
-        // the max off the top edge.
-        .y_axis(Axis::default().bounds([0.0, 1.05]))
-        .style(Style::default().bg(TOPUP_MAIN_BG));
-    frame.render_widget(chart, plot);
-}
-
-/// Trailing `window` buckets as chart points normalized to the window's
-/// peak (each series scales to its own max); returns the points and the
-/// peak. Data shorter than the window is right-aligned (newest at the
-/// right edge).
-fn series_points(buckets: &VecDeque<f64>, window: usize) -> (Vec<(f64, f64)>, f64) {
-    let len = buckets.len().min(window);
-    let skip = buckets.len() - len;
-    let peak = buckets.iter().skip(skip).copied().fold(0.0, f64::max);
-    let denom = if peak > 0.0 { peak } else { 1.0 };
-    let start_x = window - len;
-    let points = buckets
-        .iter()
-        .skip(skip)
-        .enumerate()
-        .map(|(i, value)| ((start_x + i) as f64, value / denom))
-        .collect();
-    (points, peak)
-}
-
 // Connections-table column widths (characters). `models` takes whatever
 // width remains.
 /// Selection marker / in-flight spinner column ("▸ " / "⠹ ").
@@ -811,8 +589,10 @@ fn render_connections(frame: &mut Frame, area: Rect, app: &InferenceApp) {
             app.filter_label()
         );
     }
+    // Gray borders throughout this TUI: slightly brighter when the pane
+    // has focus, dark otherwise — never green.
     let border_color = if app.pane == Pane::Requests {
-        Color::Green
+        Color::Gray
     } else {
         Color::DarkGray
     };
@@ -1093,22 +873,6 @@ fn short_time(ts: &str) -> String {
                 .to_string()
         })
         .unwrap_or_else(|_| ts.get(11..19).unwrap_or(ts).to_string())
-}
-
-/// Current wall-clock time in whole unix seconds.
-fn now_unix_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// Parse the leading decimal of a flow amount (`"0.0100 USDC"` → `0.01`).
-/// Non-numeric amounts (e.g. `"unbounded"`) yield `None`.
-fn parse_stablecoin_amount(amount: &str) -> Option<f64> {
-    let token = amount.split_whitespace().next()?;
-    let value: f64 = token.parse().ok()?;
-    (value.is_finite() && value >= 0.0).then_some(value)
 }
 
 /// Trailing port digits of a base URL (`http://127.0.0.1:11434` → `11434`).
@@ -1541,7 +1305,6 @@ mod tests {
         app.handle_key(KeyCode::Char('c'), KeyModifiers::NONE);
         assert!(app.connections.is_empty());
         assert!(app.flows.is_empty());
-        assert!(app.last_tokens.is_empty());
         assert!(app.follow);
         assert!(app.selected_id.is_none());
     }
@@ -1569,162 +1332,6 @@ mod tests {
             app.handle_key(KeyCode::Char('x'), KeyModifiers::NONE),
             Action::None
         );
-    }
-
-    // ── Chart rate accounting ──
-
-    /// Flow with a specific completion-token count.
-    fn flow_tokens(id: &str, status: FlowStatus, tokens: u64) -> PaymentFlow {
-        let mut f = flow(id, status, Some("ollama"));
-        f.inference.as_mut().unwrap().tokens_completion = Some(tokens);
-        f
-    }
-
-    #[test]
-    fn token_deltas_accumulate_into_current_bucket() {
-        let mut app = app_with(vec![], vec![]);
-
-        // FlowCreated with an initial count charts the full count.
-        app.apply_event(SseMessage::FlowCreated {
-            flow: flow_tokens("a", FlowStatus::InProgress, 100),
-        });
-        assert_eq!(app.rates.tokens.back(), Some(&100.0));
-
-        // FlowUpdated on the same flow charts only the positive delta.
-        app.apply_event(SseMessage::FlowUpdated {
-            flow: flow_tokens("a", FlowStatus::InProgress, 160),
-        });
-        assert_eq!(app.rates.tokens.back(), Some(&160.0));
-
-        // A lower/equal count charts nothing.
-        app.apply_event(SseMessage::FlowUpdated {
-            flow: flow_tokens("a", FlowStatus::InProgress, 150),
-        });
-        assert_eq!(app.rates.tokens.back(), Some(&160.0));
-
-        // A second flow adds independently.
-        app.apply_event(SseMessage::FlowCreated {
-            flow: flow_tokens("b", FlowStatus::InProgress, 40),
-        });
-        assert_eq!(app.rates.tokens.back(), Some(&200.0));
-    }
-
-    #[test]
-    fn snapshot_and_initial_flows_seed_baselines_without_charting() {
-        // Initial flows: totals predate the TUI, nothing charted.
-        let mut app = app_with(vec![], vec![flow_tokens("a", FlowStatus::InProgress, 500)]);
-        assert!(app.rates.tokens.iter().all(|v| *v == 0.0));
-
-        // Snapshot: same — but a later update charts only the delta.
-        app.apply_event(SseMessage::Snapshot {
-            flows: vec![flow_tokens("b", FlowStatus::InProgress, 300)],
-        });
-        assert!(app.rates.tokens.iter().all(|v| *v == 0.0));
-        app.apply_event(SseMessage::FlowUpdated {
-            flow: flow_tokens("b", FlowStatus::InProgress, 336),
-        });
-        assert_eq!(app.rates.tokens.back(), Some(&36.0));
-    }
-
-    #[test]
-    fn bucket_window_slides_and_caps_at_chart_window() {
-        let mut app = app_with(vec![], vec![]);
-        let start = app.rates.current_sec;
-        app.rates.add_tokens(5.0);
-
-        // One elapsed second: previous bucket keeps its total, fresh
-        // current bucket starts at zero.
-        app.rates.roll_to(start + 1);
-        assert_eq!(app.rates.tokens.len(), 2);
-        assert_eq!(app.rates.tokens[0], 5.0);
-        assert_eq!(app.rates.tokens.back(), Some(&0.0));
-
-        // Time going backwards (or repeating) is a no-op.
-        app.rates.roll_to(start);
-        assert_eq!(app.rates.tokens.len(), 2);
-
-        // A large jump caps the history at the window size.
-        app.rates.roll_to(start + 10_000);
-        assert_eq!(app.rates.tokens.len(), CHART_WINDOW);
-        assert_eq!(app.rates.stable.len(), CHART_WINDOW);
-        assert!(app.rates.tokens.iter().all(|v| *v == 0.0));
-    }
-
-    #[test]
-    fn evicted_flows_prune_token_baselines() {
-        let mut app = app_with(vec![], vec![]);
-        for i in 0..(FLOW_CAP + 5) {
-            app.apply_event(SseMessage::FlowCreated {
-                flow: flow_tokens(&format!("flow-{i}"), FlowStatus::InProgress, 10),
-            });
-        }
-        assert_eq!(app.last_tokens.len(), FLOW_CAP);
-        assert!(!app.last_tokens.contains_key("flow-0"));
-        assert!(
-            app.last_tokens
-                .contains_key(&format!("flow-{}", FLOW_CAP + 4))
-        );
-    }
-
-    #[test]
-    fn stablecoin_amounts_chart_on_delivery_transition_only() {
-        let mut app = app_with(vec![], vec![]);
-        let mut f = flow("a", FlowStatus::InProgress, None);
-        f.amount = Some("0.0100 USDC".to_string());
-
-        // In-progress with an amount: nothing charted yet.
-        app.apply_event(SseMessage::FlowCreated { flow: f.clone() });
-        assert_eq!(app.rates.stable.back(), Some(&0.0));
-
-        // Transition to delivered charts the amount…
-        f.status = FlowStatus::ResourceDelivered;
-        app.apply_event(SseMessage::FlowUpdated { flow: f.clone() });
-        assert_eq!(app.rates.stable.back(), Some(&0.01));
-
-        // …and a repeat update while already delivered does not double-count.
-        app.apply_event(SseMessage::FlowUpdated { flow: f.clone() });
-        assert_eq!(app.rates.stable.back(), Some(&0.01));
-
-        // A flow created already-delivered (one-shot exchange) counts once.
-        let mut g = flow("b", FlowStatus::ResourceDelivered, None);
-        g.amount = Some("0.0200 USDC".to_string());
-        app.apply_event(SseMessage::FlowCreated { flow: g });
-        assert!((app.rates.stable.back().unwrap() - 0.03).abs() < 1e-9);
-
-        // Unparseable amounts are ignored.
-        let mut h = flow("c", FlowStatus::ResourceDelivered, None);
-        h.amount = Some("unbounded".to_string());
-        app.apply_event(SseMessage::FlowCreated { flow: h });
-        assert!((app.rates.stable.back().unwrap() - 0.03).abs() < 1e-9);
-    }
-
-    #[test]
-    fn parse_stablecoin_amount_handles_amount_formats() {
-        assert_eq!(parse_stablecoin_amount("0.0100 USDC"), Some(0.01));
-        assert_eq!(parse_stablecoin_amount("12.5"), Some(12.5));
-        assert_eq!(parse_stablecoin_amount("unbounded"), None);
-        assert_eq!(parse_stablecoin_amount(""), None);
-        assert_eq!(parse_stablecoin_amount("-1 USDC"), None);
-        assert_eq!(parse_stablecoin_amount("NaN USDC"), None);
-    }
-
-    #[test]
-    fn series_points_normalize_and_right_align() {
-        let mut buckets = VecDeque::new();
-        buckets.extend([0.0, 5.0, 10.0]);
-        let (points, peak) = series_points(&buckets, 60);
-        assert_eq!(peak, 10.0);
-        assert_eq!(points.len(), 3);
-        // Right-aligned: newest bucket lands at x = window - 1.
-        assert_eq!(points[0], (57.0, 0.0));
-        assert_eq!(points[2], (59.0, 1.0));
-        assert_eq!(points[1], (58.0, 0.5));
-
-        // All-zero series: peak 0, values stay 0 (no divide-by-zero).
-        let zeros: VecDeque<f64> = [0.0, 0.0].into_iter().collect();
-        let (points, peak) = series_points(&zeros, 60);
-        assert_eq!(peak, 0.0);
-        assert!(points.iter().all(|(_, y)| *y == 0.0));
     }
 
     // ── Display helpers ──
@@ -1830,8 +1437,8 @@ mod tests {
                 provider("ollama", "Ollama", true, &["llama3.2:3b", "nomic-embed"]),
                 provider("llama-cpp", "llama.cpp", false, &[]),
             ],
-            // Flows feed the chart + in-flight spinner only — their paths
-            // must not render as table rows anymore.
+            // Flows feed the in-flight spinner only — their paths must
+            // not render as table rows.
             vec![
                 flow("f1", FlowStatus::ResourceDelivered, Some("ollama")),
                 flow("f2", FlowStatus::InProgress, Some("ollama")),
@@ -1852,11 +1459,10 @@ mod tests {
             text.contains("PROVIDERS"),
             "missing sidebar heading:\n{text}"
         );
-        // Chart legend (both series, colored per series).
-        assert!(text.contains("tok/s ▮"), "missing token legend:\n{text}");
+        // The chart is gone — no legend renders.
         assert!(
-            text.contains("usdc/s ▮"),
-            "missing stablecoin legend:\n{text}"
+            !text.contains("tok/s ▮"),
+            "chart legend should be gone:\n{text}"
         );
         assert!(text.contains("Ollama"), "missing provider title:\n{text}");
         assert!(text.contains("llama3.2:3b"), "missing model name:\n{text}");

@@ -372,14 +372,13 @@ body {
   font-weight: 500;
 }
 
-.conn-models {
-  font-family: var(--font-mono);
-  font-size: 11px;
-  color: var(--fg-muted);
+.conn-model-badges {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
   min-width: 0;
+  flex-shrink: 1;
 }
 
 .conn-fill {
@@ -411,12 +410,13 @@ body {
 
 /* ── Inference row columns ── */
 
-.flow-row .model {
-  color: var(--fg-secondary);
+/* Secondary, muted provider label shown next to the primary model badge */
+.provider-label {
+  color: var(--fg-muted);
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: 11px;
   flex-shrink: 0;
-  max-width: 180px;
+  max-width: 120px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -464,6 +464,17 @@ body {
 .badge.http {
   background: var(--border-subtle);
   color: var(--fg-secondary);
+}
+
+/* Model badge — the primary element on inference rows/headers. Model ids
+   are case-sensitive, so no uppercasing; long ids get ellipsized. */
+.badge.model {
+  text-transform: none;
+  font-family: var(--font-mono);
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* ── Status Indicator ── */
@@ -623,6 +634,14 @@ body {
   color: var(--fg-muted);
   font-size: 12px;
   flex-shrink: 0;
+}
+
+.inference-value .badge {
+  font-size: 10px;
+}
+
+.inference-muted {
+  color: var(--fg-muted);
 }
 
 .inference-value {

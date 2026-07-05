@@ -112,7 +112,9 @@ export function FlowList({
                     }
                     providers={providers}
                   />
-                  {selectedId === flow.id && <FlowDetail flow={flow} />}
+                  {selectedId === flow.id && (
+                    <FlowDetail flow={flow} providers={providers} />
+                  )}
                 </div>
               ))}
           </div>
