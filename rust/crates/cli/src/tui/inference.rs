@@ -845,8 +845,10 @@ fn render_connections(frame: &mut Frame, area: Rect, app: &InferenceApp) {
         prov = "prov",
         models = "models",
         req = "req",
-        tin = "tok in",
-        tout = "tok out",
+        // ↓ tokens in (prompt), ↑ tokens out (completion) — matches the
+        // web UI's arrow convention.
+        tin = "↓",
+        tout = "↑",
         paid = "$ paid",
         last = "last",
         ww = COL_WHO,
