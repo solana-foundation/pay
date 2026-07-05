@@ -40,7 +40,7 @@ interface Props {
   providers?: ProviderSummary[];
 }
 
-function ProviderBadge({
+export function ProviderBadge({
   slug,
   providers,
 }: {

@@ -10,5 +10,6 @@ export type {
   PaymentFlow,
   ProviderSummary,
   InferenceInfo,
+  ConnectionSummary,
   SSEMessage,
 } from "../api/types";

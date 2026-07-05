@@ -12,9 +12,8 @@ function AppInner() {
   const config = useConfig();
   const appMode = useAppMode();
   const inference = appMode === "inference";
-  const { flows, viewerIp, connected, clear, providers } = useFlows(
-    config?.providers,
-  );
+  const { flows, viewerIp, connected, clear, providers, connections } =
+    useFlows(config?.providers);
   const { theme, toggle: toggleTheme } = useTheme();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [mode, setMode] = useState<FilterMode>("all");
@@ -60,6 +59,14 @@ function AppInner() {
     });
   }, [flows, mode, viewerIp, search, inference, providerFilter]);
 
+  // Provider filter pills also filter connection groups (by last-seen
+  // provider). undefined outside inference mode keeps FlowList flat.
+  const visibleConnections = useMemo(() => {
+    if (!inference) return undefined;
+    if (!providerFilter) return connections;
+    return connections.filter((c) => c.provider === providerFilter);
+  }, [inference, connections, providerFilter]);
+
   return (
     <div className="app">
       <div className="main">
@@ -92,6 +99,7 @@ function AppInner() {
           selectedId={selectedId}
           onSelect={handleSelect}
           providers={inference ? providers : undefined}
+          connections={visibleConnections}
         />
       </div>
       <div className={`sidebar${sidebarOpen ? "" : " collapsed"}`}>

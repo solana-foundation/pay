@@ -325,6 +325,90 @@ body {
   text-align: right;
 }
 
+/* ── Connection groups (inference mode) ── */
+
+.conn-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 8px 24px;
+  background: var(--surface);
+  border: none;
+  border-bottom: 1px solid var(--border-subtle);
+  cursor: pointer;
+  font-family: var(--font);
+  font-size: 12px;
+  color: var(--fg);
+  text-align: left;
+}
+
+.conn-header:hover {
+  background: var(--bg-raised);
+}
+
+.conn-caret {
+  display: flex;
+  align-items: center;
+  color: var(--fg-muted);
+  flex-shrink: 0;
+  transition: transform 0.15s ease;
+}
+
+.conn-caret.open {
+  transform: rotate(90deg);
+}
+
+.conn-who {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg);
+  flex-shrink: 0;
+}
+
+.conn-who.other {
+  color: var(--fg-muted);
+  font-weight: 500;
+}
+
+.conn-models {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--fg-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.conn-fill {
+  flex: 1;
+}
+
+.conn-reqs,
+.conn-tokens {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--fg-secondary);
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.conn-failed {
+  color: var(--red);
+}
+
+.conn-paid {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--green);
+  flex-shrink: 0;
+  min-width: 68px;
+  text-align: right;
+}
+
 /* ── Inference row columns ── */
 
 .flow-row .model {

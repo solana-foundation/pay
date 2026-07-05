@@ -1,5 +1,11 @@
 import { useReducer, useEffect, useRef, useCallback } from "react";
-import type { PaymentFlow, ProviderSummary, SSEMessage } from "../types";
+import type {
+  ConnectionSummary,
+  PaymentFlow,
+  ProviderSummary,
+  SSEMessage,
+} from "../types";
+import { sortConnections } from "../lib/connections";
 
 export interface FlowState {
   flows: PaymentFlow[];
@@ -9,6 +15,8 @@ export interface FlowState {
   // True once a `provider-status` SSE message has arrived; config-seeded
   // providers never overwrite live data.
   providersLive: boolean;
+  // Per-connection aggregates (inference mode), newest activity first.
+  connections: ConnectionSummary[];
 }
 
 export type FlowAction =
@@ -18,6 +26,8 @@ export type FlowAction =
   | { type: "flow-updated"; flow: PaymentFlow }
   | { type: "provider-status"; providers: ProviderSummary[] }
   | { type: "seed-providers"; providers: ProviderSummary[] }
+  | { type: "connections-snapshot"; connections: ConnectionSummary[] }
+  | { type: "connection-updated"; connection: ConnectionSummary }
   | { type: "clear" }
   | { type: "connected"; value: boolean };
 
@@ -43,8 +53,23 @@ export function reducer(state: FlowState, action: FlowAction): FlowState {
       return state.providersLive
         ? state
         : { ...state, providers: action.providers };
+    case "connections-snapshot":
+      // Full replacement; defensively re-sorted newest-activity first.
+      return { ...state, connections: sortConnections(action.connections) };
+    case "connection-updated": {
+      // Upsert by id, then resort by updatedAt desc.
+      const rest = state.connections.filter(
+        (c) => c.id !== action.connection.id,
+      );
+      return {
+        ...state,
+        connections: sortConnections([action.connection, ...rest]),
+      };
+    }
     case "clear":
-      return { ...state, flows: [] };
+      // Clearing the log also drops per-connection aggregates so the grouped
+      // view starts fresh; the backend repopulates them on new traffic.
+      return { ...state, flows: [], connections: [] };
     case "connected":
       return { ...state, connected: action.value };
   }
@@ -56,6 +81,7 @@ export const initialFlowState: FlowState = {
   connected: false,
   providers: [],
   providersLive: false,
+  connections: [],
 };
 
 export function useFlows(initialProviders?: ProviderSummary[]) {
@@ -96,6 +122,15 @@ export function useFlows(initialProviders?: ProviderSummary[]) {
           break;
         case "provider-status":
           dispatch({ type: "provider-status", providers: msg.providers });
+          break;
+        case "connections-snapshot":
+          dispatch({
+            type: "connections-snapshot",
+            connections: msg.connections,
+          });
+          break;
+        case "connection-updated":
+          dispatch({ type: "connection-updated", connection: msg.connection });
           break;
       }
     };

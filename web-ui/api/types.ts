@@ -86,6 +86,24 @@ export interface InferenceInfo {
   tokensPerSec?: number;
 }
 
+// ── Connection (inference mode grouping) ──
+
+export interface ConnectionSummary {
+  id: string; // "conn-1"
+  payer?: string; // wallet pubkey (paid traffic)
+  clientIp: string;
+  provider?: string; // last-seen provider slug
+  models?: string[]; // distinct, bounded
+  requests: number;
+  ok: number;
+  failed: number;
+  tokensPrompt: number;
+  tokensCompletion: number;
+  paidUsd: number; // all stablecoins aggregated 1:1 into USD
+  startedAt: string;
+  updatedAt: string;
+}
+
 // ── Payment Flow ──
 
 export interface PaymentFlow {
@@ -120,4 +138,6 @@ export type SSEMessage =
   | { type: "snapshot"; flows: PaymentFlow[] }
   | { type: "flow-created"; flow: PaymentFlow }
   | { type: "flow-updated"; flow: PaymentFlow }
-  | { type: "provider-status"; providers: ProviderSummary[] };
+  | { type: "provider-status"; providers: ProviderSummary[] }
+  | { type: "connection-updated"; connection: ConnectionSummary }
+  | { type: "connections-snapshot"; connections: ConnectionSummary[] };
