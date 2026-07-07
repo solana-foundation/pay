@@ -2113,38 +2113,61 @@ fn validate_price_precision(metering: &Metering, path: &str, errs: &mut Vec<Stri
     let threshold = 10f64.powi(-(MAX_DECIMALS as i32)); // 0.000001
 
     for dim in &metering.dimensions {
-        let scale = dim.scale.max(1) as f64;
-        for tier in &dim.tiers {
-            if tier.price_usd == 0.0 {
-                continue;
-            }
-            let per_unit = tier.price_usd / scale;
-            if per_unit < threshold && per_unit > 0.0 {
-                errs.push(format!(
-                    "endpoint `{path}`: price ${:.6}/unit (${} / scale {}) is below the \
-                     minimum representable amount for 6-decimal tokens (${threshold}) — \
-                     reduce scale or increase price_usd",
-                    per_unit, tier.price_usd, dim.scale
-                ));
-            }
-        }
+        check_dimension_precision(dim, threshold, path, None, errs);
     }
 
     for variant in &metering.variants {
         for dim in &variant.dimensions {
-            let scale = dim.scale.max(1) as f64;
-            for tier in &dim.tiers {
-                if tier.price_usd == 0.0 {
-                    continue;
-                }
-                let per_unit = tier.price_usd / scale;
-                if per_unit < threshold && per_unit > 0.0 {
-                    errs.push(format!(
-                        "endpoint `{path}` (variant {}={}): price ${:.6}/unit (${} / scale {}) \
-                         is below the minimum representable amount for 6-decimal tokens",
-                        variant.param, variant.value, per_unit, tier.price_usd, dim.scale
-                    ));
-                }
+            check_dimension_precision(dim, threshold, path, Some(variant), errs);
+        }
+    }
+}
+
+/// Precision check for one metering dimension.
+///
+/// Per-unit-settled dimensions (a flat charge per request/byte) must have a
+/// per-unit price at or above the 6-decimal floor — else each unit rounds to
+/// zero and the operator collects nothing. Aggregate-settled dimensions
+/// (`unit: tokens`, or any dimension read from response usage via a `meter`)
+/// are charged `Σ quantity/scale × price` and rounded **once** at
+/// settlement, so their per-unit rate is legitimately sub-microdollar (LLM
+/// token prices are quoted per million). For those we validate the *bucket*
+/// price (`price_usd`, the charge for `scale` units) against the floor.
+fn check_dimension_precision(
+    dim: &MeterDimension,
+    threshold: f64,
+    path: &str,
+    variant: Option<&MeterVariant>,
+    errs: &mut Vec<String>,
+) {
+    let aggregate = matches!(dim.unit, BillingUnit::Tokens) || dim.meter.is_some();
+    let scale = dim.scale.max(1) as f64;
+    let vlabel = variant
+        .map(|v| format!(" (variant {}={})", v.param, v.value))
+        .unwrap_or_default();
+
+    for tier in &dim.tiers {
+        if tier.price_usd <= 0.0 {
+            continue;
+        }
+        if aggregate {
+            // Bucket price must be representable; the aggregate is rounded once.
+            if tier.price_usd < threshold {
+                errs.push(format!(
+                    "endpoint `{path}`{vlabel}: token price ${} per {} units is below the \
+                     minimum representable amount (${threshold}) — increase price_usd",
+                    tier.price_usd, dim.scale
+                ));
+            }
+        } else {
+            let per_unit = tier.price_usd / scale;
+            if per_unit < threshold {
+                errs.push(format!(
+                    "endpoint `{path}`{vlabel}: price ${:.6}/unit (${} / scale {}) is below the \
+                     minimum representable amount for 6-decimal tokens (${threshold}) — \
+                     reduce scale or increase price_usd",
+                    per_unit, tier.price_usd, dim.scale
+                ));
             }
         }
     }
@@ -3735,6 +3758,77 @@ endpoints:
     }
 
     #[test]
+    fn validate_price_precision_accepts_per_million_token_pricing() {
+        // Token pricing is per-million and settled in aggregate (rounded
+        // once), so a sub-microdollar per-token rate is fine as long as the
+        // per-1M bucket price is representable.
+        let yaml = r#"
+name: gem
+subdomain: gem
+title: Gemini
+description: token priced
+category: ai_ml
+version: v1
+routing:
+  type: respond
+endpoints:
+  - method: POST
+    path: v1/chat/completions
+    metering:
+      dimensions:
+        - direction: input
+          unit: tokens
+          scale: 1000000
+          tiers:
+            - price_usd: 0.2875
+        - direction: output
+          unit: tokens
+          scale: 1000000
+          tiers:
+            - price_usd: 34.5
+"#;
+        let spec: ApiSpec = serde_yml::from_str(yaml).unwrap();
+        let errs = validate_api_spec(&spec);
+        assert!(
+            !errs.iter()
+                .any(|e| e.contains("below the minimum representable amount")),
+            "per-million token pricing must not trip the precision floor, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_price_precision_rejects_subunit_token_bucket() {
+        // But a per-1M bucket that is itself sub-microdollar is still wrong.
+        let yaml = r#"
+name: gem
+subdomain: gem
+title: Gemini
+description: token priced
+category: ai_ml
+version: v1
+routing:
+  type: respond
+endpoints:
+  - method: POST
+    path: v1/chat/completions
+    metering:
+      dimensions:
+        - direction: input
+          unit: tokens
+          scale: 1000000
+          tiers:
+            - price_usd: 0.0000005
+"#;
+        let spec: ApiSpec = serde_yml::from_str(yaml).unwrap();
+        let errs = validate_api_spec(&spec);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("below the minimum representable amount")),
+            "a sub-microdollar per-1M bucket must be rejected, got: {errs:?}"
+        );
+    }
+
+    #[test]
     fn validate_price_precision_rejects_variant_below_token_precision() {
         let yaml = r#"
 name: variants
@@ -3755,9 +3849,9 @@ endpoints:
           dimensions:
             - direction: input
               unit: tokens
-              scale: 10000000
+              scale: 1000000
               tiers:
-                - price_usd: 1.0
+                - price_usd: 0.0000005
 "#;
         let spec: ApiSpec = serde_yml::from_str(yaml).unwrap();
         let errs = validate_api_spec(&spec);
