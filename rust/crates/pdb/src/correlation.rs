@@ -3,7 +3,7 @@
 //! Groups HTTP log entries into payment flows by correlating 402 challenges
 //! with subsequent payment retries from the same client+path.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use base64::Engine;
 use tokio::sync::broadcast;
@@ -43,9 +43,12 @@ pub struct FlowCorrelation {
     /// (paid traffic) or client ip/host (unpaid). Bounded.
     connections: HashMap<String, ConnectionSummary>,
     /// `AllExchanges` mode: 402-challenged exchanges awaiting their paid
-    /// retry, keyed `"clientIp::path"` → flow id. The retry attaches to the
-    /// challenge flow so one logical request stays one row.
-    pending_challenges: HashMap<String, String>,
+    /// retry, keyed `"clientIp::path"` → flow ids, oldest first. A QUEUE, not
+    /// a single slot: parallel requests to the same path (Claude fans out)
+    /// produce several pending challenges at once, and each retry must pair
+    /// with one of them — a single slot orphaned the older challenge, which
+    /// then sat until the 60s timeout marked it failed.
+    pending_challenges: HashMap<String, VecDeque<String>>,
     connection_id_counter: u64,
     flow_id_counter: u64,
     mode: CorrelationMode,
@@ -73,6 +76,18 @@ impl FlowCorrelation {
 
     pub fn snapshot(&self) -> Vec<PaymentFlow> {
         self.flows.clone()
+    }
+
+    /// Oldest pending challenge flow for this client+path still awaiting its
+    /// paid retry (FIFO so concurrent challenges drain in arrival order).
+    fn pop_pending_challenge(&mut self, client_ip: &str, path: &str) -> Option<String> {
+        let key = flow_key(client_ip, path);
+        let queue = self.pending_challenges.get_mut(&key)?;
+        let flow_id = queue.pop_front();
+        if queue.is_empty() {
+            self.pending_challenges.remove(&key);
+        }
+        flow_id
     }
 
     /// Current connection aggregates, most recently active first.
@@ -121,9 +136,7 @@ impl FlowCorrelation {
         }
 
         if start.payment_retry
-            && let Some(flow_id) = self
-                .pending_challenges
-                .remove(&flow_key(&start.client_ip, &start.path))
+            && let Some(flow_id) = self.pop_pending_challenge(&start.client_ip, &start.path)
             && let Some(flow) = self.flows.iter_mut().find(|f| f.id == flow_id)
         {
             self.open_exchanges.insert(start.id, flow_id);
@@ -246,7 +259,10 @@ impl FlowCorrelation {
             let key = flow_key(&flow.client_ip, &flow.resource);
             let flow_id = flow.id.clone();
             let updated = flow.clone();
-            self.pending_challenges.insert(key, flow_id);
+            self.pending_challenges
+                .entry(key)
+                .or_default()
+                .push_back(flow_id);
             let _ = self.tx.send(SseMessage::FlowUpdated { flow: updated });
             return; // handshake — connections aggregate on the paid retry
         }
@@ -439,11 +455,14 @@ impl FlowCorrelation {
         }
         // Timed-out challenges must not accept a (very) late retry.
         let flows = &self.flows;
-        self.pending_challenges.retain(|_, flow_id| {
-            flows
-                .iter()
-                .any(|f| &f.id == flow_id && f.status == FlowStatus::PaymentRequired)
-        });
+        for queue in self.pending_challenges.values_mut() {
+            queue.retain(|flow_id| {
+                flows
+                    .iter()
+                    .any(|f| &f.id == flow_id && f.status == FlowStatus::PaymentRequired)
+            });
+        }
+        self.pending_challenges.retain(|_, queue| !queue.is_empty());
     }
 
     // ── Detection ──
@@ -2258,6 +2277,56 @@ mod tests {
         assert_eq!(connections.len(), 1);
         assert_eq!(connections[0].requests, 1);
         assert!((connections[0].paid_usd - 0.001).abs() < 1e-9);
+    }
+
+    #[test]
+    fn concurrent_challenges_each_pair_with_a_retry() {
+        // Claude fans out parallel requests to the same path: two challenges
+        // are pending at once. A single-slot pending map orphaned the older
+        // one (it timed out as a failed, model-less row) — the queue must
+        // pair every retry with a challenge.
+        let (tx, _rx) = broadcast::channel(64);
+        let mut engine = FlowCorrelation::with_mode(tx, CorrelationMode::AllExchanges);
+
+        for id in [1u64, 2] {
+            engine.begin_exchange(make_start(id, "POST", "/v1/messages"));
+            let mut challenge = make_entry("POST", "/v1/messages", 402);
+            challenge.id = id;
+            challenge.res_headers.insert(
+                "www-authenticate".into(),
+                "Payment realm=\"t\", intent=\"charge\"".into(),
+            );
+            engine.ingest(challenge);
+        }
+        assert_eq!(engine.snapshot().len(), 2);
+        assert!(
+            engine
+                .snapshot()
+                .iter()
+                .all(|f| f.status == FlowStatus::PaymentRequired)
+        );
+
+        for id in [11u64, 12] {
+            engine.begin_exchange(ExchangeStart {
+                payment_retry: true,
+                ..make_start(id, "POST", "/v1/messages")
+            });
+            let mut done = make_entry("POST", "/v1/messages", 200);
+            done.id = id;
+            done.req_headers
+                .insert("authorization".into(), charge_authorization("1000", 6));
+            engine.ingest(done);
+        }
+
+        let flows = engine.snapshot();
+        assert_eq!(flows.len(), 2, "two logical requests, two rows");
+        assert!(
+            flows
+                .iter()
+                .all(|f| f.status == FlowStatus::ResourceDelivered),
+            "no orphaned challenge left to time out"
+        );
+        assert_eq!(engine.connections_snapshot()[0].requests, 2);
     }
 
     #[test]
