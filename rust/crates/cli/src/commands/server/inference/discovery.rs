@@ -54,6 +54,12 @@ impl DiscoveredProvider {
         self.provider.pricing_hint()
     }
 
+    /// Price for `model` when the provider prices per model; otherwise the
+    /// aggregate hint. `None` model falls back to the aggregate.
+    pub fn pricing_hint_for_model(&self, model: Option<&str>) -> Option<PricingHint> {
+        self.provider.pricing_hint_for_model(model)
+    }
+
     pub fn summary(&self, up: bool) -> pay_pdb::types::ProviderSummary {
         pay_pdb::types::ProviderSummary {
             slug: self.slug().to_string(),

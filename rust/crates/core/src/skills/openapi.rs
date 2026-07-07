@@ -147,7 +147,13 @@ fn parse_openapi3_endpoints(doc: &Value) -> Result<Vec<ResolvedEndpoint>> {
                     .and_then(|arr| arr.first())
                     .and_then(|v| v.as_str())
                     .map(str::to_string),
-                pricing: None,
+                // Inline pricing declared on the operation via the
+                // `x-pay-metering` extension (see [`extract_pricing_extension`]).
+                // Carries per-model `variants[]` that a live probe can't
+                // observe — e.g. Gemini's x402-upto endpoints advertise only a
+                // spending ceiling at challenge time, not the per-model token
+                // table the gateway settles against.
+                pricing: extract_pricing_extension(op),
             };
 
             let body_example = if matches!(method, "post" | "put" | "patch") {
@@ -167,6 +173,27 @@ fn parse_openapi3_endpoints(doc: &Value) -> Result<Vec<ResolvedEndpoint>> {
         }
     }
     Ok(endpoints)
+}
+
+/// Operation-level pricing declared via the `x-pay-metering` OpenAPI
+/// extension. Its value is a registry [`Metering`] block
+/// (`pay_types::metering::Metering`) — the same `dimensions`/`variants`
+/// shape the runtime gateway settles against — so operators can publish
+/// per-model pricing that a live probe can't observe (an `x402-upto`
+/// challenge advertises only a ceiling, not the per-model token table).
+///
+/// Only accepted when it deserializes cleanly into `Metering`; a malformed
+/// extension is dropped (probe-derived pricing then applies) rather than
+/// publishing a broken pricing object.
+fn extract_pricing_extension(op: &Value) -> Option<Value> {
+    let raw = op.get("x-pay-metering")?;
+    match serde_json::from_value::<pay_types::metering::Metering>(raw.clone()) {
+        Ok(_) => Some(raw.clone()),
+        Err(e) => {
+            tracing::debug!(error = %e, "ignoring malformed x-pay-metering extension");
+            None
+        }
+    }
 }
 
 /// Substitute examples for every `{path}` placeholder so live probes exercise
@@ -2613,6 +2640,78 @@ fn is_pretty_printed(body: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn x_pay_metering_extension_becomes_endpoint_pricing() {
+        // Mirrors the Gemini gateway: per-model token variants declared on
+        // the operation as `x-pay-metering` — the runtime settlement shape a
+        // live probe can't observe.
+        let doc = serde_json::json!({
+            "openapi": "3.0.0",
+            "paths": {
+                "/v1beta/models/{modelsId}:generateContent": {
+                    "post": {
+                        "summary": "Generate a Gemini response from multimodal input.",
+                        "x-pay-metering": {
+                            "schemes": ["x402-upto"],
+                            "variants": [
+                                {
+                                    "param": "model",
+                                    "value": "gemini-2.5-flash",
+                                    "dimensions": [
+                                        { "direction": "input", "unit": "tokens", "scale": 1000000, "tiers": [{ "price_usd": 0.345 }] },
+                                        { "direction": "output", "unit": "tokens", "scale": 1000000, "tiers": [{ "price_usd": 2.875 }] }
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        });
+
+        let endpoints = parse_endpoints(&doc.to_string()).unwrap();
+        let generate = endpoints
+            .iter()
+            .find(|e| e.spec.path.ends_with(":generateContent"))
+            .expect("generateContent endpoint");
+        let pricing = generate
+            .spec
+            .pricing
+            .as_ref()
+            .expect("inline pricing present");
+        let variants = pricing["variants"].as_array().unwrap();
+        assert_eq!(variants.len(), 1);
+        assert_eq!(variants[0]["value"], "gemini-2.5-flash");
+        assert_eq!(variants[0]["dimensions"][1]["tiers"][0]["price_usd"], 2.875);
+    }
+
+    #[test]
+    fn malformed_x_pay_metering_is_dropped_not_published() {
+        let doc = serde_json::json!({
+            "openapi": "3.0.0",
+            "paths": {
+                "/v1/thing": {
+                    "post": {
+                        "summary": "Do a thing with a broken metering block.",
+                        // `dimensions` must be an array of MeterDimension; a
+                        // bare string can't deserialize into Metering.
+                        "x-pay-metering": { "dimensions": "nope" }
+                    }
+                }
+            }
+        });
+
+        let endpoints = parse_endpoints(&doc.to_string()).unwrap();
+        let ep = endpoints
+            .iter()
+            .find(|e| e.spec.path == "v1/thing")
+            .unwrap();
+        assert!(
+            ep.spec.pricing.is_none(),
+            "malformed extension must not publish pricing"
+        );
+    }
 
     #[test]
     fn path_literal_len_scores_specificity() {

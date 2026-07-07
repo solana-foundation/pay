@@ -201,6 +201,17 @@ pub fn parse_frontmatter(text: &str) -> Result<(String, String)> {
 
 // ── Price helpers ──────────────────────────────────────────────────────────
 
+/// Whether inline pricing carries per-variant (e.g. per-model) tiers a live
+/// probe can't reconstruct. Such pricing is authoritative and must not be
+/// overwritten by the single price a probe observes.
+fn has_pricing_variants(pricing: &Option<serde_json::Value>) -> bool {
+    pricing
+        .as_ref()
+        .and_then(|p| p.get("variants"))
+        .and_then(|v| v.as_array())
+        .is_some_and(|arr| !arr.is_empty())
+}
+
 fn collect_prices(value: &serde_json::Value) -> Vec<f64> {
     let mut prices = Vec::new();
     match value {
@@ -932,14 +943,19 @@ fn build_detail_endpoints(
                 return None;
             }
             let mut spec = r.spec;
-            // Probe-derived pricing wins. A 2xx probe is classified as free,
-            // so clear any stale inline pricing. For indeterminate endpoints
-            // (only possible when this filter is relaxed), fall back to the
-            // spec's inline pricing.
-            match crate::skills::probe::pricing_from_probe(&probe.paid) {
-                Some(pricing) => spec.pricing = Some(pricing),
-                None if probe.probe_status == "free" => spec.pricing = None,
-                None => {}
+            // Inline `x-pay-metering` variants win: a probe observes one
+            // model's price (or, for x402-upto, no fixed price at all),
+            // while the extension carries the full per-model table. Where
+            // the operator declared no variants, probe-derived pricing wins
+            // — a 2xx probe is classified as free, so it clears stale inline
+            // pricing; an indeterminate probe (only when this filter is
+            // relaxed) falls back to the spec's inline pricing.
+            if !has_pricing_variants(&spec.pricing) {
+                match crate::skills::probe::pricing_from_probe(&probe.paid) {
+                    Some(pricing) => spec.pricing = Some(pricing),
+                    None if probe.probe_status == "free" => spec.pricing = None,
+                    None => {}
+                }
             }
             Some(DetailEndpoint {
                 spec,
@@ -1045,6 +1061,19 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn has_pricing_variants_detects_per_model_tables() {
+        assert!(has_pricing_variants(&Some(json!({
+            "variants": [{ "param": "model", "value": "x", "dimensions": [] }]
+        }))));
+        // Flat pricing (no variants) is not protected — probe wins.
+        assert!(!has_pricing_variants(&Some(json!({
+            "dimensions": [{ "unit": "requests", "tiers": [{ "price_usd": 0.01 }] }]
+        }))));
+        assert!(!has_pricing_variants(&Some(json!({ "variants": [] }))));
+        assert!(!has_pricing_variants(&None));
+    }
 
     fn endpoint(
         method: &str,

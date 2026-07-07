@@ -137,8 +137,10 @@ impl InferenceProvider for CatalogProvider {
             Dialect::Unknown
         }
     }
-    /// Min/max `price_usd` across the metered endpoints, with the billing
-    /// unit of the first priced dimension (`requests` today).
+    /// Min/max `price_usd` across every metered endpoint (all variants and
+    /// dimensions folded in), with the unit of the first priced dimension.
+    /// This is the model-agnostic aggregate; the picker prefers
+    /// [`Self::pricing_hint_for_model`] once a model is chosen.
     fn pricing_hint(&self) -> Option<PricingHint> {
         let mut min = f64::INFINITY;
         let mut max = f64::NEG_INFINITY;
@@ -149,12 +151,7 @@ impl InferenceProvider for CatalogProvider {
                 max = max.max(hi);
             }
             if unit.is_none() {
-                unit = ep
-                    .pricing
-                    .as_ref()
-                    .and_then(|p| p.pointer("/dimensions/0/unit"))
-                    .and_then(|u| u.as_str())
-                    .map(str::to_string);
+                unit = first_unit(ep.pricing.as_ref());
             }
         }
         if !min.is_finite() {
@@ -166,6 +163,117 @@ impl InferenceProvider for CatalogProvider {
             unit: unit.unwrap_or_else(|| "requests".to_string()),
         })
     }
+
+    /// Price for `model`, resolved from the catalog `variants[]` when the
+    /// provider prices per model (e.g. Gemini's per-model token tiers).
+    ///
+    /// Matching mirrors the runtime gateway: substring, first match wins,
+    /// with a `default` sentinel fallback. Across the matched variant's
+    /// dimensions (e.g. input + output token tiers) the min/max `price_usd`
+    /// is reported so a single chip conveys the spread. Falls back to the
+    /// model-agnostic [`Self::pricing_hint`] when there are no variants or
+    /// no model is given.
+    fn pricing_hint_for_model(&self, model: Option<&str>) -> Option<PricingHint> {
+        let Some(model) = model else {
+            return self.pricing_hint();
+        };
+        let mut min = f64::INFINITY;
+        let mut max = f64::NEG_INFINITY;
+        let mut unit: Option<String> = None;
+        let mut matched = false;
+        for ep in self.endpoints.iter().filter(|ep| ep.pricing.is_some()) {
+            let Some(variants) = ep
+                .pricing
+                .as_ref()
+                .and_then(|p| p.get("variants"))
+                .and_then(|v| v.as_array())
+            else {
+                continue;
+            };
+            let Some(variant) = match_variant(variants, model) else {
+                continue;
+            };
+            matched = true;
+            for (lo, hi) in dimension_prices(variant) {
+                min = min.min(lo);
+                max = max.max(hi);
+            }
+            if unit.is_none() {
+                unit = variant
+                    .get("dimensions")
+                    .and_then(|d| d.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|d| d.get("unit"))
+                    .and_then(|u| u.as_str())
+                    .map(str::to_string);
+            }
+        }
+        if !matched || !min.is_finite() {
+            return self.pricing_hint();
+        }
+        Some(PricingHint {
+            min_usd: min,
+            max_usd: max,
+            unit: unit.unwrap_or_else(|| "tokens".to_string()),
+        })
+    }
+}
+
+/// Unit of the first dimension — either a top-level `dimensions[0]` or the
+/// first variant's `dimensions[0]`.
+fn first_unit(pricing: Option<&serde_json::Value>) -> Option<String> {
+    let pricing = pricing?;
+    pricing
+        .pointer("/dimensions/0/unit")
+        .or_else(|| pricing.pointer("/variants/0/dimensions/0/unit"))
+        .and_then(|u| u.as_str())
+        .map(str::to_string)
+}
+
+/// Match a request `model` against catalog `variants[]` the way the runtime
+/// gateway does: substring (`variant.value` in `model`), first match wins,
+/// so specific variants must precede broader prefixes in the catalog. A
+/// variant whose `value` is `default` matches only when nothing else does.
+fn match_variant<'a>(
+    variants: &'a [serde_json::Value],
+    model: &str,
+) -> Option<&'a serde_json::Value> {
+    let mut default = None;
+    for variant in variants {
+        let Some(value) = variant.get("value").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if value == "default" {
+            default = default.or(Some(variant));
+        } else if model.contains(value) {
+            return Some(variant);
+        }
+    }
+    default
+}
+
+/// Min/max `price_usd` across every tier of a variant's dimensions.
+fn dimension_prices(variant: &serde_json::Value) -> Vec<(f64, f64)> {
+    let mut out = Vec::new();
+    let Some(dims) = variant.get("dimensions").and_then(|d| d.as_array()) else {
+        return out;
+    };
+    for dim in dims {
+        let Some(tiers) = dim.get("tiers").and_then(|t| t.as_array()) else {
+            continue;
+        };
+        let prices: Vec<f64> = tiers
+            .iter()
+            .filter_map(|t| t.get("price_usd").and_then(|p| p.as_f64()))
+            .collect();
+        if let (Some(lo), Some(hi)) = (
+            prices.iter().copied().reduce(f64::min),
+            prices.iter().copied().reduce(f64::max),
+        ) {
+            out.push((lo, hi));
+        }
+    }
+    out
 }
 
 /// Model names from a model-list response body. Understands Gemini's
@@ -302,6 +410,50 @@ mod tests {
         CatalogProvider::from_service(&gemini_service(service_url))
     }
 
+    /// A Gemini entry whose generateContent carries per-model `variants[]`
+    /// (the `x-pay-metering` shape), mirroring the agent-gateway YAML:
+    /// per-model input/output token tiers plus a `default` fallback.
+    fn gemini_variant_priced() -> CatalogProvider {
+        let svc: pay_core::skills::Service = serde_json::from_value(serde_json::json!({
+            "fqn": "solana-foundation/google/generativelanguage",
+            "service_url": "https://generativelanguage.google.gateway-402.com",
+            "endpoints": [{
+                "method": "POST",
+                "path": "v1beta/models/{modelsId}:generateContent",
+                "pricing": {
+                    "variants": [
+                        {
+                            "param": "model",
+                            "value": "gemini-2.5-flash-lite",
+                            "dimensions": [
+                                { "direction": "input", "unit": "tokens", "scale": 1000000, "tiers": [{ "price_usd": 0.115 }] },
+                                { "direction": "output", "unit": "tokens", "scale": 1000000, "tiers": [{ "price_usd": 0.46 }] }
+                            ]
+                        },
+                        {
+                            "param": "model",
+                            "value": "gemini-2.5-flash",
+                            "dimensions": [
+                                { "direction": "input", "unit": "tokens", "scale": 1000000, "tiers": [{ "price_usd": 0.345 }] },
+                                { "direction": "output", "unit": "tokens", "scale": 1000000, "tiers": [{ "price_usd": 2.875 }] }
+                            ]
+                        },
+                        {
+                            "param": "model",
+                            "value": "default",
+                            "dimensions": [
+                                { "direction": "input", "unit": "tokens", "scale": 1000000, "tiers": [{ "price_usd": 1.0 }] },
+                                { "direction": "output", "unit": "tokens", "scale": 1000000, "tiers": [{ "price_usd": 8.0 }] }
+                            ]
+                        }
+                    ]
+                }
+            }]
+        }))
+        .unwrap();
+        CatalogProvider::from_service(&svc)
+    }
+
     const GEMINI_MODELS_JSON: &str = r#"{
         "models": [
             { "name": "models/gemini-2.5-flash", "displayName": "Gemini 2.5 Flash" },
@@ -362,6 +514,49 @@ mod tests {
         assert_eq!(hint.max_usd, 0.01);
         assert_eq!(hint.unit, "requests");
         assert_eq!(hint.to_string(), "$0.0000–0.0100/req");
+    }
+
+    #[test]
+    fn pricing_hint_for_model_resolves_the_matching_variant() {
+        let provider = gemini_variant_priced();
+
+        // Exact substring match → that model's input/output token spread.
+        let flash = provider
+            .pricing_hint_for_model(Some("gemini-2.5-flash"))
+            .unwrap();
+        assert_eq!(flash.min_usd, 0.345);
+        assert_eq!(flash.max_usd, 2.875);
+        assert_eq!(flash.unit, "tokens");
+        assert_eq!(flash.to_string(), "$0.3450–2.8750/tok");
+
+        // First-match-wins: the flash-lite variant precedes the broader
+        // flash prefix, so a lite id resolves to lite pricing.
+        let lite = provider
+            .pricing_hint_for_model(Some("gemini-2.5-flash-lite"))
+            .unwrap();
+        assert_eq!((lite.min_usd, lite.max_usd), (0.115, 0.46));
+
+        // Unknown model falls back to the `default` sentinel variant.
+        let unknown = provider
+            .pricing_hint_for_model(Some("some-future-model"))
+            .unwrap();
+        assert_eq!((unknown.min_usd, unknown.max_usd), (1.0, 8.0));
+
+        // No model given → the model-agnostic aggregate (spans all variants).
+        let agg = provider.pricing_hint_for_model(None).unwrap();
+        assert_eq!(agg.min_usd, 0.115);
+        assert_eq!(agg.max_usd, 8.0);
+    }
+
+    #[test]
+    fn pricing_hint_for_model_falls_back_to_aggregate_without_variants() {
+        // Flat (no-variant) provider: the model arg is ignored, aggregate
+        // pricing is returned so the chip still shows a price.
+        let provider = gemini("https://example.com");
+        let hint = provider
+            .pricing_hint_for_model(Some("gemini-2.5-flash"))
+            .unwrap();
+        assert_eq!(hint, provider.pricing_hint().unwrap());
     }
 
     #[test]

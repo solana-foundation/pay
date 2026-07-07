@@ -110,6 +110,12 @@ pub trait InferenceProvider: Send + Sync {
     fn pricing_hint(&self) -> Option<PricingHint> {
         None
     }
+    /// Price for a specific model, when the provider prices per model
+    /// (catalog `variants[]`). Defaults to the model-agnostic
+    /// [`Self::pricing_hint`]; `model = None` also falls back to it.
+    fn pricing_hint_for_model(&self, _model: Option<&str>) -> Option<PricingHint> {
+        self.pricing_hint()
+    }
 }
 
 /// Built-in providers in probe priority order. Order matters: when two

@@ -490,8 +490,10 @@ fn render_provider_entry(
     let mut bottom = vec![rail];
     let mut avail = (area.width as usize).saturating_sub(2);
     // Hosted catalog entries lead with their price in a fixed-width column
-    // (tab stop) so pricing lines up across rows.
-    if let Some(hint) = provider.pricing_hint() {
+    // (tab stop) so pricing lines up across rows. On the selected row the
+    // price is resolved for the ←/→-picked model (per-model catalog
+    // variants); otherwise it's the provider-wide aggregate.
+    if let Some(hint) = provider.pricing_hint_for_model(chosen_model) {
         bottom.push(Span::styled(
             format!("{:<PRICING_COL$}", hint.to_string()),
             dim,
@@ -859,6 +861,43 @@ mod tests {
         }
     }
 
+    /// A Gemini row priced per model via `variants[]` — the selected row's
+    /// price must track the ←/→-picked model.
+    fn hosted_gemini_variant_priced() -> DiscoveredProvider {
+        let variant = |value: &str, inp: f64, out: f64| {
+            serde_json::json!({
+                "param": "model", "value": value,
+                "dimensions": [
+                    { "direction": "input", "unit": "tokens", "scale": 1000000, "tiers": [{ "price_usd": inp }] },
+                    { "direction": "output", "unit": "tokens", "scale": 1000000, "tiers": [{ "price_usd": out }] }
+                ]
+            })
+        };
+        let svc: pay_core::skills::Service = serde_json::from_value(serde_json::json!({
+            "fqn": "solana-foundation/google/generativelanguage",
+            "service_url": "https://generativelanguage.google.gateway-402.com",
+            "endpoints": [{
+                "method": "POST",
+                "path": "v1beta/models/{modelsId}:generateContent",
+                "pricing": { "variants": [
+                    variant("gemini-2.5-flash", 0.345, 2.875),
+                    variant("gemini-2.5-pro", 1.4375, 11.5),
+                ] }
+            }]
+        }))
+        .unwrap();
+        let provider =
+            crate::commands::server::inference::providers::catalog::CatalogProvider::from_service(
+                &svc,
+            );
+        DiscoveredProvider {
+            base_url: provider.service_url().to_string(),
+            provider: Arc::new(provider),
+            models: vec!["gemini-2.5-flash".into(), "gemini-2.5-pro".into()],
+            version: None,
+        }
+    }
+
     /// Render `app` into a `w`×`h` test buffer.
     fn draw(app: &ProviderPickerApp, w: u16, h: u16) -> ratatui::buffer::Buffer {
         let backend = ratatui::backend::TestBackend::new(w, h);
@@ -912,6 +951,30 @@ mod tests {
         assert!(
             !text.contains("· 1 model"),
             "model-count noise should be gone from line 2:\n{text}"
+        );
+    }
+
+    #[test]
+    fn selected_row_price_tracks_the_picked_model_for_variant_pricing() {
+        // Gemini-only so it's the selected row; flash is picked first.
+        let mut app = app(vec![hosted_gemini_variant_priced()]);
+        let flash = buffer_text(&draw(&app, 120, 30));
+        assert!(
+            flash.contains("$0.3450–2.8750/tok"),
+            "flash price must reflect its per-model variant:\n{flash}"
+        );
+
+        // →: pro's price replaces flash's.
+        app.cycle_model(1);
+        assert_eq!(app.choice().unwrap().model, "gemini-2.5-pro");
+        let pro = buffer_text(&draw(&app, 120, 30));
+        assert!(
+            pro.contains("$1.4375–11.5000/tok"),
+            "pro price must track the ←/→ selection:\n{pro}"
+        );
+        assert!(
+            !pro.contains("$0.3450"),
+            "flash price must not linger after switching model:\n{pro}"
         );
     }
 

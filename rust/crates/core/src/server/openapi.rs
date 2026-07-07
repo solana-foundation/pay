@@ -392,6 +392,77 @@ pub fn filter_to_endpoints(doc: &mut Value, endpoints: &[Endpoint]) {
     warn_on_unmatched_endpoints(doc, endpoints);
 }
 
+/// Attach each endpoint's full [`Metering`] block to its matching operation
+/// as the `x-pay-metering` OpenAPI 3 extension, so per-model `variants[]`
+/// (and any other settlement detail a live 402 probe can't observe — e.g.
+/// x402-upto endpoints advertise only a ceiling) travel with the published
+/// spec into pay-skills. The pay-skills build reads this extension into the
+/// endpoint's inline pricing (see `skills::openapi::extract_pricing_extension`).
+///
+/// OpenAPI 3 only — Google Discovery documents are converted to OpenAPI 3
+/// before publishing, so the extension is attached on that side. No-op when
+/// the doc has no `paths` object or an endpoint declares no metering.
+pub fn attach_metering_extension(doc: &mut Value, endpoints: &[Endpoint]) {
+    // Map canonical (METHOD, path) → the endpoint's metering, so we can find
+    // the right block for each operation regardless of placeholder spelling.
+    let mut metering_by_key: std::collections::HashMap<(String, String), &Metering> =
+        std::collections::HashMap::new();
+    let mut metering_by_loose: std::collections::HashMap<(String, String, String), &Metering> =
+        std::collections::HashMap::new();
+    for ep in endpoints {
+        let Some(metering) = &ep.metering else {
+            continue;
+        };
+        let method = http_method_str(&ep.method).to_string();
+        let canon = canonical_path(&ep.path);
+        if let Some((version, anchor)) = loose_path_key(&canon) {
+            metering_by_loose.insert((method.clone(), version, anchor), metering);
+        }
+        metering_by_key.insert((method, canon), metering);
+    }
+    if metering_by_key.is_empty() {
+        return;
+    }
+
+    let base_path = openapi3_base_path(doc);
+    let Some(paths) = doc.get_mut("paths").and_then(|v| v.as_object_mut()) else {
+        return;
+    };
+    for (path, item) in paths.iter_mut() {
+        let combined = if base_path.is_empty() {
+            normalize_path(path)
+        } else {
+            format!("{}/{}", base_path, path.trim_start_matches('/'))
+        };
+        let canon = canonical_path(&combined);
+        let Some(item_obj) = item.as_object_mut() else {
+            continue;
+        };
+        for method in HTTP_METHODS {
+            let Some(op) = item_obj.get_mut(*method).and_then(|v| v.as_object_mut()) else {
+                continue;
+            };
+            let upper = method.to_uppercase();
+            let metering = metering_by_key
+                .get(&(upper.clone(), canon.clone()))
+                .copied()
+                .or_else(|| {
+                    loose_path_key(&canon).and_then(|(version, anchor)| {
+                        metering_by_loose
+                            .get(&(upper.clone(), version, anchor))
+                            .copied()
+                    })
+                });
+            let Some(metering) = metering else {
+                continue;
+            };
+            if let Ok(value) = serde_json::to_value(metering) {
+                op.insert("x-pay-metering".to_string(), value);
+            }
+        }
+    }
+}
+
 /// Loud guardrail: after filtering, flag any YAML-declared endpoint that has
 /// no surviving operation in the served document. A silent drop here is what
 /// produced empty `/openapi.json` specs in the first place — a path-shape
@@ -1092,6 +1163,76 @@ mod tests {
     }
 
     use pay_types::metering::HttpMethod::{Get, Post};
+
+    fn metered_ep(
+        method: pay_types::metering::HttpMethod,
+        path: &str,
+        metering: Metering,
+    ) -> Endpoint {
+        Endpoint {
+            metering: Some(metering),
+            ..ep(method, path)
+        }
+    }
+
+    #[test]
+    fn attach_metering_extension_carries_variants_onto_operations() {
+        // Gemini-shaped: a custom-verb POST priced per model via variants.
+        let metering: Metering = serde_json::from_value(json!({
+            "schemes": ["x402-upto"],
+            "variants": [{
+                "param": "model",
+                "value": "gemini-2.5-flash",
+                "dimensions": [
+                    { "direction": "input", "unit": "tokens", "scale": 1000000, "tiers": [{ "price_usd": 0.345 }] },
+                    { "direction": "output", "unit": "tokens", "scale": 1000000, "tiers": [{ "price_usd": 2.875 }] }
+                ]
+            }]
+        }))
+        .unwrap();
+
+        let mut doc = json!({
+            "openapi": "3.0.3",
+            "servers": [{"url": "https://generativelanguage.google.gateway-402.com"}],
+            "paths": {
+                "/v1beta/models/{modelsId}:generateContent": { "post": { "summary": "generate" } },
+                "/v1beta/models": { "get": { "summary": "list" } }
+            }
+        });
+        let endpoints = vec![
+            metered_ep(Post, "v1beta/models/{modelsId}:generateContent", metering),
+            ep(Get, "v1beta/models"),
+        ];
+        attach_metering_extension(&mut doc, &endpoints);
+
+        // Priced op carries the variant table verbatim…
+        let generate = &doc["paths"]["/v1beta/models/{modelsId}:generateContent"]["post"];
+        let variants = generate["x-pay-metering"]["variants"].as_array().unwrap();
+        assert_eq!(variants[0]["value"], "gemini-2.5-flash");
+        assert_eq!(variants[0]["dimensions"][1]["tiers"][0]["price_usd"], 2.875);
+        // …and the round-trip parses back through the pay-skills reader shape.
+        assert!(serde_json::from_value::<Metering>(generate["x-pay-metering"].clone()).is_ok());
+        // The unmetered list endpoint gets no extension.
+        assert!(
+            doc["paths"]["/v1beta/models"]["get"]
+                .get("x-pay-metering")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn attach_metering_extension_is_a_noop_without_metering() {
+        let mut doc = json!({
+            "openapi": "3.0.3",
+            "paths": { "/v1/thing": { "post": { "summary": "s" } } }
+        });
+        attach_metering_extension(&mut doc, &[ep(Post, "v1/thing")]);
+        assert!(
+            doc["paths"]["/v1/thing"]["post"]
+                .get("x-pay-metering")
+                .is_none()
+        );
+    }
 
     #[test]
     fn filter_openapi3_keeps_only_allowed_methods() {
