@@ -460,9 +460,11 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
         let host = str_h("host").map(str::to_string);
 
         // Capture request-side facts for the PDB exchange emitted in `logging`.
-        // Skip the control plane's own paths (`/__402/*`) — same as the old
-        // axum logging middleware — so the debugger only shows real traffic.
-        if !path.starts_with("__402") {
+        // Skip the control plane's own paths (`/__402/*`, `/openapi.json`,
+        // `/.well-known/*`, `/`) so the debugger only shows real traffic —
+        // e.g. the ephemeral `/.well-known/pay-skills.json` that the MCP
+        // catalog tools poll must not show up as a failed OLLAMA request.
+        if !is_control_plane(&path) {
             let client_ip = str_h("x-forwarded-for")
                 .and_then(|v| v.split(',').next())
                 .map(|s| s.trim().to_string())
@@ -1031,7 +1033,26 @@ async fn write_axum_response(
 
 #[cfg(test)]
 mod tests {
-    use super::{buffered_upstream_headers, filtered_response_headers};
+    use super::{buffered_upstream_headers, filtered_response_headers, is_control_plane};
+
+    #[test]
+    fn control_plane_paths_are_not_tracked() {
+        // These bypass PDB tracking (request_filter) as well as payment.
+        // The ephemeral skills poll must not surface as a failed request.
+        for path in [
+            "",
+            "__402/health",
+            "__402/pdb/api/config",
+            "openapi.json",
+            ".well-known/pay-skills.json",
+        ] {
+            assert!(is_control_plane(path), "{path} must be control-plane");
+        }
+        // Real upstream traffic still tracks.
+        for path in ["v1/messages", "v1/chat/completions", "api/chat"] {
+            assert!(!is_control_plane(path), "{path} must be tracked");
+        }
+    }
 
     #[test]
     fn buffered_upstream_headers_force_identity_encoding() {
