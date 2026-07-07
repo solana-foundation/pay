@@ -6,6 +6,7 @@
 //! `~/.config/pay/inference-providers.yml`, which loads as
 //! [`CustomProvider`]s implementing the same trait.
 
+pub mod catalog;
 pub mod custom;
 pub mod exo;
 pub mod llama_cpp;
@@ -24,6 +25,55 @@ pub use custom::CustomProvider;
 pub struct PaidEndpoint {
     pub method: pay_types::metering::HttpMethod,
     pub path: String,
+}
+
+/// The chat-API wire dialect a provider speaks. `pay claude` drives the
+/// Anthropic `v1/messages` surface today; anything else needs the (future)
+/// protocol translator in front of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dialect {
+    Anthropic,
+    OpenAiCompat,
+    GeminiNative,
+    Unknown,
+}
+
+impl std::fmt::Display for Dialect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Dialect::Anthropic => "anthropic",
+            Dialect::OpenAiCompat => "openai-compat",
+            Dialect::GeminiNative => "gemini-native",
+            Dialect::Unknown => "unknown",
+        })
+    }
+}
+
+/// Aggregate price range across a provider's metered endpoints, for picker
+/// rows and other compact UI ("requests" today, "tokens" once providers
+/// adopt token metering).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PricingHint {
+    pub min_usd: f64,
+    pub max_usd: f64,
+    /// Billing unit the prices are quoted in (e.g. `requests`, `tokens`).
+    pub unit: String,
+}
+
+impl std::fmt::Display for PricingHint {
+    /// `$0.0100/req`, or `$0.0000–0.0100/req` when prices vary.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let unit = match self.unit.as_str() {
+            "requests" => "req",
+            "tokens" => "tok",
+            other => other,
+        };
+        if (self.min_usd - self.max_usd).abs() < f64::EPSILON {
+            write!(f, "${:.4}/{unit}", self.min_usd)
+        } else {
+            write!(f, "${:.4}–{:.4}/{unit}", self.min_usd, self.max_usd)
+        }
+    }
 }
 
 /// A local inference server the gateway can discover, front, and meter.
@@ -48,6 +98,17 @@ pub trait InferenceProvider: Send + Sync {
     /// `chat` | `completion` | `embeddings` | `other` for a request path.
     fn endpoint_kind(&self, path: &str) -> &'static str {
         default_endpoint_kind(path)
+    }
+    /// Chat-API wire dialect. Local servers are overwhelmingly
+    /// OpenAI-compatible; providers that serve `v1/messages` (what
+    /// `pay claude` drives) override to [`Dialect::Anthropic`].
+    fn dialect(&self) -> Dialect {
+        Dialect::OpenAiCompat
+    }
+    /// Price range across metered endpoints, when known (hosted catalog
+    /// providers). Local providers are unpriced until fronted by a gateway.
+    fn pricing_hint(&self) -> Option<PricingHint> {
+        None
     }
 }
 
@@ -237,6 +298,59 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn dialect_defaults_to_openai_compat_except_ollama() {
+        for provider in builtin_providers() {
+            let expected = if provider.slug() == "ollama" {
+                // Ollama serves both surfaces; `pay claude` drives
+                // v1/messages, so it counts as Anthropic-dialect.
+                Dialect::Anthropic
+            } else {
+                Dialect::OpenAiCompat
+            };
+            assert_eq!(provider.dialect(), expected, "{}", provider.slug());
+        }
+    }
+
+    #[test]
+    fn pricing_hint_defaults_to_none_for_local_providers() {
+        for provider in builtin_providers() {
+            assert_eq!(provider.pricing_hint(), None, "{}", provider.slug());
+        }
+    }
+
+    #[test]
+    fn pricing_hint_display_is_compact() {
+        let flat = PricingHint {
+            min_usd: 0.01,
+            max_usd: 0.01,
+            unit: "requests".to_string(),
+        };
+        assert_eq!(flat.to_string(), "$0.0100/req");
+
+        let range = PricingHint {
+            min_usd: 0.0,
+            max_usd: 0.01,
+            unit: "requests".to_string(),
+        };
+        assert_eq!(range.to_string(), "$0.0000–0.0100/req");
+
+        let tokens = PricingHint {
+            min_usd: 0.0007,
+            max_usd: 0.0007,
+            unit: "tokens".to_string(),
+        };
+        assert_eq!(tokens.to_string(), "$0.0007/tok");
+    }
+
+    #[test]
+    fn dialect_display_names() {
+        assert_eq!(Dialect::Anthropic.to_string(), "anthropic");
+        assert_eq!(Dialect::OpenAiCompat.to_string(), "openai-compat");
+        assert_eq!(Dialect::GeminiNative.to_string(), "gemini-native");
+        assert_eq!(Dialect::Unknown.to_string(), "unknown");
     }
 
     #[test]

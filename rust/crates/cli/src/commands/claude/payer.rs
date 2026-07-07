@@ -25,6 +25,16 @@
 //! path: with `--sandbox` the CLI forces `network_override = localnet`,
 //! and `pay_core::mpp::check_client_network_intent` refuses to sign when
 //! the challenge advertises a different network (e.g. mainnet).
+//!
+//! **Dialects.** When the upstream speaks OpenAI chat completions
+//! ([`Dialect::OpenAiCompat`] — vLLM, LM Studio, llama.cpp, Alibaba Model
+//! Studio's compatible mode), `POST /v1/messages` requests are translated
+//! to OpenAI shape (see [`super::translate`]), sent to the upstream's
+//! chat-completions path, and the response — buffered JSON or incremental
+//! SSE — is translated back to an Anthropic envelope. The 402 pay-retry
+//! composes with translation: the challenge fires on the OpenAI-side
+//! request, so the retry replays the *translated* body. All other
+//! requests and dialects pass through untouched.
 
 use std::sync::Arc;
 
@@ -40,6 +50,9 @@ use pay_core::accounts::{
     resolve_account_for_network,
 };
 
+use super::translate;
+use crate::commands::server::inference::providers::Dialect;
+
 /// Request bodies are buffered so the paid retry can replay them; cap the
 /// buffer so a runaway client cannot exhaust memory.
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
@@ -54,10 +67,30 @@ pub struct PayerProxy {
     pub payer_pubkey: Option<String>,
 }
 
+/// Where the payer forwards to, and how to talk to it.
+#[derive(Clone)]
+pub struct PayerUpstream {
+    /// Upstream base URL, e.g. `http://127.0.0.1:11434` or
+    /// `https://modelstudio.alibaba.gateway-402.com`.
+    pub base_url: String,
+    /// Chat-API wire dialect of the upstream. [`Dialect::Anthropic`]
+    /// passes through; [`Dialect::OpenAiCompat`] translates
+    /// `POST /v1/messages`; anything else passes through untranslated
+    /// (the launcher warns about those picks).
+    pub dialect: Dialect,
+    /// Chat-completions path (gate convention, no leading slash) that
+    /// translated requests are sent to, e.g. `v1/chat/completions` or
+    /// Alibaba's `compatible-mode/v1/chat/completions`.
+    pub chat_path: String,
+}
+
 /// Shared state for the proxy handlers.
 struct PayerState {
     /// Upstream base URL without a trailing slash.
     upstream: String,
+    dialect: Dialect,
+    /// Chat-completions path without a leading slash (translation target).
+    chat_path: String,
     client: reqwest::Client,
     store: Arc<dyn AccountsStore>,
     /// Forced network slug (`--sandbox` → `localnet`, `--mainnet` →
@@ -69,7 +102,7 @@ struct PayerState {
 
 impl PayerState {
     fn new(
-        upstream: String,
+        upstream: PayerUpstream,
         store: Arc<dyn AccountsStore>,
         network_override: Option<String>,
         account_override: Option<String>,
@@ -81,7 +114,9 @@ impl PayerState {
             .build()
             .map_err(|e| pay_core::Error::Config(format!("payer proxy HTTP client: {e}")))?;
         Ok(Self {
-            upstream: upstream.trim_end_matches('/').to_string(),
+            upstream: upstream.base_url.trim_end_matches('/').to_string(),
+            dialect: upstream.dialect,
+            chat_path: upstream.chat_path.trim_start_matches('/').to_string(),
             client,
             store,
             network_override,
@@ -95,13 +130,13 @@ impl PayerState {
 /// sync and blocks on the `claude` child process). Returns once the
 /// listener is bound.
 pub fn start_background(
-    upstream: &str,
+    upstream: PayerUpstream,
     network_override: Option<&str>,
     account_override: Option<&str>,
 ) -> pay_core::Result<PayerProxy> {
     let store: Arc<dyn AccountsStore> = Arc::new(FileAccountsStore::default_path());
     let state = Arc::new(PayerState::new(
-        upstream.to_string(),
+        upstream,
         store,
         network_override.map(str::to_string),
         account_override.map(str::to_string),
@@ -202,12 +237,12 @@ fn router(state: Arc<PayerState>) -> Router {
 async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
     let method = req.method().clone();
     let headers = req.headers().clone();
+    let path = req.uri().path().to_string();
     let path_query = req
         .uri()
         .path_and_query()
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_else(|| "/".to_string());
-    let url = format!("{}{}", state.upstream, path_query);
 
     // Buffer the request body so a paid retry can replay it verbatim.
     let body = match axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES).await {
@@ -219,6 +254,18 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
             )
                 .into_response();
         }
+    };
+
+    // Anthropic → OpenAI request translation for OpenAI-compatible
+    // upstreams. Happens BEFORE the send/402 loop so the pay-retry
+    // replays the translated body. Everything else passes through.
+    let (url, body, translated) = match translate_request(&state, &method, &path, &body) {
+        Some(openai_body) => (
+            format!("{}/{}", state.upstream, state.chat_path),
+            openai_body,
+            true,
+        ),
+        None => (format!("{}{}", state.upstream, path_query), body, false),
     };
 
     let first = match send_upstream(&state, &method, &url, &headers, body.clone(), None).await {
@@ -234,7 +281,7 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
     };
 
     if first.status() != StatusCode::PAYMENT_REQUIRED {
-        return stream_response(first);
+        return deliver(first, translated).await;
     }
 
     // Buffer the 402 so it can be passed through untouched when payment
@@ -289,12 +336,145 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
 
     tracing::info!(%url, "payer proxy: 402 paid — retrying once with Payment credential");
     match send_upstream(&state, &method, &url, &headers, body, Some(&auth)).await {
-        Ok(retry) => stream_response(retry),
+        Ok(retry) => deliver(retry, translated).await,
         Err(e) => {
             tracing::warn!(%url, error = %e, "payer proxy: paid retry failed — returning the original 402");
             buffered_response(status, &resp_headers, resp_body)
         }
     }
+}
+
+/// When the upstream is OpenAI-compatible and the inbound request is
+/// Claude Code's `POST /v1/messages`, return the translated OpenAI body.
+/// `None` means pass through untranslated (wrong dialect/path, or a body
+/// that isn't JSON — the upstream will produce the error).
+fn translate_request(
+    state: &PayerState,
+    method: &Method,
+    path: &str,
+    body: &Bytes,
+) -> Option<Bytes> {
+    if state.dialect != Dialect::OpenAiCompat || method != Method::POST || path != "/v1/messages" {
+        return None;
+    }
+    let anthropic: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(value) => value,
+        Err(e) => {
+            tracing::warn!(error = %e, "payer proxy: /v1/messages body is not JSON — passing through untranslated");
+            return None;
+        }
+    };
+    let openai = translate::anthropic_to_openai_request(&anthropic);
+    match serde_json::to_vec(&openai) {
+        Ok(bytes) => Some(Bytes::from(bytes)),
+        Err(e) => {
+            tracing::warn!(error = %e, "payer proxy: failed to serialize translated request — passing through");
+            None
+        }
+    }
+}
+
+/// Hand an upstream response back to Claude Code: translated (SSE or
+/// buffered JSON) when the request was translated and succeeded,
+/// streamed passthrough otherwise.
+async fn deliver(resp: reqwest::Response, translated: bool) -> Response {
+    if !translated || !resp.status().is_success() {
+        return stream_response(resp);
+    }
+    let is_sse = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|ct| ct.contains("text/event-stream"));
+    if is_sse {
+        translate_stream_response(resp)
+    } else {
+        translate_json_response(resp).await
+    }
+}
+
+/// Buffer an OpenAI `chat.completion` JSON response and return the
+/// Anthropic message envelope. Falls back to raw passthrough when the
+/// body isn't JSON.
+async fn translate_json_response(resp: reqwest::Response) -> Response {
+    let status = resp.status();
+    let upstream_headers = resp.headers().clone();
+    let bytes = match resp.bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::warn!(error = %e, "payer proxy: failed to read upstream response body");
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("payer proxy: upstream error: {e}"),
+            )
+                .into_response();
+        }
+    };
+    let openai: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(e) => {
+            tracing::warn!(error = %e, "payer proxy: upstream response is not JSON — passing through");
+            return buffered_response(status, &upstream_headers, bytes);
+        }
+    };
+    let anthropic = translate::openai_to_anthropic_response(&openai);
+    let body = serde_json::to_vec(&anthropic).unwrap_or_default();
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .unwrap_or_else(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "payer proxy: response build error",
+            )
+                .into_response()
+        })
+}
+
+/// Wrap an OpenAI SSE response in the incremental Anthropic-SSE
+/// translator — chunks flow as they arrive; a carry-over buffer inside
+/// [`translate::StreamTranslator`] reassembles SSE lines split across
+/// chunk boundaries.
+fn translate_stream_response(resp: reqwest::Response) -> Response {
+    let status = resp.status();
+    let stream_body = Body::from_stream(async_stream::stream! {
+        let mut resp = resp;
+        let mut translator = translate::StreamTranslator::new();
+        loop {
+            match resp.chunk().await {
+                Ok(Some(chunk)) => {
+                    let out = translator.push(&chunk);
+                    if !out.is_empty() {
+                        yield Ok::<_, std::io::Error>(Bytes::from(out));
+                    }
+                }
+                Ok(None) => {
+                    let out = translator.finish();
+                    if !out.is_empty() {
+                        yield Ok(Bytes::from(out));
+                    }
+                    break;
+                }
+                Err(e) => {
+                    yield Err(std::io::Error::other(e));
+                    break;
+                }
+            }
+        }
+    });
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(stream_body)
+        .unwrap_or_else(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "payer proxy: response build error",
+            )
+                .into_response()
+        })
 }
 
 /// Select a payable challenge and build the `Authorization: Payment …`
@@ -492,12 +672,59 @@ mod tests {
 
     /// Spawn the payer with an in-memory accounts store so tests never
     /// touch (or create) the user's real `~/.config/pay/accounts.yml`.
-    async fn spawn_payer(upstream: String, network_override: Option<&str>) -> String {
+    async fn spawn_payer_with(upstream: PayerUpstream, network_override: Option<&str>) -> String {
         let store: Arc<dyn AccountsStore> = Arc::new(MemoryAccountsStore::new());
         let state = Arc::new(
             PayerState::new(upstream, store, network_override.map(str::to_string), None).unwrap(),
         );
         spawn_server(router(state)).await
+    }
+
+    /// Anthropic-dialect payer (pure passthrough — no translation).
+    async fn spawn_payer(upstream: String, network_override: Option<&str>) -> String {
+        spawn_payer_with(
+            PayerUpstream {
+                base_url: upstream,
+                dialect: Dialect::Anthropic,
+                chat_path: "v1/chat/completions".to_string(),
+            },
+            network_override,
+        )
+        .await
+    }
+
+    /// OpenAI-compat payer targeting Alibaba's compatible-mode chat path.
+    async fn spawn_openai_payer(upstream: String, network_override: Option<&str>) -> String {
+        spawn_payer_with(
+            PayerUpstream {
+                base_url: upstream,
+                dialect: Dialect::OpenAiCompat,
+                chat_path: "compatible-mode/v1/chat/completions".to_string(),
+            },
+            network_override,
+        )
+        .await
+    }
+
+    const OPENAI_COMPLETION_JSON: &str = r#"{
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "model": "qwen-max",
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": "Hello!" },
+            "finish_reason": "stop"
+        }],
+        "usage": { "prompt_tokens": 12, "completion_tokens": 3 }
+    }"#;
+
+    fn anthropic_request_body() -> serde_json::Value {
+        serde_json::json!({
+            "model": "qwen-max",
+            "max_tokens": 100,
+            "system": "be brief",
+            "messages": [{ "role": "user", "content": "hi" }],
+        })
     }
 
     #[derive(Default)]
@@ -716,5 +943,201 @@ mod tests {
             rest.extend_from_slice(&chunk);
         }
         assert_eq!(&rest[..], b"data: two\n\n");
+    }
+
+    // ── OpenAI-compat dialect loopback ─────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn translates_anthropic_request_and_openai_response_for_openai_upstream() {
+        let seen = Arc::new(Mutex::new(Option::<serde_json::Value>::None));
+        let record = seen.clone();
+        let app = Router::new().route(
+            "/compatible-mode/v1/chat/completions",
+            axum::routing::post(move |body: axum::Json<serde_json::Value>| {
+                let record = record.clone();
+                async move {
+                    *record.lock().unwrap() = Some(body.0);
+                    (
+                        [(header::CONTENT_TYPE, "application/json")],
+                        OPENAI_COMPLETION_JSON,
+                    )
+                }
+            }),
+        );
+        let upstream = spawn_server(app).await;
+        let payer = spawn_openai_payer(upstream, None).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("{payer}/v1/messages?beta=true"))
+            .json(&anthropic_request_body())
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["type"], "message");
+        assert_eq!(body["role"], "assistant");
+        assert_eq!(
+            body["content"],
+            serde_json::json!([{ "type": "text", "text": "Hello!" }])
+        );
+        assert_eq!(body["stop_reason"], "end_turn");
+        assert_eq!(body["usage"]["input_tokens"], 12);
+        assert_eq!(body["usage"]["output_tokens"], 3);
+
+        // The upstream must have received the OpenAI shape.
+        let sent = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("upstream saw the request");
+        assert_eq!(
+            sent["messages"],
+            serde_json::json!([
+                { "role": "system", "content": "be brief" },
+                { "role": "user", "content": "hi" },
+            ])
+        );
+        assert_eq!(sent["model"], "qwen-max");
+        assert!(sent.get("system").is_none(), "system moved into messages");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn translates_openai_sse_stream_into_anthropic_events() {
+        const OPENAI_SSE: &str = concat!(
+            "data: {\"id\":\"chatcmpl-7\",\"model\":\"qwen-max\",\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":1}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let app = Router::new().route(
+            "/compatible-mode/v1/chat/completions",
+            axum::routing::post(|| async {
+                ([(header::CONTENT_TYPE, "text/event-stream")], OPENAI_SSE)
+            }),
+        );
+        let upstream = spawn_server(app).await;
+        let payer = spawn_openai_payer(upstream, None).await;
+
+        let mut request = anthropic_request_body();
+        request["stream"] = serde_json::json!(true);
+        let resp = reqwest::Client::new()
+            .post(format!("{payer}/v1/messages"))
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/event-stream"
+        );
+
+        let sse = resp.text().await.unwrap();
+        let event_names: Vec<&str> = sse
+            .lines()
+            .filter_map(|line| line.strip_prefix("event: "))
+            .collect();
+        assert_eq!(
+            event_names,
+            [
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ]
+        );
+        assert!(
+            sse.contains(r#""text":"Hello""#) && sse.contains(r#""text_delta""#),
+            "text delta must survive translation: {sse}"
+        );
+        assert!(
+            sse.contains(r#""output_tokens":1"#),
+            "final usage must reach message_delta: {sse}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pays_402_from_openai_upstream_and_replays_translated_body() {
+        let seen = Arc::new(Mutex::new(StubSeen::default()));
+        let record = seen.clone();
+        let app = Router::new().route(
+            "/compatible-mode/v1/chat/completions",
+            axum::routing::post(move |req: Request| {
+                let record = record.clone();
+                async move {
+                    let auth = req
+                        .headers()
+                        .get(header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string);
+                    let body = axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES)
+                        .await
+                        .unwrap();
+                    let mut seen = record.lock().unwrap();
+                    seen.calls += 1;
+                    if seen.calls == 1 {
+                        seen.retry_body = Some(body.to_vec()); // first (translated) body
+                        return Response::builder()
+                            .status(StatusCode::PAYMENT_REQUIRED)
+                            .header(header::WWW_AUTHENTICATE, challenge_header("localnet"))
+                            .body(Body::from(r#"{"error":"payment required"}"#))
+                            .unwrap();
+                    }
+                    let first_body = seen.retry_body.clone();
+                    seen.retry_auth = auth;
+                    assert_eq!(
+                        first_body.as_deref(),
+                        Some(&body[..]),
+                        "retry must replay the exact translated body"
+                    );
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(OPENAI_COMPLETION_JSON))
+                        .unwrap()
+                }
+            }),
+        );
+        let upstream = spawn_server(app).await;
+        let payer = spawn_openai_payer(upstream, None).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("{payer}/v1/messages"))
+            .json(&anthropic_request_body())
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["type"], "message",
+            "paid retry must come back translated"
+        );
+        assert_eq!(body["content"][0]["text"], "Hello!");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.calls, 2, "exactly one paid retry");
+        let auth = seen
+            .retry_auth
+            .as_deref()
+            .expect("retry carries Authorization");
+        assert!(
+            auth.starts_with("Payment "),
+            "MPP credential expected, got: {auth}"
+        );
+        // The body the 402 fired on — and that the retry replayed — is
+        // the *translated* OpenAI body.
+        let translated: serde_json::Value =
+            serde_json::from_slice(seen.retry_body.as_deref().unwrap()).unwrap();
+        assert_eq!(translated["messages"][0]["role"], "system");
+        assert_eq!(translated["messages"][1]["content"], "hi");
+        assert!(translated.get("system").is_none());
     }
 }

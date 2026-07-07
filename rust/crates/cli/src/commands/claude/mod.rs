@@ -1,16 +1,27 @@
 mod payer;
+mod translate;
 
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Args;
 
 use crate::commands::server::inference::discovery::{self, DiscoveredProvider};
+use crate::commands::server::inference::providers::{
+    Dialect, InferenceProvider, catalog as catalog_providers,
+};
 use crate::tui::{ProviderSelection, select_provider};
 
 const ALLOWED_TOOLS: &str = "mcp__pay__curl,mcp__pay__search_catalog,mcp__pay__list_catalog,mcp__pay__get_catalog_entry,mcp__pay__get_balance,mcp__pay__topup,mcp__pay__create_skill";
 const GATEWAY_BASE_URL: &str = "http://127.0.0.1:1402";
 const PROVIDER_PROBE_TIMEOUT: Duration = Duration::from_millis(400);
+/// Hosted catalog gateways are remote (TLS handshake included) — give their
+/// reachability/model probes more room than the localhost ones.
+const CATALOG_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Where OpenAI-compatible upstreams serve chat completions unless their
+/// paid endpoints say otherwise (Alibaba: `compatible-mode/v1/chat/completions`).
+const DEFAULT_CHAT_COMPLETIONS_PATH: &str = "v1/chat/completions";
 
 /// Run Claude Code with 402 payment support.
 ///
@@ -125,13 +136,16 @@ struct ClaudeLaunch {
 ///
 /// `pay claude` never spawns a gateway itself — it routes:
 ///
-/// 1. **Gateway on 127.0.0.1:1402** (the user ran `pay serve inference`,
+/// 1. **Hosted catalog provider selected** (Gemini, Model Studio, … from
+///    the pay catalog) → payer proxy targets its `service_url` directly
+///    and settles the gateway's MPP 402 challenges per request.
+/// 2. **Gateway on 127.0.0.1:1402** (the user ran `pay serve inference`,
 ///    possibly priced, in another terminal) → payer proxy targets the
 ///    gateway and settles its MPP 402 challenges.
-/// 2. **No gateway** → run local provider discovery and target the
+/// 3. **No gateway** → run local provider discovery and target the
 ///    selected provider directly (e.g. Ollama on :11434) — unmetered
 ///    passthrough, no 402s.
-/// 3. **Neither** → error with a hint.
+/// 4. **None of the above** → error with a hint.
 fn prepare_claude_launch(
     args: &[String],
     network_override: Option<&str>,
@@ -147,39 +161,83 @@ fn prepare_claude_launch(
 
     let requested_model = model_arg(args);
     let gateway_up = gateway_listening();
-    let providers = discover_local_providers()?;
+    let mut providers = discover_local_providers()?;
+    providers.extend(discover_catalog_providers());
 
-    let (upstream, model) = if gateway_up {
+    let choice = if providers.is_empty() {
+        None
+    } else {
+        Some(select_provider_choice(
+            providers,
+            requested_model.as_deref(),
+        )?)
+    };
+
+    if let Some(choice) = &choice {
+        match choice.provider.provider.dialect() {
+            Dialect::Anthropic => {}
+            Dialect::OpenAiCompat => eprintln!(
+                "⏺ translating anthropic → openai for {}",
+                choice.provider.title()
+            ),
+            dialect => eprintln!(
+                "⚠ {} speaks {dialect}; no translator yet — expect errors from claude",
+                choice.provider.title()
+            ),
+        }
+    }
+
+    let (upstream, model) = match choice {
+        // A hosted catalog provider is its own upstream: the payer proxy
+        // pays its 402s directly; the local gateway never fronts it.
+        Some(choice) if choice.provider.hosted() => {
+            eprintln!(
+                "⏺ routing claude → {} {} (hosted, paid per request)",
+                choice.provider.slug(),
+                choice.provider.base_url
+            );
+            let upstream = payer_upstream(&choice.provider, choice.provider.base_url.clone());
+            (upstream, Some(choice.model))
+        }
         // Direct discovery still supplies the model list for the
         // ANTHROPIC_DEFAULT_* env vars; the gateway routes by model.
-        let model = if providers.is_empty() {
-            requested_model
-        } else {
-            Some(select_provider_choice(providers, requested_model.as_deref())?.model)
-        };
-        eprintln!("⏺ routing claude → gateway {GATEWAY_BASE_URL}");
-        (GATEWAY_BASE_URL.to_string(), model)
-    } else {
-        if providers.is_empty() {
+        Some(choice) if gateway_up => {
+            eprintln!("⏺ routing claude → gateway {GATEWAY_BASE_URL}");
+            let upstream = payer_upstream(&choice.provider, GATEWAY_BASE_URL.to_string());
+            (upstream, Some(choice.model))
+        }
+        Some(choice) => {
+            eprintln!(
+                "⏺ routing claude → {} {} (direct, unmetered)",
+                choice.provider.slug(),
+                choice.provider.base_url
+            );
+            let upstream = payer_upstream(&choice.provider, choice.provider.base_url.clone());
+            (upstream, Some(choice.model))
+        }
+        None if gateway_up => {
+            eprintln!("⏺ routing claude → gateway {GATEWAY_BASE_URL}");
+            let upstream = payer::PayerUpstream {
+                base_url: GATEWAY_BASE_URL.to_string(),
+                dialect: Dialect::Anthropic,
+                chat_path: DEFAULT_CHAT_COMPLETIONS_PATH.to_string(),
+            };
+            (upstream, requested_model)
+        }
+        None => {
             return Err(pay_core::Error::Config(format!(
                 "no gateway on {GATEWAY_BASE_URL} and no local inference provider detected — \
                  start one, e.g. `ollama serve`, or run `pay serve inference`."
             )));
         }
-        let choice = select_provider_choice(providers, requested_model.as_deref())?;
-        eprintln!(
-            "⏺ routing claude → {} {} (direct, unmetered)",
-            choice.provider.slug(),
-            choice.provider.base_url
-        );
-        (choice.provider.base_url.clone(), Some(choice.model))
     };
 
-    let payer = payer::start_background(&upstream, network_override, account_override)?;
+    let upstream_base = upstream.base_url.clone();
+    let payer = payer::start_background(upstream, network_override, account_override)?;
     eprintln!(
         "⏺ payer proxy on {} → {} (paying as {})",
         payer.base_url,
-        upstream,
+        upstream_base,
         payer
             .payer_pubkey
             .as_deref()
@@ -193,6 +251,29 @@ fn prepare_claude_launch(
         model,
         args,
     })
+}
+
+/// Payer upstream for a picked provider: its dialect plus the
+/// chat-completions path translated `/v1/messages` requests are sent to.
+fn payer_upstream(provider: &DiscoveredProvider, base_url: String) -> payer::PayerUpstream {
+    payer::PayerUpstream {
+        base_url,
+        dialect: provider.provider.dialect(),
+        chat_path: chat_completions_path(provider.provider.as_ref()),
+    }
+}
+
+/// The provider's chat-completions path, from its paid endpoints (that's
+/// where the catalog pins Alibaba's `compatible-mode/v1/chat/completions`),
+/// falling back to the OpenAI-compatible default.
+fn chat_completions_path(provider: &dyn InferenceProvider) -> String {
+    provider
+        .paid_endpoints()
+        .into_iter()
+        .filter(|ep| matches!(ep.method, pay_types::metering::HttpMethod::Post))
+        .map(|ep| ep.path)
+        .find(|path| path.to_ascii_lowercase().contains("chat/completions"))
+        .unwrap_or_else(|| DEFAULT_CHAT_COMPLETIONS_PATH.to_string())
 }
 
 fn select_provider_choice(
@@ -217,6 +298,81 @@ fn discover_local_providers() -> pay_core::Result<Vec<DiscoveredProvider>> {
         .build()
         .map_err(|e| pay_core::Error::Config(format!("tokio runtime: {e}")))?;
     Ok(rt.block_on(discovery::discover(&registry, PROVIDER_PROBE_TIMEOUT, None)))
+}
+
+/// Hosted pay-catalog providers appended to the picker after local
+/// discovery. Everything degrades silently to local-only: catalog
+/// unavailable, an fqn not (yet) published, or an unreachable gateway all
+/// skip the entry with a debug log.
+fn discover_catalog_providers() -> Vec<DiscoveredProvider> {
+    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return Vec::new();
+    };
+    rt.block_on(async {
+        let mut catalog = match load_catalog_quietly().await {
+            Ok(catalog) => catalog,
+            Err(e) => {
+                tracing::debug!(error = %e, "skills catalog unavailable — hosted providers skipped");
+                return Vec::new();
+            }
+        };
+        let Ok(client) = reqwest::Client::builder()
+            .timeout(CATALOG_PROBE_TIMEOUT)
+            .build()
+        else {
+            return Vec::new();
+        };
+
+        let mut discovered = Vec::new();
+        let resolved = catalog_providers::resolve_catalog_providers(
+            &mut catalog,
+            catalog_providers::DEFAULT_CATALOG_FQNS,
+        )
+        .await;
+        for provider in resolved {
+            let base_url = provider.service_url().to_string();
+            let provider: Arc<dyn InferenceProvider> = Arc::new(provider);
+            let Some(version) = provider.identify(&client, &base_url).await else {
+                tracing::debug!(
+                    slug = provider.slug(),
+                    %base_url,
+                    "hosted catalog provider unreachable — skipping"
+                );
+                continue;
+            };
+            let models = provider.list_models(&client, &base_url).await;
+            discovered.push(DiscoveredProvider {
+                provider,
+                base_url,
+                models,
+                version,
+            });
+        }
+        discovered
+    })
+}
+
+/// Load the skills catalog without waking the local gateway when possible.
+///
+/// `pay_core::skills::load_skills()` re-fetches every *ephemeral* source on
+/// each call — including the `/.well-known/pay-skills.json` a running
+/// `pay serve inference` auto-registers — and that fetch goes through the
+/// payment gate, polluting the gateway's CONNECTIONS panel with an
+/// anonymous 127.0.0.1 row on every `pay claude` launch. The hosted
+/// defaults are durable CDN entries, so a fresh on-disk cache (pure disk
+/// read) is all we need; the full network load only runs when the cache is
+/// stale or missing — the same cadence as any other `pay skills` command.
+async fn load_catalog_quietly() -> pay_core::Result<pay_core::skills::Catalog> {
+    let cache_is_fresh = pay_core::skills::config::SkillsConfig::load()
+        .map(|cfg| cfg.valid_cache_path().is_some())
+        .unwrap_or(false);
+    if cache_is_fresh && let Ok(catalog) = pay_core::skills::load_cached_skills() {
+        return Ok(catalog);
+    }
+    pay_core::skills::load_skills().await
 }
 
 /// Whether an inference gateway is already serving HTTP on 127.0.0.1:1402.

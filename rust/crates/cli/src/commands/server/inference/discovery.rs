@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use super::providers::{self, CustomProvider, InferenceProvider};
+use super::providers::{self, CustomProvider, InferenceProvider, PricingHint};
 
 /// User override/extension file, merged over the built-ins by slug.
 const USER_REGISTRY_PATH: &str = "~/.config/pay/inference-providers.yml";
@@ -42,6 +42,16 @@ impl DiscoveredProvider {
 
     pub fn color(&self) -> Option<&str> {
         self.provider.color()
+    }
+
+    /// Hosted (catalog-backed) providers probe no local ports; their
+    /// `base_url` is a remote gateway that is its own payer-proxy upstream.
+    pub fn hosted(&self) -> bool {
+        self.provider.ports().is_empty()
+    }
+
+    pub fn pricing_hint(&self) -> Option<PricingHint> {
+        self.provider.pricing_hint()
     }
 
     pub fn summary(&self, up: bool) -> pay_pdb::types::ProviderSummary {

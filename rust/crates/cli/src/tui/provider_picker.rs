@@ -2,10 +2,12 @@
 //! model) a coding harness should talk to through the Pay gateway.
 //!
 //! Built to scale past local discovery — providers will eventually come from
-//! a DHT registry with many entries — so the layout is a full-width plain
-//! table (no sidebar, no borders): a model-filter chip row, a type-to-search
-//! field, and a rail-styled provider list in the notice-component style
-//! (`components/notice.rs`: colored `│` rail + bold title + dimmed body).
+//! the p2p registry with many entries — so the layout is a full-width plain
+//! table (no sidebar, no borders): a 🔍 type-to-search field and a sectioned
+//! (LOCAL / SOLANA AGENT GATEWAY / P2P), rail-styled provider list in the
+//! notice-component style (`components/notice.rs`: colored `│` rail + bold
+//! title + dimmed body). `←`/`→` cycle the selected provider's models; the
+//! picked model renders as an accent-colored chip with its price.
 
 use std::io;
 
@@ -19,11 +21,50 @@ use ratatui::widgets::{Block, Paragraph};
 use crate::commands::server::inference::discovery::DiscoveredProvider;
 
 use super::term::{SPINNER, TuiBackend, with_terminal};
-use super::theme::{TOPUP_CARD_BG, TOPUP_MAIN_BG};
+use super::theme::TOPUP_MAIN_BG;
 use super::widgets::controls_bar;
 
-/// Rows per provider entry: two content lines + one blank separator.
-const ENTRY_HEIGHT: u16 = 3;
+/// Rows per provider entry: two content lines, no separator.
+const ENTRY_HEIGHT: u16 = 2;
+
+/// Picker sections, in display order. Every provider renders under exactly
+/// one of these; empty sections show a dim `none` placeholder so the layout
+/// stays self-explanatory.
+const SECTIONS: [Section; 3] = [Section::Local, Section::Gateway, Section::P2p];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Section {
+    /// Pay-managed local providers. Nothing lands here yet — port-probed
+    /// servers are self-hosted peers and list under [`Section::P2p`].
+    Local,
+    /// Hosted pay-catalog providers behind the Solana Agent Gateway.
+    Gateway,
+    /// Self-hosted peers: port-probed inference servers (Ollama, LM
+    /// Studio, …) today, the iroh p2p registry next.
+    P2p,
+}
+
+impl Section {
+    fn title(self) -> &'static str {
+        match self {
+            Section::Local => "LOCAL",
+            Section::Gateway => "SOLANA AGENT GATEWAY",
+            Section::P2p => "P2P",
+        }
+    }
+
+    fn of(provider: &DiscoveredProvider) -> Self {
+        if provider.hosted() {
+            Section::Gateway
+        } else {
+            Section::P2p
+        }
+    }
+
+    fn rank(self) -> usize {
+        SECTIONS.iter().position(|s| *s == self).unwrap_or(0)
+    }
+}
 
 /// The provider (and model) the user picked.
 pub struct ProviderChoice {
@@ -79,8 +120,8 @@ fn run(
                 }
                 KeyCode::Up => app.move_selection(-1),
                 KeyCode::Down => app.move_selection(1),
-                KeyCode::Tab | KeyCode::Right => app.cycle_model_filter(1),
-                KeyCode::BackTab | KeyCode::Left => app.cycle_model_filter(-1),
+                KeyCode::Tab | KeyCode::Right => app.cycle_model(1),
+                KeyCode::BackTab | KeyCode::Left => app.cycle_model(-1),
                 KeyCode::Enter => {
                     if let Some(choice) = app.choice() {
                         return Ok(ProviderSelection::Selected(choice));
@@ -102,19 +143,16 @@ fn run(
 // ── App state ─────────────────────────────────────────────────────────────
 
 struct ProviderPickerApp {
-    /// Display-only harness label for headings/status.
+    /// Display-only harness label for the status line.
     harness: String,
     providers: Vec<DiscoveredProvider>,
-    /// Distinct model names across all providers, first-appearance order.
-    model_names: Vec<String>,
-    /// Active model-filter chip: `None` = "all", else index into
-    /// [`Self::model_names`].
-    model_filter: Option<usize>,
     /// Live type-to-search query (case-insensitive substring).
     search: String,
     /// Index into [`Self::filtered`].
     selected: usize,
-    /// `--model` lock: overrides both filter and per-provider choice.
+    /// `←`/`→` cursor into the selected provider's model list.
+    model_idx: usize,
+    /// `--model` lock: overrides the per-provider model choice.
     requested_model: Option<String>,
     tick: usize,
 }
@@ -122,24 +160,18 @@ struct ProviderPickerApp {
 impl ProviderPickerApp {
     fn new(
         harness: String,
-        providers: Vec<DiscoveredProvider>,
+        mut providers: Vec<DiscoveredProvider>,
         requested_model: Option<String>,
     ) -> Self {
-        let mut model_names: Vec<String> = Vec::new();
-        for provider in &providers {
-            for model in &provider.models {
-                if !model_names.contains(model) {
-                    model_names.push(model.clone());
-                }
-            }
-        }
+        // Group by section (stable, so discovery order survives within a
+        // section) — the list renders under section headers.
+        providers.sort_by_key(|p| Section::of(p).rank());
         Self {
             harness,
             providers,
-            model_names,
-            model_filter: None,
             search: String::new(),
             selected: 0,
+            model_idx: 0,
             requested_model,
             tick: 0,
         }
@@ -149,21 +181,8 @@ impl ProviderPickerApp {
         self.requested_model.is_some()
     }
 
-    /// Name of the active model-filter chip, if any.
-    fn active_model(&self) -> Option<&str> {
-        self.model_filter
-            .and_then(|idx| self.model_names.get(idx))
-            .map(String::as_str)
-    }
-
-    /// Case-insensitive substring match over title, slug, and model names,
-    /// intersected with the active model filter.
+    /// Case-insensitive substring match over title, slug, and model names.
     fn matches(&self, provider: &DiscoveredProvider) -> bool {
-        if let Some(model) = self.active_model()
-            && !provider.models.iter().any(|m| m == model)
-        {
-            return false;
-        }
         if self.search.is_empty() {
             return true;
         }
@@ -176,7 +195,25 @@ impl ProviderPickerApp {
                 .any(|m| m.to_lowercase().contains(&query))
     }
 
-    /// Providers passing the search + model filters, input order.
+    /// The provider's models narrowed by the search query. Falls back to
+    /// the full list when no model matches (the provider matched on
+    /// title/slug instead) so the row never goes blank.
+    fn visible_models<'a>(&self, provider: &'a DiscoveredProvider) -> Vec<&'a String> {
+        if !self.search.is_empty() {
+            let query = self.search.to_lowercase();
+            let matching: Vec<&String> = provider
+                .models
+                .iter()
+                .filter(|m| m.to_lowercase().contains(&query))
+                .collect();
+            if !matching.is_empty() {
+                return matching;
+            }
+        }
+        provider.models.iter().collect()
+    }
+
+    /// Providers passing the search filter, input order.
     fn filtered(&self) -> Vec<&DiscoveredProvider> {
         self.providers.iter().filter(|p| self.matches(p)).collect()
     }
@@ -186,7 +223,11 @@ impl ProviderPickerApp {
     }
 
     fn clamp_selection(&mut self) {
-        self.selected = self.selected.min(self.filtered().len().saturating_sub(1));
+        let clamped = self.selected.min(self.filtered().len().saturating_sub(1));
+        if clamped != self.selected {
+            self.selected = clamped;
+            self.model_idx = 0;
+        }
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -194,47 +235,55 @@ impl ProviderPickerApp {
         if len == 0 {
             return;
         }
-        let next = (self.selected as isize + delta).clamp(0, len as isize - 1);
-        self.selected = next as usize;
+        let next = (self.selected as isize + delta).clamp(0, len as isize - 1) as usize;
+        if next != self.selected {
+            self.selected = next;
+            self.model_idx = 0;
+        }
     }
 
-    /// Cycle the model-filter chips: all → each model → all (wraps both
-    /// ways). No-op while the model is locked by `--model`.
-    fn cycle_model_filter(&mut self, delta: isize) {
-        if self.model_locked() || self.model_names.is_empty() {
+    /// Move the model cursor across the selected provider's (search-
+    /// narrowed) models — clamped at both ends, no wrap. No-op while the
+    /// model is locked by `--model` or the provider reports no models.
+    fn cycle_model(&mut self, delta: isize) {
+        if self.model_locked() {
             return;
         }
-        let total = self.model_names.len() as isize + 1; // + "all"
-        let current = self.model_filter.map_or(0, |idx| idx as isize + 1);
-        let next = (current + delta).rem_euclid(total);
-        self.model_filter = (next > 0).then(|| (next - 1) as usize);
-        self.clamp_selection();
+        let len = match self.selected_provider() {
+            Some(provider) => self.visible_models(provider).len(),
+            None => return,
+        };
+        if len == 0 {
+            return;
+        }
+        self.model_idx = (self.model_idx as isize + delta).clamp(0, len as isize - 1) as usize;
     }
 
     fn push_search(&mut self, ch: char) {
         self.search.push(ch);
+        self.model_idx = 0;
         self.clamp_selection();
     }
 
     fn pop_search(&mut self) {
         self.search.pop();
+        self.model_idx = 0;
         self.clamp_selection();
     }
 
-    /// Model that Enter would launch for `provider`:
-    /// `--model` lock > active model-filter chip > the provider's first
-    /// model. `None` when the provider reports no models and nothing else
-    /// decides.
+    /// Model that Enter would launch for `provider`: `--model` lock > the
+    /// `←`/`→` model cursor over the search-narrowed models (selected
+    /// provider only) > the provider's first model. `None` when the
+    /// provider reports no models and nothing else decides.
     fn chosen_model(&self, provider: &DiscoveredProvider) -> Option<String> {
         if let Some(model) = &self.requested_model {
             return Some(model.clone());
         }
-        if let Some(model) = self.active_model()
-            && provider.models.iter().any(|m| m == model)
-        {
-            return Some(model.to_string());
-        }
-        provider.models.first().cloned()
+        let models = self.visible_models(provider);
+        models
+            .get(self.model_idx)
+            .or_else(|| models.first())
+            .map(|m| (*m).clone())
     }
 
     fn choice(&self) -> Option<ProviderChoice> {
@@ -254,8 +303,6 @@ fn render(frame: &mut ratatui::Frame, app: &ProviderPickerApp) {
     );
 
     let rows = Layout::vertical([
-        Constraint::Length(1), // heading
-        Constraint::Length(1), // model chips
         Constraint::Length(1), // search
         Constraint::Length(1), // gap
         Constraint::Min(0),    // provider list
@@ -263,141 +310,165 @@ fn render(frame: &mut ratatui::Frame, app: &ProviderPickerApp) {
     ])
     .split(area);
 
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!("PROVIDER FOR {}", app.harness.to_uppercase()),
-            Style::default().fg(Color::DarkGray).bold(),
-        ))),
-        inset_x(rows[0], 2),
-    );
-    render_model_chips(frame, inset_x(rows[1], 2), app);
-    render_search(frame, inset_x(rows[2], 2), app);
-    render_provider_list(frame, inset_x(rows[4], 2), app);
-    render_controls(frame, rows[5], app);
+    render_search(frame, inset_x(rows[0], 2), app);
+    render_provider_list(frame, inset_x(rows[2], 2), app);
+    render_controls(frame, rows[3], app);
 }
 
-/// Model-filter chip row: `model  all  llama3.2  qwen3 …` with the active
-/// chip highlighted. Windows from the left so the active chip stays
-/// visible when there are many models.
-fn render_model_chips(frame: &mut ratatui::Frame, area: Rect, app: &ProviderPickerApp) {
-    let dim = Style::default().fg(Color::DarkGray);
-    if app.model_locked() {
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled("model ", dim),
-                Span::styled(
-                    app.requested_model.clone().unwrap_or_default(),
-                    Style::default().fg(Color::White).bold(),
-                ),
-                Span::styled("  locked by --model", dim),
-            ])),
-            area,
-        );
-        return;
-    }
-
-    let mut chips: Vec<(&str, bool)> = vec![("all", app.model_filter.is_none())];
-    for (idx, name) in app.model_names.iter().enumerate() {
-        chips.push((name.as_str(), app.model_filter == Some(idx)));
-    }
-
-    // Drop leading chips until the active one fits in the row.
-    let avail = (area.width as usize).saturating_sub("model ".len() + 2);
-    let chip_width = |name: &str| name.chars().count() + 3; // " name " + gap
-    let active_idx = chips.iter().position(|(_, active)| *active).unwrap_or(0);
-    let mut start = 0;
-    while start < active_idx
-        && chips[start..=active_idx]
-            .iter()
-            .map(|(name, _)| chip_width(name))
-            .sum::<usize>()
-            > avail
-    {
-        start += 1;
-    }
-
-    let mut spans = vec![Span::styled("model ", dim)];
-    if start > 0 {
-        spans.push(Span::styled("… ", dim));
-    }
-    for (name, active) in chips.iter().skip(start) {
-        if *active {
-            spans.push(Span::styled(
-                format!(" {name} "),
-                Style::default().fg(Color::White).bg(TOPUP_CARD_BG).bold(),
-            ));
-        } else {
-            spans.push(Span::styled(format!(" {name} "), dim));
-        }
-        spans.push(Span::raw(" "));
+/// 🔍 type-to-search field: the live query (with a trailing cursor), or a
+/// dim placeholder while empty.
+fn render_search(frame: &mut ratatui::Frame, area: Rect, app: &ProviderPickerApp) {
+    let mut spans = vec![Span::raw("🔍 ")];
+    if app.search.is_empty() {
+        spans.push(Span::styled(
+            "looking for models…",
+            Style::default().fg(Color::DarkGray),
+        ));
+    } else {
+        spans.push(Span::styled(
+            app.search.clone(),
+            Style::default().fg(Color::White).bold(),
+        ));
+        spans.push(Span::styled("▌", Style::default().fg(Color::Gray)));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// Type-to-search field: the live query with a cursor, or a dim
-/// placeholder while empty.
-fn render_search(frame: &mut ratatui::Frame, area: Rect, app: &ProviderPickerApp) {
-    let line = if app.search.is_empty() {
-        Line::from(vec![
-            Span::styled("▌", Style::default().fg(Color::Gray)),
-            Span::styled("search providers…", Style::default().fg(Color::DarkGray)),
-        ])
-    } else {
-        Line::from(vec![
-            Span::styled(app.search.clone(), Style::default().fg(Color::White).bold()),
-            Span::styled("▌", Style::default().fg(Color::Gray)),
-        ])
-    };
-    frame.render_widget(Paragraph::new(line), area);
+/// One display row of the sectioned provider list.
+enum ListRow<'a> {
+    /// Blank line between sections.
+    Gap,
+    Header(&'static str),
+    /// Dim placeholder under an empty section.
+    None,
+    /// `usize` is the index into [`ProviderPickerApp::filtered`].
+    Entry(usize, &'a DiscoveredProvider),
+}
+
+impl ListRow<'_> {
+    fn height(&self) -> u16 {
+        match self {
+            ListRow::Entry(..) => ENTRY_HEIGHT,
+            _ => 1,
+        }
+    }
 }
 
 fn render_provider_list(frame: &mut ratatui::Frame, area: Rect, app: &ProviderPickerApp) {
     let providers = app.filtered();
-    if providers.is_empty() {
-        if area.height > 0 {
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    "no providers match",
-                    Style::default().fg(Color::DarkGray),
-                ))),
-                Rect { height: 1, ..area },
-            );
+
+    // Section-grouped rows. `filtered()` is already section-ordered (the
+    // provider list is sorted at construction), so entry indices stay in
+    // sync with the selection cursor.
+    let mut rows: Vec<ListRow> = Vec::new();
+    for (i, section) in SECTIONS.iter().enumerate() {
+        if i > 0 {
+            rows.push(ListRow::Gap);
         }
-        return;
+        rows.push(ListRow::Header(section.title()));
+        let mut any = false;
+        for (idx, provider) in providers.iter().enumerate() {
+            if Section::of(provider) == *section {
+                rows.push(ListRow::Entry(idx, provider));
+                any = true;
+            }
+        }
+        if !any {
+            rows.push(ListRow::None);
+        }
     }
 
-    let visible = (area.height / ENTRY_HEIGHT) as usize;
-    if visible == 0 {
-        return;
+    // Scroll (in lines) so the selected entry is fully visible.
+    let mut sel_end: u16 = 0;
+    let mut total: u16 = 0;
+    for row in &rows {
+        let h = row.height();
+        if let ListRow::Entry(idx, _) = row
+            && *idx == app.selected
+        {
+            sel_end = total + h;
+        }
+        total += h;
     }
-    let offset = app.selected.saturating_sub(visible.saturating_sub(1));
+    let offset = sel_end.saturating_sub(area.height);
 
-    let mut y = area.y;
-    for (idx, provider) in providers.iter().enumerate().skip(offset).take(visible) {
-        let entry_area = Rect {
+    let mut line: u16 = 0;
+    for row in &rows {
+        let h = row.height();
+        let start = line;
+        line += h;
+        if start < offset {
+            continue; // clipped above
+        }
+        let y = area.y + (start - offset);
+        if y + h > area.y + area.height {
+            break; // clipped below
+        }
+        let row_area = Rect {
             x: area.x,
             y,
             width: area.width,
-            height: ENTRY_HEIGHT,
+            height: h,
         };
-        render_provider_entry(frame, entry_area, provider, idx == app.selected);
-        y += ENTRY_HEIGHT;
+        match row {
+            ListRow::Gap => {}
+            ListRow::Header(title) => frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    *title,
+                    Style::default().fg(Color::DarkGray).bold(),
+                ))),
+                row_area,
+            ),
+            ListRow::None => frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "  none",
+                    Style::default().fg(Color::DarkGray),
+                ))),
+                row_area,
+            ),
+            ListRow::Entry(idx, provider) => {
+                let selected = *idx == app.selected;
+                let chosen = selected.then(|| app.chosen_model(provider)).flatten();
+                render_provider_entry(
+                    frame,
+                    row_area,
+                    provider,
+                    &app.visible_models(provider),
+                    selected,
+                    chosen.as_deref(),
+                );
+            }
+        }
     }
 }
 
-/// One two-line entry in the notice style: a brand-colored `│` rail
-/// spanning both lines, bold title + dim origin on line 1, dim model list
-/// on line 2. Selection thickens the rail (`┃`) and brightens the title.
+/// Width of the pricing column on hosted rows — a fixed tab stop so prices
+/// line up across entries and are easy to compare.
+const PRICING_COL: usize = 20;
+
+/// One two-line entry in the notice style: a `│` rail spanning both lines
+/// (brand-colored when selected, gray otherwise), bold title + dim origin
+/// on line 1, and the model list on line 2 — hosted rows lead with their
+/// price in a fixed-width column so prices line up. Selection thickens the
+/// rail (`┃`), brightens the title, and highlights the `←`/`→`-picked
+/// model as a white-on-accent chip (the list windows so it stays visible).
 fn render_provider_entry(
     frame: &mut ratatui::Frame,
     area: Rect,
     provider: &DiscoveredProvider,
+    models: &[&String],
     selected: bool,
+    chosen_model: Option<&str>,
 ) {
-    let accent = provider
-        .color()
-        .and_then(hex_color)
-        .unwrap_or(Color::DarkGray);
+    // Brand color marks the active row only; inactive rails stay gray.
+    let accent = if selected {
+        provider
+            .color()
+            .and_then(hex_color)
+            .unwrap_or(Color::DarkGray)
+    } else {
+        Color::DarkGray
+    };
     let rail_glyph = if selected { "┃" } else { "│" };
     let rail = Span::styled(format!("{rail_glyph} "), Style::default().fg(accent).bold());
     let title_style = if selected {
@@ -416,20 +487,34 @@ fn render_provider_entry(
         top.push(Span::styled(format!(" · v{version}"), dim));
     }
 
-    let count = provider.models.len();
-    let noun = if count == 1 { "model" } else { "models" };
-    let models = if provider.models.is_empty() {
-        "no models reported".to_string()
+    let mut bottom = vec![rail];
+    let mut avail = (area.width as usize).saturating_sub(2);
+    // Hosted catalog entries lead with their price in a fixed-width column
+    // (tab stop) so pricing lines up across rows.
+    if let Some(hint) = provider.pricing_hint() {
+        bottom.push(Span::styled(
+            format!("{:<PRICING_COL$}", hint.to_string()),
+            dim,
+        ));
+        avail = avail.saturating_sub(PRICING_COL);
+    }
+    if models.is_empty() {
+        bottom.push(Span::styled("no models reported", dim));
+    } else if let Some(chosen) = chosen_model {
+        bottom.extend(model_chip_spans(models, chosen, accent, dim, avail));
     } else {
-        provider.models.join(", ")
-    };
-    // Rail (2) + " · N models" suffix budget (12).
-    let models_width = (area.width as usize).saturating_sub(14);
-    let bottom = vec![
-        rail,
-        Span::styled(truncate_str(&models, models_width), dim),
-        Span::styled(format!(" · {count} {noun}"), dim),
-    ];
+        bottom.push(Span::styled(
+            truncate_str(
+                &models
+                    .iter()
+                    .map(|m| m.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                avail,
+            ),
+            dim,
+        ));
+    }
 
     frame.render_widget(
         Paragraph::new(vec![Line::from(top), Line::from(bottom)]),
@@ -437,12 +522,67 @@ fn render_provider_entry(
     );
 }
 
+/// The selected row's model line: every model on one line, the chosen one
+/// highlighted as a white-on-accent chip. Windows from the left so the
+/// chip stays visible when the list overflows.
+fn model_chip_spans<'a>(
+    models: &[&'a String],
+    chosen: &str,
+    accent: Color,
+    dim: Style,
+    avail: usize,
+) -> Vec<Span<'a>> {
+    let chosen_idx = models
+        .iter()
+        .position(|m| m.as_str() == chosen)
+        .unwrap_or(0);
+    let chip_width = |name: &str| name.chars().count() + 3; // " name " + gap
+
+    // Drop leading models until the chosen one fits in the row.
+    let mut start = 0;
+    while start < chosen_idx
+        && models[start..=chosen_idx]
+            .iter()
+            .map(|m| chip_width(m))
+            .sum::<usize>()
+            > avail.saturating_sub(2)
+    {
+        start += 1;
+    }
+
+    let mut spans = Vec::new();
+    if start > 0 {
+        spans.push(Span::styled("… ", dim));
+    }
+    // A `--model` override may not be in the provider's list — show it as
+    // the chip up front so the launch target is always visible.
+    if !models.iter().any(|m| m.as_str() == chosen) {
+        spans.push(Span::styled(
+            format!(" {chosen} "),
+            Style::default().fg(Color::White).bg(accent).bold(),
+        ));
+        spans.push(Span::raw(" "));
+    }
+    for (idx, model) in models.iter().enumerate().skip(start) {
+        if idx == chosen_idx && models[chosen_idx].as_str() == chosen {
+            spans.push(Span::styled(
+                format!(" {model} "),
+                Style::default().fg(Color::White).bg(accent).bold(),
+            ));
+        } else {
+            spans.push(Span::styled(format!(" {model} "), dim));
+        }
+        spans.push(Span::raw(" "));
+    }
+    spans
+}
+
 fn render_controls(frame: &mut ratatui::Frame, area: Rect, app: &ProviderPickerApp) {
     let entries: Vec<(&str, &str)> = vec![
-        ("↑ ↓", "select"),
-        ("⇥", "model filter"),
+        ("↑ ↓", "provider"),
+        ("← →", "model"),
         ("a-z", "search"),
-        ("⏎", "select"),
+        ("⏎", "launch"),
         ("Esc", "cancel"),
     ];
 
@@ -563,53 +703,61 @@ mod tests {
     }
 
     #[test]
-    fn model_filter_narrows_to_providers_serving_that_model() {
+    fn left_right_moves_the_model_cursor_without_wrapping() {
         let mut app = app(vec![
-            ollama(&["llama3.2:3b", "shared-model"]),
-            lm_studio(&["qwen2.5-7b", "shared-model"]),
+            ollama(&["llama3.2:3b", "nomic-embed"]),
+            lm_studio(&["qwen2.5-7b"]),
         ]);
-        // Distinct models, first-appearance order.
-        assert_eq!(
-            app.model_names,
-            vec!["llama3.2:3b", "shared-model", "qwen2.5-7b"]
-        );
+        assert_eq!(app.choice().unwrap().model, "llama3.2:3b");
 
-        // all → llama3.2:3b (only ollama serves it).
-        app.cycle_model_filter(1);
-        assert_eq!(app.active_model(), Some("llama3.2:3b"));
-        assert_eq!(filtered_slugs(&app), vec!["ollama"]);
+        // → moves forward and clamps at the end (no wrap).
+        app.cycle_model(1);
+        assert_eq!(app.choice().unwrap().model, "nomic-embed");
+        app.cycle_model(1);
+        assert_eq!(app.choice().unwrap().model, "nomic-embed");
 
-        // shared-model → both providers.
-        app.cycle_model_filter(1);
-        assert_eq!(app.active_model(), Some("shared-model"));
-        assert_eq!(filtered_slugs(&app), vec!["ollama", "lm-studio"]);
+        // ← moves back and clamps at the start (no wrap).
+        app.cycle_model(-1);
+        assert_eq!(app.choice().unwrap().model, "llama3.2:3b");
+        app.cycle_model(-1);
+        assert_eq!(app.choice().unwrap().model, "llama3.2:3b");
 
-        // qwen → lm-studio only; then wraps back to "all".
-        app.cycle_model_filter(1);
-        assert_eq!(filtered_slugs(&app), vec!["lm-studio"]);
-        app.cycle_model_filter(1);
-        assert_eq!(app.active_model(), None);
-        assert_eq!(filtered_slugs(&app), vec!["ollama", "lm-studio"]);
-
-        // Backwards from "all" wraps to the last model.
-        app.cycle_model_filter(-1);
-        assert_eq!(app.active_model(), Some("qwen2.5-7b"));
+        // Moving the provider selection resets the model cursor.
+        app.cycle_model(1);
+        app.move_selection(1);
+        assert_eq!(app.choice().unwrap().model, "qwen2.5-7b");
+        app.move_selection(-1);
+        assert_eq!(app.choice().unwrap().model, "llama3.2:3b");
     }
 
     #[test]
-    fn search_and_model_filter_combine() {
-        let mut app = app(vec![
-            ollama(&["shared-model"]),
-            lm_studio(&["shared-model", "qwen2.5-7b"]),
-        ]);
-        // Model filter alone keeps both…
-        app.cycle_model_filter(1); // shared-model
-        assert_eq!(app.active_model(), Some("shared-model"));
-        assert_eq!(filtered_slugs(&app), vec!["ollama", "lm-studio"]);
+    fn search_narrows_the_model_choice() {
+        let mut app = app(vec![ollama(&["llama3.2:3b", "nomic-embed", "qwen3:8b"])]);
 
-        // …the search then narrows within the model filter.
-        app.search = "studio".into();
-        assert_eq!(filtered_slugs(&app), vec!["lm-studio"]);
+        // Typing a model query narrows what ←/→ walks and what Enter picks.
+        for ch in "nomic".chars() {
+            app.push_search(ch);
+        }
+        assert_eq!(filtered_slugs(&app), vec!["ollama"]);
+        assert_eq!(app.choice().unwrap().model, "nomic-embed");
+        // Only one match — the cursor clamps inside the narrowed list.
+        app.cycle_model(1);
+        assert_eq!(app.choice().unwrap().model, "nomic-embed");
+
+        // A title/slug match keeps the full model list.
+        app.search = "ollama".into();
+        app.model_idx = 0;
+        assert_eq!(app.choice().unwrap().model, "llama3.2:3b");
+        app.cycle_model(2);
+        assert_eq!(app.choice().unwrap().model, "qwen3:8b");
+    }
+
+    #[test]
+    fn cycle_model_is_a_noop_without_models() {
+        let mut app = app(vec![ollama(&[])]);
+        app.cycle_model(1);
+        assert_eq!(app.model_idx, 0);
+        assert!(app.choice().is_none());
     }
 
     #[test]
@@ -645,27 +793,18 @@ mod tests {
     }
 
     #[test]
-    fn active_model_filter_pre_picks_that_model() {
-        let mut app = app(vec![ollama(&["llama3.2:3b", "nomic-embed"])]);
-        app.cycle_model_filter(1); // llama3.2:3b
-        app.cycle_model_filter(1); // nomic-embed
-        assert_eq!(app.active_model(), Some("nomic-embed"));
-        assert_eq!(app.choice().unwrap().model, "nomic-embed");
-    }
-
-    #[test]
-    fn requested_model_locks_the_choice_and_the_filter() {
+    fn requested_model_locks_the_choice_and_the_cursor() {
         let mut app = ProviderPickerApp::new(
             "codex".into(),
-            vec![ollama(&["llama3.2:3b"])],
+            vec![ollama(&["llama3.2:3b", "nomic-embed"])],
             Some("custom-model".into()),
         );
         assert!(app.model_locked());
         assert_eq!(app.choice().unwrap().model, "custom-model");
 
-        // Cycling the filter is a no-op while locked.
-        app.cycle_model_filter(1);
-        assert_eq!(app.model_filter, None);
+        // Cycling models is a no-op while locked.
+        app.cycle_model(1);
+        assert_eq!(app.model_idx, 0);
         assert_eq!(app.choice().unwrap().model, "custom-model");
     }
 
@@ -690,6 +829,179 @@ mod tests {
         assert_eq!(truncate_str("abc", 4), "abc");
     }
 
+    // ── Hosted (catalog) rows ──
+
+    fn hosted_gemini() -> DiscoveredProvider {
+        let svc: pay_core::skills::Service = serde_json::from_value(serde_json::json!({
+            "fqn": "solana-foundation/google/generativelanguage",
+            "title": "Generative Language API (Gemini)",
+            "service_url": "https://generativelanguage.google.gateway-402.com",
+            "endpoints": [{
+                "method": "POST",
+                "path": "v1beta/models/{modelsId}:generateContent",
+                "pricing": {
+                    "dimensions": [
+                        { "unit": "requests", "tiers": [{ "price_usd": 0.01 }] }
+                    ]
+                }
+            }]
+        }))
+        .unwrap();
+        let provider =
+            crate::commands::server::inference::providers::catalog::CatalogProvider::from_service(
+                &svc,
+            );
+        DiscoveredProvider {
+            base_url: provider.service_url().to_string(),
+            provider: Arc::new(provider),
+            models: vec!["gemini-2.5-flash".into()],
+            version: None,
+        }
+    }
+
+    /// Render `app` into a `w`×`h` test buffer.
+    fn draw(app: &ProviderPickerApp, w: u16, h: u16) -> ratatui::buffer::Buffer {
+        let backend = ratatui::backend::TestBackend::new(w, h);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, app)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
+        let mut text = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    #[test]
+    fn hosted_row_shows_pricing_hint_and_gateway_host() {
+        // Passed peer-first on purpose: the app groups by section, so the
+        // hosted entry must still sort first (gateway section precedes P2P).
+        let mut app = app(vec![ollama(&["llama3.2:3b"]), hosted_gemini()]);
+        assert_eq!(
+            filtered_slugs(&app),
+            vec!["generativelanguage", "ollama"],
+            "gateway providers must sort before p2p ones"
+        );
+        // Select ollama so the gemini row renders unselected (the selected
+        // row swaps its pricing line for the model chip).
+        app.move_selection(1);
+
+        let text = buffer_text(&draw(&app, 120, 30));
+        assert!(
+            text.contains("Google Gemini"),
+            "missing hosted brand title:\n{text}"
+        );
+        // Pricing sits in a fixed-width column (tab stop) before the
+        // models, so prices line up across hosted rows.
+        assert!(
+            text.contains(&format!("{:<PRICING_COL$}gemini-2.5-flash", "$0.0100/req")),
+            "hosted line 2 must lead with column-aligned pricing + models:\n{text}"
+        );
+        // The selected peer entry shows its model chip.
+        assert!(
+            text.contains(" llama3.2:3b "),
+            "missing selected model chip:\n{text}"
+        );
+        // The `· N models` count noise is gone from line 2.
+        assert!(
+            !text.contains("· 1 model"),
+            "model-count noise should be gone from line 2:\n{text}"
+        );
+    }
+
+    #[test]
+    fn sections_render_in_order_with_placeholders_for_empty_ones() {
+        let app = app(vec![ollama(&["llama3.2:3b"]), hosted_gemini()]);
+
+        let text = buffer_text(&draw(&app, 120, 30));
+        let local = text.find("LOCAL").expect("LOCAL header");
+        let gateway = text
+            .find("SOLANA AGENT GATEWAY")
+            .expect("SOLANA AGENT GATEWAY header");
+        let p2p = text.find("P2P").expect("P2P header");
+        assert!(local < gateway && gateway < p2p, "section order:\n{text}");
+
+        // Hosted entries land under the gateway header; port-probed
+        // servers are self-hosted peers and land under P2P.
+        let ollama_at = text.find("Ollama").expect("ollama entry");
+        let gemini_at = text.find("Google Gemini").expect("gemini entry");
+        assert!(
+            gateway < gemini_at && gemini_at < p2p,
+            "gemini under gateway:\n{text}"
+        );
+        assert!(p2p < ollama_at, "ollama under P2P:\n{text}");
+
+        // LOCAL has no providers yet — dim placeholder.
+        assert!(text.contains("none"), "empty section placeholder:\n{text}");
+    }
+
+    #[test]
+    fn selected_row_carries_brand_color_rail_and_model_chip() {
+        // Gemini selected (gateway section sorts first), ollama inactive.
+        let app = app(vec![ollama(&["llama3.2:3b"]), hosted_gemini()]);
+        assert_eq!(
+            app.selected_provider().unwrap().slug(),
+            "generativelanguage"
+        );
+
+        let buffer = draw(&app, 120, 30);
+        let text = buffer_text(&buffer);
+
+        // The picked model renders as a chip; the price leads the line.
+        assert!(
+            text.contains(" gemini-2.5-flash "),
+            "missing model chip:\n{text}"
+        );
+        assert!(
+            text.contains("$0.0100/req"),
+            "missing price on the selected row:\n{text}"
+        );
+
+        // Rails live in the list's first column (x = 2); the controls bar
+        // (last row) is excluded — its separators aren't rails.
+        let gemini_blue = Color::Rgb(0x42, 0x85, 0xf4);
+        let mut selected_rail_color = None;
+        let mut inactive_rail_color = None;
+        let mut chip_style = None;
+        for y in 0..buffer.area.height.saturating_sub(1) {
+            for x in 0..buffer.area.width {
+                let cell = &buffer[(x, y)];
+                if x == 2 {
+                    match cell.symbol() {
+                        "┃" => selected_rail_color = Some(cell.fg),
+                        "│" => inactive_rail_color = Some(cell.fg),
+                        _ => {}
+                    }
+                }
+                if cell.bg == gemini_blue {
+                    chip_style = Some(cell.fg);
+                }
+            }
+        }
+        assert_eq!(
+            selected_rail_color,
+            Some(gemini_blue),
+            "selected rail carries the brand color"
+        );
+        assert_eq!(
+            inactive_rail_color,
+            Some(Color::DarkGray),
+            "inactive rails are gray, not brand-colored"
+        );
+        // Chip: same color as the rail, highlighted text in white.
+        assert_eq!(
+            chip_style,
+            Some(Color::White),
+            "model chip must be white-on-accent"
+        );
+    }
+
     // ── Render smoke test ──
 
     #[test]
@@ -699,33 +1011,38 @@ mod tests {
             lm_studio(&["qwen2.5-7b"]),
         ]);
 
-        let backend = ratatui::backend::TestBackend::new(100, 30);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text = buffer_text(&draw(&app, 100, 30));
 
-        let buffer = terminal.backend().buffer();
-        let mut text = String::new();
-        for y in 0..buffer.area.height {
-            for x in 0..buffer.area.width {
-                text.push_str(buffer[(x, y)].symbol());
-            }
-            text.push('\n');
-        }
-
-        // Heading + filter bar + search placeholder.
+        // 🔍 search header only — no heading, no model-filter chips, no
+        // cursor glyph after the emoji while empty.
+        assert!(text.contains("🔍"), "missing search glass:\n{text}");
         assert!(
-            text.contains("PROVIDER FOR CODEX"),
-            "missing heading:\n{text}"
-        );
-        assert!(text.contains("model "), "missing chip row label:\n{text}");
-        assert!(text.contains(" all "), "missing the all chip:\n{text}");
-        assert!(
-            text.contains("search providers…"),
+            text.contains("looking for models…"),
             "missing search placeholder:\n{text}"
         );
+        assert!(
+            !text.contains('▌'),
+            "no cursor glyph while the search is empty:\n{text}"
+        );
+        assert!(
+            !text.contains("PROVIDER FOR"),
+            "heading row should be gone:\n{text}"
+        );
+        assert!(
+            !text.contains(" all "),
+            "model-filter chips should be gone:\n{text}"
+        );
 
-        // Two-line rail entries: selected rail + plain rail, titles, and
-        // per-entry detail lines.
+        // Section headers.
+        assert!(text.contains("LOCAL"), "missing LOCAL header:\n{text}");
+        assert!(
+            text.contains("SOLANA AGENT GATEWAY"),
+            "missing gateway header:\n{text}"
+        );
+        assert!(text.contains("P2P"), "missing P2P header:\n{text}");
+
+        // Two-line rail entries: selected rail + plain rail, titles, the
+        // selected row's model chip, and per-entry detail lines.
         assert!(text.contains('┃'), "missing selected rail:\n{text}");
         assert!(text.contains('│'), "missing entry rail:\n{text}");
         assert!(text.contains("Ollama"), "missing provider title:\n{text}");
@@ -734,11 +1051,19 @@ mod tests {
             "missing provider origin:\n{text}"
         );
         assert!(
-            text.contains("llama3.2:3b, nomic-embed"),
-            "missing model list line:\n{text}"
+            text.contains(" llama3.2:3b "),
+            "missing selected model chip:\n{text}"
         );
-        assert!(text.contains("2 models"), "missing model count:\n{text}");
+        // All models render on one line next to the chip.
+        assert!(
+            text.contains("nomic-embed"),
+            "missing sibling model on the selected line:\n{text}"
+        );
         assert!(text.contains("LM Studio"), "missing second entry:\n{text}");
+        assert!(
+            text.contains("qwen2.5-7b"),
+            "missing unselected model list:\n{text}"
+        );
 
         // No borders and no sidebar anywhere in the new layout.
         assert!(

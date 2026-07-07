@@ -1,8 +1,8 @@
 //! Ollama — native API on :11434 plus OpenAI- and Anthropic-compat surfaces.
 
 use super::{
-    InferenceProvider, PaidEndpoint, identify_json_key, models_from_json, openai_paid_endpoints,
-    post,
+    Dialect, InferenceProvider, PaidEndpoint, identify_json_key, models_from_json,
+    openai_paid_endpoints, post,
 };
 
 pub struct Ollama;
@@ -38,6 +38,12 @@ impl InferenceProvider for Ollama {
     }
     // endpoint_kind: the shared default already maps /api/chat → chat,
     // /api/generate → completion, /api/embed → embeddings.
+
+    /// Ollama serves both surfaces; `pay claude` drives v1/messages, so
+    /// Anthropic is the dialect that matters here.
+    fn dialect(&self) -> Dialect {
+        Dialect::Anthropic
+    }
 }
 
 #[cfg(test)]
