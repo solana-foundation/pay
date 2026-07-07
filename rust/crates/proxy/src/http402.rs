@@ -528,14 +528,27 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                         settlement: u.settlement,
                     }
                 });
-                if ctx.upto.as_ref().is_some_and(|pending| {
-                    pending.settlement.as_ref().is_some_and(|plan| {
-                        metering::upto_requires_response_body(
-                            &plan.metering,
-                            plan.variant_hint.as_deref(),
-                        )
+                // Token-metered inference upto (the host tracks the request, so
+                // the stream observer will be armed in `response_filter`) settles
+                // from observer token counts at end-of-stream — it must NOT be
+                // buffered, so SSE/NDJSON streams flow through unbuffered. Every
+                // other response-body-metered upto (Gemini's buffered JSON path)
+                // keeps buffering as before.
+                let observer_metered = ctx.log.as_ref().is_some_and(|log| log.log_id.is_some())
+                    && ctx
+                        .upto
+                        .as_ref()
+                        .is_some_and(|pending| pending.settlement.is_some());
+                if !observer_metered
+                    && ctx.upto.as_ref().is_some_and(|pending| {
+                        pending.settlement.as_ref().is_some_and(|plan| {
+                            metering::upto_requires_response_body(
+                                &plan.metering,
+                                plan.variant_hint.as_deref(),
+                            )
+                        })
                     })
-                }) {
+                {
                     return self
                         .forward_upto_buffered(
                             session,
@@ -644,22 +657,10 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                 tracing::Span::current().record("tx_sig", reference.as_str());
             }
         }
-        // x402 `upto`: the upstream responded, so settle the channel now (debit
-        // on a 2xx, refund otherwise) and attach the PAYMENT-RESPONSE receipt
-        // before the response streams downstream. `take` so `logging` won't
-        // double-settle.
-        if let Some(pending) = ctx.upto.take() {
-            let served_ok = upstream_response.status.is_success();
-            if let Some((name, value)) = self
-                .settle_pending_upto(pending, served_ok, &upstream_response.headers, None)
-                .await
-            {
-                let _ = upstream_response.insert_header(name, value);
-            }
-        }
         // Start the inference telemetry observer for hosts that opted into
         // in-flight tracking. Streamed = SSE/NDJSON content type.
-        if ctx.log.as_ref().is_some_and(|log| log.log_id.is_some()) {
+        let observe_inference = ctx.log.as_ref().is_some_and(|log| log.log_id.is_some());
+        if observe_inference {
             let streamed = upstream_response
                 .headers
                 .get("content-type")
@@ -670,6 +671,29 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                 })
                 .unwrap_or(false);
             ctx.observer = Some(crate::observer::StreamObserver::new(streamed));
+        }
+
+        // x402 `upto`: the upstream responded. Settle the channel now (debit on
+        // a 2xx, refund otherwise) and attach the PAYMENT-RESPONSE receipt
+        // before the response streams downstream — EXCEPT when the channel is
+        // token-metered AND we armed the observer: that settlement is deferred
+        // to end-of-stream (`upstream_response_body_filter`), where the
+        // observer's token counts feed the plan. `take` so `logging` won't
+        // double-settle; a deferred one is left in `ctx.upto` for the body
+        // filter (or `logging`/`fail_to_proxy`, which refund a leftover).
+        let defer_upto = observe_inference
+            && ctx
+                .upto
+                .as_ref()
+                .is_some_and(|pending| pending.settlement.is_some());
+        if !defer_upto && let Some(pending) = ctx.upto.take() {
+            let served_ok = upstream_response.status.is_success();
+            if let Some((name, value)) = self
+                .settle_pending_upto(pending, served_ok, &upstream_response.headers, None)
+                .await
+            {
+                let _ = upstream_response.insert_header(name, value);
+            }
         }
         Ok(())
     }
@@ -702,6 +726,17 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
         if end_of_stream {
             observer.finish();
             self.state.record_exchange_update(log_id, &observer.usage);
+            // Stamp the observed token counts into a deferred token-metered
+            // upto plan so `logging` settles the ACTUAL usage. This hook is
+            // synchronous, so on-chain settlement itself happens in `logging`
+            // (async); we only hand it the counts here. Non-deferred upto
+            // (already settled in `response_filter`) leaves `ctx.upto` empty,
+            // so this is a no-op for every other path.
+            if let Some(pending) = ctx.upto.as_mut()
+                && let Some(plan) = pending.settlement.as_mut()
+            {
+                plan.inferred_usage = Some(observer.usage.clone());
+            }
         } else if observer.should_emit() {
             self.state.record_exchange_update(log_id, &observer.usage);
         }
@@ -716,12 +751,22 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
     where
         Self::CTX: Send + Sync,
     {
-        // An x402 `upto` channel still held here means `response_filter` never
-        // ran (the upstream connect/response failed) — refund the full deposit
-        // so the client's funds aren't stranded in an open channel.
+        // An x402 `upto` channel still held here is one of two cases:
+        //   1. a DEFERRED token-metered channel — `response_filter` armed the
+        //      observer and left the channel open on purpose; the body filter
+        //      has stamped the observed token counts into its plan. Settle it
+        //      now against the real response status (debit the actual usage on
+        //      a 2xx, refund otherwise).
+        //   2. `response_filter` never ran (upstream connect/response failed) —
+        //      no inferred usage, status is 0/error, so this refunds the full
+        //      deposit rather than stranding the client's funds.
+        // Either way the settlement header can't ride the response (already
+        // sent), so it is dropped; the on-chain settlement/refund still runs.
+        let final_status = session.response_written().map(|resp| resp.status.as_u16());
         if let Some(pending) = ctx.upto.take() {
+            let served_ok = final_status.is_some_and(|s| (200..300).contains(&s));
             let _ = self
-                .settle_pending_upto(pending, false, &HeaderMap::new(), None)
+                .settle_pending_upto(pending, served_ok, &HeaderMap::new(), None)
                 .await;
         }
         let Some(log) = ctx.log.take() else {

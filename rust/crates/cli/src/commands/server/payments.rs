@@ -1,7 +1,7 @@
 //! Shared payment-stack machinery for the gateway commands.
 //!
-//! `pay server start` and `pay serve inference --price-usd` build the same
-//! sandbox charge stack: an auto/ephemeral fee-payer signer, localnet RPC
+//! `pay server start` and `pay serve inference --price`/`--pricing` build the
+//! same sandbox charge stack: an auto/ephemeral fee-payer signer, localnet RPC
 //! resolution, Surfpool wallet funding + payout-recipient ATA preparation,
 //! the shared recent-blockhash cache, the charge HMAC secret (mirrored into
 //! `MPP_CHALLENGE_BINDING_SECRET`), and the per-currency [`Mpp`] servers.
@@ -616,4 +616,57 @@ pub(crate) fn build_charge_mpps(
         })
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| pay_core::Error::Config(format!("Failed to create MPP server: {e}")))
+}
+
+/// Build the x402 `upto` backend for the sandbox charge stack.
+///
+/// Mirrors `server start`'s upto wiring: an [`X402Upto`] built from the
+/// operator (fee-payer) signer, the sandbox RPC, and the configured
+/// currencies, sharing the same blockhash cache as the charge MPPs. In
+/// sandbox inference the payout recipient IS the operator's own gateway
+/// wallet, so the operator keeps the whole channel payout. Used by
+/// `pay serve inference` per-token charging, where the settlement voucher is
+/// signed post-response from the observed token usage.
+pub(crate) fn build_sandbox_upto_backend(
+    currency_configs: &[(String, String, u8)],
+    recipient: &str,
+    network_slug: &str,
+    rpc_url: &str,
+    resource: &str,
+    fee_payer_signer: Arc<dyn SolanaSigner>,
+    blockhash_cache: &pay_kit::mpp::blockhash::BlockhashCache,
+) -> pay_core::Result<pay_kit::x402::server::X402Upto> {
+    let operator = fee_payer_signer.pubkey().to_string();
+    let payout = if recipient == operator {
+        pay_kit::x402::server::UptoPayout::OperatorKeepsAll
+    } else {
+        pay_kit::x402::server::UptoPayout::Beneficiary {
+            address: recipient.to_string(),
+            operator_fee_bps: 0,
+        }
+    };
+    let currencies: Vec<pay_kit::x402::server::CurrencyConfig> = currency_configs
+        .iter()
+        .map(
+            |(_symbol, mint, decimals)| pay_kit::x402::server::CurrencyConfig {
+                currency: mint.clone(),
+                decimals: *decimals,
+                token_program: None,
+            },
+        )
+        .collect();
+    let cfg = pay_kit::x402::server::UptoConfig {
+        payout,
+        currencies,
+        cluster: network_slug.to_string(),
+        rpc_url: Some(rpc_url.to_string()),
+        resource: resource.to_string(),
+        description: None,
+        max_timeout_seconds: 300,
+        program_id: None,
+        operator_signer: fee_payer_signer,
+    };
+    pay_kit::x402::server::X402Upto::new(cfg)
+        .map(|u| u.with_blockhash_cache(blockhash_cache.clone()))
+        .map_err(|e| pay_core::Error::Config(format!("Failed to create x402 upto backend: {e}")))
 }

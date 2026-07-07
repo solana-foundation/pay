@@ -3790,7 +3790,8 @@ endpoints:
         let spec: ApiSpec = serde_yml::from_str(yaml).unwrap();
         let errs = validate_api_spec(&spec);
         assert!(
-            !errs.iter()
+            !errs
+                .iter()
                 .any(|e| e.contains("below the minimum representable amount")),
             "per-million token pricing must not trip the precision floor, got: {errs:?}"
         );

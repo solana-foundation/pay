@@ -708,6 +708,7 @@ impl<S: PaymentState> PaymentGate<S> {
                         variant_hint: variant.clone(),
                         request_properties: props,
                         ceiling_usd,
+                        inferred_usage: None,
                     });
                 GateDecision::Forward {
                     session: None,

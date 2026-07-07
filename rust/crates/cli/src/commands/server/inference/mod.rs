@@ -5,12 +5,14 @@
 //! By default this is free passthrough: synthesized specs have no metered
 //! endpoints, so the payment gate forwards everything while
 //! `record_exchange` still feeds the PDB correlation engine (`AllExchanges`
-//! mode). With `--sandbox --price-usd <USD>`, the registry's `paid`
-//! endpoints are synthesized as metered charge endpoints and the command
-//! builds the same sandbox charge stack as `pay --sandbox server start`
-//! (localnet + Surfpool, ephemeral fee-payer signer, USDC), so priced
-//! endpoints 402 and verified retries move localnet stablecoins — entirely
-//! in-gate, no extra control-plane routes. See docs/serve-inference.md.
+//! mode). With `--sandbox --price`/`--pricing` (per-model token rates), the
+//! registry's `paid` endpoints are synthesized as x402-upto per-token
+//! metered endpoints and the command builds a sandbox charge stack reusing
+//! the `server start` machinery (localnet + Surfpool, ephemeral fee-payer
+//! signer, USDC). Each priced request opens a channel with a per-request USD
+//! ceiling and settles the ACTUAL token cost after serving (input×in-rate +
+//! output×out-rate, from the response stream observer) — entirely in-gate,
+//! no extra control-plane routes. See docs/serve-inference.md.
 
 pub mod discovery;
 pub mod pricing;
@@ -89,15 +91,10 @@ pub struct InferenceCommand {
     #[arg(short = 's', long)]
     pub sandbox: bool,
 
-    /// Charge this flat USD price per paid inference request (the registry's
-    /// `paid` endpoints; model-listing/health stay free). Sandbox only —
-    /// requires `--sandbox` (or global `pay --sandbox`).
-    #[arg(long, value_name = "USD", conflicts_with_all = ["price", "pricing"])]
-    pub price_usd: Option<f64>,
-
-    /// Per-model token pricing file (YAML). Display-only: shown per model in
-    /// the picker; per-token charging is not wired yet. Mutually exclusive
-    /// with `--price` and `--price-usd`. Shape:
+    /// Per-model token pricing file (YAML). With `--sandbox` this CHARGES per
+    /// token via x402-upto (input×in-rate + output×out-rate, settled after
+    /// serve); model-listing/health stay free. Mutually exclusive with
+    /// `--price`. Shape:
     ///
     /// ```yaml
     /// default: { in: 0.10, out: 0.30 }
@@ -110,16 +107,16 @@ pub struct InferenceCommand {
 
     /// Inline per-model token pricing shorthand (comma-separated
     /// `model=in/out`; `*=in/out` or a bare `in/out` sets the default), USD
-    /// per 1M tokens. Display-only. e.g.
-    /// `gemma4=0.15/0.60,qwen3:8b=0.5/1.5,*=0.1/0.3`.
+    /// per 1M tokens. With `--sandbox` this CHARGES per token via x402-upto.
+    /// e.g. `gemma4=0.15/0.60,qwen3:8b=0.5/1.5,*=0.1/0.3`.
     #[arg(long, value_name = "SPEC")]
     pub price: Option<String>,
 }
 
 /// Payment state for the inference gateway: the PDB hook for live tracking,
-/// plus — only when `--price-usd` is set — the sandbox MPP charge backend.
-/// Unpriced, the backend fields stay empty and every request is
-/// `Passthrough`, exactly as before.
+/// plus — only when per-model pricing is set (with `--sandbox`) — the sandbox
+/// x402-upto charge backend. Unpriced, the backend fields stay empty and
+/// every request is `Passthrough`, exactly as before.
 #[derive(Clone)]
 pub struct InferenceState {
     apis: Arc<Vec<ApiSpec>>,
@@ -127,7 +124,9 @@ pub struct InferenceState {
     /// (spec name == provider slug).
     providers: Arc<Vec<Arc<dyn InferenceProvider>>>,
     pdb: PdbState,
-    mpps: Vec<Mpp>,
+    /// x402-upto charge backend — the only charge scheme for inference, since
+    /// per-token settlement happens AFTER the response (mpp-charge cannot).
+    x402_upto: Option<pay_kit::x402::server::X402Upto>,
     fee_payer_signer: Option<Arc<dyn SolanaSigner>>,
     fee_payer_wallet: Option<FeePayerWallet>,
 }
@@ -150,10 +149,12 @@ impl PaymentState for InferenceState {
         &self.apis
     }
     fn mpp(&self) -> Option<&Mpp> {
-        self.mpps.first()
+        // Inference charges only via x402-upto (post-response settlement), so
+        // there is no mpp-charge backend.
+        None
     }
-    fn mpps(&self) -> Vec<&Mpp> {
-        self.mpps.iter().collect()
+    fn x402_upto(&self) -> Option<&pay_kit::x402::server::X402Upto> {
+        self.x402_upto.as_ref()
     }
     fn fee_payer_signer(&self) -> Option<Arc<dyn SolanaSigner>> {
         self.fee_payer_signer.clone()
@@ -234,37 +235,35 @@ fn enforce_sandbox(spec: &ApiSpec, path: &str) -> pay_core::Result<()> {
     }
 }
 
-/// `--price-usd` gate: monetization is sandbox-only for now (localnet
-/// stablecoins via the Surfpool sandbox). No flag ⇒ free passthrough — there
-/// is no default price. A price without sandbox is refused loudly rather
-/// than silently ignored or silently pointed at a real cluster.
-fn validate_pricing(price_usd: Option<f64>, sandbox: bool) -> pay_core::Result<Option<f64>> {
-    match price_usd {
-        None => Ok(None),
-        Some(_) if !sandbox => Err(pay_core::Error::Config(
-            "--price-usd: mainnet monetization is not wired yet — run with --sandbox".into(),
-        )),
-        Some(price) if !price.is_finite() || price <= 0.0 => Err(pay_core::Error::Config(format!(
-            "--price-usd must be a positive USD amount, got {price}"
-        ))),
-        Some(price) => Ok(Some(price)),
+/// Per-model pricing charge gate: per-token charging is sandbox-only for now
+/// (localnet stablecoins via the Surfpool sandbox). Per-model pricing WITHOUT
+/// `--sandbox` is refused loudly rather than silently pointed at a real
+/// cluster — mainnet per-token charging is not wired yet. No pricing flag ⇒
+/// free passthrough (unchanged).
+fn enforce_pricing_sandbox(
+    pricing_config: Option<&pricing::PricingConfig>,
+    sandbox: bool,
+) -> pay_core::Result<()> {
+    if pricing_config.is_some() && !sandbox {
+        return Err(pay_core::Error::Config(
+            "--price/--pricing: mainnet per-token charging is not wired yet — run with --sandbox"
+                .into(),
+        ));
     }
+    Ok(())
 }
 
-/// Resolve the display-only per-model token pricing from `--pricing <FILE>`
-/// or `--price <SPEC>`. At most one may be set (also mutually exclusive with
-/// the flat `--price-usd` — enforced by clap `conflicts_with`, re-checked
-/// here so a programmatic caller can't slip both past). `None` means today's
-/// behavior: no per-model pricing.
+/// Resolve the per-model token pricing from `--pricing <FILE>` or `--price
+/// <SPEC>`. At most one may be set (enforced by clap `conflicts_with`,
+/// re-checked here so a programmatic caller can't slip both past). `None`
+/// means no per-model pricing: free passthrough.
 fn resolve_pricing_config(
     pricing_file: Option<&str>,
     price_inline: Option<&str>,
 ) -> pay_core::Result<Option<pricing::PricingConfig>> {
     match (pricing_file, price_inline) {
         (Some(_), Some(_)) => Err(pay_core::Error::Config(
-            "--price/--pricing set per-model token pricing; --price-usd sets a flat \
-             per-request price — use one"
-                .into(),
+            "--price and --pricing both set per-model token pricing — use one".into(),
         )),
         (Some(path), None) => Ok(Some(pricing::PricingConfig::from_yaml_file(path)?)),
         (None, Some(spec)) => Ok(Some(pricing::PricingConfig::from_inline(spec)?)),
@@ -346,9 +345,9 @@ fn usage_to_info(usage: &pay_core::InferenceUsage) -> InferenceInfo {
 impl InferenceCommand {
     pub fn run(self, global_sandbox: bool) -> pay_core::Result<()> {
         let sandbox = self.sandbox || global_sandbox;
-        let price_usd = validate_pricing(self.price_usd, sandbox)?;
         let pricing_config =
             resolve_pricing_config(self.pricing.as_deref(), self.price.as_deref())?;
+        enforce_pricing_sandbox(pricing_config.as_ref(), sandbox)?;
 
         // Probe the public bind up front: Pingora only discovers a taken port
         // deep inside its service thread, where the bind failure is a panic.
@@ -377,7 +376,7 @@ impl InferenceCommand {
             .build()
             .map_err(|e| pay_core::Error::Config(format!("tokio runtime: {e}")))?;
 
-        let (internal_addr, state) = rt.block_on(self.setup(sandbox, price_usd, pricing_config))?;
+        let (internal_addr, state) = rt.block_on(self.setup(sandbox, pricing_config))?;
 
         let cores = std::thread::available_parallelism().map(|n| n.get()).ok();
         // `rt` stays alive so the watch/cleanup/axum/bridge tasks keep
@@ -450,7 +449,6 @@ impl InferenceCommand {
     async fn setup(
         &self,
         sandbox: bool,
-        price_usd: Option<f64>,
         pricing_config: Option<pricing::PricingConfig>,
     ) -> pay_core::Result<(std::net::SocketAddr, InferenceState)> {
         let registry =
@@ -512,12 +510,12 @@ impl InferenceCommand {
             ));
         }
 
-        // Display-only per-model pricing: validate against the models each
-        // provider actually serves, then overlay it so the picker can show
-        // per-model in/out token rates. Fail BEFORE opening the gateway/TUI,
-        // the same way the sandbox guard does — a typo'd model or a provider
-        // that serves none of the configured models (with no `default`) is a
-        // loud error, not a silently-dropped chip.
+        // Per-model pricing: validate against the models each provider
+        // actually serves, then overlay it so the picker can show per-model
+        // in/out token rates. Fail BEFORE opening the gateway/TUI, the same
+        // way the sandbox guard does — a typo'd model or a provider that
+        // serves none of the configured models (with no `default`) is a loud
+        // error, not a silently-dropped chip.
         if let Some(config) = &pricing_config {
             let mut errs: Vec<String> = Vec::new();
             for provider in &discovered {
@@ -538,16 +536,12 @@ impl InferenceCommand {
             for provider in &mut discovered {
                 provider.pricing = Some(config.clone());
             }
-            eprintln!(
-                "⏺ per-model pricing shown in picker (display only; per-token charging \
-                 is not wired yet)"
-            );
         }
 
-        // Sandbox charge stack — only when priced. `validate_pricing`
-        // guarantees `price_usd` implies sandbox, so this is localnet-only.
-        let payment = match price_usd {
-            Some(price) => Some(build_sandbox_payments(price).await?),
+        // Sandbox charge stack — only when priced. `enforce_pricing_sandbox`
+        // guarantees pricing implies sandbox, so this is localnet-only.
+        let payment = match &pricing_config {
+            Some(config) => Some(build_sandbox_payments(config.clone()).await?),
             None => None,
         };
 
@@ -644,26 +638,23 @@ impl InferenceCommand {
                 host_port
             );
         }
-        if let Some(payment) = &payment {
-            eprintln!(
-                "⏺ charging ${:.4}/request → {} (localnet USDC)",
-                payment.pricing.price_usd, payment.pricing.recipient
-            );
+        if payment.is_some() {
+            eprintln!("⏺ charging per token (localnet) — in/out rates from your pricing");
         }
 
-        let (mpps, fee_payer_signer, fee_payer_wallet) = match payment {
+        let (x402_upto, fee_payer_signer, fee_payer_wallet) = match payment {
             Some(payment) => (
-                payment.mpps,
+                Some(payment.x402_upto),
                 Some(payment.fee_payer_signer),
                 Some(payment.fee_payer_wallet),
             ),
-            None => (Vec::new(), None, None),
+            None => (None, None, None),
         };
         let state = InferenceState {
             apis: Arc::new(specs),
             providers: Arc::new(registry),
             pdb,
-            mpps,
+            x402_upto,
             fee_payer_signer,
             fee_payer_wallet,
         };
@@ -671,11 +662,11 @@ impl InferenceCommand {
     }
 }
 
-/// Sandbox charge backends for `--price-usd`: everything the gate needs to
-/// 402 the paid endpoints and verify retried payments in-gate.
+/// Sandbox charge backends for per-model pricing: everything the gate needs to
+/// 402 the paid endpoints and settle the per-token x402-upto channel in-gate.
 struct SandboxPayments {
     pricing: spec::SpecPricing,
-    mpps: Vec<Mpp>,
+    x402_upto: pay_kit::x402::server::X402Upto,
     fee_payer_signer: Arc<dyn SolanaSigner>,
     fee_payer_wallet: FeePayerWallet,
 }
@@ -684,8 +675,11 @@ struct SandboxPayments {
 /// machinery (`super::payments`): localnet + sandbox RPC, the ephemeral
 /// auto fee-payer signer (payout recipient = the signer's own wallet), USDC
 /// only, Surfpool funding + recipient ATA preparation, the blockhash cache,
-/// the charge HMAC secret env mirror, and a single MPP charge server.
-async fn build_sandbox_payments(price_usd: f64) -> pay_core::Result<SandboxPayments> {
+/// the charge HMAC secret env mirror, and the x402-upto charge backend (the
+/// only scheme that can settle the ACTUAL per-token cost after the response).
+async fn build_sandbox_payments(
+    config: pricing::PricingConfig,
+) -> pay_core::Result<SandboxPayments> {
     let network = crate::network::SolanaNetwork::Localnet;
     let rpc_url = payments::resolve_sandbox_rpc_url(None);
 
@@ -721,7 +715,10 @@ async fn build_sandbox_payments(price_usd: f64) -> pay_core::Result<SandboxPayme
     )
     .await?;
 
-    let challenge_binding_secret = payments::init_challenge_binding_secret();
+    // Mirror the charge HMAC secret into the env for any subscription
+    // middleware that lazy-builds; the x402-upto backend itself signs vouchers
+    // with the operator key and doesn't consume it, so we don't hold the value.
+    let _ = payments::init_challenge_binding_secret();
 
     payments::ensure_payout_recipient_token_accounts(
         &[recipient_pubkey],
@@ -734,24 +731,25 @@ async fn build_sandbox_payments(price_usd: f64) -> pay_core::Result<SandboxPayme
     .await?;
 
     let blockhash_cache = payments::spawn_blockhash_cache(&rpc_url);
-    let mpps = payments::build_charge_mpps(
+    // Charging is x402-upto only: the client opens a channel with a per-request
+    // ceiling and the operator settles the ACTUAL token cost after serving the
+    // response (mpp-charge cannot settle post-response). The backend-level
+    // resource is a fallback label; each endpoint carries its own resource for
+    // per-challenge memo uniqueness.
+    let x402_upto = payments::build_sandbox_upto_backend(
         &currency_configs,
         &recipient,
         network.slug(),
         &rpc_url,
-        &challenge_binding_secret,
-        true,
-        Some(fee_payer_signer.clone()),
+        "inference",
+        fee_payer_signer.clone(),
         &blockhash_cache,
     )?;
     let fee_payer_wallet = FeePayerWallet::new(rpc_url, recipient.clone());
 
     Ok(SandboxPayments {
-        pricing: spec::SpecPricing {
-            price_usd,
-            recipient,
-        },
-        mpps,
+        pricing: spec::SpecPricing { config, recipient },
+        x402_upto,
         fee_payer_signer,
         fee_payer_wallet,
     })
@@ -867,7 +865,7 @@ mod tests {
             apis: Arc::new(vec![spec::provider_spec(&discovered_ollama(), None)]),
             providers: Arc::new(providers::builtin_providers()),
             pdb: PdbState::with_mode(serde_json::json!({}), CorrelationMode::AllExchanges),
-            mpps: Vec::new(),
+            x402_upto: None,
             fee_payer_signer: None,
             fee_payer_wallet: None,
         }
@@ -911,23 +909,24 @@ mod tests {
     }
 
     #[test]
-    fn price_without_sandbox_is_refused() {
-        let err = validate_pricing(Some(0.001), false).expect_err("must refuse");
+    fn pricing_without_sandbox_is_refused() {
+        let config = pricing::PricingConfig::from_inline("*=0.1/0.3").unwrap();
+
+        // Per-model pricing without --sandbox is refused (mainnet per-token
+        // charging is not wired yet).
+        let err = enforce_pricing_sandbox(Some(&config), false).expect_err("must refuse");
         assert!(
             err.to_string()
-                .contains("mainnet monetization is not wired yet — run with --sandbox"),
+                .contains("mainnet per-token charging is not wired yet — run with --sandbox"),
             "unexpected message: {err}"
         );
 
-        // Non-positive / non-finite prices are refused even in sandbox.
-        assert!(validate_pricing(Some(0.0), true).is_err());
-        assert!(validate_pricing(Some(-1.0), true).is_err());
-        assert!(validate_pricing(Some(f64::NAN), true).is_err());
+        // With --sandbox it is allowed.
+        assert!(enforce_pricing_sandbox(Some(&config), true).is_ok());
 
-        // No flag = free passthrough, sandbox or not; valid price + sandbox ok.
-        assert_eq!(validate_pricing(None, false).unwrap(), None);
-        assert_eq!(validate_pricing(None, true).unwrap(), None);
-        assert_eq!(validate_pricing(Some(0.001), true).unwrap(), Some(0.001));
+        // No pricing = free passthrough, sandbox or not.
+        assert!(enforce_pricing_sandbox(None, false).is_ok());
+        assert!(enforce_pricing_sandbox(None, true).is_ok());
     }
 
     #[test]
@@ -1054,7 +1053,7 @@ mod tests {
             apis: Arc::new(apis),
             providers: state.providers.clone(),
             pdb: state.pdb.clone(),
-            mpps: Vec::new(),
+            x402_upto: None,
             fee_payer_signer: None,
             fee_payer_wallet: None,
         };
