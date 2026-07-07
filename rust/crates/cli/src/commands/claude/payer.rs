@@ -98,6 +98,11 @@ struct PayerState {
     network_override: Option<String>,
     /// `--account` override, same semantics as the curl/fetch retry path.
     account_override: Option<String>,
+    /// Optional per-request spend cap (base units of the challenge asset). When
+    /// set, an x402-upto ceiling above this is refused and the 402 passes
+    /// through. `None` (today's default) authorizes whatever the challenge
+    /// advertises, matching the MPP path's unbudgeted behavior.
+    per_request_cap_base_units: Option<u128>,
 }
 
 impl PayerState {
@@ -121,6 +126,7 @@ impl PayerState {
             store,
             network_override,
             account_override,
+            per_request_cap_base_units: None,
         })
     }
 }
@@ -306,24 +312,36 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
             .iter()
             .filter_map(|value| value.to_str().ok()),
     );
-    if challenges.is_empty() {
-        tracing::warn!(%url, "payer proxy: 402 without an MPP Payment challenge — passing through");
-        return buffered_response(status, &resp_headers, resp_body);
-    }
 
-    // `select_challenge_by_balance` / `build_credential` spin their own
-    // runtimes and may block on RPC + signing — keep them off the async
-    // workers.
-    let auth = {
+    // Scheme precedence: MPP charge first (the established path), then x402
+    // `upto` (per-token gateway). MPP wins when both are advertised — it is
+    // an exact, single-shot charge, whereas `upto` opens a spending channel
+    // for a ceiling; prefer the tighter commitment when the server offers a
+    // choice.
+    let payment = if !challenges.is_empty() {
+        // `select_challenge_by_balance` / `build_credential` spin their own
+        // runtimes and may block on RPC + signing — keep them off the async
+        // workers.
         let state = state.clone();
         let resource_url = url.clone();
         tokio::task::spawn_blocking(move || {
             build_payment_authorization(&state, &challenges, &resource_url)
         })
         .await
+    } else if let Some(upto) = parse_upto_challenge(&resp_headers, &resp_body) {
+        // x402 `upto`: open a channel for the advertised ceiling; the gateway
+        // settles the actual per-token cost after serving and refunds the rest.
+        let state = state.clone();
+        let resource_url = url.clone();
+        tokio::task::spawn_blocking(move || build_upto_authorization(&state, &upto, &resource_url))
+            .await
+    } else {
+        tracing::warn!(%url, "payer proxy: 402 without an MPP or x402-upto challenge — passing through");
+        return buffered_response(status, &resp_headers, resp_body);
     };
-    let auth = match auth {
-        Ok(Ok(auth)) => auth,
+
+    let payment = match payment {
+        Ok(Ok(payment)) => payment,
         Ok(Err(e)) => {
             tracing::warn!(%url, error = %e, "payer proxy: could not pay 402 — passing it through");
             return buffered_response(status, &resp_headers, resp_body);
@@ -334,14 +352,34 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
         }
     };
 
-    tracing::info!(%url, "payer proxy: 402 paid — retrying once with Payment credential");
-    match send_upstream(&state, &method, &url, &headers, body, Some(&auth)).await {
+    tracing::info!(%url, "payer proxy: 402 paid — retrying once with payment credential");
+    match send_upstream(&state, &method, &url, &headers, body, Some(&payment)).await {
         Ok(retry) => deliver(retry, translated).await,
         Err(e) => {
             tracing::warn!(%url, error = %e, "payer proxy: paid retry failed — returning the original 402");
             buffered_response(status, &resp_headers, resp_body)
         }
     }
+}
+
+/// Parse an x402 `upto` challenge off the buffered 402 response. `parse_upto`
+/// wants `(name, value)` string pairs and an optional body string; build them
+/// from the response's headers and (UTF-8) body.
+fn parse_upto_challenge(
+    resp_headers: &HeaderMap,
+    resp_body: &Bytes,
+) -> Option<pay_core::client::x402::UptoChallenge> {
+    let headers: Vec<(String, String)> = resp_headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_string(), value.to_string()))
+        })
+        .collect();
+    let body = std::str::from_utf8(resp_body).ok();
+    pay_core::client::x402::parse_upto(&headers, body)
 }
 
 /// When the upstream is OpenAI-compatible and the inbound request is
@@ -477,14 +515,30 @@ fn translate_stream_response(resp: reqwest::Response) -> Response {
         })
 }
 
-/// Select a payable challenge and build the `Authorization: Payment …`
+/// The header(s) a paid retry must carry. MPP charge sets a single
+/// `Authorization: Payment <credential>`; x402 `upto` sets `PAYMENT-SIGNATURE`
+/// (and never touches `Authorization`, so the caller's upstream key survives).
+struct PaidHeaders {
+    headers: Vec<(String, String)>,
+}
+
+impl PaidHeaders {
+    /// The MPP charge credential goes into `Authorization: Payment …`.
+    fn mpp(credential: String) -> Self {
+        Self {
+            headers: vec![(header::AUTHORIZATION.as_str().to_string(), credential)],
+        }
+    }
+}
+
+/// Select a payable MPP challenge and build the `Authorization: Payment …`
 /// header value — the same two calls `pay curl`'s
 /// `pay_mpp_and_retry` makes (crates/cli/src/commands/mod.rs).
 fn build_payment_authorization(
     state: &PayerState,
     challenges: &[pay_core::mpp::Challenge],
     resource_url: &str,
-) -> pay_core::Result<String> {
+) -> pay_core::Result<PaidHeaders> {
     let store = state.store.as_ref();
     let network_override = state.network_override.as_deref();
     let account_override = state.account_override.as_deref();
@@ -518,19 +572,79 @@ fn build_payment_authorization(
         );
     }
 
-    Ok(auth_header)
+    Ok(PaidHeaders::mpp(auth_header))
 }
 
-/// Forward a request upstream, replaying `body`. When `auth` is `Some`,
-/// the request's `Authorization` header is replaced with the MPP
-/// credential (the paid retry).
+/// Open an x402 `upto` channel for the challenge's advertised ceiling and
+/// return the `PAYMENT-SIGNATURE` retry header — the exact
+/// [`pay_core::client::x402::build_upto_payment`] call `pay curl`'s
+/// `pay_upto_and_retry` makes (crates/cli/src/commands/mod.rs). The authorized
+/// deposit is the challenge's own `amount` (the ceiling), so a per-request cap,
+/// when the payer grows one, is enforced here before signing.
+fn build_upto_authorization(
+    state: &PayerState,
+    challenge: &pay_core::client::x402::UptoChallenge,
+    resource_url: &str,
+) -> pay_core::Result<PaidHeaders> {
+    let store = state.store.as_ref();
+    let network_override = state.network_override.as_deref();
+    let account_override = state.account_override.as_deref();
+
+    // The channel deposit the client signs is the challenge's advertised
+    // ceiling; authorize exactly that. If the payer ever carries a per-request
+    // budget cap, refuse (and pass the 402 through) when the ceiling exceeds
+    // it — never silently open a larger channel than the caller allows.
+    if let Some(cap) = state.per_request_cap_base_units {
+        let ceiling: u128 = challenge.requirements.amount.parse().map_err(|_| {
+            pay_core::Error::Mpp(format!(
+                "x402-upto challenge advertised a non-numeric ceiling: {}",
+                challenge.requirements.amount
+            ))
+        })?;
+        if ceiling > cap {
+            return Err(pay_core::Error::Mpp(format!(
+                "x402-upto ceiling {ceiling} (base units of {}) exceeds the payer's per-request budget {cap}",
+                challenge.requirements.asset
+            )));
+        }
+    }
+
+    let built = pay_core::client::x402::build_upto_payment(
+        challenge,
+        store,
+        network_override,
+        account_override,
+        Some(resource_url),
+    )?;
+
+    if let Some(resolved) = built.ephemeral_notice {
+        tracing::info!(
+            network = %resolved.network,
+            pubkey = resolved.account.pubkey.as_deref().unwrap_or("(unknown)"),
+            "payer proxy: generated ephemeral wallet"
+        );
+    }
+
+    Ok(PaidHeaders {
+        headers: built
+            .headers
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), value))
+            .collect(),
+    })
+}
+
+/// Forward a request upstream, replaying `body`. When `payment` is `Some`,
+/// its headers are applied to the paid retry: MPP replaces `Authorization`
+/// with the `Payment` credential; x402-upto adds `PAYMENT-SIGNATURE` (leaving
+/// the caller's own `Authorization` intact).
 async fn send_upstream(
     state: &PayerState,
     method: &Method,
     url: &str,
     headers: &HeaderMap,
     body: Bytes,
-    auth: Option<&str>,
+    payment: Option<&PaidHeaders>,
 ) -> reqwest::Result<reqwest::Response> {
     let mut fwd = HeaderMap::new();
     for (name, value) in headers {
@@ -539,10 +653,18 @@ async fn send_upstream(
         }
         fwd.append(name.clone(), value.clone());
     }
-    if let Some(auth) = auth {
-        fwd.remove(header::AUTHORIZATION);
-        if let Ok(value) = HeaderValue::from_str(auth) {
-            fwd.insert(header::AUTHORIZATION, value);
+    if let Some(payment) = payment {
+        for (name, value) in &payment.headers {
+            let (Ok(name), Ok(value)) = (
+                axum::http::HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_str(value),
+            ) else {
+                continue;
+            };
+            // A paid header replaces any inbound copy (MPP's `Authorization`,
+            // an echoed `PAYMENT-SIGNATURE`) rather than appending a duplicate.
+            fwd.remove(&name);
+            fwd.insert(name, value);
         }
     }
 
@@ -659,6 +781,36 @@ mod tests {
             pay_kit::mpp::Base64UrlJson::from_value(&request).unwrap(),
         );
         pay_kit::mpp::format_www_authenticate(&challenge).unwrap()
+    }
+
+    /// A canned x402 `upto` challenge that signs fully offline: `network` is a
+    /// devnet CAIP-2 (so with no `--sandbox`/`--mainnet` override the payer
+    /// lazily mints a throwaway devnet wallet, exactly like the MPP test), the
+    /// embedded `recentBlockhash` builds the open transaction with no RPC, and
+    /// `payTo == facilitatorAddress` so no distribution split is derived. The
+    /// blockhash is *not* Surfpool-prefixed, so no auto-fund network call fires.
+    /// Returns the base64 `PAYMENT-REQUIRED` header value the gateway emits.
+    fn upto_challenge_header(amount: &str) -> String {
+        let payee = "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY";
+        let envelope = serde_json::json!({
+            "x402Version": 2,
+            "accepts": [{
+                "scheme": "upto",
+                "network": pay_kit::x402::exact::SOLANA_DEVNET,
+                "amount": amount,
+                "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                "payTo": payee,
+                "maxTimeoutSeconds": 300,
+                "extra": {
+                    "assetTransferMethod": "payment-channel",
+                    "facilitatorAddress": payee,
+                    "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                    "recentBlockhash": "9zrUHnA1nCByPksy3aL8tQ47vqdaG2vnFs4HrxgcZj4F",
+                },
+            }],
+        });
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(envelope.to_string().as_bytes())
     }
 
     async fn spawn_server(app: Router) -> String {
@@ -803,6 +955,262 @@ mod tests {
             seen.retry_body.as_deref(),
             Some(body.as_bytes()),
             "retry must replay the identical request body"
+        );
+    }
+
+    /// Stub that answers the first request with an x402 `upto` 402 (a
+    /// `PAYMENT-REQUIRED` header) and every retry with 200, recording the
+    /// retry's `PAYMENT-SIGNATURE` header and body. `amount` is the advertised
+    /// ceiling (base units).
+    fn upto_stub(seen: Arc<Mutex<StubSeen>>, amount: &'static str) -> Router {
+        Router::new().fallback(any(move |req: Request| {
+            let seen = seen.clone();
+            async move {
+                let uri = req.uri().to_string();
+                let sig = req
+                    .headers()
+                    .get("payment-signature")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                let body = axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES)
+                    .await
+                    .unwrap();
+                let mut seen = seen.lock().unwrap();
+                seen.calls += 1;
+                if seen.calls == 1 {
+                    seen.first_uri = Some(uri);
+                    seen.retry_body = Some(body.to_vec()); // first (buffered) body
+                    return Response::builder()
+                        .status(StatusCode::PAYMENT_REQUIRED)
+                        .header("payment-required", upto_challenge_header(amount))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(r#"{"error":"payment required"}"#))
+                        .unwrap();
+                }
+                // The upto retry must replay the identical body and must NOT
+                // clobber the caller's Authorization (upto uses its own
+                // PAYMENT-SIGNATURE header).
+                assert_eq!(
+                    seen.retry_body.as_deref(),
+                    Some(&body[..]),
+                    "upto retry must replay the identical body"
+                );
+                seen.retry_auth = sig;
+                (StatusCode::OK, "upto paid ok").into_response()
+            }
+        }))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pays_x402_upto_402_and_retries_with_payment_header() {
+        let seen = Arc::new(Mutex::new(StubSeen::default()));
+        // $0.50 ceiling in USDC base units — the gateway's MAX_REQUEST_USD.
+        let upstream = spawn_server(upto_stub(seen.clone(), "500000")).await;
+        // No override: the devnet challenge lazily mints a throwaway wallet and
+        // signs the channel-open offline (embedded, non-Surfpool blockhash).
+        let payer = spawn_payer(upstream, None).await;
+
+        let body = r#"{"model":"llama3.2","messages":[{"role":"user","content":"hi"}]}"#;
+        let resp = reqwest::Client::new()
+            .post(format!("{payer}/v1/messages?beta=true"))
+            .header("authorization", "Bearer upstream-key")
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.text().await.unwrap(), "upto paid ok");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.calls, 2, "exactly one retry after the upto 402");
+        assert_eq!(
+            seen.first_uri.as_deref(),
+            Some("/v1/messages?beta=true"),
+            "path + query must be preserved"
+        );
+        let sig = seen
+            .retry_auth
+            .as_deref()
+            .expect("upto retry must carry a PAYMENT-SIGNATURE header");
+        assert!(!sig.is_empty(), "PAYMENT-SIGNATURE must be non-empty");
+        assert_eq!(
+            seen.retry_body.as_deref(),
+            Some(body.as_bytes()),
+            "upto retry must replay the identical request body"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pays_x402_upto_402_from_openai_upstream_and_replays_translated_body() {
+        let seen = Arc::new(Mutex::new(StubSeen::default()));
+        let record = seen.clone();
+        let app = Router::new().route(
+            "/compatible-mode/v1/chat/completions",
+            axum::routing::post(move |req: Request| {
+                let record = record.clone();
+                async move {
+                    let sig = req
+                        .headers()
+                        .get("payment-signature")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string);
+                    let body = axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES)
+                        .await
+                        .unwrap();
+                    let mut seen = record.lock().unwrap();
+                    seen.calls += 1;
+                    if seen.calls == 1 {
+                        seen.retry_body = Some(body.to_vec()); // first (translated) body
+                        return Response::builder()
+                            .status(StatusCode::PAYMENT_REQUIRED)
+                            .header("payment-required", upto_challenge_header("500000"))
+                            .body(Body::from(r#"{"error":"payment required"}"#))
+                            .unwrap();
+                    }
+                    assert_eq!(
+                        seen.retry_body.as_deref(),
+                        Some(&body[..]),
+                        "upto retry must replay the exact translated body"
+                    );
+                    seen.retry_auth = sig;
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(OPENAI_COMPLETION_JSON))
+                        .unwrap()
+                }
+            }),
+        );
+        let upstream = spawn_server(app).await;
+        let payer = spawn_openai_payer(upstream, None).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("{payer}/v1/messages"))
+            .json(&anthropic_request_body())
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["type"], "message", "paid retry comes back translated");
+        assert_eq!(body["content"][0]["text"], "Hello!");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.calls, 2, "exactly one upto retry");
+        assert!(
+            seen.retry_auth.as_deref().is_some_and(|s| !s.is_empty()),
+            "upto retry carries PAYMENT-SIGNATURE"
+        );
+        // The body the 402 fired on — and the retry replayed — is the
+        // translated OpenAI body.
+        let translated: serde_json::Value =
+            serde_json::from_slice(seen.retry_body.as_deref().unwrap()).unwrap();
+        assert_eq!(translated["messages"][0]["role"], "system");
+        assert_eq!(translated["messages"][1]["content"], "hi");
+        assert!(translated.get("system").is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn passes_upto_402_through_when_open_fails() {
+        // A `--sandbox` (localnet-forced) payer facing a devnet upto challenge:
+        // `check_client_network_intent` refuses to sign for a network the user
+        // did not opt into, so the channel open fails and the original 402 must
+        // pass through untouched with no retry.
+        let calls = Arc::new(Mutex::new(0usize));
+        let counter = calls.clone();
+        let app = Router::new().fallback(any(move || {
+            let counter = counter.clone();
+            async move {
+                *counter.lock().unwrap() += 1;
+                Response::builder()
+                    .status(StatusCode::PAYMENT_REQUIRED)
+                    .header("payment-required", upto_challenge_header("500000"))
+                    .body(Body::from("upto money required"))
+                    .unwrap()
+            }
+        }));
+        let upstream = spawn_server(app).await;
+        let payer = spawn_payer(upstream, Some("localnet")).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("{payer}/v1/messages"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        assert!(
+            resp.headers().get("payment-required").is_some(),
+            "original upto challenge must survive the passthrough"
+        );
+        assert_eq!(resp.text().await.unwrap(), "upto money required");
+        assert_eq!(*calls.lock().unwrap(), 1, "no paid retry may be attempted");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mpp_charge_takes_precedence_over_coexisting_upto_challenge() {
+        // A 402 that advertises BOTH an MPP charge (WWW-Authenticate) and an
+        // x402 upto (PAYMENT-REQUIRED). Scheme precedence: MPP wins, so the
+        // retry carries an `Authorization: Payment …` credential, not a
+        // PAYMENT-SIGNATURE.
+        let seen = Arc::new(Mutex::new(StubSeen::default()));
+        let record = seen.clone();
+        let app = Router::new().fallback(any(move |req: Request| {
+            let record = record.clone();
+            async move {
+                let auth = req
+                    .headers()
+                    .get(header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                let has_sig = req.headers().get("payment-signature").is_some();
+                let _ = axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES).await;
+                let mut seen = record.lock().unwrap();
+                seen.calls += 1;
+                if seen.calls == 1 {
+                    return Response::builder()
+                        .status(StatusCode::PAYMENT_REQUIRED)
+                        .header(header::WWW_AUTHENTICATE, challenge_header("localnet"))
+                        .header("payment-required", upto_challenge_header("500000"))
+                        .body(Body::from(r#"{"error":"payment required"}"#))
+                        .unwrap();
+                }
+                seen.retry_auth = auth;
+                seen.first_uri = Some(has_sig.to_string()); // reuse slot: "true"/"false"
+                (StatusCode::OK, "mpp paid ok").into_response()
+            }
+        }));
+        let upstream = spawn_server(app).await;
+        let payer = spawn_payer(upstream, None).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("{payer}/v1/messages"))
+            .body(r#"{"messages":[]}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.text().await.unwrap(), "mpp paid ok");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.calls, 2, "exactly one paid retry");
+        let auth = seen
+            .retry_auth
+            .as_deref()
+            .expect("MPP retry must carry Authorization");
+        assert!(
+            auth.starts_with("Payment "),
+            "MPP charge must take precedence, got: {auth}"
+        );
+        assert_eq!(
+            seen.first_uri.as_deref(),
+            Some("false"),
+            "the MPP retry must NOT also carry a PAYMENT-SIGNATURE header"
         );
     }
 
