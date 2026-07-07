@@ -161,6 +161,8 @@ impl InferenceProvider for CatalogProvider {
             min_usd: min,
             max_usd: max,
             unit: unit.unwrap_or_else(|| "requests".to_string()),
+            // Model-agnostic aggregate: no single input/output pair to show.
+            io: None,
         })
     }
 
@@ -180,6 +182,7 @@ impl InferenceProvider for CatalogProvider {
         let mut min = f64::INFINITY;
         let mut max = f64::NEG_INFINITY;
         let mut unit: Option<String> = None;
+        let mut io: Option<(f64, f64)> = None;
         let mut matched = false;
         for ep in self.endpoints.iter().filter(|ep| ep.pricing.is_some()) {
             let Some(variants) = ep
@@ -198,6 +201,12 @@ impl InferenceProvider for CatalogProvider {
                 min = min.min(lo);
                 max = max.max(hi);
             }
+            // Real input/output token rates for this model (the
+            // consolidation win): hosted per-model rows now show the same
+            // `in $X · out $Y` chip as local ones.
+            if io.is_none() {
+                io = directional_io(variant);
+            }
             if unit.is_none() {
                 unit = variant
                     .get("dimensions")
@@ -215,8 +224,27 @@ impl InferenceProvider for CatalogProvider {
             min_usd: min,
             max_usd: max,
             unit: unit.unwrap_or_else(|| "tokens".to_string()),
+            io,
         })
     }
+}
+
+/// The `(input, output)` per-scale token rates for a variant, read from its
+/// `direction: input` / `direction: output` dimensions (first tier of each).
+/// `None` when the variant doesn't split by direction (so the row falls back
+/// to the min/max range display).
+fn directional_io(variant: &serde_json::Value) -> Option<(f64, f64)> {
+    let dims = variant.get("dimensions").and_then(|d| d.as_array())?;
+    let rate_for = |direction: &str| {
+        dims.iter()
+            .find(|d| d.get("direction").and_then(|v| v.as_str()) == Some(direction))
+            .and_then(|d| d.get("tiers"))
+            .and_then(|t| t.as_array())
+            .and_then(|tiers| tiers.first())
+            .and_then(|tier| tier.get("price_usd"))
+            .and_then(|p| p.as_f64())
+    };
+    Some((rate_for("input")?, rate_for("output")?))
 }
 
 /// Unit of the first dimension — either a top-level `dimensions[0]` or the
@@ -527,7 +555,9 @@ mod tests {
         assert_eq!(flash.min_usd, 0.345);
         assert_eq!(flash.max_usd, 2.875);
         assert_eq!(flash.unit, "tokens");
-        assert_eq!(flash.to_string(), "$0.3450–2.8750/tok");
+        // Directional dims populate `io`, so the chip shows real in/out rates.
+        assert_eq!(flash.io, Some((0.345, 2.875)));
+        assert_eq!(flash.to_string(), "in $0.34 · out $2.88 /1M tok");
 
         // First-match-wins: the flash-lite variant precedes the broader
         // flash prefix, so a lite id resolves to lite pricing.

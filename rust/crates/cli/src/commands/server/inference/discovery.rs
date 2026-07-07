@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use super::pricing::PricingConfig;
 use super::providers::{self, CustomProvider, InferenceProvider, PricingHint};
 
 /// User override/extension file, merged over the built-ins by slug.
@@ -29,6 +30,11 @@ pub struct DiscoveredProvider {
     pub models: Vec<String>,
     /// Server-reported version when the identify response carries one.
     pub version: Option<String>,
+    /// Display-only per-model token pricing overlay (`--price`/`--pricing`).
+    /// When set and it resolves the picked model, the picker shows real
+    /// in/out token rates for that model instead of the provider's own
+    /// (trait) hint. `None` keeps the pre-existing hosted behavior.
+    pub pricing: Option<PricingConfig>,
 }
 
 impl DiscoveredProvider {
@@ -54,9 +60,27 @@ impl DiscoveredProvider {
         self.provider.pricing_hint()
     }
 
-    /// Price for `model` when the provider prices per model; otherwise the
-    /// aggregate hint. `None` model falls back to the aggregate.
+    /// Price for `model`, unifying the two pricing sources at one call site:
+    ///
+    /// 1. When a display-only [`PricingConfig`] overlay
+    ///    (`--price`/`--pricing`) resolves the model, build a per-model
+    ///    in/out [`PricingHint`] from its token rates.
+    /// 2. Otherwise fall back to the provider's own (trait) hint — the
+    ///    pre-existing hosted-catalog behavior, unchanged when no overlay is
+    ///    set.
+    ///
+    /// `None` model falls back to the provider aggregate.
     pub fn pricing_hint_for_model(&self, model: Option<&str>) -> Option<PricingHint> {
+        if let (Some(config), Some(model)) = (&self.pricing, model)
+            && let Some(rate) = config.resolve(model)
+        {
+            return Some(PricingHint {
+                min_usd: rate.input_per_1m,
+                max_usd: rate.output_per_1m,
+                unit: "tokens".to_string(),
+                io: Some((rate.input_per_1m, rate.output_per_1m)),
+            });
+        }
         self.provider.pricing_hint_for_model(model)
     }
 
@@ -192,6 +216,7 @@ async fn probe_provider(
                     base_url,
                     models,
                     version,
+                    pricing: None,
                 },
                 *port,
             ));
@@ -391,6 +416,43 @@ mod tests {
                 ]
             );
         });
+    }
+
+    #[test]
+    fn pricing_overlay_resolves_to_in_out_hint_else_falls_back() {
+        let config = PricingConfig::from_inline("gemma4=0.15/0.60,*=0.1/0.3").unwrap();
+        let discovered = DiscoveredProvider {
+            provider: Arc::new(providers::ollama::Ollama),
+            base_url: "http://127.0.0.1:11434".into(),
+            models: vec!["gemma4:latest".into(), "llama3.2:3b".into()],
+            version: None,
+            pricing: Some(config),
+        };
+
+        // Overlay resolves the base-name → real per-model in/out rates.
+        let gemma = discovered
+            .pricing_hint_for_model(Some("gemma4:latest"))
+            .unwrap();
+        assert_eq!(gemma.io, Some((0.15, 0.60)));
+        assert_eq!(gemma.unit, "tokens");
+        assert_eq!(gemma.to_string(), "in $0.15 · out $0.60 /1M tok");
+
+        // A model with no explicit entry resolves via the `*` default.
+        let other = discovered
+            .pricing_hint_for_model(Some("llama3.2:3b"))
+            .unwrap();
+        assert_eq!(other.io, Some((0.1, 0.3)));
+
+        // No overlay → the provider's own (trait) hint. Local Ollama has
+        // none, so no chip — the pre-existing behavior is preserved.
+        let no_overlay = DiscoveredProvider {
+            pricing: None,
+            ..discovered.clone()
+        };
+        assert_eq!(
+            no_overlay.pricing_hint_for_model(Some("gemma4:latest")),
+            None
+        );
     }
 
     #[test]

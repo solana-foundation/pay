@@ -349,6 +349,7 @@ fn discover_catalog_providers() -> Vec<DiscoveredProvider> {
                 base_url,
                 models,
                 version,
+                pricing: None,
             });
         }
         discovered

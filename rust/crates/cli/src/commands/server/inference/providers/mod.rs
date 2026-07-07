@@ -58,11 +58,20 @@ pub struct PricingHint {
     pub max_usd: f64,
     /// Billing unit the prices are quoted in (e.g. `requests`, `tokens`).
     pub unit: String,
+    /// Explicit per-1M-token input/output rates `(input, output)`, when the
+    /// price is quoted per token direction. When `Some`, the display renders
+    /// `in $X · out $Y /1M tok`; the min/max fields stay populated (the two
+    /// rates) so range-based consumers keep working.
+    pub io: Option<(f64, f64)>,
 }
 
 impl std::fmt::Display for PricingHint {
-    /// `$0.0100/req`, or `$0.0000–0.0100/req` when prices vary.
+    /// With `io`: `in $0.15 · out $0.60 /1M tok`. Otherwise `$0.0100/req`,
+    /// or `$0.0000–0.0100/req` when prices vary.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some((input, output)) = self.io {
+            return write!(f, "in ${input:.2} · out ${output:.2} /1M tok");
+        }
         let unit = match self.unit.as_str() {
             "requests" => "req",
             "tokens" => "tok",
@@ -333,6 +342,7 @@ mod tests {
             min_usd: 0.01,
             max_usd: 0.01,
             unit: "requests".to_string(),
+            io: None,
         };
         assert_eq!(flat.to_string(), "$0.0100/req");
 
@@ -340,6 +350,7 @@ mod tests {
             min_usd: 0.0,
             max_usd: 0.01,
             unit: "requests".to_string(),
+            io: None,
         };
         assert_eq!(range.to_string(), "$0.0000–0.0100/req");
 
@@ -347,8 +358,20 @@ mod tests {
             min_usd: 0.0007,
             max_usd: 0.0007,
             unit: "tokens".to_string(),
+            io: None,
         };
         assert_eq!(tokens.to_string(), "$0.0007/tok");
+    }
+
+    #[test]
+    fn pricing_hint_display_renders_in_out_when_present() {
+        let io = PricingHint {
+            min_usd: 0.15,
+            max_usd: 0.60,
+            unit: "tokens".to_string(),
+            io: Some((0.15, 0.60)),
+        };
+        assert_eq!(io.to_string(), "in $0.15 · out $0.60 /1M tok");
     }
 
     #[test]

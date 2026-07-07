@@ -659,6 +659,7 @@ mod tests {
             base_url: "http://127.0.0.1:11434".into(),
             models: models.iter().map(|m| (*m).to_string()).collect(),
             version: Some("0.9.1".into()),
+            pricing: None,
         }
     }
 
@@ -668,6 +669,7 @@ mod tests {
             base_url: "http://127.0.0.1:1234".into(),
             models: models.iter().map(|m| (*m).to_string()).collect(),
             version: None,
+            pricing: None,
         }
     }
 
@@ -858,6 +860,7 @@ mod tests {
             provider: Arc::new(provider),
             models: vec!["gemini-2.5-flash".into()],
             version: None,
+            pricing: None,
         }
     }
 
@@ -895,6 +898,7 @@ mod tests {
             provider: Arc::new(provider),
             models: vec!["gemini-2.5-flash".into(), "gemini-2.5-pro".into()],
             version: None,
+            pricing: None,
         }
     }
 
@@ -960,7 +964,7 @@ mod tests {
         let mut app = app(vec![hosted_gemini_variant_priced()]);
         let flash = buffer_text(&draw(&app, 120, 30));
         assert!(
-            flash.contains("$0.3450–2.8750/tok"),
+            flash.contains("in $0.34 · out $2.88 /1M tok"),
             "flash price must reflect its per-model variant:\n{flash}"
         );
 
@@ -969,11 +973,11 @@ mod tests {
         assert_eq!(app.choice().unwrap().model, "gemini-2.5-pro");
         let pro = buffer_text(&draw(&app, 120, 30));
         assert!(
-            pro.contains("$1.4375–11.5000/tok"),
+            pro.contains("in $1.44 · out $11.50 /1M tok"),
             "pro price must track the ←/→ selection:\n{pro}"
         );
         assert!(
-            !pro.contains("$0.3450"),
+            !pro.contains("$0.34"),
             "flash price must not linger after switching model:\n{pro}"
         );
     }

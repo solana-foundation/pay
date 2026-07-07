@@ -140,6 +140,7 @@ mod tests {
             base_url: "http://127.0.0.1:11434".into(),
             models: vec!["llama3.2:3b".into()],
             version: Some("0.9.1".into()),
+            pricing: None,
         }
     }
 

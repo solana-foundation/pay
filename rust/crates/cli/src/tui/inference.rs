@@ -3,7 +3,7 @@
 //! `broadcast::Sender<SseMessage>` to a `std::sync::mpsc` channel by the
 //! caller).
 //!
-//! Mirrors the topup TUI's visual language — 38-col dark sidebar, content
+//! Mirrors the topup TUI's visual language — 45-col dark sidebar, content
 //! window, 1-row controls bar, rounded borders — and its event-loop shape:
 //! 50ms `event::poll` tick, non-blocking channel drain, render, key handling.
 
@@ -18,11 +18,11 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
 use super::term::{SPINNER, with_terminal};
-use super::theme::{CARD_BG, SOLANA_GREEN, TOPUP_CARD_BG, TOPUP_MAIN_BG, TOPUP_SIDEBAR_BG};
-use super::widgets::{controls_bar, sidebar_card, solana_logo};
+use super::theme::{CARD_BG, SOLANA_GREEN, TOPUP_MAIN_BG, TOPUP_SIDEBAR_BG};
+use super::widgets::{controls_bar, solana_logo};
 
 /// Local flow ring-buffer cap — mirrors PDB's 200-flow ring buffer.
 const FLOW_CAP: usize = 200;
@@ -36,6 +36,8 @@ pub struct InferenceTuiArgs {
     pub gateway_url: String,
     /// Web UI URL; `Some` enables the `w` key (opened via `webbrowser`).
     pub web_url: Option<String>,
+    /// Public address the gateway is reachable at (identity card).
+    pub public_url: String,
     /// Providers discovered before the TUI opened.
     pub initial_providers: Vec<ProviderSummary>,
     /// Flows recorded before the TUI opened.
@@ -53,13 +55,19 @@ pub fn run_inference_tui(args: InferenceTuiArgs) -> io::Result<()> {
     let InferenceTuiArgs {
         gateway_url,
         web_url,
+        public_url,
         initial_providers,
         initial_flows,
         initial_connections,
         events,
     } = args;
 
-    let mut app = InferenceApp::new(initial_providers, initial_flows, initial_connections);
+    let mut app = InferenceApp::new(
+        initial_providers,
+        initial_flows,
+        initial_connections,
+        public_url,
+    );
 
     with_terminal(|terminal| {
         loop {
@@ -120,6 +128,9 @@ enum Action {
 
 struct InferenceApp {
     providers: Vec<ProviderSummary>,
+    /// Public address the gateway is reachable at, shown on the
+    /// inference-server identity card (e.g. `http://203.0.113.4:1402`).
+    public_url: String,
     /// Flows, newest first, capped at [`FLOW_CAP`] — kept only for the
     /// in-flight indicator (not rendered as rows).
     flows: VecDeque<PaymentFlow>,
@@ -144,9 +155,11 @@ impl InferenceApp {
         providers: Vec<ProviderSummary>,
         initial_flows: Vec<PaymentFlow>,
         initial_connections: Vec<ConnectionSummary>,
+        public_url: String,
     ) -> Self {
         let mut app = Self {
             providers,
+            public_url,
             flows: VecDeque::new(),
             connections: initial_connections,
             pane: Pane::Requests,
@@ -410,19 +423,17 @@ fn render(frame: &mut Frame, app: &InferenceApp, gateway_url: &str, has_web: boo
 
     let rows = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
 
-    let columns = Layout::horizontal([Constraint::Length(38), Constraint::Min(32)]).split(rows[0]);
-    render_providers(frame, columns[0], app);
+    let columns = Layout::horizontal([Constraint::Length(45), Constraint::Min(32)]).split(rows[0]);
+    render_inference_server(frame, columns[0], app);
     render_connections(frame, columns[1], app);
 
     render_controls(frame, rows[1], app, gateway_url, has_web);
 }
 
-/// Height of a provider card: blank, title, subtitle, trailing blank.
-const PROVIDER_CARD_HEIGHT: u16 = 4;
-
-/// Left pane: Solana logo, then one card per **up** provider, plus the
-/// selected provider's models. Down providers are not rendered.
-fn render_providers(frame: &mut Frame, area: Rect, app: &InferenceApp) {
+/// Left pane: Solana logo, then an "INFERENCE SERVER" identity card for
+/// each **up** server (typically one — Ollama), showing its name, version,
+/// public address, and served models. Down servers are not rendered.
+fn render_inference_server(frame: &mut Frame, area: Rect, app: &InferenceApp) {
     frame.render_widget(
         Block::default().style(Style::default().bg(TOPUP_SIDEBAR_BG)),
         area,
@@ -456,10 +467,16 @@ fn render_providers(frame: &mut Frame, area: Rect, app: &InferenceApp) {
     }
     y += logo_height + 1;
 
+    let servers = app.up_providers();
+    let heading = if servers.len() > 1 {
+        "INFERENCE SERVERS"
+    } else {
+        "INFERENCE SERVER"
+    };
     if y < bottom {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "PROVIDERS",
+                heading,
                 Style::default().fg(Color::DarkGray).bold(),
             ))),
             Rect {
@@ -472,12 +489,11 @@ fn render_providers(frame: &mut Frame, area: Rect, app: &InferenceApp) {
     }
     y += 2;
 
-    let providers = app.up_providers();
-    if providers.is_empty() {
+    if servers.is_empty() {
         if y < bottom {
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
-                    "no providers detected",
+                    "no inference server detected",
                     Style::default().fg(Color::DarkGray),
                 ))),
                 Rect {
@@ -491,78 +507,110 @@ fn render_providers(frame: &mut Frame, area: Rect, app: &InferenceApp) {
         return;
     }
 
-    for (idx, provider) in providers.iter().enumerate() {
-        if y + PROVIDER_CARD_HEIGHT > bottom {
+    for (idx, server) in servers.iter().enumerate() {
+        let selected = app.pane == Pane::Providers && idx == app.selected_provider;
+        y = render_server_card(frame, inner, y, bottom, server, selected, &app.public_url);
+        if y >= bottom {
             break;
         }
-        let selected = app.pane == Pane::Providers && idx == app.selected_provider;
-        let accent = provider
-            .color
-            .as_deref()
-            .and_then(hex_color)
-            .unwrap_or(SOLANA_GREEN);
-        let title = format!("● {}", provider.title);
-        let models = provider.models.len();
-        let noun = if models == 1 { "model" } else { "models" };
-        let subtitle = format!(
-            ":{} · {} {}",
-            provider_port(&provider.base_url),
-            models,
-            noun
-        );
-        let card_area = Rect {
-            x: inner.x,
-            y,
-            width: inner.width,
-            height: PROVIDER_CARD_HEIGHT,
-        };
-        sidebar_card(card_area, frame, &title, &[&subtitle], accent, selected);
-
-        // Overdraw the status dot in the provider's brand color —
-        // sidebar_card styles the whole title uniformly.
-        if !selected {
-            let title_width = title.chars().count() as u16;
-            let dot_x = inner.x + inner.width.saturating_sub(title_width) / 2;
-            frame.render_widget(
-                Paragraph::new(Span::styled(
-                    "●",
-                    Style::default().fg(accent).bg(TOPUP_CARD_BG),
-                )),
-                Rect {
-                    x: dot_x.min(inner.x + inner.width.saturating_sub(1)),
-                    y: y + 1,
-                    width: 1,
-                    height: 1,
-                },
-            );
-        }
-        y += PROVIDER_CARD_HEIGHT;
-
-        if idx == app.selected_provider {
-            for model in &provider.models {
-                if y >= bottom {
-                    break;
-                }
-                frame.render_widget(
-                    Paragraph::new(Line::from(Span::styled(
-                        format!(
-                            " ▸ {}",
-                            truncate_str(model, inner.width.saturating_sub(3).into())
-                        ),
-                        Style::default().fg(Color::DarkGray),
-                    ))),
-                    Rect {
-                        x: inner.x,
-                        y,
-                        width: inner.width,
-                        height: 1,
-                    },
-                );
-                y += 1;
-            }
-        }
-        y += 1; // gap between providers
+        y += 1; // gap between cards
     }
+}
+
+/// Render one inference-server identity card starting at row `y`; returns
+/// the next free row. The card is a bordered block: brand-dot + name +
+/// version on the header, a dim `address` and `models` field list inside,
+/// each model on its own `▸` line.
+fn render_server_card(
+    frame: &mut Frame,
+    inner: Rect,
+    y: u16,
+    bottom: u16,
+    server: &ProviderSummary,
+    selected: bool,
+    public_url: &str,
+) -> u16 {
+    let accent = server
+        .color
+        .as_deref()
+        .and_then(hex_color)
+        .unwrap_or(SOLANA_GREEN);
+
+    // Field lines: address, then one line per model (indented `▸`).
+    let mut lines: Vec<Line> = Vec::new();
+    let label = Style::default().fg(Color::DarkGray);
+    let value = Style::default().fg(Color::Gray);
+
+    lines.push(Line::from(vec![
+        Span::styled("address  ", label),
+        Span::styled(
+            truncate_str(public_url, inner.width.saturating_sub(11).into()),
+            value,
+        ),
+    ]));
+
+    let model_count = server.models.len();
+    let noun = if model_count == 1 { "model" } else { "models" };
+    lines.push(Line::from(Span::styled(
+        format!("{model_count} {noun}"),
+        label,
+    )));
+    for model in &server.models {
+        lines.push(Line::from(Span::styled(
+            format!(
+                " ▸ {}",
+                truncate_str(model, inner.width.saturating_sub(5).into())
+            ),
+            value,
+        )));
+    }
+
+    // Header: brand dot + name + version. Selection brightens the border
+    // and name; otherwise the border is dim and the dot carries the brand.
+    let border_style = if selected {
+        Style::default().fg(accent)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let name_style = if selected {
+        Style::default().fg(Color::White).bold()
+    } else {
+        Style::default().fg(Color::Gray).bold()
+    };
+    let version = server
+        .version
+        .as_deref()
+        .map(|v| format!(" v{v}"))
+        .unwrap_or_default();
+    let title = Line::from(vec![
+        Span::raw(" "),
+        Span::styled("● ", Style::default().fg(accent)),
+        Span::styled(server.title.clone(), name_style),
+        Span::styled(version, Style::default().fg(Color::DarkGray)),
+        Span::raw(" "),
+    ]);
+
+    // +2 for the top/bottom border rows.
+    let card_height = (lines.len() as u16 + 2).min(bottom.saturating_sub(y));
+    if card_height < 3 {
+        return bottom;
+    }
+    let card_area = Rect {
+        x: inner.x,
+        y,
+        width: inner.width,
+        height: card_height,
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(border_style)
+        .title(title)
+        // Card shares the sidebar background — only its border sets it apart.
+        .style(Style::default().bg(TOPUP_SIDEBAR_BG));
+    frame.render_widget(Paragraph::new(lines).block(block), card_area);
+
+    y + card_height
 }
 
 // Connections-table column widths (characters). `models` takes whatever
@@ -888,16 +936,6 @@ fn short_time(ts: &str) -> String {
         .unwrap_or_else(|_| ts.get(11..19).unwrap_or(ts).to_string())
 }
 
-/// Trailing port digits of a base URL (`http://127.0.0.1:11434` → `11434`).
-fn provider_port(base_url: &str) -> &str {
-    base_url
-        .trim_end_matches('/')
-        .rsplit(':')
-        .next()
-        .filter(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
-        .unwrap_or("?")
-}
-
 /// `#rrggbb` → `Color::Rgb`.
 fn hex_color(hex: &str) -> Option<Color> {
     let hex = hex.strip_prefix('#')?;
@@ -1014,12 +1052,14 @@ mod tests {
     }
 
     fn app_with(providers: Vec<ProviderSummary>, flows: Vec<PaymentFlow>) -> InferenceApp {
-        InferenceApp::new(providers, flows, vec![])
+        InferenceApp::new(providers, flows, vec![], TEST_PUBLIC_URL.to_string())
     }
 
     fn app_with_conns(connections: Vec<ConnectionSummary>) -> InferenceApp {
-        InferenceApp::new(vec![], vec![], connections)
+        InferenceApp::new(vec![], vec![], connections, TEST_PUBLIC_URL.to_string())
     }
+
+    const TEST_PUBLIC_URL: &str = "http://203.0.113.4:1402";
 
     // ── Event application ──
 
@@ -1313,6 +1353,7 @@ mod tests {
                 conn("a", None, None, "2026-07-01T12:00:05.000Z"),
                 conn("b", None, None, "2026-07-01T12:00:01.000Z"),
             ],
+            TEST_PUBLIC_URL.to_string(),
         );
         app.handle_key(KeyCode::Down, KeyModifiers::NONE); // pin
         app.handle_key(KeyCode::Char('c'), KeyModifiers::NONE);
@@ -1394,6 +1435,7 @@ mod tests {
                 ),
                 conn("other", None, Some("lm-studio"), "2026-07-01T12:00:01.000Z"),
             ],
+            TEST_PUBLIC_URL.to_string(),
         );
         // Flow client_ip is "::1" (helper default); conns use 127.0.0.1 —
         // so only the provider fallback matches.
@@ -1411,10 +1453,7 @@ mod tests {
     }
 
     #[test]
-    fn misc_helpers_format_ports_colors_and_truncation() {
-        assert_eq!(provider_port("http://127.0.0.1:11434"), "11434");
-        assert_eq!(provider_port("http://127.0.0.1:1234/"), "1234");
-        assert_eq!(provider_port("nonsense"), "?");
+    fn misc_helpers_format_colors_and_truncation() {
         assert_eq!(hex_color("#22c55e"), Some(Color::Rgb(0x22, 0xc5, 0x5e)));
         assert_eq!(hex_color("22c55e"), None);
         assert_eq!(hex_color("#22c5"), None);
@@ -1443,6 +1482,14 @@ mod tests {
         text
     }
 
+    /// Rendered buffer as one `String` per row (for column-scoped checks).
+    fn render_region_lines(app: &InferenceApp, width: u16, has_web: bool) -> Vec<String> {
+        render_to_text(app, width, has_web)
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
     #[test]
     fn render_smoke_test_contains_key_strings() {
         let app = InferenceApp::new(
@@ -1462,15 +1509,25 @@ mod tests {
                 Some("ollama"),
                 "2026-07-01T12:01:24.020Z",
             )],
+            TEST_PUBLIC_URL.to_string(),
         );
 
         let text = render_to_text(&app, 120, true);
 
-        // Sidebar: Solana logo (braille glyph fragment) + heading + up card.
+        // Sidebar: Solana logo (braille glyph fragment) + heading + identity card.
         assert!(text.contains("⣠⣶"), "missing solana logo:\n{text}");
         assert!(
-            text.contains("PROVIDERS"),
+            text.contains("INFERENCE SERVER"),
             "missing sidebar heading:\n{text}"
+        );
+        // Identity card shows the public address.
+        assert!(
+            text.contains("203.0.113.4"),
+            "missing public address on identity card:\n{text}"
+        );
+        assert!(
+            text.contains("2 models"),
+            "missing model count on identity card:\n{text}"
         );
         // The chart is gone — no legend renders.
         assert!(
@@ -1518,10 +1575,21 @@ mod tests {
             !text.contains("DETAIL"),
             "detail panel should be gone:\n{text}"
         );
-        // The connections table is borderless now.
+        // The connections table (right pane, x >= 45) stays borderless; the
+        // sidebar identity card is intentionally bordered, so scope the
+        // check to the connections region.
+        let connections_borderless = render_region_lines(&app, 120, true).iter().all(|line| {
+            let right: String = line.chars().skip(45).collect();
+            !right.contains('╭') && !right.contains('┌')
+        });
         assert!(
-            !text.contains('╭') && !text.contains('┌'),
-            "no border glyphs should render:\n{text}"
+            connections_borderless,
+            "connections pane should render no border glyphs"
+        );
+        // The sidebar card, by contrast, draws a rounded border.
+        assert!(
+            text.contains('╭'),
+            "identity card should render a rounded border:\n{text}"
         );
     }
 
@@ -1532,7 +1600,7 @@ mod tests {
         let text = render_to_text(&app, 100, false);
 
         assert!(
-            text.contains("no providers detected"),
+            text.contains("no inference server detected"),
             "missing empty state:\n{text}"
         );
         assert!(

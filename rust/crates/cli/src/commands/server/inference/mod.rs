@@ -13,6 +13,7 @@
 //! in-gate, no extra control-plane routes. See docs/serve-inference.md.
 
 pub mod discovery;
+pub mod pricing;
 pub mod providers;
 pub mod spec;
 
@@ -49,6 +50,14 @@ pub struct InferenceCommand {
     #[arg(long, default_value = "127.0.0.1:1402")]
     pub bind: String,
 
+    /// Public IP or domain this gateway is reachable at (e.g.
+    /// `203.0.113.4` or `gateway.example.com`, with optional `scheme://`
+    /// and `:port`). Shown on the inference-server identity card. Omitted
+    /// advertises the local bind; pass `auto` to discover the public IP via
+    /// a third-party echo service (opt-in — it leaks your public IP).
+    #[arg(long)]
+    pub public_url: Option<String>,
+
     /// Only probe these providers (comma-separated slugs, e.g. `ollama,vllm`).
     #[arg(long, value_delimiter = ',')]
     pub providers: Vec<String>,
@@ -83,8 +92,28 @@ pub struct InferenceCommand {
     /// Charge this flat USD price per paid inference request (the registry's
     /// `paid` endpoints; model-listing/health stay free). Sandbox only —
     /// requires `--sandbox` (or global `pay --sandbox`).
-    #[arg(long, value_name = "USD")]
+    #[arg(long, value_name = "USD", conflicts_with_all = ["price", "pricing"])]
     pub price_usd: Option<f64>,
+
+    /// Per-model token pricing file (YAML). Display-only: shown per model in
+    /// the picker; per-token charging is not wired yet. Mutually exclusive
+    /// with `--price` and `--price-usd`. Shape:
+    ///
+    /// ```yaml
+    /// default: { in: 0.10, out: 0.30 }
+    /// models:
+    ///   "gemma4": { in: 0.15, out: 0.60 }
+    ///   "qwen3:8b": { in: 0.50, out: 1.50 }
+    /// ```
+    #[arg(long, value_name = "FILE", conflicts_with = "price")]
+    pub pricing: Option<String>,
+
+    /// Inline per-model token pricing shorthand (comma-separated
+    /// `model=in/out`; `*=in/out` or a bare `in/out` sets the default), USD
+    /// per 1M tokens. Display-only. e.g.
+    /// `gemma4=0.15/0.60,qwen3:8b=0.5/1.5,*=0.1/0.3`.
+    #[arg(long, value_name = "SPEC")]
+    pub price: Option<String>,
 }
 
 /// Payment state for the inference gateway: the PDB hook for live tracking,
@@ -222,6 +251,83 @@ fn validate_pricing(price_usd: Option<f64>, sandbox: bool) -> pay_core::Result<O
     }
 }
 
+/// Resolve the display-only per-model token pricing from `--pricing <FILE>`
+/// or `--price <SPEC>`. At most one may be set (also mutually exclusive with
+/// the flat `--price-usd` — enforced by clap `conflicts_with`, re-checked
+/// here so a programmatic caller can't slip both past). `None` means today's
+/// behavior: no per-model pricing.
+fn resolve_pricing_config(
+    pricing_file: Option<&str>,
+    price_inline: Option<&str>,
+) -> pay_core::Result<Option<pricing::PricingConfig>> {
+    match (pricing_file, price_inline) {
+        (Some(_), Some(_)) => Err(pay_core::Error::Config(
+            "--price/--pricing set per-model token pricing; --price-usd sets a flat \
+             per-request price — use one"
+                .into(),
+        )),
+        (Some(path), None) => Ok(Some(pricing::PricingConfig::from_yaml_file(path)?)),
+        (None, Some(spec)) => Ok(Some(pricing::PricingConfig::from_inline(spec)?)),
+        (None, None) => Ok(None),
+    }
+}
+
+/// Public address shown on the inference-server identity card.
+///
+/// Precedence: explicit `--public-url` (normalized to include a scheme) →
+/// auto-discovered public IP (`http://<ip>:<port>`) → the local bind
+/// (`http://127.0.0.1:<port>`) when discovery is unavailable. The port is
+/// carried from `bind` so the advertised address is directly dialable.
+fn resolve_public_address(public_url: Option<&str>, bind: &str) -> String {
+    let port = bind.rsplit(':').next().unwrap_or("1402");
+
+    let local = || format!("http://{}", bind.replace("0.0.0.0", "127.0.0.1"));
+
+    let Some(url) = public_url.map(str::trim).filter(|s| !s.is_empty()) else {
+        // No flag: advertise the local bind. We do NOT phone a third-party IP
+        // echo service by default — that leaks the host's public IP on every
+        // launch. Opt in explicitly with `--public-url auto`.
+        return local();
+    };
+
+    if url.eq_ignore_ascii_case("auto") {
+        return match discover_public_ip() {
+            Some(ip) => format!("http://{ip}:{port}"),
+            None => local(),
+        };
+    }
+
+    // Respect an explicit scheme; otherwise assume http and append the bind
+    // port when the operator didn't specify one.
+    if url.contains("://") {
+        url.to_string()
+    } else if url.contains(':') {
+        format!("http://{url}")
+    } else {
+        format!("http://{url}:{port}")
+    }
+}
+
+/// Best-effort public IP lookup via a plaintext echo service. Returns
+/// `None` on any failure (offline, timeout, unparseable) so the caller
+/// falls back to the local bind — the identity card must always render.
+fn discover_public_ip() -> Option<String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(1500))
+        .build()
+        .ok()?;
+    let ip = client
+        .get("https://api.ipify.org")
+        .send()
+        .ok()?
+        .text()
+        .ok()?
+        .trim()
+        .to_string();
+    // Guard against an error page sneaking through as the "IP".
+    ip.parse::<std::net::IpAddr>().ok().map(|ip| ip.to_string())
+}
+
 /// Observer telemetry → PDB wire type. Provider is left empty — the
 /// correlation engine merges field-wise onto the request-time info.
 fn usage_to_info(usage: &pay_core::InferenceUsage) -> InferenceInfo {
@@ -241,6 +347,8 @@ impl InferenceCommand {
     pub fn run(self, global_sandbox: bool) -> pay_core::Result<()> {
         let sandbox = self.sandbox || global_sandbox;
         let price_usd = validate_pricing(self.price_usd, sandbox)?;
+        let pricing_config =
+            resolve_pricing_config(self.pricing.as_deref(), self.price.as_deref())?;
 
         // Probe the public bind up front: Pingora only discovers a taken port
         // deep inside its service thread, where the bind failure is a panic.
@@ -269,7 +377,7 @@ impl InferenceCommand {
             .build()
             .map_err(|e| pay_core::Error::Config(format!("tokio runtime: {e}")))?;
 
-        let (internal_addr, state) = rt.block_on(self.setup(sandbox, price_usd))?;
+        let (internal_addr, state) = rt.block_on(self.setup(sandbox, price_usd, pricing_config))?;
 
         let cores = std::thread::available_parallelism().map(|n| n.get()).ok();
         // `rt` stays alive so the watch/cleanup/axum/bridge tasks keep
@@ -323,9 +431,11 @@ impl InferenceCommand {
         };
 
         let display_addr = self.bind.replace("0.0.0.0", "127.0.0.1");
+        let public_url = resolve_public_address(self.public_url.as_deref(), &self.bind);
         let tui_result = crate::tui::run_inference_tui(crate::tui::InferenceTuiArgs {
             gateway_url: format!("http://{display_addr}"),
             web_url: (!self.no_web).then(|| format!("http://{display_addr}{UI_PATH}/")),
+            public_url,
             initial_providers,
             initial_flows,
             initial_connections,
@@ -341,6 +451,7 @@ impl InferenceCommand {
         &self,
         sandbox: bool,
         price_usd: Option<f64>,
+        pricing_config: Option<pricing::PricingConfig>,
     ) -> pay_core::Result<(std::net::SocketAddr, InferenceState)> {
         let registry =
             load_registry().map_err(|e| pay_core::Error::Config(format!("registry: {e}")))?;
@@ -393,11 +504,44 @@ impl InferenceCommand {
             .await;
         spinner.finish_and_clear();
 
+        let mut discovered = discovered;
         if discovered.is_empty() {
             return Err(pay_core::Error::Config(
                 "no local inference providers found — start one (e.g. `ollama serve`) and retry"
                     .into(),
             ));
+        }
+
+        // Display-only per-model pricing: validate against the models each
+        // provider actually serves, then overlay it so the picker can show
+        // per-model in/out token rates. Fail BEFORE opening the gateway/TUI,
+        // the same way the sandbox guard does — a typo'd model or a provider
+        // that serves none of the configured models (with no `default`) is a
+        // loud error, not a silently-dropped chip.
+        if let Some(config) = &pricing_config {
+            let mut errs: Vec<String> = Vec::new();
+            for provider in &discovered {
+                errs.extend(config.validate(provider.slug(), &provider.models));
+                if config.default.is_none()
+                    && !provider.models.iter().any(|m| config.resolve(m).is_some())
+                {
+                    errs.push(format!(
+                        "pricing: no configured model is served by {} and no `default` \
+                         rate is set",
+                        provider.slug()
+                    ));
+                }
+            }
+            if !errs.is_empty() {
+                return Err(pay_core::Error::Config(errs.join("; ")));
+            }
+            for provider in &mut discovered {
+                provider.pricing = Some(config.clone());
+            }
+            eprintln!(
+                "⏺ per-model pricing shown in picker (display only; per-token charging \
+                 is not wired yet)"
+            );
         }
 
         // Sandbox charge stack — only when priced. `validate_pricing`
@@ -714,6 +858,7 @@ mod tests {
             base_url: "http://127.0.0.1:11434".into(),
             models: vec![],
             version: None,
+            pricing: None,
         }
     }
 
@@ -726,6 +871,43 @@ mod tests {
             fee_payer_signer: None,
             fee_payer_wallet: None,
         }
+    }
+
+    #[test]
+    fn public_address_precedence_and_normalization() {
+        // Explicit scheme is respected verbatim.
+        assert_eq!(
+            resolve_public_address(Some("https://gw.example.com"), "0.0.0.0:1402"),
+            "https://gw.example.com"
+        );
+        // Host with an explicit port gets an http scheme.
+        assert_eq!(
+            resolve_public_address(Some("203.0.113.4:8080"), "0.0.0.0:1402"),
+            "http://203.0.113.4:8080"
+        );
+        // Bare host/domain inherits the bind port.
+        assert_eq!(
+            resolve_public_address(Some("gw.example.com"), "0.0.0.0:1402"),
+            "http://gw.example.com:1402"
+        );
+        assert_eq!(
+            resolve_public_address(Some("203.0.113.4"), "0.0.0.0:4000"),
+            "http://203.0.113.4:4000"
+        );
+        // No flag (or a blank one) advertises the local bind — no network
+        // call, no public-IP leak by default.
+        assert_eq!(
+            resolve_public_address(None, "0.0.0.0:1402"),
+            "http://127.0.0.1:1402"
+        );
+        assert_eq!(
+            resolve_public_address(Some("   "), "127.0.0.1:1402"),
+            "http://127.0.0.1:1402"
+        );
+        // `auto` opts into public-IP discovery; offline it falls back to the
+        // local bind — this test only asserts a usable http URL shape.
+        let auto = resolve_public_address(Some("auto"), "127.0.0.1:1402");
+        assert!(auto.starts_with("http://"), "got {auto}");
     }
 
     #[test]
