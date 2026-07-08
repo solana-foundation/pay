@@ -759,13 +759,12 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
         // are written in `forward_upto_buffered`, so its receipt reaches the
         // client as a normal PAYMENT-RESPONSE header.
         let mut deferred_payment_headers = Vec::new();
-        if let Some(pending) = ctx.upto.take() {
-            if let Some(header) = self
+        if let Some(pending) = ctx.upto.take()
+            && let Some(header) = self
                 .settle_pending_upto(pending, false, &HeaderMap::new(), None)
                 .await
-            {
-                deferred_payment_headers.push(header);
-            }
+        {
+            deferred_payment_headers.push(header);
         }
         let Some(log) = ctx.log.take() else {
             return;
