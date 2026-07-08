@@ -9,6 +9,7 @@ export type {
   SessionInfo,
   PaymentFlow,
   ProviderSummary,
+  ModelPricingSummary,
   InferenceInfo,
   ConnectionSummary,
   SSEMessage,

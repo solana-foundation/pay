@@ -100,16 +100,21 @@ impl PricingConfig {
     /// the model's base name (the part before `:`, so config `qwen3` matches
     /// served `qwen3:8b`) → the `default`.
     pub fn resolve(&self, model: &str) -> Option<TokenRate> {
+        self.resolve_with_variant(model).map(|(_, rate)| rate)
+    }
+
+    /// Resolve the rate plus the configured variant label that matched.
+    pub fn resolve_with_variant(&self, model: &str) -> Option<(String, TokenRate)> {
         if let Some(rate) = self.per_model.get(model) {
-            return Some(*rate);
+            return Some((model.to_string(), *rate));
         }
         let base = model.split(':').next().unwrap_or(model);
         if base != model
             && let Some(rate) = self.per_model.get(base)
         {
-            return Some(*rate);
+            return Some((base.to_string(), *rate));
         }
-        self.default
+        self.default.map(|rate| ("default".to_string(), rate))
     }
 
     /// Validate this config against the models a provider actually serves,

@@ -73,6 +73,14 @@ export interface ProviderSummary {
   models: string[];
   version?: string;
   color?: string; // brand hex, e.g. "#22c55e"
+  modelPricing?: ModelPricingSummary[];
+}
+
+export interface ModelPricingSummary {
+  model: string;
+  variant?: string;
+  price?: string;
+  description?: string;
 }
 
 export interface InferenceInfo {

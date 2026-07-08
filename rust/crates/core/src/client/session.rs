@@ -117,6 +117,10 @@ impl SessionHandle {
     }
 
     /// Build an `Authorization` header for a payment-channel `open` action.
+    ///
+    /// `open_slot` is the channel's on-chain open slot — a channel-PDA seed
+    /// since the epoch-addressed program update — and must match the slot the
+    /// open transaction was built for (the challenge's `recentSlot`).
     #[allow(clippy::too_many_arguments)]
     pub async fn open_payment_channel_header(
         &self,
@@ -126,6 +130,7 @@ impl SessionHandle {
         mint: &str,
         salt: u64,
         grace_period: u32,
+        open_slot: u64,
         transaction: String,
     ) -> Result<String> {
         self.open_payment_channel_header_with_mode(
@@ -136,6 +141,7 @@ impl SessionHandle {
             mint,
             salt,
             grace_period,
+            open_slot,
             transaction,
         )
         .await
@@ -153,6 +159,7 @@ impl SessionHandle {
         mint: &str,
         salt: u64,
         grace_period: u32,
+        open_slot: u64,
         transaction: String,
     ) -> Result<String> {
         let session = self.inner.lock().await;
@@ -164,6 +171,7 @@ impl SessionHandle {
             mint,
             salt,
             grace_period,
+            open_slot,
             "pending",
         ) else {
             unreachable!("open_payment_channel_action always returns SessionAction::Open")
@@ -381,6 +389,11 @@ pub fn open_payment_channel_session_header_with_mode(
         &mint.to_string(),
         salt,
         grace_period,
+        // The open slot is a channel-PDA seed since the epoch-addressed
+        // program update; use the same slot the open transaction was derived
+        // for (challenge `recentSlot`, resolved inside
+        // `derive_payment_channel_open`) so the server re-derives the same PDA.
+        open.open_slot,
         open_tx.transaction,
     ))?;
 
@@ -438,6 +451,7 @@ mod tests {
             modes: vec![SessionMode::Push, SessionMode::Pull],
             pull_voucher_strategy: Some(SessionPullVoucherStrategy::ClientVoucher),
             recent_blockhash: None,
+            recent_slot: None,
         }
     }
 

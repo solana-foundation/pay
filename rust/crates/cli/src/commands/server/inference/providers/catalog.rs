@@ -158,9 +158,12 @@ impl InferenceProvider for CatalogProvider {
             return None;
         }
         Some(PricingHint {
+            display: None,
             min_usd: min,
             max_usd: max,
             unit: unit.unwrap_or_else(|| "requests".to_string()),
+            variant: None,
+            description: None,
             // Model-agnostic aggregate: no single input/output pair to show.
             io: None,
         })
@@ -183,6 +186,8 @@ impl InferenceProvider for CatalogProvider {
         let mut max = f64::NEG_INFINITY;
         let mut unit: Option<String> = None;
         let mut io: Option<(f64, f64)> = None;
+        let mut variant_name: Option<String> = None;
+        let mut description: Option<String> = None;
         let mut matched = false;
         for ep in self.endpoints.iter().filter(|ep| ep.pricing.is_some()) {
             let Some(variants) = ep
@@ -197,6 +202,9 @@ impl InferenceProvider for CatalogProvider {
                 continue;
             };
             matched = true;
+            if variant_name.is_none() {
+                variant_name = variant_value(variant);
+            }
             for (lo, hi) in dimension_prices(variant) {
                 min = min.min(lo);
                 max = max.max(hi);
@@ -206,6 +214,9 @@ impl InferenceProvider for CatalogProvider {
             // `in $X · out $Y` chip as local ones.
             if io.is_none() {
                 io = directional_io(variant);
+            }
+            if description.is_none() {
+                description = variant_description(variant);
             }
             if unit.is_none() {
                 unit = variant
@@ -221,12 +232,33 @@ impl InferenceProvider for CatalogProvider {
             return self.pricing_hint();
         }
         Some(PricingHint {
+            display: None,
             min_usd: min,
             max_usd: max,
             unit: unit.unwrap_or_else(|| "tokens".to_string()),
+            variant: variant_name,
+            description,
             io,
         })
     }
+}
+
+fn variant_value(variant: &serde_json::Value) -> Option<String> {
+    variant
+        .get("value")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn variant_description(variant: &serde_json::Value) -> Option<String> {
+    variant
+        .get("description")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 /// The `(input, output)` per-scale token rates for a variant, read from its
@@ -453,6 +485,7 @@ mod tests {
                         {
                             "param": "model",
                             "value": "gemini-2.5-flash-lite",
+                            "description": "Small, fast Gemini model.",
                             "dimensions": [
                                 { "direction": "input", "unit": "tokens", "scale": 1000000, "tiers": [{ "price_usd": 0.115 }] },
                                 { "direction": "output", "unit": "tokens", "scale": 1000000, "tiers": [{ "price_usd": 0.46 }] }
@@ -461,6 +494,7 @@ mod tests {
                         {
                             "param": "model",
                             "value": "gemini-2.5-flash",
+                            "description": "Fast Gemini model for low-latency generation.",
                             "dimensions": [
                                 { "direction": "input", "unit": "tokens", "scale": 1000000, "tiers": [{ "price_usd": 0.345 }] },
                                 { "direction": "output", "unit": "tokens", "scale": 1000000, "tiers": [{ "price_usd": 2.875 }] }
@@ -469,6 +503,7 @@ mod tests {
                         {
                             "param": "model",
                             "value": "default",
+                            "description": "Fallback Gemini pricing.",
                             "dimensions": [
                                 { "direction": "input", "unit": "tokens", "scale": 1000000, "tiers": [{ "price_usd": 1.0 }] },
                                 { "direction": "output", "unit": "tokens", "scale": 1000000, "tiers": [{ "price_usd": 8.0 }] }
@@ -555,6 +590,11 @@ mod tests {
         assert_eq!(flash.min_usd, 0.345);
         assert_eq!(flash.max_usd, 2.875);
         assert_eq!(flash.unit, "tokens");
+        assert_eq!(flash.variant.as_deref(), Some("gemini-2.5-flash"));
+        assert_eq!(
+            flash.description.as_deref(),
+            Some("Fast Gemini model for low-latency generation.")
+        );
         // Directional dims populate `io`, so the chip shows real in/out rates.
         assert_eq!(flash.io, Some((0.345, 2.875)));
         assert_eq!(flash.to_string(), "in $0.34 · out $2.88 /1M tok");
@@ -565,12 +605,22 @@ mod tests {
             .pricing_hint_for_model(Some("gemini-2.5-flash-lite"))
             .unwrap();
         assert_eq!((lite.min_usd, lite.max_usd), (0.115, 0.46));
+        assert_eq!(lite.variant.as_deref(), Some("gemini-2.5-flash-lite"));
+        assert_eq!(
+            lite.description.as_deref(),
+            Some("Small, fast Gemini model.")
+        );
 
         // Unknown model falls back to the `default` sentinel variant.
         let unknown = provider
             .pricing_hint_for_model(Some("some-future-model"))
             .unwrap();
         assert_eq!((unknown.min_usd, unknown.max_usd), (1.0, 8.0));
+        assert_eq!(unknown.variant.as_deref(), Some("default"));
+        assert_eq!(
+            unknown.description.as_deref(),
+            Some("Fallback Gemini pricing.")
+        );
 
         // No model given → the model-agnostic aggregate (spans all variants).
         let agg = provider.pricing_hint_for_model(None).unwrap();

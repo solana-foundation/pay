@@ -15,6 +15,9 @@ function ProviderCard({ provider }: { provider: ProviderSummary }) {
       : undefined;
   const expandable = provider.up && provider.models.length > 0;
   const expanded = expandable && !collapsed;
+  const pricingByModel = new Map(
+    (provider.modelPricing ?? []).map((item) => [item.model, item]),
+  );
 
   return (
     <div className={`provider-card${provider.up ? "" : " down"}`}>
@@ -42,11 +45,28 @@ function ProviderCard({ provider }: { provider: ProviderSummary }) {
       </button>
       {expanded && (
         <div className="provider-models">
-          {provider.models.map((model) => (
-            <div className="provider-model" key={model} title={model}>
-              {model}
-            </div>
-          ))}
+          {provider.models.map((model) => {
+            const pricing = pricingByModel.get(model);
+            const variantDescription = pricing?.description;
+            const title = [model, pricing?.price, variantDescription]
+              .filter(Boolean)
+              .join(" · ");
+            return (
+              <div className="provider-model" key={model} title={title}>
+                <div className="provider-model-row">
+                  <span className="provider-model-name">{model}</span>
+                  <span className="provider-model-price">
+                    {pricing?.price ?? "unpriced"}
+                  </span>
+                </div>
+                {variantDescription && (
+                  <div className="provider-model-description">
+                    {variantDescription}
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </div>
       )}
       {provider.up && provider.version && (

@@ -104,6 +104,7 @@ fn paid_endpoint(paid: &PaidEndpoint, config: &PricingConfig) -> Endpoint {
         .map(|(model, rate)| MeterVariant {
             param: "model".to_string(),
             value: model.clone(),
+            description: None,
             dimensions: token_dimensions(rate),
         })
         .collect();
@@ -216,6 +217,7 @@ mod tests {
             models: vec!["llama3.2:3b".into()],
             version: Some("0.9.1".into()),
             pricing: None,
+            model_pricing: Vec::new(),
         }
     }
 

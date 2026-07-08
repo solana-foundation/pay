@@ -562,9 +562,13 @@ pub(crate) fn spawn_blockhash_cache(rpc_url: &str) -> pay_kit::mpp::blockhash::B
     let worker_rpc_url = rpc_url.to_string();
     let refresh = move || {
         let rpc = RpcClient::new(worker_rpc_url.clone());
-        match rpc.get_latest_blockhash_with_commitment(rpc.commitment()) {
-            Ok((blockhash, last_valid_block_height)) => {
-                cache.set(blockhash.to_string(), last_valid_block_height);
+        // Fetch blockhash + lastValidBlockHeight + slot in one RPC call:
+        // getLatestBlockhash's response context carries the current slot, which
+        // the epoch-addressed program needs as the challenge `recentSlot`
+        // (channel `openSlot`) — no separate getSlot round-trip.
+        match pay_kit::mpp::blockhash::fetch_blockhash_with_slot(&rpc, rpc.commitment()) {
+            Ok(entry) => {
+                cache.set(entry.blockhash, entry.last_valid_block_height, entry.slot);
             }
             Err(e) => {
                 tracing::warn!(error = %e, "blockhash cache refresh failed");

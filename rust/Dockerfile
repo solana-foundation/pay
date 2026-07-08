@@ -30,11 +30,14 @@ FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \
+    libcap2-bin \
     && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd -r pay && useradd -r -g pay -s /sbin/nologin pay
 
 COPY --from=build /usr/local/bin/pay /usr/local/bin/pay
+
+RUN setcap 'cap_net_bind_service=+ep' /usr/local/bin/pay
 
 WORKDIR /app
 

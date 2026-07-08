@@ -2658,6 +2658,7 @@ mod tests {
                                 {
                                     "param": "model",
                                     "value": "gemini-2.5-flash",
+                                    "description": "Fast Gemini model for low-latency generation.",
                                     "dimensions": [
                                         { "direction": "input", "unit": "tokens", "scale": 1000000, "tiers": [{ "price_usd": 0.345 }] },
                                         { "direction": "output", "unit": "tokens", "scale": 1000000, "tiers": [{ "price_usd": 2.875 }] }
@@ -2683,6 +2684,10 @@ mod tests {
         let variants = pricing["variants"].as_array().unwrap();
         assert_eq!(variants.len(), 1);
         assert_eq!(variants[0]["value"], "gemini-2.5-flash");
+        assert_eq!(
+            variants[0]["description"],
+            "Fast Gemini model for low-latency generation."
+        );
         assert_eq!(variants[0]["dimensions"][1]["tiers"][0]["price_usd"], 2.875);
     }
 

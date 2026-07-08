@@ -12,6 +12,7 @@ use crate::commands::server::inference::providers::{
     Dialect, InferenceProvider, catalog as catalog_providers,
 };
 use crate::tui::{ProviderSelection, select_provider};
+use pay_pdb::types::ProviderSummary;
 
 const ALLOWED_TOOLS: &str = "mcp__pay__curl,mcp__pay__search_catalog,mcp__pay__list_catalog,mcp__pay__get_catalog_entry,mcp__pay__get_balance,mcp__pay__topup,mcp__pay__create_skill";
 const GATEWAY_BASE_URL: &str = "http://127.0.0.1:1402";
@@ -162,6 +163,14 @@ fn prepare_claude_launch(
     let requested_model = model_arg(args);
     let gateway_up = gateway_listening();
     let mut providers = discover_local_providers()?;
+    if gateway_up {
+        let gateway_providers = gateway_provider_summaries();
+        if !gateway_providers.is_empty() {
+            apply_gateway_provider_summaries(&mut providers, &gateway_providers);
+        } else {
+            apply_gateway_proxy_fallback(&mut providers);
+        }
+    }
     providers.extend(discover_catalog_providers());
 
     let choice = if providers.is_empty() {
@@ -300,6 +309,74 @@ fn discover_local_providers() -> pay_core::Result<Vec<DiscoveredProvider>> {
     Ok(rt.block_on(discovery::discover(&registry, PROVIDER_PROBE_TIMEOUT, None)))
 }
 
+#[derive(serde::Deserialize)]
+struct GatewayConfig {
+    #[serde(default)]
+    providers: Vec<ProviderSummary>,
+}
+
+fn gateway_provider_summaries() -> Vec<ProviderSummary> {
+    let Ok(client) = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(500))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    else {
+        return Vec::new();
+    };
+    fetch_gateway_provider_summaries(&client, "/__402/pdb/api/config")
+        // `pay serve inference --no-web` exposes the same provider snapshot at
+        // `/` instead of mounting the PDB config route.
+        .or_else(|| fetch_gateway_provider_summaries(&client, "/"))
+        .unwrap_or_default()
+}
+
+fn fetch_gateway_provider_summaries(
+    client: &reqwest::blocking::Client,
+    path: &str,
+) -> Option<Vec<ProviderSummary>> {
+    let response = client
+        .get(format!("{GATEWAY_BASE_URL}{path}"))
+        .send()
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    response
+        .json::<GatewayConfig>()
+        .ok()
+        .map(|config| config.providers)
+}
+
+fn apply_gateway_provider_summaries(
+    providers: &mut Vec<DiscoveredProvider>,
+    summaries: &[ProviderSummary],
+) {
+    providers.retain(|provider| {
+        summaries
+            .iter()
+            .any(|summary| summary.up && summary.slug == provider.slug())
+    });
+
+    for provider in providers {
+        let Some(summary) = summaries
+            .iter()
+            .find(|summary| summary.up && summary.slug == provider.slug())
+        else {
+            continue;
+        };
+        provider.base_url = GATEWAY_BASE_URL.to_string();
+        provider.models = summary.models.clone();
+        provider.version = summary.version.clone();
+        provider.model_pricing = summary.model_pricing.clone();
+    }
+}
+
+fn apply_gateway_proxy_fallback(providers: &mut Vec<DiscoveredProvider>) {
+    for provider in providers {
+        provider.base_url = GATEWAY_BASE_URL.to_string();
+    }
+}
+
 /// Hosted pay-catalog providers appended to the picker after local
 /// discovery. Everything degrades silently to local-only: catalog
 /// unavailable, an fqn not (yet) published, or an unreachable gateway all
@@ -350,6 +427,7 @@ fn discover_catalog_providers() -> Vec<DiscoveredProvider> {
                 models,
                 version,
                 pricing: None,
+                model_pricing: Vec::new(),
             });
         }
         discovered
@@ -590,5 +668,60 @@ mod tests {
             "CLAUDE_CODE_SUBAGENT_MODEL".to_string(),
             "llama3.2".to_string()
         )));
+    }
+
+    #[test]
+    fn gateway_summaries_rewrite_local_provider_to_proxy_and_pricing() {
+        let mut providers = vec![DiscoveredProvider {
+            provider: Arc::new(crate::commands::server::inference::providers::ollama::Ollama),
+            base_url: "http://127.0.0.1:11434".into(),
+            models: vec!["gemma4:latest".into()],
+            version: Some("0.31.1".into()),
+            pricing: None,
+            model_pricing: Vec::new(),
+        }];
+        let summaries = vec![ProviderSummary {
+            slug: "ollama".into(),
+            title: "Ollama".into(),
+            base_url: "http://127.0.0.1:11434".into(),
+            up: true,
+            models: vec!["gemma4:latest".into()],
+            version: Some("0.31.1".into()),
+            color: Some("#22c55e".into()),
+            model_pricing: vec![pay_pdb::types::ModelPricingSummary {
+                model: "gemma4:latest".into(),
+                variant: Some("gemma4".into()),
+                price: Some("in $1.00 · out $3.00 /1M tok".into()),
+                description: None,
+            }],
+        }];
+
+        apply_gateway_provider_summaries(&mut providers, &summaries);
+
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].base_url, GATEWAY_BASE_URL);
+        assert_eq!(providers[0].models, vec!["gemma4:latest"]);
+        let hint = providers[0]
+            .pricing_hint_for_model(Some("gemma4:latest"))
+            .unwrap();
+        assert_eq!(hint.to_string(), "in $1.00 · out $3.00 /1M tok");
+        assert_eq!(hint.variant.as_deref(), Some("gemma4"));
+    }
+
+    #[test]
+    fn gateway_summary_fallback_rewrites_local_provider_to_proxy() {
+        let mut providers = vec![DiscoveredProvider {
+            provider: Arc::new(crate::commands::server::inference::providers::ollama::Ollama),
+            base_url: "http://127.0.0.1:11434".into(),
+            models: vec!["gemma4:latest".into()],
+            version: Some("0.31.1".into()),
+            pricing: None,
+            model_pricing: Vec::new(),
+        }];
+
+        apply_gateway_proxy_fallback(&mut providers);
+
+        assert_eq!(providers[0].base_url, GATEWAY_BASE_URL);
+        assert_eq!(providers[0].models, vec!["gemma4:latest"]);
     }
 }

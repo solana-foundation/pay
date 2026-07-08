@@ -26,11 +26,26 @@ use crate::network::SolanaNetwork;
 
 const BROWSER_RPC_PROXY_PATH: &str = "/__402/rpc";
 const FEE_PAYER_BALANCE_OBSERVE_INTERVAL: Duration = Duration::from_secs(300);
+const DEFAULT_SERVER_BIND: &str = "0.0.0.0:1402";
 const BROWSER_RPC_ALLOWED_METHODS: &[&str] = &[
     "getLatestBlockhash",
     "surfnet_setAccount",
     "surfnet_setTokenAccount",
 ];
+
+fn default_bind() -> String {
+    match std::env::var("PORT") {
+        Ok(port) => {
+            let port = port.trim();
+            if !port.is_empty() && port.chars().all(|ch| ch.is_ascii_digit()) {
+                format!("0.0.0.0:{port}")
+            } else {
+                DEFAULT_SERVER_BIND.to_string()
+            }
+        }
+        Err(_) => DEFAULT_SERVER_BIND.to_string(),
+    }
+}
 
 /// Start the payment gateway proxy.
 ///
@@ -43,8 +58,8 @@ pub struct StartCommand {
     /// Path to the provider YAML spec file.
     pub spec: String,
 
-    /// Address to bind to.
-    #[arg(long, default_value = "0.0.0.0:1402")]
+    /// Address to bind to. Defaults to 0.0.0.0:$PORT when PORT is set.
+    #[arg(long, default_value_t = default_bind())]
     pub bind: String,
 
     /// Recipient wallet address for payments.
@@ -291,6 +306,30 @@ fn resolve_startup_payout_account(account: &str) -> pay_core::Result<Option<Stri
     }
 }
 
+fn apply_spec_env_vars(api: &ApiSpec) -> pay_core::Result<()> {
+    for (key, value) in &api.env {
+        let resolved = if let Some(var_name) = account_env_var(value) {
+            match std::env::var(var_name) {
+                Ok(v) => Some(v),
+                Err(std::env::VarError::NotPresent) => None,
+                Err(std::env::VarError::NotUnicode(_)) => {
+                    return Err(pay_core::Error::Config(format!(
+                        "spec env `{key}` references non-Unicode environment variable `{var_name}`"
+                    )));
+                }
+            }
+        } else {
+            Some(value.clone())
+        };
+
+        if let Some(resolved) = resolved {
+            // SAFETY: called before the server runtime and worker threads are spawned.
+            unsafe { std::env::set_var(key, resolved) };
+        }
+    }
+    Ok(())
+}
+
 fn parse_payout_recipient(
     label: String,
     account: &str,
@@ -460,6 +499,11 @@ impl StartCommand {
 
         let mut api: ApiSpec = serde_yml::from_str(&contents)
             .map_err(|e| pay_core::Error::Config(format!("Invalid spec: {e}")))?;
+
+        apply_spec_env_vars(&api)?;
+        api.resolve_env_templates()
+            .map_err(pay_core::Error::Config)?;
+
         // Resolve per-endpoint `schemes` defaults once, before the gate, the
         // OpenAPI builder, and the x402-backend probe read them — a session
         // spec that omits `schemes` keeps accepting `intent=session` instead of
@@ -531,19 +575,6 @@ impl StartCommand {
         };
         let openapi_proxy_mode = matches!(api.routing, RoutingConfig::Proxy { .. });
         let public_url_override = self.public_url.clone();
-
-        // Apply env vars from spec (static values or ${VAR} passthrough).
-        // SAFETY: called before any threads are spawned.
-        for (key, value) in &api.env {
-            if value.starts_with("${") && value.ends_with('}') {
-                let var_name = &value[2..value.len() - 1];
-                if let Ok(v) = std::env::var(var_name) {
-                    unsafe { std::env::set_var(key, v) };
-                }
-            } else {
-                unsafe { std::env::set_var(key, value) };
-            }
-        }
 
         let op = api.operator.clone();
         let op = op.as_ref();
@@ -705,8 +736,9 @@ impl StartCommand {
                     "operator.fee_payer is `true` but no fee payer signer is configured.\n\n\
                      In sandbox mode, start the server with `pay --sandbox server start ...` \
                      (or use `pay -s server demo`).\n\
-                     In production, set `operator.signer` in the YAML (requires the \
-                     `gcp_kms` build feature) or set `operator.fee_payer: false` \
+                     In production, set `operator.signer` in the YAML (`backend: env`, \
+                     `backend: account`, `backend: file`, or a gcp-kms signer in a \
+                     gcp_kms build) or set `operator.fee_payer: false` \
                      so clients pay their own fees."
                         .to_string(),
                 ));
@@ -2246,8 +2278,8 @@ async fn resolve_signer_with_store(
         #[cfg(not(feature = "gcp_kms"))]
         SignerConfig::GcpKms { .. } => Err(pay_core::Error::Config(
             "operator.signer.backend = gcp-kms requires the `gcp_kms` build feature. \
-             Rebuild pay with `cargo build --features gcp_kms`, or use \
-             `backend: account` / `backend: file` instead."
+             Rebuild pay with `cargo build --features gcp_kms`, or use `backend: env`, \
+             `backend: account`, or `backend: file` instead."
                 .to_string(),
         )),
         SignerConfig::Account { name } => {
@@ -2310,7 +2342,62 @@ async fn resolve_signer_with_store(
                 })?;
             Ok(Arc::new(signer))
         }
+        SignerConfig::Env { value_from_env } => {
+            let signer = load_env_keypair_signer(value_from_env)?;
+            Ok(Arc::new(signer))
+        }
     }
+}
+
+fn load_env_keypair_signer(
+    value_from_env: &str,
+) -> pay_core::Result<pay_kit::mpp::solana_keychain::MemorySigner> {
+    let raw = std::env::var(value_from_env).map_err(|error| match error {
+        std::env::VarError::NotPresent => pay_core::Error::Config(format!(
+            "operator.signer.value_from_env = `{value_from_env}` is not set"
+        )),
+        std::env::VarError::NotUnicode(_) => pay_core::Error::Config(format!(
+            "operator.signer.value_from_env = `{value_from_env}` is not valid Unicode"
+        )),
+    })?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(pay_core::Error::Config(format!(
+            "operator.signer.value_from_env = `{value_from_env}` is empty"
+        )));
+    }
+
+    let keypair = parse_env_keypair(trimmed, value_from_env)?;
+    pay_kit::mpp::solana_keychain::MemorySigner::from_bytes(&keypair).map_err(|e| {
+        pay_core::Error::Config(format!(
+            "operator.signer.value_from_env = `{value_from_env}` could not be decoded as a Solana keypair: {e}"
+        ))
+    })
+}
+
+fn parse_env_keypair(input: &str, value_from_env: &str) -> pay_core::Result<Vec<u8>> {
+    let bytes = if input.starts_with('[') {
+        serde_json::from_str::<Vec<u8>>(input).map_err(|e| {
+            pay_core::Error::Config(format!(
+                "operator.signer.value_from_env = `{value_from_env}` contains invalid keypair JSON: {e}"
+            ))
+        })?
+    } else {
+        bs58::decode(input).into_vec().map_err(|e| {
+            pay_core::Error::Config(format!(
+                "operator.signer.value_from_env = `{value_from_env}` contains invalid base58 keypair: {e}"
+            ))
+        })?
+    };
+
+    if bytes.len() != 64 {
+        return Err(pay_core::Error::Config(format!(
+            "operator.signer.value_from_env = `{value_from_env}` must decode to exactly 64 bytes, got {}",
+            bytes.len()
+        )));
+    }
+
+    Ok(bytes)
 }
 
 /// Build a concrete, clickable example path for an endpoint whose `path`
@@ -2767,11 +2854,12 @@ mod tests {
         surfpool_funding_targets, surfpool_prep_notice_body,
     };
     use super::{
-        build_pdb_config, payout_recipient_pubkeys, payout_recipient_targets,
+        build_pdb_config, default_bind, payout_recipient_pubkeys, payout_recipient_targets,
         resolve_operator_currencies, validate_browser_rpc_request, x402_currency_configs,
         x402_upto_beneficiary_pubkey, x402_upto_payout_for_recipient,
     };
     use crate::network::SolanaNetwork;
+    use serial_test::serial;
     use solana_pubkey::Pubkey;
     use std::str::FromStr;
 
@@ -2797,6 +2885,34 @@ currencies:
             serde_yml::from_str(r#"network: "devnet""#).unwrap();
 
         assert_eq!(resolve_operator_currencies(Some(&op), "USDC"), ["USDC"]);
+    }
+
+    #[test]
+    #[serial]
+    fn default_bind_uses_port_env_when_present() {
+        let previous = std::env::var("PORT").ok();
+        unsafe { std::env::set_var("PORT", "8080") };
+
+        assert_eq!(default_bind(), "0.0.0.0:8080");
+
+        match previous {
+            Some(value) => unsafe { std::env::set_var("PORT", value) },
+            None => unsafe { std::env::remove_var("PORT") },
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn default_bind_ignores_invalid_port_env() {
+        let previous = std::env::var("PORT").ok();
+        unsafe { std::env::set_var("PORT", "not-a-port") };
+
+        assert_eq!(default_bind(), "0.0.0.0:1402");
+
+        match previous {
+            Some(value) => unsafe { std::env::set_var("PORT", value) },
+            None => unsafe { std::env::remove_var("PORT") },
+        }
     }
 
     #[test]
@@ -3437,6 +3553,66 @@ endpoints:
         };
         let msg = err.to_string();
         assert!(msg.contains("64 bytes"), "missing length hint: {msg}");
+    }
+
+    // ── Env backend ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn resolve_signer_env_loads_valid_json_keypair() {
+        let env_name = format!("_PAY_TEST_SIGNER_KEYPAIR_{}", std::process::id());
+        let json: Vec<u8> = VALID_TEST_KEYPAIR_BYTES.to_vec();
+        unsafe { std::env::set_var(&env_name, serde_json::to_string(&json).unwrap()) };
+        let cfg = SignerConfig::Env {
+            value_from_env: env_name.clone(),
+        };
+        let store = MemoryAccountsStore::new();
+
+        let signer = resolve_signer_with_store(&cfg, &store).await.unwrap();
+
+        assert_eq!(signer.pubkey().to_string(), VALID_TEST_KEYPAIR_PUBKEY);
+        unsafe { std::env::remove_var(&env_name) };
+    }
+
+    #[tokio::test]
+    async fn resolve_signer_env_rejects_missing_env() {
+        let env_name = format!("_PAY_TEST_MISSING_SIGNER_KEYPAIR_{}", std::process::id());
+        unsafe { std::env::remove_var(&env_name) };
+        let cfg = SignerConfig::Env {
+            value_from_env: env_name.clone(),
+        };
+        let store = MemoryAccountsStore::new();
+
+        let err = match resolve_signer_with_store(&cfg, &store).await {
+            Ok(_) => panic!("expected error, got Ok"),
+            Err(e) => e,
+        };
+
+        let msg = err.to_string();
+        assert!(msg.contains(&env_name), "missing env var name: {msg}");
+        assert!(msg.contains("not set"), "missing not-set hint: {msg}");
+    }
+
+    #[tokio::test]
+    async fn resolve_signer_env_error_does_not_leak_secret_value() {
+        let env_name = format!("_PAY_TEST_BAD_SIGNER_KEYPAIR_{}", std::process::id());
+        unsafe { std::env::set_var(&env_name, "definitely-not-a-keypair") };
+        let cfg = SignerConfig::Env {
+            value_from_env: env_name.clone(),
+        };
+        let store = MemoryAccountsStore::new();
+
+        let err = match resolve_signer_with_store(&cfg, &store).await {
+            Ok(_) => panic!("expected error, got Ok"),
+            Err(e) => e,
+        };
+
+        let msg = err.to_string();
+        assert!(msg.contains(&env_name), "missing env var name: {msg}");
+        assert!(
+            !msg.contains("definitely-not-a-keypair"),
+            "error leaked secret value: {msg}"
+        );
+        unsafe { std::env::remove_var(&env_name) };
     }
 
     // ── Account backend ────────────────────────────────────────────────────

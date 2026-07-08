@@ -54,10 +54,19 @@ impl std::fmt::Display for Dialect {
 /// adopt token metering).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PricingHint {
+    /// Preformatted display price supplied by another Pay gateway. When set,
+    /// [`Display`] returns this verbatim.
+    pub display: Option<String>,
     pub min_usd: f64,
     pub max_usd: f64,
     /// Billing unit the prices are quoted in (e.g. `requests`, `tokens`).
     pub unit: String,
+    /// Matched pricing variant value (e.g. `gemini-2.5-flash` or `default`),
+    /// when the provider prices through catalog variants.
+    pub variant: Option<String>,
+    /// Optional description of the matched pricing variant, when the catalog
+    /// provided one.
+    pub description: Option<String>,
     /// Explicit per-1M-token input/output rates `(input, output)`, when the
     /// price is quoted per token direction. When `Some`, the display renders
     /// `in $X · out $Y /1M tok`; the min/max fields stay populated (the two
@@ -69,6 +78,9 @@ impl std::fmt::Display for PricingHint {
     /// With `io`: `in $0.15 · out $0.60 /1M tok`. Otherwise `$0.0100/req`,
     /// or `$0.0000–0.0100/req` when prices vary.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(display) = &self.display {
+            return f.write_str(display);
+        }
         if let Some((input, output)) = self.io {
             return write!(f, "in ${input:.2} · out ${output:.2} /1M tok");
         }
@@ -339,25 +351,34 @@ mod tests {
     #[test]
     fn pricing_hint_display_is_compact() {
         let flat = PricingHint {
+            display: None,
             min_usd: 0.01,
             max_usd: 0.01,
             unit: "requests".to_string(),
+            variant: None,
+            description: None,
             io: None,
         };
         assert_eq!(flat.to_string(), "$0.0100/req");
 
         let range = PricingHint {
+            display: None,
             min_usd: 0.0,
             max_usd: 0.01,
             unit: "requests".to_string(),
+            variant: None,
+            description: None,
             io: None,
         };
         assert_eq!(range.to_string(), "$0.0000–0.0100/req");
 
         let tokens = PricingHint {
+            display: None,
             min_usd: 0.0007,
             max_usd: 0.0007,
             unit: "tokens".to_string(),
+            variant: None,
+            description: None,
             io: None,
         };
         assert_eq!(tokens.to_string(), "$0.0007/tok");
@@ -366,9 +387,12 @@ mod tests {
     #[test]
     fn pricing_hint_display_renders_in_out_when_present() {
         let io = PricingHint {
+            display: None,
             min_usd: 0.15,
             max_usd: 0.60,
             unit: "tokens".to_string(),
+            variant: None,
+            description: None,
             io: Some((0.15, 0.60)),
         };
         assert_eq!(io.to_string(), "in $0.15 · out $0.60 /1M tok");

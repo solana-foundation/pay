@@ -583,6 +583,7 @@ impl InferenceCommand {
             spawn_watch_task(
                 registry.clone(),
                 self.providers.clone(),
+                pricing_config,
                 timeout,
                 Duration::from_secs(self.watch_interval),
                 pdb.clone(),
@@ -793,6 +794,7 @@ fn provider_summaries(
                     models: Vec::new(),
                     version: None,
                     color: provider.color().map(str::to_string),
+                    model_pricing: Vec::new(),
                 },
             },
         )
@@ -806,6 +808,7 @@ fn provider_summaries(
 fn spawn_watch_task(
     registry: ProviderRegistry,
     restrict: Vec<String>,
+    pricing_config: Option<pricing::PricingConfig>,
     timeout: Duration,
     interval: Duration,
     pdb: PdbState,
@@ -823,7 +826,12 @@ fn spawn_watch_task(
         ticker.tick().await; // first tick fires immediately; skip it
         loop {
             ticker.tick().await;
-            let discovered = discovery::discover(&registry, timeout, restrict_ref).await;
+            let mut discovered = discovery::discover(&registry, timeout, restrict_ref).await;
+            if let Some(config) = &pricing_config {
+                for provider in &mut discovered {
+                    provider.pricing = Some(config.clone());
+                }
+            }
             for provider in &discovered {
                 if !routed.iter().any(|slug| slug == provider.slug()) {
                     routed.push(provider.slug().to_string());
@@ -857,6 +865,7 @@ mod tests {
             models: vec![],
             version: None,
             pricing: None,
+            model_pricing: Vec::new(),
         }
     }
 

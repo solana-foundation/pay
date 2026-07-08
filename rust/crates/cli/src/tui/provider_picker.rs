@@ -24,8 +24,8 @@ use super::term::{SPINNER, TuiBackend, with_terminal};
 use super::theme::TOPUP_MAIN_BG;
 use super::widgets::controls_bar;
 
-/// Rows per provider entry: two content lines, no separator.
-const ENTRY_HEIGHT: u16 = 2;
+/// Rows per provider entry: title, model list, price/description.
+const ENTRY_HEIGHT: u16 = 3;
 
 /// Picker sections, in display order. Every provider renders under exactly
 /// one of these; empty sections show a dim `none` placeholder so the layout
@@ -442,16 +442,12 @@ fn render_provider_list(frame: &mut ratatui::Frame, area: Rect, app: &ProviderPi
     }
 }
 
-/// Width of the pricing column on hosted rows — a fixed tab stop so prices
-/// line up across entries and are easy to compare.
-const PRICING_COL: usize = 20;
-
-/// One two-line entry in the notice style: a `│` rail spanning both lines
+/// One three-line entry in the notice style: a `│` rail spanning the row
 /// (brand-colored when selected, gray otherwise), bold title + dim origin
-/// on line 1, and the model list on line 2 — hosted rows lead with their
-/// price in a fixed-width column so prices line up. Selection thickens the
-/// rail (`┃`), brightens the title, and highlights the `←`/`→`-picked
-/// model as a white-on-accent chip (the list windows so it stays visible).
+/// on line 1, the model list on line 2, and price/description on line 3.
+/// Selection thickens the rail (`┃`), brightens the title, and highlights
+/// the `←`/`→`-picked model as a white-on-accent chip (the list windows so
+/// it stays visible).
 fn render_provider_entry(
     frame: &mut ratatui::Frame,
     area: Rect,
@@ -487,25 +483,14 @@ fn render_provider_entry(
         top.push(Span::styled(format!(" · v{version}"), dim));
     }
 
-    let mut bottom = vec![rail];
-    let mut avail = (area.width as usize).saturating_sub(2);
-    // Hosted catalog entries lead with their price in a fixed-width column
-    // (tab stop) so pricing lines up across rows. On the selected row the
-    // price is resolved for the ←/→-picked model (per-model catalog
-    // variants); otherwise it's the provider-wide aggregate.
-    if let Some(hint) = provider.pricing_hint_for_model(chosen_model) {
-        bottom.push(Span::styled(
-            format!("{:<PRICING_COL$}", hint.to_string()),
-            dim,
-        ));
-        avail = avail.saturating_sub(PRICING_COL);
-    }
+    let mut models_line = vec![rail.clone()];
+    let avail = (area.width as usize).saturating_sub(2);
     if models.is_empty() {
-        bottom.push(Span::styled("no models reported", dim));
+        models_line.push(Span::styled("no models reported", dim));
     } else if let Some(chosen) = chosen_model {
-        bottom.extend(model_chip_spans(models, chosen, accent, dim, avail));
+        models_line.extend(model_chip_spans(models, chosen, accent, dim, avail));
     } else {
-        bottom.push(Span::styled(
+        models_line.push(Span::styled(
             truncate_str(
                 &models
                     .iter()
@@ -518,10 +503,41 @@ fn render_provider_entry(
         ));
     }
 
+    let detail = pricing_detail_line(provider.pricing_hint_for_model(chosen_model), rail, area);
+
     frame.render_widget(
-        Paragraph::new(vec![Line::from(top), Line::from(bottom)]),
+        Paragraph::new(vec![Line::from(top), Line::from(models_line), detail]),
         area,
     );
+}
+
+fn pricing_detail_line(
+    hint: Option<crate::commands::server::inference::providers::PricingHint>,
+    rail: Span<'static>,
+    area: Rect,
+) -> Line<'static> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut detail = vec![rail];
+    let Some(hint) = hint else {
+        detail.push(Span::styled("unpriced", dim));
+        return Line::from(detail);
+    };
+
+    let price = hint.to_string();
+    let mut used = 2 + price.chars().count();
+    detail.push(Span::styled(price, Style::default().fg(Color::Yellow)));
+    let description = hint
+        .description
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(description) = description {
+        detail.push(Span::styled(" · ", dim));
+        used += 3;
+        let remaining = (area.width as usize).saturating_sub(used);
+        detail.push(Span::styled(truncate_str(description, remaining), dim));
+    }
+    Line::from(detail)
 }
 
 /// The selected row's model line: every model on one line, the chosen one
@@ -660,6 +676,7 @@ mod tests {
             models: models.iter().map(|m| (*m).to_string()).collect(),
             version: Some("0.9.1".into()),
             pricing: None,
+            model_pricing: Vec::new(),
         }
     }
 
@@ -670,6 +687,23 @@ mod tests {
             models: models.iter().map(|m| (*m).to_string()).collect(),
             version: None,
             pricing: None,
+            model_pricing: Vec::new(),
+        }
+    }
+
+    fn proxied_ollama_with_gateway_pricing() -> DiscoveredProvider {
+        DiscoveredProvider {
+            provider: Arc::new(Ollama),
+            base_url: "http://127.0.0.1:1402".into(),
+            models: vec!["gemma4:latest".into()],
+            version: Some("0.31.1".into()),
+            pricing: None,
+            model_pricing: vec![pay_pdb::types::ModelPricingSummary {
+                model: "gemma4:latest".into(),
+                variant: Some("gemma4".into()),
+                price: Some("in $1.00 · out $3.00 /1M tok".into()),
+                description: None,
+            }],
         }
     }
 
@@ -861,15 +895,17 @@ mod tests {
             models: vec!["gemini-2.5-flash".into()],
             version: None,
             pricing: None,
+            model_pricing: Vec::new(),
         }
     }
 
     /// A Gemini row priced per model via `variants[]` — the selected row's
     /// price must track the ←/→-picked model.
     fn hosted_gemini_variant_priced() -> DiscoveredProvider {
-        let variant = |value: &str, inp: f64, out: f64| {
+        let variant = |value: &str, inp: f64, out: f64, description: &str| {
             serde_json::json!({
                 "param": "model", "value": value,
+                "description": description,
                 "dimensions": [
                     { "direction": "input", "unit": "tokens", "scale": 1000000, "tiers": [{ "price_usd": inp }] },
                     { "direction": "output", "unit": "tokens", "scale": 1000000, "tiers": [{ "price_usd": out }] }
@@ -883,8 +919,18 @@ mod tests {
                 "method": "POST",
                 "path": "v1beta/models/{modelsId}:generateContent",
                 "pricing": { "variants": [
-                    variant("gemini-2.5-flash", 0.345, 2.875),
-                    variant("gemini-2.5-pro", 1.4375, 11.5),
+                    variant(
+                        "gemini-2.5-flash",
+                        0.345,
+                        2.875,
+                        "Balanced Gemini 2.5 model for low-latency chat, coding, and multimodal tasks."
+                    ),
+                    variant(
+                        "gemini-2.5-pro",
+                        1.4375,
+                        11.5,
+                        "Gemini 2.5 Pro for complex reasoning, coding, and multimodal analysis."
+                    ),
                 ] }
             }]
         }))
@@ -899,6 +945,7 @@ mod tests {
             models: vec!["gemini-2.5-flash".into(), "gemini-2.5-pro".into()],
             version: None,
             pricing: None,
+            model_pricing: Vec::new(),
         }
     }
 
@@ -940,11 +987,13 @@ mod tests {
             text.contains("Google Gemini"),
             "missing hosted brand title:\n{text}"
         );
-        // Pricing sits in a fixed-width column (tab stop) before the
-        // models, so prices line up across hosted rows.
         assert!(
-            text.contains(&format!("{:<PRICING_COL$}gemini-2.5-flash", "$0.0100/req")),
-            "hosted line 2 must lead with column-aligned pricing + models:\n{text}"
+            text.contains("gemini-2.5-flash"),
+            "hosted model list missing model:\n{text}"
+        );
+        assert!(
+            text.contains("$0.0100/req"),
+            "hosted detail line must include pricing:\n{text}"
         );
         // The selected peer entry shows its model chip.
         assert!(
@@ -967,6 +1016,14 @@ mod tests {
             flash.contains("in $0.34 · out $2.88 /1M tok"),
             "flash price must reflect its per-model variant:\n{flash}"
         );
+        assert!(
+            flash.contains("Balanced Gemini 2.5 model"),
+            "flash description must reflect its per-model variant:\n{flash}"
+        );
+        assert!(
+            !flash.contains("tok  gemini-2.5-flash"),
+            "flash variant label must not render on the detail line:\n{flash}"
+        );
 
         // →: pro's price replaces flash's.
         app.cycle_model(1);
@@ -977,8 +1034,43 @@ mod tests {
             "pro price must track the ←/→ selection:\n{pro}"
         );
         assert!(
+            pro.contains("Gemini 2.5 Pro for complex reasoning"),
+            "pro description must track the ←/→ selection:\n{pro}"
+        );
+        assert!(
+            !pro.contains("tok  gemini-2.5-pro"),
+            "pro variant label must not render on the detail line:\n{pro}"
+        );
+        assert!(
             !pro.contains("$0.34"),
             "flash price must not linger after switching model:\n{pro}"
+        );
+        assert!(
+            !pro.contains("Balanced Gemini 2.5 model"),
+            "flash description must not linger after switching model:\n{pro}"
+        );
+    }
+
+    #[test]
+    fn proxied_local_row_hides_bare_variant_without_description() {
+        let app = app(vec![proxied_ollama_with_gateway_pricing()]);
+        let text = buffer_text(&draw(&app, 120, 30));
+
+        assert!(
+            text.contains("http://127.0.0.1:1402"),
+            "local gateway row should display the proxy URL:\n{text}"
+        );
+        assert!(
+            text.contains("gemma4:latest"),
+            "model line should still show the full served model:\n{text}"
+        );
+        assert!(
+            text.contains("in $1.00 · out $3.00 /1M tok"),
+            "gateway-supplied price should render:\n{text}"
+        );
+        assert!(
+            !text.contains("tok  gemma4"),
+            "bare local pricing key should not render without a description:\n{text}"
         );
     }
 
@@ -1020,7 +1112,7 @@ mod tests {
         let buffer = draw(&app, 120, 30);
         let text = buffer_text(&buffer);
 
-        // The picked model renders as a chip; the price leads the line.
+        // The picked model renders as a chip; the price renders on detail line.
         assert!(
             text.contains(" gemini-2.5-flash "),
             "missing model chip:\n{text}"

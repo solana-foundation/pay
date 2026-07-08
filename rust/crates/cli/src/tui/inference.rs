@@ -520,7 +520,7 @@ fn render_inference_server(frame: &mut Frame, area: Rect, app: &InferenceApp) {
 /// Render one inference-server identity card starting at row `y`; returns
 /// the next free row. The card is a bordered block: brand-dot + name +
 /// version on the header, a dim `address` and `models` field list inside,
-/// each model on its own `▸` line.
+/// each model on its own `▸` line with pricing when available.
 fn render_server_card(
     frame: &mut Frame,
     inner: Rect,
@@ -556,13 +556,7 @@ fn render_server_card(
         label,
     )));
     for model in &server.models {
-        lines.push(Line::from(Span::styled(
-            format!(
-                " ▸ {}",
-                truncate_str(model, inner.width.saturating_sub(5).into())
-            ),
-            value,
-        )));
+        lines.extend(model_price_lines(server, model, inner.width.into()));
     }
 
     // Header: brand dot + name + version. Selection brightens the border
@@ -611,6 +605,52 @@ fn render_server_card(
     frame.render_widget(Paragraph::new(lines).block(block), card_area);
 
     y + card_height
+}
+
+fn model_price_lines<'a>(
+    server: &'a ProviderSummary,
+    model: &'a str,
+    width: usize,
+) -> Vec<Line<'a>> {
+    let pricing = server
+        .model_pricing
+        .iter()
+        .find(|summary| summary.model == model);
+    let price = pricing.and_then(|summary| summary.price.as_deref());
+    let price_label = price.unwrap_or("unpriced");
+    let price_style = if price.is_some() {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let mut detail = vec![
+        Span::styled("   ", Style::default().fg(Color::DarkGray)),
+        Span::styled(price_label, price_style),
+    ];
+    let mut used = 3 + price_label.chars().count();
+    let description = pricing
+        .and_then(|summary| summary.description.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(description) = description {
+        detail.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+        used += 3;
+        detail.push(Span::styled(
+            truncate_str(description, width.saturating_sub(used)),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+
+    vec![
+        Line::from(vec![
+            Span::styled(" ▸ ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                truncate_str(model, width.saturating_sub(3)),
+                Style::default().fg(Color::Gray),
+            ),
+        ]),
+        Line::from(detail),
+    ]
 }
 
 // Connections-table column widths (characters). `models` takes whatever
@@ -968,7 +1008,7 @@ fn pad(s: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pay_pdb::types::{FlowEvent, InferenceInfo, Protocol};
+    use pay_pdb::types::{FlowEvent, InferenceInfo, ModelPricingSummary, Protocol};
 
     fn provider(slug: &str, title: &str, up: bool, models: &[&str]) -> ProviderSummary {
         ProviderSummary {
@@ -979,6 +1019,15 @@ mod tests {
             models: models.iter().map(|m| m.to_string()).collect(),
             version: None,
             color: Some("#22c55e".to_string()),
+            model_pricing: models
+                .iter()
+                .map(|model| ModelPricingSummary {
+                    model: (*model).to_string(),
+                    variant: Some((*model).to_string()),
+                    price: Some("in $0.10 · out $0.20 /1M tok".to_string()),
+                    description: None,
+                })
+                .collect(),
         }
     }
 
@@ -1536,6 +1585,10 @@ mod tests {
         );
         assert!(text.contains("Ollama"), "missing provider title:\n{text}");
         assert!(text.contains("llama3.2:3b"), "missing model name:\n{text}");
+        assert!(
+            text.contains("in $0.10 · out $0.20 /1M tok"),
+            "missing model pricing in sidebar:\n{text}"
+        );
         assert!(text.contains("web ui"), "missing web control:\n{text}");
         // Connections table: aggregates for the one connection row.
         assert!(

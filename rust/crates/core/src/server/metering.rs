@@ -1089,6 +1089,7 @@ mod tests {
                 MeterVariant {
                     param: "model".to_string(),
                     value: "gemini-pro".to_string(),
+                    description: None,
                     dimensions: vec![MeterDimension {
                         direction: pay_types::metering::MeterDirection::Input,
                         unit: pay_types::metering::BillingUnit::Tokens,
@@ -1107,6 +1108,7 @@ mod tests {
                 MeterVariant {
                     param: "model".to_string(),
                     value: "gemini-flash".to_string(),
+                    description: None,
                     dimensions: vec![MeterDimension {
                         direction: pay_types::metering::MeterDirection::Input,
                         unit: pay_types::metering::BillingUnit::Tokens,
@@ -1147,6 +1149,7 @@ mod tests {
             variants: vec![MeterVariant {
                 param: "model".to_string(),
                 value: "gemini-pro".to_string(),
+                description: None,
                 dimensions: vec![MeterDimension {
                     direction: pay_types::metering::MeterDirection::Input,
                     unit: pay_types::metering::BillingUnit::Tokens,
@@ -1784,6 +1787,7 @@ mod tests {
                 MeterVariant {
                     param: "model".to_string(),
                     value: "pro".to_string(),
+                    description: None,
                     dimensions: vec![usage_dim(
                         MeterDirection::Usage,
                         BillingUnit::Tokens,
@@ -1795,6 +1799,7 @@ mod tests {
                 MeterVariant {
                     param: "model".to_string(),
                     value: "flash".to_string(),
+                    description: None,
                     dimensions: vec![usage_dim(
                         MeterDirection::Usage,
                         BillingUnit::Tokens,
@@ -1845,6 +1850,7 @@ mod tests {
                 MeterVariant {
                     param: "model".to_string(),
                     value: "gemma4".to_string(),
+                    description: None,
                     dimensions: vec![
                         usage_dim(
                             MeterDirection::Input,
@@ -1865,6 +1871,7 @@ mod tests {
                 MeterVariant {
                     param: "model".to_string(),
                     value: "qwen3:8b".to_string(),
+                    description: None,
                     dimensions: vec![
                         usage_dim(
                             MeterDirection::Input,
@@ -1936,6 +1943,7 @@ mod tests {
             variants: vec![MeterVariant {
                 param: "model".to_string(),
                 value: "gemma4".to_string(),
+                description: None,
                 dimensions: vec![
                     usage_dim(
                         MeterDirection::Input,
@@ -1993,6 +2001,7 @@ mod tests {
         let variant = |value: &str, in_rate: f64, out_rate: f64| MeterVariant {
             param: "model".to_string(),
             value: value.to_string(),
+            description: None,
             dimensions: vec![
                 usage_dim(
                     MeterDirection::Input,

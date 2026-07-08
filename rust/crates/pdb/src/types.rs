@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 // ── Protocol & Status ──
 
@@ -151,7 +151,7 @@ pub struct InferenceInfo {
 }
 
 /// Discovered local inference provider, broadcast to UIs on (re)probe.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderSummary {
     pub slug: String,
@@ -164,6 +164,22 @@ pub struct ProviderSummary {
     /// Brand color hex, e.g. `#22c55e`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
+    /// Per-model price/description metadata for display. `models` remains the
+    /// compatibility field; this mirrors it when pricing data is known.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub model_pricing: Vec<ModelPricingSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelPricingSummary {
+    pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variant: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 // ── Payment Flow ──
@@ -320,6 +336,12 @@ mod tests {
                 models: vec!["llama3.2:3b".into()],
                 version: Some("0.9.1".into()),
                 color: Some("#22c55e".into()),
+                model_pricing: vec![ModelPricingSummary {
+                    model: "llama3.2:3b".into(),
+                    variant: Some("llama3.2:3b".into()),
+                    price: Some("in $0.10 · out $0.20 /1M tok".into()),
+                    description: Some("Small local chat model.".into()),
+                }],
             }],
         };
         let json: serde_json::Value =
@@ -330,6 +352,16 @@ mod tests {
         assert_eq!(p["baseUrl"], "http://127.0.0.1:11434");
         assert_eq!(p["up"], true);
         assert_eq!(p["version"], "0.9.1");
+        assert_eq!(p["modelPricing"][0]["model"], "llama3.2:3b");
+        assert_eq!(p["modelPricing"][0]["variant"], "llama3.2:3b");
+        assert_eq!(
+            p["modelPricing"][0]["price"],
+            "in $0.10 · out $0.20 /1M tok"
+        );
+        assert_eq!(
+            p["modelPricing"][0]["description"],
+            "Small local chat model."
+        );
     }
 
     #[test]

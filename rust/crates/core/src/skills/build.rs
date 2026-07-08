@@ -887,10 +887,13 @@ fn collect_aggregators(root: &Path, errors: &mut Vec<String>) -> Vec<AggregatorE
 /// `ResolvedEndpoint.body_example` as the request body). The published detail
 /// keeps endpoints that are either Solana-payable (`ok`) or genuinely free
 /// (`HTTP 2xx`, reported as `free`), because free discovery/metadata endpoints
-/// can be needed to construct a later paid call. Other probe outcomes are
-/// omitted from the published catalog because agents cannot call them through
-/// Pay. When probing is disabled, endpoints pass through unchanged with empty
-/// `protocol` / `supported_usd` / `probe_status` fields.
+/// can be needed to construct a later paid call. Body-sensitive endpoints with
+/// explicit variant pricing are also retained: a dummy probe may fail before
+/// the paywall, but the OpenAPI `x-pay-metering` table is still authoritative
+/// metadata for model selection. Other probe outcomes are omitted from the
+/// published catalog because agents cannot call them through Pay. When probing
+/// is disabled, endpoints pass through unchanged with empty `protocol` /
+/// `supported_usd` / `probe_status` fields.
 fn build_detail_endpoints(
     fqn: &str,
     service_url: &str,
@@ -939,7 +942,7 @@ fn build_detail_endpoints(
         .into_iter()
         .zip(probe_result.endpoints)
         .filter_map(|(r, probe)| {
-            if !should_publish_probed_endpoint(&probe) {
+            if !should_publish_probed_endpoint(&probe, &r.spec.pricing) {
                 return None;
             }
             let mut spec = r.spec;
@@ -968,9 +971,13 @@ fn build_detail_endpoints(
         .collect()
 }
 
-fn should_publish_probed_endpoint(probe: &crate::skills::probe::EndpointProbeResult) -> bool {
+fn should_publish_probed_endpoint(
+    probe: &crate::skills::probe::EndpointProbeResult,
+    pricing: &Option<serde_json::Value>,
+) -> bool {
     matches!(probe.probe_status.as_str(), "ok" | "free")
         || crate::skills::probe::is_parameterized_not_found(probe)
+        || (probe.probe_status == "unprobeable_needs_body" && has_pricing_variants(pricing))
 }
 
 // ── Public API ─────────────────────────────────────────────────────────────
@@ -1155,6 +1162,10 @@ mod tests {
                 "404 Not Found",
                 r#"{"error":"product_not_found"}"#.to_string(),
             ),
+            "/needs-body" => (
+                "400 Bad Request",
+                r#"{"error":"valid content body required"}"#.to_string(),
+            ),
             "/wrong-chain" => ("402 Payment Required", x402_body("eip155:8453")),
             "/auth" => (
                 "401 Unauthorized",
@@ -1311,5 +1322,54 @@ mod tests {
         assert_eq!(detail[0].spec.path, "/missing-resource");
         assert!(detail[0].protocol.is_empty());
         assert!(detail[0].supported_usd.is_empty());
+    }
+
+    #[test]
+    fn build_keeps_body_sensitive_endpoint_with_inline_variant_pricing() {
+        let (service_url, handle) = start_probe_server(1);
+        let pricing = json!({
+            "variants": [{
+                "param": "model",
+                "value": "gemini-test",
+                "description": "Fast text and multimodal generation.",
+                "dimensions": [{
+                    "direction": "input",
+                    "unit": "tokens",
+                    "scale": 1000000,
+                    "tiers": [{ "price_usd": 0.5 }]
+                }]
+            }]
+        });
+        let endpoints = vec![endpoint("POST", "/needs-body", Some(pricing))];
+        let options = BuildOptions {
+            probe: true,
+            probe_config: crate::skills::probe::ProbeConfig {
+                timeout_secs: 2,
+                concurrency: 1,
+                ..Default::default()
+            },
+            only: None,
+            previous_dist: None,
+        };
+
+        let detail = build_detail_endpoints("test/provider", &service_url, endpoints, &options);
+        handle.join().expect("server thread");
+
+        assert_eq!(
+            detail.len(),
+            1,
+            "variant-priced endpoint should be retained"
+        );
+        assert_eq!(
+            detail[0].probe_status.as_deref(),
+            Some("unprobeable_needs_body")
+        );
+        let variants = detail[0].spec.pricing.as_ref().unwrap()["variants"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            variants[0]["description"],
+            "Fast text and multimodal generation."
+        );
     }
 }

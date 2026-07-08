@@ -35,6 +35,10 @@ pub struct DiscoveredProvider {
     /// in/out token rates for that model instead of the provider's own
     /// (trait) hint. `None` keeps the pre-existing hosted behavior.
     pub pricing: Option<PricingConfig>,
+    /// Display-only price metadata supplied by a running pay inference
+    /// gateway. Used by `pay claude` when it connects to the gateway instead
+    /// of the raw local provider.
+    pub model_pricing: Vec<pay_pdb::types::ModelPricingSummary>,
 }
 
 impl DiscoveredProvider {
@@ -72,19 +76,55 @@ impl DiscoveredProvider {
     /// `None` model falls back to the provider aggregate.
     pub fn pricing_hint_for_model(&self, model: Option<&str>) -> Option<PricingHint> {
         if let (Some(config), Some(model)) = (&self.pricing, model)
-            && let Some(rate) = config.resolve(model)
+            && let Some((variant, rate)) = config.resolve_with_variant(model)
         {
             return Some(PricingHint {
+                display: None,
                 min_usd: rate.input_per_1m,
                 max_usd: rate.output_per_1m,
                 unit: "tokens".to_string(),
+                variant: Some(variant),
+                description: None,
                 io: Some((rate.input_per_1m, rate.output_per_1m)),
+            });
+        }
+        if let Some(model) = model
+            && let Some(summary) = self
+                .model_pricing
+                .iter()
+                .find(|summary| summary.model == model)
+            && let Some(price) = &summary.price
+        {
+            return Some(PricingHint {
+                display: Some(price.clone()),
+                min_usd: 0.0,
+                max_usd: 0.0,
+                unit: "tokens".to_string(),
+                variant: summary.variant.clone(),
+                description: summary.description.clone(),
+                io: None,
             });
         }
         self.provider.pricing_hint_for_model(model)
     }
 
     pub fn summary(&self, up: bool) -> pay_pdb::types::ProviderSummary {
+        let model_pricing = if self.model_pricing.is_empty() {
+            self.models
+                .iter()
+                .map(|model| {
+                    let hint = self.pricing_hint_for_model(Some(model));
+                    pay_pdb::types::ModelPricingSummary {
+                        model: model.clone(),
+                        variant: hint.as_ref().and_then(|hint| hint.variant.clone()),
+                        price: hint.as_ref().map(ToString::to_string),
+                        description: hint.and_then(|hint| hint.description),
+                    }
+                })
+                .collect()
+        } else {
+            self.model_pricing.clone()
+        };
         pay_pdb::types::ProviderSummary {
             slug: self.slug().to_string(),
             title: self.title().to_string(),
@@ -93,6 +133,7 @@ impl DiscoveredProvider {
             models: self.models.clone(),
             version: self.version.clone(),
             color: self.color().map(str::to_string),
+            model_pricing,
         }
     }
 }
@@ -217,6 +258,7 @@ async fn probe_provider(
                     models,
                     version,
                     pricing: None,
+                    model_pricing: Vec::new(),
                 },
                 *port,
             ));
@@ -427,6 +469,7 @@ mod tests {
             models: vec!["gemma4:latest".into(), "llama3.2:3b".into()],
             version: None,
             pricing: Some(config),
+            model_pricing: Vec::new(),
         };
 
         // Overlay resolves the base-name → real per-model in/out rates.
@@ -435,6 +478,7 @@ mod tests {
             .unwrap();
         assert_eq!(gemma.io, Some((0.15, 0.60)));
         assert_eq!(gemma.unit, "tokens");
+        assert_eq!(gemma.variant.as_deref(), Some("gemma4"));
         assert_eq!(gemma.to_string(), "in $0.15 · out $0.60 /1M tok");
 
         // A model with no explicit entry resolves via the `*` default.
@@ -442,6 +486,21 @@ mod tests {
             .pricing_hint_for_model(Some("llama3.2:3b"))
             .unwrap();
         assert_eq!(other.io, Some((0.1, 0.3)));
+        assert_eq!(other.variant.as_deref(), Some("default"));
+
+        // Provider summaries are what the inference TUI receives, including
+        // watch refreshes after the overlay is re-applied.
+        let summary = discovered.summary(true);
+        let gemma_summary = summary
+            .model_pricing
+            .iter()
+            .find(|pricing| pricing.model == "gemma4:latest")
+            .unwrap();
+        assert_eq!(
+            gemma_summary.price.as_deref(),
+            Some("in $0.15 · out $0.60 /1M tok")
+        );
+        assert_eq!(gemma_summary.variant.as_deref(), Some("gemma4"));
 
         // No overlay → the provider's own (trait) hint. Local Ollama has
         // none, so no chip — the pre-existing behavior is preserved.

@@ -16,7 +16,7 @@
 //! Server records channel state; the client signs vouchers for that channel
 //! ```
 //!
-use pay_kit::mpp::server::session::{FinalizeParams, SessionConfig, SessionServer};
+use pay_kit::mpp::server::session::{SealParams, SessionConfig, SessionServer};
 use pay_kit::mpp::settlement::worker::{RpcBroadcaster, SettlementConfig, SettlementHandle, spawn};
 use pay_kit::mpp::solana_keychain::SolanaSigner;
 use pay_kit::mpp::store::{ChannelState, MemoryChannelStore};
@@ -54,10 +54,10 @@ pub enum SessionOutcome {
     Voucher { channel_id: String, cumulative: u64 },
     /// `commit` accepted — receipt for the metered delivery.
     Commit(CommitReceipt),
-    /// `close` accepted — `FinalizeParams` carries what's needed to submit the
-    /// on-chain finalize + distribute transactions.
+    /// `close` accepted — `SealParams` carries what's needed to submit the
+    /// on-chain settle+seal + distribute transactions.
     Closed {
-        params: FinalizeParams,
+        params: SealParams,
         signature: Option<String>,
     },
 }
@@ -121,9 +121,9 @@ impl SessionOperatorRuntime {
 
         if self.channel_is_tombstoned_on_chain(channel_id).await {
             self.server
-                .mark_finalized(channel_id)
+                .mark_sealed(channel_id)
                 .await
-                .map_err(|e| Error::Mpp(format!("Failed to mark session finalized: {e}")))?;
+                .map_err(|e| Error::Mpp(format!("Failed to mark session sealed: {e}")))?;
             return Ok(SessionCloseResult::AlreadyFinalized);
         }
 
@@ -138,9 +138,9 @@ impl SessionOperatorRuntime {
             }
             Err(error) if session_close_already_requested(&error) => self
                 .server
-                .finalize_params(channel_id)
+                .seal_params(channel_id)
                 .await
-                .map_err(|e| Error::Mpp(format!("Failed to get finalize params: {e}")))?,
+                .map_err(|e| Error::Mpp(format!("Failed to get seal params: {e}")))?,
             Err(error) => {
                 return Err(Error::Mpp(format!("Session auto-close failed: {error}")));
             }
@@ -152,18 +152,18 @@ impl SessionOperatorRuntime {
             Ok(signature) => signature,
             Err(_error) if self.channel_is_tombstoned_on_chain(channel_id).await => {
                 self.server
-                    .mark_finalized(channel_id)
+                    .mark_sealed(channel_id)
                     .await
-                    .map_err(|e| Error::Mpp(format!("Failed to mark session finalized: {e}")))?;
+                    .map_err(|e| Error::Mpp(format!("Failed to mark session sealed: {e}")))?;
                 return Ok(SessionCloseResult::AlreadyFinalized);
             }
             Err(error) => return Err(error),
         };
         if let Some(signature) = signature {
             self.server
-                .mark_finalized(&params.channel_id.to_string())
+                .mark_sealed(&params.channel_id.to_string())
                 .await
-                .map_err(|e| Error::Mpp(format!("Failed to mark session finalized: {e}")))?;
+                .map_err(|e| Error::Mpp(format!("Failed to mark session sealed: {e}")))?;
             // Retain the settle signature so `/sessions/receipt/:channelId` can
             // surface the on-chain receipt URL (sessions settle out-of-band).
             self.record_settlement_signature(params.channel_id.to_string(), signature.clone());
@@ -197,7 +197,7 @@ impl SessionOperatorRuntime {
 
     async fn submit_payment_channel_settlement(
         &self,
-        params: &FinalizeParams,
+        params: &SealParams,
     ) -> Result<Option<String>> {
         // `settle_and_finalize` requires the **merchant** (recipient) to sign,
         // and for client-voucher pull the recipient is pinned to the settlement
@@ -239,7 +239,7 @@ impl SessionOperatorRuntime {
         let expires_at = params.voucher_expires_at.unwrap_or(0);
 
         let mut instructions =
-            pay_kit::mpp::program::payment_channels::build_settle_and_finalize_instructions(
+            pay_kit::mpp::program::payment_channels::build_settle_and_seal_instructions(
                 &params.recipient,
                 &params.channel_id,
                 &authorized_signer,
@@ -768,10 +768,10 @@ impl SessionMpp {
                             .await =>
                     {
                         self.server
-                            .mark_finalized(&params.channel_id.to_string())
+                            .mark_sealed(&params.channel_id.to_string())
                             .await
                             .map_err(|e| {
-                                Error::Mpp(format!("Failed to mark session finalized: {e}"))
+                                Error::Mpp(format!("Failed to mark session sealed: {e}"))
                             })?;
                         None
                     }
@@ -779,11 +779,9 @@ impl SessionMpp {
                 };
                 if let Some(signature) = signature.as_ref() {
                     self.server
-                        .mark_finalized(&params.channel_id.to_string())
+                        .mark_sealed(&params.channel_id.to_string())
                         .await
-                        .map_err(|e| {
-                            Error::Mpp(format!("Failed to mark session finalized: {e}"))
-                        })?;
+                        .map_err(|e| Error::Mpp(format!("Failed to mark session sealed: {e}")))?;
                     self.operator_runtime.record_settlement_signature(
                         params.channel_id.to_string(),
                         signature.clone(),
@@ -796,12 +794,16 @@ impl SessionMpp {
         }
     }
 
-    /// Retrieve finalize parameters for an open channel.
-    pub async fn finalize_params(&self, channel_id: &str) -> Result<FinalizeParams> {
+    /// Retrieve settle+seal parameters for an open channel.
+    ///
+    /// Named `finalize_params` for API compatibility; the underlying pay-kit
+    /// call is `seal_params` since the epoch-addressed migration renamed the
+    /// finalize step to settle+seal (behavior unchanged).
+    pub async fn finalize_params(&self, channel_id: &str) -> Result<SealParams> {
         self.server
-            .finalize_params(channel_id)
+            .seal_params(channel_id)
             .await
-            .map_err(|e| Error::Mpp(format!("Failed to get finalize params: {e}")))
+            .map_err(|e| Error::Mpp(format!("Failed to get seal params: {e}")))
     }
 
     /// Reserve a metered delivery so a client can later acknowledge it with a
@@ -944,7 +946,7 @@ impl SessionMpp {
 
     async fn submit_payment_channel_settlement(
         &self,
-        params: &FinalizeParams,
+        params: &SealParams,
     ) -> Result<Option<String>> {
         self.operator_runtime
             .submit_payment_channel_settlement(params)
@@ -1489,7 +1491,7 @@ mod tests {
             .finalize_params("missing-channel")
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("Failed to get finalize params"));
+        assert!(err.to_string().contains("Failed to get seal params"));
     }
 
     fn payment_channel_payload(
@@ -1507,6 +1509,11 @@ mod tests {
             .program_id
             .unwrap_or_else(pay_kit::mpp::program::payment_channels::default_program_id);
         let token_program = spl_token_program();
+        // The open slot is a channel-PDA seed since the epoch-addressed
+        // migration; keep it identical between the params used to derive the
+        // channel and the payload's recentSlot so the server re-derives the
+        // same PDA.
+        let open_slot = 4_242u64;
         let params = pay_kit::mpp::program::payment_channels::OpenChannelParams {
             payer,
             rent_payer: payer,
@@ -1514,6 +1521,7 @@ mod tests {
             mint,
             authorized_signer,
             salt,
+            open_slot,
             deposit: CAP,
             grace_period: 900,
             recipients: vec![],
@@ -1532,6 +1540,7 @@ mod tests {
             mint.to_string(),
             salt,
             900,
+            open_slot,
             authorized_signer.to_string(),
             "pending".to_string(),
         )
@@ -1578,6 +1587,7 @@ mod tests {
             .session_config
             .program_id
             .unwrap_or_else(pay_kit::mpp::program::payment_channels::default_program_id);
+        let open_slot = 4_242u64;
         let params = pay_kit::mpp::program::payment_channels::OpenChannelParams {
             payer,
             rent_payer: payer,
@@ -1585,6 +1595,7 @@ mod tests {
             mint,
             authorized_signer,
             salt: 99,
+            open_slot,
             deposit: CAP,
             grace_period: 900,
             recipients: vec![],
@@ -1602,6 +1613,7 @@ mod tests {
             mint.to_string(),
             params.salt,
             params.grace_period,
+            params.open_slot,
             authorized_signer.to_string(),
             "pending".to_string(),
         );
