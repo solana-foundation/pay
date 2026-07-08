@@ -12,6 +12,8 @@ use crate::types::*;
 
 const FLOW_TIMEOUT_MS: u64 = 60_000;
 const MAX_FLOWS: usize = 200;
+const X402_PAYMENT_RESPONSE_HEADER: &str = "payment-response";
+const X402_LEGACY_PAYMENT_RESPONSE_HEADER: &str = "x-payment-response";
 
 #[derive(Debug, Clone, Copy)]
 enum Phase {
@@ -497,9 +499,11 @@ impl FlowCorrelation {
         // v1 (`X-PAYMENT`) and v2 (`PAYMENT-SIGNATURE` request / `PAYMENT-RESPONSE`
         // settlement); header keys are normalized to lowercase.
         if entry.req_headers.contains_key("x-payment")
-            || entry.req_headers.contains_key("x-payment-response")
+            || entry
+                .req_headers
+                .contains_key(X402_LEGACY_PAYMENT_RESPONSE_HEADER)
             || entry.req_headers.contains_key("payment-signature")
-            || entry.res_headers.contains_key("payment-response")
+            || entry.res_headers.contains_key(X402_PAYMENT_RESPONSE_HEADER)
         {
             return Some((Protocol::X402, Phase::Retry));
         }
@@ -1280,7 +1284,10 @@ fn x402_settlement_response(entry: &LogEntry) -> Option<serde_json::Value> {
     if !(200..300).contains(&entry.status) {
         return None;
     }
-    for key in ["payment-response", "x-payment-response"] {
+    for key in [
+        X402_PAYMENT_RESPONSE_HEADER,
+        X402_LEGACY_PAYMENT_RESPONSE_HEADER,
+    ] {
         if let Some(value) = entry.res_headers.get(key)
             && let Some(json) = decode_json_value(value)
         {
@@ -2021,7 +2028,7 @@ mod tests {
             })),
         );
         rt.res_headers
-            .insert("payment-response".into(), "sig".into());
+            .insert(X402_PAYMENT_RESPONSE_HEADER.into(), "sig".into());
         engine.ingest(rt);
 
         let flows = engine.snapshot();
@@ -2427,8 +2434,10 @@ mod tests {
             "payment-signature".into(),
             x402_payment_signature("payer-wallet-x402"),
         );
-        done.res_headers
-            .insert("payment-response".into(), x402_payment_response("1234"));
+        done.res_headers.insert(
+            X402_PAYMENT_RESPONSE_HEADER.into(),
+            x402_payment_response("1234"),
+        );
         engine.ingest(done);
 
         let flows = engine.snapshot();
@@ -2441,7 +2450,7 @@ mod tests {
             flow.response_headers
                 .as_ref()
                 .unwrap()
-                .contains_key("payment-response")
+                .contains_key(X402_PAYMENT_RESPONSE_HEADER)
         );
 
         let connections = engine.connections_snapshot();

@@ -48,6 +48,8 @@ use pay_core::accounts::{
     load_or_create_ephemeral_for_network, load_or_create_ephemeral_for_network_as,
     resolve_account_for_network,
 };
+#[cfg(test)]
+use pay_kit::x402::PAYMENT_RESPONSE_HEADER;
 
 use super::claude::translate;
 use crate::commands::server::inference::providers::Dialect;
@@ -1104,7 +1106,7 @@ mod tests {
                     Response::builder()
                         .status(StatusCode::OK)
                         .header(header::CONTENT_TYPE, "application/json")
-                        .header("payment-response", "translated-upto-receipt")
+                        .header(PAYMENT_RESPONSE_HEADER, "translated-upto-receipt")
                         .body(Body::from(OPENAI_COMPLETION_JSON))
                         .unwrap()
                 }
@@ -1123,7 +1125,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
             resp.headers()
-                .get("payment-response")
+                .get(PAYMENT_RESPONSE_HEADER)
                 .and_then(|value| value.to_str().ok()),
             Some("translated-upto-receipt")
         );
@@ -1459,7 +1461,7 @@ mod tests {
                 Response::builder()
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, "text/event-stream")
-                    .header("payment-response", "translated-sse-receipt")
+                    .header(PAYMENT_RESPONSE_HEADER, "translated-sse-receipt")
                     .body(Body::from(OPENAI_SSE))
                     .unwrap()
             }),
@@ -1483,7 +1485,7 @@ mod tests {
         );
         assert_eq!(
             resp.headers()
-                .get("payment-response")
+                .get(PAYMENT_RESPONSE_HEADER)
                 .and_then(|value| value.to_str().ok()),
             Some("translated-sse-receipt")
         );
@@ -1551,7 +1553,7 @@ mod tests {
                     Response::builder()
                         .status(StatusCode::OK)
                         .header(header::CONTENT_TYPE, "application/json")
-                        .header("payment-response", "translated-mpp-receipt")
+                        .header(PAYMENT_RESPONSE_HEADER, "translated-mpp-receipt")
                         .body(Body::from(OPENAI_COMPLETION_JSON))
                         .unwrap()
                 }
@@ -1570,7 +1572,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
             resp.headers()
-                .get("payment-response")
+                .get(PAYMENT_RESPONSE_HEADER)
                 .and_then(|value| value.to_str().ok()),
             Some("translated-mpp-receipt")
         );
