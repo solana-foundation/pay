@@ -1,9 +1,9 @@
-//! 402-paying local reverse proxy for `pay claude`.
+//! 402-paying local reverse proxy for agent launchers.
 //!
-//! Claude Code cannot handle HTTP 402 payment challenges, so it can never
-//! talk to a priced inference gateway directly. This proxy sits between
-//! Claude Code and the upstream (the `pay serve inference` gateway on
-//! 127.0.0.1:1402, or a bare provider like Ollama in direct mode):
+//! Some agent CLIs cannot handle HTTP 402 payment challenges, so they cannot
+//! talk to a priced inference gateway directly. This proxy sits between the
+//! agent process and the upstream (`pay serve inference`, a hosted paid
+//! provider, or a bare local provider in direct mode):
 //!
 //! 1. Every request is forwarded upstream, preserving method, path+query,
 //!    and headers (minus hop-by-hop). The request body is buffered (capped
@@ -15,8 +15,7 @@
 //!    [`pay_core::mpp::build_credential`]), swaps the request's
 //!    `Authorization` header for `Payment <credential>`, and retries the
 //!    buffered request exactly once.
-//! 3. Response bodies stream back ([`Body::from_stream`]) — Claude Code
-//!    streams every completion over SSE.
+//! 3. Response bodies stream back ([`Body::from_stream`]).
 //! 4. If payment fails for any reason (mainnet challenge under
 //!    `--sandbox`, insufficient funds, signer errors, …) the original 402
 //!    is passed through untouched, with a `tracing::warn!` explaining why.
@@ -26,15 +25,15 @@
 //! and `pay_core::mpp::check_client_network_intent` refuses to sign when
 //! the challenge advertises a different network (e.g. mainnet).
 //!
-//! **Dialects.** When the upstream speaks OpenAI chat completions
-//! ([`Dialect::OpenAiCompat`] — vLLM, LM Studio, llama.cpp, Alibaba Model
-//! Studio's compatible mode), `POST /v1/messages` requests are translated
-//! to OpenAI shape (see [`super::translate`]), sent to the upstream's
-//! chat-completions path, and the response — buffered JSON or incremental
-//! SSE — is translated back to an Anthropic envelope. The 402 pay-retry
-//! composes with translation: the challenge fires on the OpenAI-side
-//! request, so the retry replays the *translated* body. All other
-//! requests and dialects pass through untouched.
+//! **Dialects.** The current caller is `pay claude`, which sends
+//! Anthropic-shaped `POST /v1/messages` requests. When its upstream speaks
+//! OpenAI chat completions ([`Dialect::OpenAiCompat`] — vLLM, LM Studio,
+//! llama.cpp, Alibaba Model Studio's compatible mode), those requests are
+//! translated to OpenAI shape (see [`crate::commands::claude::translate`]),
+//! sent to the upstream's chat-completions path, and translated back to an
+//! Anthropic envelope. The payment retry composes with translation: the
+//! challenge fires on the translated request, so the retry replays the
+//! translated body. Other requests and dialects pass through untouched.
 
 use std::sync::Arc;
 
@@ -50,7 +49,7 @@ use pay_core::accounts::{
     resolve_account_for_network,
 };
 
-use super::translate;
+use super::claude::translate;
 use crate::commands::server::inference::providers::Dialect;
 
 /// Request bodies are buffered so the paid retry can replay them; cap the
@@ -786,9 +785,10 @@ mod tests {
     /// A canned x402 `upto` challenge that signs fully offline: `network` is a
     /// devnet CAIP-2 (so with no `--sandbox`/`--mainnet` override the payer
     /// lazily mints a throwaway devnet wallet, exactly like the MPP test), the
-    /// embedded `recentBlockhash` builds the open transaction with no RPC, and
-    /// `payTo == facilitatorAddress` so no distribution split is derived. The
-    /// blockhash is *not* Surfpool-prefixed, so no auto-fund network call fires.
+    /// embedded `recentBlockhash` + `recentSlot` build the open transaction
+    /// with no RPC, and `payTo == facilitatorAddress` so no distribution split
+    /// is derived. The blockhash is *not* Surfpool-prefixed, so no auto-fund
+    /// network call fires.
     /// Returns the base64 `PAYMENT-REQUIRED` header value the gateway emits.
     fn upto_challenge_header(amount: &str) -> String {
         let payee = "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY";
@@ -806,6 +806,7 @@ mod tests {
                     "facilitatorAddress": payee,
                     "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
                     "recentBlockhash": "9zrUHnA1nCByPksy3aL8tQ47vqdaG2vnFs4HrxgcZj4F",
+                    "recentSlot": "123456789",
                 },
             }],
         });

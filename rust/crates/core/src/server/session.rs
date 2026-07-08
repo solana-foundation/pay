@@ -16,6 +16,7 @@
 //! Server records channel state; the client signs vouchers for that channel
 //! ```
 //!
+use pay_kit::mpp::blockhash::{BlockhashCache, CachedBlockhash};
 use pay_kit::mpp::server::session::{SealParams, SessionConfig, SessionServer};
 use pay_kit::mpp::settlement::worker::{RpcBroadcaster, SettlementConfig, SettlementHandle, spawn};
 use pay_kit::mpp::solana_keychain::SolanaSigner;
@@ -446,6 +447,7 @@ pub struct SessionMpp {
     challenge_binding_secret: String,
     realm: String,
     rpc_url: Option<String>,
+    blockhash_cache: Option<BlockhashCache>,
     payment_channel_signer: Arc<Mutex<Option<Arc<dyn SolanaSigner>>>>,
     payment_channel_payer_signer: Arc<Mutex<Option<Arc<dyn SolanaSigner>>>>,
     committed_watermarks: Arc<Mutex<HashMap<String, u64>>>,
@@ -496,6 +498,7 @@ impl SessionMpp {
 
         Self {
             rpc_url: session_config.rpc_url.clone(),
+            blockhash_cache: None,
             server,
             session_config,
             challenge_binding_secret: challenge_binding_secret.into(),
@@ -517,6 +520,14 @@ impl SessionMpp {
 
     pub fn with_pull_voucher_strategy(mut self, strategy: PullVoucherStrategy) -> Self {
         self.pull_voucher_strategy = strategy;
+        self
+    }
+
+    /// Share the server's recent-blockhash cache with session challenge
+    /// issuance so `recentBlockhash` and `recentSlot` come from the same
+    /// `getLatestBlockhash` observation.
+    pub fn with_blockhash_cache(mut self, cache: BlockhashCache) -> Self {
+        self.blockhash_cache = Some(cache);
         self
     }
 
@@ -622,7 +633,10 @@ impl SessionMpp {
         if request.modes == [SessionMode::Push] {
             request.modes.clear();
         }
-        request.recent_blockhash = self.prefetch_latest_blockhash();
+        if let Some(hint) = self.prefetch_latest_blockhash_hint() {
+            request.recent_blockhash = Some(hint.blockhash);
+            request.recent_slot = Some(hint.slot);
+        }
         let encoded = Base64UrlJson::from_typed(&request)
             .map_err(|e| Error::Mpp(format!("Failed to encode session request: {e}")))?;
         Ok(PaymentChallenge::with_challenge_binding_secret(
@@ -971,18 +985,20 @@ impl SessionMpp {
             .map_err(|e| Error::Mpp(e.to_string()))
     }
 
-    /// Best-effort prefetch of the latest blockhash for session challenges.
-    ///
-    /// Calls the same RPC as [`fetch_latest_blockhash`] but swallows errors
-    /// (logged at debug) since the challenge remains valid without this field.
-    fn prefetch_latest_blockhash(&self) -> Option<String> {
+    /// Best-effort prefetch of the latest blockhash + slot for session
+    /// challenges.
+    fn prefetch_latest_blockhash_hint(&self) -> Option<CachedBlockhash> {
         use pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient;
 
+        if let Some(cached) = self.blockhash_cache.as_ref().and_then(BlockhashCache::get) {
+            return Some(cached);
+        }
         let rpc_url = self.rpc_url.as_ref()?;
-        match RpcClient::new(rpc_url.clone()).get_latest_blockhash() {
-            Ok(blockhash) => Some(blockhash.to_string()),
+        let rpc = RpcClient::new(rpc_url.clone());
+        match pay_kit::mpp::blockhash::fetch_blockhash_with_slot(&rpc, rpc.commitment()) {
+            Ok(hint) => Some(hint),
             Err(error) => {
-                tracing::debug!(rpc_url, %error, "failed to prefetch session recent blockhash");
+                tracing::debug!(rpc_url, %error, "failed to prefetch session blockhash hint");
                 None
             }
         }
@@ -1216,7 +1232,31 @@ mod tests {
 
     #[test]
     fn prefetch_latest_blockhash_without_rpc_returns_none() {
-        assert_eq!(test_session_mpp().prefetch_latest_blockhash(), None);
+        assert!(
+            test_session_mpp()
+                .prefetch_latest_blockhash_hint()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn challenge_uses_cached_blockhash_and_recent_slot() {
+        let cache = BlockhashCache::new();
+        cache.set(
+            "SURFNETxSAFEHASHxxxxxxxxxxxxxxxxxxxxx11x".to_string(),
+            42,
+            123,
+        );
+
+        let session = test_session_mpp().with_blockhash_cache(cache);
+        let challenge = session.challenge(CAP).unwrap();
+        let request: pay_kit::mpp::SessionRequest = challenge.request.decode().unwrap();
+
+        assert_eq!(
+            request.recent_blockhash.as_deref(),
+            Some("SURFNETxSAFEHASHxxxxxxxxxxxxxxxxxxxxx11x")
+        );
+        assert_eq!(request.recent_slot, Some(123));
     }
 
     #[tokio::test]

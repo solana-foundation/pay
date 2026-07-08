@@ -7,6 +7,7 @@ pub mod docs;
 pub mod fetch;
 pub mod help;
 pub mod http;
+pub(crate) mod payer_proxy;
 pub mod qodercli;
 pub mod send;
 pub mod server;

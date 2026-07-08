@@ -175,8 +175,9 @@ fn parse_openapi3_endpoints(doc: &Value) -> Result<Vec<ResolvedEndpoint>> {
     Ok(endpoints)
 }
 
-/// Operation-level pricing declared via the `x-pay-metering` OpenAPI
-/// extension. Its value is a registry [`Metering`] block
+/// Operation-level pricing declared via the
+/// [`pay_types::metering::X_PAY_METERING_EXTENSION`] OpenAPI extension. Its
+/// value is a registry [`Metering`] block
 /// (`pay_types::metering::Metering`) — the same `dimensions`/`variants`
 /// shape the runtime gateway settles against — so operators can publish
 /// per-model pricing that a live probe can't observe (an `x402-upto`
@@ -186,7 +187,7 @@ fn parse_openapi3_endpoints(doc: &Value) -> Result<Vec<ResolvedEndpoint>> {
 /// extension is dropped (probe-derived pricing then applies) rather than
 /// publishing a broken pricing object.
 fn extract_pricing_extension(op: &Value) -> Option<Value> {
-    let raw = op.get("x-pay-metering")?;
+    let raw = op.get(pay_types::metering::X_PAY_METERING_EXTENSION)?;
     match serde_json::from_value::<pay_types::metering::Metering>(raw.clone()) {
         Ok(_) => Some(raw.clone()),
         Err(e) => {

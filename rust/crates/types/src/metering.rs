@@ -1,6 +1,10 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// OpenAPI/Discovery operation extension carrying a serialized [`Metering`]
+/// block.
+pub const X_PAY_METERING_EXTENSION: &str = "x-pay-metering";
+
 // =============================================================================
 // Provider & API
 // =============================================================================

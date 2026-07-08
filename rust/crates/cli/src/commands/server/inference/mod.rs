@@ -45,11 +45,15 @@ use providers::InferenceProvider;
 /// control plane. The SPA also stays mounted at `pay_pdb::PDB_PATH` because
 /// its API/SSE calls are absolute paths there.
 const UI_PATH: &str = "/__402/ui";
+/// Local address where `pay serve inference` listens by default.
+pub const DEFAULT_BIND: &str = "127.0.0.1:1402";
+/// Loopback URL for the default local inference gateway.
+pub const LOCAL_GATEWAY_BASE_URL: &str = "http://127.0.0.1:1402";
 
 #[derive(Debug, Args)]
 pub struct InferenceCommand {
     /// Public bind for the gateway.
-    #[arg(long, default_value = "127.0.0.1:1402")]
+    #[arg(long, default_value = DEFAULT_BIND)]
     pub bind: String,
 
     /// Public IP or domain this gateway is reachable at (e.g.

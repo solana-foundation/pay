@@ -20,6 +20,9 @@ use serde::Deserialize;
 
 pub use custom::CustomProvider;
 
+/// Conventional chat-completions path for OpenAI-compatible providers.
+pub const OPENAI_CHAT_COMPLETIONS_PATH: &str = "v1/chat/completions";
+
 /// One monetizable endpoint of a provider's API surface.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PaidEndpoint {
@@ -181,7 +184,7 @@ pub(crate) fn post(path: &str) -> PaidEndpoint {
 /// The three OpenAI-compatible paid endpoints every provider serves.
 pub(crate) fn openai_paid_endpoints() -> Vec<PaidEndpoint> {
     vec![
-        post("v1/chat/completions"),
+        post(OPENAI_CHAT_COMPLETIONS_PATH),
         post("v1/completions"),
         post("v1/embeddings"),
     ]

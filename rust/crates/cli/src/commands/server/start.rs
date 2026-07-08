@@ -985,7 +985,8 @@ impl StartCommand {
 
                 let mut smpp = SessionMpp::new(config, session_secret)
                     .with_realm(api.title.clone())
-                    .with_pull_voucher_strategy(pull_voucher_strategy);
+                    .with_pull_voucher_strategy(pull_voucher_strategy)
+                    .with_blockhash_cache(blockhash_cache.clone());
                 if let Some(operator_signer) = fee_payer_signer.clone() {
                     smpp = smpp.with_payment_channel_signer(operator_signer);
                 }

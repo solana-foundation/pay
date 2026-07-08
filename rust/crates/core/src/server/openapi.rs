@@ -19,7 +19,9 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use pay_types::metering::{ApiSpec, Endpoint, HttpMethod, Metering, Scheme};
+use pay_types::metering::{
+    ApiSpec, Endpoint, HttpMethod, Metering, Scheme, X_PAY_METERING_EXTENSION,
+};
 use pay_types::registry::OpenapiSource;
 use serde_json::{Map, Value, json};
 
@@ -175,7 +177,7 @@ pub fn synthesize_from_spec(api: &ApiSpec, ctx: &DiscoveryContext) -> Value {
         if let Some(metering) = &ep.metering
             && let Ok(value) = serde_json::to_value(metering)
         {
-            op.insert("x-pay-metering".to_string(), value);
+            op.insert(X_PAY_METERING_EXTENSION.to_string(), value);
         }
 
         // Multiple methods can share a path — merge into the same path item.
@@ -398,7 +400,7 @@ pub fn filter_to_endpoints(doc: &mut Value, endpoints: &[Endpoint]) {
 }
 
 /// Attach each endpoint's full [`Metering`] block to its matching operation or
-/// Discovery method as the `x-pay-metering` extension, so per-model
+/// Discovery method as the [`X_PAY_METERING_EXTENSION`] extension, so per-model
 /// `variants[]` (and any other settlement detail a live 402 probe can't
 /// observe — e.g. x402-upto endpoints advertise only a ceiling) travel with
 /// the published spec into pay-skills. The pay-skills build reads this
@@ -449,7 +451,7 @@ pub fn attach_metering_extension(doc: &mut Value, endpoints: &[Endpoint]) {
                     continue;
                 };
                 if let Ok(value) = serde_json::to_value(metering) {
-                    op.insert("x-pay-metering".to_string(), value);
+                    op.insert(X_PAY_METERING_EXTENSION.to_string(), value);
                 }
             }
         }
@@ -496,7 +498,7 @@ fn attach_discovery_metering_extensions(
                 continue;
             };
             if let Ok(value) = serde_json::to_value(metering) {
-                method_obj.insert("x-pay-metering".to_string(), value);
+                method_obj.insert(X_PAY_METERING_EXTENSION.to_string(), value);
             }
         }
     }
@@ -1273,7 +1275,7 @@ mod tests {
 
         let op = &doc["paths"]["/v1beta/models/{modelsId}:generateContent"]["post"];
         assert!(op.get("x-payment-info").is_some());
-        let variants = op["x-pay-metering"]["variants"].as_array().unwrap();
+        let variants = op[X_PAY_METERING_EXTENSION]["variants"].as_array().unwrap();
         assert_eq!(variants[0]["value"], "gemini-2.5-flash");
         assert_eq!(
             variants[0]["description"],
@@ -1315,7 +1317,9 @@ mod tests {
 
         // Priced op carries the variant table verbatim…
         let generate = &doc["paths"]["/v1beta/models/{modelsId}:generateContent"]["post"];
-        let variants = generate["x-pay-metering"]["variants"].as_array().unwrap();
+        let variants = generate[X_PAY_METERING_EXTENSION]["variants"]
+            .as_array()
+            .unwrap();
         assert_eq!(variants[0]["value"], "gemini-2.5-flash");
         assert_eq!(
             variants[0]["description"],
@@ -1323,11 +1327,13 @@ mod tests {
         );
         assert_eq!(variants[0]["dimensions"][1]["tiers"][0]["price_usd"], 2.875);
         // …and the round-trip parses back through the pay-skills reader shape.
-        assert!(serde_json::from_value::<Metering>(generate["x-pay-metering"].clone()).is_ok());
+        assert!(
+            serde_json::from_value::<Metering>(generate[X_PAY_METERING_EXTENSION].clone()).is_ok()
+        );
         // The unmetered list endpoint gets no extension.
         assert!(
             doc["paths"]["/v1beta/models"]["get"]
-                .get("x-pay-metering")
+                .get(X_PAY_METERING_EXTENSION)
                 .is_none()
         );
     }
@@ -1341,7 +1347,7 @@ mod tests {
         attach_metering_extension(&mut doc, &[ep(Post, "v1/thing")]);
         assert!(
             doc["paths"]["/v1/thing"]["post"]
-                .get("x-pay-metering")
+                .get(X_PAY_METERING_EXTENSION)
                 .is_none()
         );
     }
@@ -1388,7 +1394,9 @@ mod tests {
         attach_metering_extension(&mut doc, &endpoints);
 
         let generate = &doc["resources"]["models"]["methods"]["generateContent"];
-        let variants = generate["x-pay-metering"]["variants"].as_array().unwrap();
+        let variants = generate[X_PAY_METERING_EXTENSION]["variants"]
+            .as_array()
+            .unwrap();
         assert_eq!(variants[0]["value"], "gemini-2.5-flash");
         assert_eq!(
             variants[0]["description"],
@@ -1397,7 +1405,7 @@ mod tests {
         assert_eq!(variants[0]["dimensions"][1]["tiers"][0]["price_usd"], 2.875);
         assert!(
             doc["resources"]["models"]["methods"]["list"]
-                .get("x-pay-metering")
+                .get(X_PAY_METERING_EXTENSION)
                 .is_none()
         );
     }

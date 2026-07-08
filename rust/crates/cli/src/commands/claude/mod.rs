@@ -1,5 +1,4 @@
-mod payer;
-mod translate;
+pub(crate) mod translate;
 
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -7,23 +6,24 @@ use std::time::Duration;
 
 use clap::Args;
 
-use crate::commands::server::inference::discovery::{self, DiscoveredProvider};
-use crate::commands::server::inference::providers::{
-    Dialect, InferenceProvider, catalog as catalog_providers,
+use crate::commands::payer_proxy;
+use crate::commands::server::inference::{
+    self,
+    discovery::{self, DiscoveredProvider},
+    providers::{self, Dialect, InferenceProvider, catalog as catalog_providers},
 };
 use crate::tui::{ProviderSelection, select_provider};
 use pay_pdb::types::ProviderSummary;
 
 const ALLOWED_TOOLS: &str = "mcp__pay__curl,mcp__pay__search_catalog,mcp__pay__list_catalog,mcp__pay__get_catalog_entry,mcp__pay__get_balance,mcp__pay__topup,mcp__pay__create_skill";
-const GATEWAY_BASE_URL: &str = "http://127.0.0.1:1402";
 const PROVIDER_PROBE_TIMEOUT: Duration = Duration::from_millis(400);
+const ANTHROPIC_BASE_URL_ENV: &str = "ANTHROPIC_BASE_URL";
+const ANTHROPIC_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
+const ANTHROPIC_AUTH_TOKEN_ENV: &str = "ANTHROPIC_AUTH_TOKEN";
+const OLLAMA_AUTH_TOKEN: &str = "ollama";
 /// Hosted catalog gateways are remote (TLS handshake included) — give their
 /// reachability/model probes more room than the localhost ones.
 const CATALOG_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-/// Where OpenAI-compatible upstreams serve chat completions unless their
-/// paid endpoints say otherwise (Alibaba: `compatible-mode/v1/chat/completions`).
-const DEFAULT_CHAT_COMPLETIONS_PATH: &str = "v1/chat/completions";
-
 /// Run Claude Code with 402 payment support.
 ///
 /// Launches Claude Code with the pay MCP server injected automatically.
@@ -211,8 +211,14 @@ fn prepare_claude_launch(
         // Direct discovery still supplies the model list for the
         // ANTHROPIC_DEFAULT_* env vars; the gateway routes by model.
         Some(choice) if gateway_up => {
-            eprintln!("⏺ routing claude → gateway {GATEWAY_BASE_URL}");
-            let upstream = payer_upstream(&choice.provider, GATEWAY_BASE_URL.to_string());
+            eprintln!(
+                "⏺ routing claude → gateway {}",
+                inference::LOCAL_GATEWAY_BASE_URL
+            );
+            let upstream = payer_upstream(
+                &choice.provider,
+                inference::LOCAL_GATEWAY_BASE_URL.to_string(),
+            );
             (upstream, Some(choice.model))
         }
         Some(choice) => {
@@ -225,24 +231,28 @@ fn prepare_claude_launch(
             (upstream, Some(choice.model))
         }
         None if gateway_up => {
-            eprintln!("⏺ routing claude → gateway {GATEWAY_BASE_URL}");
-            let upstream = payer::PayerUpstream {
-                base_url: GATEWAY_BASE_URL.to_string(),
+            eprintln!(
+                "⏺ routing claude → gateway {}",
+                inference::LOCAL_GATEWAY_BASE_URL
+            );
+            let upstream = payer_proxy::PayerUpstream {
+                base_url: inference::LOCAL_GATEWAY_BASE_URL.to_string(),
                 dialect: Dialect::Anthropic,
-                chat_path: DEFAULT_CHAT_COMPLETIONS_PATH.to_string(),
+                chat_path: providers::OPENAI_CHAT_COMPLETIONS_PATH.to_string(),
             };
             (upstream, requested_model)
         }
         None => {
             return Err(pay_core::Error::Config(format!(
-                "no gateway on {GATEWAY_BASE_URL} and no local inference provider detected — \
-                 start one, e.g. `ollama serve`, or run `pay serve inference`."
+                "no gateway on {} and no local inference provider detected — \
+                 start one, e.g. `ollama serve`, or run `pay serve inference`.",
+                inference::LOCAL_GATEWAY_BASE_URL
             )));
         }
     };
 
     let upstream_base = upstream.base_url.clone();
-    let payer = payer::start_background(upstream, network_override, account_override)?;
+    let payer = payer_proxy::start_background(upstream, network_override, account_override)?;
     eprintln!(
         "⏺ payer proxy on {} → {} (paying as {})",
         payer.base_url,
@@ -264,8 +274,8 @@ fn prepare_claude_launch(
 
 /// Payer upstream for a picked provider: its dialect plus the
 /// chat-completions path translated `/v1/messages` requests are sent to.
-fn payer_upstream(provider: &DiscoveredProvider, base_url: String) -> payer::PayerUpstream {
-    payer::PayerUpstream {
+fn payer_upstream(provider: &DiscoveredProvider, base_url: String) -> payer_proxy::PayerUpstream {
+    payer_proxy::PayerUpstream {
         base_url,
         dialect: provider.provider.dialect(),
         chat_path: chat_completions_path(provider.provider.as_ref()),
@@ -282,7 +292,7 @@ fn chat_completions_path(provider: &dyn InferenceProvider) -> String {
         .filter(|ep| matches!(ep.method, pay_types::metering::HttpMethod::Post))
         .map(|ep| ep.path)
         .find(|path| path.to_ascii_lowercase().contains("chat/completions"))
-        .unwrap_or_else(|| DEFAULT_CHAT_COMPLETIONS_PATH.to_string())
+        .unwrap_or_else(|| providers::OPENAI_CHAT_COMPLETIONS_PATH.to_string())
 }
 
 fn select_provider_choice(
@@ -335,7 +345,7 @@ fn fetch_gateway_provider_summaries(
     path: &str,
 ) -> Option<Vec<ProviderSummary>> {
     let response = client
-        .get(format!("{GATEWAY_BASE_URL}{path}"))
+        .get(format!("{}{path}", inference::LOCAL_GATEWAY_BASE_URL))
         .send()
         .ok()?;
     if !response.status().is_success() {
@@ -364,7 +374,7 @@ fn apply_gateway_provider_summaries(
         else {
             continue;
         };
-        provider.base_url = GATEWAY_BASE_URL.to_string();
+        provider.base_url = inference::LOCAL_GATEWAY_BASE_URL.to_string();
         provider.models = summary.models.clone();
         provider.version = summary.version.clone();
         provider.model_pricing = summary.model_pricing.clone();
@@ -373,7 +383,7 @@ fn apply_gateway_provider_summaries(
 
 fn apply_gateway_proxy_fallback(providers: &mut Vec<DiscoveredProvider>) {
     for provider in providers {
-        provider.base_url = GATEWAY_BASE_URL.to_string();
+        provider.base_url = inference::LOCAL_GATEWAY_BASE_URL.to_string();
     }
 }
 
@@ -454,7 +464,8 @@ async fn load_catalog_quietly() -> pay_core::Result<pay_core::skills::Catalog> {
     pay_core::skills::load_skills().await
 }
 
-/// Whether an inference gateway is already serving HTTP on 127.0.0.1:1402.
+/// Whether an inference gateway is already serving HTTP on its default
+/// loopback URL.
 ///
 /// `/` answers with a 307 redirect (to `/__402/ui/`), not a 200, so any
 /// HTTP response at all counts as "gateway present" — only a failed
@@ -467,7 +478,10 @@ fn gateway_listening() -> bool {
         .build()
         .and_then(|client| {
             client
-                .get(format!("{GATEWAY_BASE_URL}/__402/pdb/api/config"))
+                .get(format!(
+                    "{}/__402/pdb/api/config",
+                    inference::LOCAL_GATEWAY_BASE_URL
+                ))
                 .send()
         })
         .is_ok()
@@ -510,9 +524,12 @@ fn claude_args_with_model(args: &[String], model: Option<&str>) -> Vec<String> {
 
 fn claude_env(base_url: &str, model: Option<&str>) -> Vec<(String, String)> {
     let mut env = vec![
-        ("ANTHROPIC_BASE_URL".to_string(), base_url.to_string()),
-        ("ANTHROPIC_API_KEY".to_string(), String::new()),
-        ("ANTHROPIC_AUTH_TOKEN".to_string(), "ollama".to_string()),
+        (ANTHROPIC_BASE_URL_ENV.to_string(), base_url.to_string()),
+        (ANTHROPIC_API_KEY_ENV.to_string(), String::new()),
+        (
+            ANTHROPIC_AUTH_TOKEN_ENV.to_string(),
+            OLLAMA_AUTH_TOKEN.to_string(),
+        ),
         (
             "CLAUDE_CODE_ATTRIBUTION_HEADER".to_string(),
             "0".to_string(),
@@ -655,11 +672,14 @@ mod tests {
         let env = claude_env("http://127.0.0.1:1402", Some("llama3.2"));
 
         assert!(env.contains(&(
-            "ANTHROPIC_BASE_URL".to_string(),
+            ANTHROPIC_BASE_URL_ENV.to_string(),
             "http://127.0.0.1:1402".to_string()
         )));
-        assert!(env.contains(&("ANTHROPIC_API_KEY".to_string(), String::new())));
-        assert!(env.contains(&("ANTHROPIC_AUTH_TOKEN".to_string(), "ollama".to_string())));
+        assert!(env.contains(&(ANTHROPIC_API_KEY_ENV.to_string(), String::new())));
+        assert!(env.contains(&(
+            ANTHROPIC_AUTH_TOKEN_ENV.to_string(),
+            OLLAMA_AUTH_TOKEN.to_string()
+        )));
         assert!(env.contains(&(
             "ANTHROPIC_DEFAULT_SONNET_MODEL".to_string(),
             "llama3.2".to_string()
@@ -699,7 +719,7 @@ mod tests {
         apply_gateway_provider_summaries(&mut providers, &summaries);
 
         assert_eq!(providers.len(), 1);
-        assert_eq!(providers[0].base_url, GATEWAY_BASE_URL);
+        assert_eq!(providers[0].base_url, inference::LOCAL_GATEWAY_BASE_URL);
         assert_eq!(providers[0].models, vec!["gemma4:latest"]);
         let hint = providers[0]
             .pricing_hint_for_model(Some("gemma4:latest"))
@@ -721,7 +741,7 @@ mod tests {
 
         apply_gateway_proxy_fallback(&mut providers);
 
-        assert_eq!(providers[0].base_url, GATEWAY_BASE_URL);
+        assert_eq!(providers[0].base_url, inference::LOCAL_GATEWAY_BASE_URL);
         assert_eq!(providers[0].models, vec!["gemma4:latest"]);
     }
 }
