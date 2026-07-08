@@ -209,14 +209,6 @@ body {
   border-color: var(--accent);
 }
 
-.toolbar .provider-pills {
-  display: inline-flex;
-  gap: 8px;
-  margin-right: 8px;
-  padding-right: 8px;
-  border-right: 1px solid var(--border);
-}
-
 .toolbar .filter::placeholder {
   color: var(--fg-muted);
 }

@@ -1,12 +1,40 @@
 import type { PaymentFlow } from "../types";
-import { useConfig, receiptUrl } from "../hooks/useConfig";
-import { parseReceipt, receiptSignature } from "../utils/receipt";
+import type { Config } from "../hooks/useConfig";
+import { payReceiptNetwork, useConfig, receiptUrl } from "../hooks/useConfig";
+import {
+  parseReceipt,
+  receiptSignature,
+  responseHeader,
+} from "../utils/receipt";
+
+function directReceiptUrl(flow: PaymentFlow): string | null {
+  const url = responseHeader(flow, "payment-receipt-url")?.trim();
+  return url || null;
+}
+
+export function receiptLinkHref(
+  flow: PaymentFlow,
+  config: Config | null,
+): string | null {
+  const receipt = parseReceipt(flow);
+  const signature = receiptSignature(receipt);
+  const fallbackConfig =
+    receipt?.network && payReceiptNetwork(receipt.network) !== null
+      ? { network: receipt.network }
+      : null;
+  return (
+    directReceiptUrl(flow) ??
+    (config ? receiptUrl(signature, config) : null) ??
+    receiptUrl(signature, fallbackConfig) ??
+    receiptUrl(signature, null)
+  );
+}
 
 /** Link to the flow's settlement transaction on pay.sh. Renders nothing
  *  when the flow has no receipt signature. Works for every payment pattern
  *  (per-call charge, x402, session, subscription). */
 export function hasReceiptLink(flow: PaymentFlow): boolean {
-  return !!receiptSignature(parseReceipt(flow));
+  return !!receiptLinkHref(flow, null);
 }
 
 export function ReceiptLink({
@@ -17,7 +45,7 @@ export function ReceiptLink({
   label?: string;
 }) {
   const config = useConfig();
-  const href = receiptUrl(receiptSignature(parseReceipt(flow)), config);
+  const href = receiptLinkHref(flow, config);
   if (!href) return null;
   return (
     <div className="flow-receipt">

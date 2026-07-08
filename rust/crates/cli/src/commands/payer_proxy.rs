@@ -74,6 +74,9 @@ pub struct PayerUpstream {
     /// Upstream base URL, e.g. `http://127.0.0.1:11434` or
     /// `https://modelstudio.alibaba.gateway-402.com`.
     pub base_url: String,
+    /// Optional Host header for the upstream leg. Used when connecting to a
+    /// local gateway by IP while preserving its subdomain router.
+    pub host_header: Option<String>,
     /// Chat-API wire dialect of the upstream. [`Dialect::Anthropic`]
     /// passes through; [`Dialect::OpenAiCompat`] translates
     /// `POST /v1/messages`; anything else passes through untranslated
@@ -89,6 +92,7 @@ pub struct PayerUpstream {
 struct PayerState {
     /// Upstream base URL without a trailing slash.
     upstream: String,
+    host_header: Option<HeaderValue>,
     dialect: Dialect,
     /// Chat-completions path without a leading slash (translation target).
     chat_path: String,
@@ -113,6 +117,12 @@ impl PayerState {
         network_override: Option<String>,
         account_override: Option<String>,
     ) -> pay_core::Result<Self> {
+        let host_header = upstream
+            .host_header
+            .as_deref()
+            .map(HeaderValue::from_str)
+            .transpose()
+            .map_err(|e| pay_core::Error::Config(format!("payer proxy Host header: {e}")))?;
         // No request timeout: streamed completions stay open for minutes.
         // `no_proxy` keeps env proxies from hijacking localhost traffic.
         let client = reqwest::Client::builder()
@@ -121,6 +131,7 @@ impl PayerState {
             .map_err(|e| pay_core::Error::Config(format!("payer proxy HTTP client: {e}")))?;
         Ok(Self {
             upstream: upstream.base_url.trim_end_matches('/').to_string(),
+            host_header,
             dialect: upstream.dialect,
             chat_path: upstream.chat_path.trim_start_matches('/').to_string(),
             client,
@@ -663,6 +674,9 @@ async fn send_upstream(
         }
         fwd.append(name.clone(), value.clone());
     }
+    if let Some(host) = &state.host_header {
+        fwd.insert(header::HOST, host.clone());
+    }
     if let Some(payment) = payment {
         for (name, value) in &payment.headers {
             let (Ok(name), Ok(value)) = (
@@ -865,6 +879,7 @@ mod tests {
         spawn_payer_with(
             PayerUpstream {
                 base_url: upstream,
+                host_header: None,
                 dialect: Dialect::Anthropic,
                 chat_path: "v1/chat/completions".to_string(),
             },
@@ -878,6 +893,7 @@ mod tests {
         spawn_payer_with(
             PayerUpstream {
                 base_url: upstream,
+                host_header: None,
                 dialect: Dialect::OpenAiCompat,
                 chat_path: "compatible-mode/v1/chat/completions".to_string(),
             },
@@ -911,12 +927,18 @@ mod tests {
     struct StubSeen {
         calls: usize,
         first_uri: Option<String>,
+        first_host: Option<String>,
         retry_auth: Option<String>,
         retry_body: Option<Vec<u8>>,
     }
 
     async fn stub_402_then_ok(State(seen): State<Arc<Mutex<StubSeen>>>, req: Request) -> Response {
         let uri = req.uri().to_string();
+        let host = req
+            .headers()
+            .get(header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
         let auth = req
             .headers()
             .get(header::AUTHORIZATION)
@@ -930,6 +952,7 @@ mod tests {
         seen.calls += 1;
         if seen.calls == 1 {
             seen.first_uri = Some(uri);
+            seen.first_host = host;
             return Response::builder()
                 .status(StatusCode::PAYMENT_REQUIRED)
                 .header(header::WWW_AUTHENTICATE, challenge_header("localnet"))
@@ -1270,6 +1293,48 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::CREATED);
         assert_eq!(resp.headers().get("x-upstream").unwrap(), "yes");
         assert_eq!(resp.text().await.unwrap(), "hello upstream");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forwards_configured_upstream_host_header() {
+        let seen = Arc::new(Mutex::new(StubSeen::default()));
+        let record = seen.clone();
+        let app = Router::new().fallback(any(move |req: Request| {
+            let record = record.clone();
+            async move {
+                let host = req
+                    .headers()
+                    .get(header::HOST)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                record.lock().unwrap().first_host = host;
+                (StatusCode::OK, "host ok").into_response()
+            }
+        }));
+        let upstream = spawn_server(app).await;
+        let payer = spawn_payer_with(
+            PayerUpstream {
+                base_url: upstream,
+                host_header: Some("ollama.localhost:1402".to_string()),
+                dialect: Dialect::Anthropic,
+                chat_path: "v1/chat/completions".to_string(),
+            },
+            None,
+        )
+        .await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("{payer}/v1/messages"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            seen.lock().unwrap().first_host.as_deref(),
+            Some("ollama.localhost:1402")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

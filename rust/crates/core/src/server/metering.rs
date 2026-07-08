@@ -159,7 +159,11 @@ pub fn resolve_price(
         if let Some(variant) = resolve_variant(&metering.variants, variant_hint) {
             return Some(resolve_dimensions(&variant.dimensions, props, ctx));
         }
-        // If no variant matched, use the first one as default
+        if !metering.dimensions.is_empty() {
+            return Some(resolve_dimensions(&metering.dimensions, props, ctx));
+        }
+        // Legacy specs without top-level dimensions use the first variant as
+        // their implicit default.
         if let Some(first) = metering.variants.first() {
             return Some(resolve_dimensions(&first.dimensions, props, ctx));
         }
@@ -192,6 +196,9 @@ pub fn effective_dimensions<'a>(
     if !metering.variants.is_empty() {
         if let Some(variant) = resolve_variant(&metering.variants, variant_hint) {
             return &variant.dimensions;
+        }
+        if !metering.dimensions.is_empty() {
+            return &metering.dimensions;
         }
         if let Some(first) = metering.variants.first() {
             return &first.dimensions;
@@ -1180,6 +1187,66 @@ mod tests {
         );
         assert!(price.is_some());
         assert_eq!(price.unwrap().dimensions[0].price_usd, 0.05);
+    }
+
+    #[test]
+    fn test_resolve_price_variant_no_match_uses_default_dimensions() {
+        let default_dim = MeterDimension {
+            direction: pay_types::metering::MeterDirection::Input,
+            unit: pay_types::metering::BillingUnit::Tokens,
+            scale: 1_000_000,
+            period: None,
+            tiers: vec![PriceTier {
+                up_to: None,
+                price_usd: 0.02,
+                condition: None,
+                notes: None,
+                splits: vec![],
+            }],
+            meter: None,
+        };
+        let variant_dim = MeterDimension {
+            direction: pay_types::metering::MeterDirection::Input,
+            unit: pay_types::metering::BillingUnit::Tokens,
+            scale: 1_000_000,
+            period: None,
+            tiers: vec![PriceTier {
+                up_to: None,
+                price_usd: 0.50,
+                condition: None,
+                notes: None,
+                splits: vec![],
+            }],
+            meter: None,
+        };
+        let metering = Metering {
+            dimensions: vec![default_dim],
+            variants: vec![MeterVariant {
+                param: "model".to_string(),
+                value: "gemini-pro".to_string(),
+                description: None,
+                dimensions: vec![variant_dim],
+            }],
+            sku_tiers: vec![],
+            splits: vec![],
+            schemes: None,
+            min_usd: None,
+            upto: None,
+        };
+
+        let price = resolve_price(
+            &metering,
+            &RequestProperties::default(),
+            Some("unknown-model"),
+            None,
+        )
+        .expect("default dimensions should price unmatched variants");
+
+        assert_eq!(price.dimensions[0].price_usd, 0.02);
+        assert_eq!(
+            effective_dimensions(&metering, Some("unknown-model"))[0].tiers[0].price_usd,
+            0.02
+        );
     }
 
     #[test]

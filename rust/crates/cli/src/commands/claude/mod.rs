@@ -211,14 +211,9 @@ fn prepare_claude_launch(
         // Direct discovery still supplies the model list for the
         // ANTHROPIC_DEFAULT_* env vars; the gateway routes by model.
         Some(choice) if gateway_up => {
-            eprintln!(
-                "⏺ routing claude → gateway {}",
-                inference::LOCAL_GATEWAY_BASE_URL
-            );
-            let upstream = payer_upstream(
-                &choice.provider,
-                inference::LOCAL_GATEWAY_BASE_URL.to_string(),
-            );
+            let gateway_url = inference::local_gateway_provider_url(choice.provider.slug());
+            eprintln!("⏺ routing claude → gateway {gateway_url}");
+            let upstream = gateway_payer_upstream(&choice.provider);
             (upstream, Some(choice.model))
         }
         Some(choice) => {
@@ -237,6 +232,7 @@ fn prepare_claude_launch(
             );
             let upstream = payer_proxy::PayerUpstream {
                 base_url: inference::LOCAL_GATEWAY_BASE_URL.to_string(),
+                host_header: None,
                 dialect: Dialect::Anthropic,
                 chat_path: providers::OPENAI_CHAT_COMPLETIONS_PATH.to_string(),
             };
@@ -277,6 +273,19 @@ fn prepare_claude_launch(
 fn payer_upstream(provider: &DiscoveredProvider, base_url: String) -> payer_proxy::PayerUpstream {
     payer_proxy::PayerUpstream {
         base_url,
+        host_header: None,
+        dialect: provider.provider.dialect(),
+        chat_path: chat_completions_path(provider.provider.as_ref()),
+    }
+}
+
+/// The inference gateway routes providers by Host subdomain. The payer proxy
+/// still connects to 127.0.0.1 so it does not depend on wildcard localhost
+/// DNS, but it sends the selected provider Host to the gateway.
+fn gateway_payer_upstream(provider: &DiscoveredProvider) -> payer_proxy::PayerUpstream {
+    payer_proxy::PayerUpstream {
+        base_url: inference::LOCAL_GATEWAY_BASE_URL.to_string(),
+        host_header: Some(inference::local_gateway_provider_host(provider.slug())),
         dialect: provider.provider.dialect(),
         chat_path: chat_completions_path(provider.provider.as_ref()),
     }
@@ -743,5 +752,25 @@ mod tests {
 
         assert_eq!(providers[0].base_url, inference::LOCAL_GATEWAY_BASE_URL);
         assert_eq!(providers[0].models, vec!["gemma4:latest"]);
+    }
+
+    #[test]
+    fn gateway_payer_upstream_preserves_selected_provider_host() {
+        let provider = DiscoveredProvider {
+            provider: Arc::new(crate::commands::server::inference::providers::ollama::Ollama),
+            base_url: inference::LOCAL_GATEWAY_BASE_URL.into(),
+            models: vec!["gemma4:latest".into()],
+            version: Some("0.31.1".into()),
+            pricing: None,
+            model_pricing: Vec::new(),
+        };
+
+        let upstream = gateway_payer_upstream(&provider);
+
+        assert_eq!(upstream.base_url, inference::LOCAL_GATEWAY_BASE_URL);
+        assert_eq!(
+            upstream.host_header.as_deref(),
+            Some("ollama.localhost:1402")
+        );
     }
 }

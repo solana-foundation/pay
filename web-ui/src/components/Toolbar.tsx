@@ -1,8 +1,7 @@
-import type { ProviderSummary } from "../types";
-
 type FilterMode = "all" | "mine" | "errors";
 
 interface Props {
+  inference?: boolean;
   mode: FilterMode;
   onModeChange: (mode: FilterMode) => void;
   search: string;
@@ -11,13 +10,10 @@ interface Props {
   total: number;
   onClear: () => void;
   connected: boolean;
-  // Per-provider filter (inference mode only; pills hidden when absent)
-  providers?: ProviderSummary[];
-  providerFilter?: string | null;
-  onProviderFilterChange?: (slug: string | null) => void;
 }
 
 export function Toolbar({
+  inference = false,
   mode,
   onModeChange,
   search,
@@ -26,62 +22,46 @@ export function Toolbar({
   total,
   onClear,
   connected,
-  providers,
-  providerFilter,
-  onProviderFilterChange,
 }: Props) {
+  const unit = inference ? "connections" : "flows";
   return (
     <div className="toolbar">
-      <h2>Flows</h2>
+      <h2>{inference ? "Connections" : "Flows"}</h2>
       <span className="count">
         {connected
-          ? `${count} / ${total} flows`
+          ? `${count} / ${total} ${unit}`
           : "Disconnected. Retrying..."}
       </span>
       <input
         className="filter"
-        placeholder="Filter by path..."
+        placeholder={inference ? "Filter by model..." : "Filter by path..."}
         value={search}
         onChange={(e) => onSearchChange(e.target.value)}
       />
       <span className="spacer" />
-      {providers && providers.length > 0 && onProviderFilterChange && (
-        <span className="provider-pills">
-          {providers.map((p) => (
-            <button
-              key={p.slug}
-              className={providerFilter === p.slug ? "active" : ""}
-              onClick={() =>
-                onProviderFilterChange(
-                  providerFilter === p.slug ? null : p.slug,
-                )
-              }
-              title={p.title}
-            >
-              {p.slug}
-            </button>
-          ))}
-        </span>
+      {!inference && (
+        <>
+          <button
+            className={mode === "mine" ? "active" : ""}
+            onClick={() => onModeChange("mine")}
+          >
+            This device
+          </button>
+          <button
+            className={mode === "errors" ? "active" : ""}
+            onClick={() => onModeChange("errors")}
+          >
+            Errors
+          </button>
+          <button
+            className={mode === "all" ? "active" : ""}
+            onClick={() => onModeChange("all")}
+          >
+            All
+          </button>
+          <button onClick={onClear}>Clear</button>
+        </>
       )}
-      <button
-        className={mode === "mine" ? "active" : ""}
-        onClick={() => onModeChange("mine")}
-      >
-        This device
-      </button>
-      <button
-        className={mode === "errors" ? "active" : ""}
-        onClick={() => onModeChange("errors")}
-      >
-        Errors
-      </button>
-      <button
-        className={mode === "all" ? "active" : ""}
-        onClick={() => onModeChange("all")}
-      >
-        All
-      </button>
-      <button onClick={onClear}>Clear</button>
     </div>
   );
 }

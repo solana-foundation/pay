@@ -18,7 +18,6 @@ function AppInner() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [mode, setMode] = useState<FilterMode>("all");
   const [search, setSearch] = useState("");
-  const [providerFilter, setProviderFilter] = useState<string | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(() => {
     const stored = localStorage.getItem("sidebarOpen");
     return stored === null ? true : stored === "true";
@@ -42,13 +41,16 @@ function AppInner() {
   }, [flows]);
 
   const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
     return flows.filter((f) => {
+      if (inference) {
+        if (!q) return true;
+        return f.inference?.model?.toLowerCase().includes(q) ?? false;
+      }
+
       if (mode === "mine" && viewerIp && f.clientIp !== viewerIp) return false;
       if (mode === "errors" && f.status !== "failed") return false;
-      if (inference && providerFilter && f.inference?.provider !== providerFilter)
-        return false;
-      if (search) {
-        const q = search.toLowerCase();
+      if (q) {
         if (
           !f.resource.toLowerCase().includes(q) &&
           !f.protocol.toLowerCase().includes(q)
@@ -57,15 +59,23 @@ function AppInner() {
       }
       return true;
     });
-  }, [flows, mode, viewerIp, search, inference, providerFilter]);
+  }, [flows, mode, viewerIp, search, inference]);
 
-  // Provider filter pills also filter connection groups (by last-seen
-  // provider). undefined outside inference mode keeps FlowList flat.
+  // Inference mode groups by connection and filters that grouped list by
+  // model name only. undefined outside inference mode keeps FlowList flat.
   const visibleConnections = useMemo(() => {
     if (!inference) return undefined;
-    if (!providerFilter) return connections;
-    return connections.filter((c) => c.provider === providerFilter);
-  }, [inference, connections, providerFilter]);
+    const q = search.trim().toLowerCase();
+    if (!q) return connections;
+    return connections.filter((c) =>
+      c.models?.some((model) => model.toLowerCase().includes(q)),
+    );
+  }, [inference, connections, search]);
+
+  const toolbarCount = inference
+    ? (visibleConnections?.length ?? 0)
+    : filtered.length;
+  const toolbarTotal = inference ? connections.length : flows.length;
 
   return (
     <div className="app">
@@ -82,17 +92,15 @@ function AppInner() {
           title={config?.title}
         />
         <Toolbar
+          inference={inference}
           mode={mode}
           onModeChange={setMode}
           search={search}
           onSearchChange={setSearch}
-          count={filtered.length}
-          total={flows.length}
+          count={toolbarCount}
+          total={toolbarTotal}
           onClear={clear}
           connected={connected}
-          providers={inference ? providers : undefined}
-          providerFilter={providerFilter}
-          onProviderFilterChange={inference ? setProviderFilter : undefined}
         />
         <FlowList
           flows={filtered}

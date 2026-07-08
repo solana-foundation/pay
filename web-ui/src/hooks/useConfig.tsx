@@ -4,7 +4,7 @@ import type { ProviderSummary } from "../types";
 
 export type AppMode = "inference" | "debugger";
 
-interface Config {
+export interface Config {
   recipient?: string;
   network?: string;
   rpcUrl?: string;
@@ -49,7 +49,7 @@ export function useAppMode(): AppMode {
  * (callers should then skip the receipt link). Mirrors
  * `pay_core::explorer::network_query` on the Rust side.
  */
-function payReceiptNetwork(network: string): string | null {
+export function payReceiptNetwork(network: string): string | null {
   switch (network) {
     case "mainnet":
     case "mainnet-beta":
@@ -60,6 +60,11 @@ function payReceiptNetwork(network: string): string | null {
       return "testnet";
     case "localnet":
     case "surfnet":
+    case "sandbox":
+    case "local":
+    case "solana-localnet":
+      return "sandbox";
+    case "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1":
       return "sandbox";
     default:
       return null;

@@ -50,6 +50,23 @@ pub const DEFAULT_BIND: &str = "127.0.0.1:1402";
 /// Loopback URL for the default local inference gateway.
 pub const LOCAL_GATEWAY_BASE_URL: &str = "http://127.0.0.1:1402";
 
+/// Host header that routes to a provider through the default local gateway.
+pub fn local_gateway_provider_host(slug: &str) -> String {
+    format!("{slug}.localhost:{}", default_gateway_port())
+}
+
+/// User-facing provider URL for the default local gateway.
+pub fn local_gateway_provider_url(slug: &str) -> String {
+    format!("http://{}", local_gateway_provider_host(slug))
+}
+
+fn default_gateway_port() -> &'static str {
+    DEFAULT_BIND
+        .rsplit_once(':')
+        .map(|(_, port)| port)
+        .unwrap_or("1402")
+}
+
 #[derive(Debug, Args)]
 pub struct InferenceCommand {
     /// Public bind for the gateway.
@@ -1027,7 +1044,7 @@ mod tests {
             status: 200,
             ms: 2300,
             req_headers: vec![],
-            res_headers: vec![],
+            res_headers: vec![("payment-response".into(), "receipt-signature".into())],
             client_ip: "127.0.0.1".into(),
             log_id: Some(log_id),
             usage: Some(pay_core::InferenceUsage {
@@ -1048,6 +1065,14 @@ mod tests {
         assert_eq!(inf.tokens_prompt, Some(12));
         assert_eq!(inf.tokens_completion, Some(214));
         assert_eq!(inf.tokens_per_sec, Some(41.2));
+        assert_eq!(
+            flows[0]
+                .response_headers
+                .as_ref()
+                .and_then(|headers| headers.get("payment-response"))
+                .map(String::as_str),
+            Some("receipt-signature")
+        );
     }
 
     #[test]

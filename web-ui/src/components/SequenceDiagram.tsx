@@ -23,8 +23,19 @@ const R = 7;
 const CX = 10;
 
 export function SequenceDiagram({ steps, failed, success, deliveredContent }: Props) {
-  const rowHeights = steps.map((step) =>
-    step.key === "delivery" && deliveredContent ? ROW_H + DELIVERED_CONTENT_H : ROW_H,
+  const deliveryIndex = steps.findIndex((step) => step.key === "delivery");
+  const completedIndex = steps.findIndex((step) => step.key === "completed");
+  const deliveredContentIndex = deliveredContent
+    ? deliveryIndex >= 0
+      ? deliveryIndex
+      : completedIndex >= 0
+        ? completedIndex
+        : steps.length - 1
+    : -1;
+  const rowHeights = steps.map((_, i) =>
+    i === deliveredContentIndex
+      ? ROW_H + DELIVERED_CONTENT_H
+      : ROW_H,
   );
   const rowOffsets = rowHeights.map((_, i) =>
     rowHeights.slice(0, i).reduce((sum, height) => sum + height, 0),
@@ -102,7 +113,7 @@ export function SequenceDiagram({ steps, failed, success, deliveredContent }: Pr
                 {step.label}
               </div>
               {step.ts && <div className="step-ts">{fmtTime(step.ts)}</div>}
-              {step.key === "delivery" && deliveredContent}
+              {i === deliveredContentIndex && deliveredContent}
             </div>
           ))}
         </div>
