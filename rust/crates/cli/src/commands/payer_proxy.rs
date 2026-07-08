@@ -456,17 +456,21 @@ async fn translate_json_response(resp: reqwest::Response) -> Response {
     };
     let anthropic = translate::openai_to_anthropic_response(&openai);
     let body = serde_json::to_vec(&anthropic).unwrap_or_default();
-    Response::builder()
-        .status(status)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(body))
-        .unwrap_or_else(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "payer proxy: response build error",
-            )
-                .into_response()
-        })
+    let mut builder = Response::builder().status(status);
+    if let Some(dst) = builder.headers_mut() {
+        copy_translated_response_headers(dst, &upstream_headers);
+        dst.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+    }
+    builder.body(Body::from(body)).unwrap_or_else(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "payer proxy: response build error",
+        )
+            .into_response()
+    })
 }
 
 /// Wrap an OpenAI SSE response in the incremental Anthropic-SSE
@@ -475,6 +479,7 @@ async fn translate_json_response(resp: reqwest::Response) -> Response {
 /// chunk boundaries.
 fn translate_stream_response(resp: reqwest::Response) -> Response {
     let status = resp.status();
+    let upstream_headers = resp.headers().clone();
     let stream_body = Body::from_stream(async_stream::stream! {
         let mut resp = resp;
         let mut translator = translate::StreamTranslator::new();
@@ -500,18 +505,22 @@ fn translate_stream_response(resp: reqwest::Response) -> Response {
             }
         }
     });
-    Response::builder()
-        .status(status)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .body(stream_body)
-        .unwrap_or_else(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "payer proxy: response build error",
-            )
-                .into_response()
-        })
+    let mut builder = Response::builder().status(status);
+    if let Some(dst) = builder.headers_mut() {
+        copy_translated_response_headers(dst, &upstream_headers);
+        dst.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        dst.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    }
+    builder.body(stream_body).unwrap_or_else(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "payer proxy: response build error",
+        )
+            .into_response()
+    })
 }
 
 /// The header(s) a paid retry must carry. MPP charge sets a single
@@ -719,6 +728,22 @@ fn copy_response_headers(dst: &mut HeaderMap, src: &HeaderMap) {
         }
         dst.append(name.clone(), value.clone());
     }
+}
+
+fn copy_translated_response_headers(dst: &mut HeaderMap, src: &HeaderMap) {
+    for (name, value) in src {
+        if is_hop_by_hop_response_header(name.as_str()) || is_translated_body_header(name.as_str())
+        {
+            continue;
+        }
+        dst.append(name.clone(), value.clone());
+    }
+}
+
+fn is_translated_body_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("content-type")
+        || name.eq_ignore_ascii_case("content-length")
+        || name.eq_ignore_ascii_case("content-encoding")
 }
 
 /// Hop-by-hop request headers (RFC 9110 §7.6.1) plus `host` and
@@ -1079,6 +1104,7 @@ mod tests {
                     Response::builder()
                         .status(StatusCode::OK)
                         .header(header::CONTENT_TYPE, "application/json")
+                        .header("payment-response", "translated-upto-receipt")
                         .body(Body::from(OPENAI_COMPLETION_JSON))
                         .unwrap()
                 }
@@ -1095,6 +1121,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("payment-response")
+                .and_then(|value| value.to_str().ok()),
+            Some("translated-upto-receipt")
+        );
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["type"], "message", "paid retry comes back translated");
         assert_eq!(body["content"][0]["text"], "Hello!");
@@ -1424,7 +1456,12 @@ mod tests {
         let app = Router::new().route(
             "/compatible-mode/v1/chat/completions",
             axum::routing::post(|| async {
-                ([(header::CONTENT_TYPE, "text/event-stream")], OPENAI_SSE)
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .header("payment-response", "translated-sse-receipt")
+                    .body(Body::from(OPENAI_SSE))
+                    .unwrap()
             }),
         );
         let upstream = spawn_server(app).await;
@@ -1443,6 +1480,12 @@ mod tests {
         assert_eq!(
             resp.headers().get(header::CONTENT_TYPE).unwrap(),
             "text/event-stream"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("payment-response")
+                .and_then(|value| value.to_str().ok()),
+            Some("translated-sse-receipt")
         );
 
         let sse = resp.text().await.unwrap();
@@ -1508,6 +1551,7 @@ mod tests {
                     Response::builder()
                         .status(StatusCode::OK)
                         .header(header::CONTENT_TYPE, "application/json")
+                        .header("payment-response", "translated-mpp-receipt")
                         .body(Body::from(OPENAI_COMPLETION_JSON))
                         .unwrap()
                 }
@@ -1524,6 +1568,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("payment-response")
+                .and_then(|value| value.to_str().ok()),
+            Some("translated-mpp-receipt")
+        );
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(
             body["type"], "message",
