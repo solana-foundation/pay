@@ -8,6 +8,7 @@ export interface Receipt {
   method?: string;
   signature?: string;
   txSignature?: string;
+  transaction?: string;
   settlementSignature?: string;
   activationSignature?: string;
   subscriptionId?: string;
@@ -29,9 +30,12 @@ function base64urlDecode(b64: string): string {
   }
 }
 
-/** Decode the flow's `payment-receipt` response header, or null. */
+/** Decode the flow's settlement response header, or null. */
 export function parseReceipt(flow: PaymentFlow): Receipt | null {
-  const header = flow.responseHeaders?.["payment-receipt"];
+  const header =
+    flow.responseHeaders?.["payment-receipt"] ||
+    flow.responseHeaders?.["payment-response"] ||
+    flow.responseHeaders?.["x-payment-response"];
   if (!header) return null;
   const decoded = base64urlDecode(header);
   if (!decoded) return null;
@@ -52,6 +56,7 @@ export function receiptSignature(receipt: Receipt | null): string | null {
     receipt.settlementSignature ||
     receipt.signature ||
     receipt.txSignature ||
+    receipt.transaction ||
     receipt.activationSignature ||
     receipt.reference ||
     null

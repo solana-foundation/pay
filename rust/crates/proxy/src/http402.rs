@@ -470,15 +470,17 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                 .map(|s| s.trim().to_string())
                 .or_else(|| host.clone())
                 .unwrap_or_else(|| "unknown".to_string());
-            let payment = str_h("authorization")
+            let mpp_payment = str_h("authorization")
                 .map(|a| a.len() >= 8 && a[..8].eq_ignore_ascii_case("payment "))
                 .unwrap_or(false);
+            let x402_payment = str_h(pay_kit::x402::PAYMENT_SIGNATURE_HEADER).is_some()
+                || str_h(pay_kit::x402::X402_V1_PAYMENT_HEADER).is_some();
             let log_id = self.state.record_request_start(&pay_core::RequestStart {
                 method: method.to_string(),
                 path: format!("/{path}"),
                 host: host.clone(),
                 client_ip: client_ip.clone(),
-                payment,
+                payment: mpp_payment || x402_payment,
             });
             ctx.log = Some(LogStart {
                 method: method.to_string(),
@@ -763,19 +765,24 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
         // Either way the settlement header can't ride the response (already
         // sent), so it is dropped; the on-chain settlement/refund still runs.
         let final_status = session.response_written().map(|resp| resp.status.as_u16());
+        let mut deferred_payment_headers = Vec::new();
         if let Some(pending) = ctx.upto.take() {
             let served_ok = final_status.is_some_and(|s| (200..300).contains(&s));
-            let _ = self
+            if let Some(header) = self
                 .settle_pending_upto(pending, served_ok, &HeaderMap::new(), None)
-                .await;
+                .await
+            {
+                deferred_payment_headers.push(header);
+            }
         }
         let Some(log) = ctx.log.take() else {
             return;
         };
-        let (status, res_headers) = match session.response_written() {
+        let (status, mut res_headers) = match session.response_written() {
             Some(resp) => (resp.status.as_u16(), header_pairs(&resp.headers)),
             None => (0, Vec::new()),
         };
+        res_headers.extend(header_pairs_from_owned(deferred_payment_headers));
         // Flush the observer if the body filter never saw end_of_stream
         // (upstream error / client disconnect) so partial telemetry survives.
         let usage = ctx.observer.take().map(|mut observer| {
@@ -881,6 +888,18 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
 fn header_pairs(headers: &HeaderMap) -> Vec<(String, String)> {
     headers
         .iter()
+        .map(|(k, v)| {
+            (
+                k.as_str().to_string(),
+                String::from_utf8_lossy(v.as_bytes()).into_owned(),
+            )
+        })
+        .collect()
+}
+
+fn header_pairs_from_owned(headers: Vec<(HeaderName, HeaderValue)>) -> Vec<(String, String)> {
+    headers
+        .into_iter()
         .map(|(k, v)| {
             (
                 k.as_str().to_string(),

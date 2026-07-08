@@ -235,25 +235,26 @@ impl FlowCorrelation {
 
         let now = &entry.ts;
 
-        // A 402 with an MPP challenge is not a failure — it's the handshake
+        // A 402 with a payment challenge is not a failure — it's the handshake
         // half of a paid request. Park the flow as payment-required and let
         // the paid retry attach to it (`begin_exchange`), so challenge +
         // retry render as ONE row with the 4-step payment diagram.
-        if entry.status == 402 && has_mpp_challenge(&entry) {
+        if entry.status == 402
+            && let Some(protocol) = payment_challenge_protocol(&entry)
+        {
             let started = flow.started_at.clone();
+            flow.protocol = protocol;
+            flow.scheme = flow_scheme(&entry, protocol, None);
             flow.status = FlowStatus::PaymentRequired;
             flow.updated_at = now.clone();
             flow.challenge_headers = Some(entry.res_headers.clone());
             flow.amount = extract_amount(&entry);
-            flow.steps = build_steps(&Protocol::Http);
+            flow.steps = build_steps(&protocol);
             flow.steps[0].ts = Some(started);
             flow.events.push(FlowEvent {
                 ts: now.clone(),
                 message: "402 Payment Gate".into(),
-                detail: entry
-                    .res_headers
-                    .get("www-authenticate")
-                    .map(|h| format!("www-authenticate: {}", truncate(h, 120))),
+                detail: Some(challenge_event_detail(protocol, &entry)),
             });
             update_steps(flow);
             let key = flow_key(&flow.client_ip, &flow.resource);
@@ -480,13 +481,7 @@ impl FlowCorrelation {
                 };
                 return Some((protocol, Phase::Challenge));
             }
-            if entry.path.starts_with("/x402/")
-                // v1 (`X-PAYMENT-REQUIRED`) and v2 (`PAYMENT-REQUIRED`); header
-                // keys are normalized to lowercase.
-                || entry.res_headers.contains_key("x-payment-required")
-                || entry.res_headers.contains_key("payment-required")
-                || is_x402_body(&entry.res_body)
-            {
+            if has_x402_challenge(entry) {
                 return Some((Protocol::X402, Phase::Challenge));
             }
             return None;
@@ -538,43 +533,7 @@ impl FlowCorrelation {
         steps[1].ts = Some(now.clone());
         steps[2].status = StepStatus::InProgress;
 
-        let challenge_detail = match protocol {
-            // Http never reaches create_flow (detect() can't return it);
-            // grouped with Mpp only for exhaustiveness.
-            Protocol::Mpp | Protocol::Http => format!(
-                "www-authenticate: {}",
-                truncate(
-                    entry
-                        .res_headers
-                        .get("www-authenticate")
-                        .map(|s| s.as_str())
-                        .unwrap_or(""),
-                    120
-                )
-            ),
-            Protocol::Session => format!(
-                "www-authenticate: {}",
-                truncate(
-                    entry
-                        .res_headers
-                        .get("www-authenticate")
-                        .map(|s| s.as_str())
-                        .unwrap_or(""),
-                    120
-                )
-            ),
-            Protocol::X402 => format!(
-                "x-payment-required: {}",
-                truncate(
-                    entry
-                        .res_headers
-                        .get("x-payment-required")
-                        .map(|s| s.as_str())
-                        .unwrap_or(""),
-                    120,
-                )
-            ),
-        };
+        let challenge_detail = challenge_event_detail(protocol, entry);
 
         let amount = if matches!(protocol, Protocol::Session) {
             None
@@ -1045,6 +1004,53 @@ fn has_mpp_challenge(entry: &LogEntry) -> bool {
         .is_some_and(|h| h.starts_with("Payment"))
 }
 
+fn has_x402_challenge(entry: &LogEntry) -> bool {
+    entry.path.starts_with("/x402/")
+        // v1 (`X-PAYMENT-REQUIRED`) and v2 (`PAYMENT-REQUIRED`); header keys
+        // are normalized to lowercase.
+        || entry.res_headers.contains_key("x-payment-required")
+        || entry.res_headers.contains_key("payment-required")
+        || is_x402_body(&entry.res_body)
+}
+
+fn payment_challenge_protocol(entry: &LogEntry) -> Option<Protocol> {
+    if has_mpp_challenge(entry) {
+        return Some(if is_session_challenge(entry) {
+            Protocol::Session
+        } else {
+            Protocol::Mpp
+        });
+    }
+    has_x402_challenge(entry).then_some(Protocol::X402)
+}
+
+fn challenge_event_detail(protocol: Protocol, entry: &LogEntry) -> String {
+    match protocol {
+        // Http never reaches payment challenge creation; grouped with Mpp only
+        // for exhaustiveness.
+        Protocol::Mpp | Protocol::Http | Protocol::Session => format!(
+            "www-authenticate: {}",
+            truncate(
+                entry
+                    .res_headers
+                    .get("www-authenticate")
+                    .map(|s| s.as_str())
+                    .unwrap_or(""),
+                120,
+            )
+        ),
+        Protocol::X402 => {
+            let value = entry
+                .res_headers
+                .get("payment-required")
+                .or_else(|| entry.res_headers.get("x-payment-required"))
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            format!("payment-required: {}", truncate(value, 120))
+        }
+    }
+}
+
 /// Browser plumbing aimed at the gateway itself (opening the web UI makes
 /// the browser probe these against the root) — not inference traffic, so
 /// `AllExchanges` mode keeps it out of the flow list. The requests still
@@ -1169,7 +1175,7 @@ fn extract_amount(entry: &LogEntry) -> Option<String> {
         return Some(amount.to_string());
     }
 
-    None
+    x402_required_amount(&entry.res_headers)
 }
 
 /// Human-readable amount from a decoded MPP challenge `request` object.
@@ -1190,31 +1196,70 @@ fn challenge_request_amount(request: &serde_json::Value) -> Option<String> {
     Some(format!("{:.4} USDC", value))
 }
 
+fn x402_required_amount(headers: &HashMap<String, String>) -> Option<String> {
+    for key in ["payment-required", "x-payment-required"] {
+        let Some(required) = headers.get(key).and_then(|h| decode_json_value(h)) else {
+            continue;
+        };
+        let Some(offers) = required.get("accepts").or_else(|| required.get("offers")) else {
+            continue;
+        };
+        let Some(amount) = offers
+            .as_array()
+            .and_then(|offers| offers.first())
+            .and_then(|offer| offer.get("amount"))
+            .and_then(|value| value_string(Some(value)))
+        else {
+            continue;
+        };
+        if let Some(formatted) = format_stable_amount(&amount) {
+            return Some(formatted);
+        }
+    }
+    None
+}
+
+fn format_stable_amount(raw: &str) -> Option<String> {
+    let raw = raw.parse::<u64>().ok()?;
+    Some(format!("{:.4} USDC", stable_usd_from_base_units(raw)))
+}
+
+fn stable_usd_from_base_units(raw: u64) -> f64 {
+    raw as f64 / 1_000_000.0
+}
+
 /// Settled amount for a paid exchange (`AllExchanges` mode): a 2xx response
-/// whose request carried an MPP `Payment` credential. The credential echoes
-/// the full challenge, so amount/decimals come from `challenge.request` —
-/// the same payload `extract_amount` reads from the original 402 header.
+/// whose request carried a payment credential and whose response carries a
+/// settlement receipt.
 fn paid_exchange_amount(entry: &LogEntry) -> Option<String> {
-    challenge_request_amount(&paid_exchange_request(entry)?)
+    paid_exchange_request(entry)
+        .and_then(|request| challenge_request_amount(&request))
+        .or_else(|| x402_settlement_amount(entry))
 }
 
 /// Numeric USD value of a paid exchange — stablecoins aggregate 1:1 into USD
 /// across currencies (USDC/USDT/CASH…). `None` for unpaid/unbounded.
 fn paid_exchange_usd(entry: &LogEntry) -> Option<f64> {
-    let request = paid_exchange_request(entry)?;
-    let raw = request["amount"]
-        .as_str()
-        .or_else(|| request["cap"].as_str())?
-        .parse::<u64>()
-        .ok()?;
-    if raw == u64::MAX {
-        return None;
+    if let Some(request) = paid_exchange_request(entry) {
+        let raw = request["amount"]
+            .as_str()
+            .or_else(|| request["cap"].as_str())?
+            .parse::<u64>()
+            .ok()?;
+        if raw == u64::MAX {
+            return None;
+        }
+        let decimals = request["methodDetails"]["decimals"]
+            .as_u64()
+            .or_else(|| request["decimals"].as_u64())
+            .unwrap_or(6);
+        return Some(raw as f64 / 10f64.powi(decimals as i32));
     }
-    let decimals = request["methodDetails"]["decimals"]
-        .as_u64()
-        .or_else(|| request["decimals"].as_u64())
-        .unwrap_or(6);
-    Some(raw as f64 / 10f64.powi(decimals as i32))
+
+    x402_settlement_response(entry)
+        .and_then(|receipt| value_string(receipt.get("amount")))
+        .and_then(|amount| amount.parse::<u64>().ok())
+        .map(stable_usd_from_base_units)
 }
 
 /// Decoded challenge `request` payload from a settled (2xx) paid exchange.
@@ -1231,11 +1276,35 @@ fn paid_exchange_request(entry: &LogEntry) -> Option<serde_json::Value> {
     }
 }
 
+fn x402_settlement_response(entry: &LogEntry) -> Option<serde_json::Value> {
+    if !(200..300).contains(&entry.status) {
+        return None;
+    }
+    for key in ["payment-response", "x-payment-response"] {
+        if let Some(value) = entry.res_headers.get(key)
+            && let Some(json) = decode_json_value(value)
+        {
+            return Some(json);
+        }
+    }
+    None
+}
+
+fn x402_settlement_amount(entry: &LogEntry) -> Option<String> {
+    x402_settlement_response(entry)
+        .and_then(|receipt| value_string(receipt.get("amount")))
+        .and_then(|amount| format_stable_amount(&amount))
+}
+
 /// Extract the payer's pubkey from the payment authorization header.
 ///
 /// MPP format: `Payment <base64url-json>` where JSON contains a
 /// `payload.transaction` (base64 Solana tx — first signer is the payer).
 fn extract_payer(headers: &HashMap<String, String>) -> Option<String> {
+    extract_mpp_payer(headers).or_else(|| extract_x402_payer(headers))
+}
+
+fn extract_mpp_payer(headers: &HashMap<String, String>) -> Option<String> {
     let auth = headers.get("authorization")?;
     let token = auth
         .strip_prefix("Payment ")
@@ -1284,6 +1353,18 @@ fn extract_payer(headers: &HashMap<String, String>) -> Option<String> {
 
     // Try source field (if the SDK sets it)
     json["source"].as_str().map(|s| s.to_string())
+}
+
+fn extract_x402_payer(headers: &HashMap<String, String>) -> Option<String> {
+    for key in ["payment-signature", "x-payment"] {
+        if let Some(json) = headers.get(key).and_then(|value| decode_json_value(value)) {
+            return value_string(json.get("payload").and_then(|p| p.get("from")))
+                .or_else(|| value_string(json.get("payload").and_then(|p| p.get("payer"))))
+                .or_else(|| value_string(json.get("payer")))
+                .or_else(|| value_string(json.get("source")));
+        }
+    }
+    None
 }
 
 fn is_session_challenge(entry: &LogEntry) -> bool {
@@ -2161,6 +2242,40 @@ mod tests {
         format!("Payment {credential}")
     }
 
+    fn x402_required(amount: &str) -> String {
+        encode_json(serde_json::json!({
+            "x402Version": 2,
+            "accepts": [{
+                "scheme": "upto",
+                "network": "solana-localnet",
+                "amount": amount,
+                "asset": "USDC",
+            }]
+        }))
+    }
+
+    fn x402_payment_signature(payer: &str) -> String {
+        encode_json(serde_json::json!({
+            "x402Version": 2,
+            "accepted": {"scheme": "upto"},
+            "payload": {
+                "from": payer,
+                "channelId": "channel-1",
+                "maxAmount": "100000",
+            }
+        }))
+    }
+
+    fn x402_payment_response(amount: &str) -> String {
+        encode_json(serde_json::json!({
+            "success": true,
+            "payer": "payer-wallet-x402",
+            "transaction": "settlement-signature-x402",
+            "network": "solana-localnet",
+            "amount": amount,
+        }))
+    }
+
     #[test]
     fn all_exchanges_paid_completion_sets_amount() {
         let (tx, _rx) = broadcast::channel(16);
@@ -2277,6 +2392,63 @@ mod tests {
         assert_eq!(connections.len(), 1);
         assert_eq!(connections[0].requests, 1);
         assert!((connections[0].paid_usd - 0.001).abs() < 1e-9);
+    }
+
+    #[test]
+    fn x402_challenge_and_paid_retry_merge_and_record_settlement() {
+        let (tx, _rx) = broadcast::channel(64);
+        let mut engine = FlowCorrelation::with_mode(tx, CorrelationMode::AllExchanges);
+
+        engine.begin_exchange(make_start(1, "POST", "/v1/messages"));
+        let mut challenge = make_entry("POST", "/v1/messages", 402);
+        challenge.id = 1;
+        challenge
+            .res_headers
+            .insert("payment-required".into(), x402_required("100000"));
+        engine.ingest(challenge);
+
+        let flows = engine.snapshot();
+        assert_eq!(flows.len(), 1);
+        assert!(matches!(flows[0].protocol, Protocol::X402));
+        assert_eq!(flows[0].scheme.as_deref(), Some("upto"));
+        assert_eq!(flows[0].amount.as_deref(), Some("0.1000 USDC"));
+        assert_eq!(flows[0].status, FlowStatus::PaymentRequired);
+
+        engine.begin_exchange(ExchangeStart {
+            payment_retry: true,
+            ..make_start(2, "POST", "/v1/messages")
+        });
+        assert_eq!(engine.snapshot().len(), 1);
+        assert_eq!(engine.snapshot()[0].status, FlowStatus::PaymentReceived);
+
+        let mut done = make_entry("POST", "/v1/messages", 200);
+        done.id = 2;
+        done.req_headers.insert(
+            "payment-signature".into(),
+            x402_payment_signature("payer-wallet-x402"),
+        );
+        done.res_headers
+            .insert("payment-response".into(), x402_payment_response("1234"));
+        engine.ingest(done);
+
+        let flows = engine.snapshot();
+        assert_eq!(flows.len(), 1, "challenge + x402 retry = one row");
+        let flow = &flows[0];
+        assert_eq!(flow.status, FlowStatus::ResourceDelivered);
+        assert_eq!(flow.amount.as_deref(), Some("0.0012 USDC"));
+        assert_eq!(flow.payer.as_deref(), Some("payer-wallet-x402"));
+        assert!(
+            flow.response_headers
+                .as_ref()
+                .unwrap()
+                .contains_key("payment-response")
+        );
+
+        let connections = engine.connections_snapshot();
+        assert_eq!(connections.len(), 1);
+        assert_eq!(connections[0].payer.as_deref(), Some("payer-wallet-x402"));
+        assert_eq!(connections[0].requests, 1);
+        assert!((connections[0].paid_usd - 0.001234).abs() < 1e-12);
     }
 
     #[test]
