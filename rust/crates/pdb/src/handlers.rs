@@ -17,21 +17,32 @@ use crate::types::{LogEntry, SseMessage};
 pub async fn sse_stream(State(state): State<PdbState>) -> Response {
     let mut rx = state.tx.subscribe();
 
-    let snapshot = {
+    let (snapshot, connections) = {
         let engine = state.correlation.lock().unwrap();
-        engine.snapshot()
+        (engine.snapshot(), engine.connections_snapshot())
     };
+    let providers = state.providers();
 
     let init_data = serde_json::to_string(&SseMessage::Init {
         viewer_ip: "unknown".into(),
     })
     .unwrap();
     let snapshot_data = serde_json::to_string(&SseMessage::Snapshot { flows: snapshot }).unwrap();
+    let provider_data = (!providers.is_empty())
+        .then(|| serde_json::to_string(&SseMessage::ProviderStatus { providers }).unwrap());
+    let connection_data = (!connections.is_empty())
+        .then(|| serde_json::to_string(&SseMessage::ConnectionsSnapshot { connections }).unwrap());
 
     let stream = async_stream::stream! {
         // Initial events
         yield Ok::<_, std::convert::Infallible>(format!("data: {init_data}\n\n"));
         yield Ok(format!("data: {snapshot_data}\n\n"));
+        if let Some(provider_data) = provider_data {
+            yield Ok(format!("data: {provider_data}\n\n"));
+        }
+        if let Some(connection_data) = connection_data {
+            yield Ok(format!("data: {connection_data}\n\n"));
+        }
 
         // Live events
         loop {
@@ -61,7 +72,19 @@ pub async fn logs_snapshot(State(state): State<PdbState>) -> impl IntoResponse {
 
 /// Sidebar config (`/__402/pdb/api/config`).
 pub async fn config_handler(State(state): State<PdbState>) -> impl IntoResponse {
-    Json(state.config.clone())
+    let providers = state.providers();
+    if providers.is_empty() {
+        return Json(state.config.clone());
+    }
+
+    let mut config = state.config.clone();
+    if let Some(obj) = config.as_object_mut() {
+        obj.insert(
+            "providers".to_string(),
+            serde_json::to_value(providers).unwrap_or_else(|_| serde_json::json!([])),
+        );
+    }
+    Json(config)
 }
 
 /// Debug: inject a fake MPP flow with splits, for UI testing.
@@ -211,4 +234,44 @@ pub async fn inject_fake_flow(State(state): State<PdbState>) -> impl IntoRespons
     }
 
     Json(serde_json::json!({"status": "ok", "message": "Fake flows injected (success + failure)"}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{ModelPricingSummary, ProviderSummary};
+    use axum::body::to_bytes;
+
+    #[tokio::test]
+    async fn config_handler_returns_live_provider_summaries() {
+        let state = PdbState::new(serde_json::json!({
+            "mode": "inference",
+            "providers": []
+        }));
+        state.set_providers(vec![ProviderSummary {
+            slug: "ollama".into(),
+            title: "Ollama".into(),
+            base_url: "http://127.0.0.1:11434".into(),
+            up: true,
+            models: vec!["gemma4:latest".into()],
+            version: Some("0.31.1".into()),
+            color: Some("#22c55e".into()),
+            model_pricing: vec![ModelPricingSummary {
+                model: "gemma4:latest".into(),
+                variant: Some("gemma4".into()),
+                price: Some("in $1.00 · out $3.00 /1M tok".into()),
+                description: None,
+            }],
+        }]);
+
+        let response = config_handler(State(state)).await.into_response();
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["providers"][0]["slug"], "ollama");
+        assert_eq!(
+            json["providers"][0]["modelPricing"][0]["price"],
+            "in $1.00 · out $3.00 /1M tok"
+        );
+    }
 }

@@ -493,6 +493,9 @@ fn select_meter_dimensions<'a>(
         {
             return Some(&variant.dimensions);
         }
+        if !metering.dimensions.is_empty() {
+            return Some(&metering.dimensions);
+        }
         return metering
             .variants
             .first()

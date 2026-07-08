@@ -89,6 +89,21 @@ pub trait PaymentState: Clone + Send + Sync + 'static {
     /// how proxied traffic reaches PDB now that the data plane is Pingora (which
     /// bypasses the old axum `logging_middleware`).
     fn record_exchange(&self, _exchange: HttpExchange) {}
+
+    /// Called at request time, before the upstream responds. A host that
+    /// tracks in-flight requests (`pay serve inference`) returns a log id;
+    /// the gate echoes it in [`HttpExchange::log_id`] and in
+    /// [`PaymentState::record_exchange_update`] calls. Returning `None`
+    /// (the default) also disables the gate's response stream observer for
+    /// the request — zero overhead for hosts that don't opt in.
+    fn record_request_start(&self, _start: &RequestStart) -> Option<u64> {
+        None
+    }
+
+    /// Live telemetry for an in-flight request (running token counts, TTFT),
+    /// emitted by the gate's response stream observer at most ~1/s. Default
+    /// no-op.
+    fn record_exchange_update(&self, _log_id: u64, _usage: &InferenceUsage) {}
 }
 
 /// A completed HTTP exchange handed to [`PaymentState::record_exchange`].
@@ -101,4 +116,41 @@ pub struct HttpExchange {
     pub req_headers: Vec<(String, String)>,
     pub res_headers: Vec<(String, String)>,
     pub client_ip: String,
+    /// Id returned by [`PaymentState::record_request_start`], echoed back so
+    /// the host can close the in-flight record it opened.
+    pub log_id: Option<u64>,
+    /// Final inference telemetry from the gate's stream observer, when the
+    /// host opted in via `record_request_start`.
+    pub usage: Option<InferenceUsage>,
+}
+
+/// Request-side facts handed to [`PaymentState::record_request_start`].
+#[derive(Debug, Clone)]
+pub struct RequestStart {
+    pub method: String,
+    pub path: String,
+    /// `Host` header — how the host maps the request to an API/provider.
+    pub host: Option<String>,
+    pub client_ip: String,
+    /// The request carries a payment credential — MPP `Authorization:
+    /// Payment`, x402 `PAYMENT-SIGNATURE`, or x402 v1 `X-PAYMENT`. Lets the
+    /// host merge the challenge and its retry into one tracked exchange.
+    pub payment: bool,
+}
+
+/// Inference telemetry accumulated by the gate's response stream observer
+/// (OpenAI-compatible SSE, Ollama-native NDJSON, or plain JSON bodies).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct InferenceUsage {
+    /// Model name reported by the upstream response.
+    pub model: Option<String>,
+    /// Response was a stream (`text/event-stream` / `application/x-ndjson`).
+    pub streamed: bool,
+    /// Time to first response body byte, from request receipt.
+    pub ttft_ms: Option<u64>,
+    pub tokens_prompt: Option<u64>,
+    /// Authoritative when the upstream reported usage; otherwise approximated
+    /// live from stream events and overwritten if a final count arrives.
+    pub tokens_completion: Option<u64>,
+    pub tokens_per_sec: Option<f64>,
 }

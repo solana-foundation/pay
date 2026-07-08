@@ -40,6 +40,9 @@ pub struct ResolvedEndpoint {
     /// Serialized JSON body. `None` for GET/DELETE or when the OpenAPI doc
     /// does not declare a request body for the operation.
     pub body_example: Option<String>,
+    /// Concrete example path assembled from `in: path` parameter examples.
+    /// Used for probing only; the published `spec.path` remains templated.
+    pub path_example: Option<String>,
     /// Example query string (without a leading `?`) assembled from the
     /// operation's `in: query` parameters that carry an example value, e.g.
     /// `country_code=us&brand_name=Amazon.com`. Appended to the probe URL only
@@ -131,9 +134,12 @@ fn parse_openapi3_endpoints(doc: &Value) -> Result<Vec<ResolvedEndpoint>> {
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| format!("{} {}", method.to_uppercase(), path));
 
+            let path = normalize_path(path);
+            let path_example = extract_path_example(&path, item_obj, op);
+
             let spec = EndpointSpec {
                 method: method.to_uppercase(),
-                path: normalize_path(path),
+                path,
                 description,
                 resource: op
                     .get("tags")
@@ -141,7 +147,13 @@ fn parse_openapi3_endpoints(doc: &Value) -> Result<Vec<ResolvedEndpoint>> {
                     .and_then(|arr| arr.first())
                     .and_then(|v| v.as_str())
                     .map(str::to_string),
-                pricing: None,
+                // Inline pricing declared on the operation via the
+                // `x-pay-metering` extension (see [`extract_pricing_extension`]).
+                // Carries per-model `variants[]` that a live probe can't
+                // observe — e.g. Gemini's x402-upto endpoints advertise only a
+                // spending ceiling at challenge time, not the per-model token
+                // table the gateway settles against.
+                pricing: extract_pricing_extension(op),
             };
 
             let body_example = if matches!(method, "post" | "put" | "patch") {
@@ -155,11 +167,99 @@ fn parse_openapi3_endpoints(doc: &Value) -> Result<Vec<ResolvedEndpoint>> {
             endpoints.push(ResolvedEndpoint {
                 spec,
                 body_example,
+                path_example,
                 query_example,
             });
         }
     }
     Ok(endpoints)
+}
+
+/// Operation-level pricing declared via the
+/// [`pay_types::metering::X_PAY_METERING_EXTENSION`] OpenAPI extension. Its
+/// value is a registry [`Metering`] block
+/// (`pay_types::metering::Metering`) — the same `dimensions`/`variants`
+/// shape the runtime gateway settles against — so operators can publish
+/// per-model pricing that a live probe can't observe (an `x402-upto`
+/// challenge advertises only a ceiling, not the per-model token table).
+///
+/// Only accepted when it deserializes cleanly into `Metering`; a malformed
+/// extension is dropped (probe-derived pricing then applies) rather than
+/// publishing a broken pricing object.
+fn extract_pricing_extension(op: &Value) -> Option<Value> {
+    let raw = op.get(pay_types::metering::X_PAY_METERING_EXTENSION)?;
+    match serde_json::from_value::<pay_types::metering::Metering>(raw.clone()) {
+        Ok(_) => Some(raw.clone()),
+        Err(e) => {
+            tracing::debug!(error = %e, "ignoring malformed x-pay-metering extension");
+            None
+        }
+    }
+}
+
+/// Substitute examples for every `{path}` placeholder so live probes exercise
+/// a concrete URL while the published endpoint keeps its OpenAPI shape.
+fn extract_path_example(path: &str, item_obj: &Map<String, Value>, op: &Value) -> Option<String> {
+    let placeholders = path_placeholders(path);
+    if placeholders.is_empty() {
+        return None;
+    }
+
+    let mut values: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let sources = [op.get("parameters"), item_obj.get("parameters")];
+    for params in sources.into_iter().flatten() {
+        let Some(arr) = params.as_array() else {
+            continue;
+        };
+        for param in arr {
+            if param.get("in").and_then(Value::as_str) != Some("path") {
+                continue;
+            }
+            let Some(name) = param.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            if values.contains_key(name) {
+                continue; // operation-level parameters win
+            }
+            if let Some(value) = param_example_value(param) {
+                values.insert(name.to_string(), value);
+            }
+        }
+    }
+
+    if !placeholders.iter().all(|name| values.contains_key(name)) {
+        return None;
+    }
+
+    const PATH_SET: &AsciiSet = &NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'.')
+        .remove(b'_')
+        .remove(b'~');
+    let mut concrete = path.to_string();
+    for name in placeholders {
+        let value = values.get(&name)?;
+        let encoded = utf8_percent_encode(value, PATH_SET).to_string();
+        concrete = concrete.replace(&format!("{{{name}}}"), &encoded);
+    }
+    Some(concrete)
+}
+
+fn path_placeholders(path: &str) -> Vec<String> {
+    let mut placeholders = Vec::new();
+    let mut rest = path;
+    while let Some(start) = rest.find('{') {
+        let after_start = &rest[start + 1..];
+        let Some(end) = after_start.find('}') else {
+            break;
+        };
+        let name = &after_start[..end];
+        if !name.is_empty() {
+            placeholders.push(name.to_string());
+        }
+        rest = &after_start[end + 1..];
+    }
+    placeholders
 }
 
 /// Assemble an example query string from an operation's `in: query`
@@ -875,6 +975,7 @@ fn emit_discovery_methods(
                 pricing: None,
             },
             body_example,
+            path_example: None,
             // Discovery endpoints carry their query inputs in the request body
             // shape, not OpenAPI-style `in: query` parameters.
             query_example: None,
@@ -999,6 +1100,7 @@ pub fn effective_openapi_relative_to(
                 .map(|spec| ResolvedEndpoint {
                     spec,
                     body_example: None,
+                    path_example: None,
                     // Inline `endpoints:` declare a clean path; no query
                     // examples to synthesize.
                     query_example: None,
@@ -2541,6 +2643,83 @@ mod tests {
     use super::*;
 
     #[test]
+    fn x_pay_metering_extension_becomes_endpoint_pricing() {
+        // Mirrors the Gemini gateway: per-model token variants declared on
+        // the operation as `x-pay-metering` — the runtime settlement shape a
+        // live probe can't observe.
+        let doc = serde_json::json!({
+            "openapi": "3.0.0",
+            "paths": {
+                "/v1beta/models/{modelsId}:generateContent": {
+                    "post": {
+                        "summary": "Generate a Gemini response from multimodal input.",
+                        "x-pay-metering": {
+                            "schemes": ["x402-upto"],
+                            "variants": [
+                                {
+                                    "param": "model",
+                                    "value": "gemini-2.5-flash",
+                                    "description": "Fast Gemini model for low-latency generation.",
+                                    "dimensions": [
+                                        { "direction": "input", "unit": "tokens", "scale": 1000000, "tiers": [{ "price_usd": 0.345 }] },
+                                        { "direction": "output", "unit": "tokens", "scale": 1000000, "tiers": [{ "price_usd": 2.875 }] }
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        });
+
+        let endpoints = parse_endpoints(&doc.to_string()).unwrap();
+        let generate = endpoints
+            .iter()
+            .find(|e| e.spec.path.ends_with(":generateContent"))
+            .expect("generateContent endpoint");
+        let pricing = generate
+            .spec
+            .pricing
+            .as_ref()
+            .expect("inline pricing present");
+        let variants = pricing["variants"].as_array().unwrap();
+        assert_eq!(variants.len(), 1);
+        assert_eq!(variants[0]["value"], "gemini-2.5-flash");
+        assert_eq!(
+            variants[0]["description"],
+            "Fast Gemini model for low-latency generation."
+        );
+        assert_eq!(variants[0]["dimensions"][1]["tiers"][0]["price_usd"], 2.875);
+    }
+
+    #[test]
+    fn malformed_x_pay_metering_is_dropped_not_published() {
+        let doc = serde_json::json!({
+            "openapi": "3.0.0",
+            "paths": {
+                "/v1/thing": {
+                    "post": {
+                        "summary": "Do a thing with a broken metering block.",
+                        // `dimensions` must be an array of MeterDimension; a
+                        // bare string can't deserialize into Metering.
+                        "x-pay-metering": { "dimensions": "nope" }
+                    }
+                }
+            }
+        });
+
+        let endpoints = parse_endpoints(&doc.to_string()).unwrap();
+        let ep = endpoints
+            .iter()
+            .find(|e| e.spec.path == "v1/thing")
+            .unwrap();
+        assert!(
+            ep.spec.pricing.is_none(),
+            "malformed extension must not publish pricing"
+        );
+    }
+
+    #[test]
     fn path_literal_len_scores_specificity() {
         // The custom-verb template has more literal characters, so it's the
         // more specific match.
@@ -3689,6 +3868,24 @@ mod tests {
         }"#;
         let endpoints = parse_endpoints(doc).unwrap();
         assert!(endpoints[0].query_example.is_none());
+    }
+
+    #[test]
+    fn path_example_substitutes_path_param_examples() {
+        let doc = r#"{
+            "paths": {
+                "/v1/tip/{recipient}": {
+                    "get": {
+                        "parameters": [
+                            {"name": "recipient", "in": "path", "required": true, "example": "jack"}
+                        ]
+                    }
+                }
+            }
+        }"#;
+        let endpoints = parse_endpoints(doc).unwrap();
+        assert_eq!(endpoints[0].spec.path, "v1/tip/{recipient}");
+        assert_eq!(endpoints[0].path_example.as_deref(), Some("v1/tip/jack"));
     }
 
     #[test]

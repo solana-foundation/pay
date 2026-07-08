@@ -14,6 +14,7 @@ gcp_kms = ["pay-kit/gcp_kms"]
 vendored-openssl = ["pay-core/vendored-openssl"]
 
 [dependencies]
+async-trait = "0.1"
 axum = { workspace = true }
 pay-core = { workspace = true, features = ["server", "otel"] }
 pay-proxy = { path = "../proxy" }
@@ -54,6 +55,7 @@ rand = { workspace = true }
 bs58 = { workspace = true }
 chrono = { workspace = true }
 dialoguer = { workspace = true }
+indicatif = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 qrcode = { workspace = true }
@@ -61,6 +63,8 @@ pay-pdb = { workspace = true }
 urlencoding = "2.1.3"
 uuid = { workspace = true }
 webbrowser = { workspace = true }
+# Payer proxy: incremental OpenAI→Anthropic SSE translation stream.
+async-stream = "0.3"
 
 [dev-dependencies]
 serial_test = "3"

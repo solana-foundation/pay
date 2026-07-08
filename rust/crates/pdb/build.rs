@@ -7,9 +7,9 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let asset_dir = out_dir.join("pdb-dist");
 
-    // Workspace root: crates/pdb/../../ = rust/, then ../pdb/dist
+    // Workspace root: crates/pdb/../../ = rust/, then ../web-ui/dist
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let repo_dist = manifest_dir.join("../../../pdb/dist");
+    let repo_dist = manifest_dir.join("../../../web-ui/dist");
 
     println!("cargo:rerun-if-env-changed=PAY_PDB_DIST");
     println!("cargo:rerun-if-env-changed=PAY_PDB_ALLOW_PLACEHOLDER");
@@ -22,19 +22,19 @@ fn main() {
             && env::var_os("PAY_PDB_ALLOW_PLACEHOLDER").is_none()
         {
             panic!(
-                "pdb/dist assets not found. Build the UI with `cd pdb && pnpm install --frozen-lockfile && pnpm build`, \
+                "web-ui/dist assets not found. Build the UI with `cd web-ui && pnpm install --frozen-lockfile && pnpm build`, \
                  unpack the release PDB artifact and set PAY_PDB_DIST to its dist directory, or set PAY_PDB_ALLOW_PLACEHOLDER=1 \
                  to embed the placeholder."
             );
         }
         println!(
-            "cargo:warning=pdb/dist assets not found at {}, embedding empty placeholder",
+            "cargo:warning=web-ui/dist assets not found at {}, embedding empty placeholder",
             repo_dist.display()
         );
         fs::create_dir_all(&asset_dir).unwrap();
         fs::write(
             asset_dir.join("index.html"),
-            "<html><body><h1>Payment Debugger</h1><p>Run <code>pnpm build</code> in <code>pdb/</code> to build the UI.</p></body></html>",
+            "<html><body><h1>Payment Debugger</h1><p>Run <code>pnpm build</code> in <code>web-ui/</code> to build the UI.</p></body></html>",
         )
         .unwrap();
         return;
@@ -47,7 +47,7 @@ fn main() {
     print_rerun_if_changed_recursive(&pdb_dist);
 
     println!(
-        "cargo:warning=Embedded pdb/dist from {}",
+        "cargo:warning=Embedded web-ui/dist from {}",
         pdb_dist
             .canonicalize()
             .unwrap_or_else(|_| pdb_dist.to_path_buf())

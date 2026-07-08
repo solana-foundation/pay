@@ -201,6 +201,17 @@ pub fn parse_frontmatter(text: &str) -> Result<(String, String)> {
 
 // ── Price helpers ──────────────────────────────────────────────────────────
 
+/// Whether inline pricing carries per-variant (e.g. per-model) tiers a live
+/// probe can't reconstruct. Such pricing is authoritative and must not be
+/// overwritten by the single price a probe observes.
+fn has_pricing_variants(pricing: &Option<serde_json::Value>) -> bool {
+    pricing
+        .as_ref()
+        .and_then(|p| p.get("variants"))
+        .and_then(|v| v.as_array())
+        .is_some_and(|arr| !arr.is_empty())
+}
+
 fn collect_prices(value: &serde_json::Value) -> Vec<f64> {
     let mut prices = Vec::new();
     match value {
@@ -876,10 +887,13 @@ fn collect_aggregators(root: &Path, errors: &mut Vec<String>) -> Vec<AggregatorE
 /// `ResolvedEndpoint.body_example` as the request body). The published detail
 /// keeps endpoints that are either Solana-payable (`ok`) or genuinely free
 /// (`HTTP 2xx`, reported as `free`), because free discovery/metadata endpoints
-/// can be needed to construct a later paid call. Other probe outcomes are
-/// omitted from the published catalog because agents cannot call them through
-/// Pay. When probing is disabled, endpoints pass through unchanged with empty
-/// `protocol` / `supported_usd` / `probe_status` fields.
+/// can be needed to construct a later paid call. Body-sensitive endpoints with
+/// explicit variant pricing are also retained: a dummy probe may fail before
+/// the paywall, but the OpenAPI `x-pay-metering` table is still authoritative
+/// metadata for model selection. Other probe outcomes are omitted from the
+/// published catalog because agents cannot call them through Pay. When probing
+/// is disabled, endpoints pass through unchanged with empty `protocol` /
+/// `supported_usd` / `probe_status` fields.
 fn build_detail_endpoints(
     fqn: &str,
     service_url: &str,
@@ -910,9 +924,12 @@ fn build_detail_endpoints(
                 // published `spec.path` (below) stays clean. Without the query,
                 // GETs that require parameters 4xx/5xx before the paywall and
                 // get pruned.
-                path: match &r.query_example {
-                    Some(q) => format!("{}?{}", r.spec.path, q),
-                    None => r.spec.path.clone(),
+                path: {
+                    let probe_path = r.path_example.as_ref().unwrap_or(&r.spec.path);
+                    match &r.query_example {
+                        Some(q) => format!("{}?{}", probe_path, q),
+                        None => probe_path.clone(),
+                    }
                 },
                 metered: true,
                 body: r.body_example.clone(),
@@ -925,18 +942,23 @@ fn build_detail_endpoints(
         .into_iter()
         .zip(probe_result.endpoints)
         .filter_map(|(r, probe)| {
-            if !should_publish_probed_endpoint(&probe) {
+            if !should_publish_probed_endpoint(&probe, &r.spec.pricing) {
                 return None;
             }
             let mut spec = r.spec;
-            // Probe-derived pricing wins. A 2xx probe is classified as free,
-            // so clear any stale inline pricing. For indeterminate endpoints
-            // (only possible when this filter is relaxed), fall back to the
-            // spec's inline pricing.
-            match crate::skills::probe::pricing_from_probe(&probe.paid) {
-                Some(pricing) => spec.pricing = Some(pricing),
-                None if probe.probe_status == "free" => spec.pricing = None,
-                None => {}
+            // Inline `x-pay-metering` variants win: a probe observes one
+            // model's price (or, for x402-upto, no fixed price at all),
+            // while the extension carries the full per-model table. Where
+            // the operator declared no variants, probe-derived pricing wins
+            // — a 2xx probe is classified as free, so it clears stale inline
+            // pricing; an indeterminate probe (only when this filter is
+            // relaxed) falls back to the spec's inline pricing.
+            if !has_pricing_variants(&spec.pricing) {
+                match crate::skills::probe::pricing_from_probe(&probe.paid) {
+                    Some(pricing) => spec.pricing = Some(pricing),
+                    None if probe.probe_status == "free" => spec.pricing = None,
+                    None => {}
+                }
             }
             Some(DetailEndpoint {
                 spec,
@@ -949,9 +971,13 @@ fn build_detail_endpoints(
         .collect()
 }
 
-fn should_publish_probed_endpoint(probe: &crate::skills::probe::EndpointProbeResult) -> bool {
+fn should_publish_probed_endpoint(
+    probe: &crate::skills::probe::EndpointProbeResult,
+    pricing: &Option<serde_json::Value>,
+) -> bool {
     matches!(probe.probe_status.as_str(), "ok" | "free")
         || crate::skills::probe::is_parameterized_not_found(probe)
+        || (probe.probe_status == "unprobeable_needs_body" && has_pricing_variants(pricing))
 }
 
 // ── Public API ─────────────────────────────────────────────────────────────
@@ -1043,6 +1069,19 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn has_pricing_variants_detects_per_model_tables() {
+        assert!(has_pricing_variants(&Some(json!({
+            "variants": [{ "param": "model", "value": "x", "dimensions": [] }]
+        }))));
+        // Flat pricing (no variants) is not protected — probe wins.
+        assert!(!has_pricing_variants(&Some(json!({
+            "dimensions": [{ "unit": "requests", "tiers": [{ "price_usd": 0.01 }] }]
+        }))));
+        assert!(!has_pricing_variants(&Some(json!({ "variants": [] }))));
+        assert!(!has_pricing_variants(&None));
+    }
+
     fn endpoint(
         method: &str,
         path: &str,
@@ -1057,6 +1096,7 @@ mod tests {
                 pricing,
             },
             body_example: None,
+            path_example: None,
             query_example: None,
         }
     }
@@ -1121,6 +1161,10 @@ mod tests {
             p if p.starts_with("/missing-resource") => (
                 "404 Not Found",
                 r#"{"error":"product_not_found"}"#.to_string(),
+            ),
+            "/needs-body" => (
+                "400 Bad Request",
+                r#"{"error":"valid content body required"}"#.to_string(),
             ),
             "/wrong-chain" => ("402 Payment Required", x402_body("eip155:8453")),
             "/auth" => (
@@ -1218,6 +1262,7 @@ mod tests {
                 pricing: None,
             },
             body_example: None,
+            path_example: None,
             query_example: Some("country_code=us".to_string()),
         }];
         let options = BuildOptions {
@@ -1252,6 +1297,7 @@ mod tests {
                 pricing: None,
             },
             body_example: None,
+            path_example: None,
             query_example: Some("product_id=stale".to_string()),
         }];
         let options = BuildOptions {
@@ -1276,5 +1322,54 @@ mod tests {
         assert_eq!(detail[0].spec.path, "/missing-resource");
         assert!(detail[0].protocol.is_empty());
         assert!(detail[0].supported_usd.is_empty());
+    }
+
+    #[test]
+    fn build_keeps_body_sensitive_endpoint_with_inline_variant_pricing() {
+        let (service_url, handle) = start_probe_server(1);
+        let pricing = json!({
+            "variants": [{
+                "param": "model",
+                "value": "gemini-test",
+                "description": "Fast text and multimodal generation.",
+                "dimensions": [{
+                    "direction": "input",
+                    "unit": "tokens",
+                    "scale": 1000000,
+                    "tiers": [{ "price_usd": 0.5 }]
+                }]
+            }]
+        });
+        let endpoints = vec![endpoint("POST", "/needs-body", Some(pricing))];
+        let options = BuildOptions {
+            probe: true,
+            probe_config: crate::skills::probe::ProbeConfig {
+                timeout_secs: 2,
+                concurrency: 1,
+                ..Default::default()
+            },
+            only: None,
+            previous_dist: None,
+        };
+
+        let detail = build_detail_endpoints("test/provider", &service_url, endpoints, &options);
+        handle.join().expect("server thread");
+
+        assert_eq!(
+            detail.len(),
+            1,
+            "variant-priced endpoint should be retained"
+        );
+        assert_eq!(
+            detail[0].probe_status.as_deref(),
+            Some("unprobeable_needs_body")
+        );
+        let variants = detail[0].spec.pricing.as_ref().unwrap()["variants"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            variants[0]["description"],
+            "Fast text and multimodal generation."
+        );
     }
 }

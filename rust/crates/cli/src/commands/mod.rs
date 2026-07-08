@@ -7,6 +7,7 @@ pub mod docs;
 pub mod fetch;
 pub mod help;
 pub mod http;
+pub(crate) mod payer_proxy;
 pub mod qodercli;
 pub mod send;
 pub mod server;
@@ -65,6 +66,7 @@ pub enum Command {
     /// Import funds from Venmo, PayPal, or a mobile wallet.
     Topup(topup::TopupCommand),
     /// Gate your API with stablecoin payments.
+    #[command(alias = "serve")]
     Server {
         #[command(subcommand)]
         command: server::ServerCommand,
@@ -235,7 +237,9 @@ impl Command {
                     .block_on(pay_mcp::run_server(&pay_mcp::McpOptions::default()))
                     .map_err(pay_core::Error::Config);
             }
-            Command::Claude(cmd) => std::process::exit(cmd.run(&pay_bin, account_override)?),
+            Command::Claude(cmd) => {
+                std::process::exit(cmd.run(&pay_bin, account_override, network_override)?)
+            }
             Command::Codex(cmd) => std::process::exit(cmd.run(&pay_bin, account_override)?),
             Command::Qodercli(cmd) => std::process::exit(cmd.run(&pay_bin, account_override)?),
             Command::Docs { command } => return command.run(),

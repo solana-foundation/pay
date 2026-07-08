@@ -25,12 +25,12 @@ install *args:
         shift
     fi
 
-    build_pdb() {
+    build_webui() {
         if [ -n "${PAY_PDB_DIST:-}" ]; then
-            echo "Using prebuilt PDB assets from PAY_PDB_DIST=${PAY_PDB_DIST}"
+            echo "Using prebuilt web UI assets from PAY_PDB_DIST=${PAY_PDB_DIST}"
             return
         fi
-        cd pdb
+        cd web-ui
         pnpm install --frozen-lockfile
         pnpm build
         cd ..
@@ -39,7 +39,7 @@ install *args:
     case "${target}" in
         pay)
             {{ just_executable() }} _check-native-build-deps
-            build_pdb
+            build_webui
             if [ "$#" -gt 0 ]; then
                 cargo install "$@"
             else
@@ -89,17 +89,17 @@ test:
     cd typescript && pnpm --filter @solana/pay test
     cd rust && cargo test --workspace
 
-# Build a target: `just build`, `just build pay`, `just build pdb`
+# Build a target: `just build`, `just build pay`, `just build web-ui`
 build target='all':
     #!/usr/bin/env bash
     set -euo pipefail
 
-    build_pdb() {
+    build_webui() {
         if [ -n "${PAY_PDB_DIST:-}" ]; then
-            echo "Using prebuilt PDB assets from PAY_PDB_DIST=${PAY_PDB_DIST}"
+            echo "Using prebuilt web UI assets from PAY_PDB_DIST=${PAY_PDB_DIST}"
             return
         fi
-        cd pdb
+        cd web-ui
         pnpm install --frozen-lockfile
         pnpm build
         cd ..
@@ -109,16 +109,16 @@ build target='all':
         all)
             cd typescript && pnpm --filter @solana/pay build && cd ..
             {{ just_executable() }} _check-native-build-deps
-            build_pdb
+            build_webui
             cd rust && cargo build --release
             ;;
         pay)
             {{ just_executable() }} _check-native-build-deps
-            build_pdb
+            build_webui
             cd rust && cargo build --release
             ;;
-        pdb)
-            build_pdb
+        web-ui|pdb)
+            build_webui
             ;;
         rust)
             {{ just_executable() }} _check-native-build-deps
@@ -129,7 +129,7 @@ build target='all':
             ;;
         *)
             echo "Unknown build target: {{ target }}"
-            echo "Usage: just build [all|pay|pdb|rust|typescript]"
+            echo "Usage: just build [all|pay|web-ui|rust|typescript]"
             exit 1
             ;;
     esac

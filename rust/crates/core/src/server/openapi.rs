@@ -19,7 +19,9 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use pay_types::metering::{ApiSpec, Endpoint, HttpMethod, Metering, Scheme};
+use pay_types::metering::{
+    ApiSpec, Endpoint, HttpMethod, Metering, Scheme, X_PAY_METERING_EXTENSION,
+};
 use pay_types::registry::OpenapiSource;
 use serde_json::{Map, Value, json};
 
@@ -171,6 +173,11 @@ pub fn synthesize_from_spec(api: &ApiSpec, ctx: &DiscoveryContext) -> Value {
                 "x-payment-info".to_string(),
                 json!({ "offers": Value::Array(offers) }),
             );
+        }
+        if let Some(metering) = &ep.metering
+            && let Ok(value) = serde_json::to_value(metering)
+        {
+            op.insert(X_PAY_METERING_EXTENSION.to_string(), value);
         }
 
         // Multiple methods can share a path — merge into the same path item.
@@ -390,6 +397,122 @@ pub fn filter_to_endpoints(doc: &mut Value, endpoints: &[Endpoint]) {
     }
 
     warn_on_unmatched_endpoints(doc, endpoints);
+}
+
+/// Attach each endpoint's full [`Metering`] block to its matching operation or
+/// Discovery method as the [`X_PAY_METERING_EXTENSION`] extension, so per-model
+/// `variants[]` (and any other settlement detail a live 402 probe can't
+/// observe — e.g. x402-upto endpoints advertise only a ceiling) travel with
+/// the published spec into pay-skills. The pay-skills build reads this
+/// extension into the endpoint's inline pricing (see
+/// `skills::openapi::extract_pricing_extension`).
+pub fn attach_metering_extension(doc: &mut Value, endpoints: &[Endpoint]) {
+    // Map canonical (METHOD, path) → the endpoint's metering, so we can find
+    // the right block for each operation regardless of placeholder spelling.
+    let mut metering_by_key: std::collections::HashMap<(String, String), &Metering> =
+        std::collections::HashMap::new();
+    let mut metering_by_loose: std::collections::HashMap<(String, String, String), &Metering> =
+        std::collections::HashMap::new();
+    for ep in endpoints {
+        let Some(metering) = &ep.metering else {
+            continue;
+        };
+        let method = http_method_str(&ep.method).to_string();
+        let canon = canonical_path(&ep.path);
+        if let Some((version, anchor)) = loose_path_key(&canon) {
+            metering_by_loose.insert((method.clone(), version, anchor), metering);
+        }
+        metering_by_key.insert((method, canon), metering);
+    }
+    if metering_by_key.is_empty() {
+        return;
+    }
+
+    let base_path = openapi3_base_path(doc);
+    if let Some(paths) = doc.get_mut("paths").and_then(|v| v.as_object_mut()) {
+        for (path, item) in paths.iter_mut() {
+            let combined = if base_path.is_empty() {
+                normalize_path(path)
+            } else {
+                format!("{}/{}", base_path, path.trim_start_matches('/'))
+            };
+            let canon = canonical_path(&combined);
+            let Some(item_obj) = item.as_object_mut() else {
+                continue;
+            };
+            for method in HTTP_METHODS {
+                let Some(op) = item_obj.get_mut(*method).and_then(|v| v.as_object_mut()) else {
+                    continue;
+                };
+                let upper = method.to_uppercase();
+                let metering =
+                    lookup_metering(&metering_by_key, &metering_by_loose, &upper, &canon);
+                let Some(metering) = metering else {
+                    continue;
+                };
+                if let Ok(value) = serde_json::to_value(metering) {
+                    op.insert(X_PAY_METERING_EXTENSION.to_string(), value);
+                }
+            }
+        }
+    }
+
+    if let Some(obj) = doc.as_object_mut() {
+        attach_discovery_metering_extensions(obj, &metering_by_key, &metering_by_loose);
+    }
+}
+
+fn lookup_metering<'a>(
+    by_key: &'a std::collections::HashMap<(String, String), &'a Metering>,
+    by_loose: &'a std::collections::HashMap<(String, String, String), &'a Metering>,
+    method: &str,
+    canon: &str,
+) -> Option<&'a Metering> {
+    by_key
+        .get(&(method.to_string(), canon.to_string()))
+        .copied()
+        .or_else(|| {
+            loose_path_key(canon)
+                .and_then(|(version, anchor)| by_loose.get(&(method.to_string(), version, anchor)))
+                .copied()
+        })
+}
+
+fn attach_discovery_metering_extensions(
+    container: &mut Map<String, Value>,
+    by_key: &std::collections::HashMap<(String, String), &Metering>,
+    by_loose: &std::collections::HashMap<(String, String, String), &Metering>,
+) {
+    if let Some(methods) = container.get_mut("methods").and_then(|v| v.as_object_mut()) {
+        for (_, method) in methods.iter_mut() {
+            let Some(method_obj) = method.as_object_mut() else {
+                continue;
+            };
+            let http_method = method_obj
+                .get("httpMethod")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_uppercase();
+            let canon = canonical_path(discovery_method_path(&Value::Object(method_obj.clone())));
+            let Some(metering) = lookup_metering(by_key, by_loose, &http_method, &canon) else {
+                continue;
+            };
+            if let Ok(value) = serde_json::to_value(metering) {
+                method_obj.insert(X_PAY_METERING_EXTENSION.to_string(), value);
+            }
+        }
+    }
+
+    if let Some(resources) = container
+        .get_mut("resources")
+        .and_then(|v| v.as_object_mut())
+    {
+        for (_, resource) in resources.iter_mut() {
+            if let Some(resource_obj) = resource.as_object_mut() {
+                attach_discovery_metering_extensions(resource_obj, by_key, by_loose);
+            }
+        }
+    }
 }
 
 /// Loud guardrail: after filtering, flag any YAML-declared endpoint that has
@@ -1092,6 +1215,200 @@ mod tests {
     }
 
     use pay_types::metering::HttpMethod::{Get, Post};
+
+    fn metered_ep(
+        method: pay_types::metering::HttpMethod,
+        path: &str,
+        metering: Metering,
+    ) -> Endpoint {
+        Endpoint {
+            metering: Some(metering),
+            ..ep(method, path)
+        }
+    }
+
+    #[test]
+    fn synthesized_openapi_carries_variant_descriptions_in_metering_extension() {
+        let metering: Metering = serde_json::from_value(json!({
+            "schemes": ["x402-upto"],
+            "variants": [{
+                "param": "model",
+                "value": "gemini-2.5-flash",
+                "description": "Fast Gemini model for low-latency generation.",
+                "dimensions": [
+                    { "direction": "input", "unit": "tokens", "scale": 1000000, "tiers": [{ "price_usd": 0.345 }] },
+                    { "direction": "output", "unit": "tokens", "scale": 1000000, "tiers": [{ "price_usd": 2.875 }] }
+                ]
+            }]
+        }))
+        .unwrap();
+        let api = ApiSpec {
+            name: "gemini".to_string(),
+            subdomain: "gemini".to_string(),
+            title: "Gemini".to_string(),
+            description: "Gemini".to_string(),
+            category: pay_types::metering::ApiCategory::AiMl,
+            version: "v1".to_string(),
+            env: Default::default(),
+            routing: pay_types::metering::RoutingConfig::Respond {},
+            accounting: Default::default(),
+            endpoints: vec![metered_ep(
+                Post,
+                "v1beta/models/{modelsId}:generateContent",
+                metering,
+            )],
+            free_tier: None,
+            quotas: None,
+            notes: None,
+            operator: None,
+            recipients: Default::default(),
+            session: None,
+        };
+        let doc = synthesize_from_spec(
+            &api,
+            &DiscoveryContext {
+                network_slug: "mainnet",
+                pay_to: Some("recipient"),
+                fee_payer: Some("fee-payer"),
+            },
+        );
+
+        let op = &doc["paths"]["/v1beta/models/{modelsId}:generateContent"]["post"];
+        assert!(op.get("x-payment-info").is_some());
+        let variants = op[X_PAY_METERING_EXTENSION]["variants"].as_array().unwrap();
+        assert_eq!(variants[0]["value"], "gemini-2.5-flash");
+        assert_eq!(
+            variants[0]["description"],
+            "Fast Gemini model for low-latency generation."
+        );
+        assert_eq!(variants[0]["dimensions"][1]["tiers"][0]["price_usd"], 2.875);
+    }
+
+    #[test]
+    fn attach_metering_extension_carries_variants_onto_operations() {
+        // Gemini-shaped: a custom-verb POST priced per model via variants.
+        let metering: Metering = serde_json::from_value(json!({
+            "schemes": ["x402-upto"],
+            "variants": [{
+                "param": "model",
+                "value": "gemini-2.5-flash",
+                "description": "Fast Gemini model for low-latency generation.",
+                "dimensions": [
+                    { "direction": "input", "unit": "tokens", "scale": 1000000, "tiers": [{ "price_usd": 0.345 }] },
+                    { "direction": "output", "unit": "tokens", "scale": 1000000, "tiers": [{ "price_usd": 2.875 }] }
+                ]
+            }]
+        }))
+        .unwrap();
+
+        let mut doc = json!({
+            "openapi": "3.0.3",
+            "servers": [{"url": "https://generativelanguage.google.gateway-402.com"}],
+            "paths": {
+                "/v1beta/models/{modelsId}:generateContent": { "post": { "summary": "generate" } },
+                "/v1beta/models": { "get": { "summary": "list" } }
+            }
+        });
+        let endpoints = vec![
+            metered_ep(Post, "v1beta/models/{modelsId}:generateContent", metering),
+            ep(Get, "v1beta/models"),
+        ];
+        attach_metering_extension(&mut doc, &endpoints);
+
+        // Priced op carries the variant table verbatim…
+        let generate = &doc["paths"]["/v1beta/models/{modelsId}:generateContent"]["post"];
+        let variants = generate[X_PAY_METERING_EXTENSION]["variants"]
+            .as_array()
+            .unwrap();
+        assert_eq!(variants[0]["value"], "gemini-2.5-flash");
+        assert_eq!(
+            variants[0]["description"],
+            "Fast Gemini model for low-latency generation."
+        );
+        assert_eq!(variants[0]["dimensions"][1]["tiers"][0]["price_usd"], 2.875);
+        // …and the round-trip parses back through the pay-skills reader shape.
+        assert!(
+            serde_json::from_value::<Metering>(generate[X_PAY_METERING_EXTENSION].clone()).is_ok()
+        );
+        // The unmetered list endpoint gets no extension.
+        assert!(
+            doc["paths"]["/v1beta/models"]["get"]
+                .get(X_PAY_METERING_EXTENSION)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn attach_metering_extension_is_a_noop_without_metering() {
+        let mut doc = json!({
+            "openapi": "3.0.3",
+            "paths": { "/v1/thing": { "post": { "summary": "s" } } }
+        });
+        attach_metering_extension(&mut doc, &[ep(Post, "v1/thing")]);
+        assert!(
+            doc["paths"]["/v1/thing"]["post"]
+                .get(X_PAY_METERING_EXTENSION)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn attach_metering_extension_carries_variants_onto_discovery_methods() {
+        let metering: Metering = serde_json::from_value(json!({
+            "schemes": ["x402-upto"],
+            "variants": [{
+                "param": "model",
+                "value": "gemini-2.5-flash",
+                "description": "Low-latency chat and coding tasks.",
+                "dimensions": [
+                    { "direction": "input", "unit": "tokens", "scale": 1000000, "tiers": [{ "price_usd": 0.345 }] },
+                    { "direction": "output", "unit": "tokens", "scale": 1000000, "tiers": [{ "price_usd": 2.875 }] }
+                ]
+            }]
+        }))
+        .unwrap();
+
+        let mut doc = json!({
+            "kind": "discovery#restDescription",
+            "resources": {
+                "models": {
+                    "methods": {
+                        "generateContent": {
+                            "httpMethod": "POST",
+                            "path": "v1beta/models/{modelsId}:generateContent",
+                            "flatPath": "v1beta/models/{modelsId}:generateContent"
+                        },
+                        "list": {
+                            "httpMethod": "GET",
+                            "path": "v1beta/models",
+                            "flatPath": "v1beta/models"
+                        }
+                    }
+                }
+            }
+        });
+        let endpoints = vec![
+            metered_ep(Post, "v1beta/models/{modelsId}:generateContent", metering),
+            ep(Get, "v1beta/models"),
+        ];
+        attach_metering_extension(&mut doc, &endpoints);
+
+        let generate = &doc["resources"]["models"]["methods"]["generateContent"];
+        let variants = generate[X_PAY_METERING_EXTENSION]["variants"]
+            .as_array()
+            .unwrap();
+        assert_eq!(variants[0]["value"], "gemini-2.5-flash");
+        assert_eq!(
+            variants[0]["description"],
+            "Low-latency chat and coding tasks."
+        );
+        assert_eq!(variants[0]["dimensions"][1]["tiers"][0]["price_usd"], 2.875);
+        assert!(
+            doc["resources"]["models"]["methods"]["list"]
+                .get(X_PAY_METERING_EXTENSION)
+                .is_none()
+        );
+    }
 
     #[test]
     fn filter_openapi3_keeps_only_allowed_methods() {

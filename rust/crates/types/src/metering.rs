@@ -1,6 +1,10 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// OpenAPI/Discovery operation extension carrying a serialized [`Metering`]
+/// block.
+pub const X_PAY_METERING_EXTENSION: &str = "x-pay-metering";
+
 // =============================================================================
 // Provider & API
 // =============================================================================
@@ -78,6 +82,27 @@ impl ApiSpec {
             }
         }
     }
+
+    /// Resolve `${VAR}` placeholders in deploy-time fields that are expected to
+    /// be fixed for the lifetime of the process.
+    ///
+    /// This keeps production/container specs declarative while allowing the
+    /// actual origin, operator identity, signer source, and secrets to come from
+    /// the deployment platform's secret manager. Runtime recipient aliases are
+    /// intentionally not resolved here because `${VAR}` recipient accounts can
+    /// also be supplied per request.
+    pub fn resolve_env_templates(&mut self) -> Result<(), String> {
+        self.routing.resolve_env_templates("routing")?;
+        for endpoint in &mut self.endpoints {
+            if let Some(routing) = endpoint.routing.as_mut() {
+                routing.resolve_env_templates(&format!("endpoint `{}` routing", endpoint.path))?;
+            }
+        }
+        if let Some(operator) = self.operator.as_mut() {
+            operator.resolve_env_templates("operator")?;
+        }
+        Ok(())
+    }
 }
 
 /// How a request is handled after payment verification.
@@ -144,6 +169,17 @@ pub struct PathRewrite {
 }
 
 impl RoutingConfig {
+    /// Resolve `${VAR}` placeholders in routing fields.
+    pub fn resolve_env_templates(&mut self, context: &str) -> Result<(), String> {
+        match self {
+            Self::Proxy { url, .. } => {
+                *url = resolve_env_templates_in_string(url, &format!("{context}.url"))?;
+            }
+            Self::Respond {} => {}
+        }
+        Ok(())
+    }
+
     /// Build the full upstream URL for a given request path+query.
     /// Returns `None` for the `Respond` variant.
     pub fn upstream_url(&self, path_and_query: &str) -> Option<String> {
@@ -192,6 +228,44 @@ impl RoutingConfig {
     pub fn is_respond(&self) -> bool {
         matches!(self, Self::Respond { .. })
     }
+}
+
+fn resolve_env_templates_in_string(input: &str, context: &str) -> Result<String, String> {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after_start = &rest[start + 2..];
+        let Some(end) = after_start.find('}') else {
+            return Err(format!(
+                "{context} has an unterminated `${{...}}` placeholder"
+            ));
+        };
+        let var_name = &after_start[..end];
+        if var_name.is_empty() {
+            return Err(format!("{context} contains an empty `${{}}` placeholder"));
+        }
+        let value = std::env::var(var_name).map_err(|error| match error {
+            std::env::VarError::NotPresent => {
+                format!("{context} references unset environment variable `{var_name}`")
+            }
+            std::env::VarError::NotUnicode(_) => {
+                format!("{context} references non-Unicode environment variable `{var_name}`")
+            }
+        })?;
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(format!(
+                "{context} references empty environment variable `{var_name}`"
+            ));
+        }
+        out.push_str(value);
+        rest = &after_start[end + 1..];
+    }
+
+    out.push_str(rest);
+    Ok(out)
 }
 
 /// Apply path rewrite rules to an incoming path.
@@ -628,6 +702,35 @@ pub struct OperatorConfig {
     pub realm: Option<String>,
 }
 
+impl OperatorConfig {
+    /// Resolve `${VAR}` placeholders in operator fields.
+    pub fn resolve_env_templates(&mut self, context: &str) -> Result<(), String> {
+        if let Some(signer) = self.signer.as_mut() {
+            signer.resolve_env_templates(&format!("{context}.signer"))?;
+        }
+        if let Some(recipient) = self.recipient.as_mut() {
+            *recipient =
+                resolve_env_templates_in_string(recipient, &format!("{context}.recipient"))?;
+        }
+        if let Some(rpc_url) = self.rpc_url.as_mut() {
+            *rpc_url = resolve_env_templates_in_string(rpc_url, &format!("{context}.rpc_url"))?;
+        }
+        if let Some(network) = self.network.as_mut() {
+            *network = resolve_env_templates_in_string(network, &format!("{context}.network"))?;
+        }
+        if let Some(secret) = self.challenge_binding_secret.as_mut() {
+            *secret = resolve_env_templates_in_string(
+                secret,
+                &format!("{context}.challenge_binding_secret"),
+            )?;
+        }
+        if let Some(realm) = self.realm.as_mut() {
+            *realm = resolve_env_templates_in_string(realm, &format!("{context}.realm"))?;
+        }
+        Ok(())
+    }
+}
+
 /// Signing backend configuration.
 ///
 /// Tells the server how to load the wallet that co-signs as `fee_payer`.
@@ -662,6 +765,34 @@ pub enum SignerConfig {
         /// Path to the keypair JSON file. `~` is expanded.
         path: String,
     },
+    /// Keypair material supplied by an environment variable. The value may be
+    /// a Solana CLI JSON keypair array or a base58-encoded 64-byte keypair.
+    Env {
+        /// Environment variable that contains the keypair material.
+        value_from_env: String,
+    },
+}
+
+impl SignerConfig {
+    /// Resolve `${VAR}` placeholders in signer fields that carry deploy-time
+    /// values. `Env.value_from_env` names an env var and is therefore left as-is.
+    pub fn resolve_env_templates(&mut self, context: &str) -> Result<(), String> {
+        match self {
+            Self::GcpKms { key_name, pubkey } => {
+                *key_name =
+                    resolve_env_templates_in_string(key_name, &format!("{context}.key_name"))?;
+                *pubkey = resolve_env_templates_in_string(pubkey, &format!("{context}.pubkey"))?;
+            }
+            Self::Account { name } => {
+                *name = resolve_env_templates_in_string(name, &format!("{context}.name"))?;
+            }
+            Self::File { path } => {
+                *path = resolve_env_templates_in_string(path, &format!("{context}.path"))?;
+            }
+            Self::Env { .. } => {}
+        }
+        Ok(())
+    }
 }
 
 // =============================================================================
@@ -1163,6 +1294,10 @@ pub struct MeterVariant {
     pub param: String,
     /// The value to match (e.g. "gemini-2.5-pro", "chirp-3-hd").
     pub value: String,
+    /// Human-readable description for this variant, suitable for OpenAPI and
+    /// catalog UIs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub dimensions: Vec<MeterDimension>,
 }
 
@@ -2113,38 +2248,61 @@ fn validate_price_precision(metering: &Metering, path: &str, errs: &mut Vec<Stri
     let threshold = 10f64.powi(-(MAX_DECIMALS as i32)); // 0.000001
 
     for dim in &metering.dimensions {
-        let scale = dim.scale.max(1) as f64;
-        for tier in &dim.tiers {
-            if tier.price_usd == 0.0 {
-                continue;
-            }
-            let per_unit = tier.price_usd / scale;
-            if per_unit < threshold && per_unit > 0.0 {
-                errs.push(format!(
-                    "endpoint `{path}`: price ${:.6}/unit (${} / scale {}) is below the \
-                     minimum representable amount for 6-decimal tokens (${threshold}) — \
-                     reduce scale or increase price_usd",
-                    per_unit, tier.price_usd, dim.scale
-                ));
-            }
-        }
+        check_dimension_precision(dim, threshold, path, None, errs);
     }
 
     for variant in &metering.variants {
         for dim in &variant.dimensions {
-            let scale = dim.scale.max(1) as f64;
-            for tier in &dim.tiers {
-                if tier.price_usd == 0.0 {
-                    continue;
-                }
-                let per_unit = tier.price_usd / scale;
-                if per_unit < threshold && per_unit > 0.0 {
-                    errs.push(format!(
-                        "endpoint `{path}` (variant {}={}): price ${:.6}/unit (${} / scale {}) \
-                         is below the minimum representable amount for 6-decimal tokens",
-                        variant.param, variant.value, per_unit, tier.price_usd, dim.scale
-                    ));
-                }
+            check_dimension_precision(dim, threshold, path, Some(variant), errs);
+        }
+    }
+}
+
+/// Precision check for one metering dimension.
+///
+/// Per-unit-settled dimensions (a flat charge per request/byte) must have a
+/// per-unit price at or above the 6-decimal floor — else each unit rounds to
+/// zero and the operator collects nothing. Aggregate-settled dimensions
+/// (`unit: tokens`, or any dimension read from response usage via a `meter`)
+/// are charged `Σ quantity/scale × price` and rounded **once** at
+/// settlement, so their per-unit rate is legitimately sub-microdollar (LLM
+/// token prices are quoted per million). For those we validate the *bucket*
+/// price (`price_usd`, the charge for `scale` units) against the floor.
+fn check_dimension_precision(
+    dim: &MeterDimension,
+    threshold: f64,
+    path: &str,
+    variant: Option<&MeterVariant>,
+    errs: &mut Vec<String>,
+) {
+    let aggregate = matches!(dim.unit, BillingUnit::Tokens) || dim.meter.is_some();
+    let scale = dim.scale.max(1) as f64;
+    let vlabel = variant
+        .map(|v| format!(" (variant {}={})", v.param, v.value))
+        .unwrap_or_default();
+
+    for tier in &dim.tiers {
+        if tier.price_usd <= 0.0 {
+            continue;
+        }
+        if aggregate {
+            // Bucket price must be representable; the aggregate is rounded once.
+            if tier.price_usd < threshold {
+                errs.push(format!(
+                    "endpoint `{path}`{vlabel}: token price ${} per {} units is below the \
+                     minimum representable amount (${threshold}) — increase price_usd",
+                    tier.price_usd, dim.scale
+                ));
+            }
+        } else {
+            let per_unit = tier.price_usd / scale;
+            if per_unit < threshold {
+                errs.push(format!(
+                    "endpoint `{path}`{vlabel}: price ${:.6}/unit (${} / scale {}) is below the \
+                     minimum representable amount for 6-decimal tokens (${threshold}) — \
+                     reduce scale or increase price_usd",
+                    per_unit, tier.price_usd, dim.scale
+                ));
             }
         }
     }
@@ -2501,6 +2659,7 @@ mod tests {
             variants: vec![MeterVariant {
                 param: "model".to_string(),
                 value: "gpt-4".to_string(),
+                description: Some("Flagship reasoning model".to_string()),
                 dimensions: vec![MeterDimension {
                     direction: MeterDirection::Input,
                     unit: BillingUnit::Tokens,
@@ -2526,6 +2685,10 @@ mod tests {
         let back: Metering = serde_json::from_str(&json).unwrap();
         assert_eq!(back.variants.len(), 1);
         assert_eq!(back.variants[0].value, "gpt-4");
+        assert_eq!(
+            back.variants[0].description.as_deref(),
+            Some("Flagship reasoning model")
+        );
     }
 
     #[test]
@@ -2822,6 +2985,125 @@ mod tests {
         assert!(rc.is_respond());
         assert_eq!(rc.display_url(), "respond");
         assert!(rc.upstream_url("/test").is_none());
+    }
+
+    #[test]
+    fn api_spec_resolve_env_templates_updates_deploy_time_fields() {
+        let suffix = std::process::id();
+        let upstream_var = format!("_PAY_TEST_UPSTREAM_{suffix}");
+        let recipient_var = format!("_PAY_TEST_RECIPIENT_{suffix}");
+        let rpc_var = format!("_PAY_TEST_RPC_{suffix}");
+        let signer_path_var = format!("_PAY_TEST_SIGNER_PATH_{suffix}");
+        let dynamic_recipient_var = format!("_PAY_TEST_DYNAMIC_RECIPIENT_{suffix}");
+
+        unsafe {
+            std::env::set_var(&upstream_var, " https://api.example.com ");
+            std::env::set_var(
+                &recipient_var,
+                "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY",
+            );
+            std::env::set_var(&rpc_var, "https://rpc.example.com");
+            std::env::set_var(&signer_path_var, "/secrets/keypair.json");
+            std::env::remove_var(&dynamic_recipient_var);
+        }
+
+        let yaml = format!(
+            r#"
+name: env-demo
+subdomain: env-demo
+title: Env Demo
+description: Env Demo
+category: ai_ml
+version: v1
+routing:
+  type: proxy
+  url: "${{{upstream_var}}}/v1"
+operator:
+  recipient: "${{{recipient_var}}}"
+  rpc_url: "${{{rpc_var}}}"
+  signer:
+    backend: file
+    path: "${{{signer_path_var}}}"
+recipients:
+  affiliate:
+    account: "${{{dynamic_recipient_var}}}"
+endpoints:
+  - method: GET
+    path: v1/data
+"#
+        );
+        let mut spec: ApiSpec = serde_yml::from_str(&yaml).unwrap();
+
+        spec.resolve_env_templates().unwrap();
+
+        assert_eq!(spec.routing.display_url(), "https://api.example.com/v1");
+        let operator = spec.operator.as_ref().unwrap();
+        assert_eq!(
+            operator.recipient.as_deref(),
+            Some("CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY")
+        );
+        assert_eq!(operator.rpc_url.as_deref(), Some("https://rpc.example.com"));
+        match operator.signer.as_ref().unwrap() {
+            SignerConfig::File { path } => assert_eq!(path, "/secrets/keypair.json"),
+            other => panic!("expected file signer, got {other:?}"),
+        }
+        assert_eq!(
+            spec.recipients.get("affiliate").unwrap().account,
+            format!("${{{dynamic_recipient_var}}}")
+        );
+
+        unsafe {
+            std::env::remove_var(&upstream_var);
+            std::env::remove_var(&recipient_var);
+            std::env::remove_var(&rpc_var);
+            std::env::remove_var(&signer_path_var);
+        }
+    }
+
+    #[test]
+    fn api_spec_resolve_env_templates_errors_on_missing_field_env() {
+        let missing_var = format!("_PAY_TEST_MISSING_UPSTREAM_{}", std::process::id());
+        unsafe { std::env::remove_var(&missing_var) };
+        let yaml = format!(
+            r#"
+name: env-demo
+subdomain: env-demo
+title: Env Demo
+description: Env Demo
+category: ai_ml
+version: v1
+routing:
+  type: proxy
+  url: "${{{missing_var}}}"
+endpoints:
+  - method: GET
+    path: v1/data
+"#
+        );
+        let mut spec: ApiSpec = serde_yml::from_str(&yaml).unwrap();
+
+        let err = spec.resolve_env_templates().unwrap_err();
+
+        assert!(err.contains("routing.url"));
+        assert!(err.contains(&missing_var));
+    }
+
+    #[test]
+    fn signer_config_env_backend_deserializes() {
+        let signer: SignerConfig = serde_yml::from_str(
+            r#"
+backend: env
+value_from_env: PAY_SIGNER_KEYPAIR
+"#,
+        )
+        .unwrap();
+
+        match signer {
+            SignerConfig::Env { value_from_env } => {
+                assert_eq!(value_from_env, "PAY_SIGNER_KEYPAIR")
+            }
+            other => panic!("expected env signer, got {other:?}"),
+        }
     }
 
     #[test]
@@ -3451,6 +3733,7 @@ mod tests {
                 variants: vec![MeterVariant {
                     param: "model".into(),
                     value: "gemini".into(),
+                    description: None,
                     dimensions: vec![MeterDimension {
                         direction: MeterDirection::Usage,
                         unit: BillingUnit::Requests,
@@ -3511,6 +3794,7 @@ mod tests {
                 variants: vec![MeterVariant {
                     param: "model".into(),
                     value: "gemini".into(),
+                    description: None,
                     dimensions: vec![MeterDimension {
                         direction: MeterDirection::Usage,
                         unit: BillingUnit::Requests,
@@ -3735,6 +4019,78 @@ endpoints:
     }
 
     #[test]
+    fn validate_price_precision_accepts_per_million_token_pricing() {
+        // Token pricing is per-million and settled in aggregate (rounded
+        // once), so a sub-microdollar per-token rate is fine as long as the
+        // per-1M bucket price is representable.
+        let yaml = r#"
+name: gem
+subdomain: gem
+title: Gemini
+description: token priced
+category: ai_ml
+version: v1
+routing:
+  type: respond
+endpoints:
+  - method: POST
+    path: v1/chat/completions
+    metering:
+      dimensions:
+        - direction: input
+          unit: tokens
+          scale: 1000000
+          tiers:
+            - price_usd: 0.2875
+        - direction: output
+          unit: tokens
+          scale: 1000000
+          tiers:
+            - price_usd: 34.5
+"#;
+        let spec: ApiSpec = serde_yml::from_str(yaml).unwrap();
+        let errs = validate_api_spec(&spec);
+        assert!(
+            !errs
+                .iter()
+                .any(|e| e.contains("below the minimum representable amount")),
+            "per-million token pricing must not trip the precision floor, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_price_precision_rejects_subunit_token_bucket() {
+        // But a per-1M bucket that is itself sub-microdollar is still wrong.
+        let yaml = r#"
+name: gem
+subdomain: gem
+title: Gemini
+description: token priced
+category: ai_ml
+version: v1
+routing:
+  type: respond
+endpoints:
+  - method: POST
+    path: v1/chat/completions
+    metering:
+      dimensions:
+        - direction: input
+          unit: tokens
+          scale: 1000000
+          tiers:
+            - price_usd: 0.0000005
+"#;
+        let spec: ApiSpec = serde_yml::from_str(yaml).unwrap();
+        let errs = validate_api_spec(&spec);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("below the minimum representable amount")),
+            "a sub-microdollar per-1M bucket must be rejected, got: {errs:?}"
+        );
+    }
+
+    #[test]
     fn validate_price_precision_rejects_variant_below_token_precision() {
         let yaml = r#"
 name: variants
@@ -3755,9 +4111,9 @@ endpoints:
           dimensions:
             - direction: input
               unit: tokens
-              scale: 10000000
+              scale: 1000000
               tiers:
-                - price_usd: 1.0
+                - price_usd: 0.0000005
 "#;
         let spec: ApiSpec = serde_yml::from_str(yaml).unwrap();
         let errs = validate_api_spec(&spec);

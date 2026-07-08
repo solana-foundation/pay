@@ -9,12 +9,14 @@
 //! control-plane service, then hand the public bind to Pingora.
 
 pub mod http402;
+pub mod observer;
 
 pub use http402::Http402Gate;
 
+use async_trait::async_trait;
 use pay_core::PaymentState;
 use pingora::proxy::http_proxy_service;
-use pingora::server::Server;
+use pingora::server::{RunArgs, Server, ShutdownSignal, ShutdownSignalWatch};
 
 /// Build and run the Pingora gateway on `bind`, fronting `state`'s
 /// [`PaymentGate`] and forwarding control-plane traffic to `control_plane`
@@ -53,4 +55,64 @@ pub fn run<S: PaymentState>(
     server.add_service(svc);
     tracing::info!(bind, threads = cores, "pingora gateway up (Http402Gate)");
     server.run_forever();
+}
+
+/// Like [`run`], but shuts down when `shutdown` flips to `true` (or on
+/// SIGTERM) and **returns** instead of exiting the process.
+///
+/// For callers that own the terminal/process lifecycle — e.g. the inference
+/// TUI, which runs Pingora on a spawned thread and must restore the terminal
+/// after quit. Sends Pingora a fast shutdown (no grace-period sleep).
+pub fn run_with_shutdown<S: PaymentState>(
+    state: S,
+    bind: &str,
+    control_plane: String,
+    threads: Option<usize>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let mut server = Server::new(None).map_err(|e| anyhow::anyhow!("pingora server: {e}"))?;
+    server.bootstrap();
+    let gate = Http402Gate::new(state, control_plane);
+    let mut svc = http_proxy_service(&server.configuration, gate);
+    let cores = threads.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8)
+    });
+    svc.threads = Some(cores);
+    svc.add_tcp(bind);
+    server.add_service(svc);
+    tracing::info!(bind, threads = cores, "pingora gateway up (Http402Gate)");
+    server.run(RunArgs {
+        shutdown_signal: Box::new(WatchShutdown(shutdown)),
+    });
+    Ok(())
+}
+
+/// Pingora shutdown watcher driven by a caller-owned watch channel, with
+/// SIGTERM kept as a fallback so headless `kill` still works.
+struct WatchShutdown(tokio::sync::watch::Receiver<bool>);
+
+#[async_trait]
+impl ShutdownSignalWatch for WatchShutdown {
+    async fn recv(&self) -> ShutdownSignal {
+        let mut rx = self.0.clone();
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler");
+        loop {
+            tokio::select! {
+                changed = rx.changed() => {
+                    match changed {
+                        Ok(()) if *rx.borrow() => return ShutdownSignal::FastShutdown,
+                        // Sender dropped: the controlling side is gone; shut down.
+                        Err(_) => return ShutdownSignal::FastShutdown,
+                        Ok(()) => continue,
+                    }
+                }
+                _ = sigterm.recv() => return ShutdownSignal::GracefulTerminate,
+            }
+        }
+    }
 }

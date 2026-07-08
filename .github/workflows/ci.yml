@@ -50,7 +50,7 @@ jobs:
         with:
           node-version: lts/*
       - name: Build PDB frontend
-        run: cd ../pdb && pnpm install --frozen-lockfile && pnpm build
+        run: cd ../web-ui && pnpm install --frozen-lockfile && pnpm build
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -75,7 +75,7 @@ jobs:
         with:
           node-version: lts/*
       - name: Build PDB frontend
-        run: cd ../pdb && pnpm install --frozen-lockfile && pnpm build
+        run: cd ../web-ui && pnpm install --frozen-lockfile && pnpm build
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview

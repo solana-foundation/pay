@@ -1965,6 +1965,19 @@ dependencies = [
 
 [[package]]
 name = "console"
+version = "0.15.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "054ccb5b10f9f2cbf51eb355ca1d05c2d279ce1804688d0db74b4733a5aeafd8"
+dependencies = [
+ "encode_unicode",
+ "libc",
+ "once_cell",
+ "unicode-width 0.2.0",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "console"
 version = "0.16.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d64e8af5551369d19cf50138de61f1c42074ab970f74e99be916646777f8fc87"
@@ -2535,7 +2548,7 @@ version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "25f104b501bf2364e78d0d3974cbc774f738f5865306ed128e1e0d7499c0ad96"
 dependencies = [
- "console",
+ "console 0.16.3",
  "shell-words",
  "tempfile",
  "zeroize",
@@ -3211,12 +3224,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
-name = "foldhash"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
-
-[[package]]
 name = "foreign-types"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3851,7 +3858,7 @@ checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
  "allocator-api2",
  "equivalent",
- "foldhash 0.1.5",
+ "foldhash",
 ]
 
 [[package]]
@@ -3859,11 +3866,6 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
-dependencies = [
- "allocator-api2",
- "equivalent",
- "foldhash 0.2.0",
-]
 
 [[package]]
 name = "hcl-edit"
@@ -4443,11 +4445,24 @@ dependencies = [
 
 [[package]]
 name = "indicatif"
+version = "0.17.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "183b3088984b400f4cfac3620d5e076c84da5364016b4f49473de574b2586235"
+dependencies = [
+ "console 0.15.11",
+ "number_prefix",
+ "portable-atomic",
+ "unicode-width 0.2.0",
+ "web-time",
+]
+
+[[package]]
+name = "indicatif"
 version = "0.18.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "25470f23803092da7d239834776d653104d551bc4d7eacaf31e6837854b8e9eb"
 dependencies = [
- "console",
+ "console 0.16.3",
  "portable-atomic",
  "unicode-width 0.2.0",
  "unit-prefix",
@@ -5178,8 +5193,9 @@ checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
 [[package]]
 name = "litesvm"
-version = "0.13.0"
-source = "git+https://github.com/LiteSVM/litesvm.git?rev=b097465bc66ba6033b5118b8a2d5bc2ecb9f00e1#b097465bc66ba6033b5118b8a2d5bc2ecb9f00e1"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1e00083aad2a7aa9d6900454604f7776da40be57304e5119f09222a1e9b105a"
 dependencies = [
  "agave-feature-set 4.0.0",
  "agave-precompiles",
@@ -5245,8 +5261,9 @@ dependencies = [
 
 [[package]]
 name = "litesvm-token"
-version = "0.13.0"
-source = "git+https://github.com/LiteSVM/litesvm.git?rev=b097465bc66ba6033b5118b8a2d5bc2ecb9f00e1#b097465bc66ba6033b5118b8a2d5bc2ecb9f00e1"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4a059c3ed49db666915e599476cd7aac9d9d99c385404ee53e9d4eae5beffc9c"
 dependencies = [
  "litesvm",
  "smallvec",
@@ -5881,6 +5898,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "number_prefix"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "830b246a0e5f20af87141b25c173cd1b609bd7779a4617d6ec582abaf90870f3"
+
+[[package]]
 name = "objc2"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6309,6 +6332,8 @@ checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
 name = "pay"
 version = "0.21.0"
 dependencies = [
+ "async-stream",
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "bincode",
@@ -6319,6 +6344,7 @@ dependencies = [
  "dialoguer",
  "ed25519-dalek 2.2.0",
  "glob",
+ "indicatif 0.17.11",
  "opentelemetry 0.31.0",
  "opentelemetry-otlp",
  "opentelemetry-semantic-conventions 0.31.0",
@@ -6499,7 +6525,9 @@ dependencies = [
  "pingora",
  "reqwest 0.12.28",
  "rustls 0.23.40",
+ "serde_json",
  "solana-pay-kit",
+ "tokio",
  "tracing",
 ]
 
@@ -6755,7 +6783,7 @@ dependencies = [
  "serde",
  "serde_yaml 0.8.26",
  "sfv",
- "socket2 0.6.4",
+ "socket2 0.4.10",
  "strum 0.26.3",
  "strum_macros 0.26.4",
  "tokio",
@@ -6837,8 +6865,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32f1c33f6ce9ca9b8e81190796f7d4d543d1ab2a310097d884ebe48ce5d33c4d"
 dependencies = [
  "arrayvec",
- "hashbrown 0.17.1",
- "parking_lot 0.12.5",
+ "hashbrown 0.13.2",
+ "parking_lot 0.11.2",
  "rand 0.8.6",
 ]
 
@@ -7192,7 +7220,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
@@ -9324,7 +9352,7 @@ dependencies = [
  "futures 0.3.32",
  "futures-util",
  "indexmap 2.14.0",
- "indicatif",
+ "indicatif 0.18.4",
  "log",
  "rayon",
  "solana-account 3.4.0",
@@ -9371,7 +9399,7 @@ dependencies = [
  "futures 0.3.32",
  "futures-util",
  "indexmap 2.14.0",
- "indicatif",
+ "indicatif 0.18.4",
  "log",
  "quinn",
  "rayon",
@@ -10671,12 +10699,11 @@ dependencies = [
 [[package]]
 name = "solana-pay-kit"
 version = "0.2.0"
-source = "git+https://github.com/solana-foundation/pay-kit?rev=b8b2fd467ec363dd715a0523cf95e679a7169a69#b8b2fd467ec363dd715a0523cf95e679a7169a69"
+source = "git+https://github.com/solana-foundation/pay-kit?rev=bdaad4f5ea40f365d73be8cf5634555aa5bca677#bdaad4f5ea40f365d73be8cf5634555aa5bca677"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bincode",
- "blake3",
  "borsh 1.7.0",
  "bs58",
  "bytemuck",
@@ -10709,6 +10736,7 @@ dependencies = [
  "solana-program-error 3.0.1",
  "solana-pubkey 3.0.0",
  "solana-rpc-client 4.0.0",
+ "solana-rpc-client-api 4.0.0",
  "solana-signature",
  "solana-signer",
  "solana-system-interface 2.0.0",
@@ -11377,7 +11405,7 @@ dependencies = [
  "bincode",
  "bs58",
  "futures 0.3.32",
- "indicatif",
+ "indicatif 0.18.4",
  "log",
  "reqwest 0.12.28",
  "reqwest-middleware",
@@ -11417,7 +11445,7 @@ dependencies = [
  "bincode",
  "bs58",
  "futures 0.3.32",
- "indicatif",
+ "indicatif 0.18.4",
  "log",
  "reqwest 0.12.28",
  "reqwest-middleware",
@@ -12625,7 +12653,7 @@ dependencies = [
  "bincode",
  "futures-util",
  "indexmap 2.14.0",
- "indicatif",
+ "indicatif 0.18.4",
  "log",
  "rayon",
  "solana-client-traits",
@@ -12659,7 +12687,7 @@ dependencies = [
  "bincode",
  "futures-util",
  "indexmap 2.14.0",
- "indicatif",
+ "indicatif 0.18.4",
  "log",
  "rayon",
  "solana-client-traits",

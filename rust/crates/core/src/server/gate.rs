@@ -263,9 +263,13 @@ impl<S: PaymentState> PaymentGate<S> {
             .as_deref()
             .or_else(|| self.state.session_mpp());
 
-        // MPP credential present → dispatch by intent (only if accepted). A
-        // present-but-unparseable credential is a client error (400).
-        if let Some(auth) = req.authorization {
+        // MPP credential present → dispatch by intent (only if accepted). Only
+        // `Payment`-scheme Authorization headers are payment credentials — any
+        // other scheme (Bearer/Basic/…) is auth destined for the upstream
+        // (e.g. Claude Code's ANTHROPIC_AUTH_TOKEN) and must fall through to
+        // the 402 challenge, not 400. A `Payment` credential that then fails
+        // to parse is a genuine client error (400).
+        if let Some(auth) = req.authorization.filter(is_payment_authorization) {
             match parse_authorization(auth) {
                 Ok(cred) => {
                     let intent = cred.challenge.intent.as_str();
@@ -704,6 +708,7 @@ impl<S: PaymentState> PaymentGate<S> {
                         variant_hint: variant.clone(),
                         request_properties: props,
                         ceiling_usd,
+                        inferred_usage: None,
                     });
                 GateDecision::Forward {
                     session: None,
@@ -907,7 +912,9 @@ impl<S: PaymentState> PaymentGate<S> {
             GateDecision::Respond(resp)
         };
 
-        let Some(auth) = req.authorization else {
+        // Non-`Payment` Authorization schemes are upstream auth, not a
+        // malformed credential — challenge instead of 400 (mirrors evaluate()).
+        let Some(auth) = req.authorization.filter(is_payment_authorization) else {
             return challenge_402(None);
         };
         let credential = match parse_authorization(auth) {
@@ -1159,6 +1166,12 @@ impl<S: PaymentState> PaymentGate<S> {
 /// `min_usd * that` equals `parse_units(min_usd, decimals)` without re-deriving
 /// the mint decimals — clamped to the ceiling. No `min` (or a degenerate
 /// ceiling) settles the full ceiling, preserving the prior behavior.
+/// Whether an `Authorization` header value carries the MPP `Payment` scheme
+/// (vs. Bearer/Basic/… tokens meant for the upstream).
+fn is_payment_authorization(auth: &&str) -> bool {
+    auth.len() >= 8 && auth[..8].eq_ignore_ascii_case("payment ")
+}
+
 fn upto_settle_amount(min_usd: Option<f64>, ceiling_usd: f64, max_amount: u64) -> u64 {
     match min_usd {
         Some(min_usd) if min_usd >= 0.0 && ceiling_usd > 0.0 => {
@@ -1417,6 +1430,17 @@ mod tests {
     // Ceiling $0.10 at 6 decimals == 100_000 base units (USDC).
     const CEILING_USD: f64 = 0.10;
     const CEILING_BASE: u64 = 100_000;
+
+    #[test]
+    fn only_payment_scheme_counts_as_credential() {
+        // Upstream auth (Claude Code's ANTHROPIC_AUTH_TOKEN, API bearer
+        // tokens) must fall through to the 402 challenge, not 400.
+        assert!(!is_payment_authorization(&"Bearer ollama"));
+        assert!(!is_payment_authorization(&"Basic dXNlcjpwdw=="));
+        assert!(!is_payment_authorization(&"Payment")); // no payload, no space
+        assert!(is_payment_authorization(&"Payment eyJjaGFsbGVuZ2UiOnt9fQ"));
+        assert!(is_payment_authorization(&"payment abc")); // scheme is case-insensitive
+    }
 
     #[test]
     fn upto_voucher_defaults_to_full_ceiling_without_min() {

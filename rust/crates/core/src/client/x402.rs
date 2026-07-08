@@ -276,7 +276,8 @@ pub fn parse_upto_accepts(
 /// signer. The client signs only the open; the operator broadcasts it and
 /// settles the actual metered amount. Mirrors [`build_payment`] — same signer
 /// resolution, surfpool detection, network check and auto-fund — but uses the
-/// server-provided `extra.recentBlockhash`, so no RPC round-trip is needed.
+/// server-provided `extra.recentBlockhash` + `extra.recentSlot`, so no RPC
+/// round-trip is needed.
 pub fn build_upto_payment(
     challenge: &UptoChallenge,
     store: &dyn AccountsStore,

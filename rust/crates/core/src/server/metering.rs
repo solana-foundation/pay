@@ -41,6 +41,13 @@ pub struct UptoSettlementPlan {
     pub variant_hint: Option<String>,
     pub request_properties: RequestProperties,
     pub ceiling_usd: f64,
+    /// Token counts observed on the (possibly streamed) response body by the
+    /// proxy's inference observer. When present, token dimensions
+    /// (`unit == Tokens`) settle from these counts — `Input →
+    /// tokens_prompt`, `Output → tokens_completion` — instead of the
+    /// JSON-pointer / meter extraction. `None` keeps the pure axum/JSON path
+    /// (the buffered response body is parsed as before).
+    pub inferred_usage: Option<crate::InferenceUsage>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -152,7 +159,11 @@ pub fn resolve_price(
         if let Some(variant) = resolve_variant(&metering.variants, variant_hint) {
             return Some(resolve_dimensions(&variant.dimensions, props, ctx));
         }
-        // If no variant matched, use the first one as default
+        if !metering.dimensions.is_empty() {
+            return Some(resolve_dimensions(&metering.dimensions, props, ctx));
+        }
+        // Legacy specs without top-level dimensions use the first variant as
+        // their implicit default.
         if let Some(first) = metering.variants.first() {
             return Some(resolve_dimensions(&first.dimensions, props, ctx));
         }
@@ -185,6 +196,9 @@ pub fn effective_dimensions<'a>(
     if !metering.variants.is_empty() {
         if let Some(variant) = resolve_variant(&metering.variants, variant_hint) {
             return &variant.dimensions;
+        }
+        if !metering.dimensions.is_empty() {
+            return &metering.dimensions;
         }
         if let Some(first) = metering.variants.first() {
             return &first.dimensions;
@@ -272,12 +286,25 @@ pub fn upto_actual_amount_from_response(
         });
     }
 
+    // Prefer the model the response actually reported for variant selection.
+    // Inference APIs carry the model in the request BODY, so the path-derived
+    // `variant_hint` is `None` and per-model rates would otherwise collapse to
+    // the first variant. The observer parsed the real model from the response,
+    // so use it (`resolve_variant` matches when the hint contains the variant
+    // value, e.g. `gemma4:latest` ⊇ `gemma4`); fall back to the path hint.
+    let observed_model = plan
+        .inferred_usage
+        .as_ref()
+        .and_then(|u| u.model.as_deref());
+    let variant_hint = observed_model.or(plan.variant_hint.as_deref());
+
     let result = extract_and_price_usage(
         &plan.metering,
-        plan.variant_hint.as_deref(),
+        variant_hint,
         &plan.request_properties,
         headers,
         body,
+        plan.inferred_usage.as_ref(),
     )
     .map(|actual_usd| clamp_actual_usd(&plan.metering, actual_usd, plan.ceiling_usd));
 
@@ -317,6 +344,7 @@ fn extract_and_price_usage(
     props: &RequestProperties,
     headers: &HeaderMap,
     body: Option<&[u8]>,
+    inferred_usage: Option<&crate::InferenceUsage>,
 ) -> Result<f64, UptoUsageError> {
     let dimensions = effective_dimensions(metering, variant_hint);
     if dimensions.is_empty() {
@@ -327,7 +355,29 @@ fn extract_and_price_usage(
 
     let prices = resolve_price(metering, props, variant_hint, None)
         .ok_or_else(|| UptoUsageError::MissingUsage("no resolved price".to_string()))?;
-    let json = if upto_requires_response_body(metering, variant_hint) {
+    // Observer-supplied token counts supersede body/meter extraction for token
+    // dimensions. When every dimension that would otherwise read from the
+    // response body is satisfiable from `inferred_usage`, we can skip parsing
+    // the (possibly absent, because streamed) buffered body entirely. A
+    // dimension reads from the body when it has a `ResponseJson` meter OR when
+    // a preset supplies a JSON path for it.
+    let preset = metering
+        .upto
+        .as_ref()
+        .and_then(|upto| upto.usage_preset.as_deref());
+    let body_still_needed = upto_requires_response_body(metering, variant_hint)
+        && dimensions.iter().any(|dim| {
+            let covered_by_inferred = inferred_usage
+                .and_then(|usage| inferred_quantity_for_dim(usage, dim))
+                .is_some();
+            let reads_body = dim
+                .meter
+                .as_ref()
+                .is_some_and(|m| matches!(m.source, UsageMeterSource::ResponseJson))
+                || preset_json_path(preset, dim).is_some();
+            !covered_by_inferred && reads_body
+        });
+    let json = if body_still_needed {
         let body =
             body.ok_or_else(|| UptoUsageError::MissingUsage("response body unavailable".into()))?;
         Some(
@@ -338,10 +388,6 @@ fn extract_and_price_usage(
         None
     };
 
-    let preset = metering
-        .upto
-        .as_ref()
-        .and_then(|upto| upto.usage_preset.as_deref());
     let mut total = 0.0;
     for (idx, dim) in dimensions.iter().enumerate() {
         let price = prices
@@ -349,10 +395,25 @@ fn extract_and_price_usage(
             .get(idx)
             .map(|d| d.price_usd)
             .unwrap_or(0.0);
-        let quantity = extract_dimension_quantity(dim, preset, headers, json.as_ref())?;
+        let quantity =
+            extract_dimension_quantity(dim, preset, headers, json.as_ref(), inferred_usage)?;
         total += quantity as f64 / dim.scale.max(1) as f64 * price;
     }
     Ok(total)
+}
+
+/// The observer count for a token dimension, if any: `Input → tokens_prompt`,
+/// `Output → tokens_completion`. Non-token dimensions and unset counts yield
+/// `None`, so the caller falls back to JSON/meter extraction.
+fn inferred_quantity_for_dim(usage: &crate::InferenceUsage, dim: &MeterDimension) -> Option<u64> {
+    if !matches!(dim.unit, BillingUnit::Tokens) {
+        return None;
+    }
+    match dim.direction {
+        MeterDirection::Input => usage.tokens_prompt,
+        MeterDirection::Output => usage.tokens_completion,
+        _ => None,
+    }
 }
 
 fn extract_dimension_quantity(
@@ -360,7 +421,14 @@ fn extract_dimension_quantity(
     preset: Option<&str>,
     headers: &HeaderMap,
     json: Option<&serde_json::Value>,
+    inferred_usage: Option<&crate::InferenceUsage>,
 ) -> Result<u64, UptoUsageError> {
+    // Observer token counts take precedence for token dimensions.
+    if let Some(usage) = inferred_usage
+        && let Some(quantity) = inferred_quantity_for_dim(usage, dim)
+    {
+        return Ok(quantity);
+    }
     if let Some(meter) = &dim.meter {
         return extract_from_meter(meter, headers, json);
     }
@@ -1028,6 +1096,7 @@ mod tests {
                 MeterVariant {
                     param: "model".to_string(),
                     value: "gemini-pro".to_string(),
+                    description: None,
                     dimensions: vec![MeterDimension {
                         direction: pay_types::metering::MeterDirection::Input,
                         unit: pay_types::metering::BillingUnit::Tokens,
@@ -1046,6 +1115,7 @@ mod tests {
                 MeterVariant {
                     param: "model".to_string(),
                     value: "gemini-flash".to_string(),
+                    description: None,
                     dimensions: vec![MeterDimension {
                         direction: pay_types::metering::MeterDirection::Input,
                         unit: pay_types::metering::BillingUnit::Tokens,
@@ -1086,6 +1156,7 @@ mod tests {
             variants: vec![MeterVariant {
                 param: "model".to_string(),
                 value: "gemini-pro".to_string(),
+                description: None,
                 dimensions: vec![MeterDimension {
                     direction: pay_types::metering::MeterDirection::Input,
                     unit: pay_types::metering::BillingUnit::Tokens,
@@ -1116,6 +1187,66 @@ mod tests {
         );
         assert!(price.is_some());
         assert_eq!(price.unwrap().dimensions[0].price_usd, 0.05);
+    }
+
+    #[test]
+    fn test_resolve_price_variant_no_match_uses_default_dimensions() {
+        let default_dim = MeterDimension {
+            direction: pay_types::metering::MeterDirection::Input,
+            unit: pay_types::metering::BillingUnit::Tokens,
+            scale: 1_000_000,
+            period: None,
+            tiers: vec![PriceTier {
+                up_to: None,
+                price_usd: 0.02,
+                condition: None,
+                notes: None,
+                splits: vec![],
+            }],
+            meter: None,
+        };
+        let variant_dim = MeterDimension {
+            direction: pay_types::metering::MeterDirection::Input,
+            unit: pay_types::metering::BillingUnit::Tokens,
+            scale: 1_000_000,
+            period: None,
+            tiers: vec![PriceTier {
+                up_to: None,
+                price_usd: 0.50,
+                condition: None,
+                notes: None,
+                splits: vec![],
+            }],
+            meter: None,
+        };
+        let metering = Metering {
+            dimensions: vec![default_dim],
+            variants: vec![MeterVariant {
+                param: "model".to_string(),
+                value: "gemini-pro".to_string(),
+                description: None,
+                dimensions: vec![variant_dim],
+            }],
+            sku_tiers: vec![],
+            splits: vec![],
+            schemes: None,
+            min_usd: None,
+            upto: None,
+        };
+
+        let price = resolve_price(
+            &metering,
+            &RequestProperties::default(),
+            Some("unknown-model"),
+            None,
+        )
+        .expect("default dimensions should price unmatched variants");
+
+        assert_eq!(price.dimensions[0].price_usd, 0.02);
+        assert_eq!(
+            effective_dimensions(&metering, Some("unknown-model"))[0].tiers[0].price_usd,
+            0.02
+        );
     }
 
     #[test]
@@ -1292,6 +1423,7 @@ mod tests {
             variant_hint: None,
             request_properties: RequestProperties::default(),
             ceiling_usd,
+            inferred_usage: None,
         }
     }
 
@@ -1722,6 +1854,7 @@ mod tests {
                 MeterVariant {
                     param: "model".to_string(),
                     value: "pro".to_string(),
+                    description: None,
                     dimensions: vec![usage_dim(
                         MeterDirection::Usage,
                         BillingUnit::Tokens,
@@ -1733,6 +1866,7 @@ mod tests {
                 MeterVariant {
                     param: "model".to_string(),
                     value: "flash".to_string(),
+                    description: None,
                     dimensions: vec![usage_dim(
                         MeterDirection::Usage,
                         BillingUnit::Tokens,
@@ -1756,6 +1890,7 @@ mod tests {
             variant_hint: Some("models/gemini-flash".to_string()),
             request_properties: RequestProperties::default(),
             ceiling_usd: 0.10,
+            inferred_usage: None,
         };
 
         let actual = upto_actual_amount_from_response(
@@ -1768,5 +1903,266 @@ mod tests {
 
         assert_eq!(actual.usd, 0.02);
         assert_eq!(actual.base_units, 20_000);
+    }
+
+    #[test]
+    fn upto_actual_amount_selects_variant_from_observed_model() {
+        // Body-model API: the path hint is None, so without the observed model
+        // the price would collapse to the FIRST variant (gemma4). The observer
+        // reports the served model (`qwen3:8b`), which must select the qwen
+        // variant. Rates: gemma4 in 0.10/out 0.30, qwen3:8b in 0.50/out 1.50.
+        let metering = Metering {
+            dimensions: vec![],
+            variants: vec![
+                MeterVariant {
+                    param: "model".to_string(),
+                    value: "gemma4".to_string(),
+                    description: None,
+                    dimensions: vec![
+                        usage_dim(
+                            MeterDirection::Input,
+                            BillingUnit::Tokens,
+                            1_000_000,
+                            0.10,
+                            Some(response_json("/usage/prompt_tokens")),
+                        ),
+                        usage_dim(
+                            MeterDirection::Output,
+                            BillingUnit::Tokens,
+                            1_000_000,
+                            0.30,
+                            Some(response_json("/usage/completion_tokens")),
+                        ),
+                    ],
+                },
+                MeterVariant {
+                    param: "model".to_string(),
+                    value: "qwen3:8b".to_string(),
+                    description: None,
+                    dimensions: vec![
+                        usage_dim(
+                            MeterDirection::Input,
+                            BillingUnit::Tokens,
+                            1_000_000,
+                            0.50,
+                            Some(response_json("/usage/prompt_tokens")),
+                        ),
+                        usage_dim(
+                            MeterDirection::Output,
+                            BillingUnit::Tokens,
+                            1_000_000,
+                            1.50,
+                            Some(response_json("/usage/completion_tokens")),
+                        ),
+                    ],
+                },
+            ],
+            sku_tiers: vec![],
+            splits: vec![],
+            schemes: None,
+            min_usd: None,
+            upto: Some(pay_types::metering::UptoMetering {
+                max_usd: Some(0.50),
+                ..Default::default()
+            }),
+        };
+        // Path hint is None (model is in the body); observer reports qwen3:8b
+        // plus token counts {prompt: 100, completion: 200}.
+        let plan = UptoSettlementPlan {
+            metering,
+            variant_hint: None,
+            request_properties: RequestProperties::default(),
+            ceiling_usd: 0.50,
+            inferred_usage: Some(crate::InferenceUsage {
+                model: Some("qwen3:8b".to_string()),
+                tokens_prompt: Some(100),
+                tokens_completion: Some(200),
+                ..Default::default()
+            }),
+        };
+
+        // qwen rates: 100/1e6*0.50 + 200/1e6*1.50 = 0.00005 + 0.0003 = 0.00035.
+        let actual =
+            upto_actual_amount_from_response(&plan, 500_000, &HeaderMap::new(), None).unwrap();
+        let qwen_expected = 100.0 / 1_000_000.0 * 0.50 + 200.0 / 1_000_000.0 * 1.50;
+        assert!(
+            (actual.usd - qwen_expected).abs() < 1e-12,
+            "expected qwen rate {qwen_expected}, got {}",
+            actual.usd
+        );
+
+        // Sanity: the gemma4 (first-variant) rate would be cheaper — prove we
+        // did NOT fall back to it.
+        let gemma_wrong = 100.0 / 1_000_000.0 * 0.10 + 200.0 / 1_000_000.0 * 0.30;
+        assert!(
+            (actual.usd - gemma_wrong).abs() > 1e-9,
+            "must not fall back to the first variant's rate"
+        );
+    }
+
+    #[test]
+    fn upto_actual_amount_prefers_inferred_usage_over_json() {
+        // Per-model variant: input $0.10/1M, output $0.30/1M. inferred_usage
+        // {prompt: 12, completion: 214} → 12/1e6*0.10 + 214/1e6*0.30
+        // = 0.0000012 + 0.0000642 = 0.0000654 USD.
+        let metering = Metering {
+            dimensions: vec![],
+            variants: vec![MeterVariant {
+                param: "model".to_string(),
+                value: "gemma4".to_string(),
+                description: None,
+                dimensions: vec![
+                    usage_dim(
+                        MeterDirection::Input,
+                        BillingUnit::Tokens,
+                        1_000_000,
+                        0.10,
+                        // A JSON meter is present as the fallback; the observer
+                        // path must supersede it (and the body is absent here).
+                        Some(response_json("/usage/input_tokens")),
+                    ),
+                    usage_dim(
+                        MeterDirection::Output,
+                        BillingUnit::Tokens,
+                        1_000_000,
+                        0.30,
+                        Some(response_json("/usage/output_tokens")),
+                    ),
+                ],
+            }],
+            sku_tiers: vec![],
+            splits: vec![],
+            schemes: None,
+            min_usd: None,
+            upto: Some(pay_types::metering::UptoMetering {
+                max_usd: Some(0.50),
+                ..Default::default()
+            }),
+        };
+        let plan = UptoSettlementPlan {
+            metering,
+            variant_hint: Some("gemma4:latest".to_string()),
+            request_properties: RequestProperties::default(),
+            ceiling_usd: 0.50,
+            inferred_usage: Some(crate::InferenceUsage {
+                tokens_prompt: Some(12),
+                tokens_completion: Some(214),
+                ..Default::default()
+            }),
+        };
+
+        // No response body: settlement must still succeed from inferred_usage.
+        let actual =
+            upto_actual_amount_from_response(&plan, 100_000, &HeaderMap::new(), None).unwrap();
+
+        let expected = 12.0 / 1_000_000.0 * 0.10 + 214.0 / 1_000_000.0 * 0.30;
+        assert!((actual.usd - expected).abs() < 1e-12, "usd={}", actual.usd);
+    }
+
+    #[test]
+    fn upto_settles_at_the_observed_models_variant_not_the_first() {
+        // Two per-model variants; the body-model API leaves variant_hint None,
+        // so without the observed-model fix this would settle at the first
+        // variant (`cheap`). The observer reports `pricey`, which must be the
+        // rate charged.
+        let variant = |value: &str, in_rate: f64, out_rate: f64| MeterVariant {
+            param: "model".to_string(),
+            value: value.to_string(),
+            description: None,
+            dimensions: vec![
+                usage_dim(
+                    MeterDirection::Input,
+                    BillingUnit::Tokens,
+                    1_000_000,
+                    in_rate,
+                    None,
+                ),
+                usage_dim(
+                    MeterDirection::Output,
+                    BillingUnit::Tokens,
+                    1_000_000,
+                    out_rate,
+                    None,
+                ),
+            ],
+        };
+        let metering = Metering {
+            dimensions: vec![],
+            variants: vec![
+                variant("cheap-model", 0.10, 0.30),
+                variant("pricey-model", 1.00, 3.00),
+            ],
+            sku_tiers: vec![],
+            splits: vec![],
+            schemes: None,
+            min_usd: None,
+            upto: Some(pay_types::metering::UptoMetering {
+                max_usd: Some(0.50),
+                ..Default::default()
+            }),
+        };
+        let plan = UptoSettlementPlan {
+            metering,
+            variant_hint: None, // path carries no model (inference API)
+            request_properties: RequestProperties::default(),
+            ceiling_usd: 0.50,
+            inferred_usage: Some(crate::InferenceUsage {
+                model: Some("pricey-model".to_string()),
+                tokens_prompt: Some(1_000),
+                tokens_completion: Some(1_000),
+                ..Default::default()
+            }),
+        };
+
+        let actual =
+            upto_actual_amount_from_response(&plan, 100_000, &HeaderMap::new(), None).unwrap();
+
+        // pricey rates: 1000/1e6*1.00 + 1000/1e6*3.00 = 0.004, NOT the cheap
+        // variant's 1000/1e6*0.10 + 1000/1e6*0.30 = 0.0004.
+        let pricey = 1_000.0 / 1_000_000.0 * 1.00 + 1_000.0 / 1_000_000.0 * 3.00;
+        assert!(
+            (actual.usd - pricey).abs() < 1e-12,
+            "settled at the observed model's rate: usd={}",
+            actual.usd
+        );
+    }
+
+    #[test]
+    fn upto_actual_amount_falls_back_to_json_without_inferred_usage() {
+        // Same shape, but inferred_usage None → the JSON pointers drive it.
+        let metering = upto_metering(
+            vec![
+                usage_dim(
+                    MeterDirection::Input,
+                    BillingUnit::Tokens,
+                    1_000_000,
+                    0.10,
+                    Some(response_json("/usage/input_tokens")),
+                ),
+                usage_dim(
+                    MeterDirection::Output,
+                    BillingUnit::Tokens,
+                    1_000_000,
+                    0.30,
+                    Some(response_json("/usage/output_tokens")),
+                ),
+            ],
+            Some(pay_types::metering::UptoMetering {
+                max_usd: Some(0.50),
+                ..Default::default()
+            }),
+        );
+        let body = br#"{"usage":{"input_tokens":12,"output_tokens":214}}"#;
+
+        let actual = upto_actual_amount_from_response(
+            &settlement_plan(metering, 0.50),
+            100_000,
+            &HeaderMap::new(),
+            Some(body),
+        )
+        .unwrap();
+
+        let expected = 12.0 / 1_000_000.0 * 0.10 + 214.0 / 1_000_000.0 * 0.30;
+        assert!((actual.usd - expected).abs() < 1e-12, "usd={}", actual.usd);
     }
 }

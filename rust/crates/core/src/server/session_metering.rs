@@ -573,6 +573,10 @@ fn select_dimensions<'a>(
             return Ok(&variant.dimensions);
         }
 
+        if !metering.dimensions.is_empty() {
+            return Ok(&metering.dimensions);
+        }
+
         return metering
             .variants
             .first()
@@ -803,6 +807,7 @@ endpoints:
                 pay_types::metering::MeterVariant {
                     param: "model".to_string(),
                     value: "gemini-2.5-pro".to_string(),
+                    description: None,
                     dimensions: vec![one_tier_dimension(
                         MeterDirection::Output,
                         BillingUnit::Tokens,
@@ -813,6 +818,7 @@ endpoints:
                 pay_types::metering::MeterVariant {
                     param: "model".to_string(),
                     value: "gemini-2.5-flash".to_string(),
+                    description: None,
                     dimensions: vec![one_tier_dimension(
                         MeterDirection::Output,
                         BillingUnit::QuotaUnits,
@@ -845,6 +851,7 @@ endpoints:
             variants: vec![pay_types::metering::MeterVariant {
                 param: "model".to_string(),
                 value: "default".to_string(),
+                description: None,
                 dimensions: vec![one_tier_dimension(
                     MeterDirection::Usage,
                     BillingUnit::Requests,

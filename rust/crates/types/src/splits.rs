@@ -633,31 +633,22 @@ percent: 2.9
     fn yaml_full_spec_loads() {
         let yaml = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../../pdb/proxy/payment-debugger.yml"
+            "/../../../web-ui/proxy/payment-debugger.yml"
         ))
         .unwrap();
         let spec: crate::metering::ApiSpec = serde_yml::from_str(&yaml).unwrap();
         assert_eq!(spec.name, "payment-debugger");
         assert!(!spec.recipients.is_empty());
         // Check that an endpoint with splits loaded correctly
-        let invoice = spec
+        let checkout = spec
             .endpoints
             .iter()
-            .find(|e| e.path == "api/v1/invoices/pay")
+            .find(|e| e.path == "api/v1/orders/checkout")
             .unwrap();
-        let splits = &invoice.metering.as_ref().unwrap().splits;
-        assert_eq!(splits.len(), 3);
+        let splits = &checkout.metering.as_ref().unwrap().splits;
+        assert_eq!(splits.len(), 1);
         assert_eq!(splits[0].recipient, "vendor");
-        assert_eq!(splits[0].amount, Some(85.0));
-        // Check per-tier splits
-        let compute = spec
-            .endpoints
-            .iter()
-            .find(|e| e.path == "api/v1/compute/run")
-            .unwrap();
-        let tiers = &compute.metering.as_ref().unwrap().dimensions[0].tiers;
-        assert!(!tiers[0].splits.is_empty());
-        assert!(tiers[0].splits[0].percent.is_some());
+        assert_eq!(splits[0].percent, Some(10.0));
     }
 
     #[test]
