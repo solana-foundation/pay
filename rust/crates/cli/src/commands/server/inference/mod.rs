@@ -531,26 +531,12 @@ impl InferenceCommand {
             ));
         }
 
-        // Per-model pricing: validate against the models each provider
-        // actually serves, then overlay it so the picker can show per-model
-        // in/out token rates. Fail BEFORE opening the gateway/TUI, the same
-        // way the sandbox guard does — a typo'd model or a provider that
-        // serves none of the configured models (with no `default`) is a loud
-        // error, not a silently-dropped chip.
+        // Per-model pricing: validate explicit model keys against the union
+        // of discovered models, then ensure each routed provider has at least
+        // one resolved rate (or a default). Fail BEFORE opening the
+        // gateway/TUI, the same way the sandbox guard does.
         if let Some(config) = &pricing_config {
-            let mut errs: Vec<String> = Vec::new();
-            for provider in &discovered {
-                errs.extend(config.validate(provider.slug(), &provider.models));
-                if config.default.is_none()
-                    && !provider.models.iter().any(|m| config.resolve(m).is_some())
-                {
-                    errs.push(format!(
-                        "pricing: no configured model is served by {} and no `default` \
-                         rate is set",
-                        provider.slug()
-                    ));
-                }
-            }
+            let errs = validate_pricing_config_for_discovered(config, &discovered);
             if !errs.is_empty() {
                 return Err(pay_core::Error::Config(errs.join("; ")));
             }
@@ -792,6 +778,34 @@ fn registry_scope<'a>(
         .collect()
 }
 
+fn validate_pricing_config_for_discovered(
+    config: &pricing::PricingConfig,
+    discovered: &[DiscoveredProvider],
+) -> Vec<String> {
+    let available_models: Vec<String> = discovered
+        .iter()
+        .flat_map(|provider| provider.models.iter().cloned())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let mut errs = config.validate("discovered providers", &available_models);
+    if config.default.is_none() {
+        for provider in discovered {
+            if !provider
+                .models
+                .iter()
+                .any(|model| config.resolve(model).is_some())
+            {
+                errs.push(format!(
+                    "pricing: no configured model is served by {} and no `default` rate is set",
+                    provider.slug()
+                ));
+            }
+        }
+    }
+    errs
+}
+
 /// One summary per in-scope registry provider — discovered ones carry
 /// models/version and `up: true`, the rest render as "not detected".
 fn provider_summaries(
@@ -879,15 +893,22 @@ mod tests {
     use super::*;
     use pay_pdb::types::FlowStatus;
 
-    fn discovered_ollama() -> discovery::DiscoveredProvider {
+    fn discovered_provider(
+        provider: Arc<dyn InferenceProvider>,
+        models: &[&str],
+    ) -> discovery::DiscoveredProvider {
         discovery::DiscoveredProvider {
-            provider: Arc::new(providers::ollama::Ollama),
-            base_url: "http://127.0.0.1:11434".into(),
-            models: vec![],
+            provider,
+            base_url: "http://127.0.0.1:9999".into(),
+            models: models.iter().map(|model| (*model).to_string()).collect(),
             version: None,
             pricing: None,
             model_pricing: Vec::new(),
         }
+    }
+
+    fn discovered_ollama() -> discovery::DiscoveredProvider {
+        discovered_provider(Arc::new(providers::ollama::Ollama), &[])
     }
 
     fn state() -> InferenceState {
@@ -957,6 +978,37 @@ mod tests {
         // No pricing = free passthrough, sandbox or not.
         assert!(enforce_pricing_sandbox(None, false).is_ok());
         assert!(enforce_pricing_sandbox(None, true).is_ok());
+    }
+
+    #[test]
+    fn pricing_validation_uses_discovered_model_union() {
+        let config =
+            pricing::PricingConfig::from_inline("gemma4=0.15/0.60,llama3.2=0.1/0.3").unwrap();
+        let discovered = vec![
+            discovered_provider(Arc::new(providers::ollama::Ollama), &["gemma4:latest"]),
+            discovered_provider(Arc::new(providers::lm_studio::LmStudio), &["llama3.2:3b"]),
+        ];
+
+        assert_eq!(
+            validate_pricing_config_for_discovered(&config, &discovered),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn pricing_validation_requires_provider_rate_without_default() {
+        let config = pricing::PricingConfig::from_inline("gemma4=0.15/0.60").unwrap();
+        let discovered = vec![
+            discovered_provider(Arc::new(providers::ollama::Ollama), &["gemma4:latest"]),
+            discovered_provider(Arc::new(providers::lm_studio::LmStudio), &["llama3.2:3b"]),
+        ];
+
+        let errs = validate_pricing_config_for_discovered(&config, &discovered);
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(
+            errs[0].contains("no configured model is served by lm-studio"),
+            "{errs:?}"
+        );
     }
 
     #[test]
