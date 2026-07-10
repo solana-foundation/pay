@@ -12,6 +12,7 @@ pub mod exo;
 pub mod llama_cpp;
 pub mod lm_studio;
 pub mod ollama;
+pub mod remote_gateway;
 pub mod vllm;
 
 use std::sync::Arc;

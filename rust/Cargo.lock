@@ -7220,7 +7220,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
@@ -7956,7 +7956,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -10699,7 +10699,7 @@ dependencies = [
 [[package]]
 name = "solana-pay-kit"
 version = "0.2.0"
-source = "git+https://github.com/solana-foundation/pay-kit?rev=bdaad4f5ea40f365d73be8cf5634555aa5bca677#bdaad4f5ea40f365d73be8cf5634555aa5bca677"
+source = "git+https://github.com/solana-foundation/pay-kit?rev=bb684e4e002a6a59e680d0187eb193f680bfecd1#bb684e4e002a6a59e680d0187eb193f680bfecd1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",

@@ -172,6 +172,7 @@ fn prepare_claude_launch(
         }
     }
     providers.extend(discover_catalog_providers());
+    providers.extend(discover_registry_gateways());
 
     let choice = if providers.is_empty() {
         None
@@ -394,6 +395,68 @@ fn apply_gateway_proxy_fallback(providers: &mut Vec<DiscoveredProvider>) {
     for provider in providers {
         provider.base_url = inference::LOCAL_GATEWAY_BASE_URL.to_string();
     }
+}
+
+/// Remote gateways from `~/.config/pay/inference.yaml` (managed via
+/// `pay inference add/rm/ls`), appended to the picker after local discovery
+/// and the hosted catalog. Each origin is probed for its live discovery
+/// document — models and pricing come from the fresh snapshot so a stale
+/// cache never mislabels a row; unreachable or unparseable origins are
+/// skipped with a debug log, same as catalog entries.
+fn discover_registry_gateways() -> Vec<DiscoveredProvider> {
+    let registry = match crate::commands::inference::registry::InferenceRegistry::load() {
+        Ok(registry) => registry,
+        Err(e) => {
+            tracing::debug!(error = %e, "inference registry unreadable — remote gateways skipped");
+            return Vec::new();
+        }
+    };
+    if registry.gateways.is_empty() {
+        return Vec::new();
+    }
+    let Ok(client) = reqwest::blocking::Client::builder()
+        .timeout(CATALOG_PROBE_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    else {
+        return Vec::new();
+    };
+
+    let mut discovered = Vec::new();
+    for gateway in &registry.gateways {
+        let url = format!(
+            "{}{}",
+            gateway.origin,
+            crate::commands::inference::registry::GATEWAY_CONFIG_PATH
+        );
+        let summaries = client
+            .get(&url)
+            .send()
+            .ok()
+            .filter(|r| r.status().is_success())
+            .and_then(|r| r.json::<GatewayConfig>().ok())
+            .map(|config| config.providers);
+        let Some(summaries) = summaries else {
+            tracing::debug!(origin = %gateway.origin, "registered gateway unreachable — skipping");
+            continue;
+        };
+        for summary in summaries.into_iter().filter(|s| s.up) {
+            let provider = providers::remote_gateway::RemoteGateway::new(
+                summary.slug,
+                summary.title,
+                summary.color,
+            );
+            discovered.push(DiscoveredProvider {
+                provider: Arc::new(provider),
+                base_url: gateway.origin.clone(),
+                models: summary.models,
+                version: summary.version,
+                pricing: None,
+                model_pricing: summary.model_pricing,
+            });
+        }
+    }
+    discovered
 }
 
 /// Hosted pay-catalog providers appended to the picker after local

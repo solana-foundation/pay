@@ -172,11 +172,10 @@ fn x402_upto_payout_for_recipient(
     operator: &str,
 ) -> pay_kit::x402::server::UptoPayout {
     if recipient == operator {
-        pay_kit::x402::server::UptoPayout::OperatorKeepsAll
+        pay_kit::x402::server::UptoPayout::ReceiverKeepsAll
     } else {
         pay_kit::x402::server::UptoPayout::Beneficiary {
             address: recipient.to_string(),
-            operator_fee_bps: 0,
         }
     }
 }
@@ -1324,7 +1323,9 @@ impl StartCommand {
                         description: None,
                         max_timeout_seconds: 300,
                         program_id: None,
-                        operator_signer: signer,
+                        withdraw_delay: 0,
+                        fee_payer_signer: signer,
+                        receiver_authorizer_signer: None,
                     };
                     match pay_kit::x402::server::X402Upto::new(cfg) {
                         Ok(u) => Some(u.with_blockhash_cache(blockhash_cache.clone())),
@@ -3309,7 +3310,7 @@ endpoints:
 
         assert!(matches!(
             payout,
-            pay_kit::x402::server::UptoPayout::OperatorKeepsAll
+            pay_kit::x402::server::UptoPayout::ReceiverKeepsAll
         ));
     }
 
@@ -3319,14 +3320,10 @@ endpoints:
         let payout = x402_upto_payout_for_recipient(recipient, VALID_TEST_KEYPAIR_PUBKEY);
 
         match payout {
-            pay_kit::x402::server::UptoPayout::Beneficiary {
-                address,
-                operator_fee_bps,
-            } => {
+            pay_kit::x402::server::UptoPayout::Beneficiary { address } => {
                 assert_eq!(address, recipient);
-                assert_eq!(operator_fee_bps, 0);
             }
-            pay_kit::x402::server::UptoPayout::OperatorKeepsAll => {
+            pay_kit::x402::server::UptoPayout::ReceiverKeepsAll => {
                 panic!("distinct recipient should be configured as beneficiary")
             }
         }

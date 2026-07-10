@@ -7,6 +7,7 @@ pub mod docs;
 pub mod fetch;
 pub mod help;
 pub mod http;
+pub mod inference;
 pub(crate) mod payer_proxy;
 pub mod qodercli;
 pub mod send;
@@ -75,6 +76,12 @@ pub enum Command {
     Skills {
         #[command(subcommand)]
         command: skills::SkillsCommand,
+    },
+    /// Manage remote inference gateways shown in the `pay claude` picker
+    /// (add, rm, ls). With no subcommand, lists registered gateways.
+    Inference {
+        #[command(subcommand)]
+        command: Option<inference::InferenceCommand>,
     },
     /// Manage MPP `subscription`-intent delegations (list, new, cancel,
     /// status). With no subcommand, lists all subscriptions and prints the
@@ -146,6 +153,7 @@ impl Command {
             | Command::Account { .. }
             | Command::Whoami(_)
             | Command::Skills { .. }
+            | Command::Inference { .. }
             | Command::Subscriptions { .. }
             | Command::Catalog { .. }
             | Command::Install(_)
@@ -169,6 +177,7 @@ impl Command {
             Command::Account { .. }
             | Command::Whoami(_)
             | Command::Skills { .. }
+            | Command::Inference { .. }
             | Command::Subscriptions { .. }
             | Command::Catalog { .. }
             | Command::Install(_)
@@ -214,6 +223,10 @@ impl Command {
             },
             Command::Whoami(cmd) => return cmd.run(network_override, account_override),
             Command::Skills { command } => return command.run(),
+            Command::Inference { command } => match command {
+                Some(cmd) => return cmd.run(),
+                None => return inference::run_default(),
+            },
             Command::Subscriptions { command } => match command {
                 Some(cmd) => return cmd.run(),
                 None => return subscriptions::run_default(),

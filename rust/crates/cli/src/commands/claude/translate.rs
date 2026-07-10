@@ -178,17 +178,114 @@ fn tool_result_text(content: Option<&Value>) -> String {
 }
 
 fn translate_tool(tool: &Value) -> Value {
+    let mut parameters = tool
+        .get("input_schema")
+        .cloned()
+        .unwrap_or_else(|| json!({ "type": "object" }));
+    sanitize_schema(&mut parameters);
     json!({
         "type": "function",
         "function": {
             "name": tool.get("name").cloned().unwrap_or_else(|| json!("")),
             "description": tool.get("description").cloned().unwrap_or_else(|| json!("")),
-            "parameters": tool
-                .get("input_schema")
-                .cloned()
-                .unwrap_or_else(|| json!({ "type": "object" })),
+            "parameters": parameters,
         },
     })
+}
+
+/// Keys whose value is a single subschema.
+const SCHEMA_KEYS: &[&str] = &[
+    "items",
+    "additionalItems",
+    "not",
+    "if",
+    "then",
+    "else",
+    "contains",
+    "propertyNames",
+    "unevaluatedItems",
+    "unevaluatedProperties",
+];
+/// Keys whose value is a map of subschemas.
+const SCHEMA_MAP_KEYS: &[&str] = &["properties", "patternProperties", "$defs", "definitions"];
+/// Keys whose value is a list of subschemas.
+const SCHEMA_LIST_KEYS: &[&str] = &["anyOf", "allOf", "oneOf", "prefixItems"];
+/// Value-constraint keywords that llama.cpp's schema→grammar converter
+/// expands into bounded-repetition GBNF rules. Rich Claude Code / MCP tool
+/// schemas (e.g. `maxLength: 100000`) blow past its repetition sanity cap
+/// ("number of repetitions exceeds sane defaults") or produce huge grammars.
+/// They constrain values, not the tool-call *shape*, so dropping them keeps
+/// tool calling working — the model still honors them from the field
+/// descriptions — while the grammar stays small enough to compile.
+const STRIP_KEYS: &[&str] = &[
+    "minLength",
+    "maxLength",
+    "pattern",
+    "format",
+    "minItems",
+    "maxItems",
+    "uniqueItems",
+    "minProperties",
+    "maxProperties",
+    "minimum",
+    "maximum",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+    "multipleOf",
+];
+
+/// JSON Schema allows `true`/`false` wherever a subschema is expected, and
+/// Claude Code's tool definitions use that form (e.g. `"items": true`).
+/// llama.cpp's schema→grammar converter rejects boolean subschemas with
+/// `400 JSON schema conversion failed: Unrecognized schema: true`, so
+/// rewrite them to the equivalent object form before forwarding:
+/// `true` → `{}`; `false` → `{}` too, trading the (rare, un-satisfiable)
+/// "no value allowed" constraint for an unconstrained one rather than a
+/// hard error. `additionalProperties` keeps `false` — the converter
+/// understands it there and it's load-bearing for strict schemas — while
+/// `additionalProperties: true` is dropped (it's the default).
+fn sanitize_schema(schema: &mut Value) {
+    let Some(obj) = schema.as_object_mut() else {
+        return;
+    };
+    for key in STRIP_KEYS {
+        obj.remove(*key);
+    }
+    match obj.get("additionalProperties") {
+        Some(Value::Bool(true)) => {
+            obj.remove("additionalProperties");
+        }
+        Some(Value::Bool(false)) | None => {}
+        Some(_) => {
+            let ap = obj.get_mut("additionalProperties").unwrap();
+            sanitize_subschema(ap);
+        }
+    }
+    for (key, value) in obj.iter_mut() {
+        if SCHEMA_KEYS.contains(&key.as_str()) {
+            sanitize_subschema(value);
+        } else if SCHEMA_MAP_KEYS.contains(&key.as_str()) {
+            if let Some(map) = value.as_object_mut() {
+                for subschema in map.values_mut() {
+                    sanitize_subschema(subschema);
+                }
+            }
+        } else if SCHEMA_LIST_KEYS.contains(&key.as_str())
+            && let Some(list) = value.as_array_mut()
+        {
+            for subschema in list.iter_mut() {
+                sanitize_subschema(subschema);
+            }
+        }
+    }
+}
+
+fn sanitize_subschema(value: &mut Value) {
+    if value.is_boolean() {
+        *value = json!({});
+    } else {
+        sanitize_schema(value);
+    }
 }
 
 fn translate_tool_choice(tool_choice: &Value) -> Option<Value> {
@@ -669,6 +766,91 @@ mod tests {
         assert_eq!(
             messages[3],
             json!({ "role": "user", "content": "and Oakland?" })
+        );
+    }
+
+    #[test]
+    fn tool_schemas_lose_boolean_subschemas_llama_cpp_rejects() {
+        // Claude Code tool definitions carry JSON-Schema boolean subschemas;
+        // llama.cpp's grammar converter 400s on them ("Unrecognized schema:
+        // true"). They must be rewritten to the object form on the way out.
+        let anthropic = json!({
+            "model": "m",
+            "messages": [],
+            "tools": [{
+                "name": "edit",
+                "input_schema": {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "properties": {
+                        "meta": true,
+                        "tags": { "type": "array", "items": true },
+                        "nested": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": { "extra": false },
+                        },
+                    },
+                    "anyOf": [true, { "type": "string" }],
+                },
+            }],
+        });
+        let openai = anthropic_to_openai_request(&anthropic);
+        let parameters = &openai["tools"][0]["function"]["parameters"];
+        assert_eq!(
+            *parameters,
+            json!({
+                "type": "object",
+                "properties": {
+                    "meta": {},
+                    "tags": { "type": "array", "items": {} },
+                    "nested": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": { "extra": {} },
+                    },
+                },
+                "anyOf": [{}, { "type": "string" }],
+            }),
+            "additionalProperties:true dropped, booleans → {{}}, false kept only on additionalProperties"
+        );
+    }
+
+    #[test]
+    fn tool_schemas_strip_value_constraints_that_blow_up_the_grammar() {
+        // llama.cpp caps grammar repetitions; large maxLength/maxItems and
+        // pattern/format constraints exceed it. They're stripped (structure
+        // and enums survive) so the grammar compiles.
+        let anthropic = json!({
+            "model": "m",
+            "messages": [],
+            "tools": [{
+                "name": "topup",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "url": { "type": "string", "maxLength": 100000, "format": "uri", "pattern": "^https?://" },
+                        "pixels_per_module": { "type": "integer", "minimum": 1, "maximum": 64 },
+                        "tags": { "type": "array", "items": { "type": "string" }, "maxItems": 5000 },
+                        "kind": { "type": "string", "enum": ["a", "b"] },
+                    },
+                },
+            }],
+        });
+        let openai = anthropic_to_openai_request(&anthropic);
+        let parameters = &openai["tools"][0]["function"]["parameters"];
+        assert_eq!(
+            *parameters,
+            json!({
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string" },
+                    "pixels_per_module": { "type": "integer" },
+                    "tags": { "type": "array", "items": { "type": "string" } },
+                    "kind": { "type": "string", "enum": ["a", "b"] },
+                },
+            }),
+            "value constraints stripped recursively; type/enum/structure kept"
         );
     }
 

@@ -243,6 +243,7 @@ fn main() {
                 | Command::Account { .. }
                 | Command::Whoami(_)
                 | Command::Skills { .. }
+                | Command::Inference { .. }
                 | Command::Subscriptions { .. }
                 | Command::Catalog { .. }
                 | Command::Install(_)
