@@ -5,7 +5,7 @@ use reqwest::blocking::Client;
 use tracing::debug;
 
 use crate::client::runner::{self, RunOutcome};
-use crate::{Error, Result};
+use crate::{ClientApp, Error, Result};
 
 /// Raw HTTP response — keeps status, headers, and body together so callers
 /// (e.g. the rich probe pipeline) can both run `classify_402` and extract
@@ -61,15 +61,25 @@ pub fn fetch_request(
     extra_headers: &[(String, String)],
     body: Option<&str>,
 ) -> Result<RunOutcome> {
+    fetch_request_for(ClientApp::Cli, method, url, extra_headers, body)
+}
+
+pub fn fetch_request_for(
+    client_app: ClientApp,
+    method: &str,
+    url: &str,
+    extra_headers: &[(String, String)],
+    body: Option<&str>,
+) -> Result<RunOutcome> {
     let method = Method::from_bytes(method.as_bytes())
         .map_err(|e| Error::Mpp(format!("Invalid HTTP method `{method}`: {e}")))?;
-    let raw = fetch_raw_with_method(method, url, extra_headers, body)?;
+    let raw = fetch_raw_with_method(client_app, method, url, extra_headers, body)?;
     Ok(raw_to_outcome(raw, url))
 }
 
 /// Fetch a URL, detecting 402 + MPP challenges.
 pub fn fetch(url: &str, extra_headers: &[(String, String)]) -> Result<RunOutcome> {
-    let raw = fetch_raw_with_method(Method::GET, url, extra_headers, None)?;
+    let raw = fetch_raw_with_method(ClientApp::Cli, Method::GET, url, extra_headers, None)?;
     Ok(raw_to_outcome(raw, url))
 }
 
@@ -84,9 +94,19 @@ pub fn fetch_raw(
     extra_headers: &[(String, String)],
     body: Option<&str>,
 ) -> Result<RawResponse> {
+    fetch_raw_for(ClientApp::Cli, method, url, extra_headers, body)
+}
+
+pub fn fetch_raw_for(
+    client_app: ClientApp,
+    method: &str,
+    url: &str,
+    extra_headers: &[(String, String)],
+    body: Option<&str>,
+) -> Result<RawResponse> {
     let method = Method::from_bytes(method.as_bytes())
         .map_err(|e| Error::Mpp(format!("Invalid HTTP method `{method}`: {e}")))?;
-    fetch_raw_with_method(method, url, extra_headers, body)
+    fetch_raw_with_method(client_app, method, url, extra_headers, body)
 }
 
 fn raw_to_outcome(raw: RawResponse, url: &str) -> RunOutcome {
@@ -105,13 +125,14 @@ fn raw_to_outcome(raw: RawResponse, url: &str) -> RunOutcome {
 }
 
 fn fetch_raw_with_method(
+    client_app: ClientApp,
     method: Method,
     url: &str,
     extra_headers: &[(String, String)],
     body: Option<&str>,
 ) -> Result<RawResponse> {
     let client = Client::builder()
-        .user_agent(format!("pay/{}", env!("CARGO_PKG_VERSION")))
+        .user_agent(client_app.user_agent())
         .build()
         .map_err(|e| Error::Mpp(format!("Failed to create HTTP client: {e}")))?;
 
@@ -272,6 +293,59 @@ mod tests {
         match result {
             RunOutcome::Completed { body, .. } => {
                 assert_eq!(body.unwrap(), b"test-value");
+            }
+            _ => panic!("Expected Completed"),
+        }
+    }
+
+    #[test]
+    fn fetch_defaults_to_cli_user_agent() {
+        let app = axum::Router::new().route(
+            "/ua",
+            axum::routing::get(|headers: axum::http::HeaderMap| async move {
+                headers
+                    .get("user-agent")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("missing")
+                    .to_string()
+            }),
+        );
+        let base_url = start_server(app);
+
+        let result = fetch(&format!("{base_url}/ua"), &[]).unwrap();
+        match result {
+            RunOutcome::Completed { body, .. } => {
+                assert_eq!(
+                    body.unwrap(),
+                    ClientApp::Cli.user_agent().as_bytes().to_vec()
+                );
+            }
+            _ => panic!("Expected Completed"),
+        }
+    }
+
+    #[test]
+    fn fetch_request_for_sends_mcp_user_agent() {
+        let app = axum::Router::new().route(
+            "/ua",
+            axum::routing::get(|headers: axum::http::HeaderMap| async move {
+                headers
+                    .get("user-agent")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("missing")
+                    .to_string()
+            }),
+        );
+        let base_url = start_server(app);
+
+        let result =
+            fetch_request_for(ClientApp::Mcp, "GET", &format!("{base_url}/ua"), &[], None).unwrap();
+        match result {
+            RunOutcome::Completed { body, .. } => {
+                assert_eq!(
+                    body.unwrap(),
+                    ClientApp::Mcp.user_agent().as_bytes().to_vec()
+                );
             }
             _ => panic!("Expected Completed"),
         }

@@ -575,8 +575,13 @@ fn do_paid_fetch(
         _ => extra_headers.to_vec(),
     };
 
-    let outcome =
-        pay_core::client::fetch::fetch_request(method, url, &initial_headers, body.as_deref())?;
+    let outcome = pay_core::client::fetch::fetch_request_for(
+        pay_core::ClientApp::Mcp,
+        method,
+        url,
+        &initial_headers,
+        body.as_deref(),
+    )?;
 
     match outcome {
         RunOutcome::MppChallenge {
@@ -647,7 +652,8 @@ fn do_paid_fetch(
                     );
                 }
             }
-            interpret_retry(pay_core::client::fetch::fetch_request(
+            interpret_retry(pay_core::client::fetch::fetch_request_for(
+                pay_core::ClientApp::Mcp,
                 method,
                 url,
                 &headers,
@@ -670,7 +676,8 @@ fn do_paid_fetch(
                     .into_iter()
                     .map(|(name, value)| (name.to_string(), value)),
             );
-            interpret_retry(pay_core::client::fetch::fetch_request(
+            interpret_retry(pay_core::client::fetch::fetch_request_for(
+                pay_core::ClientApp::Mcp,
                 method,
                 url,
                 &headers,
@@ -692,7 +699,8 @@ fn do_paid_fetch(
                     .into_iter()
                     .map(|(name, value)| (name.to_string(), value)),
             );
-            interpret_retry(pay_core::client::fetch::fetch_request(
+            interpret_retry(pay_core::client::fetch::fetch_request_for(
+                pay_core::ClientApp::Mcp,
                 method,
                 url,
                 &headers,
@@ -723,8 +731,13 @@ fn do_paid_fetch(
                     .into_iter()
                     .map(|(name, value)| (name.to_string(), value)),
             );
-            let retry =
-                pay_core::client::fetch::fetch_request(method, url, &headers, body.as_deref())?;
+            let retry = pay_core::client::fetch::fetch_request_for(
+                pay_core::ClientApp::Mcp,
+                method,
+                url,
+                &headers,
+                body.as_deref(),
+            )?;
 
             // If sign-in granted access, we're done — credits were spent, no
             // payment made. If the server still refuses (e.g. the wallet has
@@ -748,7 +761,8 @@ fn do_paid_fetch(
                         .into_iter()
                         .map(|(name, value)| (name.to_string(), value)),
                 );
-                interpret_retry(pay_core::client::fetch::fetch_request(
+                interpret_retry(pay_core::client::fetch::fetch_request_for(
+                    pay_core::ClientApp::Mcp,
                     method,
                     url,
                     &headers,
@@ -798,7 +812,8 @@ fn do_paid_fetch(
                 )?;
             let mut headers = extra_headers.to_vec();
             headers.push(("Authorization".to_string(), built.authorization.clone()));
-            let retry = pay_core::client::fetch::fetch_request(
+            let retry = pay_core::client::fetch::fetch_request_for(
+                pay_core::ClientApp::Mcp,
                 method,
                 url,
                 &headers,

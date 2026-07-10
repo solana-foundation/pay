@@ -7,6 +7,7 @@ pub mod instructions;
 pub mod keystore;
 pub mod signer;
 pub mod skills;
+pub mod user_agent;
 
 // Client modules (CLI)
 pub mod client;
@@ -31,6 +32,7 @@ pub mod server;
 pub use config::{Config, LogFormat};
 pub use error::{Error, Result};
 pub use server::{AccountingKey, AccountingStore, InMemoryStore, current_period};
+pub use user_agent::ClientApp;
 
 #[cfg(feature = "server")]
 pub use pay_kit::mpp as solana_mpp;

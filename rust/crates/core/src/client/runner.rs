@@ -6,7 +6,7 @@ use tracing::{debug, info};
 use crate::client::mpp;
 use crate::client::subscription;
 use crate::client::x402;
-use crate::{Error, Result};
+use crate::{ClientApp, Error, Result};
 
 /// The outcome of running a wrapped command.
 #[derive(Debug)]
@@ -144,7 +144,9 @@ fn run_curl_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunO
     let body_file = NamedTempFile::new()?;
     let body_path = body_file.path();
 
-    debug!(args = ?user_args, extra = ?extra_headers, "Running curl");
+    let headers = headers_with_default_user_agent(user_args, extra_headers, ToolKind::Curl);
+
+    debug!(args = ?user_args, extra = ?headers, "Running curl");
 
     // Body goes to `-o body_file` so we can swallow it on 402; stdout is piped
     // so curl's `-w` writeout (which it emits to stdout after the transfer) is
@@ -152,7 +154,7 @@ fn run_curl_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunO
     // '%{http_code}'` silently drops the writeout because we'd discard stdout.
     let mut cmd = Command::new("curl");
     cmd.args(user_args);
-    for h in extra_headers {
+    for h in &headers {
         cmd.arg("-H").arg(h);
     }
     cmd.arg("-D").arg(header_path);
@@ -259,19 +261,21 @@ fn run_wget_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunO
         .iter()
         .any(|a| a == "-S" || a == "--server-response");
 
+    let headers = headers_with_default_user_agent(user_args, extra_headers, ToolKind::Wget);
+
     let mut cmd = Command::new("wget");
     if !has_server_response {
         cmd.arg("--server-response");
     }
     cmd.args(user_args);
-    for h in extra_headers {
+    for h in &headers {
         cmd.arg("--header").arg(h);
     }
     cmd.stdin(Stdio::inherit());
     cmd.stdout(Stdio::inherit());
     cmd.stderr(Stdio::piped());
 
-    debug!(args = ?user_args, extra = ?extra_headers, "Running wget");
+    debug!(args = ?user_args, extra = ?headers, "Running wget");
 
     let output = cmd.output()?;
     let exit_code = output.status.code().unwrap_or(1);
@@ -305,7 +309,9 @@ fn run_httpie_inner(user_args: &[String], extra_headers: &[String]) -> Result<Ru
 
     check_command_exists("http")?;
 
-    debug!(args = ?user_args, extra = ?extra_headers, "Running httpie");
+    let headers = headers_with_default_user_agent(user_args, extra_headers, ToolKind::Httpie);
+
+    debug!(args = ?user_args, extra = ?headers, "Running httpie");
 
     // HTTPie has no `-D <file>` equivalent, so we capture stdout and parse the
     // response status from the first `HTTP/x.y <code>` line. We force two flags
@@ -319,7 +325,7 @@ fn run_httpie_inner(user_args: &[String], extra_headers: &[String]) -> Result<Ru
     let stdin_is_tty = std::io::stdin().is_terminal();
     let mut cmd = Command::new("http");
     cmd.args(user_args);
-    for h in extra_headers {
+    for h in &headers {
         cmd.arg(h);
     }
     cmd.arg("--print=hb");
@@ -817,6 +823,34 @@ enum ToolKind {
     Httpie,
 }
 
+fn headers_with_default_user_agent(
+    args: &[String],
+    extra_headers: &[String],
+    tool: ToolKind,
+) -> Vec<String> {
+    let mut headers = Vec::with_capacity(extra_headers.len() + 1);
+    if !user_already_set_user_agent(args, tool)
+        && !extra_headers
+            .iter()
+            .any(|header| is_header_name(header, "user-agent"))
+    {
+        headers.push(formatted_header(
+            tool,
+            "User-Agent",
+            &ClientApp::Cli.user_agent(),
+        ));
+    }
+    headers.extend(extra_headers.iter().cloned());
+    headers
+}
+
+fn formatted_header(tool: ToolKind, name: &str, value: &str) -> String {
+    match tool {
+        ToolKind::Curl | ToolKind::Wget => format!("{name}: {value}"),
+        ToolKind::Httpie => format!("{name}:{value}"),
+    }
+}
+
 /// Best-effort URL extraction across the three CLI tools we wrap.
 ///
 /// `curl`/`wget` require a fully-qualified URL on the command line —
@@ -911,55 +945,97 @@ fn pre_attach_cached_auth(args: &[String], tool: ToolKind) -> Vec<String> {
     let Some(token) = crate::client::authenticate::cached_header_for_resource(&store, &url) else {
         return Vec::new();
     };
-    let formatted = match tool {
-        ToolKind::Curl | ToolKind::Wget => format!("Authorization: {token}"),
-        ToolKind::Httpie => format!("Authorization:{token}"),
-    };
-    vec![formatted]
+    vec![formatted_header(tool, "Authorization", &token)]
 }
 
 /// True when the user already passed an Authorization header through
 /// the wrapper's args, so we don't clobber it with a cached token.
 fn user_already_set_auth(args: &[String], tool: ToolKind) -> bool {
+    user_already_set_header(args, tool, "authorization")
+}
+
+fn user_already_set_user_agent(args: &[String], tool: ToolKind) -> bool {
+    if user_already_set_header(args, tool, "user-agent") {
+        return true;
+    }
+    let mut iter = args.iter().peekable();
+    while let Some(arg) = iter.next() {
+        match tool {
+            ToolKind::Curl => {
+                if arg == "-A" || arg == "--user-agent" {
+                    return iter.peek().is_some();
+                }
+                if arg.starts_with("-A") && arg.len() > 2 {
+                    return true;
+                }
+                if arg.starts_with("--user-agent=") {
+                    return true;
+                }
+            }
+            ToolKind::Wget => {
+                if arg == "-U" || arg == "--user-agent" {
+                    return iter.peek().is_some();
+                }
+                if arg.starts_with("-U") && arg.len() > 2 {
+                    return true;
+                }
+                if arg.starts_with("--user-agent=") {
+                    return true;
+                }
+            }
+            ToolKind::Httpie => {}
+        }
+    }
+    false
+}
+
+fn user_already_set_header(args: &[String], tool: ToolKind, header_name: &str) -> bool {
     let mut iter = args.iter().peekable();
     while let Some(arg) = iter.next() {
         match tool {
             ToolKind::Curl => {
                 if (arg == "-H" || arg == "--header")
                     && let Some(next) = iter.peek()
-                    && next.to_ascii_lowercase().starts_with("authorization:")
+                    && is_header_name(next, header_name)
                 {
                     return true;
                 }
                 if let Some(val) = arg
                     .strip_prefix("-H")
                     .or_else(|| arg.strip_prefix("--header="))
-                    && val.to_ascii_lowercase().starts_with("authorization:")
+                    && is_header_name(val, header_name)
                 {
                     return true;
                 }
             }
             ToolKind::Wget => {
                 if let Some(val) = arg.strip_prefix("--header=")
-                    && val.to_ascii_lowercase().starts_with("authorization:")
+                    && is_header_name(val, header_name)
                 {
                     return true;
                 }
                 if arg == "--header"
                     && let Some(next) = iter.peek()
-                    && next.to_ascii_lowercase().starts_with("authorization:")
+                    && is_header_name(next, header_name)
                 {
                     return true;
                 }
             }
             ToolKind::Httpie => {
-                if arg.to_ascii_lowercase().starts_with("authorization:") {
+                if is_header_name(arg, header_name) {
                     return true;
                 }
             }
         }
     }
     false
+}
+
+fn is_header_name(header: &str, expected: &str) -> bool {
+    header
+        .split_once(':')
+        .map(|(name, _)| name.trim().eq_ignore_ascii_case(expected))
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -1007,6 +1083,52 @@ mod pre_attach_tests {
     fn user_auth_overrides_httpie_pre_attach() {
         let args = s(&["GET", ":1402/", "Authorization:Bearer existing"]);
         assert!(user_already_set_auth(&args, ToolKind::Httpie));
+    }
+
+    #[test]
+    fn curl_injects_default_cli_user_agent() {
+        let args = s(&["https://example.com"]);
+        let headers = headers_with_default_user_agent(&args, &[], ToolKind::Curl);
+        assert_eq!(
+            headers,
+            vec![format!("User-Agent: {}", ClientApp::Cli.user_agent())]
+        );
+    }
+
+    #[test]
+    fn httpie_injects_default_cli_user_agent_in_request_item_form() {
+        let args = s(&["GET", "example.com"]);
+        let headers = headers_with_default_user_agent(&args, &[], ToolKind::Httpie);
+        assert_eq!(
+            headers,
+            vec![format!("User-Agent:{}", ClientApp::Cli.user_agent())]
+        );
+    }
+
+    #[test]
+    fn user_agent_header_overrides_default_for_wget() {
+        let args = s(&[
+            "--header",
+            "User-Agent: custom-client",
+            "https://example.com",
+        ]);
+        let headers = headers_with_default_user_agent(&args, &[], ToolKind::Wget);
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn curl_user_agent_flag_overrides_default() {
+        let args = s(&["-A", "custom-client", "https://example.com"]);
+        let headers = headers_with_default_user_agent(&args, &[], ToolKind::Curl);
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn extra_user_agent_header_overrides_default() {
+        let args = s(&["https://example.com"]);
+        let extra = s(&["User-Agent: retry-client"]);
+        let headers = headers_with_default_user_agent(&args, &extra, ToolKind::Curl);
+        assert_eq!(headers, extra);
     }
 
     #[test]
