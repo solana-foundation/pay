@@ -20,9 +20,10 @@ pub mod whoami;
 
 use clap::Subcommand;
 use owo_colors::OwoColorize;
+use pay_core::client::receipt;
 use pay_core::client::subscription as sub_client;
 use pay_core::mpp;
-use pay_core::runner::RunOutcome;
+use pay_core::runner::{DecodedPaymentChallenges, RunOutcome};
 use pay_core::x402;
 use pay_core::x402::Challenge as X402Challenge;
 use pay_core::{run_curl_with_headers, run_httpie_with_headers, run_wget_with_headers};
@@ -305,12 +306,14 @@ fn handle_outcome(
         RunOutcome::MppChallenge {
             challenge,
             alternatives,
+            advertised_challenges,
             resource_url,
             // TODO(step2): route `x402_alternative` through
             // `mpp::choose_payment` so CLI auto-pay also falls back to a
             // fundable x402 offer. The MCP `curl` path already does this.
             ..
         } => {
+            print_verbose_challenges(&advertised_challenges, verbose, is_json);
             let req: ChargeRequest = challenge.request.decode().unwrap_or_default();
             let mut challenges = Vec::with_capacity(1 + alternatives.len());
             challenges.push((*challenge).clone());
@@ -387,8 +390,10 @@ fn handle_outcome(
         RunOutcome::SubscriptionChallenge {
             challenge,
             authenticate,
+            advertised_challenges,
             resource_url,
         } => {
+            print_verbose_challenges(&advertised_challenges, verbose, is_json);
             let decoded = match sub_client::decode(&challenge) {
                 Ok(d) => d,
                 Err(e) => {
@@ -487,8 +492,10 @@ fn handle_outcome(
 
         RunOutcome::SessionChallenge {
             challenge,
+            advertised_challenges,
             resource_url,
         } => {
+            print_verbose_challenges(&advertised_challenges, verbose, is_json);
             let req: Option<SessionRequest> = challenge.request.decode().ok();
             let cap_usdc = req
                 .as_ref()
@@ -541,8 +548,10 @@ fn handle_outcome(
 
         RunOutcome::X402Challenge {
             challenge,
+            advertised_challenges,
             resource_url,
         } => {
+            print_verbose_challenges(&advertised_challenges, verbose, is_json);
             if auto_pay {
                 enforce_payment_cap(
                     &challenge.requirements.amount,
@@ -601,8 +610,10 @@ fn handle_outcome(
 
         RunOutcome::X402UptoChallenge {
             challenge,
+            advertised_challenges,
             resource_url,
         } => {
+            print_verbose_challenges(&advertised_challenges, verbose, is_json);
             if auto_pay {
                 // The cap is the authorized ceiling (the channel deposit).
                 enforce_payment_cap(
@@ -660,9 +671,11 @@ fn handle_outcome(
 
         RunOutcome::X402SignInChallenge {
             challenge,
+            advertised_challenges,
             resource_url,
             ..
         } => {
+            print_verbose_challenges(&advertised_challenges, verbose, is_json);
             if auto_pay {
                 if verbose && !is_json {
                     eprintln!("{}", "402 Sign-In Required (x402)".dimmed());
@@ -694,8 +707,10 @@ fn handle_outcome(
 
         RunOutcome::UnknownPaymentRequired {
             headers: _,
+            advertised_challenges,
             resource_url,
         } => {
+            print_verbose_challenges(&advertised_challenges, verbose, is_json);
             if is_json {
                 output::print_json(&serde_json::json!({
                     "status": 402,
@@ -713,8 +728,12 @@ fn handle_outcome(
         }
 
         RunOutcome::PaymentRejected {
-            reason, retryable, ..
+            reason,
+            retryable,
+            advertised_challenges,
+            ..
         } => {
+            print_verbose_challenges(&advertised_challenges, verbose, is_json);
             // First-call rejection: the request already carried an Authorization
             // header (e.g. cached from a previous run) and the server rejected
             // it. There's no point retrying with the same header — surface the
@@ -742,8 +761,12 @@ fn handle_outcome(
         }
 
         RunOutcome::Completed {
-            exit_code, body, ..
+            exit_code,
+            body,
+            response_headers,
+            ..
         } => {
+            print_verbose_receipt(&response_headers, network_override, verbose, is_json);
             if let Some(body) = body {
                 use std::io::Write;
                 let _ = std::io::stdout().write_all(&body);
@@ -753,6 +776,80 @@ fn handle_outcome(
     }
 
     Ok(())
+}
+
+fn print_verbose_challenges(challenges: &DecodedPaymentChallenges, verbose: bool, is_json: bool) {
+    if !verbose || is_json {
+        return;
+    }
+    if let Some(rendered) = render_verbose_challenges(challenges) {
+        eprintln!("{rendered}");
+    }
+}
+
+fn render_verbose_challenges(challenges: &DecodedPaymentChallenges) -> Option<String> {
+    if challenges.is_empty() {
+        return None;
+    }
+    let decoded = serde_json::to_string_pretty(challenges).ok()?;
+    Some(format!("402 payment challenges (decoded):\n{decoded}"))
+}
+
+fn print_verbose_receipt(
+    headers: &[(String, String)],
+    fallback_network: Option<&str>,
+    verbose: bool,
+    is_json: bool,
+) {
+    if !verbose || is_json {
+        return;
+    }
+    if let Some(rendered) = render_verbose_receipt(headers, fallback_network) {
+        eprintln!("\n{rendered}");
+    }
+}
+
+fn render_verbose_receipt(
+    headers: &[(String, String)],
+    fallback_network: Option<&str>,
+) -> Option<String> {
+    let direct_url = response_header(headers, "payment-receipt-url")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let Some(decoded) = receipt::decode_response_receipt(headers) else {
+        return direct_url.map(|url| format!("Receipt: {url}"));
+    };
+    let payload = serde_json::to_string_pretty(&decoded.decoded).ok()?;
+    let mut rendered = format!(
+        "Final payment response ({}, decoded):\n{payload}",
+        decoded.protocol
+    );
+
+    let generated_url = decoded.signature.as_deref().and_then(|signature| {
+        fallback_network
+            .and_then(|network| pay_core::explorer::advanced_tx_url(network, signature))
+            .or_else(|| {
+                decoded
+                    .network
+                    .as_deref()
+                    .and_then(|network| pay_core::explorer::advanced_tx_url(network, signature))
+            })
+            .or_else(|| pay_core::explorer::advanced_tx_url("mainnet", signature))
+    });
+
+    if let Some(url) = direct_url.or(generated_url) {
+        rendered.push_str("\nReceipt: ");
+        rendered.push_str(&url);
+    }
+    Some(rendered)
+}
+
+fn response_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
 }
 
 fn mpp_challenges_within_cap(
@@ -966,9 +1063,14 @@ fn pay_mpp_and_retry(
         eprintln!("{}", "Payment signed, retrying...\n".dimmed());
     }
 
+    let receipt_network = ctx
+        .network_override
+        .map(str::to_string)
+        .or_else(|| mpp_challenge_network(challenge));
+    let verbose = ctx.verbose;
     let retry_outcome =
         retry_with_header(ctx.tool, "Authorization", &auth_header, ctx.fetch_headers)?;
-    handle_retry_outcome(retry_outcome, is_json)
+    handle_retry_outcome(retry_outcome, is_json, verbose, receipt_network.as_deref())
 }
 
 fn pay_subscription_and_retry(
@@ -1008,6 +1110,10 @@ fn pay_subscription_and_retry(
         &built.authorization,
         ctx.fetch_headers,
     )?;
+    let receipt_network = ctx
+        .network_override
+        .map(str::to_string)
+        .or_else(|| mpp_challenge_network(challenge));
 
     // On any 2xx outcome, persist a best-effort local record. The
     // `subscription_id` is the deterministic SubscriptionDelegation PDA
@@ -1032,7 +1138,12 @@ fn pay_subscription_and_retry(
         }
     }
 
-    handle_retry_outcome(retry_outcome, is_json)
+    handle_retry_outcome(
+        retry_outcome,
+        is_json,
+        ctx.verbose,
+        receipt_network.as_deref(),
+    )
 }
 
 // `persist_local_subscription_after_activation` lives in
@@ -1078,6 +1189,31 @@ fn mpp_challenge_currencies(challenges: &[mpp::Challenge]) -> Vec<String> {
             Some(request.currency)
         })
         .collect()
+}
+
+fn mpp_challenge_network(challenge: &mpp::Challenge) -> Option<String> {
+    let request = challenge.request.decode_value().ok()?;
+    request
+        .get("methodDetails")
+        .and_then(|details| details.get("network"))
+        .or_else(|| request.get("network"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+fn x402_receipt_network(
+    network_override: Option<&str>,
+    challenge_network: &str,
+    challenge_cluster: Option<&str>,
+    recent_blockhash: Option<&str>,
+) -> String {
+    if let Some(network) = network_override {
+        return network.to_string();
+    }
+    if recent_blockhash.is_some_and(|hash| hash.starts_with(mpp::SURFPOOL_BLOCKHASH_PREFIX)) {
+        return "localnet".to_string();
+    }
+    challenge_cluster.unwrap_or(challenge_network).to_string()
 }
 
 /// Distinct networks advertised across MPP challenges, used by error messages
@@ -1152,8 +1288,15 @@ fn pay_x402_and_retry(
         eprintln!("{}", "Payment signed, retrying...\n".dimmed());
     }
 
+    let receipt_network = x402_receipt_network(
+        ctx.network_override,
+        &challenge.requirements.network,
+        challenge.requirements.cluster.as_deref(),
+        challenge.requirements.recent_blockhash.as_deref(),
+    );
+    let verbose = ctx.verbose;
     let retry_outcome = retry_with_headers(ctx.tool, &built_payment.headers, ctx.fetch_headers)?;
-    handle_retry_outcome(retry_outcome, is_json)
+    handle_retry_outcome(retry_outcome, is_json, verbose, Some(&receipt_network))
 }
 
 fn pay_upto_and_retry(
@@ -1185,8 +1328,15 @@ fn pay_upto_and_retry(
         eprintln!("{}", "Payment signed, retrying...\n".dimmed());
     }
 
+    let receipt_network = x402_receipt_network(
+        ctx.network_override,
+        &challenge.requirements.network,
+        None,
+        challenge.requirements.extra.recent_blockhash.as_deref(),
+    );
+    let verbose = ctx.verbose;
     let retry_outcome = retry_with_headers(ctx.tool, &built_payment.headers, ctx.fetch_headers)?;
-    handle_retry_outcome(retry_outcome, is_json)
+    handle_retry_outcome(retry_outcome, is_json, verbose, Some(&receipt_network))
 }
 
 fn pay_x402_siwx_and_retry(
@@ -1218,8 +1368,10 @@ fn pay_x402_siwx_and_retry(
         eprintln!("{}", "Sign-in signed, retrying...\n".dimmed());
     }
 
+    let receipt_network = ctx.network_override.map(str::to_string);
+    let verbose = ctx.verbose;
     let retry_outcome = retry_with_headers(ctx.tool, &built_payment.headers, ctx.fetch_headers)?;
-    handle_retry_outcome(retry_outcome, is_json)
+    handle_retry_outcome(retry_outcome, is_json, verbose, receipt_network.as_deref())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1354,8 +1506,11 @@ fn pay_session_and_retry(
         header
     };
 
+    let receipt_network = network_override
+        .map(str::to_string)
+        .or_else(|| mpp_challenge_network(challenge));
     let retry_outcome = retry_with_header(tool, "Authorization", &auth_header, fetch_headers)?;
-    handle_retry_outcome(retry_outcome, is_json)
+    handle_retry_outcome(retry_outcome, is_json, verbose, receipt_network.as_deref())
 }
 
 fn validate_tool_request_before_signing(tool: &Tool) -> pay_core::Result<()> {
@@ -1460,11 +1615,20 @@ fn retry_header_args_httpie(headers_to_add: &[(&str, String)]) -> Vec<String> {
         .collect()
 }
 
-fn handle_retry_outcome(outcome: RunOutcome, is_json: bool) -> pay_core::Result<()> {
+fn handle_retry_outcome(
+    outcome: RunOutcome,
+    is_json: bool,
+    verbose: bool,
+    receipt_network: Option<&str>,
+) -> pay_core::Result<()> {
     match outcome {
         RunOutcome::Completed {
-            exit_code, body, ..
+            exit_code,
+            body,
+            response_headers,
+            ..
         } => {
+            print_verbose_receipt(&response_headers, receipt_network, verbose, is_json);
             if let Some(body) = body {
                 use std::io::Write;
                 let _ = std::io::stdout().write_all(&body);
@@ -1517,6 +1681,119 @@ fn parse_header_args(args: &[String]) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verbose_challenge_rendering_groups_decoded_protocols() {
+        let challenges = DecodedPaymentChallenges {
+            x402: vec![serde_json::json!({
+                "scheme": "upto",
+                "amount": "250000",
+                "asset": "USDC"
+            })],
+            mpp: vec![serde_json::json!({
+                "intent": "charge",
+                "request": { "amount": "10", "currency": "USDC" }
+            })],
+        };
+
+        let rendered = render_verbose_challenges(&challenges).unwrap();
+        assert!(rendered.starts_with("402 payment challenges (decoded):"));
+        assert!(rendered.contains("\"x402\""));
+        assert!(rendered.contains("\"mpp\""));
+        assert!(rendered.contains("\"upto\""));
+        assert!(rendered.contains("\"charge\""));
+    }
+
+    #[test]
+    fn verbose_challenge_rendering_skips_empty_responses() {
+        assert!(render_verbose_challenges(&DecodedPaymentChallenges::default()).is_none());
+    }
+
+    #[test]
+    fn verbose_receipt_rendering_decodes_x402_and_links_advanced_view() {
+        let transaction = "32ETeMZD7wr5g59jZVE4ycW6eNwVi5Rhv9kWAHYVZQAMgLrRjxsWYQcsfZHBFBDFQgE8xDg4tT4uTCPq7X6JVZif";
+        let headers = vec![(
+            "payment-response".to_string(),
+            "eyJzdWNjZXNzIjp0cnVlLCJwYXllciI6IkNIUEVnRjdYMWhZSmY2NG9SeDUzQUJVTDQzRFhwRWpUSkJ6QVltWldOdUtSIiwidHJhbnNhY3Rpb24iOiIzMkVUZU1aRDd3cjVnNTlqWlZFNHljVzZlTndWaTVSaHY5a1dBSFlWWlFBTWdMclJqeHNXWVFjc2ZaSEJGQkRGUWdFOHhEZzR0VDR1VENQcTdYNkpWWmlmIiwibmV0d29yayI6InNvbGFuYTo1ZXlrdDRVc0Z2OFA4TkpkVFJFcFkxdnpxS3FaS3ZkcCIsImFtb3VudCI6IjExIn0=".to_string(),
+        )];
+
+        let rendered = render_verbose_receipt(&headers, Some("sandbox")).unwrap();
+        assert!(rendered.starts_with("Final payment response (x402, decoded):"));
+        assert!(rendered.contains("\"success\": true"));
+        assert!(rendered.contains("\"amount\": \"11\""));
+        assert!(rendered.contains(transaction));
+        assert!(rendered.contains(&format!(
+            "https://pay.sh/receipt/{transaction}?network=sandbox&view=advanced"
+        )));
+    }
+
+    #[test]
+    fn verbose_receipt_rendering_prefers_server_receipt_url() {
+        let headers = vec![
+            (
+                "payment-response".to_string(),
+                "direct-settlement-signature".to_string(),
+            ),
+            (
+                "Payment-Receipt-Url".to_string(),
+                "https://receipts.example/authoritative".to_string(),
+            ),
+        ];
+
+        let rendered = render_verbose_receipt(&headers, Some("sandbox")).unwrap();
+        assert!(rendered.contains("https://receipts.example/authoritative"));
+        assert!(!rendered.contains("pay.sh/receipt"));
+    }
+
+    #[test]
+    fn verbose_receipt_rendering_supports_url_only_response() {
+        let headers = vec![(
+            "payment-receipt-url".to_string(),
+            "https://receipts.example/url-only".to_string(),
+        )];
+
+        assert_eq!(
+            render_verbose_receipt(&headers, None).as_deref(),
+            Some("Receipt: https://receipts.example/url-only")
+        );
+    }
+
+    #[test]
+    fn verbose_receipt_rendering_decodes_mpp_receipt() {
+        let receipt = pay_kit::mpp::ReceiptKind::Charge(pay_kit::mpp::Receipt::success(
+            "solana",
+            "mpp-settlement-signature",
+            "challenge-1",
+        ));
+        let header = pay_kit::mpp::format_receipt(&receipt).unwrap();
+        let headers = vec![("payment-receipt".to_string(), header)];
+
+        let rendered = render_verbose_receipt(&headers, Some("localnet")).unwrap();
+        assert!(rendered.starts_with("Final payment response (mpp, decoded):"));
+        assert!(rendered.contains("\"reference\": \"mpp-settlement-signature\""));
+        assert!(rendered.contains(
+            "https://pay.sh/receipt/mpp-settlement-signature?network=sandbox&view=advanced"
+        ));
+    }
+
+    #[test]
+    fn x402_receipt_network_distinguishes_devnet_from_surfpool() {
+        let devnet = pay_kit::x402::exact::SOLANA_DEVNET;
+        assert_eq!(x402_receipt_network(None, devnet, None, None), devnet);
+        assert_eq!(
+            x402_receipt_network(
+                None,
+                devnet,
+                None,
+                Some("SURFNETxSAFEHASHxxxxxxxxxxxxxxxxxxx18b8dc98"),
+            ),
+            "localnet"
+        );
+        assert_eq!(
+            x402_receipt_network(Some("mainnet"), devnet, None, None),
+            "mainnet"
+        );
+    }
 
     #[test]
     fn parse_header_args_basic() {

@@ -285,6 +285,26 @@ pub fn build_upto_payment(
     account_override: Option<&str>,
     resource_url: Option<&str>,
 ) -> Result<BuiltPayment> {
+    build_upto_payment_with_override(
+        challenge,
+        store,
+        network_override,
+        account_override,
+        resource_url,
+        None,
+    )
+}
+
+/// Variant of [`build_upto_payment`] that accepts an optional auth-gate
+/// override threaded down to the signer.
+pub fn build_upto_payment_with_override(
+    challenge: &UptoChallenge,
+    store: &dyn AccountsStore,
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+    resource_url: Option<&str>,
+    auth_override: crate::signer::AuthOverride,
+) -> Result<BuiltPayment> {
     let requirements = &challenge.requirements;
     let amount = format_amount(&requirements.amount, &requirements.asset);
     let prompt_context = crate::client::prompt::payment_prompt_context(None, &[resource_url]);
@@ -329,7 +349,7 @@ pub fn build_upto_payment(
             account_override,
             &amount,
             &intent,
-            None,
+            auth_override,
         )?;
 
     let rpc_url = std::env::var("PAY_RPC_URL").unwrap_or_else(|_| {

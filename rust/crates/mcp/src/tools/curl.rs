@@ -637,12 +637,14 @@ fn do_paid_fetch(
                     );
                 }
                 ChosenPayment::X402Upto(challenge) => {
-                    let built_payment = pay_core::client::x402::build_upto_payment(
+                    let built_payment =
+                        pay_core::client::x402::build_upto_payment_with_override(
                         challenge.as_ref(),
                         &store,
                         network_override.as_deref(),
                         account_override.as_deref(),
                         Some(url),
+                        make_auth_override(),
                     )?;
                     headers.extend(
                         built_payment
@@ -685,12 +687,13 @@ fn do_paid_fetch(
             )?)
         }
         RunOutcome::X402UptoChallenge { challenge, .. } => {
-            let built_payment = pay_core::client::x402::build_upto_payment(
+            let built_payment = pay_core::client::x402::build_upto_payment_with_override(
                 &challenge,
                 &store,
                 network_override.as_deref(),
                 account_override.as_deref(),
                 Some(url),
+                make_auth_override(),
             )?;
             let mut headers = extra_headers.to_vec();
             headers.extend(

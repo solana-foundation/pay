@@ -121,6 +121,7 @@ fn raw_to_outcome(raw: RawResponse, url: &str) -> RunOutcome {
         exit_code,
         body: Some(raw.body),
         content_type,
+        response_headers: raw.headers,
     }
 }
 
@@ -445,6 +446,29 @@ mod tests {
             } => {
                 assert_eq!(content_type.as_deref(), Some("image/png"));
                 assert_eq!(body.unwrap(), vec![0x89, b'P', b'N', b'G']);
+            }
+            _ => panic!("Expected Completed"),
+        }
+    }
+
+    #[test]
+    fn fetch_completed_preserves_payment_response_header() {
+        let app = axum::Router::new().route(
+            "/paid",
+            axum::routing::get(|| async {
+                ([("payment-response", "encoded-settlement")], "delivered")
+            }),
+        );
+        let base_url = start_server(app);
+
+        let result = fetch(&format!("{base_url}/paid"), &[]).unwrap();
+        match result {
+            RunOutcome::Completed {
+                response_headers, ..
+            } => {
+                assert!(response_headers.iter().any(|(name, value)| {
+                    name.eq_ignore_ascii_case("payment-response") && value == "encoded-settlement"
+                }));
             }
             _ => panic!("Expected Completed"),
         }
