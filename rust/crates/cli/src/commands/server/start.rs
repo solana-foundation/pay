@@ -169,14 +169,13 @@ impl PaymentState for AppState {
 
 fn x402_upto_payout_for_recipient(
     recipient: &str,
-    operator: &str,
+    receiver_authorizer: &str,
 ) -> pay_kit::x402::server::UptoPayout {
-    if recipient == operator {
-        pay_kit::x402::server::UptoPayout::OperatorKeepsAll
+    if recipient == receiver_authorizer {
+        pay_kit::x402::server::UptoPayout::ReceiverKeepsAll
     } else {
         pay_kit::x402::server::UptoPayout::Beneficiary {
             address: recipient.to_string(),
-            operator_fee_bps: 0,
         }
     }
 }
@@ -1311,12 +1310,15 @@ impl StartCommand {
             // settlement vouchers), so it's only available with a fee-payer signer.
             let x402_upto = match (wants_x402, fee_payer_signer.clone()) {
                 (true, Some(signer)) => {
-                    let operator = signer.pubkey().to_string();
+                    let receiver_authorizer = signer.pubkey().to_string();
                     let cfg = pay_kit::x402::server::UptoConfig {
-                        // If the YAML recipient differs from the operator signer,
+                        // If the YAML recipient differs from the receiver signer,
                         // pay the recipient through a bound 100% distribution
-                        // split; otherwise the operator keeps the channel payout.
-                        payout: x402_upto_payout_for_recipient(&recipient, &operator),
+                        // split; otherwise the receiver keeps the channel payout.
+                        payout: x402_upto_payout_for_recipient(
+                            &recipient,
+                            &receiver_authorizer,
+                        ),
                         currencies: x402_currencies.clone(),
                         cluster: network.slug().to_string(),
                         rpc_url: Some(rpc_url.clone()),
@@ -1324,7 +1326,9 @@ impl StartCommand {
                         description: None,
                         max_timeout_seconds: 300,
                         program_id: None,
-                        operator_signer: signer,
+                        withdraw_delay: 0,
+                        fee_payer_signer: signer,
+                        receiver_authorizer_signer: None,
                     };
                     match pay_kit::x402::server::X402Upto::new(cfg) {
                         Ok(u) => Some(u.with_blockhash_cache(blockhash_cache.clone())),
@@ -3303,13 +3307,13 @@ endpoints:
     }
 
     #[test]
-    fn x402_upto_payout_keeps_all_when_recipient_is_operator() {
+    fn x402_upto_payout_keeps_all_when_recipient_is_receiver_authorizer() {
         let payout =
             x402_upto_payout_for_recipient(VALID_TEST_KEYPAIR_PUBKEY, VALID_TEST_KEYPAIR_PUBKEY);
 
         assert!(matches!(
             payout,
-            pay_kit::x402::server::UptoPayout::OperatorKeepsAll
+            pay_kit::x402::server::UptoPayout::ReceiverKeepsAll
         ));
     }
 
@@ -3319,14 +3323,10 @@ endpoints:
         let payout = x402_upto_payout_for_recipient(recipient, VALID_TEST_KEYPAIR_PUBKEY);
 
         match payout {
-            pay_kit::x402::server::UptoPayout::Beneficiary {
-                address,
-                operator_fee_bps,
-            } => {
+            pay_kit::x402::server::UptoPayout::Beneficiary { address } => {
                 assert_eq!(address, recipient);
-                assert_eq!(operator_fee_bps, 0);
             }
-            pay_kit::x402::server::UptoPayout::OperatorKeepsAll => {
+            pay_kit::x402::server::UptoPayout::ReceiverKeepsAll => {
                 panic!("distinct recipient should be configured as beneficiary")
             }
         }

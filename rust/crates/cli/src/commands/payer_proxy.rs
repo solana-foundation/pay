@@ -827,7 +827,7 @@ mod tests {
     /// devnet CAIP-2 (so with no `--sandbox`/`--mainnet` override the payer
     /// lazily mints a throwaway devnet wallet, exactly like the MPP test), the
     /// embedded `recentBlockhash` + `recentSlot` build the open transaction
-    /// with no RPC, and `payTo == facilitatorAddress` so no distribution split
+    /// with no RPC, and `payTo == receiverAuthorizer` so no distribution split
     /// is derived. The blockhash is *not* Surfpool-prefixed, so no auto-fund
     /// network call fires.
     /// Returns the base64 `PAYMENT-REQUIRED` header value the gateway emits.
@@ -843,8 +843,9 @@ mod tests {
                 "payTo": payee,
                 "maxTimeoutSeconds": 300,
                 "extra": {
-                    "assetTransferMethod": "payment-channel",
-                    "facilitatorAddress": payee,
+                    "feePayer": payee,
+                    "receiverAuthorizer": payee,
+                    "withdrawDelay": 900,
                     "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
                     "recentBlockhash": "9zrUHnA1nCByPksy3aL8tQ47vqdaG2vnFs4HrxgcZj4F",
                     "recentSlot": "123456789",

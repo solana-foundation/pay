@@ -6457,7 +6457,6 @@ dependencies = [
  "secret-service",
  "serde",
  "serde_json",
- "shellexpand",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -10700,7 +10699,7 @@ dependencies = [
 [[package]]
 name = "solana-pay-kit"
 version = "0.2.0"
-source = "git+https://github.com/solana-foundation/pay-kit?rev=bdaad4f5ea40f365d73be8cf5634555aa5bca677#bdaad4f5ea40f365d73be8cf5634555aa5bca677"
+source = "git+https://github.com/solana-foundation/pay-kit?rev=66cf5a3ccf2051a937aa08ec978129b3aa004eee#66cf5a3ccf2051a937aa08ec978129b3aa004eee"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -15337,7 +15336,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

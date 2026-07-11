@@ -298,11 +298,11 @@ impl Account {
             Keystore::GnomeKeyring => Some(format!("gnome-keyring:{name}")),
             Keystore::WindowsHello => Some(format!("windows-hello:{name}")),
             Keystore::OnePassword => Some(format!("1password:{name}")),
-            Keystore::File => Some(
-                self.path
-                    .clone()
-                    .unwrap_or_else(|| format!("~/.config/pay/{name}.json")),
-            ),
+            Keystore::File => Some(self.path.clone().unwrap_or_else(|| {
+                FileAccountsStore::default_keypair_path(name)
+                    .to_string_lossy()
+                    .into_owned()
+            })),
             Keystore::Ephemeral => None,
         }
     }
@@ -561,6 +561,13 @@ impl FileAccountsStore {
         Self {
             path: PathBuf::from(shellexpand::tilde(ACCOUNTS_FILE).into_owned()),
         }
+    }
+
+    /// Default owner-only keypair path alongside `accounts.yml`.
+    pub fn default_keypair_path(account_name: &str) -> PathBuf {
+        Self::default_path()
+            .path
+            .with_file_name(format!("{account_name}.json"))
     }
 
     /// Store rooted at an explicit path (used by tests and non-default deployments).
@@ -995,7 +1002,11 @@ mod tests {
         };
         assert_eq!(
             acct.signer_source("myacct"),
-            Some("~/.config/pay/myacct.json".to_string())
+            Some(
+                FileAccountsStore::default_keypair_path("myacct")
+                    .to_string_lossy()
+                    .into_owned()
+            )
         );
     }
 

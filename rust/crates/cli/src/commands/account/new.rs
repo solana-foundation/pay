@@ -263,8 +263,8 @@ fn available_backends_hint() -> &'static str {
     }
 }
 
-pub(super) fn file_backend_path(account_name: &str) -> String {
-    format!("~/.config/pay/{account_name}.json")
+pub(super) fn file_backend_path(account_name: &str) -> std::path::PathBuf {
+    pay_core::accounts::FileAccountsStore::default_keypair_path(account_name)
 }
 
 /// Resolve and preflight the backend before setup performs any unrelated
@@ -553,7 +553,10 @@ mod tests {
 
     #[test]
     fn file_backend_path_matches_account_default() {
-        assert_eq!(file_backend_path("server"), "~/.config/pay/server.json");
+        assert_eq!(
+            file_backend_path("server"),
+            pay_core::accounts::FileAccountsStore::default_keypair_path("server")
+        );
     }
 
     #[test]

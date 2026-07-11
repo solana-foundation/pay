@@ -71,7 +71,7 @@ impl Keystore {
     ///
     /// The file is not encrypted. Callers persisting a mainnet account should
     /// keep `auth_required` enabled so runtime access is approved separately.
-    pub fn file(path: impl AsRef<str>) -> Self {
+    pub fn file(path: impl Into<std::path::PathBuf>) -> Self {
         Self::new(auth::NoAuth, store::FileStore::new(path), false)
     }
 

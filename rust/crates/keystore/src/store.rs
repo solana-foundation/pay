@@ -79,10 +79,8 @@ pub struct FileStore {
 }
 
 impl FileStore {
-    pub fn new(path: impl AsRef<str>) -> Self {
-        Self {
-            path: PathBuf::from(shellexpand::tilde(path.as_ref()).into_owned()),
-        }
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
     }
 
     pub fn path(&self) -> &Path {
@@ -509,7 +507,7 @@ mod tests {
     fn file_store_roundtrips_keypair_and_derived_pubkey() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("pay").join("server.json");
-        let store = FileStore::new(path.to_string_lossy());
+        let store = FileStore::new(path.clone());
         let keypair: Vec<u8> = (0..64).collect();
 
         store.store("keypair:server", &keypair).unwrap();
@@ -549,7 +547,7 @@ mod tests {
     fn file_store_rejects_mismatched_pubkey() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("server.json");
-        let store = FileStore::new(path.to_string_lossy());
+        let store = FileStore::new(path);
         let keypair: Vec<u8> = (0..64).collect();
 
         store.store("keypair:server", &keypair).unwrap();

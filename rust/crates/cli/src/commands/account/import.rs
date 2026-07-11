@@ -83,7 +83,7 @@ impl ImportCommand {
         if backend_id == "file" && ks.exists(&name) {
             return Err(pay_core::Error::Config(format!(
                 "Keypair file {} already exists. Choose another account name or remove the file explicitly before importing.",
-                super::new::file_backend_path(&name)
+                super::new::file_backend_path(&name).display()
             )));
         }
 

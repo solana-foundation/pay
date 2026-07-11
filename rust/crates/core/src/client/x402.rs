@@ -45,7 +45,7 @@ pub struct SiwxAuthChallenge {
 }
 
 /// An x402 `upto` (usage-metered) challenge: authorize a ceiling now, the
-/// operator settles the actual amount after serving.
+/// receiver authorizer settles the actual amount after serving.
 #[derive(Debug, Clone)]
 pub struct UptoChallenge {
     pub requirements: pay_kit::x402::upto::UptoRequirements,
@@ -272,12 +272,12 @@ pub fn parse_upto_accepts(
 }
 
 /// Build a signed x402 `upto` payment: a payment-channel `open` authorization
-/// whose deposit is the authorized ceiling, with the operator as the voucher
-/// signer. The client signs only the open; the operator broadcasts it and
-/// settles the actual metered amount. Mirrors [`build_payment`] — same signer
-/// resolution, surfpool detection, network check and auto-fund — but uses the
-/// server-provided `extra.recentBlockhash` + `extra.recentSlot`, so no RPC
-/// round-trip is needed.
+/// whose deposit is the authorized ceiling. The client signs only the open;
+/// the fee payer co-signs and broadcasts it, and the receiver authorizer signs
+/// settlement for the actual metered amount. Mirrors [`build_payment`] — same
+/// signer resolution, surfpool detection, network check and auto-fund — but
+/// uses the server-provided `extra.recentBlockhash` + `extra.recentSlot`, so no
+/// RPC round-trip is needed.
 pub fn build_upto_payment(
     challenge: &UptoChallenge,
     store: &dyn AccountsStore,
