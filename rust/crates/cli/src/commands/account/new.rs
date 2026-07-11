@@ -58,10 +58,7 @@ pub fn create_account(
     vault: Option<&str>,
     force: bool,
 ) -> pay_core::Result<(String, &'static str)> {
-    let backend_id = match backend {
-        Some(b) => b.to_string(),
-        None => pick_backend()?,
-    };
+    let backend_id = resolve_backend(backend)?;
 
     let (ks, keystore_kind, backend_display, op_info) = build_keystore(&backend_id, vault)?;
 
@@ -172,14 +169,9 @@ fn build_keystore(
 
         #[cfg(target_os = "linux")]
         "gnome-keyring" => {
-            if !Keystore::gnome_keyring_available() {
-                return Err(pay_core::Error::Config(
-                    "GNOME Keyring is not available.".to_string(),
-                ));
-            }
-            crate::commands::setup::install_linux_polkit_policy_if_needed()?;
+            let ks = gnome_keyring_for_account_write()?;
             Ok((
-                Keystore::gnome_keyring(),
+                ks,
                 pay_core::accounts::Keystore::GnomeKeyring,
                 "GNOME Keyring",
                 None,
@@ -250,6 +242,57 @@ fn available_backends_hint() -> &'static str {
     } else {
         "a supported platform backend"
     }
+}
+
+/// Resolve and preflight the backend before setup performs any unrelated
+/// configuration writes.
+pub fn resolve_backend(backend: Option<&str>) -> pay_core::Result<String> {
+    let backend = match backend {
+        Some(backend) => backend.to_string(),
+        None => pick_backend()?,
+    };
+
+    #[cfg(target_os = "linux")]
+    if backend == "gnome-keyring" && !Keystore::gnome_keyring_available() {
+        return Err(gnome_keyring_unavailable_error());
+    }
+
+    Ok(backend)
+}
+
+#[cfg(target_os = "linux")]
+fn gnome_keyring_unavailable_error() -> pay_core::Error {
+    pay_core::Error::Config(
+        "GNOME Keyring Secret Service is not reachable in this session.\n\
+         On a headless Linux server, run and pre-unlock GNOME Keyring as the same service user, \
+         then ensure pay/Hermes inherits that session's DBUS_SESSION_BUS_ADDRESS.\n\
+         Install the `gnome-keyring` package if it is missing, then retry with \
+         `pay setup --backend gnome-keyring`. Pay will not start or unlock the service automatically."
+            .to_string(),
+    )
+}
+
+/// Build the GNOME store for an explicit create/import operation.
+///
+/// A headless process may have an already-unlocked Secret Service but no
+/// Polkit agent. The command itself is explicit consent to write the key, so
+/// skip only this setup-time auth gate. The persisted account remains
+/// `auth_required: true`; runtime MCP signing is still approved via elicitation.
+#[cfg(target_os = "linux")]
+pub(super) fn gnome_keyring_for_account_write() -> pay_core::Result<Keystore> {
+    if !Keystore::gnome_keyring_available() {
+        return Err(gnome_keyring_unavailable_error());
+    }
+
+    if Keystore::gnome_keyring_local_auth_available() {
+        crate::commands::setup::install_linux_polkit_policy_if_needed()?;
+        return Ok(Keystore::gnome_keyring());
+    }
+
+    eprintln!(
+        "Note: No local Polkit prompt is available; using the already-unlocked GNOME Keyring without a setup-time prompt. Runtime signing still requires MCP approval or a configured Polkit agent."
+    );
+    Ok(Keystore::gnome_keyring_no_auth())
 }
 
 /// Resolve which 1Password account to use. If only one account is
@@ -346,6 +389,10 @@ pub fn pick_backend() -> pay_core::Result<String> {
     let options: Vec<Opt> = Vec::new();
 
     if options.is_empty() {
+        #[cfg(target_os = "linux")]
+        return Err(gnome_keyring_unavailable_error());
+
+        #[cfg(not(target_os = "linux"))]
         return Err(pay_core::Error::Config(
             "No supported keystore backend is available on this system.".to_string(),
         ));
@@ -467,6 +514,16 @@ pub fn generate_keypair() -> (Vec<u8>, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unavailable_keyring_error_explains_headless_session_requirements() {
+        let message = gnome_keyring_unavailable_error().to_string();
+
+        assert!(message.contains("Secret Service is not reachable"));
+        assert!(message.contains("pre-unlock"));
+        assert!(message.contains("DBUS_SESSION_BUS_ADDRESS"));
+    }
 
     #[test]
     fn topup_required_body_uses_default_topup_command_for_default_account() {

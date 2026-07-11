@@ -212,9 +212,9 @@ pub(super) fn build_keystore(
 
         #[cfg(target_os = "linux")]
         "gnome-keyring" => {
-            crate::commands::setup::install_linux_polkit_policy_if_needed()?;
+            let ks = super::new::gnome_keyring_for_account_write()?;
             Ok((
-                Keystore::gnome_keyring(),
+                ks,
                 pay_core::accounts::Keystore::GnomeKeyring,
                 "Stored in GNOME Keyring.",
             ))

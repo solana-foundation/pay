@@ -108,10 +108,31 @@ impl Keystore {
         Self::new(linux::Polkit, linux::SecretServiceStore, true)
     }
 
-    /// Check if GNOME Secret Service is available (Linux only).
+    /// GNOME Keyring storage without a local Polkit gate.
+    ///
+    /// This is intended for explicit account setup/import in a headless
+    /// session, or when a higher layer supplies its own authentication gate.
+    /// Runtime signing should keep `auth_required` enabled and provide that
+    /// gate rather than silently bypassing approval.
+    #[cfg(target_os = "linux")]
+    pub fn gnome_keyring_no_auth() -> Self {
+        Self::new(auth::NoAuth, linux::SecretServiceStore, false)
+    }
+
+    /// Check if GNOME Secret Service storage is reachable (Linux only).
     #[cfg(target_os = "linux")]
     pub fn gnome_keyring_available() -> bool {
         linux::SecretServiceStore::is_available()
+    }
+
+    /// Check if this process has a local graphical Polkit prompt path.
+    ///
+    /// This is deliberately separate from Secret Service reachability: a
+    /// headless service can have an unlocked keyring without having any local
+    /// UI that can approve a signing request.
+    #[cfg(target_os = "linux")]
+    pub fn gnome_keyring_local_auth_available() -> bool {
+        linux::Polkit.is_available()
     }
 
     /// Windows Credential Manager + Windows Hello.
@@ -143,7 +164,7 @@ impl Keystore {
         }
         #[cfg(target_os = "linux")]
         {
-            if Self::gnome_keyring_available() {
+            if Self::gnome_keyring_local_auth_available() {
                 return true;
             }
         }
