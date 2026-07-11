@@ -42,8 +42,14 @@ impl ClaudeCommand {
         pay_bin: &str,
         active_account_name: Option<&str>,
         network_override: Option<&str>,
+        alternate_provider: bool,
     ) -> pay_core::Result<i32> {
-        let launch = prepare_claude_launch(&self.args, network_override, active_account_name)?;
+        let launch = prepare_claude_launch(
+            &self.args,
+            alternate_provider,
+            network_override,
+            active_account_name,
+        )?;
 
         let mut mcp_server = serde_json::json!({
             "command": pay_bin,
@@ -132,6 +138,23 @@ struct ClaudeLaunch {
     args: Vec<String>,
 }
 
+fn prepare_claude_launch(
+    args: &[String],
+    alternate_provider: bool,
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+) -> pay_core::Result<ClaudeLaunch> {
+    if !alternate_provider {
+        return Ok(ClaudeLaunch {
+            base_url: None,
+            model: None,
+            args: args.to_vec(),
+        });
+    }
+
+    prepare_alternate_claude_launch(args, network_override, account_override)
+}
+
 /// Decide where Claude Code's traffic goes and put the 402-paying payer
 /// proxy in front of it.
 ///
@@ -147,7 +170,7 @@ struct ClaudeLaunch {
 ///    selected provider directly (e.g. Ollama on :11434) — unmetered
 ///    passthrough, no 402s.
 /// 4. **None of the above** → error with a hint.
-fn prepare_claude_launch(
+fn prepare_alternate_claude_launch(
     args: &[String],
     network_override: Option<&str>,
     account_override: Option<&str>,
@@ -645,6 +668,17 @@ mod tests {
         ] {
             assert!(ALLOWED_TOOLS.split(',').any(|allowed| allowed == tool));
         }
+    }
+
+    #[test]
+    fn native_launch_preserves_args_without_provider_overrides() {
+        let args = vec!["--model".into(), "sonnet".into(), "hello".into()];
+
+        let launch = prepare_claude_launch(&args, false, None, None).unwrap();
+
+        assert_eq!(launch.args, args);
+        assert_eq!(launch.base_url, None);
+        assert_eq!(launch.model, None);
     }
 
     #[test]

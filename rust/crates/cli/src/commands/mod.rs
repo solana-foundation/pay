@@ -203,6 +203,7 @@ impl Command {
         account_override: Option<&str>,
         verbose: bool,
         sandbox: bool,
+        alternate_provider: bool,
     ) -> pay_core::Result<()> {
         let pay_bin = std::env::current_exe()
             .map(|p| p.to_string_lossy().to_string())
@@ -238,9 +239,12 @@ impl Command {
                     .block_on(pay_mcp::run_server(&pay_mcp::McpOptions::default()))
                     .map_err(pay_core::Error::Config);
             }
-            Command::Claude(cmd) => {
-                std::process::exit(cmd.run(&pay_bin, account_override, network_override)?)
-            }
+            Command::Claude(cmd) => std::process::exit(cmd.run(
+                &pay_bin,
+                account_override,
+                network_override,
+                alternate_provider,
+            )?),
             Command::Codex(cmd) => std::process::exit(cmd.run(&pay_bin, account_override)?),
             Command::Qodercli(cmd) => std::process::exit(cmd.run(&pay_bin, account_override)?),
             Command::Docs { command } => return command.run(),
