@@ -11,7 +11,7 @@ pub struct NewCommand {
     pub name: String,
 
     /// Storage backend: "keychain" (macOS), "gnome-keyring" (Linux),
-    /// or "windows-hello" (Windows).
+    /// "windows-hello" (Windows), or "file" (headless fallback).
     #[arg(long)]
     pub backend: Option<String>,
 
@@ -60,7 +60,7 @@ pub fn create_account(
 ) -> pay_core::Result<(String, &'static str)> {
     let backend_id = resolve_backend(backend)?;
 
-    let (ks, keystore_kind, backend_display, op_info) = build_keystore(&backend_id, vault)?;
+    let (ks, keystore_kind, backend_display, op_info) = build_keystore(&backend_id, vault, name)?;
 
     if ks.exists(name) && !force {
         let pubkey = ks
@@ -126,6 +126,7 @@ pub struct OpAccountInfo {
 fn build_keystore(
     backend_id: &str,
     vault: Option<&str>,
+    account_name: &str,
 ) -> pay_core::Result<(
     Keystore,
     pay_core::accounts::Keystore,
@@ -201,6 +202,13 @@ fn build_keystore(
             "Windows Hello is only available on Windows".to_string(),
         )),
 
+        "file" => Ok((
+            Keystore::file(file_backend_path(account_name)),
+            pay_core::accounts::Keystore::File,
+            "owner-only keypair file",
+            None,
+        )),
+
         "1password" => {
             if !Keystore::onepassword_available() {
                 return Err(pay_core::Error::Config(
@@ -233,15 +241,30 @@ fn build_keystore(
 /// Comma-separated list of backends that work on the current OS.
 /// Used in error messages so we don't suggest `keychain` to a Linux user.
 fn available_backends_hint() -> &'static str {
-    if cfg!(target_os = "macos") {
+    #[cfg(target_os = "macos")]
+    {
         "'keychain'"
-    } else if cfg!(target_os = "linux") {
-        "'gnome-keyring'"
-    } else if cfg!(target_os = "windows") {
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if Keystore::gnome_keyring_available() {
+            "'gnome-keyring'"
+        } else {
+            "'file'"
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
         "'windows-hello'"
-    } else {
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
         "a supported platform backend"
     }
+}
+
+pub(super) fn file_backend_path(account_name: &str) -> String {
+    format!("~/.config/pay/{account_name}.json")
 }
 
 /// Resolve and preflight the backend before setup performs any unrelated
@@ -369,7 +392,10 @@ pub fn pick_backend() -> pay_core::Result<String> {
                 label: "GNOME Keyring (password prompt)".into(),
             }]
         } else {
-            Vec::new()
+            vec![Opt {
+                id: "file",
+                label: "Owner-only keypair file (not encrypted)".into(),
+            }]
         }
     };
 
@@ -523,6 +549,11 @@ mod tests {
         assert!(message.contains("Secret Service is not reachable"));
         assert!(message.contains("pre-unlock"));
         assert!(message.contains("DBUS_SESSION_BUS_ADDRESS"));
+    }
+
+    #[test]
+    fn file_backend_path_matches_account_default() {
+        assert_eq!(file_backend_path("server"), "~/.config/pay/server.json");
     }
 
     #[test]

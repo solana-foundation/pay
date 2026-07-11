@@ -67,6 +67,14 @@ impl Keystore {
         Self::new(auth::NoAuth, store::InMemoryStore::new(), false)
     }
 
+    /// Owner-only Solana JSON keypair file without a setup-time auth prompt.
+    ///
+    /// The file is not encrypted. Callers persisting a mainnet account should
+    /// keep `auth_required` enabled so runtime access is approved separately.
+    pub fn file(path: impl AsRef<str>) -> Self {
+        Self::new(auth::NoAuth, store::FileStore::new(path), false)
+    }
+
     /// 1Password via `op` CLI with signout/signin auth cycle.
     pub fn onepassword(account: Option<String>) -> Self {
         Self::new(
