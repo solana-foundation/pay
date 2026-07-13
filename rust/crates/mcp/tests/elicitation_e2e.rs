@@ -1,7 +1,7 @@
 //! End-to-end test for the elicitation-backed auth gate.
 //!
-//! Wires `ElicitationAuth` against a real rmcp client/server pair on an
-//! ephemeral loopback TCP connection. The client auto-accepts (or declines) the
+//! Wires `ElicitationAuth` against a real rmcp client/server pair on a
+//! bounded in-memory duplex connection. The client auto-accepts (or declines) the
 //! elicitation, the server-side gate calls `authenticate()`, and we
 //! assert the result.
 //!
@@ -10,7 +10,6 @@
 //! without needing a real Pay account, real signing, or any
 //! out-of-process server.
 
-use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,11 +20,11 @@ use rmcp::{
     model::*,
     service::{RequestContext, RoleClient},
 };
-use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
 const STEP_TIMEOUT: Duration = Duration::from_secs(5);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+const AUTH_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Minimal server with no tools. We only need it to be alive so we can
 /// take its peer and feed it to `ElicitationAuth`.
@@ -82,44 +81,18 @@ async fn run_with_action(
     Result<(), pay_keystore::Error>,
     Option<CreateElicitationRequestParam>,
 ) {
-    // Use a real OS socket transport, but bind only to an ephemeral loopback
-    // address. This never contacts an external network service.
-    let listener = tokio::time::timeout(STEP_TIMEOUT, TcpListener::bind((Ipv4Addr::LOCALHOST, 0)))
-        .await
-        .expect("loopback listener bind timed out")
-        .expect("loopback listener should bind");
-    let address = listener
-        .local_addr()
-        .expect("loopback listener should have a local address");
-    assert!(address.ip().is_loopback(), "listener must stay on loopback");
+    let (server_transport, client_transport) = tokio::io::duplex(8192);
 
     // `serve()` performs the MCP initialize handshake before it returns. The
     // server side must therefore run concurrently with the client side. The old
-    // harness awaited it here before starting the client, which deadlocked at
-    // initialization and incorrectly blamed tokio::io::duplex.
+    // harness awaited it before starting the client, which deadlocked at
+    // initialization.
     let server_task = tokio::spawn(async move {
-        let (server_transport, remote_address) =
-            tokio::time::timeout(STEP_TIMEOUT, listener.accept())
-                .await
-                .expect("loopback accept timed out")
-                .expect("loopback client should connect");
-        assert!(
-            remote_address.ip().is_loopback(),
-            "client connection must stay on loopback"
-        );
         tokio::time::timeout(STEP_TIMEOUT, BareServer.serve(server_transport))
             .await
             .expect("server initialize handshake timed out")
             .expect("server should serve")
     });
-
-    let client_transport = tokio::time::timeout(STEP_TIMEOUT, TcpStream::connect(address))
-        .await
-        .expect("loopback connect timed out")
-        .expect("client should connect over loopback");
-    client_transport
-        .set_nodelay(true)
-        .expect("loopback transport should enable TCP_NODELAY");
 
     let client_handler = ConfigurableClient::new(action);
     let client = tokio::time::timeout(STEP_TIMEOUT, client_handler.clone().serve(client_transport))
@@ -140,7 +113,7 @@ async fn run_with_action(
     );
 
     let server_peer = server.peer().clone();
-    let auth = ElicitationAuth::new(server_peer);
+    let auth = ElicitationAuth::with_timeout(server_peer, AUTH_TIMEOUT);
     let intent = AuthIntent::authorize_payment("$0.50", "test API call");
 
     // ElicitationAuth's `authenticate` is sync and bridges to async via
@@ -152,12 +125,20 @@ async fn run_with_action(
     let result = match tokio::time::timeout(STEP_TIMEOUT, &mut auth_task).await {
         Ok(join_result) => join_result.expect("auth task should not panic"),
         Err(_) => {
-            // A started `spawn_blocking` task cannot be forcibly aborted. Closing
-            // both transports makes the pending peer request fail closed and lets
-            // the blocking bridge unwind instead of holding the test runtime open.
-            auth_task.abort();
+            // A started `spawn_blocking` task cannot be aborted. Close both
+            // transports, then prove the task unwinds within the cleanup budget.
+            // The gate's explicit two-second deadline is the final fail-closed
+            // bound if the transport does not respond to cancellation.
             let _ = tokio::time::timeout(CLEANUP_TIMEOUT, client.cancel()).await;
             let _ = tokio::time::timeout(CLEANUP_TIMEOUT, server.cancel()).await;
+            let cleanup_result = tokio::time::timeout(CLEANUP_TIMEOUT, &mut auth_task)
+                .await
+                .expect("timed-out auth task did not unwind after transport cancellation")
+                .expect("timed-out auth task should not panic");
+            assert!(
+                cleanup_result.is_err(),
+                "timed-out authorization must fail closed after cancellation"
+            );
             panic!("elicitation auth round-trip timed out");
         }
     };

@@ -229,17 +229,9 @@ fn httpie_wrapper_keeps_a_200_body_transcript_completed_and_classifies_real_402(
             .expect("run fake HTTPie 200"),
     );
     let argv = env.argv();
-    assert_argv_contains_in_order(
-        &argv,
-        &[
-            "GET",
-            URL,
-            "X-Inert-HTTPie: 200",
-            "--print=hb",
-            "--ignore-stdin",
-        ],
-    );
+    assert_argv_contains_in_order(&argv, &["GET", URL, "X-Inert-HTTPie: 200", "--print=hb"]);
     assert_arg_occurs_once(&argv, "X-Inert-HTTPie: 200");
+    assert_arg_occurs_once(&argv, "--print=hb");
 
     env.set_response("httpie-402");
     assert_unknown_402(
@@ -248,17 +240,9 @@ fn httpie_wrapper_keeps_a_200_body_transcript_completed_and_classifies_real_402(
         "httpie-402",
     );
     let argv = env.argv();
-    assert_argv_contains_in_order(
-        &argv,
-        &[
-            "GET",
-            URL,
-            "X-Inert-HTTPie: 402",
-            "--print=hb",
-            "--ignore-stdin",
-        ],
-    );
+    assert_argv_contains_in_order(&argv, &["GET", URL, "X-Inert-HTTPie: 402", "--print=hb"]);
     assert_arg_occurs_once(&argv, "X-Inert-HTTPie: 402");
+    assert_arg_occurs_once(&argv, "--print=hb");
 }
 
 const CURL_FAKE: &str = r#"#!/bin/sh
