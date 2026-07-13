@@ -263,7 +263,7 @@ pub enum PlanStatus {
 /// strings.
 pub fn compute_plan_id_numeric(operator: &str, endpoint_path: &str) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in operator.bytes().chain([b'/']).chain(endpoint_path.bytes()) {
+    for byte in operator.bytes().chain(*b"/").chain(endpoint_path.bytes()) {
         hash ^= byte as u64;
         hash = hash.wrapping_mul(0x100000001b3);
     }
