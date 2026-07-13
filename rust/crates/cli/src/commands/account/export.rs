@@ -64,7 +64,7 @@ impl ExportCommand {
                     pay_core::Error::Config(format!("Failed to write {}: {e}", path))
                 })?;
             }
-            eprintln!("Exported to {} (pubkey: {})", path, &pubkey);
+            eprintln!("Exported to {} (pubkey: {})", path, pubkey);
         }
 
         Ok(())

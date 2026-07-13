@@ -6447,6 +6447,7 @@ dependencies = [
  "pay-types",
  "serde_json",
  "solana-pay-kit",
+ "tempfile",
 ]
 
 [[package]]
@@ -6483,6 +6484,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yml",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
