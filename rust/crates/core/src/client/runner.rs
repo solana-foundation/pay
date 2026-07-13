@@ -730,7 +730,8 @@ pub(crate) fn parse_verification_failure(body: Option<&str>) -> Option<(String, 
 }
 
 fn check_command_exists(cmd: &str) -> Result<()> {
-    match Command::new("which").arg(cmd).output() {
+    let locator = if cfg!(windows) { "where" } else { "which" };
+    match Command::new(locator).arg(cmd).output() {
         Ok(output) if output.status.success() => Ok(()),
         _ => Err(Error::CommandNotFound {
             cmd: cmd.to_string(),
@@ -2239,9 +2240,17 @@ HTTP request sent, awaiting response...
     }
 
     #[test]
-    fn check_command_exists_finds_ls() {
+    #[cfg(unix)]
+    fn check_command_exists_finds_platform_command() {
         // `ls` should exist on any unix system
         assert!(check_command_exists("ls").is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn check_command_exists_finds_platform_command() {
+        // `cmd.exe` and `where.exe` are part of every supported Windows host.
+        assert!(check_command_exists("cmd").is_ok());
     }
 
     #[test]
