@@ -13,10 +13,13 @@ pub mod observer;
 
 pub use http402::Http402Gate;
 
+#[cfg(unix)]
 use async_trait::async_trait;
 use pay_core::PaymentState;
 use pingora::proxy::http_proxy_service;
-use pingora::server::{RunArgs, Server, ShutdownSignal, ShutdownSignalWatch};
+use pingora::server::Server;
+#[cfg(unix)]
+use pingora::server::{RunArgs, ShutdownSignal, ShutdownSignalWatch};
 
 /// Build and run the Pingora gateway on `bind`, fronting `state`'s
 /// [`PaymentGate`] and forwarding control-plane traffic to `control_plane`
@@ -63,6 +66,7 @@ pub fn run<S: PaymentState>(
 /// For callers that own the terminal/process lifecycle — e.g. the inference
 /// TUI, which runs Pingora on a spawned thread and must restore the terminal
 /// after quit. Sends Pingora a fast shutdown (no grace-period sleep).
+#[cfg(unix)]
 pub fn run_with_shutdown<S: PaymentState>(
     state: S,
     bind: &str,
@@ -91,10 +95,25 @@ pub fn run_with_shutdown<S: PaymentState>(
     Ok(())
 }
 
+/// Windows builds fail closed before binding because Pingora 0.5 does not
+/// expose its custom shutdown signal hook outside Unix.
+#[cfg(windows)]
+pub fn run_with_shutdown<S: PaymentState>(
+    _state: S,
+    _bind: &str,
+    _control_plane: String,
+    _threads: Option<usize>,
+    _shutdown: tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    anyhow::bail!("interactive proxy shutdown is not supported on Windows")
+}
+
 /// Pingora shutdown watcher driven by a caller-owned watch channel, with
 /// SIGTERM kept as a fallback so headless `kill` still works.
+#[cfg(unix)]
 struct WatchShutdown(tokio::sync::watch::Receiver<bool>);
 
+#[cfg(unix)]
 #[async_trait]
 impl ShutdownSignalWatch for WatchShutdown {
     async fn recv(&self) -> ShutdownSignal {
