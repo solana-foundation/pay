@@ -1,6 +1,7 @@
 /// Pay client surface making an outbound HTTP request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ClientApp {
+    #[default]
     Cli,
     Mcp,
 }
@@ -15,12 +16,6 @@ impl ClientApp {
 
     pub fn user_agent(self) -> String {
         format!("pay/{}/{}", self.name(), env!("CARGO_PKG_VERSION"))
-    }
-}
-
-impl Default for ClientApp {
-    fn default() -> Self {
-        Self::Cli
     }
 }
 

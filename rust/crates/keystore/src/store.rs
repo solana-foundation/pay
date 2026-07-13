@@ -417,7 +417,7 @@ impl SecretStore for OnePasswordStore {
             "--category=Crypto Wallet",
             &format!("--title={title}"),
             &format!("--tags={OP_TAG}"),
-            &format!("recoveryPhrase[concealed]={}", &*hex),
+            &format!("recoveryPhrase[concealed]={}", *hex),
         ]);
         if !wallet_address.is_empty() {
             cmd.arg(format!("Wallet.wallet address[text]={wallet_address}"));

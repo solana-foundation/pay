@@ -157,8 +157,8 @@ pub fn persist_token(
 pub fn cached_header_for_resource(store: &dyn AccountsStore, resource_url: &str) -> Option<String> {
     let file = store.load().ok()?;
     let now = chrono::Utc::now();
-    for (_network, accounts) in file.accounts.iter() {
-        for (_account, account) in accounts.iter() {
+    for accounts in file.accounts.values() {
+        for account in accounts.values() {
             for sub in account.subscriptions.values() {
                 if !is_token_usable_for(sub, resource_url, now) {
                     continue;
