@@ -59,6 +59,58 @@ jobs:
           workspaces: rust
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # Compile opt-in network coverage without making a public-network request.
+  rust-network-test-feature-compile:
+    name: Rust network_tests feature compile (no run)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Compile the OpenAPI smoke behind network_tests
+        run: >-
+          cargo test -p pay-core --test openapi_resolve_smoke
+          --features network_tests --no-run
+
+  # Compile each OS-specific native path without expanding PR CI to the full workspace.
+  rust-native-platform-compile:
+    name: Rust native paths (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        working-directory: ./rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Compile CLI native paths
+        run: cargo check -p pay --all-targets
+      - name: Test native keystore paths
+        run: cargo test -p pay-keystore
+
+  native-release-artifact-contract:
+    name: Native release artifact contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+      - name: Check npm declarations match the release matrix
+        run: node scripts/check-native-release-artifacts.mjs
+
   # ── Rust tests + coverage ──
   rust-test:
     name: Rust tests + coverage

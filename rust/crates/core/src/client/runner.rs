@@ -2156,6 +2156,27 @@ HTTP request sent, awaiting response...
     }
 
     #[test]
+    fn parse_httpie_200_body_transcript_is_not_a_second_response() {
+        // HTTPie emits the response body after the blank line. That body is
+        // opaque application data, even when it happens to contain a complete
+        // 402 transcript.
+        let raw = "HTTP/1.1 200 OK\nContent-Type: text/plain\n\nupstream transcript:\nHTTP/1.1 402 Payment Required\nWWW-Authenticate: Payment realm=\"offline\"\n\n{\"error\":\"payment required\"}";
+        let (status, headers, body) = parse_httpie_output(raw);
+        assert_eq!(status, Some(200));
+        assert!(
+            headers
+                .iter()
+                .any(|(key, value)| { key == "content-type" && value == "text/plain" })
+        );
+        assert_eq!(
+            body.as_deref(),
+            Some(
+                "upstream transcript:\nHTTP/1.1 402 Payment Required\nWWW-Authenticate: Payment realm=\"offline\"\n\n{\"error\":\"payment required\"}"
+            )
+        );
+    }
+
+    #[test]
     fn parse_httpie_402_response() {
         let raw = "HTTP/1.1 402 Payment Required\nWWW-Authenticate: Payment realm=\"x\"\n\n{\"error\":\"verification_failed\",\"message\":\"bad\",\"retryable\":false}";
         let (status, headers, body) = parse_httpie_output(raw);
