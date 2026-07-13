@@ -35,6 +35,8 @@ pub fn run<S: PaymentState>(
     control_plane: String,
     threads: Option<usize>,
 ) -> anyhow::Result<()> {
+    ensure_proxy_runtime_supported()?;
+
     // rustls 0.23 requires a process-default CryptoProvider. The dependency tree
     // enables BOTH ring (pingora) and aws-lc-rs (reqwest), so rustls can't pick
     // one automatically and pingora's TLS init panics. Install ring (what
@@ -95,9 +97,9 @@ pub fn run_with_shutdown<S: PaymentState>(
     Ok(())
 }
 
-/// Windows builds fail closed before binding because Pingora 0.5 does not
+/// Non-Unix builds fail closed before binding because Pingora 0.5 does not
 /// expose its custom shutdown signal hook outside Unix.
-#[cfg(windows)]
+#[cfg(not(unix))]
 pub fn run_with_shutdown<S: PaymentState>(
     _state: S,
     _bind: &str,
@@ -105,7 +107,17 @@ pub fn run_with_shutdown<S: PaymentState>(
     _threads: Option<usize>,
     _shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    anyhow::bail!("interactive proxy shutdown is not supported on Windows")
+    ensure_proxy_runtime_supported()
+}
+
+#[cfg(unix)]
+fn ensure_proxy_runtime_supported() -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_proxy_runtime_supported() -> anyhow::Result<()> {
+    anyhow::bail!("the Pingora proxy runtime is not supported on this platform")
 }
 
 /// Pingora shutdown watcher driven by a caller-owned watch channel, with
@@ -133,5 +145,19 @@ impl ShutdownSignalWatch for WatchShutdown {
                 _ = sigterm.recv() => return ShutdownSignal::GracefulTerminate,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod platform_tests {
+    use super::ensure_proxy_runtime_supported;
+
+    #[test]
+    fn proxy_runtime_support_is_explicit_for_the_host() {
+        #[cfg(unix)]
+        assert!(ensure_proxy_runtime_supported().is_ok());
+
+        #[cfg(not(unix))]
+        assert!(ensure_proxy_runtime_supported().is_err());
     }
 }
