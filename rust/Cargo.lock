@@ -6484,6 +6484,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yml",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
