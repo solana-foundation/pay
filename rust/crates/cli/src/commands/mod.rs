@@ -188,7 +188,13 @@ enum Tool<'a> {
     Curl(&'a [String]),
     Wget(&'a [String]),
     Http(&'a [String]),
-    Fetch { url: &'a str },
+    Fetch {
+        method: &'a str,
+        url: &'a str,
+        body: Option<&'a pay_core::fetch::RequestBody>,
+        redirect_policy: pay_core::fetch::RedirectPolicy,
+        validation_body: Option<&'a str>,
+    },
 }
 
 impl Command {
@@ -256,17 +262,34 @@ impl Command {
             Command::Wget(cmd) => (pay_core::run_wget(&cmd.args)?, Tool::Wget(&cmd.args)),
             Command::Http(cmd) => (pay_core::run_httpie(&cmd.args)?, Tool::Http(&cmd.args)),
             Command::Fetch(cmd) => {
-                let parsed_headers = parse_header_args(&cmd.headers);
-                pay_core::skills::validate_cached_catalog_request("GET", &cmd.url, None)?;
-                let outcome = pay_core::fetch::fetch(&cmd.url, &parsed_headers)?;
-                let tool = Tool::Fetch { url: &cmd.url };
+                let prepared = cmd.prepare()?;
+                pay_core::skills::validate_cached_catalog_request(
+                    &prepared.method,
+                    &cmd.url,
+                    prepared.validation_body.as_deref(),
+                )?;
+                let outcome = pay_core::fetch::fetch_request_with_body_for(
+                    pay_core::ClientApp::Cli,
+                    &prepared.method,
+                    &cmd.url,
+                    &prepared.headers,
+                    prepared.body.as_ref(),
+                    prepared.redirect_policy,
+                )?;
+                let tool = Tool::Fetch {
+                    method: &prepared.method,
+                    url: &cmd.url,
+                    body: prepared.body.as_ref(),
+                    redirect_policy: prepared.redirect_policy,
+                    validation_body: prepared.validation_body.as_deref(),
+                };
                 return handle_outcome(
                     outcome,
                     &tool,
                     auto_pay,
                     output_fmt,
                     payment_cap,
-                    Some(parsed_headers),
+                    Some(prepared.headers.clone()),
                     network_override,
                     account_override,
                     sandbox,
@@ -1520,7 +1543,12 @@ fn pay_session_and_retry(
 fn validate_tool_request_before_signing(tool: &Tool) -> pay_core::Result<()> {
     match tool {
         Tool::Curl(args) => pay_core::runner::validate_curl_args_against_catalog(args),
-        Tool::Fetch { url } => pay_core::skills::validate_cached_catalog_request("GET", url, None),
+        Tool::Fetch {
+            method,
+            url,
+            validation_body,
+            ..
+        } => pay_core::skills::validate_cached_catalog_request(method, url, *validation_body),
         Tool::Wget(args) => pay_core::runner::validate_wget_args_against_catalog(args),
         // TODO: catalog validation for HTTPie request-item syntax
         // (`Header:Value`, `field=value`, `field:=raw`, …).
@@ -1592,14 +1620,27 @@ fn retry_with_headers(
             let extra = retry_header_args_httpie(headers_to_add);
             run_httpie_with_headers(args, &extra)
         }
-        Tool::Fetch { url, .. } => {
+        Tool::Fetch {
+            method,
+            url,
+            body,
+            redirect_policy,
+            ..
+        } => {
             let mut headers = fetch_headers.unwrap_or_default();
             headers.extend(
                 headers_to_add
                     .iter()
                     .map(|(name, value)| (name.to_string(), value.clone())),
             );
-            pay_core::fetch::fetch(url, &headers)
+            pay_core::fetch::fetch_request_with_body_for(
+                pay_core::ClientApp::Cli,
+                method,
+                url,
+                &headers,
+                *body,
+                *redirect_policy,
+            )
         }
     }
 }
@@ -1670,16 +1711,6 @@ fn handle_retry_outcome(
             std::process::exit(1);
         }
     }
-}
-
-/// Parse "Key: Value" header args into (key, value) pairs.
-fn parse_header_args(args: &[String]) -> Vec<(String, String)> {
-    args.iter()
-        .filter_map(|h| {
-            let (key, value) = h.split_once(':')?;
-            Some((key.trim().to_string(), value.trim().to_string()))
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -1797,51 +1828,6 @@ mod tests {
             x402_receipt_network(Some("mainnet"), devnet, None, None),
             "mainnet"
         );
-    }
-
-    #[test]
-    fn parse_header_args_basic() {
-        let args: Vec<String> = vec![
-            "Content-Type: application/json".to_string(),
-            "Authorization: Bearer token123".to_string(),
-        ];
-        let headers = parse_header_args(&args);
-        assert_eq!(headers.len(), 2);
-        assert_eq!(headers[0].0, "Content-Type");
-        assert_eq!(headers[0].1, "application/json");
-        assert_eq!(headers[1].0, "Authorization");
-        assert_eq!(headers[1].1, "Bearer token123");
-    }
-
-    #[test]
-    fn parse_header_args_empty() {
-        let headers = parse_header_args(&[]);
-        assert!(headers.is_empty());
-    }
-
-    #[test]
-    fn parse_header_args_no_colon() {
-        let args: Vec<String> = vec!["no-colon-here".to_string()];
-        let headers = parse_header_args(&args);
-        assert!(headers.is_empty());
-    }
-
-    #[test]
-    fn parse_header_args_trims_whitespace() {
-        let args: Vec<String> = vec!["  Key  :  Value  ".to_string()];
-        let headers = parse_header_args(&args);
-        assert_eq!(headers.len(), 1);
-        assert_eq!(headers[0].0, "Key");
-        assert_eq!(headers[0].1, "Value");
-    }
-
-    #[test]
-    fn parse_header_args_value_with_colon() {
-        let args: Vec<String> = vec!["Location: https://example.com:8080/path".to_string()];
-        let headers = parse_header_args(&args);
-        assert_eq!(headers.len(), 1);
-        assert_eq!(headers[0].0, "Location");
-        assert_eq!(headers[0].1, "https://example.com:8080/path");
     }
 
     #[test]

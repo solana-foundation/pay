@@ -1,4 +1,5 @@
 use base64::{Engine, engine::general_purpose};
+use pay_core::client::fetch::{RedirectPolicy, RequestBody};
 use rmcp::model::{CallToolResult, Content, RawResource};
 use rmcp::schemars;
 use schemars::JsonSchema;
@@ -6,6 +7,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Params {
     #[schemars(description = "The URL to fetch (e.g. https://api.example.com/data)")]
     pub url: String,
@@ -19,10 +21,13 @@ pub struct Params {
         description = "Request body for POST/PUT/PATCH. Pass either a string or a JSON value; JSON values are serialized before sending and validated locally against cached Pay catalog OpenAPI schemas when available."
     )]
     pub body: Option<BodyParam>,
-    #[schemars(
-        description = "Path to a local file whose contents become the request body. Use this instead of `body` for large payloads you can't inline into the tool call — e.g. a JSON request embedding a base64-encoded image for an image-to-image model. Mutually exclusive with `body`."
-    )]
-    pub body_file: Option<String>,
+
+    // Keep a precise migration error for callers that cached the short-lived
+    // `body_file` schema. This value is never interpreted as a path and is
+    // deliberately omitted from the advertised tool schema.
+    #[serde(default, rename = "body_file")]
+    #[schemars(skip)]
+    deprecated_body_file: Option<Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -38,27 +43,6 @@ impl BodyParam {
             Self::Text(body) => Ok(body),
             Self::Json(value) => serde_json::to_string(&value),
         }
-    }
-}
-
-/// Resolve the outgoing request body from the mutually-exclusive `body`
-/// (inline) and `body_file` (path read from disk) params. `body_file` lets the
-/// caller send a payload too large to inline into a tool call — e.g. a JSON
-/// request embedding a base64-encoded image — by assembling it on disk first.
-fn resolve_body(
-    body: Option<BodyParam>,
-    body_file: Option<String>,
-) -> Result<Option<String>, String> {
-    match (body, body_file) {
-        (Some(_), Some(_)) => Err("Pass either `body` or `body_file`, not both.".to_string()),
-        (Some(inline), None) => inline
-            .into_string()
-            .map(Some)
-            .map_err(|err| format!("Failed to serialize request body: {err}")),
-        (None, Some(path)) => std::fs::read_to_string(&path)
-            .map(Some)
-            .map_err(|err| format!("Failed to read body_file '{path}': {err}")),
-        (None, None) => Ok(None),
     }
 }
 
@@ -82,29 +66,81 @@ pub fn prepare_headers(
     if has_body
         && !headers
             .iter()
-            .any(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+            .any(|(key, _)| key.eq_ignore_ascii_case("content-type"))
     {
         headers.push(("Content-Type".to_string(), "application/json".to_string()));
     }
     headers
 }
 
+fn normalize_http_method(method: Option<&str>) -> Result<String, String> {
+    let method = method.unwrap_or("GET");
+    if method.is_empty() || !method.bytes().all(is_http_token_byte) {
+        return Err(format!(
+            "Invalid HTTP method `{method}`. Use an HTTP token such as GET, POST, PUT, PATCH, or DELETE."
+        ));
+    }
+    Ok(method.to_ascii_uppercase())
+}
+
+fn is_http_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
 pub async fn run(
     params: Params,
     peer: rmcp::Peer<rmcp::service::RoleServer>,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
-    // Resolve the request body from either the inline `body` or `body_file`
-    // (a path read from disk, for payloads too large to inline into a tool call).
-    let body: Option<String> = match resolve_body(params.body.clone(), params.body_file.clone()) {
-        Ok(body) => body,
-        Err(message) => return Ok(super::tool_error(message)),
+    if params.deprecated_body_file.is_some() {
+        return Ok(super::tool_error(
+            "`body_file` is not accepted because an MCP-supplied path could expose arbitrary local files. Use inline `body` for ordinary JSON. For local files, run one filesystem-authorized command such as `pay fetch <URL> --method POST --body-file <PATH>`.",
+        ));
+    }
+
+    let method = match normalize_http_method(params.method.as_deref()) {
+        Ok(method) => method,
+        Err(error) => return Ok(super::tool_error(error)),
     };
-    let headers = prepare_headers(&params.headers, body.is_some());
-    let method = params.method.clone().unwrap_or_else(|| "GET".to_string());
     let url = params.url.clone();
+    let user_headers = params.headers.clone();
+    let inline_body = params.body.clone();
 
     let response = tokio::task::spawn_blocking(move || {
-        do_paid_fetch(&method, &url, &headers, body, Some(peer))
+        let body = inline_body
+            .map(BodyParam::into_string)
+            .transpose()
+            .map_err(|error| {
+                pay_core::Error::RequestValidation(format!(
+                    "Failed to serialize request body: {error}"
+                ))
+            })?
+            .map(RequestBody::text);
+        let headers = prepare_headers(&user_headers, body.is_some());
+        do_paid_fetch(
+            &method,
+            &url,
+            &headers,
+            body.as_ref(),
+            RedirectPolicy::Follow,
+            Some(peer),
+        )
     })
     .await
     .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
@@ -521,12 +557,24 @@ fn do_paid_fetch(
     method: &str,
     url: &str,
     extra_headers: &[(String, String)],
-    body: Option<String>,
+    body: Option<&RequestBody>,
+    redirect_policy: RedirectPolicy,
     peer: Option<rmcp::Peer<rmcp::service::RoleServer>>,
 ) -> Result<PaidFetchResult, pay_core::Error> {
     use pay_core::client::runner::RunOutcome;
 
-    pay_core::skills::validate_cached_catalog_request(method, url, body.as_deref())?;
+    validate_cached_catalog_body(method, url, extra_headers, body)?;
+
+    let fetch_request = |headers: &[(String, String)]| {
+        pay_core::client::fetch::fetch_request_with_body_for(
+            pay_core::ClientApp::Mcp,
+            method,
+            url,
+            headers,
+            body,
+            redirect_policy,
+        )
+    };
 
     // Build a fresh elicitation-backed AuthGate per signing operation when
     // we have a peer AND no local biometric is available. A local Touch ID /
@@ -575,13 +623,7 @@ fn do_paid_fetch(
         _ => extra_headers.to_vec(),
     };
 
-    let outcome = pay_core::client::fetch::fetch_request_for(
-        pay_core::ClientApp::Mcp,
-        method,
-        url,
-        &initial_headers,
-        body.as_deref(),
-    )?;
+    let outcome = fetch_request(&initial_headers)?;
 
     match outcome {
         RunOutcome::MppChallenge {
@@ -654,13 +696,7 @@ fn do_paid_fetch(
                     );
                 }
             }
-            interpret_retry(pay_core::client::fetch::fetch_request_for(
-                pay_core::ClientApp::Mcp,
-                method,
-                url,
-                &headers,
-                body.as_deref(),
-            )?)
+            interpret_retry(fetch_request(&headers)?)
         }
         RunOutcome::X402Challenge { challenge, .. } => {
             let built_payment = pay_core::client::x402::build_payment_with_override(
@@ -678,13 +714,7 @@ fn do_paid_fetch(
                     .into_iter()
                     .map(|(name, value)| (name.to_string(), value)),
             );
-            interpret_retry(pay_core::client::fetch::fetch_request_for(
-                pay_core::ClientApp::Mcp,
-                method,
-                url,
-                &headers,
-                body.as_deref(),
-            )?)
+            interpret_retry(fetch_request(&headers)?)
         }
         RunOutcome::X402UptoChallenge { challenge, .. } => {
             let built_payment = pay_core::client::x402::build_upto_payment_with_override(
@@ -702,13 +732,7 @@ fn do_paid_fetch(
                     .into_iter()
                     .map(|(name, value)| (name.to_string(), value)),
             );
-            interpret_retry(pay_core::client::fetch::fetch_request_for(
-                pay_core::ClientApp::Mcp,
-                method,
-                url,
-                &headers,
-                body.as_deref(),
-            )?)
+            interpret_retry(fetch_request(&headers)?)
         }
         RunOutcome::X402SignInChallenge {
             challenge,
@@ -734,13 +758,7 @@ fn do_paid_fetch(
                     .into_iter()
                     .map(|(name, value)| (name.to_string(), value)),
             );
-            let retry = pay_core::client::fetch::fetch_request_for(
-                pay_core::ClientApp::Mcp,
-                method,
-                url,
-                &headers,
-                body.as_deref(),
-            )?;
+            let retry = fetch_request(&headers)?;
 
             // If sign-in granted access, we're done — credits were spent, no
             // payment made. If the server still refuses (e.g. the wallet has
@@ -764,13 +782,7 @@ fn do_paid_fetch(
                         .into_iter()
                         .map(|(name, value)| (name.to_string(), value)),
                 );
-                interpret_retry(pay_core::client::fetch::fetch_request_for(
-                    pay_core::ClientApp::Mcp,
-                    method,
-                    url,
-                    &headers,
-                    body.as_deref(),
-                )?)
+                interpret_retry(fetch_request(&headers)?)
             } else if let RunOutcome::PaymentRejected { reason, .. } = retry {
                 Err(pay_core::Error::PaymentRejected(reason))
             } else {
@@ -815,13 +827,7 @@ fn do_paid_fetch(
                 )?;
             let mut headers = extra_headers.to_vec();
             headers.push(("Authorization".to_string(), built.authorization.clone()));
-            let retry = pay_core::client::fetch::fetch_request_for(
-                pay_core::ClientApp::Mcp,
-                method,
-                url,
-                &headers,
-                body.as_deref(),
-            )?;
+            let retry = fetch_request(&headers)?;
             if let RunOutcome::Completed { exit_code, .. } = &retry
                 && *exit_code == 0
                 && let Err(e) =
@@ -846,6 +852,50 @@ fn do_paid_fetch(
             ..
         } => Ok((body.unwrap_or_default(), content_type)),
     }
+}
+
+/// Run cached catalog validation when it can faithfully describe the body.
+///
+/// The catalog validator currently validates JSON schemas. Passing non-JSON
+/// text to it as `None` would incorrectly mean "there is no body", while
+/// passing that UTF-8 media would incorrectly parse it as JSON.
+/// Keep method/path/query/body schema validation for JSON and body-less calls,
+/// and skip only the body-schema preflight for non-JSON media.
+fn validate_cached_catalog_body(
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: Option<&RequestBody>,
+) -> Result<(), pay_core::Error> {
+    let Some(body) = body else {
+        return pay_core::skills::validate_cached_catalog_request(method, url, None);
+    };
+
+    let content_type = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        .map(|(_, value)| value.as_str());
+    if !content_type.is_some_and(is_json_media_type) {
+        return Ok(());
+    }
+
+    let text = body.as_text().ok_or_else(|| {
+        pay_core::Error::RequestValidation(
+            "A request declared as JSON contains non-UTF-8 bytes. Stage valid UTF-8 JSON or use the payload's actual content type."
+                .to_string(),
+        )
+    })?;
+    pay_core::skills::validate_cached_catalog_request(method, url, Some(text))
+}
+
+fn is_json_media_type(value: &str) -> bool {
+    let media_type = value
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    media_type == "application/json" || media_type.ends_with("+json")
 }
 
 fn pay_error_to_tool_result(err: pay_core::Error) -> CallToolResult {
@@ -900,6 +950,7 @@ mod tests {
         assert!(params.method.is_none());
         assert!(params.headers.is_none());
         assert!(params.body.is_none());
+        assert!(params.deprecated_body_file.is_none());
     }
 
     #[test]
@@ -944,52 +995,42 @@ mod tests {
     }
 
     #[test]
-    fn resolve_body_inline_text() {
-        let out = resolve_body(Some(BodyParam::Text("hello".to_string())), None).unwrap();
-        assert_eq!(out.as_deref(), Some("hello"));
+    fn method_normalization_matches_wire_method() {
+        assert_eq!(normalize_http_method(Some("post")).unwrap(), "POST");
+        assert_eq!(normalize_http_method(None).unwrap(), "GET");
+        assert!(normalize_http_method(Some("BAD METHOD")).is_err());
     }
 
     #[test]
-    fn resolve_body_inline_json_serialized() {
-        let out = resolve_body(Some(BodyParam::Json(serde_json::json!({"q": 1}))), None).unwrap();
-        assert_eq!(out.as_deref(), Some(r#"{"q":1}"#));
+    fn deprecated_body_file_is_recognized_only_for_a_migration_error() {
+        let params = serde_json::from_str::<Params>(
+            r#"{"url":"https://example.com","body_file":"/home/user/.ssh/id_ed25519"}"#,
+        )
+        .unwrap();
+        assert!(params.deprecated_body_file.is_some());
+
+        let schema = serde_json::to_value(rmcp::schemars::schema_for!(Params)).unwrap();
+        assert!(schema.pointer("/properties/body_file").is_none());
+        assert!(schema.pointer("/properties/body").is_some());
     }
 
     #[test]
-    fn resolve_body_none() {
-        assert_eq!(resolve_body(None, None).unwrap(), None);
+    fn json_media_type_detection_handles_parameters_and_suffixes() {
+        assert!(is_json_media_type("application/json"));
+        assert!(is_json_media_type(
+            "Application/Problem+JSON; charset=utf-8"
+        ));
+        assert!(!is_json_media_type("image/png"));
+        assert!(!is_json_media_type("multipart/form-data; boundary=abc"));
     }
 
     #[test]
-    fn resolve_body_rejects_both() {
-        let err = resolve_body(
-            Some(BodyParam::Text("x".to_string())),
-            Some("/tmp/x".to_string()),
+    fn params_still_reject_unknown_fields() {
+        let error = serde_json::from_str::<Params>(
+            r#"{"url":"https://example.com","read_any_file":"/etc/passwd"}"#,
         )
         .unwrap_err();
-        assert!(err.contains("not both"));
-    }
-
-    #[test]
-    fn resolve_body_reads_file() {
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "pay-curl-bodyfile-test-{}.json",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::write(&path, r#"{"from":"file"}"#).unwrap();
-        let out = resolve_body(None, Some(path.to_string_lossy().into_owned())).unwrap();
-        assert_eq!(out.as_deref(), Some(r#"{"from":"file"}"#));
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn resolve_body_missing_file_errors() {
-        let err = resolve_body(None, Some("/no/such/file.json".to_string())).unwrap_err();
-        assert!(err.contains("Failed to read body_file"));
+        assert!(error.to_string().contains("unknown field `read_any_file`"));
     }
 
     #[test]
@@ -1056,7 +1097,7 @@ mod tests {
 
     #[test]
     fn do_paid_fetch_returns_error_for_invalid_url() {
-        let result = do_paid_fetch("GET", "not-a-url", &[], None, None);
+        let result = do_paid_fetch("GET", "not-a-url", &[], None, RedirectPolicy::Follow, None);
         assert!(result.is_err());
     }
 

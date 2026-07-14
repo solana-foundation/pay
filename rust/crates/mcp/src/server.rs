@@ -43,6 +43,12 @@ them with upstream API hosts.
 request and `Content-Type: application/json` is added when no content type is
 provided.
 
+The MCP tool never accepts or reads a caller-provided filesystem path. For a
+large, binary, or multipart local body, run one filesystem-authorized command:
+`pay fetch <URL> --method <METHOD> --body-file <PATH>` or use `--form` and
+`--form-file`. Pay snapshots local files once and reuses the exact bytes for a
+402 retry.
+
 For URLs that match a cached Pay catalog endpoint with an inlined OpenAPI
 document, Pay validates the method and JSON request body locally before sending.
 If required fields or types are wrong, the tool returns a clear validation error
