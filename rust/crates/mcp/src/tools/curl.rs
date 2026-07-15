@@ -5,6 +5,8 @@ use rmcp::schemars;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
+use std::fs::File;
+use std::io::Read;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
@@ -209,14 +211,11 @@ async fn approved_body_file(
 
     let path = file.path.clone();
     let expected = file.identity;
-    let (body, content_type) = tokio::task::spawn_blocking(move || {
-        let (body, content_type) = RequestBody::from_file(&path)?;
-        ensure_body_file_unchanged(&path, expected)?;
-        Ok::<_, pay_core::Error>((body, content_type))
-    })
-    .await
-    .map_err(|error| format!("Could not read approved request body file: {error}"))?
-    .map_err(|error| error.to_string())?;
+    let (body, content_type) =
+        tokio::task::spawn_blocking(move || snapshot_approved_body_file(&path, expected))
+            .await
+            .map_err(|error| format!("Could not read approved request body file: {error}"))?
+            .map_err(|error| error.to_string())?;
     Ok(ApprovedBodyFile { body, content_type })
 }
 
@@ -227,10 +226,11 @@ struct ResolvedBodyFile {
     identity: BodyFileIdentity,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 struct BodyFileIdentity {
     bytes: u64,
     modified: SystemTime,
+    handle: same_file::Handle,
 }
 
 fn resolve_body_file_path(
@@ -317,37 +317,68 @@ fn resolve_body_file_path(
             path.display()
         )
     })?;
+    let handle = same_file::Handle::from_path(&canonical_file).map_err(|error| {
+        format!(
+            "Could not open `body_file` `{}` for approval: {error}",
+            canonical_file.display()
+        )
+    })?;
     Ok(ResolvedBodyFile {
         path: canonical_file,
         bytes: metadata.len(),
         identity: BodyFileIdentity {
             bytes: metadata.len(),
             modified,
+            handle,
         },
     })
 }
 
-fn ensure_body_file_unchanged(
+fn snapshot_approved_body_file(
     path: &std::path::Path,
     expected: BodyFileIdentity,
-) -> pay_core::Result<()> {
-    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+) -> pay_core::Result<(RequestBody, String)> {
+    let mut file = File::open(path).map_err(|error| {
         pay_core::Error::RequestValidation(format!(
-            "Could not recheck approved `body_file` `{}`: {error}",
+            "Could not open approved `body_file` `{}`: {error}",
             path.display()
         ))
     })?;
-    let unchanged = metadata.file_type().is_file()
-        && !metadata.file_type().is_symlink()
+    let handle = same_file::Handle::from_file(file.try_clone().map_err(|error| {
+        pay_core::Error::RequestValidation(format!(
+            "Could not verify approved `body_file` `{}`: {error}",
+            path.display()
+        ))
+    })?)
+    .map_err(|error| {
+        pay_core::Error::RequestValidation(format!(
+            "Could not verify approved `body_file` `{}`: {error}",
+            path.display()
+        ))
+    })?;
+    let metadata = file.metadata()?;
+    let unchanged = handle == expected.handle
+        && metadata.file_type().is_file()
         && metadata.len() == expected.bytes
         && metadata.modified().ok() == Some(expected.modified);
-    if unchanged {
-        Ok(())
-    } else {
-        Err(pay_core::Error::RequestValidation(
+    if !unchanged {
+        return Err(pay_core::Error::RequestValidation(
             "The local file changed after approval. Review and retry the request.".to_string(),
-        ))
+        ));
     }
+    let mut bytes = Vec::with_capacity(expected.bytes as usize);
+    file.take(pay_core::client::fetch::MAX_REQUEST_BODY_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > pay_core::client::fetch::MAX_REQUEST_BODY_BYTES {
+        return Err(pay_core::Error::RequestValidation(
+            "The local file exceeds the 64 MiB upload limit.".to_string(),
+        ));
+    }
+    let content_type = mime_guess::from_path(path)
+        .first_raw()
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    Ok((RequestBody::bytes(bytes), content_type))
 }
 
 fn mcp_root_path(root: &Root) -> Result<PathBuf, String> {
@@ -1266,7 +1297,34 @@ mod tests {
         let file = resolve_body_file_path("payload.json", &[root]).unwrap();
         std::fs::write(&path, b"changed").unwrap();
 
-        assert!(ensure_body_file_unchanged(&file.path, file.identity).is_err());
+        assert!(snapshot_approved_body_file(&file.path, file.identity).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn swapped_root_cannot_redirect_an_approved_file() {
+        use std::os::unix::fs::symlink;
+
+        let outer = tempfile::tempdir().unwrap();
+        let root_path = outer.path().join("root");
+        let moved_root = outer.path().join("moved-root");
+        let outside = outer.path().join("outside");
+        std::fs::create_dir(&root_path).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(root_path.join("payload"), b"approved").unwrap();
+        std::fs::write(outside.join("payload"), b"outside!").unwrap();
+        let root = Root {
+            uri: reqwest::Url::from_directory_path(&root_path)
+                .unwrap()
+                .to_string(),
+            name: Some("workspace".to_string()),
+        };
+
+        let file = resolve_body_file_path("payload", &[root]).unwrap();
+        std::fs::rename(&root_path, &moved_root).unwrap();
+        symlink(&outside, &root_path).unwrap();
+
+        assert!(snapshot_approved_body_file(&file.path, file.identity).is_err());
     }
 
     #[test]
