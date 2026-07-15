@@ -23,7 +23,7 @@ pub struct Params {
     )]
     pub body: Option<BodyParam>,
     #[schemars(
-        description = "Local file to use as the request body. The path must be within an MCP client-declared filesystem root. Pay asks the user to approve the file, size, method, and destination before reading it. Cannot be combined with body."
+        description = "Local file to use as the request body. The path must be within an MCP client-declared filesystem root. Pay snapshots the file and asks the user to approve its size, method, and destination before sending it. Cannot be combined with body."
     )]
     pub body_file: Option<String>,
 }
@@ -189,10 +189,9 @@ struct ApprovedBodyFile {
     content_type: String,
 }
 
-/// Resolve a local body path against the roots the MCP client explicitly
-/// delegated to this server, obtain user approval, then snapshot the file.
-/// The snapshot (rather than the path) goes to the HTTP layer so a 402 retry
-/// cannot read a different version of the file.
+/// Resolve and snapshot a local body file before asking the user to approve
+/// its exact contents. The approved snapshot, rather than the path, goes to
+/// the HTTP layer so a 402 retry cannot read a different version of the file.
 async fn approved_body_file(
     peer: &rmcp::Peer<rmcp::service::RoleServer>,
     requested_path: &str,
@@ -208,24 +207,18 @@ async fn approved_body_file(
     let display_path = file.path.display().to_string();
     crate::auth::confirm_file_upload(peer, &display_path, file.bytes, method, &destination).await?;
 
-    let path = file.path;
-    let expected_bytes = file.bytes;
-    let (body, content_type) = tokio::task::spawn_blocking(move || RequestBody::from_file(&path))
-        .await
-        .map_err(|error| format!("Could not read approved request body file: {error}"))?
-        .map_err(|error| error.to_string())?;
-    if body.as_bytes().len() as u64 != expected_bytes {
-        return Err(
-            "The local file changed after approval. Review and retry the request.".to_string(),
-        );
-    }
-    Ok(ApprovedBodyFile { body, content_type })
+    Ok(ApprovedBodyFile {
+        body: file.body,
+        content_type: file.content_type,
+    })
 }
 
 #[derive(Debug)]
 struct ResolvedBodyFile {
     path: PathBuf,
     bytes: u64,
+    body: RequestBody,
+    content_type: String,
 }
 
 fn resolve_body_file_path(
@@ -306,9 +299,13 @@ fn resolve_body_file_path(
         ));
     }
 
+    let (body, content_type) = RequestBody::from_file(&path)
+        .map_err(|error| format!("Could not read `body_file` `{}`: {error}", path.display()))?;
     Ok(ResolvedBodyFile {
         path,
-        bytes: metadata.len(),
+        bytes: body.as_bytes().len() as u64,
+        body,
+        content_type,
     })
 }
 
@@ -1211,6 +1208,25 @@ mod tests {
         let file = resolve_body_file_path("photo.png", &[root]).unwrap();
         assert_eq!(file.path, std::fs::canonicalize(path).unwrap());
         assert_eq!(file.bytes, 11);
+        assert_eq!(file.body.as_bytes(), b"image bytes");
+    }
+
+    #[test]
+    fn body_file_uses_the_snapshot_that_was_presented_for_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("payload.json");
+        std::fs::write(&path, br#"{"approved":true}"#).unwrap();
+        let root = Root {
+            uri: reqwest::Url::from_directory_path(dir.path())
+                .unwrap()
+                .to_string(),
+            name: Some("workspace".to_string()),
+        };
+
+        let file = resolve_body_file_path("payload.json", &[root]).unwrap();
+        std::fs::write(&path, br#"{"replaced":true}"#).unwrap();
+
+        assert_eq!(file.body.as_bytes(), br#"{"approved":true}"#);
     }
 
     #[test]
