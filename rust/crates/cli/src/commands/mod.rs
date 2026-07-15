@@ -1782,6 +1782,7 @@ fn validate_tool_request_before_signing(tool: &Tool) -> pay_core::Result<()> {
         Tool::Fetch {
             method,
             url,
+            body,
             validation_body,
             ..
         } if body.is_some() && validation_body.is_none() => {
