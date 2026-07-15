@@ -3126,11 +3126,20 @@ mod tests {
                 &[("name".to_string(), "photo".to_string())],
                 None,
                 false,
+                Some("application/json"),
             ),
             RequestValidationOutcome::Valid
         );
         assert!(matches!(
-            validate_request_with_body_validation(&doc, "POST", "/upload", &[], None, false),
+            validate_request_with_body_validation(
+                &doc,
+                "POST",
+                "/upload",
+                &[],
+                None,
+                false,
+                Some("application/json"),
+            ),
             RequestValidationOutcome::Invalid(_)
         ));
     }
