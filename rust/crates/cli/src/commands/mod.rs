@@ -879,6 +879,7 @@ fn render_verbose_receipt(
             payment.and_then(|payment| payment.scheme),
         )
     );
+    let title = crate::components::terminal::sanitize_terminal_text(&title);
     let body = if let Some(url) = direct_url {
         crate::components::link_with_arrow("Link to receipt", &url)
     } else if let Some(signature) = decoded.signature.as_deref() {
@@ -2157,6 +2158,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rendered.title, "0.000011 USDC paid via x402 / exact");
+    }
+
+    #[test]
+    fn receipt_title_strips_server_supplied_terminal_controls() {
+        let headers = vec![(
+            "payment-response".to_string(),
+            r#"{"amount":"11","asset":"USDC\u001b","scheme":"exact\u0007"}"#.to_string(),
+        )];
+
+        let rendered = render_verbose_receipt(&headers, None, None).unwrap();
+
+        assert!(!rendered.title.contains('\u{1b}'));
+        assert!(!rendered.title.contains('\u{7}'));
+        assert_eq!(rendered.title, "11 USDC paid via x402 / exact");
     }
 
     #[test]

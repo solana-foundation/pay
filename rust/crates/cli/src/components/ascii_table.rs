@@ -2,6 +2,8 @@
 //!
 //! Tables use at most 78 columns, leaving room for a two-column notice rail.
 
+use super::terminal::sanitize_terminal_text;
+
 const MAX_TABLE_WIDTH: usize = 78;
 const MAX_CELL_WIDTH: usize = 48;
 
@@ -82,7 +84,7 @@ where
 }
 
 fn abbreviate(value: &str, width: usize) -> String {
-    let value = value.replace(['\r', '\n'], " ");
+    let value = sanitize_terminal_text(value);
     if display_width(&value) <= width {
         return value;
     }
@@ -112,5 +114,19 @@ mod tests {
         assert!(table.contains("challenge.amount"));
         assert!(table.contains("..."));
         assert!(table.lines().all(|line| display_width(line) <= 80));
+    }
+
+    #[test]
+    fn strips_terminal_controls_from_cells_before_rendering() {
+        let table = render_table(
+            &["Field"],
+            &[vec![
+                "safe\u{1b}]8;;https://evil.example\u{1b}\\text\u{7}".to_string(),
+            ]],
+        );
+
+        assert!(!table.contains('\u{1b}'));
+        assert!(!table.contains('\u{7}'));
+        assert!(table.contains("safe]8;;https://evil.example\\text"));
     }
 }

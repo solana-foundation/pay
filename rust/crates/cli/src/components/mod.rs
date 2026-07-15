@@ -7,6 +7,7 @@ pub mod help;
 pub mod link;
 pub mod log_format;
 pub mod notice;
+pub(crate) mod terminal;
 
 pub use account::{
     explorer_link, format_account_header, print_balance_unavailable, print_balances,
