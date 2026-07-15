@@ -338,7 +338,7 @@ fn snapshot_approved_body_file(
     path: &std::path::Path,
     expected: BodyFileIdentity,
 ) -> pay_core::Result<(RequestBody, String)> {
-    let mut file = File::open(path).map_err(|error| {
+    let file = File::open(path).map_err(|error| {
         pay_core::Error::RequestValidation(format!(
             "Could not open approved `body_file` `{}`: {error}",
             path.display()
