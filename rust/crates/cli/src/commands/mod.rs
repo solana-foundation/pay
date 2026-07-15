@@ -870,6 +870,7 @@ struct ReceiptDisplayContext<'a> {
 #[derive(Clone, Copy)]
 enum ReceiptProvenance<'a> {
     InitialRequest,
+    NonPaymentRetry,
     PaidRetry(Option<ReceiptDisplayContext<'a>>),
 }
 
@@ -880,6 +881,7 @@ fn render_receipt_for_completion(
 ) -> Option<ReceiptNotice> {
     match provenance {
         ReceiptProvenance::InitialRequest => None,
+        ReceiptProvenance::NonPaymentRetry => None,
         ReceiptProvenance::PaidRetry(payment) => {
             render_verbose_receipt(headers, fallback_network, payment)
         }
@@ -1264,7 +1266,7 @@ fn pay_mpp_and_retry(
         is_json,
         verbose,
         receipt_network.as_deref(),
-        None,
+        ReceiptProvenance::PaidRetry(None),
     )
 }
 
@@ -1338,7 +1340,7 @@ fn pay_subscription_and_retry(
         is_json,
         ctx.verbose,
         receipt_network.as_deref(),
-        None,
+        ReceiptProvenance::PaidRetry(None),
     )
 }
 
@@ -1497,10 +1499,10 @@ fn pay_x402_and_retry(
         is_json,
         verbose,
         Some(&receipt_network),
-        Some(ReceiptDisplayContext {
+        ReceiptProvenance::PaidRetry(Some(ReceiptDisplayContext {
             asset: Some(&challenge.requirements.currency),
             scheme: Some("exact"),
-        }),
+        })),
     )
 }
 
@@ -1549,10 +1551,10 @@ fn pay_upto_and_retry(
         is_json,
         verbose,
         Some(&receipt_network),
-        Some(ReceiptDisplayContext {
+        ReceiptProvenance::PaidRetry(Some(ReceiptDisplayContext {
             asset: Some(&challenge.requirements.asset),
             scheme: Some("upto"),
-        }),
+        })),
     )
 }
 
@@ -1627,7 +1629,7 @@ fn pay_x402_siwx_and_retry(
         is_json,
         verbose,
         receipt_network.as_deref(),
-        None,
+        ReceiptProvenance::NonPaymentRetry,
     )
 }
 
@@ -1772,7 +1774,7 @@ fn pay_session_and_retry(
         is_json,
         verbose,
         receipt_network.as_deref(),
-        None,
+        ReceiptProvenance::PaidRetry(None),
     )
 }
 
@@ -1910,7 +1912,7 @@ fn handle_retry_outcome(
     is_json: bool,
     verbose: bool,
     receipt_network: Option<&str>,
-    payment: Option<ReceiptDisplayContext<'_>>,
+    provenance: ReceiptProvenance<'_>,
 ) -> pay_core::Result<()> {
     match outcome {
         RunOutcome::Completed {
@@ -1922,7 +1924,7 @@ fn handle_retry_outcome(
             print_verbose_receipt(
                 &response_headers,
                 receipt_network,
-                ReceiptProvenance::PaidRetry(payment),
+                provenance,
                 verbose,
                 is_json,
             );
@@ -2224,6 +2226,19 @@ mod tests {
 
         assert!(
             render_receipt_for_completion(&headers, None, ReceiptProvenance::InitialRequest,)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn sign_in_retry_never_renders_a_payment_receipt() {
+        let headers = vec![(
+            "payment-receipt-url".to_string(),
+            "https://receipts.example/sign-in".to_string(),
+        )];
+
+        assert!(
+            render_receipt_for_completion(&headers, None, ReceiptProvenance::NonPaymentRetry,)
                 .is_none()
         );
     }
