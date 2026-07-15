@@ -1139,13 +1139,33 @@ pub fn validate_request(
     query_params: &[(String, String)],
     body: Option<&str>,
 ) -> RequestValidationOutcome {
+    validate_request_with_body_validation(doc, method, relative_path, query_params, body, true)
+}
+
+/// Validate a request's method, path, and query parameters while optionally
+/// skipping JSON-schema validation for an opaque, non-JSON request body.
+pub fn validate_request_with_body_validation(
+    doc: &Value,
+    method: &str,
+    relative_path: &str,
+    query_params: &[(String, String)],
+    body: Option<&str>,
+    validate_body: bool,
+) -> RequestValidationOutcome {
     let method = method.trim().to_ascii_uppercase();
     let relative_path = normalize_path(relative_path);
     if doc.get("openapi").is_some() || doc.get("swagger").is_some() || doc.get("paths").is_some() {
-        return validate_openapi3_request(doc, &method, &relative_path, query_params, body);
+        return validate_openapi3_request(
+            doc,
+            &method,
+            &relative_path,
+            query_params,
+            body,
+            validate_body,
+        );
     }
     if doc.get("resources").is_some() || doc.get("methods").is_some() {
-        return validate_discovery_request(doc, &method, &relative_path, body);
+        return validate_discovery_request(doc, &method, &relative_path, body, validate_body);
     }
     RequestValidationOutcome::NotInSpec
 }
@@ -1165,6 +1185,7 @@ fn validate_openapi3_request(
     relative_path: &str,
     query_params: &[(String, String)],
     body: Option<&str>,
+    validate_body: bool,
 ) -> RequestValidationOutcome {
     let Some(paths) = doc.get("paths").and_then(|v| v.as_object()) else {
         return RequestValidationOutcome::NotInSpec;
@@ -1214,7 +1235,12 @@ fn validate_openapi3_request(
     let spec_path = normalize_path(spec_path);
     let mut query_problems =
         validate_openapi_query_parameters(doc, item_obj, operation, query_params);
-    match validate_openapi_operation_body(doc, method, &spec_path, operation, body) {
+    let body_outcome = if validate_body {
+        validate_openapi_operation_body(doc, method, &spec_path, operation, body)
+    } else {
+        RequestValidationOutcome::Valid
+    };
+    match body_outcome {
         RequestValidationOutcome::Valid if query_problems.is_empty() => {
             RequestValidationOutcome::Valid
         }
@@ -1241,6 +1267,7 @@ fn validate_discovery_request(
     method: &str,
     relative_path: &str,
     body: Option<&str>,
+    validate_body: bool,
 ) -> RequestValidationOutcome {
     let mut methods = Vec::new();
     if let Some(resources) = doc.get("resources").and_then(|v| v.as_object()) {
@@ -1293,7 +1320,11 @@ fn validate_discovery_request(
         });
     };
 
-    validate_discovery_operation_body(doc, method, spec_path, method_doc, body)
+    if validate_body {
+        validate_discovery_operation_body(doc, method, spec_path, method_doc, body)
+    } else {
+        RequestValidationOutcome::Valid
+    }
 }
 
 fn validate_openapi_query_parameters(
@@ -2986,6 +3017,47 @@ mod tests {
             vec!["request body is required by the catalog OpenAPI schema. Required fields: query."]
         );
         assert_eq!(failure.example.as_deref(), Some(r#"{"query":"test"}"#));
+    }
+
+    #[test]
+    fn opaque_body_validation_keeps_method_and_query_validation() {
+        let doc = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/upload": {
+                    "post": {
+                        "parameters": [{
+                            "in": "query",
+                            "name": "name",
+                            "required": true,
+                            "schema": { "type": "string" }
+                        }],
+                        "requestBody": {
+                            "required": true,
+                            "content": {
+                                "application/json": { "schema": { "type": "object" } }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        assert_eq!(
+            validate_request_with_body_validation(
+                &doc,
+                "POST",
+                "/upload",
+                &[("name".to_string(), "photo".to_string())],
+                None,
+                false,
+            ),
+            RequestValidationOutcome::Valid
+        );
+        assert!(matches!(
+            validate_request_with_body_validation(&doc, "POST", "/upload", &[], None, false),
+            RequestValidationOutcome::Invalid(_)
+        ));
     }
 
     #[test]

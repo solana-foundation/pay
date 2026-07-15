@@ -264,11 +264,18 @@ impl Command {
             Command::Http(cmd) => (pay_core::run_httpie(&cmd.args)?, Tool::Http(&cmd.args)),
             Command::Fetch(cmd) => {
                 let prepared = cmd.prepare()?;
-                pay_core::skills::validate_cached_catalog_request(
-                    &prepared.method,
-                    &cmd.url,
-                    prepared.validation_body.as_deref(),
-                )?;
+                if prepared.body.is_some() && prepared.validation_body.is_none() {
+                    pay_core::skills::validate_cached_catalog_request_metadata(
+                        &prepared.method,
+                        &cmd.url,
+                    )?;
+                } else {
+                    pay_core::skills::validate_cached_catalog_request(
+                        &prepared.method,
+                        &cmd.url,
+                        prepared.validation_body.as_deref(),
+                    )?;
+                }
                 let outcome = pay_core::fetch::fetch_request_with_body_for(
                     pay_core::ClientApp::Cli,
                     &prepared.method,
@@ -1772,6 +1779,14 @@ fn pay_session_and_retry(
 fn validate_tool_request_before_signing(tool: &Tool) -> pay_core::Result<()> {
     match tool {
         Tool::Curl(args) => pay_core::runner::validate_curl_args_against_catalog(args),
+        Tool::Fetch {
+            method,
+            url,
+            validation_body,
+            ..
+        } if body.is_some() && validation_body.is_none() => {
+            pay_core::skills::validate_cached_catalog_request_metadata(method, url)
+        }
         Tool::Fetch {
             method,
             url,
