@@ -21,7 +21,7 @@ use pay_kit::x402::{
         siwx_extension_from_payment_required,
     },
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::accounts::{AccountsStore, ResolvedEphemeral};
 use crate::{Error, Result};
@@ -197,7 +197,7 @@ pub fn build_payment_with_override(
     });
     let rpc = RpcClient::new(rpc_url.clone());
 
-    info!(
+    debug!(
         amount = %requirements.amount,
         currency = %requirements.currency,
         cluster = %network,

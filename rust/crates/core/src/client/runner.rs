@@ -784,7 +784,7 @@ pub(crate) fn classify_402_with_preference(
         // challenge also parses leniently as exact, so prefer the upto reading
         // when the server advertises the `upto` scheme.
         if let Some(upto) = x402::parse_upto(headers, body) {
-            info!(
+            debug!(
                 resource = resource_url,
                 "Detected x402 upto challenge (Solana)"
             );

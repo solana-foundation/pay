@@ -30,6 +30,7 @@ use pay_core::{run_curl_with_headers, run_httpie_with_headers, run_wget_with_hea
 use pay_kit::mpp::{ChargeRequest, SessionRequest};
 use pay_types::Stablecoin;
 
+use crate::components::ascii_table;
 use crate::no_dna;
 use crate::output::{self, OutputFormat};
 
@@ -649,16 +650,6 @@ fn handle_outcome(
                     payment_cap,
                     "x402",
                 )?;
-                if verbose && !is_json {
-                    eprintln!(
-                        "{}",
-                        format!(
-                            "402 Payment Required (x402 upto) — up to {} {}",
-                            challenge.requirements.amount, challenge.requirements.asset
-                        )
-                        .dimmed()
-                    );
-                }
                 return pay_upto_and_retry(
                     &challenge,
                     &resource_url,
@@ -793,7 +784,7 @@ fn handle_outcome(
             response_headers,
             ..
         } => {
-            print_verbose_receipt(&response_headers, network_override, verbose, is_json);
+            print_verbose_receipt(&response_headers, network_override, None, verbose, is_json);
             if let Some(body) = body {
                 use std::io::Write;
                 let _ = std::io::stdout().write_all(&body);
@@ -810,7 +801,10 @@ fn print_verbose_challenges(challenges: &DecodedPaymentChallenges, verbose: bool
         return;
     }
     if let Some(rendered) = render_verbose_challenges(challenges) {
-        eprintln!("{rendered}");
+        eprint!(
+            "{}",
+            crate::components::notice_body(crate::components::NoticeLevel::Info, &rendered)
+        );
     }
 }
 
@@ -818,58 +812,193 @@ fn render_verbose_challenges(challenges: &DecodedPaymentChallenges) -> Option<St
     if challenges.is_empty() {
         return None;
     }
-    let decoded = serde_json::to_string_pretty(challenges).ok()?;
-    Some(format!("402 payment challenges (decoded):\n{decoded}"))
+    let mut rows = Vec::with_capacity(challenges.x402.len() + challenges.mpp.len());
+    for (protocol, challenges) in [("x402", &challenges.x402), ("mpp", &challenges.mpp)] {
+        for (index, challenge) in challenges.iter().enumerate() {
+            rows.push(challenge_summary_row(protocol, index + 1, challenge));
+        }
+    }
+    Some(ascii_table::render_table(
+        &["Protocol", "Offer", "Type", "Amount", "Network", "Target"],
+        &rows,
+    ))
 }
 
 fn print_verbose_receipt(
     headers: &[(String, String)],
     fallback_network: Option<&str>,
+    payment: Option<ReceiptDisplayContext<'_>>,
     verbose: bool,
     is_json: bool,
 ) {
     if !verbose || is_json {
         return;
     }
-    if let Some(rendered) = render_verbose_receipt(headers, fallback_network) {
-        eprintln!("\n{rendered}");
+    if let Some(rendered) = render_verbose_receipt(headers, fallback_network, payment) {
+        crate::components::print_notice(
+            crate::components::NoticeLevel::Success,
+            &rendered.title,
+            &rendered.body,
+        );
     }
+}
+
+struct ReceiptNotice {
+    title: String,
+    body: String,
+}
+
+#[derive(Clone, Copy)]
+struct ReceiptDisplayContext<'a> {
+    asset: Option<&'a str>,
+    scheme: Option<&'a str>,
 }
 
 fn render_verbose_receipt(
     headers: &[(String, String)],
     fallback_network: Option<&str>,
-) -> Option<String> {
+    payment: Option<ReceiptDisplayContext<'_>>,
+) -> Option<ReceiptNotice> {
     let direct_url = response_header(headers, "payment-receipt-url")
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
     let Some(decoded) = receipt::decode_response_receipt(headers) else {
-        return direct_url.map(|url| format!("Receipt: {url}"));
+        return direct_url.map(|url| ReceiptNotice {
+            title: "Payment completed".to_string(),
+            body: crate::components::link_with_arrow("Link to receipt", &url),
+        });
     };
-    let payload = serde_json::to_string_pretty(&decoded.decoded).ok()?;
-    let mut rendered = format!(
-        "Final payment response ({}, decoded):\n{payload}",
-        decoded.protocol
+    let amount = receipt_amount(&decoded.decoded, payment.and_then(|payment| payment.asset))
+        .unwrap_or_else(|| "Payment".to_string());
+    let title = format!(
+        "{amount} paid via {}",
+        receipt_protocol_label(
+            decoded.protocol,
+            &decoded.decoded,
+            payment.and_then(|payment| payment.scheme),
+        )
     );
+    let body = if let Some(url) = direct_url {
+        crate::components::link_with_arrow("Link to receipt", &url)
+    } else if let Some(signature) = decoded.signature.as_deref() {
+        let network = fallback_network
+            .or(decoded.network.as_deref())
+            .unwrap_or("mainnet");
+        crate::components::solana_transaction_link(signature, network)
+    } else {
+        "Payment receipt received".to_string()
+    };
+    Some(ReceiptNotice { title, body })
+}
 
-    let generated_url = decoded.signature.as_deref().and_then(|signature| {
-        fallback_network
-            .and_then(|network| pay_core::explorer::advanced_tx_url(network, signature))
-            .or_else(|| {
-                decoded
-                    .network
-                    .as_deref()
-                    .and_then(|network| pay_core::explorer::advanced_tx_url(network, signature))
-            })
-            .or_else(|| pay_core::explorer::advanced_tx_url("mainnet", signature))
-    });
+fn challenge_summary_row(protocol: &str, offer: usize, value: &serde_json::Value) -> Vec<String> {
+    let kind = match protocol {
+        "x402" => json_string(value, &[&["scheme"]]).unwrap_or_else(|| "payment".to_string()),
+        "mpp" => json_string(value, &[&["intent"]]).unwrap_or_else(|| "charge".to_string()),
+        _ => "-".to_string(),
+    };
+    let amount = format_amount(value);
+    let network = json_string(
+        value,
+        &[&["network"], &["cluster"], &["request", "network"]],
+    )
+    .unwrap_or_else(|| "-".to_string());
+    let target = json_string(
+        value,
+        &[
+            &["payTo"],
+            &["pay_to"],
+            &["recipient"],
+            &["realm"],
+            &["request", "recipient"],
+        ],
+    )
+    .unwrap_or_else(|| "-".to_string());
 
-    if let Some(url) = direct_url.or(generated_url) {
-        rendered.push_str("\nReceipt: ");
-        rendered.push_str(&url);
+    vec![
+        protocol.to_string(),
+        offer.to_string(),
+        kind,
+        amount,
+        network,
+        target,
+    ]
+}
+
+fn receipt_amount(value: &serde_json::Value, fallback_asset: Option<&str>) -> Option<String> {
+    let amount = json_string(value, &[&["amount"], &["settlement", "amount"]])?;
+    let currency = json_string(
+        value,
+        &[&["asset"], &["currency"], &["settlement", "asset"]],
+    )
+    .or_else(|| fallback_asset.map(str::to_string));
+    Some(currency.map_or(amount.clone(), |currency| {
+        display_token_amount(&amount, &currency)
+    }))
+}
+
+fn receipt_protocol_label(
+    protocol: receipt::ReceiptProtocol,
+    value: &serde_json::Value,
+    fallback_scheme: Option<&str>,
+) -> String {
+    let scheme = match protocol {
+        receipt::ReceiptProtocol::X402 => {
+            json_string(value, &[&["accepted", "scheme"], &["scheme"]])
+        }
+        receipt::ReceiptProtocol::Mpp => json_string(value, &[&["intent"], &["receipt", "intent"]]),
+    };
+    scheme
+        .or_else(|| fallback_scheme.map(str::to_string))
+        .map_or_else(
+            || protocol.to_string(),
+            |scheme| format!("{protocol} / {scheme}"),
+        )
+}
+
+fn format_amount(value: &serde_json::Value) -> String {
+    let amount = json_string(
+        value,
+        &[&["amount"], &["maxAmountRequired"], &["request", "amount"]],
+    );
+    let currency = json_string(
+        value,
+        &[&["asset"], &["currency"], &["request", "currency"]],
+    );
+    match (amount, currency) {
+        (Some(amount), Some(currency)) => display_token_amount(&amount, &currency),
+        (Some(amount), None) => amount,
+        _ => "-".to_string(),
     }
-    Some(rendered)
+}
+
+fn json_string(value: &serde_json::Value, paths: &[&[&str]]) -> Option<String> {
+    paths.iter().find_map(|path| {
+        path.iter()
+            .try_fold(value, |current, key| current.get(*key))
+            .and_then(|value| match value {
+                serde_json::Value::String(value) => Some(value.clone()),
+                serde_json::Value::Number(_) | serde_json::Value::Bool(_) => {
+                    Some(value.to_string())
+                }
+                _ => None,
+            })
+    })
+}
+
+fn compact_identifier(value: &str) -> String {
+    const PREFIX: usize = 10;
+    const SUFFIX: usize = 8;
+    let chars: Vec<char> = value.chars().collect();
+    if chars.len() <= PREFIX + SUFFIX + 3 {
+        return value.to_string();
+    }
+    format!(
+        "{}...{}",
+        chars[..PREFIX].iter().collect::<String>(),
+        chars[chars.len() - SUFFIX..].iter().collect::<String>()
+    )
 }
 
 fn response_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
@@ -1097,7 +1226,13 @@ fn pay_mpp_and_retry(
     let verbose = ctx.verbose;
     let retry_outcome =
         retry_with_header(ctx.tool, "Authorization", &auth_header, ctx.fetch_headers)?;
-    handle_retry_outcome(retry_outcome, is_json, verbose, receipt_network.as_deref())
+    handle_retry_outcome(
+        retry_outcome,
+        is_json,
+        verbose,
+        receipt_network.as_deref(),
+        None,
+    )
 }
 
 fn pay_subscription_and_retry(
@@ -1170,6 +1305,7 @@ fn pay_subscription_and_retry(
         is_json,
         ctx.verbose,
         receipt_network.as_deref(),
+        None,
     )
 }
 
@@ -1323,7 +1459,16 @@ fn pay_x402_and_retry(
     );
     let verbose = ctx.verbose;
     let retry_outcome = retry_with_headers(ctx.tool, &built_payment.headers, ctx.fetch_headers)?;
-    handle_retry_outcome(retry_outcome, is_json, verbose, Some(&receipt_network))
+    handle_retry_outcome(
+        retry_outcome,
+        is_json,
+        verbose,
+        Some(&receipt_network),
+        Some(ReceiptDisplayContext {
+            asset: Some(&challenge.requirements.currency),
+            scheme: Some("exact"),
+        }),
+    )
 }
 
 fn pay_upto_and_retry(
@@ -1335,7 +1480,14 @@ fn pay_upto_and_retry(
     validate_tool_request_before_signing(ctx.tool)?;
 
     if ctx.verbose && !is_json {
-        eprintln!("{}", "Paying (x402 upto)...".dimmed());
+        crate::components::print_notice(
+            crate::components::NoticeLevel::Success,
+            "Selecting x402 upto challenge",
+            &x402_upto_selection_notice_body(&display_x402_upto_amount(
+                &challenge.requirements.amount,
+                &challenge.requirements.asset,
+            )),
+        );
     }
 
     let store = pay_core::accounts::FileAccountsStore::default_path();
@@ -1351,10 +1503,6 @@ fn pay_upto_and_retry(
         render_generated_wallet_notice(&resolved, is_json)?;
     }
 
-    if ctx.verbose && !is_json {
-        eprintln!("{}", "Payment signed, retrying...\n".dimmed());
-    }
-
     let receipt_network = x402_receipt_network(
         ctx.network_override,
         &challenge.requirements.network,
@@ -1363,7 +1511,50 @@ fn pay_upto_and_retry(
     );
     let verbose = ctx.verbose;
     let retry_outcome = retry_with_headers(ctx.tool, &built_payment.headers, ctx.fetch_headers)?;
-    handle_retry_outcome(retry_outcome, is_json, verbose, Some(&receipt_network))
+    handle_retry_outcome(
+        retry_outcome,
+        is_json,
+        verbose,
+        Some(&receipt_network),
+        Some(ReceiptDisplayContext {
+            asset: Some(&challenge.requirements.asset),
+            scheme: Some("upto"),
+        }),
+    )
+}
+
+fn x402_upto_selection_notice_body(amount: &str) -> String {
+    format!("Authorize up to {amount}; Pay will request wallet approval and retry the request.")
+}
+
+fn display_x402_upto_amount(amount: &str, asset: &str) -> String {
+    display_token_amount(amount, asset)
+}
+
+fn display_token_amount(amount: &str, asset: &str) -> String {
+    let Some(stablecoin) = Stablecoin::from_mint(asset).or_else(|| Stablecoin::parse_symbol(asset))
+    else {
+        return format!("{amount} {}", compact_identifier(asset));
+    };
+    let display_amount = amount
+        .parse::<u64>()
+        .map(|amount| format_token_amount(amount, stablecoin.decimals()))
+        .unwrap_or_else(|_| amount.to_string());
+    format!("{display_amount} {}", stablecoin.symbol())
+}
+
+fn format_token_amount(amount: u64, decimals: u8) -> String {
+    let divisor = 10_u64.pow(u32::from(decimals));
+    let whole = amount / divisor;
+    let fraction = amount % divisor;
+    if fraction == 0 {
+        return whole.to_string();
+    }
+    let mut fraction = format!("{fraction:0width$}", width = usize::from(decimals));
+    while fraction.ends_with('0') {
+        fraction.pop();
+    }
+    format!("{whole}.{fraction}")
 }
 
 fn pay_x402_siwx_and_retry(
@@ -1398,7 +1589,13 @@ fn pay_x402_siwx_and_retry(
     let receipt_network = ctx.network_override.map(str::to_string);
     let verbose = ctx.verbose;
     let retry_outcome = retry_with_headers(ctx.tool, &built_payment.headers, ctx.fetch_headers)?;
-    handle_retry_outcome(retry_outcome, is_json, verbose, receipt_network.as_deref())
+    handle_retry_outcome(
+        retry_outcome,
+        is_json,
+        verbose,
+        receipt_network.as_deref(),
+        None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1537,7 +1734,13 @@ fn pay_session_and_retry(
         .map(str::to_string)
         .or_else(|| mpp_challenge_network(challenge));
     let retry_outcome = retry_with_header(tool, "Authorization", &auth_header, fetch_headers)?;
-    handle_retry_outcome(retry_outcome, is_json, verbose, receipt_network.as_deref())
+    handle_retry_outcome(
+        retry_outcome,
+        is_json,
+        verbose,
+        receipt_network.as_deref(),
+        None,
+    )
 }
 
 fn validate_tool_request_before_signing(tool: &Tool) -> pay_core::Result<()> {
@@ -1665,6 +1868,7 @@ fn handle_retry_outcome(
     is_json: bool,
     verbose: bool,
     receipt_network: Option<&str>,
+    payment: Option<ReceiptDisplayContext<'_>>,
 ) -> pay_core::Result<()> {
     match outcome {
         RunOutcome::Completed {
@@ -1673,7 +1877,13 @@ fn handle_retry_outcome(
             response_headers,
             ..
         } => {
-            print_verbose_receipt(&response_headers, receipt_network, verbose, is_json);
+            print_verbose_receipt(
+                &response_headers,
+                receipt_network,
+                payment,
+                verbose,
+                is_json,
+            );
             if let Some(body) = body {
                 use std::io::Write;
                 let _ = std::io::stdout().write_all(&body);
@@ -1732,11 +1942,16 @@ mod tests {
         };
 
         let rendered = render_verbose_challenges(&challenges).unwrap();
-        assert!(rendered.starts_with("402 payment challenges (decoded):"));
-        assert!(rendered.contains("\"x402\""));
-        assert!(rendered.contains("\"mpp\""));
-        assert!(rendered.contains("\"upto\""));
-        assert!(rendered.contains("\"charge\""));
+        assert!(rendered.starts_with('+'));
+        assert!(!rendered.contains("402 payment offers"));
+        assert!(rendered.contains("| Protocol"));
+        assert!(rendered.contains("x402"));
+        assert!(rendered.contains("mpp"));
+        assert!(rendered.contains("upto"));
+        assert!(rendered.contains("charge"));
+        assert!(rendered.contains("0.25 USDC"));
+        assert!(rendered.contains("0.00001 USDC"));
+        assert!(rendered.lines().all(|line| line.chars().count() <= 80));
     }
 
     #[test]
@@ -1746,20 +1961,15 @@ mod tests {
 
     #[test]
     fn verbose_receipt_rendering_decodes_x402_and_links_advanced_view() {
-        let transaction = "32ETeMZD7wr5g59jZVE4ycW6eNwVi5Rhv9kWAHYVZQAMgLrRjxsWYQcsfZHBFBDFQgE8xDg4tT4uTCPq7X6JVZif";
         let headers = vec![(
             "payment-response".to_string(),
             "eyJzdWNjZXNzIjp0cnVlLCJwYXllciI6IkNIUEVnRjdYMWhZSmY2NG9SeDUzQUJVTDQzRFhwRWpUSkJ6QVltWldOdUtSIiwidHJhbnNhY3Rpb24iOiIzMkVUZU1aRDd3cjVnNTlqWlZFNHljVzZlTndWaTVSaHY5a1dBSFlWWlFBTWdMclJqeHNXWVFjc2ZaSEJGQkRGUWdFOHhEZzR0VDR1VENQcTdYNkpWWmlmIiwibmV0d29yayI6InNvbGFuYTo1ZXlrdDRVc0Z2OFA4TkpkVFJFcFkxdnpxS3FaS3ZkcCIsImFtb3VudCI6IjExIn0=".to_string(),
         )];
 
-        let rendered = render_verbose_receipt(&headers, Some("sandbox")).unwrap();
-        assert!(rendered.starts_with("Final payment response (x402, decoded):"));
-        assert!(rendered.contains("\"success\": true"));
-        assert!(rendered.contains("\"amount\": \"11\""));
-        assert!(rendered.contains(transaction));
-        assert!(rendered.contains(&format!(
-            "https://pay.sh/receipt/{transaction}?network=sandbox&view=advanced"
-        )));
+        let rendered = render_verbose_receipt(&headers, Some("sandbox"), None).unwrap();
+        assert_eq!(rendered.title, "11 paid via x402");
+        assert!(rendered.body.contains("Link to receipt"));
+        assert!(rendered.body.contains("32ETeMZD7wr5g59j"));
     }
 
     #[test]
@@ -1775,9 +1985,14 @@ mod tests {
             ),
         ];
 
-        let rendered = render_verbose_receipt(&headers, Some("sandbox")).unwrap();
-        assert!(rendered.contains("https://receipts.example/authoritative"));
-        assert!(!rendered.contains("pay.sh/receipt"));
+        let rendered = render_verbose_receipt(&headers, Some("sandbox"), None).unwrap();
+        assert_eq!(rendered.title, "Payment paid via x402");
+        assert!(
+            rendered
+                .body
+                .contains("https://receipts.example/authoritative")
+        );
+        assert!(!rendered.body.contains("pay.sh/receipt"));
     }
 
     #[test]
@@ -1787,10 +2002,10 @@ mod tests {
             "https://receipts.example/url-only".to_string(),
         )];
 
-        assert_eq!(
-            render_verbose_receipt(&headers, None).as_deref(),
-            Some("Receipt: https://receipts.example/url-only")
-        );
+        let rendered = render_verbose_receipt(&headers, None, None).unwrap();
+        assert_eq!(rendered.title, "Payment completed");
+        assert!(rendered.body.contains("Link to receipt"));
+        assert!(rendered.body.contains("https://receipts.example/url-only"));
     }
 
     #[test]
@@ -1803,12 +2018,10 @@ mod tests {
         let header = pay_kit::mpp::format_receipt(&receipt).unwrap();
         let headers = vec![("payment-receipt".to_string(), header)];
 
-        let rendered = render_verbose_receipt(&headers, Some("localnet")).unwrap();
-        assert!(rendered.starts_with("Final payment response (mpp, decoded):"));
-        assert!(rendered.contains("\"reference\": \"mpp-settlement-signature\""));
-        assert!(rendered.contains(
-            "https://pay.sh/receipt/mpp-settlement-signature?network=sandbox&view=advanced"
-        ));
+        let rendered = render_verbose_receipt(&headers, Some("localnet"), None).unwrap();
+        assert_eq!(rendered.title, "Payment paid via mpp");
+        assert!(rendered.body.contains("Link to receipt"));
+        assert!(rendered.body.contains("mpp-settlement-signature"));
     }
 
     #[test]
@@ -1897,6 +2110,68 @@ mod tests {
         assert_eq!(format_stablecoin_amount(1_000_000), "1");
         assert_eq!(format_stablecoin_amount(1_250_000), "1.25");
         assert_eq!(format_stablecoin_amount(1), "0.000001");
+    }
+
+    #[test]
+    fn display_amount_resolves_mint_and_decimals() {
+        let amount = serde_json::json!({
+            "amount": "250000",
+            "asset": pay_types::stablecoin_mints::USDC_MAINNET,
+        });
+        assert_eq!(format_amount(&amount), "0.25 USDC");
+    }
+
+    #[test]
+    fn receipt_protocol_label_includes_the_payment_scheme() {
+        assert_eq!(
+            receipt_protocol_label(
+                receipt::ReceiptProtocol::X402,
+                &serde_json::json!({ "accepted": { "scheme": "upto" } }),
+                None,
+            ),
+            "x402 / upto"
+        );
+        assert_eq!(
+            receipt_protocol_label(
+                receipt::ReceiptProtocol::Mpp,
+                &serde_json::json!({ "intent": "charge" }),
+                None,
+            ),
+            "mpp / charge"
+        );
+    }
+
+    #[test]
+    fn receipt_uses_selected_payment_metadata_when_server_omits_it() {
+        let headers = vec![(
+            "payment-response".to_string(),
+            r#"{"amount":"11"}"#.to_string(),
+        )];
+        let rendered = render_verbose_receipt(
+            &headers,
+            None,
+            Some(ReceiptDisplayContext {
+                asset: Some(pay_types::stablecoin_mints::USDC_MAINNET),
+                scheme: Some("exact"),
+            }),
+        )
+        .unwrap();
+        assert_eq!(rendered.title, "0.000011 USDC paid via x402 / exact");
+    }
+
+    #[test]
+    fn x402_upto_notice_uses_a_human_stablecoin_amount() {
+        assert_eq!(
+            display_x402_upto_amount("250000", pay_types::stablecoin_mints::USDC_MAINNET),
+            "0.25 USDC"
+        );
+    }
+
+    #[test]
+    fn x402_upto_selection_notice_describes_the_selected_offer() {
+        let body = x402_upto_selection_notice_body("0.25 USDC");
+        assert!(body.starts_with("Authorize up to 0.25 USDC"));
+        assert!(body.contains("wallet approval"));
     }
 
     #[test]
