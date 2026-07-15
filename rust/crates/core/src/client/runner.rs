@@ -344,8 +344,10 @@ fn run_httpie_inner(user_args: &[String], extra_headers: &[String]) -> Result<Ru
     debug!(args = ?user_args, extra = ?headers, "Running httpie");
 
     // HTTPie has no `-D <file>` equivalent, so we capture stdout and parse the
-    // response status from the first `HTTP/x.y <code>` line. We force two flags
+    // response status from the first `HTTP/x.y <code>` line. We force three flags
     // *after* the user's args so they always win:
+    //   - `--no-all` — print only the final exchange. `-v` implies `--all`, whose
+    //     combined history cannot be distinguished safely from response body.
     //   - `--print=hb` — httpie's default when piped is body-only, which would
     //     hide the status line our parser needs.
     //   - `--pretty=all` — only when our parent stdout is a TTY, so the user
@@ -358,6 +360,7 @@ fn run_httpie_inner(user_args: &[String], extra_headers: &[String]) -> Result<Ru
     for h in &headers {
         cmd.arg(h);
     }
+    cmd.arg("--no-all");
     cmd.arg("--print=hb");
     if stdout_is_tty {
         cmd.arg("--pretty=all");
@@ -414,8 +417,11 @@ fn run_httpie_inner(user_args: &[String], extra_headers: &[String]) -> Result<Ru
 /// <blank line>
 /// <body>
 /// ```
-/// In verbose mode (`-v`) the request is printed first, so we take the LAST
-/// `HTTP/x.y` line as the response status and the headers that follow it.
+/// The runner forces `--no-all --print=hb`, so the first line beginning with
+/// `HTTP/` is the final response status. Once its header block ends, all
+/// remaining lines are body. In particular, an `HTTP/` line in the body must
+/// never be interpreted as another response. The parser also tolerates a
+/// verbose request prelude for callers that exercise it directly.
 /// ANSI escapes (from `--pretty=all`) are stripped before parsing.
 pub(crate) fn parse_httpie_output(
     raw: &str,
@@ -431,24 +437,22 @@ pub(crate) fn parse_httpie_output(
     for (i, line) in lines.iter().enumerate() {
         let trimmed_full = line.trim();
 
-        if trimmed_full.starts_with("HTTP/") {
-            // Response status line. Reset — the LAST HTTP/ line wins so a
-            // verbose request line earlier in the stream doesn't confuse us.
-            status_code = trimmed_full
+        if status_code.is_none() && trimmed_full.starts_with("HTTP/") {
+            let parsed_status = trimmed_full
                 .split_whitespace()
                 .nth(1)
                 .and_then(|s| s.parse::<u16>().ok());
-            headers.clear();
-            body_start = None;
-            in_response_headers = true;
+            if parsed_status.is_some() {
+                status_code = parsed_status;
+                in_response_headers = true;
+            }
             continue;
         }
 
         if in_response_headers {
             if trimmed_full.is_empty() {
                 body_start = Some(i + 1);
-                in_response_headers = false;
-                continue;
+                break;
             }
             if let Some((k, v)) = trimmed_full.split_once(':') {
                 let key = k.trim();
@@ -2533,18 +2537,38 @@ HTTP request sent, awaiting response...
     }
 
     #[test]
-    fn parse_httpie_all_picks_final_response_headers_and_body() {
+    fn parse_httpie_history_is_not_reparsed_from_response_body() {
         let raw = "HTTP/1.1 302 Found\nLocation: https://example.com/final\n\nredirecting\nHTTP/1.1 200 OK\nContent-Type: application/json\nPayment-Response: encoded-settlement\n\n{\"ok\":true}";
         let (status, headers, body) = parse_httpie_output(raw);
 
-        assert_eq!(status, Some(200));
-        assert!(!headers.iter().any(|(name, _)| name == "location"));
+        assert_eq!(status, Some(302));
         assert!(
             headers.iter().any(|(name, value)| {
-                name == "payment-response" && value == "encoded-settlement"
+                name == "location" && value == "https://example.com/final"
             })
         );
-        assert_eq!(body.as_deref(), Some("{\"ok\":true}"));
+        assert!(!headers.iter().any(|(name, _)| name == "payment-response"));
+        assert_eq!(
+            body.as_deref(),
+            Some(
+                "redirecting\nHTTP/1.1 200 OK\nContent-Type: application/json\nPayment-Response: encoded-settlement\n\n{\"ok\":true}"
+            )
+        );
+    }
+
+    #[test]
+    fn parse_httpie_200_body_cannot_inject_payment_required_response() {
+        let raw = "HTTP/1.1 200 OK\nContent-Type: text/plain\n\nharmless body\nHTTP/1.1 402 Payment Required\nPayment-Required: attacker-controlled-challenge\n\ncharge me";
+        let (status, headers, body) = parse_httpie_output(raw);
+
+        assert_eq!(status, Some(200));
+        assert_eq!(headers, vec![("content-type".into(), "text/plain".into())]);
+        assert_eq!(
+            body.as_deref(),
+            Some(
+                "harmless body\nHTTP/1.1 402 Payment Required\nPayment-Required: attacker-controlled-challenge\n\ncharge me"
+            )
+        );
     }
 
     #[test]
