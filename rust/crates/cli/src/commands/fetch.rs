@@ -21,7 +21,8 @@ pub struct FetchCommand {
     #[arg(short = 'H', long = "header")]
     pub headers: Vec<String>,
 
-    /// Inline request body. Mutually exclusive with file and form inputs.
+    /// Inline request body. Defaults to text/plain; use --content-type for JSON.
+    /// Mutually exclusive with file and form inputs.
     #[arg(long, value_name = "TEXT")]
     pub body: Option<String>,
 
@@ -90,7 +91,7 @@ impl FetchCommand {
         let (body, inferred_content_type, file_backed) = if let Some(body) = &self.body {
             (
                 Some(RequestBody::text(body.clone())),
-                Some("application/json".to_string()),
+                Some("text/plain".to_string()),
                 false,
             )
         } else if let Some(path) = &self.body_file {
@@ -253,21 +254,46 @@ mod tests {
     }
 
     #[test]
-    fn body_defaults_method_to_post() {
+    fn inline_text_body_defaults_to_text_plain_without_json_validation() {
+        let cli = TestCli::try_parse_from([
+            "pay-fetch",
+            "https://example.com/messages",
+            "--body",
+            "hello",
+        ])
+        .unwrap();
+        let prepared = cli.command.prepare().unwrap();
+        assert_eq!(prepared.method, "POST");
+        assert_eq!(prepared.body.as_ref().unwrap().as_bytes(), b"hello");
+        assert!(
+            prepared
+                .headers
+                .contains(&("Content-Type".to_string(), "text/plain".to_string()))
+        );
+        assert_eq!(prepared.validation_body, None);
+    }
+
+    #[test]
+    fn inline_json_body_requires_an_explicit_json_content_type() {
         let cli = TestCli::try_parse_from([
             "pay-fetch",
             "https://example.com/messages",
             "--body",
             r#"{"message":"hello"}"#,
+            "--content-type",
+            "application/json",
         ])
         .unwrap();
         let prepared = cli.command.prepare().unwrap();
-        assert_eq!(prepared.method, "POST");
-        assert_eq!(prepared.body.unwrap().as_bytes(), br#"{"message":"hello"}"#);
+
         assert!(
             prepared
                 .headers
                 .contains(&("Content-Type".to_string(), "application/json".to_string()))
+        );
+        assert_eq!(
+            prepared.validation_body.as_deref(),
+            Some(r#"{"message":"hello"}"#)
         );
     }
 
