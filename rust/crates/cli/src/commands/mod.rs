@@ -784,7 +784,13 @@ fn handle_outcome(
             response_headers,
             ..
         } => {
-            print_verbose_receipt(&response_headers, network_override, None, verbose, is_json);
+            print_verbose_receipt(
+                &response_headers,
+                network_override,
+                ReceiptProvenance::InitialRequest,
+                verbose,
+                is_json,
+            );
             if let Some(body) = body {
                 use std::io::Write;
                 let _ = std::io::stdout().write_all(&body);
@@ -827,14 +833,14 @@ fn render_verbose_challenges(challenges: &DecodedPaymentChallenges) -> Option<St
 fn print_verbose_receipt(
     headers: &[(String, String)],
     fallback_network: Option<&str>,
-    payment: Option<ReceiptDisplayContext<'_>>,
+    provenance: ReceiptProvenance<'_>,
     verbose: bool,
     is_json: bool,
 ) {
     if !verbose || is_json {
         return;
     }
-    if let Some(rendered) = render_verbose_receipt(headers, fallback_network, payment) {
+    if let Some(rendered) = render_receipt_for_completion(headers, fallback_network, provenance) {
         crate::components::print_notice(
             crate::components::NoticeLevel::Success,
             &rendered.title,
@@ -852,6 +858,25 @@ struct ReceiptNotice {
 struct ReceiptDisplayContext<'a> {
     asset: Option<&'a str>,
     scheme: Option<&'a str>,
+}
+
+#[derive(Clone, Copy)]
+enum ReceiptProvenance<'a> {
+    InitialRequest,
+    PaidRetry(Option<ReceiptDisplayContext<'a>>),
+}
+
+fn render_receipt_for_completion(
+    headers: &[(String, String)],
+    fallback_network: Option<&str>,
+    provenance: ReceiptProvenance<'_>,
+) -> Option<ReceiptNotice> {
+    match provenance {
+        ReceiptProvenance::InitialRequest => None,
+        ReceiptProvenance::PaidRetry(payment) => {
+            render_verbose_receipt(headers, fallback_network, payment)
+        }
+    }
 }
 
 fn render_verbose_receipt(
@@ -1881,7 +1906,7 @@ fn handle_retry_outcome(
             print_verbose_receipt(
                 &response_headers,
                 receipt_network,
-                payment,
+                ReceiptProvenance::PaidRetry(payment),
                 verbose,
                 is_json,
             );
@@ -2172,6 +2197,19 @@ mod tests {
         assert!(!rendered.title.contains('\u{1b}'));
         assert!(!rendered.title.contains('\u{7}'));
         assert_eq!(rendered.title, "11 USDC paid via x402 / exact");
+    }
+
+    #[test]
+    fn initial_response_never_renders_a_payment_receipt() {
+        let headers = vec![(
+            "payment-receipt-url".to_string(),
+            "https://receipts.example/unpaid".to_string(),
+        )];
+
+        assert!(
+            render_receipt_for_completion(&headers, None, ReceiptProvenance::InitialRequest,)
+                .is_none()
+        );
     }
 
     #[test]
