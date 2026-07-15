@@ -1105,13 +1105,10 @@ fn do_paid_fetch(
     }
 }
 
-/// Run cached catalog validation when it can faithfully describe the body.
+/// Run cached catalog validation for every request.
 ///
-/// The catalog validator currently validates JSON schemas. Passing non-JSON
-/// text to it as `None` would incorrectly mean "there is no body", while
-/// passing that UTF-8 media would incorrectly parse it as JSON.
-/// Keep method/path/query/body schema validation for JSON and body-less calls,
-/// and skip only the body-schema preflight for non-JSON media.
+/// Non-JSON bodies keep method, path, query, and media-type validation while
+/// intentionally skipping JSON-schema validation.
 fn validate_cached_catalog_body(
     method: &str,
     url: &str,
@@ -1127,7 +1124,11 @@ fn validate_cached_catalog_body(
         .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
         .map(|(_, value)| value.as_str());
     if !content_type.is_some_and(is_json_media_type) {
-        return Ok(());
+        return pay_core::skills::validate_cached_catalog_opaque_request(
+            method,
+            url,
+            content_type.unwrap_or("application/octet-stream"),
+        );
     }
 
     let text = body.as_text().ok_or_else(|| {
