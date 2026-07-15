@@ -195,6 +195,7 @@ enum Tool<'a> {
         body: Option<&'a pay_core::fetch::RequestBody>,
         redirect_policy: pay_core::fetch::RedirectPolicy,
         validation_body: Option<&'a str>,
+        content_type: Option<&'a str>,
     },
 }
 
@@ -265,9 +266,13 @@ impl Command {
             Command::Fetch(cmd) => {
                 let prepared = cmd.prepare()?;
                 if prepared.body.is_some() && prepared.validation_body.is_none() {
-                    pay_core::skills::validate_cached_catalog_request_metadata(
+                    pay_core::skills::validate_cached_catalog_opaque_request(
                         &prepared.method,
                         &cmd.url,
+                        prepared
+                            .content_type
+                            .as_deref()
+                            .unwrap_or("application/octet-stream"),
                     )?;
                 } else {
                     pay_core::skills::validate_cached_catalog_request(
@@ -290,6 +295,7 @@ impl Command {
                     body: prepared.body.as_ref(),
                     redirect_policy: prepared.redirect_policy,
                     validation_body: prepared.validation_body.as_deref(),
+                    content_type: prepared.content_type.as_deref(),
                 };
                 return handle_outcome(
                     outcome,
@@ -1786,9 +1792,14 @@ fn validate_tool_request_before_signing(tool: &Tool) -> pay_core::Result<()> {
             url,
             body,
             validation_body,
+            content_type,
             ..
         } if body.is_some() && validation_body.is_none() => {
-            pay_core::skills::validate_cached_catalog_request_metadata(method, url)
+            pay_core::skills::validate_cached_catalog_opaque_request(
+                method,
+                url,
+                content_type.unwrap_or("application/octet-stream"),
+            )
         }
         Tool::Fetch {
             method,

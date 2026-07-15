@@ -1429,13 +1429,23 @@ pub fn validate_cached_catalog_request(
     resource_url: &str,
     body: Option<&str>,
 ) -> Result<()> {
-    validate_cached_catalog_request_with_body_validation(method, resource_url, body, true)
+    validate_cached_catalog_request_with_body_validation(method, resource_url, body, true, None)
 }
 
 /// Validate a cached endpoint's method and query parameters without attempting
 /// JSON-schema validation for an opaque request body.
-pub fn validate_cached_catalog_request_metadata(method: &str, resource_url: &str) -> Result<()> {
-    validate_cached_catalog_request_with_body_validation(method, resource_url, None, false)
+pub fn validate_cached_catalog_opaque_request(
+    method: &str,
+    resource_url: &str,
+    content_type: &str,
+) -> Result<()> {
+    validate_cached_catalog_request_with_body_validation(
+        method,
+        resource_url,
+        None,
+        false,
+        Some(content_type),
+    )
 }
 
 fn validate_cached_catalog_request_with_body_validation(
@@ -1443,6 +1453,7 @@ fn validate_cached_catalog_request_with_body_validation(
     resource_url: &str,
     body: Option<&str>,
     validate_body: bool,
+    opaque_content_type: Option<&str>,
 ) -> Result<()> {
     let Some(context) = cached_openapi_context_for_resource_url(resource_url) else {
         return Ok(());
@@ -1455,6 +1466,7 @@ fn validate_cached_catalog_request_with_body_validation(
         &context.query_params,
         body,
         validate_body,
+        opaque_content_type,
     ) {
         openapi::RequestValidationOutcome::Valid | openapi::RequestValidationOutcome::NotInSpec => {
             Ok(())

@@ -49,6 +49,7 @@ pub struct PreparedFetchRequest {
     pub body: Option<RequestBody>,
     pub redirect_policy: RedirectPolicy,
     pub validation_body: Option<String>,
+    pub content_type: Option<String>,
 }
 
 impl FetchCommand {
@@ -154,6 +155,7 @@ impl FetchCommand {
                 RedirectPolicy::Follow
             },
             validation_body,
+            content_type,
         })
     }
 }
