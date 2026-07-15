@@ -1,10 +1,11 @@
 use base64::{Engine, engine::general_purpose};
 use pay_core::client::fetch::{RedirectPolicy, RequestBody};
-use rmcp::model::{CallToolResult, Content, RawResource};
+use rmcp::model::{CallToolResult, Content, RawResource, Root};
 use rmcp::schemars;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
+use std::path::PathBuf;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -21,13 +22,10 @@ pub struct Params {
         description = "Request body for POST/PUT/PATCH. Pass either a string or a JSON value; JSON values are serialized before sending and validated locally against cached Pay catalog OpenAPI schemas when available."
     )]
     pub body: Option<BodyParam>,
-
-    // Keep a precise migration error for callers that cached the short-lived
-    // `body_file` schema. This value is never interpreted as a path and is
-    // deliberately omitted from the advertised tool schema.
-    #[serde(default, rename = "body_file")]
-    #[schemars(skip)]
-    deprecated_body_file: Option<Value>,
+    #[schemars(
+        description = "Local file to use as the request body. The path must be within an MCP client-declared filesystem root. Pay asks the user to approve the file, size, method, and destination before reading it. Cannot be combined with body."
+    )]
+    pub body_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -73,6 +71,21 @@ pub fn prepare_headers(
     headers
 }
 
+fn prepare_headers_with_content_type(
+    user_headers: &Option<std::collections::HashMap<String, String>>,
+    default_content_type: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut headers = prepare_headers(user_headers, false);
+    if let Some(content_type) = default_content_type
+        && !headers
+            .iter()
+            .any(|(key, _)| key.eq_ignore_ascii_case("content-type"))
+    {
+        headers.push(("Content-Type".to_string(), content_type.to_string()));
+    }
+    headers
+}
+
 fn normalize_http_method(method: Option<&str>) -> Result<String, String> {
     let method = method.unwrap_or("GET");
     if method.is_empty() || !method.bytes().all(is_http_token_byte) {
@@ -108,9 +121,9 @@ pub async fn run(
     params: Params,
     peer: rmcp::Peer<rmcp::service::RoleServer>,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
-    if params.deprecated_body_file.is_some() {
+    if params.body.is_some() && params.body_file.is_some() {
         return Ok(super::tool_error(
-            "`body_file` is not accepted because an MCP-supplied path could expose arbitrary local files. Use inline `body` for ordinary JSON. For local files, run one filesystem-authorized command such as `pay fetch <URL> --method POST --body-file <PATH>`.",
+            "Pass either `body` or `body_file`, not both.",
         ));
     }
 
@@ -118,27 +131,43 @@ pub async fn run(
         Ok(method) => method,
         Err(error) => return Ok(super::tool_error(error)),
     };
-    let url = params.url.clone();
-    let user_headers = params.headers.clone();
-    let inline_body = params.body.clone();
+    let is_file_body = params.body_file.is_some();
+    let body_and_content_type = match (params.body, params.body_file) {
+        (Some(body), None) => match body.into_string() {
+            Ok(body) => (
+                Some(RequestBody::text(body)),
+                Some("application/json".to_string()),
+            ),
+            Err(error) => {
+                return Ok(super::tool_error(format!(
+                    "Failed to serialize request body: {error}"
+                )));
+            }
+        },
+        (None, Some(path)) => match approved_body_file(&peer, &path, &method, &params.url).await {
+            Ok(body) => (Some(body.body), Some(body.content_type)),
+            Err(error) => return Ok(super::tool_error(error)),
+        },
+        (None, None) => (None, None),
+        (Some(_), Some(_)) => unreachable!("body/body_file conflict returned above"),
+    };
+    let headers =
+        prepare_headers_with_content_type(&params.headers, body_and_content_type.1.as_deref());
+    let url = params.url;
+    let body = body_and_content_type.0;
+    let redirect_policy = if is_file_body {
+        RedirectPolicy::None
+    } else {
+        RedirectPolicy::Follow
+    };
 
     let response = tokio::task::spawn_blocking(move || {
-        let body = inline_body
-            .map(BodyParam::into_string)
-            .transpose()
-            .map_err(|error| {
-                pay_core::Error::RequestValidation(format!(
-                    "Failed to serialize request body: {error}"
-                ))
-            })?
-            .map(RequestBody::text);
-        let headers = prepare_headers(&user_headers, body.is_some());
         do_paid_fetch(
             &method,
             &url,
             &headers,
             body.as_ref(),
-            RedirectPolicy::Follow,
+            redirect_policy,
             Some(peer),
         )
     })
@@ -153,6 +182,159 @@ pub async fn run(
         ))),
         Err(err) => Ok(pay_error_to_tool_result(err)),
     }
+}
+
+struct ApprovedBodyFile {
+    body: RequestBody,
+    content_type: String,
+}
+
+/// Resolve a local body path against the roots the MCP client explicitly
+/// delegated to this server, obtain user approval, then snapshot the file.
+/// The snapshot (rather than the path) goes to the HTTP layer so a 402 retry
+/// cannot read a different version of the file.
+async fn approved_body_file(
+    peer: &rmcp::Peer<rmcp::service::RoleServer>,
+    requested_path: &str,
+    method: &str,
+    url: &str,
+) -> Result<ApprovedBodyFile, String> {
+    let roots = peer
+        .list_roots()
+        .await
+        .map_err(|error| format!("Could not obtain MCP filesystem roots: {error}"))?;
+    let file = resolve_body_file_path(requested_path, &roots.roots)?;
+    let destination = destination_label(url);
+    let display_path = file.path.display().to_string();
+    crate::auth::confirm_file_upload(peer, &display_path, file.bytes, method, &destination).await?;
+
+    let path = file.path;
+    let expected_bytes = file.bytes;
+    let (body, content_type) = tokio::task::spawn_blocking(move || RequestBody::from_file(&path))
+        .await
+        .map_err(|error| format!("Could not read approved request body file: {error}"))?
+        .map_err(|error| error.to_string())?;
+    if body.as_bytes().len() as u64 != expected_bytes {
+        return Err(
+            "The local file changed after approval. Review and retry the request.".to_string(),
+        );
+    }
+    Ok(ApprovedBodyFile { body, content_type })
+}
+
+#[derive(Debug)]
+struct ResolvedBodyFile {
+    path: PathBuf,
+    bytes: u64,
+}
+
+fn resolve_body_file_path(
+    requested_path: &str,
+    roots: &[Root],
+) -> Result<ResolvedBodyFile, String> {
+    if requested_path.is_empty() {
+        return Err("`body_file` must not be empty.".to_string());
+    }
+    if roots.is_empty() {
+        return Err(
+            "The MCP client did not provide any filesystem roots. Add the file's directory as an MCP root, then retry `body_file`."
+                .to_string(),
+        );
+    }
+
+    let root_paths = roots
+        .iter()
+        .map(mcp_root_path)
+        .collect::<Result<Vec<_>, _>>()?;
+    let requested = PathBuf::from(requested_path);
+    let path = if requested.is_absolute() {
+        requested
+    } else if root_paths.len() == 1 && root_paths[0].is_dir() {
+        root_paths[0].join(requested)
+    } else {
+        return Err(
+            "A relative `body_file` needs exactly one directory MCP root. Use an absolute path inside a declared root when more than one root is available."
+                .to_string(),
+        );
+    };
+
+    let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+        format!(
+            "Could not inspect `body_file` `{}`: {error}",
+            path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "`body_file` `{}` must not be a symlink.",
+            path.display()
+        ));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "`body_file` `{}` must be a regular file.",
+            path.display()
+        ));
+    }
+    if metadata.len() > pay_core::client::fetch::MAX_REQUEST_BODY_BYTES as u64 {
+        return Err(format!(
+            "`body_file` `{}` exceeds the 64 MiB limit.",
+            path.display()
+        ));
+    }
+
+    let canonical_file = std::fs::canonicalize(&path).map_err(|error| {
+        format!(
+            "Could not resolve `body_file` `{}`: {error}",
+            path.display()
+        )
+    })?;
+    let permitted = root_paths.iter().any(|root| {
+        let root_metadata = std::fs::metadata(root).ok();
+        root_metadata.is_some_and(|metadata| {
+            if metadata.is_file() {
+                canonical_file == *root
+            } else {
+                canonical_file.starts_with(root)
+            }
+        })
+    });
+    if !permitted {
+        return Err(format!(
+            "`body_file` `{}` is outside the MCP client's declared filesystem roots.",
+            canonical_file.display()
+        ));
+    }
+
+    Ok(ResolvedBodyFile {
+        path,
+        bytes: metadata.len(),
+    })
+}
+
+fn mcp_root_path(root: &Root) -> Result<PathBuf, String> {
+    let uri = reqwest::Url::parse(&root.uri)
+        .map_err(|error| format!("MCP root `{}` is not a valid URI: {error}", root.uri))?;
+    if uri.scheme() != "file" {
+        return Err(format!("MCP root `{}` is not a local file URI.", root.uri));
+    }
+    let path = uri
+        .to_file_path()
+        .map_err(|_| format!("MCP root `{}` is not a valid local file path.", root.uri))?;
+    std::fs::canonicalize(&path)
+        .map_err(|error| format!("Could not resolve MCP root `{}`: {error}", path.display()))
+}
+
+fn destination_label(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|parsed| {
+            parsed.host_str().map(|host| match parsed.port() {
+                Some(port) => format!("{}://{host}:{port}", parsed.scheme()),
+                None => format!("{}://{host}", parsed.scheme()),
+            })
+        })
+        .unwrap_or_else(|| url.to_string())
 }
 
 /// Route a response body to the right MCP content kind based on its MIME type.
@@ -950,7 +1132,7 @@ mod tests {
         assert!(params.method.is_none());
         assert!(params.headers.is_none());
         assert!(params.body.is_none());
-        assert!(params.deprecated_body_file.is_none());
+        assert!(params.body_file.is_none());
     }
 
     #[test]
@@ -1002,16 +1184,71 @@ mod tests {
     }
 
     #[test]
-    fn deprecated_body_file_is_recognized_only_for_a_migration_error() {
+    fn body_file_is_advertised_and_deserializes() {
         let params = serde_json::from_str::<Params>(
-            r#"{"url":"https://example.com","body_file":"/home/user/.ssh/id_ed25519"}"#,
+            r#"{"url":"https://example.com","body_file":"/workspace/photo.png"}"#,
         )
         .unwrap();
-        assert!(params.deprecated_body_file.is_some());
+        assert_eq!(params.body_file.as_deref(), Some("/workspace/photo.png"));
 
         let schema = serde_json::to_value(rmcp::schemars::schema_for!(Params)).unwrap();
-        assert!(schema.pointer("/properties/body_file").is_none());
+        assert!(schema.pointer("/properties/body_file").is_some());
         assert!(schema.pointer("/properties/body").is_some());
+    }
+
+    #[test]
+    fn resolves_relative_file_inside_the_single_declared_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("photo.png");
+        std::fs::write(&path, b"image bytes").unwrap();
+        let root = Root {
+            uri: reqwest::Url::from_directory_path(dir.path())
+                .unwrap()
+                .to_string(),
+            name: Some("workspace".to_string()),
+        };
+
+        let file = resolve_body_file_path("photo.png", &[root]).unwrap();
+        assert_eq!(file.path, std::fs::canonicalize(path).unwrap());
+        assert_eq!(file.bytes, 11);
+    }
+
+    #[test]
+    fn rejects_file_outside_declared_roots() {
+        let allowed = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let root = Root {
+            uri: reqwest::Url::from_directory_path(allowed.path())
+                .unwrap()
+                .to_string(),
+            name: None,
+        };
+
+        let error = resolve_body_file_path(outside.path().to_str().unwrap(), &[root]).unwrap_err();
+        assert!(error.contains("outside the MCP client's declared filesystem roots"));
+    }
+
+    #[test]
+    fn relative_file_with_multiple_roots_requires_an_absolute_path() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let roots = [
+            Root {
+                uri: reqwest::Url::from_directory_path(first.path())
+                    .unwrap()
+                    .to_string(),
+                name: None,
+            },
+            Root {
+                uri: reqwest::Url::from_directory_path(second.path())
+                    .unwrap()
+                    .to_string(),
+                name: None,
+            },
+        ];
+
+        let error = resolve_body_file_path("photo.png", &roots).unwrap_err();
+        assert!(error.contains("relative `body_file`"));
     }
 
     #[test]
