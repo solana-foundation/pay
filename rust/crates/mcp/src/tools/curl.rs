@@ -6,6 +6,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -189,9 +190,8 @@ struct ApprovedBodyFile {
     content_type: String,
 }
 
-/// Resolve and snapshot a local body file before asking the user to approve
-/// its exact contents. The approved snapshot, rather than the path, goes to
-/// the HTTP layer so a 402 retry cannot read a different version of the file.
+/// Resolve a local body file, obtain user approval, then snapshot the approved
+/// file. A changed file is rejected rather than silently sent after approval.
 async fn approved_body_file(
     peer: &rmcp::Peer<rmcp::service::RoleServer>,
     requested_path: &str,
@@ -207,18 +207,30 @@ async fn approved_body_file(
     let display_path = file.path.display().to_string();
     crate::auth::confirm_file_upload(peer, &display_path, file.bytes, method, &destination).await?;
 
-    Ok(ApprovedBodyFile {
-        body: file.body,
-        content_type: file.content_type,
+    let path = file.path.clone();
+    let expected = file.identity;
+    let (body, content_type) = tokio::task::spawn_blocking(move || {
+        let (body, content_type) = RequestBody::from_file(&path)?;
+        ensure_body_file_unchanged(&path, expected)?;
+        Ok::<_, pay_core::Error>((body, content_type))
     })
+    .await
+    .map_err(|error| format!("Could not read approved request body file: {error}"))?
+    .map_err(|error| error.to_string())?;
+    Ok(ApprovedBodyFile { body, content_type })
 }
 
 #[derive(Debug)]
 struct ResolvedBodyFile {
     path: PathBuf,
     bytes: u64,
-    body: RequestBody,
-    content_type: String,
+    identity: BodyFileIdentity,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BodyFileIdentity {
+    bytes: u64,
+    modified: SystemTime,
 }
 
 fn resolve_body_file_path(
@@ -299,14 +311,43 @@ fn resolve_body_file_path(
         ));
     }
 
-    let (body, content_type) = RequestBody::from_file(&path)
-        .map_err(|error| format!("Could not read `body_file` `{}`: {error}", path.display()))?;
+    let modified = metadata.modified().map_err(|error| {
+        format!(
+            "Could not read modification time for `body_file` `{}`: {error}",
+            path.display()
+        )
+    })?;
     Ok(ResolvedBodyFile {
-        path,
-        bytes: body.as_bytes().len() as u64,
-        body,
-        content_type,
+        path: canonical_file,
+        bytes: metadata.len(),
+        identity: BodyFileIdentity {
+            bytes: metadata.len(),
+            modified,
+        },
     })
+}
+
+fn ensure_body_file_unchanged(
+    path: &std::path::Path,
+    expected: BodyFileIdentity,
+) -> pay_core::Result<()> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        pay_core::Error::RequestValidation(format!(
+            "Could not recheck approved `body_file` `{}`: {error}",
+            path.display()
+        ))
+    })?;
+    let unchanged = metadata.file_type().is_file()
+        && !metadata.file_type().is_symlink()
+        && metadata.len() == expected.bytes
+        && metadata.modified().ok() == Some(expected.modified);
+    if unchanged {
+        Ok(())
+    } else {
+        Err(pay_core::Error::RequestValidation(
+            "The local file changed after approval. Review and retry the request.".to_string(),
+        ))
+    }
 }
 
 fn mcp_root_path(root: &Root) -> Result<PathBuf, String> {
@@ -1208,11 +1249,10 @@ mod tests {
         let file = resolve_body_file_path("photo.png", &[root]).unwrap();
         assert_eq!(file.path, std::fs::canonicalize(path).unwrap());
         assert_eq!(file.bytes, 11);
-        assert_eq!(file.body.as_bytes(), b"image bytes");
     }
 
     #[test]
-    fn body_file_uses_the_snapshot_that_was_presented_for_approval() {
+    fn changed_body_file_is_rejected_after_approval() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("payload.json");
         std::fs::write(&path, br#"{"approved":true}"#).unwrap();
@@ -1224,9 +1264,9 @@ mod tests {
         };
 
         let file = resolve_body_file_path("payload.json", &[root]).unwrap();
-        std::fs::write(&path, br#"{"replaced":true}"#).unwrap();
+        std::fs::write(&path, b"changed").unwrap();
 
-        assert_eq!(file.body.as_bytes(), br#"{"approved":true}"#);
+        assert!(ensure_body_file_unchanged(&file.path, file.identity).is_err());
     }
 
     #[test]
