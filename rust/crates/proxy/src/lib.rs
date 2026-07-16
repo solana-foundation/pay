@@ -13,10 +13,14 @@ pub mod observer;
 
 pub use http402::Http402Gate;
 
-use async_trait::async_trait;
 use pay_core::PaymentState;
 use pingora::proxy::http_proxy_service;
-use pingora::server::{RunArgs, Server, ShutdownSignal, ShutdownSignalWatch};
+use pingora::server::{RunArgs, Server};
+#[cfg(unix)]
+use {
+    async_trait::async_trait,
+    pingora::server::{ShutdownSignal, ShutdownSignalWatch},
+};
 
 /// Build and run the Pingora gateway on `bind`, fronting `state`'s
 /// [`PaymentGate`] and forwarding control-plane traffic to `control_plane`
@@ -85,16 +89,27 @@ pub fn run_with_shutdown<S: PaymentState>(
     svc.add_tcp(bind);
     server.add_service(svc);
     tracing::info!(bind, threads = cores, "pingora gateway up (Http402Gate)");
+    // Pingora's caller-driven shutdown (`RunArgs::shutdown_signal`) is unix-only;
+    // on Windows the server can't be signalled programmatically, so we just run it
+    // with defaults and drop the watcher.
+    #[cfg(unix)]
     server.run(RunArgs {
         shutdown_signal: Box::new(WatchShutdown(shutdown)),
     });
+    #[cfg(windows)]
+    {
+        let _ = shutdown;
+        server.run(RunArgs::default());
+    }
     Ok(())
 }
 
 /// Pingora shutdown watcher driven by a caller-owned watch channel, with
 /// SIGTERM kept as a fallback so headless `kill` still works.
+#[cfg(unix)]
 struct WatchShutdown(tokio::sync::watch::Receiver<bool>);
 
+#[cfg(unix)]
 #[async_trait]
 impl ShutdownSignalWatch for WatchShutdown {
     async fn recv(&self) -> ShutdownSignal {
