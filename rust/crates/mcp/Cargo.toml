@@ -12,11 +12,13 @@ base64 = { workspace = true }
 crc32fast = { workspace = true }
 flate2 = { workspace = true }
 mime_guess = { workspace = true }
+same-file = { workspace = true }
 qrcode = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yml = { workspace = true }
 rmcp = { workspace = true }
+reqwest = { workspace = true }
 schemars = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -27,3 +29,4 @@ tracing-subscriber = { workspace = true }
 # duplex transport. The `client` feature is only needed for tests; pulling
 # it in here keeps the production build lean.
 rmcp = { version = "0.9", features = ["server", "transport-io", "elicitation", "schemars", "client"] }
+tempfile = { workspace = true }

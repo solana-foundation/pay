@@ -6330,7 +6330,7 @@ checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
 
 [[package]]
 name = "pay"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -6385,7 +6385,7 @@ dependencies = [
 
 [[package]]
 name = "pay-core"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -6401,7 +6401,9 @@ dependencies = [
  "futures-util",
  "hmac 0.12.1",
  "http 1.4.2",
+ "libc",
  "md-5",
+ "mime_guess",
  "openssl-sys",
  "opentelemetry 0.31.0",
  "pay-keystore",
@@ -6440,7 +6442,7 @@ dependencies = [
 
 [[package]]
 name = "pay-integration"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "base64 0.22.1",
  "pay-core",
@@ -6451,13 +6453,13 @@ dependencies = [
 
 [[package]]
 name = "pay-keystore"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "bs58",
  "secret-service",
  "serde",
  "serde_json",
- "shellexpand",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "windows",
@@ -6468,7 +6470,7 @@ dependencies = [
 
 [[package]]
 name = "pay-mcp"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "base64 0.22.1",
  "crc32fast",
@@ -6478,11 +6480,14 @@ dependencies = [
  "pay-keystore",
  "pay-types",
  "qrcode",
+ "reqwest 0.12.28",
  "rmcp",
+ "same-file",
  "schemars 0.8.22",
  "serde",
  "serde_json",
  "serde_yml",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -6490,7 +6495,7 @@ dependencies = [
 
 [[package]]
 name = "pay-pdb"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -6512,7 +6517,7 @@ dependencies = [
 
 [[package]]
 name = "pay-proxy"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6533,7 +6538,7 @@ dependencies = [
 
 [[package]]
 name = "pay-types"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "schemars 0.8.22",
  "serde",
@@ -10699,7 +10704,7 @@ dependencies = [
 [[package]]
 name = "solana-pay-kit"
 version = "0.2.0"
-source = "git+https://github.com/solana-foundation/pay-kit?rev=bdaad4f5ea40f365d73be8cf5634555aa5bca677#bdaad4f5ea40f365d73be8cf5634555aa5bca677"
+source = "git+https://github.com/solana-foundation/pay-kit?rev=66cf5a3ccf2051a937aa08ec978129b3aa004eee#66cf5a3ccf2051a937aa08ec978129b3aa004eee"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -15336,7 +15341,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
