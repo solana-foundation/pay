@@ -5891,7 +5891,7 @@ version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "680998035259dcfcafe653688bf2aa6d3e2dc05e98be6ab46afb089dc84f1df8"
 dependencies = [
- "proc-macro-crate 1.3.1",
+ "proc-macro-crate 3.5.0",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
@@ -10705,7 +10705,7 @@ dependencies = [
 [[package]]
 name = "solana-pay-kit"
 version = "0.3.0"
-source = "git+https://github.com/solana-foundation/pay-kit?rev=75f97c2930f0382fa35732197dee4fab4b9e7259#75f97c2930f0382fa35732197dee4fab4b9e7259"
+source = "git+https://github.com/solana-foundation/pay-kit?rev=962f662cf21b17218baf28250572f608260d0c7a#962f662cf21b17218baf28250572f608260d0c7a"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -15342,7 +15342,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

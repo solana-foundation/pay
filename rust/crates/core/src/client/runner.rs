@@ -692,7 +692,7 @@ pub(crate) fn classify_402_with_preference(
         {
             let is_solana_method = challenge.method.as_str() == "solana";
             if is_solana_method {
-                info!(
+                debug!(
                     resource = resource_url,
                     "Detected MPP payment-channel challenge (Solana)"
                 );
@@ -866,13 +866,13 @@ pub(crate) fn classify_402_with_preference(
     }
 }
 
-/// Pure parser: pulls a `verification_failed` reason out of a 402 JSON body.
+/// Pure parser: pulls a payment rejection reason out of a 402 JSON body.
 ///
 /// Returns `(message, retryable)` if the body matches the shape emitted by
-/// `crates/core/src/server/payment.rs` for verification failures:
+/// the server emits for verification and session failures:
 ///
 /// ```json
-/// {"error": "verification_failed", "message": "...", "retryable": false}
+/// {"error": "session_failed", "message": "...", "retryable": true}
 /// ```
 ///
 /// Returns `None` for any other body shape (or absent body), so the caller
@@ -883,7 +883,8 @@ pub(crate) fn parse_verification_failure(body: Option<&str>) -> Option<(String, 
         return None;
     }
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
-    if v.get("error")?.as_str()? != "verification_failed" {
+    let error = v.get("error")?.as_str()?;
+    if !matches!(error, "verification_failed" | "session_failed") {
         return None;
     }
     let message = v
@@ -2179,6 +2180,16 @@ HTTP request sent, awaiting response...
         assert_eq!(
             parsed,
             Some(("rpc temporarily unavailable".to_string(), true))
+        );
+    }
+
+    #[test]
+    fn parse_verification_failure_accepts_session_failure() {
+        let body = r#"{"error":"session_failed","message":"open transaction not visible","retryable":true}"#;
+        let parsed = parse_verification_failure(Some(body));
+        assert_eq!(
+            parsed,
+            Some(("open transaction not visible".to_string(), true))
         );
     }
 

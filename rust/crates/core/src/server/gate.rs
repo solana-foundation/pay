@@ -1424,6 +1424,7 @@ async fn session_authorized(
                 serde_json::to_vec(&json!({
                     "error": "session_failed",
                     "message": e.to_string(),
+                    "retryable": true,
                 }))
                 .unwrap_or_default(),
             ))

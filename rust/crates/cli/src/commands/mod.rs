@@ -832,7 +832,7 @@ fn render_verbose_challenges(challenges: &DecodedPaymentChallenges) -> Option<St
         }
     }
     Some(ascii_table::render_table(
-        &["Protocol", "Terms", "Network", "Recipient / Realm"],
+        &["Protocol", "Terms", "Network"],
         &rows,
     ))
 }
@@ -940,24 +940,13 @@ fn challenge_summary_row(protocol: &str, value: &serde_json::Value) -> Vec<Strin
     )
     .map(|network| format_challenge_network(value, &network))
     .unwrap_or_else(|| "-".to_string());
-    let target = json_string(
-        value,
-        &[
-            &["payTo"],
-            &["pay_to"],
-            &["recipient"],
-            &["realm"],
-            &["request", "recipient"],
-        ],
-    )
-    .unwrap_or_else(|| "-".to_string());
     let terms = match (kind.as_str(), amount.as_str()) {
         (_, "-") => "-".to_string(),
         ("upto" | "session", amount) => format!("up to {amount}"),
         (_, amount) => amount.to_string(),
     };
 
-    vec![format!("{protocol}/{kind}"), terms, network, target]
+    vec![format!("{protocol}/{kind}"), terms, network]
 }
 
 fn format_challenge_network(value: &serde_json::Value, network: &str) -> String {
@@ -1540,11 +1529,14 @@ fn pay_upto_and_retry(
     if ctx.verbose && !is_json {
         crate::components::print_notice(
             crate::components::NoticeLevel::Success,
-            "Selecting x402 upto challenge",
-            &x402_upto_selection_notice_body(&display_x402_upto_amount(
-                &challenge.requirements.amount,
-                &challenge.requirements.asset,
-            )),
+            "Authorizing x402 payment",
+            &payment_authorization_notice_body(
+                &display_x402_upto_amount(
+                    &challenge.requirements.amount,
+                    &challenge.requirements.asset,
+                ),
+                None,
+            ),
         );
     }
 
@@ -1579,10 +1571,6 @@ fn pay_upto_and_retry(
             scheme: Some("upto"),
         })),
     )
-}
-
-fn x402_upto_selection_notice_body(amount: &str) -> String {
-    format!("Authorize up to {amount}; Pay will request wallet approval and retry the request.")
 }
 
 fn display_x402_upto_amount(amount: &str, asset: &str) -> String {
@@ -1691,9 +1679,9 @@ fn pay_session_and_retry(
 
     if verbose && !is_json {
         crate::components::print_notice(
-            crate::components::NoticeLevel::Info,
-            "Authorizing MPP payment channel",
-            &mpp_session_authorization_notice_body(&cap_display, &deposit_display),
+            crate::components::NoticeLevel::Success,
+            "Authorizing MPP session",
+            &payment_authorization_notice_body(&cap_display, Some(&deposit_display)),
         );
     }
 
@@ -1780,12 +1768,13 @@ fn pay_session_and_retry(
     )
 }
 
-fn mpp_session_authorization_notice_body(cap: &str, deposit: &str) -> String {
-    format!(
-        "Spending limit: {cap}\n\
-         Proposed channel deposit: {deposit}\n\
-         The provider will validate and open the channel with the retried request."
-    )
+fn payment_authorization_notice_body(limit: &str, deposit: Option<&str>) -> String {
+    let mut body = format!("Spending limit: {limit}\n");
+    if let Some(deposit) = deposit {
+        body.push_str(&format!("Channel deposit: {deposit}\n"));
+    }
+    body.push_str("Approve in your wallet to retry the request.");
+    body
 }
 
 fn validate_tool_request_before_signing(tool: &Tool) -> pay_core::Result<()> {
@@ -2013,7 +2002,9 @@ mod tests {
         assert!(!rendered.contains("402 payment offers"));
         assert!(rendered.contains("| Protocol"));
         assert!(rendered.contains("Terms"));
-        assert!(rendered.contains("Recipient / Realm"));
+        assert!(!rendered.contains("Recipient / Realm"));
+        assert!(!rendered.contains("x402-recipient"));
+        assert!(!rendered.contains("Example provider"));
         assert!(rendered.contains("x402/upto"));
         assert!(rendered.contains("mpp/charge"));
         assert!(rendered.contains("up to 0.25 USDC"));
@@ -2045,15 +2036,7 @@ mod tests {
             }),
         );
 
-        assert_eq!(
-            row,
-            [
-                "mpp/session",
-                "up to 0.1 USDG",
-                "Solana mainnet",
-                "Alibaba Cloud Model Studio"
-            ]
-        );
+        assert_eq!(row, ["mpp/session", "up to 0.1 USDG", "Solana mainnet"]);
     }
 
     #[test]
@@ -2310,21 +2293,23 @@ mod tests {
     }
 
     #[test]
-    fn x402_upto_selection_notice_describes_the_selected_offer() {
-        let body = x402_upto_selection_notice_body("0.25 USDC");
-        assert!(body.starts_with("Authorize up to 0.25 USDC"));
-        assert!(body.contains("wallet approval"));
+    fn x402_upto_notice_uses_shared_authorization_copy() {
+        let body = payment_authorization_notice_body("0.25 USDC", None);
+        assert_eq!(
+            body,
+            "Spending limit: 0.25 USDC\nApprove in your wallet to retry the request."
+        );
     }
 
     #[test]
-    fn mpp_session_notice_explains_authorization_without_mode_jargon() {
-        let body = mpp_session_authorization_notice_body("0.1 USDG", "0.1 USDG");
+    fn mpp_session_notice_adds_deposit_to_shared_authorization_copy() {
+        let body = payment_authorization_notice_body("0.1 USDG", Some("0.1 USDG"));
 
         assert_eq!(
             body,
             "Spending limit: 0.1 USDG\n\
-             Proposed channel deposit: 0.1 USDG\n\
-             The provider will validate and open the channel with the retried request."
+             Channel deposit: 0.1 USDG\n\
+             Approve in your wallet to retry the request."
         );
         assert!(!body.to_ascii_lowercase().contains("push"));
         assert!(!body.to_ascii_lowercase().contains("pull"));
