@@ -21,7 +21,7 @@ use pay_kit::x402::{
         siwx_extension_from_payment_required,
     },
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::accounts::{AccountsStore, ResolvedEphemeral};
 use crate::{Error, Result};
@@ -359,15 +359,6 @@ pub fn build_upto_payment_with_override(
             default_rpc_url(&network).to_string()
         }
     });
-
-    info!(
-        amount = %requirements.amount,
-        currency = %requirements.asset,
-        cluster = %network,
-        recipient = %requirements.pay_to,
-        signer = %signer.pubkey(),
-        "Building x402 upto payment"
-    );
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
