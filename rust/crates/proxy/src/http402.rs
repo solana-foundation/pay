@@ -34,6 +34,7 @@ use pay_core::server::metering::{self, UptoSettlementPlan};
 use pay_core::server::proxy::{
     STRIP_HEADERS, UpstreamPlan, prepare_upstream, routing_signs_request_body,
 };
+use pay_kit::mpp::{PAYMENT_RECEIPT_HEADER, Receipt, base64url_encode};
 use pay_kit::x402::server::VerifiedUptoOpen;
 use pay_types::metering::ApiSpec;
 use pingora::http::{RequestHeader, ResponseHeader};
@@ -99,8 +100,67 @@ struct PendingUpto {
 struct PendingSession {
     handle: std::sync::Arc<pay_core::server::session::SessionMpp>,
     channel_id: String,
+    committed_base_units: u64,
     available_base_units: u64,
     settlement: Option<Box<UptoSettlementPlan>>,
+}
+
+fn delegated_session_receipt_annotation(
+    network: &str,
+    currency: &str,
+    channel_id: &str,
+    amount: u64,
+    cumulative: u64,
+    authorized: u64,
+) -> Result<ReceiptAnnotation, String> {
+    let mut receipt = serde_json::to_value(Receipt::success("solana", channel_id, ""))
+        .map_err(|error| format!("failed to serialize MPP session receipt: {error}"))?;
+    let fields = receipt
+        .as_object_mut()
+        .ok_or_else(|| "MPP session receipt did not serialize as an object".to_string())?;
+    fields.insert("intent".to_string(), serde_json::json!("session"));
+    fields.insert("amount".to_string(), serde_json::json!(amount.to_string()));
+    fields.insert(
+        "acceptedCumulative".to_string(),
+        serde_json::json!(cumulative.to_string()),
+    );
+    fields.insert(
+        "spent".to_string(),
+        serde_json::json!(cumulative.to_string()),
+    );
+    fields.insert(
+        "authorized".to_string(),
+        serde_json::json!(authorized.to_string()),
+    );
+    fields.insert(
+        "remaining".to_string(),
+        serde_json::json!(authorized.saturating_sub(cumulative).to_string()),
+    );
+    fields.insert("currency".to_string(), serde_json::json!(currency));
+    fields.insert("network".to_string(), serde_json::json!(network));
+
+    let encoded = serde_json::to_vec(&receipt)
+        .map(|json| base64url_encode(&json))
+        .map_err(|error| format!("failed to encode MPP session receipt: {error}"))?;
+    let receipt_value = HeaderValue::from_str(&encoded)
+        .map_err(|error| format!("invalid MPP session receipt header: {error}"))?;
+    let mut headers = vec![(
+        HeaderName::from_static(PAYMENT_RECEIPT_HEADER),
+        receipt_value,
+    )];
+    if let Some(url) = pay_core::explorer::account_url(network, channel_id) {
+        let value = HeaderValue::from_str(&url)
+            .map_err(|error| format!("invalid MPP session receipt URL: {error}"))?;
+        headers.push((HeaderName::from_static("payment-receipt-url"), value));
+    }
+
+    Ok(ReceiptAnnotation {
+        headers,
+        // The stable receipt reference is the channel PDA, not a transaction
+        // signature. A settlement transaction only exists when the channel
+        // closes, so do not record this as the span's `tx_sig`.
+        reference: None,
+    })
 }
 
 /// Request-side facts captured up front for the PDB exchange.
@@ -428,7 +488,8 @@ impl<S: PaymentState> Http402Gate<S> {
                 .settle_delegated_session(ctx, &response_headers, &body)
                 .await
             {
-                Ok(()) => {}
+                Ok(Some(receipt)) => ctx.receipt = Some(receipt),
+                Ok(None) => {}
                 Err(error) => {
                     tracing::error!(%error, "failed to settle delegated MPP session usage");
                     let extra = self.drain_payment_headers(ctx, false).await;
@@ -496,12 +557,12 @@ impl<S: PaymentState> Http402Gate<S> {
         ctx: &mut Ctx,
         response_headers: &HeaderMap,
         response_body: &[u8],
-    ) -> Result<(), String> {
+    ) -> Result<Option<ReceiptAnnotation>, String> {
         let Some(pending) = ctx.session.take() else {
-            return Ok(());
+            return Ok(None);
         };
         let Some(plan) = pending.settlement else {
-            return Ok(());
+            return Ok(None);
         };
         let actual = metering::upto_actual_amount_from_response(
             &plan,
@@ -515,7 +576,7 @@ impl<S: PaymentState> Http402Gate<S> {
                 channel = %pending.channel_id,
                 "delegated MPP session response rated at zero"
             );
-            return Ok(());
+            return Ok(None);
         }
 
         let cumulative = pending
@@ -530,7 +591,18 @@ impl<S: PaymentState> Http402Gate<S> {
             usd = actual.usd,
             "delegated MPP session voucher accepted"
         );
-        Ok(())
+        let authorized = pending
+            .committed_base_units
+            .saturating_add(pending.available_base_units);
+        delegated_session_receipt_annotation(
+            pending.handle.network(),
+            pending.handle.currency(),
+            &pending.channel_id,
+            actual.base_units,
+            cumulative,
+            authorized,
+        )
+        .map(Some)
     }
 
     async fn finish_buffered_axum_response(
@@ -659,6 +731,7 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                 ctx.session = session_forward.map(|forward| PendingSession {
                     handle: forward.handle,
                     channel_id: forward.channel_id,
+                    committed_base_units: forward.committed_base_units,
                     available_base_units: forward.available_base_units,
                     settlement: forward.settlement,
                 });
@@ -1215,8 +1288,8 @@ async fn write_axum_response(
 #[cfg(test)]
 mod tests {
     use super::{
-        buffered_upstream_headers, filtered_response_headers, is_control_plane,
-        is_streamed_response,
+        buffered_upstream_headers, delegated_session_receipt_annotation, filtered_response_headers,
+        is_control_plane, is_streamed_response,
     };
 
     #[test]
@@ -1310,5 +1383,39 @@ mod tests {
             http::HeaderValue::from_static("application/json"),
         );
         assert!(!is_streamed_response(&json));
+    }
+
+    #[test]
+    fn delegated_session_receipt_reports_the_accepted_voucher() {
+        let annotation = delegated_session_receipt_annotation(
+            "mainnet",
+            pay_types::stablecoin_mints::USDC_MAINNET,
+            "JAxsw27vxSNVSTEpgvnGPsGvfVmDX6jMqezbYU7D673Z",
+            1,
+            1,
+            100_000,
+        )
+        .unwrap();
+        let headers = annotation
+            .headers
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_string(),
+                    value.to_str().unwrap().to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let decoded = pay_core::client::receipt::decode_response_receipt(&headers).unwrap();
+
+        assert_eq!(decoded.decoded["intent"], "session");
+        assert_eq!(decoded.decoded["amount"], "1");
+        assert_eq!(decoded.decoded["acceptedCumulative"], "1");
+        assert_eq!(decoded.decoded["spent"], "1");
+        assert_eq!(decoded.decoded["remaining"], "99999");
+        assert!(headers.iter().any(|(name, value)| {
+            name == "payment-receipt-url"
+                && value == "https://pay.sh/receipt/JAxsw27vxSNVSTEpgvnGPsGvfVmDX6jMqezbYU7D673Z"
+        }));
     }
 }

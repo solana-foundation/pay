@@ -284,6 +284,46 @@ fn resolve_session_splits(
     Ok(splits)
 }
 
+fn delegated_session_channel_payout(
+    recipient: &str,
+    operator: &str,
+    mut splits: Vec<pay_kit::mpp::server::session::Split>,
+) -> pay_core::Result<(String, Vec<pay_kit::mpp::server::session::Split>)> {
+    if recipient == operator {
+        return Ok((recipient.to_string(), splits));
+    }
+
+    let recipient = solana_pubkey::Pubkey::from_str(recipient).map_err(|e| {
+        pay_core::Error::Config(format!(
+            "delegated session recipient is not a valid Solana pubkey: {e}"
+        ))
+    })?;
+    let explicit_bps = splits
+        .iter()
+        .try_fold(0_u16, |total, split| total.checked_add(split.bps))
+        .ok_or_else(|| {
+            pay_core::Error::Config("delegated session split basis points overflow".to_string())
+        })?;
+    let primary_bps = 10_000_u16.checked_sub(explicit_bps).ok_or_else(|| {
+        pay_core::Error::Config("delegated session splits exceed 100%".to_string())
+    })?;
+
+    if let Some(existing) = splits.iter_mut().find(|split| split.recipient == recipient) {
+        existing.bps = existing.bps.checked_add(primary_bps).ok_or_else(|| {
+            pay_core::Error::Config(
+                "delegated session recipient split basis points overflow".to_string(),
+            )
+        })?;
+    } else {
+        splits.push(pay_kit::mpp::server::session::Split {
+            recipient,
+            bps: primary_bps,
+        });
+    }
+
+    Ok((operator.to_string(), splits))
+}
+
 fn account_env_var(account: &str) -> Option<&str> {
     account
         .strip_prefix("${")
@@ -981,6 +1021,16 @@ impl StartCommand {
                     .or(fee_payer_signer.as_ref())
                     .map(|signer| signer.pubkey().to_string())
                     .unwrap_or_else(|| recipient.clone());
+                let (session_recipient, session_splits) =
+                    if settlement_authority == SettlementAuthority::Delegated {
+                        delegated_session_channel_payout(
+                            &recipient,
+                            &session_operator,
+                            session_splits,
+                        )?
+                    } else {
+                        (recipient.clone(), session_splits)
+                    };
                 if client_voucher_pull && should_fund {
                     ensure_surfpool_session_distribution_accounts(&rpc_url, &session_splits)
                         .await?;
@@ -991,7 +1041,7 @@ impl StartCommand {
                     let cap_base =
                         (sess.cap_usdc * 10f64.powi(i32::from(*session_decimals))).round() as u64;
                     let config = SessionConfig {
-                        recipient: recipient.clone(),
+                        recipient: session_recipient.clone(),
                         operator: session_operator.clone(),
                         splits: session_splits.clone(),
                         currency: session_mpp_currency.clone(),
@@ -2939,9 +2989,9 @@ mod tests {
         surfpool_funding_targets, surfpool_prep_notice_body,
     };
     use super::{
-        build_pdb_config, default_bind, payout_recipient_pubkeys, payout_recipient_targets,
-        resolve_operator_currencies, validate_browser_rpc_request, x402_currency_configs,
-        x402_upto_beneficiary_pubkey, x402_upto_payout_for_recipient,
+        build_pdb_config, default_bind, delegated_session_channel_payout, payout_recipient_pubkeys,
+        payout_recipient_targets, resolve_operator_currencies, validate_browser_rpc_request,
+        x402_currency_configs, x402_upto_beneficiary_pubkey, x402_upto_payout_for_recipient,
     };
     use crate::network::SolanaNetwork;
     use serial_test::serial;
@@ -3338,6 +3388,54 @@ endpoints:
 
         assert_eq!(beneficiary.unwrap().to_string(), recipient);
         assert_eq!(same_as_operator, None);
+    }
+
+    #[test]
+    fn delegated_session_uses_operator_as_zero_share_payee() {
+        let operator = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+
+        let (payee, splits) = delegated_session_channel_payout(
+            &recipient.to_string(),
+            &operator.to_string(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert_eq!(payee, operator.to_string());
+        assert_eq!(splits.len(), 1);
+        assert_eq!(splits[0].recipient, recipient);
+        assert_eq!(splits[0].bps, 10_000);
+    }
+
+    #[test]
+    fn delegated_session_preserves_explicit_splits_and_routes_remainder() {
+        let operator = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let partner = Pubkey::new_unique();
+
+        let (payee, splits) = delegated_session_channel_payout(
+            &recipient.to_string(),
+            &operator.to_string(),
+            vec![pay_kit::mpp::server::session::Split {
+                recipient: partner,
+                bps: 2_500,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(payee, operator.to_string());
+        assert!(
+            splits
+                .iter()
+                .any(|split| { split.recipient == recipient && split.bps == 7_500 })
+        );
+        assert!(
+            splits
+                .iter()
+                .any(|split| { split.recipient == partner && split.bps == 2_500 })
+        );
+        assert_eq!(splits.iter().map(|split| split.bps).sum::<u16>(), 10_000);
     }
 
     #[test]

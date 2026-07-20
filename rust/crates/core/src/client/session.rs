@@ -370,6 +370,11 @@ pub fn open_payment_channel_session_header_with_mode(
     let authorized_signer = match request.settlement_authority {
         pay_kit::mpp::SessionSettlementAuthority::ClientVoucher => session_signer.pubkey(),
         pay_kit::mpp::SessionSettlementAuthority::Delegated => fee_payer,
+        _ => {
+            return Err(Error::Mpp(
+                "unsupported MPP session settlement authority".to_string(),
+            ));
+        }
     };
 
     let open = derive_payment_channel_open(DerivePaymentChannelOpenParams {
