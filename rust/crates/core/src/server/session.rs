@@ -23,7 +23,8 @@ use pay_kit::mpp::solana_keychain::SolanaSigner;
 use pay_kit::mpp::store::{ChannelState, MemoryChannelStore};
 use pay_kit::mpp::{
     Base64UrlJson, CommitReceipt, OpenPayload, PaymentChallenge, SessionAction, SessionMode,
-    SessionPullVoucherStrategy, parse_authorization,
+    SessionPullVoucherStrategy, SessionSettlementAuthority, SignedVoucher, VoucherData,
+    VoucherPayload, parse_authorization,
 };
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
@@ -74,6 +75,7 @@ struct SessionOperatorRuntime {
     payment_channel_signer: Arc<Mutex<Option<Arc<dyn SolanaSigner>>>>,
     payment_channel_payer_signer: Arc<Mutex<Option<Arc<dyn SolanaSigner>>>>,
     committed_watermarks: Arc<Mutex<HashMap<String, u64>>>,
+    delegated_voucher_lock: Arc<tokio::sync::Mutex<()>>,
     /// Channel id → on-chain settlement signature, recorded when the channel
     /// finalizes. Surfaced via the `/sessions/receipt/:channelId` poll so the
     /// playground can show the settle receipt URL (sessions settle out-of-band
@@ -486,6 +488,7 @@ impl SessionMpp {
         let payment_channel_signer = Arc::new(Mutex::new(None));
         let payment_channel_payer_signer = Arc::new(Mutex::new(None));
         let committed_watermarks = Arc::new(Mutex::new(HashMap::new()));
+        let delegated_voucher_lock = Arc::new(tokio::sync::Mutex::new(()));
         let settlement_signatures = Arc::new(Mutex::new(HashMap::new()));
         let pull_sessions = Arc::new(Mutex::new(HashSet::new()));
         let operator_runtime = SessionOperatorRuntime {
@@ -494,6 +497,7 @@ impl SessionMpp {
             payment_channel_signer: Arc::clone(&payment_channel_signer),
             payment_channel_payer_signer: Arc::clone(&payment_channel_payer_signer),
             committed_watermarks: Arc::clone(&committed_watermarks),
+            delegated_voucher_lock,
             settlement_signatures: Arc::clone(&settlement_signatures),
             settlement_worker: Arc::new(tokio::sync::OnceCell::new()),
         };
@@ -592,6 +596,73 @@ impl SessionMpp {
     /// Minimum accepted voucher increment in base units.
     pub fn min_voucher_delta(&self) -> u64 {
         self.session_config.min_voucher_delta
+    }
+
+    /// Who is authorized to sign cumulative settlement vouchers.
+    pub fn settlement_authority(&self) -> SessionSettlementAuthority {
+        self.session_config.settlement_authority
+    }
+
+    /// Meter a successful response and persist an operator-signed cumulative
+    /// voucher before releasing that response to the client.
+    pub async fn authorize_delegated_usage(&self, channel_id: &str, amount: u64) -> Result<u64> {
+        if self.settlement_authority() != SessionSettlementAuthority::Delegated {
+            return Err(Error::Mpp(
+                "session does not delegate voucher authority to the operator".to_string(),
+            ));
+        }
+        if amount == 0 {
+            return Ok(self.committed_watermark(channel_id).unwrap_or_default());
+        }
+
+        // Serialize read/sign/verify so concurrent responses cannot construct
+        // two vouchers from the same cumulative watermark.
+        let _guard = self.operator_runtime.delegated_voucher_lock.lock().await;
+        let current = self.committed_watermark(channel_id).ok_or_else(|| {
+            Error::Mpp(format!("unknown delegated session channel: {channel_id}"))
+        })?;
+        let cumulative = current
+            .checked_add(amount)
+            .ok_or_else(|| Error::Mpp("session cumulative amount overflow".to_string()))?;
+        let signer = self
+            .operator_runtime
+            .payment_channel_signer()
+            .ok_or_else(|| Error::Mpp("delegated session signer is not configured".to_string()))?;
+        let operator = solana_pubkey::Pubkey::from_str(&self.session_config.operator)
+            .map_err(|e| Error::Mpp(format!("invalid session operator: {e}")))?;
+        if signer.pubkey() != operator {
+            return Err(Error::Mpp(format!(
+                "delegated session signer {} does not match operator {operator}",
+                signer.pubkey()
+            )));
+        }
+
+        let data = VoucherData {
+            channel_id: channel_id.to_string(),
+            cumulative: cumulative.to_string(),
+            expires_at: pay_kit::mpp::DEFAULT_SESSION_EXPIRES_AT,
+            nonce: None,
+        };
+        let message = data
+            .message_bytes()
+            .map_err(|e| Error::Mpp(format!("failed to encode delegated voucher: {e}")))?;
+        let signature = signer
+            .sign_message(&message)
+            .await
+            .map_err(|e| Error::Mpp(format!("failed to sign delegated voucher: {e}")))?;
+        let accepted = self
+            .server
+            .verify_voucher(&VoucherPayload {
+                voucher: SignedVoucher {
+                    data,
+                    signature: bs58::encode(signature.as_ref()).into_string(),
+                },
+            })
+            .await
+            .map_err(|e| Error::PaymentRejected(e.to_string()))?;
+        self.record_committed_watermark(channel_id.to_string(), accepted.cumulative);
+        self.touch_channel(channel_id.to_string());
+        Ok(accepted.cumulative)
     }
 
     /// Record channel activity so the lifecycle runloop can defer auto-close.
@@ -718,11 +789,17 @@ impl SessionMpp {
                     p
                 };
 
-                let state = self
-                    .server
-                    .process_open(payload_for_open)
-                    .await
-                    .map_err(|e| Error::Mpp(format!("Session open failed: {e}")))?;
+                // The host has independently validated, co-signed, submitted,
+                // and observed a successful status for transactions it
+                // broadcasts. Persist those opens without asking a second RPC
+                // client to rediscover the same signature. Opens received by
+                // any other integration retain PayKit's standard verification.
+                let state = if submitted_open.is_some() {
+                    self.server.process_preverified_open(payload_for_open).await
+                } else {
+                    self.server.process_open(payload_for_open).await
+                }
+                .map_err(|e| Error::Mpp(format!("Session open failed: {e}")))?;
 
                 if let Some(signature) = &submitted_open {
                     tracing::info!(%signature, "payment-channel open transaction confirmed");
@@ -935,12 +1012,7 @@ impl SessionMpp {
         .await
         .map_err(|e| Error::Mpp(e.to_string()))?;
 
-        // Push-mode `process_open` performs the authoritative on-chain status
-        // check. Return after broadcast so we do not serially poll the same
-        // signature twice through two RPC clients. Pull mode skips that check,
-        // so it still confirms here before persisting the channel.
-        let confirm_before_return = payload.mode != SessionMode::Push;
-        submit_versioned_transaction(rpc_url, tx, "payment-channel open", confirm_before_return)
+        submit_versioned_transaction(rpc_url, tx, "payment-channel open")
             .await
             .map(Some)
     }
@@ -1128,20 +1200,20 @@ async fn sign_and_submit_transaction(
         rpc_url,
         solana_transaction::versioned::VersionedTransaction::from(tx.clone()),
         context,
-        true,
     )
     .await
 }
 
-/// Broadcast an already-signed transaction (legacy or v0), optionally waiting
-/// for its first successful processed status before returning.
+/// Broadcast an already-signed transaction (legacy or v0) and wait for its
+/// first successful processed status before returning.
 async fn submit_versioned_transaction(
     rpc_url: String,
     tx: solana_transaction::versioned::VersionedTransaction,
     context: &'static str,
-    confirm_before_return: bool,
 ) -> Result<String> {
     tokio::task::spawn_blocking(move || {
+        use std::time::Instant;
+
         use pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient;
         use solana_commitment_config::CommitmentConfig;
 
@@ -1151,19 +1223,32 @@ async fn submit_versioned_transaction(
                 Error::Mpp(format!("{context} transaction is missing a signature"))
             })?;
 
+        let submit_started = Instant::now();
         match rpc.send_transaction(&tx) {
             Ok(signature) => {
-                if confirm_before_return {
-                    wait_for_transaction_processed(&rpc, &signature, context)?;
-                }
+                let rpc_send_ms = submit_started.elapsed().as_millis();
+                let wait_started = Instant::now();
+                wait_for_transaction_processed(&rpc, &signature, context)?;
+                tracing::info!(
+                    %signature,
+                    context,
+                    rpc_send_ms,
+                    processed_wait_ms = wait_started.elapsed().as_millis(),
+                    "transaction reached processed status"
+                );
                 Ok(signature.to_string())
             }
             Err(send_error) => {
+                let rpc_send_ms = submit_started.elapsed().as_millis();
+                let wait_started = Instant::now();
                 match wait_for_transaction_processed(&rpc, &expected_signature, context) {
                     Ok(()) => {
                         tracing::warn!(
                             %expected_signature,
                             error = %send_error,
+                            context,
+                            rpc_send_ms,
+                            processed_wait_ms = wait_started.elapsed().as_millis(),
                             "{context} transaction confirmed after submit returned an error"
                         );
                         Ok(expected_signature.to_string())
@@ -1578,6 +1663,61 @@ mod tests {
             session.committed_watermark(&active.channel_id_str()),
             Some(60)
         );
+    }
+
+    #[tokio::test]
+    async fn delegated_usage_signs_and_persists_cumulative_voucher() {
+        let signer: Arc<dyn SolanaSigner> = Arc::from(test_session_signer());
+        let operator = signer.pubkey();
+        let mut config = test_session_config();
+        config.operator = operator.to_string();
+        config.settlement_authority = SessionSettlementAuthority::Delegated;
+        let session =
+            SessionMpp::new(config, "test-secret").with_payment_channel_signer(Arc::clone(&signer));
+        let payload =
+            payment_channel_payload(&session, solana_pubkey::Pubkey::new_unique(), operator, 91);
+        let opened = tokio::time::timeout(
+            Duration::from_secs(2),
+            session.server.process_preverified_open(&payload),
+        )
+        .await
+        .expect("delegated open timed out")
+        .unwrap();
+        session.record_committed_watermark(opened.channel_id.clone(), opened.cumulative);
+
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                session.authorize_delegated_usage(&opened.channel_id, 75),
+            )
+            .await
+            .expect("first delegated voucher timed out")
+            .unwrap(),
+            75
+        );
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                session.authorize_delegated_usage(&opened.channel_id, 25),
+            )
+            .await
+            .expect("second delegated voucher timed out")
+            .unwrap(),
+            100
+        );
+        let close_payload = pay_kit::mpp::ClosePayload {
+            channel_id: opened.channel_id.clone(),
+            voucher: None,
+        };
+        let close = tokio::time::timeout(
+            Duration::from_secs(2),
+            session.server.process_close(&close_payload),
+        )
+        .await
+        .expect("delegated close timed out")
+        .unwrap();
+        assert_eq!(close.settled, 100);
+        assert_eq!(session.committed_watermark(&opened.channel_id), Some(100));
     }
 
     #[tokio::test]

@@ -18,9 +18,8 @@
 //!   with a signature computed over an empty body. Header / Bearer / OAuth2 /
 //!   QueryParam auth, and HMAC that doesn't digest the body, all work. Lifting
 //!   this needs request-body buffering before the upstream connect.
-//! - **Response-side session metering**: debiting a push channel as bytes flow
-//!   back ([`upstream_response_body_filter`]) is not wired yet; session
-//!   open/voucher/close (all request-side, in the gate) work.
+//! Delegated MPP sessions and x402 `upto` share the buffered response-metering
+//! path so usage is rated once and settlement is persisted before release.
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
@@ -68,6 +67,10 @@ pub struct Ctx {
     /// (debit on success) or `logging` (refund when the upstream never
     /// responded). Taken when settled, so it's never double-settled.
     upto: Option<PendingUpto>,
+    /// A delegated MPP session opened pre-serve. Responses are buffered and
+    /// rated with the same usage pipeline as x402 `upto`, then the gateway
+    /// signs and persists the cumulative voucher before returning the body.
+    session: Option<PendingSession>,
     /// Captured at `request_filter` for the Payment Debugger exchange emitted
     /// in `logging` (the data plane is Pingora, so the old axum logging
     /// middleware never sees proxied traffic).
@@ -91,6 +94,13 @@ struct PendingUpto {
     open: VerifiedUptoOpen,
     settle_amount: u64,
     settlement: Option<UptoSettlementPlan>,
+}
+
+struct PendingSession {
+    handle: std::sync::Arc<pay_core::server::session::SessionMpp>,
+    channel_id: String,
+    available_base_units: u64,
+    settlement: Option<Box<UptoSettlementPlan>>,
 }
 
 /// Request-side facts captured up front for the PDB exchange.
@@ -295,7 +305,7 @@ impl<S: PaymentState> Http402Gate<S> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn forward_upto_buffered(
+    async fn forward_response_metered_buffered(
         &self,
         session: &mut Session,
         ctx: &mut Ctx,
@@ -321,7 +331,7 @@ impl<S: PaymentState> Http402Gate<S> {
         let body = match read_downstream_body(session, BUFFERED_REQUEST_BODY_LIMIT).await {
             Ok(body) => body,
             Err(e) => {
-                tracing::warn!(error = %e, "failed to buffer request body for x402 upto");
+                tracing::warn!(error = %e, "failed to buffer response-metered request body");
                 let extra = self.drain_payment_headers(ctx, false).await;
                 write_buffered_response(
                     session,
@@ -353,6 +363,11 @@ impl<S: PaymentState> Http402Gate<S> {
             .upto
             .as_ref()
             .and_then(|pending| pending.settlement.as_ref())
+            .or_else(|| {
+                ctx.session
+                    .as_ref()
+                    .and_then(|pending| pending.settlement.as_deref())
+            })
             .map(|plan| metering::upto_response_body_limit(&plan.metering))
             .unwrap_or(DEFAULT_RESPONSE_BODY_LIMIT);
 
@@ -393,7 +408,7 @@ impl<S: PaymentState> Http402Gate<S> {
         let body = match collect_reqwest_body(upstream, response_limit).await {
             Ok(body) => body,
             Err(e) => {
-                tracing::warn!(error = %e, "failed to buffer response body for x402 upto");
+                tracing::warn!(error = %e, "failed to buffer response-metered body");
                 let extra = self.drain_payment_headers(ctx, false).await;
                 write_buffered_response(
                     session,
@@ -407,7 +422,28 @@ impl<S: PaymentState> Http402Gate<S> {
             }
         };
 
-        self.observe_buffered_upto_response(ctx, &response_headers, &body);
+        self.observe_buffered_metered_response(ctx, &response_headers, &body);
+        if status.is_success() {
+            match self
+                .settle_delegated_session(ctx, &response_headers, &body)
+                .await
+            {
+                Ok(()) => {}
+                Err(error) => {
+                    tracing::error!(%error, "failed to settle delegated MPP session usage");
+                    let extra = self.drain_payment_headers(ctx, false).await;
+                    write_buffered_response(
+                        session,
+                        StatusCode::BAD_GATEWAY,
+                        HeaderMap::new(),
+                        Bytes::from_static(b"{\"error\":\"session_settlement_failed\"}"),
+                        extra,
+                    )
+                    .await?;
+                    return Ok(true);
+                }
+            }
+        }
         let extra = self
             .drain_payment_headers_with_response(
                 ctx,
@@ -419,16 +455,21 @@ impl<S: PaymentState> Http402Gate<S> {
         write_buffered_response(session, status, response_headers, body, extra).await?;
         tracing::debug!(
             path,
-            "served x402 upto via buffered response-metered proxy path"
+            "served payment via buffered response-metered proxy path"
         );
         Ok(true)
     }
 
-    fn observe_buffered_upto_response(&self, ctx: &mut Ctx, headers: &HeaderMap, body: &[u8]) {
+    fn observe_buffered_metered_response(&self, ctx: &mut Ctx, headers: &HeaderMap, body: &[u8]) {
         let Some(plan) = ctx
             .upto
             .as_mut()
             .and_then(|pending| pending.settlement.as_mut())
+            .or_else(|| {
+                ctx.session
+                    .as_mut()
+                    .and_then(|pending| pending.settlement.as_deref_mut())
+            })
         else {
             return;
         };
@@ -448,6 +489,48 @@ impl<S: PaymentState> Http402Gate<S> {
             self.state.record_exchange_update(log_id, &usage);
         }
         ctx.buffered_usage = Some(usage);
+    }
+
+    async fn settle_delegated_session(
+        &self,
+        ctx: &mut Ctx,
+        response_headers: &HeaderMap,
+        response_body: &[u8],
+    ) -> Result<(), String> {
+        let Some(pending) = ctx.session.take() else {
+            return Ok(());
+        };
+        let Some(plan) = pending.settlement else {
+            return Ok(());
+        };
+        let actual = metering::upto_actual_amount_from_response(
+            &plan,
+            pending.available_base_units,
+            response_headers,
+            Some(response_body),
+        )
+        .map_err(|error| error.to_string())?;
+        if actual.base_units == 0 {
+            tracing::info!(
+                channel = %pending.channel_id,
+                "delegated MPP session response rated at zero"
+            );
+            return Ok(());
+        }
+
+        let cumulative = pending
+            .handle
+            .authorize_delegated_usage(&pending.channel_id, actual.base_units)
+            .await
+            .map_err(|error| error.to_string())?;
+        tracing::info!(
+            channel = %pending.channel_id,
+            amount = actual.base_units,
+            cumulative,
+            usd = actual.usd,
+            "delegated MPP session voucher accepted"
+        );
+        Ok(())
     }
 
     async fn finish_buffered_axum_response(
@@ -480,6 +563,7 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
             target: None,
             receipt: None,
             upto: None,
+            session: None,
             log: None,
             observer: None,
             buffered_usage: None,
@@ -556,7 +640,11 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                 write_gate_response(session, r).await?;
                 Ok(true)
             }
-            GateDecision::Forward { receipt, upto, .. } => {
+            GateDecision::Forward {
+                session: session_forward,
+                receipt,
+                upto,
+            } => {
                 ctx.receipt = receipt;
                 // x402 `upto`: the channel is open; hold it for post-response
                 // settlement (response_filter on success, logging on failure).
@@ -568,20 +656,34 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                         settlement: u.settlement,
                     }
                 });
-                // x402-upto settlement receipts must ride the response. Any
-                // response-body-metered plan therefore uses the buffered path:
-                // observe the full body, settle, attach PAYMENT-RESPONSE, then
-                // write the downstream response.
-                if ctx.upto.as_ref().is_some_and(|pending| {
-                    pending.settlement.as_ref().is_some_and(|plan| {
+                ctx.session = session_forward.map(|forward| PendingSession {
+                    handle: forward.handle,
+                    channel_id: forward.channel_id,
+                    available_base_units: forward.available_base_units,
+                    settlement: forward.settlement,
+                });
+                // Delegated sessions always settle before releasing a
+                // successful response, including fixed-price endpoints. x402
+                // `upto` only needs this path when pricing consumes response
+                // usage; its fixed-price path can settle in response_filter.
+                let delegated_session = ctx
+                    .session
+                    .as_ref()
+                    .and_then(|pending| pending.settlement.as_ref())
+                    .is_some();
+                let response_metered_upto = ctx
+                    .upto
+                    .as_ref()
+                    .and_then(|pending| pending.settlement.as_ref())
+                    .is_some_and(|plan| {
                         metering::upto_requires_response_body(
                             &plan.metering,
                             plan.variant_hint.as_deref(),
                         )
-                    })
-                }) {
+                    });
+                if delegated_session || response_metered_upto {
                     return self
-                        .forward_upto_buffered(
+                        .forward_response_metered_buffered(
                             session,
                             ctx,
                             &path,

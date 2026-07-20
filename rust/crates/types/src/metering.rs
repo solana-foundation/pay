@@ -808,6 +808,17 @@ impl SignerConfig {
 
 /// Session channel parameters — emitted by the server when the API
 /// is configured for MPP session payments (off-chain vouchers).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionSettlementAuthority {
+    /// The client owns the channel voucher key and signs each cumulative debit.
+    #[default]
+    ClientVoucher,
+    /// The client delegates voucher authority to the gateway operator, which
+    /// meters successful responses and signs their cumulative settlement.
+    Delegated,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SessionSpec {
     /// Default channel cap offered to clients (USDC, human-readable).
@@ -817,6 +828,10 @@ pub struct SessionSpec {
     /// Prevents spam vouchers smaller than one API call's cost.
     #[serde(default)]
     pub min_voucher_delta: u64,
+    /// Who signs cumulative settlement vouchers. Independent from `modes`,
+    /// which controls how channel transactions are submitted.
+    #[serde(default)]
+    pub settlement_authority: SessionSettlementAuthority,
     /// Session modes this server accepts.
     ///
     /// Allowed values: `"push"` (payment channel, client-funded) and/or
@@ -2507,6 +2522,22 @@ mod tests {
 
         assert_eq!(session.batch_open_interval_ms, 400);
         assert_eq!(session.close_delay_ms, 15_000);
+        assert_eq!(
+            session.settlement_authority,
+            SessionSettlementAuthority::ClientVoucher
+        );
+    }
+
+    #[test]
+    fn session_spec_parses_delegated_settlement_authority() {
+        let session: SessionSpec =
+            serde_json::from_str(r#"{"cap_usdc":10.0,"settlement_authority":"delegated"}"#)
+                .unwrap();
+
+        assert_eq!(
+            session.settlement_authority,
+            SessionSettlementAuthority::Delegated
+        );
     }
 
     #[test]
@@ -3689,6 +3720,7 @@ value_from_env: PAY_SIGNER_KEYPAIR
         spec.session = Some(SessionSpec {
             cap_usdc: 10.0,
             min_voucher_delta: 0,
+            settlement_authority: SessionSettlementAuthority::ClientVoucher,
             modes: vec![],
             pull_voucher_strategy: SessionPullVoucherStrategy::Disabled,
             batch_open_interval_ms: 400,
@@ -3853,6 +3885,7 @@ value_from_env: PAY_SIGNER_KEYPAIR
         spec.session = Some(SessionSpec {
             cap_usdc: 10.0,
             min_voucher_delta: 0,
+            settlement_authority: SessionSettlementAuthority::ClientVoucher,
             modes: vec![],
             pull_voucher_strategy: SessionPullVoucherStrategy::Disabled,
             batch_open_interval_ms: 400,

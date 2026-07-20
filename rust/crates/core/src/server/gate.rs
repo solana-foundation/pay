@@ -111,6 +111,12 @@ pub struct SessionForward {
     pub handle: Arc<SessionMpp>,
     pub channel_id: String,
     pub committed_base_units: u64,
+    /// Response-metered settlement plan for a delegated session. The adapter
+    /// buffers the response, rates actual usage, and persists an
+    /// operator-signed cumulative voucher before releasing the response.
+    pub settlement: Option<Box<metering::UptoSettlementPlan>>,
+    /// Remaining channel capacity available to the metered delivery.
+    pub available_base_units: u64,
 }
 
 /// An x402 `upto` channel opened (and confirmed on-chain) before the resource
@@ -289,6 +295,8 @@ impl<S: PaymentState> PaymentGate<S> {
                             session_mpps[index],
                             session_handles.get(index).cloned(),
                             auth,
+                            meter,
+                            req,
                             subdomain,
                             path,
                         )
@@ -1373,19 +1381,64 @@ async fn session_authorized(
     sm: &SessionMpp,
     handle: Option<Arc<SessionMpp>>,
     auth: &str,
+    meter: &pay_types::metering::Metering,
+    req: &GateRequest<'_>,
     subdomain: &str,
     path: &str,
 ) -> GateDecision {
     match sm.process(auth).await {
-        Ok(SessionOutcome::Active { state, signature }) => GateDecision::Forward {
-            session: handle.map(|h| SessionForward {
-                handle: h,
-                channel_id: state.channel_id,
-                committed_base_units: state.cumulative,
-            }),
-            receipt: signature.map(|reference| session_receipt_annotation(sm.network(), reference)),
-            upto: None,
-        },
+        Ok(SessionOutcome::Active { state, signature }) => {
+            if sm.settlement_authority() == pay_kit::mpp::SessionSettlementAuthority::ClientVoucher
+            {
+                let mut response = GateResponse::json(
+                    StatusCode::PAYMENT_REQUIRED,
+                    serde_json::to_vec(&json!({
+                        "error": "session_voucher_required",
+                        "message": "The channel is open; submit a client-signed voucher before requesting paid service.",
+                        "channelId": state.channel_id,
+                    }))
+                    .unwrap_or_default(),
+                );
+                if let Some(reference) = signature {
+                    response
+                        .headers
+                        .extend(session_receipt_annotation(sm.network(), reference).headers);
+                }
+                return GateDecision::Respond(response);
+            }
+            let Some(handle) = handle else {
+                return GateDecision::Respond(GateResponse::json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Bytes::from_static(br#"{"error":"session_backend_unavailable"}"#),
+                ));
+            };
+            let available_base_units = state.deposit.saturating_sub(state.cumulative);
+            let props = metering::RequestProperties {
+                body_size: req.content_length,
+                ..Default::default()
+            };
+            let variant = variant_hint_from_path(path);
+            let ceiling_usd = available_base_units as f64 / 10_f64.powi(sm.decimals() as i32);
+            let settlement = Some(Box::new(metering::UptoSettlementPlan {
+                metering: meter.clone(),
+                variant_hint: variant,
+                request_properties: props,
+                ceiling_usd,
+                inferred_usage: None,
+            }));
+            GateDecision::Forward {
+                session: Some(SessionForward {
+                    handle,
+                    channel_id: state.channel_id,
+                    committed_base_units: state.cumulative,
+                    settlement,
+                    available_base_units,
+                }),
+                receipt: signature
+                    .map(|reference| session_receipt_annotation(sm.network(), reference)),
+                upto: None,
+            }
+        }
         Ok(SessionOutcome::Voucher {
             channel_id,
             cumulative,
@@ -1394,6 +1447,8 @@ async fn session_authorized(
                 handle: h,
                 channel_id,
                 committed_base_units: cumulative,
+                settlement: None,
+                available_base_units: 0,
             }),
             receipt: None,
             upto: None,

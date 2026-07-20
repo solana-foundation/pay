@@ -877,8 +877,13 @@ impl StartCommand {
             // ── Create one session MPP server per configured currency ──
             let session_mpps: Vec<Arc<SessionMpp>> = if let Some(ref sess) = api.session {
                 use pay_core::server::session::PullVoucherStrategy;
-                use pay_types::metering::SessionPullVoucherStrategy as ConfigPullVoucherStrategy;
-                use pay_kit::mpp::server::session::SessionConfig;
+                use pay_types::metering::{
+                    SessionPullVoucherStrategy as ConfigPullVoucherStrategy,
+                    SessionSettlementAuthority as ConfigSettlementAuthority,
+                };
+                use pay_kit::mpp::server::session::{
+                    SessionConfig, SettlementAuthority,
+                };
                 use pay_kit::mpp::{SessionMode, SessionPullVoucherStrategy};
                 use std::str::FromStr;
 
@@ -945,6 +950,19 @@ impl StartCommand {
                 let session_splits = resolve_session_splits(&api, sess)?;
                 let client_voucher_pull = modes.contains(&SessionMode::Pull)
                     && pull_voucher_strategy == PullVoucherStrategy::ClientVoucher;
+                let settlement_authority = match sess.settlement_authority {
+                    ConfigSettlementAuthority::ClientVoucher => {
+                        SettlementAuthority::ClientVoucher
+                    }
+                    ConfigSettlementAuthority::Delegated => SettlementAuthority::Delegated,
+                };
+                if settlement_authority == SettlementAuthority::Delegated
+                    && fee_payer_signer.is_none()
+                {
+                    return Err(pay_core::Error::Config(
+                        "delegated session settlement requires operator.fee_payer so the gateway can sign metered vouchers".to_string(),
+                    ));
+                }
                 if client_voucher_pull
                     && let Some(settlement_signer) = fee_payer_signer.as_ref()
                     && recipient != settlement_signer.pubkey().to_string()
@@ -981,6 +999,7 @@ impl StartCommand {
                         network: network.slug().to_string(),
                         max_cap: cap_base,
                         min_voucher_delta: sess.min_voucher_delta,
+                        settlement_authority,
                         modes: modes.clone(),
                         pull_voucher_strategy: sdk_pull_voucher_strategy.clone(),
                         grace_period_seconds:
