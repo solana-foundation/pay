@@ -258,10 +258,12 @@ impl<S: PaymentState> PaymentGate<S> {
         let meter = metering_config.expect("gated endpoint has metering");
         let accepted = meter.accepted_schemes();
 
-        let session_handle = self.state.session_mpp_handle();
-        let session_mpp = session_handle
-            .as_deref()
-            .or_else(|| self.state.session_mpp());
+        let session_handles = self.state.session_mpp_handles();
+        let session_mpps: Vec<&SessionMpp> = if session_handles.is_empty() {
+            self.state.session_mpps()
+        } else {
+            session_handles.iter().map(Arc::as_ref).collect()
+        };
 
         // MPP credential present → dispatch by intent (only if accepted). Only
         // `Payment`-scheme Authorization headers are payment credentials — any
@@ -275,11 +277,17 @@ impl<S: PaymentState> PaymentGate<S> {
                     let intent = cred.challenge.intent.as_str();
                     if intent == "session"
                         && accepted.contains(&Scheme::MppSession)
-                        && let Some(sm) = session_mpp
+                        && let Ok(request) = cred
+                            .challenge
+                            .request
+                            .decode::<pay_kit::mpp::SessionRequest>()
+                        && let Some(index) = session_mpps
+                            .iter()
+                            .position(|session| session.currency() == request.currency)
                     {
                         return session_authorized(
-                            sm,
-                            session_handle.clone(),
+                            session_mpps[index],
+                            session_handles.get(index).cloned(),
                             auth,
                             subdomain,
                             path,
@@ -349,7 +357,7 @@ impl<S: PaymentState> PaymentGate<S> {
             api,
             meter,
             &accepted,
-            session_mpp,
+            &session_mpps,
             req,
             subdomain,
             path,
@@ -369,7 +377,7 @@ impl<S: PaymentState> PaymentGate<S> {
         api: &pay_types::metering::ApiSpec,
         meter: &pay_types::metering::Metering,
         accepted: &[Scheme],
-        session_mpp: Option<&SessionMpp>,
+        session_mpps: &[&SessionMpp],
         req: &GateRequest<'_>,
         subdomain: &str,
         path: &str,
@@ -395,21 +403,21 @@ impl<S: PaymentState> PaymentGate<S> {
         let mut challenge_headers: Vec<(HeaderName, HeaderValue)> = Vec::new();
         let mut advertised: Vec<&str> = Vec::new();
 
-        if accepted.contains(&Scheme::MppSession)
-            && let Some(sm) = session_mpp
-        {
-            match sm.challenge_header(u64::MAX) {
-                Ok(h) => {
-                    if let Ok(v) = HeaderValue::from_str(&h) {
-                        challenge_headers.push((header::WWW_AUTHENTICATE, v));
-                        advertised.push("session");
+        if accepted.contains(&Scheme::MppSession) && !session_mpps.is_empty() {
+            for sm in session_mpps {
+                match sm.challenge_header(u64::MAX) {
+                    Ok(h) => {
+                        if let Ok(v) = HeaderValue::from_str(&h) {
+                            challenge_headers.push((header::WWW_AUTHENTICATE, v));
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(currency = sm.currency(), error = %e, "session challenge generation failed");
+                        return gen_failed();
                     }
                 }
-                Err(e) => {
-                    tracing::error!(error = %e, "session challenge generation failed");
-                    return gen_failed();
-                }
             }
+            advertised.push("session");
         }
 
         if accepted.contains(&Scheme::MppCharge) {

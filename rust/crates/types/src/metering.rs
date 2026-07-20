@@ -1,6 +1,10 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+pub mod profiles;
+
+pub use profiles::{ApiProfile, OpenAiSurface, XtreamSurface};
+
 /// OpenAPI/Discovery operation extension carrying a serialized [`Metering`]
 /// block.
 pub const X_PAY_METERING_EXTENSION: &str = "x-pay-metering";
@@ -34,6 +38,9 @@ pub struct ApiSpec {
     /// How volume tiers are tracked: pooled (shared counter) or per_agent (per wallet).
     #[serde(default)]
     pub accounting: AccountingMode,
+    /// Explicit endpoint declarations. A source document may leave this empty
+    /// when a versioned API profile supplies the standard protocol surface.
+    #[serde(default)]
     pub endpoints: Vec<Endpoint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub free_tier: Option<FreeTier>,

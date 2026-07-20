@@ -60,6 +60,12 @@ pub trait PaymentState: Clone + Send + Sync + 'static {
     fn session_mpp_handle(&self) -> Option<Arc<server::session::SessionMpp>> {
         None
     }
+    fn session_mpps(&self) -> Vec<&server::session::SessionMpp> {
+        self.session_mpp().into_iter().collect()
+    }
+    fn session_mpp_handles(&self) -> Vec<Arc<server::session::SessionMpp>> {
+        self.session_mpp_handle().into_iter().collect()
+    }
     fn fee_payer_wallet(&self) -> Option<&server::telemetry::FeePayerWallet> {
         None
     }

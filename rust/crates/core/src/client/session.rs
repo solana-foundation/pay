@@ -397,7 +397,7 @@ pub fn open_payment_channel_session_header_with_mode(
         open_tx.transaction,
     ))?;
 
-    tracing::info!(
+    tracing::debug!(
         payer = %payer,
         channel = %open_tx.channel_id,
         deposit,

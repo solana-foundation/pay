@@ -26,10 +26,8 @@ pub(crate) fn render_table(headers: &[&str], rows: &[Vec<String>]) -> String {
     output.push('\n');
     for row in rows {
         push_line(&mut output, row.iter().cloned(), &widths);
-        output.push_str(&rule);
-        output.push('\n');
     }
-    output.pop(); // final newline
+    output.push_str(&rule);
     output
 }
 
@@ -114,6 +112,10 @@ mod tests {
         assert!(table.contains("challenge.amount"));
         assert!(table.contains("..."));
         assert!(table.lines().all(|line| display_width(line) <= 80));
+        assert_eq!(
+            table.lines().filter(|line| line.starts_with('+')).count(),
+            3
+        );
     }
 
     #[test]

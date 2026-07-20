@@ -470,6 +470,11 @@ impl SessionMpp {
         &self.session_config.network
     }
 
+    /// Currency identifier advertised by this session backend.
+    pub fn currency(&self) -> &str {
+        &self.session_config.currency
+    }
+
     /// Create from a [`SessionConfig`] and an HMAC secret key.
     pub fn new(config: SessionConfig, challenge_binding_secret: impl Into<String>) -> Self {
         let session_config = config.clone();
@@ -685,7 +690,9 @@ impl SessionMpp {
 
                 let mut submitted_open = None;
                 let open_payload;
-                let payload_for_open = if client_voucher_pull {
+                let submit_client_transaction =
+                    p.transaction.is_some() && (p.mode == SessionMode::Push || client_voucher_pull);
+                let payload_for_open = if submit_client_transaction || client_voucher_pull {
                     let signature = if p.transaction.is_some() {
                         self.submit_payment_channel_open(p).await?.ok_or_else(|| {
                             Error::Mpp(
@@ -1377,6 +1384,26 @@ mod tests {
         payload.mode = SessionMode::Pull;
 
         session.process_pull_open(&payload).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn push_open_submits_the_client_transaction_before_verification() {
+        let session = test_session_mpp();
+        let payload = payment_channel_payload(
+            &session,
+            solana_pubkey::Pubkey::new_unique(),
+            solana_pubkey::Pubkey::new_unique(),
+            45,
+        );
+        let challenge = session.challenge(CAP).unwrap();
+        let credential = PaymentCredential::new(challenge.to_echo(), payload);
+        let auth_header = format_authorization(&credential).unwrap();
+
+        let err = session.process(&auth_header).await.unwrap_err();
+        assert!(
+            err.to_string().contains("requires an operator signer"),
+            "push transaction was not routed through server submission: {err}"
+        );
     }
 
     #[tokio::test]
