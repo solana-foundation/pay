@@ -49,8 +49,12 @@ fn session_close_already_finalized(error: &pay_kit::mpp::Error) -> bool {
 /// The result of processing a session action.
 #[derive(Debug)]
 pub enum SessionOutcome {
-    /// `open` or `topup` — channel state after the action.
-    Active(ChannelState),
+    /// `open` or `topup` — channel state after the action and the on-chain
+    /// transaction signature that authorized it.
+    Active {
+        state: ChannelState,
+        signature: Option<String>,
+    },
     /// `voucher` accepted — channel id + new settled cumulative (base units).
     Voucher { channel_id: String, cumulative: u64 },
     /// `commit` accepted — receipt for the metered delivery.
@@ -720,7 +724,7 @@ impl SessionMpp {
                     .await
                     .map_err(|e| Error::Mpp(format!("Session open failed: {e}")))?;
 
-                if let Some(signature) = submitted_open {
+                if let Some(signature) = &submitted_open {
                     tracing::info!(%signature, "payment-channel open transaction confirmed");
                 }
 
@@ -729,7 +733,10 @@ impl SessionMpp {
                 }
                 self.record_committed_watermark(state.channel_id.clone(), state.cumulative);
                 self.touch_channel(state.channel_id.clone());
-                Ok(SessionOutcome::Active(state))
+                Ok(SessionOutcome::Active {
+                    state,
+                    signature: Some(payload_for_open.signature.clone()),
+                })
             }
 
             SessionAction::Voucher(p) => {
@@ -769,7 +776,10 @@ impl SessionMpp {
                     .map_err(|e| Error::Mpp(format!("TopUp failed: {e}")))?;
                 self.record_committed_watermark(state.channel_id.clone(), state.cumulative);
                 self.touch_channel(state.channel_id.clone());
-                Ok(SessionOutcome::Active(state))
+                Ok(SessionOutcome::Active {
+                    state,
+                    signature: Some(p.signature.clone()),
+                })
             }
 
             SessionAction::Close(p) => {
@@ -925,7 +935,12 @@ impl SessionMpp {
         .await
         .map_err(|e| Error::Mpp(e.to_string()))?;
 
-        submit_versioned_transaction(rpc_url, tx, "payment-channel open")
+        // Push-mode `process_open` performs the authoritative on-chain status
+        // check. Return after broadcast so we do not serially poll the same
+        // signature twice through two RPC clients. Pull mode skips that check,
+        // so it still confirms here before persisting the channel.
+        let confirm_before_return = payload.mode != SessionMode::Push;
+        submit_versioned_transaction(rpc_url, tx, "payment-channel open", confirm_before_return)
             .await
             .map(Some)
     }
@@ -1113,22 +1128,24 @@ async fn sign_and_submit_transaction(
         rpc_url,
         solana_transaction::versioned::VersionedTransaction::from(tx.clone()),
         context,
+        true,
     )
     .await
 }
 
-/// Broadcast an already-signed transaction (legacy or v0) and confirm it.
-/// Shared by the legacy server-opened path and the client-built open path.
+/// Broadcast an already-signed transaction (legacy or v0), optionally waiting
+/// for its first successful processed status before returning.
 async fn submit_versioned_transaction(
     rpc_url: String,
     tx: solana_transaction::versioned::VersionedTransaction,
     context: &'static str,
+    confirm_before_return: bool,
 ) -> Result<String> {
     tokio::task::spawn_blocking(move || {
         use pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient;
         use solana_commitment_config::CommitmentConfig;
 
-        let rpc = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
+        let rpc = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::processed());
         let expected_signature =
             tx.signatures.first().copied().ok_or_else(|| {
                 Error::Mpp(format!("{context} transaction is missing a signature"))
@@ -1136,11 +1153,13 @@ async fn submit_versioned_transaction(
 
         match rpc.send_transaction(&tx) {
             Ok(signature) => {
-                wait_for_transaction_confirmation(&rpc, &signature, context)?;
+                if confirm_before_return {
+                    wait_for_transaction_processed(&rpc, &signature, context)?;
+                }
                 Ok(signature.to_string())
             }
             Err(send_error) => {
-                match wait_for_transaction_confirmation(&rpc, &expected_signature, context) {
+                match wait_for_transaction_processed(&rpc, &expected_signature, context) {
                     Ok(()) => {
                         tracing::warn!(
                             %expected_signature,
@@ -1160,7 +1179,10 @@ async fn submit_versioned_transaction(
     .map_err(|e| Error::Mpp(format!("spawn_blocking join error: {e}")))?
 }
 
-fn wait_for_transaction_confirmation(
+/// Wait for the transaction's first successful status. `get_signature_status`
+/// has no confirmation filter, so this accepts `processed` and anything above
+/// it rather than waiting for `confirmed` or `finalized`.
+fn wait_for_transaction_processed(
     rpc: &pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient,
     signature: &solana_signature::Signature,
     context: &'static str,
@@ -1338,9 +1360,14 @@ mod tests {
         );
         let open_header = handle.open_header(CAP, "open_sig").await.unwrap();
 
-        let SessionOutcome::Active(opened) = session.process(&open_header).await.unwrap() else {
+        let SessionOutcome::Active {
+            state: opened,
+            signature: open_signature,
+        } = session.process(&open_header).await.unwrap()
+        else {
             panic!("expected open to return active session");
         };
+        assert_eq!(open_signature.as_deref(), Some("open_sig"));
         assert_eq!(opened.deposit, CAP);
         assert_eq!(session.committed_watermark(&opened.channel_id), Some(0));
 
@@ -1354,10 +1381,14 @@ mod tests {
         assert_eq!(session.committed_watermark(&opened.channel_id), Some(75));
 
         let topup_header = handle.topup_header(CAP + 500, "topup_sig").await.unwrap();
-        let SessionOutcome::Active(topped_up) = session.process(&topup_header).await.unwrap()
+        let SessionOutcome::Active {
+            state: topped_up,
+            signature: topup_signature,
+        } = session.process(&topup_header).await.unwrap()
         else {
             panic!("expected topup outcome");
         };
+        assert_eq!(topup_signature.as_deref(), Some("topup_sig"));
         assert_eq!(topped_up.deposit, CAP + 500);
 
         let close_header = handle.close_header(Some(25)).await.unwrap();
@@ -1396,7 +1427,10 @@ mod tests {
             45,
         );
         let challenge = session.challenge(CAP).unwrap();
-        let credential = PaymentCredential::new(challenge.to_echo(), payload);
+        let credential = PaymentCredential::new(
+            challenge.to_echo(),
+            serde_json::to_value(SessionAction::Open(payload)).unwrap(),
+        );
         let auth_header = format_authorization(&credential).unwrap();
 
         let err = session.process(&auth_header).await.unwrap_err();
@@ -1478,7 +1512,9 @@ mod tests {
         );
 
         let open_header = handle.open_header(CAP, "open_sig").await.unwrap();
-        let SessionOutcome::Active(opened) = session.process(&open_header).await.unwrap() else {
+        let SessionOutcome::Active { state: opened, .. } =
+            session.process(&open_header).await.unwrap()
+        else {
             panic!("expected open to return active session");
         };
         assert_eq!(session.committed_watermark(&opened.channel_id), Some(0));
@@ -1508,7 +1544,7 @@ mod tests {
                 serde_json::to_value(open_action).unwrap(),
             ))
             .unwrap();
-        let SessionOutcome::Active(_) = session.process(&open_header).await.unwrap() else {
+        let SessionOutcome::Active { .. } = session.process(&open_header).await.unwrap() else {
             panic!("expected open outcome");
         };
 

@@ -1355,6 +1355,19 @@ fn variant_hint_from_path(path: &str) -> Option<String> {
     None
 }
 
+fn session_receipt_annotation(network: &str, reference: String) -> ReceiptAnnotation {
+    let mut headers = Vec::new();
+    if let Some(url) = crate::explorer::tx_url(network, &reference)
+        && let Ok(value) = HeaderValue::from_str(&url)
+    {
+        headers.push((PAYMENT_RECEIPT_URL, value));
+    }
+    ReceiptAnnotation {
+        headers,
+        reference: Some(reference),
+    }
+}
+
 /// Process a session credential and map the outcome to a [`GateDecision`].
 async fn session_authorized(
     sm: &SessionMpp,
@@ -1364,13 +1377,13 @@ async fn session_authorized(
     path: &str,
 ) -> GateDecision {
     match sm.process(auth).await {
-        Ok(SessionOutcome::Active(state)) => GateDecision::Forward {
+        Ok(SessionOutcome::Active { state, signature }) => GateDecision::Forward {
             session: handle.map(|h| SessionForward {
                 handle: h,
                 channel_id: state.channel_id,
                 committed_base_units: state.cumulative,
             }),
-            receipt: None,
+            receipt: signature.map(|reference| session_receipt_annotation(sm.network(), reference)),
             upto: None,
         },
         Ok(SessionOutcome::Voucher {
@@ -1439,6 +1452,19 @@ mod tests {
     // Ceiling $0.10 at 6 decimals == 100_000 base units (USDC).
     const CEILING_USD: f64 = 0.10;
     const CEILING_BASE: u64 = 100_000;
+
+    #[test]
+    fn session_receipt_links_to_the_authorizing_transaction() {
+        let receipt = session_receipt_annotation("mainnet", "open_signature".to_string());
+
+        assert_eq!(receipt.reference.as_deref(), Some("open_signature"));
+        assert_eq!(receipt.headers.len(), 1);
+        assert_eq!(receipt.headers[0].0, PAYMENT_RECEIPT_URL);
+        assert_eq!(
+            receipt.headers[0].1.to_str().unwrap(),
+            "https://pay.sh/receipt/open_signature"
+        );
+    }
 
     #[test]
     fn only_payment_scheme_counts_as_credential() {
