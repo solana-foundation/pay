@@ -690,19 +690,19 @@ pub(crate) fn classify_402_with_preference(
             .iter()
             .find(|challenge| challenge.intent.as_str() == "session")
     {
-            let is_solana_method = challenge.method.as_str() == "solana";
-            if is_solana_method {
-                debug!(
-                    resource = resource_url,
-                    "Detected MPP payment-channel challenge (Solana)"
-                );
-                return RunOutcome::SessionChallenge {
-                    challenge: Box::new(challenge.clone()),
-                    advertised_challenges,
-                    resource_url: resource_url.to_string(),
-                };
-            }
-            // Non-Solana session — fall through to x402 or error.
+        let is_solana_method = challenge.method.as_str() == "solana";
+        if is_solana_method {
+            debug!(
+                resource = resource_url,
+                "Detected MPP payment-channel challenge (Solana)"
+            );
+            return RunOutcome::SessionChallenge {
+                challenge: Box::new(challenge.clone()),
+                advertised_challenges,
+                resource_url: resource_url.to_string(),
+            };
+        }
+        // Non-Solana session — fall through to x402 or error.
     }
 
     // Subscription challenge: checked before generic charge because the
@@ -713,21 +713,21 @@ pub(crate) fn classify_402_with_preference(
             .iter()
             .find(|c| subscription::is_subscription_challenge(c))
     {
-            info!(
-                resource = resource_url,
-                "Detected MPP subscription challenge (Solana)"
-            );
-            let authenticate = mpp_challenges
-                .iter()
-                .find(|c| c.intent.as_str() == "authenticate" && c.method.as_str() == "solana")
-                .cloned()
-                .map(Box::new);
-            return RunOutcome::SubscriptionChallenge {
-                challenge: Box::new(challenge.clone()),
-                authenticate,
-                advertised_challenges,
-                resource_url: resource_url.to_string(),
-            };
+        info!(
+            resource = resource_url,
+            "Detected MPP subscription challenge (Solana)"
+        );
+        let authenticate = mpp_challenges
+            .iter()
+            .find(|c| c.intent.as_str() == "authenticate" && c.method.as_str() == "solana")
+            .cloned()
+            .map(Box::new);
+        return RunOutcome::SubscriptionChallenge {
+            challenge: Box::new(challenge.clone()),
+            authenticate,
+            advertised_challenges,
+            resource_url: resource_url.to_string(),
+        };
     }
 
     // Default policy: prefer MPP for one-shot Solana payments (native
