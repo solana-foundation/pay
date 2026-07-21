@@ -18,8 +18,9 @@
 //!   with a signature computed over an empty body. Header / Bearer / OAuth2 /
 //!   QueryParam auth, and HMAC that doesn't digest the body, all work. Lifting
 //!   this needs request-body buffering before the upstream connect.
-//! Delegated MPP sessions and x402 `upto` share the buffered response-metering
-//! path so usage is rated once and settlement is persisted before release.
+//! - **Response metering**: Delegated MPP sessions and x402 `upto` share the
+//!   buffered response-metering path so usage is rated once and settlement is
+//!   persisted before release.
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};

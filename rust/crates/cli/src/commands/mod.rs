@@ -1736,7 +1736,7 @@ fn pay_session_and_retry(
             }
         }
     } else {
-        let header = if let Some(request) = req {
+        if let Some(request) = req {
             let store = pay_core::accounts::FileAccountsStore::default_path();
             let (_handle, header) = pay_core::session::open_payment_channel_session_header(
                 challenge,
@@ -1751,8 +1751,7 @@ fn pay_session_and_retry(
         } else {
             let (_handle, header) = pay_core::session::open_session_header(challenge, deposit)?;
             header
-        };
-        header
+        }
     };
 
     let receipt_network = network_override

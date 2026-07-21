@@ -685,11 +685,11 @@ pub(crate) fn classify_402_with_preference(
     // the recipient is a valid Solana pubkey.
     // Session MPP: the method field ("solana") indicates chain support.
     // Session requests don't use ChargeRequest so mpp_is_solana doesn't apply.
-    if preference != ProtocolPreference::OnlyX402 {
-        if let Some(challenge) = mpp_challenges
+    if preference != ProtocolPreference::OnlyX402
+        && let Some(challenge) = mpp_challenges
             .iter()
             .find(|challenge| challenge.intent.as_str() == "session")
-        {
+    {
             let is_solana_method = challenge.method.as_str() == "solana";
             if is_solana_method {
                 debug!(
@@ -703,17 +703,16 @@ pub(crate) fn classify_402_with_preference(
                 };
             }
             // Non-Solana session — fall through to x402 or error.
-        }
     }
 
     // Subscription challenge: checked before generic charge because the
     // intent is more specific. Solana is the only method profile pay
     // implements today, so we filter by both.
-    if preference != ProtocolPreference::OnlyX402 {
-        if let Some(challenge) = mpp_challenges
+    if preference != ProtocolPreference::OnlyX402
+        && let Some(challenge) = mpp_challenges
             .iter()
             .find(|c| subscription::is_subscription_challenge(c))
-        {
+    {
             info!(
                 resource = resource_url,
                 "Detected MPP subscription challenge (Solana)"
@@ -729,7 +728,6 @@ pub(crate) fn classify_402_with_preference(
                 advertised_challenges,
                 resource_url: resource_url.to_string(),
             };
-        }
     }
 
     // Default policy: prefer MPP for one-shot Solana payments (native
