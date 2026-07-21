@@ -1413,6 +1413,17 @@ async fn session_authorized(
                 ));
             };
             let available_base_units = state.deposit.saturating_sub(state.cumulative);
+            if available_base_units == 0 {
+                return GateDecision::Respond(GateResponse::json(
+                    StatusCode::PAYMENT_REQUIRED,
+                    serde_json::to_vec(&json!({
+                        "error": "session_cap_exhausted",
+                        "message": "The session spending cap has been exhausted; open a new session.",
+                        "channelId": state.channel_id,
+                    }))
+                    .unwrap_or_default(),
+                ));
+            }
             let props = metering::RequestProperties {
                 body_size: req.content_length,
                 ..Default::default()

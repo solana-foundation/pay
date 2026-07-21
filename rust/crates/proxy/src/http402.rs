@@ -573,6 +573,7 @@ impl<S: PaymentState> Http402Gate<S> {
         )
         .map_err(|error| error.to_string())?;
         if actual.base_units == 0 {
+            pending.handle.touch_channel(pending.channel_id.clone());
             tracing::info!(
                 channel = %pending.channel_id,
                 "delegated MPP session response rated at zero"
