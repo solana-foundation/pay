@@ -117,6 +117,7 @@ pub struct SessionForward {
     pub settlement: Option<Box<metering::UptoSettlementPlan>>,
     /// Remaining channel capacity available to the metered delivery.
     pub available_base_units: u64,
+    pub reservation_base_units: u64,
 }
 
 /// An x402 `upto` channel opened (and confirmed on-chain) before the resource
@@ -1424,6 +1425,12 @@ async fn session_authorized(
                     .unwrap_or_default(),
                 ));
             }
+            if !handle.reserve_delegated_capacity(&state.channel_id, available_base_units) {
+                return GateDecision::Respond(GateResponse::json(
+                    StatusCode::PAYMENT_REQUIRED,
+                    Bytes::from_static(br#"{"error":"session_capacity_reserved","message":"Another request is currently using this session capacity."}"#),
+                ));
+            }
             let props = metering::RequestProperties {
                 body_size: req.content_length,
                 ..Default::default()
@@ -1444,6 +1451,7 @@ async fn session_authorized(
                     committed_base_units: state.cumulative,
                     settlement,
                     available_base_units,
+                    reservation_base_units: available_base_units,
                 }),
                 receipt: signature
                     .map(|reference| session_receipt_annotation(sm.network(), reference)),
@@ -1460,6 +1468,7 @@ async fn session_authorized(
                 committed_base_units: cumulative,
                 settlement: None,
                 available_base_units: 0,
+                reservation_base_units: 0,
             }),
             receipt: None,
             upto: None,

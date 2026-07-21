@@ -75,6 +75,7 @@ struct SessionOperatorRuntime {
     payment_channel_signer: Arc<Mutex<Option<Arc<dyn SolanaSigner>>>>,
     payment_channel_payer_signer: Arc<Mutex<Option<Arc<dyn SolanaSigner>>>>,
     committed_watermarks: Arc<Mutex<HashMap<String, u64>>>,
+    reserved_capacity: Arc<Mutex<HashMap<String, u64>>>,
     delegated_voucher_lock: Arc<tokio::sync::Mutex<()>>,
     /// Channel id → on-chain settlement signature, recorded when the channel
     /// finalizes. Surfaced via the `/sessions/receipt/:channelId` poll so the
@@ -87,6 +88,13 @@ struct SessionOperatorRuntime {
 }
 
 impl SessionOperatorRuntime {
+    fn reserve_capacity(&self, channel_id: &str, amount: u64) -> bool {
+        let Ok(mut reservations) = self.reserved_capacity.lock() else { return false; };
+        if reservations.contains_key(channel_id) { return false; }
+        reservations.insert(channel_id.to_string(), amount);
+        true
+    }
+    fn release_capacity(&self, channel_id: &str) { if let Ok(mut reservations) = self.reserved_capacity.lock() { reservations.remove(channel_id); } }
     fn record_committed_watermark(&self, session_id: impl Into<String>, cumulative: u64) {
         if let Ok(mut watermarks) = self.committed_watermarks.lock() {
             let session_id = session_id.into();
@@ -488,6 +496,7 @@ impl SessionMpp {
         let payment_channel_signer = Arc::new(Mutex::new(None));
         let payment_channel_payer_signer = Arc::new(Mutex::new(None));
         let committed_watermarks = Arc::new(Mutex::new(HashMap::new()));
+        let reserved_capacity = Arc::new(Mutex::new(HashMap::new()));
         let delegated_voucher_lock = Arc::new(tokio::sync::Mutex::new(()));
         let settlement_signatures = Arc::new(Mutex::new(HashMap::new()));
         let pull_sessions = Arc::new(Mutex::new(HashSet::new()));
@@ -497,6 +506,7 @@ impl SessionMpp {
             payment_channel_signer: Arc::clone(&payment_channel_signer),
             payment_channel_payer_signer: Arc::clone(&payment_channel_payer_signer),
             committed_watermarks: Arc::clone(&committed_watermarks),
+            reserved_capacity: Arc::clone(&reserved_capacity),
             delegated_voucher_lock,
             settlement_signatures: Arc::clone(&settlement_signatures),
             settlement_worker: Arc::new(tokio::sync::OnceCell::new()),
@@ -663,6 +673,14 @@ impl SessionMpp {
         self.record_committed_watermark(channel_id.to_string(), accepted.cumulative);
         self.touch_channel(channel_id.to_string());
         Ok(accepted.cumulative)
+    }
+
+    pub fn reserve_delegated_capacity(&self, channel_id: &str, amount: u64) -> bool {
+        self.operator_runtime.reserve_capacity(channel_id, amount)
+    }
+
+    pub fn release_delegated_capacity(&self, channel_id: &str) {
+        self.operator_runtime.release_capacity(channel_id);
     }
 
     /// Record channel activity so the lifecycle runloop can defer auto-close.

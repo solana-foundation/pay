@@ -104,6 +104,7 @@ struct PendingSession {
     committed_base_units: u64,
     available_base_units: u64,
     settlement: Option<Box<UptoSettlementPlan>>,
+    reservation_base_units: u64,
 }
 
 fn delegated_session_receipt_annotation(
@@ -574,6 +575,7 @@ impl<S: PaymentState> Http402Gate<S> {
         .map_err(|error| error.to_string())?;
         if actual.base_units == 0 {
             pending.handle.touch_channel(pending.channel_id.clone());
+            pending.handle.release_delegated_capacity(&pending.channel_id);
             tracing::info!(
                 channel = %pending.channel_id,
                 "delegated MPP session response rated at zero"
@@ -581,11 +583,18 @@ impl<S: PaymentState> Http402Gate<S> {
             return Ok(None);
         }
 
-        let cumulative = pending
+        let cumulative = match pending
             .handle
             .authorize_delegated_usage(&pending.channel_id, actual.base_units)
             .await
-            .map_err(|error| error.to_string())?;
+        {
+            Ok(cumulative) => cumulative,
+            Err(error) => {
+                pending.handle.release_delegated_capacity(&pending.channel_id);
+                return Err(error.to_string());
+            }
+        };
+        pending.handle.release_delegated_capacity(&pending.channel_id);
         tracing::info!(
             channel = %pending.channel_id,
             amount = actual.base_units,
@@ -736,6 +745,7 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                     committed_base_units: forward.committed_base_units,
                     available_base_units: forward.available_base_units,
                     settlement: forward.settlement,
+                    reservation_base_units: forward.reservation_base_units,
                 });
                 // Delegated sessions always settle before releasing a
                 // successful response, including fixed-price endpoints. x402
