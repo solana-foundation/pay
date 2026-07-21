@@ -686,7 +686,9 @@ async fn middleware_accepts_session_open_and_voucher_then_close() {
         .send()
         .await
         .unwrap();
-    assert_eq!(open_resp.status(), 200);
+    // Client-voucher sessions acknowledge the open before requiring the first
+    // client-signed voucher for paid service.
+    assert_eq!(open_resp.status(), 402);
 
     let voucher_header = handle.voucher_header(25).await.unwrap();
     let voucher_resp = client
