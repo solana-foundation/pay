@@ -324,6 +324,21 @@ impl SessionOperatorRuntime {
     }
 }
 
+/// Exclusive claim on a delegated session's remaining capacity.
+///
+/// The claim is released on drop so adapter errors, cancelled requests, and
+/// settlement failures cannot strand a channel in the reserved state.
+pub struct DelegatedCapacityLease {
+    runtime: SessionOperatorRuntime,
+    channel_id: String,
+}
+
+impl Drop for DelegatedCapacityLease {
+    fn drop(&mut self) {
+        self.runtime.release_capacity(&self.channel_id);
+    }
+}
+
 #[derive(Clone)]
 struct SessionLifecycleHandle {
     tx: mpsc::UnboundedSender<SessionLifecycleCommand>,
@@ -425,7 +440,20 @@ impl SessionLifecycleRunloop {
 
         for channel_id in due {
             self.deadlines.remove(&channel_id);
-            match self.runtime.operator_close_channel(&channel_id).await {
+            // Closing and serving both claim the same channel slot. This makes
+            // the reservation check atomic with the start of close: a request
+            // already in flight defers close, while a close already in progress
+            // prevents a new request from reserving stale capacity.
+            if !self.runtime.reserve_capacity(&channel_id, 0) {
+                if let Some(close_delay) = self.close_delay {
+                    self.deadlines
+                        .insert(channel_id, Instant::now() + close_delay);
+                }
+                continue;
+            }
+            let close_result = self.runtime.operator_close_channel(&channel_id).await;
+            self.runtime.release_capacity(&channel_id);
+            match close_result {
                 Ok(SessionCloseResult::Closed { settled }) => {
                     tracing::info!(channel_id, settled, "operator auto-closed payment channel");
                 }
@@ -683,12 +711,17 @@ impl SessionMpp {
         Ok(accepted.cumulative)
     }
 
-    pub fn reserve_delegated_capacity(&self, channel_id: &str, amount: u64) -> bool {
-        self.operator_runtime.reserve_capacity(channel_id, amount)
-    }
-
-    pub fn release_delegated_capacity(&self, channel_id: &str) {
-        self.operator_runtime.release_capacity(channel_id);
+    pub fn reserve_delegated_capacity(
+        &self,
+        channel_id: &str,
+        amount: u64,
+    ) -> Option<DelegatedCapacityLease> {
+        self.operator_runtime
+            .reserve_capacity(channel_id, amount)
+            .then(|| DelegatedCapacityLease {
+                runtime: self.operator_runtime.clone(),
+                channel_id: channel_id.to_string(),
+            })
     }
 
     /// Record channel activity so the lifecycle runloop can defer auto-close.
@@ -1637,6 +1670,65 @@ mod tests {
         assert!(
             err.to_string().contains("close is pending"),
             "expected auto-close to reject later voucher, got: {err}"
+        );
+    }
+
+    #[test]
+    fn delegated_capacity_lease_releases_on_drop() {
+        let session = test_session_mpp();
+        let first = session
+            .reserve_delegated_capacity("channel", CAP)
+            .expect("first reservation should succeed");
+        assert!(
+            session.reserve_delegated_capacity("channel", CAP).is_none(),
+            "a live lease must exclude concurrent reservations"
+        );
+
+        drop(first);
+
+        assert!(
+            session.reserve_delegated_capacity("channel", CAP).is_some(),
+            "dropping the lease must release capacity"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegated_capacity_lease_defers_idle_close() {
+        let session = Arc::new(test_session_mpp());
+        session.start_lifecycle_runloop(Duration::from_millis(10));
+        let challenge = session.challenge(CAP).unwrap();
+        let handle = SessionHandle::new(
+            solana_pubkey::Pubkey::new_unique(),
+            test_session_signer(),
+            challenge,
+        );
+
+        let open_header = handle.open_header(CAP, "open_sig").await.unwrap();
+        let SessionOutcome::Active { state: opened, .. } =
+            session.process(&open_header).await.unwrap()
+        else {
+            panic!("expected open to return active session");
+        };
+        let lease = session
+            .reserve_delegated_capacity(&opened.channel_id, CAP)
+            .expect("request should reserve channel capacity");
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let voucher_header = handle.voucher_header(75).await.unwrap();
+        assert!(
+            session.process(&voucher_header).await.is_ok(),
+            "idle-close must not start while a request owns the lease"
+        );
+
+        drop(lease);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let voucher_header = handle.voucher_header(75).await.unwrap();
+        let error = session.process(&voucher_header).await.unwrap_err();
+        assert!(
+            error.to_string().contains("close is pending"),
+            "expected idle-close after lease release, got: {error}"
         );
     }
 

@@ -16,11 +16,12 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http::{HeaderName, HeaderValue, Method, StatusCode, header};
+use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use pay_kit::mpp::server::{ChargeOptions, VerificationError};
 use pay_kit::mpp::{
-    ChargeRequest, PAYMENT_RECEIPT_HEADER, PaymentCredential, ReceiptKind, format_receipt,
-    format_www_authenticate, format_www_authenticate_many, parse_authorization,
+    ChargeRequest, PAYMENT_RECEIPT_HEADER, PaymentCredential, Receipt, ReceiptKind,
+    base64url_encode, format_receipt, format_www_authenticate, format_www_authenticate_many,
+    parse_authorization,
 };
 use pay_kit::x402::PAYMENT_RESPONSE_HEADER;
 use pay_kit::x402::server::{ExactOptions, VerifiedUptoOpen, X402, X402BatchSettlement, X402Upto};
@@ -29,7 +30,7 @@ use serde_json::json;
 
 use crate::PaymentState;
 use crate::server::metering;
-use crate::server::session::{SessionMpp, SessionOutcome};
+use crate::server::session::{DelegatedCapacityLease, SessionMpp, SessionOutcome};
 use crate::server::telemetry;
 
 /// `payment-receipt-url` — shareable `pay.sh/receipt/<sig>` link.
@@ -117,6 +118,119 @@ pub struct SessionForward {
     pub settlement: Option<Box<metering::UptoSettlementPlan>>,
     /// Remaining channel capacity available to the metered delivery.
     pub available_base_units: u64,
+    /// Releases the exclusive capacity reservation on every terminal path.
+    _reservation: Option<DelegatedCapacityLease>,
+}
+
+pub fn delegated_session_receipt_annotation(
+    network: &str,
+    currency: &str,
+    channel_id: &str,
+    amount: u64,
+    cumulative: u64,
+    authorized: u64,
+) -> Result<ReceiptAnnotation, String> {
+    let mut receipt = serde_json::to_value(Receipt::success("solana", channel_id, ""))
+        .map_err(|error| format!("failed to serialize MPP session receipt: {error}"))?;
+    let fields = receipt
+        .as_object_mut()
+        .ok_or_else(|| "MPP session receipt did not serialize as an object".to_string())?;
+    fields.insert("intent".to_string(), serde_json::json!("session"));
+    fields.insert("amount".to_string(), serde_json::json!(amount.to_string()));
+    fields.insert(
+        "acceptedCumulative".to_string(),
+        serde_json::json!(cumulative.to_string()),
+    );
+    fields.insert(
+        "spent".to_string(),
+        serde_json::json!(cumulative.to_string()),
+    );
+    fields.insert(
+        "authorized".to_string(),
+        serde_json::json!(authorized.to_string()),
+    );
+    fields.insert(
+        "remaining".to_string(),
+        serde_json::json!(authorized.saturating_sub(cumulative).to_string()),
+    );
+    fields.insert("currency".to_string(), serde_json::json!(currency));
+    fields.insert("network".to_string(), serde_json::json!(network));
+
+    let encoded = serde_json::to_vec(&receipt)
+        .map(|json| base64url_encode(&json))
+        .map_err(|error| format!("failed to encode MPP session receipt: {error}"))?;
+    let receipt_value = HeaderValue::from_str(&encoded)
+        .map_err(|error| format!("invalid MPP session receipt header: {error}"))?;
+    let mut headers = vec![(
+        HeaderName::from_static(PAYMENT_RECEIPT_HEADER),
+        receipt_value,
+    )];
+    if let Some(url) = crate::explorer::account_url(network, channel_id) {
+        let value = HeaderValue::from_str(&url)
+            .map_err(|error| format!("invalid MPP session receipt URL: {error}"))?;
+        headers.push((PAYMENT_RECEIPT_URL, value));
+    }
+
+    Ok(ReceiptAnnotation {
+        headers,
+        // The stable receipt reference is the channel PDA, not a transaction
+        // signature. Settlement only reaches chain when the channel closes.
+        reference: None,
+    })
+}
+
+/// Rate and persist a delegated-session response before releasing it.
+///
+/// Consuming `pending` also consumes its capacity lease. The lease's drop
+/// implementation therefore releases capacity on success and on every error.
+pub async fn settle_delegated_session(
+    pending: SessionForward,
+    response_headers: &HeaderMap,
+    response_body: Option<&[u8]>,
+) -> Result<Option<ReceiptAnnotation>, String> {
+    let Some(plan) = pending.settlement.as_deref() else {
+        return Ok(None);
+    };
+    let actual = metering::upto_actual_amount_from_response(
+        plan,
+        pending.available_base_units,
+        response_headers,
+        response_body,
+    )
+    .map_err(|error| error.to_string())?;
+    if actual.base_units == 0 {
+        pending.handle.touch_channel(pending.channel_id.clone());
+        tracing::info!(
+            channel = %pending.channel_id,
+            "delegated MPP session response rated at zero"
+        );
+        return Ok(None);
+    }
+
+    let cumulative = pending
+        .handle
+        .authorize_delegated_usage(&pending.channel_id, actual.base_units)
+        .await
+        .map_err(|error| error.to_string())?;
+    tracing::info!(
+        channel = %pending.channel_id,
+        amount = actual.base_units,
+        cumulative,
+        usd = actual.usd,
+        "delegated MPP session voucher accepted"
+    );
+    let authorized = pending
+        .committed_base_units
+        .saturating_add(pending.available_base_units);
+    delegated_session_receipt_annotation(
+        pending.handle.network(),
+        pending.handle.currency(),
+        &pending.channel_id,
+        actual.base_units,
+        cumulative,
+        authorized,
+    )
+    .map(Some)
 }
 
 /// An x402 `upto` channel opened (and confirmed on-chain) before the resource
@@ -1424,12 +1538,14 @@ async fn session_authorized(
                     .unwrap_or_default(),
                 ));
             }
-            if !handle.reserve_delegated_capacity(&state.channel_id, available_base_units) {
+            let Some(reservation) =
+                handle.reserve_delegated_capacity(&state.channel_id, available_base_units)
+            else {
                 return GateDecision::Respond(GateResponse::json(
                     StatusCode::PAYMENT_REQUIRED,
                     Bytes::from_static(br#"{"error":"session_capacity_reserved","message":"Another request is currently using this session capacity."}"#),
                 ));
-            }
+            };
             let props = metering::RequestProperties {
                 body_size: req.content_length,
                 ..Default::default()
@@ -1450,6 +1566,7 @@ async fn session_authorized(
                     committed_base_units: state.cumulative,
                     settlement,
                     available_base_units,
+                    _reservation: Some(reservation),
                 }),
                 receipt: signature
                     .map(|reference| session_receipt_annotation(sm.network(), reference)),
@@ -1466,6 +1583,7 @@ async fn session_authorized(
                 committed_base_units: cumulative,
                 settlement: None,
                 available_base_units: 0,
+                _reservation: None,
             }),
             receipt: None,
             upto: None,

@@ -28,14 +28,13 @@ use futures_util::StreamExt;
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use pay_core::PaymentState;
 use pay_core::server::gate::{
-    GateDecision, GateRequest, GateResponse, PaymentGate, ReceiptAnnotation, settle_upto,
-    settle_upto_metered,
+    GateDecision, GateRequest, GateResponse, PaymentGate, ReceiptAnnotation, SessionForward,
+    settle_delegated_session as settle_delegated_session_forward, settle_upto, settle_upto_metered,
 };
 use pay_core::server::metering::{self, UptoSettlementPlan};
 use pay_core::server::proxy::{
     STRIP_HEADERS, UpstreamPlan, prepare_upstream, routing_signs_request_body,
 };
-use pay_kit::mpp::{PAYMENT_RECEIPT_HEADER, Receipt, base64url_encode};
 use pay_kit::x402::server::VerifiedUptoOpen;
 use pay_types::metering::ApiSpec;
 use pingora::http::{RequestHeader, ResponseHeader};
@@ -72,7 +71,7 @@ pub struct Ctx {
     /// A delegated MPP session opened pre-serve. Responses are buffered and
     /// rated with the same usage pipeline as x402 `upto`, then the gateway
     /// signs and persists the cumulative voucher before returning the body.
-    session: Option<PendingSession>,
+    session: Option<SessionForward>,
     /// Captured at `request_filter` for the Payment Debugger exchange emitted
     /// in `logging` (the data plane is Pingora, so the old axum logging
     /// middleware never sees proxied traffic).
@@ -96,72 +95,6 @@ struct PendingUpto {
     open: VerifiedUptoOpen,
     settle_amount: u64,
     settlement: Option<UptoSettlementPlan>,
-}
-
-struct PendingSession {
-    handle: std::sync::Arc<pay_core::server::session::SessionMpp>,
-    channel_id: String,
-    committed_base_units: u64,
-    available_base_units: u64,
-    settlement: Option<Box<UptoSettlementPlan>>,
-}
-
-fn delegated_session_receipt_annotation(
-    network: &str,
-    currency: &str,
-    channel_id: &str,
-    amount: u64,
-    cumulative: u64,
-    authorized: u64,
-) -> Result<ReceiptAnnotation, String> {
-    let mut receipt = serde_json::to_value(Receipt::success("solana", channel_id, ""))
-        .map_err(|error| format!("failed to serialize MPP session receipt: {error}"))?;
-    let fields = receipt
-        .as_object_mut()
-        .ok_or_else(|| "MPP session receipt did not serialize as an object".to_string())?;
-    fields.insert("intent".to_string(), serde_json::json!("session"));
-    fields.insert("amount".to_string(), serde_json::json!(amount.to_string()));
-    fields.insert(
-        "acceptedCumulative".to_string(),
-        serde_json::json!(cumulative.to_string()),
-    );
-    fields.insert(
-        "spent".to_string(),
-        serde_json::json!(cumulative.to_string()),
-    );
-    fields.insert(
-        "authorized".to_string(),
-        serde_json::json!(authorized.to_string()),
-    );
-    fields.insert(
-        "remaining".to_string(),
-        serde_json::json!(authorized.saturating_sub(cumulative).to_string()),
-    );
-    fields.insert("currency".to_string(), serde_json::json!(currency));
-    fields.insert("network".to_string(), serde_json::json!(network));
-
-    let encoded = serde_json::to_vec(&receipt)
-        .map(|json| base64url_encode(&json))
-        .map_err(|error| format!("failed to encode MPP session receipt: {error}"))?;
-    let receipt_value = HeaderValue::from_str(&encoded)
-        .map_err(|error| format!("invalid MPP session receipt header: {error}"))?;
-    let mut headers = vec![(
-        HeaderName::from_static(PAYMENT_RECEIPT_HEADER),
-        receipt_value,
-    )];
-    if let Some(url) = pay_core::explorer::account_url(network, channel_id) {
-        let value = HeaderValue::from_str(&url)
-            .map_err(|error| format!("invalid MPP session receipt URL: {error}"))?;
-        headers.push((HeaderName::from_static("payment-receipt-url"), value));
-    }
-
-    Ok(ReceiptAnnotation {
-        headers,
-        // The stable receipt reference is the channel PDA, not a transaction
-        // signature. A settlement transaction only exists when the channel
-        // closes, so do not record this as the span's `tx_sig`.
-        reference: None,
-    })
 }
 
 /// Request-side facts captured up front for the PDB exchange.
@@ -325,6 +258,13 @@ impl<S: PaymentState> Http402Gate<S> {
         response_body: Option<&[u8]>,
     ) -> Vec<(HeaderName, HeaderValue)> {
         let mut extra: Vec<(HeaderName, HeaderValue)> = Vec::new();
+        if !served_ok {
+            // Dropping the forwarded session drops its capacity lease. Keep
+            // this in the shared terminal-path drain so request buffering,
+            // upstream setup/send, response buffering, and proxy failures all
+            // release immediately.
+            ctx.session.take();
+        }
         if let Some(pending) = ctx.upto.take()
             && let Some((n, v)) = self
                 .settle_pending_upto(pending, served_ok, response_headers, response_body)
@@ -506,11 +446,6 @@ impl<S: PaymentState> Http402Gate<S> {
                 }
             }
         }
-        if let Some(pending) = ctx.session.as_ref() {
-            pending
-                .handle
-                .release_delegated_capacity(&pending.channel_id);
-        }
         let extra = self
             .drain_payment_headers_with_response(
                 ctx,
@@ -567,63 +502,7 @@ impl<S: PaymentState> Http402Gate<S> {
         let Some(pending) = ctx.session.take() else {
             return Ok(None);
         };
-        let Some(plan) = pending.settlement else {
-            return Ok(None);
-        };
-        let actual = metering::upto_actual_amount_from_response(
-            &plan,
-            pending.available_base_units,
-            response_headers,
-            Some(response_body),
-        )
-        .map_err(|error| error.to_string())?;
-        if actual.base_units == 0 {
-            pending.handle.touch_channel(pending.channel_id.clone());
-            pending
-                .handle
-                .release_delegated_capacity(&pending.channel_id);
-            tracing::info!(
-                channel = %pending.channel_id,
-                "delegated MPP session response rated at zero"
-            );
-            return Ok(None);
-        }
-
-        let cumulative = match pending
-            .handle
-            .authorize_delegated_usage(&pending.channel_id, actual.base_units)
-            .await
-        {
-            Ok(cumulative) => cumulative,
-            Err(error) => {
-                pending
-                    .handle
-                    .release_delegated_capacity(&pending.channel_id);
-                return Err(error.to_string());
-            }
-        };
-        pending
-            .handle
-            .release_delegated_capacity(&pending.channel_id);
-        tracing::info!(
-            channel = %pending.channel_id,
-            amount = actual.base_units,
-            cumulative,
-            usd = actual.usd,
-            "delegated MPP session voucher accepted"
-        );
-        let authorized = pending
-            .committed_base_units
-            .saturating_add(pending.available_base_units);
-        delegated_session_receipt_annotation(
-            pending.handle.network(),
-            pending.handle.currency(),
-            &pending.channel_id,
-            actual.base_units,
-            cumulative,
-            authorized,
-        )
-        .map(Some)
+        settle_delegated_session_forward(pending, response_headers, Some(response_body)).await
     }
 
     async fn finish_buffered_axum_response(
@@ -641,6 +520,24 @@ impl<S: PaymentState> Http402Gate<S> {
                 Bytes::new()
             }
         };
+        if status.is_success() {
+            match self.settle_delegated_session(ctx, &headers, &body).await {
+                Ok(Some(receipt)) => ctx.receipt = Some(receipt),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::error!(%error, "failed to settle delegated MPP session usage");
+                    let extra = self.drain_payment_headers(ctx, false).await;
+                    return write_buffered_response(
+                        session,
+                        StatusCode::BAD_GATEWAY,
+                        HeaderMap::new(),
+                        Bytes::from_static(b"{\"error\":\"session_settlement_failed\"}"),
+                        extra,
+                    )
+                    .await;
+                }
+            }
+        }
         let extra = self
             .drain_payment_headers_with_response(ctx, status.is_success(), &headers, Some(&body))
             .await;
@@ -749,13 +646,7 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                         settlement: u.settlement,
                     }
                 });
-                ctx.session = session_forward.map(|forward| PendingSession {
-                    handle: forward.handle,
-                    channel_id: forward.channel_id,
-                    committed_base_units: forward.committed_base_units,
-                    available_base_units: forward.available_base_units,
-                    settlement: forward.settlement,
-                });
+                ctx.session = session_forward;
                 // Delegated sessions always settle before releasing a
                 // successful response, including fixed-price endpoints. x402
                 // `upto` only needs this path when pricing consumes response
@@ -964,6 +855,9 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
         // are written in `forward_upto_buffered`, so its receipt reaches the
         // client as a normal PAYMENT-RESPONSE header.
         let mut deferred_payment_headers = Vec::new();
+        // Covers cancellation/disconnect paths that bypassed all explicit
+        // drains. Dropping the session releases its capacity lease.
+        ctx.session.take();
         if let Some(pending) = ctx.upto.take()
             && let Some(header) = self
                 .settle_pending_upto(pending, false, &HeaderMap::new(), None)
@@ -1309,9 +1203,10 @@ async fn write_axum_response(
 #[cfg(test)]
 mod tests {
     use super::{
-        buffered_upstream_headers, delegated_session_receipt_annotation, filtered_response_headers,
-        is_control_plane, is_streamed_response,
+        buffered_upstream_headers, filtered_response_headers, is_control_plane,
+        is_streamed_response,
     };
+    use pay_core::server::gate::delegated_session_receipt_annotation;
 
     #[test]
     fn control_plane_paths_are_not_tracked() {
