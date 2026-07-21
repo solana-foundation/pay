@@ -507,6 +507,9 @@ impl<S: PaymentState> Http402Gate<S> {
                 }
             }
         }
+        if let Some(pending) = ctx.session.as_ref() {
+            pending.handle.release_delegated_capacity(&pending.channel_id);
+        }
         let extra = self
             .drain_payment_headers_with_response(
                 ctx,
