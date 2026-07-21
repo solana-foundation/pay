@@ -104,7 +104,6 @@ struct PendingSession {
     committed_base_units: u64,
     available_base_units: u64,
     settlement: Option<Box<UptoSettlementPlan>>,
-    reservation_base_units: u64,
 }
 
 fn delegated_session_receipt_annotation(
@@ -756,7 +755,6 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                     committed_base_units: forward.committed_base_units,
                     available_base_units: forward.available_base_units,
                     settlement: forward.settlement,
-                    reservation_base_units: forward.reservation_base_units,
                 });
                 // Delegated sessions always settle before releasing a
                 // successful response, including fixed-price endpoints. x402

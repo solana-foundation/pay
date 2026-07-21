@@ -117,7 +117,6 @@ pub struct SessionForward {
     pub settlement: Option<Box<metering::UptoSettlementPlan>>,
     /// Remaining channel capacity available to the metered delivery.
     pub available_base_units: u64,
-    pub reservation_base_units: u64,
 }
 
 /// An x402 `upto` channel opened (and confirmed on-chain) before the resource
@@ -1451,7 +1450,6 @@ async fn session_authorized(
                     committed_base_units: state.cumulative,
                     settlement,
                     available_base_units,
-                    reservation_base_units: available_base_units,
                 }),
                 receipt: signature
                     .map(|reference| session_receipt_annotation(sm.network(), reference)),
@@ -1468,7 +1466,6 @@ async fn session_authorized(
                 committed_base_units: cumulative,
                 settlement: None,
                 available_base_units: 0,
-                reservation_base_units: 0,
             }),
             receipt: None,
             upto: None,
