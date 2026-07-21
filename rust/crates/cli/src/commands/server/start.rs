@@ -1018,7 +1018,7 @@ impl StartCommand {
                 };
                 let session_operator = fee_payer_signer
                     .as_ref()
-                    .or_else(|| session_channel_payer_signer.as_ref())
+                    .or(session_channel_payer_signer.as_ref())
                     .map(|signer| signer.pubkey().to_string())
                     .unwrap_or_else(|| recipient.clone());
                 let (session_recipient, session_splits) =
