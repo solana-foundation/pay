@@ -581,27 +581,11 @@ impl<S: PaymentState> Http402Gate<S> {
             return Ok(None);
         }
 
-        let cumulative = match pending
+        let cumulative = pending
             .handle
             .authorize_delegated_usage(&pending.channel_id, actual.base_units)
             .await
-        {
-            Ok(cumulative) => cumulative,
-            Err(error) => {
-                // Another concurrent response may have consumed the remaining
-                // cap after this request was admitted. The upstream response
-                // has already been produced, so preserve it and leave this
-                // over-cap response unsettled rather than turning it into a
-                // misleading gateway failure.
-                pending.handle.touch_channel(pending.channel_id.clone());
-                tracing::warn!(
-                    channel = %pending.channel_id,
-                    error = %error,
-                    "delegated MPP response exceeded remaining session capacity"
-                );
-                return Ok(None);
-            }
-        };
+            .map_err(|error| error.to_string())?;
         tracing::info!(
             channel = %pending.channel_id,
             amount = actual.base_units,
