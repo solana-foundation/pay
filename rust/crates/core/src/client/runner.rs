@@ -685,15 +685,16 @@ pub(crate) fn classify_402_with_preference(
     // the recipient is a valid Solana pubkey.
     // Session MPP: the method field ("solana") indicates chain support.
     // Session requests don't use ChargeRequest so mpp_is_solana doesn't apply.
-    if let Some(challenge) = mpp_challenges
-        .iter()
-        .find(|challenge| challenge.intent.as_str() == "session")
+    if preference != ProtocolPreference::OnlyX402
+        && let Some(challenge) = mpp_challenges
+            .iter()
+            .find(|challenge| challenge.intent.as_str() == "session")
     {
         let is_solana_method = challenge.method.as_str() == "solana";
         if is_solana_method {
-            info!(
+            debug!(
                 resource = resource_url,
-                "Detected MPP session challenge (Solana)"
+                "Detected MPP payment-channel challenge (Solana)"
             );
             return RunOutcome::SessionChallenge {
                 challenge: Box::new(challenge.clone()),
@@ -707,9 +708,10 @@ pub(crate) fn classify_402_with_preference(
     // Subscription challenge: checked before generic charge because the
     // intent is more specific. Solana is the only method profile pay
     // implements today, so we filter by both.
-    if let Some(challenge) = mpp_challenges
-        .iter()
-        .find(|c| subscription::is_subscription_challenge(c))
+    if preference != ProtocolPreference::OnlyX402
+        && let Some(challenge) = mpp_challenges
+            .iter()
+            .find(|c| subscription::is_subscription_challenge(c))
     {
         info!(
             resource = resource_url,
@@ -825,7 +827,11 @@ pub(crate) fn classify_402_with_preference(
                 resource_url: resource_url.to_string(),
             };
         }
-        ProtocolPreference::OnlyX402 if !charge_challenges.is_empty() => {
+        ProtocolPreference::OnlyX402
+            if mpp_challenges
+                .iter()
+                .any(|challenge| challenge.method.as_str() == "solana") =>
+        {
             return RunOutcome::PaymentRejected {
                 reason: "Server only offers an MPP challenge, but --x402 was requested. \
                          Drop --x402 to settle via MPP, or pick a server that advertises x402."
@@ -858,13 +864,13 @@ pub(crate) fn classify_402_with_preference(
     }
 }
 
-/// Pure parser: pulls a `verification_failed` reason out of a 402 JSON body.
+/// Pure parser: pulls a payment rejection reason out of a 402 JSON body.
 ///
 /// Returns `(message, retryable)` if the body matches the shape emitted by
-/// `crates/core/src/server/payment.rs` for verification failures:
+/// the server emits for verification and session failures:
 ///
 /// ```json
-/// {"error": "verification_failed", "message": "...", "retryable": false}
+/// {"error": "session_failed", "message": "...", "retryable": true}
 /// ```
 ///
 /// Returns `None` for any other body shape (or absent body), so the caller
@@ -875,7 +881,8 @@ pub(crate) fn parse_verification_failure(body: Option<&str>) -> Option<(String, 
         return None;
     }
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
-    if v.get("error")?.as_str()? != "verification_failed" {
+    let error = v.get("error")?.as_str()?;
+    if !matches!(error, "verification_failed" | "session_failed") {
         return None;
     }
     let message = v
@@ -1795,6 +1802,27 @@ HTTP request sent, awaiting response...
         ]
     }
 
+    fn dual_protocol_session_402() -> Vec<(String, String)> {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        let session_request = serde_json::json!({
+            "cap": "1000000",
+            "currency": "USDC",
+            "network": "devnet",
+            "operator": "So11111111111111111111111111111111111111112",
+            "recipient": "So11111111111111111111111111111111111111112",
+            "modes": ["pull"]
+        });
+        let session_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&session_request).unwrap());
+        let mut headers = dual_protocol_402();
+        headers[0].1 = format!(
+            "Payment id=\"dual-session\", realm=\"test\", method=\"solana\", \
+             intent=\"session\", request=\"{session_b64}\""
+        );
+        headers
+    }
+
     #[test]
     fn decoded_challenges_group_mpp_and_x402_before_protocol_selection() {
         let headers = dual_protocol_402();
@@ -1891,6 +1919,28 @@ HTTP request sent, awaiting response...
             ProtocolPreference::OnlyX402,
         );
         assert!(matches!(outcome, RunOutcome::X402Challenge { .. }));
+    }
+
+    #[test]
+    fn preference_only_x402_skips_mpp_session_when_both_offered() {
+        let outcome = classify_402_with_preference(
+            &dual_protocol_session_402(),
+            None,
+            "https://example.com/resource",
+            ProtocolPreference::OnlyX402,
+        );
+        assert!(matches!(outcome, RunOutcome::X402Challenge { .. }));
+    }
+
+    #[test]
+    fn preference_auto_still_prefers_mpp_session_when_both_offered() {
+        let outcome = classify_402_with_preference(
+            &dual_protocol_session_402(),
+            None,
+            "https://example.com/resource",
+            ProtocolPreference::Auto,
+        );
+        assert!(matches!(outcome, RunOutcome::SessionChallenge { .. }));
     }
 
     #[test]
@@ -2128,6 +2178,16 @@ HTTP request sent, awaiting response...
         assert_eq!(
             parsed,
             Some(("rpc temporarily unavailable".to_string(), true))
+        );
+    }
+
+    #[test]
+    fn parse_verification_failure_accepts_session_failure() {
+        let body = r#"{"error":"session_failed","message":"open transaction not visible","retryable":true}"#;
+        let parsed = parse_verification_failure(Some(body));
+        assert_eq!(
+            parsed,
+            Some(("open transaction not visible".to_string(), true))
         );
     }
 

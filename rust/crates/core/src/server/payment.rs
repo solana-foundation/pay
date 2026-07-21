@@ -91,14 +91,25 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
             upto,
         } => {
             let mut req = req;
+            let mut delegated_session = None;
             if let Some(sf) = session {
-                req.extensions_mut().insert(SessionStreamContext::new(
-                    sf.handle,
-                    sf.channel_id,
-                    sf.committed_base_units,
-                ));
+                if sf.settlement.is_some() {
+                    // Delegated sessions are settled from the completed
+                    // response below. The client-voucher stream context waits
+                    // for client commits and must not be installed here.
+                    delegated_session = Some(sf);
+                } else {
+                    req.extensions_mut().insert(SessionStreamContext::new(
+                        sf.handle,
+                        sf.channel_id,
+                        sf.committed_base_units,
+                    ));
+                }
             }
             let mut response = next.run(req).await;
+            if let Some(sf) = delegated_session {
+                response = settle_axum_delegated_response(sf, response).await;
+            }
             // x402 `upto`: settle the opened channel *after* serving — debit the
             // metered amount on success, refund on failure.
             if let Some(uf) = upto {
@@ -178,6 +189,56 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
             response
         }
         GateDecision::Passthrough => next.run(req).await,
+    }
+}
+
+async fn settle_axum_delegated_response(
+    forward: crate::server::gate::SessionForward,
+    response: Response,
+) -> Response {
+    if !response.status().is_success() {
+        // Dropping `forward` releases the capacity lease without charging for
+        // a response that was not successfully served.
+        return response;
+    }
+
+    let limit = forward
+        .settlement
+        .as_deref()
+        .map(|plan| metering::upto_response_body_limit(&plan.metering))
+        .unwrap_or(1024 * 1024);
+    let (mut parts, body) = response.into_parts();
+    let bytes = match axum::body::to_bytes(body, limit).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::warn!(%error, "failed to buffer delegated session response body");
+            return Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"error":"response_metering_failed"}"#))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        }
+    };
+
+    match crate::server::gate::settle_delegated_session(forward, &parts.headers, Some(&bytes)).await
+    {
+        Ok(receipt) => {
+            if let Some(receipt) = receipt {
+                for (name, value) in receipt.headers {
+                    parts.headers.append(name, value);
+                }
+            }
+            parts.headers.remove(header::CONTENT_LENGTH);
+            Response::from_parts(parts, Body::from(bytes))
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to settle delegated MPP session usage");
+            Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"error":"session_settlement_failed"}"#))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
     }
 }
 

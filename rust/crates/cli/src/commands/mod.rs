@@ -538,20 +538,13 @@ fn handle_outcome(
         } => {
             print_verbose_challenges(&advertised_challenges, verbose, is_json);
             let req: Option<SessionRequest> = challenge.request.decode().ok();
-            let cap_usdc = req
+            let cap_display = req
                 .as_ref()
-                .and_then(|r| r.cap.parse::<u64>().ok())
-                .unwrap_or(0) as f64
-                / 1_000_000.0;
+                .map(|request| display_token_amount(&request.cap, &request.currency))
+                .unwrap_or_else(|| "unknown".to_string());
 
             if auto_pay {
                 enforce_session_cap(req.as_ref(), payment_cap)?;
-                if verbose && !is_json {
-                    eprintln!(
-                        "{}",
-                        format!("402 Payment Required (MPP session) — cap ${cap_usdc:.2} USDC — opening session…").dimmed()
-                    );
-                }
                 return pay_session_and_retry(
                     &challenge,
                     req.as_ref(),
@@ -570,7 +563,8 @@ fn handle_outcome(
                     "status": 402,
                     "protocol": "mpp-session",
                     "challenge": {
-                        "cap_usdc": cap_usdc,
+                        "cap": req.as_ref().map(|r| &r.cap),
+                        "cap_display": cap_display,
                         "currency": req.as_ref().map(|r| &r.currency),
                         "network": req.as_ref().and_then(|r| r.network.as_deref()),
                         "min_voucher_delta": req.as_ref().and_then(|r| r.min_voucher_delta.as_deref()),
@@ -579,10 +573,10 @@ fn handle_outcome(
                     "resource": resource_url,
                 }))?;
             } else {
-                eprintln!(
-                    "{}",
-                    format!("402 Payment Required (MPP session) — cap ${cap_usdc:.2} USDC")
-                        .dimmed()
+                crate::components::print_notice(
+                    crate::components::NoticeLevel::Info,
+                    "MPP payment channel required",
+                    &format!("Spending limit: {cap_display}"),
                 );
             }
         }
@@ -833,12 +827,12 @@ fn render_verbose_challenges(challenges: &DecodedPaymentChallenges) -> Option<St
     }
     let mut rows = Vec::with_capacity(challenges.x402.len() + challenges.mpp.len());
     for (protocol, challenges) in [("x402", &challenges.x402), ("mpp", &challenges.mpp)] {
-        for (index, challenge) in challenges.iter().enumerate() {
-            rows.push(challenge_summary_row(protocol, index + 1, challenge));
+        for challenge in challenges {
+            rows.push(challenge_summary_row(protocol, challenge));
         }
     }
     Some(ascii_table::render_table(
-        &["Protocol", "Offer", "Type", "Amount", "Network", "Target"],
+        &["Protocol", "Terms", "Network"],
         &rows,
     ))
 }
@@ -933,7 +927,7 @@ fn render_verbose_receipt(
     Some(ReceiptNotice { title, body })
 }
 
-fn challenge_summary_row(protocol: &str, offer: usize, value: &serde_json::Value) -> Vec<String> {
+fn challenge_summary_row(protocol: &str, value: &serde_json::Value) -> Vec<String> {
     let kind = match protocol {
         "x402" => json_string(value, &[&["scheme"]]).unwrap_or_else(|| "payment".to_string()),
         "mpp" => json_string(value, &[&["intent"]]).unwrap_or_else(|| "charge".to_string()),
@@ -944,27 +938,35 @@ fn challenge_summary_row(protocol: &str, offer: usize, value: &serde_json::Value
         value,
         &[&["network"], &["cluster"], &["request", "network"]],
     )
+    .map(|network| format_challenge_network(value, &network))
     .unwrap_or_else(|| "-".to_string());
-    let target = json_string(
-        value,
-        &[
-            &["payTo"],
-            &["pay_to"],
-            &["recipient"],
-            &["realm"],
-            &["request", "recipient"],
-        ],
-    )
-    .unwrap_or_else(|| "-".to_string());
+    let terms = match (kind.as_str(), amount.as_str()) {
+        (_, "-") => "-".to_string(),
+        ("upto" | "session", amount) => format!("up to {amount}"),
+        (_, amount) => amount.to_string(),
+    };
 
-    vec![
-        protocol.to_string(),
-        offer.to_string(),
-        kind,
-        amount,
-        network,
-        target,
-    ]
+    vec![format!("{protocol}/{kind}"), terms, network]
+}
+
+fn format_challenge_network(value: &serde_json::Value, network: &str) -> String {
+    use pay_kit::x402::exact::{SOLANA_DEVNET, SOLANA_MAINNET, SOLANA_TESTNET};
+
+    let cluster = match network {
+        SOLANA_MAINNET | "solana:mainnet" | "mainnet" | "mainnet-beta" => "mainnet",
+        SOLANA_DEVNET | "solana:devnet" | "solana-devnet" | "devnet" => "devnet",
+        SOLANA_TESTNET | "solana:testnet" | "solana-testnet" | "testnet" => "testnet",
+        "localnet" | "sandbox" => "localnet",
+        _ => return network.to_string(),
+    };
+    let is_solana = network.starts_with("solana:")
+        || json_string(value, &[&["method"]]).is_some_and(|method| method == "solana");
+
+    if is_solana {
+        format!("Solana {cluster}")
+    } else {
+        cluster.to_string()
+    }
 }
 
 fn receipt_amount(value: &serde_json::Value, fallback_asset: Option<&str>) -> Option<String> {
@@ -1001,7 +1003,12 @@ fn receipt_protocol_label(
 fn format_amount(value: &serde_json::Value) -> String {
     let amount = json_string(
         value,
-        &[&["amount"], &["maxAmountRequired"], &["request", "amount"]],
+        &[
+            &["amount"],
+            &["maxAmountRequired"],
+            &["request", "amount"],
+            &["request", "cap"],
+        ],
     );
     let currency = json_string(
         value,
@@ -1121,10 +1128,7 @@ fn enforce_session_cap(
             "session payment cap requires a decoded SessionRequest".to_string(),
         ));
     };
-    let required_micro = request
-        .cap
-        .parse::<u64>()
-        .map_err(|e| pay_core::Error::Mpp(format!("Invalid session cap: {e}")))?;
+    let required_micro = amount_as_stablecoin_micro(&request.cap, &request.currency)?;
 
     if required_micro <= payment_cap {
         return Ok(());
@@ -1132,7 +1136,9 @@ fn enforce_session_cap(
 
     Err(payment_cap_error(
         "MPP session",
-        "USDC",
+        Stablecoin::from_mint(&request.currency)
+            .map(Stablecoin::symbol)
+            .unwrap_or(&request.currency),
         required_micro,
         payment_cap,
     ))
@@ -1523,11 +1529,14 @@ fn pay_upto_and_retry(
     if ctx.verbose && !is_json {
         crate::components::print_notice(
             crate::components::NoticeLevel::Success,
-            "Selecting x402 upto challenge",
-            &x402_upto_selection_notice_body(&display_x402_upto_amount(
-                &challenge.requirements.amount,
-                &challenge.requirements.asset,
-            )),
+            "Authorizing x402 payment",
+            &payment_authorization_notice_body(
+                &display_x402_upto_amount(
+                    &challenge.requirements.amount,
+                    &challenge.requirements.asset,
+                ),
+                None,
+            ),
         );
     }
 
@@ -1562,10 +1571,6 @@ fn pay_upto_and_retry(
             scheme: Some("upto"),
         })),
     )
-}
-
-fn x402_upto_selection_notice_body(amount: &str) -> String {
-    format!("Authorize up to {amount}; Pay will request wallet approval and retry the request.")
 }
 
 fn display_x402_upto_amount(amount: &str, asset: &str) -> String {
@@ -1665,13 +1670,24 @@ fn pay_session_and_retry(
         .and_then(|r| r.cap.parse::<u64>().ok())
         .unwrap_or(1_000_000);
     let deposit = (min_delta * 1_000).max(1_000_000).min(cap);
+    let cap_display = req
+        .map(|request| display_token_amount(&request.cap, &request.currency))
+        .unwrap_or_else(|| format!("{cap} base units"));
+    let deposit_display = req
+        .map(|request| display_token_amount(&deposit.to_string(), &request.currency))
+        .unwrap_or_else(|| format!("{deposit} base units"));
+
+    if verbose && !is_json {
+        crate::components::print_notice(
+            crate::components::NoticeLevel::Success,
+            "Authorizing MPP session",
+            &payment_authorization_notice_body(&cap_display, Some(&deposit_display)),
+        );
+    }
 
     let supports_push = req
         .map(|r| r.modes.is_empty() || r.modes.contains(&SessionMode::Push))
         .unwrap_or(true);
-    let supports_pull = req
-        .map(|r| r.modes.contains(&SessionMode::Pull))
-        .unwrap_or(false);
     let use_pull = req
         .map(|r| {
             r.modes.contains(&SessionMode::Pull)
@@ -1693,17 +1709,6 @@ fn pay_session_and_retry(
         let store = pay_core::accounts::FileAccountsStore::default_path();
         match request.pull_voucher_strategy.as_ref() {
             Some(SessionPullVoucherStrategy::ClientVoucher) => {
-                if verbose && !is_json {
-                    eprintln!(
-                        "{}",
-                        format!(
-                            "Opening pull client-voucher session (deposit {} µUSDC)…",
-                            deposit
-                        )
-                        .dimmed()
-                    );
-                }
-
                 let (_handle, header) =
                     pay_core::session::open_payment_channel_session_header_with_mode(
                         challenge,
@@ -1715,10 +1720,6 @@ fn pay_session_and_retry(
                         SessionMode::Pull,
                         sandbox,
                     )?;
-
-                if verbose && !is_json {
-                    eprintln!("{}", "Pull session opened — sending request…\n".dimmed());
-                }
                 header
             }
             Some(SessionPullVoucherStrategy::OperatedVoucher) => {
@@ -1735,19 +1736,7 @@ fn pay_session_and_retry(
             }
         }
     } else {
-        if verbose && !is_json {
-            eprintln!(
-                "{}",
-                format!(
-                    "Opening {}session (deposit {} µUSDC)…",
-                    if supports_pull { "push " } else { "" },
-                    deposit
-                )
-                .dimmed()
-            );
-        }
-
-        let header = if let Some(request) = req {
+        if let Some(request) = req {
             let store = pay_core::accounts::FileAccountsStore::default_path();
             let (_handle, header) = pay_core::session::open_payment_channel_session_header(
                 challenge,
@@ -1762,13 +1751,7 @@ fn pay_session_and_retry(
         } else {
             let (_handle, header) = pay_core::session::open_session_header(challenge, deposit)?;
             header
-        };
-
-        if verbose && !is_json {
-            eprintln!("{}", "Push session opened — sending request…\n".dimmed());
         }
-
-        header
     };
 
     let receipt_network = network_override
@@ -1782,6 +1765,15 @@ fn pay_session_and_retry(
         receipt_network.as_deref(),
         ReceiptProvenance::PaidRetry(None),
     )
+}
+
+fn payment_authorization_notice_body(limit: &str, deposit: Option<&str>) -> String {
+    let mut body = format!("Spending limit: {limit}\n");
+    if let Some(deposit) = deposit {
+        body.push_str(&format!("Channel deposit: {deposit}\n"));
+    }
+    body.push_str("Approve in your wallet to retry the request.");
+    body
 }
 
 fn validate_tool_request_before_signing(tool: &Tool) -> pay_core::Result<()> {
@@ -1988,11 +1980,19 @@ mod tests {
             x402: vec![serde_json::json!({
                 "scheme": "upto",
                 "amount": "250000",
-                "asset": "USDC"
+                "asset": "USDC",
+                "network": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "payTo": "x402-recipient"
             })],
             mpp: vec![serde_json::json!({
                 "intent": "charge",
-                "request": { "amount": "10", "currency": "USDC" }
+                "method": "solana",
+                "realm": "Example provider",
+                "request": {
+                    "amount": "10",
+                    "currency": "USDC",
+                    "network": "mainnet"
+                }
             })],
         };
 
@@ -2000,13 +2000,42 @@ mod tests {
         assert!(rendered.starts_with('+'));
         assert!(!rendered.contains("402 payment offers"));
         assert!(rendered.contains("| Protocol"));
-        assert!(rendered.contains("x402"));
-        assert!(rendered.contains("mpp"));
-        assert!(rendered.contains("upto"));
-        assert!(rendered.contains("charge"));
-        assert!(rendered.contains("0.25 USDC"));
+        assert!(rendered.contains("Terms"));
+        assert!(!rendered.contains("Recipient / Realm"));
+        assert!(!rendered.contains("x402-recipient"));
+        assert!(!rendered.contains("Example provider"));
+        assert!(rendered.contains("x402/upto"));
+        assert!(rendered.contains("mpp/charge"));
+        assert!(rendered.contains("up to 0.25 USDC"));
         assert!(rendered.contains("0.00001 USDC"));
+        assert_eq!(rendered.matches("Solana mainnet").count(), 2);
+        assert_eq!(
+            rendered
+                .lines()
+                .filter(|line| line.starts_with('+'))
+                .count(),
+            3
+        );
         assert!(rendered.lines().all(|line| line.chars().count() <= 80));
+    }
+
+    #[test]
+    fn verbose_session_challenge_reports_cap_and_currency() {
+        let row = challenge_summary_row(
+            "mpp",
+            &serde_json::json!({
+                "intent": "session",
+                "method": "solana",
+                "realm": "Alibaba Cloud Model Studio",
+                "request": {
+                    "cap": "100000",
+                    "currency": pay_types::stablecoin_mints::USDG_MAINNET,
+                    "network": "mainnet"
+                }
+            }),
+        );
+
+        assert_eq!(row, ["mpp/session", "up to 0.1 USDG", "Solana mainnet"]);
     }
 
     #[test]
@@ -2263,10 +2292,26 @@ mod tests {
     }
 
     #[test]
-    fn x402_upto_selection_notice_describes_the_selected_offer() {
-        let body = x402_upto_selection_notice_body("0.25 USDC");
-        assert!(body.starts_with("Authorize up to 0.25 USDC"));
-        assert!(body.contains("wallet approval"));
+    fn x402_upto_notice_uses_shared_authorization_copy() {
+        let body = payment_authorization_notice_body("0.25 USDC", None);
+        assert_eq!(
+            body,
+            "Spending limit: 0.25 USDC\nApprove in your wallet to retry the request."
+        );
+    }
+
+    #[test]
+    fn mpp_session_notice_adds_deposit_to_shared_authorization_copy() {
+        let body = payment_authorization_notice_body("0.1 USDG", Some("0.1 USDG"));
+
+        assert_eq!(
+            body,
+            "Spending limit: 0.1 USDG\n\
+             Channel deposit: 0.1 USDG\n\
+             Approve in your wallet to retry the request."
+        );
+        assert!(!body.to_ascii_lowercase().contains("push"));
+        assert!(!body.to_ascii_lowercase().contains("pull"));
     }
 
     #[test]
