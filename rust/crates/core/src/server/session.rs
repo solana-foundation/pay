@@ -89,12 +89,20 @@ struct SessionOperatorRuntime {
 
 impl SessionOperatorRuntime {
     fn reserve_capacity(&self, channel_id: &str, amount: u64) -> bool {
-        let Ok(mut reservations) = self.reserved_capacity.lock() else { return false; };
-        if reservations.contains_key(channel_id) { return false; }
+        let Ok(mut reservations) = self.reserved_capacity.lock() else {
+            return false;
+        };
+        if reservations.contains_key(channel_id) {
+            return false;
+        }
         reservations.insert(channel_id.to_string(), amount);
         true
     }
-    fn release_capacity(&self, channel_id: &str) { if let Ok(mut reservations) = self.reserved_capacity.lock() { reservations.remove(channel_id); } }
+    fn release_capacity(&self, channel_id: &str) {
+        if let Ok(mut reservations) = self.reserved_capacity.lock() {
+            reservations.remove(channel_id);
+        }
+    }
     fn record_committed_watermark(&self, session_id: impl Into<String>, cumulative: u64) {
         if let Ok(mut watermarks) = self.committed_watermarks.lock() {
             let session_id = session_id.into();

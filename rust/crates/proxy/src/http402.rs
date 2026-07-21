@@ -508,7 +508,9 @@ impl<S: PaymentState> Http402Gate<S> {
             }
         }
         if let Some(pending) = ctx.session.as_ref() {
-            pending.handle.release_delegated_capacity(&pending.channel_id);
+            pending
+                .handle
+                .release_delegated_capacity(&pending.channel_id);
         }
         let extra = self
             .drain_payment_headers_with_response(
@@ -578,7 +580,9 @@ impl<S: PaymentState> Http402Gate<S> {
         .map_err(|error| error.to_string())?;
         if actual.base_units == 0 {
             pending.handle.touch_channel(pending.channel_id.clone());
-            pending.handle.release_delegated_capacity(&pending.channel_id);
+            pending
+                .handle
+                .release_delegated_capacity(&pending.channel_id);
             tracing::info!(
                 channel = %pending.channel_id,
                 "delegated MPP session response rated at zero"
@@ -593,11 +597,15 @@ impl<S: PaymentState> Http402Gate<S> {
         {
             Ok(cumulative) => cumulative,
             Err(error) => {
-                pending.handle.release_delegated_capacity(&pending.channel_id);
+                pending
+                    .handle
+                    .release_delegated_capacity(&pending.channel_id);
                 return Err(error.to_string());
             }
         };
-        pending.handle.release_delegated_capacity(&pending.channel_id);
+        pending
+            .handle
+            .release_delegated_capacity(&pending.channel_id);
         tracing::info!(
             channel = %pending.channel_id,
             amount = actual.base_units,
