@@ -355,10 +355,22 @@ impl SessionOperatorRuntime {
         })?;
         let token_program = spl_token_program();
 
-        let signature = match params.voucher_signature.as_deref() {
-            Some(signature) => Some(decode_voucher_signature(signature)?),
-            None if params.settled == 0 => None,
-            None => {
+        // A periodic watermark push may have landed immediately before this
+        // close. Reusing that same cumulative voucher in `settle_and_seal`
+        // fails with VoucherWatermarkNotMonotonic (0xEA). When chain already
+        // has the latest accepted watermark, seal it without another voucher.
+        let channel_id = params.channel_id.to_string();
+        let onchain_settled = self
+            .fetch_payment_channel(&channel_id)
+            .await?
+            .map(|channel| channel.settlement.settled)
+            .unwrap_or_default();
+        let voucher_required = close_voucher_required(onchain_settled, params.settled);
+        let signature = match (voucher_required, params.voucher_signature.as_deref()) {
+            (false, _) => None,
+            (true, Some(signature)) => Some(decode_voucher_signature(signature)?),
+            (true, None) if params.settled == 0 => None,
+            (true, None) => {
                 return Err(Error::Mpp(
                     "payment-channel settlement missing highest voucher signature".to_string(),
                 ));
@@ -419,14 +431,15 @@ impl SessionOperatorRuntime {
                 }
             })
             .await;
-        match handle
-            .settle(params.channel_id.to_string(), instructions)
-            .await
-        {
+        match handle.settle(channel_id, instructions).await {
             Ok(signature) => Ok(Some(signature)),
             Err(e) => Err(Error::Mpp(format!("payment-channel settlement: {e}"))),
         }
     }
+}
+
+fn close_voucher_required(onchain_settled: u64, latest_accepted: u64) -> bool {
+    onchain_settled < latest_accepted
 }
 
 /// Exclusive claim on a delegated session's remaining capacity.
@@ -2274,5 +2287,12 @@ mod tests {
         let err = validate_payment_channel_open_transaction(&tx, &expected, &wrong_fee_payer)
             .unwrap_err();
         assert!(err.to_string().contains("fee payer"));
+    }
+
+    #[test]
+    fn close_omits_voucher_when_watermark_already_landed() {
+        assert!(close_voucher_required(4_330, 4_331));
+        assert!(!close_voucher_required(4_331, 4_331));
+        assert!(!close_voucher_required(4_332, 4_331));
     }
 }
