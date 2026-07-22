@@ -38,6 +38,7 @@ session:
   min_voucher_delta: 1
   # Idle delay before the operator closes and settles the channel.
   close_delay_ms: 15000
+  settlement_interval_ms: 5000
   # Pull follows charge semantics at the payment boundary: the operator opens
   # and funds the payment-channel, then the client signs cumulative vouchers.
   modes: [pull]
@@ -203,6 +204,17 @@ endpoints:
       metered against official Gemini API paid-tier standard pricing, quantized
       to 0.000001 USDC settlement increments where sub-µUSDC token prices
       require batching.
+    metering:
+      schemes: [mpp-session]
+      variants: *official_gemini_generation_metering
+
+  # Agent harnesses such as Claude, Goose, and Qoder speak OpenAI Chat
+  # Completions. Google exposes the same Gemini models through this official
+  # compatibility surface, so they do not need a Gemini-native client.
+  - method: POST
+    path: "v1beta/openai/chat/completions"
+    resource: "chat"
+    description: "OpenAI-compatible chat completions for Gemini models."
     metering:
       schemes: [mpp-session]
       variants: *official_gemini_generation_metering

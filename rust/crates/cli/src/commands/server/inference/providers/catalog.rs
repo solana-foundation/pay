@@ -16,6 +16,13 @@ pub const DEFAULT_CATALOG_FQNS: &[&str] = &[
     "solana-foundation/google/generativelanguage",
 ];
 
+const ALIBABA_MODELSTUDIO_FQN: &str = "solana-foundation/alibaba/modelstudio";
+const ALIBABA_MODELSTUDIO_GATEWAY_URL: &str = "https://modelstudio.alibaba.gateway-402.com";
+const ALIBABA_RESPONSES_PATH: &str = "compatible-mode/v1/responses";
+const GOOGLE_GEMINI_FQN: &str = "solana-foundation/google/generativelanguage";
+const GOOGLE_GEMINI_GATEWAY_URL: &str = "https://generativelanguage.google.gateway-402.com";
+const GOOGLE_OPENAI_CHAT_PATH: &str = "v1beta/openai/chat/completions";
+
 /// A hosted inference provider backed by a resolved catalog entry.
 pub struct CatalogProvider {
     fqn: String,
@@ -68,6 +75,167 @@ impl CatalogProvider {
     }
 }
 
+/// Built-in Alibaba provider used until its skills-catalog entry is
+/// published. The deployed gateway already exists, so making picker
+/// visibility depend on the separate catalog publication is unnecessary.
+/// Models and pricing stay sourced from the gateway YAML rather than a second
+/// hard-coded list.
+pub fn alibaba_modelstudio_fallback() -> CatalogProvider {
+    let yaml = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../web-ui/proxy/alibaba-qwen.yml"
+    ));
+    let mut provider = provider_from_embedded_spec(
+        ALIBABA_MODELSTUDIO_FQN,
+        "modelstudio",
+        ALIBABA_MODELSTUDIO_GATEWAY_URL,
+        yaml,
+    );
+    add_alibaba_responses_compat(&mut provider);
+    provider
+}
+
+/// Built-in Gemini provider. The spec includes Google's official OpenAI
+/// compatibility endpoint so OpenAI-chat agent harnesses can use Gemini
+/// without a Gemini-native client.
+pub fn google_gemini_fallback() -> CatalogProvider {
+    let yaml = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../web-ui/proxy/google-gemini.yml"
+    ));
+    provider_from_embedded_spec(
+        GOOGLE_GEMINI_FQN,
+        "generativelanguage",
+        GOOGLE_GEMINI_GATEWAY_URL,
+        yaml,
+    )
+}
+
+fn provider_from_embedded_spec(
+    fqn: &str,
+    slug: &str,
+    gateway_url: &str,
+    yaml: &str,
+) -> CatalogProvider {
+    let spec: pay_types::metering::ApiSpec =
+        serde_yml::from_str(yaml).expect("embedded inference gateway spec must be valid");
+    let endpoints = spec
+        .endpoints
+        .into_iter()
+        .map(|endpoint| pay_core::skills::Endpoint {
+            method: format!("{:?}", endpoint.method).to_ascii_uppercase(),
+            path: endpoint.path,
+            full_path: String::new(),
+            resource: endpoint.resource,
+            description: endpoint.description.unwrap_or_default(),
+            pricing: endpoint
+                .metering
+                .and_then(|metering| serde_json::to_value(metering).ok()),
+        })
+        .collect();
+
+    CatalogProvider {
+        fqn: fqn.to_string(),
+        slug: slug.to_string(),
+        title: display_title(fqn, &spec.title),
+        service_url: gateway_url.to_string(),
+        endpoints,
+    }
+}
+
+/// Add the compatibility endpoint to an older cached catalog entry. Copy its
+/// pricing from native `generateContent`, which keeps the overlay aligned with
+/// the live catalog's current model/rate variants.
+fn add_gemini_openai_compat(provider: &mut CatalogProvider) {
+    if provider
+        .endpoints
+        .iter()
+        .any(|endpoint| endpoint.path.trim_matches('/') == GOOGLE_OPENAI_CHAT_PATH)
+    {
+        return;
+    }
+    let mut endpoint = provider
+        .endpoints
+        .iter()
+        .find(|endpoint| {
+            endpoint.method.eq_ignore_ascii_case("POST")
+                && endpoint.path.trim_matches('/') == "v1beta/models/{modelsId}:generateContent"
+        })
+        .cloned()
+        .or_else(|| {
+            google_gemini_fallback()
+                .endpoints
+                .into_iter()
+                .find(|endpoint| endpoint.path.trim_matches('/') == GOOGLE_OPENAI_CHAT_PATH)
+        });
+    if let Some(endpoint) = endpoint.as_mut() {
+        endpoint.path = GOOGLE_OPENAI_CHAT_PATH.to_string();
+        endpoint.full_path.clear();
+        endpoint.resource = Some("chat".to_string());
+        endpoint.description = "OpenAI-compatible chat completions for Gemini models.".to_string();
+    }
+    if let Some(endpoint) = endpoint {
+        provider.endpoints.push(endpoint);
+    }
+}
+
+/// Upgrade older Model Studio catalog entries with the Responses API route
+/// used by Codex. The deployed upstream keeps all OpenAI-compatible surfaces
+/// below `compatible-mode/`.
+fn add_alibaba_responses_compat(provider: &mut CatalogProvider) {
+    if let Some(endpoint) = provider
+        .endpoints
+        .iter_mut()
+        .find(|endpoint| endpoint.path.trim_matches('/').ends_with("/responses"))
+    {
+        endpoint.path = ALIBABA_RESPONSES_PATH.to_string();
+        endpoint.full_path.clear();
+        return;
+    }
+    let mut endpoint = provider
+        .endpoints
+        .iter()
+        .find(|endpoint| {
+            endpoint.method.eq_ignore_ascii_case("POST")
+                && endpoint
+                    .path
+                    .to_ascii_lowercase()
+                    .contains("chat/completions")
+        })
+        .cloned();
+    if let Some(endpoint) = endpoint.as_mut() {
+        endpoint.path = ALIBABA_RESPONSES_PATH.to_string();
+        endpoint.full_path.clear();
+        endpoint.resource = Some("responses".to_string());
+        endpoint.description = "OpenAI Responses API for Qwen agent models.".to_string();
+    }
+    if let Some(endpoint) = endpoint {
+        provider.endpoints.push(endpoint);
+    }
+}
+
+/// Keep the live default gateways visible while their separate catalog entries
+/// are missing. Older cached Gemini entries are upgraded with the official
+/// OpenAI compatibility route until the refreshed gateway catalog includes it.
+pub fn append_default_fallbacks(providers: &mut Vec<CatalogProvider>) {
+    if let Some(provider) = providers
+        .iter_mut()
+        .find(|provider| provider.fqn == ALIBABA_MODELSTUDIO_FQN)
+    {
+        add_alibaba_responses_compat(provider);
+    } else {
+        providers.push(alibaba_modelstudio_fallback());
+    }
+    if let Some(provider) = providers
+        .iter_mut()
+        .find(|provider| provider.fqn == GOOGLE_GEMINI_FQN)
+    {
+        add_gemini_openai_compat(provider);
+    } else {
+        providers.push(google_gemini_fallback());
+    }
+}
+
 #[async_trait::async_trait]
 impl InferenceProvider for CatalogProvider {
     fn slug(&self) -> &str {
@@ -106,13 +274,14 @@ impl InferenceProvider for CatalogProvider {
         None
     }
     async fn list_models(&self, client: &reqwest::Client, base_url: &str) -> Vec<String> {
+        let fallback = || models_from_pricing_variants(&self.endpoints);
         let Some(ep) = self.model_list_endpoint() else {
-            return Vec::new();
+            return fallback();
         };
         let path = format!("/{}", ep.path.trim_start_matches('/'));
         match get_json(client, base_url.trim_end_matches('/'), &path).await {
             Some(json) => parse_model_names(&json),
-            None => Vec::new(),
+            None => fallback(),
         }
     }
     /// Metered catalog endpoints, in gate convention (no leading slash).
@@ -130,7 +299,15 @@ impl InferenceProvider for CatalogProvider {
     }
     fn dialect(&self) -> Dialect {
         if self.fqn.contains("google/generativelanguage") {
-            Dialect::GeminiNative
+            if self
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.path.trim_matches('/') == GOOGLE_OPENAI_CHAT_PATH)
+            {
+                Dialect::OpenAiCompat
+            } else {
+                Dialect::GeminiNative
+            }
         } else if self.fqn.contains("alibaba/modelstudio") {
             Dialect::OpenAiCompat
         } else {
@@ -354,6 +531,27 @@ fn parse_model_names(json: &serde_json::Value) -> Vec<String> {
             .collect();
     }
     Vec::new()
+}
+
+/// Model variants are also the catalog for hosted gateways that cannot proxy
+/// an upstream model-list endpoint (Model Studio is one such provider).
+fn models_from_pricing_variants(endpoints: &[pay_core::skills::Endpoint]) -> Vec<String> {
+    let mut models = Vec::new();
+    for value in endpoints
+        .iter()
+        .filter_map(|endpoint| endpoint.pricing.as_ref())
+        .filter_map(|pricing| pricing.get("variants"))
+        .filter_map(serde_json::Value::as_array)
+        .flatten()
+        .filter_map(|variant| variant.get("value"))
+        .filter_map(serde_json::Value::as_str)
+        .filter(|value| *value != "default")
+    {
+        if !models.iter().any(|model| model == value) {
+            models.push(value.to_string());
+        }
+    }
+    models
 }
 
 /// Picker title for a catalog entry. Known default fqns get a short brand
@@ -652,9 +850,15 @@ mod tests {
 
     #[test]
     fn dialect_maps_known_fqns() {
-        assert_eq!(
-            gemini("https://example.com").dialect(),
-            Dialect::GeminiNative
+        let mut native_gemini = gemini("https://example.com");
+        assert_eq!(native_gemini.dialect(), Dialect::GeminiNative);
+        add_gemini_openai_compat(&mut native_gemini);
+        assert_eq!(native_gemini.dialect(), Dialect::OpenAiCompat);
+        assert!(
+            native_gemini
+                .paid_endpoints()
+                .iter()
+                .any(|endpoint| endpoint.path == GOOGLE_OPENAI_CHAT_PATH)
         );
 
         let alibaba: pay_core::skills::Service = serde_json::from_value(serde_json::json!({
@@ -695,6 +899,49 @@ mod tests {
             serde_json::from_str(r#"{"data":[{"id":"qwen-max"},{"id":"qwen-plus"}]}"#).unwrap();
         assert_eq!(parse_model_names(&json), vec!["qwen-max", "qwen-plus"]);
         assert!(parse_model_names(&serde_json::json!({"ok": true})).is_empty());
+    }
+
+    #[test]
+    fn pricing_variants_are_a_model_catalog_without_the_default_sentinel() {
+        let provider = gemini_variant_priced();
+        assert_eq!(
+            models_from_pricing_variants(&provider.endpoints),
+            vec!["gemini-2.5-flash-lite", "gemini-2.5-flash"]
+        );
+    }
+
+    #[test]
+    fn alibaba_qwen_gateway_spec_is_valid_for_all_agent_surfaces() {
+        let yaml = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../web-ui/proxy/alibaba-qwen.yml"
+        ));
+        let spec: pay_types::metering::ApiSpec = serde_yml::from_str(yaml).unwrap();
+        assert_eq!(
+            spec.endpoints
+                .iter()
+                .map(|endpoint| endpoint.path.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "compatible-mode/v1/chat/completions",
+                "v1/responses",
+                "v1/messages"
+            ]
+        );
+        assert!(pay_types::metering::validate_api_spec(&spec).is_empty());
+
+        for endpoint in &spec.endpoints {
+            let variants = &endpoint
+                .metering
+                .as_ref()
+                .expect("each Qwen surface is metered")
+                .variants;
+            assert!(
+                variants
+                    .iter()
+                    .any(|variant| variant.value == "qwen3-coder-next")
+            );
+        }
     }
 
     #[test]
@@ -746,6 +993,60 @@ mod tests {
             let slugs: Vec<&str> = providers.iter().map(|p| p.slug()).collect();
             assert_eq!(slugs, vec!["generativelanguage"]);
         });
+    }
+
+    #[test]
+    fn alibaba_fallback_is_picker_ready_without_a_catalog_entry() {
+        let provider = alibaba_modelstudio_fallback();
+
+        assert_eq!(provider.title(), "Alibaba Model Studio");
+        assert_eq!(provider.slug(), "modelstudio");
+        assert_eq!(
+            provider.service_url(),
+            "https://modelstudio.alibaba.gateway-402.com"
+        );
+        assert_eq!(provider.dialect(), Dialect::OpenAiCompat);
+        assert!(
+            provider
+                .paid_endpoints()
+                .iter()
+                .any(|endpoint| endpoint.path == ALIBABA_RESPONSES_PATH)
+        );
+        assert_eq!(
+            models_from_pricing_variants(&provider.endpoints),
+            [
+                "qwen3.7-plus",
+                "qwen3.7-max",
+                "qwen3.6-flash",
+                "qwen3-coder-next",
+                "qwen3-coder-plus",
+            ]
+        );
+
+        let mut providers = Vec::new();
+        append_default_fallbacks(&mut providers);
+        append_default_fallbacks(&mut providers);
+        assert_eq!(
+            providers.len(),
+            2,
+            "fallbacks must not duplicate themselves"
+        );
+    }
+
+    #[test]
+    fn gemini_fallback_is_openai_chat_compatible() {
+        let provider = google_gemini_fallback();
+
+        assert_eq!(provider.title(), "Google Gemini");
+        assert_eq!(provider.slug(), "generativelanguage");
+        assert_eq!(provider.service_url(), GOOGLE_GEMINI_GATEWAY_URL);
+        assert_eq!(provider.dialect(), Dialect::OpenAiCompat);
+        assert!(
+            provider
+                .paid_endpoints()
+                .iter()
+                .any(|endpoint| endpoint.path == GOOGLE_OPENAI_CHAT_PATH)
+        );
     }
 
     #[test]

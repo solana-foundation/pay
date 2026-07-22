@@ -20,7 +20,7 @@ use pay_kit::mpp::blockhash::{BlockhashCache, CachedBlockhash};
 use pay_kit::mpp::server::session::{SealParams, SessionConfig, SessionServer};
 use pay_kit::mpp::settlement::worker::{RpcBroadcaster, SettlementConfig, SettlementHandle, spawn};
 use pay_kit::mpp::solana_keychain::SolanaSigner;
-use pay_kit::mpp::store::{ChannelState, MemoryChannelStore};
+use pay_kit::mpp::store::{ChannelState, ChannelStore, MemoryChannelStore};
 use pay_kit::mpp::{
     Base64UrlJson, CommitReceipt, OpenPayload, PaymentChallenge, SessionAction, SessionMode,
     SessionPullVoucherStrategy, SessionSettlementAuthority, SignedVoucher, VoucherData,
@@ -70,7 +70,7 @@ pub enum SessionOutcome {
 
 #[derive(Clone)]
 struct SessionOperatorRuntime {
-    server: Arc<SessionServer<MemoryChannelStore>>,
+    server: Arc<SessionServer<Arc<dyn ChannelStore>>>,
     rpc_url: Option<String>,
     payment_channel_signer: Arc<Mutex<Option<Arc<dyn SolanaSigner>>>>,
     payment_channel_payer_signer: Arc<Mutex<Option<Arc<dyn SolanaSigner>>>>,
@@ -137,6 +137,85 @@ impl SessionOperatorRuntime {
             .ok()
             .and_then(|signer| signer.clone())
             .or_else(|| self.payment_channel_signer())
+    }
+
+    /// Push the latest accepted cumulative voucher on-chain without sealing
+    /// the channel. The on-chain watermark is read first, so retries are
+    /// idempotent and a successfully landed watermark is not re-broadcast on
+    /// every lifecycle tick.
+    async fn operator_push_watermark(&self, channel_id: &str) -> Result<()> {
+        let Some(signer) = self.payment_channel_signer() else {
+            // Verification-only servers have no authority to settle. Idle
+            // close retains its existing no-op behavior for these instances.
+            return Ok(());
+        };
+        let Some(rpc_url) = self.rpc_url.clone() else {
+            return Ok(());
+        };
+        let params = self
+            .server
+            .seal_params(channel_id)
+            .await
+            .map_err(|e| Error::Mpp(format!("Failed to get watermark params: {e}")))?;
+        if params.settled == 0 {
+            return Ok(());
+        }
+
+        let channel = self.fetch_payment_channel(channel_id).await?;
+        let Some(channel) = channel else {
+            // A missing/deallocated channel has nothing left to settle.
+            return Ok(());
+        };
+        // Only OPEN channels accept an intermediate settle. CLOSING/SEALED/
+        // DISTRIBUTED channels are already advancing through the close path.
+        if channel.status != 0 || channel.settlement.settled >= params.settled {
+            return Ok(());
+        }
+
+        let authorized_signer = params.authorized_signer.ok_or_else(|| {
+            Error::Mpp("payment-channel watermark missing authorized signer".to_string())
+        })?;
+        let voucher_signature = params.voucher_signature.as_deref().ok_or_else(|| {
+            Error::Mpp("payment-channel watermark missing voucher signature".to_string())
+        })?;
+        let signature = decode_voucher_signature(voucher_signature)?;
+        let expires_at = params.voucher_expires_at.ok_or_else(|| {
+            Error::Mpp("payment-channel watermark missing voucher expiry".to_string())
+        })?;
+        let instructions = pay_kit::mpp::program::payment_channels::build_settle_instructions(
+            &params.channel_id,
+            &authorized_signer,
+            &signature,
+            params.settled,
+            expires_at,
+            &params.program_id,
+        )
+        .map_err(|e| Error::Mpp(format!("failed to build watermark instruction: {e}")))?;
+
+        let operator = signer.pubkey();
+        let handle = self
+            .settlement_worker
+            .get_or_init(|| {
+                let signer = Arc::clone(&signer);
+                async move {
+                    spawn(
+                        SettlementConfig::new(operator, signer),
+                        Arc::new(RpcBroadcaster::new(rpc_url)),
+                    )
+                }
+            })
+            .await;
+        let signature = handle
+            .settle(params.channel_id.to_string(), instructions)
+            .await
+            .map_err(|e| Error::Mpp(format!("payment-channel watermark settlement: {e}")))?;
+        tracing::info!(
+            channel_id,
+            cumulative = params.settled,
+            %signature,
+            "payment-channel watermark broadcast"
+        );
+        Ok(())
     }
 
     async fn operator_close_channel(&self, channel_id: &str) -> Result<SessionCloseResult> {
@@ -216,6 +295,32 @@ impl SessionOperatorRuntime {
             .await
             .map(|account| account.data.as_slice() == [2])
             .unwrap_or(false)
+    }
+
+    async fn fetch_payment_channel(
+        &self,
+        channel_id: &str,
+    ) -> Result<
+        Option<pay_kit::mpp::program::payment_channels::generated::generated::accounts::Channel>,
+    > {
+        let Some(rpc_url) = self.rpc_url.clone() else {
+            return Ok(None);
+        };
+        let channel = solana_pubkey::Pubkey::from_str(channel_id)
+            .map_err(|e| Error::Mpp(format!("invalid payment channel: {e}")))?;
+        use pay_kit::mpp::program::payment_channels::generated::generated::accounts::Channel;
+        use pay_kit::mpp::solana_rpc_client::nonblocking::rpc_client::RpcClient;
+        use solana_commitment_config::CommitmentConfig;
+        RpcClient::new(rpc_url)
+            .get_account_with_commitment(&channel, CommitmentConfig::confirmed())
+            .await
+            .map_err(|error| Error::Mpp(format!("failed to fetch payment channel: {error}")))?
+            .value
+            .map(|account| {
+                Channel::from_bytes(&account.data)
+                    .map_err(|e| Error::Mpp(format!("failed to decode payment channel: {e}")))
+            })
+            .transpose()
     }
 
     async fn submit_payment_channel_settlement(
@@ -354,16 +459,25 @@ impl SessionLifecycleHandle {
 
 #[derive(Debug)]
 enum SessionLifecycleCommand {
-    ConfigureCloseDelay { close_delay: Option<Duration> },
-    Touch { channel_id: String },
-    Remove { channel_id: String },
+    Configure {
+        close_delay: Option<Duration>,
+        settlement_interval: Option<Duration>,
+    },
+    Touch {
+        channel_id: String,
+    },
+    Remove {
+        channel_id: String,
+    },
 }
 
 struct SessionLifecycleRunloop {
     runtime: SessionOperatorRuntime,
     close_delay: Option<Duration>,
+    settlement_interval: Option<Duration>,
+    next_settlement: Option<Instant>,
     rx: mpsc::UnboundedReceiver<SessionLifecycleCommand>,
-    deadlines: HashMap<String, Instant>,
+    last_activity: HashMap<String, Instant>,
 }
 
 impl SessionLifecycleRunloop {
@@ -374,8 +488,10 @@ impl SessionLifecycleRunloop {
         Self {
             runtime,
             close_delay: None,
+            settlement_interval: None,
+            next_settlement: None,
             rx,
-            deadlines: HashMap::new(),
+            last_activity: HashMap::new(),
         }
     }
 
@@ -390,6 +506,7 @@ impl SessionLifecycleRunloop {
                     }
                     _ = tokio::time::sleep_until(deadline) => {
                         self.close_due_channels().await;
+                        self.push_due_watermarks().await;
                     }
                 }
             } else {
@@ -403,22 +520,31 @@ impl SessionLifecycleRunloop {
 
     fn handle_command(&mut self, command: Option<SessionLifecycleCommand>) -> bool {
         match command {
-            Some(SessionLifecycleCommand::ConfigureCloseDelay { close_delay }) => {
+            Some(SessionLifecycleCommand::Configure {
+                close_delay,
+                settlement_interval,
+            }) => {
                 self.close_delay = close_delay;
-                if self.close_delay.is_none() {
-                    self.deadlines.clear();
-                }
+                self.settlement_interval = settlement_interval;
+                self.next_settlement = settlement_interval
+                    .filter(|_| !self.last_activity.is_empty())
+                    .map(|interval| Instant::now() + interval);
                 true
             }
             Some(SessionLifecycleCommand::Touch { channel_id }) => {
-                if let Some(close_delay) = self.close_delay {
-                    let deadline = Instant::now() + close_delay;
-                    self.deadlines.insert(channel_id, deadline);
+                self.last_activity.insert(channel_id, Instant::now());
+                if self.next_settlement.is_none()
+                    && let Some(interval) = self.settlement_interval
+                {
+                    self.next_settlement = Some(Instant::now() + interval);
                 }
                 true
             }
             Some(SessionLifecycleCommand::Remove { channel_id }) => {
-                self.deadlines.remove(&channel_id);
+                self.last_activity.remove(&channel_id);
+                if self.last_activity.is_empty() {
+                    self.next_settlement = None;
+                }
                 true
             }
             None => false,
@@ -426,32 +552,51 @@ impl SessionLifecycleRunloop {
     }
 
     fn next_wakeup(&self) -> Option<Instant> {
-        self.deadlines.values().copied().min()
+        let close = self.close_delay.and_then(|delay| {
+            self.last_activity
+                .values()
+                .map(|last_activity| *last_activity + delay)
+                .min()
+        });
+        match (close, self.next_settlement) {
+            (Some(close), Some(settlement)) => Some(close.min(settlement)),
+            (Some(close), None) => Some(close),
+            (None, Some(settlement)) => Some(settlement),
+            (None, None) => None,
+        }
     }
 
     async fn close_due_channels(&mut self) {
+        let Some(close_delay) = self.close_delay else {
+            return;
+        };
         let now = Instant::now();
         let due = self
-            .deadlines
+            .last_activity
             .iter()
-            .filter(|(_, deadline)| **deadline <= now)
+            .filter(|(_, last_activity)| **last_activity + close_delay <= now)
             .map(|(channel_id, _)| channel_id.clone())
             .collect::<Vec<_>>();
 
+        let mut closing = Vec::with_capacity(due.len());
         for channel_id in due {
-            self.deadlines.remove(&channel_id);
+            self.last_activity.remove(&channel_id);
             // Closing and serving both claim the same channel slot. This makes
             // the reservation check atomic with the start of close: a request
             // already in flight defers close, while a close already in progress
             // prevents a new request from reserving stale capacity.
             if !self.runtime.reserve_capacity(&channel_id, 0) {
-                if let Some(close_delay) = self.close_delay {
-                    self.deadlines
-                        .insert(channel_id, Instant::now() + close_delay);
-                }
+                self.last_activity.insert(channel_id, Instant::now());
                 continue;
             }
-            let close_result = self.runtime.operator_close_channel(&channel_id).await;
+            let runtime = self.runtime.clone();
+            closing.push(async move {
+                let result = runtime.operator_close_channel(&channel_id).await;
+                (channel_id, result)
+            });
+        }
+
+        for (channel_id, close_result) in futures_util::future::join_all(closing).await {
             self.runtime.release_capacity(&channel_id);
             match close_result {
                 Ok(SessionCloseResult::Closed { settled }) => {
@@ -466,13 +611,48 @@ impl SessionLifecycleRunloop {
                         error = %error,
                         "operator auto-close failed; retrying after delay"
                     );
-                    if let Some(close_delay) = self.close_delay {
-                        self.deadlines
-                            .insert(channel_id, Instant::now() + close_delay);
-                    }
+                    self.last_activity.insert(channel_id, Instant::now());
                 }
             }
         }
+    }
+
+    async fn push_due_watermarks(&mut self) {
+        let Some(interval) = self.settlement_interval else {
+            self.next_settlement = None;
+            return;
+        };
+        let now = Instant::now();
+        if self.next_settlement.is_some_and(|deadline| deadline > now) {
+            return;
+        }
+
+        // Idle channels were removed (or rescheduled after an error) by
+        // `close_due_channels`; everything left here should remain open.
+        let channels = self.last_activity.keys().cloned().collect::<Vec<_>>();
+        let mut settlements = Vec::with_capacity(channels.len());
+        for channel_id in channels {
+            if !self.runtime.reserve_capacity(&channel_id, 0) {
+                continue;
+            }
+            let runtime = self.runtime.clone();
+            settlements.push(async move {
+                let result = runtime.operator_push_watermark(&channel_id).await;
+                (channel_id, result)
+            });
+        }
+        for (channel_id, result) in futures_util::future::join_all(settlements).await {
+            self.runtime.release_capacity(&channel_id);
+            if let Err(error) = result {
+                tracing::warn!(
+                    channel_id,
+                    error = %error,
+                    "operator watermark push failed; retrying next interval"
+                );
+            }
+        }
+
+        self.next_settlement = (!self.last_activity.is_empty()).then(|| now + interval);
     }
 }
 
@@ -492,7 +672,7 @@ enum SessionCloseResult {
 /// server validates and co-signs. Pull-mode delegation setup remains available
 /// for compatibility, but it no longer opens a synthetic channel.
 pub struct SessionMpp {
-    server: Arc<SessionServer<MemoryChannelStore>>,
+    server: Arc<SessionServer<Arc<dyn ChannelStore>>>,
     session_config: SessionConfig,
     challenge_binding_secret: String,
     realm: String,
@@ -527,8 +707,21 @@ impl SessionMpp {
 
     /// Create from a [`SessionConfig`] and an HMAC secret key.
     pub fn new(config: SessionConfig, challenge_binding_secret: impl Into<String>) -> Self {
+        Self::new_with_channel_store(
+            config,
+            challenge_binding_secret,
+            Arc::new(MemoryChannelStore::new()),
+        )
+    }
+
+    /// Create with a caller-provided durable channel store.
+    pub fn new_with_channel_store(
+        config: SessionConfig,
+        challenge_binding_secret: impl Into<String>,
+        channel_store: Arc<dyn ChannelStore>,
+    ) -> Self {
         let session_config = config.clone();
-        let server = Arc::new(SessionServer::new(config, MemoryChannelStore::new()));
+        let server = Arc::new(SessionServer::new(config, channel_store));
         let payment_channel_signer = Arc::new(Mutex::new(None));
         let payment_channel_payer_signer = Arc::new(Mutex::new(None));
         let committed_watermarks = Arc::new(Mutex::new(HashMap::new()));
@@ -617,19 +810,26 @@ impl SessionMpp {
     /// The runloop is intentionally centralized: request handlers only record
     /// activity, while this task owns the close/settle/distribute sequence.
     pub fn start_lifecycle_runloop(&self, close_delay: Duration) {
-        if close_delay.is_zero() {
-            self.lifecycle
-                .send(SessionLifecycleCommand::ConfigureCloseDelay { close_delay: None });
-            tracing::info!("session auto-close disabled");
-            return;
-        }
+        self.start_lifecycle_runloop_with_settlement(close_delay, Duration::ZERO);
+    }
 
-        self.lifecycle
-            .send(SessionLifecycleCommand::ConfigureCloseDelay {
-                close_delay: Some(close_delay),
-            });
+    /// Configure the lifecycle runloop to reconcile active channels' latest
+    /// cumulative voucher on-chain and to settle+seal channels after an idle
+    /// period. Either duration may be zero to disable that behavior.
+    pub fn start_lifecycle_runloop_with_settlement(
+        &self,
+        close_delay: Duration,
+        settlement_interval: Duration,
+    ) {
+        let close_delay = (!close_delay.is_zero()).then_some(close_delay);
+        let settlement_interval = (!settlement_interval.is_zero()).then_some(settlement_interval);
+        self.lifecycle.send(SessionLifecycleCommand::Configure {
+            close_delay,
+            settlement_interval,
+        });
         tracing::info!(
-            close_delay_ms = close_delay.as_millis(),
+            close_delay_ms = close_delay.map(|delay| delay.as_millis()),
+            settlement_interval_ms = settlement_interval.map(|interval| interval.as_millis()),
             "started session lifecycle runloop"
         );
     }

@@ -429,6 +429,16 @@ fn extract_dimension_quantity(
     {
         return Ok(quantity);
     }
+    // Responses and Chat Completions use different names for the same token
+    // dimensions. Let the endpoint-level Responses preset override meters
+    // inherited from a shared model-pricing table.
+    if preset.is_some_and(|preset| preset.eq_ignore_ascii_case("openai-responses"))
+        && let Some(path) = preset_json_path(preset, dim)
+    {
+        let json =
+            json.ok_or_else(|| UptoUsageError::MissingUsage("response body unavailable".into()))?;
+        return extract_from_json_pointer(json, path);
+    }
     if let Some(meter) = &dim.meter {
         return extract_from_meter(meter, headers, json);
     }
@@ -480,17 +490,33 @@ fn extract_from_meter(
 
 fn preset_json_path(preset: Option<&str>, dim: &MeterDimension) -> Option<&'static str> {
     let preset = preset?;
-    if !preset.eq_ignore_ascii_case("google-generativelanguage") {
-        return None;
+    if preset.eq_ignore_ascii_case("google-generativelanguage") {
+        return match (dim.direction, dim.unit) {
+            (MeterDirection::Input, BillingUnit::Tokens) => Some("/usageMetadata/promptTokenCount"),
+            (MeterDirection::Output, BillingUnit::Tokens) => {
+                Some("/usageMetadata/candidatesTokenCount")
+            }
+            (MeterDirection::Usage, BillingUnit::Tokens) => Some("/usageMetadata/totalTokenCount"),
+            _ => None,
+        };
     }
-    match (dim.direction, dim.unit) {
-        (MeterDirection::Input, BillingUnit::Tokens) => Some("/usageMetadata/promptTokenCount"),
-        (MeterDirection::Output, BillingUnit::Tokens) => {
-            Some("/usageMetadata/candidatesTokenCount")
-        }
-        (MeterDirection::Usage, BillingUnit::Tokens) => Some("/usageMetadata/totalTokenCount"),
-        _ => None,
+    if preset.eq_ignore_ascii_case("openai-compatible") {
+        return match (dim.direction, dim.unit) {
+            (MeterDirection::Input, BillingUnit::Tokens) => Some("/usage/prompt_tokens"),
+            (MeterDirection::Output, BillingUnit::Tokens) => Some("/usage/completion_tokens"),
+            (MeterDirection::Usage, BillingUnit::Tokens) => Some("/usage/total_tokens"),
+            _ => None,
+        };
     }
+    if preset.eq_ignore_ascii_case("openai-responses") {
+        return match (dim.direction, dim.unit) {
+            (MeterDirection::Input, BillingUnit::Tokens) => Some("/usage/input_tokens"),
+            (MeterDirection::Output, BillingUnit::Tokens) => Some("/usage/output_tokens"),
+            (MeterDirection::Usage, BillingUnit::Tokens) => Some("/usage/total_tokens"),
+            _ => None,
+        };
+    }
+    None
 }
 
 fn extract_from_json_pointer(json: &serde_json::Value, path: &str) -> Result<u64, UptoUsageError> {
@@ -1532,6 +1558,85 @@ mod tests {
             }),
         );
         let body = br#"{"usageMetadata":{"promptTokenCount":2000,"candidatesTokenCount":1000}}"#;
+
+        let actual = upto_actual_amount_from_response(
+            &settlement_plan(metering, 0.10),
+            100_000,
+            &HeaderMap::new(),
+            Some(body),
+        )
+        .unwrap();
+
+        assert_eq!(actual.usd, 0.05);
+        assert_eq!(actual.base_units, 50_000);
+    }
+
+    #[test]
+    fn upto_actual_amount_supports_openai_compatible_preset() {
+        let metering = upto_metering(
+            vec![
+                usage_dim(
+                    MeterDirection::Input,
+                    BillingUnit::Tokens,
+                    1_000,
+                    0.01,
+                    None,
+                ),
+                usage_dim(
+                    MeterDirection::Output,
+                    BillingUnit::Tokens,
+                    1_000,
+                    0.03,
+                    None,
+                ),
+            ],
+            Some(pay_types::metering::UptoMetering {
+                max_usd: Some(0.10),
+                usage_preset: Some("openai-compatible".to_string()),
+                ..Default::default()
+            }),
+        );
+        let body =
+            br#"{"usage":{"prompt_tokens":2000,"completion_tokens":1000,"total_tokens":3000}}"#;
+
+        let actual = upto_actual_amount_from_response(
+            &settlement_plan(metering, 0.10),
+            100_000,
+            &HeaderMap::new(),
+            Some(body),
+        )
+        .unwrap();
+
+        assert_eq!(actual.usd, 0.05);
+        assert_eq!(actual.base_units, 50_000);
+    }
+
+    #[test]
+    fn openai_responses_preset_overrides_shared_chat_usage_meters() {
+        let metering = upto_metering(
+            vec![
+                usage_dim(
+                    MeterDirection::Input,
+                    BillingUnit::Tokens,
+                    1_000,
+                    0.01,
+                    Some(response_json("/usage/prompt_tokens")),
+                ),
+                usage_dim(
+                    MeterDirection::Output,
+                    BillingUnit::Tokens,
+                    1_000,
+                    0.03,
+                    Some(response_json("/usage/completion_tokens")),
+                ),
+            ],
+            Some(pay_types::metering::UptoMetering {
+                max_usd: Some(0.10),
+                usage_preset: Some("openai-responses".to_string()),
+                ..Default::default()
+            }),
+        );
+        let body = br#"{"usage":{"input_tokens":2000,"output_tokens":1000,"total_tokens":3000}}"#;
 
         let actual = upto_actual_amount_from_response(
             &settlement_plan(metering, 0.10),
