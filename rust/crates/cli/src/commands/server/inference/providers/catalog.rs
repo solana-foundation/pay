@@ -31,6 +31,9 @@ pub struct CatalogProvider {
     title: String,
     service_url: String,
     endpoints: Vec<pay_core::skills::Endpoint>,
+    /// Last-resort model IDs for gateways without a model-list endpoint.
+    /// The live skills catalog remains authoritative when it is available.
+    fallback_models: Vec<String>,
 }
 
 impl CatalogProvider {
@@ -45,6 +48,7 @@ impl CatalogProvider {
             title,
             service_url: svc.meta.service_url.trim_end_matches('/').to_string(),
             endpoints: svc.endpoints.clone(),
+            fallback_models: Vec::new(),
         }
     }
 
@@ -78,68 +82,90 @@ impl CatalogProvider {
 /// Built-in Alibaba provider used until its skills-catalog entry is
 /// published. The deployed gateway already exists, so making picker
 /// visibility depend on the separate catalog publication is unnecessary.
-/// Models and pricing stay sourced from the gateway YAML rather than a second
-/// hard-coded list.
+/// Endpoint pricing stays sourced from the live skills catalog. This fallback
+/// contains only the routing surface and model IDs required to launch an agent.
 pub fn alibaba_modelstudio_fallback() -> CatalogProvider {
-    let yaml = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../../web-ui/proxy/alibaba-qwen.yml"
-    ));
-    let mut provider = provider_from_embedded_spec(
-        ALIBABA_MODELSTUDIO_FQN,
-        "modelstudio",
-        ALIBABA_MODELSTUDIO_GATEWAY_URL,
-        yaml,
-    );
-    add_alibaba_responses_compat(&mut provider);
-    provider
-}
-
-/// Built-in Gemini provider. The spec includes Google's official OpenAI
-/// compatibility endpoint so OpenAI-chat agent harnesses can use Gemini
-/// without a Gemini-native client.
-pub fn google_gemini_fallback() -> CatalogProvider {
-    let yaml = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../../web-ui/proxy/google-gemini.yml"
-    ));
-    provider_from_embedded_spec(
-        GOOGLE_GEMINI_FQN,
-        "generativelanguage",
-        GOOGLE_GEMINI_GATEWAY_URL,
-        yaml,
-    )
-}
-
-fn provider_from_embedded_spec(
-    fqn: &str,
-    slug: &str,
-    gateway_url: &str,
-    yaml: &str,
-) -> CatalogProvider {
-    let spec: pay_types::metering::ApiSpec =
-        serde_yml::from_str(yaml).expect("embedded inference gateway spec must be valid");
-    let endpoints = spec
-        .endpoints
-        .into_iter()
-        .map(|endpoint| pay_core::skills::Endpoint {
-            method: format!("{:?}", endpoint.method).to_ascii_uppercase(),
-            path: endpoint.path,
-            full_path: String::new(),
-            resource: endpoint.resource,
-            description: endpoint.description.unwrap_or_default(),
-            pricing: endpoint
-                .metering
-                .and_then(|metering| serde_json::to_value(metering).ok()),
-        })
-        .collect();
-
     CatalogProvider {
-        fqn: fqn.to_string(),
-        slug: slug.to_string(),
-        title: display_title(fqn, &spec.title),
-        service_url: gateway_url.to_string(),
-        endpoints,
+        fqn: ALIBABA_MODELSTUDIO_FQN.to_string(),
+        slug: "modelstudio".to_string(),
+        title: "Alibaba Model Studio".to_string(),
+        service_url: ALIBABA_MODELSTUDIO_GATEWAY_URL.to_string(),
+        endpoints: vec![
+            paid_endpoint(
+                "compatible-mode/v1/chat/completions",
+                "chat",
+                "OpenAI-compatible chat completions for Qwen agent models.",
+            ),
+            paid_endpoint(
+                ALIBABA_RESPONSES_PATH,
+                "responses",
+                "OpenAI Responses API for Qwen agent models.",
+            ),
+            paid_endpoint(
+                "v1/messages",
+                "messages",
+                "Anthropic-compatible messages for Qwen agent models.",
+            ),
+        ],
+        fallback_models: [
+            "qwen3.7-plus",
+            "qwen3.7-max",
+            "qwen3.6-flash",
+            "qwen3-coder-next",
+            "qwen3-coder-plus",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
+    }
+}
+
+/// Built-in Gemini provider with Google's official OpenAI compatibility path,
+/// so OpenAI-chat agent harnesses do not require a Gemini-native client.
+pub fn google_gemini_fallback() -> CatalogProvider {
+    CatalogProvider {
+        fqn: GOOGLE_GEMINI_FQN.to_string(),
+        slug: "generativelanguage".to_string(),
+        title: "Google Gemini".to_string(),
+        service_url: GOOGLE_GEMINI_GATEWAY_URL.to_string(),
+        endpoints: vec![
+            pay_core::skills::Endpoint {
+                method: "GET".to_string(),
+                path: "v1beta/models".to_string(),
+                full_path: String::new(),
+                resource: Some("models".to_string()),
+                description: "List available Gemini models.".to_string(),
+                pricing: None,
+            },
+            paid_endpoint(
+                GOOGLE_OPENAI_CHAT_PATH,
+                "chat",
+                "OpenAI-compatible chat completions for Gemini models.",
+            ),
+        ],
+        fallback_models: [
+            "gemini-3.1-pro-preview",
+            "gemini-3.1-flash-lite",
+            "gemini-2.5-pro",
+            "gemini-2.5-flash-lite",
+            "gemini-2.5-flash",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
+    }
+}
+
+fn paid_endpoint(path: &str, resource: &str, description: &str) -> pay_core::skills::Endpoint {
+    pay_core::skills::Endpoint {
+        method: "POST".to_string(),
+        path: path.to_string(),
+        full_path: String::new(),
+        resource: Some(resource.to_string()),
+        description: description.to_string(),
+        // Endpoint presence is enough for local routing. Rates and dimensions
+        // belong to the live gateway catalog, not this client fallback.
+        pricing: Some(serde_json::json!({})),
     }
 }
 
@@ -274,13 +300,27 @@ impl InferenceProvider for CatalogProvider {
         None
     }
     async fn list_models(&self, client: &reqwest::Client, base_url: &str) -> Vec<String> {
-        let fallback = || models_from_pricing_variants(&self.endpoints);
+        let fallback = || {
+            let models = models_from_pricing_variants(&self.endpoints);
+            if models.is_empty() {
+                self.fallback_models.clone()
+            } else {
+                models
+            }
+        };
         let Some(ep) = self.model_list_endpoint() else {
             return fallback();
         };
         let path = format!("/{}", ep.path.trim_start_matches('/'));
         match get_json(client, base_url.trim_end_matches('/'), &path).await {
-            Some(json) => parse_model_names(&json),
+            Some(json) => {
+                let models = parse_model_names(&json);
+                if models.is_empty() {
+                    fallback()
+                } else {
+                    models
+                }
+            }
             None => fallback(),
         }
     }
@@ -911,37 +951,32 @@ mod tests {
     }
 
     #[test]
-    fn alibaba_qwen_gateway_spec_is_valid_for_all_agent_surfaces() {
-        let yaml = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../../web-ui/proxy/alibaba-qwen.yml"
-        ));
-        let spec: pay_types::metering::ApiSpec = serde_yml::from_str(yaml).unwrap();
+    fn alibaba_fallback_covers_all_agent_surfaces() {
+        let provider = alibaba_modelstudio_fallback();
         assert_eq!(
-            spec.endpoints
+            provider
+                .endpoints
                 .iter()
                 .map(|endpoint| endpoint.path.as_str())
                 .collect::<Vec<_>>(),
             [
                 "compatible-mode/v1/chat/completions",
-                "v1/responses",
+                "compatible-mode/v1/responses",
                 "v1/messages"
             ]
         );
-        assert!(pay_types::metering::validate_api_spec(&spec).is_empty());
-
-        for endpoint in &spec.endpoints {
-            let variants = &endpoint
-                .metering
-                .as_ref()
-                .expect("each Qwen surface is metered")
-                .variants;
-            assert!(
-                variants
-                    .iter()
-                    .any(|variant| variant.value == "qwen3-coder-next")
-            );
-        }
+        assert!(
+            provider
+                .endpoints
+                .iter()
+                .all(|endpoint| endpoint.pricing.is_some())
+        );
+        assert!(
+            provider
+                .fallback_models
+                .iter()
+                .any(|model| model == "qwen3-coder-next")
+        );
     }
 
     #[test]
