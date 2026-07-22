@@ -390,9 +390,9 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
 
     // Buffer the 402 so it can be passed through untouched when payment
     // is impossible. 402 bodies are small (a JSON error envelope).
-    let status = first.status();
-    let resp_headers = first.headers().clone();
-    let resp_body = match first.bytes().await {
+    let mut status = first.status();
+    let mut resp_headers = first.headers().clone();
+    let mut resp_body = match first.bytes().await {
         Ok(bytes) => bytes,
         Err(e) => {
             tracing::warn!(%url, error = %e, "payer proxy: failed to read 402 body");
@@ -404,12 +404,67 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
         }
     };
 
-    let mpp_challenges = pay_core::mpp::parse_all(
+    let mut mpp_challenges = pay_core::mpp::parse_all(
         resp_headers
             .get_all(header::WWW_AUTHENTICATE)
             .iter()
             .filter_map(|value| value.to_str().ok()),
     );
+
+    // A cached delegated session is represented by its idempotent `open`
+    // credential. Once the server seals that channel, the resulting 402 is a
+    // terminal-session error rather than a fresh challenge. Rediscovery must
+    // therefore happen without the stale credential before we can open a
+    // replacement channel.
+    if state.payment_protocol == PaymentProtocol::MppSession
+        && used_cached_session
+        && !mpp_challenges.iter().any(|challenge| {
+            challenge.method.as_str() == "solana" && challenge.intent.as_str() == "session"
+        })
+    {
+        tracing::info!(%url, "payer proxy: cached MPP session ended; requesting a fresh challenge");
+        let refreshed = match send_upstream(&state, &method, &url, &headers, body.clone(), None)
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!(%url, %error, "payer proxy: failed to refresh MPP session challenge");
+                return buffered_response(status, &resp_headers, resp_body);
+            }
+        };
+        if refreshed.status() != StatusCode::PAYMENT_REQUIRED {
+            if state.require_payment && refreshed.status().is_success() {
+                tracing::error!(%url, status = %refreshed.status(), "payer proxy: hosted provider bypassed its payment gate while refreshing a session");
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    "payer proxy: hosted provider returned success without a payment challenge; refusing an ungated response",
+                )
+                    .into_response();
+            }
+            return deliver(refreshed, translated).await;
+        }
+
+        status = refreshed.status();
+        resp_headers = refreshed.headers().clone();
+        resp_body = match refreshed.bytes().await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!(%url, %error, "payer proxy: failed to read refreshed MPP session challenge");
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    format!("payer proxy: upstream error: {error}"),
+                )
+                    .into_response();
+            }
+        };
+        mpp_challenges = pay_core::mpp::parse_all(
+            resp_headers
+                .get_all(header::WWW_AUTHENTICATE)
+                .iter()
+                .filter_map(|value| value.to_str().ok()),
+        );
+    }
+
     let charge_challenges: Vec<_> = mpp_challenges
         .iter()
         .filter(|challenge| pay_kit::mpp::client::is_solana_charge_challenge(challenge))
@@ -1549,6 +1604,91 @@ mod tests {
         assert!(
             seen.iter().all(|(_, signature)| signature.is_none()),
             "session enforcement must never fall back to x402"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ended_cached_session_discovers_and_opens_a_replacement() {
+        fn open_test_session(
+            _state: &PayerState,
+            _challenge: &pay_core::mpp::Challenge,
+        ) -> pay_core::Result<(PaidHeaders, String)> {
+            let authorization = "Payment test-session".to_string();
+            Ok((PaidHeaders::mpp(authorization.clone()), authorization))
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+        let record = seen.clone();
+        let app = Router::new().fallback(any(move |req: Request| {
+            let record = record.clone();
+            async move {
+                let authorization = req
+                    .headers()
+                    .get(header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                let _ = axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES).await;
+                let mut seen = record.lock().unwrap();
+                seen.push(authorization.clone());
+                match seen.len() {
+                    1 | 4 => Response::builder()
+                        .status(StatusCode::PAYMENT_REQUIRED)
+                        .header(header::WWW_AUTHENTICATE, session_challenge_header())
+                        .body(Body::from(r#"{"error":"payment required"}"#))
+                        .unwrap(),
+                    2 | 5 => (StatusCode::OK, "session paid").into_response(),
+                    3 => Response::builder()
+                        .status(StatusCode::PAYMENT_REQUIRED)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            r#"{"error":"session_failed","message":"channel is already sealed"}"#,
+                        ))
+                        .unwrap(),
+                    call => panic!("unexpected upstream call {call}"),
+                }
+            }
+        }));
+        let upstream = spawn_server(app).await;
+        let store: Arc<dyn AccountsStore> = Arc::new(MemoryAccountsStore::new());
+        let state = PayerState::new(
+            PayerUpstream {
+                base_url: upstream,
+                host_header: None,
+                dialect: Dialect::Anthropic,
+                chat_path: "v1/chat/completions".to_string(),
+                responses_path: "v1/responses".to_string(),
+                require_payment: true,
+                payment_protocol: PaymentProtocol::MppSession,
+            },
+            store,
+            None,
+            None,
+        )
+        .unwrap()
+        .with_session_opener(open_test_session);
+        let payer = spawn_server(router(Arc::new(state))).await;
+
+        let client = reqwest::Client::new();
+        for prompt in ["one", "two"] {
+            let response = client
+                .post(format!("{payer}/v1/messages"))
+                .body(prompt)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                None,
+                Some("Payment test-session".to_string()),
+                Some("Payment test-session".to_string()),
+                None,
+                Some("Payment test-session".to_string()),
+            ],
+            "a terminal cached session must be followed by unauthenticated challenge discovery",
         );
     }
 
