@@ -975,7 +975,7 @@ mod tests {
             chat_completions_path(&provider),
             "compatible-mode/v1/chat/completions"
         );
-        assert_eq!(responses_path(&provider), "compatible-mode/v1/responses");
+        assert_eq!(responses_path(&provider), "v1/responses");
     }
 
     #[test]

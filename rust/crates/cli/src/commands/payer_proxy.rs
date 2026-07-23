@@ -98,8 +98,7 @@ pub struct PayerUpstream {
     /// translated requests are sent to, e.g. `v1/chat/completions` or
     /// Alibaba's `compatible-mode/v1/chat/completions`.
     pub chat_path: String,
-    /// Responses API path used by Codex, e.g.
-    /// `compatible-mode/v1/responses` for Alibaba Model Studio.
+    /// Responses API path used by Codex, e.g. `v1/responses`.
     pub responses_path: String,
     /// Refuse successful responses that were served without a 402 handshake.
     /// Hosted catalog providers set this so a gateway routing mistake cannot
@@ -1186,7 +1185,7 @@ mod tests {
                 host_header: None,
                 dialect: Dialect::OpenAiCompat,
                 chat_path: "compatible-mode/v1/chat/completions".to_string(),
-                responses_path: "compatible-mode/v1/responses".to_string(),
+                responses_path: "v1/responses".to_string(),
                 require_payment: false,
                 payment_protocol: PaymentProtocol::Auto,
             },
@@ -1221,7 +1220,7 @@ mod tests {
     #[tokio::test]
     async fn direct_openai_responses_uses_declared_provider_path() {
         let upstream = spawn_server(Router::new().route(
-            "/compatible-mode/v1/responses",
+            "/v1/responses",
             axum::routing::post(|req: Request| async move {
                 assert_eq!(req.uri().query(), Some("trace=1"));
                 (StatusCode::OK, "responses path reached")

@@ -18,7 +18,7 @@ pub const DEFAULT_CATALOG_FQNS: &[&str] = &[
 
 const ALIBABA_MODELSTUDIO_FQN: &str = "solana-foundation/alibaba/modelstudio";
 const ALIBABA_MODELSTUDIO_GATEWAY_URL: &str = "https://modelstudio.alibaba.gateway-402.com";
-const ALIBABA_RESPONSES_PATH: &str = "compatible-mode/v1/responses";
+const ALIBABA_RESPONSES_PATH: &str = "v1/responses";
 const GOOGLE_GEMINI_FQN: &str = "solana-foundation/google/generativelanguage";
 const GOOGLE_GEMINI_GATEWAY_URL: &str = "https://generativelanguage.google.gateway-402.com";
 const GOOGLE_OPENAI_CHAT_PATH: &str = "v1beta/openai/chat/completions";
@@ -961,7 +961,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "compatible-mode/v1/chat/completions",
-                "compatible-mode/v1/responses",
+                "v1/responses",
                 "v1/messages"
             ]
         );

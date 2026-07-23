@@ -32,6 +32,8 @@ session:
   # Default channel cap offered to clients (USDC, human-readable).
   # Clients may request a lower cap; the server will not accept higher.
   cap_usdc: 10.0
+  # The gateway meters successful responses and signs cumulative vouchers.
+  settlement_authority: delegated
   # Minimum voucher increment (base units = µUSDC).
   # Official Gemini token prices can be sub-µUSDC per token. We settle in
   # 0.000001 USDC quanta (1 µUSDC) once usage has accumulated enough value.
