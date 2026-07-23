@@ -37,12 +37,13 @@ use crate::{Error, Result};
 const INTENT: &str = "session";
 const METHOD: &str = "solana";
 const DEFAULT_REALM: &str = "MPP Session";
-fn session_close_already_requested(error: &pay_kit::mpp::Error) -> bool {
-    error.to_string().contains("Close already requested")
-}
-
 fn session_close_already_finalized(error: &pay_kit::mpp::Error) -> bool {
     error.to_string().contains("already finalized")
+}
+
+fn session_close_needs_reconciliation(error: &pay_kit::mpp::Error) -> bool {
+    let message = error.to_string();
+    message.contains("Close already requested") || message.contains("Channel is already sealed")
 }
 
 // ── Session outcome ────────────────────────────────────────────────────────
@@ -238,7 +239,7 @@ impl SessionOperatorRuntime {
             Err(error) if session_close_already_finalized(&error) => {
                 return Ok(SessionCloseResult::AlreadyFinalized);
             }
-            Err(error) if session_close_already_requested(&error) => self
+            Err(error) if session_close_needs_reconciliation(&error) => self
                 .server
                 .seal_params(channel_id)
                 .await
@@ -270,6 +271,7 @@ impl SessionOperatorRuntime {
             // surface the on-chain receipt URL (sessions settle out-of-band).
             self.record_settlement_signature(params.channel_id.to_string(), signature.clone());
             tracing::info!(
+                monotonic_counter.pay_payment_channels_closed_total = 1_u64,
                 %signature,
                 channel = %params.channel_id,
                 "payment-channel settlement confirmed"
@@ -423,6 +425,7 @@ impl SessionOperatorRuntime {
             .settlement_worker
             .get_or_init(|| {
                 let signer = Arc::clone(&signer);
+                let rpc_url = rpc_url.clone();
                 async move {
                     spawn(
                         SettlementConfig::new(operator, signer),
@@ -431,10 +434,12 @@ impl SessionOperatorRuntime {
                 }
             })
             .await;
-        match handle.settle(channel_id, instructions).await {
-            Ok(signature) => Ok(Some(signature)),
-            Err(e) => Err(Error::Mpp(format!("payment-channel settlement: {e}"))),
-        }
+        let signature = handle
+            .settle(channel_id, instructions)
+            .await
+            .map_err(|e| Error::Mpp(format!("payment-channel settlement: {e}")))?;
+        wait_for_transaction_confirmed(&rpc_url, &signature, "payment-channel settlement").await?;
+        Ok(Some(signature))
     }
 }
 
@@ -1132,11 +1137,17 @@ impl SessionMpp {
             }
 
             SessionAction::Close(p) => {
-                let params = self
-                    .server
-                    .process_close(p)
-                    .await
-                    .map_err(|e| Error::Mpp(format!("Session close failed: {e}")))?;
+                let params = match self.server.process_close(p).await {
+                    Ok(params) => params,
+                    Err(error) if session_close_needs_reconciliation(&error) => self
+                        .server
+                        .seal_params(&p.channel_id)
+                        .await
+                        .map_err(|e| Error::Mpp(format!("Failed to get seal params: {e}")))?,
+                    Err(error) => {
+                        return Err(Error::Mpp(format!("Session close failed: {error}")));
+                    }
+                };
                 self.record_committed_watermark(params.channel_id.to_string(), params.settled);
                 let settlement = self.submit_payment_channel_settlement(&params).await;
                 let signature = match settlement {
@@ -1166,7 +1177,12 @@ impl SessionMpp {
                         params.channel_id.to_string(),
                         signature.clone(),
                     );
-                    tracing::info!(%signature, channel = %params.channel_id, "payment-channel settlement confirmed");
+                    tracing::info!(
+                        monotonic_counter.pay_payment_channels_closed_total = 1_u64,
+                        %signature,
+                        channel = %params.channel_id,
+                        "payment-channel settlement confirmed"
+                    );
                 }
                 self.unschedule_channel_close(params.channel_id.to_string());
                 Ok(SessionOutcome::Closed { params, signature })
@@ -1534,6 +1550,44 @@ async fn submit_versioned_transaction(
     })
     .await
     .map_err(|e| Error::Mpp(format!("spawn_blocking join error: {e}")))?
+}
+
+/// Wait for a previously broadcast transaction to succeed at confirmed
+/// commitment before allowing durable state to advance.
+async fn wait_for_transaction_confirmed(
+    rpc_url: &str,
+    signature: &str,
+    context: &'static str,
+) -> Result<()> {
+    use pay_kit::mpp::solana_rpc_client::nonblocking::rpc_client::RpcClient;
+    use solana_commitment_config::CommitmentConfig;
+
+    let signature = solana_signature::Signature::from_str(signature)
+        .map_err(|e| Error::Mpp(format!("invalid {context} signature: {e}")))?;
+    let rpc = RpcClient::new(rpc_url.to_string());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last_status_error = None;
+    while Instant::now() < deadline {
+        match rpc
+            .get_signature_status_with_commitment(&signature, CommitmentConfig::confirmed())
+            .await
+        {
+            Ok(Some(Ok(()))) => return Ok(()),
+            Ok(Some(Err(error))) => {
+                return Err(Error::Mpp(format!("{context} transaction failed: {error}")));
+            }
+            Ok(None) => {}
+            Err(error) => last_status_error = Some(error.to_string()),
+        }
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+
+    let detail = last_status_error
+        .map(|error| format!("; last status error: {error}"))
+        .unwrap_or_default();
+    Err(Error::Mpp(format!(
+        "{context} transaction was not confirmed before timeout{detail}"
+    )))
 }
 
 /// Wait for the transaction's first successful status. `get_signature_status`
@@ -2294,5 +2348,16 @@ mod tests {
         assert!(close_voucher_required(4_330, 4_331));
         assert!(!close_voucher_required(4_331, 4_331));
         assert!(!close_voucher_required(4_332, 4_331));
+    }
+
+    #[test]
+    fn close_reconciles_durable_state_after_failed_broadcast() {
+        let close_pending = pay_kit::mpp::Error::Other("Close already requested".to_string());
+        let sealed = pay_kit::mpp::Error::Other("Channel is already sealed".to_string());
+        let missing = pay_kit::mpp::Error::Other("Channel not found".to_string());
+
+        assert!(session_close_needs_reconciliation(&close_pending));
+        assert!(session_close_needs_reconciliation(&sealed));
+        assert!(!session_close_needs_reconciliation(&missing));
     }
 }
