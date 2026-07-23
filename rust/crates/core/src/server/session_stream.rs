@@ -13,7 +13,7 @@ use futures_util::{Stream, StreamExt};
 use pay_types::metering::{BillingUnit, MeterDimension, MeterDirection, Metering};
 use serde_json::Value;
 
-use crate::server::metering::RequestProperties;
+use crate::server::metering::{RequestProperties, parse_tokens_per_quota_unit};
 use crate::server::session::SessionMpp;
 use crate::server::session_metering::{
     GateMode, Result as MeteringResult, SessionGateDecision, SessionMeterDimension,
@@ -366,6 +366,17 @@ impl StreamUsageAccumulator {
                     changed = true;
                 }
             }
+
+            if let Some(usage) = value.get("usage") {
+                if let Some(input) = usage_u64(usage, "prompt_tokens") {
+                    self.input_tokens = self.input_tokens.max(input);
+                    changed = true;
+                }
+                if let Some(output) = usage_u64(usage, "completion_tokens") {
+                    self.output_tokens = self.output_tokens.max(output);
+                    changed = true;
+                }
+            }
         }
 
         changed
@@ -503,19 +514,6 @@ fn select_meter_dimensions<'a>(
     }
 
     (!metering.dimensions.is_empty()).then_some(&metering.dimensions)
-}
-
-fn parse_tokens_per_quota_unit(notes: &str) -> Option<u64> {
-    let lower = notes.to_ascii_lowercase();
-    let marker = " tokens per quota unit";
-    let index = lower.find(marker)?;
-    let prefix = lower[..index].trim_end();
-    prefix.split_whitespace().find_map(|part| {
-        part.replace(',', "")
-            .parse::<u64>()
-            .ok()
-            .filter(|value| *value > 0)
-    })
 }
 
 fn gemini_text_char_count(value: &Value) -> u64 {
@@ -669,6 +667,48 @@ mod tests {
         assert_eq!(
             observation.get(MeterDirection::Output, BillingUnit::QuotaUnits),
             Some(224)
+        );
+    }
+
+    #[test]
+    fn sse_accumulator_observes_openai_compatible_usage() {
+        let spec = SessionMeterSpec::new([
+            SessionMeterDimension::required(MeterDirection::Input, BillingUnit::QuotaUnits, 1, 3),
+            SessionMeterDimension::required(MeterDirection::Output, BillingUnit::QuotaUnits, 1, 5),
+        ]);
+        let hints = SessionUsageHints::from_metering(
+            &metering(vec![
+                dimension(
+                    MeterDirection::Input,
+                    BillingUnit::QuotaUnits,
+                    Some("4 input tokens per quota unit"),
+                ),
+                dimension(
+                    MeterDirection::Output,
+                    BillingUnit::QuotaUnits,
+                    Some("2 output tokens per quota unit"),
+                ),
+            ]),
+            None,
+        );
+        let mut accumulator = StreamUsageAccumulator::new(spec, hints);
+
+        let changed = accumulator.observe_chunk(
+            br#"data: {"usage":{"prompt_tokens":8,"completion_tokens":5,"total_tokens":13}}
+
+"#,
+            true,
+        );
+        let observation = accumulator.observation();
+
+        assert!(changed);
+        assert_eq!(
+            observation.get(MeterDirection::Input, BillingUnit::QuotaUnits),
+            Some(2)
+        );
+        assert_eq!(
+            observation.get(MeterDirection::Output, BillingUnit::QuotaUnits),
+            Some(3)
         );
     }
 

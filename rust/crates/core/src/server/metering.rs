@@ -42,11 +42,9 @@ pub struct UptoSettlementPlan {
     pub request_properties: RequestProperties,
     pub ceiling_usd: f64,
     /// Token counts observed on the (possibly streamed) response body by the
-    /// proxy's inference observer. When present, token dimensions
-    /// (`unit == Tokens`) settle from these counts — `Input →
-    /// tokens_prompt`, `Output → tokens_completion` — instead of the
-    /// JSON-pointer / meter extraction. `None` keeps the pure axum/JSON path
-    /// (the buffered response body is parsed as before).
+    /// proxy's inference observer. Token and quota-unit dimensions settle from
+    /// these counts — `Input → tokens_prompt`, `Output → tokens_completion` —
+    /// instead of JSON-pointer extraction. `None` keeps the buffered-body path.
     pub inferred_usage: Option<crate::InferenceUsage>,
 }
 
@@ -245,7 +243,7 @@ pub fn upto_uses_response_usage(metering: &Metering, variant_hint: Option<&str>)
         .is_some()
         || effective_dimensions(metering, variant_hint)
             .iter()
-            .any(|dim| dim.meter.is_some())
+            .any(|dim| dim.meter.is_some() || dim.unit == BillingUnit::QuotaUnits)
 }
 
 pub fn upto_requires_response_body(metering: &Metering, variant_hint: Option<&str>) -> bool {
@@ -257,9 +255,11 @@ pub fn upto_requires_response_body(metering: &Metering, variant_hint: Option<&st
         || effective_dimensions(metering, variant_hint)
             .iter()
             .any(|dim| {
-                dim.meter
-                    .as_ref()
-                    .is_some_and(|meter| matches!(meter.source, UsageMeterSource::ResponseJson))
+                dim.unit == BillingUnit::QuotaUnits
+                    || dim
+                        .meter
+                        .as_ref()
+                        .is_some_and(|meter| matches!(meter.source, UsageMeterSource::ResponseJson))
             })
 }
 
@@ -374,7 +374,8 @@ fn extract_and_price_usage(
                 .meter
                 .as_ref()
                 .is_some_and(|m| matches!(m.source, UsageMeterSource::ResponseJson))
-                || preset_json_path(preset, dim).is_some();
+                || preset_json_path(preset, dim).is_some()
+                || dim.unit == BillingUnit::QuotaUnits;
             !covered_by_inferred && reads_body
         });
     let json = if body_still_needed {
@@ -402,18 +403,77 @@ fn extract_and_price_usage(
     Ok(total)
 }
 
-/// The observer count for a token dimension, if any: `Input → tokens_prompt`,
-/// `Output → tokens_completion`. Non-token dimensions and unset counts yield
-/// `None`, so the caller falls back to JSON/meter extraction.
+/// The observer count for a token or quota-unit dimension, if any.
 fn inferred_quantity_for_dim(usage: &crate::InferenceUsage, dim: &MeterDimension) -> Option<u64> {
-    if !matches!(dim.unit, BillingUnit::Tokens) {
-        return None;
-    }
-    match dim.direction {
+    let tokens = match dim.direction {
         MeterDirection::Input => usage.tokens_prompt,
         MeterDirection::Output => usage.tokens_completion,
         _ => None,
+    }?;
+    match dim.unit {
+        BillingUnit::Tokens => Some(tokens),
+        BillingUnit::QuotaUnits => {
+            quota_tokens_per_unit(dim).map(|per_unit| ceil_div_u64(tokens, per_unit))
+        }
+        _ => None,
     }
+}
+
+fn quota_tokens_per_unit(dim: &MeterDimension) -> Option<u64> {
+    dim.tiers
+        .iter()
+        .filter_map(|tier| tier.notes.as_deref())
+        .find_map(parse_tokens_per_quota_unit)
+}
+
+pub(crate) fn parse_tokens_per_quota_unit(notes: &str) -> Option<u64> {
+    let lower = notes.to_ascii_lowercase();
+    let index = lower.find(" tokens per quota unit")?;
+    lower[..index].split_whitespace().rev().find_map(|part| {
+        part.replace(',', "")
+            .parse::<u64>()
+            .ok()
+            .filter(|value| *value > 0)
+    })
+}
+
+fn quota_token_quantity(json: &serde_json::Value, direction: MeterDirection) -> Option<u64> {
+    let openai_usage = json.get("usage");
+    match direction {
+        MeterDirection::Input => openai_usage
+            .and_then(|usage| usage.get("prompt_tokens"))
+            .and_then(serde_json::Value::as_u64)
+            .or_else(|| {
+                json.pointer("/usageMetadata/promptTokenCount")
+                    .and_then(serde_json::Value::as_u64)
+            }),
+        MeterDirection::Output => openai_usage
+            .and_then(|usage| usage.get("completion_tokens"))
+            .and_then(serde_json::Value::as_u64)
+            .or_else(|| {
+                let usage = json.get("usageMetadata")?;
+                let input = usage.get("promptTokenCount")?.as_u64()?;
+                let candidates = usage
+                    .get("candidatesTokenCount")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                let thoughts = usage
+                    .get("thoughtsTokenCount")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                let derived = usage
+                    .get("totalTokenCount")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|total| total.checked_sub(input))
+                    .unwrap_or(0);
+                Some(candidates.saturating_add(thoughts).max(derived))
+            }),
+        _ => None,
+    }
+}
+
+fn ceil_div_u64(value: u64, divisor: u64) -> u64 {
+    value.saturating_add(divisor.saturating_sub(1)) / divisor.max(1)
 }
 
 fn extract_dimension_quantity(
@@ -441,6 +501,24 @@ fn extract_dimension_quantity(
     }
     if let Some(meter) = &dim.meter {
         return extract_from_meter(meter, headers, json);
+    }
+
+    if dim.unit == BillingUnit::QuotaUnits {
+        let json =
+            json.ok_or_else(|| UptoUsageError::MissingUsage("response body unavailable".into()))?;
+        let tokens = quota_token_quantity(json, dim.direction).ok_or_else(|| {
+            UptoUsageError::MissingUsage(format!(
+                "no token usage for {:?} quota units",
+                dim.direction
+            ))
+        })?;
+        let per_unit = quota_tokens_per_unit(dim).ok_or_else(|| {
+            UptoUsageError::MissingUsage(format!(
+                "no tokens-per-quota-unit hint for {:?}",
+                dim.direction
+            ))
+        })?;
+        return Ok(ceil_div_u64(tokens, per_unit));
     }
 
     if let Some(path) = preset_json_path(preset, dim) {
@@ -1609,6 +1687,39 @@ mod tests {
 
         assert_eq!(actual.usd, 0.05);
         assert_eq!(actual.base_units, 50_000);
+    }
+
+    #[test]
+    fn quota_units_support_openai_compatible_usage() {
+        let mut input = usage_dim(
+            MeterDirection::Input,
+            BillingUnit::QuotaUnits,
+            1,
+            0.000001,
+            None,
+        );
+        input.tiers[0].notes = Some("4 input tokens per quota unit".to_string());
+        let mut output = usage_dim(
+            MeterDirection::Output,
+            BillingUnit::QuotaUnits,
+            1,
+            0.000003,
+            None,
+        );
+        output.tiers[0].notes = Some("2 output tokens per quota unit".to_string());
+        let metering = upto_metering(vec![input, output], None);
+        let body = br#"{"usage":{"prompt_tokens":8,"completion_tokens":5,"total_tokens":13}}"#;
+
+        let actual = upto_actual_amount_from_response(
+            &settlement_plan(metering, 0.10),
+            100_000,
+            &HeaderMap::new(),
+            Some(body),
+        )
+        .unwrap();
+
+        assert!((actual.usd - 0.000011).abs() < f64::EPSILON);
+        assert_eq!(actual.base_units, 11);
     }
 
     #[test]
