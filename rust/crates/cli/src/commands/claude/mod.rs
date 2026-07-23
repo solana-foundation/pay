@@ -200,13 +200,13 @@ impl AlternateClient {
         match (self, dialect) {
             (Self::Claude, Dialect::Anthropic) => supports_post_endpoint(provider, "v1/messages"),
             (Self::Claude, Dialect::OpenAiCompat) => {
-                supports_post_endpoint(provider, providers::OPENAI_CHAT_COMPLETIONS_PATH)
+                supports_post_endpoint(provider, "chat/completions")
             }
             (Self::Codex, Dialect::OpenAiCompat) => {
                 supports_post_endpoint(provider, "v1/responses")
             }
             (Self::Goose | Self::Qoder, Dialect::OpenAiCompat) => {
-                supports_post_endpoint(provider, providers::OPENAI_CHAT_COMPLETIONS_PATH)
+                supports_post_endpoint(provider, "chat/completions")
             }
             _ => false,
         }

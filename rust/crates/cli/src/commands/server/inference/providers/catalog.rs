@@ -1047,16 +1047,20 @@ mod tests {
                 .iter()
                 .any(|endpoint| endpoint.path == ALIBABA_RESPONSES_PATH)
         );
-        assert_eq!(
-            models_from_pricing_variants(&provider.endpoints),
-            [
-                "qwen3.7-plus",
-                "qwen3.7-max",
-                "qwen3.6-flash",
-                "qwen3-coder-next",
-                "qwen3-coder-plus",
-            ]
-        );
+        rt().block_on(async {
+            assert_eq!(
+                provider
+                    .list_models(&client(), provider.service_url())
+                    .await,
+                [
+                    "qwen3.7-plus",
+                    "qwen3.7-max",
+                    "qwen3.6-flash",
+                    "qwen3-coder-next",
+                    "qwen3-coder-plus",
+                ]
+            );
+        });
 
         let mut providers = Vec::new();
         append_default_fallbacks(&mut providers);
