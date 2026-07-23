@@ -33,8 +33,7 @@ session:
   settlement_authority: delegated
   close_delay_ms: 15000
   settlement_interval_ms: 5000
-  modes: [pull]
-  pull_voucher_strategy: client_voucher
+  modes: [push]
   splits:
     - recipient: gateway
       percent: 0.1
