@@ -542,10 +542,11 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
             deliver(retry, translated).await
         }
         Err(e) => {
-            if let Some(cache) = session_authorization.as_mut() {
-                **cache = None;
-            }
-            tracing::warn!(%url, error = %e, "payer proxy: paid retry failed — returning the original 402");
+            // The open credential is idempotent and the channel may already
+            // have been funded even though the response was lost. Preserve it
+            // across transport failures; only a definitive 402 rejection
+            // above proves that the cached session cannot be reused.
+            tracing::warn!(%url, error = %e, "payer proxy: paid retry failed — preserving the session and returning the original 402");
             buffered_response(status, &resp_headers, resp_body)
         }
     }
@@ -1061,6 +1062,7 @@ mod tests {
     use std::time::Duration;
 
     use pay_core::accounts::MemoryAccountsStore;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
 
@@ -1603,6 +1605,72 @@ mod tests {
         assert!(
             seen.iter().all(|(_, signature)| signature.is_none()),
             "session enforcement must never fall back to x402"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_open_credential_survives_a_paid_retry_transport_error() {
+        fn open_test_session(
+            _state: &PayerState,
+            _challenge: &pay_core::mpp::Challenge,
+        ) -> pay_core::Result<(PaidHeaders, String)> {
+            let authorization = "Payment durable-open".to_string();
+            Ok((PaidHeaders::mpp(authorization.clone()), authorization))
+        }
+
+        // Serve exactly the challenge response, then stop listening before the
+        // paid retry. This models a connection failure after the open may
+        // already have funded its channel.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let challenge = session_challenge_header();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            drop(listener);
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).await;
+            let body = r#"{"error":"payment required"}"#;
+            let response = format!(
+                "HTTP/1.1 402 Payment Required\r\nWWW-Authenticate: {challenge}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let store: Arc<dyn AccountsStore> = Arc::new(MemoryAccountsStore::new());
+        let state = Arc::new(
+            PayerState::new(
+                PayerUpstream {
+                    base_url: format!("http://{addr}"),
+                    host_header: None,
+                    dialect: Dialect::Anthropic,
+                    chat_path: "v1/chat/completions".to_string(),
+                    responses_path: "v1/responses".to_string(),
+                    require_payment: true,
+                    payment_protocol: PaymentProtocol::MppSession,
+                },
+                store,
+                None,
+                None,
+            )
+            .unwrap()
+            .with_session_opener(open_test_session),
+        );
+        let payer = spawn_server(router(state.clone())).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("{payer}/v1/messages"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(
+            state.session_authorization.lock().await.as_deref(),
+            Some("Payment durable-open"),
+            "an ambiguous transport failure must retain the idempotent open credential"
         );
     }
 
