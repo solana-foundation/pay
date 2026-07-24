@@ -12,7 +12,7 @@ use pay_kit::mpp::AUTHORIZATION_HEADER;
 
 use crate::PaymentState;
 use crate::server::metering::{self, RequestProperties};
-use crate::server::session_stream::SessionStreamContext;
+use crate::server::session_stream::{self, SessionStreamContext};
 use crate::server::telemetry;
 
 /// Axum middleware that gates metered endpoints behind MPP payment.
@@ -200,6 +200,39 @@ async fn settle_axum_delegated_response(
         // Dropping `forward` releases the capacity lease without charging for
         // a response that was not successfully served.
         return response;
+    }
+
+    let is_sse = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .any(|part| part.trim().eq_ignore_ascii_case("text/event-stream"))
+        });
+    if is_sse && session_stream::DelegatedSessionStreamMeter::supports(&forward) {
+        let (mut parts, body) = response.into_parts();
+        let meter = match session_stream::DelegatedSessionStreamMeter::from_forward(forward) {
+            Ok(meter) => meter,
+            Err(error) => {
+                tracing::error!(%error, "failed to configure delegated session stream metering");
+                return Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"error":"session_metering_failed"}"#))
+                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            }
+        };
+        parts.headers.remove(header::CONTENT_LENGTH);
+        return Response::from_parts(
+            parts,
+            Body::from_stream(session_stream::meter_delegated_response_stream(
+                body.into_data_stream(),
+                meter,
+                true,
+            )),
+        );
     }
 
     let limit = forward

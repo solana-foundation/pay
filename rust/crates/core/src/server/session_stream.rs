@@ -13,6 +13,7 @@ use futures_util::{Stream, StreamExt};
 use pay_types::metering::{BillingUnit, MeterDimension, MeterDirection, Metering};
 use serde_json::Value;
 
+use crate::server::gate::SessionForward;
 use crate::server::metering::{RequestProperties, quota_tokens_per_unit, resolve_variant};
 use crate::server::session::SessionMpp;
 use crate::server::session_metering::{
@@ -147,6 +148,119 @@ pub struct SessionStreamMeter {
     current: UsageObservation,
 }
 
+/// Server-authorized meter for a delegated session response stream.
+///
+/// The meter owns the session's capacity lease for the lifetime of the body.
+/// Each cumulative usage increase is signed and persisted before the bytes
+/// that exposed it are released to the client.
+pub(crate) struct DelegatedSessionStreamMeter {
+    forward: SessionForward,
+    gate: SessionUsageGate,
+    accumulator: StreamUsageAccumulator,
+    current: UsageObservation,
+}
+
+impl DelegatedSessionStreamMeter {
+    pub(crate) fn from_forward(forward: SessionForward) -> Result<Self, BoxError> {
+        let plan = forward.settlement.as_deref().ok_or_else(|| {
+            box_error(std::io::Error::other(
+                "delegated stream forward is missing its settlement plan",
+            ))
+        })?;
+        let spec = spec_from_metering(
+            &plan.metering,
+            SessionMeteringContext::new()
+                .with_request_properties(&plan.request_properties)
+                .with_optional_variant_hint(plan.variant_hint.as_deref()),
+        )
+        .map_err(box_error)?;
+        let hints = SessionUsageHints::from_metering(
+            &plan.metering,
+            plan.variant_hint.as_deref(),
+            &plan.request_properties,
+        );
+        let settlement = StablecoinSettlement::new(forward.handle.decimals());
+        // A delegated signer is local to the gateway, so there is no reason to
+        // release chargeable output while waiting to batch a client voucher.
+        // Stablecoin precision still naturally batches sub-base-unit usage.
+        let gate = SessionUsageGate::new(spec.clone(), settlement, forward.committed_base_units, 1)
+            .map_err(box_error)?;
+        let current = zero_observation(&spec);
+        Ok(Self {
+            forward,
+            gate,
+            accumulator: StreamUsageAccumulator::new(spec, hints),
+            current,
+        })
+    }
+
+    pub(crate) fn supports(forward: &SessionForward) -> bool {
+        let Some(plan) = forward.settlement.as_deref() else {
+            return false;
+        };
+        spec_from_metering(
+            &plan.metering,
+            SessionMeteringContext::new()
+                .with_request_properties(&plan.request_properties)
+                .with_optional_variant_hint(plan.variant_hint.as_deref()),
+        )
+        .is_ok_and(|spec| has_stream_observable_dimension(&spec))
+    }
+
+    fn observe_chunk(
+        &mut self,
+        chunk: &[u8],
+        is_sse: bool,
+    ) -> MeteringResult<Option<SessionGateDecision>> {
+        if !self.accumulator.observe_chunk(chunk, is_sse) {
+            return Ok(None);
+        }
+        self.current = self.accumulator.observation();
+        self.gate
+            .observe(self.current.clone(), GateMode::Streaming)
+            .map(Some)
+    }
+
+    fn finish(&mut self) -> MeteringResult<Option<SessionGateDecision>> {
+        if !self.accumulator.has_observation() {
+            return Ok(None);
+        }
+        self.gate
+            .observe(self.current.clone(), GateMode::Final)
+            .map(Some)
+    }
+
+    async fn settle(&mut self, decision: SessionGateDecision) -> Result<(), BoxError> {
+        if !decision.requires_voucher() {
+            return Ok(());
+        }
+        let target = decision.target_cumulative_base_units();
+        let committed = self.gate.committed_base_units();
+        let amount = target.saturating_sub(committed);
+        if amount == 0 {
+            return Ok(());
+        }
+        let authorized = self
+            .forward
+            .committed_base_units
+            .saturating_add(self.forward.available_base_units);
+        if target > authorized {
+            return Err(box_error(std::io::Error::other(format!(
+                "delegated session {} requires cumulative {target}, above authorized {authorized}",
+                self.forward.channel_id
+            ))));
+        }
+        let accepted = self
+            .forward
+            .handle
+            .authorize_delegated_usage(&self.forward.channel_id, amount)
+            .await
+            .map_err(box_error)?;
+        self.gate.record_commit(accepted);
+        Ok(())
+    }
+}
+
 impl SessionStreamMeter {
     pub fn new(
         spec: SessionMeterSpec,
@@ -226,6 +340,37 @@ where
 
         if let Some(decision) = meter.finish().map_err(box_error)? {
             settle_decision(&mut meter, decision).await?;
+        }
+    }
+}
+
+/// Wrap a delegated-session response stream without buffering it.
+///
+/// Chargeable chunks remain behind the payment gate until the gateway's
+/// cumulative voucher has been persisted. Dropping the returned stream drops
+/// the owned meter and releases its exclusive capacity lease.
+pub(crate) fn meter_delegated_response_stream<S, E>(
+    stream: S,
+    mut meter: DelegatedSessionStreamMeter,
+    is_sse: bool,
+) -> impl Stream<Item = Result<Bytes, BoxError>> + Send + 'static
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+    E: StdError + Send + Sync + 'static,
+{
+    async_stream::try_stream! {
+        futures_util::pin_mut!(stream);
+        while let Some(next) = stream.next().await {
+            let chunk = next.map_err(box_error)?;
+            let decision = meter.observe_chunk(&chunk, is_sse).map_err(box_error)?;
+            if let Some(decision) = decision {
+                meter.settle(decision).await?;
+            }
+            yield chunk;
+        }
+
+        if let Some(decision) = meter.finish().map_err(box_error)? {
+            meter.settle(decision).await?;
         }
     }
 }
@@ -340,12 +485,12 @@ impl StreamUsageAccumulator {
                 continue;
             };
 
-            let text_chars = gemini_text_char_count(&value);
+            let text_chars = streamed_text_char_count(&value);
             if text_chars > 0 {
                 self.output_chars = self.output_chars.saturating_add(text_chars);
                 self.output_words = self
                     .output_words
-                    .saturating_add(gemini_text_word_count(&value));
+                    .saturating_add(streamed_text_word_count(&value));
                 changed = true;
             }
 
@@ -518,18 +663,18 @@ fn select_meter_dimensions<'a>(
     (!metering.dimensions.is_empty()).then_some(&metering.dimensions)
 }
 
-fn gemini_text_char_count(value: &Value) -> u64 {
-    gemini_texts(value)
+fn streamed_text_char_count(value: &Value) -> u64 {
+    streamed_texts(value)
         .map(|text| text.chars().count() as u64)
         .sum()
 }
 
-fn gemini_text_word_count(value: &Value) -> u64 {
-    gemini_texts(value).map(count_words).sum()
+fn streamed_text_word_count(value: &Value) -> u64 {
+    streamed_texts(value).map(count_words).sum()
 }
 
-fn gemini_texts(value: &Value) -> impl Iterator<Item = &str> {
-    value
+fn streamed_texts(value: &Value) -> impl Iterator<Item = &str> {
+    let gemini = value
         .get("candidates")
         .and_then(Value::as_array)
         .into_iter()
@@ -542,7 +687,29 @@ fn gemini_texts(value: &Value) -> impl Iterator<Item = &str> {
                 .into_iter()
                 .flatten()
         })
-        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .filter_map(|part| part.get("text").and_then(Value::as_str));
+    let openai = value
+        .get("choices")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|choice| {
+            choice
+                .get("delta")
+                .and_then(|delta| delta.get("content"))
+                .and_then(Value::as_str)
+                .or_else(|| choice.get("text").and_then(Value::as_str))
+        });
+    let top_level_delta = value
+        .get("delta")
+        .and_then(|delta| {
+            delta
+                .as_str()
+                .or_else(|| delta.get("text").and_then(Value::as_str))
+        })
+        .into_iter();
+
+    gemini.chain(openai).chain(top_level_delta)
 }
 
 fn usage_u64(value: &Value, key: &str) -> Option<u64> {
@@ -586,9 +753,9 @@ mod tests {
     use crate::client::session::SessionHandle;
     use crate::server::metering::parse_tokens_per_quota_unit;
     use crate::server::session::SessionOutcome;
-    use pay_kit::mpp::SessionMode;
     use pay_kit::mpp::server::session::SessionConfig;
     use pay_kit::mpp::solana_keychain::{SolanaSigner, memory::MemorySigner};
+    use pay_kit::mpp::{SessionMode, SessionSettlementAuthority};
     use pay_types::metering::{MeterDimension, PriceTier};
 
     fn dimension(
@@ -765,6 +932,32 @@ mod tests {
     }
 
     #[test]
+    fn sse_accumulator_uses_openai_delta_words_as_live_output_floor() {
+        let spec = SessionMeterSpec::new([SessionMeterDimension::required(
+            MeterDirection::Output,
+            BillingUnit::Tokens,
+            1,
+            1,
+        )]);
+        let mut accumulator = StreamUsageAccumulator::new(spec, SessionUsageHints::default());
+
+        let changed = accumulator.observe_chunk(
+            br#"data: {"choices":[{"delta":{"content":"one two three"}}]}
+
+"#,
+            true,
+        );
+
+        assert!(changed);
+        assert_eq!(
+            accumulator
+                .observation()
+                .get(MeterDirection::Output, BillingUnit::Tokens),
+            Some(3)
+        );
+    }
+
+    #[test]
     fn sse_accumulator_excludes_gemini_tool_prompt_tokens_from_output() {
         let spec = SessionMeterSpec::new([SessionMeterDimension::required(
             MeterDirection::Output,
@@ -901,5 +1094,119 @@ mod tests {
             .expect("upstream chunk should remain successful");
 
         assert_eq!(released, Bytes::from_static(b"paid"));
+    }
+
+    #[tokio::test]
+    async fn delegated_stream_releases_each_chunk_after_its_voucher() {
+        use ed25519_dalek::SigningKey;
+
+        let signing_key = SigningKey::generate(&mut rand::thread_rng());
+        let verifying_key = signing_key.verifying_key();
+        let mut operator_keypair = [0_u8; 64];
+        operator_keypair[..32].copy_from_slice(signing_key.as_bytes());
+        operator_keypair[32..].copy_from_slice(verifying_key.as_bytes());
+        let operator: Arc<dyn SolanaSigner> =
+            Arc::new(MemorySigner::from_bytes(&operator_keypair).unwrap());
+        let client_operator: Box<dyn SolanaSigner> =
+            Box::new(MemorySigner::from_bytes(&operator_keypair).unwrap());
+        let mut config = SessionConfig {
+            operator: operator.pubkey().to_string(),
+            recipient: solana_pubkey::Pubkey::new_unique().to_string(),
+            max_cap: 1_000,
+            currency: solana_pubkey::Pubkey::new_unique().to_string(),
+            network: "localnet".to_string(),
+            min_voucher_delta: 1,
+            modes: vec![SessionMode::Push],
+            ..SessionConfig::default()
+        };
+        config.settlement_authority = SessionSettlementAuthority::Delegated;
+        let session = Arc::new(
+            SessionMpp::new(config, "delegated-stream-test-secret")
+                .with_payment_channel_signer(operator),
+        );
+        let challenge = session.challenge(1_000).unwrap();
+        let handle = SessionHandle::new(
+            solana_pubkey::Pubkey::new_unique(),
+            client_operator,
+            challenge,
+        );
+        let open_header = handle.open_header(1_000, "open_sig").await.unwrap();
+        let SessionOutcome::Active { state, .. } = session.process(&open_header).await.unwrap()
+        else {
+            panic!("expected an active delegated session");
+        };
+        let reservation = session
+            .reserve_delegated_capacity(&state.channel_id, 1_000)
+            .expect("session capacity should be available");
+        let forward = SessionForward::delegated(
+            session.clone(),
+            state.channel_id.clone(),
+            0,
+            crate::server::metering::UptoSettlementPlan {
+                metering: metering(vec![MeterDimension {
+                    direction: MeterDirection::Output,
+                    unit: BillingUnit::Tokens,
+                    scale: 1,
+                    period: None,
+                    tiers: vec![PriceTier {
+                        up_to: None,
+                        price_usd: 0.000001,
+                        condition: None,
+                        notes: None,
+                        splits: vec![],
+                    }],
+                    meter: None,
+                }]),
+                variant_hint: None,
+                request_properties: RequestProperties::default(),
+                ceiling_usd: 0.001,
+                inferred_usage: None,
+            },
+            1_000,
+            reservation,
+        );
+        let meter = DelegatedSessionStreamMeter::from_forward(forward).unwrap();
+        let release_second = Arc::new(tokio::sync::Notify::new());
+        let upstream_release = Arc::clone(&release_second);
+        let upstream = async_stream::stream! {
+            yield Ok::<_, std::io::Error>(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"one two\"}}]}\n\n"
+            ));
+            upstream_release.notified().await;
+            yield Ok::<_, std::io::Error>(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"three\"}}]}\n\n"
+            ));
+        };
+        let metered = meter_delegated_response_stream(upstream, meter, true);
+        futures_util::pin_mut!(metered);
+
+        let first = tokio::time::timeout(Duration::from_secs(1), metered.next())
+            .await
+            .expect("first chunk must not wait for upstream EOF")
+            .expect("stream should yield its first chunk")
+            .expect("first chunk should remain successful");
+        assert_eq!(
+            first,
+            Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"content\":\"one two\"}}]}\n\n")
+        );
+        assert_eq!(session.committed_watermark(&state.channel_id), Some(2));
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), metered.next())
+                .await
+                .is_err(),
+            "second chunk should still be waiting on the upstream"
+        );
+        release_second.notify_one();
+        let second = tokio::time::timeout(Duration::from_secs(1), metered.next())
+            .await
+            .expect("second chunk should resume")
+            .expect("stream should yield its second chunk")
+            .expect("second chunk should remain successful");
+        assert_eq!(
+            second,
+            Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"content\":\"three\"}}]}\n\n")
+        );
+        assert_eq!(session.committed_watermark(&state.channel_id), Some(3));
     }
 }
