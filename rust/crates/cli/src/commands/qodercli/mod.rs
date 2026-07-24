@@ -12,6 +12,7 @@ use std::process::{Command, Stdio};
 
 use clap::Args;
 
+use super::agent_args::args_without_model;
 use super::claude::{AlternateClient, AlternateProvider, prepare_alternate_provider};
 
 /// Allow-list of pay MCP tools surfaced to qodercli. Must stay in sync
@@ -220,22 +221,6 @@ fn qoder_model_list_contains(output: &str, provider_model: &str, model: &str) ->
     output.lines().map(str::trim).any(|line| {
         line == provider_model || line == format!("Pay: {model}") || line == format!("Pay {model}")
     })
-}
-
-fn args_without_model(args: &[String]) -> Vec<String> {
-    let mut out = Vec::with_capacity(args.len());
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        if matches!(arg.as_str(), "--model" | "-m") {
-            let _ = iter.next();
-            continue;
-        }
-        if arg.starts_with("--model=") {
-            continue;
-        }
-        out.push(arg.clone());
-    }
-    out
 }
 
 // On Windows, cmd.exe (used to execute .cmd batch wrappers) rejects

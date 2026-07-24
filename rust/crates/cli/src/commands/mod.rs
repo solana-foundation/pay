@@ -1,4 +1,5 @@
 pub mod account;
+pub(crate) mod agent_args;
 pub mod catalog;
 pub mod claude;
 pub mod codex;

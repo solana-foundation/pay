@@ -5,6 +5,7 @@ use std::process::{Command, Stdio};
 
 use clap::Args;
 
+use super::agent_args::args_without_model;
 use super::claude::{AlternateClient, AlternateProvider, prepare_alternate_provider};
 
 const GOOSE_PROVIDER_ENV: &str = "GOOSE_PROVIDER";
@@ -117,22 +118,6 @@ fn goose_help_requested(args: &[String]) -> bool {
         .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
 }
 
-fn args_without_model(args: &[String]) -> Vec<String> {
-    let mut out = Vec::with_capacity(args.len());
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        if matches!(arg.as_str(), "--model" | "-m") {
-            let _ = iter.next();
-            continue;
-        }
-        if arg.starts_with("--model=") {
-            continue;
-        }
-        out.push(arg.clone());
-    }
-    out
-}
-
 fn pay_mcp_command(pay_bin: &str) -> String {
     #[cfg(windows)]
     return format!("\"{}\" mcp", pay_bin.replace('"', "\"\""));
@@ -166,14 +151,6 @@ mod tests {
             GOOSE_DISABLE_SESSION_NAMING_ENV.to_string(),
             "true".to_string()
         )));
-    }
-
-    #[test]
-    fn selected_model_is_not_forwarded_to_goose_session() {
-        assert_eq!(
-            args_without_model(&["--model".into(), "qwen3.7-plus".into(), "--debug".into()]),
-            vec!["--debug"]
-        );
     }
 
     #[test]

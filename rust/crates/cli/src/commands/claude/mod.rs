@@ -5,6 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Args;
+
+use super::agent_args::model_arg;
 use owo_colors::OwoColorize;
 
 use crate::commands::payer_proxy;
@@ -723,24 +725,6 @@ fn claude_metadata_requested(args: &[String]) -> bool {
         .any(|arg| matches!(arg.as_str(), "-h" | "--help" | "--version" | "-v"))
 }
 
-fn model_arg(args: &[String]) -> Option<String> {
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        if let Some(model) = arg.strip_prefix("--model=")
-            && !model.is_empty()
-        {
-            return Some(model.to_string());
-        }
-        if matches!(arg.as_str(), "--model" | "-m")
-            && let Some(model) = iter.next()
-            && !model.trim().is_empty()
-        {
-            return Some(model.to_string());
-        }
-    }
-    None
-}
-
 fn claude_args_with_model(args: &[String], model: Option<&str>) -> Vec<String> {
     let Some(model) = model else {
         return args.to_vec();
@@ -886,23 +870,6 @@ mod tests {
         assert_eq!(launch.args, args);
         assert_eq!(launch.base_url, None);
         assert_eq!(launch.model, None);
-    }
-
-    #[test]
-    fn model_arg_reads_long_and_short_forms() {
-        assert_eq!(
-            model_arg(&["--model".into(), "llama3.2".into()]),
-            Some("llama3.2".into())
-        );
-        assert_eq!(
-            model_arg(&["--model=qwen3.5".into()]),
-            Some("qwen3.5".into())
-        );
-        assert_eq!(
-            model_arg(&["-m".into(), "gemma4".into()]),
-            Some("gemma4".into())
-        );
-        assert_eq!(model_arg(&["--model".into()]), None);
     }
 
     #[test]
