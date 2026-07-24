@@ -216,10 +216,12 @@ where
             let chunk = next.map_err(box_error)?;
             meter.touch_channel();
             let decision = meter.observe_chunk(&chunk, is_sse).map_err(box_error)?;
-            yield chunk;
             if let Some(decision) = decision {
                 settle_decision(&mut meter, decision).await?;
             }
+            // Do not release the bytes that crossed the voucher threshold
+            // until the corresponding cumulative commit is durable.
+            yield chunk;
         }
 
         if let Some(decision) = meter.finish().map_err(box_error)? {
@@ -581,7 +583,12 @@ impl<'a> OptionalVariantHint<'a> for SessionMeteringContext<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::session::SessionHandle;
     use crate::server::metering::parse_tokens_per_quota_unit;
+    use crate::server::session::SessionOutcome;
+    use pay_kit::mpp::SessionMode;
+    use pay_kit::mpp::server::session::SessionConfig;
+    use pay_kit::mpp::solana_keychain::{SolanaSigner, memory::MemorySigner};
     use pay_types::metering::{MeterDimension, PriceTier};
 
     fn dimension(
@@ -615,6 +622,17 @@ mod tests {
             min_usd: None,
             upto: None,
         }
+    }
+
+    fn stream_test_signer() -> Box<dyn SolanaSigner> {
+        use ed25519_dalek::SigningKey;
+
+        let signing_key = SigningKey::generate(&mut rand::thread_rng());
+        let verifying_key = signing_key.verifying_key();
+        let mut keypair = [0_u8; 64];
+        keypair[..32].copy_from_slice(signing_key.as_bytes());
+        keypair[32..].copy_from_slice(verifying_key.as_bytes());
+        Box::new(MemorySigner::from_bytes(&keypair).unwrap())
     }
 
     #[test]
@@ -826,5 +844,62 @@ mod tests {
         )]);
 
         assert!(!has_stream_observable_dimension(&spec));
+    }
+
+    #[tokio::test]
+    async fn chargeable_stream_chunk_waits_for_matching_commit() {
+        let session = Arc::new(SessionMpp::new(
+            SessionConfig {
+                operator: solana_pubkey::Pubkey::new_unique().to_string(),
+                recipient: solana_pubkey::Pubkey::new_unique().to_string(),
+                max_cap: 1_000,
+                currency: solana_pubkey::Pubkey::new_unique().to_string(),
+                network: "localnet".to_string(),
+                min_voucher_delta: 1,
+                modes: vec![SessionMode::Push],
+                ..SessionConfig::default()
+            },
+            "stream-test-secret",
+        ));
+        let challenge = session.challenge(1_000).unwrap();
+        let handle = SessionHandle::new(
+            solana_pubkey::Pubkey::new_unique(),
+            stream_test_signer(),
+            challenge,
+        );
+        let open_header = handle.open_header(1_000, "open_sig").await.unwrap();
+        let SessionOutcome::Active { state, .. } = session.process(&open_header).await.unwrap()
+        else {
+            panic!("expected an active session");
+        };
+        let context = SessionStreamContext::new(session.clone(), state.channel_id, 0);
+        let spec = SessionMeterSpec::new([SessionMeterDimension::required(
+            MeterDirection::Output,
+            BillingUnit::Bytes,
+            1,
+            1,
+        )]);
+        let meter = SessionStreamMeter::new(spec, SessionUsageHints::default(), context).unwrap();
+        let upstream =
+            futures_util::stream::iter([Ok::<_, reqwest::Error>(Bytes::from_static(b"paid"))]);
+        let metered = meter_response_stream(upstream, meter, false);
+        futures_util::pin_mut!(metered);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), metered.next())
+                .await
+                .is_err(),
+            "chargeable output must remain withheld while its commit is pending"
+        );
+
+        let voucher = handle.voucher_header(4).await.unwrap();
+        session.process(&voucher).await.unwrap();
+        let released = tokio::time::timeout(Duration::from_secs(1), metered.next())
+            .await
+            .expect("stream should resume after the commit")
+            .expect("stream should yield the withheld chunk")
+            .expect("upstream chunk should remain successful");
+
+        assert_eq!(released, Bytes::from_static(b"paid"));
     }
 }
