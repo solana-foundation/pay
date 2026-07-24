@@ -122,7 +122,7 @@ struct PayerState {
     /// Cached delegated-session authorization. Holding the mutex serializes
     /// requests because the server reserves a session's remaining capacity
     /// while it meters a response.
-    session_authorization: tokio::sync::Mutex<Option<String>>,
+    session_authorization: Arc<tokio::sync::Mutex<Option<String>>>,
     session_opener: SessionOpener,
     client: reqwest::Client,
     store: Arc<dyn AccountsStore>,
@@ -165,7 +165,7 @@ impl PayerState {
             responses_path: upstream.responses_path.trim_start_matches('/').to_string(),
             require_payment: upstream.require_payment,
             payment_protocol: upstream.payment_protocol,
-            session_authorization: tokio::sync::Mutex::new(None),
+            session_authorization: Arc::new(tokio::sync::Mutex::new(None)),
             session_opener: build_session_authorization,
             client,
             store,
@@ -336,7 +336,7 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
     // process. Keep the guard until the gateway has accepted and metered this
     // response so two concurrent calls cannot reserve the same channel cap.
     let mut session_authorization = if state.payment_protocol == PaymentProtocol::MppSession {
-        Some(state.session_authorization.lock().await)
+        Some(state.session_authorization.clone().lock_owned().await)
     } else {
         None
     };
@@ -378,7 +378,7 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
             };
             return (StatusCode::BAD_GATEWAY, message).into_response();
         }
-        return deliver(first, translated).await;
+        return deliver(first, translated, session_authorization.take()).await;
     }
 
     // The cached channel may have expired, closed, or exhausted its cap. Drop
@@ -440,7 +440,7 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
                 )
                     .into_response();
             }
-            return deliver(refreshed, translated).await;
+            return deliver(refreshed, translated, session_authorization.take()).await;
         }
 
         status = refreshed.status();
@@ -539,7 +539,7 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
             {
                 **cache = None;
             }
-            deliver(retry, translated).await
+            deliver(retry, translated, session_authorization.take()).await
         }
         Err(e) => {
             // The open credential is idempotent and the channel may already
@@ -630,9 +630,15 @@ fn translate_request(
 /// Hand an upstream response back to Claude Code: translated (SSE or
 /// buffered JSON) when the request was translated and succeeded,
 /// streamed passthrough otherwise.
-async fn deliver(resp: reqwest::Response, translated: bool) -> Response {
+type SessionAuthorizationGuard = tokio::sync::OwnedMutexGuard<Option<String>>;
+
+async fn deliver(
+    resp: reqwest::Response,
+    translated: bool,
+    session_guard: Option<SessionAuthorizationGuard>,
+) -> Response {
     if !translated || !resp.status().is_success() {
-        return stream_response(resp);
+        return stream_response(resp, session_guard);
     }
     let is_sse = resp
         .headers()
@@ -640,7 +646,7 @@ async fn deliver(resp: reqwest::Response, translated: bool) -> Response {
         .and_then(|value| value.to_str().ok())
         .is_some_and(|ct| ct.contains("text/event-stream"));
     if is_sse {
-        translate_stream_response(resp)
+        translate_stream_response(resp, session_guard)
     } else {
         translate_json_response(resp).await
     }
@@ -693,10 +699,14 @@ async fn translate_json_response(resp: reqwest::Response) -> Response {
 /// translator — chunks flow as they arrive; a carry-over buffer inside
 /// [`translate::StreamTranslator`] reassembles SSE lines split across
 /// chunk boundaries.
-fn translate_stream_response(resp: reqwest::Response) -> Response {
+fn translate_stream_response(
+    resp: reqwest::Response,
+    session_guard: Option<SessionAuthorizationGuard>,
+) -> Response {
     let status = resp.status();
     let upstream_headers = resp.headers().clone();
     let stream_body = Body::from_stream(async_stream::stream! {
+        let _session_guard = session_guard;
         let mut resp = resp;
         let mut translator = translate::StreamTranslator::new();
         loop {
@@ -972,7 +982,10 @@ async fn send_upstream(
 
 /// Stream an upstream response back to the client without buffering —
 /// SSE completion streams must flow chunk by chunk.
-fn stream_response(resp: reqwest::Response) -> Response {
+fn stream_response(
+    resp: reqwest::Response,
+    session_guard: Option<SessionAuthorizationGuard>,
+) -> Response {
     let status = resp.status();
     let headers = resp.headers().clone();
 
@@ -980,15 +993,27 @@ fn stream_response(resp: reqwest::Response) -> Response {
     if let Some(dst) = builder.headers_mut() {
         copy_response_headers(dst, &headers);
     }
-    builder
-        .body(Body::from_stream(resp.bytes_stream()))
-        .unwrap_or_else(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "payer proxy: response build error",
-            )
-                .into_response()
-        })
+    let stream_body = Body::from_stream(async_stream::stream! {
+        let _session_guard = session_guard;
+        let mut resp = resp;
+        loop {
+            match resp.chunk().await {
+                Ok(Some(chunk)) => yield Ok::<_, std::io::Error>(chunk),
+                Ok(None) => break,
+                Err(error) => {
+                    yield Err(std::io::Error::other(error));
+                    break;
+                }
+            }
+        }
+    });
+    builder.body(stream_body).unwrap_or_else(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "payer proxy: response build error",
+        )
+            .into_response()
+    })
 }
 
 /// Rebuild a fully-buffered upstream response (the 402 passthrough path).
@@ -1672,6 +1697,118 @@ mod tests {
             Some("Payment durable-open"),
             "an ambiguous transport failure must retain the idempotent open credential"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cached_session_stays_locked_until_stream_body_finishes() {
+        fn open_test_session(
+            _state: &PayerState,
+            _challenge: &pay_core::mpp::Challenge,
+        ) -> pay_core::Result<(PaidHeaders, String)> {
+            let authorization = "Payment streaming-session".to_string();
+            Ok((PaidHeaders::mpp(authorization.clone()), authorization))
+        }
+
+        let calls = Arc::new(Mutex::new(0_usize));
+        let release_stream = Arc::new(tokio::sync::Notify::new());
+        let record = calls.clone();
+        let release = release_stream.clone();
+        let app = Router::new().fallback(any(move |req: Request| {
+            let record = record.clone();
+            let release = release.clone();
+            async move {
+                let authorization = req
+                    .headers()
+                    .get(header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                let _ = axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES).await;
+                let call = {
+                    let mut calls = record.lock().unwrap();
+                    *calls += 1;
+                    *calls
+                };
+                match call {
+                    1 => Response::builder()
+                        .status(StatusCode::PAYMENT_REQUIRED)
+                        .header(header::WWW_AUTHENTICATE, session_challenge_header())
+                        .body(Body::from(r#"{"error":"payment required"}"#))
+                        .unwrap(),
+                    2 => {
+                        assert_eq!(authorization.as_deref(), Some("Payment streaming-session"));
+                        let body = Body::from_stream(async_stream::stream! {
+                            yield Ok::<_, std::io::Error>(Bytes::from_static(b"first "));
+                            release.notified().await;
+                            yield Ok(Bytes::from_static(b"done"));
+                        });
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .body(body)
+                            .unwrap()
+                    }
+                    3 => {
+                        assert_eq!(authorization.as_deref(), Some("Payment streaming-session"));
+                        (StatusCode::OK, "second response").into_response()
+                    }
+                    call => panic!("unexpected upstream call {call}"),
+                }
+            }
+        }));
+        let upstream = spawn_server(app).await;
+        let store: Arc<dyn AccountsStore> = Arc::new(MemoryAccountsStore::new());
+        let state = Arc::new(
+            PayerState::new(
+                PayerUpstream {
+                    base_url: upstream,
+                    host_header: None,
+                    dialect: Dialect::Anthropic,
+                    chat_path: "v1/chat/completions".to_string(),
+                    responses_path: "v1/responses".to_string(),
+                    require_payment: true,
+                    payment_protocol: PaymentProtocol::MppSession,
+                },
+                store,
+                None,
+                None,
+            )
+            .unwrap()
+            .with_session_opener(open_test_session),
+        );
+        let payer = spawn_server(router(state)).await;
+        let client = reqwest::Client::new();
+
+        let first = client
+            .post(format!("{payer}/v1/messages"))
+            .body("first")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let second_client = client.clone();
+        let second_url = format!("{payer}/v1/messages");
+        let second =
+            tokio::spawn(async move { second_client.post(second_url).body("second").send().await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            *calls.lock().unwrap(),
+            2,
+            "the second request must not reach upstream while the first stream is active"
+        );
+        assert!(
+            !second.is_finished(),
+            "the second request must wait for the first stream's session lock"
+        );
+
+        release_stream.notify_one();
+        assert_eq!(first.text().await.unwrap(), "first done");
+        let second = tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .expect("second request should resume after the first stream")
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.text().await.unwrap(), "second response");
+        assert_eq!(*calls.lock().unwrap(), 3);
     }
 
     #[tokio::test(flavor = "multi_thread")]
