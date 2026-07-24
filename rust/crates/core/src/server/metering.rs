@@ -368,14 +368,9 @@ fn extract_and_price_usage(
     let body_still_needed = upto_requires_response_body(metering, variant_hint)
         && dimensions.iter().any(|dim| {
             let covered_by_inferred = inferred_usage
-                .and_then(|usage| inferred_quantity_for_dim(usage, dim))
+                .and_then(|usage| inferred_quantity_for_dim(usage, dim, props))
                 .is_some();
-            let reads_body = dim
-                .meter
-                .as_ref()
-                .is_some_and(|m| matches!(m.source, UsageMeterSource::ResponseJson))
-                || preset_json_path(preset, dim).is_some()
-                || dim.unit == BillingUnit::QuotaUnits;
+            let reads_body = dimension_reads_response_body(dim, preset);
             !covered_by_inferred && reads_body
         });
     let json = if body_still_needed {
@@ -397,14 +392,18 @@ fn extract_and_price_usage(
             .map(|d| d.price_usd)
             .unwrap_or(0.0);
         let quantity =
-            extract_dimension_quantity(dim, preset, headers, json.as_ref(), inferred_usage)?;
+            extract_dimension_quantity(dim, preset, props, headers, json.as_ref(), inferred_usage)?;
         total += quantity as f64 / dim.scale.max(1) as f64 * price;
     }
     Ok(total)
 }
 
 /// The observer count for a token or quota-unit dimension, if any.
-fn inferred_quantity_for_dim(usage: &crate::InferenceUsage, dim: &MeterDimension) -> Option<u64> {
+fn inferred_quantity_for_dim(
+    usage: &crate::InferenceUsage,
+    dim: &MeterDimension,
+    props: &RequestProperties,
+) -> Option<u64> {
     let tokens = match dim.direction {
         MeterDirection::Input => usage.tokens_prompt,
         MeterDirection::Output => usage.tokens_completion,
@@ -413,17 +412,19 @@ fn inferred_quantity_for_dim(usage: &crate::InferenceUsage, dim: &MeterDimension
     match dim.unit {
         BillingUnit::Tokens => Some(tokens),
         BillingUnit::QuotaUnits => {
-            quota_tokens_per_unit(dim).map(|per_unit| ceil_div_u64(tokens, per_unit))
+            quota_tokens_per_unit(dim, props).map(|per_unit| ceil_div_u64(tokens, per_unit))
         }
         _ => None,
     }
 }
 
-fn quota_tokens_per_unit(dim: &MeterDimension) -> Option<u64> {
-    dim.tiers
-        .iter()
-        .filter_map(|tier| tier.notes.as_deref())
-        .find_map(parse_tokens_per_quota_unit)
+pub(crate) fn quota_tokens_per_unit(
+    dim: &MeterDimension,
+    props: &RequestProperties,
+) -> Option<u64> {
+    select_price_tier(dim, props)
+        .and_then(|tier| tier.notes.as_deref())
+        .and_then(parse_tokens_per_quota_unit)
 }
 
 pub(crate) fn parse_tokens_per_quota_unit(notes: &str) -> Option<u64> {
@@ -461,10 +462,14 @@ fn quota_token_quantity(json: &serde_json::Value, direction: MeterDirection) -> 
                     .get("thoughtsTokenCount")
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(0);
+                let tool_prompt = usage
+                    .get("toolUsePromptTokenCount")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
                 let derived = usage
                     .get("totalTokenCount")
                     .and_then(serde_json::Value::as_u64)
-                    .and_then(|total| total.checked_sub(input))
+                    .map(|total| total.saturating_sub(input).saturating_sub(tool_prompt))
                     .unwrap_or(0);
                 Some(candidates.saturating_add(thoughts).max(derived))
             }),
@@ -479,15 +484,24 @@ fn ceil_div_u64(value: u64, divisor: u64) -> u64 {
 fn extract_dimension_quantity(
     dim: &MeterDimension,
     preset: Option<&str>,
+    props: &RequestProperties,
     headers: &HeaderMap,
     json: Option<&serde_json::Value>,
     inferred_usage: Option<&crate::InferenceUsage>,
 ) -> Result<u64, UptoUsageError> {
     // Observer token counts take precedence for token dimensions.
     if let Some(usage) = inferred_usage
-        && let Some(quantity) = inferred_quantity_for_dim(usage, dim)
+        && let Some(quantity) = inferred_quantity_for_dim(usage, dim, props)
     {
         return Ok(quantity);
+    }
+    // A response-header meter is already explicit and does not require
+    // buffering a JSON body. Endpoint presets only disambiguate inherited
+    // JSON meters whose field names differ by API dialect.
+    if let Some(meter) = &dim.meter
+        && matches!(meter.source, UsageMeterSource::ResponseHeader)
+    {
+        return extract_from_meter(meter, headers, json);
     }
     // Responses and Chat Completions use different names for the same token
     // dimensions. Let the endpoint-level Responses preset override meters
@@ -512,7 +526,7 @@ fn extract_dimension_quantity(
                 dim.direction
             ))
         })?;
-        let per_unit = quota_tokens_per_unit(dim).ok_or_else(|| {
+        let per_unit = quota_tokens_per_unit(dim, props).ok_or_else(|| {
             UptoUsageError::MissingUsage(format!(
                 "no tokens-per-quota-unit hint for {:?}",
                 dim.direction
@@ -535,6 +549,14 @@ fn extract_dimension_quantity(
         "no usage meter for {:?} {:?}",
         dim.direction, dim.unit
     )))
+}
+
+fn dimension_reads_response_body(dim: &MeterDimension, preset: Option<&str>) -> bool {
+    match dim.meter.as_ref().map(|meter| &meter.source) {
+        Some(UsageMeterSource::ResponseHeader) => false,
+        Some(UsageMeterSource::ResponseJson) => true,
+        None => dim.unit == BillingUnit::QuotaUnits || preset_json_path(preset, dim).is_some(),
+    }
 }
 
 fn extract_from_meter(
@@ -688,12 +710,19 @@ pub fn record_usage(
     resolve_price(metering, props, variant_hint, Some(ctx))
 }
 
-fn resolve_variant<'a>(
+pub(crate) fn resolve_variant<'a>(
     variants: &'a [MeterVariant],
     hint: Option<&str>,
 ) -> Option<&'a MeterVariant> {
-    let hint = hint?;
-    variants.iter().find(|v| hint.contains(&v.value))
+    let mut default = None;
+    for variant in variants {
+        if variant.value.eq_ignore_ascii_case("default") {
+            default.get_or_insert(variant);
+        } else if hint.is_some_and(|hint| hint.contains(&variant.value)) {
+            return Some(variant);
+        }
+    }
+    default
 }
 
 fn resolve_dimensions(
@@ -747,17 +776,37 @@ fn resolve_tier(
         return first_non_free_price(tiers);
     }
 
-    // No volume tiers — resolve by condition
-    for tier in tiers {
-        if let Some(ref condition) = tier.condition
-            && !evaluate_condition(condition, props)
-        {
-            continue;
-        }
-        return tier.price_usd;
-    }
+    select_price_tier_from_tiers(tiers, props)
+        .map(|tier| tier.price_usd)
+        .unwrap_or(0.0)
+}
 
-    tiers.last().map(|t| t.price_usd).unwrap_or(0.0)
+pub(crate) fn select_price_tier<'a>(
+    dimension: &'a MeterDimension,
+    props: &RequestProperties,
+) -> Option<&'a PriceTier> {
+    if dimension.tiers.iter().any(|tier| tier.up_to.is_some()) {
+        return dimension
+            .tiers
+            .iter()
+            .find(|tier| tier.price_usd > 0.0)
+            .or_else(|| dimension.tiers.first());
+    }
+    select_price_tier_from_tiers(&dimension.tiers, props)
+}
+
+fn select_price_tier_from_tiers<'a>(
+    tiers: &'a [PriceTier],
+    props: &RequestProperties,
+) -> Option<&'a PriceTier> {
+    tiers
+        .iter()
+        .find(|tier| {
+            tier.condition
+                .as_ref()
+                .is_none_or(|condition| evaluate_condition(condition, props))
+        })
+        .or_else(|| tiers.last())
 }
 
 /// Resolve tier based on cumulative volume usage.
@@ -1254,6 +1303,54 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_price_uses_explicit_default_variant_for_unknown_hint() {
+        let metering = Metering {
+            dimensions: vec![],
+            variants: vec![
+                MeterVariant {
+                    param: "model".to_string(),
+                    value: "qwen-turbo".to_string(),
+                    description: None,
+                    dimensions: vec![usage_dim(
+                        MeterDirection::Usage,
+                        BillingUnit::Requests,
+                        1,
+                        0.001,
+                        None,
+                    )],
+                },
+                MeterVariant {
+                    param: "model".to_string(),
+                    value: "default".to_string(),
+                    description: None,
+                    dimensions: vec![usage_dim(
+                        MeterDirection::Usage,
+                        BillingUnit::Requests,
+                        1,
+                        0.100,
+                        None,
+                    )],
+                },
+            ],
+            sku_tiers: vec![],
+            splits: vec![],
+            schemes: None,
+            min_usd: None,
+            upto: None,
+        };
+
+        let price = resolve_price(
+            &metering,
+            &RequestProperties::default(),
+            Some("unknown-model"),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(price.dimensions[0].price_usd, 0.100);
+    }
+
+    #[test]
     fn test_resolve_price_variant_no_match_uses_first() {
         let metering = Metering {
             dimensions: vec![],
@@ -1723,6 +1820,76 @@ mod tests {
     }
 
     #[test]
+    fn quota_units_use_notes_from_the_selected_conditional_tier() {
+        let mut input = usage_dim(
+            MeterDirection::Input,
+            BillingUnit::QuotaUnits,
+            1,
+            0.000005,
+            None,
+        );
+        input.tiers = vec![
+            PriceTier {
+                up_to: None,
+                price_usd: 0.000005,
+                condition: Some(MeterCondition::ContextLength {
+                    op: CompareOp::Lte,
+                    value: 200_000,
+                }),
+                notes: Some("4 input tokens per quota unit".to_string()),
+                splits: vec![],
+            },
+            PriceTier {
+                up_to: None,
+                price_usd: 0.000005,
+                condition: Some(MeterCondition::ContextLength {
+                    op: CompareOp::Gt,
+                    value: 200_000,
+                }),
+                notes: Some("2 input tokens per quota unit".to_string()),
+                splits: vec![],
+            },
+        ];
+        let mut plan = settlement_plan(upto_metering(vec![input], None), 0.10);
+        plan.request_properties.context_length = Some(250_000);
+        plan.inferred_usage = Some(crate::InferenceUsage {
+            tokens_prompt: Some(5),
+            ..Default::default()
+        });
+
+        let actual =
+            upto_actual_amount_from_response(&plan, 100_000, &HeaderMap::new(), None).unwrap();
+
+        assert!((actual.usd - 0.000015).abs() < f64::EPSILON);
+        assert_eq!(actual.base_units, 15);
+    }
+
+    #[test]
+    fn gemini_tool_prompt_tokens_are_not_billed_as_output() {
+        let mut output = usage_dim(
+            MeterDirection::Output,
+            BillingUnit::QuotaUnits,
+            1,
+            0.000001,
+            None,
+        );
+        output.tiers[0].notes = Some("1 output tokens per quota unit".to_string());
+        let metering = upto_metering(vec![output], None);
+        let body = br#"{"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":3,"thoughtsTokenCount":2,"toolUsePromptTokenCount":20,"totalTokenCount":35}}"#;
+
+        let actual = upto_actual_amount_from_response(
+            &settlement_plan(metering, 0.10),
+            100_000,
+            &HeaderMap::new(),
+            Some(body),
+        )
+        .unwrap();
+
+        assert!((actual.usd - 0.000005).abs() < f64::EPSILON);
+        assert_eq!(actual.base_units, 5);
+    }
+
+    #[test]
     fn openai_responses_preset_overrides_shared_chat_usage_meters() {
         let metering = upto_metering(
             vec![
@@ -1773,6 +1940,37 @@ mod tests {
             )],
             Some(pay_types::metering::UptoMetering {
                 max_usd: Some(0.10),
+                ..Default::default()
+            }),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("x-usage-tokens", HeaderValue::from_static("2500"));
+
+        let actual = upto_actual_amount_from_response(
+            &settlement_plan(metering, 0.10),
+            100_000,
+            &headers,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(actual.usd, 0.05);
+        assert_eq!(actual.base_units, 50_000);
+    }
+
+    #[test]
+    fn openai_responses_preset_honors_explicit_response_header_meter() {
+        let metering = upto_metering(
+            vec![usage_dim(
+                MeterDirection::Input,
+                BillingUnit::Tokens,
+                1_000,
+                0.02,
+                Some(response_header("x-usage-tokens")),
+            )],
+            Some(pay_types::metering::UptoMetering {
+                max_usd: Some(0.10),
+                usage_preset: Some("openai-responses".to_string()),
                 ..Default::default()
             }),
         );

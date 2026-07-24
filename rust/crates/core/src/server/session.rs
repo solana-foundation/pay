@@ -1137,6 +1137,14 @@ impl SessionMpp {
             }
 
             SessionAction::Close(p) => {
+                let _lease = self
+                    .reserve_delegated_capacity(&p.channel_id, 0)
+                    .ok_or_else(|| {
+                        Error::Mpp(format!(
+                            "Session channel {} is busy with another request",
+                            p.channel_id
+                        ))
+                    })?;
                 let params = match self.server.process_close(p).await {
                     Ok(params) => params,
                     Err(error) if session_close_needs_reconciliation(&error) => self
@@ -1803,6 +1811,16 @@ mod tests {
         assert_eq!(topped_up.deposit, CAP + 500);
 
         let close_header = handle.close_header(Some(25)).await.unwrap();
+        let competing_lease = session
+            .reserve_delegated_capacity(&opened.channel_id, 0)
+            .expect("test should reserve the channel");
+        let error = session.process(&close_header).await.unwrap_err();
+        assert!(
+            error.to_string().contains("busy with another request"),
+            "client close must not race another channel owner: {error}"
+        );
+        drop(competing_lease);
+
         let SessionOutcome::Closed { params, signature } =
             session.process(&close_header).await.unwrap()
         else {
