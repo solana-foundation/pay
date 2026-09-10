@@ -4037,11 +4037,6 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
-dependencies = [
- "allocator-api2",
- "equivalent",
- "foldhash 0.2.0",
-]
 
 [[package]]
 name = "hcl-edit"
@@ -4312,7 +4307,7 @@ dependencies = [
  "httpdate",
  "itoa",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.4.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -7299,7 +7294,7 @@ dependencies = [
  "serde",
  "serde_yaml",
  "sfv",
- "socket2 0.6.5",
+ "socket2 0.4.10",
  "strum 0.26.3",
  "strum_macros 0.26.4",
  "tokio",
@@ -7382,8 +7377,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6705a26ad89d241a989a5395641931ba37076f5ab5fbd19ee92402414a43af32"
 dependencies = [
  "arrayvec",
- "hashbrown 0.17.1",
- "parking_lot 0.12.5",
+ "hashbrown 0.13.2",
+ "parking_lot 0.11.2",
  "rand 0.8.8",
 ]
 
@@ -7757,7 +7752,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -11319,8 +11314,8 @@ dependencies = [
 
 [[package]]
 name = "solana-pay-kit"
-version = "0.6.0"
-source = "git+https://github.com/solana-foundation/pay-kit.git?rev=c143bfab#c143bfabef82dbdf01dcff7a52ab29bf166d7eb4"
+version = "0.8.0"
+source = "git+https://github.com/solana-foundation/pay-kit.git?rev=7b8edd2a#7b8edd2a71baf607adb67996a917ac8f60ebb398"
 dependencies = [
  "async-trait",
  "base64 0.22.1",

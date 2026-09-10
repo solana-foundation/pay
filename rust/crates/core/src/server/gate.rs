@@ -1193,10 +1193,9 @@ impl<S: PaymentState> PaymentGate<S> {
         }
     }
 
-    /// Subscription endpoint: no auth → 402 (subscription + authenticate
-    /// challenges); `authenticate` intent → stateless verify → forward / 402;
-    /// `subscription` intent → activation → forward (+ receipt + "next time"
-    /// authenticate challenge) / 402.
+    /// Subscription endpoint: no auth → subscription 402; `subscription`
+    /// activation or bearer proof → live-state verification → forward / 402.
+    /// Legacy `authenticate` credentials remain accepted during migration.
     async fn evaluate_subscription(
         &self,
         api: &pay_types::metering::ApiSpec,
@@ -1247,9 +1246,12 @@ impl<S: PaymentState> PaymentGate<S> {
             realm,
             fee_payer,
             fee_payer_signer: signer.clone(),
+            store: self.state.subscription_store(),
         };
 
-        // Build the 402: subscription challenge + optional authenticate challenge.
+        // Build the canonical subscription challenge. Its activation proof is
+        // retained and reused directly; no companion authenticate challenge is
+        // needed by the current draft.
         let challenge_402 = |error: Option<(&str, bool)>| -> GateDecision {
             let mut headers: Vec<(HeaderName, HeaderValue)> = Vec::new();
             match sub::build_challenge(spec, defaults.clone(), description) {
@@ -1271,14 +1273,6 @@ impl<S: PaymentState> PaymentGate<S> {
                         Bytes::from_static(br#"{"error":"subscription_misconfigured"}"#),
                     ));
                 }
-            }
-            if let Ok(Some(authsrv)) =
-                authenticate::build_handler(spec, defaults.clone(), subdomain, &canonical)
-                && let Ok(ac) = authsrv.challenge()
-                && let Ok(w) = format_www_authenticate(&ac)
-                && let Ok(v) = HeaderValue::from_str(&w)
-            {
-                headers.push((header::WWW_AUTHENTICATE, v));
             }
             telemetry::record_402_challenge_sent(
                 "mpp/subscription",
@@ -1369,14 +1363,6 @@ impl<S: PaymentState> PaymentGate<S> {
                     && let Ok(v) = HeaderValue::from_str(&rs)
                 {
                     headers.push((HeaderName::from_static(PAYMENT_RECEIPT_HEADER), v));
-                }
-                if let Ok(Some(authsrv)) =
-                    authenticate::build_handler(spec, defaults.clone(), subdomain, &canonical)
-                    && let Ok(ac) = authsrv.challenge()
-                    && let Ok(w) = format_www_authenticate(&ac)
-                    && let Ok(v) = HeaderValue::from_str(&w)
-                {
-                    headers.push((header::WWW_AUTHENTICATE, v));
                 }
                 GateDecision::Forward {
                     session: None,

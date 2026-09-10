@@ -141,9 +141,9 @@ pub struct Account {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
 
-    /// Active MPP subscriptions held by this account, keyed by
-    /// `subscription_id` (the base58 `SubscriptionDelegation` PDA from the
-    /// `Payment-Receipt` header). Omitted from YAML when empty so the
+    /// Active MPP subscriptions held by this account, keyed by the server's
+    /// opaque `subscription_id`. Legacy entries may still use the on-chain
+    /// delegation PDA as their key. Omitted from YAML when empty so the
     /// `accounts.yml` shape stays unchanged for accounts without
     /// subscriptions.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -191,9 +191,14 @@ impl std::fmt::Display for SubscriptionStatus {
 /// `SubscriptionReceiptExtensions` without lossy reformatting.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Subscription {
-    /// Base58 of the on-chain `SubscriptionDelegation` PDA — the stable
-    /// identifier returned in `Payment-Receipt.subscriptionId`.
+    /// Server-issued opaque identifier returned in `Payment-Receipt.subscriptionId`.
     pub subscription_id: String,
+
+    /// Base58 of the on-chain `SubscriptionDelegation` PDA. Older account
+    /// files used this address as `subscription_id`, so consumers fall back
+    /// to that field when this one is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_delegation: Option<String>,
 
     /// Base58 of the on-chain `Plan` PDA (the spec's `externalId`).
     pub plan_id: String,
@@ -260,23 +265,30 @@ pub struct Subscription {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 
-    /// Cached `authenticate`-intent credential. When present and unexpired,
-    /// the client attaches it as `Authorization: Payment <token>` to
-    /// subscription-gated requests so the server can authorise without
-    /// the wallet re-signing. Generated once per billing period during
-    /// activation (or lazily on the first 402 of the period).
+    /// Cached subscription bearer credential. New records contain the
+    /// reusable `type="proof"` subscription credential; older records may
+    /// contain a SIWMPP `authenticate` credential.
     ///
     /// The token shape is the full `Payment <base64url(credential)>`
     /// header value — callers MAY attach it verbatim.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub authenticate_token: Option<String>,
 
-    /// RFC 3339 expiry timestamp on the cached authenticate token. Used
-    /// to gate attachment: the client MUST treat the token as missing
-    /// once the wall clock crosses this value. Typically equal to the
-    /// current billing period's end.
+    /// RFC 3339 expiry timestamp used by legacy SIWMPP credentials. The
+    /// canonical subscription proof is governed by `expires_at` and live
+    /// on-chain subscription state instead.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub authenticate_expires_at: Option<String>,
+}
+
+impl Subscription {
+    /// Return the on-chain delegation address, with a fallback for account
+    /// files written before `subscriptionId` became an opaque server ID.
+    pub fn delegation_address(&self) -> &str {
+        self.subscription_delegation
+            .as_deref()
+            .unwrap_or(&self.subscription_id)
+    }
 }
 
 impl Account {
@@ -905,6 +917,7 @@ mod tests {
     fn fake_subscription(id: &str, plan: &str) -> Subscription {
         Subscription {
             subscription_id: id.to_string(),
+            subscription_delegation: None,
             plan_id: plan.to_string(),
             program_id: None,
             mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),

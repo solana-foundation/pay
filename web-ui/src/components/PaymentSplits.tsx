@@ -226,12 +226,12 @@ export function PaymentSplits({ flow, success }: { flow: PaymentFlow; success: b
   // activation transaction instead of a misleading $0 flow.
   if (parsed.kind === "authenticate") {
     const receipt = parseReceipt(flow);
-    const periodStart = fmtDate(receipt?.periodStartTs);
-    const periodEnd = fmtDate(receipt?.periodEndTs);
+    const periodStart = fmtDate(receipt?.periodStart);
+    const periodEnd = fmtDate(receipt?.periodEnd);
     const isSubscription = !!(
       receipt?.subscriptionId ||
-      receipt?.planId ||
-      receipt?.periodEndTs
+      receipt?.subscriptionDelegation ||
+      receipt?.periodEnd
     );
     const title = isSubscription ? "Subscription Access" : "Wallet Sign-In";
     const note = isSubscription
@@ -258,11 +258,14 @@ export function PaymentSplits({ flow, success }: { flow: PaymentFlow; success: b
                 </a>
               </div>
             )}
-            {receipt?.planId && (
+            {receipt?.subscriptionDelegation && (
               <div className="signin-row">
-                <span className="signin-row-label">Plan</span>
-                <span className="signin-row-value" title={receipt.planId}>
-                  {shortAddr(receipt.planId)}
+                <span className="signin-row-label">Delegation</span>
+                <span
+                  className="signin-row-value"
+                  title={receipt.subscriptionDelegation}
+                >
+                  {shortAddr(receipt.subscriptionDelegation)}
                 </span>
               </div>
             )}

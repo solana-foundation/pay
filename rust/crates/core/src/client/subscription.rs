@@ -14,11 +14,10 @@
 //! authoritative wire shapes.
 
 use pay_kit::mpp::client::{
-    BuildSubscriptionActivationOptions, SubscriptionMethodDetails,
-    build_subscription_activation_transaction_with_options,
+    SubscriptionMethodDetails, build_subscription_access_credential,
+    build_subscription_activation_credential,
 };
 use pay_kit::mpp::format_authorization;
-use pay_kit::mpp::protocol::core::PaymentCredential;
 use pay_kit::mpp::protocol::intents::{
     SubscriptionPeriodUnit, SubscriptionReceiptExtensions, SubscriptionRequest,
 };
@@ -74,12 +73,11 @@ pub struct BuiltCredential {
     pub resource_url: Option<String>,
     /// Human-readable description echoed from the challenge.
     pub description: Option<String>,
-    /// `Authorization: Payment …` header signed against the bundled
-    /// `authenticate` challenge (when present in the 402). Populated by
-    /// [`build_credential`] when called with an authenticate challenge so
-    /// the post-activation persistence step caches it for re-use.
+    /// Reusable `Authorization: Payment …` subscription bearer proof.
+    /// Stored after activation and attached to later requests.
     pub authenticate_token: Option<String>,
-    /// Server-set RFC 3339 expiration of [`Self::authenticate_token`].
+    /// Legacy SIWMPP expiry. Subscription proofs instead use the
+    /// subscription-level `subscriptionExpires`, when configured.
     pub authenticate_expires_at: Option<String>,
 }
 
@@ -130,12 +128,12 @@ pub fn decode(challenge: &Challenge) -> Result<DecodedSubscriptionChallenge> {
     let method_details = SubscriptionMethodDetails::from_json(&method_details_value)
         .map_err(|e| Error::Mpp(format!("Invalid subscription methodDetails: {e}")))?;
 
-    // The Solana profile uses on-chain Plan PDAs; the SDK reads `planId` from
+    // The Solana profile uses on-chain Plan PDAs; the SDK reads `planAddress` from
     // methodDetails. We keep validation strict so a misconfigured challenge
     // fails before the user pays.
-    if method_details.plan_id.is_empty() {
+    if method_details.plan_address.is_empty() {
         return Err(Error::Mpp(
-            "Subscription challenge missing methodDetails.planId".into(),
+            "Subscription challenge missing methodDetails.planAddress".into(),
         ));
     }
 
@@ -313,7 +311,7 @@ pub fn build_credential_with_authenticate_and_override(
     info!(
         amount = %decoded.amount_base_units,
         currency = %decoded.currency_label,
-        plan = %decoded.method_details.plan_id,
+        plan = %decoded.method_details.plan_address,
         network = %network,
         %rpc_url,
         signer = %subscriber,
@@ -337,45 +335,32 @@ pub fn build_credential_with_authenticate_and_override(
         }
     }
 
-    let payload = rt
-        .block_on(build_subscription_activation_transaction_with_options(
-            &signer,
-            &rpc,
-            &decoded.method_details,
-            BuildSubscriptionActivationOptions {
-                external_id: decoded.request.external_id.clone(),
-                ..Default::default()
-            },
+    let activation = rt
+        .block_on(build_subscription_activation_credential(
+            &signer, &rpc, challenge,
         ))
         .map_err(|e| Error::Mpp(format!("Failed to build activation transaction: {e}")))?;
 
-    let credential = PaymentCredential::new(challenge.to_echo(), payload);
-    let authorization = format_authorization(&credential)
+    let authorization = format_authorization(&activation.credential)
         .map_err(|e| Error::Mpp(format!("Failed to format subscription credential: {e}")))?;
+
+    let access_credential = build_subscription_access_credential(
+        challenge,
+        activation.subscription_delegation,
+        activation.authentication,
+    );
+    let subscription_token = format_authorization(&access_credential)
+        .map_err(|e| Error::Mpp(format!("Failed to format subscription bearer proof: {e}")))?;
 
     // Account name resolution: the override wins, else we re-read the
     // resolver the signer used. We need this for persistence so the
     // subscription row lands under the right `(network, account)` tuple.
     let account_name = resolve_account_name(store, &network, account_override)?;
 
-    // Sign the SIWMPP authenticate challenge with the SAME unlocked
-    // signer when present. We do this immediately so the user doesn't
-    // re-prompt later, and so the persistence step can cache the token
-    // in the same row as the freshly-activated subscription.
-    let (authenticate_token, authenticate_expires_at) = match authenticate_challenge {
-        Some(auth) => match sign_authenticate(&rt, &signer, auth, &decoded.method_details) {
-            Ok((header, expiry)) => (Some(header), Some(expiry)),
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    "Subscription activation signed, but SIWMPP authenticate signing failed — \
-                     server will re-issue a 402 with a fresh authenticate challenge on next call"
-                );
-                (None, None)
-            }
-        },
-        None => (None, None),
-    };
+    // Retain the argument for source compatibility with callers that still
+    // collect the legacy companion challenge. The canonical subscription
+    // proof above replaces that extra signing flow.
+    let _ = authenticate_challenge;
 
     Ok(BuiltCredential {
         authorization,
@@ -386,46 +371,9 @@ pub fn build_credential_with_authenticate_and_override(
         ephemeral_notice,
         resource_url: resource_url.map(str::to_string),
         description: extract_description(challenge),
-        authenticate_token,
-        authenticate_expires_at,
+        authenticate_token: Some(subscription_token),
+        authenticate_expires_at: None,
     })
-}
-
-/// Sign a SIWMPP `authenticate` challenge with the same signer the
-/// activation tx used. Returns (Authorization header, expires_at).
-fn sign_authenticate(
-    rt: &tokio::runtime::Runtime,
-    signer: &dyn SolanaSigner,
-    challenge: &Challenge,
-    method_details: &SubscriptionMethodDetails,
-) -> Result<(String, String)> {
-    use pay_kit::mpp::program::subscriptions::{
-        default_program_id, find_subscription_pda, parse_pubkey,
-    };
-
-    let plan_pubkey = parse_pubkey(&method_details.plan_id, "planId")
-        .map_err(|e| Error::Mpp(format!("Invalid planId for authenticate: {e}")))?;
-    let program_pubkey = match method_details.program_id.as_deref() {
-        Some(p) => parse_pubkey(p, "programId")
-            .map_err(|e| Error::Mpp(format!("Invalid programId for authenticate: {e}")))?,
-        None => default_program_id(),
-    };
-    let (subscription_pda, _) =
-        find_subscription_pda(&plan_pubkey, &signer.pubkey(), &program_pubkey);
-
-    let header = rt
-        .block_on(pay_kit::mpp::client::build_authenticate_credential_header(
-            signer,
-            challenge,
-            &subscription_pda.to_string(),
-        ))
-        .map_err(|e| Error::Mpp(format!("Failed to build authenticate credential: {e}")))?;
-
-    let request: pay_kit::mpp::AuthenticateRequest = challenge
-        .request
-        .decode()
-        .map_err(|e| Error::Mpp(format!("Decoding authenticate request: {e}")))?;
-    Ok((header, request.expiration_time))
 }
 
 /// Parse a `Payment-Receipt` header into a [`Subscription`] and persist it
@@ -435,13 +383,9 @@ fn sign_authenticate(
 /// intended to be called immediately after the retry sees a 2xx response so
 /// we record the freshly-activated subscription before any further work.
 ///
-/// The standard pay-kit `Receipt` struct does not yet model subscription
-/// extension fields (`subscriptionId`, `periodIndex`, `periodStartTs`,
-/// `periodEndTs`, `expiresAt`). We therefore parse the base64url-encoded
-/// receipt JSON directly here, extracting both the standard fields and the
-/// subscription-extension fields the spec adds. A follow-up should widen
-/// `pay_kit::mpp::Receipt` to include a `metadata` map and drop this local
-/// parsing.
+/// The SDK's typed receipt parser validates the canonical extension fields:
+/// `subscriptionId`, `subscriptionDelegation`, `periodIndex`, `periodStart`,
+/// `periodEnd`, and optional `expiresAt`.
 pub fn persist_from_receipt(
     built: &BuiltCredential,
     receipt_header: &str,
@@ -502,14 +446,15 @@ fn subscription_from_built_and_extensions(
 ) -> Subscription {
     Subscription {
         subscription_id: parsed.extensions.subscription_id.clone(),
-        plan_id: parsed.extensions.plan_id.clone(),
-        program_id: if built.decoded.method_details.program_id.as_deref()
+        subscription_delegation: Some(parsed.extensions.subscription_delegation.clone()),
+        plan_id: built.decoded.method_details.plan_address.clone(),
+        program_id: if built.decoded.method_details.subscription_program.as_deref()
             == Some(pay_kit::mpp::program::subscriptions::SUBSCRIPTIONS_PROGRAM_ID)
-            || built.decoded.method_details.program_id.is_none()
+            || built.decoded.method_details.subscription_program.is_none()
         {
             None
         } else {
-            built.decoded.method_details.program_id.clone()
+            built.decoded.method_details.subscription_program.clone()
         },
         mint: built.decoded.method_details.mint.clone(),
         currency: Some(built.decoded.currency_label.clone()),
@@ -523,13 +468,9 @@ fn subscription_from_built_and_extensions(
         activated_at: parsed
             .timestamp
             .clone()
-            .unwrap_or_else(|| parsed.extensions.period_start_ts.clone()),
-        activation_signature: parsed
-            .extensions
-            .activation_signature
-            .clone()
-            .unwrap_or_default(),
-        last_charged_period: parsed.extensions.period_index.parse::<u64>().ok(),
+            .unwrap_or_else(|| parsed.extensions.period_start.clone()),
+        activation_signature: parsed.reference.clone(),
+        last_charged_period: Some(parsed.extensions.period_index),
         expires_at: parsed.extensions.expires_at.clone(),
         resource_url: built.resource_url.clone(),
         description: built.description.clone(),
@@ -557,12 +498,13 @@ fn period_unit_name(unit: SubscriptionPeriodUnit) -> &'static str {
     }
 }
 
-/// Derive the deterministic `subscription_id` (the `SubscriptionDelegation`
-/// PDA) from a [`BuiltCredential`] and persist a fresh `Subscription` entry
+/// Derive the `SubscriptionDelegation` PDA from a [`BuiltCredential`] and
+/// persist a fresh `Subscription` entry
 /// into `accounts.yml`. Used by every activation path that doesn't see the
 /// `Payment-Receipt` header (curl/wget/httpie wrappers, the MCP curl tool)
 /// — the receipt would otherwise be the authoritative source of the
-/// `subscription_id`. A best-effort `getSignaturesForAddress` against the
+/// opaque `subscriptionId`. In this fallback record the PDA is also used as a
+/// legacy local identifier. A best-effort `getSignaturesForAddress` against the
 /// freshly-created PDA backfills the activation signature; if that fails
 /// (RPC blip, indexer lag) it stays empty and `pay subscriptions refresh`
 /// can reconcile later.
@@ -574,13 +516,13 @@ pub fn persist_local_subscription_after_activation(
         SUBSCRIPTIONS_PROGRAM_ID, default_program_id, find_subscription_pda, parse_pubkey,
     };
 
-    let program_id = match built.decoded.method_details.program_id.as_deref() {
-        Some(p) => parse_pubkey(p, "programId")
-            .map_err(|e| Error::Mpp(format!("Invalid programId: {e}")))?,
+    let program_id = match built.decoded.method_details.subscription_program.as_deref() {
+        Some(p) => parse_pubkey(p, "subscriptionProgram")
+            .map_err(|e| Error::Mpp(format!("Invalid subscriptionProgram: {e}")))?,
         None => default_program_id(),
     };
-    let plan_pda = parse_pubkey(&built.decoded.method_details.plan_id, "planId")
-        .map_err(|e| Error::Mpp(format!("Invalid planId: {e}")))?;
+    let plan_pda = parse_pubkey(&built.decoded.method_details.plan_address, "planAddress")
+        .map_err(|e| Error::Mpp(format!("Invalid planAddress: {e}")))?;
     let subscriber = parse_pubkey(&built.subscriber, "subscriber")
         .map_err(|e| Error::Mpp(format!("Invalid subscriber: {e}")))?;
     let (subscription_pda, _) = find_subscription_pda(&plan_pda, &subscriber, &program_id);
@@ -591,14 +533,15 @@ pub fn persist_local_subscription_after_activation(
 
     let subscription = crate::accounts::Subscription {
         subscription_id: subscription_pda.to_string(),
-        plan_id: built.decoded.method_details.plan_id.clone(),
-        program_id: if built.decoded.method_details.program_id.as_deref()
+        subscription_delegation: Some(subscription_pda.to_string()),
+        plan_id: built.decoded.method_details.plan_address.clone(),
+        program_id: if built.decoded.method_details.subscription_program.as_deref()
             == Some(SUBSCRIPTIONS_PROGRAM_ID)
-            || built.decoded.method_details.program_id.is_none()
+            || built.decoded.method_details.subscription_program.is_none()
         {
             None
         } else {
-            built.decoded.method_details.program_id.clone()
+            built.decoded.method_details.subscription_program.clone()
         },
         mint: built.decoded.method_details.mint.clone(),
         currency: Some(built.decoded.currency_label.clone()),
@@ -736,7 +679,8 @@ mod tests {
             "externalId": PLAN,
             "description": "Pro feed",
             "methodDetails": {
-                "planId": PLAN,
+                "planAddress": PLAN,
+                "subscriptionProgram": pay_kit::mpp::program::subscriptions::SUBSCRIPTIONS_PROGRAM_ID,
                 "mint": MINT,
                 "tokenProgram": TOKEN_PROGRAM,
                 "puller": PULLER,
@@ -795,7 +739,7 @@ mod tests {
         assert_eq!(decoded.amount_base_units, "10000000");
         assert_eq!(decoded.period_unit, SubscriptionPeriodUnit::Day);
         assert_eq!(decoded.period_count, 30);
-        assert_eq!(decoded.method_details.plan_id, PLAN);
+        assert_eq!(decoded.method_details.plan_address, PLAN);
         assert_eq!(decoded.network, "mainnet");
         // USDC mainnet mint resolves to the symbol.
         assert_eq!(decoded.currency_label, "USDC");
@@ -830,7 +774,13 @@ mod tests {
             "periodUnit": "month",
             "periodCount": "1",
             "recipient": RECIPIENT,
-            "methodDetails": {"planId": PLAN, "mint": MINT, "tokenProgram": TOKEN_PROGRAM, "puller": PULLER},
+            "methodDetails": {
+                "planAddress": PLAN,
+                "subscriptionProgram": pay_kit::mpp::program::subscriptions::SUBSCRIPTIONS_PROGRAM_ID,
+                "mint": MINT,
+                "tokenProgram": TOKEN_PROGRAM,
+                "puller": PULLER
+            },
         });
         let b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&request).unwrap());
         let header = format!(
@@ -852,7 +802,8 @@ mod tests {
             "periodCount": "30",
             "recipient": RECIPIENT,
             "methodDetails": {
-                "planId": PLAN,
+                "planAddress": PLAN,
+                "subscriptionProgram": pay_kit::mpp::program::subscriptions::SUBSCRIPTIONS_PROGRAM_ID,
                 "mint": "Bonk1111111111111111111111111111111111111111",
                 "tokenProgram": TOKEN_PROGRAM,
                 "puller": PULLER,
@@ -898,10 +849,10 @@ mod tests {
             "timestamp": "2026-01-15T12:03:10Z",
             "reference": "5J8signature",
             "subscriptionId": "BXQGmO5VwTrl5RfFr6Y8XQZ4nPj9QqMOiKkRn3pZ4ZE",
-            "planId": PLAN,
-            "periodIndex": "0",
-            "periodStartTs": "2026-01-15T12:03:10Z",
-            "periodEndTs": "2026-02-14T12:03:10Z",
+            "subscriptionDelegation": "De1egation11111111111111111111111111111111",
+            "periodIndex": 0,
+            "periodStart": "2026-01-15T12:03:10Z",
+            "periodEnd": "2026-02-14T12:03:10Z",
             "expiresAt": "2026-07-14T12:00:00Z",
         });
         let header = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
@@ -912,8 +863,11 @@ mod tests {
             parsed.extensions.subscription_id,
             "BXQGmO5VwTrl5RfFr6Y8XQZ4nPj9QqMOiKkRn3pZ4ZE"
         );
-        assert_eq!(parsed.extensions.plan_id, PLAN);
-        assert_eq!(parsed.extensions.period_index, "0");
+        assert_eq!(
+            parsed.extensions.subscription_delegation,
+            "De1egation11111111111111111111111111111111"
+        );
+        assert_eq!(parsed.extensions.period_index, 0);
         assert_eq!(
             parsed.extensions.expires_at.as_deref(),
             Some("2026-07-14T12:00:00Z")

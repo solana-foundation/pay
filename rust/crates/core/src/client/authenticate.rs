@@ -1,14 +1,13 @@
-//! Pay-side helpers for the MPP `authenticate` intent (SIWMPP).
+//! Pay-side helpers for cached subscription bearer credentials.
 //!
-//! Pairs with [`crate::server::authenticate`] on the server side: a
-//! subscription-gated endpoint emits both a `subscription` and an
-//! `authenticate` challenge in its 402 response, plus a fresh
-//! `authenticate` challenge in the success response of a successful
-//! activation. The helpers in this module let pay clients:
+//! Current clients retain the signed `type="proof"` credential from a
+//! successful subscription activation and reuse it directly. The legacy
+//! SIWMPP helpers remain here so existing account files and older servers keep
+//! working during migration. This module lets pay clients:
 //!
-//! - extract the authenticate challenge from a multi-WWW-Authenticate
+//! - extract a legacy authenticate challenge from a multi-WWW-Authenticate
 //!   header set ([`pick_authenticate_challenge`]),
-//! - sign a credential against it and persist the resulting
+//! - sign a legacy credential against it and persist the resulting
 //!   `Authorization: Payment …` header for re-use across requests
 //!   ([`sign_and_persist`]),
 //! - look up a previously-cached header for a given resource URL
@@ -147,8 +146,8 @@ pub fn persist_token(
 }
 
 /// Look up a cached `Authorization: Payment …` header for the given
-/// resource URL. Returns `Some(header)` when a tracked subscription
-/// matches the URL AND has a non-expired token, `None` otherwise.
+/// resource URL. Supports both the canonical subscription proof and legacy
+/// SIWMPP credentials stored by older clients.
 ///
 /// The URL match is prefix-based: a stored subscription's
 /// `resource_url` matches any request URL that starts with it. This
@@ -221,8 +220,12 @@ fn is_token_usable_for(
     if !url_is_sub_resource(resource_url, stored_url) {
         return false;
     }
-    let Some(expires_at) = sub.authenticate_expires_at.as_deref() else {
-        return false;
+    let expires_at = sub
+        .authenticate_expires_at
+        .as_deref()
+        .or(sub.expires_at.as_deref());
+    let Some(expires_at) = expires_at else {
+        return true;
     };
     match chrono::DateTime::parse_from_rfc3339(expires_at) {
         Ok(t) => t.with_timezone(&chrono::Utc) > now,
@@ -245,6 +248,7 @@ mod tests {
     ) -> Subscription {
         Subscription {
             subscription_id: id.to_string(),
+            subscription_delegation: None,
             plan_id: "Amp9FrnEX17tVeZ7QnHX1Hh4TynhH4sXLRSde797vdKR".to_string(),
             program_id: None,
             mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),
@@ -309,6 +313,24 @@ mod tests {
         let store = store_with(sub);
         let hit = cached_header_for_resource(&store, "https://api.example.com/v1/resource");
         assert_eq!(hit.as_deref(), Some(token));
+    }
+
+    #[test]
+    fn cached_subscription_proof_without_legacy_expiry_is_usable() {
+        let token = "Payment canonical-subscription-proof";
+        let sub = make_sub(
+            "opaque-subscription-id",
+            Some("https://api.example.com/v1"),
+            Some(token),
+            None,
+            SubscriptionStatus::Active,
+        );
+        let store = store_with(sub);
+
+        assert_eq!(
+            cached_header_for_resource(&store, "https://api.example.com/v1/resource").as_deref(),
+            Some(token)
+        );
     }
 
     #[test]

@@ -56,6 +56,7 @@ fn defaults<'a>() -> sub_server::OperatorDefaults<'a> {
         realm: Some("test-realm"),
         fee_payer: false,
         fee_payer_signer: None,
+        store: Some(std::sync::Arc::new(pay_kit::mpp::store::MemoryStore::new())),
     }
 }
 
@@ -78,7 +79,7 @@ fn server_built_challenge_round_trips_through_client_classify_and_decode() {
     //    server's `methodDetails` shape matches what the client expects —
     //    they were authored independently and could drift.
     let decoded = sub_client::decode(&challenge).expect("decode");
-    assert_eq!(decoded.method_details.plan_id, PLAN);
+    assert_eq!(decoded.method_details.plan_address, PLAN);
     assert_eq!(decoded.method_details.puller, OPERATOR);
     assert_eq!(decoded.amount_base_units, "9990000");
     assert_eq!(decoded.period_count, 30);
@@ -94,10 +95,10 @@ fn receipt_parser_extracts_subscription_extensions() {
         "timestamp": "2026-05-29T12:03:10Z",
         "reference": "5J8signature",
         "subscriptionId": "BXQGmO5VwTrl5RfFr6Y8XQZ4nPj9QqMOiKkRn3pZ4ZE",
-        "planId": PLAN,
-        "periodIndex": "0",
-        "periodStartTs": "2026-05-29T12:03:10Z",
-        "periodEndTs": "2026-06-28T12:03:10Z",
+        "subscriptionDelegation": "De1egation11111111111111111111111111111111",
+        "periodIndex": 0,
+        "periodStart": "2026-05-29T12:03:10Z",
+        "periodEnd": "2026-06-28T12:03:10Z",
     });
     let header = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
     let parsed = sub_client::parse_subscription_receipt(&header).expect("receipt");
@@ -107,8 +108,11 @@ fn receipt_parser_extracts_subscription_extensions() {
         parsed.extensions.subscription_id,
         "BXQGmO5VwTrl5RfFr6Y8XQZ4nPj9QqMOiKkRn3pZ4ZE"
     );
-    assert_eq!(parsed.extensions.plan_id, PLAN);
-    assert_eq!(parsed.extensions.period_index, "0");
+    assert_eq!(
+        parsed.extensions.subscription_delegation,
+        "De1egation11111111111111111111111111111111"
+    );
+    assert_eq!(parsed.extensions.period_index, 0);
 }
 
 #[test]
@@ -138,6 +142,7 @@ fn persistence_round_trip_through_memory_store() {
 
     let subscription = Subscription {
         subscription_id: "BXQGmO5VwTrl5RfFr6Y8XQZ4nPj9QqMOiKkRn3pZ4ZE".to_string(),
+        subscription_delegation: Some("De1egation11111111111111111111111111111111".to_string()),
         plan_id: PLAN.to_string(),
         program_id: None,
         mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),

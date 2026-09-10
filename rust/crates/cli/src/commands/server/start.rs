@@ -841,6 +841,7 @@ struct AppState {
     browser_rpc_url: Option<String>,
     fee_payer_wallet: Option<FeePayerWallet>,
     fee_payer_signer: Option<Arc<dyn SolanaSigner>>,
+    subscription_store: Arc<dyn pay_kit::mpp::store::Store>,
     x402: Option<pay_kit::x402::server::X402>,
     x402_upto: Option<pay_kit::x402::server::X402Upto>,
     x402_batch: Option<pay_kit::x402::server::X402BatchSettlement>,
@@ -877,6 +878,9 @@ impl PaymentState for AppState {
     }
     fn fee_payer_signer(&self) -> Option<Arc<dyn SolanaSigner>> {
         self.fee_payer_signer.clone()
+    }
+    fn subscription_store(&self) -> Option<Arc<dyn pay_kit::mpp::store::Store>> {
+        Some(Arc::clone(&self.subscription_store))
     }
     fn x402(&self) -> Option<&pay_kit::x402::server::X402> {
         self.x402.as_ref()
@@ -2426,6 +2430,7 @@ impl StartCommand {
                 browser_rpc_url: Some(BROWSER_RPC_PROXY_PATH.to_string()),
                 fee_payer_wallet,
                 fee_payer_signer: fee_payer_signer.clone(),
+                subscription_store: Arc::new(pay_kit::mpp::store::MemoryStore::new()),
                 x402,
                 x402_upto,
                 x402_batch,

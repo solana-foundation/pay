@@ -4,12 +4,9 @@
 //! (`pay_types::metering::SubscriptionEndpoint`) and the SDK's
 //! `pay_kit::mpp::server::SubscriptionServer`.
 //!
-//! v0 covers challenge emission. The activation-credential verification
-//! path is delegated to a follow-up because pay-kit's Rust SDK does not yet
-//! ship a verify implementation for the subscription intent — the
-//! TypeScript SDK does, and a port is queued. Until then,
-//! [`verify_activation`] returns a `not_implemented` error that the
-//! middleware surfaces as a 501.
+//! The SDK verifies activation transactions, confirms their on-chain state,
+//! binds the signed proof only after confirmation, and revalidates the live
+//! delegation for subsequent bearer-proof access.
 
 use std::str::FromStr;
 
@@ -58,6 +55,9 @@ pub struct OperatorDefaults<'a> {
     /// with it before broadcasting. The middleware threads it through
     /// from `PaymentState::fee_payer_signer`.
     pub fee_payer_signer: Option<std::sync::Arc<dyn pay_kit::mpp::solana_keychain::SolanaSigner>>,
+    /// Process-lifetime storage for activation reservations and proof bindings.
+    /// Every handler rebuilt for this endpoint must share this instance.
+    pub store: Option<std::sync::Arc<dyn pay_kit::mpp::store::Store>>,
 }
 
 /// Resolve `(amount_base_units, decimals, mint_b58)` from the endpoint
@@ -194,7 +194,7 @@ pub fn build_handler(
         } else {
             None
         },
-        store: None,
+        store: defaults.store.clone(),
         // The on-chain Plan terms (numeric id, bump, created_at) are
         // populated by pay-side spec/yaml plumbing; for now we leave
         // them None and the client falls back to RPC-fetching the Plan.
@@ -545,6 +545,7 @@ mod tests {
             realm: Some("test-realm"),
             fee_payer: false,
             fee_payer_signer: None,
+            store: Some(std::sync::Arc::new(pay_kit::mpp::store::MemoryStore::new())),
         }
     }
 

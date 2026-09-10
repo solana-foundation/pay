@@ -36,7 +36,7 @@ impl RefreshCommand {
 
         // Collect candidates up front; `all_subscriptions` borrows
         // immutably and we need to write back via `upsert_subscription`.
-        let candidates: Vec<(String, String, String, String)> = accounts
+        let candidates: Vec<(String, String, String, String, String)> = accounts
             .all_subscriptions()
             .filter(|(net, name, sub)| {
                 self.network.as_deref().map(|n| n == *net).unwrap_or(true)
@@ -48,6 +48,7 @@ impl RefreshCommand {
                     net.to_string(),
                     name.to_string(),
                     sub.subscription_id.clone(),
+                    sub.delegation_address().to_string(),
                     sub.network.clone(),
                 )
             })
@@ -65,8 +66,8 @@ impl RefreshCommand {
 
         let mut updated = 0usize;
         let mut failed = 0usize;
-        for (net, account_name, sub_id, sub_network) in candidates {
-            match lookup_activation_signature(&sub_network, &sub_id, self.rpc_url.as_deref()) {
+        for (net, account_name, sub_id, delegation, sub_network) in candidates {
+            match lookup_activation_signature(&sub_network, &delegation, self.rpc_url.as_deref()) {
                 Some(sig) => {
                     // Reload-and-update-in-place is overkill — the entry
                     // is still in the in-memory `accounts` map. Pull it,

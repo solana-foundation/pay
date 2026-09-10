@@ -78,6 +78,13 @@ pub trait PaymentState: Clone + Send + Sync + 'static {
         None
     }
 
+    /// Store used to bind a confirmed subscription activation to its reusable
+    /// bearer proof. Hosts must return the same store across requests; otherwise
+    /// a proof accepted during activation cannot be recognized on later access.
+    fn subscription_store(&self) -> Option<Arc<dyn pay_kit::mpp::store::Store>> {
+        None
+    }
+
     /// x402 `exact` handler, when the server accepts x402 payments.
     fn x402(&self) -> Option<&pay_kit::x402::server::X402> {
         None

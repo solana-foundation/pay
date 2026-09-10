@@ -46,7 +46,8 @@ const DIRECT_PATH_MIN_LAMPORTS: u64 = 50_000;
 
 #[derive(clap::Args)]
 pub struct CancelCommand {
-    /// Base58 `subscription_id` to cancel.
+    /// Locally stored subscription id to cancel. Current receipts use an opaque
+    /// id; legacy records may use the base58 delegation PDA.
     pub subscription_id: String,
 
     /// Skip the on-chain cancel transaction and only flip the local
@@ -119,8 +120,9 @@ impl CancelCommand {
             }
             None => default_program_id(),
         };
-        let subscription_pda = parse_pubkey(&subscription.subscription_id, "subscription_id")
-            .map_err(|e| pay_core::Error::Config(e.to_string()))?;
+        let subscription_pda =
+            parse_pubkey(subscription.delegation_address(), "subscription_delegation")
+                .map_err(|e| pay_core::Error::Config(e.to_string()))?;
         let plan_pda = parse_pubkey(&subscription.plan_id, "plan_id")
             .map_err(|e| pay_core::Error::Config(e.to_string()))?;
         let (event_authority, _) = find_event_authority_pda(&program_id);

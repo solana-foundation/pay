@@ -1,8 +1,6 @@
 import type { PaymentFlow } from "../types";
 
-/** Decoded `payment-receipt` response header. Fields vary by pattern:
- *  per-call charges carry `settlementSignature`/`signature`, subscriptions
- *  carry `activationSignature` plus plan/period metadata. */
+/** Decoded `payment-receipt` response header. Fields vary by pattern. */
 export interface Receipt {
   status?: string;
   method?: string;
@@ -27,10 +25,11 @@ export interface Receipt {
     settlementSignature?: string;
   };
   subscriptionId?: string;
-  planId?: string;
-  periodIndex?: string;
-  periodStartTs?: string;
-  periodEndTs?: string;
+  subscriptionDelegation?: string;
+  periodIndex?: number;
+  periodStart?: string;
+  periodEnd?: string;
+  expiresAt?: string;
   reference?: string;
   timestamp?: string;
 }
@@ -76,10 +75,7 @@ export function parseReceipt(flow: PaymentFlow): Receipt | null {
   return { reference: header };
 }
 
-/** Best settlement transaction signature for a receipt, across patterns.
- *  Per-call charges put the settlement signature in `reference`; that's the
- *  last fallback so subscriptions (whose `reference` is the subscriptionId,
- *  not a tx) still resolve to `activationSignature` first. */
+/** Best settlement transaction signature for a receipt, across patterns. */
 export function receiptSignature(receipt: Receipt | null): string | null {
   if (!receipt) return null;
   return (
