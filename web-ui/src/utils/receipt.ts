@@ -75,14 +75,40 @@ export function parseReceipt(flow: PaymentFlow): Receipt | null {
   return { reference: header };
 }
 
-/** Best settlement transaction signature for a receipt, across patterns. */
-export function receiptSignature(receipt: Receipt | null): string | null {
-  if (!receipt) return null;
+/** Whether this flow used a reusable subscription proof rather than activation. */
+export function isSubscriptionAccessReceipt(
+  flow: PaymentFlow,
+  receipt: Receipt | null,
+): boolean {
   const isSubscription = !!(
-    receipt.subscriptionId ||
-    receipt.subscriptionDelegation ||
-    receipt.periodEnd
+    receipt?.subscriptionId ||
+    receipt?.subscriptionDelegation ||
+    receipt?.periodEnd
   );
+  if (!isSubscription) return false;
+
+  const authorization = Object.entries(flow.paymentHeaders ?? {}).find(
+    ([name]) => name.toLowerCase() === "authorization",
+  )?.[1];
+  const encoded = authorization?.replace(/^Payment\s+/i, "").trim();
+  const decoded = encoded ? base64urlDecode(encoded) : "";
+  if (!decoded) return false;
+  try {
+    const credential = JSON.parse(decoded) as {
+      payload?: { type?: unknown };
+    };
+    return credential.payload?.type === "proof";
+  } catch {
+    return false;
+  }
+}
+
+/** Best settlement transaction signature for a receipt, across patterns. */
+export function receiptSignature(
+  receipt: Receipt | null,
+  includeReference = true,
+): string | null {
+  if (!receipt) return null;
   return (
     receipt.settlementSignature ||
     receipt.settlementTransaction ||
@@ -99,7 +125,7 @@ export function receiptSignature(receipt: Receipt | null): string | null {
     receipt.receipt?.transaction ||
     receipt.receipt?.transactionId ||
     receipt.activationSignature ||
-    (!isSubscription ? receipt.reference : null) ||
+    (includeReference ? receipt.reference : null) ||
     null
   );
 }
