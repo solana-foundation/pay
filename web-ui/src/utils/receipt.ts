@@ -78,6 +78,11 @@ export function parseReceipt(flow: PaymentFlow): Receipt | null {
 /** Best settlement transaction signature for a receipt, across patterns. */
 export function receiptSignature(receipt: Receipt | null): string | null {
   if (!receipt) return null;
+  const isSubscription = !!(
+    receipt.subscriptionId ||
+    receipt.subscriptionDelegation ||
+    receipt.periodEnd
+  );
   return (
     receipt.settlementSignature ||
     receipt.settlementTransaction ||
@@ -94,7 +99,7 @@ export function receiptSignature(receipt: Receipt | null): string | null {
     receipt.receipt?.transaction ||
     receipt.receipt?.transactionId ||
     receipt.activationSignature ||
-    receipt.reference ||
+    (!isSubscription ? receipt.reference : null) ||
     null
   );
 }

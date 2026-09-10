@@ -61,6 +61,26 @@ describe("receipt parsing", () => {
     expect(receiptSignature(receipt)).toBe("direct-settlement-signature");
   });
 
+  it("does not treat a subscription reference as a transaction signature", () => {
+    expect(
+      receiptSignature({
+        periodEnd: "2026-10-10T00:00:00Z",
+        reference: "subscription-delegation-pda",
+        subscriptionDelegation: "subscription-delegation-pda",
+      }),
+    ).toBeNull();
+  });
+
+  it("uses the activation signature for subscription activation receipts", () => {
+    expect(
+      receiptSignature({
+        activationSignature: "activation-signature",
+        reference: "subscription-delegation-pda",
+        subscriptionDelegation: "subscription-delegation-pda",
+      }),
+    ).toBe("activation-signature");
+  });
+
   it("matches receipt headers case-insensitively", () => {
     const receipt = parseReceipt(
       flowWithHeaders({
