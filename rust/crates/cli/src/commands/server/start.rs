@@ -2976,7 +2976,7 @@ async fn ensure_subscription_plans(
     use dialoguer::Confirm;
     use dialoguer::theme::ColorfulTheme;
     use pay_core::server::subscription::{
-        PlanStatus, check_plan_exists, compute_plan_id_numeric, publish_plan,
+        PlanStatus, check_plan_exists, compute_plan_id_numeric, fetch_plan_created_at, publish_plan,
     };
     use pay_kit::mpp::program::subscriptions::{default_program_id, find_plan_pda, plan_id_seed};
     use solana_pubkey::Pubkey;
@@ -3068,12 +3068,23 @@ async fn ensure_subscription_plans(
                     plan = %plan_pda,
                     "subscription Plan already on-chain — reusing",
                 );
+                let plan_created_at = fetch_plan_created_at(rpc_url, &plan_pda).await?;
                 sub_spec.plan_id = Some(plan_pda.to_string());
                 sub_spec.plan_id_numeric = Some(plan_id_numeric);
                 sub_spec.plan_bump = Some(plan_bump);
-                // created_at we cannot determine without an extra RPC fetch;
-                // leave any existing YAML value untouched. The client falls
-                // back to fetching the Plan when this is None.
+                sub_spec.plan_created_at = Some(plan_created_at);
+                // A fresh demo directory has no pinned Plan metadata even when
+                // its deterministic PDA already exists from an earlier run.
+                // Persist the hydrated fields so this launch and subsequent
+                // launches emit a complete, settle-able challenge.
+                publications.push(pay_core::server::subscription::PublishedPlan {
+                    endpoint_path: endpoint.path.clone(),
+                    plan_id_numeric,
+                    plan_pda: plan_pda.to_string(),
+                    plan_bump,
+                    plan_created_at,
+                    broadcast_signature: None,
+                });
             }
             PlanStatus::WrongOwner { actual_owner } => {
                 return Err(pay_core::Error::Config(format!(

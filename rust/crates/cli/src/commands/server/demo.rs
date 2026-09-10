@@ -1,12 +1,12 @@
 //! `pay server demo` — start the gateway with a bundled demo paywall.
 //!
-//! Extracts the embedded payment-debugger.yml to `./pay-demo.yaml` in the
+//! Extracts the embedded playground API spec to `./pay-demo.yaml` in the
 //! current working directory, then invokes `pay gate api` with sandbox and
 //! debugger implied.
 
 use crate::commands::server::start::StartCommand;
 
-const DEMO_PAYWALL: &str = include_str!("payment-debugger.yml");
+const DEMO_PAYWALL: &str = include_str!("../../../../../playground-api.yaml");
 
 #[derive(clap::Args)]
 pub struct DemoCommand {
@@ -38,10 +38,17 @@ impl DemoCommand {
         account_override: Option<&str>,
         _sandbox: bool,
     ) -> pay_core::Result<()> {
-        // Extract the embedded paywall to ./pay-demo.yaml.
+        // Keep the generated file after first launch: subscription Plan
+        // publication writes its PDA and immutable terms back into this YAML,
+        // and the challenge-binding secret must remain stable for bearer reuse.
         let paywall_path = std::path::PathBuf::from("pay-demo.yaml");
-        std::fs::write(&paywall_path, DEMO_PAYWALL)
-            .map_err(|e| pay_core::Error::Config(format!("Failed to write pay-demo.yaml: {e}")))?;
+        if !paywall_path.exists() {
+            let challenge_secret = bs58::encode(rand::random::<[u8; 32]>()).into_string();
+            let rendered = DEMO_PAYWALL.replace("${MPP_SECRET_KEY}", &challenge_secret);
+            std::fs::write(&paywall_path, rendered).map_err(|e| {
+                pay_core::Error::Config(format!("Failed to write pay-demo.yaml: {e}"))
+            })?;
+        }
 
         // Demo mode always runs on sandbox. Default to hosted Surfpool;
         // --local overrides to localhost.
@@ -67,5 +74,36 @@ impl DemoCommand {
             scaffolded_paywall: Some("./pay-demo.yaml".to_string()),
         };
         cmd.run(legacy_signer_source, account_override, true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundled_demo_exposes_all_playground_payment_patterns() {
+        let api: pay_types::metering::ApiSpec = serde_yml::from_str(DEMO_PAYWALL).unwrap();
+        let paths: Vec<&str> = api
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.path.as_str())
+            .collect();
+
+        assert_eq!(paths.len(), 6);
+        assert!(paths.contains(&"api/v1/quote/{symbol}"));
+        assert!(paths.contains(&"api/v1/fortune"));
+        assert!(paths.contains(&"api/v1/joke"));
+        assert!(paths.contains(&"api/v1/summarize"));
+        assert!(paths.contains(&"api/v1/feed"));
+        assert!(paths.contains(&"api/v1/stream"));
+        assert!(
+            api.endpoints
+                .iter()
+                .find(|endpoint| endpoint.path == "api/v1/feed")
+                .unwrap()
+                .subscription
+                .is_some()
+        );
     }
 }
