@@ -1296,6 +1296,18 @@ impl Scheme {
             Self::MppSession | Self::X402Upto | Self::X402BatchSettlement
         )
     }
+
+    /// The `protocol` label used in tracing/metrics call sites and
+    /// [`crate::telemetry`]-style events (e.g. `"mpp/session"`).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::MppCharge => "mpp/charge",
+            Self::MppSession => "mpp/session",
+            Self::X402Exact => "x402/exact",
+            Self::X402Upto => "x402/upto",
+            Self::X402BatchSettlement => "x402/batch",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]

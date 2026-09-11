@@ -24,6 +24,10 @@ pay-acp = { workspace = true }
 pay-proxy = { path = "../proxy" }
 pay-keystore = { workspace = true }
 pay-types = { workspace = true }
+# Billing-event export sink: a bounded background task drains the
+# in-process channel `record_exchange` feeds and XADDs into a Redis Stream.
+# Same feature set as pay-worker's consumer side of that stream.
+redis = { version = "0.32", features = ["aio", "tokio-comp", "connection-manager"] }
 clap = { workspace = true }
 glob = { workspace = true }
 serde = { workspace = true }

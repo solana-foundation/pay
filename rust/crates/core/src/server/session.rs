@@ -176,8 +176,14 @@ pub enum SessionOutcome {
         state: Box<ChannelState>,
         signature: Option<String>,
     },
-    /// `voucher` accepted — channel id + new settled cumulative (base units).
-    Voucher { channel_id: String, cumulative: u64 },
+    /// `voucher` accepted — channel id, new settled cumulative (base units),
+    /// and the incremental amount this one request charged (base units) —
+    /// the delta the gate reports for this exchange, not the running total.
+    Voucher {
+        channel_id: String,
+        cumulative: u64,
+        charged: u64,
+    },
     /// `close` accepted — `SealParams` carries what's needed to submit the
     /// on-chain settle+seal + distribute transactions.
     Closed {
@@ -1911,6 +1917,7 @@ impl SessionMpp {
                 Ok(SessionOutcome::Voucher {
                     channel_id,
                     cumulative,
+                    charged: acceptance.charged,
                 })
             }
 

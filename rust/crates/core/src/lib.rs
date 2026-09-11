@@ -148,6 +148,124 @@ pub struct HttpExchange {
     /// Final inference telemetry from the gate's stream observer, when the
     /// host opted in via `record_request_start`.
     pub usage: Option<InferenceUsage>,
+    /// Pricing/settlement outcome for this exchange, when the endpoint is
+    /// metered. `None` for endpoints the gate never prices at all (control
+    /// plane, unmetered subscription auth) — distinct from
+    /// [`ChargeStatus::NotCharged`], which means a metered endpoint's request
+    /// specifically wasn't charged (free tier, short-circuited before
+    /// payment).
+    pub charge: Option<ChargeOutcome>,
+}
+
+/// Outcome of a proxied request's pricing, independent of on-chain
+/// settlement timing — a request can be reportable (unit, quantity, USD
+/// amount known) before its payment is confirmed on-chain. Covers every
+/// [`pay_types::metering::Scheme`]: charge-style schemes (`mpp/charge`,
+/// `x402/exact`, `x402/batch`) know this synchronously before forwarding;
+/// usage-metered schemes (`x402/upto`, `mpp/session`) only know it once the
+/// response has been served and settlement computed.
+#[derive(Debug, Clone)]
+pub struct ChargeOutcome {
+    /// The endpoint's declared subdomain (e.g. `"vision"`, `"bigquery"`) —
+    /// how a deployment maps this request to a specific proxied API. Always
+    /// present whenever a `ChargeOutcome` exists at all.
+    pub subdomain: String,
+    pub scheme: pay_types::metering::Scheme,
+    pub status: ChargeStatus,
+    /// `None` iff `status` is [`ChargeStatus::NotCharged`].
+    pub currency: Option<String>,
+    /// `None` iff `status` is [`ChargeStatus::NotCharged`].
+    pub amount_usd: Option<f64>,
+    /// The billing dimension that priced this request (e.g. `"tokens"`,
+    /// `"requests"`, `"bytes"`) — the serialized form of
+    /// [`pay_types::metering::BillingUnit`], mirroring
+    /// [`pay_types::metering::ResolvedDimension::unit`]. `None` when the
+    /// endpoint's `paywall.yml` doesn't resolve one for this request.
+    pub unit: Option<String>,
+    /// Quantity billed in `unit`, when the gate computed an exact count
+    /// (e.g. a usage-metered token/byte count). `None` for flat per-call
+    /// pricing, where quantity is implicitly 1 request.
+    pub quantity: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChargeStatus {
+    /// Served and settled for a non-zero amount (on-chain confirmation may
+    /// still be pending for deferred schemes).
+    Charged,
+    /// Served, but settled to zero — a refund (failed delivery, missing-usage
+    /// policy, or a `!served_ok` post-response settlement).
+    Refunded,
+    /// Not charged at all: free tier, or short-circuited before any payment
+    /// was verified.
+    NotCharged,
+    /// The resource was served, but the settlement attempt itself errored
+    /// (e.g. a deferred on-chain settle broadcast failed) — distinct from a
+    /// deliberate `Refunded`. The amount, if any, is unknown.
+    Failed,
+}
+
+/// A metered exchange flattened for wire transport to an external reporting
+/// pipeline (JSON over a Redis Stream, today) — the same shape for every
+/// [`pay_types::metering::Scheme`], so a single downstream consumer (e.g. a
+/// partner's usage/billing feed) never needs to know which payment protocol
+/// served a given request.
+///
+/// Hosts construct this from a completed [`HttpExchange`] inside
+/// [`PaymentState::record_exchange`] and hand it to a bounded, non-blocking
+/// sink — never anything that could stall the request/response cycle that
+/// produced it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BillingEvent {
+    pub method: String,
+    pub path: String,
+    /// `Host` header from the original request, when present — the
+    /// strongest per-deployment signal of which proxied fleet/domain
+    /// served this request (e.g. `vision.google-sandbox.example.com`
+    /// distinguishes provider and environment, not just API name).
+    pub host: Option<String>,
+    /// The endpoint's declared subdomain (e.g. `"vision"`, `"bigquery"`) —
+    /// identifies which proxied API served this request, independent of
+    /// deployment domain naming.
+    pub subdomain: String,
+    pub status: u16,
+    pub ms: u64,
+    pub scheme: pay_types::metering::Scheme,
+    pub charge_status: ChargeStatus,
+    pub currency: Option<String>,
+    pub amount_usd: Option<f64>,
+    pub unit: Option<String>,
+    pub quantity: Option<u64>,
+}
+
+impl BillingEvent {
+    /// `None` when the exchange has no charge to report at all — a request
+    /// outside the per-call metering model entirely (e.g. subscription
+    /// auth), not merely one that wasn't charged (that's
+    /// `charge_status: NotCharged`, still reported).
+    pub fn from_exchange(exchange: &HttpExchange) -> Option<Self> {
+        let charge = exchange.charge.as_ref()?;
+        let host = exchange
+            .req_headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("host"))
+            .map(|(_, value)| value.clone());
+        Some(Self {
+            method: exchange.method.clone(),
+            path: exchange.path.clone(),
+            host,
+            subdomain: charge.subdomain.clone(),
+            status: exchange.status,
+            ms: exchange.ms,
+            scheme: charge.scheme,
+            charge_status: charge.status,
+            currency: charge.currency.clone(),
+            amount_usd: charge.amount_usd,
+            unit: charge.unit.clone(),
+            quantity: charge.quantity,
+        })
+    }
 }
 
 /// Request-side facts handed to [`PaymentState::record_request_start`].
@@ -179,4 +297,122 @@ pub struct InferenceUsage {
     /// live from stream events and overwritten if a final count arrives.
     pub tokens_completion: Option<u64>,
     pub tokens_per_sec: Option<f64>,
+}
+
+#[cfg(test)]
+mod billing_event_tests {
+    use super::*;
+
+    fn exchange(charge: Option<ChargeOutcome>) -> HttpExchange {
+        HttpExchange {
+            method: "POST".to_string(),
+            path: "v1/simple/echo".to_string(),
+            status: 200,
+            ms: 42,
+            req_headers: Vec::new(),
+            res_headers: Vec::new(),
+            client_ip: "127.0.0.1".to_string(),
+            log_id: None,
+            usage: None,
+            charge,
+        }
+    }
+
+    #[test]
+    fn no_charge_at_all_produces_no_billing_event() {
+        assert!(BillingEvent::from_exchange(&exchange(None)).is_none());
+    }
+
+    #[test]
+    fn host_header_is_extracted_case_insensitively() {
+        let charge = ChargeOutcome {
+            subdomain: "vision".to_string(),
+            scheme: pay_types::metering::Scheme::MppCharge,
+            status: ChargeStatus::Charged,
+            currency: Some("SOL".to_string()),
+            amount_usd: Some(0.01),
+            unit: None,
+            quantity: None,
+        };
+        let mut exchange = exchange(Some(charge));
+        // Real proxied requests carry a title-case `Host` header, but
+        // nothing in the HTTP spec requires that exact casing — the lookup
+        // must not depend on it.
+        exchange.req_headers = vec![(
+            "HOST".to_string(),
+            "vision.google-sandbox.example.com".to_string(),
+        )];
+
+        let event = BillingEvent::from_exchange(&exchange).unwrap();
+        assert_eq!(
+            event.host.as_deref(),
+            Some("vision.google-sandbox.example.com")
+        );
+        assert_eq!(event.subdomain, "vision");
+    }
+
+    #[test]
+    fn missing_host_header_reports_none_not_an_error() {
+        let charge = ChargeOutcome {
+            subdomain: "vision".to_string(),
+            scheme: pay_types::metering::Scheme::MppCharge,
+            status: ChargeStatus::Charged,
+            currency: Some("SOL".to_string()),
+            amount_usd: Some(0.01),
+            unit: None,
+            quantity: None,
+        };
+        let event = BillingEvent::from_exchange(&exchange(Some(charge))).unwrap();
+        assert_eq!(event.host, None);
+    }
+
+    #[test]
+    fn a_charged_exchange_maps_every_field() {
+        let charge = ChargeOutcome {
+            subdomain: "vision".to_string(),
+            scheme: pay_types::metering::Scheme::MppCharge,
+            status: ChargeStatus::Charged,
+            currency: Some("SOL".to_string()),
+            amount_usd: Some(0.01),
+            unit: Some("requests".to_string()),
+            quantity: None,
+        };
+        let event = BillingEvent::from_exchange(&exchange(Some(charge)))
+            .expect("a charge always produces an event");
+
+        assert_eq!(event.method, "POST");
+        assert_eq!(event.path, "v1/simple/echo");
+        assert_eq!(event.subdomain, "vision");
+        assert_eq!(event.status, 200);
+        assert_eq!(event.ms, 42);
+        assert_eq!(event.scheme, pay_types::metering::Scheme::MppCharge);
+        assert_eq!(event.charge_status, ChargeStatus::Charged);
+        assert_eq!(event.currency.as_deref(), Some("SOL"));
+        assert_eq!(event.amount_usd, Some(0.01));
+        assert_eq!(event.unit.as_deref(), Some("requests"));
+    }
+
+    /// Locks the wire contract `report-billing-events` (a separate crate,
+    /// deserializing untyped JSON) depends on. A serde rename on either
+    /// enum would silently break that consumer without a compile error
+    /// anywhere in this crate — this test is what would catch it.
+    #[test]
+    fn a_not_charged_exchange_serializes_to_the_consumer_expected_wire_shape() {
+        let charge = ChargeOutcome {
+            subdomain: "vision".to_string(),
+            scheme: pay_types::metering::Scheme::MppSession,
+            status: ChargeStatus::NotCharged,
+            currency: None,
+            amount_usd: None,
+            unit: None,
+            quantity: None,
+        };
+        let event = BillingEvent::from_exchange(&exchange(Some(charge))).unwrap();
+        let json = serde_json::to_value(&event).unwrap();
+
+        assert_eq!(json["scheme"], "mpp-session");
+        assert_eq!(json["charge_status"], "not_charged");
+        assert_eq!(json["currency"], serde_json::Value::Null);
+        assert_eq!(json["amount_usd"], serde_json::Value::Null);
+    }
 }
