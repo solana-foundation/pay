@@ -836,6 +836,7 @@ pub struct StartCommand {
 #[derive(Clone)]
 struct AppState {
     apis: Arc<Vec<ApiSpec>>,
+    openapi_doc: Option<Arc<serde_json::Value>>,
     mpps: Vec<Mpp>,
     session_mpps: Vec<Arc<SessionMpp>>,
     browser_rpc_url: Option<String>,
@@ -851,6 +852,9 @@ struct AppState {
 impl PaymentState for AppState {
     fn apis(&self) -> &[ApiSpec] {
         &self.apis
+    }
+    fn openapi_document(&self) -> Option<&serde_json::Value> {
+        self.openapi_doc.as_deref()
     }
     fn mpp(&self) -> Option<&Mpp> {
         self.mpps.first()
@@ -2425,6 +2429,7 @@ impl StartCommand {
 
             let state = AppState {
                 apis: Arc::new(vec![api.clone()]),
+                openapi_doc: openapi_doc.clone(),
                 mpps,
                 session_mpps,
                 browser_rpc_url: Some(BROWSER_RPC_PROXY_PATH.to_string()),
