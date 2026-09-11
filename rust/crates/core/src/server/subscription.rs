@@ -552,7 +552,7 @@ mod tests {
 
         assert_eq!(plan_id, compute_plan_id_numeric(operator, endpoint));
         assert!(plan_id > 0);
-        assert!(plan_id <= (1_u64 << 53) - 1);
+        assert!(plan_id < 1_u64 << 53);
         let json = serde_json::to_string(&plan_id).unwrap();
         let round_trip: f64 = serde_json::from_str(&json).unwrap();
         assert_eq!(round_trip as u64, plan_id);

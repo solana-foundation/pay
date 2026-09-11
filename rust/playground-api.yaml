@@ -176,6 +176,10 @@ endpoints:
       period: "1d"
       price_usd: 0.10
       currency: "USDC"
+      plan_id: 2steskyRfLpeetnbgpbUZP1CsE7Ve4SijNYK5gZnWdm7
+      plan_id_numeric: 8769999984541905
+      plan_bump: 253
+      plan_created_at: 1789072924
 
   # ===========================================================================
   # SESSION — open a payment channel, stream metered deliveries, settle on
