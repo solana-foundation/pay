@@ -67,6 +67,8 @@ reqwest = { workspace = true, features = ["json"] }
 pay-keystore = { workspace = true }
 pay-kit = { workspace = true }
 http-body = { workspace = true }
+solana-keychain = { workspace = true }
+async-trait = "0.1"
 bincode = { workspace = true }
 solana-commitment-config = { workspace = true }
 solana-hash = { workspace = true }

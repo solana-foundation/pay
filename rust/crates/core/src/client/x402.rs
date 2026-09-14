@@ -274,7 +274,7 @@ pub fn build_payment_with_override(
 /// resolution, Surfpool detection, network-intent check and auto-funding are
 /// factored here rather than kept in step either side could drift out of.
 struct ChannelPaymentSetup {
-    signer: pay_kit::mpp::solana_keychain::MemorySigner,
+    signer: crate::signer::ResolvedSigner,
     ephemeral_notice: Option<ResolvedEphemeral>,
     rpc: RpcClient,
     rt: tokio::runtime::Runtime,
@@ -1506,6 +1506,7 @@ mod tests {
         let pubkey = "4BuiY9QUUfPoAGNJBja3JapAuVWMc9c7in6UCgyC2zPR";
         let account = Account {
             keystore: Keystore::Ephemeral,
+            provider: None,
             active: true,
             auth_required: Some(false),
             pubkey: Some(pubkey.to_string()),

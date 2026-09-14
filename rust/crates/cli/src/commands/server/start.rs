@@ -1570,14 +1570,7 @@ impl StartCommand {
                 Some(signer)
             } else if let Some(ref cfg) = signer_cfg {
                 Some(resolve_signer(cfg).await?)
-            } else if (fee_payer || !has_explicit_recipient || api.session.is_some())
-                && let Some(signer) = super::load_account_or_legacy_signer(
-                    network.slug(),
-                    account_override.as_deref(),
-                    legacy_signer_source.as_deref(),
-                    &pay_core::keystore::AuthIntent::use_gateway_fee_payer(),
-                )?
-            {
+            } else if fee_payer || !has_explicit_recipient || api.session.is_some() {
                 // Mainnet (or unknown network) with no `operator.signer`
                 // block but a default keypair from `pay setup` —
                 // typically `keychain:default`. Load it once at startup
@@ -1585,7 +1578,19 @@ impl StartCommand {
                 // tells the user *why* it's being asked. The same
                 // signer is then used as both the fee-payer and the
                 // recipient-pubkey source (no second load).
-                Some(Arc::new(signer) as Arc<dyn SolanaSigner>)
+                //
+                // Off the async worker — see [`blocking_signer_resolution`].
+                let slug = network.slug().to_string();
+                blocking_signer_resolution(move || {
+                    super::load_account_or_legacy_signer(
+                        &slug,
+                        account_override.as_deref(),
+                        legacy_signer_source.as_deref(),
+                        &pay_core::keystore::AuthIntent::use_gateway_fee_payer(),
+                    )
+                })
+                .await?
+                .map(|signer| Arc::new(signer) as Arc<dyn SolanaSigner>)
             } else {
                 None
             };
@@ -3343,6 +3348,23 @@ fn resolve_operator_currencies(op: Option<&OperatorConfig>, cli_currency: &str) 
     }
 }
 
+/// Run a blocking signer resolution off the async worker.
+///
+/// Account resolution blocks on the OS auth gate, and a remote backend
+/// drives its own current-thread runtime to reach the provider — which
+/// *panics* rather than erroring if it lands on a thread driving async
+/// tasks. `pay_core::remote::load_remote_signer` states the contract; this
+/// is how gateway startup keeps it.
+async fn blocking_signer_resolution<T, F>(resolve: F) -> pay_core::Result<T>
+where
+    F: FnOnce() -> pay_core::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(resolve).await.map_err(|e| {
+        pay_core::Error::Config(format!("Resolving the gateway signer failed to run: {e}"))
+    })?
+}
+
 /// Create a SolanaSigner from the operator.signer config.
 ///
 /// Production wrapper around [`resolve_signer_with_store`] that uses the
@@ -3419,14 +3441,27 @@ async fn resolve_signer_with_store(
                         "Account `{name}` is ephemeral but has no inline secret_key_b58"
                     ))
                 })?;
-                pay_kit::mpp::solana_keychain::MemorySigner::from_bytes(&bytes).map_err(|e| {
-                    pay_core::Error::Config(format!("Invalid keypair bytes for `{name}`: {e}"))
-                })?
+                pay_core::signer::ResolvedSigner::Memory(Box::new(
+                    pay_kit::mpp::solana_keychain::MemorySigner::from_bytes(&bytes).map_err(
+                        |e| {
+                            pay_core::Error::Config(format!(
+                                "Invalid keypair bytes for `{name}`: {e}"
+                            ))
+                        },
+                    )?,
+                ))
             } else {
-                let intent = pay_core::keystore::AuthIntent::use_gateway_fee_payer();
-                pay_core::signer::load_signer_from_account_with_intent(
-                    account, name, network, &intent,
-                )?
+                // Off the async worker — see [`blocking_signer_resolution`].
+                let account = account.clone();
+                let name = name.clone();
+                let network = network.to_string();
+                blocking_signer_resolution(move || {
+                    let intent = pay_core::keystore::AuthIntent::use_gateway_fee_payer();
+                    pay_core::signer::load_signer_from_account_with_intent(
+                        &account, &name, &network, &intent,
+                    )
+                })
+                .await?
             };
             Ok(Arc::new(signer))
         }
@@ -4787,6 +4822,7 @@ endpoints:
     // `resolve_signer_with_store` so we can inject a `MemoryAccountsStore`
     // and never touch `~/.config/pay/accounts.yml`.
 
+    use super::blocking_signer_resolution;
     use super::resolve_signer_with_store;
     use pay_core::accounts::{
         Account, AccountsFile, Keystore as AcctKeystore, MemoryAccountsStore,
@@ -4820,6 +4856,7 @@ endpoints:
     fn ephemeral_account_with_known_pubkey() -> (Account, String) {
         let pubkey = bs58::encode(&VALID_TEST_KEYPAIR_BYTES[32..]).into_string();
         let acct = Account {
+            provider: None,
             keystore: AcctKeystore::Ephemeral,
             active: false,
             auth_required: Some(false),
@@ -4832,6 +4869,39 @@ endpoints:
             subscriptions: std::collections::BTreeMap::new(),
         };
         (acct, pubkey)
+    }
+
+    /// A remote backend reaches its provider by building a current-thread
+    /// runtime and blocking on it (`pay_core::remote::openfort`'s `connect`).
+    /// Run directly on a thread driving async tasks that panics instead of
+    /// erroring, taking gateway startup down with it — so both startup signer
+    /// paths route account resolution through this helper. Dropping the hop
+    /// fails this test.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blocking_signer_resolution_survives_a_nested_runtime() {
+        let resolved = blocking_signer_resolution(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            Ok(rt.block_on(async { "resolved" }))
+        })
+        .await
+        .expect("resolution must complete off the async worker");
+
+        assert_eq!(resolved, "resolved");
+    }
+
+    /// A failing resolution still arrives as an error, not a panic.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blocking_signer_resolution_propagates_errors() {
+        let err = blocking_signer_resolution::<(), _>(|| {
+            Err(pay_core::Error::Config("bad credentials".to_string()))
+        })
+        .await
+        .expect_err("the closure's error must reach the caller");
+
+        assert!(err.to_string().contains("bad credentials"));
     }
 
     // ── File backend ───────────────────────────────────────────────────────
@@ -4999,6 +5069,7 @@ endpoints:
         // base58. Should fail with a helpful message naming the account.
         let mut file = AccountsFile::default();
         let bad = Account {
+            provider: None,
             keystore: AcctKeystore::Ephemeral,
             active: false,
             auth_required: Some(false),
