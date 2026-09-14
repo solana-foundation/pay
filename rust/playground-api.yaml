@@ -56,7 +56,7 @@ recipients:
     label: Platform
 
 # ── Session channel parameters (used by the `stream` endpoint) ──
-# Mirrors the TS `session(usd('1.00'), { closeDelayMs: 2000, unitPrice: 0.0001 })`.
+# Mirrors the TS `session(usd('1.00'), { closeDelayMs: 5000, unitPrice: 0.0001 })`.
 # cap_usdc is the channel deposit ceiling; per-delivery price lives on the
 # endpoint metering below. close_delay_ms is the idle delay before the operator
 # settles and closes the channel.
@@ -67,7 +67,7 @@ recipients:
 # matches that, so it's left unset here.
 session:
   cap_usdc: 1.0
-  close_delay_ms: 2000
+  close_delay_ms: 5000
   # Inactivity thresholds (seconds) the client may pick between when opening
   # the session; the server clamps the idle-close deadline to whichever is
   # shorter than close_delay_ms.
@@ -166,29 +166,20 @@ endpoints:
   # SUBSCRIPTION — recurring on-chain plan, activated on first call.
   # TS: feed → subscription(usd('0.10'), { periodCount: 1, periodUnit: 'day' }).
   #
-  # OPT-IN: a subscription endpoint requires an on-chain `Plan` account, so the
-  # server refuses to start until the `plan_id*` fields below are populated. The
-  # TS playground bootstraps the plan on the sandbox first; here you publish it
-  # once, which fills these fields in place:
-  #
-  #   pay --sandbox server plans publish playground-api.yaml --write
-  #
-  # Then uncomment this endpoint to serve it. (Left commented so the spec runs
-  # out-of-the-box, mirroring the TS demo where feed mounts only with a plan.)
-  #
-  # - method: GET
-  #   path: "api/v1/feed"
-  #   resource: "feed"
-  #   description: "News feed — recurring subscription, $0.10/day."
-  #   subscription:
-  #     period: "1d"
-  #     price_usd: 0.10
-  #     currency: "USDC"
-  #     # Filled in place by `pay server plans publish --write`:
-  #     # plan_id: ...
-  #     # plan_id_numeric: ...
-  #     # plan_bump: ...
-  #     # plan_created_at: ...
+  # On first sandbox launch, `pay gate api` prompts to publish the Plan and
+  # writes its PDA and immutable terms into this file for subsequent launches.
+  - method: GET
+    path: "api/v1/feed"
+    resource: "feed"
+    description: "News feed — recurring subscription, $0.10/day."
+    subscription:
+      period: "1d"
+      price_usd: 0.10
+      currency: "USDC"
+      plan_id: 2steskyRfLpeetnbgpbUZP1CsE7Ve4SijNYK5gZnWdm7
+      plan_id_numeric: 8769999984541905
+      plan_bump: 253
+      plan_created_at: 1789072924
 
   # ===========================================================================
   # SESSION — open a payment channel, stream metered deliveries, settle on

@@ -1,8 +1,6 @@
 import type { PaymentFlow } from "../types";
 
-/** Decoded `payment-receipt` response header. Fields vary by pattern:
- *  per-call charges carry `settlementSignature`/`signature`, subscriptions
- *  carry `activationSignature` plus plan/period metadata. */
+/** Decoded `payment-receipt` response header. Fields vary by pattern. */
 export interface Receipt {
   status?: string;
   method?: string;
@@ -27,10 +25,11 @@ export interface Receipt {
     settlementSignature?: string;
   };
   subscriptionId?: string;
-  planId?: string;
-  periodIndex?: string;
-  periodStartTs?: string;
-  periodEndTs?: string;
+  subscriptionDelegation?: string;
+  periodIndex?: number;
+  periodStart?: string;
+  periodEnd?: string;
+  expiresAt?: string;
   reference?: string;
   timestamp?: string;
 }
@@ -76,11 +75,39 @@ export function parseReceipt(flow: PaymentFlow): Receipt | null {
   return { reference: header };
 }
 
-/** Best settlement transaction signature for a receipt, across patterns.
- *  Per-call charges put the settlement signature in `reference`; that's the
- *  last fallback so subscriptions (whose `reference` is the subscriptionId,
- *  not a tx) still resolve to `activationSignature` first. */
-export function receiptSignature(receipt: Receipt | null): string | null {
+/** Whether this flow used a reusable subscription proof rather than activation. */
+export function isSubscriptionAccessReceipt(
+  flow: PaymentFlow,
+  receipt: Receipt | null,
+): boolean {
+  const isSubscription = !!(
+    receipt?.subscriptionId ||
+    receipt?.subscriptionDelegation ||
+    receipt?.periodEnd
+  );
+  if (!isSubscription) return false;
+
+  const authorization = Object.entries(flow.paymentHeaders ?? {}).find(
+    ([name]) => name.toLowerCase() === "authorization",
+  )?.[1];
+  const encoded = authorization?.replace(/^Payment\s+/i, "").trim();
+  const decoded = encoded ? base64urlDecode(encoded) : "";
+  if (!decoded) return false;
+  try {
+    const credential = JSON.parse(decoded) as {
+      payload?: { type?: unknown };
+    };
+    return credential.payload?.type === "proof";
+  } catch {
+    return false;
+  }
+}
+
+/** Best settlement transaction signature for a receipt, across patterns. */
+export function receiptSignature(
+  receipt: Receipt | null,
+  includeReference = true,
+): string | null {
   if (!receipt) return null;
   return (
     receipt.settlementSignature ||
@@ -98,7 +125,7 @@ export function receiptSignature(receipt: Receipt | null): string | null {
     receipt.receipt?.transaction ||
     receipt.receipt?.transactionId ||
     receipt.activationSignature ||
-    receipt.reference ||
+    (includeReference ? receipt.reference : null) ||
     null
   );
 }

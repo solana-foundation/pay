@@ -1,5 +1,5 @@
 //! `pay subscriptions status <subscription-id>` — full detail for one
-//! subscription, looked up by its base58 `SubscriptionDelegation` PDA.
+//! subscription, looked up by its locally stored opaque id.
 
 use owo_colors::OwoColorize;
 
@@ -9,8 +9,8 @@ use crate::components;
 
 #[derive(clap::Args)]
 pub struct StatusCommand {
-    /// Base58 `subscription_id` (the `SubscriptionDelegation` PDA returned
-    /// in the `Payment-Receipt` header at activation time).
+    /// Opaque `subscriptionId` returned in the activation receipt. Legacy
+    /// records may use the base58 delegation PDA here.
     pub subscription_id: String,
 
     /// Emit JSON instead of the formatted view. Useful for scripting.
@@ -53,6 +53,7 @@ impl StatusCommand {
         println!("  network          {network}");
         println!("  account          {account}");
         println!("  status           {}", sub.status);
+        println!("  delegation       {}", sub.delegation_address());
         println!("  plan             {}", sub.plan_id);
         println!("  mint             {}", sub.mint);
         if let Some(curr) = &sub.currency {

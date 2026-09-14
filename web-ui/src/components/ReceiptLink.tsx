@@ -2,6 +2,7 @@ import type { PaymentFlow } from "../types";
 import type { Config } from "../hooks/useConfig";
 import { payReceiptNetwork, useConfig, receiptUrl } from "../hooks/useConfig";
 import {
+  isSubscriptionAccessReceipt,
   parseReceipt,
   receiptSignature,
   responseHeader,
@@ -17,7 +18,10 @@ export function receiptLinkHref(
   config: Config | null,
 ): string | null {
   const receipt = parseReceipt(flow);
-  const signature = receiptSignature(receipt);
+  const signature = receiptSignature(
+    receipt,
+    !isSubscriptionAccessReceipt(flow, receipt),
+  );
   const fallbackConfig =
     receipt?.network && payReceiptNetwork(receipt.network) !== null
       ? { network: receipt.network }

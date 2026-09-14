@@ -61,6 +61,48 @@ describe("receipt parsing", () => {
     expect(receiptSignature(receipt)).toBe("direct-settlement-signature");
   });
 
+  it("does not link a reusable subscription proof as an activation", () => {
+    const href = receiptLinkHref(
+      {
+        ...flowWithHeaders({
+          "payment-receipt": encodeJson({
+            periodEnd: "2026-10-10T00:00:00Z",
+            reference: "subscription-delegation-pda",
+            subscriptionDelegation: "subscription-delegation-pda",
+          }),
+        }),
+        paymentHeaders: {
+          authorization: `Payment ${encodeJson({ payload: { type: "proof" } })}`,
+        },
+      },
+      null,
+    );
+
+    expect(href).toBeNull();
+  });
+
+  it("links subscription activation signatures carried in reference", () => {
+    const href = receiptLinkHref(
+      {
+        ...flowWithHeaders({
+          "payment-receipt": encodeJson({
+            periodEnd: "2026-10-10T00:00:00Z",
+            reference: "activation-signature",
+            subscriptionDelegation: "subscription-delegation-pda",
+          }),
+        }),
+        paymentHeaders: {
+          authorization: `Payment ${encodeJson({ payload: { type: "transaction" } })}`,
+        },
+      },
+      null,
+    );
+
+    expect(href).toBe(
+      "https://pay.sh/receipt/activation-signature?view=advanced",
+    );
+  });
+
   it("matches receipt headers case-insensitively", () => {
     const receipt = parseReceipt(
       flowWithHeaders({

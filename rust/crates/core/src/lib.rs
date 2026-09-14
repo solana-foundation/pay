@@ -1,5 +1,6 @@
 // Shared modules
 pub mod accounts;
+mod b58;
 pub mod config;
 pub mod error;
 pub mod explorer;
@@ -75,6 +76,13 @@ pub trait PaymentState: Clone + Send + Sync + 'static {
     /// transaction; charge / session paths construct their own MPP
     /// instances at startup and don't ask for it through this trait.
     fn fee_payer_signer(&self) -> Option<Arc<dyn pay_kit::mpp::solana_keychain::SolanaSigner>> {
+        None
+    }
+
+    /// Store used to bind a confirmed subscription activation to its reusable
+    /// bearer proof. Hosts must return the same store across requests; otherwise
+    /// a proof accepted during activation cannot be recognized on later access.
+    fn subscription_store(&self) -> Option<Arc<dyn pay_kit::mpp::store::Store>> {
         None
     }
 

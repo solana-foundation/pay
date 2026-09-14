@@ -129,6 +129,7 @@ mod tests {
             realm: Some("api.example.com"),
             fee_payer: false,
             fee_payer_signer: None,
+            store: Some(std::sync::Arc::new(pay_kit::mpp::store::MemoryStore::new())),
         }
     }
 

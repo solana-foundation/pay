@@ -4,12 +4,9 @@
 //! (`pay_types::metering::SubscriptionEndpoint`) and the SDK's
 //! `pay_kit::mpp::server::SubscriptionServer`.
 //!
-//! v0 covers challenge emission. The activation-credential verification
-//! path is delegated to a follow-up because pay-kit's Rust SDK does not yet
-//! ship a verify implementation for the subscription intent — the
-//! TypeScript SDK does, and a port is queued. Until then,
-//! [`verify_activation`] returns a `not_implemented` error that the
-//! middleware surfaces as a 501.
+//! The SDK verifies activation transactions, confirms their on-chain state,
+//! binds the signed proof only after confirmation, and revalidates the live
+//! delegation for subsequent bearer-proof access.
 
 use std::str::FromStr;
 
@@ -58,6 +55,9 @@ pub struct OperatorDefaults<'a> {
     /// with it before broadcasting. The middleware threads it through
     /// from `PaymentState::fee_payer_signer`.
     pub fee_payer_signer: Option<std::sync::Arc<dyn pay_kit::mpp::solana_keychain::SolanaSigner>>,
+    /// Process-lifetime storage for activation reservations and proof bindings.
+    /// Every handler rebuilt for this endpoint must share this instance.
+    pub store: Option<std::sync::Arc<dyn pay_kit::mpp::store::Store>>,
 }
 
 /// Resolve `(amount_base_units, decimals, mint_b58)` from the endpoint
@@ -194,7 +194,7 @@ pub fn build_handler(
         } else {
             None
         },
-        store: None,
+        store: defaults.store.clone(),
         // The on-chain Plan terms (numeric id, bump, created_at) are
         // populated by pay-side spec/yaml plumbing; for now we leave
         // them None and the client falls back to RPC-fetching the Plan.
@@ -267,9 +267,17 @@ pub fn compute_plan_id_numeric(operator: &str, endpoint_path: &str) -> u64 {
         hash ^= byte as u64;
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    // Never return zero — the program treats plan_id=0 as a reserved
-    // sentinel in some validators.
-    if hash == 0 { 1 } else { hash }
+    // `plan_id_numeric` crosses the MPP wire as a JSON number. Keep it within
+    // JavaScript's exact integer range so RFC 8785/JCS canonicalization cannot
+    // round the PDA seed between challenge emission and activation.
+    let json_safe_hash = hash & ((1_u64 << 53) - 1);
+    // Never return zero — the program treats plan_id=0 as a reserved sentinel
+    // in some validators.
+    if json_safe_hash == 0 {
+        1
+    } else {
+        json_safe_hash
+    }
 }
 
 /// Check whether the expected Plan PDA exists on-chain.
@@ -412,7 +420,7 @@ pub async fn publish_plan(
 /// Read just the `created_at` (i64 LE) out of a freshly-published Plan
 /// account at the canonical offset. Avoids vendoring the full Plan
 /// account decoder for the one field `pay gate api` actually needs.
-async fn fetch_plan_created_at(rpc_url: &str, plan_pda: &solana_pubkey::Pubkey) -> Result<i64> {
+pub async fn fetch_plan_created_at(rpc_url: &str, plan_pda: &solana_pubkey::Pubkey) -> Result<i64> {
     let url = rpc_url.to_string();
     let pda = *plan_pda;
     tokio::task::spawn_blocking(move || -> Result<i64> {
@@ -535,6 +543,21 @@ pub async fn verify_activation(
 mod tests {
     use super::*;
 
+    #[test]
+    fn computed_plan_id_is_stable_and_json_safe() {
+        let operator = "F82JMeQmD7Lfbh6vCJWsz2ABJ5AAthhVjUyqzgHyUtog";
+        let endpoint = "api/v1/feed";
+
+        let plan_id = compute_plan_id_numeric(operator, endpoint);
+
+        assert_eq!(plan_id, compute_plan_id_numeric(operator, endpoint));
+        assert!(plan_id > 0);
+        assert!(plan_id < 1_u64 << 53);
+        let json = serde_json::to_string(&plan_id).unwrap();
+        let round_trip: f64 = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_trip as u64, plan_id);
+    }
+
     fn operator_defaults<'a>() -> OperatorDefaults<'a> {
         OperatorDefaults {
             puller: "5fKb5cF22cFybZB1H4hLDydFhwoQy9JzKzRWaSbMkB6h",
@@ -545,6 +568,7 @@ mod tests {
             realm: Some("test-realm"),
             fee_payer: false,
             fee_payer_signer: None,
+            store: Some(std::sync::Arc::new(pay_kit::mpp::store::MemoryStore::new())),
         }
     }
 

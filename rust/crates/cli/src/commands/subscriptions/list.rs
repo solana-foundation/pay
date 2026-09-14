@@ -53,6 +53,7 @@ impl ListCommand {
                         "network": network,
                         "account": account,
                         "subscription_id": sub.subscription_id,
+                        "subscription_delegation": sub.delegation_address(),
                         "plan_id": sub.plan_id,
                         "mint": sub.mint,
                         "currency": sub.currency,

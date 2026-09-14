@@ -2,8 +2,8 @@
 //!
 //! Subscriptions are persisted alongside accounts in
 //! `~/.config/pay/accounts.yml`, one entry per `(network, account, plan)`.
-//! The base58 `subscriptionId` is the on-chain `SubscriptionDelegation` PDA
-//! returned in the `Payment-Receipt` header at activation time.
+//! Current receipts separate the server-issued opaque `subscriptionId` from
+//! the base58 on-chain `subscriptionDelegation` PDA.
 
 pub mod cancel;
 pub mod list;
@@ -19,11 +19,11 @@ pub enum SubscriptionCommand {
     /// List subscriptions across every account, or filter by --account / --network.
     #[command(alias = "ls")]
     List(list::ListCommand),
-    /// Show detail for a single subscription by its base58 subscription id.
+    /// Show detail for a single subscription by its locally stored id.
     Status(status::StatusCommand),
     /// Activate a new subscription against an explicit on-chain Plan PDA.
     New(new::NewCommand),
-    /// Cancel a subscription by its base58 subscription id.
+    /// Cancel a subscription by its locally stored id.
     #[command(alias = "rm")]
     Cancel(cancel::CancelCommand),
     /// Backfill missing on-chain data (e.g. activation_signature) on local entries.
