@@ -195,10 +195,17 @@ pub async fn run(
     params: Params,
     peer: rmcp::Peer<rmcp::service::RoleServer>,
     session_cache: Arc<SessionCache>,
+    scope: crate::context::CallScope,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
     if params.body.is_some() && params.body_file.is_some() {
         return Ok(super::tool_error(
             "Pass either `body` or `body_file`, not both.",
+        ));
+    }
+    if params.body_file.is_some() && !scope.body_files {
+        return Ok(super::tool_error(
+            "`body_file` is not available on this server: it has no access to your files. \
+             Pass the body inline with `body`.",
         ));
     }
 
@@ -245,6 +252,7 @@ pub async fn run(
             redirect_policy,
             Some(peer),
             session_cache.as_ref(),
+            &scope,
         )
     })
     .await
@@ -881,6 +889,7 @@ fn sniff_media_mime(bytes: &[u8]) -> Option<&'static str> {
 /// octet streams — round-trip without UTF-8 mangling.
 type PaidFetchResult = (Vec<u8>, Option<String>);
 
+#[allow(clippy::too_many_arguments)]
 fn do_paid_fetch(
     method: &str,
     url: &str,
@@ -889,6 +898,7 @@ fn do_paid_fetch(
     redirect_policy: RedirectPolicy,
     peer: Option<rmcp::Peer<rmcp::service::RoleServer>>,
     session_cache: &SessionCache,
+    scope: &crate::context::CallScope,
 ) -> Result<PaidFetchResult, pay_core::Error> {
     use pay_core::client::runner::RunOutcome;
 
@@ -912,40 +922,23 @@ fn do_paid_fetch(
         )
     };
 
-    // Build a fresh elicitation-backed AuthGate per signing operation when
-    // we have a peer AND no local biometric is available. A local Touch ID /
-    // Windows Hello / polkit prompt is faster and more familiar than a
-    // round-trip through the MCP client UI, so we prefer it whenever the
-    // platform offers it. `PAY_FORCE_ELICITATION=1` opts back into the
-    // elicitation path for users who want approvals in the MCP client
-    // anyway (remote MCP, screen-sharing demos, etc.).
-    //
-    // When None (e.g. unit tests, or biometrics-available path), each
-    // `_with_override` call gets `None` and falls back to the platform
-    // default gate. The peer is cheap to clone (it wraps an Arc).
-    let make_auth_override = || -> pay_core::signer::AuthOverride {
-        let peer = peer.as_ref()?;
-        let force = std::env::var("PAY_FORCE_ELICITATION")
-            .ok()
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        if !force && pay_keystore::Keystore::any_biometric_available() {
-            return None;
-        }
-        Some(Box::new(crate::ElicitationAuth::new(peer.clone())) as Box<dyn pay_keystore::AuthGate>)
-    };
+    // A fresh gate per signing operation, chosen by the caller's context:
+    // the platform prompt or the client's elicitation on a laptop, the
+    // tenant's spending policy in the cloud. `None` lets the account's own
+    // policy decide.
+    let make_auth_override =
+        || -> pay_core::signer::AuthOverride { scope.auth_override(peer.as_ref()) };
 
-    let store = pay_core::accounts::FileAccountsStore::default_path();
-    let network_override = std::env::var("PAY_NETWORK_ENFORCED").ok();
-    let account_override = std::env::var("PAY_ACTIVE_ACCOUNT").ok();
+    let store: &dyn pay_core::accounts::AccountsStore = scope.accounts.as_ref();
+    let network_override = scope.network_override.clone();
+    let account_override = scope.account_override.clone();
 
     // SIWMPP pre-attach: if a cached authenticate token covers this URL
     // (URL-prefix match against a tracked Active subscription with a
     // non-expired token), attach it BEFORE the first fetch. On hit the
     // server validates the token and skips the 402 entirely — no Touch
     // ID prompt, no extra round trip. On miss this is a no-op.
-    let cached_auth_header =
-        pay_core::client::authenticate::cached_header_for_resource(&store, url);
+    let cached_auth_header = pay_core::client::authenticate::cached_header_for_resource(store, url);
     let mut initial_headers: Vec<(String, String)> = match cached_auth_header.as_deref() {
         Some(token)
             if !extra_headers
@@ -970,7 +963,11 @@ fn do_paid_fetch(
         initial_headers.push(("Authorization".to_string(), authorization.clone()));
     }
 
-    let outcome = fetch_request(&initial_headers)?;
+    let outcome = fetch_request(&initial_headers)?.for_account(
+        store,
+        network_override.as_deref(),
+        account_override.as_deref(),
+    )?;
 
     // A reused authorization that receives a 402 is no longer trustworthy.
     // Drop it before negotiating a fresh session from the server challenge.
@@ -1000,7 +997,7 @@ fn do_paid_fetch(
                 &challenges,
                 x402_alternative.as_deref(),
                 &x402_upto_accepts,
-                &store,
+                store,
                 network_override.as_deref(),
                 account_override.as_deref(),
             )?;
@@ -1010,7 +1007,7 @@ fn do_paid_fetch(
                     let (auth_header, _ephemeral) =
                         pay_core::client::mpp::build_credential_with_override(
                             ch.as_ref(),
-                            &store,
+                            store,
                             network_override.as_deref(),
                             account_override.as_deref(),
                             Some(url),
@@ -1021,7 +1018,7 @@ fn do_paid_fetch(
                 ChosenPayment::X402(challenge) => {
                     let built_payment = pay_core::client::x402::build_payment_with_override(
                         challenge.as_ref(),
-                        &store,
+                        store,
                         network_override.as_deref(),
                         account_override.as_deref(),
                         Some(url),
@@ -1037,7 +1034,7 @@ fn do_paid_fetch(
                 ChosenPayment::X402Upto(challenge) => {
                     let built_payment = pay_core::client::x402::build_upto_payment_with_override(
                         challenge.as_ref(),
-                        &store,
+                        store,
                         network_override.as_deref(),
                         account_override.as_deref(),
                         Some(url),
@@ -1056,7 +1053,7 @@ fn do_paid_fetch(
         RunOutcome::X402Challenge { challenge, .. } => {
             let built_payment = pay_core::client::x402::build_payment_with_override(
                 &challenge,
-                &store,
+                store,
                 network_override.as_deref(),
                 account_override.as_deref(),
                 Some(url),
@@ -1074,7 +1071,7 @@ fn do_paid_fetch(
         RunOutcome::X402UptoChallenge { challenge, .. } => {
             let built_payment = pay_core::client::x402::build_upto_payment_with_override(
                 &challenge,
-                &store,
+                store,
                 network_override.as_deref(),
                 account_override.as_deref(),
                 Some(url),
@@ -1092,7 +1089,7 @@ fn do_paid_fetch(
         RunOutcome::X402BatchChallenge { challenge, .. } => {
             let built = pay_core::client::x402::build_batch_payment(
                 &challenge,
-                &store,
+                store,
                 &session_cache.batch_channels,
                 None,
                 network_override.as_deref(),
@@ -1126,7 +1123,7 @@ fn do_paid_fetch(
             {
                 let retry = pay_core::client::x402::build_batch_payment(
                     corrective,
-                    &store,
+                    store,
                     &session_cache.batch_channels,
                     None,
                     network_override.as_deref(),
@@ -1171,7 +1168,7 @@ fn do_paid_fetch(
             // the payment signature requires a second approval.
             let built = pay_core::client::x402::build_siwx_auth_header_with_override(
                 &challenge,
-                &store,
+                store,
                 network_override.as_deref(),
                 account_override.as_deref(),
                 Some(url),
@@ -1195,7 +1192,7 @@ fn do_paid_fetch(
             } else if let Some(pay_challenge) = payment_fallback {
                 let built_payment = pay_core::client::x402::build_payment_with_override(
                     &pay_challenge,
-                    &store,
+                    store,
                     network_override.as_deref(),
                     account_override.as_deref(),
                     Some(url),
@@ -1231,7 +1228,7 @@ fn do_paid_fetch(
             let (open_authorization, use_authorization) =
                 pay_core::session::open_operator_signed_session_authorizations(
                     &challenge,
-                    &store,
+                    store,
                     network_override.as_deref(),
                     account_override.as_deref(),
                     url,
@@ -1267,7 +1264,7 @@ fn do_paid_fetch(
                 pay_core::client::subscription::build_credential_with_authenticate_and_override(
                     &challenge,
                     authenticate.as_deref(),
-                    &store,
+                    store,
                     network_override.as_deref(),
                     account_override.as_deref(),
                     Some(url),
@@ -1280,7 +1277,7 @@ fn do_paid_fetch(
                 && *exit_code == 0
                 && let Err(e) =
                     pay_core::client::subscription::persist_local_subscription_after_activation(
-                        &built, &store,
+                        &built, store,
                     )
             {
                 tracing::warn!(
@@ -1685,6 +1682,14 @@ mod tests {
     #[test]
     fn do_paid_fetch_returns_error_for_invalid_url() {
         let cache = SessionCache::default();
+        let scope = crate::context::CallScope {
+            accounts: Arc::new(pay_core::accounts::MemoryAccountsStore::new()),
+            network_override: None,
+            account_override: None,
+            rpc_url_override: None,
+            approval: Arc::new(crate::context::LocalApproval),
+            body_files: true,
+        };
         let result = do_paid_fetch(
             "GET",
             "not-a-url",
@@ -1693,6 +1698,7 @@ mod tests {
             RedirectPolicy::Follow,
             None,
             &cache,
+            &scope,
         );
         assert!(result.is_err());
     }
@@ -1781,29 +1787,6 @@ mod tests {
         let text = &result.content[0].as_text().unwrap().text;
         assert!(text.starts_with("Pay curl failed: Payment rejected:"));
         assert!(!text.contains("User declined"));
-    }
-
-    // ── Env var propagation for network/account overrides ─────────────
-
-    #[test]
-    fn network_override_reads_from_env() {
-        // Simulate what main.rs sets when --sandbox is used
-        unsafe { std::env::set_var("PAY_NETWORK_ENFORCED", "localnet") };
-        let val = std::env::var("PAY_NETWORK_ENFORCED").ok();
-        assert_eq!(val.as_deref(), Some("localnet"));
-        unsafe { std::env::remove_var("PAY_NETWORK_ENFORCED") };
-
-        // Without the env var, returns None
-        let val = std::env::var("PAY_NETWORK_ENFORCED").ok();
-        assert!(val.is_none());
-    }
-
-    #[test]
-    fn account_override_reads_from_env() {
-        unsafe { std::env::set_var("PAY_ACTIVE_ACCOUNT", "my-wallet") };
-        let val = std::env::var("PAY_ACTIVE_ACCOUNT").ok();
-        assert_eq!(val.as_deref(), Some("my-wallet"));
-        unsafe { std::env::remove_var("PAY_ACTIVE_ACCOUNT") };
     }
 
     #[test]

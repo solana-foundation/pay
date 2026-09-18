@@ -15,7 +15,7 @@ use pay_core::accounts::AccountsStore;
 use pay_core::server::session::{SessionLifecycleReconciliation, SessionMpp};
 use pay_core::server::telemetry::FeePayerWallet;
 use pay_kit::mpp::server::Mpp;
-use pay_kit::mpp::solana_keychain::SolanaSigner;
+use pay_kit::mpp::solana_keychain::TransactionSigner;
 use pay_types::Stablecoin;
 use pay_types::metering::{
     ApiSpec, OperatorConfig, RoutingConfig, SessionBenchmarkTestMint, SignerConfig,
@@ -130,6 +130,41 @@ async fn session_channel_store()
         "MPP sessions",
     )
     .await
+}
+
+async fn subscription_store() -> pay_core::Result<Arc<dyn pay_kit::mpp::store::Store>> {
+    let redis_url = ["PAY_MPP_REDIS_URL", "PAY_SESSION_REDIS_URL"]
+        .into_iter()
+        .find_map(|var| {
+            std::env::var(var)
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        });
+
+    let Some(redis_url) = redis_url else {
+        return Ok(Arc::new(pay_kit::mpp::store::MemoryStore::new()));
+    };
+
+    #[cfg(feature = "redis-session-store")]
+    {
+        let store = pay_core::server::subscription::RedisSubscriptionStore::connect(
+            &redis_url,
+            "pay:subscription:v1:",
+        )
+        .await?;
+        tracing::info!("using durable Redis store for subscription proofs");
+        Ok(Arc::new(store))
+    }
+
+    #[cfg(not(feature = "redis-session-store"))]
+    {
+        let _ = redis_url;
+        Err(pay_core::Error::Config(
+            "an MPP Redis URL is set, but this pay binary was built without the redis-session-store feature"
+                .to_string(),
+        ))
+    }
 }
 
 /// Resolve the channel store backing x402 `batch-settlement`.
@@ -840,7 +875,7 @@ struct AppState {
     session_mpps: Vec<Arc<SessionMpp>>,
     browser_rpc_url: Option<String>,
     fee_payer_wallet: Option<FeePayerWallet>,
-    fee_payer_signer: Option<Arc<dyn SolanaSigner>>,
+    fee_payer_signer: Option<Arc<dyn TransactionSigner>>,
     subscription_store: Arc<dyn pay_kit::mpp::store::Store>,
     x402: Option<pay_kit::x402::server::X402>,
     x402_upto: Option<pay_kit::x402::server::X402Upto>,
@@ -876,11 +911,11 @@ impl PaymentState for AppState {
     fn fee_payer_wallet(&self) -> Option<&FeePayerWallet> {
         self.fee_payer_wallet.as_ref()
     }
-    fn fee_payer_signer(&self) -> Option<Arc<dyn SolanaSigner>> {
+    fn fee_payer_signer(&self) -> Option<Arc<dyn TransactionSigner>> {
         self.fee_payer_signer.clone()
     }
     fn subscription_store(&self) -> Option<Arc<dyn pay_kit::mpp::store::Store>> {
-        Some(Arc::clone(&self.subscription_store))
+        Some(self.subscription_store.clone())
     }
     fn x402(&self) -> Option<&pay_kit::x402::server::X402> {
         self.x402.as_ref()
@@ -1559,7 +1594,7 @@ impl StartCommand {
             //   4. **None** — leaves fee_payer_signer empty. Caught by
             //      the early-validation guard below if `fee_payer: true`.
             let mut generated_gateway_account: Option<(String, String)> = None;
-            let fee_payer_signer: Option<Arc<dyn SolanaSigner>> = if should_use_auto_fee_payer_signer(
+            let fee_payer_signer: Option<Arc<dyn TransactionSigner>> = if should_use_auto_fee_payer_signer(
                 sandbox,
                 &network,
                 signer_cfg.as_ref(),
@@ -1590,7 +1625,7 @@ impl StartCommand {
                     )
                 })
                 .await?
-                .map(|signer| Arc::new(signer) as Arc<dyn SolanaSigner>)
+                .map(|signer| Arc::new(signer) as Arc<dyn TransactionSigner>)
             } else {
                 None
             };
@@ -1749,6 +1784,7 @@ impl StartCommand {
             // MPP_CHALLENGE_BINDING_SECRET for the subscription middleware —
             // see `payments::init_challenge_binding_secret`.)
             let challenge_binding_secret = payments::init_challenge_binding_secret();
+            let subscription_store = subscription_store().await?;
 
             payments::ensure_payout_recipient_token_accounts(
                 &payout_recipients,
@@ -2203,7 +2239,10 @@ impl StartCommand {
                     },
                 };
                 match pay_kit::x402::server::X402::new(cfg) {
-                    Ok(x) => Some(x.with_blockhash_cache(blockhash_cache.clone())),
+                    Ok(x) => Some(
+                        x.with_tx_v1(pay_kit::core::tx::TxV1Mode::Auto)
+                            .with_blockhash_cache(blockhash_cache.clone()),
+                    ),
                     Err(e) => {
                         eprintln!("x402 backend disabled ({e}); x402 schemes won't be offered");
                         None
@@ -2239,7 +2278,10 @@ impl StartCommand {
                         receiver_authorizer_signer: None,
                     };
                     match pay_kit::x402::server::X402Upto::new(cfg) {
-                        Ok(u) => Some(u.with_blockhash_cache(blockhash_cache.clone())),
+                        Ok(u) => Some(
+                            u.with_tx_v1(pay_kit::core::tx::TxV1Mode::Auto)
+                                .with_blockhash_cache(blockhash_cache.clone()),
+                        ),
                         Err(e) => {
                             eprintln!("x402 upto backend disabled ({e})");
                             None
@@ -2316,7 +2358,8 @@ impl StartCommand {
                         .unwrap_or(30),
                     };
                     match pay_kit::x402::server::X402BatchSettlement::with_store(cfg, batch_store) {
-                        Ok(mut b) => {
+                        Ok(b) => {
+                            let mut b = b.with_tx_v1(pay_kit::core::tx::TxV1Mode::Auto);
                             match batch_lifecycle_reconciliation(durable_batch_store) {
                                 BatchLifecycleReconciliation::Embedded => {
                                     let lifecycle_config =
@@ -2435,7 +2478,7 @@ impl StartCommand {
                 browser_rpc_url: Some(BROWSER_RPC_PROXY_PATH.to_string()),
                 fee_payer_wallet,
                 fee_payer_signer: fee_payer_signer.clone(),
-                subscription_store: Arc::new(pay_kit::mpp::store::MemoryStore::new()),
+                subscription_store,
                 x402,
                 x402_upto,
                 x402_batch,
@@ -2975,7 +3018,7 @@ async fn ensure_subscription_plans(
     mut api: ApiSpec,
     spec_path: &str,
     operator_pubkey_str: &str,
-    fee_payer_signer: Option<Arc<dyn SolanaSigner>>,
+    fee_payer_signer: Option<Arc<dyn TransactionSigner>>,
     rpc_url: &str,
 ) -> pay_core::Result<ApiSpec> {
     use dialoguer::Confirm;
@@ -3373,7 +3416,7 @@ where
 ///
 /// Must be called from within the main async runtime so the GCP auth
 /// token cache's background refresh tasks stay alive.
-async fn resolve_signer(config: &SignerConfig) -> pay_core::Result<Arc<dyn SolanaSigner>> {
+async fn resolve_signer(config: &SignerConfig) -> pay_core::Result<Arc<dyn TransactionSigner>> {
     let store = pay_core::accounts::FileAccountsStore::default_path();
     resolve_signer_with_store(config, &store).await
 }
@@ -3387,7 +3430,7 @@ async fn resolve_signer(config: &SignerConfig) -> pay_core::Result<Arc<dyn Solan
 async fn resolve_signer_with_store(
     config: &SignerConfig,
     store: &dyn AccountsStore,
-) -> pay_core::Result<Arc<dyn SolanaSigner>> {
+) -> pay_core::Result<Arc<dyn TransactionSigner>> {
     match config {
         #[cfg(feature = "gcp_kms")]
         SignerConfig::GcpKms { key_name, pubkey } => {
@@ -3435,21 +3478,9 @@ async fn resolve_signer_with_store(
                     ))
                 })?;
             // Use the Account's load path so ephemeral entries work too.
-            let signer = if account.keystore == pay_core::accounts::Keystore::Ephemeral {
-                let bytes = account.ephemeral_keypair_bytes().ok_or_else(|| {
-                    pay_core::Error::Config(format!(
-                        "Account `{name}` is ephemeral but has no inline secret_key_b58"
-                    ))
-                })?;
-                pay_core::signer::ResolvedSigner::Memory(Box::new(
-                    pay_kit::mpp::solana_keychain::MemorySigner::from_bytes(&bytes).map_err(
-                        |e| {
-                            pay_core::Error::Config(format!(
-                                "Invalid keypair bytes for `{name}`: {e}"
-                            ))
-                        },
-                    )?,
-                ))
+            let signer = if account.backend == pay_core::accounts::BackendKind::Ephemeral {
+                pay_core::signer::signer_for_ephemeral_account(account)
+                    .map_err(|e| pay_core::Error::Config(format!("Account `{name}`: {e}")))?
             } else {
                 // Off the async worker — see [`blocking_signer_resolution`].
                 let account = account.clone();
@@ -4825,11 +4856,11 @@ endpoints:
     use super::blocking_signer_resolution;
     use super::resolve_signer_with_store;
     use pay_core::accounts::{
-        Account, AccountsFile, Keystore as AcctKeystore, MemoryAccountsStore,
+        Account, AccountsFile, BackendKind as AcctKeystore, MemoryAccountsStore,
     };
     use pay_types::metering::SignerConfig;
     // SolanaSigner trait is brought into scope by the parent module's
-    // `use pay_kit::mpp::solana_keychain::SolanaSigner;` so calls like
+    // `use pay_kit::mpp::solana_keychain::{TransactionSigner};` so calls like
     // `signer.pubkey()` resolve through the trait method.
 
     /// A real ed25519 keypair (sk[32] || pk[32]) lifted from the
@@ -4857,7 +4888,7 @@ endpoints:
         let pubkey = bs58::encode(&VALID_TEST_KEYPAIR_BYTES[32..]).into_string();
         let acct = Account {
             provider: None,
-            keystore: AcctKeystore::Ephemeral,
+            backend: AcctKeystore::Ephemeral,
             active: false,
             auth_required: Some(false),
             pubkey: Some(pubkey.clone()),
@@ -5070,7 +5101,7 @@ endpoints:
         let mut file = AccountsFile::default();
         let bad = Account {
             provider: None,
-            keystore: AcctKeystore::Ephemeral,
+            backend: AcctKeystore::Ephemeral,
             active: false,
             auth_required: Some(false),
             pubkey: Some("4BuiY9QUUfPoAGNJBja3JapAuVWMc9c7in6UCgyC2zPR".to_string()),

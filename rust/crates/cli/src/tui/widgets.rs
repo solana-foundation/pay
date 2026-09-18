@@ -4,7 +4,7 @@
 
 use qrcode::{Color as QrColor, QrCode};
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
@@ -237,7 +237,7 @@ fn render_scale_spans(
 pub(crate) fn render_slider_box<'a>(
     frame: &mut ratatui::Frame,
     area: Rect,
-    title: impl Into<ratatui::widgets::block::Title<'a>>,
+    title: impl Into<ratatui::text::Line<'a>>,
     position: usize,
     max_steps: usize,
     scale_labels: &[(usize, &str)],

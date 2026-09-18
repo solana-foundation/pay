@@ -83,6 +83,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - name: Install Surfpool CLI
+        uses: ./.github/actions/install-surfpool
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust

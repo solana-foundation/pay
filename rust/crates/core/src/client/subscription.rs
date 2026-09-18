@@ -335,6 +335,8 @@ pub fn build_credential_with_authenticate_and_override(
         }
     }
 
+    // Activation binds a reusable bearer proof signed as a raw message.
+    signer.require_raw_message_signing("a subscription proof")?;
     let activation = rt
         .block_on(build_subscription_activation_credential(
             &signer, &rpc, challenge,

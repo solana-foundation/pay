@@ -2,7 +2,7 @@
 //!
 //! Thin wrapper around `pay_kit::mpp` for challenge detection and credential building.
 
-use pay_kit::mpp::client::build_credential_header;
+use pay_kit::mpp::client::{BuildChargeTransactionOptions, build_credential_header_with_options};
 use pay_kit::mpp::protocol::solana::default_rpc_url;
 use pay_kit::mpp::solana_keychain::SolanaSigner;
 use pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient;
@@ -174,8 +174,16 @@ pub fn build_credential_with_override(
         }
     }
 
+    // Cap the transaction version at what the wallet can sign (a Ledger
+    // signs v0 only); the kit negotiates against what the server advertises.
+    let options = BuildChargeTransactionOptions {
+        max_tx_version: signer.max_tx_version(),
+        ..Default::default()
+    };
     let header = rt
-        .block_on(build_credential_header(&signer, &rpc, challenge))
+        .block_on(build_credential_header_with_options(
+            &signer, &rpc, challenge, options,
+        ))
         .map_err(|e| Error::Mpp(format!("Failed to build credential: {e}")))?;
 
     Ok((header, ephemeral_notice))

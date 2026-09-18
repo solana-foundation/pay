@@ -100,6 +100,10 @@ struct Opts {
 }
 
 fn main() {
+    // Telemetry constructs a reqwest client before the proxy starts. Install
+    // rustls's process-wide provider before either subsystem can initialize.
+    pay_proxy::install_crypto_provider();
+
     if commands::help::root_overview_help_requested() {
         if commands::help::args_include_no_dna() {
             no_dna::enable_for_process();
@@ -217,11 +221,18 @@ fn main() {
             None
         };
         if let Some(network) = enforced_network {
-            let exists = accounts
+            // Same rule as pay-core's signer resolution: a remote or
+            // hardware account registered on mainnet signs raw bytes and
+            // carries no chain state, so it serves every network.
+            let on_network = accounts
                 .accounts
                 .get(network)
                 .is_some_and(|net| net.contains_key(name.as_str()));
-            if !exists {
+            let remote_on_mainnet = network != pay_core::accounts::MAINNET_NETWORK
+                && accounts
+                    .named_account_for_network(pay_core::accounts::MAINNET_NETWORK, name)
+                    .is_some_and(|a| a.backend == pay_core::accounts::BackendKind::Remote);
+            if !on_network && !remote_on_mainnet {
                 eprintln!("Error: account '{name}' not found in {network}.");
                 std::process::exit(1);
             }
@@ -278,6 +289,7 @@ fn main() {
         || matches!(
             command,
             Command::Setup(_)
+                | Command::CloudOnboard(_)
                 | Command::Account { .. }
                 | Command::Whoami(_)
                 | Command::Skills { .. }
@@ -497,10 +509,13 @@ fn init_logging(
     verbose: bool,
     otlp_sidecar: Option<&str>,
 ) -> Option<observability::OtelGuard> {
+    // `solana_remote_wallet` probes for Trezor Bridge on every Ledger
+    // connect and logs the refused connection as an error; its failures
+    // reach the user as pay errors instead.
     let default = if verbose || otlp_sidecar.is_some() {
-        "pay=info,warn"
+        "pay=info,warn,solana_remote_wallet=off"
     } else {
-        "warn"
+        "warn,solana_remote_wallet=off"
     };
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default));
 

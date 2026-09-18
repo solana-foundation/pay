@@ -94,11 +94,10 @@ use pay_api_types::transfer_batch::{
     TransferBatchRequest, TransferBatchResponse, TransferBatchStatus, TransferNetwork,
 };
 use pay_kit::mpp::protocol::solana::programs;
-use pay_kit::mpp::solana_keychain::SolanaSigner;
-use solana_message::Message;
+use pay_kit::mpp::solana_keychain::TransactionSigner;
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
-use solana_transaction::Transaction;
+use solana_transaction::versioned::VersionedTransaction;
 
 use crate::ata::associated_token_address;
 use crate::rpc::RpcClient;
@@ -379,7 +378,7 @@ fn parse_positive_base_units(amount: &str, decimals: u8) -> Option<u64> {
 /// key material directly, only the [`SolanaSigner`] trait object.
 pub struct TransferBatchSponsor {
     pub fee_payer_pubkey: Pubkey,
-    pub signer: Arc<dyn SolanaSigner>,
+    pub signer: Arc<dyn TransactionSigner>,
 }
 
 /// Operator-configured pricing and transaction-shape ceilings. See the
@@ -531,7 +530,11 @@ pub async fn submit(
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(prepared_transaction_base64.trim())
         .map_err(|e| TransferBatchError::MalformedCredential(e.to_string()))?;
-    let mut tx: Transaction = bincode::deserialize(&bytes)
+    let mut tx = pay_kit::core::tx::decode_bytes(&bytes)
+        .map_err(|e| TransferBatchError::MalformedCredential(e.to_string()))?;
+    // Version 0 only: the chunk validator below reads the ComputeBudget prefix
+    // by index. Legacy and lookup tables are rejected here.
+    pay_kit::core::tx::check_envelope(&tx, &[pay_kit::core::tx::TxVersion::V0])
         .map_err(|e| TransferBatchError::MalformedCredential(e.to_string()))?;
 
     validate_prepared_transaction(chunk, runtime, &tx)?;
@@ -547,16 +550,16 @@ pub async fn submit(
         return Err(TransferBatchError::FeePayerSlotAlreadySigned);
     }
 
-    runtime
-        .sponsor
-        .signer
-        .sign_transaction(&mut tx)
-        .await
-        .map_err(|e| TransferBatchError::SigningFailed(e.to_string()))?;
+    pay_kit::core::signing::cosign_versioned_fee_payer(
+        runtime.sponsor.signer.as_ref(),
+        &runtime.sponsor.fee_payer_pubkey,
+        &mut tx,
+    )
+    .await
+    .map_err(|e| TransferBatchError::SigningFailed(e.to_string()))?;
 
-    let signed_bytes =
-        bincode::serialize(&tx).map_err(|e| TransferBatchError::SigningFailed(e.to_string()))?;
-    let signed_b64 = base64::engine::general_purpose::STANDARD.encode(signed_bytes);
+    let signed_b64 = pay_kit::core::tx::encode(&tx)
+        .map_err(|e| TransferBatchError::SigningFailed(e.to_string()))?;
 
     let signature = runtime
         .rpc
@@ -582,10 +585,13 @@ pub async fn submit(
     })
 }
 
-fn verify_sender_signature(tx: &Transaction, sender: &Pubkey) -> Result<(), TransferBatchError> {
+fn verify_sender_signature(
+    tx: &VersionedTransaction,
+    sender: &Pubkey,
+) -> Result<(), TransferBatchError> {
     let index = tx
         .message
-        .account_keys
+        .static_account_keys()
         .iter()
         .position(|k| k == sender)
         .ok_or(TransferBatchError::InvalidSenderSignature)?;
@@ -596,7 +602,7 @@ fn verify_sender_signature(tx: &Transaction, sender: &Pubkey) -> Result<(), Tran
     if *signature == Signature::default() {
         return Err(TransferBatchError::InvalidSenderSignature);
     }
-    if !signature.verify(sender.as_ref(), &tx.message_data()) {
+    if !signature.verify(sender.as_ref(), &tx.message.serialize()) {
         return Err(TransferBatchError::InvalidSenderSignature);
     }
     Ok(())
@@ -609,9 +615,9 @@ fn verify_sender_signature(tx: &Transaction, sender: &Pubkey) -> Result<(), Tran
 fn validate_prepared_transaction(
     chunk: &ValidatedChunk,
     runtime: &TransferBatchRuntime<'_>,
-    tx: &Transaction,
+    tx: &VersionedTransaction,
 ) -> Result<(), TransferBatchError> {
-    let message = &tx.message;
+    let message = &MessageView::from(&tx.message);
 
     let actual_fee_payer = *message
         .account_keys
@@ -631,7 +637,7 @@ fn validate_prepared_transaction(
         program_id(programs::TOKEN_2022_PROGRAM),
         program_id(programs::MEMO_PROGRAM),
     ];
-    for ix in &message.instructions {
+    for ix in message.instructions {
         let pid = account_at(message, ix.program_id_index)?;
         if !allowed_programs.contains(&pid) {
             return Err(mismatch(&format!(
@@ -721,6 +727,23 @@ fn validate_prepared_transaction(
     Ok(())
 }
 
+/// Static view of a versioned message: the kit builds and accepts only
+/// versions 0 and 1, neither with address lookup tables, so every account an
+/// instruction names is a static key.
+struct MessageView<'a> {
+    account_keys: &'a [Pubkey],
+    instructions: &'a [solana_message::compiled_instruction::CompiledInstruction],
+}
+
+impl<'a> From<&'a solana_message::VersionedMessage> for MessageView<'a> {
+    fn from(message: &'a solana_message::VersionedMessage) -> Self {
+        Self {
+            account_keys: message.static_account_keys(),
+            instructions: message.instructions(),
+        }
+    }
+}
+
 fn mismatch(detail: &str) -> TransferBatchError {
     TransferBatchError::TransactionMismatch(detail.to_string())
 }
@@ -729,17 +752,17 @@ fn program_id(value: &str) -> Pubkey {
     Pubkey::from_str(value).expect("PayKit program id constants are always valid base58")
 }
 
-fn instruction_at(
-    message: &Message,
+fn instruction_at<'a>(
+    message: &MessageView<'a>,
     index: usize,
-) -> Result<&solana_message::compiled_instruction::CompiledInstruction, TransferBatchError> {
+) -> Result<&'a solana_message::compiled_instruction::CompiledInstruction, TransferBatchError> {
     message
         .instructions
         .get(index)
         .ok_or_else(|| mismatch("prepared transaction is missing an expected instruction"))
 }
 
-fn account_at(message: &Message, index: u8) -> Result<Pubkey, TransferBatchError> {
+fn account_at(message: &MessageView<'_>, index: u8) -> Result<Pubkey, TransferBatchError> {
     message
         .account_keys
         .get(index as usize)
@@ -748,7 +771,7 @@ fn account_at(message: &Message, index: u8) -> Result<Pubkey, TransferBatchError
 }
 
 fn decode_compute_unit_price(
-    message: &Message,
+    message: &MessageView<'_>,
     ix: &solana_message::compiled_instruction::CompiledInstruction,
 ) -> Result<u64, TransferBatchError> {
     let program = account_at(message, ix.program_id_index)?;
@@ -762,7 +785,7 @@ fn decode_compute_unit_price(
 }
 
 fn decode_compute_unit_limit(
-    message: &Message,
+    message: &MessageView<'_>,
     ix: &solana_message::compiled_instruction::CompiledInstruction,
 ) -> Result<u32, TransferBatchError> {
     let program = account_at(message, ix.program_id_index)?;
@@ -777,7 +800,7 @@ fn decode_compute_unit_limit(
 
 #[allow(clippy::too_many_arguments)]
 fn validate_ata_create(
-    message: &Message,
+    message: &MessageView<'_>,
     ix: &solana_message::compiled_instruction::CompiledInstruction,
     fee_payer: &Pubkey,
     owner: &Pubkey,
@@ -827,7 +850,7 @@ fn validate_ata_create(
 
 #[allow(clippy::too_many_arguments)]
 fn validate_transfer_checked(
-    message: &Message,
+    message: &MessageView<'_>,
     ix: &solana_message::compiled_instruction::CompiledInstruction,
     source_ata: &Pubkey,
     mint: &Pubkey,
@@ -886,7 +909,7 @@ fn validate_transfer_checked(
 }
 
 fn validate_memo(
-    message: &Message,
+    message: &MessageView<'_>,
     ix: &solana_message::compiled_instruction::CompiledInstruction,
     expected_memo: &str,
 ) -> Result<(), TransferBatchError> {
@@ -906,24 +929,12 @@ fn validate_memo(
 // Only used to build well-formed test fixtures below; kept internal.
 #[cfg(test)]
 fn compute_unit_price_instruction(micro_lamports: u64) -> solana_instruction::Instruction {
-    let mut data = vec![COMPUTE_UNIT_PRICE_DISCRIMINATOR];
-    data.extend_from_slice(&micro_lamports.to_le_bytes());
-    solana_instruction::Instruction {
-        program_id: program_id(programs::COMPUTE_BUDGET_PROGRAM),
-        accounts: vec![],
-        data,
-    }
+    pay_kit::core::tx::unit_price_instruction(micro_lamports)
 }
 
 #[cfg(test)]
 fn compute_unit_limit_instruction(units: u32) -> solana_instruction::Instruction {
-    let mut data = vec![COMPUTE_UNIT_LIMIT_DISCRIMINATOR];
-    data.extend_from_slice(&units.to_le_bytes());
-    solana_instruction::Instruction {
-        program_id: program_id(programs::COMPUTE_BUDGET_PROGRAM),
-        accounts: vec![],
-        data,
-    }
+    pay_kit::core::tx::unit_limit_instruction(units)
 }
 
 #[cfg(test)]
@@ -932,6 +943,7 @@ mod tests {
     use crate::stablecoin::TokenProgram;
     use pay_api_types::transfer_batch::TransferBatchEntry;
     use pay_kit::mpp::client::{TransferEntry, build_spl_transfer_batch_instructions};
+    use pay_kit::mpp::solana_keychain::SolanaSigner;
     use solana_hash::Hash;
 
     fn coin() -> Stablecoin {
@@ -1069,12 +1081,13 @@ mod tests {
     /// (`secret[0..32] || public[32..64]`) rather than going through the
     /// `solana_signer::Signer` trait, so tests don't need a direct
     /// dependency on the `solana-signer` crate just for one accessor.
-    fn fresh_signer() -> (pay_kit::mpp::solana_keychain::Signer, Pubkey) {
+    fn fresh_signer() -> (pay_kit::mpp::solana_keychain::MemorySigner, Pubkey) {
         let keypair = solana_keypair::Keypair::new();
         let bytes = keypair.to_bytes();
         let pubkey = Pubkey::new_from_array(bytes[32..64].try_into().unwrap());
         let json = serde_json::to_string(&bytes.to_vec()).unwrap();
-        let signer = pay_kit::mpp::solana_keychain::Signer::from_memory(&json).unwrap();
+        let signer =
+            pay_kit::mpp::solana_keychain::MemorySigner::from_private_key_string(&json).unwrap();
         assert_eq!(signer.pubkey(), pubkey);
         (signer, pubkey)
     }
@@ -1106,7 +1119,7 @@ mod tests {
         chunk: &ValidatedChunk,
         fee_payer: &Pubkey,
         settings: &TransferBatchSettings,
-    ) -> Transaction {
+    ) -> VersionedTransaction {
         let last = chunk.transfers.len() - 1;
         let entries: Vec<TransferEntry> = chunk
             .transfers
@@ -1140,9 +1153,14 @@ mod tests {
             .unwrap(),
         );
 
-        let message =
-            Message::new_with_blockhash(&instructions, Some(fee_payer), &Hash::new_unique());
-        Transaction::new_unsigned(message)
+        pay_kit::core::tx::build_unsigned_unchecked(
+            pay_kit::core::tx::TxVersion::V0,
+            fee_payer,
+            &instructions,
+            Hash::new_unique(),
+            None,
+        )
+        .unwrap()
     }
 
     /// Build the exact chunk transaction `sender_signer` would produce via
@@ -1151,11 +1169,13 @@ mod tests {
     async fn build_signed_chunk_transaction(
         chunk: &ValidatedChunk,
         fee_payer: &Pubkey,
-        sender_signer: &pay_kit::mpp::solana_keychain::Signer,
+        sender_signer: &pay_kit::mpp::solana_keychain::MemorySigner,
         settings: &TransferBatchSettings,
-    ) -> Transaction {
+    ) -> VersionedTransaction {
         let mut tx = unsigned_chunk_transaction(chunk, fee_payer, settings);
-        sender_signer.sign_transaction(&mut tx).await.unwrap();
+        pay_kit::core::signing::sign_versioned_transaction_slot(sender_signer, &mut tx)
+            .await
+            .unwrap();
         tx
     }
 

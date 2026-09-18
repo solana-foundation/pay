@@ -829,7 +829,7 @@ mod tests {
     use crate::server::session::test_channel_state;
     use pay_kit::mpp::blockhash::BlockhashCache;
     use pay_kit::mpp::server::session::{SessionConfig, VoucherSigner};
-    use pay_kit::mpp::solana_keychain::{SolanaSigner, memory::MemorySigner};
+    use pay_kit::mpp::solana_keychain::{TransactionSigner, memory::MemorySigner};
     use pay_kit::mpp::store::{ChannelStore, MemoryChannelStore};
     use pay_types::metering::{MeterDimension, PriceTier};
 
@@ -866,7 +866,7 @@ mod tests {
         }
     }
 
-    fn stream_test_signer() -> Box<dyn SolanaSigner> {
+    fn stream_test_signer() -> Box<dyn TransactionSigner> {
         use ed25519_dalek::SigningKey;
 
         let signing_key = SigningKey::generate(&mut rand::thread_rng());
@@ -1237,7 +1237,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
         let mut operator_keypair = [0_u8; 64];
         operator_keypair[..32].copy_from_slice(signing_key.as_bytes());
         operator_keypair[32..].copy_from_slice(verifying_key.as_bytes());
-        let operator: Arc<dyn SolanaSigner> =
+        let operator: Arc<dyn TransactionSigner> =
             Arc::new(MemorySigner::from_bytes(&operator_keypair).unwrap());
         let config = SessionConfig {
             operator: operator.pubkey().to_string(),

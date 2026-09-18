@@ -17,9 +17,13 @@ fn default_network() -> String {
     "mainnet".to_string()
 }
 
-pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
-    let network = params.network;
-    let accounts = match pay_core::accounts::AccountsFile::load() {
+pub async fn run(
+    params: Params,
+    scope: &crate::context::CallScope,
+) -> Result<CallToolResult, rmcp::ErrorData> {
+    // A forced network wins over the parameter, as it does for payments.
+    let network = scope.network_override.clone().unwrap_or(params.network);
+    let accounts = match scope.accounts.load() {
         Ok(accounts) => accounts,
         Err(err) => {
             return Ok(super::tool_error(format!(
@@ -27,7 +31,13 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
             )));
         }
     };
-    let Some((_name, account)) = accounts.account_for_network(&network) else {
+    let selected = match scope.account_override.as_deref() {
+        Some(name) => accounts
+            .named_account_for_network(&network, name)
+            .map(|account| (name, account)),
+        None => accounts.account_for_network(&network),
+    };
+    let Some((_name, account)) = selected else {
         return Ok(super::tool_error(format!(
             "No account configured for {network}. Run `pay setup` first."
         )));
@@ -39,11 +49,7 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
         ));
     };
     let pubkey = pubkey.to_string();
-    let rpc_url = if network == "mainnet" {
-        pay_core::balance::mainnet_rpc_url()
-    } else {
-        std::env::var("PAY_RPC_URL").unwrap_or_else(|_| pay_core::balance::mainnet_rpc_url())
-    };
+    let rpc_url = scope.rpc_url(&network);
 
     let balances = match pay_core::client::balance::get_stablecoin_balances(&rpc_url, &pubkey).await
     {

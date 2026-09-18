@@ -15,7 +15,9 @@ include_dir = "0.7.4"
 mime_guess = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-solana-transaction = { workspace = true, features = ["bincode"] }
+solana-transaction = { workspace = true, features = ["serde", "wincode"] }
+# Canonical wire codec for every Solana message version (bincode cannot decode V1).
+wincode = "0.5"
 tokio = { workspace = true }
 
 [dev-dependencies]

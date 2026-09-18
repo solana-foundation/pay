@@ -7,7 +7,7 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
-use pay_kit::mpp::solana_keychain::SolanaSigner;
+use pay_kit::mpp::solana_keychain::TransactionSigner;
 use solana_instruction::{AccountMeta, Instruction};
 use solana_pubkey::Pubkey;
 
@@ -88,7 +88,7 @@ pub struct RegistrationOutcome {
 /// idempotent. A conflicting existing entry must be deregistered explicitly.
 pub async fn register_service(
     registration: &ServiceRegistration,
-    signer: Arc<dyn SolanaSigner>,
+    signer: Arc<dyn TransactionSigner>,
     rpc_url: &str,
 ) -> pay_core::Result<RegistrationOutcome> {
     let program_id = program_id()?;
@@ -171,7 +171,7 @@ pub async fn register_service(
 /// grace period eventually makes the entry eligible for rewarded eviction.
 pub fn spawn_renewal_task(
     registration: ServiceRegistration,
-    signer: Arc<dyn SolanaSigner>,
+    signer: Arc<dyn TransactionSigner>,
     rpc_url: String,
 ) {
     tokio::spawn(async move {
@@ -325,14 +325,11 @@ fn validate_field(name: &str, value: &str, max_len: usize, required: bool) -> pa
 }
 
 async fn sign_simulate_and_broadcast(
-    signer: Arc<dyn SolanaSigner>,
+    signer: Arc<dyn TransactionSigner>,
     instruction: Instruction,
     rpc_url: &str,
 ) -> pay_core::Result<String> {
     use pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient;
-    use solana_message::Message;
-    use solana_signature::Signature;
-    use solana_transaction::Transaction;
 
     let url = rpc_url.to_string();
     let signer_pubkey = signer.pubkey();
@@ -349,45 +346,34 @@ async fn sign_simulate_and_broadcast(
     .await
     .map_err(|error| pay_core::Error::Mpp(format!("provider registry RPC task: {error}")))??;
 
-    let message = Message::new_with_blockhash(&[instruction], Some(&signer_pubkey), &blockhash);
-    let mut transaction = Transaction::new_unsigned(message);
-    let signature = signer
-        .sign_message(&transaction.message_data())
+    let mut transaction = pay_kit::core::tx::build_unsigned(
+        pay_kit::core::tx::TxVersion::V0,
+        &signer_pubkey,
+        &[instruction],
+        blockhash,
+        None,
+    )
+    .map_err(|error| {
+        pay_core::Error::Mpp(format!("provider registration build failed: {error}"))
+    })?;
+    pay_kit::core::signing::sign_versioned_transaction_slot(signer.as_ref(), &mut transaction)
         .await
         .map_err(|error| {
             pay_core::Error::Mpp(format!("provider registration signing failed: {error}"))
         })?;
-    let signer_index = transaction
-        .message
-        .account_keys
-        .iter()
-        .position(|key| *key == signer_pubkey)
-        .ok_or_else(|| {
-            pay_core::Error::Mpp("provider authority absent from transaction".to_string())
-        })?;
-    transaction.signatures[signer_index] = Signature::from(<[u8; 64]>::from(signature));
-    let serialized = bincode::serialize(&transaction).map_err(|error| {
-        pay_core::Error::Mpp(format!(
-            "failed to serialize provider registration: {error}"
-        ))
-    })?;
 
     tokio::task::spawn_blocking(move || {
         let rpc = RpcClient::new(url);
-        let transaction: Transaction = bincode::deserialize(&serialized).map_err(|error| {
-            pay_core::Error::Mpp(format!(
-                "provider registration transaction round-trip: {error}"
-            ))
-        })?;
-        let simulation = rpc.simulate_transaction(&transaction).map_err(|error| {
-            pay_core::Error::Mpp(format!("provider registration simulation failed: {error}"))
-        })?;
+        let simulation =
+            pay_kit::core::rpc::simulate_transaction(&rpc, &transaction).map_err(|error| {
+                pay_core::Error::Mpp(format!("provider registration simulation failed: {error}"))
+            })?;
         if let Some(error) = simulation.value.err {
             return Err(pay_core::Error::Mpp(format!(
                 "provider registration simulation rejected: {error:?}"
             )));
         }
-        rpc.send_and_confirm_transaction(&transaction)
+        pay_kit::core::rpc::send_and_confirm_transaction(&rpc, &transaction)
             .map(|signature| signature.to_string())
             .map_err(|error| {
                 pay_core::Error::Mpp(format!("provider registration broadcast failed: {error}"))

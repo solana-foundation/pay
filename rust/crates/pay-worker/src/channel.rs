@@ -274,7 +274,7 @@ async fn find_open_signature(
     oldest.ok_or(JobError::OpenTxNotFound)
 }
 
-/// Decode a base64 bincode transaction and return the data bytes of the
+/// Decode a base64 wire transaction and return the data bytes of the
 /// instruction whose program id is the payment-channels program and whose
 /// discriminator (`data[0]`) is `OPEN_DISCRIMINATOR` (1).
 ///
@@ -286,17 +286,16 @@ async fn find_open_signature(
 /// both message versions.
 fn extract_open_ix_data(tx_b64: &str) -> Result<Vec<u8>, JobError> {
     use base64::Engine;
-    use solana_message::VersionedMessage;
     let raw = base64::engine::general_purpose::STANDARD
         .decode(tx_b64.trim())
         .map_err(|e| JobError::OpenIxDecode(format!("base64 decode: {e}")))?;
-    let tx: solana_transaction::versioned::VersionedTransaction = bincode::deserialize(&raw)
-        .map_err(|e| JobError::OpenIxDecode(format!("bincode deserialize: {e}")))?;
+    let tx: solana_transaction::versioned::VersionedTransaction = wincode::deserialize(&raw)
+        .map_err(|e| JobError::OpenIxDecode(format!("transaction decode: {e}")))?;
     let program_id = default_program_id();
-    let (keys, instructions) = match &tx.message {
-        VersionedMessage::Legacy(m) => (&m.account_keys, &m.instructions),
-        VersionedMessage::V0(m) => (&m.account_keys, &m.instructions),
-    };
+    // Versions 0 and 1 both keep every account an instruction names in the
+    // static keys (the kit never uses lookup tables).
+    let keys = tx.message.static_account_keys();
+    let instructions = tx.message.instructions();
     for ix in instructions {
         let Some(program) = keys.get(ix.program_id_index as usize) else {
             continue;
@@ -562,5 +561,36 @@ mod tests {
     #[test]
     fn extract_open_ix_data_rejects_garbage() {
         assert!(extract_open_ix_data("not base64!!!").is_err());
+    }
+
+    #[test]
+    fn extract_open_ix_data_accepts_legacy_transactions() {
+        use base64::Engine;
+        use solana_hash::Hash;
+        use solana_message::{
+            MessageHeader, VersionedMessage, compiled_instruction::CompiledInstruction,
+        };
+        use solana_signature::Signature;
+        use solana_transaction::versioned::VersionedTransaction;
+
+        let expected = vec![OPEN_DISCRIMINATOR, 7, 8, 9];
+        let message = solana_message::legacy::Message {
+            header: MessageHeader::default(),
+            account_keys: vec![default_program_id()],
+            recent_blockhash: Hash::default(),
+            instructions: vec![CompiledInstruction {
+                program_id_index: 0,
+                accounts: Vec::new(),
+                data: expected.clone(),
+            }],
+        };
+        let transaction = VersionedTransaction {
+            signatures: vec![Signature::default()],
+            message: VersionedMessage::Legacy(message),
+        };
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(wincode::serialize(&transaction).expect("serialize legacy transaction"));
+
+        assert_eq!(extract_open_ix_data(&encoded).unwrap(), expected);
     }
 }

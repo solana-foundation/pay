@@ -8,12 +8,15 @@
     "dev:api": "tsx watch api/index.ts",
     "dev:web": "vite",
     "build": "vite build && tsc --noEmit",
+    "build:cloud": "vite build --config vite.cloud.config.ts",
+    "dev:cloud": "vite --config vite.cloud.config.ts --port 5174",
     "test": "vitest run",
     "start": "tsx api/index.ts",
     "proxy": "tsx proxy/server.ts",
     "test:proxy": "tsx proxy/e2e.ts"
   },
   "dependencies": {
+    "@privy-io/react-auth": "^3.43.0",
     "@solana/kit": "^6.10.0",
     "@solana/mpp": "^0.5.2",
     "cors": "^2.8.6",
@@ -35,7 +38,16 @@
     "tsx": "^4.23.13",
     "typescript": "^5.9.3",
     "vite": "^6.4.3",
-    "vitest": "^3.2.7"
+    "vitest": "^4.1.11"
   },
-  "packageManager": "pnpm@9.15.0"
+  "packageManager": "pnpm@9.15.0",
+  "pnpm": {
+    "overrides": {
+      "axios@>=1.0.0 <1.18.0": "1.18.0",
+      "decode-uri-component@<0.5.0": "0.5.0",
+      "qs@>=2.2.5 <6.16.0": "6.16.0",
+      "uuid@<11.1.1": "11.1.1",
+      "ws@>=8.0.0 <8.21.0": "8.21.0"
+    }
+  }
 }

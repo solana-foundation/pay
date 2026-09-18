@@ -605,7 +605,7 @@ impl BenchScheme for BatchSettlement {
         // the challenged blockhash + slot. The sponsor co-signs and broadcasts.
         let token_program = pc::parse_pubkey(&requirements.extra.token_program)
             .map_err(|e| anyhow::anyhow!("bad extra.tokenProgram: {e}"))?;
-        let terms = resolve_terms_with_token_program(&requirements, token_program)
+        let terms = resolve_terms_with_token_program(&requirements, token_program, None)
             .map_err(|e| anyhow::anyhow!("resolve batch terms: {e}"))?;
         let (blockhash, open_slot) = open_hints(&requirements)?;
         let payer_signer = MemorySigner::from_bytes(&ctx.wallet.keypair)
@@ -820,7 +820,7 @@ impl BenchScheme for BatchSettlement {
             .context("close: batch recovery challenge")?;
         let token_program = pc::parse_pubkey(&requirements.extra.token_program)
             .map_err(|e| anyhow::anyhow!("close: bad extra.tokenProgram: {e}"))?;
-        let terms = resolve_terms_with_token_program(&requirements, token_program)
+        let terms = resolve_terms_with_token_program(&requirements, token_program, None)
             .map_err(|e| anyhow::anyhow!("close: resolve batch terms: {e}"))?;
         let (blockhash, _open_slot) = open_hints(&requirements)?;
         let signer = MemorySigner::from_bytes(&ctx.wallet.keypair)
@@ -1190,6 +1190,7 @@ mod tests {
             pay_to: Pubkey::from([5_u8; 32]).to_string(),
             max_timeout_seconds: 60,
             extra: BatchExtra {
+                transaction_versions: None,
                 payment_flow: None,
                 fee_payer: fee_payer.to_string(),
                 receiver_authorizer: None,
@@ -1299,6 +1300,7 @@ mod tests {
             pay_to: pc::pubkey_string(&Pubkey::from([5u8; 32])),
             max_timeout_seconds: 60,
             extra: BatchExtra {
+                transaction_versions: None,
                 payment_flow: None,
                 fee_payer: pc::pubkey_string(&fee_payer),
                 receiver_authorizer: None,

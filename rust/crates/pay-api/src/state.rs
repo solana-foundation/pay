@@ -143,7 +143,7 @@ async fn build_confidential_workers(
 fn spawn_confidential_workers(
     config: &Config,
     coin: &Stablecoin,
-    signer: std::sync::Arc<dyn pay_kit::mpp::solana_keychain::SolanaSigner>,
+    signer: std::sync::Arc<dyn pay_kit::mpp::solana_keychain::TransactionSigner>,
     fee_payer_pubkey: String,
 ) -> HashMap<Network, ConfidentialHandle> {
     let mut handles = HashMap::with_capacity(config.networks.len());
@@ -181,7 +181,7 @@ fn spawn_confidential_workers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pay_kit::mpp::solana_keychain::{Signer, SolanaSigner};
+    use pay_kit::mpp::solana_keychain::SolanaSigner;
 
     /// A minimal config with send disabled (its default).
     fn minimal_config(send_enabled: bool) -> Config {
@@ -216,7 +216,10 @@ mod tests {
     async fn confidential_workers_are_created_per_configured_network() {
         let keypair = solana_keypair::Keypair::new();
         let keypair_bytes = serde_json::to_string(&keypair.to_bytes().to_vec()).unwrap();
-        let signer = std::sync::Arc::new(Signer::from_memory(&keypair_bytes).unwrap());
+        let signer = std::sync::Arc::new(
+            pay_kit::mpp::solana_keychain::MemorySigner::from_private_key_string(&keypair_bytes)
+                .unwrap(),
+        );
         let coin = Stablecoin {
             symbol: "USDC22".into(),
             mint: solana_pubkey::Pubkey::new_unique(),

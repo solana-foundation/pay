@@ -1,0 +1,16 @@
+name: Install Surfpool
+description: Install the checksum-verified Surfpool CLI used by Rust integration tests
+
+runs:
+  using: composite
+  steps:
+    - name: Download and install Surfpool
+      shell: bash
+      run: |
+        archive="${RUNNER_TEMP}/surfpool-linux-x64.tar.gz"
+        curl --fail --location --silent --show-error \
+          https://github.com/solana-foundation/surfpool/releases/download/v1.5.0/surfpool-linux-x64.tar.gz \
+          --output "${archive}"
+        echo "5b20a3b46e60c4f819af7b4da5c3ea211f76041710617841cc23247d15887ddc  ${archive}" | sha256sum --check
+        sudo tar --extract --gzip --file "${archive}" --directory /usr/local/bin surfpool
+        surfpool --version

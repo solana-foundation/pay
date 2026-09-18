@@ -22,7 +22,6 @@ use axum::http::Request;
 use axum::middleware;
 use axum::response::IntoResponse;
 use axum::routing::any;
-use base64::Engine;
 use ed25519_dalek::{Signer as _, SigningKey};
 use pay_core::PaymentState;
 use pay_kit::mpp::server::Mpp;
@@ -31,9 +30,7 @@ use pay_types::metering::ApiSpec;
 use serde_json::Value;
 use solana_hash::Hash;
 use solana_instruction::{AccountMeta, Instruction};
-use solana_message::Message;
 use solana_pubkey::Pubkey;
-use solana_transaction::Transaction;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -132,18 +129,24 @@ fn build_credential_with_blockhash(
         data,
     };
 
-    let message = Message::new_with_blockhash(&[ix], Some(&payer_pk), &recent_blockhash);
-    let mut tx = Transaction::new_unsigned(message);
+    // Version 0, like every pay client builds; the server rejects legacy
+    // before it looks at the blockhash.
+    let mut tx = pay_kit::core::tx::build_unsigned(
+        pay_kit::core::tx::TxVersion::V0,
+        &payer_pk,
+        &[ix],
+        recent_blockhash,
+        None,
+    )
+    .unwrap();
 
-    // Sign the transaction message with the payer's ed25519 key directly.
-    // We bypass the async SolanaSigner trait because the test is sync and
-    // only needs one signature.
-    let msg_data = tx.message_data();
-    let sig = payer.sign(&msg_data);
+    // Sign the versioned message bytes with the payer's ed25519 key directly.
+    // We bypass the async signer trait because the test is sync and only
+    // needs one signature.
+    let sig = payer.sign(&tx.message.serialize());
     tx.signatures = vec![solana_signature::Signature::from(sig.to_bytes())];
 
-    let tx_bytes = bincode::serialize(&tx).unwrap();
-    let tx_b64 = base64::engine::general_purpose::STANDARD.encode(&tx_bytes);
+    let tx_b64 = pay_kit::core::tx::encode(&tx).unwrap();
 
     let payload = serde_json::json!({
         "type": "transaction",

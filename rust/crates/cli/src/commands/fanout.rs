@@ -9,7 +9,7 @@ use chrono::Utc;
 use ed25519_dalek::SigningKey;
 use futures_util::{StreamExt, TryStreamExt};
 use pay_core::accounts::{
-    Account, AccountChoice, AccountsFile, AccountsStore, FileAccountsStore, Keystore,
+    Account, AccountChoice, AccountsFile, AccountsStore, BackendKind, FileAccountsStore,
     MemoryAccountsStore, resolve_account_for_network,
 };
 use pay_core::client::push::executor::{
@@ -532,7 +532,7 @@ fn resolve_signing_account(
         let pubkey = Pubkey::new_from_array(public);
         let account_name = "fanout-keypair".to_string();
         let account = Account {
-            keystore: Keystore::File,
+            backend: BackendKind::File,
             provider: None,
             active: true,
             auth_required: Some(false),

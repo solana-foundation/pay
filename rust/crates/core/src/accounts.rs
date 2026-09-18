@@ -62,10 +62,14 @@ pub fn default_auth_required_for_network(network: &str) -> bool {
 
 // ── Keystore + Account ──────────────────────────────────────────────────────
 
-/// Which keystore backend holds the secret key.
+/// Which signing backend holds an account's key.
+///
+/// Persisted as the `keystore` field of `accounts.yml`. The kind is a
+/// storage tag; what a backend can do comes from [`Account::descriptor`]
+/// and [`crate::backend::SigningBackend`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum Keystore {
+pub enum BackendKind {
     AppleKeychain,
     GnomeKeyring,
     WindowsHello,
@@ -82,16 +86,16 @@ pub enum Keystore {
     Remote,
 }
 
-impl std::fmt::Display for Keystore {
+impl std::fmt::Display for BackendKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Keystore::AppleKeychain => write!(f, "apple-keychain"),
-            Keystore::GnomeKeyring => write!(f, "gnome-keyring"),
-            Keystore::WindowsHello => write!(f, "windows-hello"),
-            Keystore::OnePassword => write!(f, "1password"),
-            Keystore::File => write!(f, "file"),
-            Keystore::Ephemeral => write!(f, "ephemeral"),
-            Keystore::Remote => write!(f, "remote"),
+            BackendKind::AppleKeychain => write!(f, "apple-keychain"),
+            BackendKind::GnomeKeyring => write!(f, "gnome-keyring"),
+            BackendKind::WindowsHello => write!(f, "windows-hello"),
+            BackendKind::OnePassword => write!(f, "1password"),
+            BackendKind::File => write!(f, "file"),
+            BackendKind::Ephemeral => write!(f, "ephemeral"),
+            BackendKind::Remote => write!(f, "remote"),
         }
     }
 }
@@ -103,8 +107,10 @@ fn is_false(b: &bool) -> bool {
 /// A single account entry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Account {
-    /// Which keystore backend stores the secret key.
-    pub keystore: Keystore,
+    /// Which signing backend holds the key. Serialised as `keystore` so
+    /// existing account files keep their shape.
+    #[serde(rename = "keystore")]
+    pub backend: BackendKind,
 
     /// Remote backend id for `keystore: remote` (`openfort`, …). Free
     /// text: a new provider registers itself in `pay_core::remote`
@@ -310,10 +316,72 @@ impl Subscription {
 impl Account {
     /// Whether this account should require backend auth on secret-key access.
     pub fn auth_required_for_network(&self, network: &str) -> bool {
-        self.keystore != Keystore::Ephemeral
+        self.backend != BackendKind::Ephemeral
             && self
                 .auth_required
                 .unwrap_or_else(|| default_auth_required_for_network(network))
+    }
+
+    /// The backend behind this account, resolved through the registry.
+    ///
+    /// Local kinds map to their keystore backend, `ephemeral` to the inline
+    /// wallet, and `remote` to the provider named in [`Account::provider`].
+    /// Errors when a remote entry names no provider or an unregistered one.
+    pub fn descriptor(&self) -> Result<&'static dyn crate::backend::SigningBackend> {
+        match self.backend {
+            BackendKind::Ephemeral => Ok(&crate::backend::Ephemeral),
+            BackendKind::Remote => {
+                let id = self.provider.as_deref().ok_or_else(|| {
+                    Error::Config(format!(
+                        "Remote account is missing its `provider` field in accounts.yml \
+                         (one of: {}).",
+                        crate::remote::provider_ids().join(", ")
+                    ))
+                })?;
+                crate::remote::provider(id)
+                    .map(|p| p as &'static dyn crate::backend::SigningBackend)
+                    .ok_or_else(|| {
+                        Error::Config(format!(
+                            "Account names an unknown remote backend `{id}`. \
+                             This build of pay supports: {}.",
+                            crate::remote::provider_ids().join(", ")
+                        ))
+                    })
+            }
+            _ => crate::backend::local_by_kind(&self.backend)
+                .map(|b| b as &'static dyn crate::backend::SigningBackend)
+                .ok_or_else(|| {
+                    Error::Config(format!(
+                        "No keystore backend is registered for `{}`.",
+                        self.backend
+                    ))
+                }),
+        }
+    }
+
+    /// Store parameters for this account's local backend: the 1Password
+    /// vault and account, or the keypair file path. `file_path` must be
+    /// resolved by the caller with [`Account::file_path`] because it may
+    /// fall back to a computed default.
+    pub fn store_params<'a>(
+        &'a self,
+        file_path: Option<&'a str>,
+    ) -> crate::backend::StoreParams<'a> {
+        crate::backend::StoreParams {
+            vault: self.vault.as_deref(),
+            op_account: self.account.as_deref(),
+            file_path,
+        }
+    }
+
+    /// Keypair file path for a `file` account: the stored `path`, else the
+    /// default location for `name`.
+    pub fn file_path(&self, name: &str) -> String {
+        self.path.clone().unwrap_or_else(|| {
+            FileAccountsStore::default_keypair_path(name)
+                .to_string_lossy()
+                .into_owned()
+        })
     }
 
     /// Build the signer source string used by `pay_core::signer::load_signer`
@@ -322,17 +390,12 @@ impl Account {
     /// the inline secret, and remote accounts sign through their provider
     /// without any local keypair to load.
     pub fn signer_source(&self, name: &str) -> Option<String> {
-        match self.keystore {
-            Keystore::AppleKeychain => Some(format!("keychain:{name}")),
-            Keystore::GnomeKeyring => Some(format!("gnome-keyring:{name}")),
-            Keystore::WindowsHello => Some(format!("windows-hello:{name}")),
-            Keystore::OnePassword => Some(format!("1password:{name}")),
-            Keystore::File => Some(self.path.clone().unwrap_or_else(|| {
-                FileAccountsStore::default_keypair_path(name)
-                    .to_string_lossy()
-                    .into_owned()
-            })),
-            Keystore::Ephemeral | Keystore::Remote => None,
+        match self.backend {
+            BackendKind::File => Some(self.file_path(name)),
+            BackendKind::Ephemeral | BackendKind::Remote => None,
+            _ => {
+                crate::backend::local_by_kind(&self.backend).map(|b| format!("{}:{name}", b.flag()))
+            }
         }
     }
 
@@ -340,7 +403,7 @@ impl Account {
     /// account, decoded from base58. Returns `None` for non-ephemeral
     /// accounts (which don't store the secret in this file).
     pub fn ephemeral_keypair_bytes(&self) -> Option<Vec<u8>> {
-        if self.keystore != Keystore::Ephemeral {
+        if self.backend != BackendKind::Ephemeral {
             return None;
         }
         crate::b58::decode_64(self.secret_key_b58.as_deref()?)
@@ -578,6 +641,13 @@ pub fn resolve_account_for_network(network: &str, file: &AccountsFile) -> Accoun
 pub trait AccountsStore: Send + Sync {
     fn load(&self) -> Result<AccountsFile>;
     fn save(&self, file: &AccountsFile) -> Result<()>;
+
+    /// Where this store's remote accounts keep their credentials. The
+    /// platform secret store by default; pay-cloud's tenant stores carry
+    /// their own so the same signing paths serve both.
+    fn credential_source(&self) -> &dyn crate::remote::CredentialSource {
+        &crate::remote::PlatformCredentials
+    }
 }
 
 /// On-disk YAML store at `~/.config/pay/accounts.yml`.
@@ -725,12 +795,12 @@ pub fn load_or_create_ephemeral_for_network_as(
         .named_account_for_network(network, account_name)
         .cloned()
     {
-        if account.keystore != Keystore::Ephemeral {
+        if account.backend != BackendKind::Ephemeral {
             return Err(Error::Config(format!(
                 "Network `{network}` account `{account_name}` is \
                  `{}`-backed, not ephemeral. Resolve via the keystore loader \
                  instead of generating a fresh wallet.",
-                account.keystore
+                account.backend
             )));
         }
         return Ok(ResolvedEphemeral {
@@ -744,12 +814,12 @@ pub fn load_or_create_ephemeral_for_network_as(
     if account_name == DEFAULT_ACCOUNT_NAME {
         match resolve_account_for_network(network, &file) {
             AccountChoice::Resolved { name, account } => {
-                if account.keystore != Keystore::Ephemeral {
+                if account.backend != BackendKind::Ephemeral {
                     return Err(Error::Config(format!(
                         "Network `{network}` is mapped to account `{name}` which is \
                          `{}`-backed, not ephemeral. Resolve via the keystore loader \
                          instead of generating a fresh wallet.",
-                        account.keystore
+                        account.backend
                     )));
                 }
                 return Ok(ResolvedEphemeral {
@@ -794,12 +864,12 @@ pub fn load_or_create_exact_ephemeral_for_network_as(
         .named_account_for_network(network, account_name)
         .cloned()
     {
-        if account.keystore != Keystore::Ephemeral {
+        if account.backend != BackendKind::Ephemeral {
             return Err(Error::Config(format!(
                 "Network `{network}` account `{account_name}` is \
                  `{}`-backed, not ephemeral. Resolve via the keystore loader \
                  instead of generating a fresh wallet.",
-                account.keystore
+                account.backend
             )));
         }
         return Ok(ResolvedEphemeral {
@@ -831,7 +901,7 @@ fn generate_ephemeral_account() -> Account {
     full[..32].copy_from_slice(&signing_key.to_bytes());
     full[32..].copy_from_slice(&verifying_key.to_bytes());
     Account {
-        keystore: Keystore::Ephemeral,
+        backend: BackendKind::Ephemeral,
         provider: None,
         active: false,
         auth_required: Some(false),
@@ -905,7 +975,7 @@ mod tests {
 
     fn keychain_account(pubkey: &str) -> Account {
         Account {
-            keystore: Keystore::AppleKeychain,
+            backend: BackendKind::AppleKeychain,
             provider: None,
             active: false,
             auth_required: None,
@@ -921,7 +991,7 @@ mod tests {
 
     fn fake_ephemeral(pubkey: &str) -> Account {
         Account {
-            keystore: Keystore::Ephemeral,
+            backend: BackendKind::Ephemeral,
             provider: None,
             active: false,
             auth_required: Some(false),
@@ -965,24 +1035,24 @@ mod tests {
 
     #[test]
     fn keystore_display_includes_ephemeral() {
-        assert_eq!(Keystore::AppleKeychain.to_string(), "apple-keychain");
-        assert_eq!(Keystore::Ephemeral.to_string(), "ephemeral");
-        assert_eq!(Keystore::Remote.to_string(), "remote");
+        assert_eq!(BackendKind::AppleKeychain.to_string(), "apple-keychain");
+        assert_eq!(BackendKind::Ephemeral.to_string(), "ephemeral");
+        assert_eq!(BackendKind::Remote.to_string(), "remote");
     }
 
     #[test]
     fn keystore_serde_roundtrip_all_variants() {
         for ks in [
-            Keystore::AppleKeychain,
-            Keystore::GnomeKeyring,
-            Keystore::WindowsHello,
-            Keystore::OnePassword,
-            Keystore::File,
-            Keystore::Ephemeral,
-            Keystore::Remote,
+            BackendKind::AppleKeychain,
+            BackendKind::GnomeKeyring,
+            BackendKind::WindowsHello,
+            BackendKind::OnePassword,
+            BackendKind::File,
+            BackendKind::Ephemeral,
+            BackendKind::Remote,
         ] {
             let yaml = serde_yml::to_string(&ks).unwrap();
-            let back: Keystore = serde_yml::from_str(&yaml).unwrap();
+            let back: BackendKind = serde_yml::from_str(&yaml).unwrap();
             assert_eq!(back, ks);
         }
     }
@@ -1005,7 +1075,7 @@ mod tests {
     #[test]
     fn signer_source_file_uses_path_when_set() {
         let acct = Account {
-            keystore: Keystore::File,
+            backend: BackendKind::File,
             provider: None,
             active: false,
             auth_required: None,
@@ -1026,7 +1096,7 @@ mod tests {
     #[test]
     fn signer_source_file_falls_back_to_default_path() {
         let acct = Account {
-            keystore: Keystore::File,
+            backend: BackendKind::File,
             provider: None,
             active: false,
             auth_required: None,
@@ -1052,7 +1122,7 @@ mod tests {
     fn ephemeral_keypair_bytes_roundtrip() {
         let raw_bytes: Vec<u8> = (0u8..64).collect();
         let acct = Account {
-            keystore: Keystore::Ephemeral,
+            backend: BackendKind::Ephemeral,
             provider: None,
             active: false,
             auth_required: Some(false),
@@ -1094,7 +1164,7 @@ mod tests {
     #[test]
     fn auth_required_is_always_false_for_ephemeral_accounts() {
         let mut acct = keychain_account("pk");
-        acct.keystore = Keystore::Ephemeral;
+        acct.backend = BackendKind::Ephemeral;
         acct.auth_required = Some(true);
         assert!(!acct.auth_required_for_network(MAINNET_NETWORK));
     }
@@ -1278,7 +1348,7 @@ mod tests {
         assert!(resolved.created, "should report creation");
         assert_eq!(resolved.network, "devnet");
         assert_eq!(resolved.account_name, DEFAULT_ACCOUNT_NAME);
-        assert_eq!(resolved.account.keystore, Keystore::Ephemeral);
+        assert_eq!(resolved.account.backend, BackendKind::Ephemeral);
         assert!(resolved.account.pubkey.is_some());
         assert!(resolved.account.secret_key_b58.is_some());
         assert!(

@@ -11,7 +11,7 @@ use solana_commitment_config::CommitmentConfig;
 use solana_hash::Hash;
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
-use solana_transaction::Transaction;
+use solana_transaction::versioned::VersionedTransaction;
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 use tracing::{debug, warn};
@@ -311,7 +311,10 @@ impl FixtureRpc {
         .await
     }
 
-    pub async fn submit_and_confirm(&self, transaction: &Transaction) -> Result<Signature> {
+    pub async fn submit_and_confirm(
+        &self,
+        transaction: &VersionedTransaction,
+    ) -> Result<Signature> {
         self.tx_pipeline
             .submit_verified(transaction)
             .await

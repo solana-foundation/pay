@@ -1,0 +1,494 @@
+/* pay-cloud onboarding page — light theme only for now. */
+
+:root {
+  --cloud-bg: #ffffff;
+  --cloud-fg: #111111;
+  --cloud-fg-muted: #666666;
+  --cloud-border: #cfcfcf;
+  --cloud-button: #1c1c1c;
+  --cloud-button-fg: #ffffff;
+  --cloud-button-fg-disabled: rgba(255, 255, 255, 0.45);
+  --cloud-red: #c62828;
+  --cloud-font: "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica,
+    Arial, sans-serif;
+  --cloud-gap: 24px;
+  --cloud-control-height: 88px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--cloud-bg);
+  color: var(--cloud-fg);
+  font-family: var(--cloud-font);
+  -webkit-font-smoothing: antialiased;
+}
+
+.cloud-page {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 48px 24px;
+}
+
+.cloud-card {
+  width: 100%;
+  max-width: 690px;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--cloud-gap);
+  margin: 0;
+}
+
+.cloud-title {
+  margin: 0;
+  font-size: 36px;
+  line-height: 1.2;
+  font-weight: 700;
+  color: var(--cloud-fg);
+  text-align: center;
+}
+
+.cloud-subtitle {
+  margin: -8px 0 0;
+  font-size: 22px;
+  line-height: 1.3;
+  font-weight: 400;
+  color: var(--cloud-fg-muted);
+  text-align: center;
+}
+
+/* Email box: label pinned top-left inside the border, input fills the rest. */
+.cloud-field {
+  position: relative;
+  display: block;
+  height: var(--cloud-control-height);
+  border: 1px solid var(--cloud-border);
+  border-radius: 12px;
+  background: var(--cloud-bg);
+  cursor: text;
+  transition: border-color 120ms ease;
+}
+
+.cloud-field:focus-within {
+  border-color: var(--cloud-fg);
+}
+
+.cloud-field-label {
+  position: absolute;
+  top: 16px;
+  left: 20px;
+  font-size: 17px;
+  line-height: 1;
+  color: var(--cloud-fg-muted);
+  pointer-events: none;
+}
+
+.cloud-field-input {
+  width: 100%;
+  height: 100%;
+  padding: 40px 20px 14px;
+  border: 0;
+  border-radius: 12px;
+  background: transparent;
+  color: var(--cloud-fg);
+  font: inherit;
+  font-size: 22px;
+  line-height: 1.2;
+  outline: none;
+}
+
+.cloud-field-input:disabled {
+  color: var(--cloud-fg-muted);
+}
+
+.cloud-continue {
+  height: var(--cloud-control-height);
+  width: 100%;
+  border: 0;
+  border-radius: 999px;
+  background: linear-gradient(180deg, #2a2a2a 0%, var(--cloud-button) 100%);
+  color: var(--cloud-button-fg);
+  font: inherit;
+  font-size: 22px;
+  font-weight: 500;
+  cursor: pointer;
+  transition:
+    color 120ms ease,
+    transform 80ms ease;
+}
+
+.cloud-continue:hover:enabled {
+  background: var(--cloud-button);
+}
+
+.cloud-continue:active:enabled {
+  transform: scale(0.995);
+}
+
+.cloud-continue:disabled {
+  color: var(--cloud-button-fg-disabled);
+  cursor: default;
+}
+
+.cloud-continue:focus-visible {
+  outline: 2px solid var(--cloud-fg);
+  outline-offset: 3px;
+}
+
+.cloud-error {
+  margin: -8px 0 0;
+  font-size: 15px;
+  line-height: 1.4;
+  color: var(--cloud-red);
+  text-align: center;
+}
+
+.cloud-note {
+  margin: -8px 0 0;
+  font-size: 15px;
+  line-height: 1.4;
+  color: var(--cloud-fg-muted);
+  text-align: center;
+}
+
+.cloud-note code {
+  font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+  font-size: 14px;
+  padding: 1px 6px;
+  border-radius: 6px;
+  background: #f2f2f2;
+  color: var(--cloud-fg);
+}
+
+.cloud-host {
+  margin: 32px 0 0;
+  font-size: 14px;
+  color: var(--cloud-fg-muted);
+  text-align: center;
+}
+
+@media (max-width: 480px) {
+  .cloud-page {
+    padding: 32px 12px;
+  }
+
+  .cloud-title {
+    font-size: 30px;
+  }
+
+  .cloud-subtitle {
+    font-size: 18px;
+  }
+
+  .cloud-field,
+  .cloud-continue {
+    height: 76px;
+  }
+
+  .cloud-field-input {
+    font-size: 19px;
+    padding-top: 36px;
+  }
+
+  .cloud-continue {
+    font-size: 19px;
+  }
+}
+
+/* ── Terminal theme: shown when the page was opened by `pay setup` ──────────
+   Tokens follow pay.sh: black canvas, #0e0e0e surface, hairline borders,
+   white primary action, green focus. Mono everywhere. */
+
+:root {
+  --term-page: #000000;
+  --term-surface: #0e0e0e;
+  --term-surface-raised: #161616;
+  --term-border: rgba(255, 255, 255, 0.08);
+  --term-fg: #ffffff;
+  --term-fg-subtle: #a6a6a6;
+  --term-fg-dim: #565656;
+  --term-green: #7fec86;
+  --term-red: #ff6159;
+  --term-yellow: #ffbd2e;
+  --term-dot-green: #28c941;
+  --term-font: "JetBrains Mono", Menlo, "SF Mono", ui-monospace, Consolas, monospace;
+}
+
+html[data-cloud-theme="terminal"] body,
+html[data-cloud-theme="terminal"] #root {
+  background: var(--term-page);
+  color: var(--term-fg);
+  font-family: var(--term-font);
+}
+
+.cloud-page--terminal {
+  align-items: flex-start;
+  justify-content: flex-start;
+  padding: 40px 48px;
+}
+
+/* No window chrome: the page is the terminal. */
+.cloud-term {
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+  width: 100%;
+  max-width: 960px;
+  font-family: var(--term-font);
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--term-fg);
+}
+
+.cloud-term-banner {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* pay-web-ui's tiled wordmark, at the hero's 80px height. The gaps and
+   outline frames between tiles are part of the asset. */
+.cloud-term-wordmark {
+  display: block;
+  height: 80px;
+  color: var(--term-fg);
+}
+
+.cloud-term-wordmark svg {
+  display: block;
+  height: 100%;
+  width: auto;
+  max-width: 100%;
+}
+
+.cloud-term-tagline {
+  color: var(--term-fg);
+}
+
+.cloud-term-lines,
+.cloud-term-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.cloud-term-line {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.cloud-term-line--muted {
+  color: var(--term-fg-subtle);
+}
+
+.cloud-term-line--error {
+  color: var(--term-red);
+}
+
+.cloud-term-prompt {
+  color: var(--term-green);
+  font-weight: 700;
+}
+
+.cloud-term-prompt--field {
+  flex: none;
+  padding-top: 11px;
+}
+
+.cloud-term-field {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin-top: 12px;
+  cursor: text;
+}
+
+.cloud-term-input {
+  flex: 1;
+  min-width: 0;
+  height: 44px;
+  padding: 0 12px;
+  border: 1px solid var(--term-border);
+  border-radius: 0;
+  background: var(--term-surface-raised);
+  color: var(--term-fg);
+  font: inherit;
+  caret-color: var(--term-green);
+  outline: none;
+  transition: border-color 120ms ease;
+}
+
+.cloud-term-input::placeholder {
+  color: var(--term-fg-dim);
+}
+
+.cloud-term-input:focus {
+  border-color: var(--term-green);
+}
+
+.cloud-term-input:disabled {
+  color: var(--term-fg-subtle);
+}
+
+.cloud-term-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 16px;
+  margin-top: 4px;
+}
+
+.cloud-term-button {
+  height: 44px;
+  padding: 0 28px;
+  border: 1px solid var(--term-fg);
+  border-radius: 0;
+  background: var(--term-fg);
+  color: #000000;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+  transition:
+    background-color 120ms ease,
+    color 120ms ease,
+    border-color 120ms ease;
+}
+
+.cloud-term-button:hover:enabled {
+  background: var(--term-green);
+  border-color: var(--term-green);
+}
+
+.cloud-term-button:disabled {
+  background: transparent;
+  color: var(--term-fg-dim);
+  border-color: var(--term-border);
+  cursor: default;
+}
+
+.cloud-term-button:focus-visible {
+  outline: 2px solid var(--term-green);
+  outline-offset: 2px;
+}
+.cloud-term-button--ghost,
+.cloud-term-button--ghost:hover:enabled {
+  background: transparent;
+  color: var(--term-fg);
+  border-color: var(--term-border);
+}
+.cloud-term-button--ghost:hover:enabled {
+  border-color: var(--term-red);
+  color: var(--term-red);
+}
+
+.cloud-term-hint {
+  color: var(--term-fg-subtle);
+  font-size: 13px;
+}
+
+/* Funding page: amount presets, fee table, embedded card form. */
+.cloud-term-amounts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+.cloud-term-amount {
+  height: 44px;
+  min-width: 96px;
+  padding: 0 20px;
+  border: 1px solid var(--term-border);
+  border-radius: 0;
+  background: var(--term-surface-raised);
+  color: var(--term-fg);
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+  transition:
+    background-color 120ms ease,
+    border-color 120ms ease;
+}
+.cloud-term-amount:hover:enabled {
+  border-color: var(--term-green);
+}
+.cloud-term-amount--active,
+.cloud-term-amount--active:hover:enabled {
+  background: var(--term-fg);
+  border-color: var(--term-fg);
+  color: #000000;
+}
+.cloud-term-amount:focus-visible {
+  outline: 2px solid var(--term-green);
+  outline-offset: 2px;
+}
+.cloud-term-table {
+  width: 100%;
+  max-width: 480px;
+  border-collapse: collapse;
+}
+.cloud-term-table td {
+  padding: 8px 0;
+  border-bottom: 1px solid var(--term-border);
+}
+.cloud-term-table td:last-child {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.cloud-term-table-muted td {
+  color: var(--term-fg-subtle);
+}
+.cloud-term-table-total td {
+  font-weight: 700;
+  border-bottom: none;
+}
+.cloud-term-link {
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--term-green);
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+.cloud-term-warn {
+  color: var(--term-yellow);
+}
+.cloud-term-frame {
+  display: block;
+  width: 100%;
+  max-width: 560px;
+  border: 1px solid var(--term-border);
+  background: #000000;
+}
+
+@media (max-width: 600px) {
+  .cloud-page--terminal {
+    padding: 20px 16px;
+  }
+
+  .cloud-term {
+    gap: 20px;
+  }
+
+  .cloud-term-wordmark {
+    height: 56px;
+  }
+
+  .cloud-term-field {
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .cloud-term-prompt--field {
+    padding-top: 0;
+  }
+}

@@ -31,7 +31,7 @@ use clap::Args;
 use pay_core::PaymentState;
 use pay_core::server::telemetry::FeePayerWallet;
 use pay_kit::mpp::server::Mpp;
-use pay_kit::mpp::solana_keychain::SolanaSigner;
+use pay_kit::mpp::solana_keychain::TransactionSigner;
 use pay_pdb::PdbState;
 use pay_pdb::correlation::CorrelationMode;
 use pay_pdb::types::{InferenceInfo, ProviderSummary};
@@ -161,7 +161,7 @@ pub struct InferenceState {
     /// x402-upto charge backend — the only charge scheme for inference, since
     /// per-token settlement happens AFTER the response (mpp-charge cannot).
     x402_upto: Option<pay_kit::x402::server::X402Upto>,
-    fee_payer_signer: Option<Arc<dyn SolanaSigner>>,
+    fee_payer_signer: Option<Arc<dyn TransactionSigner>>,
     fee_payer_wallet: Option<FeePayerWallet>,
 }
 
@@ -190,7 +190,7 @@ impl PaymentState for InferenceState {
     fn x402_upto(&self) -> Option<&pay_kit::x402::server::X402Upto> {
         self.x402_upto.as_ref()
     }
-    fn fee_payer_signer(&self) -> Option<Arc<dyn SolanaSigner>> {
+    fn fee_payer_signer(&self) -> Option<Arc<dyn TransactionSigner>> {
         self.fee_payer_signer.clone()
     }
     fn fee_payer_wallet(&self) -> Option<&FeePayerWallet> {
@@ -456,7 +456,7 @@ impl InferenceCommand {
                             .to_string(),
                     )
                 })?;
-                Arc::new(signer) as Arc<dyn SolanaSigner>
+                Arc::new(signer) as Arc<dyn TransactionSigner>
             };
             let registration = super::provider_registration::ServiceRegistration::new(
                 "inference",
@@ -796,7 +796,7 @@ impl InferenceCommand {
 struct SandboxPayments {
     pricing: spec::SpecPricing,
     x402_upto: pay_kit::x402::server::X402Upto,
-    fee_payer_signer: Arc<dyn SolanaSigner>,
+    fee_payer_signer: Arc<dyn TransactionSigner>,
     fee_payer_wallet: FeePayerWallet,
 }
 

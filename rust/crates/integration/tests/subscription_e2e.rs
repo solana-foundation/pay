@@ -18,7 +18,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 use pay_core::accounts::{
-    Account, AccountsFile, AccountsStore, Keystore, MemoryAccountsStore, Subscription,
+    Account, AccountsFile, AccountsStore, BackendKind, MemoryAccountsStore, Subscription,
     SubscriptionStatus,
 };
 use pay_core::client::subscription as sub_client;
@@ -125,7 +125,7 @@ fn persistence_round_trip_through_memory_store() {
         "localnet",
         "default",
         Account {
-            keystore: Keystore::Ephemeral,
+            backend: BackendKind::Ephemeral,
             provider: None,
             active: true,
             auth_required: Some(false),

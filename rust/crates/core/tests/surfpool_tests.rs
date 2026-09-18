@@ -1,8 +1,8 @@
-//! Integration tests using surfpool-sdk (embedded Solana validator).
+//! Integration tests using a local Surfpool process.
 //!
 //! Tests the client modules (balance, send, dev) and server modules
 //! (payment middleware) against a real Solana runtime — no external
-//! process needed.
+//! process managed by this test binary.
 //!
 //! Run: `cargo test -p pay-core --features server --test surfpool_tests`
 
@@ -10,25 +10,97 @@
 
 use pay_core::client;
 use serial_test::serial;
-use surfpool_sdk::{Keypair, Signer, Surfnet};
-
-static SURFNET: tokio::sync::OnceCell<Surfnet> = tokio::sync::OnceCell::const_new();
+use solana_keypair::Keypair;
+use solana_signer::Signer;
+use std::process::{Child, Command, Stdio};
 
 // =============================================================================
 // Helpers
 // =============================================================================
 
-async fn start_surfnet() -> &'static Surfnet {
-    SURFNET
-        .get_or_init(|| async {
-            Surfnet::builder()
-                .offline(true)
-                .airdrop_sol(10_000_000_000)
-                .start()
+struct TestSurfnet {
+    child: Child,
+    rpc_url: String,
+}
+
+impl TestSurfnet {
+    async fn start() -> Self {
+        let rpc_port = reserve_port();
+        let ws_port = reserve_port();
+        let studio_port = reserve_port();
+        let rpc_url = format!("http://127.0.0.1:{rpc_port}");
+        let child = Command::new("surfpool")
+            .args([
+                "start",
+                "--offline",
+                "--ci",
+                "--no-deploy",
+                "--airdrop-amount",
+                "0",
+                "--port",
+                &rpc_port.to_string(),
+                "--ws-port",
+                &ws_port.to_string(),
+                "--studio-port",
+                &studio_port.to_string(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start surfpool CLI; install it from https://run.surfpool.run/");
+
+        let client = reqwest::Client::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let ready = client
+                .post(&rpc_url)
+                .json(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "getHealth"
+                }))
+                .send()
                 .await
-                .expect("Failed to start Surfnet")
-        })
-        .await
+                .is_ok();
+            if ready {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "Surfpool did not start"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        Self { child, rpc_url }
+    }
+
+    async fn fund_sol(&self, pubkey: &solana_pubkey::Pubkey, lamports: u64) {
+        pay_kit::mpp::settlement::testkit::fund_sol(&self.rpc_url, pubkey, lamports).await;
+    }
+
+    fn rpc_url(&self) -> &str {
+        &self.rpc_url
+    }
+}
+
+impl Drop for TestSurfnet {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn reserve_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("reserve Surfpool port")
+        .local_addr()
+        .expect("read Surfpool port")
+        .port()
+}
+
+async fn start_surfnet() -> TestSurfnet {
+    TestSurfnet::start().await
 }
 
 // =============================================================================
@@ -40,10 +112,7 @@ async fn start_surfnet() -> &'static Surfnet {
 async fn balance_funded_account() {
     let surfnet = start_surfnet().await;
     let account = Keypair::new();
-    surfnet
-        .cheatcodes()
-        .fund_sol(&account.pubkey(), 10_000_000_000)
-        .unwrap();
+    surfnet.fund_sol(&account.pubkey(), 10_000_000_000).await;
     let pubkey = account.pubkey().to_string();
 
     let rpc = surfnet.rpc_url().to_string();
@@ -74,10 +143,7 @@ async fn balance_empty_account() {
 async fn balance_diff_received() {
     let surfnet = start_surfnet().await;
     let account = Keypair::new();
-    surfnet
-        .cheatcodes()
-        .fund_sol(&account.pubkey(), 10_000_000_000)
-        .unwrap();
+    surfnet.fund_sol(&account.pubkey(), 10_000_000_000).await;
     let pubkey = account.pubkey().to_string();
 
     let rpc = surfnet.rpc_url().to_string();
@@ -85,10 +151,7 @@ async fn balance_diff_received() {
     let before = client::balance::get_balances(&rpc, &pk).await.unwrap();
 
     // Fund more SOL
-    surfnet
-        .cheatcodes()
-        .fund_sol(&account.pubkey(), 15_000_000_000)
-        .unwrap();
+    surfnet.fund_sol(&account.pubkey(), 15_000_000_000).await;
 
     let after = client::balance::get_balances(&rpc, &pk).await.unwrap();
     let diff = after.diff_received(&before);
@@ -164,10 +227,7 @@ async fn full_payment_flow_with_surfnet() {
 
     let surfnet = start_surfnet().await;
     let recipient = Keypair::new();
-    surfnet
-        .cheatcodes()
-        .fund_sol(&recipient.pubkey(), 1_000_000_000)
-        .unwrap();
+    surfnet.fund_sol(&recipient.pubkey(), 1_000_000_000).await;
 
     let api: ApiSpec =
         serde_yml::from_str(&std::fs::read_to_string("tests/fixtures/test-paywall.yml").unwrap())
@@ -230,10 +290,7 @@ async fn full_payment_flow_with_surfnet() {
 
     // Step 2: Build payment
     let payer = Keypair::new();
-    surfnet
-        .cheatcodes()
-        .fund_sol(&payer.pubkey(), 2_000_000_000)
-        .unwrap();
+    surfnet.fund_sol(&payer.pubkey(), 2_000_000_000).await;
     let signer = MemorySigner::from_bytes(&payer.to_bytes()).unwrap();
     let rpc =
         pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient::new(surfnet.rpc_url().to_string());
@@ -294,10 +351,7 @@ async fn replayed_authorization_is_rejected() {
 
     let surfnet = start_surfnet().await;
     let recipient = Keypair::new();
-    surfnet
-        .cheatcodes()
-        .fund_sol(&recipient.pubkey(), 1_000_000_000)
-        .unwrap();
+    surfnet.fund_sol(&recipient.pubkey(), 1_000_000_000).await;
 
     let api: ApiSpec =
         serde_yml::from_str(&std::fs::read_to_string("tests/fixtures/test-paywall.yml").unwrap())
@@ -356,10 +410,7 @@ async fn replayed_authorization_is_rejected() {
 
     // Step 2: Build a payment credential.
     let payer = Keypair::new();
-    surfnet
-        .cheatcodes()
-        .fund_sol(&payer.pubkey(), 2_000_000_000)
-        .unwrap();
+    surfnet.fund_sol(&payer.pubkey(), 2_000_000_000).await;
     let signer = MemorySigner::from_bytes(&payer.to_bytes()).unwrap();
     let rpc =
         pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient::new(surfnet.rpc_url().to_string());
@@ -822,10 +873,7 @@ async fn mpp_build_credential_with_surfnet() {
 
     let surfnet = start_surfnet().await;
     let recipient = Keypair::new();
-    surfnet
-        .cheatcodes()
-        .fund_sol(&recipient.pubkey(), 1_000_000_000)
-        .unwrap();
+    surfnet.fund_sol(&recipient.pubkey(), 1_000_000_000).await;
 
     let api: ApiSpec =
         serde_yml::from_str(&std::fs::read_to_string("tests/fixtures/test-paywall.yml").unwrap())
@@ -888,10 +936,7 @@ async fn mpp_build_credential_with_surfnet() {
     // Step 2: Create a funded payer (the new network-aware path takes
     // raw secret bytes via a MemoryAccountsStore, no temp file needed).
     let payer = Keypair::new();
-    surfnet
-        .cheatcodes()
-        .fund_sol(&payer.pubkey(), 2_000_000_000)
-        .unwrap();
+    surfnet.fund_sol(&payer.pubkey(), 2_000_000_000).await;
 
     // Step 3: Build credential using pay_core's network-aware path.
     //
@@ -916,7 +961,7 @@ async fn mpp_build_credential_with_surfnet() {
             "localnet",
             "default",
             pay_core::accounts::Account {
-                keystore: pay_core::accounts::Keystore::Ephemeral,
+                backend: pay_core::accounts::BackendKind::Ephemeral,
                 provider: None,
                 active: false,
                 auth_required: Some(false),

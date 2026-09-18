@@ -4,6 +4,7 @@
 //! mainnet run; flipping `network: mainnet` swaps the funder/target for the
 //! same engine code.
 
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use tokio::sync::watch;
 
@@ -14,10 +15,9 @@ use pay_core::PaymentState;
 use pay_core::server::session::SessionMpp;
 use pay_kit::mpp::server::Mpp;
 use pay_kit::mpp::server::session::{SessionConfig, VoucherSigner};
-use pay_kit::mpp::solana_keychain::SolanaSigner;
+use pay_kit::mpp::solana_keychain::TransactionSigner;
 use pay_kit::mpp::solana_keychain::memory::MemorySigner;
 use pay_types::metering::ApiSpec;
-use surfpool_sdk::{Keypair, Signer, Surfnet};
 
 use crate::config::{Endpoint, Network, RunConfig, Scheme};
 use crate::engine::{self, PipelineParams};
@@ -25,7 +25,7 @@ use crate::journal::{self, Journal};
 use crate::report::ReportJson;
 use crate::scheme;
 use crate::seeded_session;
-use crate::wallet::{self, ForkFunder};
+use crate::wallet::{self, Funder};
 
 const PROVIDER_SPEC: &str = include_str!("../configs/bench-provider.yml");
 const GATE_ONLY_PROVIDER_SPEC: &str = r#"
@@ -83,6 +83,19 @@ struct AppState {
 struct OfflineProxy {
     url: String,
     shutdown: watch::Sender<bool>,
+}
+
+/// Surfpool runs as a child process so its dependency tree stays out of pay's
+/// production lockfile. Dropping the handle always stops the local validator.
+struct SurfpoolProcess {
+    child: Child,
+}
+
+impl Drop for SurfpoolProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 impl Drop for OfflineProxy {
@@ -152,7 +165,7 @@ fn build_state(
     rpc_url: &str,
     recipient: &str,
     operator: &str,
-    operator_signer: Option<Arc<dyn SolanaSigner>>,
+    operator_signer: Option<Arc<dyn TransactionSigner>>,
 ) -> Result<AppState> {
     match scheme {
         Scheme::MppSession => {
@@ -210,41 +223,87 @@ fn build_state(
 /// Spin a surfpool fork + the pay proxy, returning the live handle (keep it
 /// alive) and the proxy/RPC URLs. Shared by `run` (in-process driver), `serve`
 /// (proxy-only, separate process), and tests.
-async fn setup_fork_proxy(cfg: &RunConfig) -> Result<(Surfnet, String, String)> {
+async fn setup_fork_proxy(cfg: &RunConfig) -> Result<(SurfpoolProcess, String, String)> {
     // The fork's datasource: if the config supplies an RPC (rpc_url /
     // rpc_url_env), surfpool JIT-fetches mainnet state from it (a real
     // mainnet-fork); otherwise it runs as a pure offline localnet.
     let datasource = cfg.resolve_rpc_url()?;
-    let mut builder = Surfnet::builder().airdrop_sol(10_000_000_000);
+    let rpc_port = reserve_port()?;
+    let ws_port = reserve_port()?;
+    let studio_port = reserve_port()?;
+    let rpc_url = format!("http://127.0.0.1:{rpc_port}");
+    let mut command = Command::new("surfpool");
+    command.args([
+        "start",
+        "--ci",
+        "--no-deploy",
+        "--airdrop-amount",
+        "0",
+        "--port",
+        &rpc_port.to_string(),
+        "--ws-port",
+        &ws_port.to_string(),
+        "--studio-port",
+        &studio_port.to_string(),
+    ]);
     match &datasource {
         Some(url) => {
             tracing::info!(datasource = %redact(url), "starting surfpool JIT mainnet-fork");
-            builder = builder.remote_rpc_url(url.clone());
+            command.args(["--rpc-url", url]);
         }
         None => {
             tracing::info!("starting surfpool offline localnet (no datasource configured)");
-            builder = builder.offline(true);
+            command.arg("--offline");
         }
     }
-    let surfnet = builder
-        .start()
-        .await
-        .map_err(|e| anyhow::anyhow!("start surfnet: {e}"))?;
-    let rpc_url = surfnet.rpc_url().to_string();
+    let mut child = command
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("start surfpool CLI; install it from https://run.surfpool.run/")?;
+    let client = reqwest::Client::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let ready = client
+            .post(&rpc_url)
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getHealth"
+            }))
+            .send()
+            .await
+            .is_ok();
+        if ready {
+            break;
+        }
+        if let Some(status) = child.try_wait().context("poll surfpool process")? {
+            anyhow::bail!("surfpool exited before binding its RPC port: {status}");
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            anyhow::bail!("surfpool did not bind {rpc_url} within fifteen seconds");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let surfpool = SurfpoolProcess { child };
+    let fork_funder = wallet::ExternalForkFunder {
+        rpc_url: rpc_url.clone(),
+    };
 
     // The wallet that collects proceeds — funded so its account exists.
-    let recipient = Keypair::new();
-    surfnet
-        .cheatcodes()
-        .fund_sol(&recipient.pubkey(), 1_000_000_000)
-        .map_err(|e| anyhow::anyhow!("fund recipient: {e}"))?;
+    let recipient = wallet::Wallet::random();
+    fork_funder
+        .fund(&recipient.pubkey, 1_000_000_000, None)
+        .await
+        .context("fund recipient")?;
     // The operator (session fee-payer / channel authority + settlement signer)
     // — funded, and its signer drives on-chain batched settlement at close.
-    let operator = Keypair::new();
-    surfnet
-        .cheatcodes()
-        .fund_sol(&operator.pubkey(), 1_000_000_000)
-        .map_err(|e| anyhow::anyhow!("fund operator: {e}"))?;
+    let operator = wallet::Wallet::random();
+    fork_funder
+        .fund(&operator.pubkey, 1_000_000_000, None)
+        .await
+        .context("fund operator")?;
     // Only hand the proxy a settlement signer when the config opts into real
     // on-chain settlement; otherwise the stand-in close stays a no-op.
     let settle_onchain = cfg
@@ -252,9 +311,9 @@ async fn setup_fork_proxy(cfg: &RunConfig) -> Result<(Surfnet, String, String)> 
         .as_ref()
         .map(|s| s.settle_onchain)
         .unwrap_or(false);
-    let operator_signer: Option<Arc<dyn SolanaSigner>> = if settle_onchain {
+    let operator_signer: Option<Arc<dyn TransactionSigner>> = if settle_onchain {
         Some(Arc::new(
-            MemorySigner::from_bytes(&operator.to_bytes())
+            MemorySigner::from_bytes(&operator.keypair)
                 .map_err(|e| anyhow::anyhow!("operator signer: {e}"))?,
         ))
     } else {
@@ -266,13 +325,19 @@ async fn setup_fork_proxy(cfg: &RunConfig) -> Result<(Surfnet, String, String)> 
         cfg.run.scheme,
         Arc::new(vec![api]),
         &rpc_url,
-        &recipient.pubkey().to_string(),
-        &operator.pubkey().to_string(),
+        &recipient.pubkey.to_string(),
+        &operator.pubkey.to_string(),
         operator_signer,
     )?;
     let proxy_url = serve(state).await?;
     tracing::info!(%proxy_url, %rpc_url, scheme = ?cfg.run.scheme, "fork proxy up");
-    Ok((surfnet, proxy_url, rpc_url))
+    Ok((surfpool, proxy_url, rpc_url))
+}
+
+fn reserve_port() -> Result<u16> {
+    Ok(std::net::TcpListener::bind("127.0.0.1:0")?
+        .local_addr()?
+        .port())
 }
 
 /// Point `cfg` at the proxy + force the routing Host header. Self-test targets a
@@ -345,9 +410,11 @@ pub async fn run(mut cfg: RunConfig) -> Result<ReportJson> {
         rewrite_endpoints(&mut cfg, &proxy_url.url);
         return drive(&cfg, &wallet::NoopFunder, "unused".to_string()).await;
     }
-    let (surfnet, proxy_url, rpc_url) = setup_fork_proxy(&cfg).await?;
+    let (_surfpool, proxy_url, rpc_url) = setup_fork_proxy(&cfg).await?;
     rewrite_endpoints(&mut cfg, &proxy_url);
-    let funder = ForkFunder { surfnet: &surfnet };
+    let funder = wallet::ExternalForkFunder {
+        rpc_url: rpc_url.clone(),
+    };
     drive(&cfg, &funder, rpc_url).await
 }
 
@@ -376,8 +443,8 @@ async fn setup_free_proxy() -> Result<OfflineProxy> {
 /// Offline Pingora proxy: no fork. It uses the benchmark-only confirmed-state
 /// fixture and must never be reported as an open-channel or network benchmark.
 async fn setup_offline_proxy(cfg: &RunConfig) -> Result<OfflineProxy> {
-    let operator = Keypair::new().pubkey().to_string();
-    let recipient = Keypair::new().pubkey().to_string();
+    let operator = wallet::Wallet::random().pubkey.to_string();
+    let recipient = wallet::Wallet::random().pubkey.to_string();
     let session_cfg = cfg
         .session
         .as_ref()

@@ -11,13 +11,24 @@
 //! `POST /v2/accounts/backend/{id}/sign`, and verifies the returned
 //! ed25519 signature against the address pinned at init.
 
-use pay_kit::solana_keychain::{OpenfortSigner, SolanaSigner};
+use pay_kit::solana_keychain::{OpenfortSigner, TransactionSigner};
 use serde::Deserialize;
 
+use crate::backend::{Approval, Custody, SigningBackend};
 use crate::remote::{CredentialField, Credentials, RemoteProvider, RemoteWallet};
 use crate::{Error, Result};
 
 const API_BASE: &str = "https://api.openfort.io";
+/// Same override Openfort's own CLI honours, for staging or a local mock.
+const API_BASE_ENV: &str = "OPENFORT_BASE_URL";
+
+fn api_base() -> String {
+    std::env::var(API_BASE_ENV)
+        .ok()
+        .map(|v| v.trim().trim_end_matches('/').to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| API_BASE.to_string())
+}
 
 /// The Openfort remote backend.
 pub struct Openfort;
@@ -35,15 +46,38 @@ static FIELDS: &[CredentialField] = &[
     },
 ];
 
-impl RemoteProvider for Openfort {
+impl SigningBackend for Openfort {
     fn id(&self) -> &'static str {
         "openfort"
     }
-
     fn display_name(&self) -> &'static str {
         "Openfort backend wallet"
     }
+    fn description(&self) -> &'static str {
+        "remote signing, the key stays in Openfort's custody"
+    }
+    fn custody(&self) -> Custody {
+        Custody::Remote
+    }
+    /// Backend wallets are created inside Openfort's TEE and never export.
+    fn is_exportable(&self) -> bool {
+        false
+    }
+    fn signs_raw_messages(&self) -> bool {
+        true
+    }
+    fn approval(&self) -> Approval {
+        Approval::ProviderPolicy
+    }
+    fn is_available(&self) -> bool {
+        true
+    }
+    fn max_tx_version(&self) -> Option<pay_kit::core::tx::TxVersion> {
+        None
+    }
+}
 
+impl RemoteProvider for Openfort {
     fn credential_fields(&self) -> &'static [CredentialField] {
         FIELDS
     }
@@ -96,7 +130,7 @@ impl RemoteProvider for Openfort {
 
         let page: AccountsPage = rt.block_on(async {
             let response = client
-                .get(format!("{API_BASE}/v2/accounts?limit=100"))
+                .get(format!("{}/v2/accounts?limit=100", api_base()))
                 .bearer_auth(secret_key)
                 .send()
                 .await
@@ -127,7 +161,11 @@ impl RemoteProvider for Openfort {
          (chain type: Solana / SVM), then run this command again."
     }
 
-    fn connect(&self, credentials: &Credentials, wallet_id: &str) -> Result<Box<dyn SolanaSigner>> {
+    fn connect(
+        &self,
+        credentials: &Credentials,
+        wallet_id: &str,
+    ) -> Result<Box<dyn TransactionSigner>> {
         let secret_key = credentials
             .get("secret_key")
             .ok_or_else(|| Error::Config("Missing the Openfort secret key.".to_string()))?;
@@ -135,16 +173,19 @@ impl RemoteProvider for Openfort {
             .get("wallet_secret")
             .ok_or_else(|| Error::Config("Missing the Openfort wallet secret.".to_string()))?;
 
-        let mut signer = OpenfortSigner::new(
-            secret_key.clone(),
-            wallet_id.to_string(),
-            wallet_secret.clone(),
-        )
-        .map_err(|e| {
-            Error::Config(format!(
-                "Invalid Openfort credentials for `{wallet_id}`: {e}"
-            ))
-        })?;
+        let mut signer =
+            OpenfortSigner::from_config(pay_kit::solana_keychain::openfort::OpenfortSignerConfig {
+                secret_key: secret_key.clone(),
+                account_id: wallet_id.to_string(),
+                wallet_secret: wallet_secret.clone(),
+                api_base_url: Some(api_base()),
+                http_client_config: None,
+            })
+            .map_err(|e| {
+                Error::Config(format!(
+                    "Invalid Openfort credentials for `{wallet_id}`: {e}"
+                ))
+            })?;
 
         // The payment client paths are synchronous and create their own
         // tokio runtimes for header building, so a throwaway current-thread

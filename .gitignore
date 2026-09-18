@@ -17,6 +17,7 @@ bun.lock
 bun.lockb
 tsconfig.tsbuildinfo
 dist/
+dist-cloud/
 .vercel
 
 # CLI binary (downloaded at runtime by run.js)
@@ -35,3 +36,6 @@ coverage*.json
 
 # Local benchmark profiler captures (large, machine-specific artifacts)
 docs/benchmarks/profiles/2026-09-05-base58/
+
+# Keypair exports from `pay account export` must never be committed.
+pay-account-*.json

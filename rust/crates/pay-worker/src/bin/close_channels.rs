@@ -20,9 +20,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pay_api_core::rpc::RpcClient;
-use pay_kit::core::payment_channels::{self, MAX_RECLAIMS_PER_TX};
-use pay_kit::core::settlement::packing::{ChannelInstructionGroup, MAX_TX_BYTES, pack, tx_size};
-use pay_kit::mpp::solana_keychain::SolanaSigner;
+use pay_kit::core::payment_channels;
+use pay_kit::core::settlement::packing::{ChannelInstructionGroup, pack, tx_size};
+use pay_kit::core::tx::{TxV1Mode, TxVersion};
+use pay_kit::mpp::solana_keychain::TransactionSigner;
 use pay_worker::channel::{
     self, DecodedChannel, STATUS_CLOSING, STATUS_DISTRIBUTED, STATUS_OPEN, STATUS_SEALED,
 };
@@ -30,10 +31,8 @@ use pay_worker::config::Config;
 use pay_worker::error::JobError;
 use pay_worker::signer::build_fee_payer_signer;
 use solana_instruction::Instruction;
-use solana_message::Message;
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
-use solana_transaction::Transaction;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -234,6 +233,13 @@ async fn run() -> Result<usize, JobError> {
 
     let config = Config::load(&network)?;
     let rpc_url = config.rpc_url_for(&network)?.to_string();
+    // Version 1 when the cluster gate is active: reclaim batches fit 62
+    // channels instead of 28.
+    let tx_version = pay_kit::core::tx::highest(
+        &TxV1Mode::Auto
+            .resolve(&pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient::new(rpc_url.clone())),
+    );
+    info!(tx_version = %tx_version, "transaction version for operator transactions");
     let treasury_owner = if config.treasury_owner.trim().is_empty() {
         payment_channels::treasury_owner_for_cluster(&network)
     } else {
@@ -294,6 +300,7 @@ async fn run() -> Result<usize, JobError> {
             &rpc_url,
             &signer,
             me,
+            tx_version,
             *address,
             &treasury_owner,
             now,
@@ -347,6 +354,7 @@ async fn run() -> Result<usize, JobError> {
         &rpc_url,
         &signer,
         me,
+        tx_version,
         reclaim_candidates,
         dry_run,
         confirm_timeout,
@@ -379,8 +387,9 @@ enum ChannelOutcome {
 async fn process_channel(
     rpc: &RpcClient,
     rpc_url: &str,
-    signer: &Arc<dyn SolanaSigner>,
+    signer: &Arc<dyn TransactionSigner>,
     me: Pubkey,
+    tx_version: TxVersion,
     address: Pubkey,
     treasury_owner: &Pubkey,
     now: i64,
@@ -439,7 +448,7 @@ async fn process_channel(
         if dry_run {
             continue;
         }
-        let sig = build_sign_send(rpc, rpc_url, signer, me, &step.instructions).await?;
+        let sig = build_sign_send(rpc, rpc_url, signer, me, tx_version, &step.instructions).await?;
         rpc.confirm_signature(rpc_url, &sig.to_string(), confirm_timeout)
             .await?;
         info!(
@@ -595,25 +604,33 @@ struct ReclaimBatchOutcome {
 }
 
 fn pack_reclaim_candidates(
+    version: TxVersion,
     candidates: Vec<ChannelInstructionGroup>,
     fee_payer: &Pubkey,
 ) -> Vec<Vec<ChannelInstructionGroup>> {
-    pack(candidates, fee_payer, MAX_RECLAIMS_PER_TX)
+    pack(
+        version,
+        candidates,
+        fee_payer,
+        None,
+        pay_kit::core::payment_channels::max_reclaims_per_tx(version),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn process_reclaim_batches(
     rpc: &RpcClient,
     rpc_url: &str,
-    signer: &Arc<dyn SolanaSigner>,
+    signer: &Arc<dyn TransactionSigner>,
     fee_payer: Pubkey,
+    tx_version: TxVersion,
     candidates: Vec<ChannelInstructionGroup>,
     dry_run: bool,
     confirm_timeout: Duration,
 ) -> ReclaimBatchOutcome {
     let mut outcome = ReclaimBatchOutcome::default();
 
-    for group in pack_reclaim_candidates(candidates, &fee_payer) {
+    for group in pack_reclaim_candidates(tx_version, candidates, &fee_payer) {
         let channels: Vec<_> = group
             .iter()
             .map(|candidate| candidate.channel_id.clone())
@@ -623,15 +640,17 @@ async fn process_reclaim_batches(
             .into_iter()
             .flat_map(|candidate| candidate.instructions)
             .collect();
-        let serialized_size = tx_size(&instructions, &fee_payer);
+        let max_tx_bytes = tx_version.limits().max_bytes;
+        let serialized_size =
+            tx_size(tx_version, &instructions, &fee_payer, None).unwrap_or(usize::MAX);
 
-        if serialized_size > MAX_TX_BYTES {
+        if serialized_size > max_tx_bytes {
             outcome.failures += channel_count;
             error!(
                 channels = ?channels,
                 channel_count,
                 tx_bytes = serialized_size,
-                max_tx_bytes = MAX_TX_BYTES,
+                max_tx_bytes,
                 "reclaim batch exceeds Solana transaction size"
             );
             continue;
@@ -650,7 +669,8 @@ async fn process_reclaim_batches(
         }
 
         let result = async {
-            let signature = build_sign_send(rpc, rpc_url, signer, fee_payer, &instructions).await?;
+            let signature =
+                build_sign_send(rpc, rpc_url, signer, fee_payer, tx_version, &instructions).await?;
             rpc.confirm_signature(rpc_url, &signature.to_string(), confirm_timeout)
                 .await?;
             Ok::<_, JobError>(signature)
@@ -692,8 +712,9 @@ async fn process_reclaim_batches(
 async fn build_sign_send(
     rpc: &RpcClient,
     rpc_url: &str,
-    signer: &Arc<dyn SolanaSigner>,
+    signer: &Arc<dyn TransactionSigner>,
     fee_payer: Pubkey,
+    tx_version: TxVersion,
     instructions: &[Instruction],
 ) -> Result<Signature, JobError> {
     let blockhash_b58 = rpc.get_latest_blockhash(rpc_url).await?;
@@ -701,37 +722,31 @@ async fn build_sign_send(
     five8::decode_32(&blockhash_b58, &mut blockhash_arr)
         .map_err(|e| JobError::TxBuild(format!("blockhash decode: {e}")))?;
 
-    let mut message = Message::new(instructions, Some(&fee_payer));
-    message.recent_blockhash = solana_message::Hash::from(blockhash_arr);
-
-    let mut tx = Transaction::new_unsigned(message);
+    let mut tx = pay_kit::core::tx::build_unsigned(
+        tx_version,
+        &fee_payer,
+        instructions,
+        solana_message::Hash::from(blockhash_arr),
+        None,
+    )
+    .map_err(|e| JobError::TxBuild(e.to_string()))?;
 
     // Fee payer occupies signature slot 0. There may be additional required
     // signers (payer/payee) — but for KMS-operator flows the fee payer is the
     // only signer we hold, so any other required signer means the step isn't
     // one we can complete. Guard against silently sending a half-signed tx.
-    let required = tx.message.header.num_required_signatures as usize;
+    let required = tx.message.header().num_required_signatures as usize;
     if required != 1 {
         return Err(JobError::TxBuild(format!(
             "transaction requires {required} signatures but only the fee payer (KMS) is available"
         )));
     }
 
-    let msg_bytes = tx.message_data();
-    let sig_bytes = signer
-        .sign_message(&msg_bytes)
+    pay_kit::core::signing::cosign_versioned_fee_payer(signer.as_ref(), &fee_payer, &mut tx)
         .await
         .map_err(|_| JobError::Signing)?;
-    let signature = Signature::from(<[u8; 64]>::from(sig_bytes));
-    if tx.signatures.is_empty() {
-        return Err(JobError::TxBuild(
-            "transaction has no signature slots".into(),
-        ));
-    }
-    tx.signatures[0] = signature;
 
-    let serialized = bincode::serialize(&tx).map_err(|e| JobError::TxBuild(e.to_string()))?;
-    let tx_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &serialized);
+    let tx_b64 = pay_kit::core::tx::encode(&tx).map_err(|e| JobError::TxBuild(e.to_string()))?;
     let sig_str = rpc.send_raw_transaction(rpc_url, &tx_b64).await?;
     Signature::from_str(&sig_str).map_err(|_| JobError::TxBuild("malformed signature".into()))
 }
@@ -831,7 +846,7 @@ mod tests {
             .map(|index| reclaim_candidate(index, &fee_payer))
             .collect();
 
-        let groups = pack_reclaim_candidates(candidates, &fee_payer);
+        let groups = pack_reclaim_candidates(TxVersion::V0, candidates, &fee_payer);
 
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].len(), 2);
@@ -840,34 +855,40 @@ mod tests {
     #[test]
     fn reclaim_batches_use_the_operation_specific_cap() {
         let fee_payer = pubkey(2, 0);
-        let candidates = (0..=MAX_RECLAIMS_PER_TX)
+        let candidates = (0..=pay_kit::core::payment_channels::MAX_RECLAIMS_PER_TX)
             .map(|index| reclaim_candidate(index, &fee_payer))
             .collect();
 
-        let groups = pack_reclaim_candidates(candidates, &fee_payer);
+        let groups = pack_reclaim_candidates(TxVersion::V0, candidates, &fee_payer);
         let group_sizes: Vec<_> = groups.iter().map(Vec::len).collect();
 
-        assert_eq!(group_sizes, vec![MAX_RECLAIMS_PER_TX, 1]);
+        assert_eq!(
+            group_sizes,
+            vec![pay_kit::core::payment_channels::MAX_RECLAIMS_PER_TX, 1]
+        );
         for group in groups {
             let instructions: Vec<_> = group
                 .into_iter()
                 .flat_map(|candidate| candidate.instructions)
                 .collect();
-            assert!(tx_size(&instructions, &fee_payer) <= MAX_TX_BYTES);
+            assert!(
+                tx_size(TxVersion::V0, &instructions, &fee_payer, None).unwrap()
+                    <= TxVersion::V0.limits().max_bytes
+            );
         }
     }
 
     #[test]
     fn varying_rent_payers_are_still_byte_bounded() {
         let fee_payer = pubkey(2, 0);
-        let candidates = (0..MAX_RECLAIMS_PER_TX)
+        let candidates = (0..pay_kit::core::payment_channels::MAX_RECLAIMS_PER_TX)
             .map(|index| {
                 let rent_payer = pubkey(3, index);
                 reclaim_candidate(index, &rent_payer)
             })
             .collect();
 
-        let groups = pack_reclaim_candidates(candidates, &fee_payer);
+        let groups = pack_reclaim_candidates(TxVersion::V0, candidates, &fee_payer);
 
         assert!(groups.len() > 1);
         for group in groups {
@@ -875,7 +896,10 @@ mod tests {
                 .into_iter()
                 .flat_map(|candidate| candidate.instructions)
                 .collect();
-            assert!(tx_size(&instructions, &fee_payer) <= MAX_TX_BYTES);
+            assert!(
+                tx_size(TxVersion::V0, &instructions, &fee_payer, None).unwrap()
+                    <= TxVersion::V0.limits().max_bytes
+            );
         }
     }
 }

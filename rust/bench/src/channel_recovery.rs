@@ -6,14 +6,11 @@
 
 use anyhow::{Context, Result, bail};
 use futures::{StreamExt, stream};
-use pay_kit::mpp::solana_keychain::SolanaSigner;
 use pay_kit::mpp::solana_keychain::memory::MemorySigner;
 use solana_hash::Hash;
 use solana_instruction::Instruction;
-use solana_message::Message;
 use solana_pubkey::Pubkey;
-use solana_signature::Signature;
-use solana_transaction::Transaction;
+use solana_transaction::versioned::VersionedTransaction;
 
 use crate::fixture_rpc::FixtureRpc;
 use crate::wallet::Wallet;
@@ -35,23 +32,21 @@ pub(crate) async fn signed_transaction(
     extra_signers: &[&Wallet],
     instructions: Vec<Instruction>,
     blockhash: Hash,
-) -> Result<Transaction> {
-    let message = Message::new_with_blockhash(&instructions, Some(&fee_payer.pubkey), &blockhash);
-    let mut transaction = Transaction::new_unsigned(message);
+) -> Result<VersionedTransaction> {
+    let mut transaction = pay_kit::core::tx::build_unsigned(
+        pay_kit::core::tx::TxVersion::V0,
+        &fee_payer.pubkey,
+        &instructions,
+        blockhash,
+        None,
+    )
+    .map_err(|e| anyhow::anyhow!("building recovery transaction: {e}"))?;
     for wallet in std::iter::once(fee_payer).chain(extra_signers.iter().copied()) {
         let signer =
             MemorySigner::from_bytes(&wallet.keypair).context("loading recovery signer")?;
-        let signature = signer
-            .sign_message(&transaction.message_data())
+        pay_kit::core::signing::sign_versioned_transaction_slot(&signer, &mut transaction)
             .await
-            .context("signing recovery transaction")?;
-        let index = transaction
-            .message
-            .account_keys
-            .iter()
-            .position(|key| *key == wallet.pubkey)
-            .context("recovery signer is absent from transaction")?;
-        transaction.signatures[index] = Signature::from(<[u8; 64]>::from(signature));
+            .map_err(|e| anyhow::anyhow!("signing recovery transaction: {e}"))?;
     }
     Ok(transaction)
 }
@@ -62,7 +57,7 @@ pub(crate) async fn signed_transaction(
 /// failure report.
 pub(crate) async fn submit_transactions<L: std::fmt::Display>(
     rpc: &FixtureRpc,
-    transactions: Vec<(L, Transaction)>,
+    transactions: Vec<(L, VersionedTransaction)>,
     concurrency: usize,
     operation: &str,
 ) -> Result<()> {

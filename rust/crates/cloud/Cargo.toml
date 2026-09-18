@@ -1,0 +1,54 @@
+[package]
+name = "pay-cloud"
+description = "pay-cloud v0: browser onboarding for the pay CLI (PKCE start/exchange + embedded UI)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "pay-cloud"
+path = "src/main.rs"
+
+[features]
+default = ["openfort", "coinflow", "mcp", "privy"]
+# Openfort wallet driver: dashboard consent handoff, wallet-secret
+# registration and Solana backend wallet creation. Off leaves pay-cloud
+# with no custody backend, which is enough to exercise the PKCE handshake.
+openfort = ["dep:p256", "dep:reqwest"]
+# Card purchases of USDC through Coinflow (`/api/fund/*`, the `/fund` page).
+coinflow = ["dep:reqwest", "dep:bs58"]
+# The hosted connector: pay's MCP tools over streamable HTTP at `/mcp`.
+mcp = ["dep:rmcp", "dep:pay-mcp", "dep:pay-core", "dep:http"]
+# Privy as the connector's login and wallet: the consent page signs the
+# user in with Privy, pay-cloud verifies the token, and the user's Privy
+# wallet (with pay's key as a signer) becomes the tenant's wallet.
+privy = ["mcp", "dep:reqwest", "dep:jsonwebtoken", "dep:p256"]
+
+[dependencies]
+async-trait = "0.1"
+axum = { workspace = true }
+base64 = { workspace = true }
+bs58 = { workspace = true, optional = true }
+clap = { workspace = true }
+http = { version = "1", optional = true }
+include_dir = "0.7.4"
+jsonwebtoken = { version = "9", optional = true }
+mime_guess = { workspace = true }
+pay-core = { workspace = true, optional = true }
+pay-mcp = { workspace = true, optional = true }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "pem", "std"], optional = true }
+rand = { workspace = true }
+rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"], optional = true }
+reqwest = { workspace = true, features = ["json"], optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "net", "time"] }
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+url = "2"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

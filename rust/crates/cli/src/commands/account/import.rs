@@ -2,7 +2,6 @@
 
 use dialoguer::{Confirm, theme::ColorfulTheme};
 use owo_colors::OwoColorize;
-use pay_core::keystore::Keystore;
 
 /// Import an account from a JSON key file into a secure keystore.
 #[derive(clap::Args)]
@@ -77,8 +76,8 @@ impl ImportCommand {
             None => super::new::pick_backend()?,
         };
 
-        let (ks, keystore_kind, _) =
-            super::import::build_keystore(&backend_id, self.vault.as_deref(), &name)?;
+        let (ks, keystore_kind, _, _) =
+            super::new::build_keystore(&backend_id, self.vault.as_deref(), &name)?;
 
         if backend_id == "file" && ks.exists(&name) {
             return Err(pay_core::Error::Config(format!(
@@ -108,7 +107,7 @@ impl ImportCommand {
             &name,
             pay_core::accounts::Account {
                 provider: None,
-                keystore: keystore_kind,
+                backend: keystore_kind,
                 active: false,
                 auth_required: Some(true),
                 pubkey: Some(pubkey_b58),
@@ -201,80 +200,4 @@ fn resolve_name(
         }
     }
     Ok(name.to_string())
-}
-
-pub(super) fn build_keystore(
-    backend_id: &str,
-    vault: Option<&str>,
-    account_name: &str,
-) -> pay_core::Result<(Keystore, pay_core::accounts::Keystore, &'static str)> {
-    match backend_id {
-        #[cfg(target_os = "macos")]
-        "keychain" => Ok((
-            Keystore::apple_keychain(),
-            pay_core::accounts::Keystore::AppleKeychain,
-            "Stored in macOS Keychain.",
-        )),
-        #[cfg(not(target_os = "macos"))]
-        "keychain" => Err(pay_core::Error::Config(
-            "Keychain is only available on macOS".into(),
-        )),
-
-        #[cfg(target_os = "linux")]
-        "gnome-keyring" => {
-            let ks = super::new::gnome_keyring_for_account_write()?;
-            Ok((
-                ks,
-                pay_core::accounts::Keystore::GnomeKeyring,
-                "Stored in GNOME Keyring.",
-            ))
-        }
-        #[cfg(not(target_os = "linux"))]
-        "gnome-keyring" => Err(pay_core::Error::Config(
-            "GNOME Keyring is only available on Linux".into(),
-        )),
-
-        #[cfg(target_os = "windows")]
-        "windows-hello" => Ok((
-            Keystore::windows_hello(),
-            pay_core::accounts::Keystore::WindowsHello,
-            "Stored in Windows Credential Manager.",
-        )),
-        #[cfg(not(target_os = "windows"))]
-        "windows-hello" => Err(pay_core::Error::Config(
-            "Windows Hello is only available on Windows".into(),
-        )),
-
-        "file" => Ok((
-            Keystore::file(super::new::file_backend_path(account_name)),
-            pay_core::accounts::Keystore::File,
-            "Stored in an owner-only keypair file.",
-        )),
-
-        "1password" => {
-            let op_account = super::new::resolve_op_account()?;
-            let ks = match vault {
-                Some(v) => Keystore::onepassword_with_vault(v, op_account),
-                None => Keystore::onepassword(op_account),
-            };
-            Ok((
-                ks,
-                pay_core::accounts::Keystore::OnePassword,
-                "Stored in 1Password.",
-            ))
-        }
-
-        // Any registered remote backend: the key is in the provider's
-        // custody, so there is nothing local to import.
-        other if pay_core::remote::provider(other).is_some() => {
-            let provider = pay_core::remote::provider(other).expect("checked above");
-            Err(pay_core::Error::Config(format!(
-                "A {} holds no local keypair to import. Connect one with \
-                 `pay account new <NAME> --backend {other}`.",
-                provider.display_name()
-            )))
-        }
-
-        other => Err(pay_core::Error::Config(format!("Unknown backend: {other}"))),
-    }
 }

@@ -4,15 +4,18 @@
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ProtocolVersion, ServerCapabilities, ServerInfo};
+use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use std::sync::Arc;
 
+use crate::context::{LocalContext, PayContext};
 use crate::tools;
 
 pub struct PayMcp {
     #[allow(dead_code)]
     tool_router: rmcp::handler::server::router::tool::ToolRouter<Self>,
     session_cache: Arc<tools::curl::SessionCache>,
+    context: Arc<dyn PayContext>,
 }
 
 impl Default for PayMcp {
@@ -23,10 +26,18 @@ impl Default for PayMcp {
 
 #[tool_router]
 impl PayMcp {
+    /// The server `pay mcp` runs: this machine's accounts and prompts.
     pub fn new() -> Self {
+        Self::with_context(Arc::new(LocalContext::new()))
+    }
+
+    /// A server whose calls are resolved by `context`; pay-cloud's per-tenant
+    /// server.
+    pub fn with_context(context: Arc<dyn PayContext>) -> Self {
         Self {
             tool_router: Self::tool_router(),
             session_cache: Arc::new(tools::curl::SessionCache::default()),
+            context,
         }
     }
 
@@ -61,9 +72,10 @@ and does not submit the request or payment.
     async fn curl(
         &self,
         Parameters(params): Parameters<tools::curl::Params>,
-        peer: rmcp::Peer<rmcp::service::RoleServer>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        tools::curl::run(params, peer, self.session_cache.clone()).await
+        let scope = self.context.scope(&ctx)?;
+        tools::curl::run(params, ctx.peer, self.session_cache.clone(), scope).await
     }
 
     #[tool(
@@ -134,8 +146,10 @@ setup costs. Use this to check available funds before making paid API calls.
     async fn get_balance(
         &self,
         Parameters(params): Parameters<tools::get_balance::Params>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        tools::get_balance::run(params).await
+        let scope = self.context.scope(&ctx)?;
+        tools::get_balance::run(params, &scope).await
     }
 
     #[tool(
@@ -152,8 +166,10 @@ a purchase; it only renders the QR PNG and returns the funding address.
     async fn topup(
         &self,
         Parameters(params): Parameters<tools::topup::Params>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        tools::topup::run(params).await
+        let scope = self.context.scope(&ctx)?;
+        tools::topup::run(params, &scope).await
     }
 
     #[tool(description = r#"Create or validate a pay-skills provider listing.
@@ -186,7 +202,11 @@ impl ServerHandler for PayMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_protocol_version(ProtocolVersion::V_2025_06_18)
-            .with_server_info(rmcp::model::Implementation::from_build_env())
+            .with_server_info(
+                rmcp::model::Implementation::new("pay", env!("CARGO_PKG_VERSION"))
+                    .with_title("Pay")
+                    .with_website_url("https://pay.sh"),
+            )
             .with_instructions(pay_core::instructions::INSTRUCTIONS)
     }
 }
@@ -195,6 +215,14 @@ impl ServerHandler for PayMcp {
 mod tests {
     use super::*;
     use rmcp::ServerHandler;
+
+    #[test]
+    fn server_info_names_pay_not_the_sdk() {
+        let info = PayMcp::new().get_info();
+        assert_eq!(info.server_info.name, "pay");
+        assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(info.server_info.title.as_deref(), Some("Pay"));
+    }
 
     #[test]
     fn server_info_has_instructions() {

@@ -6,6 +6,9 @@ license.workspace = true
 
 [features]
 default = []
+# Ledger hardware wallets through solana-keychain's `ledger` backend. Opt-in:
+# it links hidapi (IOKit on macOS, hid on Windows, libudev on Linux).
+ledger = ["solana-keychain/ledger"]
 # Payment middleware for axum-based servers (metering, accounting, 402 flow).
 server = ["dep:axum", "dep:http"]
 # Distributed-tracing context propagation: extract W3C traceparent from incoming
@@ -18,9 +21,10 @@ network_tests = []
 # Activates openssl-sys/vendored which is pulled in transitively by
 # solana-rpc-client → reqwest → native-tls → openssl-sys.
 vendored-openssl = ["openssl-sys/vendored"]
-# Durable MPP session state backed by Redis. Runtime selection still requires
-# PAY_MPP_REDIS_URL; without it the in-memory store remains the default.
-redis-session-store = ["pay-kit/redis-store"]
+# Durable MPP session state and subscription proof bindings backed by Redis.
+# Runtime selection still requires PAY_MPP_REDIS_URL; without it the in-memory
+# stores remain the default.
+redis-session-store = ["pay-kit/redis-store", "dep:redis"]
 
 [dependencies]
 axum = { workspace = true, optional = true }
@@ -64,6 +68,7 @@ five8 = { workspace = true }
 blake3 = { workspace = true }
 dashmap = "5.5"
 reqwest = { workspace = true, features = ["json"] }
+redis = { version = "0.32", features = ["aio", "tokio-comp", "connection-manager"], optional = true }
 pay-keystore = { workspace = true }
 pay-kit = { workspace = true }
 http-body = { workspace = true }
@@ -97,11 +102,12 @@ serde_yml = { workspace = true }
 toml = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
-surfpool-sdk = { git = "https://github.com/solana-foundation/surfpool", rev = "b46c47e06c28ed1aa31e119215b479b70e72d4c3" }
 serde_json = { workspace = true }
 tower = "0.5"
 serial_test = "3"
 solana-client = "3.1"
+solana-keypair = { workspace = true }
+solana-signer = "3.0"
 
 [[test]]
 name = "metering_tests"

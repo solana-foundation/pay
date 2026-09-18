@@ -312,7 +312,7 @@ impl RpcClient {
                 {
                     "commitment": "confirmed",
                     "encoding": "jsonParsed",
-                    "maxSupportedTransactionVersion": 0
+                    "maxSupportedTransactionVersion": 1
                 }
             ],
         });
@@ -344,7 +344,7 @@ impl RpcClient {
                 {
                     "commitment": "confirmed",
                     "encoding": "base64",
-                    "maxSupportedTransactionVersion": 0
+                    "maxSupportedTransactionVersion": 1
                 }
             ],
         });

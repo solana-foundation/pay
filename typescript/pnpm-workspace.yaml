@@ -1,2 +1,6 @@
 packages:
   - packages/solana-pay/core
+
+overrides:
+  esbuild@>=0.27.3 <0.28.1: 0.28.1
+  vite: 8.0.16

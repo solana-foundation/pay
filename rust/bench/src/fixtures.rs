@@ -13,16 +13,15 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail, ensure};
 use futures::{StreamExt, TryStreamExt};
-use pay_kit::mpp::protocol::solana::check_transaction_packet_size;
-use pay_kit::mpp::solana_keychain::{SolanaSigner, memory::MemorySigner};
+use pay_kit::mpp::protocol::solana::check_transaction_size;
+use pay_kit::mpp::solana_keychain::memory::MemorySigner;
 use serde::Deserialize;
 use solana_instruction::Instruction;
-use solana_message::Message;
 use solana_program_pack::Pack;
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
 use solana_system_interface::instruction as system_instruction;
-use solana_transaction::Transaction;
+use solana_transaction::versioned::VersionedTransaction;
 use spl_token_2022_interface::extension::StateWithExtensions;
 use spl_token_2022_interface::instruction as token_instruction;
 use spl_token_2022_interface::state::Account as TokenAccount;
@@ -53,7 +52,7 @@ struct PreparedUser {
 
 struct PreparedTransaction {
     signature: Signature,
-    transaction: Transaction,
+    transaction: VersionedTransaction,
     user_index: usize,
 }
 
@@ -1057,8 +1056,14 @@ pub async fn mint_supply(config_path: &str, amount: &str, yes: bool) -> Result<(
     )
     .map_err(|e| anyhow::anyhow!("building mint_to instruction: {e}"))?;
     let (blockhash, _) = rpc.latest_blockhash().await.context("fetching blockhash")?;
-    let message = Message::new_with_blockhash(&[ix], Some(&funder.pubkey), &blockhash);
-    let mut transaction = Transaction::new_unsigned(message);
+    let mut transaction = pay_kit::core::tx::build_unsigned(
+        pay_kit::core::tx::TxVersion::V0,
+        &funder.pubkey,
+        &[ix],
+        blockhash,
+        None,
+    )
+    .map_err(|e| anyhow::anyhow!("building fixture transaction: {e}"))?;
     sign_transaction(&mut transaction, &funder).await?;
     let sig = rpc
         .submit_and_confirm(&transaction)
@@ -1153,9 +1158,14 @@ fn pack_setup_instruction_batches(
         }
         let mut candidate = current_instructions.clone();
         candidate.extend(item.instructions.iter().cloned());
-        let candidate_tx = Transaction::new_unsigned(Message::new(&candidate, Some(fee_payer)));
         let candidate_fits = current_users < MAX_SETUP_USERS_PER_TRANSACTION
-            && check_transaction_packet_size(&candidate_tx).is_ok();
+            && pay_kit::core::tx::measure(
+                pay_kit::core::tx::TxVersion::V0,
+                fee_payer,
+                &candidate,
+                None,
+            )
+            .is_ok_and(|size| size <= pay_kit::core::tx::TxVersion::V0.limits().max_bytes);
 
         if current_users > 0 && !candidate_fits {
             batches.push((current_index, std::mem::take(&mut current_instructions)));
@@ -1167,9 +1177,15 @@ fn pack_setup_instruction_batches(
         current_instructions.extend(item.instructions);
         current_users += 1;
 
-        let transaction =
-            Transaction::new_unsigned(Message::new(&current_instructions, Some(fee_payer)));
-        check_transaction_packet_size(&transaction).map_err(|error| {
+        let transaction = pay_kit::core::tx::build_unsigned_unchecked(
+            pay_kit::core::tx::TxVersion::V0,
+            fee_payer,
+            &current_instructions,
+            solana_hash::Hash::default(),
+            None,
+        )
+        .map_err(|e| anyhow::anyhow!("building setup transaction: {e}"))?;
+        check_transaction_size(&transaction).map_err(|error| {
             anyhow::anyhow!(
                 "setup instructions for user {} exceed the Solana transaction packet limit: {error}",
                 item.index
@@ -1250,8 +1266,14 @@ async fn prepare_transaction_with_blockhash(
     if instructions.is_empty() {
         return Ok(None);
     }
-    let message = Message::new_with_blockhash(&instructions, Some(&fee_payer.pubkey), &blockhash);
-    let mut transaction = Transaction::new_unsigned(message);
+    let mut transaction = pay_kit::core::tx::build_unsigned(
+        pay_kit::core::tx::TxVersion::V0,
+        &fee_payer.pubkey,
+        &instructions,
+        blockhash,
+        None,
+    )
+    .map_err(|e| anyhow::anyhow!("building fixture transaction: {e}"))?;
     sign_transaction(&mut transaction, fee_payer).await?;
     if let Some(signer) = additional_signer
         && signer.pubkey != fee_payer.pubkey
@@ -1353,21 +1375,12 @@ async fn resolve_pending(rpc: &FixtureRpc, journal: &mut FixtureJournal) -> Resu
     Ok(())
 }
 
-async fn sign_transaction(transaction: &mut Transaction, wallet: &Wallet) -> Result<()> {
+async fn sign_transaction(transaction: &mut VersionedTransaction, wallet: &Wallet) -> Result<()> {
     let signer =
         MemorySigner::from_bytes(&wallet.keypair).context("loading derived wallet signer")?;
-    let signature = signer
-        .sign_message(&transaction.message_data())
+    pay_kit::core::signing::sign_versioned_transaction_slot(&signer, transaction)
         .await
-        .context("signing fixture transaction")?;
-    let index = transaction
-        .message
-        .account_keys
-        .iter()
-        .position(|key| *key == wallet.pubkey)
-        .context("fixture signer is absent from transaction")?;
-    transaction.signatures[index] = Signature::from(<[u8; 64]>::from(signature));
-    Ok(())
+        .map_err(|e| anyhow::anyhow!("signing fixture transaction: {e}"))
 }
 
 fn decimal_to_base(value: &str, decimals: u8) -> Result<u64> {

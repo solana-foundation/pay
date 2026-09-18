@@ -48,8 +48,14 @@ pub enum RunOutcome {
     },
     /// The server returned 402 with an MPP session challenge (intent="session").
     /// Session payments require a stateful client with an MPP payment channel.
+    ///
+    /// `fallback` is what the same 402 resolves to with the session offer set
+    /// aside (a charge or x402 offer), when it advertised one. A signer that
+    /// cannot open this session takes it instead; see
+    /// [`RunOutcome::for_signer`].
     SessionChallenge {
         challenge: Box<mpp::Challenge>,
+        fallback: Option<Box<RunOutcome>>,
         advertised_challenges: DecodedPaymentChallenges,
         resource_url: String,
     },
@@ -499,6 +505,143 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
+impl RunOutcome {
+    /// A 402 that names a payment pay knows how to make.
+    fn is_payment_challenge(&self) -> bool {
+        matches!(
+            self,
+            RunOutcome::MppChallenge { .. }
+                | RunOutcome::SessionChallenge { .. }
+                | RunOutcome::SubscriptionChallenge { .. }
+                | RunOutcome::X402Challenge { .. }
+                | RunOutcome::X402UptoChallenge { .. }
+                | RunOutcome::X402BatchChallenge { .. }
+                | RunOutcome::X402SignInChallenge { .. }
+        )
+    }
+
+    /// Swap a payment offer `backend` cannot sign for the next offer on the
+    /// same 402, so the choice follows what the signer can do rather than
+    /// failing at signing time.
+    ///
+    /// Today this matters for offers that need a raw message signature: an
+    /// operator-signed session proof and an x402 sign-in. A hardware wallet
+    /// signs neither, so it pays the charge advertised beside them. When the
+    /// 402 offered nothing else, the refusal becomes a `PaymentRejected`
+    /// with the reason. Every other variant passes through unchanged.
+    pub fn for_signer(self, backend: &dyn crate::backend::SigningBackend) -> RunOutcome {
+        match self {
+            RunOutcome::SessionChallenge {
+                challenge,
+                fallback,
+                advertised_challenges,
+                resource_url,
+            } => match crate::client::session::check_signer(&challenge, backend) {
+                Ok(()) => RunOutcome::SessionChallenge {
+                    challenge,
+                    fallback,
+                    advertised_challenges,
+                    resource_url,
+                },
+                Err(refusal) => match fallback {
+                    Some(offer) => {
+                        info!(
+                            resource = %resource_url,
+                            backend = backend.id(),
+                            "Skipping MPP session the signer cannot open; taking the next offer"
+                        );
+                        *offer
+                    }
+                    None => rejected_for_signer(refusal, advertised_challenges, resource_url),
+                },
+            },
+            RunOutcome::X402SignInChallenge {
+                challenge,
+                payment_fallback,
+                advertised_challenges,
+                resource_url,
+            } => match backend.require_raw_message_signing("an x402 sign-in challenge") {
+                Ok(()) => RunOutcome::X402SignInChallenge {
+                    challenge,
+                    payment_fallback,
+                    advertised_challenges,
+                    resource_url,
+                },
+                Err(refusal) => match payment_fallback {
+                    Some(payment) => {
+                        info!(
+                            resource = %resource_url,
+                            backend = backend.id(),
+                            "Skipping x402 sign-in the signer cannot produce; paying instead"
+                        );
+                        RunOutcome::X402Challenge {
+                            challenge: payment,
+                            advertised_challenges,
+                            resource_url,
+                        }
+                    }
+                    None => rejected_for_signer(refusal, advertised_challenges, resource_url),
+                },
+            },
+            other => other,
+        }
+    }
+
+    /// [`for_signer`](Self::for_signer) for the account that will pay: the
+    /// named or default account on the network the offer names (or the
+    /// forced one), read from `accounts.yml` without prompting. Outcomes
+    /// that carry no offer, and networks where a throwaway software wallet
+    /// would be created, pass through unchanged.
+    pub fn for_account(
+        self,
+        store: &dyn crate::accounts::AccountsStore,
+        network_override: Option<&str>,
+        account_override: Option<&str>,
+    ) -> Result<RunOutcome> {
+        // Only the offers `for_signer` may veto are looked at. A malformed
+        // offer passes through so its own payment path reports the error.
+        let network = match &self {
+            RunOutcome::SessionChallenge { challenge, .. } => {
+                let Ok(request) = challenge.request.decode::<pay_kit::mpp::SessionRequest>() else {
+                    return Ok(self);
+                };
+                network_override
+                    .map(str::to_string)
+                    .unwrap_or(request.method_details.network)
+            }
+            RunOutcome::X402SignInChallenge { challenge, .. } => {
+                match x402::sign_in_chain(challenge, network_override) {
+                    Ok((_, network)) => network,
+                    Err(_) => return Ok(self),
+                }
+            }
+            _ => return Ok(self),
+        };
+        match crate::signer::backend_for_network(&network, store, account_override)? {
+            Some(backend) => Ok(self.for_signer(backend)),
+            None => Ok(self),
+        }
+    }
+}
+
+/// The signer refused the only offer: report why instead of failing later.
+fn rejected_for_signer(
+    refusal: Error,
+    advertised_challenges: DecodedPaymentChallenges,
+    resource_url: String,
+) -> RunOutcome {
+    let reason = match refusal {
+        Error::Config(message) => message,
+        other => other.to_string(),
+    };
+    RunOutcome::PaymentRejected {
+        reason: format!("{reason} This endpoint offers no other payment option."),
+        retryable: false,
+        advertised_challenges,
+        resource_url,
+    }
+}
+
 /// Caller's preference for which payment protocol to use when a 402
 /// advertises more than one. `Auto` mirrors the historical defaults
 /// (MPP first for one-shot Solana charges, fall back to x402). The
@@ -656,6 +799,31 @@ pub(crate) fn classify_402_with_preference(
     resource_url: &str,
     preference: ProtocolPreference,
 ) -> RunOutcome {
+    classify_402_inner(
+        headers,
+        body,
+        resource_url,
+        preference,
+        SessionOffers::Considered,
+    )
+}
+
+/// Whether the classifier may pick an MPP session offer. `Ignored` computes
+/// the fallback carried by [`RunOutcome::SessionChallenge`]: the same 402 as
+/// seen by a client that cannot open a session.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SessionOffers {
+    Considered,
+    Ignored,
+}
+
+fn classify_402_inner(
+    headers: &[(String, String)],
+    body: Option<&str>,
+    resource_url: &str,
+    preference: ProtocolPreference,
+    sessions: SessionOffers,
+) -> RunOutcome {
     let advertised_challenges = decode_payment_challenges(headers, body);
 
     // A `verification_failed` body wins over a fresh challenge: it means the
@@ -699,6 +867,7 @@ pub(crate) fn classify_402_with_preference(
     // Session MPP: the method field ("solana") indicates chain support.
     // Session requests don't use ChargeRequest so mpp_is_solana doesn't apply.
     if preference != ProtocolPreference::OnlyX402
+        && sessions == SessionOffers::Considered
         && let Some(challenge) = mpp_challenges
             .iter()
             .find(|challenge| challenge.intent.as_str() == "session")
@@ -709,8 +878,16 @@ pub(crate) fn classify_402_with_preference(
                 resource = resource_url,
                 "Detected MPP payment-channel challenge (Solana)"
             );
+            let fallback = classify_402_inner(
+                headers,
+                body,
+                resource_url,
+                preference,
+                SessionOffers::Ignored,
+            );
             return RunOutcome::SessionChallenge {
                 challenge: Box::new(challenge.clone()),
+                fallback: fallback.is_payment_challenge().then(|| Box::new(fallback)),
                 advertised_challenges,
                 resource_url: resource_url.to_string(),
             };
@@ -1919,6 +2096,263 @@ HTTP request sent, awaiting response...
                 x402_requirements.to_string(),
             ),
         ]
+    }
+
+    /// A 402 shaped like the Gemini gateway's: an operator-signed session
+    /// and a flat charge for the same price, both MPP over Solana.
+    fn session_and_charge_402(voucher_signer: &str) -> Vec<(String, String)> {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        let session_request = serde_json::json!({
+            "amount": "45000",
+            "currency": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            "recipient": "BcdwLA62UPEAvRn7AWauMUXKtYMXxdLzTPaSQg5tNaFc",
+            "suggestedDeposit": "250000",
+            "methodDetails": {
+                "network": "mainnet",
+                "channelProgram": "CHNLxYvVA28MJP9PrFuDXccuoGXAx7jBacfLEkahyGsX",
+                "operator": "BcdwLA62UPEAvRn7AWauMUXKtYMXxdLzTPaSQg5tNaFc",
+                "voucherSigner": voucher_signer,
+                "minVoucherDelta": "1"
+            }
+        });
+        let charge_request = serde_json::json!({
+            "amount": "45000",
+            "currency": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            "recipient": "Cs2zdfUNonRdRGsiZUQQLdTxzxVvJZmgiX2mpLYKuEqP",
+            "methodDetails": { "network": "mainnet" }
+        });
+        let encode = |v: &serde_json::Value| URL_SAFE_NO_PAD.encode(serde_json::to_vec(v).unwrap());
+        vec![
+            (
+                "www-authenticate".to_string(),
+                format!(
+                    "Payment id=\"s\", realm=\"test\", method=\"solana\", intent=\"session\", request=\"{}\"",
+                    encode(&session_request)
+                ),
+            ),
+            (
+                "www-authenticate".to_string(),
+                format!(
+                    "Payment id=\"c\", realm=\"test\", method=\"solana\", intent=\"charge\", request=\"{}\"",
+                    encode(&charge_request)
+                ),
+            ),
+        ]
+    }
+
+    #[test]
+    fn session_challenge_carries_the_charge_from_the_same_402_as_fallback() {
+        let outcome = classify_402(&session_and_charge_402("operator"), None, "https://e.com/r");
+        let RunOutcome::SessionChallenge { fallback, .. } = outcome else {
+            panic!("session is preferred when offered: {outcome:?}");
+        };
+        let fallback = fallback.expect("the charge beside the session is the fallback");
+        assert!(
+            matches!(*fallback, RunOutcome::MppChallenge { .. }),
+            "{fallback:?}"
+        );
+    }
+
+    #[test]
+    fn session_challenge_carries_x402_fallback_when_that_is_the_other_offer() {
+        let outcome = classify_402(&dual_protocol_session_402(), None, "https://e.com/r");
+        let RunOutcome::SessionChallenge { fallback, .. } = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert!(matches!(
+            fallback.as_deref(),
+            Some(RunOutcome::X402Challenge { .. })
+        ));
+    }
+
+    #[test]
+    fn session_only_402_has_no_fallback() {
+        let mut headers = session_and_charge_402("operator");
+        headers.truncate(1);
+        let outcome = classify_402(&headers, None, "https://e.com/r");
+        let RunOutcome::SessionChallenge { fallback, .. } = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert!(fallback.is_none());
+    }
+
+    #[test]
+    fn for_signer_keeps_the_session_for_a_signer_that_signs_raw_messages() {
+        use crate::backend::testing::SignsAnything;
+        let outcome = classify_402(&session_and_charge_402("operator"), None, "https://e.com/r")
+            .for_signer(&SignsAnything);
+        assert!(
+            matches!(outcome, RunOutcome::SessionChallenge { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn for_signer_takes_the_charge_when_the_session_needs_a_raw_signature() {
+        use crate::backend::testing::TransactionsOnly;
+        let outcome = classify_402(&session_and_charge_402("operator"), None, "https://e.com/r")
+            .for_signer(&TransactionsOnly);
+        let RunOutcome::MppChallenge { challenge, .. } = outcome else {
+            panic!("a transactions-only signer must pay the charge: {outcome:?}");
+        };
+        assert_eq!(challenge.intent.as_str(), "charge");
+    }
+
+    #[test]
+    fn for_signer_keeps_a_client_signed_session_for_a_hardware_signer() {
+        use crate::backend::testing::TransactionsOnly;
+        let outcome = classify_402(&session_and_charge_402("client"), None, "https://e.com/r")
+            .for_signer(&TransactionsOnly);
+        assert!(
+            matches!(outcome, RunOutcome::SessionChallenge { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn for_signer_rejects_with_the_reason_when_nothing_else_is_offered() {
+        use crate::backend::testing::TransactionsOnly;
+        let mut headers = session_and_charge_402("operator");
+        headers.truncate(1);
+        let outcome = classify_402(&headers, None, "https://e.com/r").for_signer(&TransactionsOnly);
+        let RunOutcome::PaymentRejected {
+            reason, retryable, ..
+        } = outcome
+        else {
+            panic!("{outcome:?}");
+        };
+        assert!(!retryable);
+        assert!(
+            reason.starts_with("Test hardware wallet cannot sign an operator-signed session proof"),
+            "{reason}"
+        );
+        assert!(
+            reason.ends_with("This endpoint offers no other payment option."),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn for_signer_pays_instead_of_signing_in_when_the_signer_cannot_sign_in() {
+        use crate::backend::testing::{SignsAnything, TransactionsOnly};
+        let headers = siwx_with_payment_402();
+        let signed_in = classify_402(&headers, None, "https://e.com/r").for_signer(&SignsAnything);
+        assert!(
+            matches!(signed_in, RunOutcome::X402SignInChallenge { .. }),
+            "{signed_in:?}"
+        );
+        let paid = classify_402(&headers, None, "https://e.com/r").for_signer(&TransactionsOnly);
+        assert!(matches!(paid, RunOutcome::X402Challenge { .. }), "{paid:?}");
+    }
+
+    #[test]
+    fn for_signer_leaves_other_outcomes_alone() {
+        use crate::backend::testing::TransactionsOnly;
+        let outcome = classify_402(&dual_protocol_402(), None, "https://e.com/r");
+        assert!(matches!(outcome, RunOutcome::MppChallenge { .. }));
+        let same = outcome.for_signer(&TransactionsOnly);
+        assert!(matches!(same, RunOutcome::MppChallenge { .. }));
+    }
+
+    #[test]
+    fn for_account_passes_through_when_a_throwaway_wallet_would_pay() {
+        // No account on an ephemeral network: a software wallet is created
+        // at payment time and signs anything, so the session stands.
+        let store = crate::accounts::MemoryAccountsStore::new();
+        let outcome = classify_402(&session_and_charge_402("operator"), None, "https://e.com/r")
+            .for_account(&store, Some("localnet"), None)
+            .unwrap();
+        assert!(
+            matches!(outcome, RunOutcome::SessionChallenge { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn for_account_uses_the_network_the_offer_names() {
+        // Mainnet with nothing configured is an error at payment time; the
+        // pre-check reports the same thing rather than guessing a wallet.
+        let store = crate::accounts::MemoryAccountsStore::new();
+        let Err(err) = classify_402(&session_and_charge_402("operator"), None, "https://e.com/r")
+            .for_account(&store, None, None)
+        else {
+            panic!("mainnet without an account is an error");
+        };
+        assert!(
+            err.to_string()
+                .contains("No account configured for network `mainnet`"),
+            "{err}"
+        );
+    }
+
+    #[cfg(feature = "ledger")]
+    #[test]
+    fn for_account_lets_a_ledger_account_pay_the_charge() {
+        let mut file = crate::accounts::AccountsFile::default();
+        file.upsert(
+            "mainnet",
+            "ledger",
+            crate::accounts::Account {
+                backend: crate::accounts::BackendKind::Remote,
+                provider: Some("ledger".to_string()),
+                active: true,
+                auth_required: Some(true),
+                pubkey: Some("CcZFhGwFVkZevr555EZJpWbeq4irboT6zHfrSKWKCy3Z".to_string()),
+                vault: None,
+                account: Some("m/44'/501'/0'".to_string()),
+                path: None,
+                secret_key_b58: None,
+                created_at: None,
+                subscriptions: Default::default(),
+            },
+        );
+        let store = crate::accounts::MemoryAccountsStore::with_file(file);
+        let outcome = classify_402(&session_and_charge_402("operator"), None, "https://e.com/r")
+            .for_account(&store, None, None)
+            .unwrap();
+        assert!(
+            matches!(outcome, RunOutcome::MppChallenge { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    /// An x402 402 offering sign-in-with-x beside an exact payment.
+    fn siwx_with_payment_402() -> Vec<(String, String)> {
+        use base64::Engine;
+        let payment_required = serde_json::json!({
+            pay_kit::x402::X402_VERSION_FIELD: pay_kit::x402::X402_VERSION_V2,
+            "resource": { "url": "https://e.com/r", "description": "API access" },
+            "accepts": [{
+                "scheme": "exact",
+                "network": pay_kit::x402::exact::SOLANA_MAINNET,
+                "amount": "1000",
+                "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                "payTo": "Cs2zdfUNonRdRGsiZUQQLdTxzxVvJZmgiX2mpLYKuEqP",
+                "maxTimeoutSeconds": 60,
+                "extra": { "feePayer": "BcdwLA62UPEAvRn7AWauMUXKtYMXxdLzTPaSQg5tNaFc" }
+            }],
+            "extensions": {
+                "sign-in-with-x": {
+                    "info": {
+                        "domain": "e.com",
+                        "uri": "https://e.com",
+                        "version": "1",
+                        "nonce": "nonce-123",
+                        "issuedAt": "2026-04-27T00:00:00Z"
+                    },
+                    "supportedChains": [{
+                        "chainId": pay_kit::x402::exact::SOLANA_MAINNET,
+                        "type": "ed25519",
+                        "signatureScheme": "siws"
+                    }]
+                }
+            }
+        });
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(payment_required.to_string().as_bytes());
+        vec![(pay_kit::x402::PAYMENT_REQUIRED_HEADER.to_string(), encoded)]
     }
 
     fn dual_protocol_session_402() -> Vec<(String, String)> {

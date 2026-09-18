@@ -28,13 +28,10 @@ use pay_kit::mpp::program::subscriptions::{
     CancelSubscriptionAccounts, build_cancel_subscription_ix, default_program_id,
     find_event_authority_pda, parse_pubkey,
 };
-use pay_kit::mpp::solana_keychain::SolanaSigner;
+use pay_kit::mpp::solana_keychain::{SolanaSigner, TransactionSigner};
 use pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient;
 use pay_kit::mpp::{PaymentChallenge, parse_www_authenticate};
-use solana_message::Message;
 use solana_pubkey::Pubkey;
-use solana_signature::Signature;
-use solana_transaction::Transaction;
 
 use pay_core::accounts::{AccountsFile, AccountsStore, FileAccountsStore, SubscriptionStatus};
 
@@ -345,7 +342,7 @@ impl CancelCommand {
 // ── Direct on-chain path ────────────────────────────────────────────────────
 
 async fn broadcast_direct(
-    signer: &dyn SolanaSigner,
+    signer: &dyn TransactionSigner,
     instruction: solana_instruction::Instruction,
     rpc_url: &str,
 ) -> pay_core::Result<String> {
@@ -363,28 +360,21 @@ async fn broadcast_direct(
     .await
     .map_err(|e| pay_core::Error::Mpp(format!("RPC task join: {e}")))??;
 
-    let message = Message::new_with_blockhash(&[instruction], Some(&pubkey), &blockhash);
-    let mut tx = Transaction::new_unsigned(message);
-    let sig_bytes = signer
-        .sign_message(&tx.message_data())
+    let mut tx = pay_kit::core::tx::build_unsigned(
+        pay_kit::core::tx::TxVersion::V0,
+        &pubkey,
+        &[instruction],
+        blockhash,
+        None,
+    )
+    .map_err(|e| pay_core::Error::Mpp(format!("Failed to build tx: {e}")))?;
+    pay_kit::core::signing::sign_versioned_transaction_slot(signer, &mut tx)
         .await
         .map_err(|e| pay_core::Error::Mpp(format!("Subscriber signing failed: {e}")))?;
-    let signature = Signature::from(<[u8; 64]>::from(sig_bytes));
-    let signer_index = tx
-        .message
-        .account_keys
-        .iter()
-        .position(|k| *k == pubkey)
-        .ok_or_else(|| pay_core::Error::Mpp("Subscriber pubkey absent from account_keys".into()))?;
-    tx.signatures[signer_index] = signature;
 
-    let serialised = bincode::serialize(&tx)
-        .map_err(|e| pay_core::Error::Mpp(format!("Failed to serialise tx: {e}")))?;
     let confirmed = tokio::task::spawn_blocking(move || {
         let rpc = RpcClient::new(url);
-        let tx: Transaction = bincode::deserialize(&serialised)
-            .map_err(|e| pay_core::Error::Mpp(format!("tx round-trip: {e}")))?;
-        rpc.send_and_confirm_transaction(&tx)
+        pay_kit::core::rpc::send_and_confirm_transaction(&rpc, &tx)
             .map_err(|e| pay_core::Error::Mpp(format!("Broadcast failed: {e}")))
     })
     .await
@@ -402,7 +392,7 @@ async fn broadcast_direct(
 
 #[allow(clippy::too_many_arguments)]
 async fn broadcast_via_gateway(
-    signer: Arc<dyn SolanaSigner>,
+    signer: Arc<dyn TransactionSigner>,
     instruction: solana_instruction::Instruction,
     gateway_fee_payer: &Pubkey,
     gateway_url: &str,
@@ -434,28 +424,21 @@ async fn broadcast_via_gateway(
     .await
     .map_err(|e| pay_core::Error::Mpp(format!("RPC task join: {e}")))??;
 
-    let message = Message::new_with_blockhash(&[instruction], Some(gateway_fee_payer), &blockhash);
-    let mut tx = Transaction::new_unsigned(message);
-    let subscriber = signer.pubkey();
-    let subscriber_index = tx
-        .message
-        .account_keys
-        .iter()
-        .position(|k| *k == subscriber)
-        .ok_or_else(|| {
-            pay_core::Error::Mpp(
-                "Subscriber pubkey absent from cancel_subscription account_keys".into(),
-            )
-        })?;
-    let sig_bytes = signer
-        .sign_message(&tx.message_data())
+    let mut tx = pay_kit::core::tx::build_unsigned(
+        pay_kit::core::tx::TxVersion::V0,
+        gateway_fee_payer,
+        &[instruction],
+        blockhash,
+        None,
+    )
+    .map_err(|e| pay_core::Error::Mpp(format!("Failed to build tx: {e}")))?;
+    // Subscriber signs its own slot; the gateway co-signs the fee-payer slot.
+    pay_kit::core::signing::sign_versioned_transaction_slot(signer.as_ref(), &mut tx)
         .await
         .map_err(|e| pay_core::Error::Mpp(format!("Subscriber signing failed: {e}")))?;
-    tx.signatures[subscriber_index] = Signature::from(<[u8; 64]>::from(sig_bytes));
 
-    let tx_bytes = bincode::serialize(&tx)
+    let tx_b64 = pay_kit::core::tx::encode(&tx)
         .map_err(|e| pay_core::Error::Mpp(format!("Failed to serialise tx: {e}")))?;
-    let tx_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_bytes);
 
     // ── Sign the USDC charge credential against the probed challenge ───
     let rpc = RpcClient::new(url.clone());

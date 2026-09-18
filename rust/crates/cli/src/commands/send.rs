@@ -540,7 +540,7 @@ fn stablecoin_balance_summary(balances: &AccountBalances) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pay_core::accounts::{Account, Keystore};
+    use pay_core::accounts::{Account, BackendKind};
     use pay_core::balance::TokenBalance;
 
     const VALID_PUBKEY: &str = "11111111111111111111111111111111";
@@ -548,7 +548,7 @@ mod tests {
 
     fn test_account(pubkey: Option<&str>) -> Account {
         Account {
-            keystore: Keystore::AppleKeychain,
+            backend: BackendKind::AppleKeychain,
             provider: None,
             active: false,
             auth_required: Some(false),

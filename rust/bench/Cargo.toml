@@ -27,8 +27,8 @@ solana-transaction = { workspace = true }
 solana-instruction = { workspace = true }
 solana-commitment-config = { workspace = true }
 solana-hash = { workspace = true }
-solana-account = "3.4.0"
-solana-transaction-status-client-types = "4.0.0"
+solana-account = "4"
+solana-transaction-status-client-types = "4.1"
 
 tokio = { workspace = true, features = ["full"] }
 tokio-util = "0.7"
@@ -62,6 +62,7 @@ opentelemetry = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 opentelemetry-semantic-conventions = { workspace = true }
 opentelemetry_sdk = { workspace = true }
+opentelemetry-appender-tracing = "0.32"
 
 anyhow = "1"
 async-trait = "0.1"
@@ -79,10 +80,6 @@ solana-program-pack = "3.1"
 # CPU flamegraph profiling → Pyroscope (Grafana). pprof-rs sampling backend.
 pyroscope = "0.5"
 pyroscope_pprofrs = "0.2"
-
-# Embedded validator for rehearsal (fork) runs. Same pinned rev as pay-core's
-# dev-dependency so the lock resolves to a single copy.
-surfpool-sdk = { git = "https://github.com/solana-foundation/surfpool", rev = "b46c47e06c28ed1aa31e119215b479b70e72d4c3" }
 
 [dev-dependencies]
 base64.workspace = true

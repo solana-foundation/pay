@@ -24,10 +24,11 @@ pub struct NewCommand {
     #[arg(long)]
     pub force: bool,
 
-    /// Remote-backend credential as `key=value`, repeatable (e.g.
-    /// `--credential secret_key=sk_live_…`). Each field also reads
+    /// Remote-backend credential read from a file, as `key=@path`,
+    /// repeatable (e.g. `--credential secret_key=@/run/secrets/openfort`).
+    /// Values are never taken from the command line. Each field also reads
     /// `{PROVIDER}_{FIELD}` from the environment.
-    #[arg(long = "credential", value_name = "KEY=VALUE")]
+    #[arg(long = "credential", value_name = "KEY=@FILE")]
     pub credentials: Vec<String>,
 
     /// Remote-backend wallet id (env: `{PROVIDER}_WALLET_ID`). Defaults to
@@ -74,6 +75,13 @@ pub fn create_account(
     remote: &RemoteInputs,
 ) -> pay_core::Result<(String, &'static str)> {
     let backend_id = resolve_backend(backend)?;
+
+    if backend_id == crate::commands::cloud_onboard::CLOUD_BACKEND_FLAG {
+        return Err(pay_core::Error::Config(
+            "The browser-linked remote wallet is set up with `pay setup --backend cloud`."
+                .to_string(),
+        ));
+    }
 
     if let Some(provider) = pay_core::remote::provider(&backend_id) {
         let inputs = remote.clone().with_env_wallet_id(provider.id());
@@ -140,11 +148,13 @@ pub fn create_account(
 /// Remote-backend credentials supplied up front, so setup can run without
 /// a TTY.
 ///
-/// Values are provider-agnostic: `--credential key=value` (repeatable)
-/// names any field the chosen provider declares, and each field also
-/// falls back to a `{PROVIDER}_{FIELD}` environment variable —
-/// `OPENFORT_SECRET_KEY` for Openfort's `secret_key`. Anything still
-/// missing is prompted for interactively.
+/// Values are provider-agnostic: `--credential key=@file` (repeatable)
+/// names any field the chosen provider declares and reads its value from
+/// the file, and each field also falls back to a `{PROVIDER}_{FIELD}`
+/// environment variable — `OPENFORT_SECRET_KEY` for Openfort's
+/// `secret_key`. A value on the command line itself is refused: argv is
+/// readable by every process on the machine and kept in shell history.
+/// Anything still missing is prompted for interactively.
 #[derive(Clone, Default)]
 pub struct RemoteInputs {
     /// Credential values keyed by [`CredentialField::key`](pay_core::remote::CredentialField).
@@ -155,16 +165,15 @@ pub struct RemoteInputs {
 }
 
 impl RemoteInputs {
-    /// Parse repeated `key=value` credential flags and the wallet id.
+    /// Parse repeated `key=@file` credential flags and the wallet id.
+    ///
+    /// Errors never echo the flag: an operator who typed a secret where a
+    /// path belongs must not see it copied into logs.
     pub fn resolve(credentials: &[String], wallet_id: Option<String>) -> pay_core::Result<Self> {
         let mut map = std::collections::BTreeMap::new();
         for entry in credentials {
-            let (key, value) = entry.split_once('=').ok_or_else(|| {
-                pay_core::Error::Config(format!(
-                    "Invalid --credential `{entry}`: expected key=value."
-                ))
-            })?;
-            map.insert(key.trim().to_string(), value.trim().to_string());
+            let (key, value) = parse_credential_flag(entry)?;
+            map.insert(key, value);
         }
         Ok(Self {
             credentials: map,
@@ -199,6 +208,47 @@ impl RemoteInputs {
     }
 }
 
+/// One `--credential KEY=@FILE` flag: the key and the file's trimmed
+/// contents. `KEY=VALUE` is refused with the two accepted alternatives.
+fn parse_credential_flag(entry: &str) -> pay_core::Result<(String, String)> {
+    let Some((key, source)) = entry.split_once('=') else {
+        return Err(pay_core::Error::Config(
+            "Invalid --credential: expected KEY=@FILE.".to_string(),
+        ));
+    };
+    let key = key.trim();
+    if key.is_empty() {
+        return Err(pay_core::Error::Config(
+            "Invalid --credential: the key before `=` is empty.".to_string(),
+        ));
+    }
+    let Some(path) = source.trim().strip_prefix('@') else {
+        return Err(pay_core::Error::Config(format!(
+            "--credential {key}=<value> is not accepted: a value on the command line is visible \
+             to other processes and kept in shell history. Put it in a file and pass \
+             --credential {key}=@/path/to/file, or set the {{PROVIDER}}_{} environment variable.",
+            key.to_uppercase()
+        )));
+    };
+    if path.is_empty() {
+        return Err(pay_core::Error::Config(format!(
+            "--credential {key}=@: no file path after `@`."
+        )));
+    }
+    let value = std::fs::read_to_string(path).map_err(|err| {
+        pay_core::Error::Config(format!(
+            "Could not read --credential {key} from `{path}`: {err}"
+        ))
+    })?;
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(pay_core::Error::Config(format!(
+            "--credential {key}: `{path}` is empty."
+        )));
+    }
+    Ok((key.to_string(), value.to_string()))
+}
+
 /// `openfort` + `secret_key` → `OPENFORT_SECRET_KEY`.
 fn env_key(provider_id: &str, field: &str) -> String {
     format!("{provider_id}_{field}")
@@ -221,7 +271,7 @@ fn require_tty(missing: &str) -> pay_core::Result<()> {
     }
     Err(pay_core::Error::Config(format!(
         "No terminal to prompt for `{missing}`.\n\
-         Pass it non-interactively instead: --credential {missing}=<value> (repeatable) \
+         Pass it non-interactively instead: --credential {missing}=@<file> (repeatable) \
          and --wallet-id, or the matching {{PROVIDER}}_{{FIELD}} environment variables."
     )))
 }
@@ -286,7 +336,21 @@ fn create_remote_account(
 ) -> pay_core::Result<(String, &'static str)> {
     let display = provider.display_name();
 
-    if pay_core::remote::credentials_exist(name) && !force {
+    // Hardware wallets keep nothing in the secret store: "already
+    // connected" means an accounts.yml entry exists.
+    let already_connected = if provider.requires_credentials() {
+        pay_core::remote::credentials_exist(name)
+    } else {
+        pay_core::accounts::AccountsFile::load()
+            .ok()
+            .and_then(|f| {
+                f.named_account_for_network(pay_core::accounts::MAINNET_NETWORK, name)
+                    .map(|a| a.provider.as_deref() == Some(provider.id()))
+            })
+            .unwrap_or(false)
+    };
+
+    if already_connected && !force {
         let pubkey = pay_core::accounts::AccountsFile::load()
             .ok()
             .and_then(|f| {
@@ -317,7 +381,7 @@ fn create_remote_account(
         .iter()
         .any(|f| inputs.credential(provider, f).is_none())
         && std::io::IsTerminal::is_terminal(&std::io::stderr());
-    if will_prompt {
+    if will_prompt || !provider.requires_credentials() {
         eprintln!();
         eprintln!("  {}", provider.credentials_hint());
     }
@@ -362,9 +426,11 @@ fn create_remote_account(
     eprintln!("  {}", format!("Verifying with {display}…").dimmed());
     let pubkey = pay_core::remote::fetch_wallet_address(provider, &credentials, &wallet_id)?;
 
-    let ks = platform_credential_keystore()?;
-    let intent = pay_core::keystore::AuthIntent::create_account(name);
-    pay_core::remote::store_credentials(&ks, name, &credentials, &intent)?;
+    if provider.requires_credentials() {
+        let ks = platform_credential_keystore()?;
+        let intent = pay_core::keystore::AuthIntent::create_account(name);
+        pay_core::remote::store_credentials(&ks, name, &credentials, &intent)?;
+    }
 
     save_account_remote(name, provider.id(), &pubkey, &wallet_id)?;
 
@@ -393,43 +459,19 @@ fn prompt_credential(
 
 /// Platform secret store used for remote credential blobs, with the
 /// same setup-time gating fallbacks as the keypair backends.
-fn platform_credential_keystore() -> pay_core::Result<Keystore> {
-    #[cfg(target_os = "macos")]
-    {
-        if Keystore::apple_touchid_available() {
-            Ok(Keystore::apple_keychain())
-        } else {
-            eprintln!(
-                "Note: Touch ID is not enrolled on this Mac; storing the credentials in Apple Keychain without a biometric gate."
-            );
-            Ok(Keystore::new(
-                pay_core::keystore::auth::NoAuth,
-                pay_core::keystore::macos::AppleKeychainStore,
-                false,
-            ))
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        gnome_keyring_for_account_write()
-    }
-    #[cfg(target_os = "windows")]
-    {
-        if !Keystore::windows_hello_available() {
-            return Err(pay_core::Error::Config(
-                "Windows Hello is not configured.".to_string(),
-            ));
-        }
-        Ok(Keystore::windows_hello())
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    {
-        Err(pay_core::Error::Config(
+pub(crate) fn platform_credential_keystore() -> pay_core::Result<Keystore> {
+    let platform = pay_core::backend::platform().ok_or_else(|| {
+        pay_core::Error::Config(
             "Remote-backend accounts require a platform secret store, which is unavailable on \
              this platform."
                 .to_string(),
-        ))
+        )
+    })?;
+    if !platform.is_available() {
+        return Err(backend_unavailable_error(platform));
     }
+    let gate = setup_gate(platform)?;
+    platform.keystore(&pay_core::backend::StoreParams::default(), gate)
 }
 
 /// Resolved 1Password account info for storing in accounts.yml.
@@ -438,118 +480,137 @@ pub struct OpAccountInfo {
     pub account: Option<String>,
 }
 
-fn build_keystore(
+pub(super) fn build_keystore(
     backend_id: &str,
     vault: Option<&str>,
     account_name: &str,
 ) -> pay_core::Result<(
     Keystore,
-    pay_core::accounts::Keystore,
+    pay_core::accounts::BackendKind,
     &'static str,
     Option<OpAccountInfo>,
 )> {
-    match backend_id {
-        #[cfg(target_os = "macos")]
-        "keychain" => {
-            // When Touch ID is unavailable (no enrolled biometry — common
-            // on VMs, CI runners, headless servers), the keychain store is
-            // still usable, but the biometric gate has nothing to gate
-            // with. Fall back to NoAuth so account setup can proceed.
-            // Runtime signing still routes through the platform gate
-            // (or the MCP elicitation override when invoked through
-            // pay-mcp), so security at use-time is unchanged — only the
-            // initial setup step relaxes when biometry is missing.
-            let ks = if Keystore::apple_touchid_available() {
-                Keystore::apple_keychain()
+    use pay_core::accounts::BackendKind;
+    use pay_core::backend::StoreParams;
+
+    let Some(local) = pay_core::backend::local_by_flag(backend_id) else {
+        return Err(pay_core::Error::Config(format!(
+            "Unknown backend: {backend_id}. Use {}.",
+            available_backends_hint()
+        )));
+    };
+    if let Some(reason) = local.deprecated() {
+        return Err(pay_core::Error::Config(reason.to_string()));
+    }
+    if !local.is_available() {
+        return Err(backend_unavailable_error(local));
+    }
+
+    let kind = local.kind();
+    let file_path = file_backend_path(account_name)
+        .to_string_lossy()
+        .into_owned();
+    let op_account = match kind {
+        BackendKind::OnePassword => resolve_op_account()?,
+        _ => None,
+    };
+    let params = match kind {
+        BackendKind::OnePassword => StoreParams {
+            vault,
+            op_account: op_account.as_deref(),
+            file_path: None,
+        },
+        BackendKind::File => StoreParams {
+            file_path: Some(&file_path),
+            ..StoreParams::default()
+        },
+        _ => StoreParams::default(),
+    };
+    let op_info = match kind {
+        BackendKind::OnePassword => Some(OpAccountInfo {
+            vault: vault.map(|v| v.to_string()),
+            account: op_account.clone(),
+        }),
+        _ => None,
+    };
+
+    let gate = setup_gate(local)?;
+    let ks = local.keystore(&params, gate)?;
+    Ok((ks, kind, local.display_name(), op_info))
+}
+
+/// The approval gate to put in front of a store at account-creation time.
+///
+/// Creating or importing an account is explicit consent to write the key,
+/// so setup relaxes the gate on hosts where the platform prompt cannot run
+/// (no enrolled Touch ID, no local polkit agent). The persisted account
+/// keeps `auth_required: true`, so runtime signing is still approved
+/// through the platform prompt or the MCP elicitation override.
+pub(super) fn setup_gate(
+    local: &dyn pay_core::backend::LocalKeystoreBackend,
+) -> pay_core::Result<pay_core::backend::Gate> {
+    use pay_core::accounts::BackendKind;
+    use pay_core::backend::Gate;
+
+    match local.kind() {
+        BackendKind::AppleKeychain => {
+            if local.platform_gate_available() {
+                Ok(Gate::Platform)
             } else {
                 eprintln!(
-                    "Note: Touch ID is not enrolled on this Mac; storing the new account in Apple Keychain without a biometric gate. Runtime signing will still require approval via the configured auth path."
+                    "Note: Touch ID is not enrolled on this Mac; storing in Apple Keychain without a biometric gate. Runtime signing will still require approval via the configured auth path."
                 );
-                Keystore::new(
-                    pay_core::keystore::auth::NoAuth,
-                    pay_core::keystore::macos::AppleKeychainStore,
-                    false,
-                )
-            };
-            Ok((
-                ks,
-                pay_core::accounts::Keystore::AppleKeychain,
-                "Apple Keychain",
-                None,
-            ))
+                Ok(Gate::Disabled)
+            }
         }
-        #[cfg(not(target_os = "macos"))]
-        "keychain" => Err(pay_core::Error::Config(
-            "Keychain is only available on macOS".to_string(),
-        )),
-
-        #[cfg(target_os = "linux")]
-        "gnome-keyring" => {
-            let ks = gnome_keyring_for_account_write()?;
-            Ok((
-                ks,
-                pay_core::accounts::Keystore::GnomeKeyring,
-                "GNOME Keyring",
-                None,
-            ))
+        BackendKind::GnomeKeyring => {
+            if !local.is_available() {
+                return Err(gnome_keyring_unavailable_error());
+            }
+            if local.platform_gate_available() {
+                #[cfg(target_os = "linux")]
+                crate::commands::setup::install_linux_polkit_policy_if_needed()?;
+                Ok(Gate::Platform)
+            } else {
+                eprintln!(
+                    "Note: No local Polkit prompt is available; using the already-unlocked GNOME Keyring without a setup-time prompt. Runtime signing still requires MCP approval or a configured Polkit agent."
+                );
+                Ok(Gate::Disabled)
+            }
         }
-        #[cfg(not(target_os = "linux"))]
-        "gnome-keyring" => Err(pay_core::Error::Config(
-            "GNOME Keyring is only available on Linux".to_string(),
-        )),
-
-        #[cfg(target_os = "windows")]
-        "windows-hello" => {
-            if !Keystore::windows_hello_available() {
-                return Err(pay_core::Error::Config(
+        BackendKind::WindowsHello => {
+            if local.platform_gate_available() {
+                Ok(Gate::Platform)
+            } else {
+                Err(pay_core::Error::Config(
                     "Windows Hello is not configured.".to_string(),
-                ));
+                ))
             }
-            Ok((
-                Keystore::windows_hello(),
-                pay_core::accounts::Keystore::WindowsHello,
-                "Windows Hello",
-                None,
-            ))
         }
-        #[cfg(not(target_os = "windows"))]
-        "windows-hello" => Err(pay_core::Error::Config(
-            "Windows Hello is only available on Windows".to_string(),
-        )),
-
-        "file" => Ok((
-            Keystore::file(file_backend_path(account_name)),
-            pay_core::accounts::Keystore::File,
-            "owner-only keypair file",
-            None,
-        )),
-
-        "1password" => {
-            if !Keystore::onepassword_available() {
-                return Err(pay_core::Error::Config(
-                    "1Password CLI (`op`) is not installed or not signed in.".to_string(),
-                ));
-            }
-            let op_account = resolve_op_account()?;
-            let ks = match vault {
-                Some(v) => Keystore::onepassword_with_vault(v, op_account.clone()),
-                None => Keystore::onepassword(op_account.clone()),
-            };
-            Ok((
-                ks,
-                pay_core::accounts::Keystore::OnePassword,
-                "1Password",
-                Some(OpAccountInfo {
-                    vault: vault.map(|v| v.to_string()),
-                    account: op_account,
-                }),
-            ))
-        }
-
-        other => Err(pay_core::Error::Config(format!(
-            "Unknown backend: {other}. Use {}.",
-            available_backends_hint()
+        // 1Password prompts through `op`; file writes never prompt.
+        BackendKind::OnePassword | BackendKind::File => Ok(Gate::Platform),
+        BackendKind::Ephemeral | BackendKind::Remote => Err(pay_core::Error::Config(format!(
+            "`{}` is not a local keystore backend.",
+            local.id()
         ))),
+    }
+}
+
+fn backend_unavailable_error(
+    local: &dyn pay_core::backend::LocalKeystoreBackend,
+) -> pay_core::Error {
+    match local.kind() {
+        pay_core::accounts::BackendKind::GnomeKeyring => gnome_keyring_unavailable_error(),
+        pay_core::accounts::BackendKind::OnePassword => pay_core::Error::Config(
+            "1Password CLI (`op`) is not installed or not signed in.".to_string(),
+        ),
+        pay_core::accounts::BackendKind::WindowsHello => {
+            pay_core::Error::Config("Windows Hello is not configured.".to_string())
+        }
+        _ => pay_core::Error::Config(format!(
+            "{} is not available on this platform.",
+            local.display_name()
+        )),
     }
 }
 
@@ -557,28 +618,23 @@ fn build_keystore(
 /// keystore first and every registered remote backend after it. Used in
 /// error messages so we don't suggest `keychain` to a Linux user.
 fn available_backends_hint() -> String {
-    #[cfg(target_os = "macos")]
-    let platform = Some("keychain");
-    #[cfg(target_os = "linux")]
-    let platform = if Keystore::gnome_keyring_available() {
-        Some("gnome-keyring")
-    } else {
-        return "'file'".to_string();
+    let platform = pay_core::backend::platform().filter(|p| p.is_available());
+    let Some(platform) = platform else {
+        return if cfg!(target_os = "linux") {
+            "'file'".to_string()
+        } else {
+            "a supported platform backend".to_string()
+        };
     };
-    #[cfg(target_os = "windows")]
-    let platform = Some("windows-hello");
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    let platform: Option<&str> = None;
 
-    let quoted: Vec<String> = platform
-        .into_iter()
-        .chain(pay_core::remote::provider_ids())
+    std::iter::once(platform.flag())
+        .chain(std::iter::once(
+            crate::commands::cloud_onboard::CLOUD_BACKEND_FLAG,
+        ))
+        .chain(pay_core::remote::providers().map(|p| p.flag()))
         .map(|id| format!("'{id}'"))
-        .collect();
-    match quoted.len() {
-        0 => "a supported platform backend".to_string(),
-        _ => quoted.join(" or "),
-    }
+        .collect::<Vec<_>>()
+        .join(" or ")
 }
 
 pub(super) fn file_backend_path(account_name: &str) -> std::path::PathBuf {
@@ -593,15 +649,18 @@ pub fn resolve_backend(backend: Option<&str>) -> pay_core::Result<String> {
         None => pick_backend()?,
     };
 
-    #[cfg(target_os = "linux")]
-    if backend == "gnome-keyring" && !Keystore::gnome_keyring_available() {
-        return Err(gnome_keyring_unavailable_error());
+    if let Some(local) = pay_core::backend::local_by_flag(&backend) {
+        if let Some(reason) = local.deprecated() {
+            return Err(pay_core::Error::Config(reason.to_string()));
+        }
+        if !local.is_available() {
+            return Err(backend_unavailable_error(local));
+        }
     }
 
     Ok(backend)
 }
 
-#[cfg(target_os = "linux")]
 fn gnome_keyring_unavailable_error() -> pay_core::Error {
     pay_core::Error::Config(
         "GNOME Keyring Secret Service is not reachable in this session.\n\
@@ -611,29 +670,6 @@ fn gnome_keyring_unavailable_error() -> pay_core::Error {
          `pay setup --backend gnome-keyring`. Pay will not start or unlock the service automatically."
             .to_string(),
     )
-}
-
-/// Build the GNOME store for an explicit create/import operation.
-///
-/// A headless process may have an already-unlocked Secret Service but no
-/// Polkit agent. The command itself is explicit consent to write the key, so
-/// skip only this setup-time auth gate. The persisted account remains
-/// `auth_required: true`; runtime MCP signing is still approved via elicitation.
-#[cfg(target_os = "linux")]
-pub(super) fn gnome_keyring_for_account_write() -> pay_core::Result<Keystore> {
-    if !Keystore::gnome_keyring_available() {
-        return Err(gnome_keyring_unavailable_error());
-    }
-
-    if Keystore::gnome_keyring_local_auth_available() {
-        crate::commands::setup::install_linux_polkit_policy_if_needed()?;
-        return Ok(Keystore::gnome_keyring());
-    }
-
-    eprintln!(
-        "Note: No local Polkit prompt is available; using the already-unlocked GNOME Keyring without a setup-time prompt. Runtime signing still requires MCP approval or a configured Polkit agent."
-    );
-    Ok(Keystore::gnome_keyring_no_auth())
 }
 
 /// Resolve which 1Password account to use. If only one account is
@@ -692,60 +728,46 @@ pub fn pick_backend() -> pay_core::Result<String> {
 
     struct Opt {
         id: &'static str,
-        label: String,
+        name: String,
+        detail: String,
     }
 
-    // Only show platform-native backend on the current OS
-    #[cfg(target_os = "macos")]
-    let mut options = vec![Opt {
-        id: "keychain",
-        label: "macOS Keychain (requires Touch ID)".into(),
-    }];
-
-    #[cfg(target_os = "linux")]
-    let mut options = {
-        if Keystore::gnome_keyring_available() {
-            vec![Opt {
-                id: "gnome-keyring",
-                label: "GNOME Keyring (password prompt)".into(),
-            }]
-        } else {
-            vec![Opt {
-                id: "file",
-                label: "Owner-only keypair file (not encrypted)".into(),
-            }]
-        }
-    };
-
-    #[cfg(target_os = "windows")]
-    let mut options = {
-        if Keystore::windows_hello_available() {
-            vec![Opt {
-                id: "windows-hello",
-                label: "Windows Hello (fingerprint / face / PIN)".into(),
-            }]
-        } else {
-            Vec::new()
-        }
-    };
-
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    let mut options: Vec<Opt> = Vec::new();
-
-    // Remote backends sign elsewhere, but their API credentials still
-    // live in the platform secret store — only offer them when one is
-    // available (the first entry is always platform-native).
-    if options.first().is_some_and(|o| o.id != "file") {
-        for provider in pay_core::remote::providers() {
-            options.push(Opt {
-                id: provider.id(),
-                label: format!(
-                    "{} (remote signing — the key stays in the provider's custody)",
-                    provider.display_name()
-                ),
-            });
+    fn opt(backend: &dyn pay_core::backend::SigningBackend) -> Opt {
+        Opt {
+            id: backend.flag(),
+            name: backend.display_name().to_string(),
+            detail: backend.description().to_string(),
         }
     }
+
+    // The OS-native store comes first. Linux without a reachable keyring
+    // falls back to the plain file; Windows without Hello offers nothing.
+    let platform = pay_core::backend::platform().filter(|p| p.is_available());
+    let mut options: Vec<Opt> = match platform {
+        Some(p) => vec![opt(p)],
+        None if cfg!(target_os = "linux") => vec![opt(&pay_core::backend::File)],
+        None => Vec::new(),
+    };
+
+    // The remote wallet is set up from the browser; its token lives in the
+    // platform secret store, so only offer it when one is available. A
+    // bring-your-own custody provider (`--backend openfort`) is a flag, not
+    // a picker entry: the browser flow is the remote wallet.
+    if platform.is_some() {
+        options.push(Opt {
+            id: crate::commands::cloud_onboard::CLOUD_BACKEND_FLAG,
+            name: crate::commands::cloud_onboard::CLOUD_BACKEND_NAME.to_string(),
+            detail: crate::commands::cloud_onboard::CLOUD_BACKEND_DETAIL.to_string(),
+        });
+    }
+
+    // Hardware wallets need no secret store at all, so they are offered
+    // whenever this build includes them, plugged in or not.
+    options.extend(
+        pay_core::remote::providers()
+            .filter(|p| p.custody() == pay_core::backend::Custody::Hardware)
+            .map(|p| opt(p)),
+    );
 
     if options.is_empty() {
         #[cfg(target_os = "linux")]
@@ -757,22 +779,34 @@ pub fn pick_backend() -> pay_core::Result<String> {
         ));
     }
 
-    let items: Vec<String> = options.iter().map(|o| o.label.clone()).collect();
+    // Two aligned columns: the backend name, then what it means for the
+    // user, dimmed. The theme highlights the whole active row.
+    let name_width = options
+        .iter()
+        .map(|o| o.name.chars().count())
+        .max()
+        .unwrap_or(0);
+    let items: Vec<String> = options
+        .iter()
+        .map(|o| format!("{:<name_width$}   {}", o.name, o.detail.dimmed()))
+        .collect();
 
     eprintln!();
-    let selection = Select::new()
-        .with_prompt("Where should pay store your account?")
+    let selection = Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
+        .with_prompt("Where should pay keep your wallet?")
         .items(&items)
         .default(0)
-        .interact()
-        .map_err(|e| pay_core::Error::Config(format!("Selection cancelled: {e}")))?;
+        .report(true)
+        .interact_opt()
+        .map_err(|e| pay_core::Error::Config(format!("Selection failed: {e}")))?
+        .ok_or_else(|| pay_core::Error::Config("Setup cancelled.".to_string()))?;
 
     Ok(options[selection].id.to_string())
 }
 
 pub fn save_account(
     name: &str,
-    keystore: pay_core::accounts::Keystore,
+    backend: pay_core::accounts::BackendKind,
     pubkey: &str,
     vault: Option<String>,
     path: Option<String>,
@@ -783,7 +817,7 @@ pub fn save_account(
         pay_core::accounts::MAINNET_NETWORK,
         name,
         pay_core::accounts::Account {
-            keystore,
+            backend,
             provider: None,
             active: false,
             auth_required: Some(true),
@@ -812,7 +846,7 @@ pub fn save_account_remote(
         pay_core::accounts::MAINNET_NETWORK,
         name,
         pay_core::accounts::Account {
-            keystore: pay_core::accounts::Keystore::Remote,
+            backend: pay_core::accounts::BackendKind::Remote,
             provider: Some(provider_id.to_string()),
             active: false,
             auth_required: Some(true),
@@ -903,6 +937,66 @@ pub fn generate_keypair() -> (Vec<u8>, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_flag_reads_the_value_from_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret");
+        std::fs::write(&path, "  sk_live_abc\n").unwrap();
+        let inputs = RemoteInputs::resolve(
+            &[format!("secret_key=@{}", path.display())],
+            Some(" acc_1 ".to_string()),
+        )
+        .unwrap();
+        assert_eq!(inputs.credentials["secret_key"], "sk_live_abc");
+        assert_eq!(inputs.wallet_id.as_deref(), Some("acc_1"));
+    }
+
+    #[test]
+    fn credential_flag_refuses_a_value_on_the_command_line_without_echoing_it() {
+        let Err(pay_core::Error::Config(msg)) =
+            RemoteInputs::resolve(&["secret_key=sk_live_topsecret".to_string()], None)
+        else {
+            panic!("argv values must be refused");
+        };
+        assert!(!msg.contains("topsecret"), "{msg}");
+        assert!(
+            msg.contains("--credential secret_key=@/path/to/file"),
+            "{msg}"
+        );
+        assert!(msg.contains("{PROVIDER}_SECRET_KEY"), "{msg}");
+
+        let Err(pay_core::Error::Config(msg)) =
+            RemoteInputs::resolve(&["sk_live_topsecret".to_string()], None)
+        else {
+            panic!("a flag without `=` must be refused");
+        };
+        assert!(!msg.contains("topsecret"), "{msg}");
+    }
+
+    #[test]
+    fn credential_flag_reports_missing_and_empty_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope");
+        let Err(pay_core::Error::Config(msg)) =
+            RemoteInputs::resolve(&[format!("secret_key=@{}", missing.display())], None)
+        else {
+            panic!("a missing file is an error");
+        };
+        assert!(
+            msg.contains("Could not read --credential secret_key"),
+            "{msg}"
+        );
+
+        let empty = dir.path().join("empty");
+        std::fs::write(&empty, "\n").unwrap();
+        let Err(pay_core::Error::Config(msg)) =
+            RemoteInputs::resolve(&[format!("secret_key=@{}", empty.display())], None)
+        else {
+            panic!("an empty file is an error");
+        };
+        assert!(msg.ends_with("is empty."), "{msg}");
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

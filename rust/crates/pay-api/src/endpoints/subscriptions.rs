@@ -38,13 +38,13 @@ use pay_kit::mpp::program::subscriptions::{
 };
 use pay_kit::mpp::protocol::solana::MethodDetails;
 use pay_kit::mpp::server::{Config as MppConfig, Mpp};
-use pay_kit::mpp::solana_keychain::{Signer, SolanaSigner};
+use pay_kit::mpp::solana_keychain::{Signer, TransactionSigner};
 use pay_kit::mpp::{ChargeRequest as MppChargeRequest, PaymentCredential};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
-use solana_transaction::Transaction;
+use solana_transaction::versioned::VersionedTransaction;
 use tracing::{info, warn};
 
 use crate::state::AppState;
@@ -123,7 +123,7 @@ struct CancelReceiptResponse {
 
 struct ParsedCancelTx {
     /// The full (partially-signed) transaction the agent submitted.
-    tx: Transaction,
+    tx: VersionedTransaction,
     /// Subscriber pubkey extracted from the cancel_subscription
     /// instruction's first account meta.
     subscriber: Pubkey,
@@ -381,16 +381,17 @@ fn resolve_cancel_request(
 /// rejected.
 fn parse_cancel_tx(tx_b64: &str, expected_fee_payer: &str) -> Result<ParsedCancelTx, Error> {
     use base64::Engine;
-    use solana_sanitize::Sanitize;
     let raw = base64::engine::general_purpose::STANDARD
         .decode(tx_b64.trim())
         .map_err(|_| Error::InvalidPaymentCredential)?;
-    let tx: Transaction =
-        bincode::deserialize(&raw).map_err(|_| Error::InvalidPaymentCredential)?;
+    let tx = pay_kit::core::tx::decode_bytes(&raw).map_err(|_| Error::InvalidPaymentCredential)?;
+    // Version 0 only (no legacy, no lookup tables), within the size limit.
+    pay_kit::core::tx::check_envelope(&tx, &[pay_kit::core::tx::TxVersion::V0])
+        .map_err(|_| Error::InvalidPaymentCredential)?;
     tx.sanitize().map_err(|_| Error::InvalidPaymentCredential)?;
 
-    let keys = &tx.message.account_keys;
-    let required_signatures = tx.message.header.num_required_signatures as usize;
+    let keys = tx.message.static_account_keys();
+    let required_signatures = tx.message.header().num_required_signatures as usize;
     if keys.is_empty() || required_signatures == 0 || tx.signatures.len() != required_signatures {
         return Err(Error::InvalidPaymentCredential);
     }
@@ -409,7 +410,7 @@ fn parse_cancel_tx(tx_b64: &str, expected_fee_payer: &str) -> Result<ParsedCance
     let memo = Pubkey::from_str(MEMO_PROGRAM_ID).expect("valid memo program id");
 
     let mut cancel_ix_index: Option<usize> = None;
-    for (i, ix) in tx.message.instructions.iter().enumerate() {
+    for (i, ix) in tx.message.instructions().iter().enumerate() {
         let prog_idx = ix.program_id_index as usize;
         if prog_idx >= keys.len() {
             return Err(Error::InvalidPaymentCredential);
@@ -429,7 +430,7 @@ fn parse_cancel_tx(tx_b64: &str, expected_fee_payer: &str) -> Result<ParsedCance
     }
 
     let cancel_ix_index = cancel_ix_index.ok_or(Error::InvalidPaymentCredential)?;
-    let cancel_ix = &tx.message.instructions[cancel_ix_index];
+    let cancel_ix = &tx.message.instructions()[cancel_ix_index];
 
     // Subscriber = accounts[0], plan_pda = accounts[1], subscription_pda =
     // accounts[2] per the program's `CancelSubscriptionAccounts` layout.
@@ -493,6 +494,7 @@ fn build_charge_request(
         decimals: Some(resolved.coin.decimals),
         token_program: Some(resolved.coin.token_program.to_string()),
         fee_payer: Some(true),
+        transaction_versions: None,
         fee_payer_key: Some(resolved.fee_payer_pubkey.clone()),
         splits: None,
         recent_blockhash,
@@ -540,7 +542,7 @@ fn validate_paid_cancel_request(
 async fn co_sign_and_broadcast(
     state: &AppState,
     resolved: &ResolvedCancel,
-    signer: Arc<dyn SolanaSigner>,
+    signer: Arc<dyn TransactionSigner>,
 ) -> Result<Signature, Error> {
     // Broadcast path requires the full parsed tx — `verify_and_broadcast`
     // only invokes us after confirming `parsed.is_some()`.
@@ -550,26 +552,10 @@ async fn co_sign_and_broadcast(
         .ok_or(Error::InvalidPaymentCredential)?;
     let mut tx = parsed.tx.clone();
     let fee_payer = signer.pubkey();
-    let fee_payer_index = tx
-        .message
-        .account_keys
-        .iter()
-        .position(|k| *k == fee_payer)
-        .ok_or(Error::FeePayerSigner)?;
-
-    let msg_bytes = tx.message_data();
-    let sig_bytes = signer
-        .sign_message(&msg_bytes)
+    pay_kit::core::signing::cosign_versioned_fee_payer(signer.as_ref(), &fee_payer, &mut tx)
         .await
         .map_err(|_| Error::FeePayerSigner)?;
-    let signature = Signature::from(<[u8; 64]>::from(sig_bytes));
-    if tx.signatures.len() <= fee_payer_index {
-        return Err(Error::FeePayerSigner);
-    }
-    tx.signatures[fee_payer_index] = signature;
-
-    let serialised = bincode::serialize(&tx).map_err(|_| Error::PaymentChallenge)?;
-    let tx_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &serialised);
+    let tx_b64 = pay_kit::core::tx::encode(&tx).map_err(|_| Error::PaymentChallenge)?;
 
     let sig_str = state
         .rpc
@@ -581,7 +567,7 @@ async fn co_sign_and_broadcast(
 async fn new_mpp(
     state: &AppState,
     resolved: &ResolvedCancel,
-    fee_payer_signer: Option<Arc<dyn SolanaSigner>>,
+    fee_payer_signer: Option<Arc<dyn TransactionSigner>>,
 ) -> Result<Mpp, Error> {
     let has_fee_payer_signer = fee_payer_signer.is_some();
     Mpp::new(MppConfig {
@@ -600,7 +586,7 @@ async fn new_mpp(
     .map_err(|_| Error::PaymentChallenge)
 }
 
-async fn fee_payer_signer(state: &AppState) -> Result<Arc<dyn SolanaSigner>, Error> {
+async fn fee_payer_signer(state: &AppState) -> Result<Arc<dyn TransactionSigner>, Error> {
     let key_name = state
         .subscriptions_fee_payer
         .key_name
@@ -622,7 +608,15 @@ async fn fee_payer_signer(state: &AppState) -> Result<Arc<dyn SolanaSigner>, Err
     let signer = Signer::from_gcp_kms(key_name.to_string(), pubkey.to_string())
         .await
         .map_err(|_| Error::FeePayerSigner)?;
-    Ok(Arc::new(signer))
+    match signer {
+        Signer::GcpKms(signer) => Ok(Arc::new(signer)),
+        Signer::Memory(signer) => Ok(Arc::new(signer)),
+        // Feature unification can add keychain variants this service never
+        // configures (e.g. `openfort` enabled by the CLI); none of them is a
+        // fee payer here.
+        #[allow(unreachable_patterns)]
+        _ => Err(Error::FeePayerSigner),
+    }
 }
 
 fn configured_fee_payer_pubkey(state: &AppState) -> Result<String, Error> {
@@ -730,15 +724,14 @@ impl IntoResponse for ApiError {
 mod tests {
     use super::*;
     use solana_instruction::{AccountMeta, Instruction};
-    use solana_message::Message;
-    use solana_transaction::Transaction;
+    use solana_transaction::versioned::VersionedTransaction;
 
     fn build_cancel_tx(
         fee_payer: Pubkey,
         subscriber: Pubkey,
         plan_pda: Pubkey,
         subscription_pda: Pubkey,
-    ) -> Transaction {
+    ) -> VersionedTransaction {
         let program_id = Pubkey::from_str(SUBSCRIPTIONS_PROGRAM_ID).unwrap();
         let event_authority = Pubkey::new_unique();
         // Order in CancelSubscriptionAccounts: subscriber, plan_pda,
@@ -754,13 +747,18 @@ mod tests {
             ],
             data: vec![INSTRUCTION_CANCEL_SUBSCRIPTION],
         };
-        let message = Message::new(&[ix], Some(&fee_payer));
-        Transaction::new_unsigned(message)
+        pay_kit::core::tx::build_unsigned_unchecked(
+            pay_kit::core::tx::TxVersion::V0,
+            &fee_payer,
+            &[ix],
+            solana_hash::Hash::default(),
+            None,
+        )
+        .unwrap()
     }
 
-    fn encode_tx(tx: &Transaction) -> String {
-        let bytes = bincode::serialize(tx).unwrap();
-        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes)
+    fn encode_tx(tx: &VersionedTransaction) -> String {
+        pay_kit::core::tx::encode(tx).unwrap()
     }
 
     #[test]
@@ -827,8 +825,14 @@ mod tests {
             accounts: vec![],
             data: vec![0xAA],
         };
-        let message = Message::new(&[cancel_ix, rogue_ix], Some(&fee_payer));
-        let tx = Transaction::new_unsigned(message);
+        let tx = pay_kit::core::tx::build_unsigned_unchecked(
+            pay_kit::core::tx::TxVersion::V0,
+            &fee_payer,
+            &[cancel_ix, rogue_ix],
+            solana_hash::Hash::default(),
+            None,
+        )
+        .unwrap();
         assert!(parse_cancel_tx(&encode_tx(&tx), &fee_payer.to_string()).is_err());
     }
 
@@ -842,8 +846,14 @@ mod tests {
             accounts: vec![],
             data: vec![2, 0, 0, 0, 0],
         };
-        let message = Message::new(&[ix], Some(&fee_payer));
-        let tx = Transaction::new_unsigned(message);
+        let tx = pay_kit::core::tx::build_unsigned_unchecked(
+            pay_kit::core::tx::TxVersion::V0,
+            &fee_payer,
+            &[ix],
+            solana_hash::Hash::default(),
+            None,
+        )
+        .unwrap();
         assert!(parse_cancel_tx(&encode_tx(&tx), &fee_payer.to_string()).is_err());
     }
 
@@ -863,8 +873,14 @@ mod tests {
             ],
             data: vec![INSTRUCTION_CANCEL_SUBSCRIPTION],
         };
-        let message = Message::new(&[ix.clone(), ix], Some(&fee_payer));
-        let tx = Transaction::new_unsigned(message);
+        let tx = pay_kit::core::tx::build_unsigned_unchecked(
+            pay_kit::core::tx::TxVersion::V0,
+            &fee_payer,
+            &[ix.clone(), ix],
+            solana_hash::Hash::default(),
+            None,
+        )
+        .unwrap();
         assert!(parse_cancel_tx(&encode_tx(&tx), &fee_payer.to_string()).is_err());
     }
 

@@ -11,14 +11,12 @@
 
 use std::collections::HashMap;
 
-use base64::Engine;
 use chrono::{DateTime, Utc};
 use pay_kit::mpp::solana_keychain::SolanaSigner;
 use solana_hash::Hash;
-use solana_message::Message;
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
-use solana_transaction::Transaction;
+use solana_transaction::versioned::VersionedTransaction;
 
 use crate::accounts::AccountsStore;
 use crate::client::push::manifest::TransferManifest;
@@ -332,7 +330,7 @@ impl BatchSigningPermit {
     pub fn sign_chunk(
         &mut self,
         chunk_index: u32,
-        prepared_transaction: &Transaction,
+        prepared_transaction: &VersionedTransaction,
         last_valid_block_height: u64,
     ) -> Result<SignedChunk> {
         self.ensure_not_expired()?;
@@ -398,7 +396,7 @@ impl BatchSigningPermit {
     pub fn resign_chunk(
         &mut self,
         chunk_index: u32,
-        prepared_transaction: &Transaction,
+        prepared_transaction: &VersionedTransaction,
         last_valid_block_height: u64,
         expiry: &BlockhashExpiryProof,
     ) -> Result<SignedChunk> {
@@ -432,7 +430,7 @@ impl BatchSigningPermit {
                 "chunk {chunk_index} exceeded the bounded re-sign attempt limit ({MAX_RESIGN_ATTEMPTS_PER_CHUNK})"
             )));
         }
-        if prepared_transaction.message.recent_blockhash == record.blockhash {
+        if *prepared_transaction.message.recent_blockhash() == record.blockhash {
             return Err(Error::Config(format!(
                 "chunk {chunk_index}: re-sign must use a fresh blockhash, not the expired one"
             )));
@@ -464,26 +462,37 @@ impl BatchSigningPermit {
 
     fn sign_transaction_bytes(
         &self,
-        prepared_transaction: &Transaction,
+        prepared_transaction: &VersionedTransaction,
     ) -> Result<(Signature, Hash, String)> {
         let mut tx = prepared_transaction.clone();
-        let result = self
-            .runtime
-            .block_on(self.signer.sign_transaction(&mut tx))
+        self.runtime
+            .block_on(pay_kit::core::signing::sign_versioned_transaction_slot(
+                &self.signer,
+                &mut tx,
+            ))
             .map_err(|e| Error::Config(format!("failed to sign prepared transaction: {e}")))?;
-        let (_, signature) = result.into_signed_transaction();
-        let blockhash = tx.message.recent_blockhash;
-        let bytes = bincode::serialize(&tx)
+        let signer_index = tx
+            .message
+            .static_account_keys()
+            .iter()
+            .position(|key| *key == self.account_pubkey)
+            .ok_or_else(|| Error::Config("signer is not in the prepared transaction".into()))?;
+        let signature = tx.signatures[signer_index];
+        let blockhash = *tx.message.recent_blockhash();
+        let encoded = pay_kit::core::tx::encode(&tx)
             .map_err(|e| Error::Config(format!("failed to serialize signed transaction: {e}")))?;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
         Ok((signature, blockhash, encoded))
     }
 
     /// Re-validate every field the plan requires before a signature is ever
     /// produced. See the module docs and the plan's "One-approval batch
     /// permit" section for the exact checklist.
-    fn validate_prepared_transaction(&self, plan: &PlannedChunk, tx: &Transaction) -> Result<()> {
-        let message = &tx.message;
+    fn validate_prepared_transaction(
+        &self,
+        plan: &PlannedChunk,
+        tx: &VersionedTransaction,
+    ) -> Result<()> {
+        let message = &MessageView::from(&tx.message);
         let chunk_index = plan.chunk_index;
 
         let actual_fee_payer = *message
@@ -507,7 +516,7 @@ impl BatchSigningPermit {
             token_2022_program_id(),
             memo_program_id(),
         ];
-        for ix in &message.instructions {
+        for ix in message.instructions {
             let program_id = *message
                 .account_keys
                 .get(ix.program_id_index as usize)
@@ -602,15 +611,32 @@ impl BatchSigningPermit {
     }
 }
 
+/// Static view of a versioned message: the kit builds and accepts only
+/// versions 0 and 1, neither with address lookup tables, so every account an
+/// instruction names is a static key.
+struct MessageView<'a> {
+    account_keys: &'a [Pubkey],
+    instructions: &'a [solana_message::compiled_instruction::CompiledInstruction],
+}
+
+impl<'a> From<&'a solana_message::VersionedMessage> for MessageView<'a> {
+    fn from(message: &'a solana_message::VersionedMessage) -> Self {
+        Self {
+            account_keys: message.static_account_keys(),
+            instructions: message.instructions(),
+        }
+    }
+}
+
 fn config_error(chunk_index: u32, detail: &str) -> Error {
     Error::Config(format!("chunk {chunk_index}: {detail}"))
 }
 
-fn instruction_at(
-    message: &Message,
+fn instruction_at<'a>(
+    message: &MessageView<'a>,
     index: usize,
     chunk_index: u32,
-) -> Result<&solana_message::compiled_instruction::CompiledInstruction> {
+) -> Result<&'a solana_message::compiled_instruction::CompiledInstruction> {
     message.instructions.get(index).ok_or_else(|| {
         config_error(
             chunk_index,
@@ -619,7 +645,7 @@ fn instruction_at(
     })
 }
 
-fn account_at(message: &Message, index: u8, chunk_index: u32) -> Result<Pubkey> {
+fn account_at(message: &MessageView<'_>, index: u8, chunk_index: u32) -> Result<Pubkey> {
     message
         .account_keys
         .get(index as usize)
@@ -628,7 +654,7 @@ fn account_at(message: &Message, index: u8, chunk_index: u32) -> Result<Pubkey> 
 }
 
 fn decode_compute_unit_price(
-    message: &Message,
+    message: &MessageView<'_>,
     ix: &solana_message::compiled_instruction::CompiledInstruction,
     chunk_index: u32,
 ) -> Result<u64> {
@@ -649,7 +675,7 @@ fn decode_compute_unit_price(
 }
 
 fn decode_compute_unit_limit(
-    message: &Message,
+    message: &MessageView<'_>,
     ix: &solana_message::compiled_instruction::CompiledInstruction,
     chunk_index: u32,
 ) -> Result<u32> {
@@ -671,7 +697,7 @@ fn decode_compute_unit_limit(
 
 #[allow(clippy::too_many_arguments)]
 fn validate_ata_create(
-    message: &Message,
+    message: &MessageView<'_>,
     ix: &solana_message::compiled_instruction::CompiledInstruction,
     fee_payer: &Pubkey,
     owner: &Pubkey,
@@ -748,7 +774,7 @@ fn validate_ata_create(
 
 #[allow(clippy::too_many_arguments)]
 fn validate_transfer_checked(
-    message: &Message,
+    message: &MessageView<'_>,
     ix: &solana_message::compiled_instruction::CompiledInstruction,
     source_ata: &Pubkey,
     mint: &Pubkey,
@@ -828,7 +854,7 @@ fn validate_transfer_checked(
 }
 
 fn validate_memo(
-    message: &Message,
+    message: &MessageView<'_>,
     ix: &solana_message::compiled_instruction::CompiledInstruction,
     expected_memo: &str,
     chunk_index: u32,
@@ -850,10 +876,17 @@ fn validate_memo(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::accounts::{Account, AccountsFile, Keystore, MemoryAccountsStore};
+
+    /// Mutable access to a version-0 fixture's static account keys.
+    fn keys_mut(tx: &mut VersionedTransaction) -> &mut Vec<Pubkey> {
+        match &mut tx.message {
+            solana_message::VersionedMessage::V0(message) => &mut message.account_keys,
+            _ => panic!("fixture is version 0"),
+        }
+    }
+    use crate::accounts::{Account, AccountsFile, BackendKind, MemoryAccountsStore};
     use crate::client::push::manifest::{ManifestContext, parse_manifest_csv};
     use crate::client::push::planner::{AtaSnapshot, DestinationAtaStatus, pack_chunks};
-    use solana_message::Message as LegacyMessage;
 
     fn fresh_account_and_store() -> (MemoryAccountsStore, Pubkey) {
         let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
@@ -863,7 +896,7 @@ mod tests {
         full.extend_from_slice(&verifying_key.to_bytes());
 
         let account = Account {
-            keystore: Keystore::Ephemeral,
+            backend: BackendKind::Ephemeral,
             provider: None,
             active: false,
             auth_required: Some(false),
@@ -961,7 +994,10 @@ mod tests {
         (permit, manifest, sender)
     }
 
-    fn build_unsigned_transaction(plan: &PlannedChunk, permit: &BatchSigningPermit) -> Transaction {
+    fn build_unsigned_transaction(
+        plan: &PlannedChunk,
+        permit: &BatchSigningPermit,
+    ) -> VersionedTransaction {
         build_unsigned_transaction_with(plan, permit, permit.fee_payer, permit.account_pubkey)
     }
 
@@ -970,7 +1006,7 @@ mod tests {
         permit: &BatchSigningPermit,
         fee_payer: Pubkey,
         authority: Pubkey,
-    ) -> Transaction {
+    ) -> VersionedTransaction {
         use crate::client::push::planner::{
             compute_unit_limit_instruction, compute_unit_price_instruction,
         };
@@ -1009,9 +1045,14 @@ mod tests {
             .unwrap(),
         );
 
-        let message =
-            LegacyMessage::new_with_blockhash(&instructions, Some(&fee_payer), &Hash::new_unique());
-        Transaction::new_unsigned(message)
+        pay_kit::core::tx::build_unsigned_unchecked(
+            pay_kit::core::tx::TxVersion::V0,
+            &fee_payer,
+            &instructions,
+            Hash::new_unique(),
+            None,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1069,11 +1110,11 @@ mod tests {
         let bad_mint = Pubkey::new_unique();
         let idx = tx
             .message
-            .account_keys
+            .static_account_keys()
             .iter()
             .position(|k| *k == permit.mint)
             .unwrap();
-        tx.message.account_keys[idx] = bad_mint;
+        keys_mut(&mut tx)[idx] = bad_mint;
 
         let err = permit.sign_chunk(0, &tx, 1_000).unwrap_err();
         assert!(err.to_string().contains("mint"), "{err}");
@@ -1086,11 +1127,11 @@ mod tests {
         let mut tx = build_unsigned_transaction(&plan, &permit);
         let idx = tx
             .message
-            .account_keys
+            .static_account_keys()
             .iter()
             .position(|k| *k == permit.source_ata)
             .unwrap();
-        tx.message.account_keys[idx] = Pubkey::new_unique();
+        keys_mut(&mut tx)[idx] = Pubkey::new_unique();
 
         let err = permit.sign_chunk(0, &tx, 1_000).unwrap_err();
         assert!(err.to_string().contains("source ATA"), "{err}");
@@ -1127,11 +1168,11 @@ mod tests {
         let disallowed = Pubkey::new_unique();
         let idx = tx
             .message
-            .account_keys
+            .static_account_keys()
             .iter()
             .position(|k| *k == memo_program_id())
             .unwrap();
-        tx.message.account_keys[idx] = disallowed;
+        keys_mut(&mut tx)[idx] = disallowed;
 
         let err = permit.sign_chunk(0, &tx, 1_000).unwrap_err();
         assert!(err.to_string().contains("disallowed program"), "{err}");

@@ -91,8 +91,23 @@ struct ResolvedAccount {
     address: String,
 }
 
-pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
-    let account = match resolve_account(params.account.as_deref()) {
+pub async fn run(
+    params: Params,
+    scope: &crate::context::CallScope,
+) -> Result<CallToolResult, rmcp::ErrorData> {
+    let accounts = match scope.accounts.load() {
+        Ok(accounts) => accounts,
+        Err(err) => {
+            return Ok(super::tool_error(format!(
+                "Failed to load Pay accounts: {err}"
+            )));
+        }
+    };
+    let requested = params
+        .account
+        .as_deref()
+        .or(scope.account_override.as_deref());
+    let account = match resolve_account(requested, &accounts) {
         Ok(account) => account,
         Err(message) => return Ok(super::tool_error(message)),
     };
@@ -167,9 +182,10 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
     ]))
 }
 
-fn resolve_account(account: Option<&str>) -> Result<ResolvedAccount, String> {
-    let accounts = pay_core::accounts::AccountsFile::load()
-        .map_err(|e| format!("Failed to load Pay accounts: {e}"))?;
+fn resolve_account(
+    account: Option<&str>,
+    accounts: &pay_core::accounts::AccountsFile,
+) -> Result<ResolvedAccount, String> {
     let mainnet = pay_core::accounts::MAINNET_NETWORK;
 
     if let Some(account) = account.map(str::trim).filter(|account| !account.is_empty()) {

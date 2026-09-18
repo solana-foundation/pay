@@ -13,7 +13,6 @@ use ed25519_dalek::SigningKey;
 use hkdf::Hkdf;
 use sha2::Sha256;
 use solana_pubkey::Pubkey;
-use surfpool_sdk::Surfnet;
 
 use crate::config::{FunderCfg, Network};
 
@@ -26,6 +25,12 @@ pub struct Wallet {
 }
 
 impl Wallet {
+    pub(crate) fn random() -> Self {
+        let mut seed = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut seed);
+        Self::from_seed(seed)
+    }
+
     fn from_seed(seed: [u8; 32]) -> Self {
         let signing = SigningKey::from_bytes(&seed);
         let public = signing.verifying_key().to_bytes();
@@ -86,9 +91,7 @@ pub fn load_funder(cfg: &FunderCfg, network: Network) -> Result<Wallet> {
     if network == Network::Fork {
         // Rehearsal with no real funder: an ephemeral key is fine, the fork
         // mints funds via cheatcodes regardless of who the "funder" is.
-        let mut seed = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut seed);
-        return Ok(Wallet::from_seed(seed));
+        return Ok(Wallet::random());
     }
     bail!("a funder keypair (funder.keypair_env or keypair_path) is required on {network:?}")
 }
@@ -141,44 +144,6 @@ pub trait Funder: Send + Sync {
 
     /// Human label for logs.
     fn kind(&self) -> &'static str;
-}
-
-/// Fork funder — mints funds directly via surfpool cheatcodes. Sweeping is a
-/// no-op because the fork ledger is discarded when the validator stops.
-pub struct ForkFunder<'a> {
-    pub surfnet: &'a Surfnet,
-}
-
-#[async_trait]
-impl Funder for ForkFunder<'_> {
-    async fn fund(
-        &self,
-        user: &Pubkey,
-        sol_lamports: u64,
-        token: Option<(&Pubkey, u64)>,
-    ) -> Result<()> {
-        let cc = self.surfnet.cheatcodes();
-        // Cross the surfpool type boundary via string to stay version-agnostic.
-        let user_sp = sp_pubkey(user)?;
-        if sol_lamports > 0 {
-            cc.fund_sol(&user_sp, sol_lamports)
-                .map_err(|e| anyhow::anyhow!("fund_sol: {e}"))?;
-        }
-        if let Some((mint, amount)) = token {
-            let mint_sp = sp_pubkey(mint)?;
-            cc.fund_token(&user_sp, &mint_sp, amount, None)
-                .map_err(|e| anyhow::anyhow!("fund_token: {e}"))?;
-        }
-        Ok(())
-    }
-
-    async fn sweep(&self, _user: &Wallet, _mint: Option<&Pubkey>) -> Result<SweepResult> {
-        Ok(SweepResult::default())
-    }
-
-    fn kind(&self) -> &'static str {
-        "fork"
-    }
 }
 
 /// External fork funder — mints via surfpool cheatcodes over **RPC** (no
@@ -265,14 +230,6 @@ impl Funder for FixtureFunder {
     fn kind(&self) -> &'static str {
         "fixture"
     }
-}
-
-/// Convert a canonical `solana_pubkey::Pubkey` into surfpool's `Pubkey` type via
-/// its string form, so a version skew between the two crates can't bite us.
-fn sp_pubkey(pk: &Pubkey) -> Result<surfpool_sdk::Pubkey> {
-    pk.to_string()
-        .parse::<surfpool_sdk::Pubkey>()
-        .map_err(|e| anyhow::anyhow!("pubkey conversion: {e}"))
 }
 
 /// Mainnet funder — real SPL transfers + ATA management + sweep. Implemented in

@@ -54,11 +54,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - name: Install libudev (ledger feature)
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets --features pay/ledger,pay-core/ledger -- -D warnings
 
   # ── Windows Rust check ──
   rust-windows-check:
@@ -82,7 +85,7 @@ jobs:
         with:
           workspaces: rust
           key: check-windows
-      - run: cargo check -p pay
+      - run: cargo check -p pay --features ledger
 
   # ── Rust tests + coverage ──
   rust-test:
@@ -105,13 +108,17 @@ jobs:
         with:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Install Surfpool CLI
+        uses: ./.github/actions/install-surfpool
+      - name: Install libudev (ledger feature)
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
       - name: Run tests with coverage
         env:
           SURFPOOL_REPORT: "1"
-        run: cargo llvm-cov --workspace --features server --exclude pay --ignore-filename-regex 'crates/cli/' --json --output-path coverage.json
+        run: cargo llvm-cov --workspace --features server,pay-core/ledger --exclude pay --ignore-filename-regex 'crates/cli/' --json --output-path coverage.json
       - name: Upload Rust coverage
         if: always()
         uses: actions/upload-artifact@v4

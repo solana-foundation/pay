@@ -12,7 +12,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use pay_kit::mpp::server::Mpp;
-use pay_kit::mpp::solana_keychain::SolanaSigner;
+use pay_kit::mpp::solana_keychain::TransactionSigner;
 use pay_types::Stablecoin;
 use pay_types::metering::SignerConfig;
 
@@ -40,7 +40,7 @@ pub(crate) type GeneratedGatewayAccount = (String, String);
 /// new account was generated, so the caller can surface it in its banner.
 pub(crate) fn load_auto_fee_payer_signer(
     network: &SolanaNetwork,
-) -> pay_core::Result<(Arc<dyn SolanaSigner>, Option<GeneratedGatewayAccount>)> {
+) -> pay_core::Result<(Arc<dyn TransactionSigner>, Option<GeneratedGatewayAccount>)> {
     let auto_network = network.slug();
     let store = pay_core::accounts::FileAccountsStore::default_path();
     let _ = pay_core::accounts::load_or_create_exact_ephemeral_for_network_as(
@@ -60,7 +60,7 @@ pub(crate) fn load_auto_fee_payer_signer(
             resolved.account.pubkey.unwrap_or_else(|| "?".to_string()),
         )
     });
-    Ok((Arc::new(signer) as Arc<dyn SolanaSigner>, generated))
+    Ok((Arc::new(signer) as Arc<dyn TransactionSigner>, generated))
 }
 
 /// Sandbox RPC URL fallback chain.
@@ -395,7 +395,7 @@ pub(crate) async fn ensure_payout_recipient_token_accounts(
     network: &str,
     rpc_url: &str,
     allow_startup_creation: bool,
-    fee_payer_signer: Option<Arc<dyn SolanaSigner>>,
+    fee_payer_signer: Option<Arc<dyn TransactionSigner>>,
 ) -> pay_core::Result<()> {
     if recipients.is_empty() || stable_requirements.is_empty() {
         return Ok(());
@@ -485,14 +485,11 @@ pub(crate) fn create_associated_token_account_idempotent_ix(
 }
 
 async fn sign_and_broadcast_gateway(
-    signer: Arc<dyn SolanaSigner>,
+    signer: Arc<dyn TransactionSigner>,
     instructions: Vec<solana_instruction::Instruction>,
     rpc_url: &str,
 ) -> pay_core::Result<String> {
     use pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient;
-    use solana_message::Message;
-    use solana_signature::Signature;
-    use solana_transaction::Transaction;
 
     let url = rpc_url.to_string();
     let signer_pubkey = signer.pubkey();
@@ -507,35 +504,21 @@ async fn sign_and_broadcast_gateway(
     .await
     .map_err(|e| pay_core::Error::Mpp(format!("RPC task join: {e}")))??;
 
-    let message = Message::new_with_blockhash(&instructions, Some(&signer_pubkey), &blockhash);
-    let mut tx = Transaction::new_unsigned(message);
-    let msg_bytes = tx.message_data();
-    let sig_bytes = signer
-        .sign_message(&msg_bytes)
+    let mut tx = pay_kit::core::tx::build_unsigned(
+        pay_kit::core::tx::TxVersion::V0,
+        &signer_pubkey,
+        &instructions,
+        blockhash,
+        None,
+    )
+    .map_err(|e| pay_core::Error::Mpp(format!("Failed to build tx: {e}")))?;
+    pay_kit::core::signing::sign_versioned_transaction_slot(signer.as_ref(), &mut tx)
         .await
         .map_err(|e| pay_core::Error::Mpp(format!("Operator signing failed: {e}")))?;
-    let signature = Signature::from(<[u8; 64]>::from(sig_bytes));
 
-    let signer_index = tx
-        .message
-        .account_keys
-        .iter()
-        .position(|key| *key == signer_pubkey)
-        .ok_or_else(|| pay_core::Error::Mpp("Operator pubkey absent from account_keys".into()))?;
-    if tx.signatures.len() <= signer_index {
-        return Err(pay_core::Error::Mpp(
-            "Transaction signatures vec is shorter than account_keys".into(),
-        ));
-    }
-    tx.signatures[signer_index] = signature;
-
-    let serialized = bincode::serialize(&tx)
-        .map_err(|e| pay_core::Error::Mpp(format!("Failed to serialise tx: {e}")))?;
     let confirmed_sig = tokio::task::spawn_blocking(move || {
         let rpc = RpcClient::new(url);
-        let tx: Transaction = bincode::deserialize(&serialized)
-            .map_err(|e| pay_core::Error::Mpp(format!("tx round-trip: {e}")))?;
-        rpc.send_and_confirm_transaction(&tx)
+        pay_kit::core::rpc::send_and_confirm_transaction(&rpc, &tx)
             .map_err(|e| pay_core::Error::Mpp(format!("Broadcast failed: {e}")))
     })
     .await
@@ -615,7 +598,7 @@ pub(crate) fn build_charge_mpps(
     rpc_url: &str,
     challenge_binding_secret: &str,
     fee_payer: bool,
-    fee_payer_signer: Option<Arc<dyn SolanaSigner>>,
+    fee_payer_signer: Option<Arc<dyn TransactionSigner>>,
     blockhash_cache: &pay_kit::mpp::blockhash::BlockhashCache,
 ) -> pay_core::Result<Vec<Mpp>> {
     currency_configs
@@ -633,7 +616,10 @@ pub(crate) fn build_charge_mpps(
                 html: true,
                 ..Default::default()
             })
-            .map(|m| m.with_blockhash_cache(blockhash_cache.clone()))
+            .map(|m| {
+                m.with_tx_v1(pay_kit::core::tx::TxV1Mode::Auto)
+                    .with_blockhash_cache(blockhash_cache.clone())
+            })
         })
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| pay_core::Error::Config(format!("Failed to create MPP server: {e}")))
@@ -654,7 +640,7 @@ pub(crate) fn build_sandbox_upto_backend(
     network_slug: &str,
     rpc_url: &str,
     resource: &str,
-    fee_payer_signer: Arc<dyn SolanaSigner>,
+    fee_payer_signer: Arc<dyn TransactionSigner>,
     blockhash_cache: &pay_kit::mpp::blockhash::BlockhashCache,
 ) -> pay_core::Result<pay_kit::x402::server::X402Upto> {
     let receiver_authorizer = fee_payer_signer.pubkey().to_string();
@@ -689,6 +675,7 @@ pub(crate) fn build_sandbox_upto_backend(
         receiver_authorizer_signer: None,
     };
     pay_kit::x402::server::X402Upto::new(cfg)
+        .map(|upto| upto.with_tx_v1(pay_kit::core::tx::TxV1Mode::Auto))
         .map(|u| u.with_blockhash_cache(blockhash_cache.clone()))
         .map_err(|e| pay_core::Error::Config(format!("Failed to create x402 upto backend: {e}")))
 }

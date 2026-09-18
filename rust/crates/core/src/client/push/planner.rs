@@ -9,16 +9,15 @@
 
 use solana_hash::Hash;
 use solana_instruction::Instruction;
-use solana_message::Message;
 use solana_pubkey::Pubkey;
-use solana_transaction::Transaction;
+use solana_transaction::versioned::VersionedTransaction;
 use std::str::FromStr;
 
 use pay_kit::mpp::client::{
     ComputeBudgetOptions, TransferEntry, build_spl_transfer_batch_instructions,
 };
 use pay_kit::mpp::protocol::solana::{
-    MAX_SPLITS, SOLANA_MAX_COMPUTE_UNIT_LIMIT, check_transaction_packet_size, programs,
+    MAX_SPLITS, SOLANA_MAX_COMPUTE_UNIT_LIMIT, check_transaction_size, programs,
 };
 
 use super::manifest::TransferManifest;
@@ -39,7 +38,7 @@ pub const MAX_GASLESS_TRANSFERS_PER_CHUNK: usize = MAX_SPLITS;
 /// estimated transaction fees)`).
 pub const MIN_FEE_RESERVE_LAMPORTS: u64 = 10_000;
 
-/// Conservative secondary safety margin on top of `check_transaction_packet_size`.
+/// Conservative secondary safety margin on top of `check_transaction_size`.
 /// A legacy message can technically reference more account keys than this
 /// before hitting the packet-size ceiling in unusual cases (many
 /// already-existing ATAs, e.g.), but pay-push chunks are homogeneous
@@ -520,16 +519,23 @@ fn build_planned_chunk(
     .map_err(kit_error)?;
     instructions.extend(batch);
 
-    let message = Message::new_with_blockhash(&instructions, Some(fee_payer), &Hash::default());
-    if message.account_keys.len() > MAX_STATIC_ACCOUNT_KEYS {
+    // Version 0: the sponsor (pay-api) validates the ComputeBudget prefix by
+    // index and does not yet advertise version 1 for push chunks.
+    let transaction = pay_kit::core::tx::build_unsigned_unchecked(
+        pay_kit::core::tx::TxVersion::V0,
+        fee_payer,
+        &instructions,
+        Hash::default(),
+        None,
+    )
+    .map_err(|e| Error::Config(e.to_string()))?;
+    let account_keys = transaction.message.static_account_keys().len();
+    if account_keys > MAX_STATIC_ACCOUNT_KEYS {
         return Err(Error::Config(format!(
-            "chunk needs {} account keys, exceeding the conservative {MAX_STATIC_ACCOUNT_KEYS}-key limit",
-            message.account_keys.len()
+            "chunk needs {account_keys} account keys, exceeding the conservative {MAX_STATIC_ACCOUNT_KEYS}-key limit"
         )));
     }
-
-    let transaction = Transaction::new_unsigned(message);
-    let serialized_len = check_transaction_packet_size(&transaction).map_err(kit_error)?;
+    let serialized_len = check_transaction_size(&transaction).map_err(kit_error)?;
 
     let entries = row_indices
         .iter()
@@ -573,7 +579,7 @@ pub fn build_chunk_transaction(
     sender: &Pubkey,
     fee_payer: &Pubkey,
     blockhash: Hash,
-) -> Result<Transaction> {
+) -> Result<VersionedTransaction> {
     let last = chunk.entries.len().checked_sub(1).ok_or_else(|| {
         Error::Config("cannot build a transaction for a chunk with no entries".to_string())
     })?;
@@ -609,8 +615,14 @@ pub fn build_chunk_transaction(
         .map_err(kit_error)?,
     );
 
-    let message = Message::new_with_blockhash(&instructions, Some(fee_payer), &blockhash);
-    Ok(Transaction::new_unsigned(message))
+    pay_kit::core::tx::build_unsigned(
+        pay_kit::core::tx::TxVersion::V0,
+        fee_payer,
+        &instructions,
+        blockhash,
+        None,
+    )
+    .map_err(|e| Error::Config(e.to_string()))
 }
 
 fn estimate_compute_units(transfer_count: usize, ata_create_count: usize) -> u32 {
@@ -636,23 +648,11 @@ pub fn refine_compute_unit_limit(units_consumed: u64) -> u32 {
 // ── Instruction helpers (mirror PayKit's private compute-budget builders) ──
 
 pub(crate) fn compute_unit_price_instruction(micro_lamports: u64) -> Instruction {
-    let mut data = vec![COMPUTE_UNIT_PRICE_DISCRIMINATOR];
-    data.extend_from_slice(&micro_lamports.to_le_bytes());
-    Instruction {
-        program_id: compute_budget_program_id(),
-        accounts: vec![],
-        data,
-    }
+    pay_kit::core::tx::unit_price_instruction(micro_lamports)
 }
 
 pub(crate) fn compute_unit_limit_instruction(units: u32) -> Instruction {
-    let mut data = vec![COMPUTE_UNIT_LIMIT_DISCRIMINATOR];
-    data.extend_from_slice(&units.to_le_bytes());
-    Instruction {
-        program_id: compute_budget_program_id(),
-        accounts: vec![],
-        data,
-    }
+    pay_kit::core::tx::unit_limit_instruction(units)
 }
 
 /// Standard Associated Token Account address derivation

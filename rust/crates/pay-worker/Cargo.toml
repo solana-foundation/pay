@@ -44,9 +44,10 @@ redis = { version = "0.32", features = ["aio", "tokio-comp", "connection-manager
 pay-kit = { workspace = true, features = ["gcp_kms", "worker", "redis-store"] }
 solana-pubkey = { workspace = true }
 solana-signature = { workspace = true }
-solana-transaction = { workspace = true }
+solana-transaction = { workspace = true, features = ["serde", "wincode"] }
 solana-message = { workspace = true }
+solana-hash = { workspace = true }
 solana-instruction = { workspace = true }
 solana-address = { version = "2", features = ["borsh", "curve25519"] }
-bincode = { workspace = true }
+wincode = "0.5"
 spl-token-2022-interface = "2.1.0"

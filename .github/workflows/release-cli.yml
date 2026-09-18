@@ -78,6 +78,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - name: Install Surfpool CLI
+        uses: ./.github/actions/install-surfpool
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
@@ -139,12 +141,23 @@ jobs:
         if: matrix.use-cross
         run: cp -R ../web-ui/dist pdb-dist
 
+      # The `ledger` feature links libudev on Linux (hidapi, hidraw backend).
+      - name: Install libudev (Linux)
+        if: runner.os == 'Linux' && !matrix.use-cross
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev
+
       - name: Configure cross env passthrough
         if: matrix.use-cross
         run: |
           cat > Cross.toml <<'EOF'
           [build.env]
           passthrough = ["PAY_PDB_DIST", "PAY_PDB_ALLOW_PLACEHOLDER"]
+
+          [target.${{ matrix.target }}]
+          pre-build = [
+            "dpkg --add-architecture $CROSS_DEB_ARCH",
+            "apt-get update && apt-get install -y libudev-dev:$CROSS_DEB_ARCH",
+          ]
           EOF
 
       - uses: dtolnay/rust-toolchain@stable
@@ -165,6 +178,7 @@ jobs:
         run: >-
           cargo build --release
           --target ${{ matrix.target }}
+          --features ledger
 
       - name: Build (cross)
         if: matrix.use-cross
@@ -173,7 +187,7 @@ jobs:
         run: >-
           cross build --release
           --target ${{ matrix.target }}
-          --features vendored-openssl
+          --features vendored-openssl,ledger
 
       - name: Package (unix)
         if: runner.os != 'Windows'

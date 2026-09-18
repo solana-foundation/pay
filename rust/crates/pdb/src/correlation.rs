@@ -1342,19 +1342,23 @@ fn extract_mpp_payer(headers: &HashMap<String, String>) -> Option<String> {
         let tx_bytes = base64::engine::general_purpose::STANDARD
             .decode(tx_b64)
             .ok()?;
-        let tx: solana_transaction::Transaction = bincode::deserialize(&tx_bytes).ok()?;
+        // Canonical decode for versions 0 and 1 (legacy payloads are no longer
+        // produced by any pay client).
+        let tx: solana_transaction::versioned::VersionedTransaction =
+            wincode::deserialize(&tx_bytes).ok()?;
+        let keys = tx.message.static_account_keys();
 
         // Find the first account key whose signature is non-zero
         // (the client-signed key). The fee payer signature is typically
         // all zeros because the server fills it in after verification.
         let zero_sig = [0u8; 64];
         for (i, sig) in tx.signatures.iter().enumerate() {
-            if sig.as_ref() != zero_sig && i < tx.message.account_keys.len() {
-                return Some(tx.message.account_keys[i].to_string());
+            if sig.as_ref() != zero_sig && i < keys.len() {
+                return Some(keys[i].to_string());
             }
         }
         // Fallback: first account key
-        let pubkey = tx.message.account_keys.first()?;
+        let pubkey = keys.first()?;
         return Some(pubkey.to_string());
     }
 

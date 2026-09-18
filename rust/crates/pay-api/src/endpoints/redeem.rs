@@ -19,19 +19,17 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use base64::Engine;
 use pay_api_core::Error;
 use pay_api_core::ata::{ATA_PROGRAM_ID, associated_token_address};
 use pay_api_core::receipt::MEMO_PROGRAM;
 use pay_api_types::Network;
-use pay_kit::mpp::solana_keychain::SolanaSigner;
+use pay_kit::mpp::solana_keychain::TransactionSigner;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use solana_instruction::{AccountMeta, Instruction};
-use solana_message::Message;
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
-use solana_transaction::Transaction;
+use solana_transaction::versioned::VersionedTransaction;
 use spl_token_2022_interface::instruction as token_ix;
 use tracing::{info, warn};
 
@@ -449,7 +447,7 @@ async fn record_redemption_signature(
     Ok(())
 }
 
-// ── Transaction construction ──────────────────────────────────────────────
+// ── VersionedTransaction construction ──────────────────────────────────────────────
 
 fn build_unsigned(
     code: &str,
@@ -458,7 +456,7 @@ fn build_unsigned(
     hot_wallet: &Pubkey,
     cfg: &RedemptionState,
     blockhash: solana_hash::Hash,
-) -> Result<Transaction, String> {
+) -> Result<VersionedTransaction, String> {
     let hot_ata = associated_token_address(hot_wallet, &cfg.mint, &cfg.token_program);
     let dest_ata = associated_token_address(destination, &cfg.mint, &cfg.token_program);
 
@@ -494,41 +492,26 @@ fn build_unsigned(
         data: redeem_memo(code).into_bytes(),
     });
 
-    Ok(Transaction::new_unsigned(Message::new_with_blockhash(
+    pay_kit::core::tx::build_unsigned(
+        pay_kit::core::tx::TxVersion::V0,
+        hot_wallet,
         &ixs,
-        Some(hot_wallet),
-        &blockhash,
-    )))
+        blockhash,
+        None,
+    )
+    .map_err(|e| format!("build redeem transaction: {e}"))
 }
 
 /// Sign and serialize the transaction without contacting the RPC.
 async fn sign_transaction(
-    mut tx: Transaction,
-    signer: Arc<dyn SolanaSigner>,
+    mut tx: VersionedTransaction,
+    signer: Arc<dyn TransactionSigner>,
 ) -> Result<String, String> {
     let fee_payer = signer.pubkey();
-    let idx = tx
-        .message
-        .account_keys
-        .iter()
-        .position(|k| *k == fee_payer)
-        .ok_or_else(|| "fee payer not in account keys".to_string())?;
-
-    let msg_bytes = tx.message_data();
-    let sig_bytes = signer
-        .sign_message(&msg_bytes)
+    pay_kit::core::signing::cosign_versioned_fee_payer(signer.as_ref(), &fee_payer, &mut tx)
         .await
         .map_err(|e| format!("fee-payer sign failed: {e}"))?;
-    let signature = Signature::from(<[u8; 64]>::from(sig_bytes));
-    if tx.signatures.len() <= idx {
-        return Err("tx.signatures slot missing for fee payer".into());
-    }
-    tx.signatures[idx] = signature;
-
-    let serialised = bincode::serialize(&tx).map_err(|e| format!("bincode: {e}"))?;
-    let tx_b64 = base64::engine::general_purpose::STANDARD.encode(&serialised);
-
-    Ok(tx_b64)
+    pay_kit::core::tx::encode(&tx).map_err(|e| format!("encode: {e}"))
 }
 
 async fn broadcast_transaction(
@@ -558,7 +541,7 @@ fn is_deterministic_preflight_error(error: &Error) -> bool {
     .any(|marker| message.contains(marker))
 }
 
-async fn fee_payer_signer(state: &AppState) -> Result<Arc<dyn SolanaSigner>, Error> {
+async fn fee_payer_signer(state: &AppState) -> Result<Arc<dyn TransactionSigner>, Error> {
     crate::signer::build_fee_payer_signer(
         &state.send.fee_payer,
         "send.fee_payer.key_name is missing",

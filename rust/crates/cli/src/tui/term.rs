@@ -116,6 +116,8 @@ impl<W: io::Write> io::Write for DowngradeBackend<W> {
 }
 
 impl<W: io::Write> Backend for DowngradeBackend<W> {
+    type Error = io::Error;
+
     fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
     where
         I: Iterator<Item = (u16, u16, &'a Cell)>,

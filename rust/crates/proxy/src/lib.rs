@@ -22,6 +22,16 @@ use {
     pingora::server::{ShutdownSignal, ShutdownSignalWatch},
 };
 
+/// Install the process-wide rustls crypto provider before any HTTP or telemetry
+/// client is constructed.
+///
+/// The dependency tree enables both `ring` and `aws-lc-rs`, so rustls cannot
+/// choose a provider automatically. This is idempotent: an error only means a
+/// provider was already installed.
+pub fn install_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 /// Build and run the Pingora gateway on `bind`, fronting `state`'s
 /// [`PaymentGate`] and forwarding control-plane traffic to `control_plane`
 /// (the `host:port` of an internal axum service).
@@ -72,7 +82,7 @@ fn run_inner<S: PaymentState>(
     // one automatically and pingora's TLS init panics. Install ring (what
     // pingora-rustls uses) once, before any pingora TLS setup. Idempotent — the
     // Err just means a provider is already installed, which is fine.
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    install_crypto_provider();
 
     let mut server = Server::new(None).map_err(|e| anyhow::anyhow!("pingora server: {e}"))?;
     server.bootstrap();
@@ -122,7 +132,7 @@ pub fn run_with_shutdown<S: PaymentState>(
     threads: Option<usize>,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    install_crypto_provider();
 
     let mut server = Server::new(None).map_err(|e| anyhow::anyhow!("pingora server: {e}"))?;
     server.bootstrap();

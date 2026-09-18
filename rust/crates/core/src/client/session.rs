@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use pay_kit::mpp::client::session::ActiveSession;
-use pay_kit::mpp::solana_keychain::SolanaSigner;
+use pay_kit::mpp::solana_keychain::{SolanaSigner, TransactionSigner};
 use pay_kit::mpp::{
     ClosePayload, PaymentChallenge, PaymentCredential, SessionAction, SessionAuthentication,
     SessionAuthenticationType, SessionRequest, SessionVoucherSigner, SignedVoucher, UsePayload,
@@ -76,7 +76,7 @@ impl SessionHandle {
     /// `authorized_signer` in the open transaction.
     pub fn new(
         channel_id: Pubkey,
-        signer: Box<dyn SolanaSigner>,
+        signer: Box<dyn TransactionSigner>,
         challenge: PaymentChallenge,
     ) -> Self {
         Self::from_active(ActiveSession::new(channel_id, signer), challenge)
@@ -253,6 +253,27 @@ impl SessionHandle {
 
 // ── Session open ─────────────────────────────────────────────────────────────
 
+/// Whether `backend` can open this session challenge.
+///
+/// An operator-signed session authenticates the payer with a reusable proof
+/// signed as a raw message; a backend that only signs transactions (a
+/// hardware wallet) cannot produce it and gets the same refusal the signing
+/// path would raise later. Client-signed sessions need only the channel
+/// open transaction, which every backend signs.
+pub fn check_signer(
+    challenge: &PaymentChallenge,
+    backend: &dyn crate::backend::SigningBackend,
+) -> Result<()> {
+    let request: SessionRequest = challenge
+        .request
+        .decode()
+        .map_err(|error| Error::Mpp(format!("invalid MPP session challenge: {error}")))?;
+    if request.method_details.voucher_signer == Some(SessionVoucherSigner::Operator) {
+        backend.require_raw_message_signing("an operator-signed session proof")?;
+    }
+    Ok(())
+}
+
 /// Open a payment-channel session from a 402 challenge.
 ///
 /// Builds the open transaction against the challenge's `recentBlockhash` and
@@ -350,7 +371,7 @@ pub fn open_payment_channel_session_header_with_override(
     let mut kp_bytes = [0u8; 64];
     kp_bytes[..32].copy_from_slice(sk.as_bytes());
     kp_bytes[32..].copy_from_slice(vk.as_bytes());
-    let session_signer: Box<dyn pay_kit::mpp::solana_keychain::SolanaSigner> =
+    let session_signer: Box<dyn pay_kit::mpp::solana_keychain::TransactionSigner> =
         Box::new(MemorySigner::from_bytes(&kp_bytes).map_err(|e| Error::Mpp(e.to_string()))?);
 
     let voucher_signer = details
@@ -376,6 +397,8 @@ pub fn open_payment_channel_session_header_with_override(
     let open_options = PaymentChannelOpenOptions {
         deposit: Some(deposit),
         salt: Some(salt),
+        // A Ledger signs v0 only; the kit negotiates against the challenge.
+        max_tx_version: signer.max_tx_version(),
         ..PaymentChannelOpenOptions::default()
     };
 
@@ -392,6 +415,10 @@ pub fn open_payment_channel_session_header_with_override(
     .map_err(|e| Error::Mpp(format!("derive_payment_channel_open: {e}")))?;
 
     let authentication = if voucher_signer == SessionVoucherSigner::Operator {
+        // The proof is a raw message signature by the payer key; a hardware
+        // wallet cannot produce one. Client-signed sessions use an ephemeral
+        // voucher key and are unaffected.
+        signer.require_raw_message_signing("an operator-signed session proof")?;
         let mut proof = SessionAuthentication {
             kind: SessionAuthenticationType::Proof,
             challenge_id: challenge.id.clone(),
@@ -625,6 +652,7 @@ mod tests {
                     recipient: solana_pubkey::Pubkey::new_unique().to_string(),
                     share_bps: 100,
                 }],
+                transaction_versions: None,
             },
         }
     }
@@ -640,7 +668,55 @@ mod tests {
         )
     }
 
-    fn test_keypair() -> (ed25519_dalek::SigningKey, Box<dyn SolanaSigner>) {
+    fn test_challenge_signed_by(signer: SessionVoucherSigner) -> PaymentChallenge {
+        let mut request = test_request();
+        request.method_details.voucher_signer = Some(signer);
+        request.method_details.operator = Some(Pubkey::new_unique().to_string());
+        PaymentChallenge::with_challenge_binding_secret(
+            "test-secret",
+            "test-realm",
+            "solana",
+            "session",
+            Base64UrlJson::from_typed(&request).unwrap(),
+        )
+    }
+
+    #[test]
+    fn check_signer_lets_any_backend_open_a_client_signed_session() {
+        use crate::backend::testing::{SignsAnything, TransactionsOnly};
+        let challenge = test_challenge_signed_by(SessionVoucherSigner::Client);
+        assert!(check_signer(&challenge, &TransactionsOnly).is_ok());
+        assert!(check_signer(&challenge, &SignsAnything).is_ok());
+    }
+
+    #[test]
+    fn check_signer_refuses_an_operator_signed_session_without_raw_messages() {
+        use crate::backend::testing::{SignsAnything, TransactionsOnly};
+        let challenge = test_challenge_signed_by(SessionVoucherSigner::Operator);
+        assert!(check_signer(&challenge, &SignsAnything).is_ok());
+        let Err(Error::Config(msg)) = check_signer(&challenge, &TransactionsOnly) else {
+            panic!("a transactions-only backend cannot sign the session proof");
+        };
+        assert!(msg.contains("operator-signed session proof"), "{msg}");
+    }
+
+    #[test]
+    fn check_signer_reports_a_malformed_session_request() {
+        use crate::backend::testing::TransactionsOnly;
+        let challenge = PaymentChallenge::with_challenge_binding_secret(
+            "test-secret",
+            "test-realm",
+            "solana",
+            "session",
+            Base64UrlJson::from_typed(&serde_json::json!({"not": "a session"})).unwrap(),
+        );
+        let Err(Error::Mpp(msg)) = check_signer(&challenge, &TransactionsOnly) else {
+            panic!("an undecodable request is an MPP error");
+        };
+        assert!(msg.starts_with("invalid MPP session challenge"), "{msg}");
+    }
+
+    fn test_keypair() -> (ed25519_dalek::SigningKey, Box<dyn TransactionSigner>) {
         use ed25519_dalek::SigningKey;
         use pay_kit::mpp::solana_keychain::MemorySigner;
 
@@ -652,7 +728,7 @@ mod tests {
         (sk.clone(), Box::new(MemorySigner::from_bytes(&kp).unwrap()))
     }
 
-    fn test_signer() -> Box<dyn SolanaSigner> {
+    fn test_signer() -> Box<dyn TransactionSigner> {
         test_keypair().1
     }
 

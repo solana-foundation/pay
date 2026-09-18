@@ -28,19 +28,28 @@
 //! for a dozen custody providers, so an implementation is usually a thin
 //! wrapper over one of those.
 
+#[cfg(feature = "ledger")]
+pub mod ledger;
 pub mod openfort;
+pub mod privy;
 
 use std::collections::BTreeMap;
 
-use pay_kit::solana_keychain::SolanaSigner;
+use pay_kit::solana_keychain::TransactionSigner;
 
 use crate::accounts::Account;
+use crate::backend::{Gate, SigningBackend, StoreParams};
 use crate::keystore::AuthIntent;
 use crate::signer::{AuthOverride, ResolvedSigner};
 use crate::{Error, Result};
 
 /// The registered remote backends, by [`RemoteProvider::id`].
-static PROVIDERS: &[&dyn RemoteProvider] = &[&openfort::Openfort];
+static PROVIDERS: &[&dyn RemoteProvider] = &[
+    &openfort::Openfort,
+    &privy::Privy,
+    #[cfg(feature = "ledger")]
+    &ledger::Ledger,
+];
 
 /// Look up a backend by id (`openfort`), or `None` if unregistered.
 pub fn provider(id: &str) -> Option<&'static dyn RemoteProvider> {
@@ -55,6 +64,91 @@ pub fn provider_ids() -> Vec<&'static str> {
 /// Every registered backend, for menus built from the registry.
 pub fn providers() -> impl Iterator<Item = &'static dyn RemoteProvider> {
     PROVIDERS.iter().copied()
+}
+
+/// Where an account's remote credentials come from.
+///
+/// The CLI reads them from the platform secret store behind Touch ID;
+/// pay-cloud holds them per tenant. An [`AccountsStore`](crate::accounts::AccountsStore)
+/// names its source, so the same signing paths serve both without knowing
+/// which one they are on. The source applies `gate` before handing the
+/// credentials out: that is where a spending policy or a prompt runs.
+pub trait CredentialSource: Send + Sync {
+    fn load(
+        &self,
+        account: &str,
+        provider_id: &str,
+        gate: Gate,
+        intent: &AuthIntent,
+    ) -> Result<Credentials>;
+}
+
+/// The platform secret store, the CLI's source.
+pub struct PlatformCredentials;
+
+impl CredentialSource for PlatformCredentials {
+    fn load(
+        &self,
+        account: &str,
+        provider_id: &str,
+        gate: Gate,
+        intent: &AuthIntent,
+    ) -> Result<Credentials> {
+        let (ks, backend) = platform_keystore(gate)?;
+        if !ks.credential_exists(account) {
+            return Err(Error::Config(format!(
+                "No credentials stored for account `{account}`.\n\
+                 Run `pay account new {account} --backend {provider_id}` to connect it."
+            )));
+        }
+        let blob = ks
+            .load_credential_with_intent(account, intent)
+            .map_err(|e| crate::signer::map_keystore_backend_error(backend, e))?;
+        serde_json::from_slice(&blob).map_err(|e| {
+            Error::Config(format!(
+                "Stored credentials for `{account}` are corrupted ({e}). \
+                 Re-connect the wallet: `pay account destroy {account}` then \
+                 `pay account new {account} --backend {provider_id}`."
+            ))
+        })
+    }
+}
+
+/// Credentials held in memory, gated on every load. pay-cloud's per-tenant
+/// source, and a test double.
+pub struct MemoryCredentials {
+    credentials: Credentials,
+}
+
+impl MemoryCredentials {
+    pub fn new(credentials: Credentials) -> Self {
+        Self { credentials }
+    }
+}
+
+impl CredentialSource for MemoryCredentials {
+    fn load(
+        &self,
+        _account: &str,
+        _provider_id: &str,
+        gate: Gate,
+        intent: &AuthIntent,
+    ) -> Result<Credentials> {
+        match gate {
+            Gate::Disabled => {}
+            Gate::Override(auth) => auth
+                .authenticate(intent)
+                .map_err(|e| Error::Config(format!("Authorization refused: {e}")))?,
+            Gate::Platform => {
+                return Err(Error::Config(
+                    "In-memory credentials have no platform prompt to gate them; \
+                     supply an auth override or disable the gate."
+                        .to_string(),
+                ));
+            }
+        }
+        Ok(self.credentials.clone())
+    }
 }
 
 /// One credential a provider needs in order to sign — an API key, a
@@ -86,15 +180,22 @@ pub type Credentials = BTreeMap<String, String>;
 /// collect, then turn those credentials into wallet listings and signers.
 /// Everything else — prompting, storage, the auth gate, accounts.yml — is
 /// handled generically by this module.
-pub trait RemoteProvider: Send + Sync {
-    /// Stable id used by `--backend`, `accounts.yml`, and env vars.
-    fn id(&self) -> &'static str;
-
-    /// Human-readable name for CLI output ("Openfort backend wallet").
-    fn display_name(&self) -> &'static str;
-
-    /// The credentials to collect, in prompt order.
+///
+/// The provider's identity and capabilities ([`SigningBackend::id`],
+/// [`SigningBackend::is_exportable`], …) come from the supertrait; this
+/// trait adds only what connecting to a remote wallet needs.
+pub trait RemoteProvider: SigningBackend {
+    /// The credentials to collect, in prompt order. Empty for backends where
+    /// the device is the credential (hardware wallets).
     fn credential_fields(&self) -> &'static [CredentialField];
+
+    /// Whether anything is stored in the platform secret store for an
+    /// account on this backend. False when [`credential_fields`](Self::credential_fields)
+    /// is empty: setup prompts for nothing, resolution loads nothing, and
+    /// destroy deletes nothing.
+    fn requires_credentials(&self) -> bool {
+        !self.credential_fields().is_empty()
+    }
 
     /// One line telling the user where to obtain the credentials.
     fn credentials_hint(&self) -> &'static str;
@@ -122,89 +223,30 @@ pub trait RemoteProvider: Send + Sync {
     fn no_wallets_hint(&self) -> &'static str;
 
     /// Connect to a wallet, resolving and pinning its address.
-    fn connect(&self, credentials: &Credentials, wallet_id: &str) -> Result<Box<dyn SolanaSigner>>;
+    fn connect(
+        &self,
+        credentials: &Credentials,
+        wallet_id: &str,
+    ) -> Result<Box<dyn TransactionSigner>>;
 }
 
 // ── Credential storage ──────────────────────────────────────────────────────
 
-/// Build the platform secret store for remote credential blobs.
+/// The platform secret store for remote credential blobs, behind `gate`.
 ///
-/// `gated` selects whether loads pass through the platform auth prompt;
-/// `auth_override` (MCP elicitation) replaces the platform gate when
-/// present, mirroring the keypair backends.
-fn platform_keystore(
-    gated: bool,
-    auth_override: AuthOverride,
-) -> Result<(crate::keystore::Keystore, &'static str)> {
-    #[cfg(target_os = "macos")]
-    {
-        let ks = if gated {
-            match auth_override {
-                Some(gate) => crate::keystore::Keystore::from_boxed_auth(
-                    gate,
-                    Box::new(crate::keystore::macos::AppleKeychainStore),
-                    true,
-                ),
-                None => crate::keystore::Keystore::apple_keychain(),
-            }
-        } else {
-            crate::keystore::Keystore::new(
-                crate::keystore::auth::NoAuth,
-                crate::keystore::macos::AppleKeychainStore,
-                false,
-            )
-        };
-        Ok((ks, "keychain"))
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let ks = if gated {
-            match auth_override {
-                Some(gate) => crate::keystore::Keystore::from_boxed_auth(
-                    gate,
-                    Box::new(crate::keystore::linux::SecretServiceStore),
-                    true,
-                ),
-                None => crate::keystore::Keystore::gnome_keyring(),
-            }
-        } else {
-            crate::keystore::Keystore::new(
-                crate::keystore::auth::NoAuth,
-                crate::keystore::linux::SecretServiceStore,
-                false,
-            )
-        };
-        Ok((ks, "gnome-keyring"))
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let ks = if gated {
-            match auth_override {
-                Some(gate) => crate::keystore::Keystore::from_boxed_auth(
-                    gate,
-                    Box::new(crate::keystore::windows::WindowsCredentialStore),
-                    true,
-                ),
-                None => crate::keystore::Keystore::windows_hello(),
-            }
-        } else {
-            crate::keystore::Keystore::new(
-                crate::keystore::auth::NoAuth,
-                crate::keystore::windows::WindowsCredentialStore,
-                false,
-            )
-        };
-        Ok((ks, "windows-hello"))
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    {
-        let _ = (gated, auth_override);
-        Err(Error::Config(
+/// Returns the keystore and the backend flag used in error messages.
+fn platform_keystore(gate: Gate) -> Result<(crate::keystore::Keystore, &'static str)> {
+    let platform = crate::backend::platform().ok_or_else(|| {
+        Error::Config(
             "Remote backend accounts require a platform secret store (Keychain, GNOME \
              Keyring, or Windows Credential Manager), which is unavailable on this platform."
                 .to_string(),
-        ))
-    }
+        )
+    })?;
+    Ok((
+        platform.keystore(&StoreParams::default(), gate)?,
+        platform.flag(),
+    ))
 }
 
 /// Store credentials through an already-built platform keystore. The CLI
@@ -225,41 +267,15 @@ pub fn store_credentials(
 /// Check whether credentials exist for this account name in the platform
 /// secret store. Never prompts.
 pub fn credentials_exist(name: &str) -> bool {
-    platform_keystore(false, None).is_ok_and(|(ks, _)| ks.credential_exists(name))
+    platform_keystore(Gate::Disabled).is_ok_and(|(ks, _)| ks.credential_exists(name))
 }
 
 /// Delete the credential blob for this account name from the platform
 /// secret store, passing through the platform auth prompt.
 pub fn delete_credentials(name: &str, intent: &AuthIntent) -> Result<()> {
-    let (ks, backend) = platform_keystore(true, None)?;
+    let (ks, backend) = platform_keystore(Gate::Platform)?;
     ks.delete_credential_with_intent(name, intent)
         .map_err(|e| crate::signer::map_keystore_backend_error(backend, e))
-}
-
-fn load_credentials(
-    name: &str,
-    provider_id: &str,
-    gated: bool,
-    auth_override: AuthOverride,
-    intent: &AuthIntent,
-) -> Result<Credentials> {
-    let (ks, backend) = platform_keystore(gated, auth_override)?;
-    if !ks.credential_exists(name) {
-        return Err(Error::Config(format!(
-            "No credentials stored for account `{name}`.\n\
-             Run `pay account new {name} --backend {provider_id}` to connect it."
-        )));
-    }
-    let blob = ks
-        .load_credential_with_intent(name, intent)
-        .map_err(|e| crate::signer::map_keystore_backend_error(backend, e))?;
-    serde_json::from_slice(&blob).map_err(|e| {
-        Error::Config(format!(
-            "Stored credentials for `{name}` are corrupted ({e}). \
-             Re-connect the wallet: `pay account destroy {name}` then \
-             `pay account new {name} --backend {provider_id}`."
-        ))
-    })
 }
 
 // ── Account resolution ──────────────────────────────────────────────────────
@@ -314,6 +330,25 @@ pub fn load_remote_signer(
     intent: &AuthIntent,
     auth_override: AuthOverride,
 ) -> Result<ResolvedSigner> {
+    load_remote_signer_from(
+        &PlatformCredentials,
+        account,
+        name,
+        network,
+        intent,
+        auth_override,
+    )
+}
+
+/// [`load_remote_signer`] with the credentials read from `source`.
+pub fn load_remote_signer_from(
+    source: &dyn CredentialSource,
+    account: &Account,
+    name: &str,
+    network: &str,
+    intent: &AuthIntent,
+    auth_override: AuthOverride,
+) -> Result<ResolvedSigner> {
     let provider = account_provider(account, name)?;
 
     let wallet_id = account.account.clone().ok_or_else(|| {
@@ -324,9 +359,19 @@ pub fn load_remote_signer(
         ))
     })?;
 
-    let gated = account.auth_required_for_network(network);
-    let account_intent = intent.with_account_context(name);
-    let credentials = load_credentials(name, provider.id(), gated, auth_override, &account_intent)?;
+    let credentials = if provider.requires_credentials() {
+        let gated = account.auth_required_for_network(network);
+        let account_intent = intent.with_account_context(name);
+        source.load(
+            name,
+            provider.id(),
+            Gate::for_policy(gated, auth_override),
+            &account_intent,
+        )?
+    } else {
+        // Hardware wallets: nothing stored locally, the device approves.
+        Credentials::new()
+    };
 
     let signer = provider
         .connect(&credentials, &wallet_id)
@@ -345,7 +390,7 @@ pub fn load_remote_signer(
         )));
     }
 
-    Ok(ResolvedSigner::Remote(signer))
+    Ok(ResolvedSigner::remote(provider, signer))
 }
 
 /// Explain a failed [`RemoteProvider::connect`] in terms of what is
@@ -365,6 +410,13 @@ fn explain_connect_failure(
     name: &str,
     original: Error,
 ) -> Error {
+    // The explanation below reasons about stored API credentials. A backend
+    // with none (a hardware wallet) already says what is wrong: the device
+    // is unplugged, locked, or busy.
+    if !provider.requires_credentials() {
+        return original;
+    }
+
     let id = provider.id();
     let display_name = provider.display_name();
     let reconnect = format!("pay account new {name} --backend {id} --force");
@@ -406,12 +458,12 @@ fn explain_connect_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::accounts::Keystore as KeystoreKind;
+    use crate::accounts::BackendKind as KeystoreKind;
     use std::collections::BTreeMap;
 
     fn remote_account(provider: Option<&str>, wallet_id: Option<&str>) -> Account {
         Account {
-            keystore: KeystoreKind::Remote,
+            backend: KeystoreKind::Remote,
             provider: provider.map(str::to_string),
             active: false,
             auth_required: Some(false),
@@ -430,6 +482,7 @@ mod tests {
         assert_eq!(provider("openfort").map(|p| p.id()), Some("openfort"));
         assert!(provider("not-a-backend").is_none());
         assert!(provider_ids().contains(&"openfort"));
+        assert_eq!(provider("privy").map(|p| p.id()), Some("privy"));
     }
 
     /// Every registered provider must declare at least one credential and
@@ -443,8 +496,13 @@ mod tests {
         assert_eq!(ids.len(), unique.len(), "provider ids must be unique");
 
         for p in PROVIDERS {
-            assert!(!p.credential_fields().is_empty(), "{}", p.id());
             assert!(!p.display_name().is_empty(), "{}", p.id());
+            assert_eq!(
+                p.requires_credentials(),
+                !p.credential_fields().is_empty(),
+                "{}: requires_credentials must follow the declared fields",
+                p.id()
+            );
         }
     }
 
@@ -468,6 +526,66 @@ mod tests {
         assert!(msg.contains("openfort"));
     }
 
+    /// An auth gate that records whether it ran and answers as told.
+    struct Recording {
+        allow: bool,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl crate::keystore::AuthGate for Recording {
+        fn authenticate(&self, _intent: &AuthIntent) -> pay_keystore::Result<()> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.allow {
+                Ok(())
+            } else {
+                Err(pay_keystore::Error::AuthDenied(
+                    "declined by policy".to_string(),
+                ))
+            }
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn memory_credentials_apply_the_gate_on_every_load() {
+        let mut creds = Credentials::new();
+        creds.insert("secret_key".to_string(), "sk_test".to_string());
+        let source = MemoryCredentials::new(creds.clone());
+        let intent = AuthIntent::default_payment();
+
+        assert_eq!(
+            source
+                .load("t", "openfort", Gate::Disabled, &intent)
+                .unwrap(),
+            creds
+        );
+
+        let allow = Box::new(Recording {
+            allow: true,
+            calls: Default::default(),
+        });
+        assert!(
+            source
+                .load("t", "openfort", Gate::Override(allow), &intent)
+                .is_ok()
+        );
+
+        let deny = Box::new(Recording {
+            allow: false,
+            calls: Default::default(),
+        });
+        let err = source
+            .load("t", "openfort", Gate::Override(deny), &intent)
+            .unwrap_err();
+        assert!(err.to_string().contains("declined by policy"), "{err}");
+
+        let err = source
+            .load("t", "openfort", Gate::Platform, &intent)
+            .unwrap_err();
+        assert!(err.to_string().contains("no platform prompt"), "{err}");
+    }
+
     #[test]
     fn load_remote_signer_requires_wallet_id() {
         let account = remote_account(Some("openfort"), None);
@@ -487,15 +605,45 @@ mod tests {
     /// for credentials the provider rejects outright.
     struct FakeProvider(std::result::Result<Vec<&'static str>, ()>);
 
-    impl RemoteProvider for FakeProvider {
+    impl SigningBackend for FakeProvider {
         fn id(&self) -> &'static str {
             "fake"
         }
         fn display_name(&self) -> &'static str {
             "Fake custody"
         }
+        fn description(&self) -> &'static str {
+            "test double"
+        }
+        fn custody(&self) -> crate::backend::Custody {
+            crate::backend::Custody::Remote
+        }
+        fn is_exportable(&self) -> bool {
+            false
+        }
+        fn signs_raw_messages(&self) -> bool {
+            true
+        }
+        fn approval(&self) -> crate::backend::Approval {
+            crate::backend::Approval::ProviderPolicy
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn max_tx_version(&self) -> Option<pay_kit::core::tx::TxVersion> {
+            None
+        }
+    }
+
+    impl RemoteProvider for FakeProvider {
+        /// A credentialed provider, so connect failures get the stored
+        /// credentials explanation.
         fn credential_fields(&self) -> &'static [CredentialField] {
-            &[]
+            &[CredentialField {
+                key: "api_key",
+                label: "Fake API key",
+                secret: true,
+            }]
         }
         fn credentials_hint(&self) -> &'static str {
             "hint"
@@ -515,7 +663,7 @@ mod tests {
                 Err(()) => Err(Error::Config("credentials rejected".to_string())),
             }
         }
-        fn connect(&self, _c: &Credentials, _w: &str) -> Result<Box<dyn SolanaSigner>> {
+        fn connect(&self, _c: &Credentials, _w: &str) -> Result<Box<dyn TransactionSigner>> {
             unimplemented!("tests only exercise the failure path")
         }
     }
@@ -559,6 +707,69 @@ mod tests {
     fn empty_project_points_at_wallet_creation() {
         let msg = explain(Ok(vec![]), "acc_live");
         assert!(msg.contains("Create one first."), "{msg}");
+    }
+
+    /// A provider with nothing stored (a hardware wallet) has no
+    /// credentials to reason about: its own error is the explanation.
+    #[test]
+    fn credential_less_provider_keeps_its_own_error() {
+        struct DeviceOnly;
+        impl SigningBackend for DeviceOnly {
+            fn id(&self) -> &'static str {
+                "device"
+            }
+            fn display_name(&self) -> &'static str {
+                "Device"
+            }
+            fn description(&self) -> &'static str {
+                "test double"
+            }
+            fn custody(&self) -> crate::backend::Custody {
+                crate::backend::Custody::Hardware
+            }
+            fn is_exportable(&self) -> bool {
+                false
+            }
+            fn signs_raw_messages(&self) -> bool {
+                false
+            }
+            fn approval(&self) -> crate::backend::Approval {
+                crate::backend::Approval::DeviceConfirmation
+            }
+            fn is_available(&self) -> bool {
+                true
+            }
+            fn max_tx_version(&self) -> Option<pay_kit::core::tx::TxVersion> {
+                None
+            }
+        }
+        impl RemoteProvider for DeviceOnly {
+            fn credential_fields(&self) -> &'static [CredentialField] {
+                &[]
+            }
+            fn credentials_hint(&self) -> &'static str {
+                "plug it in"
+            }
+            fn no_wallets_hint(&self) -> &'static str {
+                "no device"
+            }
+            fn discover(&self, _: &Credentials) -> Result<Vec<RemoteWallet>> {
+                panic!("discovery must not run without credentials to check")
+            }
+            fn connect(&self, _: &Credentials, _: &str) -> Result<Box<dyn TransactionSigner>> {
+                unreachable!()
+            }
+        }
+
+        let msg = explain_connect_failure(
+            &DeviceOnly,
+            &Credentials::new(),
+            "m/44'/501'/0'",
+            "demo",
+            Error::Config("Could not connect to the device".to_string()),
+        )
+        .to_string();
+        assert_eq!(msg, "Configuration error: Could not connect to the device");
     }
 
     /// When the wallet *is* there, the provider's own error is the real

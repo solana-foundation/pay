@@ -3,7 +3,7 @@
 //! Thin wrapper around `pay_kit::x402::client::exact` for challenge detection
 //! and payment building.
 
-use pay_kit::x402::solana_keychain::SolanaSigner;
+use pay_kit::x402::solana_keychain::{SolanaSigner, TransactionSigner};
 use pay_kit::x402::solana_rpc_client::rpc_client::RpcClient;
 use pay_kit::x402::{
     PAYMENT_REQUIRED_HEADER, X402_V1_PAYMENT_REQUIRED_HEADER, X402_VERSION_FIELD, X402_VERSION_V1,
@@ -236,7 +236,12 @@ pub fn build_payment_with_override(
     let (payment_header_name, payment_header_value) = match challenge.x402_version {
         X402_VERSION_V1 => {
             let header = rt
-                .block_on(build_payment_header_v1(&signer, &rpc, requirements))
+                .block_on(build_payment_header_v1(
+                    &signer,
+                    &rpc,
+                    requirements,
+                    signer.max_tx_version(),
+                ))
                 .map_err(|e| Error::Mpp(format!("Failed to build x402 payment: {e}")))?;
             (X402_V1_PAYMENT_HEADER, header)
         }
@@ -248,6 +253,7 @@ pub fn build_payment_with_override(
                     &rpc,
                     requirements,
                     extensions,
+                    signer.max_tx_version(),
                 ))
                 .map_err(|e| Error::Mpp(format!("Failed to build x402 payment: {e}")))?;
             (X402_V2_PAYMENT_HEADER, header)
@@ -255,6 +261,9 @@ pub fn build_payment_with_override(
     };
 
     let mut headers = vec![(payment_header_name, payment_header_value)];
+    if challenge.siwx.is_some() {
+        signer.require_raw_message_signing("an x402 sign-in challenge")?;
+    }
     if let Some((header_name, header_value)) = build_siwx_header(challenge, &signer, &network, &rt)?
     {
         headers.push((header_name, header_value));
@@ -483,6 +492,7 @@ pub fn build_upto_payment_with_override(
             requirements,
             expires_at,
             nonce,
+            signer.max_tx_version(),
         ))
         .map_err(|e| Error::Mpp(format!("Failed to build x402 upto payment: {e}")))?;
 
@@ -570,11 +580,14 @@ pub fn build_batch_payment(
         resource_url,
         auth_override,
     )?;
+    // Vouchers are raw message signatures by the payer key; a hardware wallet
+    // cannot produce them. Charges and client-signed sessions still work.
+    signer.require_raw_message_signing("a batch-settlement voucher")?;
 
     // The advertised token program is checked against the mint's real owner:
     // every associated token address in the `open` derives from it, so trusting
     // a wrong value would escrow into accounts the program never touches.
-    let terms = batch_client::resolve_terms(&rpc, requirements)
+    let terms = batch_client::resolve_terms(&rpc, requirements, None)
         .map_err(|e| Error::Mpp(format!("batch-settlement terms rejected: {e}")))?;
 
     let (channel, payload, voucher) = match existing {
@@ -687,18 +700,7 @@ pub fn build_siwx_auth_header_with_override(
     resource_url: Option<&str>,
     auth_override: crate::signer::AuthOverride,
 ) -> Result<BuiltPayment> {
-    let preferred_chain_id = network_override.and_then(siwx_chain_id_for_network);
-    let chain = pay_kit::x402::siwx::select_siwx_chain(
-        &challenge.extension,
-        &SiwxChainSelectionOptions {
-            preferred_chain_id,
-            supported_chain_ids: vec![],
-        },
-    )
-    .map_err(|e| Error::Mpp(format!("Failed to select x402 sign-in challenge: {e}")))?;
-    let network = network_override
-        .map(str::to_string)
-        .unwrap_or_else(|| normalize_network(&chain.chain_id));
+    let (chain, network) = sign_in_chain(challenge, network_override)?;
     let desc = crate::client::prompt::payment_description(None, &[resource_url]);
     let reason = format!("authorize sign-in for {desc}");
     let intent = crate::keystore::AuthIntent::from_reason(&reason);
@@ -710,6 +712,8 @@ pub fn build_siwx_auth_header_with_override(
             &intent,
             auth_override,
         )?;
+    // Sign-in is a raw message signature over the SIWX payload.
+    signer.require_raw_message_signing("an x402 sign-in challenge")?;
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -726,7 +730,7 @@ pub fn build_siwx_auth_header_with_override(
 
 fn build_siwx_header(
     challenge: &Challenge,
-    signer: &dyn SolanaSigner,
+    signer: &dyn TransactionSigner,
     network: &str,
     rt: &tokio::runtime::Runtime,
 ) -> Result<Option<(&'static str, String)>> {
@@ -753,6 +757,27 @@ fn build_siwx_header(
 ///
 /// x402 challenges use CAIP-2 chain IDs like `solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp`
 /// (Solana mainnet). The pay account system uses `mainnet`, `devnet`, `localnet`.
+/// The chain a sign-in challenge is answered on and its pay network slug:
+/// the forced network when given, else the Solana chain the challenge offers.
+pub(crate) fn sign_in_chain(
+    challenge: &SiwxAuthChallenge,
+    network_override: Option<&str>,
+) -> Result<(pay_kit::x402::siwx::SupportedChain, String)> {
+    let preferred_chain_id = network_override.and_then(siwx_chain_id_for_network);
+    let chain = pay_kit::x402::siwx::select_siwx_chain(
+        &challenge.extension,
+        &SiwxChainSelectionOptions {
+            preferred_chain_id,
+            supported_chain_ids: vec![],
+        },
+    )
+    .map_err(|e| Error::Mpp(format!("Failed to select x402 sign-in challenge: {e}")))?;
+    let network = network_override
+        .map(str::to_string)
+        .unwrap_or_else(|| normalize_network(&chain.chain_id));
+    Ok((chain, network))
+}
+
 fn normalize_network(raw: &str) -> String {
     match raw {
         // Solana CAIP-2 genesis hashes
@@ -922,7 +947,7 @@ fn x402_version_from_json(body: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::accounts::{Account, AccountsFile, Keystore, MemoryAccountsStore};
+    use crate::accounts::{Account, AccountsFile, BackendKind, MemoryAccountsStore};
     use pay_kit::x402::exact::EXACT_SCHEME;
 
     fn sample_requirements() -> PaymentRequirements {
@@ -943,6 +968,7 @@ mod tests {
             extra: None,
             accepted: None,
             resource_info: None,
+            transaction_versions: None,
         }
     }
 
@@ -1057,7 +1083,7 @@ mod tests {
                 "maxAmountRequired": "5000",
                 "payTo": "abc123",
                 "asset": "SOL",
-                "resource": "/test"
+                "resource": "/test",
             }]
         })
         .to_string();
@@ -1505,7 +1531,7 @@ mod tests {
         ];
         let pubkey = "4BuiY9QUUfPoAGNJBja3JapAuVWMc9c7in6UCgyC2zPR";
         let account = Account {
-            keystore: Keystore::Ephemeral,
+            backend: BackendKind::Ephemeral,
             provider: None,
             active: true,
             auth_required: Some(false),

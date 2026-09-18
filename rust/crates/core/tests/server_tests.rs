@@ -700,7 +700,7 @@ async fn middleware_accepts_session_voucher_then_close() {
         let mut kp = [0u8; 64];
         kp[..32].copy_from_slice(sk.as_bytes());
         kp[32..].copy_from_slice(vk.as_bytes());
-        let signer: Box<dyn pay_kit::mpp::solana_keychain::SolanaSigner> =
+        let signer: Box<dyn pay_kit::mpp::solana_keychain::TransactionSigner> =
             Box::new(pay_kit::mpp::solana_keychain::memory::MemorySigner::from_bytes(&kp).unwrap());
         (sk, signer)
     };

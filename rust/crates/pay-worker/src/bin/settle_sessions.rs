@@ -20,7 +20,7 @@ use pay_kit::core::store::{
     ChannelState, ChannelStore, DEFAULT_FINALIZED_CHANNEL_RETENTION, RedisChannelStore, StoreError,
 };
 use pay_kit::core::tx_pipeline::{TxPipeline, TxPipelineConfig};
-use pay_kit::mpp::solana_keychain::SolanaSigner;
+use pay_kit::mpp::solana_keychain::TransactionSigner;
 use pay_worker::channel::{self, STATUS_CLOSING, STATUS_DISTRIBUTED, STATUS_OPEN, STATUS_SEALED};
 use pay_worker::config::Config;
 use pay_worker::error::JobError;
@@ -368,7 +368,7 @@ struct SettlementRuntime {
     rpc_url: String,
     treasury_owner: Pubkey,
     rpc: RpcClient,
-    signer: Arc<dyn SolanaSigner>,
+    signer: Arc<dyn TransactionSigner>,
     operator: Pubkey,
     confirm_timeout: Duration,
 }
@@ -1112,8 +1112,22 @@ async fn run_batch(runtime: &SettlementRuntime) -> Result<SettleSessionsMetrics,
     }
 
     let pipeline = TxPipeline::new(runtime.rpc_url.clone(), TxPipelineConfig::default());
+    // Version 1 when the cluster gate is active: 18 voucher settlements per
+    // flush transaction instead of 4.
+    let tx_version = {
+        let rpc_url = runtime.rpc_url.clone();
+        tokio::task::spawn_blocking(move || {
+            pay_kit::core::tx::highest(
+                &pay_kit::core::tx::TxV1Mode::Auto
+                    .resolve(&pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient::new(rpc_url)),
+            )
+        })
+        .await
+        .unwrap_or(pay_kit::core::tx::TxVersion::V0)
+    };
     let handle = spawn(
-        SettlementConfig::new(runtime.operator, Arc::clone(&runtime.signer)),
+        SettlementConfig::new(runtime.operator, Arc::clone(&runtime.signer))
+            .with_tx_version(tx_version),
         Arc::new(RpcBroadcaster::with_pipeline(pipeline.clone())),
     );
     let mut submissions = JoinSet::new();

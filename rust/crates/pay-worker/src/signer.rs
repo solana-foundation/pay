@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use pay_kit::mpp::solana_keychain::{Signer, SolanaSigner};
+use pay_kit::mpp::solana_keychain::{Signer, SolanaSigner, TransactionSigner};
 
 use crate::config::FeePayerConfig;
 use crate::error::JobError;
@@ -21,7 +21,7 @@ const LOCAL_PRIVATE_KEY_ENV: &str = "LOCAL_FEE_PAYER_PRIVATE_KEY";
 /// Build a fee-payer `SolanaSigner` from config + env. See module docs.
 pub async fn build_fee_payer_signer(
     fee_payer: &FeePayerConfig,
-) -> Result<Arc<dyn SolanaSigner>, JobError> {
+) -> Result<Arc<dyn TransactionSigner>, JobError> {
     if let Ok(key) = std::env::var(LOCAL_PRIVATE_KEY_ENV) {
         let key = key.trim();
         if !key.is_empty() {
@@ -45,7 +45,7 @@ pub async fn build_fee_payer_signer(
                 return Err(JobError::FeePayerSigner);
             }
             tracing::warn!(pubkey = %signer.pubkey(), "using local fee-payer private key");
-            return Ok(Arc::new(signer));
+            return into_transaction_signer(signer);
         }
     }
 
@@ -66,5 +66,20 @@ pub async fn build_fee_payer_signer(
     let signer = Signer::from_gcp_kms(key_name.to_string(), pubkey.to_string())
         .await
         .map_err(|_| JobError::FeePayerSigner)?;
-    Ok(Arc::new(signer))
+    into_transaction_signer(signer)
+}
+
+/// The keychain `Signer` enum only implements message signing; transactions
+/// are signed by the concrete backend. Both backends this service configures
+/// implement `TransactionSigner`.
+fn into_transaction_signer(signer: Signer) -> Result<Arc<dyn TransactionSigner>, JobError> {
+    match signer {
+        Signer::Memory(signer) => Ok(Arc::new(signer)),
+        Signer::GcpKms(signer) => Ok(Arc::new(signer)),
+        // Feature unification can add keychain variants this service never
+        // configures (e.g. `openfort` enabled by the CLI); none of them is a
+        // fee payer here.
+        #[allow(unreachable_patterns)]
+        _ => Err(JobError::FeePayerSigner),
+    }
 }

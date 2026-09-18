@@ -129,9 +129,6 @@ pub(crate) fn load_account_or_legacy_signer(
     }
 
     legacy_source
-        .map(|source| {
-            pay_core::signer::load_signer_with_intent(source, intent)
-                .map(|s| pay_core::signer::ResolvedSigner::Memory(Box::new(s)))
-        })
+        .map(|source| pay_core::signer::load_resolved_signer_with_intent(source, intent))
         .transpose()
 }

@@ -2,7 +2,7 @@
 
 use dialoguer::Confirm;
 use owo_colors::OwoColorize;
-use pay_core::accounts::{Account, AccountsFile, Keystore as KeystoreKind, MAINNET_NETWORK};
+use pay_core::accounts::{Account, AccountsFile, BackendKind as KeystoreKind, MAINNET_NETWORK};
 use pay_core::keystore::Keystore;
 
 /// Permanently delete an account and its secret key.
@@ -73,8 +73,16 @@ impl DestroyCommand {
             .pubkey
             .clone()
             .unwrap_or_else(|| "unknown".to_string());
-        let keystore_kind = entry.keystore.clone();
+        let keystore_kind = entry.backend.clone();
         let op_account = entry.account.clone();
+        let stores_credentials = entry
+            .provider
+            .as_deref()
+            .and_then(pay_core::remote::provider)
+            .is_none_or(|p| p.requires_credentials());
+        // Whether the backend can hand the keypair back at all; remote
+        // custody cannot, so there is nothing to offer for export.
+        let exportable = entry.descriptor().is_ok_and(|b| b.is_exportable());
 
         // Show account list with the target in red
         super::list::print_account_list(
@@ -88,9 +96,8 @@ impl DestroyCommand {
         if !self.yes {
             let theme = dialoguer::theme::ColorfulTheme::default();
 
-            // Offer to export first. Remote-backend accounts have no
-            // local keypair to export — skip the offer.
-            let export = keystore_kind != KeystoreKind::Remote
+            // Offer to export first, when the backend can export at all.
+            let export = exportable
                 && Confirm::with_theme(&theme)
                     .with_prompt(format!(
                         "Export '{}' before removing?",
@@ -129,7 +136,13 @@ impl DestroyCommand {
         }
 
         // Delete from keystore backend
-        if keystore_kind == KeystoreKind::Remote {
+        if keystore_kind == KeystoreKind::Remote && !stores_credentials {
+            // Hardware wallet: nothing was stored locally beyond accounts.yml.
+            eprintln!(
+                "{}",
+                "  Nothing to remove from the secret store; the key stays on the device.".dimmed()
+            );
+        } else if keystore_kind == KeystoreKind::Remote {
             // Remove the API credential blob from the platform secret
             // store. The wallet itself stays intact at the provider.
             let intent = pay_core::keystore::AuthIntent::delete_account(&self.account);
@@ -206,108 +219,74 @@ impl DestroyCommand {
     }
 }
 
-/// Build a Keystore for the given kind, or None for File-based/Ephemeral.
+/// Build the keystore holding an account's keypair, or `None` when there
+/// is nothing external to delete: file keypairs are left on disk, ephemeral
+/// wallets live inside `accounts.yml`, and remote credential blobs are
+/// removed through `pay_core::remote::delete_credentials`.
 fn keystore_for_kind(
     kind: &KeystoreKind,
     op_account: Option<String>,
 ) -> pay_core::Result<Option<Keystore>> {
-    match kind {
-        #[cfg(target_os = "macos")]
-        KeystoreKind::AppleKeychain => Ok(Some(Keystore::apple_keychain())),
-        #[cfg(not(target_os = "macos"))]
-        KeystoreKind::AppleKeychain => Err(pay_core::Error::Config(
-            "Cannot delete Keychain entries on this platform".to_string(),
-        )),
+    use pay_core::backend::{Gate, StoreParams};
 
-        #[cfg(target_os = "linux")]
-        KeystoreKind::GnomeKeyring => Ok(Some(Keystore::gnome_keyring())),
-        #[cfg(not(target_os = "linux"))]
-        KeystoreKind::GnomeKeyring => Err(pay_core::Error::Config(
-            "Cannot delete GNOME Keyring entries on this platform".to_string(),
-        )),
-
-        #[cfg(target_os = "windows")]
-        KeystoreKind::WindowsHello => Ok(Some(Keystore::windows_hello())),
-        #[cfg(not(target_os = "windows"))]
-        KeystoreKind::WindowsHello => Err(pay_core::Error::Config(
-            "Cannot delete Windows Hello entries on this platform".to_string(),
-        )),
-
-        KeystoreKind::OnePassword => Ok(Some(Keystore::onepassword(op_account))),
-        KeystoreKind::File => Ok(None),
-        // Ephemeral keypairs live entirely inside accounts.yml — there's
-        // no external keystore to delete from. The earlier `accounts.remove`
-        // call already wiped the entry, so we just no-op here.
-        KeystoreKind::Ephemeral => Ok(None),
-        // Remote credential blobs are deleted through
-        // `pay_core::remote::delete_credentials` before this is called.
-        KeystoreKind::Remote => Ok(None),
+    if matches!(
+        kind,
+        KeystoreKind::File | KeystoreKind::Ephemeral | KeystoreKind::Remote
+    ) {
+        return Ok(None);
     }
+    let local = pay_core::backend::local_by_kind(kind).ok_or_else(|| {
+        pay_core::Error::Config(format!("No keystore backend is registered for `{kind}`."))
+    })?;
+    if !local.is_available() {
+        return Err(pay_core::Error::Config(format!(
+            "Cannot delete {} entries on this platform",
+            local.display_name()
+        )));
+    }
+    let params = StoreParams {
+        op_account: op_account.as_deref(),
+        ..StoreParams::default()
+    };
+    local.keystore(&params, Gate::Platform).map(Some)
 }
 
-/// Probe keystores for a legacy account that predates accounts.yml.
+/// Probe keystores for a legacy account that predates accounts.yml: the
+/// OS-native store first, then 1Password.
 fn discover_legacy_account(name: &str) -> Option<Account> {
-    #[cfg(target_os = "macos")]
-    {
-        let ks = Keystore::apple_keychain();
-        if ks.exists(name) {
-            let pubkey = ks.pubkey(name).ok().map(|b| bs58::encode(&b).into_string());
-            return Some(Account {
-                provider: None,
-                keystore: KeystoreKind::AppleKeychain,
-                active: false,
-                auth_required: Some(true),
-                pubkey,
-                vault: None,
-                account: None,
-                path: None,
-                secret_key_b58: None,
-                created_at: None,
-                subscriptions: std::collections::BTreeMap::new(),
-            });
-        }
-    }
+    use pay_core::backend::{Gate, LocalKeystoreBackend, StoreParams};
 
-    #[cfg(target_os = "linux")]
-    {
-        let ks = Keystore::gnome_keyring();
-        if ks.exists(name) {
-            let pubkey = ks.pubkey(name).ok().map(|b| bs58::encode(&b).into_string());
-            return Some(Account {
-                provider: None,
-                keystore: KeystoreKind::GnomeKeyring,
-                active: false,
-                auth_required: Some(true),
-                pubkey,
-                vault: None,
-                account: None,
-                path: None,
-                secret_key_b58: None,
-                created_at: None,
-                subscriptions: std::collections::BTreeMap::new(),
-            });
-        }
-    }
+    let candidates: Vec<&'static dyn LocalKeystoreBackend> = pay_core::backend::platform()
+        .into_iter()
+        .chain(std::iter::once(
+            &pay_core::backend::OnePassword as &'static dyn LocalKeystoreBackend,
+        ))
+        .collect();
 
-    {
-        let ks = Keystore::onepassword(None);
-        if ks.exists(name) {
-            let pubkey = ks.pubkey(name).ok().map(|b| bs58::encode(&b).into_string());
-            return Some(Account {
-                provider: None,
-                keystore: KeystoreKind::OnePassword,
-                active: false,
-                auth_required: Some(true),
-                pubkey,
-                vault: None,
-                account: None,
-                path: None,
-                secret_key_b58: None,
-                created_at: None,
-                subscriptions: std::collections::BTreeMap::new(),
-            });
+    for local in candidates {
+        if !local.is_available() {
+            continue;
         }
+        let Ok(ks) = local.keystore(&StoreParams::default(), Gate::Platform) else {
+            continue;
+        };
+        if !ks.exists(name) {
+            continue;
+        }
+        let pubkey = ks.pubkey(name).ok().map(|b| bs58::encode(&b).into_string());
+        return Some(Account {
+            provider: None,
+            backend: local.kind(),
+            active: false,
+            auth_required: Some(true),
+            pubkey,
+            vault: None,
+            account: None,
+            path: None,
+            secret_key_b58: None,
+            created_at: None,
+            subscriptions: std::collections::BTreeMap::new(),
+        });
     }
-
     None
 }
