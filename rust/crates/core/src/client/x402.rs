@@ -139,7 +139,7 @@ pub fn build_payment_with_override(
     auth_override: crate::signer::AuthOverride,
 ) -> Result<BuiltPayment> {
     let requirements = &challenge.requirements;
-    let amount = format_amount(&requirements.amount, &requirements.currency);
+    let amount = format_amount(&requirements.amount, &requirements.currency, requirements.decimals);
     let prompt_context = crate::client::prompt::payment_prompt_context(
         requirements.description.as_deref(),
         &[Some(requirements.resource.as_str()), resource_url],
@@ -289,6 +289,8 @@ struct ChannelOffer<'a> {
     amount: &'a str,
     /// Mint address.
     asset: &'a str,
+    /// Mint decimals when known, so the displayed amount matches the transfer.
+    decimals: Option<u8>,
     /// Whether the approval funds channel escrow rather than one request.
     channel_escrow: bool,
     /// The challenge's blockhash build hint. Beyond saving an RPC round trip it
@@ -311,7 +313,7 @@ fn prepare_channel_payment(
     // `PaymentLimit::from_amount`, which would drop the amount-specific spend
     // limit and fall back to the generic authorization action. Keep the amount
     // canonical and carry the escrow context in the intent kind instead.
-    let display_amount = format_amount(offer.amount, offer.asset);
+    let display_amount = format_amount(offer.amount, offer.asset, offer.decimals);
     let prompt_context = crate::client::prompt::payment_prompt_context(None, &[resource_url]);
     let intent = if offer.channel_escrow {
         crate::keystore::AuthIntent::authorize_channel_escrow(
@@ -449,6 +451,8 @@ pub fn build_upto_payment_with_override(
             network: &requirements.network,
             amount: &requirements.amount,
             asset: &requirements.asset,
+            // upto/batch requirements don't carry mint decimals; fall back to the label convention
+            decimals: None,
             channel_escrow: false,
             recent_blockhash: requirements.extra.recent_blockhash.as_deref(),
         },
@@ -561,6 +565,8 @@ pub fn build_batch_payment(
             network: &requirements.network,
             amount: &authorization_amount,
             asset: &requirements.asset,
+            // upto/batch requirements don't carry mint decimals; fall back to the label convention
+            decimals: None,
             channel_escrow: escrow_amount.is_some(),
             recent_blockhash: requirements.extra.recent_blockhash.as_deref(),
         },
@@ -837,13 +843,16 @@ fn parse_payment_required_envelope_header(value: &str) -> Option<PaymentRequired
     serde_json::from_slice::<PaymentRequiredEnvelope>(&decoded).ok()
 }
 
-fn format_amount(amount: &str, currency: &str) -> String {
+fn format_amount(amount: &str, currency: &str, decimals: Option<u8>) -> String {
     let base: u64 = amount.parse().unwrap_or(0);
-    let value = if currency.to_uppercase() == "SOL" {
-        base as f64 / 1_000_000_000.0
-    } else {
-        base as f64 / 1_000_000.0
-    };
+    // Prefer the mint's real decimals so the displayed/consented amount matches
+    // what the on-chain TransferChecked actually moves. Fall back to the
+    // currency-label convention (SOL = 9, otherwise 6) only when the decimals
+    // are unknown.
+    let exponent = decimals
+        .map(u32::from)
+        .unwrap_or_else(|| if currency.eq_ignore_ascii_case("SOL") { 9 } else { 6 });
+    let value = base as f64 / 10f64.powi(exponent as i32);
     format!("${}", format_value(value))
 }
 
@@ -1014,27 +1023,47 @@ mod tests {
 
     #[test]
     fn format_amount_usdc() {
-        assert_eq!(format_amount("1000000", "USDC"), "$1.00");
+        assert_eq!(format_amount("1000000", "USDC", Some(6)), "$1.00");
     }
 
     #[test]
     fn format_amount_usdc_with_fee_fraction() {
-        assert_eq!(format_amount("1001500", "USDC"), "$1.0015");
+        assert_eq!(format_amount("1001500", "USDC", Some(6)), "$1.0015");
     }
 
     #[test]
     fn format_amount_sol() {
-        assert_eq!(format_amount("1000000000", "SOL"), "$1.00");
+        assert_eq!(format_amount("1000000000", "SOL", Some(9)), "$1.00");
     }
 
     #[test]
     fn format_amount_zero() {
-        assert_eq!(format_amount("0", "USDC"), "$0");
+        assert_eq!(format_amount("0", "USDC", Some(6)), "$0");
     }
 
     #[test]
     fn format_amount_invalid_number() {
-        assert_eq!(format_amount("abc", "USDC"), "$0");
+        assert_eq!(format_amount("abc", "USDC", Some(6)), "$0");
+    }
+
+    #[test]
+    fn format_amount_uses_mint_decimals_not_currency_label() {
+        // A sub-6-decimal token: the same base units must render as the real
+        // value, not the currency label's assumed 6 decimals. Previously this
+        // returned "$1.00" while the on-chain TransferChecked moved 10,000
+        // tokens (a 10^(6-2) understatement of the consented amount).
+        assert_eq!(format_amount("1000000", "USDC", Some(2)), "$10000.00");
+        assert_ne!(
+            format_amount("1000000", "USDC", Some(2)),
+            format_amount("1000000", "USDC", Some(6))
+        );
+    }
+
+    #[test]
+    fn format_amount_falls_back_to_label_when_decimals_unknown() {
+        // Backwards compatible: unknown decimals keep the prior label behaviour.
+        assert_eq!(format_amount("1000000", "USDC", None), "$1.00");
+        assert_eq!(format_amount("1000000000", "SOL", None), "$1.00");
     }
 
     #[test]
