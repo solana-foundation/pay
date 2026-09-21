@@ -813,8 +813,8 @@ async fn build_sandbox_payments(
     let rpc_url = payments::resolve_sandbox_rpc_url(None);
 
     let (fee_payer_signer, generated) = payments::load_auto_fee_payer_signer(&network)?;
-    if let Some((account_name, pubkey)) = &generated {
-        eprintln!("⏺ generated gateway account {account_name} ({pubkey}) on localnet");
+    if generated.is_some() {
+        eprintln!("⏺ generated a gateway account on localnet");
     }
     // Funds land in the gateway's own sandbox wallet — no separate
     // recipient flag in sandbox monetization.

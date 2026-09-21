@@ -592,7 +592,7 @@ impl RunOutcome {
     /// forced one), read from `accounts.yml` without prompting. Outcomes
     /// that carry no offer, and networks where a throwaway software wallet
     /// would be created, pass through unchanged.
-    pub fn for_account(
+    pub fn for_configured_signer(
         self,
         store: &dyn crate::accounts::AccountsStore,
         network_override: Option<&str>,
@@ -2257,12 +2257,12 @@ HTTP request sent, awaiting response...
     }
 
     #[test]
-    fn for_account_passes_through_when_a_throwaway_wallet_would_pay() {
+    fn configured_signer_passes_through_when_a_throwaway_wallet_would_pay() {
         // No account on an ephemeral network: a software wallet is created
         // at payment time and signs anything, so the session stands.
         let store = crate::accounts::MemoryAccountsStore::new();
         let outcome = classify_402(&session_and_charge_402("operator"), None, "https://e.com/r")
-            .for_account(&store, Some("localnet"), None)
+            .for_configured_signer(&store, Some("localnet"), None)
             .unwrap();
         assert!(
             matches!(outcome, RunOutcome::SessionChallenge { .. }),
@@ -2271,12 +2271,12 @@ HTTP request sent, awaiting response...
     }
 
     #[test]
-    fn for_account_uses_the_network_the_offer_names() {
+    fn configured_signer_uses_the_network_the_offer_names() {
         // Mainnet with nothing configured is an error at payment time; the
         // pre-check reports the same thing rather than guessing a wallet.
         let store = crate::accounts::MemoryAccountsStore::new();
         let Err(err) = classify_402(&session_and_charge_402("operator"), None, "https://e.com/r")
-            .for_account(&store, None, None)
+            .for_configured_signer(&store, None, None)
         else {
             panic!("mainnet without an account is an error");
         };
@@ -2289,7 +2289,7 @@ HTTP request sent, awaiting response...
 
     #[cfg(feature = "ledger")]
     #[test]
-    fn for_account_lets_a_ledger_account_pay_the_charge() {
+    fn configured_signer_lets_a_ledger_account_pay_the_charge() {
         let mut file = crate::accounts::AccountsFile::default();
         file.upsert(
             "mainnet",
@@ -2310,7 +2310,7 @@ HTTP request sent, awaiting response...
         );
         let store = crate::accounts::MemoryAccountsStore::with_file(file);
         let outcome = classify_402(&session_and_charge_402("operator"), None, "https://e.com/r")
-            .for_account(&store, None, None)
+            .for_configured_signer(&store, None, None)
             .unwrap();
         assert!(
             matches!(outcome, RunOutcome::MppChallenge { .. }),

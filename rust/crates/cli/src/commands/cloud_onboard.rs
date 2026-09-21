@@ -103,7 +103,7 @@ pub fn run_setup_onboarding(account: &str, force: bool) -> pay_core::Result<Stri
         account: account.to_string(),
     })?;
     ensure_ready(&result)?;
-    register_provisioned_account(account, &result, force)
+    store_provisioned_wallet(account, &result, force)
 }
 
 /// Only a `ready` exchange carries a wallet to register.
@@ -130,7 +130,7 @@ fn ensure_ready(result: &OnboardResult) -> pay_core::Result<()> {
 
 /// Store a `ready` exchange result as a remote account named `account`.
 /// Returns the verified address.
-pub fn register_provisioned_account(
+pub fn store_provisioned_wallet(
     account: &str,
     result: &OnboardResult,
     force: bool,
