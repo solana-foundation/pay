@@ -1,11 +1,11 @@
 # pay-cloud
 
-The hosted half of pay. One axum server, one embedded web app, four jobs:
+The hosted half of pay. One axum server, a separately deployed frontend, and four jobs:
 
 - **Onboarding** for `pay setup --backend cloud`: the `gh auth login`
-  pattern. The CLI opens a page here, the page sends the browser through a
+  pattern. The CLI follows a redirect to the pages app, which sends the browser through a
   wallet provider (Openfort), and the CLI redeems a one-time code with PKCE.
-- **Funding**: the `/fund` page buys USDC with a card through Coinflow for
+- **Funding**: the pages app's `/onramp` page buys USDC with a card through Coinflow for
   any address, used by the TUI and the web flow alike.
 - **The MCP connector**: `/mcp` serves the pay tools over streamable HTTP
   to hosts like Grok, Claude and Cursor, behind an OAuth 2.1 authorization
@@ -24,7 +24,7 @@ Everything below runs locally. State is in memory and lost on restart.
 rust/crates/cloud/dev/run.sh
 ```
 
-Builds both web bundles and the binaries, starts a mock Openfort so wallet
+Builds the payment-debugger bundle and the binaries, starts a mock Openfort so wallet
 creation works with no Openfort account, loads the repo-root `.env`
 (Coinflow sandbox), and starts pay-cloud on `http://127.0.0.1:8402` with
 the connector on. It prints the commands to try: adding the connector to
@@ -40,9 +40,9 @@ the public URL. `COINFLOW_*` configure funding (see `docs/onramp-coinflow.md`).
 `OPENFORT_BASE_URL` and `OPENFORT_AUTH_PAGE_URL` point the driver at a
 mock or staging.
 
-`PAY_CLOUD_PAGES_URL` moves the consent page to the pay.sh web app
+`PAY_CLOUD_PAGES_URL` points browser redirects at the pay.sh web app
 (`/connect` there, which proxies `/api/oauth/*` and `/api/fund/*` back
-here); unset, the embedded `/authorize` page is used.
+here); it defaults to `https://pay.sh`.
 
 Privy login on the consent page needs, from dashboard.privy.io:
 `PRIVY_APP_ID` and `PRIVY_APP_SECRET` (App settings),
@@ -57,18 +57,13 @@ override, or `PRIVY_VERIFICATION_KEY` for a single PEM). Optional:
 origin under allowed origins. Put them in the repo-root `.env`; `dev/run.sh`
 loads it.
 
-## Build the UI
+## Frontend
 
-The onboarding page lives in `web-ui/` (second Vite app, built into
-`web-ui/dist-cloud/`) and is embedded into the binary at compile time:
+The browser UI lives in the separate `solana-foundation/pay-web-ui`
+repository and is deployed independently. Point local pay-cloud at it with
+`PAY_CLOUD_PAGES_URL`.
 
-```sh
-cd web-ui && pnpm install --frozen-lockfile && pnpm build:cloud
-```
-
-Without a built `dist-cloud`, debug builds embed a placeholder page; release
-builds fail unless `PAY_CLOUD_ALLOW_PLACEHOLDER=1` is set. `PAY_CLOUD_DIST`
-points the build at an alternative dist directory.
+This crate does not build, embed, or serve frontend assets.
 
 ## Run
 
@@ -79,8 +74,8 @@ cargo run -p pay-cloud -- --port 8402
 Flags: `--bind` (default `127.0.0.1`), `--port` (default `8402`). Logging is
 `RUST_LOG`-driven and goes to stderr.
 
-Pages: `GET /`, `GET /onboard`, `GET /onboard/*` serve the SPA; other unknown
-paths fall back to `index.html`. `GET /health` returns `{"status":"ok"}`.
+Browser entrypoints redirect to `PAY_CLOUD_PAGES_URL`; unknown paths return
+JSON 404 responses. `GET /health` returns `{"status":"ok"}`.
 
 Try it end to end without the browser:
 

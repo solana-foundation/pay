@@ -2001,7 +2001,8 @@ mod tests {
         .await;
         assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
         let consent = reply.location();
-        assert_eq!(consent.path(), "/authorize");
+        assert_eq!(consent.origin().ascii_serialization(), "https://pay.sh");
+        assert_eq!(consent.path(), "/connect");
         let request_id = reply.query("request").unwrap();
 
         // The consent page learns who is asking, and that this browser has
@@ -2804,7 +2805,7 @@ mod tests {
             let refused = topup_message(&app, &access).await;
             let message = refused["error"]["message"].as_str().unwrap().to_string();
             assert!(
-                message.contains("https://cloud.test/authorize?link="),
+                message.contains("https://pay.sh/connect?link="),
                 "{message}"
             );
             let ticket = message

@@ -1,6 +1,6 @@
 [package]
 name = "pay-cloud"
-description = "pay-cloud v0: browser onboarding for the pay CLI (PKCE start/exchange + embedded UI)"
+description = "pay-cloud v0: browser onboarding APIs for the pay CLI and hosted connector"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -31,9 +31,7 @@ base64 = { workspace = true }
 bs58 = { workspace = true, optional = true }
 clap = { workspace = true }
 http = { version = "1", optional = true }
-include_dir = "0.7.4"
 jsonwebtoken = { version = "9", optional = true }
-mime_guess = { workspace = true }
 pay-core = { workspace = true, optional = true }
 pay-mcp = { workspace = true, optional = true }
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "pem", "std"], optional = true }

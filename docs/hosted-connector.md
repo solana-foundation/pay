@@ -107,9 +107,8 @@ Done on `feat/pay-cloud`:
   out so `pay_subject` lives on pay.sh. A new wallet continues to that
   app's `/onramp` (Coinflow React SDK, card and Apple/Google Pay) with
   `request` and `client`, which approves the pending request when funded
-  or skipped. pay-cloud sends users there when `PAY_CLOUD_PAGES_URL` is
-  set; the embedded pages remain the fallback until the new ones are
-  verified live, then they go.
+  or skipped. pay-cloud sends users there through `PAY_CLOUD_PAGES_URL`
+  (default `https://pay.sh`) and does not embed or serve a frontend.
 - **Guests (2026-09-18).** The consent page offers "Continue as guest":
   Approve with `{"guest": true}` mints a wallet-less `guest_…` subject and
   the host connects normally. Catalog tools need no wallet; the first tool
@@ -134,11 +133,11 @@ Done on `feat/pay-cloud` (PR #464, rebased on main after PR #423 merged on 2026-
   capability trait; `RemoteProvider` is a supertrait so Circle is a file
   plus a registry line. See `docs/keychain.md`. 1Password is deprecated:
   existing accounts load, new ones are refused.
-- `pay-cloud` v0 (`crates/cloud`): serves the onboarding page embedded from
-  `web-ui/dist-cloud`, `POST /api/onboard/start`, `POST /v1/onboard/exchange`
+- `pay-cloud` v0 (`crates/cloud`): serves `POST /api/onboard/start` and
+  `POST /v1/onboard/exchange`
   with PKCE S256, single-use five-minute codes. In-memory only.
-- `web-ui` cloud app: `pnpm build:cloud`, `WelcomeCard` and `EmailField`
-  components under `src/components/cloud`.
+- Browser pages live in the separate `solana-foundation/pay-web-ui`
+  repository and are deployed independently from this service.
 - `pay setup --backend cloud` and the "Remote wallet" picker entry run the
   loopback flow end to end; the exchange returns `status: pending` because
   provisioning is not built. `PAY_CLOUD_LOCAL=1` targets `http://127.0.0.1:8402`, `PAY_CLOUD_URL` any other server,

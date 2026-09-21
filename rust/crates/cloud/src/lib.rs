@@ -1,7 +1,7 @@
 //! pay-cloud v0 — browser onboarding for the `pay` CLI.
 //!
-//! Serves the embedded onboarding page (`web-ui/dist-cloud`, compiled in via
-//! `include_dir!`) and two JSON endpoints:
+//! Serves the onboarding APIs used by the separately deployed pay-web-ui
+//! frontend and these JSON endpoints:
 //!
 //! - `POST /api/onboard/start` — page → server: open a session; with a
 //!   `provider`, returns that provider's consent URL.
@@ -21,13 +21,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use axum::Router;
-use axum::body::Body;
-use axum::extract::Request;
-use axum::http::{Response, StatusCode};
-use axum::response::IntoResponse;
+use axum::extract::{OriginalUri, State};
+use axum::http::StatusCode;
+use axum::response::Redirect;
 use axum::routing::{get, post};
-use include_dir::{Dir, include_dir};
-use mime_guess::from_path;
 use serde_json::json;
 
 pub use onboard::{OnboardSession, SESSION_TTL};
@@ -45,7 +42,7 @@ pub mod privy;
 #[cfg(feature = "mcp")]
 pub mod tenants;
 
-static ASSETS: Dir<'_> = include_dir!("$OUT_DIR/cloud-dist");
+const DEFAULT_PAGES_URL: &str = "https://pay.sh";
 
 /// Most sessions held at once. A session is a few hundred bytes and lives
 /// five minutes, so this bounds the store at a few megabytes while leaving
@@ -77,9 +74,9 @@ pub struct AppState {
     by_state: Arc<Mutex<HashMap<String, String>>>,
     drivers: Arc<Vec<Box<dyn drivers::WalletDriver>>>,
     public_url: String,
-    /// Where the browser pages live when they are not the embedded ones:
-    /// the pay.sh web app, which proxies its API calls back here.
-    pages_url: Option<String>,
+    /// The separately deployed pay.sh web app, which proxies its API calls
+    /// back here.
+    pages_url: String,
     /// Card purchases through Coinflow; `None` until configured.
     #[cfg(feature = "coinflow")]
     funding: Option<Arc<funding::Funding>>,
@@ -169,7 +166,7 @@ impl AppState {
             by_state: Arc::default(),
             drivers: Arc::new(drivers),
             public_url: public_url.into().trim_end_matches('/').to_string(),
-            pages_url: None,
+            pages_url: DEFAULT_PAGES_URL.to_string(),
             #[cfg(feature = "coinflow")]
             funding: None,
             #[cfg(feature = "mcp")]
@@ -244,15 +241,15 @@ impl AppState {
         &self.public_url
     }
 
-    /// Serve the consent page from `url` (the pay.sh web app) instead of the
-    /// embedded one. That app proxies `/api/oauth/*` and `/api/fund/*` here.
+    /// Serve browser pages from `url` (the pay.sh web app). That app proxies
+    /// `/api/oauth/*` and `/api/fund/*` here.
     pub fn with_pages_url(mut self, url: impl Into<String>) -> Self {
-        self.pages_url = Some(url.into().trim_end_matches('/').to_string());
+        self.pages_url = url.into().trim_end_matches('/').to_string();
         self
     }
 
     /// The consent page for a pending authorization: `/connect` on the
-    /// pages app when configured, else the embedded `/authorize`.
+    /// separately deployed pages app.
     pub fn consent_page_url(&self, request_id: &str) -> String {
         format!("{}?request={request_id}", self.consent_page())
     }
@@ -260,10 +257,11 @@ impl AppState {
     /// The consent page itself, where a guest also attaches a wallet
     /// (`?link=<ticket>`).
     pub fn consent_page(&self) -> String {
-        match &self.pages_url {
-            Some(pages) => format!("{pages}/connect"),
-            None => format!("{}/authorize", self.public_url),
-        }
+        format!("{}/connect", self.pages_url())
+    }
+
+    fn pages_url(&self) -> &str {
+        &self.pages_url
     }
 
     /// Where a provider's consent page should send the browser back.
@@ -378,18 +376,19 @@ impl AppState {
     }
 }
 
-/// Full pay-cloud router: health, onboarding JSON endpoints, embedded SPA.
+/// Full pay-cloud router: health and API endpoints. Browser routes redirect
+/// to the separately deployed pages app.
 pub fn router(state: AppState) -> Router {
     let router = Router::new()
         .route("/health", get(health))
         .route("/api/onboard/start", post(onboard::start))
         .route("/api/onboard/{provider}/complete", post(onboard::complete))
         .route("/v1/onboard/exchange", post(onboard::exchange))
-        .route("/", get(serve_index))
-        .route("/onboard", get(serve_index))
-        .route("/onboard/{*rest}", get(serve_index))
-        .route("/fund", get(serve_index))
-        .route("/authorize", get(serve_index));
+        .route("/", get(redirect_pages_root))
+        .route("/onboard", get(redirect_onboard))
+        .route("/onboard/{*rest}", get(redirect_onboard))
+        .route("/fund", get(redirect_fund))
+        .route("/authorize", get(redirect_authorize));
     // Metadata at the root and at the RFC 9728 / RFC 8414 path-based
     // locations for the `/mcp` resource; hosts try either. OpenID discovery
     // too, since some clients start there.
@@ -473,92 +472,59 @@ pub fn router(state: AppState) -> Router {
             axum::http::HeaderName::from_static("mcp-session-id"),
         ])
         .max_age(std::time::Duration::from_secs(600));
-    router.fallback(get(serve_static)).layer(cors)
+    router.fallback(get(not_found)).layer(cors)
 }
 
 async fn health() -> axum::Json<serde_json::Value> {
     axum::Json(json!({ "status": "ok" }))
 }
 
-fn html_response(status: StatusCode, body: &[u8]) -> Response<Body> {
-    Response::builder()
-        .status(status)
-        .header("Content-Type", "text/html; charset=utf-8")
-        .header("Cache-Control", "no-cache")
-        .body(Body::from(body.to_vec()))
-        .unwrap()
+async fn redirect_pages_root(State(state): State<AppState>) -> Redirect {
+    Redirect::temporary(state.pages_url())
 }
 
-fn not_found() -> Response<Body> {
-    Response::builder()
-        .status(StatusCode::NOT_FOUND)
-        .body(Body::empty())
-        .unwrap()
+async fn redirect_onboard(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+) -> Redirect {
+    redirect_to_page(&state, uri.path(), uri.query())
 }
 
-/// Serve the SPA entry point (`/`, `/onboard`, `/onboard/*`).
-async fn serve_index() -> Response<Body> {
-    match ASSETS.get_file("index.html") {
-        Some(file) => html_response(StatusCode::OK, file.contents()),
-        None => not_found(),
-    }
+async fn redirect_fund(State(state): State<AppState>, OriginalUri(uri): OriginalUri) -> Redirect {
+    redirect_to_page(&state, "/onramp", uri.query())
 }
 
-/// Serve embedded static files with SPA fallback to `index.html`.
-async fn serve_static(req: Request) -> Response<Body> {
-    let path = req.uri().path().trim_start_matches('/');
+async fn redirect_authorize(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+) -> Redirect {
+    redirect_to_page(&state, "/connect", uri.query())
+}
 
-    // Machine-facing prefixes never fall back to the page: a host probing
-    // a metadata URL must get 404, not HTML that fails to parse.
-    if [".well-known/", "api/", "oauth/", "v1/", "mcp"]
-        .iter()
-        .any(|prefix| path.starts_with(prefix))
-    {
-        return (
-            StatusCode::NOT_FOUND,
-            axum::Json(
-                json!({ "error": "not_found", "message": format!("No route for /{path}.") }),
-            ),
-        )
-            .into_response();
+fn redirect_to_page(state: &AppState, path: &str, query: Option<&str>) -> Redirect {
+    let mut target = format!("{}{path}", state.pages_url());
+    if let Some(query) = query {
+        target.push('?');
+        target.push_str(query);
     }
+    Redirect::temporary(&target)
+}
 
-    let file = if path.is_empty() {
-        ASSETS.get_file("index.html")
-    } else {
-        ASSETS
-            .get_file(path)
-            .or_else(|| ASSETS.get_file(format!("{path}.html")))
-            .or_else(|| ASSETS.get_file(format!("{path}/index.html")))
-            .or_else(|| ASSETS.get_file("index.html"))
-    };
-
-    match file {
-        Some(file) => {
-            let mime = from_path(file.path()).first_or_octet_stream();
-            let cache = if mime.type_() == mime_guess::mime::TEXT
-                && mime.subtype() == mime_guess::mime::HTML
-            {
-                "no-cache"
-            } else {
-                "public, max-age=31536000, immutable"
-            };
-            Response::builder()
-                .status(StatusCode::OK)
-                .header("Content-Type", mime.as_ref())
-                .header("Cache-Control", cache)
-                .body(Body::from(file.contents().to_vec()))
-                .unwrap()
-        }
-        None => not_found(),
-    }
+async fn not_found(OriginalUri(uri): OriginalUri) -> (StatusCode, axum::Json<serde_json::Value>) {
+    (
+        StatusCode::NOT_FOUND,
+        axum::Json(json!({
+            "error": "not_found",
+            "message": format!("No route for {}.", uri.path()),
+        })),
+    )
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use axum::body::to_bytes;
-    use axum::http::{Method, header};
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Method, Request, header};
     use serde_json::Value;
     use tower::ServiceExt;
 
@@ -927,26 +893,40 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn spa_routes_serve_index_html() {
-        let app = router(test_state());
-        for path in [
-            "/",
-            "/onboard",
-            "/onboard/anything?x=1",
-            "/some/unknown/route",
+    async fn browser_routes_redirect_to_the_pages_app() {
+        let app = router(test_state().with_pages_url("https://pages.test"));
+        for (path, expected) in [
+            ("/", "https://pages.test"),
+            ("/onboard", "https://pages.test/onboard"),
+            (
+                "/onboard/anything?x=1",
+                "https://pages.test/onboard/anything?x=1",
+            ),
+            ("/fund?address=abc", "https://pages.test/onramp?address=abc"),
+            (
+                "/authorize?request=req",
+                "https://pages.test/connect?request=req",
+            ),
         ] {
             let res = app
                 .clone()
                 .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
                 .await
                 .unwrap();
-            assert_eq!(res.status(), StatusCode::OK, "{path}");
-            let ct = res.headers()[header::CONTENT_TYPE]
-                .to_str()
-                .unwrap()
-                .to_string();
-            assert!(ct.starts_with("text/html"), "{path}: {ct}");
+            assert_eq!(res.status(), StatusCode::TEMPORARY_REDIRECT, "{path}");
+            assert_eq!(res.headers()[header::LOCATION], expected, "{path}");
         }
+
+        let missing = app
+            .oneshot(
+                Request::builder()
+                    .uri("/some/unknown/route")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     }
 
     /// A driver whose provisioning blocks until the test opens the gate,

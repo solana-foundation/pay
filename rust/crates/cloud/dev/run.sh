@@ -95,8 +95,8 @@ fi
 PUBLIC_URL="${PUBLIC_URL:-http://127.0.0.1:$PORT}"
 
 if [ "$SKIP_BUILD" = 0 ]; then
-  step "Building the web bundles"
-  (cd "$ROOT/web-ui" && pnpm install --frozen-lockfile --silent && pnpm -s build >/dev/null && pnpm -s build:cloud >/dev/null)
+  step "Building the payment debugger web bundle"
+  (cd "$ROOT/web-ui" && pnpm install --frozen-lockfile --silent && pnpm -s build >/dev/null)
   step "Building pay-cloud and the pay CLI"
   (cd "$ROOT/rust" && cargo build -q -p pay-cloud -p pay)
 fi
@@ -164,7 +164,7 @@ $( [ -n "$STATIC_TOKEN" ] && printf '  Header-authenticated host (Grok custom co
   CLI, buy USDC with a card (Coinflow sandbox, test card 4242 4242 4242 4242):
     PAY_ONRAMP=coinflow PAY_CLOUD_LOCAL=1 $ROOT/rust/target/debug/pay topup
 
-  Pages:  $PUBLIC_URL/onboard   $PUBLIC_URL/fund?address=<pubkey>   $PUBLIC_URL/authorize
+  Pages:  ${PAY_CLOUD_PAGES_URL:-https://pay.sh}/connect   ${PAY_CLOUD_PAGES_URL:-https://pay.sh}/onramp
   OAuth:  $PUBLIC_URL/.well-known/oauth-authorization-server
 $( if [ -n "${PRIVY_APP_ID:-}" ]; then printf '  Privy:  consent page signs users in with app %s; wallets get signer %s\n' "$PRIVY_APP_ID" "${PRIVY_SIGNER_ID:-?}"; else printf '  Privy:  off (set PRIVY_APP_ID, PRIVY_APP_SECRET, PRIVY_VERIFICATION_KEY,\n          PRIVY_AUTHORIZATION_PRIVATE_KEY, PRIVY_SIGNER_ID in .env)\n'; fi )
 
