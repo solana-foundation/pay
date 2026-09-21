@@ -326,7 +326,7 @@ fn select_account(
 /// created at payment time (those are software keys that sign anything).
 ///
 /// Lets a caller pick a payment offer the account can actually sign before
-/// committing to it; see [`crate::runner::RunOutcome::for_account`].
+/// committing to it; see [`crate::runner::RunOutcome::for_configured_signer`].
 pub fn backend_for_network(
     network: &str,
     store: &dyn AccountsStore,

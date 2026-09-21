@@ -425,8 +425,9 @@ fn resolve_onramp_host() -> String {
 /// dismiss the TUI at any time with `Esc`/`q`/`Ctrl-C`, which yields
 /// `Ok(None)`.
 ///
-/// When stderr is not a TTY (e.g. CI, piped output), this falls back to
-/// printing static top-up instructions and returns `Ok(None)` immediately.
+/// When stderr is not a TTY (e.g. CI, piped output), this asks the user to
+/// rerun interactively and returns `Ok(None)` immediately. Account-derived
+/// funding details are not written to redirected logs.
 ///
 /// # Parameters
 /// - `pubkey`: base58 destination address shown in the QR code and threaded
@@ -447,7 +448,9 @@ pub fn run_topup_flow(
 ) -> pay_core::Result<Option<TopupCompletion>> {
     let onramp_host = resolve_onramp_host();
     if !std::io::IsTerminal::is_terminal(&std::io::stderr()) {
-        print_topup_instructions(pubkey, &onramp_host, account_name);
+        eprintln!(
+            "Top-up details require an interactive terminal. Run `pay topup` from a terminal."
+        );
         return Ok(None);
     }
 
@@ -1628,27 +1631,6 @@ fn render_topup_controls(
     };
 
     controls_bar(frame, area, entries, Some(Line::from(status_spans)));
-}
-
-fn print_topup_instructions(pubkey: &str, onramp_host: &str, account_name: &str) {
-    eprintln!("Top up your pay account:");
-    eprintln!("  Address: {pubkey}");
-    eprintln!("  1. Transfer funds from an existing Solana account.");
-    let provider = OnrampProvider::current();
-    let url = match provider {
-        OnrampProvider::Moonpay => build_onramp_url(onramp_host, pubkey, None),
-        OnrampProvider::Coinflow => crate::commands::cloud_onboard::build_fund_url(
-            &crate::commands::cloud_onboard::FundUrlParams {
-                cloud_url: onramp_host,
-                address: pubkey,
-                callback: None,
-                state: None,
-                account: account_name,
-                cli: env!("CARGO_PKG_VERSION"),
-            },
-        ),
-    };
-    eprintln!("  2. Buy USDC with {}: {url}", provider.display_name());
 }
 
 fn build_onramp_redirect_url(host: &str) -> String {

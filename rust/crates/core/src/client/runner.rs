@@ -505,6 +505,54 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
+#[derive(Clone, Copy)]
+enum RawMessageSupport {
+    Supported,
+    TransactionsOnly(&'static str),
+}
+
+impl RawMessageSupport {
+    fn from_backend(backend: &dyn crate::backend::SigningBackend) -> Self {
+        if backend.signs_raw_messages() {
+            Self::Supported
+        } else {
+            Self::TransactionsOnly(backend.display_name())
+        }
+    }
+
+    fn from_capability(signs_raw_messages: bool) -> Self {
+        if signs_raw_messages {
+            Self::Supported
+        } else {
+            Self::TransactionsOnly("The selected signer")
+        }
+    }
+
+    fn require(self, what: &str) -> Result<()> {
+        match self {
+            Self::Supported => Ok(()),
+            Self::TransactionsOnly(name) => Err(Error::Config(format!(
+                "{name} cannot sign {what}: it needs a raw message signature, but \
+                 this signer only signs transactions. Pay with a charge or a client-signed \
+                 session instead, or use a software or remote wallet for this service."
+            ))),
+        }
+    }
+
+    fn check_session(self, challenge: &mpp::Challenge) -> Result<()> {
+        let request = challenge
+            .request
+            .decode::<pay_kit::mpp::SessionRequest>()
+            .map_err(|error| Error::Mpp(format!("invalid MPP session challenge: {error}")))?;
+        if request.method_details.voucher_signer
+            == Some(pay_kit::mpp::SessionVoucherSigner::Operator)
+        {
+            self.require("an operator-signed session proof")?;
+        }
+        Ok(())
+    }
+}
+
 impl RunOutcome {
     /// A 402 that names a payment pay knows how to make.
     fn is_payment_challenge(&self) -> bool {
@@ -530,13 +578,17 @@ impl RunOutcome {
     /// 402 offered nothing else, the refusal becomes a `PaymentRejected`
     /// with the reason. Every other variant passes through unchanged.
     pub fn for_signer(self, backend: &dyn crate::backend::SigningBackend) -> RunOutcome {
+        self.for_raw_message_support(RawMessageSupport::from_backend(backend))
+    }
+
+    fn for_raw_message_support(self, support: RawMessageSupport) -> RunOutcome {
         match self {
             RunOutcome::SessionChallenge {
                 challenge,
                 fallback,
                 advertised_challenges,
                 resource_url,
-            } => match crate::client::session::check_signer(&challenge, backend) {
+            } => match support.check_session(&challenge) {
                 Ok(()) => RunOutcome::SessionChallenge {
                     challenge,
                     fallback,
@@ -547,7 +599,6 @@ impl RunOutcome {
                     Some(offer) => {
                         info!(
                             resource = %resource_url,
-                            backend = backend.id(),
                             "Skipping MPP session the signer cannot open; taking the next offer"
                         );
                         *offer
@@ -560,7 +611,7 @@ impl RunOutcome {
                 payment_fallback,
                 advertised_challenges,
                 resource_url,
-            } => match backend.require_raw_message_signing("an x402 sign-in challenge") {
+            } => match support.require("an x402 sign-in challenge") {
                 Ok(()) => RunOutcome::X402SignInChallenge {
                     challenge,
                     payment_fallback,
@@ -571,7 +622,6 @@ impl RunOutcome {
                     Some(payment) => {
                         info!(
                             resource = %resource_url,
-                            backend = backend.id(),
                             "Skipping x402 sign-in the signer cannot produce; paying instead"
                         );
                         RunOutcome::X402Challenge {
@@ -618,7 +668,10 @@ impl RunOutcome {
             _ => return Ok(self),
         };
         match crate::signer::backend_for_network(&network, store, account_override)? {
-            Some(backend) => Ok(self.for_signer(backend)),
+            Some(backend) => {
+                let support = RawMessageSupport::from_capability(backend.signs_raw_messages());
+                Ok(self.for_raw_message_support(support))
+            }
             None => Ok(self),
         }
     }
@@ -2183,10 +2236,7 @@ HTTP request sent, awaiting response...
         use crate::backend::testing::SignsAnything;
         let outcome = classify_402(&session_and_charge_402("operator"), None, "https://e.com/r")
             .for_signer(&SignsAnything);
-        assert!(
-            matches!(outcome, RunOutcome::SessionChallenge { .. }),
-            "{outcome:?}"
-        );
+        assert!(matches!(outcome, RunOutcome::SessionChallenge { .. }));
     }
 
     #[test]
@@ -2312,10 +2362,7 @@ HTTP request sent, awaiting response...
         let outcome = classify_402(&session_and_charge_402("operator"), None, "https://e.com/r")
             .for_configured_signer(&store, None, None)
             .unwrap();
-        assert!(
-            matches!(outcome, RunOutcome::MppChallenge { .. }),
-            "{outcome:?}"
-        );
+        assert!(matches!(outcome, RunOutcome::MppChallenge { .. }));
     }
 
     /// An x402 402 offering sign-in-with-x beside an exact payment.
