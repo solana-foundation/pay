@@ -667,9 +667,9 @@ impl RunOutcome {
             }
             _ => return Ok(self),
         };
-        match crate::signer::backend_for_network(&network, store, account_override)? {
-            Some(backend) => {
-                let support = RawMessageSupport::from_capability(backend.signs_raw_messages());
+        match crate::signer::raw_message_support_for_network(&network, store, account_override)? {
+            Some(signs_raw_messages) => {
+                let support = RawMessageSupport::from_capability(signs_raw_messages);
                 Ok(self.for_raw_message_support(support))
             }
             None => Ok(self),
@@ -2255,10 +2255,7 @@ HTTP request sent, awaiting response...
         use crate::backend::testing::TransactionsOnly;
         let outcome = classify_402(&session_and_charge_402("client"), None, "https://e.com/r")
             .for_signer(&TransactionsOnly);
-        assert!(
-            matches!(outcome, RunOutcome::SessionChallenge { .. }),
-            "{outcome:?}"
-        );
+        assert!(matches!(outcome, RunOutcome::SessionChallenge { .. }));
     }
 
     #[test]

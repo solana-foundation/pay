@@ -339,6 +339,19 @@ pub fn backend_for_network(
     }
 }
 
+/// Whether the configured signer can produce raw message signatures.
+///
+/// Returning only a boolean keeps account-derived configuration data out of
+/// callers that may later write an unrelated HTTP response body to stdout.
+pub fn raw_message_support_for_network(
+    network: &str,
+    store: &dyn AccountsStore,
+    account_override: Option<&str>,
+) -> Result<Option<bool>> {
+    Ok(backend_for_network(network, store, account_override)?
+        .map(crate::backend::SigningBackend::signs_raw_messages))
+}
+
 /// Fall back to a same-named `mainnet` account when the current network
 /// has no mapping and the account signs remotely (`keystore: remote`).
 ///
