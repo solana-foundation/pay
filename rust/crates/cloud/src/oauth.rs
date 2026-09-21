@@ -148,6 +148,12 @@ impl TokenError {
             description: description.into(),
         }
     }
+    fn temporarily_unavailable(description: impl Into<String>) -> Self {
+        Self {
+            error: "temporarily_unavailable",
+            description: description.into(),
+        }
+    }
 }
 
 /// Access and refresh tokens handed to a client.
@@ -380,11 +386,10 @@ impl Store {
         code_verifier: &str,
         redirect_uri: Option<&str>,
     ) -> Result<TokenResponse, TokenError> {
-        let grant = self
-            .codes
-            .lock()
-            .unwrap()
-            .remove(&sha256_hex(code))
+        let code_hash = sha256_hex(code);
+        let mut codes = self.codes.lock().unwrap();
+        let grant = codes
+            .remove(&code_hash)
             .ok_or_else(|| TokenError::invalid_grant("unknown or already used code"))?;
         if self.now().saturating_duration_since(grant.created_at) > CODE_TTL {
             return Err(TokenError::invalid_grant("the code has expired"));
@@ -409,7 +414,15 @@ impl Store {
                 "code_verifier does not match code_challenge",
             ));
         }
-        Ok(self.issue(&grant.client_id, &grant.subject, &grant.scope))
+        match self.issue(&grant.client_id, &grant.subject, &grant.scope) {
+            Ok(tokens) => Ok(tokens),
+            Err(err) => {
+                // Capacity is transient; do not burn a valid code when no
+                // usable token pair could be persisted.
+                codes.insert(code_hash, grant);
+                Err(err)
+            }
+        }
     }
 
     /// Refresh grant with rotation: the presented refresh token is retired
@@ -420,8 +433,9 @@ impl Store {
         refresh_token: &str,
     ) -> Result<TokenResponse, TokenError> {
         let mut tokens = self.tokens.lock().unwrap();
+        let refresh_hash = sha256_hex(refresh_token);
         let record = tokens
-            .remove(&sha256_hex(refresh_token))
+            .remove(&refresh_hash)
             .ok_or_else(|| TokenError::invalid_grant("unknown or already used refresh token"))?;
         if record.kind != TokenKind::Refresh {
             return Err(TokenError::invalid_grant("not a refresh token"));
@@ -434,21 +448,56 @@ impl Store {
         if self.now() > record.expires_at {
             return Err(TokenError::invalid_grant("the refresh token has expired"));
         }
-        drop(tokens);
-        Ok(self.issue(&record.client_id, &record.subject, &record.scope))
+        match Self::issue_into(
+            &mut tokens,
+            self.now(),
+            &record.client_id,
+            &record.subject,
+            &record.scope,
+        ) {
+            Ok(tokens) => Ok(tokens),
+            Err(err) => {
+                tokens.insert(refresh_hash, record);
+                Err(err)
+            }
+        }
     }
 
-    fn issue(&self, client_id: &str, subject: &str, scope: &str) -> TokenResponse {
+    fn issue(
+        &self,
+        client_id: &str,
+        subject: &str,
+        scope: &str,
+    ) -> Result<TokenResponse, TokenError> {
+        Self::issue_into(
+            &mut self.tokens.lock().unwrap(),
+            self.now(),
+            client_id,
+            subject,
+            scope,
+        )
+    }
+
+    fn issue_into(
+        tokens: &mut HashMap<String, TokenRecord>,
+        now: Instant,
+        client_id: &str,
+        subject: &str,
+        scope: &str,
+    ) -> Result<TokenResponse, TokenError> {
+        tokens.retain(|_, token| now <= token.expires_at);
+        if tokens.len() > MAX_ROWS.saturating_sub(2) {
+            return Err(TokenError::temporarily_unavailable(
+                "The token store is full. Try again later.",
+            ));
+        }
         let access_token = random_token();
         let refresh_token = random_token();
-        let now = self.now();
-        let mut tokens = self.tokens.lock().unwrap();
         for (token, kind, ttl) in [
             (&access_token, TokenKind::Access, ACCESS_TTL),
             (&refresh_token, TokenKind::Refresh, REFRESH_TTL),
         ] {
-            insert_bounded(
-                &mut tokens,
+            tokens.insert(
                 sha256_hex(token),
                 TokenRecord {
                     kind,
@@ -457,16 +506,15 @@ impl Store {
                     scope: scope.to_string(),
                     expires_at: now + ttl,
                 },
-                |t| now > t.expires_at,
             );
         }
-        TokenResponse {
+        Ok(TokenResponse {
             access_token,
             token_type: "Bearer",
             expires_in: ACCESS_TTL.as_secs(),
             refresh_token,
             scope: scope.to_string(),
-        }
+        })
     }
 
     /// Forget a token of either kind. Unknown tokens are fine (RFC 7009).
@@ -554,12 +602,15 @@ pub struct RegistrationRequest {
 /// `POST /oauth/register`
 pub async fn register(State(state): State<AppState>, body: Bytes) -> Result<Response, ApiError> {
     let store = oauth_of(&state)?;
-    // Registration bodies carry no secrets, and what a host sends is the
-    // first thing to read when its handshake stalls.
-    tracing::info!(body = %String::from_utf8_lossy(&body), "oauth registration request");
     let req: RegistrationRequest = serde_json::from_slice(&body).map_err(|e| {
         ApiError::bad_request("invalid_client_metadata", format!("Invalid JSON: {e}"))
     })?;
+    tracing::info!(
+        name = req.client_name.as_deref().unwrap_or("-"),
+        redirect_count = req.redirect_uris.len(),
+        auth = req.token_endpoint_auth_method.as_deref().unwrap_or("none"),
+        "oauth registration request"
+    );
     let (client, secret) = store.register(req)?;
     tracing::info!(
         client_id = %client.client_id,
@@ -974,38 +1025,52 @@ async fn approve_with_privy(
     let subject = crate::privy::subject_for_user(&identity.user_id);
     let mut bound = None;
     if state.tenants().get(&subject).is_none() {
-        let wallet = match privy.solana_wallet(&identity.user_id).await {
-            Ok(Some(existing)) => {
-                bound = Some(Bound::Existing);
-                Ok(existing)
+        let _claim = state
+            .tenants()
+            .claim_provisioning(&subject)
+            .ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::CONFLICT,
+                    "provisioning",
+                    "This wallet is already being prepared. Try again in a moment.",
+                )
+            })?;
+        // A previous claimant may have completed between our first lookup
+        // and this reservation.
+        if state.tenants().get(&subject).is_none() {
+            let wallet = match privy.solana_wallet(&identity.user_id).await {
+                Ok(Some(existing)) => {
+                    bound = Some(Bound::Existing);
+                    Ok(existing)
+                }
+                Ok(None) => {
+                    bound = Some(Bound::Created);
+                    privy.create_wallet(&identity.user_id).await
+                }
+                Err(e) => Err(e),
             }
-            Ok(None) => {
-                bound = Some(Bound::Created);
-                privy.create_wallet(&identity.user_id).await
+            .map_err(|e| {
+                tracing::warn!(error = %e, "privy wallet lookup failed");
+                ApiError::new(StatusCode::BAD_GATEWAY, "provider_error", e.to_string())
+            })?;
+            if !wallet.pay_can_sign {
+                return Err(ApiError::new(
+                    StatusCode::CONFLICT,
+                    "signer_required",
+                    format!(
+                        "Your Privy wallet {} does not let pay sign yet. Add pay as a signer, then approve again.",
+                        wallet.address
+                    ),
+                )
+                .with_details(serde_json::json!({
+                    "address": wallet.address,
+                    "signer_id": privy.signer_id(),
+                    "policy_id": privy.policy_id(),
+                })));
             }
-            Err(e) => Err(e),
+            tracing::info!(%subject, address = %wallet.address, ?bound, "privy tenant bound");
+            state.tenants().bind(privy.tenant_record(&subject, &wallet));
         }
-        .map_err(|e| {
-            tracing::warn!(error = %e, "privy wallet lookup failed");
-            ApiError::new(StatusCode::BAD_GATEWAY, "provider_error", e.to_string())
-        })?;
-        if !wallet.pay_can_sign {
-            return Err(ApiError::new(
-                StatusCode::CONFLICT,
-                "signer_required",
-                format!(
-                    "Your Privy wallet {} does not let pay sign yet. Add pay as a signer, then approve again.",
-                    wallet.address
-                ),
-            )
-            .with_details(serde_json::json!({
-                "address": wallet.address,
-                "signer_id": privy.signer_id(),
-                "policy_id": privy.policy_id(),
-            })));
-        }
-        tracing::info!(%subject, address = %wallet.address, ?bound, "privy tenant bound");
-        state.tenants().bind(privy.tenant_record(&subject, &wallet));
     }
     Ok((subject, bound))
 }
@@ -1084,10 +1149,10 @@ fn basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
 }
 
 fn token_error(err: TokenError) -> Response {
-    let status = if err.error == "invalid_client" {
-        StatusCode::UNAUTHORIZED
-    } else {
-        StatusCode::BAD_REQUEST
+    let status = match err.error {
+        "invalid_client" => StatusCode::UNAUTHORIZED,
+        "temporarily_unavailable" => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::BAD_REQUEST,
     };
     let mut response = (
         status,
@@ -1109,21 +1174,62 @@ pub async fn token(
     let Some(store) = state.oauth() else {
         return token_error(TokenError::invalid_request("OAuth is not enabled."));
     };
+    let has_authorization = headers.contains_key(header::AUTHORIZATION);
     let basic = basic_credentials(&headers);
-    let client_id = match form
-        .client_id
-        .as_deref()
-        .filter(|c| !c.is_empty())
-        .or(basic.as_ref().map(|(id, _)| id.as_str()))
+    if has_authorization && basic.is_none() {
+        return token_error(TokenError::invalid_client(
+            "Authorization must contain valid HTTP Basic credentials.",
+        ));
+    }
+    if basic.is_some()
+        && (form.client_id.as_deref().is_some_and(|id| !id.is_empty())
+            || form
+                .client_secret
+                .as_deref()
+                .is_some_and(|secret| !secret.is_empty()))
     {
-        Some(id) => id.to_string(),
-        None => return token_error(TokenError::invalid_client("client_id is required.")),
+        return token_error(TokenError::invalid_request(
+            "Use exactly one client authentication method.",
+        ));
+    }
+    let client_id = basic.as_ref().map(|(id, _)| id.clone()).or_else(|| {
+        form.client_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+    });
+    let Some(client_id) = client_id else {
+        return token_error(TokenError::invalid_client("client_id is required."));
     };
     let client_id = client_id.as_str();
-    let secret = form
-        .client_secret
-        .as_deref()
-        .or(basic.as_ref().map(|(_, s)| s.as_str()));
+    let Some(client) = store.client(client_id) else {
+        return token_error(TokenError::invalid_client("unknown client_id"));
+    };
+    let secret = match client.token_endpoint_auth_method.as_str() {
+        "none" if basic.is_none() && form.client_secret.is_none() => None,
+        "client_secret_post" if basic.is_none() => form.client_secret.as_deref(),
+        "client_secret_basic" if basic.is_some() => basic.as_ref().map(|(_, s)| s.as_str()),
+        "none" => {
+            return token_error(TokenError::invalid_client(
+                "This client must not send a client secret.",
+            ));
+        }
+        "client_secret_post" => {
+            return token_error(TokenError::invalid_client(
+                "This client must authenticate with client_secret in the request body.",
+            ));
+        }
+        "client_secret_basic" => {
+            return token_error(TokenError::invalid_client(
+                "This client must authenticate with HTTP Basic.",
+            ));
+        }
+        _ => {
+            return token_error(TokenError::invalid_client(
+                "unsupported client authentication",
+            ));
+        }
+    };
     if let Err(err) = store.authenticate_client(client_id, secret) {
         return token_error(err);
     }
@@ -1232,20 +1338,19 @@ pub async fn link_complete(
                 "Sign in to link a wallet.",
             )
         })?;
-    // Check the ticket before touching Privy, consume it only on success.
-    let guest = state
+    // Reserve the ticket before touching Privy. The claim is released on
+    // every error, so a provider failure can be retried safely.
+    let claim = state
         .tenants()
-        .peek_link(&ticket)
+        .claim_link(&ticket)
         .ok_or_else(unknown_link)?;
+    let guest = claim.subject().to_string();
     let (subject, bound) = approve_with_privy(&state, token).await?;
     let record = state.tenants().get(&subject).ok_or_else(unknown_request)?;
-    state
-        .tenants()
-        .take_link(&ticket)
-        .ok_or_else(unknown_link)?;
     let mut linked = (*record).clone();
     linked.subject = guest.clone();
     state.tenants().bind(linked);
+    claim.commit();
     tracing::info!(%guest, %subject, address = %record.pubkey, "guest connection linked to a wallet");
     let funded = !(funding_enabled(&state)
         && (bound == Some(Bound::Created)
@@ -1373,6 +1478,52 @@ mod tests {
         let mut implicit = grok_registration();
         implicit.response_types = Some(vec!["token".to_string()]);
         assert!(store.register(implicit).is_err());
+    }
+
+    #[test]
+    fn a_full_token_store_does_not_consume_an_authorization_code() {
+        let store = Store::new("https://cloud.test");
+        let (client, _) = store.register(grok_registration()).unwrap();
+        let code = random_token();
+        store.codes.lock().unwrap().insert(
+            sha256_hex(&code),
+            CodeGrant {
+                client_id: client.client_id.clone(),
+                redirect_uri: GROK_REDIRECT.to_string(),
+                code_challenge: pkce_challenge(VERIFIER),
+                subject: "sub_1".to_string(),
+                scope: SCOPE.to_string(),
+                created_at: store.now(),
+            },
+        );
+        let expires_at = store.now() + REFRESH_TTL;
+        let mut tokens = store.tokens.lock().unwrap();
+        for i in 0..MAX_ROWS - 1 {
+            tokens.insert(
+                format!("token_{i}"),
+                TokenRecord {
+                    kind: TokenKind::Access,
+                    client_id: client.client_id.clone(),
+                    subject: "sub_other".to_string(),
+                    scope: SCOPE.to_string(),
+                    expires_at,
+                },
+            );
+        }
+        drop(tokens);
+
+        let err = store
+            .exchange_code(&client.client_id, &code, VERIFIER, Some(GROK_REDIRECT))
+            .unwrap_err();
+        assert_eq!(err.error, "temporarily_unavailable");
+        assert!(store.codes.lock().unwrap().contains_key(&sha256_hex(&code)));
+
+        store.tokens.lock().unwrap().clear();
+        assert!(
+            store
+                .exchange_code(&client.client_id, &code, VERIFIER, Some(GROK_REDIRECT))
+                .is_ok()
+        );
     }
 
     #[test]
@@ -2351,7 +2502,7 @@ mod tests {
         assert_eq!(with.status, StatusCode::BAD_REQUEST, "{}", with.body);
         assert_eq!(with.json()["error"], "invalid_grant");
 
-        // HTTP Basic works too and may carry the client id itself.
+        // A post-auth client cannot switch to HTTP Basic.
         use base64::Engine;
         let basic =
             base64::engine::general_purpose::STANDARD.encode(format!("{client_id}:{secret}"));
@@ -2367,7 +2518,55 @@ mod tests {
                 .unwrap(),
         )
         .await;
-        assert_eq!(reply.json()["error"], "invalid_grant", "{}", reply.body);
+        assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{}", reply.body);
+        assert_eq!(reply.json()["error"], "invalid_client", "{}", reply.body);
+
+        // A Basic client must use Basic and cannot combine it with form
+        // credentials, even when the ids happen to match.
+        let mut body = grok_dcr_body();
+        body["token_endpoint_auth_method"] = json!("client_secret_basic");
+        let registered = post_json(&app, "/oauth/register", body).await;
+        let basic_id = registered.json()["client_id"].as_str().unwrap().to_string();
+        let basic_secret = registered.json()["client_secret"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let basic =
+            base64::engine::general_purpose::STANDARD.encode(format!("{basic_id}:{basic_secret}"));
+        let accepted = send(
+            &app,
+            Request::builder()
+                .method(Method::POST)
+                .uri("/oauth/token")
+                .header(header::HOST, "cloud.test")
+                .header(header::AUTHORIZATION, format!("Basic {basic}"))
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("grant_type=refresh_token&refresh_token=x"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            accepted.json()["error"],
+            "invalid_grant",
+            "{}",
+            accepted.body
+        );
+        let conflicting = send(
+            &app,
+            Request::builder()
+                .method(Method::POST)
+                .uri("/oauth/token")
+                .header(header::HOST, "cloud.test")
+                .header(header::AUTHORIZATION, format!("Basic {basic}"))
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(format!(
+                    "grant_type=refresh_token&refresh_token=x&client_id={basic_id}"
+                )))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(conflicting.status, StatusCode::BAD_REQUEST);
+        assert_eq!(conflicting.json()["error"], "invalid_request");
     }
 
     fn app_state_has_no_plaintext(_secret: &str) -> bool {

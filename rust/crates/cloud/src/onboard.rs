@@ -617,6 +617,38 @@ pub async fn complete(
         return complete_for_returning_connector(&state, authorization, driver, &grant, existing);
     }
 
+    // Separate OAuth requests for the same provider account have separate
+    // onboarding sessions. Reserve the stable subject as well, so only one
+    // of them may perform first-time external provisioning.
+    #[cfg(feature = "mcp")]
+    let _subject_claim = if session.authorization.is_some() {
+        driver
+            .account_identity(&grant)
+            .map(|identity| {
+                let subject = crate::tenants::subject_for(driver.id(), &identity);
+                state.tenants().claim_provisioning(&subject).ok_or_else(|| {
+                    state.release_provisioning(&echoed_state);
+                    ApiError::new(
+                        StatusCode::CONFLICT,
+                        "provisioning",
+                        "This provider account is already being prepared. Try again in a moment.",
+                    )
+                })
+            })
+            .transpose()?
+    } else {
+        None
+    };
+
+    // A previous claimant may have bound the tenant just before this claim.
+    #[cfg(feature = "mcp")]
+    if let Some(authorization) = session.authorization.as_deref()
+        && let Some(existing) = returning_tenant(&state, driver, &grant)
+    {
+        state.take_session(&session.code);
+        return complete_for_returning_connector(&state, authorization, driver, &grant, existing);
+    }
+
     let wallet = match driver.provision(&grant).await {
         Ok(wallet) => wallet,
         Err(err) => {

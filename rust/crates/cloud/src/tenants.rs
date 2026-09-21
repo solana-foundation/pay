@@ -9,7 +9,7 @@
 //! This is the in-memory registry; the Postgres-backed store replaces it
 //! without changing the context.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -110,12 +110,14 @@ impl TenantRecord {
 struct LinkTicket {
     subject: String,
     created_at: Instant,
+    claimed: bool,
 }
 
 /// Every bound tenant, by subject, plus the link tickets outstanding.
 pub struct TenantRegistry {
     tenants: Mutex<HashMap<String, Arc<TenantRecord>>>,
     links: Mutex<HashMap<String, LinkTicket>>,
+    provisioning: Mutex<HashSet<String>>,
     ledger: Arc<dyn SpendLedger>,
 }
 
@@ -134,6 +136,7 @@ impl TenantRegistry {
         Self {
             tenants: Mutex::default(),
             links: Mutex::default(),
+            provisioning: Mutex::default(),
             ledger,
         }
     }
@@ -144,17 +147,19 @@ impl TenantRegistry {
         let ticket = crate::onboard::random_token();
         let now = Instant::now();
         let mut links = self.links.lock().unwrap();
+        links.retain(|_, t| now.saturating_duration_since(t.created_at) <= LINK_TTL);
+        if links.values().any(|ticket| ticket.subject == subject) {
+            return None;
+        }
         if links.len() >= MAX_LINKS {
-            links.retain(|_, t| now.saturating_duration_since(t.created_at) <= LINK_TTL);
-            if links.len() >= MAX_LINKS {
-                return None;
-            }
+            return None;
         }
         links.insert(
             crate::onboard::sha256_hex(&ticket),
             LinkTicket {
                 subject: subject.to_string(),
                 created_at: now,
+                claimed: false,
             },
         );
         Some(ticket)
@@ -164,18 +169,38 @@ impl TenantRegistry {
     pub fn peek_link(&self, ticket: &str) -> Option<String> {
         let links = self.links.lock().unwrap();
         let t = links.get(&crate::onboard::sha256_hex(ticket))?;
-        (Instant::now().saturating_duration_since(t.created_at) <= LINK_TTL)
+        (!t.claimed && Instant::now().saturating_duration_since(t.created_at) <= LINK_TTL)
             .then(|| t.subject.clone())
     }
 
-    /// Consume a live ticket.
-    pub fn take_link(&self, ticket: &str) -> Option<String> {
-        let t = self
-            .links
-            .lock()
-            .unwrap()
-            .remove(&crate::onboard::sha256_hex(ticket))?;
-        (Instant::now().saturating_duration_since(t.created_at) <= LINK_TTL).then_some(t.subject)
+    /// Reserve a live ticket before external provisioning. Dropping the
+    /// claim releases it for a retry; committing consumes it.
+    pub(crate) fn claim_link<'a>(&'a self, ticket: &str) -> Option<LinkClaim<'a>> {
+        let key = crate::onboard::sha256_hex(ticket);
+        let mut links = self.links.lock().unwrap();
+        let entry = links.get_mut(&key)?;
+        if entry.claimed || Instant::now().saturating_duration_since(entry.created_at) > LINK_TTL {
+            return None;
+        }
+        entry.claimed = true;
+        Some(LinkClaim {
+            registry: self,
+            key,
+            subject: entry.subject.clone(),
+            committed: false,
+        })
+    }
+
+    /// Reserve first-time provisioning for one stable provider subject.
+    pub(crate) fn claim_provisioning<'a>(&'a self, subject: &str) -> Option<ProvisioningClaim<'a>> {
+        let mut provisioning = self.provisioning.lock().unwrap();
+        if !provisioning.insert(subject.to_string()) {
+            return None;
+        }
+        Some(ProvisioningClaim {
+            registry: self,
+            subject: subject.to_string(),
+        })
     }
 
     /// Bind (or rebind) a subject to a wallet.
@@ -216,6 +241,49 @@ impl TenantRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+pub(crate) struct LinkClaim<'a> {
+    registry: &'a TenantRegistry,
+    key: String,
+    subject: String,
+    committed: bool,
+}
+
+impl LinkClaim<'_> {
+    pub fn subject(&self) -> &str {
+        &self.subject
+    }
+
+    pub fn commit(mut self) {
+        self.registry.links.lock().unwrap().remove(&self.key);
+        self.committed = true;
+    }
+}
+
+impl Drop for LinkClaim<'_> {
+    fn drop(&mut self) {
+        if !self.committed
+            && let Some(ticket) = self.registry.links.lock().unwrap().get_mut(&self.key)
+        {
+            ticket.claimed = false;
+        }
+    }
+}
+
+pub(crate) struct ProvisioningClaim<'a> {
+    registry: &'a TenantRegistry,
+    subject: String,
+}
+
+impl Drop for ProvisioningClaim<'_> {
+    fn drop(&mut self) {
+        self.registry
+            .provisioning
+            .lock()
+            .unwrap()
+            .remove(&self.subject);
     }
 }
 
@@ -490,10 +558,33 @@ mod tests {
         let ticket = registry.mint_link("guest_1").unwrap();
         assert!(ticket.len() >= 32);
         assert_eq!(registry.peek_link(&ticket).as_deref(), Some("guest_1"));
-        assert_eq!(registry.take_link(&ticket).as_deref(), Some("guest_1"));
+        let claim = registry.claim_link(&ticket).unwrap();
+        assert_eq!(claim.subject(), "guest_1");
+        assert!(registry.peek_link(&ticket).is_none(), "claimed");
+        drop(claim);
+        assert!(registry.peek_link(&ticket).is_some(), "released for retry");
+        registry.claim_link(&ticket).unwrap().commit();
         assert!(registry.peek_link(&ticket).is_none(), "consumed");
-        assert!(registry.take_link("nope").is_none());
+        assert!(registry.claim_link("nope").is_none());
         assert!(is_guest("guest_abc") && !is_guest("sub_abc"));
+    }
+
+    #[test]
+    fn a_guest_can_hold_only_one_link_ticket() {
+        let registry = TenantRegistry::new();
+        assert!(registry.mint_link("guest_1").is_some());
+        assert!(registry.mint_link("guest_1").is_none());
+        assert!(registry.mint_link("guest_2").is_some());
+    }
+
+    #[test]
+    fn first_time_provisioning_is_exclusive_per_subject() {
+        let registry = TenantRegistry::new();
+        let first = registry.claim_provisioning("sub_1").unwrap();
+        assert!(registry.claim_provisioning("sub_1").is_none());
+        assert!(registry.claim_provisioning("sub_2").is_some());
+        drop(first);
+        assert!(registry.claim_provisioning("sub_1").is_some());
     }
 
     #[test]

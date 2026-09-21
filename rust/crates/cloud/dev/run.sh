@@ -11,6 +11,9 @@
 #   rust/crates/cloud/dev/run.sh --anonymous              # DEV ONLY: no-auth hosts act as that wallet
 #   rust/crates/cloud/dev/run.sh --tunnel --anonymous     # Grok demo: quick tunnel + no-auth mock wallet
 #   rust/crates/cloud/dev/run.sh --funnel --anonymous     # same, on a stable Tailscale Funnel hostname
+#   rust/crates/cloud/dev/run.sh --funnel --funnel-port 8443 --port 8403 --mock-port 8498
+#                                                 # a second instance beside the first (Funnel also
+#                                                 # serves 8443 and 10000), e.g. Privy for Claude.ai
 #
 # Reads the repo-root .env (Coinflow sandbox settings) when present.
 # Ctrl-C stops everything.
@@ -26,6 +29,8 @@ STATIC_TOKEN=""
 ANONYMOUS=0
 TUNNEL=0
 FUNNEL=0
+FUNNEL_PORT=443
+FUNNEL_ACTIVE=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -37,7 +42,9 @@ while [ $# -gt 0 ]; do
     --anonymous) ANONYMOUS=1; shift ;;
     --tunnel) TUNNEL=1; shift ;;
     --funnel) FUNNEL=1; shift ;;
-    -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
+    --funnel-port) FUNNEL_PORT="$2"; shift 2 ;;
+    --mock-port) MOCK_PORT="$2"; shift 2 ;;
+    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
 done
@@ -45,7 +52,14 @@ done
 step() { printf '\n\033[1m› %s\033[0m\n' "$*"; }
 
 PIDS=()
-cleanup() { for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null || true; done; }
+cleanup() {
+  if [ "$FUNNEL_ACTIVE" = 1 ]; then
+    tailscale funnel --https="$FUNNEL_PORT" off >/dev/null 2>&1 || true
+  fi
+  for p in "${PIDS[@]:-}"; do
+    [ -n "$p" ] && kill "$p" 2>/dev/null || true
+  done
+}
 trap cleanup EXIT INT TERM
 
 if [ "$TUNNEL" = 1 ]; then
@@ -70,10 +84,12 @@ if [ "$FUNNEL" = 1 ]; then
   # survives restarts, unlike a quick tunnel. Needs `tailscale up` and
   # Funnel enabled for the tailnet (the command says how if it is not).
   command -v tailscale >/dev/null || { echo "tailscale not found" >&2; exit 1; }
-  step "Exposing 127.0.0.1:$PORT through Tailscale Funnel"
-  tailscale funnel --bg "$PORT" >/dev/null
+  step "Exposing 127.0.0.1:$PORT through Tailscale Funnel on :$FUNNEL_PORT"
+  tailscale funnel --bg --https="$FUNNEL_PORT" "$PORT" >/dev/null
+  FUNNEL_ACTIVE=1
   HOST="$(tailscale status --json | python3 -c 'import sys,json; print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))')"
   PUBLIC_URL="https://$HOST"
+  [ "$FUNNEL_PORT" != 443 ] && PUBLIC_URL="$PUBLIC_URL:$FUNNEL_PORT"
 fi
 
 PUBLIC_URL="${PUBLIC_URL:-http://127.0.0.1:$PORT}"
@@ -84,9 +100,6 @@ if [ "$SKIP_BUILD" = 0 ]; then
   step "Building pay-cloud and the pay CLI"
   (cd "$ROOT/rust" && cargo build -q -p pay-cloud -p pay)
 fi
-
-pkill -f 'target/debug/pay-cloud' 2>/dev/null || true
-pkill -f 'dev/mock_openfort.py' 2>/dev/null || true
 
 if [ -f "$ROOT/.env" ]; then
   set -a; . "$ROOT/.env"; set +a

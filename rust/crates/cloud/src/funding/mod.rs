@@ -14,7 +14,7 @@
 //! pay's merchant wallet, and the start response says so.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::Json;
@@ -22,6 +22,7 @@ use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use serde::{Deserialize, Serialize};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::AppState;
 use crate::onboard::{ApiError, validate_callback, validate_state};
@@ -36,6 +37,12 @@ pub const LINK_TTL_MINUTES: u32 = 30;
 pub const PAYMENT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Most payment records held at once; expired ones are swept when full.
 pub const MAX_PAYMENTS: usize = 8192;
+/// Provider-heavy checkout starts allowed at once across the service.
+pub const MAX_CONCURRENT_CHECKOUTS: usize = 8;
+/// Minimum interval between checkout starts for the same destination.
+pub const CHECKOUT_COOLDOWN: Duration = Duration::from_secs(5);
+/// Most destination throttles retained at once.
+pub const MAX_CHECKOUT_CLIENTS: usize = 8192;
 
 /// Card rails offered on the page. Bank rails need a payer identity and
 /// take days; PayPal and Venmo are not configured on the merchant.
@@ -49,10 +56,8 @@ pub const MERCHANT_ID_ENV: &str = "COINFLOW_MERCHANT_ID";
 pub const WEBHOOK_KEY_ENV: &str = "COINFLOW_WEBHOOK_KEY";
 pub const SETTLE_TO_CUSTOMER_ENV: &str = "COINFLOW_SETTLE_TO_CUSTOMER";
 pub const API_URL_ENV: &str = "COINFLOW_API_URL";
-/// `hosted` (default) or `direct`: whether pages embed Coinflow's hosted
-/// checkout in an iframe, or render card fields themselves through the
-/// Coinflow SDK (TokenEx). Direct entry needs the page's origin on the
-/// merchant's referrer allowlist at Coinflow and PCI SAQ A-EP.
+/// Card-entry mode. Only `hosted` is accepted until the pages app implements
+/// Coinflow's direct SDK and the deployment meets its PCI requirements.
 pub const CARD_ENTRY_ENV: &str = "COINFLOW_CARD_ENTRY";
 
 /// Coinflow environment. Decides the API host and the origin of the hosted
@@ -113,9 +118,6 @@ pub struct Config {
 pub enum CardEntry {
     /// Coinflow's hosted checkout page in an iframe; works from any origin.
     Hosted,
-    /// The page's own fields via the Coinflow SDK; the origin must be on
-    /// the merchant's allowlist at Coinflow.
-    Direct,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -124,8 +126,10 @@ pub enum ConfigError {
     BadEnv(String),
     #[error("{MERCHANT_ID_ENV} is required when {API_KEY_ENV} is set")]
     MissingMerchant,
-    #[error("{CARD_ENTRY_ENV} must be `hosted` or `direct`, got `{0}`")]
+    #[error("{CARD_ENTRY_ENV} must be `hosted`, got `{0}`")]
     BadCardEntry(String),
+    #[error("{CARD_ENTRY_ENV}=direct is not supported yet; use `hosted`")]
+    DirectCardEntryUnsupported,
 }
 
 impl Config {
@@ -148,7 +152,7 @@ impl Config {
             None => CardEntry::Hosted,
             Some(raw) => match raw.to_ascii_lowercase().as_str() {
                 "hosted" => CardEntry::Hosted,
-                "direct" => CardEntry::Direct,
+                "direct" => return Err(ConfigError::DirectCardEntryUnsupported),
                 _ => return Err(ConfigError::BadCardEntry(raw)),
             },
         };
@@ -411,6 +415,8 @@ fn rank(status: PaymentStatus) -> u8 {
 pub struct Funding {
     coinflow: Coinflow,
     payments: Mutex<HashMap<String, PaymentRecord>>,
+    checkout_slots: Arc<Semaphore>,
+    checkout_clients: Mutex<HashMap<String, Instant>>,
 }
 
 impl Funding {
@@ -418,11 +424,52 @@ impl Funding {
         Self {
             coinflow: Coinflow::new(cfg),
             payments: Mutex::default(),
+            checkout_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_CHECKOUTS)),
+            checkout_clients: Mutex::default(),
         }
     }
 
     pub fn config(&self) -> &Config {
         &self.coinflow.cfg
+    }
+
+    fn admit_checkout(&self, client: &str) -> Result<OwnedSemaphorePermit, ApiError> {
+        let permit = self
+            .checkout_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                ApiError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "busy",
+                    "Too many checkouts are starting. Try again in a moment.",
+                )
+            })?;
+        let now = Instant::now();
+        let mut clients = self.checkout_clients.lock().unwrap();
+        if clients.len() >= MAX_CHECKOUT_CLIENTS {
+            clients
+                .retain(|_, started| now.saturating_duration_since(*started) < CHECKOUT_COOLDOWN);
+            if clients.len() >= MAX_CHECKOUT_CLIENTS && !clients.contains_key(client) {
+                return Err(ApiError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "busy",
+                    "Too many checkouts were started recently. Try again in a moment.",
+                ));
+            }
+        }
+        if clients
+            .get(client)
+            .is_some_and(|started| now.saturating_duration_since(*started) < CHECKOUT_COOLDOWN)
+        {
+            return Err(ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                "A checkout was just started for this wallet. Try again in a few seconds.",
+            ));
+        }
+        clients.insert(client.to_string(), now);
+        Ok(permit)
     }
 
     /// Apply a webhook event. Returns the record when the event changed
@@ -578,6 +625,11 @@ pub async fn start(
     if let Some(state) = req.state.as_deref() {
         validate_state(state)?;
     }
+
+    // Admission happens before the first merchant-authenticated request.
+    // The permit bounds global provider work; the destination is the stable
+    // client key available to both browser and CLI callers.
+    let _checkout_permit = funding.admit_checkout(&req.address)?;
 
     let cfg = funding.config();
     let coinflow = &funding.coinflow;
@@ -798,6 +850,21 @@ mod tests {
                 }),
             },
         }
+    }
+
+    #[test]
+    fn checkout_admission_limits_each_wallet_and_global_concurrency() {
+        let funding = Funding::new(test_config("http://127.0.0.1:1"));
+        let first = funding.admit_checkout("wallet_0").unwrap();
+        let repeated = funding.admit_checkout("wallet_0").unwrap_err();
+        assert_eq!(repeated.status, StatusCode::TOO_MANY_REQUESTS);
+
+        let mut permits = vec![first];
+        for i in 1..MAX_CONCURRENT_CHECKOUTS {
+            permits.push(funding.admit_checkout(&format!("wallet_{i}")).unwrap());
+        }
+        let busy = funding.admit_checkout("one_more").unwrap_err();
+        assert_eq!(busy.status, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]

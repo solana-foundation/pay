@@ -55,7 +55,9 @@ fn dollars(minor: u64) -> String {
 /// What a subject has spent today.
 pub trait SpendLedger: Send + Sync {
     fn spent_today(&self, subject: &str) -> u64;
-    fn record(&self, subject: &str, amount: u64);
+    /// Atomically check `cap` and reserve `amount` for today. Returns the
+    /// resulting total, or that same would-be total when it exceeds the cap.
+    fn check_and_record(&self, subject: &str, amount: u64, cap: Option<u64>) -> Result<u64, u64>;
 }
 
 /// Day counter, so a ledger can be driven in tests.
@@ -102,14 +104,19 @@ impl SpendLedger for MemoryLedger {
         }
     }
 
-    fn record(&self, subject: &str, amount: u64) {
+    fn check_and_record(&self, subject: &str, amount: u64, cap: Option<u64>) -> Result<u64, u64> {
         let today = (self.clock)();
         let mut totals = self.totals.lock().unwrap();
         let entry = totals.entry(subject.to_string()).or_insert((today, 0));
         if entry.0 != today {
             *entry = (today, 0);
         }
-        entry.1 = entry.1.saturating_add(amount);
+        let next = entry.1.saturating_add(amount);
+        if cap.is_some_and(|cap| next > cap) {
+            return Err(next);
+        }
+        entry.1 = next;
+        Ok(next)
     }
 }
 
@@ -157,20 +164,17 @@ impl AuthGate for PolicyGate {
                 dollars(ceiling)
             )));
         }
-        if let Some(cap) = self.policy.daily_cap {
-            let spent = self.ledger.spent_today(&self.subject);
-            if spent.saturating_add(amount) > cap {
-                return Err(denied(format!(
-                    "{} would take today's spend to {} against a daily cap of {}",
-                    dollars(amount),
-                    dollars(spent.saturating_add(amount)),
-                    dollars(cap)
-                )));
-            }
+        if let Err(next) =
+            self.ledger
+                .check_and_record(&self.subject, amount, self.policy.daily_cap)
+        {
+            return Err(denied(format!(
+                "{} would take today's spend to {} against a daily cap of {}",
+                dollars(amount),
+                dollars(next),
+                dollars(self.policy.daily_cap.expect("cap was checked"))
+            )));
         }
-        // Recorded at approval, before the payment settles: a burst of
-        // calls cannot slip past the cap between check and settlement.
-        self.ledger.record(&self.subject, amount);
         Ok(())
     }
 
@@ -293,6 +297,32 @@ mod tests {
     fn frozen_lets_nothing_through() {
         let gate = PolicyGate::new("sub", SpendPolicy::FROZEN, Arc::new(MemoryLedger::new()));
         assert!(gate.authenticate(&payment("$0.0001")).is_err());
+    }
+
+    #[test]
+    fn concurrent_approvals_cannot_exceed_the_daily_cap() {
+        let ledger: Arc<dyn SpendLedger> = Arc::new(MemoryLedger::new());
+        let policy = SpendPolicy::dollars(1.0, 1.0);
+        let gates = [
+            PolicyGate::new("sub", policy, ledger.clone()),
+            PolicyGate::new("sub", policy, ledger.clone()),
+        ];
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let handles = gates.map(|gate| {
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                gate.authenticate(&payment("$1")).is_ok()
+            })
+        });
+        barrier.wait();
+        let approved = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .filter(|approved| *approved)
+            .count();
+        assert_eq!(approved, 1);
+        assert_eq!(ledger.spent_today("sub"), 10_000);
     }
 
     #[test]
