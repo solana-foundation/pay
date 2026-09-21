@@ -963,11 +963,13 @@ fn do_paid_fetch(
         initial_headers.push(("Authorization".to_string(), authorization.clone()));
     }
 
-    let outcome = fetch_request(&initial_headers)?.for_configured_signer(
+    let outcome = fetch_request(&initial_headers)?;
+    let signer_support = outcome.configured_signer_support(
         store,
         network_override.as_deref(),
         account_override.as_deref(),
     )?;
+    let outcome = outcome.for_signer_support(signer_support);
 
     // A reused authorization that receives a 402 is no longer trustworthy.
     // Drop it before negotiating a fresh session from the server challenge.

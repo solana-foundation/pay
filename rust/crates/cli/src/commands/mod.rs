@@ -405,11 +405,12 @@ fn handle_outcome(
 
     // Let the paying account's backend veto an offer it cannot sign (a Ledger
     // and an operator-signed session) before we commit to it.
-    let outcome = outcome.for_configured_signer(
+    let signer_support = outcome.configured_signer_support(
         &pay_core::accounts::FileAccountsStore::default_path(),
         network_override,
         account_override,
     )?;
+    let outcome = outcome.for_signer_support(signer_support);
 
     match outcome {
         RunOutcome::MppChallenge {

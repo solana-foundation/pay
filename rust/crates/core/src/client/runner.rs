@@ -637,23 +637,23 @@ impl RunOutcome {
         }
     }
 
-    /// [`for_signer`](Self::for_signer) for the account that will pay: the
-    /// named or default account on the network the offer names (or the
-    /// forced one), read from `accounts.yml` without prompting. Outcomes
-    /// that carry no offer, and networks where a throwaway software wallet
-    /// would be created, pass through unchanged.
-    pub fn for_configured_signer(
-        self,
+    /// Whether the signer configured for this offer can sign raw messages.
+    ///
+    /// The named or default signer is read from `accounts.yml` without
+    /// prompting. `None` means this outcome needs no capability check or a
+    /// throwaway software wallet will be created at payment time.
+    pub fn configured_signer_support(
+        &self,
         store: &dyn crate::accounts::AccountsStore,
         network_override: Option<&str>,
         account_override: Option<&str>,
-    ) -> Result<RunOutcome> {
+    ) -> Result<Option<bool>> {
         // Only the offers `for_signer` may veto are looked at. A malformed
         // offer passes through so its own payment path reports the error.
-        let network = match &self {
+        let network = match self {
             RunOutcome::SessionChallenge { challenge, .. } => {
                 let Ok(request) = challenge.request.decode::<pay_kit::mpp::SessionRequest>() else {
-                    return Ok(self);
+                    return Ok(None);
                 };
                 network_override
                     .map(str::to_string)
@@ -662,17 +662,22 @@ impl RunOutcome {
             RunOutcome::X402SignInChallenge { challenge, .. } => {
                 match x402::sign_in_chain(challenge, network_override) {
                     Ok((_, network)) => network,
-                    Err(_) => return Ok(self),
+                    Err(_) => return Ok(None),
                 }
             }
-            _ => return Ok(self),
+            _ => return Ok(None),
         };
-        match crate::signer::raw_message_support_for_network(&network, store, account_override)? {
-            Some(signs_raw_messages) => {
-                let support = RawMessageSupport::from_capability(signs_raw_messages);
-                Ok(self.for_raw_message_support(support))
+        crate::signer::raw_message_support_for_network(&network, store, account_override)
+    }
+
+    /// Apply a capability previously returned by
+    /// [`configured_signer_support`](Self::configured_signer_support).
+    pub fn for_signer_support(self, signs_raw_messages: Option<bool>) -> RunOutcome {
+        match signs_raw_messages {
+            Some(capability) => {
+                self.for_raw_message_support(RawMessageSupport::from_capability(capability))
             }
-            None => Ok(self),
+            None => self,
         }
     }
 }
@@ -2308,9 +2313,11 @@ HTTP request sent, awaiting response...
         // No account on an ephemeral network: a software wallet is created
         // at payment time and signs anything, so the session stands.
         let store = crate::accounts::MemoryAccountsStore::new();
-        let outcome = classify_402(&session_and_charge_402("operator"), None, "https://e.com/r")
-            .for_configured_signer(&store, Some("localnet"), None)
+        let outcome = classify_402(&session_and_charge_402("operator"), None, "https://e.com/r");
+        let support = outcome
+            .configured_signer_support(&store, Some("localnet"), None)
             .unwrap();
+        let outcome = outcome.for_signer_support(support);
         assert!(
             matches!(outcome, RunOutcome::SessionChallenge { .. }),
             "{outcome:?}"
@@ -2322,9 +2329,8 @@ HTTP request sent, awaiting response...
         // Mainnet with nothing configured is an error at payment time; the
         // pre-check reports the same thing rather than guessing a wallet.
         let store = crate::accounts::MemoryAccountsStore::new();
-        let Err(err) = classify_402(&session_and_charge_402("operator"), None, "https://e.com/r")
-            .for_configured_signer(&store, None, None)
-        else {
+        let outcome = classify_402(&session_and_charge_402("operator"), None, "https://e.com/r");
+        let Err(err) = outcome.configured_signer_support(&store, None, None) else {
             panic!("mainnet without an account is an error");
         };
         assert!(
@@ -2356,9 +2362,11 @@ HTTP request sent, awaiting response...
             },
         );
         let store = crate::accounts::MemoryAccountsStore::with_file(file);
-        let outcome = classify_402(&session_and_charge_402("operator"), None, "https://e.com/r")
-            .for_configured_signer(&store, None, None)
+        let outcome = classify_402(&session_and_charge_402("operator"), None, "https://e.com/r");
+        let support = outcome
+            .configured_signer_support(&store, None, None)
             .unwrap();
+        let outcome = outcome.for_signer_support(support);
         assert!(matches!(outcome, RunOutcome::MppChallenge { .. }));
     }
 
