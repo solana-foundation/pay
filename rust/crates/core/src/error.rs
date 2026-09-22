@@ -25,6 +25,11 @@ pub enum Error {
     #[error("Payment rejected: {0}")]
     PaymentRejected(String),
 
+    /// A before-sign payee check refused the server-chosen wallet.
+    /// Nothing was signed.
+    #[error("payee refused: {0}")]
+    PayeeRefused(String),
+
     #[error("Request validation error: {0}")]
     RequestValidation(String),
 }
