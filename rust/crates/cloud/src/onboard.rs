@@ -625,7 +625,7 @@ pub async fn complete(
         driver
             .account_identity(&grant)
             .map(|identity| {
-                let subject = crate::tenants::subject_for(driver.id(), &identity);
+                let subject = state.tenants().provider_subject(driver.id(), &identity);
                 state.tenants().claim_provisioning(&subject).ok_or_else(|| {
                     state.release_provisioning(&echoed_state);
                     ApiError::new(
@@ -693,9 +693,8 @@ fn returning_tenant(
     #[cfg(feature = "mcp")]
     {
         let identity = driver.account_identity(grant)?;
-        state
-            .tenants()
-            .get(&crate::tenants::subject_for(driver.id(), &identity))
+        let subject = state.tenants().provider_subject(driver.id(), &identity);
+        state.tenants().get(&subject)
     }
 }
 
@@ -777,8 +776,10 @@ fn complete_for_connector(
         // Stable per provider account; a grant with no account identity
         // (a provider that has none) falls back to this wallet's address.
         let subject = match driver.account_identity(grant) {
-            Some(identity) => crate::tenants::subject_for(driver.id(), &identity),
-            None => crate::tenants::subject_for(driver.id(), &format!("wallet:{address}")),
+            Some(identity) => state.tenants().provider_subject(driver.id(), &identity),
+            None => state
+                .tenants()
+                .provider_subject(driver.id(), &format!("wallet:{address}")),
         };
         let record = TenantRecord::from_wallet(&subject, &wallet);
         if !state.attach_wallet(echoed_state, wallet) {

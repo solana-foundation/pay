@@ -180,16 +180,15 @@ impl WalletDriver for Openfort {
     }
 
     fn account_identity(&self, grant: &ConsentGrant) -> Option<String> {
-        use sha2::{Digest, Sha256};
-
         let api_key = grant.api_key.trim();
         if api_key.is_empty() {
             return None;
         }
         // `project_id` comes from the browser fragment and is not an
-        // authenticated principal. Bind returning tenants to possession of
-        // the high-entropy provider credential without retaining that secret.
-        Some(format!("key:{:x}", Sha256::digest(api_key.as_bytes())))
+        // authenticated principal. The registry binds returning tenants to
+        // possession of this high-entropy credential with a keyed HMAC; this
+        // raw value is used only transiently and is never stored as identity.
+        Some(api_key.to_string())
     }
 
     /// `{dashboard}/oauth/consent?redirect_uri=…&state=…`, the page

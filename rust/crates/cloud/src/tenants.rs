@@ -147,19 +147,29 @@ impl TenantRegistry {
         }
     }
 
-    fn sign_cookie_value(&self, purpose: &[u8], value: &str) -> String {
+    fn mac_hex(&self, purpose: &[u8], value: &str) -> String {
         let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&self.cookie_key)
             .expect("HMAC accepts a key of any size");
         mac.update(purpose);
         mac.update(&[0]);
         mac.update(value.as_bytes());
-        let signature: String = mac
-            .finalize()
+        mac.finalize()
             .into_bytes()
             .iter()
             .map(|byte| format!("{byte:02x}"))
-            .collect();
-        format!("{value}.{signature}")
+            .collect()
+    }
+
+    fn sign_cookie_value(&self, purpose: &[u8], value: &str) -> String {
+        format!("{value}.{}", self.mac_hex(purpose, value))
+    }
+
+    /// Derive the opaque tenant subject from a provider-authenticated
+    /// identity. The server secret makes this safe even when the identity is
+    /// itself a credential, and the in-memory registry resets with the key.
+    pub fn provider_subject(&self, provider_id: &str, identity: &str) -> String {
+        let digest = self.mac_hex(b"provider_identity", &format!("{provider_id}:{identity}"));
+        format!("sub_{}", &digest[..32])
     }
 
     fn verify_cookie_value(&self, purpose: &[u8], signed: &str) -> Option<String> {
