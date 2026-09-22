@@ -101,6 +101,57 @@ pub fn parse_siwx_auth(
     Some(SiwxAuthChallenge { extension })
 }
 
+/// What a before-sign payee check is allowed to see. `amount` is the atomic
+/// integer the signer would authorize. `asset` is the exact `currency` or the
+/// upto/batch `asset`. `network` is the challenge's network string.
+#[derive(Debug, Clone, Copy)]
+pub struct PayeeCheckContext<'a> {
+    pub recipient: &'a str,
+    pub amount: u64,
+    pub asset: &'a str,
+    pub network: &'a str,
+    pub resource: &'a str,
+}
+
+/// Refusal from a [`PayeeCheck`]. The builders turn this into
+/// [`Error::PayeeRefused`] and return before the signer is loaded.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum PayeeCheckError {
+    #[error("payee refused by client policy: {0}")]
+    Refused(String),
+}
+
+/// Optional check. `None` keeps today's sign path.
+pub type PayeeCheck<'a> =
+    dyn Fn(&PayeeCheckContext<'_>) -> std::result::Result<(), PayeeCheckError> + Send + Sync + 'a;
+
+fn atomic_amount(amount: &str) -> Result<u64> {
+    amount
+        .parse::<u64>()
+        .map_err(|_| Error::Mpp(format!("invalid amount: {amount}")))
+}
+
+fn enforce_payee_check(
+    payee_check: Option<&PayeeCheck<'_>>,
+    recipient: &str,
+    amount: u64,
+    asset: &str,
+    network: &str,
+    resource: &str,
+) -> Result<()> {
+    let Some(check) = payee_check else {
+        return Ok(());
+    };
+    check(&PayeeCheckContext {
+        recipient,
+        amount,
+        asset,
+        network,
+        resource,
+    })
+    .map_err(|e| Error::PayeeRefused(e.to_string()))
+}
+
 /// Build signed x402 retry headers.
 ///
 /// The `ephemeral_notice` field is `Some` only when this call generated a fresh
@@ -137,6 +188,28 @@ pub fn build_payment_with_override(
     account_override: Option<&str>,
     resource_url: Option<&str>,
     auth_override: crate::signer::AuthOverride,
+) -> Result<BuiltPayment> {
+    build_payment_with_override_and_payee_check(
+        challenge,
+        store,
+        network_override,
+        account_override,
+        resource_url,
+        auth_override,
+        None,
+    )
+}
+
+/// [`build_payment_with_override`] plus an optional payee check. `None` is the
+/// default path. A refusal returns before the signer is loaded.
+pub fn build_payment_with_override_and_payee_check(
+    challenge: &Challenge,
+    store: &dyn AccountsStore,
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+    resource_url: Option<&str>,
+    auth_override: crate::signer::AuthOverride,
+    payee_check: Option<&PayeeCheck<'_>>,
 ) -> Result<BuiltPayment> {
     let requirements = &challenge.requirements;
     let amount = format_amount(&requirements.amount, &requirements.currency);
@@ -182,6 +255,19 @@ pub fn build_payment_with_override(
     let should_auto_fund_surfpool =
         should_auto_fund_surfpool_for_x402(network_override, embedded_blockhash);
     let network = network_override.map(str::to_string).unwrap_or(cluster);
+    let resource = if requirements.resource.is_empty() {
+        resource_url.unwrap_or("")
+    } else {
+        requirements.resource.as_str()
+    };
+    enforce_payee_check(
+        payee_check,
+        &requirements.recipient,
+        atomic_amount(&requirements.amount)?,
+        &requirements.currency,
+        &requirements.network,
+        resource,
+    )?;
 
     let (signer, ephemeral_notice) =
         crate::signer::load_signer_for_network_payment_with_intent_and_override(
@@ -305,6 +391,8 @@ fn prepare_channel_payment(
     account_override: Option<&str>,
     resource_url: Option<&str>,
     auth_override: crate::signer::AuthOverride,
+    payee_check: Option<&PayeeCheck<'_>>,
+    recipient: &str,
 ) -> Result<ChannelPaymentSetup> {
     // The escrow framing must not be folded into the amount string: a prefixed
     // value like "channel escrow: $25.00" is unparseable by
@@ -353,6 +441,14 @@ fn prepare_channel_payment(
     let should_auto_fund_surfpool =
         should_auto_fund_surfpool_for_x402(network_override, offer.recent_blockhash);
     let network = network_override.map(str::to_string).unwrap_or(cluster);
+    enforce_payee_check(
+        payee_check,
+        recipient,
+        atomic_amount(offer.amount)?,
+        offer.asset,
+        offer.network,
+        resource_url.unwrap_or(""),
+    )?;
 
     let (signer, ephemeral_notice) =
         crate::signer::load_signer_for_network_payment_with_intent_and_override(
@@ -443,6 +539,27 @@ pub fn build_upto_payment_with_override(
     resource_url: Option<&str>,
     auth_override: crate::signer::AuthOverride,
 ) -> Result<BuiltPayment> {
+    build_upto_payment_with_override_and_payee_check(
+        challenge,
+        store,
+        network_override,
+        account_override,
+        resource_url,
+        auth_override,
+        None,
+    )
+}
+
+/// [`build_upto_payment_with_override`] plus an optional payee check.
+pub fn build_upto_payment_with_override_and_payee_check(
+    challenge: &UptoChallenge,
+    store: &dyn AccountsStore,
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+    resource_url: Option<&str>,
+    auth_override: crate::signer::AuthOverride,
+    payee_check: Option<&PayeeCheck<'_>>,
+) -> Result<BuiltPayment> {
     let requirements = &challenge.requirements;
     let setup = prepare_channel_payment(
         ChannelOffer {
@@ -457,6 +574,8 @@ pub fn build_upto_payment_with_override(
         account_override,
         resource_url,
         auth_override,
+        payee_check,
+        &requirements.pay_to,
     )?;
     let ChannelPaymentSetup {
         signer,
@@ -539,6 +658,32 @@ pub fn build_batch_payment(
     resource_url: Option<&str>,
     auth_override: crate::signer::AuthOverride,
 ) -> Result<BuiltBatchPayment> {
+    build_batch_payment_with_payee_check(
+        challenge,
+        store,
+        cache,
+        deposit_amount,
+        network_override,
+        account_override,
+        resource_url,
+        auth_override,
+        None,
+    )
+}
+
+/// [`build_batch_payment`] plus an optional payee check.
+#[allow(clippy::too_many_arguments)]
+pub fn build_batch_payment_with_payee_check(
+    challenge: &BatchChallenge,
+    store: &dyn AccountsStore,
+    cache: &crate::client::batch::BatchChannelCache,
+    deposit_amount: Option<u64>,
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+    resource_url: Option<&str>,
+    auth_override: crate::signer::AuthOverride,
+    payee_check: Option<&PayeeCheck<'_>>,
+) -> Result<BuiltBatchPayment> {
     use pay_kit::x402::client::batch_settlement as batch_client;
 
     let requirements = &challenge.requirements;
@@ -569,6 +714,8 @@ pub fn build_batch_payment(
         account_override,
         resource_url,
         auth_override,
+        payee_check,
+        &requirements.pay_to,
     )?;
 
     // The advertised token program is checked against the mint's real owner:
@@ -922,8 +1069,25 @@ fn x402_version_from_json(body: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::accounts::{Account, AccountsFile, Keystore, MemoryAccountsStore};
+    use crate::accounts::{Account, AccountsFile, AccountsStore, Keystore, MemoryAccountsStore};
     use pay_kit::x402::exact::EXACT_SCHEME;
+
+    /// Store that fails the test if the signer path reads or writes accounts.
+    struct PanicStore;
+
+    impl AccountsStore for PanicStore {
+        fn load(&self) -> Result<AccountsFile> {
+            panic!("signer store was loaded");
+        }
+
+        fn save(&self, _file: &AccountsFile) -> Result<()> {
+            panic!("signer store was saved");
+        }
+    }
+
+    fn refuse_recipient(ctx: &PayeeCheckContext<'_>) -> std::result::Result<(), PayeeCheckError> {
+        Err(PayeeCheckError::Refused(ctx.recipient.to_string()))
+    }
 
     fn sample_requirements() -> PaymentRequirements {
         PaymentRequirements {
@@ -1625,6 +1789,236 @@ mod tests {
 
         assert!(msg.contains("No account configured for network `mainnet`"));
         assert!(msg.contains("pay setup"));
+    }
+
+    #[test]
+    fn exact_refuses_before_signer_load() {
+        let store = PanicStore;
+        let challenge = Challenge {
+            x402_version: X402_VERSION_V2,
+            requirements: sample_requirements(),
+            siwx: None,
+            extensions: None,
+        };
+
+        let err = build_payment_with_override_and_payee_check(
+            &challenge,
+            &store,
+            None,
+            None,
+            None,
+            None,
+            Some(&refuse_recipient),
+        )
+        .unwrap_err();
+
+        match err {
+            Error::PayeeRefused(reason) => {
+                assert!(reason.contains("11111111111111111111111111111111"));
+            }
+            other => panic!("expected PayeeRefused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exact_allowed_payee_reaches_the_existing_signer_path() {
+        let store = MemoryAccountsStore::new();
+        let challenge = Challenge {
+            x402_version: X402_VERSION_V2,
+            requirements: sample_requirements(),
+            siwx: None,
+            extensions: None,
+        };
+        let without = build_payment(&challenge, &store, None, None, None).unwrap_err();
+        let with = build_payment_with_override_and_payee_check(
+            &challenge,
+            &store,
+            None,
+            None,
+            None,
+            None,
+            Some(&|ctx| {
+                assert_eq!(ctx.recipient, "11111111111111111111111111111111");
+                assert_eq!(ctx.amount, 1_000_000);
+                assert_eq!(ctx.asset, "USDC");
+                assert_eq!(ctx.network, "solana");
+                assert_eq!(ctx.resource, "https://api.example.com/v1/test");
+                Ok(())
+            }),
+        )
+        .unwrap_err();
+
+        assert_eq!(with.to_string(), without.to_string());
+        assert!(
+            with.to_string()
+                .contains("No account configured for network `mainnet`")
+        );
+    }
+
+    fn sample_upto() -> UptoChallenge {
+        UptoChallenge {
+            requirements: pay_kit::x402::upto::UptoRequirements {
+                scheme: "upto".to_string(),
+                network: "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp".to_string(),
+                amount: "1000000".to_string(),
+                asset: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),
+                pay_to: "11111111111111111111111111111111".to_string(),
+                max_timeout_seconds: 60,
+                extra: pay_kit::x402::upto::UptoExtra {
+                    token_program: None,
+                    fee_payer: "AepWpq3GQwL8CeKMtZyKtKPa7W91Coygh3ropAJapVdU".to_string(),
+                    receiver_authorizer: "AepWpq3GQwL8CeKMtZyKtKPa7W91Coygh3ropAJapVdU".to_string(),
+                    withdraw_delay: 3600,
+                    recent_blockhash: None,
+                    last_valid_block_height: None,
+                    recent_slot: None,
+                    valid_after: None,
+                    memo: None,
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn upto_refuses_before_signer_load() {
+        let store = PanicStore;
+        let err = build_upto_payment_with_override_and_payee_check(
+            &sample_upto(),
+            &store,
+            None,
+            None,
+            Some("https://seller.example/paid"),
+            None,
+            Some(&|ctx| {
+                assert_eq!(ctx.recipient, "11111111111111111111111111111111");
+                assert_eq!(ctx.amount, 1_000_000);
+                assert_eq!(ctx.asset, "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
+                assert_eq!(ctx.network, "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp");
+                assert_eq!(ctx.resource, "https://seller.example/paid");
+                Err(PayeeCheckError::Refused("blocked".to_string()))
+            }),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, Error::PayeeRefused(_)));
+    }
+
+    #[test]
+    fn upto_allowed_payee_reaches_the_existing_signer_path() {
+        let store = MemoryAccountsStore::new();
+        let challenge = sample_upto();
+        let without = build_upto_payment(
+            &challenge,
+            &store,
+            None,
+            None,
+            Some("https://seller.example/paid"),
+        )
+        .unwrap_err();
+        let with = build_upto_payment_with_override_and_payee_check(
+            &challenge,
+            &store,
+            None,
+            None,
+            Some("https://seller.example/paid"),
+            None,
+            Some(&|_ctx| Ok(())),
+        )
+        .unwrap_err();
+
+        assert_eq!(with.to_string(), without.to_string());
+        assert!(
+            with.to_string()
+                .contains("No account configured for network `mainnet`")
+        );
+    }
+
+    fn sample_batch() -> BatchChallenge {
+        use pay_kit::x402::batch_settlement::{BatchExtra, BatchRequirements};
+        BatchChallenge {
+            requirements: BatchRequirements {
+                scheme: "batch-settlement".to_string(),
+                network: "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp".to_string(),
+                amount: "1000".to_string(),
+                asset: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),
+                pay_to: "11111111111111111111111111111111".to_string(),
+                max_timeout_seconds: 300,
+                extra: BatchExtra {
+                    payment_flow: None,
+                    fee_payer: "AepWpq3GQwL8CeKMtZyKtKPa7W91Coygh3ropAJapVdU".to_string(),
+                    receiver_authorizer: None,
+                    withdraw_delay: 3600,
+                    token_program: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
+                    memo: None,
+                    recent_blockhash: None,
+                    recent_slot: None,
+                    channel_state: None,
+                    voucher_state: None,
+                },
+            },
+            error: None,
+        }
+    }
+
+    #[test]
+    fn batch_refuses_before_signer_load() {
+        let store = PanicStore;
+        let cache = crate::client::batch::BatchChannelCache::new();
+        let err = build_batch_payment_with_payee_check(
+            &sample_batch(),
+            &store,
+            &cache,
+            None,
+            None,
+            None,
+            Some("https://seller.example/paid"),
+            None,
+            Some(&|ctx| {
+                assert_eq!(ctx.recipient, "11111111111111111111111111111111");
+                assert_eq!(ctx.amount, 1000);
+                assert_eq!(ctx.resource, "https://seller.example/paid");
+                Err(PayeeCheckError::Refused("blocked".to_string()))
+            }),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, Error::PayeeRefused(_)));
+    }
+
+    #[test]
+    fn batch_allowed_payee_reaches_the_existing_signer_path() {
+        let store = MemoryAccountsStore::new();
+        let cache = crate::client::batch::BatchChannelCache::new();
+        let challenge = sample_batch();
+        let without = build_batch_payment(
+            &challenge,
+            &store,
+            &cache,
+            None,
+            None,
+            None,
+            Some("https://seller.example/paid"),
+            None,
+        )
+        .unwrap_err();
+        let with = build_batch_payment_with_payee_check(
+            &challenge,
+            &store,
+            &cache,
+            None,
+            None,
+            None,
+            Some("https://seller.example/paid"),
+            None,
+            Some(&|_ctx| Ok(())),
+        )
+        .unwrap_err();
+
+        assert_eq!(with.to_string(), without.to_string());
+        assert!(
+            with.to_string()
+                .contains("No account configured for network `mainnet`")
+        );
     }
 
     #[test]
