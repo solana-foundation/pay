@@ -1,5 +1,6 @@
 pub mod ata;
 pub mod channel_state;
+pub mod credit;
 pub mod error;
 pub mod receipt;
 pub mod rpc;
@@ -8,11 +9,12 @@ pub mod subscription_state;
 pub mod token_metadata;
 pub mod transfer_batch;
 
+pub use credit::{CreditProgram, CreditProgramSpec, fetch_credit_balances};
 pub use error::{Error, Result};
 pub use pay_api_types::{
-    Network, Receipt, ReceiptAmount, ReceiptIntent, ReceiptIntentKind, ReceiptSession,
-    ReceiptSessionEvent, ReceiptSplit, ReceiptStatus, ReceiptSubscription, ReceiptTransfer,
-    StablecoinBalance, StablecoinBalances, SubscriptionStatus,
+    CreditBalance, Network, Receipt, ReceiptAmount, ReceiptIntent, ReceiptIntentKind,
+    ReceiptSession, ReceiptSessionEvent, ReceiptSplit, ReceiptStatus, ReceiptSubscription,
+    ReceiptTransfer, StablecoinBalance, StablecoinBalances, SubscriptionStatus,
 };
 pub use receipt::{apply_confirmation_status, build_receipt, build_receipt_skeleton};
 pub use rpc::RpcClient;

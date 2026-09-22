@@ -800,6 +800,7 @@ mod tests {
                 2_000_000,
                 "USDT",
             )],
+            credits: vec![],
             tokens_unavailable: false,
         };
 
@@ -818,6 +819,7 @@ mod tests {
                 1_000_000,
                 "USDG",
             )],
+            credits: vec![],
             tokens_unavailable: false,
         };
 
@@ -856,6 +858,7 @@ mod tests {
                     "USDT",
                 ),
             ],
+            credits: vec![],
             tokens_unavailable: false,
         };
 
@@ -890,6 +893,7 @@ mod tests {
                     "USDT",
                 ),
             ],
+            credits: vec![],
             tokens_unavailable: false,
         };
 
@@ -911,6 +915,7 @@ mod tests {
                 999_999,
                 "USDT",
             )],
+            credits: vec![],
             tokens_unavailable: false,
         };
 

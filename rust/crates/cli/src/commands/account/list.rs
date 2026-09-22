@@ -230,6 +230,12 @@ pub fn format_balance_display(
                 let label = token.symbol_or(&token.mint[..8]);
                 parts.push(format!("{:.2} {label}", token.ui_amount));
             }
+            for credit in &bal.credits {
+                parts.push(format!(
+                    "{:.2} {} credits",
+                    credit.ui_amount, credit.currency
+                ));
+            }
             if parts.is_empty() {
                 explorer_link(pubkey, rpc_url)
             } else {

@@ -38,6 +38,7 @@ fn infer_network(rpc_url: &str) -> &'static str {
     let lower = rpc_url.to_lowercase();
     if lower.contains("127.0.0.1")
         || lower.contains("localhost")
+        || lower.contains("devnet")
         || lower.contains("surfnet")
         || lower.contains("surfpool")
     {
@@ -53,6 +54,15 @@ pub struct TokenBalance {
     pub raw_amount: u64,
     pub ui_amount: f64,
     pub symbol: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreditBalance {
+    pub program_id: String,
+    pub accounts: Vec<String>,
+    pub currency: String,
+    pub raw_amount: u64,
+    pub ui_amount: f64,
 }
 
 impl TokenBalance {
@@ -80,6 +90,7 @@ impl TokenBalance {
 pub struct AccountBalances {
     pub sol_lamports: u64,
     pub tokens: Vec<TokenBalance>,
+    pub credits: Vec<CreditBalance>,
     /// True when the pay-api stablecoin lookup failed for this account (e.g.
     /// pay-api unreachable). `tokens` will be empty in that case; callers
     /// should render an "unavailable" indicator instead of treating the
@@ -158,6 +169,8 @@ impl ReceivedFunds {
 #[derive(Deserialize)]
 struct ApiResponse {
     balances: Vec<ApiBalance>,
+    #[serde(default)]
+    credits: std::collections::BTreeMap<String, ApiCredit>,
 }
 
 #[derive(Deserialize)]
@@ -172,12 +185,26 @@ struct ApiBalance {
     symbol: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct ApiCredit {
+    #[serde(default)]
+    accounts: Vec<String>,
+    currency: String,
+    raw_amount: String,
+    ui_amount: f64,
+}
+
+struct ApiBalances {
+    tokens: Vec<TokenBalance>,
+    credits: Vec<CreditBalance>,
+}
+
 async fn fetch_stablecoins_via_api(
     client: &reqwest::Client,
     api_url: &str,
     pubkey: &str,
     network: &str,
-) -> crate::Result<Vec<TokenBalance>> {
+) -> crate::Result<ApiBalances> {
     let url = format!(
         "{}/v1/balance/stablecoins?address={}&network={}",
         api_url.trim_end_matches('/'),
@@ -204,7 +231,11 @@ async fn fetch_stablecoins_via_api(
         .await
         .map_err(|e| crate::Error::Config(format!("pay-api decode error: {e}")))?;
 
-    Ok(parsed
+    Ok(parse_api_balances(parsed))
+}
+
+fn parse_api_balances(parsed: ApiResponse) -> ApiBalances {
+    let tokens = parsed
         .balances
         .into_iter()
         .filter_map(|b| {
@@ -227,7 +258,25 @@ async fn fetch_stablecoins_via_api(
                 symbol,
             })
         })
-        .collect())
+        .collect();
+    let credits = parsed
+        .credits
+        .into_iter()
+        .filter_map(|(program_id, credit)| {
+            let raw_amount = credit.raw_amount.parse().ok()?;
+            if raw_amount == 0 {
+                return None;
+            }
+            Some(CreditBalance {
+                program_id,
+                accounts: credit.accounts,
+                currency: credit.currency,
+                raw_amount,
+                ui_amount: credit.ui_amount,
+            })
+        })
+        .collect();
+    ApiBalances { tokens, credits }
 }
 
 // ── public API ──────────────────────────────────────────────────────────────
@@ -260,20 +309,27 @@ pub async fn get_balances(rpc_url: &str, pubkey: &str) -> crate::Result<AccountB
     .await?;
     let sol_lamports = sol_resp["result"]["value"].as_u64().unwrap_or(0);
 
-    let (tokens, tokens_unavailable) =
+    let (api_balances, tokens_unavailable) =
         match fetch_stablecoins_via_api(&client, &pay_api_url(), pubkey, infer_network(rpc_url))
             .await
         {
-            Ok(t) => (t, false),
+            Ok(balances) => (balances, false),
             Err(e) => {
                 tracing::debug!(error = %e, "pay-api unreachable; returning empty token balances");
-                (Vec::new(), true)
+                (
+                    ApiBalances {
+                        tokens: Vec::new(),
+                        credits: Vec::new(),
+                    },
+                    true,
+                )
             }
         };
 
     Ok(AccountBalances {
         sol_lamports,
-        tokens,
+        tokens: api_balances.tokens,
+        credits: api_balances.credits,
         tokens_unavailable,
     })
 }
@@ -287,20 +343,27 @@ pub async fn get_stablecoin_balances(
     pubkey: &str,
 ) -> crate::Result<AccountBalances> {
     let client = balance_client()?;
-    let (tokens, tokens_unavailable) =
+    let (api_balances, tokens_unavailable) =
         match fetch_stablecoins_via_api(&client, &pay_api_url(), pubkey, infer_network(rpc_url))
             .await
         {
-            Ok(t) => (t, false),
+            Ok(balances) => (balances, false),
             Err(e) => {
                 tracing::debug!(error = %e, "pay-api unreachable; returning empty token balances");
-                (Vec::new(), true)
+                (
+                    ApiBalances {
+                        tokens: Vec::new(),
+                        credits: Vec::new(),
+                    },
+                    true,
+                )
             }
         };
 
     Ok(AccountBalances {
         sol_lamports: 0,
-        tokens,
+        tokens: api_balances.tokens,
+        credits: api_balances.credits,
         tokens_unavailable,
     })
 }
@@ -408,9 +471,10 @@ async fn fetch_stablecoin_balances_batch_into(
 
     while let Some(Ok((pk, result))) = set.join_next().await {
         match result {
-            Ok(tokens) => {
+            Ok(api_balances) => {
                 if let Some(entry) = balances.get_mut(&pk) {
-                    entry.tokens = tokens;
+                    entry.tokens = api_balances.tokens;
+                    entry.credits = api_balances.credits;
                 }
             }
             Err(e) => {
@@ -514,6 +578,7 @@ mod tests {
         assert_eq!(infer_network("http://127.0.0.1:8899"), "sandbox");
         assert_eq!(infer_network("http://localhost:8899"), "sandbox");
         assert_eq!(infer_network("https://402.surfnet.dev:8899"), "sandbox");
+        assert_eq!(infer_network("https://api.devnet.solana.com"), "sandbox");
         assert_eq!(
             infer_network("https://api.mainnet-beta.solana.com"),
             "mainnet"
@@ -526,7 +591,29 @@ mod tests {
         let b = AccountBalances::default();
         assert_eq!(b.sol_lamports, 0);
         assert!(b.tokens.is_empty());
+        assert!(b.credits.is_empty());
         assert!(!b.tokens_unavailable);
+    }
+
+    #[test]
+    fn api_credits_are_kept_separate_from_wallet_tokens() {
+        let parsed: ApiResponse = serde_json::from_value(serde_json::json!({
+            "balances": [],
+            "credits": {
+                "FD1amxhTsDpwzoVX41dxp2ygAESURV2zdUACzxM1Dfw9": {
+                    "accounts": ["34LSBjeswZorbZyYdV3XUmmTDhZyvLXpnDjjBdTjeKPa"],
+                    "currency": "USD",
+                    "raw_amount": "5000000",
+                    "ui_amount": 5.0
+                }
+            }
+        }))
+        .unwrap();
+        let balances = parse_api_balances(parsed);
+        assert!(balances.tokens.is_empty());
+        assert_eq!(balances.credits.len(), 1);
+        assert_eq!(balances.credits[0].raw_amount, 5_000_000);
+        assert_eq!(balances.credits[0].ui_amount, 5.0);
     }
 
     #[test]
@@ -565,11 +652,13 @@ mod tests {
         let baseline = AccountBalances {
             sol_lamports: 1_000_000,
             tokens: vec![],
+            credits: vec![],
             tokens_unavailable: false,
         };
         let current = AccountBalances {
             sol_lamports: 2_000_000,
             tokens: vec![],
+            credits: vec![],
             tokens_unavailable: false,
         };
         let diff = current.diff_received(&baseline);
@@ -582,11 +671,13 @@ mod tests {
         let baseline = AccountBalances {
             sol_lamports: 2_000_000,
             tokens: vec![],
+            credits: vec![],
             tokens_unavailable: false,
         };
         let current = AccountBalances {
             sol_lamports: 1_000_000,
             tokens: vec![],
+            credits: vec![],
             tokens_unavailable: false,
         };
         let diff = current.diff_received(&baseline);
@@ -603,6 +694,7 @@ mod tests {
                 ui_amount: 10.0,
                 symbol: Some("USDC".to_string()),
             }],
+            credits: vec![],
             tokens_unavailable: false,
         };
         let current = AccountBalances {
@@ -613,6 +705,7 @@ mod tests {
                 ui_amount: 25.5,
                 symbol: Some("USDC".to_string()),
             }],
+            credits: vec![],
             tokens_unavailable: false,
         };
         let diff = current.diff_received(&baseline);
@@ -626,6 +719,7 @@ mod tests {
         let baseline = AccountBalances {
             sol_lamports: 0,
             tokens: vec![],
+            credits: vec![],
             tokens_unavailable: false,
         };
         let current = AccountBalances {
@@ -636,6 +730,7 @@ mod tests {
                 ui_amount: 100.0,
                 symbol: None,
             }],
+            credits: vec![],
             tokens_unavailable: false,
         };
         let diff = current.diff_received(&baseline);
@@ -653,6 +748,7 @@ mod tests {
                 ui_amount: 50.0,
                 symbol: Some("USDC".to_string()),
             }],
+            credits: vec![],
             tokens_unavailable: false,
         };
         let diff = balances.diff_received(&balances);
@@ -668,6 +764,7 @@ mod tests {
         let baseline = AccountBalances {
             sol_lamports: 0,
             tokens: vec![],
+            credits: vec![],
             tokens_unavailable: true,
         };
         let current = AccountBalances {
@@ -678,6 +775,7 @@ mod tests {
                 ui_amount: 5.0,
                 symbol: Some("USDC".to_string()),
             }],
+            credits: vec![],
             tokens_unavailable: false,
         };
         let diff = current.diff_received(&baseline);
@@ -696,11 +794,13 @@ mod tests {
                 ui_amount: 5.0,
                 symbol: Some("USDC".to_string()),
             }],
+            credits: vec![],
             tokens_unavailable: false,
         };
         let current = AccountBalances {
             sol_lamports: 0,
             tokens: vec![],
+            credits: vec![],
             tokens_unavailable: true,
         };
         let diff = current.diff_received(&baseline);
@@ -714,11 +814,13 @@ mod tests {
         let baseline = AccountBalances {
             sol_lamports: 100,
             tokens: vec![],
+            credits: vec![],
             tokens_unavailable: true,
         };
         let current = AccountBalances {
             sol_lamports: 1_000,
             tokens: vec![],
+            credits: vec![],
             tokens_unavailable: true,
         };
         let diff = current.diff_received(&baseline);

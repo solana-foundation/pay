@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use figment::Figment;
 use figment::providers::{Env, Format, Yaml};
-use pay_api_core::StablecoinSpec;
+use pay_api_core::{CreditProgramSpec, StablecoinSpec};
 use pay_api_types::Network;
 use pay_api_types::transfer_batch::TransferNetwork;
 use serde::Deserialize;
@@ -25,6 +25,10 @@ pub struct Config {
     /// The stablecoin set the API reports balances for. Order is preserved in
     /// every response.
     pub stablecoins: Vec<StablecoinSpec>,
+
+    /// Program-backed credit allowances included in the stablecoin response.
+    #[serde(default)]
+    pub credit_programs: Vec<CreditProgramSpec>,
 
     /// MoonPay checkout configuration for `/v1/onramp/start`.
     #[serde(default)]

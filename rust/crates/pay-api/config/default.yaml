@@ -56,6 +56,18 @@ stablecoins:
     token_program: token_2022
     decimals: 6
 
+# Program-backed credits reported alongside wallet-owned stablecoins. The
+# Coinflow sandbox program stores one 56-byte allowance account per customer.
+credit_programs:
+  - network: mainnet
+    program_id: FD1amxhTsDpwzoVX41dxp2ygAESURV2zdUACzxM1Dfw9
+    currency: USD
+    decimals: 6
+  - network: sandbox
+    program_id: FD1amxhTsDpwzoVX41dxp2ygAESURV2zdUACzxM1Dfw9
+    currency: USD
+    decimals: 6
+
 moonpay:
   onramp_currency_code: usdc_sol
   onramp_base_currency_amount: "20"

@@ -574,6 +574,7 @@ mod tests {
                     symbol: Some(symbol.to_string()),
                 })
                 .collect(),
+            credits: vec![],
             tokens_unavailable: false,
         }
     }

@@ -5,7 +5,7 @@ use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use pay_api_core::{Error, fetch_stablecoin_balances};
+use pay_api_core::{Error, fetch_credit_balances, fetch_stablecoin_balances};
 use pay_api_types::Network;
 use serde::Deserialize;
 use serde_json::json;
@@ -33,10 +33,12 @@ pub async fn handler(
         .map_err(ApiError)?;
     let rpc_url = state.rpc_url_for(network).map_err(ApiError)?;
 
-    let balances =
-        fetch_stablecoin_balances(&state.rpc, rpc_url, &owner, network, &state.stablecoins)
-            .await
-            .map_err(ApiError)?;
+    let (mut balances, credits) = tokio::try_join!(
+        fetch_stablecoin_balances(&state.rpc, rpc_url, &owner, network, &state.stablecoins),
+        fetch_credit_balances(&state.rpc, rpc_url, &owner, network, &state.credit_programs,)
+    )
+    .map_err(ApiError)?;
+    balances.credits = credits;
     telemetry::record_balance_request(network, balances.balances.len());
 
     Ok(Json(balances))

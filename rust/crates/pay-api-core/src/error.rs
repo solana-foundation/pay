@@ -10,6 +10,9 @@ pub enum Error {
     #[error("invalid mint for stablecoin {symbol}: {mint}")]
     InvalidMint { symbol: String, mint: String },
 
+    #[error("invalid credit program: {0}")]
+    InvalidCreditProgram(String),
+
     #[error("network not configured: {0}")]
     NetworkNotConfigured(String),
 
@@ -54,6 +57,9 @@ pub enum Error {
 
     #[error("malformed token account data")]
     TokenAccountDecode,
+
+    #[error("malformed credit account data")]
+    CreditAccountDecode,
 }
 
 impl Error {
@@ -62,6 +68,7 @@ impl Error {
         match self {
             Self::InvalidAddress
             | Self::InvalidMint { .. }
+            | Self::InvalidCreditProgram(_)
             | Self::InvalidAmount(_)
             | Self::UnsupportedCurrency(_)
             | Self::UnknownNetwork(_)

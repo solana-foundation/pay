@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use pay_api_core::ata::TOKEN_2022_PROGRAM_ID;
-use pay_api_core::{Error, RpcClient, Stablecoin};
+use pay_api_core::{CreditProgram, Error, RpcClient, Stablecoin};
 use pay_api_types::Network;
 
 use pay_kit::mpp::server::{self, ConfidentialHandle, ConfidentialWorkerConfig};
@@ -19,6 +19,7 @@ pub struct AppState {
     pub rpc: RpcClient,
     pub networks: HashMap<Network, NetworkConfig>,
     pub stablecoins: Vec<Stablecoin>,
+    pub credit_programs: Vec<CreditProgram>,
     pub moonpay: MoonpayConfig,
     pub send: SendConfig,
     pub subscriptions: SubscriptionsConfig,
@@ -53,6 +54,11 @@ impl AppState {
             .iter()
             .map(|s| s.resolve())
             .collect::<Result<Vec<_>, _>>()?;
+        let credit_programs = config
+            .credit_programs
+            .iter()
+            .map(|program| program.resolve())
+            .collect::<Result<Vec<_>, _>>()?;
 
         let subscriptions_challenge_binding_secret = config
             .subscriptions_challenge_binding_secret()
@@ -77,6 +83,7 @@ impl AppState {
             rpc: RpcClient::new(Duration::from_millis(config.rpc_timeout_ms))?,
             networks: config.networks.clone(),
             stablecoins,
+            credit_programs,
             moonpay: config.moonpay.clone(),
             send: config.send.clone(),
             subscriptions: config.subscriptions.clone(),
