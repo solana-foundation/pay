@@ -843,7 +843,7 @@ pub async fn exchange(
             email: session.email,
         },
         None => ExchangeResponse::Pending {
-            provider: "pay-cloud",
+            provider: "pay-connect",
             status: "pending",
             email: session.email.unwrap_or_default(),
             network: NETWORK,

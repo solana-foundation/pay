@@ -106,7 +106,7 @@ bs58 = "0.5"
 # Firedancer's fixed-size Base58 codec for hot pubkey/signature paths.
 five8 = "1.0"
 blake3 = "1"
-# PKCE S256 (pay-cloud onboarding).
+# PKCE S256 (pay-connect onboarding).
 sha2 = "0.10"
 qrcode = { version = "0.14", default-features = false }
 mime_guess = { version = "2.0", default-features = false, features = ["rev-mappings"] }

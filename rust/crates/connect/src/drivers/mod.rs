@@ -1,7 +1,7 @@
-//! Wallet drivers: how pay-cloud turns a signed-in user into a wallet the
+//! Wallet drivers: how pay-connect turns a signed-in user into a wallet the
 //! `pay` CLI can use.
 //!
-//! pay-cloud holds no custody account of its own. A driver walks the user
+//! pay-connect holds no custody account of its own. A driver walks the user
 //! through the provider's own sign-in (a consent page that hands back the
 //! user's project credentials), then uses those credentials to prepare a
 //! wallet, and returns everything the CLI needs to register the account
@@ -89,7 +89,7 @@ pub enum DriverError {
     InvalidGrant(String),
 }
 
-/// A custody provider pay-cloud can onboard a user with.
+/// A custody provider pay-connect can onboard a user with.
 #[async_trait::async_trait]
 pub trait WalletDriver: Send + Sync {
     /// `pay_core::remote` provider id.

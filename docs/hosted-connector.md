@@ -1,18 +1,18 @@
-# Pay Cloud: hosted connector, remote-wallet onboarding, and Ledger
+# Pay Connect: hosted connector, remote-wallet onboarding, and Ledger
 
-Status: revision 2, milestone 1 in progress on branch `feat/pay-cloud`.
+Status: revision 2, milestone 1 in progress on branch `feat/pay-connect`.
 Owner: pay core team.
 
 ## Milestone 2 status (2026-09-16): the Grok connector
 
-Done on `feat/pay-cloud`:
+Done on `feat/pay-connect`:
 
-- **A3** `/mcp` in pay-cloud: rmcp streamable HTTP, a `PayMcp` per session,
+- **A3** `/mcp` in pay-connect: rmcp streamable HTTP, a `PayMcp` per session,
   `Host` validation from the public URL, bearer middleware. Enabled by
-  `PAY_CLOUD_MCP=1`; `PAY_CLOUD_MCP_TOKENS` adds static tokens for hosts
+  `PAY_CONNECT_MCP=1`; `PAY_CONNECT_MCP_TOKENS` adds static tokens for hosts
   that only take a header. Every refusal is a 401 with the RFC 9728
   `WWW-Authenticate resource_metadata` pointer.
-- **A4** OAuth 2.1 authorization server in pay-cloud: both well-known
+- **A4** OAuth 2.1 authorization server in pay-connect: both well-known
   documents, DCR accepting Grok's exact registration (public client,
   `https://grok.com/connectors/oauth/callback`), `/oauth/authorize` with
   mandatory S256 PKCE and RFC 8707 `resource`, a terminal-themed consent page
@@ -22,7 +22,7 @@ Done on `feat/pay-cloud`:
   curl run against a local server did the same.
 - **A2** `PayContext` in pay-mcp: every tool call resolves a `CallScope`
   (accounts store, overrides, approval policy, whether local files may be
-  read). `LocalContext` reproduces `pay mcp`; pay-cloud's `CloudContext`
+  read). `LocalContext` reproduces `pay mcp`; pay-connect's `ConnectContext`
   resolves the bearer's tenant into a read-only one-account store whose
   credentials live in memory (`CredentialSource` on `AccountsStore`, the
   A1 injection seam) and a `PolicyApproval`: per-call ceiling and daily cap
@@ -85,7 +85,7 @@ Done on `feat/pay-cloud`:
   consent page signs the user in with Privy (`@privy-io/react-auth`, app id
   served by `GET /api/oauth/authorize/{request}` as `privy.app_id`) and
   posts the access token as `Authorization: Bearer` to `/approve`.
-  pay-cloud verifies it offline (ES256, `PRIVY_VERIFICATION_KEY`, audience
+  pay-connect verifies it offline (ES256, `PRIVY_VERIFICATION_KEY`, audience
   the app id, issuer `privy.io`), takes the DID as the tenant subject
   (`subject_for("privy", did)`), finds the user's embedded Solana wallet or
   creates one owned by the user with pay's key quorum as an additional
@@ -103,11 +103,11 @@ Done on `feat/pay-cloud`:
   `/connect` in the pay.sh Next.js app (branch `feat/connect` there), with
   a headless Privy sign-in (`useLoginWithEmail`: our own email and code
   inputs, no Privy modal) and `/api/connect/*` route handlers proxying to
-  pay-cloud, forwarding `Authorization` and `Cookie` in and `Set-Cookie`
+  pay-connect, forwarding `Authorization` and `Cookie` in and `Set-Cookie`
   out so `pay_subject` lives on pay.sh. A new wallet continues to that
   app's `/onramp` (Coinflow React SDK, card and Apple/Google Pay) with
   `request` and `client`, which approves the pending request when funded
-  or skipped. pay-cloud sends users there through `PAY_CLOUD_PAGES_URL`
+  or skipped. pay-connect sends users there through `PAY_CONNECT_PAGES_URL`
   (default `https://pay.sh`) and does not embed or serve a frontend.
 - **Guests (2026-09-18).** The consent page offers "Continue as guest":
   Approve with `{"guest": true}` mints a wallet-less `guest_…` subject and
@@ -127,36 +127,36 @@ Done on `feat/pay-cloud`:
 
 ## Milestone 1 status (2026-09-15)
 
-Done on `feat/pay-cloud` (PR #464, rebased on main after PR #423 merged on 2026-09-16):
+Done on `feat/pay-connect` (PR #464, rebased on main after PR #423 merged on 2026-09-16):
 
 - Keychain cleanup: `pay_core::backend` registry and `SigningBackend`
   capability trait; `RemoteProvider` is a supertrait so Circle is a file
   plus a registry line. See `docs/keychain.md`. 1Password is deprecated:
   existing accounts load, new ones are refused.
-- `pay-cloud` v0 (`crates/cloud`): serves `POST /api/onboard/start` and
+- `pay-connect` v0 (`crates/connect`): serves `POST /api/onboard/start` and
   `POST /v1/onboard/exchange`
   with PKCE S256, single-use five-minute codes. In-memory only.
 - Browser pages live in the separate `solana-foundation/pay-web-ui`
   repository and are deployed independently from this service.
-- `pay setup --backend cloud` and the "Remote wallet" picker entry run the
+- `pay setup --backend connect` and the "Remote wallet" picker entry run the
   loopback flow end to end; the exchange returns `status: pending` because
-  provisioning is not built. `PAY_CLOUD_LOCAL=1` targets `http://127.0.0.1:8402`, `PAY_CLOUD_URL` any other server,
+  provisioning is not built. `PAY_CONNECT_LOCAL=1` targets `http://127.0.0.1:8402`, `PAY_CONNECT_URL` any other server,
   `PAY_NO_BROWSER=1` skips opening the browser.
 
-- Openfort onboarding driver (`pay_cloud::drivers::openfort`, `openfort`
+- Openfort onboarding driver (`pay_connect::drivers::openfort`, `openfort`
   cargo feature, on by default): the page's "Continue with Openfort" sends
   the browser to Openfort's own consent page; the fragment comes back to
   `/onboard/openfort/callback`; the driver registers a fresh wallet secret,
   records its public key on the project, creates a Solana backend wallet,
   and the exchange hands the CLI `{secret_key, wallet_secret, wallet_id,
   pubkey}`. The CLI verifies the address with Openfort and registers a
-  normal `--backend openfort` account. pay-cloud keeps nothing past the
+  normal `--backend openfort` account. pay-connect keeps nothing past the
   five-minute session.
 
 ### Decision change (2026-09-15): pay owns no custody account
 
-The earlier revision had pay-cloud own one Openfort project and a backend
-wallet per tenant, which made pay-cloud a custodian with a policy engine.
+The earlier revision had pay-connect own one Openfort project and a backend
+wallet per tenant, which made pay-connect a custodian with a policy engine.
 Ludo's direction is the opposite: sign users up with the provider
 programmatically and hand them their own project. Openfort's dashboard
 already exposes the pieces its CLI uses (`/oauth/consent` returning the
@@ -187,7 +187,7 @@ connector custody question above.
 ### Ledger status (2026-09-15)
 
 - pay is on pay-kit `0626cd7c` (pay-kit main, PR #323 merged) with solana-keychain
-  `6461a18`, via a cherry-pick of pay PR #462 onto `feat/pay-cloud`. Every
+  `6461a18`, via a cherry-pick of pay PR #462 onto `feat/pay-connect`. Every
   signer implements keychain 2.x `TransactionSigner`.
 - `remote::ledger` provider behind the `ledger` feature; V0 cap and
   raw-message guards in place. See `docs/keychain.md`.
@@ -219,7 +219,7 @@ connector custody question above.
    ChatGPT, or Cursor, signs in once, funds an address, and their agent gets
    the seven Pay tools with no CLI and no key material on the host.
 2. **Remote wallet in `pay setup`.** A new backend, "Remote wallet", opens
-   `cloud.pay.sh` in the browser. The page handles sign-in, custody backend
+   `connect.pay.sh` in the browser. The page handles sign-in, custody backend
    choice (Openfort now, Circle later), wallet provisioning, onramp, and
    spending caps, then hands the CLI what it needs to sign locally. The TUI
    onramp is skipped for this backend.
@@ -233,7 +233,7 @@ a daily cap.
 ## One service, two front doors
 
 ```text
-              ┌──────────────── cloud.pay.sh (pay-cloud, Cloud Run) ────────────────┐
+              ┌──────────────── connect.pay.sh (pay-connect, Cloud Run) ────────────────┐
 MCP hosts ───►│ /mcp            streamable HTTP MCP, OAuth 2.1 bearer                │
               │ /oauth/*        DCR, PKCE, token, revoke; /.well-known/*             │
 pay setup ───►│ /onboard/*      sign-in, backend picker, provision, fund, caps       │
@@ -261,8 +261,8 @@ place.
 | Party | Holds | Can do |
 | --- | --- | --- |
 | Custody backend | The tenant's private key in a TEE | Sign when presented with valid project credentials |
-| pay-cloud | Project-level backend credentials from Secret Manager. Per tenant: wallet id, pubkey, policy, receipts, hashed tokens | Request a signature for any tenant wallet, subject to its own policy check |
-| CLI (`pay setup --backend remote`) | A tenant-scoped API token in the platform keystore, Touch ID gated like any account | Ask pay-cloud to sign; cannot exceed the tenant's caps |
+| pay-connect | Project-level backend credentials from Secret Manager. Per tenant: wallet id, pubkey, policy, receipts, hashed tokens | Request a signature for any tenant wallet, subject to its own policy check |
+| CLI (`pay setup --backend remote`) | A tenant-scoped API token in the platform keystore, Touch ID gated like any account | Ask pay-connect to sign; cannot exceed the tenant's caps |
 | MCP host | An OAuth access token for one tenant | Call tools; paid calls are policy-checked |
 | User | A sign-in identity and a funding address, no secret | Set caps, read receipts, revoke, withdraw |
 
@@ -278,13 +278,13 @@ not.
 **Why the CLI never receives Openfort credentials.** For the same reason: the
 credentials are project-wide. Handing them to one user's CLI would let that
 user sign for every other tenant's wallet. So "the data needed for using
-Openfort locally" is not Openfort's data. It is a pay-cloud tenant token plus
-the wallet id and pubkey, and the CLI signs through pay-cloud, which signs
+Openfort locally" is not Openfort's data. It is a pay-connect tenant token plus
+the wallet id and pubkey, and the CLI signs through pay-connect, which signs
 through Openfort. This is PR #423's `RemoteProvider` with a second provider,
-`paycloud`, beside `openfort`. Users who own an Openfort project can still use
+`payconnect`, beside `openfort`. Users who own an Openfort project can still use
 `--backend openfort` directly; that path is unchanged.
 
-**Where policy is enforced.** pay-cloud is the only holder of the project
+**Where policy is enforced.** pay-connect is the only holder of the project
 credentials, so it is the enforcement point for every signature: per-call
 ceiling, daily cap, mainnet only, and a URL allowlist for MCP calls. Every
 signature request carries an intent (URL, amount, currency, protocol) that is
@@ -299,16 +299,16 @@ freezes a tenant without moving funds.
 
 ## Decisions
 
-1. **New crate `crates/cloud`, package `pay-cloud`.** pay-api stays the
+1. **New crate `crates/connect`, package `pay-connect`.** pay-api stays the
    stateless balance and settlement service; tenant state and long-lived MCP
    sessions have a different failure profile.
 2. **Postgres for tenant state, Redis for sessions and counters.**
-3. **`CustodyBackend` trait inside pay-cloud** with `create_wallet`,
+3. **`CustodyBackend` trait inside pay-connect** with `create_wallet`,
    `address`, `sign_transaction`, `sign_message`. Openfort first, Circle
    second. This is server-side and distinct from pay-core's `RemoteProvider`,
    which is the client-side view.
-4. **`paycloud` as a pay-core `RemoteProvider`.** Credential field: one
-   `api_token`. `connect` builds a `PayCloudSigner` implementing
+4. **`payconnect` as a pay-core `RemoteProvider`.** Credential field: one
+   `api_token`. `connect` builds a `PayConnectSigner` implementing
    `SolanaSigner` and `TransactionSigner` over HTTPS.
 5. **Loopback callback for browser to CLI**, the pattern `gh auth login` and
    `gcloud auth login` use, with a device-code poll for headless hosts. I
@@ -327,7 +327,7 @@ freezes a tenant without moving funds.
 9. **Ledger is a `RemoteProvider` too**, id `ledger`, with no credential
    fields. The registry becomes the single place a backend is added,
    whether the key is in a TEE, a cloud, or a USB device.
-10. **Connector custody: pay-cloud stores per-tenant Openfort credentials
+10. **Connector custody: pay-connect stores per-tenant Openfort credentials
     (2026-09-16).** A browser-only host has no CLI and no Touch ID, so
     something server-side must sign. The credentials come from the same
     consent driver the CLI onboarding uses, encrypted at rest, and policy is
@@ -335,21 +335,21 @@ freezes a tenant without moving funds.
     wallet per tenant (rejected on 2026-09-15) because it reuses M1 whole and
     keeps each user on their own Openfort project. Build order for the Grok
     connector: A3 transport, A4 OAuth, A2 tenant context, A5 tenant store.
-    A6 (the CLI signing through pay-cloud) is not needed for the connector.
+    A6 (the CLI signing through pay-connect) is not needed for the connector.
 11. **Connector identity and wallet at Privy; no database for now
     (2026-09-17).** Supersedes 10 for the connector. Per-tenant Openfort
-    credentials made pay-cloud a custodian of every user's project secret
+    credentials made pay-connect a custodian of every user's project secret
     and forced an encrypted store. With Privy the user owns the wallet,
     pay's authorization key is one additional signer constrained by the
     user's grant and Privy's policy, identity is Privy's signed token, and
-    pay-cloud holds only the app's operator credentials. The remaining
+    pay-connect holds only the app's operator credentials. The remaining
     state (OAuth clients, codes, tokens, the daily spend counter) is short
     lived and stays in memory behind the existing bounded stores; Redis
     when there is more than one replica. The CLI path is unchanged: a
     user's own Openfort project and local keychain. Openfort's embedded
     wallet mode would fit the same shape if one vendor is preferred.
 
-## Track A: pay-cloud service
+## Track A: pay-connect service
 
 ### A1 Land PR #423 and add credential injection
 
@@ -382,19 +382,19 @@ pub trait PayContext: Send + Sync {
   are tenant-independent.
 - `PolicyGate` as an `AuthGate` beside `ElicitationAuth`: checks the intent's
   amount against `per_call_ceiling` and remaining `daily_cap`, records spend
-  on success. The cloud context returns `ElicitationAuth` when the peer
+  on success. The connect context returns `ElicitationAuth` when the peer
   advertises elicitation, else `PolicyGate`.
 - Assert a multi-thread runtime: `ElicitationAuth` uses `block_in_place`.
 
 ### A3 Crate, transport, sessions
 
-- `crates/cloud`: axum, tower-http, rmcp with `server-side-http`, sqlx
+- `crates/connect`: axum, tower-http, rmcp with `server-side-http`, sqlx
   (postgres, rustls), redis, figment YAML plus env, OpenTelemetry. Bootstrap
   mirrors `pay-api/src/main.rs`.
 - `/mcp`: `StreamableHttpService` with `stateful_mode = true`,
   `allowed_hosts = ["mcp.pay.sh"]`, keep-alive 15 s. A middleware validates
   the bearer, loads the tenant, and inserts a `TenantHandle` into request
-  extensions; `CloudContext` reads it from the `http::request::Parts` rmcp
+  extensions; `ConnectContext` reads it from the `http::request::Parts` rmcp
   injects into each tool call. Reject a call whose tenant differs from the
   one that opened the session.
 - Redis `SessionStore` for rmcp sessions; per-tenant MPP authorizations and
@@ -415,14 +415,14 @@ pub trait PayContext: Send + Sync {
 Opaque random tokens stored hashed, 1 h access and 30 d refresh. `/mcp`
 without a token returns `401` with `WWW-Authenticate: Bearer
 resource_metadata=…`. Static API tokens minted on `/connect/keys` serve hosts
-that only take headers and the CLI's `paycloud` provider. A conformance test
+that only take headers and the CLI's `payconnect` provider. A conformance test
 replays Grok's exact DCR body (`client_name: "Grok"`, redirect
 `https://grok.com/connectors/oauth/callback`, `token_endpoint_auth_method:
 "none"`).
 
 ### A5 Tenant store and custody
 
-Migrations in `crates/cloud/migrations/`:
+Migrations in `crates/connect/migrations/`:
 
 ```text
 tenants(id, siws_pubkey, created_at, disabled_at)
@@ -460,7 +460,7 @@ POST /v1/wallets/{id}/sign-message
 ```
 
 - Bearer is a tenant API token. The wallet must belong to the tenant.
-- Before signing a transaction, pay-cloud decodes the message and verifies the
+- Before signing a transaction, pay-connect decodes the message and verifies the
   stablecoin transfer amount against the intent and the policy, using
   pay-kit's existing charge verification helpers. A message that moves more
   than the intent claims is refused.
@@ -501,7 +501,7 @@ CLI
   code_verifier = random 32 bytes, base64url
   code_challenge = base64url(sha256(code_verifier))
   bind 127.0.0.1:0, serve GET /callback
-  open https://cloud.pay.sh/onboard
+  open https://connect.pay.sh/onboard
         ?callback=http://127.0.0.1:PORT/callback&state=…&code_challenge=…
         &account=<name>&host=<hostname>&cli=<version>
   print "Complete setup in your browser… (press q to cancel)"
@@ -520,7 +520,7 @@ CLI
 
 ```json
 {
-  "provider": "paycloud",
+  "provider": "payconnect",
   "wallet_id": "w_01J…",
   "pubkey": "7xKX…",
   "network": "mainnet",
@@ -540,15 +540,15 @@ CLI
   `/v1/onboard/poll`. Also the automatic path when no browser can be opened
   or stderr is not a TTY.
 
-### B2 `paycloud` RemoteProvider in pay-core
+### B2 `payconnect` RemoteProvider in pay-core
 
-- `core/src/remote/paycloud.rs`: `id = "paycloud"`, one credential field
+- `core/src/remote/payconnect.rs`: `id = "payconnect"`, one credential field
   `api_token`, `discover` lists the tenant's wallets via
-  `GET /v1/wallets`, `connect` returns `PayCloudSigner`.
-- `PayCloudSigner` implements `SolanaSigner` and `TransactionSigner`: caches
+  `GET /v1/wallets`, `connect` returns `PayConnectSigner`.
+- `PayConnectSigner` implements `SolanaSigner` and `TransactionSigner`: caches
   the pubkey, posts to `/v1/wallets/{id}/sign-transaction` and `sign-message`,
   verifies the returned signature locally before use. Base URL from
-  `PAY_CLOUD_URL`, default `https://cloud.pay.sh`.
+  `PAY_CONNECT_URL`, default `https://connect.pay.sh`.
 - Intent metadata: pay-core's builders know the URL, amount, and protocol
   when they sign. Thread an `Option<SignIntent>` into the signer through the
   existing `AuthIntent` that already carries amount and description.
@@ -559,7 +559,7 @@ CLI
     mainnet:
       ludo:
         keystore: remote
-        provider: paycloud
+        provider: payconnect
         account: w_01J…
         pubkey: 7xKX…
         auth_required: true
@@ -567,7 +567,7 @@ CLI
 
 ### B3 Setup and account changes
 
-- `pick_backend` gains "Remote wallet (cloud.pay.sh)" and "Ledger hardware
+- `pick_backend` gains "Remote wallet (connect.pay.sh)" and "Ledger hardware
   wallet" entries, drawn from `pay_core::remote::providers()` after the
   platform entry. `--backend remote` and `--backend ledger` flags.
 - `setup.rs`: when the backend is `remote`, run the B1 flow, skip
@@ -575,9 +575,9 @@ CLI
   funding was skipped, print the existing "top-up required" notice with
   `pay topup` pointing at the cloud fund page.
 - `account new --backend remote` runs the same flow for an additional
-  account. `account destroy` revokes the token at pay-cloud, then deletes the
+  account. `account destroy` revokes the token at pay-connect, then deletes the
   blob. `account export` keeps refusing for remote accounts.
-- `pay topup` for a `paycloud` account opens `/connect/fund` instead of the
+- `pay topup` for a `payconnect` account opens `/connect/fund` instead of the
   TUI.
 
 ### B4 Circle later
@@ -585,7 +585,7 @@ CLI
 `CircleBackend` implements `CustodyBackend` with developer-controlled wallets:
 API key plus entity secret ciphertext, both project-wide, wallet creation and
 sign endpoints per wallet id. The onboarding backend picker lists it once the
-implementation lands. Nothing in the CLI changes; the `paycloud` provider is
+implementation lands. Nothing in the CLI changes; the `payconnect` provider is
 backend-agnostic.
 
 ## Track C: Ledger
@@ -649,7 +649,7 @@ envelope instead, so verification fails. Affected today:
    `keystore: remote, provider: ledger, account: "m/44'/501'/0'", pubkey`.
    `auth_required` is ignored; the device is the gate.
 3. `SignerCapabilities { raw_message: bool, max_tx_version: TxVersion }` on
-   `ResolvedSigner`. Memory, openfort, paycloud: raw true, V1. Ledger: raw
+   `ResolvedSigner`. Memory, openfort, payconnect: raw true, V1. Ledger: raw
    false, V0. `choose_payment` filters out options that need a raw message
    when the signer cannot provide one, and every builder call passes
    `max_tx_version` from the capabilities. Today pay-core passes no cap.
@@ -685,7 +685,7 @@ lifts every "unsupported" row in C2.
 | Week | Track A | Track B | Track C |
 | --- | --- | --- | --- |
 | 1 | A1 merge #423 plus injection; A2 `PayContext` | | C3: cherry-pick `ledger` feature to kit main, close pr-206 |
-| 2 | A3 transport; A5 store and Openfort backend; A6 signer API; static bearer | B2 `paycloud` provider against a local pay-cloud | C4.1 land #462, bump kit pin |
+| 2 | A3 transport; A5 store and Openfort backend; A6 signer API; static bearer | B2 `payconnect` provider against a local pay-connect | C4.1 land #462, bump kit pin |
 | 3 | A7 onboarding pages and exchange; A4 OAuth AS | B1 loopback flow; B3 setup changes; skip TUI onramp | C4.2 to C4.4 ledger provider, capabilities, prompts |
 | 4 | A3 Redis sessions; `/connect/*`; A8 ops; deploy | B1 headless poll; `pay topup` cloud path | C4.5 runtime test; C4.6 setup; C5 build matrix |
 | 5 | B4 Circle backend | | C6 spec drafts |
@@ -723,7 +723,7 @@ spec drafts deferred.
 
 ## Risks
 
-- **Hosted custody is custody.** pay-cloud can request any signature for any
+- **Hosted custody is custody.** pay-connect can request any signature for any
   tenant. Mitigations: caps in code, receipts, withdraw, and the
   non-custodial allowance phase as the exit.
 - **OAuth surface.** Public-client profile only, PKCE required, exact redirect

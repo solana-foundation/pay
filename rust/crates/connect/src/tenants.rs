@@ -490,7 +490,7 @@ impl CloudContext {
                  card), then ask again. Browsing the catalog works without a wallet."
             ),
             None => "This connection has no wallet yet. Finish setting up your pay account at \
-                     cloud.pay.sh, then try again."
+                     connect.pay.sh, then try again."
                 .to_string(),
         }
     }

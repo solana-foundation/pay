@@ -944,7 +944,7 @@ pub async fn approve(
             .subject_cookie(&subject, state.public_url().starts_with("https://"))
     });
     // After a Privy sign-in, a wallet with nothing to pay with goes to the
-    // funding page first when card purchases are on: a wallet created
+    // funding page first: a wallet created
     // seconds ago, or any wallet pay-api reports as holding no stablecoin.
     // The request stays pending and the funding page approves it by cookie
     // when the user is done (or skips).
@@ -954,7 +954,6 @@ pub async fn approve(
         .map(|t| t.pubkey.clone())
         .ok_or_else(unknown_request)?;
     let needs_funding = fresh_login
-        && funding_enabled(&state)
         && (bound == Some(Bound::Created) || state.wallet_probe().holds_nothing(&address).await);
     if needs_funding {
         store.pending(&id).ok_or_else(unknown_request)?;
@@ -983,16 +982,6 @@ pub async fn approve(
         response.headers_mut().insert(header::SET_COOKIE, cookie);
     }
     Ok(response)
-}
-
-#[cfg(feature = "coinflow")]
-fn funding_enabled(state: &AppState) -> bool {
-    state.funding().is_some()
-}
-
-#[cfg(not(feature = "coinflow"))]
-fn funding_enabled(_state: &AppState) -> bool {
-    false
 }
 
 /// How a Privy sign-in bound its tenant, when it did.
@@ -1385,9 +1374,8 @@ pub async fn link_complete(
     state.tenants().bind(linked);
     claim.commit();
     tracing::info!(%guest, %subject, address = %record.pubkey, "guest connection linked to a wallet");
-    let funded = !(funding_enabled(&state)
-        && (bound == Some(Bound::Created)
-            || state.wallet_probe().holds_nothing(&record.pubkey).await));
+    let funded = !(bound == Some(Bound::Created)
+        || state.wallet_probe().holds_nothing(&record.pubkey).await);
     let mut response = Json(LinkResult {
         address: record.pubkey.clone(),
         funded,
@@ -2660,7 +2648,7 @@ mod tests {
             assert_eq!(view.json()["has_wallet"], false);
 
             // Approve with the Privy access token: the wallet is created
-            // with pay's signer, the tenant bound, the browser remembered.
+            // with pay's signer, the tenant bound, and funding offered.
             let token = fake.token_for(USER);
             let approved = post_json_with(
                 &app,
@@ -2681,6 +2669,16 @@ mod tests {
             assert_eq!(tenant.provider, "privy");
             assert_eq!(tenant.pubkey, ADDRESS);
             assert_eq!(tenant.credentials["app_secret"], "secret_test");
+
+            assert_eq!(
+                approved.json()["fund"]["address"],
+                ADDRESS,
+                "{}",
+                approved.body
+            );
+            let approved =
+                post_json_as(&app, &approve_path(&request_id), json!({}), Some(&cookie)).await;
+            assert_eq!(approved.status, StatusCode::OK, "{}", approved.body);
 
             // Code → tokens → an MCP tool call names that wallet.
             let redirect = Url::parse(approved.json()["redirect"].as_str().unwrap()).unwrap();
@@ -2729,29 +2727,18 @@ mod tests {
             assert_eq!(mock.created.lock().unwrap().len(), 1);
         }
 
-        /// With card purchases on, a wallet created during sign-in is funded
+        /// A wallet created during sign-in is funded
         /// before the host gets its code: Approve answers with the address
         /// and the still-open request, and the funding page approves by
         /// cookie when done.
-        #[cfg(feature = "coinflow")]
         #[tokio::test]
         async fn a_new_wallet_is_funded_before_the_host_gets_its_code() {
             let mock = Arc::new(MockPrivy::default());
             let base = mock_privy(mock.clone()).await;
             let fake = FakeApp::new(&base);
-            let coinflow = crate::funding::Config {
-                api_key: "cf_test".to_string(),
-                env: crate::funding::Env::Sandbox,
-                merchant_id: "pay".to_string(),
-                webhook_key: None,
-                settle_to_customer: false,
-                api_url: "http://127.0.0.1:1".to_string(),
-                card_entry: crate::funding::CardEntry::Hosted,
-            };
             let state = AppState::with_drivers("https://cloud.test", vec![])
                 .with_mcp(crate::mcp::Config::new("https://cloud.test", vec![]))
                 .with_privy(crate::privy::Privy::new(fake.cfg.clone()).unwrap())
-                .with_funding(crate::funding::Funding::new(coinflow))
                 // Once created, the wallet is treated as funded.
                 .with_wallet_probe(Arc::new(crate::FixedProbe(false)));
             let app = crate::router(state.clone());
@@ -2901,7 +2888,7 @@ mod tests {
             .await;
             assert_eq!(linked.status, StatusCode::OK, "{}", linked.body);
             assert_eq!(linked.json()["address"], ADDRESS);
-            assert_eq!(linked.json()["funded"], true, "no funding configured");
+            assert_eq!(linked.json()["funded"], false, "new wallets need funding");
             assert!(cookie_of(&linked).starts_with("pay_subject=sub_"));
             assert_eq!(mock.created.lock().unwrap().len(), 1);
             assert_eq!(state.tenants().len(), 2, "guest subject and privy subject");
@@ -2914,7 +2901,6 @@ mod tests {
 
         /// An existing wallet that pay-api reports empty is funded first too,
         /// on every Privy sign-in; a cookie approval never detours.
-        #[cfg(feature = "coinflow")]
         #[tokio::test]
         async fn an_existing_empty_wallet_is_funded_first() {
             let mock = Arc::new(MockPrivy::default());
@@ -2927,19 +2913,9 @@ mod tests {
             );
             let base = mock_privy(mock.clone()).await;
             let fake = FakeApp::new(&base);
-            let coinflow = crate::funding::Config {
-                api_key: "cf_test".to_string(),
-                env: crate::funding::Env::Sandbox,
-                merchant_id: "pay".to_string(),
-                webhook_key: None,
-                settle_to_customer: false,
-                api_url: "http://127.0.0.1:1".to_string(),
-                card_entry: crate::funding::CardEntry::Hosted,
-            };
             let state = AppState::with_drivers("https://cloud.test", vec![])
                 .with_mcp(crate::mcp::Config::new("https://cloud.test", vec![]))
                 .with_privy(crate::privy::Privy::new(fake.cfg.clone()).unwrap())
-                .with_funding(crate::funding::Funding::new(coinflow))
                 .with_wallet_probe(Arc::new(crate::FixedProbe(true)));
             let app = crate::router(state.clone());
             let client_id = register_grok(&app).await;

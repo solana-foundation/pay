@@ -20,7 +20,7 @@ pub struct SetupCommand {
     pub force: bool,
 
     /// Storage backend: "keychain" (macOS), "gnome-keyring" (Linux),
-    /// "windows-hello" (Windows), "file" (headless fallback), "cloud" (a
+    /// "windows-hello" (Windows), "file" (headless fallback), "connect" (a
     /// remote wallet linked from your browser), or a remote signing backend
     /// registered in `pay_core::remote` ("openfort").
     #[arg(long)]
@@ -125,12 +125,12 @@ impl SetupCommand {
         // choice, so none of the local keypair steps below apply. Nothing
         // is installed until provisioning returns an account; funding then
         // runs the same way as for every other backend.
-        if backend == super::cloud_onboard::CLOUD_BACKEND_FLAG {
-            let pubkey = super::cloud_onboard::run_setup_onboarding(&account_name, self.force)?;
+        if backend == super::connect_onboard::CONNECT_BACKEND_FLAG {
+            let pubkey = super::connect_onboard::run_setup_onboarding(&account_name, self.force)?;
             return fund_new_account(
                 &pubkey,
                 &account_name,
-                super::cloud_onboard::CLOUD_BACKEND_NAME,
+                super::connect_onboard::CONNECT_BACKEND_NAME,
                 false,
             );
         }

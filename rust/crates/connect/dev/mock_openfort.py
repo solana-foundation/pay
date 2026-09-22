@@ -1,4 +1,4 @@
-"""A stand-in for the Openfort endpoints pay-cloud's driver touches.
+"""A stand-in for the Openfort endpoints pay-connect's driver touches.
 
 Lets the whole onboarding and connector flow run on one machine with no
 Openfort account: the consent page redirects straight back with a mock
@@ -6,7 +6,7 @@ grant, and the provisioning calls answer with one fixed wallet.
 
     python3 mock_openfort.py 8499
 
-Point pay-cloud at it with OPENFORT_BASE_URL and OPENFORT_AUTH_PAGE_URL
+Point pay-connect at it with OPENFORT_BASE_URL and OPENFORT_AUTH_PAGE_URL
 (both http://127.0.0.1:8499). Credentials it hands out sign nothing real.
 """
 import json

@@ -1,26 +1,24 @@
 [package]
-name = "pay-cloud"
-description = "pay-cloud v0: browser onboarding APIs for the pay CLI and hosted connector"
+name = "pay-connect"
+description = "pay-connect v0: browser onboarding APIs for the pay CLI and hosted connector"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "pay-cloud"
+name = "pay-connect"
 path = "src/main.rs"
 
 [features]
-default = ["openfort", "coinflow", "mcp", "privy"]
+default = ["openfort", "mcp", "privy"]
 # Openfort wallet driver: dashboard consent handoff, wallet-secret
-# registration and Solana backend wallet creation. Off leaves pay-cloud
+# registration and Solana backend wallet creation. Off leaves pay-connect
 # with no custody backend, which is enough to exercise the PKCE handshake.
 openfort = ["dep:p256", "dep:reqwest"]
-# Card purchases of USDC through Coinflow (`/api/fund/*`, the `/fund` page).
-coinflow = ["dep:reqwest", "dep:bs58"]
 # The hosted connector: pay's MCP tools over streamable HTTP at `/mcp`.
 mcp = ["dep:rmcp", "dep:pay-mcp", "dep:pay-core", "dep:http"]
 # Privy as the connector's login and wallet: the consent page signs the
-# user in with Privy, pay-cloud verifies the token, and the user's Privy
+# user in with Privy, pay-connect verifies the token, and the user's Privy
 # wallet (with pay's key as a signer) becomes the tenant's wallet.
 privy = ["mcp", "dep:reqwest", "dep:jsonwebtoken", "dep:p256"]
 
@@ -28,7 +26,6 @@ privy = ["mcp", "dep:reqwest", "dep:jsonwebtoken", "dep:p256"]
 async-trait = "0.1"
 axum = { workspace = true }
 base64 = { workspace = true }
-bs58 = { workspace = true, optional = true }
 clap = { workspace = true }
 http = { version = "1", optional = true }
 hmac = "0.12"

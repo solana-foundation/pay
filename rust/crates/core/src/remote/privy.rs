@@ -7,7 +7,7 @@
 //! is one policy-checked HTTPS call per transaction.
 //!
 //! This is the operator's view: the same three credentials sign for every
-//! wallet the key quorum is a signer on. pay-cloud uses it for hosted
+//! wallet the key quorum is a signer on. pay-connect uses it for hosted
 //! connector wallets, where the user owns the wallet and grants pay's key
 //! as an additional signer; the CLI can use it for an app's server wallets.
 //!

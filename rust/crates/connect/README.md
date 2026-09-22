@@ -1,8 +1,8 @@
-# pay-cloud
+# pay-connect
 
 The hosted half of pay. One axum server, a separately deployed frontend, and four jobs:
 
-- **Onboarding** for `pay setup --backend cloud`: the `gh auth login`
+- **Onboarding** for `pay setup --backend connect`: the `gh auth login`
   pattern. The CLI follows a redirect to the pages app, which sends the browser through a
   wallet provider (Openfort), and the CLI redeems a one-time code with PKCE.
 - **Funding**: the pages app's `/onramp` page buys USDC with a card through Coinflow for
@@ -13,7 +13,7 @@ The hosted half of pay. One axum server, a separately deployed frontend, and fou
 - **Tenants**: a connector subject bound to a wallet and a spending policy.
   With Privy configured, the consent page signs the user in with Privy and
   the user's Privy wallet (pay's key as an additional signer) is the
-  tenant's wallet; pay-cloud then holds only the app's operator
+  tenant's wallet; pay-connect then holds only the app's operator
   credentials, nothing per user.
 
 Everything below runs locally. State is in memory and lost on restart.
@@ -21,27 +21,27 @@ Everything below runs locally. State is in memory and lost on restart.
 ## Try it
 
 ```sh
-rust/crates/cloud/dev/run.sh
+rust/crates/connect/dev/run.sh
 ```
 
 Builds the payment-debugger bundle and the binaries, starts a mock Openfort so wallet
 creation works with no Openfort account, loads the repo-root `.env`
-(Coinflow sandbox), and starts pay-cloud on `http://127.0.0.1:8402` with
+(Coinflow sandbox), and starts pay-connect on `http://127.0.0.1:8402` with
 the connector on. It prints the commands to try: adding the connector to
 Claude Code and authenticating through the consent page, `pay setup
---backend cloud`, and `pay topup` with a card. `--real-openfort` uses the
+--backend connect`, and `pay topup` with a card. `--real-openfort` uses the
 real dashboard; `--public-url` sets the issuer and allowed hosts for a
 tunnel, which Grok needs.
 
-Environment: `PAY_CLOUD_MCP=1` mounts `/mcp` and the OAuth server;
-`PAY_CLOUD_MCP_TOKENS` adds comma-separated static bearer tokens;
-`PAY_CLOUD_MCP_ALLOWED_HOSTS` overrides the `Host` allowlist derived from
-the public URL. `COINFLOW_*` configure funding (see `docs/onramp-coinflow.md`).
+Environment: `PAY_CONNECT_MCP=1` mounts `/mcp` and the OAuth server;
+`PAY_CONNECT_MCP_TOKENS` adds comma-separated static bearer tokens;
+`PAY_CONNECT_MCP_ALLOWED_HOSTS` overrides the `Host` allowlist derived from
+the public URL. Coinflow checkout configuration and APIs live in `pay-web-ui`.
 `OPENFORT_BASE_URL` and `OPENFORT_AUTH_PAGE_URL` point the driver at a
 mock or staging.
 
-`PAY_CLOUD_PAGES_URL` points browser redirects at the pay.sh web app
-(`/connect` there, which proxies `/api/oauth/*` and `/api/fund/*` back
+`PAY_CONNECT_PAGES_URL` points browser redirects at the pay.sh web app
+(`/connect` there, which proxies `/api/oauth/*` back
 here); it defaults to `https://pay.sh`.
 
 Privy login on the consent page needs, from dashboard.privy.io:
@@ -52,7 +52,7 @@ dashboard's Authorization keys page creates both, or `POST /v1/key_quorums`
 with a locally generated key). Token signatures are checked against the
 app's JWKS, fetched once at startup from auth.privy.io (`PRIVY_JWKS_URL` to
 override, or `PRIVY_VERIFICATION_KEY` for a single PEM). Optional:
-`PRIVY_POLICY_ID` to attach a wallet policy to wallets pay-cloud creates,
+`PRIVY_POLICY_ID` to attach a wallet policy to wallets pay-connect creates,
 `PRIVY_API_BASE_URL` for a mock. The dashboard must also list the server's
 origin under allowed origins. Put them in the repo-root `.env`; `dev/run.sh`
 loads it.
@@ -60,27 +60,27 @@ loads it.
 ## Frontend
 
 The browser UI lives in the separate `solana-foundation/pay-web-ui`
-repository and is deployed independently. Point local pay-cloud at it with
-`PAY_CLOUD_PAGES_URL`.
+repository and is deployed independently. Point local pay-connect at it with
+`PAY_CONNECT_PAGES_URL`.
 
 This crate does not build, embed, or serve frontend assets.
 
 ## Run
 
 ```sh
-cargo run -p pay-cloud -- --port 8402
+cargo run -p pay-connect -- --port 8402
 ```
 
 Flags: `--bind` (default `127.0.0.1`), `--port` (default `8402`). Logging is
 `RUST_LOG`-driven and goes to stderr.
 
-Browser entrypoints redirect to `PAY_CLOUD_PAGES_URL`; unknown paths return
+Browser entrypoints redirect to `PAY_CONNECT_PAGES_URL`; unknown paths return
 JSON 404 responses. `GET /health` returns `{"status":"ok"}`.
 
 Try it end to end without the browser:
 
 ```sh
-cargo run -p pay -- cloud-onboard --url http://127.0.0.1:8402
+cargo run -p pay -- connect-onboard --url http://127.0.0.1:8402
 ```
 
 ## JSON endpoints
@@ -133,7 +133,7 @@ Response `200`:
 
 ```json
 {
-  "provider": "pay-cloud",
+  "provider": "pay-connect",
   "status": "pending",
   "email": "a@b.co",
   "network": "mainnet",

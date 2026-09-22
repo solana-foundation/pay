@@ -31,7 +31,7 @@ impl PayMcp {
         Self::with_context(Arc::new(LocalContext::new()))
     }
 
-    /// A server whose calls are resolved by `context`; pay-cloud's per-tenant
+    /// A server whose calls are resolved by `context`; pay-connect's per-tenant
     /// server.
     pub fn with_context(context: Arc<dyn PayContext>) -> Self {
         Self {

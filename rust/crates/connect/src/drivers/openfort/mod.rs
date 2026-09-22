@@ -15,7 +15,7 @@
 //!
 //! The consent page (`/oauth/consent`) is the same one Openfort's CLI uses:
 //! it signs the user in or up, lets them pick or create a project, and
-//! redirects back with the project's keys in the URL fragment. pay-cloud
+//! redirects back with the project's keys in the URL fragment. pay-connect
 //! never sees an Openfort password and never keeps the keys past the
 //! onboarding session.
 
@@ -348,14 +348,14 @@ mod tests {
     #[test]
     fn consent_url_targets_the_dashboard_consent_page() {
         let d = Openfort::default();
-        let url = d.consent_url("https://cloud.pay.sh/onboard/openfort/callback", "st-1");
+        let url = d.consent_url("https://connect.pay.sh/onboard/openfort/callback", "st-1");
         let parsed = url::Url::parse(&url).unwrap();
         assert_eq!(parsed.origin().ascii_serialization(), DEFAULT_DASHBOARD_URL);
         assert_eq!(parsed.path(), "/oauth/consent");
         let q: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
         assert_eq!(
             q["redirect_uri"],
-            "https://cloud.pay.sh/onboard/openfort/callback"
+            "https://connect.pay.sh/onboard/openfort/callback"
         );
         assert_eq!(q["state"], "st-1");
     }

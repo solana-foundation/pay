@@ -1,4 +1,4 @@
-//! pay-cloud v0 — browser onboarding for the `pay` CLI.
+//! pay-connect v0 — browser onboarding for the `pay` CLI.
 //!
 //! Serves the onboarding APIs used by the separately deployed pay-web-ui
 //! frontend and these JSON endpoints:
@@ -29,8 +29,6 @@ use serde_json::json;
 
 pub use onboard::{OnboardSession, SESSION_TTL};
 
-#[cfg(feature = "coinflow")]
-pub mod funding;
 #[cfg(feature = "mcp")]
 pub mod hosts;
 #[cfg(feature = "mcp")]
@@ -77,9 +75,6 @@ pub struct AppState {
     /// The separately deployed pay.sh web app, which proxies its API calls
     /// back here.
     pages_url: String,
-    /// Card purchases through Coinflow; `None` until configured.
-    #[cfg(feature = "coinflow")]
-    funding: Option<Arc<funding::Funding>>,
     /// The hosted MCP connector; `None` until enabled.
     #[cfg(feature = "mcp")]
     mcp: Option<Arc<mcp::Config>>,
@@ -150,7 +145,7 @@ impl WalletProbe for FixedProbe {
 
 impl AppState {
     /// State with every compiled-in driver. `public_url` is how browsers
-    /// reach this server, e.g. `https://cloud.pay.sh` or
+    /// reach this server, e.g. `https://connect.pay.sh` or
     /// `http://127.0.0.1:8402`.
     pub fn new(public_url: impl Into<String>) -> Self {
         Self::with_drivers(public_url, drivers::all())
@@ -167,8 +162,6 @@ impl AppState {
             drivers: Arc::new(drivers),
             public_url: public_url.into().trim_end_matches('/').to_string(),
             pages_url: DEFAULT_PAGES_URL.to_string(),
-            #[cfg(feature = "coinflow")]
-            funding: None,
             #[cfg(feature = "mcp")]
             mcp: None,
             #[cfg(feature = "mcp")]
@@ -225,24 +218,12 @@ impl AppState {
         self.oauth.as_deref()
     }
 
-    /// Enable card purchases with this Coinflow merchant.
-    #[cfg(feature = "coinflow")]
-    pub fn with_funding(mut self, funding: funding::Funding) -> Self {
-        self.funding = Some(Arc::new(funding));
-        self
-    }
-
-    #[cfg(feature = "coinflow")]
-    pub fn funding(&self) -> Option<&funding::Funding> {
-        self.funding.as_deref()
-    }
-
     pub fn public_url(&self) -> &str {
         &self.public_url
     }
 
     /// Serve browser pages from `url` (the pay.sh web app). That app proxies
-    /// `/api/oauth/*` and `/api/fund/*` here.
+    /// `/api/oauth/*` here. Funding APIs are owned by pay-web-ui.
     pub fn with_pages_url(mut self, url: impl Into<String>) -> Self {
         self.pages_url = url.into().trim_end_matches('/').to_string();
         self
@@ -376,7 +357,7 @@ impl AppState {
     }
 }
 
-/// Full pay-cloud router: health and API endpoints. Browser routes redirect
+/// Full pay-connect router: health and API endpoints. Browser routes redirect
 /// to the separately deployed pages app.
 pub fn router(state: AppState) -> Router {
     let router = Router::new()
@@ -424,11 +405,6 @@ pub fn router(state: AppState) -> Router {
         .route("/api/oauth/link/{ticket}", get(oauth::link_view))
         .route("/api/oauth/link/{ticket}", post(oauth::link_complete))
         .route("/api/session/logout", post(oauth::sign_out));
-    #[cfg(feature = "coinflow")]
-    let router = router
-        .route("/api/fund/start", post(funding::start))
-        .route("/api/fund/webhook", post(funding::webhook))
-        .route("/api/fund/{payment_id}", get(funding::status));
     #[cfg(feature = "mcp")]
     let mcp = state.mcp.clone().map(|cfg| {
         (
@@ -703,7 +679,7 @@ pub(crate) mod tests {
         assert_eq!(
             body,
             json!({
-                "provider": "pay-cloud",
+                "provider": "pay-connect",
                 "status": "pending",
                 "email": "a@b.co",
                 "network": "mainnet",

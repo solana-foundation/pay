@@ -69,7 +69,7 @@ pub fn providers() -> impl Iterator<Item = &'static dyn RemoteProvider> {
 /// Where an account's remote credentials come from.
 ///
 /// The CLI reads them from the platform secret store behind Touch ID;
-/// pay-cloud holds them per tenant. An [`AccountsStore`](crate::accounts::AccountsStore)
+/// pay-connect holds them per tenant. An [`AccountsStore`](crate::accounts::AccountsStore)
 /// names its source, so the same signing paths serve both without knowing
 /// which one they are on. The source applies `gate` before handing the
 /// credentials out: that is where a spending policy or a prompt runs.
@@ -114,7 +114,7 @@ impl CredentialSource for PlatformCredentials {
     }
 }
 
-/// Credentials held in memory, gated on every load. pay-cloud's per-tenant
+/// Credentials held in memory, gated on every load. pay-connect's per-tenant
 /// source, and a test double.
 pub struct MemoryCredentials {
     credentials: Credentials,

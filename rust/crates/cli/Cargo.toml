@@ -71,7 +71,7 @@ pay-pdb = { workspace = true }
 urlencoding = "2.1.3"
 uuid = { workspace = true }
 webbrowser = { workspace = true }
-# Loopback onboarding (`pay cloud-onboard`): PKCE S256 + browser URL host.
+# Loopback onboarding (`pay connect-onboard`): PKCE S256 + browser URL host.
 sha2 = { workspace = true }
 hostname = "0.4"
 # Payer proxy: incremental OpenAI→Anthropic SSE translation stream.

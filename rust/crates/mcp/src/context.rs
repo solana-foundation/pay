@@ -5,7 +5,7 @@
 //! a hosted server where every call belongs to a different tenant. A
 //! [`PayContext`] turns a request into a [`CallScope`]: the accounts to
 //! use, the overrides, and how approval works. [`LocalContext`] reproduces
-//! the laptop behaviour; pay-cloud supplies a tenant context.
+//! the laptop behaviour; pay-connect supplies a tenant context.
 
 use std::sync::Arc;
 

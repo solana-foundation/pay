@@ -76,9 +76,9 @@ pub fn create_account(
 ) -> pay_core::Result<(String, &'static str)> {
     let backend_id = resolve_backend(backend)?;
 
-    if backend_id == crate::commands::cloud_onboard::CLOUD_BACKEND_FLAG {
+    if backend_id == crate::commands::connect_onboard::CONNECT_BACKEND_FLAG {
         return Err(pay_core::Error::Config(
-            "The browser-linked remote wallet is set up with `pay setup --backend cloud`."
+            "The browser-linked remote wallet is set up with `pay setup --backend connect`."
                 .to_string(),
         ));
     }
@@ -629,7 +629,7 @@ fn available_backends_hint() -> String {
 
     std::iter::once(platform.flag())
         .chain(std::iter::once(
-            crate::commands::cloud_onboard::CLOUD_BACKEND_FLAG,
+            crate::commands::connect_onboard::CONNECT_BACKEND_FLAG,
         ))
         .chain(pay_core::remote::providers().map(|p| p.flag()))
         .map(|id| format!("'{id}'"))
@@ -755,9 +755,9 @@ pub fn pick_backend() -> pay_core::Result<String> {
     // a picker entry: the browser flow is the remote wallet.
     if platform.is_some() {
         options.push(Opt {
-            id: crate::commands::cloud_onboard::CLOUD_BACKEND_FLAG,
-            name: crate::commands::cloud_onboard::CLOUD_BACKEND_NAME.to_string(),
-            detail: crate::commands::cloud_onboard::CLOUD_BACKEND_DETAIL.to_string(),
+            id: crate::commands::connect_onboard::CONNECT_BACKEND_FLAG,
+            name: crate::commands::connect_onboard::CONNECT_BACKEND_NAME.to_string(),
+            detail: crate::commands::connect_onboard::CONNECT_BACKEND_DETAIL.to_string(),
         });
     }
 

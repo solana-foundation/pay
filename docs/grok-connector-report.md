@@ -15,7 +15,7 @@ client.
 
 ## Environment
 
-- Server: pay-cloud (Rust, axum, rmcp 1.8 streamable HTTP), served over
+- Server: pay-connect (Rust, axum, rmcp 1.8 streamable HTTP), served over
   HTTPS through a public tunnel. Host header and TLS are valid.
 - MCP transport: streamable HTTP at `/mcp`, stateful sessions.
 - Authorization server: same origin, RFC 8414 + RFC 9728 metadata, RFC 7591
@@ -125,4 +125,4 @@ The same documents are also served at the path-based locations
 ## Contact
 
 Ludo Galabru, Solana Foundation. Server source: github.com/solana-foundation/pay
-(`rust/crates/cloud`).
+(`rust/crates/connect`).

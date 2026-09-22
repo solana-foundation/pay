@@ -2,10 +2,10 @@
 //!
 //! A browser-only MCP user has no CLI and no keychain. With Privy the
 //! consent page signs them in (email, passkey, social), Privy holds the
-//! wallet, and pay-cloud keeps nothing secret per user:
+//! wallet, and pay-connect keeps nothing secret per user:
 //!
 //! 1. The page obtains a Privy access token and posts it with Approve.
-//! 2. pay-cloud verifies the token offline (ES256, the app's verification
+//! 2. pay-connect verifies the token offline (ES256, the app's verification
 //!    key from the dashboard) and takes the user's DID as identity.
 //! 3. It finds the user's Solana wallet, or creates one owned by the user
 //!    with pay's key quorum as an additional signer and the configured
@@ -14,7 +14,7 @@
 //!    three operator credentials; Privy's policy and pay's spend policy
 //!    both apply.
 //!
-//! Everything pay-cloud needs is in the environment: `PRIVY_APP_ID`,
+//! Everything pay-connect needs is in the environment: `PRIVY_APP_ID`,
 //! `PRIVY_APP_SECRET`, `PRIVY_AUTHORIZATION_PRIVATE_KEY` (`wallet-auth:…`),
 //! `PRIVY_SIGNER_ID` (that key's quorum id), optionally `PRIVY_POLICY_ID`,
 //! `PRIVY_API_BASE_URL`, and one of `PRIVY_VERIFICATION_KEY` (a single PEM,
@@ -55,7 +55,7 @@ pub struct Config {
     pub authorization_key: String,
     /// Key quorum id of that key, as Privy lists it on wallets.
     pub signer_id: String,
-    /// Policy attached to wallets pay-cloud creates.
+    /// Policy attached to wallets pay-connect creates.
     pub policy_id: Option<String>,
     pub api_base: String,
 }
@@ -213,7 +213,7 @@ impl Keys {
     }
 }
 
-/// The Privy client pay-cloud holds: app credentials and the verifier.
+/// The Privy client pay-connect holds: app credentials and the verifier.
 pub struct Privy {
     cfg: Config,
     http: reqwest::Client,

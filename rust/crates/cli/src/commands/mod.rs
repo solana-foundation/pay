@@ -6,8 +6,8 @@ pub(crate) mod agent_args;
 mod buzz_setup;
 pub mod catalog;
 pub mod claude;
-pub mod cloud_onboard;
 pub mod codex;
+pub mod connect_onboard;
 pub mod curl;
 pub mod docs;
 pub mod fanout;
@@ -56,9 +56,9 @@ pub enum Command {
     Acp(acp::AcpCommand),
     /// Run Claude Code with 402 payment support.
     Claude(claude::ClaudeCommand),
-    /// Link this terminal to pay-cloud from the browser (preview).
+    /// Link this terminal to pay-connect from the browser (preview).
     #[command(hide = true)]
-    CloudOnboard(cloud_onboard::CloudOnboardCommand),
+    ConnectOnboard(connect_onboard::ConnectOnboardCommand),
     /// Run Codex with 402 payment support.
     Codex(codex::CodexCommand),
     /// Run Goose with 402 payment support.
@@ -174,7 +174,7 @@ impl Command {
             | Command::Fanout(_)
             | Command::Topup(_) => true,
             Command::Setup(_)
-            | Command::CloudOnboard(_)
+            | Command::ConnectOnboard(_)
             | Command::Account { .. }
             | Command::Whoami(_)
             | Command::Skills { .. }
@@ -210,7 +210,7 @@ impl Command {
             | Command::Send(_)
             | Command::Fanout(_)
             | Command::Setup(_)
-            | Command::CloudOnboard(_)
+            | Command::ConnectOnboard(_)
             | Command::Topup(_)
             | Command::Server { .. }
             | Command::Gate { .. }
@@ -271,7 +271,7 @@ impl Command {
             }
             Command::Fanout(cmd) => return cmd.run(network_override, account_override, verbose),
             Command::Setup(cmd) => return cmd.run(),
-            Command::CloudOnboard(cmd) => return cmd.run(),
+            Command::ConnectOnboard(cmd) => return cmd.run(),
             Command::Topup(cmd) => return cmd.run(),
             Command::Server { command } => {
                 return command.run(keypair_override, account_override, sandbox);
