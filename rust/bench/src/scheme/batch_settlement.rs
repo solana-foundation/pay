@@ -213,6 +213,7 @@ impl BatchSettlement {
             // salt/open_slot keeps the echoed config well-formed.
             salt: "0".to_string(),
             open_slot,
+            voucher_signer: None,
         }
     }
 
@@ -1199,6 +1200,9 @@ mod tests {
                 memo: None,
                 recent_blockhash: None,
                 recent_slot: None,
+                voucher_signer: None,
+                operator: None,
+                max_idle_secs: None,
                 channel_state: None,
                 voucher_state: None,
             },
@@ -1309,6 +1313,9 @@ mod tests {
                 memo: None,
                 recent_blockhash: None,
                 recent_slot: None,
+                voucher_signer: None,
+                operator: None,
+                max_idle_secs: None,
                 channel_state: None,
                 voucher_state: None,
             },
