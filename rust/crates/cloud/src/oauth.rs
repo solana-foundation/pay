@@ -817,7 +817,10 @@ pub async fn pending_view(
         .ok()
         .and_then(|u| u.host_str().map(str::to_string))
         .unwrap_or_default();
-    let wallet = crate::tenants::cookie::subject(&headers).and_then(|s| state.tenants().get(&s));
+    let wallet = state
+        .tenants()
+        .subject_from_cookie(&headers)
+        .and_then(|s| state.tenants().get(&s));
     Ok(Json(PendingView {
         client_name: client
             .client_name
@@ -920,7 +923,9 @@ pub async fn approve(
             (subject, true, bound)
         }
         None => (
-            crate::tenants::cookie::subject(&headers)
+            state
+                .tenants()
+                .subject_from_cookie(&headers)
                 .filter(|s| state.tenants().get(s).is_some())
                 .ok_or_else(|| {
                     ApiError::new(
@@ -933,8 +938,11 @@ pub async fn approve(
             None,
         ),
     };
-    let cookie = fresh_login
-        .then(|| crate::tenants::cookie::set(&subject, state.public_url().starts_with("https://")));
+    let cookie = fresh_login.then(|| {
+        state
+            .tenants()
+            .subject_cookie(&subject, state.public_url().starts_with("https://"))
+    });
     // After a Privy sign-in, a wallet with nothing to pay with goes to the
     // funding page first when card purchases are on: a wallet created
     // seconds ago, or any wallet pay-api reports as holding no stablecoin.
@@ -1296,15 +1304,23 @@ fn unknown_link() -> ApiError {
 pub async fn link_view(
     State(state): State<AppState>,
     Path(ticket): Path<String>,
-) -> Result<Json<LinkView>, ApiError> {
+) -> Result<Response, ApiError> {
     let subject = state
         .tenants()
         .peek_link(&ticket)
         .ok_or_else(unknown_link)?;
-    Ok(Json(LinkView {
+    let mut response = Json(LinkView {
         guest: state.tenants().get(&subject).is_none(),
         privy: privy_login(&state),
-    }))
+    })
+    .into_response();
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        state
+            .tenants()
+            .link_cookie(&ticket, state.public_url().starts_with("https://")),
+    );
+    Ok(response)
 }
 
 /// The wallet now behind a linked connection.
@@ -1316,6 +1332,14 @@ pub struct LinkResult {
     pub funded: bool,
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct LinkCompleteBody {
+    /// The UI must show the user what is being linked and require an explicit
+    /// confirmation before submitting this operation.
+    #[serde(default)]
+    pub confirm: bool,
+}
+
 /// `POST /api/oauth/link/{ticket}` with `Authorization: Bearer <privy
 /// access token>`: attach the signed-in user's wallet to the guest
 /// connection the ticket names. The guest's existing tokens now pay from
@@ -1324,7 +1348,16 @@ pub async fn link_complete(
     State(state): State<AppState>,
     Path(ticket): Path<String>,
     headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Response, ApiError> {
+    let body: LinkCompleteBody = serde_json::from_slice(&body).unwrap_or_default();
+    if !body.confirm || !state.tenants().link_cookie_matches(&headers, &ticket) {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "confirmation_required",
+            "Open this link in the same browser and explicitly confirm that you want to attach its wallet.",
+        ));
+    }
     let token = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -1362,7 +1395,9 @@ pub async fn link_complete(
     .into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
-        crate::tenants::cookie::set(&subject, state.public_url().starts_with("https://")),
+        state
+            .tenants()
+            .subject_cookie(&subject, state.public_url().starts_with("https://")),
     );
     Ok(response)
 }
@@ -2197,7 +2232,8 @@ mod tests {
         let app = crate::router(state.clone());
         let client_id = register_grok(&app).await;
 
-        // First sign-in from one browser: a wallet is created for project pro_1.
+        // First sign-in from one browser: a wallet is created for this
+        // authenticated provider credential.
         let first_request = start_authorization(&app, &client_id, None).await;
         let first = complete_with_provider(
             &app,
@@ -2209,32 +2245,34 @@ mod tests {
         let first_cookie = cookie_of(&first);
         assert_eq!(state.tenants().len(), 1);
 
-        // Second sign-in, a different browser (no cookie), the same provider
-        // account with a rotated key: same wallet, no second tenant, the
-        // key refreshed, and the new browser gets the same subject cookie.
+        // Second sign-in, a different browser (no cookie), with the same
+        // credential: same wallet, no second tenant.
         let second_request = start_authorization(&app, &client_id, None).await;
         let second = complete_with_provider(
             &app,
             &second_request,
-            &format!("#api_key=sk_rotated&project_id=pro_1&state={second_request}"),
+            &format!("#api_key=sk_one&project_id=pro_1&state={second_request}"),
         )
         .await;
         assert_eq!(second.status, StatusCode::OK, "{}", second.body);
         assert_eq!(second.json()["address"], first.json()["address"]);
         assert_eq!(cookie_of(&second), first_cookie, "same subject");
         assert_eq!(state.tenants().len(), 1, "no second wallet");
-        let subject = first_cookie.trim_start_matches("pay_subject=");
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, first_cookie.parse().unwrap());
+        let subject = state.tenants().subject_from_cookie(&headers).unwrap();
         assert_eq!(
-            state.tenants().get(subject).unwrap().credentials["secret_key"],
-            "sk_rotated"
+            state.tenants().get(&subject).unwrap().credentials["secret_key"],
+            "sk_one"
         );
 
-        // A different provider account is a different tenant.
+        // Browser-supplied project metadata cannot select that tenant. A
+        // different credential claiming the same project gets a new subject.
         let third_request = start_authorization(&app, &client_id, None).await;
         let third = complete_with_provider(
             &app,
             &third_request,
-            &format!("#api_key=sk_two&project_id=pro_2&state={third_request}"),
+            &format!("#api_key=sk_two&project_id=pro_1&state={third_request}"),
         )
         .await;
         assert_eq!(third.status, StatusCode::OK, "{}", third.body);
@@ -2636,8 +2674,10 @@ mod tests {
             let cookie = cookie_of(&approved);
             assert_eq!(state.tenants().len(), 1);
             assert_eq!(mock.created.lock().unwrap().len(), 1);
-            let subject = cookie.trim_start_matches("pay_subject=");
-            let tenant = state.tenants().get(subject).unwrap();
+            let mut headers = HeaderMap::new();
+            headers.insert(header::COOKIE, cookie.parse().unwrap());
+            let subject = state.tenants().subject_from_cookie(&headers).unwrap();
+            let tenant = state.tenants().get(&subject).unwrap();
             assert_eq!(tenant.provider, "privy");
             assert_eq!(tenant.pubkey, ADDRESS);
             assert_eq!(tenant.credentials["app_secret"], "secret_test");
@@ -2820,20 +2860,42 @@ mod tests {
             assert_eq!(view.status, StatusCode::OK, "{}", view.body);
             assert_eq!(view.json()["guest"], true);
             assert_eq!(view.json()["privy"]["app_id"], "app_test");
+            let link_cookie = cookie_of(&view);
 
             // No sign-in, no link.
-            let anon =
-                post_json_as(&app, &format!("/api/oauth/link/{ticket}"), json!({}), None).await;
+            let anon = post_json_as(
+                &app,
+                &format!("/api/oauth/link/{ticket}"),
+                json!({ "confirm": true }),
+                Some(&link_cookie),
+            )
+            .await;
             assert_eq!(anon.status, StatusCode::UNAUTHORIZED, "{}", anon.body);
 
             // Sign in with Privy on the link page: a wallet is created and
             // attached to the guest connection; the browser is remembered.
             let token = fake.token_for(USER);
-            let linked = post_json_with(
+            let unconfirmed = post_json_with(
                 &app,
                 &format!("/api/oauth/link/{ticket}"),
                 json!({}),
-                None,
+                Some(&link_cookie),
+                Some(&token),
+            )
+            .await;
+            assert_eq!(
+                unconfirmed.status,
+                StatusCode::CONFLICT,
+                "{}",
+                unconfirmed.body
+            );
+            assert_eq!(mock.created.lock().unwrap().len(), 0);
+
+            let linked = post_json_with(
+                &app,
+                &format!("/api/oauth/link/{ticket}"),
+                json!({ "confirm": true }),
+                Some(&link_cookie),
                 Some(&token),
             )
             .await;

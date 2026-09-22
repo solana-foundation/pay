@@ -179,6 +179,19 @@ impl WalletDriver for Openfort {
         "Openfort"
     }
 
+    fn account_identity(&self, grant: &ConsentGrant) -> Option<String> {
+        use sha2::{Digest, Sha256};
+
+        let api_key = grant.api_key.trim();
+        if api_key.is_empty() {
+            return None;
+        }
+        // `project_id` comes from the browser fragment and is not an
+        // authenticated principal. Bind returning tenants to possession of
+        // the high-entropy provider credential without retaining that secret.
+        Some(format!("key:{:x}", Sha256::digest(api_key.as_bytes())))
+    }
+
     /// `{dashboard}/oauth/consent?redirect_uri=…&state=…`, the page
     /// Openfort's CLI opens for `openfort login`.
     fn consent_url(&self, redirect_uri: &str, state: &str) -> String {
@@ -190,8 +203,7 @@ impl WalletDriver for Openfort {
         url.to_string()
     }
 
-    /// The secret API key comes fresh from each consent; the wallet secret
-    /// registered on the project stays.
+    /// Refresh the credential after the same authenticated grant is reused.
     fn refresh_credentials(
         &self,
         credentials: &mut std::collections::BTreeMap<String, String>,
@@ -371,6 +383,25 @@ mod tests {
         ));
         let err = parse_consent_fragment("error=access_denied&state=st-1").unwrap_err();
         assert!(err.to_string().contains("access_denied"));
+    }
+
+    #[test]
+    fn account_identity_is_bound_to_the_credential_not_claimed_project_metadata() {
+        let driver = Openfort::default();
+        let grant = |api_key: &str, project_id: &str| ConsentGrant {
+            api_key: api_key.to_string(),
+            project_id: Some(project_id.to_string()),
+            ..ConsentGrant::default()
+        };
+
+        assert_eq!(
+            driver.account_identity(&grant("sk_one", "pro_1")),
+            driver.account_identity(&grant("sk_one", "pro_attacker"))
+        );
+        assert_ne!(
+            driver.account_identity(&grant("sk_one", "pro_1")),
+            driver.account_identity(&grant("sk_attacker", "pro_1"))
+        );
     }
 
     #[tokio::test]

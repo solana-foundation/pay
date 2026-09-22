@@ -1,21 +1,25 @@
-//! `pay account import` — import an account from a JSON key file.
+//! `pay account import` — import an account from a JSON or base58 key file.
 
 use dialoguer::{Confirm, theme::ColorfulTheme};
 use owo_colors::OwoColorize;
 
-/// Import an account from a JSON key file into a secure keystore.
+/// Import an account from a JSON or base58 key file into a secure keystore.
 #[derive(clap::Args)]
 pub struct ImportCommand {
     /// Account name (required).
     pub name: String,
 
-    /// Path to the JSON key file.
+    /// Path to the JSON or base58 key file.
     pub file: String,
 
     /// Storage backend: "keychain", "gnome-keyring", "windows-hello", or
     /// "file" (headless fallback).
     #[arg(long)]
     pub backend: Option<String>,
+
+    /// Replace an existing account or stored key with the same name.
+    #[arg(long)]
+    pub force: bool,
 
     /// Legacy vault name.
     #[arg(long, hide = true)]
@@ -30,8 +34,16 @@ impl ImportCommand {
         let expanded = shellexpand::tilde(&self.file);
         let data = std::fs::read_to_string(expanded.as_ref())
             .map_err(|e| pay_core::Error::Config(format!("Failed to read {}: {e}", self.file)))?;
-        let keypair_bytes: Vec<u8> = serde_json::from_str(&data)
-            .map_err(|e| pay_core::Error::Config(format!("Invalid keypair JSON: {e}")))?;
+        let keypair_bytes: Vec<u8> = match serde_json::from_str(data.trim()) {
+            Ok(bytes) => bytes,
+            Err(json_error) => bs58::decode(data.trim())
+                .into_vec()
+                .map_err(|base58_error| {
+                    pay_core::Error::Config(format!(
+                        "Invalid keypair file (JSON: {json_error}; base58: {base58_error})"
+                    ))
+                })?,
+        };
 
         if keypair_bytes.len() != 64 {
             return Err(pay_core::Error::Config(format!(
@@ -68,7 +80,7 @@ impl ImportCommand {
         }
 
         // 4. Resolve account name — confirm overwrite if it already exists.
-        let name = resolve_name(&theme, &self.name, &accounts)?;
+        let name = resolve_name(&self.name, &accounts, self.force)?;
 
         // 4. Pick backend and import
         let backend_id = match &self.backend {
@@ -79,10 +91,9 @@ impl ImportCommand {
         let (ks, keystore_kind, _, _) =
             super::new::build_keystore(&backend_id, self.vault.as_deref(), &name)?;
 
-        if backend_id == "file" && ks.exists(&name) {
+        if ks.exists(&name) && !self.force {
             return Err(pay_core::Error::Config(format!(
-                "Keypair file {} already exists. Choose another account name or remove the file explicitly before importing.",
-                super::new::file_backend_path(&name).display()
+                "Stored key for account '{name}' already exists. Re-run with --force to replace it."
             )));
         }
 
@@ -175,29 +186,19 @@ fn display_balance(pubkey: &str) {
 }
 
 fn resolve_name(
-    theme: &ColorfulTheme,
     name: &str,
     accounts: &pay_core::accounts::AccountsFile,
+    force: bool,
 ) -> pay_core::Result<String> {
-    let has_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
     let exists = accounts
         .accounts
         .get(pay_core::accounts::MAINNET_NETWORK)
         .is_some_and(|net| net.contains_key(name));
 
-    if exists && has_tty {
-        let overwrite = Confirm::with_theme(theme)
-            .with_prompt(format!(
-                "Account '{}' already exists. Overwrite?",
-                name.yellow()
-            ))
-            .default(false)
-            .interact()
-            .map_err(|e| pay_core::Error::Config(format!("Prompt error: {e}")))?;
-
-        if !overwrite {
-            return Err(pay_core::Error::Config("Import cancelled.".to_string()));
-        }
+    if exists && !force {
+        return Err(pay_core::Error::Config(format!(
+            "Account '{name}' already exists. Re-run with --force to replace it."
+        )));
     }
     Ok(name.to_string())
 }

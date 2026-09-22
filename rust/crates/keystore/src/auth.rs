@@ -19,6 +19,8 @@ pub enum AuthIntent {
         /// ten-thousandths ([`USD_MINOR_UNITS_PER_DOLLAR`]), when known. A
         /// spending policy reads this; a prompt reads `message`.
         amount_minor_units: Option<u64>,
+        /// True when one approval creates authority for future merchant pulls.
+        recurring: bool,
     },
     CreateAccount(String),
     ImportAccount(String),
@@ -168,6 +170,7 @@ impl AuthIntent {
             message: format!("authorize payment of {amount} for {description}"),
             limit: PaymentLimit::from_amount(amount),
             amount_minor_units: parse_usd_minor_units(amount),
+            recurring: false,
         }
     }
 
@@ -181,6 +184,21 @@ impl AuthIntent {
             ),
             limit: PaymentLimit::from_amount(amount),
             amount_minor_units: parse_usd_minor_units(amount),
+            recurring: false,
+        }
+    }
+
+    pub fn authorize_subscription(amount: &str, reason: &str, operator: &str) -> Self {
+        Self::AuthorizePayment {
+            message: payment_authorization_message(
+                PaymentAmountKind::Exact,
+                amount,
+                Some(reason),
+                operator,
+            ),
+            limit: PaymentLimit::from_amount(amount),
+            amount_minor_units: parse_usd_minor_units(amount),
+            recurring: true,
         }
     }
 
@@ -202,6 +220,7 @@ impl AuthIntent {
             ),
             limit: PaymentLimit::from_amount(amount),
             amount_minor_units: parse_usd_minor_units(amount),
+            recurring: false,
         }
     }
 
@@ -212,10 +231,12 @@ impl AuthIntent {
                 message,
                 limit,
                 amount_minor_units,
+                recurring,
             } => Self::AuthorizePayment {
                 message: payment_message_with_account(message, &account),
                 limit: *limit,
                 amount_minor_units: *amount_minor_units,
+                recurring: *recurring,
             },
             other => other.clone(),
         }
@@ -226,6 +247,7 @@ impl AuthIntent {
             message: "authorize a payment with pay".to_string(),
             limit: None,
             amount_minor_units: None,
+            recurring: false,
         }
     }
 
@@ -234,6 +256,7 @@ impl AuthIntent {
             message: format!("authorize sending SOL to {recipient}"),
             limit: None,
             amount_minor_units: None,
+            recurring: false,
         }
     }
 
@@ -268,6 +291,7 @@ impl AuthIntent {
             limit: amount.and_then(PaymentLimit::from_amount),
             // The allowance is what may leave the account; a policy judges that.
             amount_minor_units: parse_usd_minor_units(limit),
+            recurring: false,
         }
     }
 
@@ -326,6 +350,7 @@ impl AuthIntent {
                 message,
                 limit,
                 amount_minor_units: None,
+                recurring: false,
             }
         } else if lower.starts_with("set up") || lower.starts_with("store keypair") {
             Self::CreateAccount(message)
@@ -385,6 +410,18 @@ impl AuthIntent {
         matches!(
             self,
             Self::AuthorizePayment { .. } | Self::AuthorizeBatch { .. }
+        )
+    }
+
+    /// Whether this approval delegates authority for later charges that do
+    /// not pass through this process again.
+    pub fn is_recurring(&self) -> bool {
+        matches!(
+            self,
+            Self::AuthorizePayment {
+                recurring: true,
+                ..
+            }
         )
     }
 

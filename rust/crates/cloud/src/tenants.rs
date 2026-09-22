@@ -13,6 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use hmac::{Hmac, Mac};
 use pay_core::accounts::{Account, AccountsFile, AccountsStore, BackendKind, MAINNET_NETWORK};
 use pay_core::remote::{CredentialSource, Credentials, MemoryCredentials};
 use pay_mcp::context::{CallScope, PayContext};
@@ -119,6 +120,7 @@ pub struct TenantRegistry {
     links: Mutex<HashMap<String, LinkTicket>>,
     provisioning: Mutex<HashSet<String>>,
     ledger: Arc<dyn SpendLedger>,
+    cookie_key: [u8; 32],
 }
 
 impl Default for TenantRegistry {
@@ -133,12 +135,77 @@ impl TenantRegistry {
     }
 
     pub fn with_ledger(ledger: Arc<dyn SpendLedger>) -> Self {
+        use rand::RngCore;
+        let mut cookie_key = [0_u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut cookie_key);
         Self {
             tenants: Mutex::default(),
             links: Mutex::default(),
             provisioning: Mutex::default(),
             ledger,
+            cookie_key,
         }
+    }
+
+    fn sign_cookie_value(&self, purpose: &[u8], value: &str) -> String {
+        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&self.cookie_key)
+            .expect("HMAC accepts a key of any size");
+        mac.update(purpose);
+        mac.update(&[0]);
+        mac.update(value.as_bytes());
+        let signature: String = mac
+            .finalize()
+            .into_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        format!("{value}.{signature}")
+    }
+
+    fn verify_cookie_value(&self, purpose: &[u8], signed: &str) -> Option<String> {
+        let (value, signature) = signed.rsplit_once('.')?;
+        let signature = hex_decode(signature)?;
+        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&self.cookie_key).ok()?;
+        mac.update(purpose);
+        mac.update(&[0]);
+        mac.update(value.as_bytes());
+        mac.verify_slice(&signature).ok()?;
+        Some(value.to_string())
+    }
+
+    /// Read a server-authenticated browser subject. Unsigned and tampered
+    /// cookies are deliberately ignored.
+    pub fn subject_from_cookie(&self, headers: &axum::http::HeaderMap) -> Option<String> {
+        let signed = cookie::value(headers, cookie::SUBJECT_NAME)?;
+        self.verify_cookie_value(b"subject", &signed)
+            .filter(|subject| !subject.is_empty() && subject.len() <= 128)
+    }
+
+    pub fn subject_cookie(&self, subject: &str, secure: bool) -> axum::http::HeaderValue {
+        cookie::set(
+            cookie::SUBJECT_NAME,
+            &self.sign_cookie_value(b"subject", subject),
+            secure,
+        )
+    }
+
+    /// Bind link completion to the browser that deliberately opened the
+    /// confirmation view. Only the ticket hash is placed in the cookie.
+    pub fn link_cookie(&self, ticket: &str, secure: bool) -> axum::http::HeaderValue {
+        let ticket_hash = crate::onboard::sha256_hex(ticket);
+        cookie::set(
+            cookie::LINK_NAME,
+            &self.sign_cookie_value(b"link", &ticket_hash),
+            secure,
+        )
+    }
+
+    pub fn link_cookie_matches(&self, headers: &axum::http::HeaderMap, ticket: &str) -> bool {
+        let Some(signed) = cookie::value(headers, cookie::LINK_NAME) else {
+            return false;
+        };
+        self.verify_cookie_value(b"link", &signed).as_deref()
+            == Some(crate::onboard::sha256_hex(ticket).as_str())
     }
 
     /// A fresh ticket for `subject`; `None` when the table is full of live
@@ -329,27 +396,28 @@ impl AccountsStore for TenantAccounts {
 pub mod cookie {
     use axum::http::{HeaderMap, HeaderValue, header};
 
-    pub const NAME: &str = "pay_subject";
+    pub const SUBJECT_NAME: &str = "pay_subject";
+    pub const LINK_NAME: &str = "pay_link";
     const ONE_YEAR: u64 = 365 * 24 * 60 * 60;
 
     /// The subject the request's cookie names, if any.
-    pub fn subject(headers: &HeaderMap) -> Option<String> {
+    pub(super) fn value(headers: &HeaderMap, name: &str) -> Option<String> {
         headers
             .get_all(header::COOKIE)
             .iter()
             .filter_map(|v| v.to_str().ok())
             .flat_map(|line| line.split(';'))
             .filter_map(|pair| pair.trim().split_once('='))
-            .find(|(k, _)| *k == NAME)
+            .find(|(k, _)| *k == name)
             .map(|(_, v)| v.trim().to_string())
-            .filter(|v| !v.is_empty() && v.len() <= 128)
+            .filter(|v| !v.is_empty() && v.len() <= 256)
     }
 
     /// `Set-Cookie` for `subject`. `Secure` when the site is served over
     /// https; a local http server would otherwise never see it back.
-    pub fn set(subject: &str, secure: bool) -> HeaderValue {
+    pub(super) fn set(name: &str, value: &str, secure: bool) -> HeaderValue {
         let mut cookie =
-            format!("{NAME}={subject}; Path=/; Max-Age={ONE_YEAR}; HttpOnly; SameSite=Lax");
+            format!("{name}={value}; Path=/; Max-Age={ONE_YEAR}; HttpOnly; SameSite=Lax");
         if secure {
             cookie.push_str("; Secure");
         }
@@ -358,12 +426,22 @@ pub mod cookie {
 
     /// `Set-Cookie` that deletes the subject cookie.
     pub fn clear(secure: bool) -> HeaderValue {
-        let mut cookie = format!("{NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax");
+        let mut cookie = format!("{SUBJECT_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax");
         if secure {
             cookie.push_str("; Secure");
         }
         HeaderValue::from_str(&cookie).expect("cookie is ascii")
     }
+}
+
+fn hex_decode(value: &str) -> Option<Vec<u8>> {
+    if !value.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..value.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&value[index..index + 2], 16).ok())
+        .collect()
 }
 
 /// pay-mcp context for the hosted connector.
@@ -495,30 +573,50 @@ mod tests {
     #[test]
     fn subject_cookie_round_trips() {
         use axum::http::{HeaderMap, header};
-        let value = cookie::set("sub_abc", true);
+        let registry = TenantRegistry::new();
+        let value = registry.subject_cookie("sub_abc", true);
         let text = value.to_str().unwrap();
+        assert!(text.starts_with("pay_subject=sub_abc."), "{text}");
+        assert!(text.ends_with("; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax; Secure"));
         assert!(
-            text.starts_with(
-                "pay_subject=sub_abc; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax; Secure"
-            ),
-            "{text}"
+            !registry
+                .subject_cookie("s", false)
+                .to_str()
+                .unwrap()
+                .contains("Secure")
         );
-        assert!(!cookie::set("s", false).to_str().unwrap().contains("Secure"));
         assert_eq!(
             cookie::clear(true).to_str().unwrap(),
             "pay_subject=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax; Secure"
         );
 
         let mut headers = HeaderMap::new();
+        let request_cookie = text.split(';').next().unwrap();
         headers.insert(
             header::COOKIE,
-            "theme=dark; pay_subject=sub_abc; other=1".parse().unwrap(),
+            format!("theme=dark; {request_cookie}; other=1")
+                .parse()
+                .unwrap(),
         );
-        assert_eq!(cookie::subject(&headers).as_deref(), Some("sub_abc"));
+        assert_eq!(
+            registry.subject_from_cookie(&headers).as_deref(),
+            Some("sub_abc")
+        );
+
+        let mut tampered = HeaderMap::new();
+        tampered.insert(
+            header::COOKIE,
+            request_cookie
+                .replace("sub_abc", "sub_evil")
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(registry.subject_from_cookie(&tampered), None);
+        assert_eq!(TenantRegistry::new().subject_from_cookie(&headers), None);
         let mut none = HeaderMap::new();
         none.insert(header::COOKIE, "theme=dark".parse().unwrap());
-        assert_eq!(cookie::subject(&none), None);
-        assert_eq!(cookie::subject(&HeaderMap::new()), None);
+        assert_eq!(registry.subject_from_cookie(&none), None);
+        assert_eq!(registry.subject_from_cookie(&HeaderMap::new()), None);
     }
 
     #[test]

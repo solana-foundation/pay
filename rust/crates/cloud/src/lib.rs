@@ -546,6 +546,12 @@ pub(crate) mod tests {
         fn display_name(&self) -> &'static str {
             "Fake custody"
         }
+        fn account_identity(&self, grant: &drivers::ConsentGrant) -> Option<String> {
+            Some(format!(
+                "key:{}",
+                crate::onboard::sha256_hex(&grant.api_key)
+            ))
+        }
         fn consent_url(&self, redirect_uri: &str, state: &str) -> String {
             format!("https://fake.test/consent?redirect_uri={redirect_uri}&state={state}")
         }

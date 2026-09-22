@@ -352,6 +352,10 @@ impl LocalKeystoreBackend for File {
         let path = params
             .file_path
             .ok_or_else(|| Error::Config("The file backend needs a keypair path.".to_string()))?;
+        // Account files historically accepted `~` paths.  Expand here rather
+        // than in FileStore so callers that intentionally use a literal path
+        // keep doing so.
+        let path = shellexpand::tilde(path).into_owned();
         let store = crate::keystore::store::FileStore::new(path);
         // Writes never prompt: creating the file is the explicit action.
         Ok(match gate {

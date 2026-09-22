@@ -140,9 +140,20 @@ pub fn decode(challenge: &Challenge) -> Result<DecodedSubscriptionChallenge> {
     let period_count = request
         .parse_period_count()
         .map_err(|e| Error::Mpp(e.to_string()))?;
-    let _ = request
+    let period_hours = request
         .period_hours()
         .map_err(|e| Error::Mpp(e.to_string()))?;
+    if method_details.amount.as_deref() != Some(request.amount.as_str()) {
+        return Err(Error::Mpp(
+            "Subscription methodDetails.amount must match request.amount".into(),
+        ));
+    }
+    if method_details.expected_period_hours != Some(period_hours) {
+        return Err(Error::Mpp(
+            "Subscription methodDetails.expectedPeriodHours must match the requested cadence"
+                .into(),
+        ));
+    }
 
     let network = method_details_value
         .get("network")
@@ -267,7 +278,7 @@ pub fn build_credential_with_authenticate_and_override(
         "Recurring subscription — {amount_label} {currency} every {period_label}",
         currency = decoded.currency_label
     );
-    let auth_intent = crate::keystore::AuthIntent::authorize_payment_details(
+    let auth_intent = crate::keystore::AuthIntent::authorize_subscription(
         &amount_label,
         &intent_reason,
         &prompt_context.operator,
@@ -686,6 +697,8 @@ mod tests {
                 "mint": MINT,
                 "tokenProgram": TOKEN_PROGRAM,
                 "puller": PULLER,
+                "amount": "10000000",
+                "expectedPeriodHours": 720,
                 "decimals": 6,
                 "network": network,
             },
@@ -749,6 +762,28 @@ mod tests {
     }
 
     #[test]
+    fn decode_rejects_amount_that_differs_from_signed_activation() {
+        let mut challenge = subscription_challenge("mainnet");
+        let mut request: serde_json::Value = challenge.request.decode().unwrap();
+        request["methodDetails"]["amount"] = serde_json::json!("1");
+        challenge.request = pay_kit::mpp::Base64UrlJson::from_value(&request).unwrap();
+
+        let error = decode(&challenge).unwrap_err();
+        assert!(error.to_string().contains("amount must match"), "{error}");
+    }
+
+    #[test]
+    fn decode_rejects_cadence_that_differs_from_signed_activation() {
+        let mut challenge = subscription_challenge("mainnet");
+        let mut request: serde_json::Value = challenge.request.decode().unwrap();
+        request["methodDetails"]["expectedPeriodHours"] = serde_json::json!(24);
+        challenge.request = pay_kit::mpp::Base64UrlJson::from_value(&request).unwrap();
+
+        let error = decode(&challenge).unwrap_err();
+        assert!(error.to_string().contains("cadence"), "{error}");
+    }
+
+    #[test]
     fn decode_rejects_challenge_without_method_details() {
         let request = serde_json::json!({
             "amount": "10000000",
@@ -809,6 +844,8 @@ mod tests {
                 "mint": "Bonk1111111111111111111111111111111111111111",
                 "tokenProgram": TOKEN_PROGRAM,
                 "puller": PULLER,
+                "amount": "1",
+                "expectedPeriodHours": 720,
                 "decimals": 5,
                 "network": "mainnet",
             },

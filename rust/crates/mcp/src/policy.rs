@@ -148,6 +148,12 @@ impl AuthGate for PolicyGate {
             return Ok(());
         }
         let denied = |why: String| pay_keystore::Error::AuthDenied(why);
+        if intent.is_recurring() {
+            return Err(denied(
+                "recurring subscriptions are not supported by the hosted spending policy because future merchant pulls cannot be recorded per request"
+                    .to_string(),
+            ));
+        }
         let Some(amount) = intent.amount_minor_units() else {
             return Err(denied(
                 "this payment does not state an amount, and the account is under a spending \
@@ -291,6 +297,22 @@ mod tests {
         );
         assert!(gate.authenticate(&AuthIntent::create_account("a")).is_ok());
         assert!(gate.authenticate(&AuthIntent::use_account("read")).is_ok());
+    }
+
+    #[test]
+    fn recurring_authority_is_refused_when_future_pulls_cannot_be_recorded() {
+        let gate = PolicyGate::new(
+            "sub",
+            SpendPolicy::dollars(10.0, 100.0),
+            Arc::new(MemoryLedger::new()),
+        );
+        let intent = AuthIntent::authorize_subscription("$1.00", "monthly service", "api.test");
+
+        let error = gate.authenticate(&intent).unwrap_err();
+        assert!(
+            error.to_string().contains("recurring subscriptions"),
+            "{error}"
+        );
     }
 
     #[test]

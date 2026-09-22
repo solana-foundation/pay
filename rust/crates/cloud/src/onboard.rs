@@ -711,7 +711,6 @@ fn complete_for_returning_connector(
 ) -> Result<Response, ApiError> {
     #[cfg(feature = "mcp")]
     {
-        use crate::tenants::cookie;
         let oauth = state.oauth().ok_or_else(|| {
             ApiError::bad_request("connector_disabled", "This server has no MCP connector.")
         })?;
@@ -739,7 +738,7 @@ fn complete_for_returning_connector(
         .into_response();
         response.headers_mut().insert(
             axum::http::header::SET_COOKIE,
-            cookie::set(
+            state.tenants().subject_cookie(
                 &existing.subject,
                 state.public_url().starts_with("https://"),
             ),
@@ -770,7 +769,7 @@ fn complete_for_connector(
     }
     #[cfg(feature = "mcp")]
     {
-        use crate::tenants::{TenantRecord, cookie};
+        use crate::tenants::TenantRecord;
         let oauth = state.oauth().ok_or_else(|| {
             ApiError::bad_request("connector_disabled", "This server has no MCP connector.")
         })?;
@@ -803,7 +802,9 @@ fn complete_for_connector(
         .into_response();
         response.headers_mut().insert(
             axum::http::header::SET_COOKIE,
-            cookie::set(&subject, state.public_url().starts_with("https://")),
+            state
+                .tenants()
+                .subject_cookie(&subject, state.public_url().starts_with("https://")),
         );
         Ok(response)
     }

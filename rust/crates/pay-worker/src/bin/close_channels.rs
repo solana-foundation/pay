@@ -21,7 +21,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pay_api_core::rpc::RpcClient;
 use pay_kit::core::payment_channels;
-use pay_kit::core::settlement::packing::{ChannelInstructionGroup, pack, tx_size};
+use pay_kit::core::settlement::packing::{ChannelInstructionGroup, tx_size};
 use pay_kit::core::tx::{TxV1Mode, TxVersion};
 use pay_kit::mpp::solana_keychain::TransactionSigner;
 use pay_worker::channel::{
@@ -608,13 +608,37 @@ fn pack_reclaim_candidates(
     candidates: Vec<ChannelInstructionGroup>,
     fee_payer: &Pubkey,
 ) -> Vec<Vec<ChannelInstructionGroup>> {
-    pack(
-        version,
-        candidates,
-        fee_payer,
-        None,
-        pay_kit::core::payment_channels::max_reclaims_per_tx(version),
-    )
+    let max_operations = pay_kit::core::payment_channels::max_reclaims_per_tx(version);
+    let mut batches = Vec::new();
+    let mut current = Vec::new();
+
+    for candidate in candidates {
+        let mut proposed: Vec<Instruction> = current
+            .iter()
+            .flat_map(|group: &ChannelInstructionGroup| group.instructions.iter().cloned())
+            .collect();
+        proposed.extend(candidate.instructions.iter().cloned());
+
+        // `tx_size` alone is insufficient for V1: a transaction can fit in
+        // 4 KiB while exceeding the format's 64-static-account ceiling.
+        let fits = current.len() < max_operations
+            && pay_kit::core::tx::build_unsigned(
+                version,
+                fee_payer,
+                &proposed,
+                solana_hash::Hash::default(),
+                None,
+            )
+            .is_ok();
+        if !fits && !current.is_empty() {
+            batches.push(std::mem::take(&mut current));
+        }
+        current.push(candidate);
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -900,6 +924,33 @@ mod tests {
                 tx_size(TxVersion::V0, &instructions, &fee_payer, None).unwrap()
                     <= TxVersion::V0.limits().max_bytes
             );
+        }
+    }
+
+    #[test]
+    fn v1_reclaims_with_distinct_rent_payers_respect_all_wire_limits() {
+        let fee_payer = pubkey(2, 0);
+        let candidates = (0..pay_kit::core::payment_channels::MAX_RECLAIMS_PER_TX_V1)
+            .map(|index| reclaim_candidate(index, &pubkey(3, index)))
+            .collect();
+
+        let groups = pack_reclaim_candidates(TxVersion::V1, candidates, &fee_payer);
+
+        assert!(groups.len() > 1);
+        assert_eq!(groups.iter().map(Vec::len).sum::<usize>(), 62);
+        for group in groups {
+            let instructions: Vec<_> = group
+                .into_iter()
+                .flat_map(|candidate| candidate.instructions)
+                .collect();
+            pay_kit::core::tx::build_unsigned(
+                TxVersion::V1,
+                &fee_payer,
+                &instructions,
+                solana_hash::Hash::default(),
+                None,
+            )
+            .unwrap();
         }
     }
 }

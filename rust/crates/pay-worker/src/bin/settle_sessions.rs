@@ -1125,9 +1125,18 @@ async fn run_batch(runtime: &SettlementRuntime) -> Result<SettleSessionsMetrics,
         .await
         .unwrap_or(pay_kit::core::tx::TxVersion::V0)
     };
-    let handle = spawn(
+    let mut settlement_config =
         SettlementConfig::new(runtime.operator, Arc::clone(&runtime.signer))
-            .with_tx_version(tx_version),
+            .with_tx_version(tx_version);
+    if tx_version == pay_kit::core::tx::TxVersion::V1 {
+        // Fifteen distribution settlements can introduce 67 distinct static
+        // accounts. Keep V1 enabled, but cap this heterogeneous workload below
+        // its 64-account ceiling until pay-kit packs against compiled messages.
+        settlement_config.max_voucher_settlements_per_tx =
+            settlement_config.max_voucher_settlements_per_tx.min(14);
+    }
+    let handle = spawn(
+        settlement_config,
         Arc::new(RpcBroadcaster::with_pipeline(pipeline.clone())),
     );
     let mut submissions = JoinSet::new();

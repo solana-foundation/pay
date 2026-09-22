@@ -110,17 +110,11 @@ pub trait WalletDriver: Send + Sync {
     /// Turn a grant into a wallet the CLI can use.
     async fn provision(&self, grant: &ConsentGrant) -> Result<ProvisionedWallet, DriverError>;
 
-    /// What identifies the user's account at the provider across sign-ins,
-    /// when the grant carries it: the project id for Openfort. A returning
-    /// user is recognised by this, not by a cookie, so a wallet survives a
-    /// lost browser.
-    fn account_identity(&self, grant: &ConsentGrant) -> Option<String> {
-        grant
-            .project_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|p| !p.is_empty())
-            .map(str::to_string)
+    /// A provider-authenticated account identity, when the driver can derive
+    /// one from the grant. Display metadata supplied by the browser must not
+    /// be used here.
+    fn account_identity(&self, _grant: &ConsentGrant) -> Option<String> {
+        None
     }
 
     /// A returning user signed in again: carry any credential the new

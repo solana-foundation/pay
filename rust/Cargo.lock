@@ -5178,6 +5178,7 @@ dependencies = [
  "base64 0.22.1",
  "bs58",
  "clap",
+ "hmac 0.12.1",
  "http 1.5.0",
  "jsonwebtoken 9.3.1",
  "p256",

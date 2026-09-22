@@ -91,9 +91,16 @@ impl FileStore {
         let raw = Zeroizing::new(std::fs::read_to_string(&self.path).map_err(|e| {
             Error::Backend(format!("read keypair file {}: {e}", self.path.display()))
         })?);
-        let bytes: Vec<u8> = serde_json::from_str(&raw).map_err(|e| {
-            Error::Backend(format!("parse keypair file {}: {e}", self.path.display()))
-        })?;
+        let trimmed = raw.trim();
+        let bytes: Vec<u8> = match serde_json::from_str(trimmed) {
+            Ok(bytes) => bytes,
+            Err(json_error) => bs58::decode(trimmed).into_vec().map_err(|base58_error| {
+                Error::Backend(format!(
+                    "parse keypair file {} as JSON ({json_error}) or base58 ({base58_error})",
+                    self.path.display()
+                ))
+            })?,
+        };
         if bytes.len() != 64 {
             return Err(Error::InvalidKeypair(format!(
                 "keypair file {} contains {} bytes; expected 64",
@@ -556,5 +563,17 @@ mod tests {
         assert!(
             matches!(error, Error::InvalidKeypair(message) if message.contains("does not match"))
         );
+    }
+
+    #[test]
+    fn file_store_reads_base58_keypair() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("server.key");
+        let keypair: Vec<u8> = (0..64).collect();
+        std::fs::write(&path, bs58::encode(&keypair).into_string()).unwrap();
+
+        let store = FileStore::new(path);
+        assert_eq!(&*store.load("keypair:server").unwrap(), &keypair);
+        assert_eq!(&*store.load("pubkey:server").unwrap(), &keypair[32..]);
     }
 }
