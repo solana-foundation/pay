@@ -118,15 +118,6 @@ pub(crate) struct AlternateProvider {
     pub model: Option<String>,
 }
 
-/// Provider metadata used by setup-time integrations that need a deterministic,
-/// headless `pay --alt` route without starting the payer proxy yet.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct AlternateProviderOption {
-    pub slug: String,
-    pub title: String,
-    pub models: Vec<String>,
-}
-
 #[derive(Clone, Copy)]
 enum AlternateRouteKind {
     Hosted,
@@ -255,23 +246,6 @@ pub(crate) fn prepare_alternate_provider_for(
         base_url: client.payer_base_url(&payer.base_url),
         model,
     })
-}
-
-/// Discover providers that can back an ACP runtime without launching a payer
-/// proxy. Buzz setup uses this to persist a provider and model for its
-/// headless custom-harness process.
-pub(crate) fn discover_acp_provider_options(
-    client: AlternateClient,
-) -> pay_core::Result<Vec<AlternateProviderOption>> {
-    let (providers, _) = discover_compatible_providers(client)?;
-    Ok(providers
-        .into_iter()
-        .map(|provider| AlternateProviderOption {
-            slug: provider.slug().to_string(),
-            title: provider.title().to_string(),
-            models: provider.models,
-        })
-        .collect())
 }
 
 fn discover_compatible_providers(

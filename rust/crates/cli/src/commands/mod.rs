@@ -3,7 +3,6 @@ pub mod acp;
 mod acp_middleware;
 pub(crate) mod agent;
 pub(crate) mod agent_args;
-mod buzz_setup;
 pub mod catalog;
 pub mod claude;
 pub mod codex;

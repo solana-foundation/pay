@@ -30,7 +30,7 @@ pub struct SetupCommand {
     #[arg(long, hide = true)]
     pub vault: Option<String>,
 
-    /// Re-install integrations, including MCP configs, agent skill, and Buzz.
+    /// Re-install integrations, including MCP configs and the agent skill.
     #[arg(long)]
     pub update: bool,
 
@@ -113,7 +113,6 @@ impl SetupCommand {
                 ),
             );
             eprintln!();
-            super::buzz_setup::maybe_configure();
             return Ok(());
         }
 
@@ -148,7 +147,6 @@ impl SetupCommand {
             self.force,
             &self.remote_inputs()?,
         )?;
-        super::buzz_setup::maybe_configure();
 
         // Headless setup path: when there's no biometric backend available
         // on this platform (VM / CI / server), we already fell back to
@@ -191,7 +189,6 @@ impl SetupCommand {
             )?;
             (pk, false)
         };
-        super::buzz_setup::maybe_configure();
 
         // 2. POST to pay-api's `/v1/redeem`. Honors `PAY_API_URL` via
         //    the same helper the `/v1/send` client uses, so override
@@ -466,7 +463,6 @@ fn run_update() -> pay_core::Result<()> {
     eprintln!();
     maybe_install_skill();
     install_mcp_configs();
-    super::buzz_setup::maybe_configure();
     eprintln!("  {}", "Update complete.".dimmed());
     eprintln!();
     Ok(())
