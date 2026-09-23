@@ -27,6 +27,7 @@ use crate::protocol::{
 
 const REQUEST_TTL: Duration = Duration::from_secs(10 * 60);
 const CODE_TTL: Duration = Duration::from_secs(5 * 60);
+const TOKEN_TTL: Duration = Duration::from_secs(90 * 24 * 60 * 60);
 const MAX_ROWS: usize = 4096;
 
 #[derive(Clone)]
@@ -43,12 +44,17 @@ struct Grant {
     created_at: Instant,
 }
 
+struct Token {
+    subject: String,
+    created_at: Instant,
+}
+
 /// In-memory v0 store. Only hashes of exchange codes and API tokens are kept.
 #[derive(Default)]
 pub struct Store {
     pending: Mutex<HashMap<String, Pending>>,
     grants: Mutex<HashMap<String, Grant>>,
-    tokens: Mutex<HashMap<String, String>>,
+    tokens: Mutex<HashMap<String, Token>>,
 }
 
 impl Store {
@@ -112,15 +118,43 @@ impl Store {
     fn issue_token(&self, subject: String) -> Result<String, ApiError> {
         let token = format!("pct_{}", random_token());
         let mut tokens = self.tokens.lock().unwrap();
+        let now = Instant::now();
+        tokens.retain(|_, row| now.saturating_duration_since(row.created_at) <= TOKEN_TTL);
         if tokens.len() >= MAX_ROWS {
-            return Err(ApiError::busy());
+            let oldest = tokens
+                .iter()
+                .min_by_key(|(_, row)| row.created_at)
+                .map(|(hash, _)| hash.clone())
+                .expect("a full token store has an oldest row");
+            tokens.remove(&oldest);
         }
-        tokens.insert(sha256_hex(&token), subject);
+        tokens.insert(
+            sha256_hex(&token),
+            Token {
+                subject,
+                created_at: now,
+            },
+        );
         Ok(token)
     }
 
     pub fn authenticate(&self, token: &str) -> Option<String> {
-        self.tokens.lock().unwrap().get(&sha256_hex(token)).cloned()
+        let hash = sha256_hex(token);
+        let mut tokens = self.tokens.lock().unwrap();
+        let row = tokens.get(&hash)?;
+        if Instant::now().saturating_duration_since(row.created_at) > TOKEN_TTL {
+            tokens.remove(&hash);
+            return None;
+        }
+        Some(row.subject.clone())
+    }
+
+    fn revoke(&self, token: &str) -> bool {
+        self.tokens
+            .lock()
+            .unwrap()
+            .remove(&sha256_hex(token))
+            .is_some()
     }
 }
 
@@ -274,6 +308,7 @@ pub struct CompleteResponse {
     network: &'static str,
     wallet_id: String,
     pubkey: String,
+    expires_in: u64,
     credentials: std::collections::BTreeMap<String, String>,
 }
 
@@ -299,8 +334,39 @@ pub async fn complete(
         network: "mainnet",
         wallet_id: tenant.wallet_id.clone(),
         pubkey: tenant.pubkey.clone(),
+        expires_in: TOKEN_TTL.as_secs(),
         credentials: [("api_token".to_string(), token)].into_iter().collect(),
     }))
+}
+
+/// Revoke the caller's CLI token. Revocation is idempotent from the client's
+/// perspective, but an absent or malformed credential is still unauthorized.
+pub async fn revoke(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    let token = bearer_token(&headers).ok_or_else(invalid_token)?;
+    if !state.cli().revoke(token) {
+        return Err(invalid_token());
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn invalid_token() -> ApiError {
+    ApiError::new(
+        StatusCode::UNAUTHORIZED,
+        "invalid_token",
+        "A valid CLI token is required.",
+    )
 }
 
 fn unknown_request() -> ApiError {
@@ -432,6 +498,22 @@ mod tests {
         assert_eq!(query["state"], STATE);
         let code = &query["code"];
 
+        // A full live store must not turn successful onboarding into a
+        // permanent 503. Completion evicts the oldest token below.
+        {
+            let now = Instant::now();
+            let mut tokens = state.cli().tokens.lock().unwrap();
+            for index in 0..MAX_ROWS {
+                tokens.insert(
+                    format!("existing-{index}"),
+                    Token {
+                        subject: format!("subject-{index}"),
+                        created_at: now,
+                    },
+                );
+            }
+        }
+
         let complete = app
             .clone()
             .oneshot(
@@ -473,6 +555,33 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, json!([{ "id": WALLET, "address": ADDRESS }]));
 
+        let revoked = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/v1/cli")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoked.status(), StatusCode::NO_CONTENT);
+
+        let after_revoke = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/wallets")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(after_revoke.status(), StatusCode::UNAUTHORIZED);
+
         let replay = app
             .oneshot(
                 Request::builder()
@@ -493,5 +602,67 @@ mod tests {
         let (status, body) = json(replay).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"], "invalid_grant");
+    }
+
+    #[test]
+    fn expired_tokens_are_rejected_and_swept_before_issuing() {
+        let store = Store::default();
+        let expired_at = Instant::now() - TOKEN_TTL - Duration::from_secs(1);
+        {
+            let mut tokens = store.tokens.lock().unwrap();
+            for index in 0..MAX_ROWS {
+                tokens.insert(
+                    format!("expired-{index}"),
+                    Token {
+                        subject: SUBJECT.to_string(),
+                        created_at: expired_at,
+                    },
+                );
+            }
+            tokens.insert(
+                sha256_hex("pct_expired"),
+                Token {
+                    subject: SUBJECT.to_string(),
+                    created_at: expired_at,
+                },
+            );
+        }
+
+        assert_eq!(store.authenticate("pct_expired"), None);
+        let fresh = store.issue_token(SUBJECT.to_string()).unwrap();
+        assert_eq!(store.authenticate(&fresh).as_deref(), Some(SUBJECT));
+        assert_eq!(store.tokens.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn full_live_token_store_evicts_the_oldest_token() {
+        let store = Store::default();
+        let oldest = sha256_hex("pct_oldest");
+        let now = Instant::now();
+        {
+            let mut tokens = store.tokens.lock().unwrap();
+            tokens.insert(
+                oldest.clone(),
+                Token {
+                    subject: "oldest".to_string(),
+                    created_at: now - Duration::from_secs(1),
+                },
+            );
+            for index in 1..MAX_ROWS {
+                tokens.insert(
+                    format!("live-{index}"),
+                    Token {
+                        subject: index.to_string(),
+                        created_at: now,
+                    },
+                );
+            }
+        }
+
+        let fresh = store.issue_token(SUBJECT.to_string()).unwrap();
+        let tokens = store.tokens.lock().unwrap();
+        assert_eq!(tokens.len(), MAX_ROWS);
+        assert!(!tokens.contains_key(&oldest));
+        assert!(tokens.contains_key(&sha256_hex(&fresh)));
     }
 }

@@ -305,7 +305,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/oauth/authorize/{request}/deny", post(oauth::deny))
         .route("/api/oauth/link/{ticket}", get(oauth::link_view))
         .route("/api/oauth/link/{ticket}", post(oauth::link_complete))
-        .route("/v1/cli", get(cli::start))
+        .route("/v1/cli", get(cli::start).delete(cli::revoke))
         .route("/v1/cli/complete", post(cli::complete))
         .route("/api/cli/{request}", get(cli::pending_view))
         .route("/api/cli/{request}/approve", post(cli::approve))
