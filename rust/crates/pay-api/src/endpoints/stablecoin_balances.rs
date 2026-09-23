@@ -33,12 +33,23 @@ pub async fn handler(
         .map_err(ApiError)?;
     let rpc_url = state.rpc_url_for(network).map_err(ApiError)?;
 
-    let (mut balances, credits) = tokio::try_join!(
+    let (balances, credits) = tokio::join!(
         fetch_stablecoin_balances(&state.rpc, rpc_url, &owner, network, &state.stablecoins),
         fetch_credit_balances(&state.rpc, rpc_url, &owner, network, &state.credit_programs,)
-    )
-    .map_err(ApiError)?;
-    balances.credits = credits;
+    );
+    let mut balances = balances.map_err(ApiError)?;
+    match credits {
+        Ok(credits) => balances.credits = credits,
+        Err(error) => {
+            balances.credits_unavailable = true;
+            warn!(
+                %error,
+                address = %owner,
+                ?network,
+                "credit balance lookup failed; returning token balances"
+            );
+        }
+    }
     telemetry::record_balance_request(network, balances.balances.len());
 
     Ok(Json(balances))

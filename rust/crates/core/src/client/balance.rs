@@ -91,6 +91,9 @@ pub struct AccountBalances {
     pub sol_lamports: u64,
     pub tokens: Vec<TokenBalance>,
     pub credits: Vec<CreditBalance>,
+    /// True when pay-api returned token balances but could not determine
+    /// program-backed credit balances.
+    pub credits_unavailable: bool,
     /// True when the pay-api stablecoin lookup failed for this account (e.g.
     /// pay-api unreachable). `tokens` will be empty in that case; callers
     /// should render an "unavailable" indicator instead of treating the
@@ -171,6 +174,8 @@ struct ApiResponse {
     balances: Vec<ApiBalance>,
     #[serde(default)]
     credits: std::collections::BTreeMap<String, ApiCredit>,
+    #[serde(default)]
+    credits_unavailable: bool,
 }
 
 #[derive(Deserialize)]
@@ -197,6 +202,7 @@ struct ApiCredit {
 struct ApiBalances {
     tokens: Vec<TokenBalance>,
     credits: Vec<CreditBalance>,
+    credits_unavailable: bool,
 }
 
 async fn fetch_stablecoins_via_api(
@@ -276,7 +282,11 @@ fn parse_api_balances(parsed: ApiResponse) -> ApiBalances {
             })
         })
         .collect();
-    ApiBalances { tokens, credits }
+    ApiBalances {
+        tokens,
+        credits,
+        credits_unavailable: parsed.credits_unavailable,
+    }
 }
 
 // ── public API ──────────────────────────────────────────────────────────────
@@ -320,6 +330,7 @@ pub async fn get_balances(rpc_url: &str, pubkey: &str) -> crate::Result<AccountB
                     ApiBalances {
                         tokens: Vec::new(),
                         credits: Vec::new(),
+                        credits_unavailable: true,
                     },
                     true,
                 )
@@ -330,6 +341,7 @@ pub async fn get_balances(rpc_url: &str, pubkey: &str) -> crate::Result<AccountB
         sol_lamports,
         tokens: api_balances.tokens,
         credits: api_balances.credits,
+        credits_unavailable: api_balances.credits_unavailable,
         tokens_unavailable,
     })
 }
@@ -354,6 +366,7 @@ pub async fn get_stablecoin_balances(
                     ApiBalances {
                         tokens: Vec::new(),
                         credits: Vec::new(),
+                        credits_unavailable: true,
                     },
                     true,
                 )
@@ -364,6 +377,7 @@ pub async fn get_stablecoin_balances(
         sol_lamports: 0,
         tokens: api_balances.tokens,
         credits: api_balances.credits,
+        credits_unavailable: api_balances.credits_unavailable,
         tokens_unavailable,
     })
 }
@@ -475,12 +489,14 @@ async fn fetch_stablecoin_balances_batch_into(
                 if let Some(entry) = balances.get_mut(&pk) {
                     entry.tokens = api_balances.tokens;
                     entry.credits = api_balances.credits;
+                    entry.credits_unavailable = api_balances.credits_unavailable;
                 }
             }
             Err(e) => {
                 tracing::debug!(error = %e, %pk, "pay-api token fetch failed");
                 if let Some(entry) = balances.get_mut(&pk) {
                     entry.tokens_unavailable = true;
+                    entry.credits_unavailable = true;
                 }
             }
         }
@@ -592,6 +608,7 @@ mod tests {
         assert_eq!(b.sol_lamports, 0);
         assert!(b.tokens.is_empty());
         assert!(b.credits.is_empty());
+        assert!(!b.credits_unavailable);
         assert!(!b.tokens_unavailable);
     }
 
@@ -614,6 +631,27 @@ mod tests {
         assert_eq!(balances.credits.len(), 1);
         assert_eq!(balances.credits[0].raw_amount, 5_000_000);
         assert_eq!(balances.credits[0].ui_amount, 5.0);
+        assert!(!balances.credits_unavailable);
+    }
+
+    #[test]
+    fn api_reports_unavailable_credits_separately_from_tokens() {
+        let parsed: ApiResponse = serde_json::from_value(serde_json::json!({
+            "balances": [{
+                "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                "raw_amount": "1000000",
+                "ui_amount": 1.0,
+                "symbol": "USDC"
+            }],
+            "credits": {},
+            "credits_unavailable": true
+        }))
+        .unwrap();
+
+        let balances = parse_api_balances(parsed);
+        assert_eq!(balances.tokens.len(), 1);
+        assert!(balances.credits.is_empty());
+        assert!(balances.credits_unavailable);
     }
 
     #[test]
@@ -653,12 +691,14 @@ mod tests {
             sol_lamports: 1_000_000,
             tokens: vec![],
             credits: vec![],
+            credits_unavailable: false,
             tokens_unavailable: false,
         };
         let current = AccountBalances {
             sol_lamports: 2_000_000,
             tokens: vec![],
             credits: vec![],
+            credits_unavailable: false,
             tokens_unavailable: false,
         };
         let diff = current.diff_received(&baseline);
@@ -672,12 +712,14 @@ mod tests {
             sol_lamports: 2_000_000,
             tokens: vec![],
             credits: vec![],
+            credits_unavailable: false,
             tokens_unavailable: false,
         };
         let current = AccountBalances {
             sol_lamports: 1_000_000,
             tokens: vec![],
             credits: vec![],
+            credits_unavailable: false,
             tokens_unavailable: false,
         };
         let diff = current.diff_received(&baseline);
@@ -695,6 +737,7 @@ mod tests {
                 symbol: Some("USDC".to_string()),
             }],
             credits: vec![],
+            credits_unavailable: false,
             tokens_unavailable: false,
         };
         let current = AccountBalances {
@@ -706,6 +749,7 @@ mod tests {
                 symbol: Some("USDC".to_string()),
             }],
             credits: vec![],
+            credits_unavailable: false,
             tokens_unavailable: false,
         };
         let diff = current.diff_received(&baseline);
@@ -720,6 +764,7 @@ mod tests {
             sol_lamports: 0,
             tokens: vec![],
             credits: vec![],
+            credits_unavailable: false,
             tokens_unavailable: false,
         };
         let current = AccountBalances {
@@ -731,6 +776,7 @@ mod tests {
                 symbol: None,
             }],
             credits: vec![],
+            credits_unavailable: false,
             tokens_unavailable: false,
         };
         let diff = current.diff_received(&baseline);
@@ -749,6 +795,7 @@ mod tests {
                 symbol: Some("USDC".to_string()),
             }],
             credits: vec![],
+            credits_unavailable: false,
             tokens_unavailable: false,
         };
         let diff = balances.diff_received(&balances);
@@ -765,6 +812,7 @@ mod tests {
             sol_lamports: 0,
             tokens: vec![],
             credits: vec![],
+            credits_unavailable: false,
             tokens_unavailable: true,
         };
         let current = AccountBalances {
@@ -776,6 +824,7 @@ mod tests {
                 symbol: Some("USDC".to_string()),
             }],
             credits: vec![],
+            credits_unavailable: false,
             tokens_unavailable: false,
         };
         let diff = current.diff_received(&baseline);
@@ -795,12 +844,14 @@ mod tests {
                 symbol: Some("USDC".to_string()),
             }],
             credits: vec![],
+            credits_unavailable: false,
             tokens_unavailable: false,
         };
         let current = AccountBalances {
             sol_lamports: 0,
             tokens: vec![],
             credits: vec![],
+            credits_unavailable: false,
             tokens_unavailable: true,
         };
         let diff = current.diff_received(&baseline);
@@ -815,12 +866,14 @@ mod tests {
             sol_lamports: 100,
             tokens: vec![],
             credits: vec![],
+            credits_unavailable: false,
             tokens_unavailable: true,
         };
         let current = AccountBalances {
             sol_lamports: 1_000,
             tokens: vec![],
             credits: vec![],
+            credits_unavailable: false,
             tokens_unavailable: true,
         };
         let diff = current.diff_received(&baseline);

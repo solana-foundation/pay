@@ -65,6 +65,11 @@ pub struct StablecoinBalances {
     /// Program-backed USD credits keyed by the credit program address.
     #[serde(default)]
     pub credits: BTreeMap<String, CreditBalance>,
+    /// True when token balances were fetched successfully but the independent
+    /// credit-program lookup failed. An empty `credits` map is not authoritative
+    /// when this is set.
+    #[serde(default)]
+    pub credits_unavailable: bool,
 }
 
 /// One on-chain credit allowance for a customer.

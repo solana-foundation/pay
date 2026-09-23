@@ -801,6 +801,7 @@ mod tests {
                 "USDT",
             )],
             credits: vec![],
+            credits_unavailable: false,
             tokens_unavailable: false,
         };
 
@@ -820,6 +821,7 @@ mod tests {
                 "USDG",
             )],
             credits: vec![],
+            credits_unavailable: false,
             tokens_unavailable: false,
         };
 
@@ -859,6 +861,7 @@ mod tests {
                 ),
             ],
             credits: vec![],
+            credits_unavailable: false,
             tokens_unavailable: false,
         };
 
@@ -894,6 +897,7 @@ mod tests {
                 ),
             ],
             credits: vec![],
+            credits_unavailable: false,
             tokens_unavailable: false,
         };
 
@@ -916,6 +920,7 @@ mod tests {
                 "USDT",
             )],
             credits: vec![],
+            credits_unavailable: false,
             tokens_unavailable: false,
         };
 

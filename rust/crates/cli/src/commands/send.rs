@@ -575,6 +575,7 @@ mod tests {
                 })
                 .collect(),
             credits: vec![],
+            credits_unavailable: false,
             tokens_unavailable: false,
         }
     }

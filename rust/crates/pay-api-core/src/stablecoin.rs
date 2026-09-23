@@ -110,6 +110,7 @@ pub async fn fetch_stablecoin_balances(
         network,
         balances,
         credits: BTreeMap::new(),
+        credits_unavailable: false,
     })
 }
 

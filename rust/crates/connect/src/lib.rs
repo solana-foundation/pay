@@ -90,9 +90,7 @@ impl WalletProbe for PayApiProbe {
         );
         let lookup = pay_core::client::balance::get_stablecoin_balances(&rpc, address);
         match tokio::time::timeout(std::time::Duration::from_secs(5), lookup).await {
-            Ok(Ok(balances)) => {
-                !balances.tokens_unavailable && balances.tokens.iter().all(|t| t.raw_amount == 0)
-            }
+            Ok(Ok(balances)) => balances_hold_nothing(&balances),
             Ok(Err(e)) => {
                 tracing::info!(%address, error = %e, "balance lookup failed; assuming funded");
                 false
@@ -102,6 +100,51 @@ impl WalletProbe for PayApiProbe {
                 false
             }
         }
+    }
+}
+
+#[cfg(feature = "mcp")]
+fn balances_hold_nothing(balances: &pay_core::client::balance::AccountBalances) -> bool {
+    !balances.tokens_unavailable
+        && !balances.credits_unavailable
+        && balances.tokens.iter().all(|token| token.raw_amount == 0)
+        && balances.credits.iter().all(|credit| credit.raw_amount == 0)
+}
+
+#[cfg(all(test, feature = "mcp"))]
+mod balance_probe_tests {
+    use super::balances_hold_nothing;
+    use pay_core::client::balance::{AccountBalances, CreditBalance};
+
+    #[test]
+    fn known_empty_wallet_holds_nothing() {
+        assert!(balances_hold_nothing(&AccountBalances::default()));
+    }
+
+    #[test]
+    fn credit_only_wallet_does_not_look_empty() {
+        let balances = AccountBalances {
+            credits: vec![CreditBalance {
+                program_id: "credit-program".into(),
+                accounts: vec!["allowance-account".into()],
+                currency: "USD".into(),
+                raw_amount: 1,
+                ui_amount: 0.000_001,
+            }],
+            ..Default::default()
+        };
+
+        assert!(!balances_hold_nothing(&balances));
+    }
+
+    #[test]
+    fn unavailable_credits_do_not_look_empty() {
+        let balances = AccountBalances {
+            credits_unavailable: true,
+            ..Default::default()
+        };
+
+        assert!(!balances_hold_nothing(&balances));
     }
 }
 
