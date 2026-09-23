@@ -65,9 +65,9 @@ pub async fn sign_transaction(
         )
     })?;
     let amount_minor = transaction_spend_minor(&transaction, &tenant.pubkey)?;
-    state
+    let reservation = state
         .tenants()
-        .authorize_cli_transaction(&tenant, amount_minor)
+        .reserve_cli_transaction(&tenant, amount_minor)
         .map_err(policy_denied)?;
     let signer = connect_signer(tenant).await?;
     let result = signer
@@ -76,6 +76,7 @@ pub async fn sign_transaction(
         .map_err(provider_error)?;
     let complete = matches!(result, solana_keychain::SignTransactionResult::Complete(_));
     let (transaction_b64, signature) = result.into_signed_transaction();
+    reservation.commit();
     Ok(Json(SignTransactionResponse {
         transaction_b64,
         signature: signature.to_string(),

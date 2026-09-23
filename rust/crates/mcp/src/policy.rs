@@ -58,6 +58,8 @@ pub trait SpendLedger: Send + Sync {
     /// Atomically check `cap` and reserve `amount` for today. Returns the
     /// resulting total, or that same would-be total when it exceeds the cap.
     fn check_and_record(&self, subject: &str, amount: u64, cap: Option<u64>) -> Result<u64, u64>;
+    /// Release a prior reservation that did not result in a signature.
+    fn release(&self, subject: &str, amount: u64);
 }
 
 /// Day counter, so a ledger can be driven in tests.
@@ -117,6 +119,16 @@ impl SpendLedger for MemoryLedger {
         }
         entry.1 = next;
         Ok(next)
+    }
+
+    fn release(&self, subject: &str, amount: u64) {
+        let today = (self.clock)();
+        let mut totals = self.totals.lock().unwrap();
+        if let Some((day, total)) = totals.get_mut(subject)
+            && *day == today
+        {
+            *total = total.saturating_sub(amount);
+        }
     }
 }
 

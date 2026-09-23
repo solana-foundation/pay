@@ -111,6 +111,29 @@ pub struct TenantRegistry {
     cookie_key: [u8; 32],
 }
 
+/// An allowance reservation that is automatically released unless a wallet
+/// provider actually returns a signature.
+pub struct SpendReservation {
+    subject: String,
+    amount: u64,
+    ledger: Arc<dyn SpendLedger>,
+    committed: bool,
+}
+
+impl SpendReservation {
+    pub fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for SpendReservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.ledger.release(&self.subject, self.amount);
+        }
+    }
+}
+
 impl Default for TenantRegistry {
     fn default() -> Self {
         Self::with_ledger(Arc::new(MemoryLedger::new()))
@@ -138,11 +161,11 @@ impl TenantRegistry {
     /// Apply a tenant's hosted spending policy to a transaction whose amount
     /// has already been derived from its instructions, not supplied by the
     /// caller. Successful authorization reserves the amount in the ledger.
-    pub fn authorize_cli_transaction(
+    pub fn reserve_cli_transaction(
         &self,
         tenant: &TenantRecord,
         amount_minor: u64,
-    ) -> Result<(), String> {
+    ) -> Result<SpendReservation, String> {
         let whole = amount_minor / USD_MINOR_UNITS_PER_DOLLAR;
         let fraction = amount_minor % USD_MINOR_UNITS_PER_DOLLAR;
         let amount = format!("${whole}.{fraction:04}");
@@ -152,7 +175,13 @@ impl TenantRegistry {
                 "hosted CLI transaction",
                 "connect.pay.sh",
             ))
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        Ok(SpendReservation {
+            subject: tenant.subject.clone(),
+            amount: amount_minor,
+            ledger: self.ledger.clone(),
+            committed: false,
+        })
     }
 
     fn mac_hex(&self, purpose: &[u8], value: &str) -> String {
@@ -717,6 +746,25 @@ mod tests {
         assert!(registry.get("sub_2").is_none());
         assert!(registry.remove("sub_1").is_some());
         assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn failed_signing_releases_reserved_allowance() {
+        let ledger = Arc::new(MemoryLedger::new());
+        let registry = TenantRegistry::with_ledger(ledger.clone());
+        let tenant = record("sub_1");
+
+        {
+            let _failed = registry.reserve_cli_transaction(&tenant, 10_000).unwrap();
+            assert_eq!(ledger.spent_today("sub_1"), 10_000);
+        }
+        assert_eq!(ledger.spent_today("sub_1"), 0);
+
+        registry
+            .reserve_cli_transaction(&tenant, 10_000)
+            .unwrap()
+            .commit();
+        assert_eq!(ledger.spent_today("sub_1"), 10_000);
     }
 
     // ── Through /mcp ───────────────────────────────────────────────────
