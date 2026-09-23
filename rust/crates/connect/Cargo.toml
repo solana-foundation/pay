@@ -28,6 +28,7 @@ http = { version = "1", optional = true }
 hmac = "0.12"
 jsonwebtoken = { version = "9", optional = true }
 pay-core = { workspace = true, optional = true }
+pay-kit = { workspace = true }
 pay-mcp = { workspace = true, optional = true }
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "pem", "std"], optional = true }
 rand = { workspace = true }
@@ -36,6 +37,8 @@ reqwest = { workspace = true, features = ["json"], optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 solana-keychain = { workspace = true }
+solana-message = { workspace = true }
+solana-pubkey = { workspace = true }
 solana-transaction = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }

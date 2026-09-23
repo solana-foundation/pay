@@ -120,7 +120,7 @@ http-body = "1"
 # deps. The `axum` feature (kit's own gate) is intentionally OFF — pay has its
 # own gate (pay-core + pay-proxy).
 #
-pay-kit = { package = "solana-pay-kit", git = "https://github.com/solana-foundation/pay-kit.git", rev = "584db42410ea732e173fc67788a0d491ba6d1326", default-features = false, features = [
+pay-kit = { package = "solana-pay-kit", git = "https://github.com/solana-foundation/pay-kit.git", rev = "85da4856fd0fb6745051f4a8cfd4bd682b9bf5e2", default-features = false, features = [
     "mpp",
     "x402",
     "client",

@@ -15,9 +15,10 @@ use std::time::{Duration, Instant};
 
 use hmac::{Hmac, Mac};
 use pay_core::accounts::{Account, AccountsFile, AccountsStore, BackendKind, MAINNET_NETWORK};
+use pay_core::keystore::{AuthGate, AuthIntent, USD_MINOR_UNITS_PER_DOLLAR};
 use pay_core::remote::{CredentialSource, Credentials, MemoryCredentials};
 use pay_mcp::context::{CallScope, PayContext};
-use pay_mcp::policy::{MemoryLedger, PolicyApproval, SpendLedger, SpendPolicy};
+use pay_mcp::policy::{MemoryLedger, PolicyApproval, PolicyGate, SpendLedger, SpendPolicy};
 use rmcp::service::{RequestContext, RoleServer};
 
 use crate::mcp::Tenant;
@@ -132,6 +133,26 @@ impl TenantRegistry {
             ledger,
             cookie_key,
         }
+    }
+
+    /// Apply a tenant's hosted spending policy to a transaction whose amount
+    /// has already been derived from its instructions, not supplied by the
+    /// caller. Successful authorization reserves the amount in the ledger.
+    pub fn authorize_cli_transaction(
+        &self,
+        tenant: &TenantRecord,
+        amount_minor: u64,
+    ) -> Result<(), String> {
+        let whole = amount_minor / USD_MINOR_UNITS_PER_DOLLAR;
+        let fraction = amount_minor % USD_MINOR_UNITS_PER_DOLLAR;
+        let amount = format!("${whole}.{fraction:04}");
+        PolicyGate::new(&tenant.subject, tenant.policy, self.ledger.clone())
+            .authenticate(&AuthIntent::authorize_payment_details(
+                &amount,
+                "hosted CLI transaction",
+                "connect.pay.sh",
+            ))
+            .map_err(|error| error.to_string())
     }
 
     fn mac_hex(&self, purpose: &[u8], value: &str) -> String {
