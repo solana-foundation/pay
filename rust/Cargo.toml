@@ -65,6 +65,7 @@ opentelemetry-otlp = { version = "0.32", default-features = false, features = [
     "logs",
     "metrics",
     "reqwest-blocking-client",
+    "reqwest-rustls",
     "trace",
 ] }
 opentelemetry-semantic-conventions = "0.32.1"
