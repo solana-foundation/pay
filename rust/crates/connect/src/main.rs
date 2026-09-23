@@ -4,7 +4,7 @@ use tower_http::trace::TraceLayer;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-/// pay-connect v0: browser onboarding for the pay CLI.
+/// Privy-backed hosted wallets for MCP clients and the pay CLI.
 #[derive(Parser)]
 #[command(name = "pay-connect", version, about)]
 struct Args {
@@ -53,7 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => state,
     };
-    info!(public_url, drivers = ?state.driver_ids(), "wallet drivers");
+    info!(public_url, "pay-connect configured");
     #[cfg(feature = "mcp")]
     let state = match pay_connect::mcp::Config::from_env(&public_url) {
         Some(cfg) => {
@@ -68,9 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "DEV ONLY: requests with no Authorization act as this tenant; never deploy like this"
                 );
             }
-            let state = state.with_mcp(cfg.clone());
-            dev_mock_tenants(&state, &cfg).await?;
-            state
+            state.with_mcp(cfg)
         }
         None => {
             info!(
@@ -117,53 +115,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
-    Ok(())
-}
-
-/// `PAY_CONNECT_DEV_MOCK_TENANTS=1`: give every static token a wallet from
-/// the first driver using a mock grant, so a host connected with a header
-/// can use every tool. Only meaningful against the mock Openfort; a real
-/// provider refuses the grant, which is the point.
-#[cfg(feature = "mcp")]
-async fn dev_mock_tenants(
-    state: &AppState,
-    cfg: &pay_connect::mcp::Config,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let enabled = std::env::var("PAY_CONNECT_DEV_MOCK_TENANTS")
-        .ok()
-        .is_some_and(|v| matches!(v.trim(), "1" | "true"));
-    if !enabled || cfg.tokens().is_empty() {
-        return Ok(());
-    }
-    let Some(driver_id) = state.driver_ids().first().copied() else {
-        return Err("PAY_CONNECT_DEV_MOCK_TENANTS needs a wallet driver".into());
-    };
-    let driver = state.driver(driver_id).expect("listed driver exists");
-    let grant = pay_connect::drivers::ConsentGrant {
-        api_key: "sk_test_mock".to_string(),
-        publishable_key: Some("pk_test_mock".to_string()),
-        project_id: Some("pro_mock".to_string()),
-        project: Some("Mock project".to_string()),
-    };
-    for token in cfg.tokens() {
-        let wallet = driver
-            .provision(&grant)
-            .await
-            .map_err(|e| format!("dev tenant provisioning failed: {e}"))?;
-        let subject = pay_connect::mcp::token_fingerprint(token);
-        info!(%subject, address = %wallet.address, "DEV ONLY: static token bound to a mock wallet");
-        state
-            .tenants()
-            .bind(pay_connect::tenants::TenantRecord::from_wallet(
-                &subject, &wallet,
-            ));
-    }
-    Ok(())
-}
-
-#[cfg(not(feature = "mcp"))]
-#[allow(dead_code)]
-async fn dev_mock_tenants(_state: &AppState, _cfg: &()) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 

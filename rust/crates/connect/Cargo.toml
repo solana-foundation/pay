@@ -10,11 +10,7 @@ name = "pay-connect"
 path = "src/main.rs"
 
 [features]
-default = ["openfort", "mcp", "privy"]
-# Openfort wallet driver: dashboard consent handoff, wallet-secret
-# registration and Solana backend wallet creation. Off leaves pay-connect
-# with no custody backend, which is enough to exercise the PKCE handshake.
-openfort = ["dep:p256", "dep:reqwest"]
+default = ["mcp", "privy"]
 # The hosted connector: pay's MCP tools over streamable HTTP at `/mcp`.
 mcp = ["dep:rmcp", "dep:pay-mcp", "dep:pay-core", "dep:http"]
 # Privy as the connector's login and wallet: the consent page signs the
@@ -26,6 +22,7 @@ privy = ["mcp", "dep:reqwest", "dep:jsonwebtoken", "dep:p256"]
 async-trait = "0.1"
 axum = { workspace = true }
 base64 = { workspace = true }
+bincode = { workspace = true }
 clap = { workspace = true }
 http = { version = "1", optional = true }
 hmac = "0.12"
@@ -38,6 +35,8 @@ rmcp = { workspace = true, features = ["server", "transport-streamable-http-serv
 reqwest = { workspace = true, features = ["json"], optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+solana-keychain = { workspace = true }
+solana-transaction = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "net", "time"] }

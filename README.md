@@ -55,6 +55,26 @@ pay claude
 pay codex
 ```
 
+For unattended agents, `pay mcp` can enforce pay-kit's payment permissions
+before any transaction is built or signed. Configure them inline or with a
+strict YAML file:
+
+```sh
+pay mcp --allow-origin https://api.example.com --allow-network mainnet --max-payment '$1.00'
+pay mcp --permissions ./pay-permissions.yml
+```
+
+```yaml
+origins: [https://api.example.com]
+networks: [mainnet]
+max_payment: "$1.00"
+allow_any_asset: false
+```
+
+Configured permissions apply to MPP charge and x402 exact, upto, and
+batch-settlement payments. Stateful MPP sessions and subscriptions fail closed
+while a permission policy is active.
+
 ACP clients such as Buzz can launch the same paid inference route without
 sharing their protocol stream with Pay:
 

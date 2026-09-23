@@ -25,7 +25,7 @@ use url::Url;
 
 use crate::AppState;
 use crate::mcp::Tenant;
-use crate::onboard::{ApiError, is_base64url_alphabet, random_token, sha256_hex};
+use crate::protocol::{ApiError, is_base64url_alphabet, random_token, sha256_hex};
 
 pub const ACCESS_TTL: Duration = Duration::from_secs(60 * 60);
 pub const REFRESH_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
@@ -409,7 +409,7 @@ impl Store {
         if !is_base64url_alphabet(code_verifier) || !(43..=128).contains(&code_verifier.len()) {
             return Err(TokenError::invalid_grant("code_verifier is malformed"));
         }
-        if crate::onboard::pkce_challenge(code_verifier) != grant.code_challenge {
+        if crate::protocol::pkce_challenge(code_verifier) != grant.code_challenge {
             return Err(TokenError::invalid_grant(
                 "code_verifier does not match code_challenge",
             ));
@@ -789,7 +789,7 @@ pub struct PrivyLogin {
 }
 
 #[cfg(feature = "privy")]
-fn privy_login(state: &AppState) -> Option<PrivyLogin> {
+pub(crate) fn privy_login(state: &AppState) -> Option<PrivyLogin> {
     state.privy().map(|p| PrivyLogin {
         app_id: p.app_id().to_string(),
         signer_id: p.signer_id().to_string(),
@@ -798,7 +798,7 @@ fn privy_login(state: &AppState) -> Option<PrivyLogin> {
 }
 
 #[cfg(not(feature = "privy"))]
-fn privy_login(_state: &AppState) -> Option<PrivyLogin> {
+pub(crate) fn privy_login(_state: &AppState) -> Option<PrivyLogin> {
     None
 }
 
@@ -830,7 +830,7 @@ pub async fn pending_view(
         scope: request.scope,
         has_wallet: wallet.is_some(),
         wallet_address: wallet.map(|w| w.pubkey.clone()),
-        providers: state.driver_ids(),
+        providers: Vec::new(),
         host: client.host,
         privy: privy_login(&state),
     }))
@@ -890,9 +890,8 @@ pub struct ApproveBody {
 /// `Authorization: Bearer <privy access token>` (their Privy wallet is
 /// found or created and bound as the tenant); the wallet this browser's
 /// subject cookie already names; or a guest (`{"guest": true}`), who gets
-/// a fresh wallet-less subject. A browser with none of these creates a
-/// wallet through `/api/onboard/start` instead, which approves on
-/// completion.
+/// a fresh wallet-less subject. A browser with none of these receives
+/// `no_wallet` and must authenticate with Privy or continue as a guest.
 pub async fn approve(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -987,7 +986,7 @@ pub async fn approve(
 /// How a Privy sign-in bound its tenant, when it did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(feature = "privy"), allow(dead_code))]
-enum Bound {
+pub(crate) enum Bound {
     /// The wallet was created just now; it holds nothing.
     Created,
     /// An existing Privy wallet was bound for the first time on this server.
@@ -1001,7 +1000,7 @@ enum Bound {
 /// `signer_required` with what the page needs to add the signer
 /// client-side.
 #[cfg(feature = "privy")]
-async fn approve_with_privy(
+pub(crate) async fn approve_with_privy(
     state: &AppState,
     token: &str,
 ) -> Result<(String, Option<Bound>), ApiError> {
@@ -1073,7 +1072,7 @@ async fn approve_with_privy(
 }
 
 #[cfg(not(feature = "privy"))]
-async fn approve_with_privy(
+pub(crate) async fn approve_with_privy(
     _state: &AppState,
     _token: &str,
 ) -> Result<(String, Option<Bound>), ApiError> {
@@ -1412,7 +1411,7 @@ pub async fn revoke(State(state): State<AppState>, Form(form): Form<RevokeForm>)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::onboard::pkce_challenge;
+    use crate::protocol::pkce_challenge;
 
     const GROK_REDIRECT: &str = "https://grok.com/connectors/oauth/callback";
     const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
@@ -1732,15 +1731,10 @@ mod tests {
     use serde_json::{Value, json};
     use tower::ServiceExt;
 
-    const FAKE_WALLET: &str = "Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS";
-
     fn app() -> Router {
         crate::router(
-            AppState::with_drivers(
-                "https://cloud.test",
-                vec![Box::new(crate::tests::FakeDriver)],
-            )
-            .with_mcp(crate::mcp::Config::new("https://cloud.test", vec![])),
+            AppState::new("https://cloud.test")
+                .with_mcp(crate::mcp::Config::new("https://cloud.test", vec![])),
         )
     }
 
@@ -1990,202 +1984,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn the_whole_grok_flow_ends_with_a_working_mcp_session() {
-        let app = app();
-        let client_id = register_grok(&app).await;
-
-        // /mcp refuses first and says where to go.
-        let unauthenticated = send(
-            &app,
-            Request::builder()
-                .method(Method::POST)
-                .uri("/mcp")
-                .header(header::HOST, "cloud.test")
-                .header(header::CONTENT_TYPE, "application/json")
-                .header(header::ACCEPT, "application/json, text/event-stream")
-                .body(Body::from(crate::mcp::tests::INIT))
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(unauthenticated.status, StatusCode::UNAUTHORIZED);
-        assert!(
-            unauthenticated.headers[header::WWW_AUTHENTICATE]
-                .to_str()
-                .unwrap()
-                .contains("https://cloud.test/.well-known/oauth-protected-resource")
-        );
-
-        // Authorize: browser is sent to the consent page.
-        let reply = get(
-            &app,
-            &authorize_path(&client_id, &[("resource", "https://cloud.test/mcp")]),
-        )
-        .await;
-        assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
-        let consent = reply.location();
-        assert_eq!(consent.origin().ascii_serialization(), "https://pay.sh");
-        assert_eq!(consent.path(), "/connect");
-        let request_id = reply.query("request").unwrap();
-
-        // The consent page learns who is asking, and that this browser has
-        // no wallet yet.
-        let view = get(&app, &format!("/api/oauth/authorize/{request_id}")).await;
-        assert_eq!(view.status, StatusCode::OK, "{}", view.body);
-        assert_eq!(view.json()["client_name"], "Grok");
-        assert_eq!(view.json()["redirect_host"], "grok.com");
-        assert_eq!(view.json()["has_wallet"], false);
-        assert_eq!(view.json()["providers"], json!(["fake"]));
-
-        // Without a wallet, Approve is refused.
-        let refused = post_json(
-            &app,
-            &format!("/api/oauth/authorize/{request_id}/approve"),
-            json!({}),
-        )
-        .await;
-        assert_eq!(refused.status, StatusCode::CONFLICT, "{}", refused.body);
-        assert_eq!(refused.json()["error"], "no_wallet");
-
-        // Create one: the provider hop is started from the consent page.
-        let started = post_json(
-            &app,
-            "/api/onboard/start",
-            json!({ "provider": "fake", "authorization_request": request_id }),
-        )
-        .await;
-        assert_eq!(started.status, StatusCode::OK, "{}", started.body);
-        let consent_url = started.json()["consent"].as_str().unwrap().to_string();
-        assert!(
-            consent_url.contains(&format!("state={request_id}")),
-            "{consent_url}"
-        );
-
-        // The provider comes back; completing binds the wallet to a new
-        // subject, approves the request, and remembers the browser.
-        let completed = post_json(
-            &app,
-            "/api/onboard/fake/complete",
-            json!({ "fragment": format!("#api_key=sk_ok&state={request_id}") }),
-        )
-        .await;
-        assert_eq!(completed.status, StatusCode::OK, "{}", completed.body);
-        assert_eq!(completed.json()["origin"], "connector");
-        assert_eq!(completed.json()["address"], FAKE_WALLET);
-        let cookie = cookie_of(&completed);
-        assert!(cookie.starts_with("pay_subject=sub_"), "{cookie}");
-        let back = Url::parse(completed.json()["redirect"].as_str().unwrap()).unwrap();
-        assert_eq!(back.origin().ascii_serialization(), "https://grok.com");
-        assert_eq!(back.path(), "/connectors/oauth/callback");
-        let params: std::collections::HashMap<_, _> = back.query_pairs().into_owned().collect();
-        assert_eq!(params["state"], "st4te");
-        let code = params["code"].clone();
-
-        // Token exchange with the verifier.
-        let tokens = post_form(
-            &app,
-            "/oauth/token",
-            &[
-                ("grant_type", "authorization_code"),
-                ("client_id", &client_id),
-                ("code", &code),
-                ("code_verifier", VERIFIER),
-                ("redirect_uri", GROK_REDIRECT),
-            ],
-        )
-        .await;
-        assert_eq!(tokens.status, StatusCode::OK, "{}", tokens.body);
-        assert_eq!(tokens.headers[header::CACHE_CONTROL], "no-store");
-        let json = tokens.json();
-        assert_eq!(json["token_type"], "Bearer");
-        let access = json["access_token"].as_str().unwrap().to_string();
-        let refresh = json["refresh_token"].as_str().unwrap().to_string();
-
-        // The access token opens an MCP session whose tools act for the
-        // wallet just created.
-        let text = topup_text(&app, &access).await;
-        assert!(text.contains(FAKE_WALLET), "{text}");
-
-        // The same browser connecting another client keeps its wallet.
-        let again = get_as(&app, &authorize_path(&client_id, &[]), Some(&cookie)).await;
-        let again_id = again.query("request").unwrap();
-        let view = get_as(
-            &app,
-            &format!("/api/oauth/authorize/{again_id}"),
-            Some(&cookie),
-        )
-        .await;
-        assert_eq!(view.json()["has_wallet"], true, "{}", view.body);
-        assert_eq!(view.json()["wallet_address"], FAKE_WALLET);
-        let approved = post_json_as(
-            &app,
-            &format!("/api/oauth/authorize/{again_id}/approve"),
-            json!({}),
-            Some(&cookie),
-        )
-        .await;
-        assert_eq!(approved.status, StatusCode::OK, "{}", approved.body);
-        let back = Url::parse(approved.json()["redirect"].as_str().unwrap()).unwrap();
-        let params: std::collections::HashMap<_, _> = back.query_pairs().into_owned().collect();
-        let second = post_form(
-            &app,
-            "/oauth/token",
-            &[
-                ("grant_type", "authorization_code"),
-                ("client_id", &client_id),
-                ("code", &params["code"]),
-                ("code_verifier", VERIFIER),
-            ],
-        )
-        .await;
-        assert_eq!(second.status, StatusCode::OK, "{}", second.body);
-        let second_access = second.json()["access_token"].as_str().unwrap().to_string();
-        assert!(topup_text(&app, &second_access).await.contains(FAKE_WALLET));
-
-        // Refresh rotates; revoke ends it.
-        let rotated = post_form(
-            &app,
-            "/oauth/token",
-            &[
-                ("grant_type", "refresh_token"),
-                ("client_id", &client_id),
-                ("refresh_token", &refresh),
-            ],
-        )
-        .await;
-        assert_eq!(rotated.status, StatusCode::OK, "{}", rotated.body);
-        let new_access = rotated.json()["access_token"].as_str().unwrap().to_string();
-        let stale = post_form(
-            &app,
-            "/oauth/token",
-            &[
-                ("grant_type", "refresh_token"),
-                ("client_id", &client_id),
-                ("refresh_token", &refresh),
-            ],
-        )
-        .await;
-        assert_eq!(stale.status, StatusCode::BAD_REQUEST);
-        assert_eq!(stale.json()["error"], "invalid_grant");
-
-        let revoked = post_form(&app, "/oauth/revoke", &[("token", &new_access)]).await;
-        assert_eq!(revoked.status, StatusCode::OK);
-        let after = send(
-            &app,
-            Request::builder()
-                .method(Method::POST)
-                .uri("/mcp")
-                .header(header::HOST, "cloud.test")
-                .header(header::AUTHORIZATION, format!("Bearer {new_access}"))
-                .header(header::CONTENT_TYPE, "application/json")
-                .header(header::ACCEPT, "application/json, text/event-stream")
-                .body(Body::from(crate::mcp::tests::INIT))
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(after.status, StatusCode::UNAUTHORIZED);
-    }
-
     /// Start an authorization for `client_id` and return the pending id.
     async fn start_authorization(app: &Router, client_id: &str, cookie: Option<&str>) -> String {
         let reply = get_as(app, &authorize_path(client_id, &[]), cookie).await;
@@ -2193,85 +1991,10 @@ mod tests {
         reply.query("request").unwrap()
     }
 
-    /// Complete the provider hop for `request_id` as a fresh browser.
-    async fn complete_with_provider(app: &Router, request_id: &str, fragment: &str) -> Reply {
-        let started = post_json(
-            app,
-            "/api/onboard/start",
-            json!({ "provider": "fake", "authorization_request": request_id }),
-        )
-        .await;
-        assert_eq!(started.status, StatusCode::OK, "{}", started.body);
-        post_json(
-            app,
-            "/api/onboard/fake/complete",
-            json!({ "fragment": fragment }),
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn a_returning_provider_account_gets_its_wallet_back_without_a_cookie() {
-        let state = AppState::with_drivers(
-            "https://cloud.test",
-            vec![Box::new(crate::tests::FakeDriver)],
-        )
-        .with_mcp(crate::mcp::Config::new("https://cloud.test", vec![]));
-        let app = crate::router(state.clone());
-        let client_id = register_grok(&app).await;
-
-        // First sign-in from one browser: a wallet is created for this
-        // authenticated provider credential.
-        let first_request = start_authorization(&app, &client_id, None).await;
-        let first = complete_with_provider(
-            &app,
-            &first_request,
-            &format!("#api_key=sk_one&project_id=pro_1&state={first_request}"),
-        )
-        .await;
-        assert_eq!(first.status, StatusCode::OK, "{}", first.body);
-        let first_cookie = cookie_of(&first);
-        assert_eq!(state.tenants().len(), 1);
-
-        // Second sign-in, a different browser (no cookie), with the same
-        // credential: same wallet, no second tenant.
-        let second_request = start_authorization(&app, &client_id, None).await;
-        let second = complete_with_provider(
-            &app,
-            &second_request,
-            &format!("#api_key=sk_one&project_id=pro_1&state={second_request}"),
-        )
-        .await;
-        assert_eq!(second.status, StatusCode::OK, "{}", second.body);
-        assert_eq!(second.json()["address"], first.json()["address"]);
-        assert_eq!(cookie_of(&second), first_cookie, "same subject");
-        assert_eq!(state.tenants().len(), 1, "no second wallet");
-        let mut headers = HeaderMap::new();
-        headers.insert(header::COOKIE, first_cookie.parse().unwrap());
-        let subject = state.tenants().subject_from_cookie(&headers).unwrap();
-        assert_eq!(
-            state.tenants().get(&subject).unwrap().credentials["secret_key"],
-            "sk_one"
-        );
-
-        // Browser-supplied project metadata cannot select that tenant. A
-        // different credential claiming the same project gets a new subject.
-        let third_request = start_authorization(&app, &client_id, None).await;
-        let third = complete_with_provider(
-            &app,
-            &third_request,
-            &format!("#api_key=sk_two&project_id=pro_1&state={third_request}"),
-        )
-        .await;
-        assert_eq!(third.status, StatusCode::OK, "{}", third.body);
-        assert_ne!(cookie_of(&third), first_cookie);
-        assert_eq!(state.tenants().len(), 2);
-    }
-
     #[tokio::test]
     async fn the_consent_page_can_live_on_the_pages_app() {
         let app = crate::router(
-            AppState::with_drivers("https://cloud.test", vec![])
+            AppState::new("https://cloud.test")
                 .with_mcp(crate::mcp::Config::new("https://cloud.test", vec![]))
                 .with_pages_url("https://pay.test/"),
         );
@@ -2626,7 +2349,7 @@ mod tests {
             let mock = Arc::new(MockPrivy::default());
             let base = mock_privy(mock.clone()).await;
             let fake = FakeApp::new(&base);
-            let state = AppState::with_drivers("https://cloud.test", vec![])
+            let state = AppState::new("https://cloud.test")
                 .with_mcp(crate::mcp::Config::new("https://cloud.test", vec![]))
                 .with_privy(crate::privy::Privy::new(fake.cfg.clone()).unwrap());
             (crate::router(state.clone()), state, fake, mock)
@@ -2736,7 +2459,7 @@ mod tests {
             let mock = Arc::new(MockPrivy::default());
             let base = mock_privy(mock.clone()).await;
             let fake = FakeApp::new(&base);
-            let state = AppState::with_drivers("https://cloud.test", vec![])
+            let state = AppState::new("https://cloud.test")
                 .with_mcp(crate::mcp::Config::new("https://cloud.test", vec![]))
                 .with_privy(crate::privy::Privy::new(fake.cfg.clone()).unwrap())
                 // Once created, the wallet is treated as funded.
@@ -2913,7 +2636,7 @@ mod tests {
             );
             let base = mock_privy(mock.clone()).await;
             let fake = FakeApp::new(&base);
-            let state = AppState::with_drivers("https://cloud.test", vec![])
+            let state = AppState::new("https://cloud.test")
                 .with_mcp(crate::mcp::Config::new("https://cloud.test", vec![]))
                 .with_privy(crate::privy::Privy::new(fake.cfg.clone()).unwrap())
                 .with_wallet_probe(Arc::new(crate::FixedProbe(true)));

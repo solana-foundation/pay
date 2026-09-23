@@ -15,6 +15,7 @@ pub mod fetch;
 pub mod goose;
 pub mod help;
 pub mod http;
+pub mod mcp;
 pub(crate) mod payer_proxy;
 pub mod qodercli;
 pub mod send;
@@ -118,7 +119,7 @@ pub enum Command {
     #[command(alias = "add", short_flag = 'i')]
     Install(skills::install::InstallCommand),
     /// Start the MCP server (for Claude Code, Cursor, etc.)
-    Mcp,
+    Mcp(mcp::McpCommand),
     /// Generate documentation artifacts (e.g. the provider-spec JSON Schema).
     Docs {
         #[command(subcommand)]
@@ -184,7 +185,7 @@ impl Command {
             | Command::Server { .. }
             | Command::Gate { .. }
             | Command::Docs { .. }
-            | Command::Mcp => false,
+            | Command::Mcp(_) => false,
         }
     }
 
@@ -215,7 +216,7 @@ impl Command {
             | Command::Server { .. }
             | Command::Gate { .. }
             | Command::Docs { .. } => ToolKind::Mcp,
-            Command::Mcp => ToolKind::Mcp,
+            Command::Mcp(_) => ToolKind::Mcp,
         }
     }
 }
@@ -279,7 +280,8 @@ impl Command {
             Command::Gate { command } => {
                 return command.run(keypair_override, account_override, sandbox);
             }
-            Command::Mcp => {
+            Command::Mcp(cmd) => {
+                let options = cmd.options().map_err(pay_core::Error::Config)?;
                 let rt = tokio::runtime::Builder::new_multi_thread()
                     .enable_all()
                     .build()
@@ -287,7 +289,7 @@ impl Command {
                         pay_core::Error::Config(format!("Failed to create runtime: {e}"))
                     })?;
                 return rt
-                    .block_on(pay_mcp::run_server(&pay_mcp::McpOptions::default()))
+                    .block_on(pay_mcp::run_server(&options))
                     .map_err(pay_core::Error::Config);
             }
             Command::Claude(cmd) => std::process::exit(cmd.run(
@@ -2537,7 +2539,10 @@ mod tests {
 
     #[test]
     fn tool_kind_mcp() {
-        assert!(matches!(Command::Mcp.tool_kind(), ToolKind::Mcp));
+        assert!(matches!(
+            Command::Mcp(mcp::McpCommand::default()).tool_kind(),
+            ToolKind::Mcp
+        ));
     }
 
     #[test]

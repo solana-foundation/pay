@@ -4,11 +4,11 @@
 //!
 //! 1. Generate `state` and a PKCE verifier/challenge (RFC 7636 S256).
 //! 2. Bind an ephemeral `127.0.0.1` listener with a single `GET /callback`.
-//! 3. Open `{connect_url}/onboard?callback=…&state=…&code_challenge=…` in the
+//! 3. Open `{connect_url}/v1/cli?callback=…&state=…&code_challenge=…` in the
 //!    browser (the URL is also printed so it can be copied).
 //! 4. pay-connect redirects the browser to the callback with a one-time
 //!    `code`; the handler checks `state` and hands the code back.
-//! 5. `POST {connect_url}/v1/onboard/exchange` with the code and verifier.
+//! 5. `POST {connect_url}/v1/cli/complete` with the code and verifier.
 //!
 //! The hidden `pay connect-onboard` subcommand exposes the same flow directly
 //! for development.
@@ -55,8 +55,8 @@ const LOCAL_CONNECT_URL: &str = "http://127.0.0.1:8402";
 /// `--backend` value that selects the browser-linked remote wallet in
 /// `pay setup` and `pay account new`.
 pub const CONNECT_BACKEND_FLAG: &str = "connect";
-/// Picker name and detail for the remote wallet.
-pub const CONNECT_BACKEND_NAME: &str = "Remote wallet";
+/// Picker name and detail for the cloud wallet.
+pub const CONNECT_BACKEND_NAME: &str = "Cloud wallet";
 pub const CONNECT_BACKEND_DETAIL: &str =
     "sign in from your browser; funds and approvals live at connect.pay.sh";
 
@@ -189,7 +189,13 @@ pub fn store_provisioned_wallet(
     let ks = super::account::new::platform_credential_keystore()?;
     let intent = pay_core::keystore::AuthIntent::create_account(account);
     pay_core::remote::store_credentials(&ks, account, &result.credentials, &intent)?;
-    super::account::new::save_account_remote(account, provider.id(), &pubkey, wallet_id)?;
+    super::account::new::save_account_remote_with_auth(
+        account,
+        provider.id(),
+        &pubkey,
+        wallet_id,
+        false,
+    )?;
 
     let mut body = format!(
         "Account `{account}` signs through {}.\nAddress: {pubkey}\nWallet: {wallet_id}",
@@ -198,7 +204,7 @@ pub fn store_provisioned_wallet(
     if let Some(project) = result.project_id.as_deref().filter(|p| !p.is_empty()) {
         body.push_str(&format!("\nProject: {project}"));
     }
-    components::print_notice(components::NoticeLevel::Info, "Remote wallet ready", &body);
+    components::print_notice(components::NoticeLevel::Info, "Cloud wallet ready", &body);
     Ok(pubkey)
 }
 
@@ -230,7 +236,7 @@ pub struct OnboardRequest {
     pub account: String,
 }
 
-/// Response of `POST /v1/onboard/exchange`. Every field defaults so the
+/// Response of `POST /v1/cli/complete`. Every field defaults so the
 /// server can grow the payload without breaking older CLIs.
 ///
 /// `status: "ready"` carries a provisioned wallet: `provider` is a
@@ -397,10 +403,10 @@ pub struct BrowserUrlParams<'a> {
     pub cli: &'a str,
 }
 
-/// `{connect_url}/onboard?callback=…&state=…&code_challenge=…&account=…&host=…&cli=…`
+/// `{connect_url}/v1/cli?callback=…&state=…&code_challenge=…&account=…&host=…&cli=…`
 pub fn build_browser_url(p: &BrowserUrlParams<'_>) -> String {
     format!(
-        "{}/onboard?callback={}&state={}&code_challenge={}&account={}&host={}&cli={}",
+        "{}/v1/cli?callback={}&state={}&code_challenge={}&account={}&host={}&cli={}",
         p.connect_url.trim_end_matches('/'),
         urlencoding::encode(p.callback),
         urlencoding::encode(p.state),
@@ -439,6 +445,8 @@ pub struct CallbackQuery {
     pub payment_id: Option<String>,
     #[serde(default)]
     pub signature: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 /// What a `/callback` hit must carry to complete the flow that opened the
@@ -455,6 +463,7 @@ pub enum Expect {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Accepted {
     Code(String),
+    Denied(String),
     Payment {
         payment_id: String,
         /// On-chain signature, when pay-connect already knew it.
@@ -476,7 +485,13 @@ pub fn accept_callback(
     }
     let present = |v: &Option<String>| v.as_deref().filter(|s| !s.is_empty()).map(str::to_string);
     match expect {
-        Expect::Code => present(&q.code).map(Accepted::Code).ok_or("missing code"),
+        Expect::Code => {
+            if let Some(error) = present(&q.error) {
+                Ok(Accepted::Denied(error))
+            } else {
+                present(&q.code).map(Accepted::Code).ok_or("missing code")
+            }
+        }
         Expect::Payment => present(&q.payment_id)
             .map(|payment_id| Accepted::Payment {
                 payment_id,
@@ -617,6 +632,9 @@ impl CallbackListener {
     pub async fn wait_for_code(self, timeout: Duration) -> pay_core::Result<String> {
         match self.wait_for(timeout).await? {
             Accepted::Code(code) => Ok(code),
+            Accepted::Denied(error) => Err(pay_core::Error::Config(format!(
+                "Cloud wallet setup was cancelled ({error})."
+            ))),
             Accepted::Payment { .. } => Err(pay_core::Error::Config(
                 "loopback callback delivered a payment where a code was expected".to_string(),
             )),
@@ -726,7 +744,7 @@ impl FundingSession {
                                     payment_id,
                                     signature,
                                 },
-                                Accepted::Code(_) => {
+                                Accepted::Code(_) | Accepted::Denied(_) => {
                                     unreachable!("listener bound with Expect::Payment")
                                 }
                             },
@@ -752,7 +770,7 @@ impl FundingSession {
 
 // ── Exchange ──────────────────────────────────────────────────────────────
 
-/// `POST {connect_url}/v1/onboard/exchange`. Must be called outside a tokio
+/// `POST {connect_url}/v1/cli/complete`. Must be called outside a tokio
 /// runtime (blocking client).
 pub fn exchange_code(
     connect_url: &str,
@@ -773,7 +791,7 @@ pub fn exchange_code(
     let body = serde_json::json!({ "code": code, "code_verifier": code_verifier });
     let res = client
         .post(format!(
-            "{}/v1/onboard/exchange",
+            "{}/v1/cli/complete",
             connect_url.trim_end_matches('/')
         ))
         .header(header::CONTENT_TYPE, "application/json")
@@ -919,7 +937,7 @@ mod tests {
         assert_eq!(
             url,
             format!(
-                "http://127.0.0.1:8402/onboard?callback=http%3A%2F%2F127.0.0.1%3A53211%2Fcallback\
+                "http://127.0.0.1:8402/v1/cli?callback=http%3A%2F%2F127.0.0.1%3A53211%2Fcallback\
 &state=st_ate-1234567890&code_challenge={RFC_CHALLENGE}&account=my%20account%26x&host=ludo%27s%20mbp&cli=0.29.0"
             )
         );
@@ -951,6 +969,15 @@ mod tests {
         assert_eq!(
             accept_callback(Expect::Code, &q(Some(""), Some("s")), "s"),
             Err("missing code")
+        );
+        let denied = CallbackQuery {
+            state: Some("s".to_string()),
+            error: Some("access_denied".to_string()),
+            ..CallbackQuery::default()
+        };
+        assert_eq!(
+            accept_callback(Expect::Code, &denied, "s"),
+            Ok(Accepted::Denied("access_denied".to_string()))
         );
     }
 
@@ -1106,7 +1133,7 @@ mod tests {
     #[test]
     fn exchange_parses_success_response() {
         let app = Router::new().route(
-            "/v1/onboard/exchange",
+            "/v1/cli/complete",
             post(|Json(body): Json<serde_json::Value>| async move {
                 assert_eq!(body["code"], "c0de");
                 assert_eq!(body["code_verifier"], RFC_VERIFIER);
@@ -1136,7 +1163,7 @@ mod tests {
     #[test]
     fn exchange_surfaces_server_error_message() {
         let app = Router::new().route(
-            "/v1/onboard/exchange",
+            "/v1/cli/complete",
             post(|| async {
                 (
                     StatusCode::BAD_REQUEST,
@@ -1159,7 +1186,7 @@ mod tests {
     #[test]
     fn exchange_falls_back_to_http_status_without_message() {
         let app = Router::new().route(
-            "/v1/onboard/exchange",
+            "/v1/cli/complete",
             post(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "boom") }),
         );
         let base = spawn_stub(app);

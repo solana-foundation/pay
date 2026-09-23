@@ -1,18 +1,16 @@
 #!/usr/bin/env bash
 # Build and run pay-connect locally with everything switched on: the
-# onboarding handoff, the MCP connector and its OAuth server. The separate
-# pay-web-ui app owns funding. By default a mock Openfort runs beside it so the wallet
-# flows work with no Openfort account.
+# CLI linking, the MCP connector and its OAuth server. The separate
+# pay-web-ui app owns the browser UI and funding.
 #
-#   rust/crates/connect/dev/run.sh                 # mock Openfort, http://127.0.0.1:8402
-#   rust/crates/connect/dev/run.sh --real-openfort # use dashboard.openfort.io
+#   rust/crates/connect/dev/run.sh                 # http://127.0.0.1:8402
 #   rust/crates/connect/dev/run.sh --public-url https://xyz.trycloudflare.com
 #   rust/crates/connect/dev/run.sh --pages-url http://localhost:3000
 #   rust/crates/connect/dev/run.sh --static-token <token>   # header auth + a mock wallet for it
 #   rust/crates/connect/dev/run.sh --anonymous              # DEV ONLY: no-auth hosts act as that wallet
 #   rust/crates/connect/dev/run.sh --tunnel --anonymous     # Grok demo: quick tunnel + no-auth mock wallet
 #   rust/crates/connect/dev/run.sh --funnel --anonymous     # same, on a stable Tailscale Funnel hostname
-#   rust/crates/connect/dev/run.sh --funnel --funnel-port 8443 --port 8403 --mock-port 8498
+#   rust/crates/connect/dev/run.sh --funnel --funnel-port 8443 --port 8403
 #                                                 # a second instance beside the first (Funnel also
 #                                                 # serves 8443 and 10000), e.g. Privy for Claude.ai
 #
@@ -22,10 +20,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../../../.." && pwd)"
 PORT=8402
-MOCK_PORT=8499
 PUBLIC_URL=""
 PAGES_URL=""
-REAL_OPENFORT=0
 SKIP_BUILD=0
 STATIC_TOKEN=""
 ANONYMOUS=0
@@ -39,14 +35,12 @@ while [ $# -gt 0 ]; do
     --port) PORT="$2"; shift 2 ;;
     --public-url) PUBLIC_URL="$2"; shift 2 ;;
     --pages-url) PAGES_URL="$2"; shift 2 ;;
-    --real-openfort) REAL_OPENFORT=1; shift ;;
     --skip-build) SKIP_BUILD=1; shift ;;
     --static-token) STATIC_TOKEN="$2"; shift 2 ;;
     --anonymous) ANONYMOUS=1; shift ;;
     --tunnel) TUNNEL=1; shift ;;
     --funnel) FUNNEL=1; shift ;;
     --funnel-port) FUNNEL_PORT="$2"; shift 2 ;;
-    --mock-port) MOCK_PORT="$2"; shift 2 ;;
     -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
@@ -118,34 +112,18 @@ else
   export PAY_CONNECT_PAGES_URL="${PAY_CONNECT_PAGES_URL:-http://localhost:3000}"
 fi
 
-if [ "$REAL_OPENFORT" = 0 ]; then
-  step "Starting mock Openfort on http://127.0.0.1:$MOCK_PORT"
-  python3 "$ROOT/rust/crates/connect/dev/mock_openfort.py" "$MOCK_PORT" &
-  PIDS+=($!)
-  # pay-connect may provision dev wallets against the mock at startup.
-  for _ in $(seq 1 50); do
-    curl -fsS -o /dev/null "http://127.0.0.1:$MOCK_PORT/v2/accounts" 2>/dev/null && break
-    sleep 0.2
-  done
-  export OPENFORT_BASE_URL="http://127.0.0.1:$MOCK_PORT"
-  export OPENFORT_AUTH_PAGE_URL="http://127.0.0.1:$MOCK_PORT"
-else
-  unset OPENFORT_BASE_URL OPENFORT_AUTH_PAGE_URL
-fi
-
 export PAY_CONNECT_MCP=1
 export RUST_LOG="${RUST_LOG:-info,pay_connect=debug}"
 if [ "$ANONYMOUS" = 1 ] && [ -z "$STATIC_TOKEN" ]; then
   STATIC_TOKEN="pay_dev_$(openssl rand -hex 16)"
 fi
 if [ -n "$STATIC_TOKEN" ]; then
-  # A header-authenticated host; with the mock, the token gets a wallet too.
+  # A header-authenticated host. Wallet binding still happens through Privy.
   export PAY_CONNECT_MCP_TOKENS="$STATIC_TOKEN"
-  [ "$REAL_OPENFORT" = 0 ] && export PAY_CONNECT_DEV_MOCK_TENANTS=1
 fi
 if [ "$ANONYMOUS" = 1 ]; then
   # DEV ONLY: hosts that send no header and cannot finish OAuth act as the
-  # static token's tenant. Anyone with the URL can use that mock wallet.
+  # static token's tenant. Use only against a local development server.
   export PAY_CONNECT_DEV_ANONYMOUS_TOKEN="$STATIC_TOKEN"
 fi
 
@@ -167,11 +145,10 @@ cat <<EOF
 $( [ -n "$STATIC_TOKEN" ] && printf '  Header-authenticated host (Grok custom connector, "headers" field):\n    Authorization: Bearer %s\n\n' "$STATIC_TOKEN" )  MCP connector (what Grok would use), with Claude Code as the host:
     claude mcp add --transport http payconnect $PUBLIC_URL/mcp
     then in Claude Code:  /mcp  → payconnect → Authenticate
-    The browser lands on the consent page, creates a wallet$( [ "$REAL_OPENFORT" = 0 ] && printf ' (mock Openfort)' ), and returns.
+    The browser lands on the consent page, signs in with Privy, and returns.
 
-  CLI, remote wallet setup (with the mock, use a scratch HOME so mock
-  credentials never land in your real keychain):
-    HOME=\$(mktemp -d) PAY_CONNECT_LOCAL=1 $ROOT/rust/target/debug/pay setup --backend connect
+  CLI, cloud wallet setup:
+    PAY_CONNECT_LOCAL=1 $ROOT/rust/target/debug/pay setup --backend connect
 
   CLI, open the pay.sh onramp (the pages backend owns its provider configuration):
     PAY_ONRAMP=coinflow PAY_CONNECT_LOCAL=1 $ROOT/rust/target/debug/pay topup

@@ -27,7 +27,6 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::drivers::ProvisionedWallet;
 use crate::tenants::TenantRecord;
 
 pub const PROVIDER_ID: &str = "privy";
@@ -431,16 +430,15 @@ impl Privy {
             pay_core::remote::privy::AUTHORIZATION_KEY_FIELD.to_string(),
             self.cfg.authorization_key.clone(),
         );
-        TenantRecord::from_wallet(
-            subject,
-            &ProvisionedWallet {
-                provider: PROVIDER_ID,
-                credentials,
-                wallet_id: wallet.id.clone(),
-                address: wallet.address.clone(),
-                project_id: None,
-            },
-        )
+        TenantRecord {
+            subject: subject.to_string(),
+            account_name: crate::tenants::CONNECTOR_ACCOUNT.to_string(),
+            provider: PROVIDER_ID.to_string(),
+            wallet_id: wallet.id.clone(),
+            pubkey: wallet.address.clone(),
+            credentials,
+            policy: crate::tenants::DEFAULT_POLICY,
+        }
     }
 }
 

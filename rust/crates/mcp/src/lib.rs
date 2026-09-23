@@ -2,12 +2,14 @@
 
 mod auth;
 pub mod context;
+pub mod permissions;
 pub mod policy;
 mod server;
 mod tools;
 
 pub use auth::ElicitationAuth;
 pub use context::{ApprovalPolicy, CallScope, LocalContext, PayContext};
+pub use permissions::{McpPermissions, PermissionConfig};
 
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
@@ -16,10 +18,13 @@ pub use server::PayMcp;
 
 /// Options for the MCP server.
 #[derive(Default)]
-pub struct McpOptions {}
+pub struct McpOptions {
+    /// Optional fail-closed payment permissions for this MCP process.
+    pub permissions: Option<McpPermissions>,
+}
 
 /// Start the MCP server on stdio.
-pub async fn run_server(_opts: &McpOptions) -> Result<(), String> {
+pub async fn run_server(opts: &McpOptions) -> Result<(), String> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -31,7 +36,8 @@ pub async fn run_server(_opts: &McpOptions) -> Result<(), String> {
 
     tracing::info!("Starting pay MCP server");
 
-    let service = PayMcp::new()
+    let context = LocalContext::new().with_permissions(opts.permissions.clone());
+    let service = PayMcp::with_context(std::sync::Arc::new(context))
         .serve(stdio())
         .await
         .inspect_err(|e| {

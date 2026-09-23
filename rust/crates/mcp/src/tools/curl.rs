@@ -986,6 +986,7 @@ fn do_paid_fetch(
             alternatives,
             x402_alternative,
             x402_upto_accepts,
+            resource_url,
             ..
         } => {
             use pay_core::client::mpp::ChosenPayment;
@@ -1006,6 +1007,9 @@ fn do_paid_fetch(
             let mut headers = extra_headers.to_vec();
             match chosen {
                 ChosenPayment::Mpp(ch) => {
+                    if let Some(permissions) = &scope.payment_permissions {
+                        permissions.authorize_mpp(ch.as_ref(), &resource_url)?;
+                    }
                     let (auth_header, _ephemeral) =
                         pay_core::client::mpp::build_credential_with_override(
                             ch.as_ref(),
@@ -1018,6 +1022,9 @@ fn do_paid_fetch(
                     headers.push(("Authorization".to_string(), auth_header));
                 }
                 ChosenPayment::X402(challenge) => {
+                    if let Some(permissions) = &scope.payment_permissions {
+                        permissions.authorize_x402(challenge.as_ref(), &resource_url)?;
+                    }
                     let built_payment = pay_core::client::x402::build_payment_with_override(
                         challenge.as_ref(),
                         store,
@@ -1034,6 +1041,9 @@ fn do_paid_fetch(
                     );
                 }
                 ChosenPayment::X402Upto(challenge) => {
+                    if let Some(permissions) = &scope.payment_permissions {
+                        permissions.authorize_upto(challenge.as_ref(), &resource_url)?;
+                    }
                     let built_payment = pay_core::client::x402::build_upto_payment_with_override(
                         challenge.as_ref(),
                         store,
@@ -1052,7 +1062,14 @@ fn do_paid_fetch(
             }
             interpret_retry(fetch_request(&headers)?)
         }
-        RunOutcome::X402Challenge { challenge, .. } => {
+        RunOutcome::X402Challenge {
+            challenge,
+            resource_url,
+            ..
+        } => {
+            if let Some(permissions) = &scope.payment_permissions {
+                permissions.authorize_x402(&challenge, &resource_url)?;
+            }
             let built_payment = pay_core::client::x402::build_payment_with_override(
                 &challenge,
                 store,
@@ -1070,7 +1087,14 @@ fn do_paid_fetch(
             );
             interpret_retry(fetch_request(&headers)?)
         }
-        RunOutcome::X402UptoChallenge { challenge, .. } => {
+        RunOutcome::X402UptoChallenge {
+            challenge,
+            resource_url,
+            ..
+        } => {
+            if let Some(permissions) = &scope.payment_permissions {
+                permissions.authorize_upto(&challenge, &resource_url)?;
+            }
             let built_payment = pay_core::client::x402::build_upto_payment_with_override(
                 &challenge,
                 store,
@@ -1088,7 +1112,14 @@ fn do_paid_fetch(
             );
             interpret_retry(fetch_request(&headers)?)
         }
-        RunOutcome::X402BatchChallenge { challenge, .. } => {
+        RunOutcome::X402BatchChallenge {
+            challenge,
+            resource_url,
+            ..
+        } => {
+            if let Some(permissions) = &scope.payment_permissions {
+                permissions.authorize_batch(&challenge, &resource_url)?;
+            }
             let built = pay_core::client::x402::build_batch_payment(
                 &challenge,
                 store,
@@ -1123,6 +1154,9 @@ fn do_paid_fetch(
                     .adopt_corrective(&corrective.requirements)
                     .is_ok_and(|adopted| adopted.is_some())
             {
+                if let Some(permissions) = &scope.payment_permissions {
+                    permissions.authorize_batch(corrective, &resource_url)?;
+                }
                 let retry = pay_core::client::x402::build_batch_payment(
                     corrective,
                     store,
@@ -1162,6 +1196,7 @@ fn do_paid_fetch(
         RunOutcome::X402SignInChallenge {
             challenge,
             payment_fallback,
+            resource_url,
             ..
         } => {
             // Prefer spending existing credits: sign in with the wallet and
@@ -1192,6 +1227,9 @@ fn do_paid_fetch(
             if matches!(retry, RunOutcome::Completed { .. }) {
                 interpret_retry(retry)
             } else if let Some(pay_challenge) = payment_fallback {
+                if let Some(permissions) = &scope.payment_permissions {
+                    permissions.authorize_x402(&pay_challenge, &resource_url)?;
+                }
                 let built_payment = pay_core::client::x402::build_payment_with_override(
                     &pay_challenge,
                     store,
@@ -1222,6 +1260,9 @@ fn do_paid_fetch(
             }
         }
         RunOutcome::SessionChallenge { challenge, .. } => {
+            if let Some(permissions) = &scope.payment_permissions {
+                permissions.reject_unsupported("MPP session payments")?;
+            }
             let key = session_key.ok_or_else(|| {
                 pay_core::Error::Mpp(
                     "MPP session payments require an absolute HTTP(S) URL".to_string(),
@@ -1251,6 +1292,9 @@ fn do_paid_fetch(
             authenticate,
             ..
         } => {
+            if let Some(permissions) = &scope.payment_permissions {
+                permissions.reject_unsupported("MPP subscription payments")?;
+            }
             // Build + send the activation credential, same flow as
             // `pay http`. Touch ID (or whatever keystore the active
             // account uses) gates the signature, so an agent invocation
@@ -1690,6 +1734,7 @@ mod tests {
             account_override: None,
             rpc_url_override: None,
             approval: Arc::new(crate::context::LocalApproval),
+            payment_permissions: None,
             body_files: true,
         };
         let result = do_paid_fetch(

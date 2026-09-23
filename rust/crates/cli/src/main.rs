@@ -128,7 +128,7 @@ fn main() {
     });
 
     // MCP server — needs its own runtime, exit early
-    if matches!(command, Command::Mcp) {
+    if matches!(command, Command::Mcp(_)) {
         let mcp_seq = std::sync::atomic::AtomicUsize::new(0);
         let rt = match tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -307,7 +307,7 @@ fn main() {
                 | Command::Http(_)
                 | Command::Fetch(_)
                 | Command::Acp(_)
-                | Command::Mcp
+                | Command::Mcp(_)
         ) {
         None
     } else if matches!(command, Command::Server { .. } | Command::Gate { .. }) {

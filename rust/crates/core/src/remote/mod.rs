@@ -31,6 +31,7 @@
 #[cfg(feature = "ledger")]
 pub mod ledger;
 pub mod openfort;
+pub mod payconnect;
 pub mod privy;
 
 use std::collections::BTreeMap;
@@ -45,6 +46,7 @@ use crate::{Error, Result};
 
 /// The registered remote backends, by [`RemoteProvider::id`].
 static PROVIDERS: &[&dyn RemoteProvider] = &[
+    &payconnect::PayConnect,
     &openfort::Openfort,
     &privy::Privy,
     #[cfg(feature = "ledger")]
