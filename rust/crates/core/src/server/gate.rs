@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
-use pay_kit::mpp::server::{ChargeOptions, VerificationError};
+use pay_kit::mpp::server::{ChargeOptions, Mpp, VerificationError};
 use pay_kit::mpp::{
     ChargeRequest, PAYMENT_RECEIPT_HEADER, PaymentCredential, Receipt, ReceiptKind,
     SessionReceiptExtensions, SessionReceiptIntent, base64url_encode, format_receipt,
@@ -1457,8 +1457,54 @@ impl<S: PaymentState> PaymentGate<S> {
             }
         };
 
+        // One MPP per accepted currency is configured; the credential names the
+        // one it paid with. Verify against that server only. Trying every
+        // server and keeping the last error reported the last currency's
+        // mismatch instead of the real settlement failure.
+        let paid_currency = match credential.challenge.request.decode::<ChargeRequest>() {
+            Ok(request) => request.currency,
+            Err(e) => {
+                let message = format!("Failed to decode credential request: {e}");
+                telemetry::record_settlement_error("mpp/charge", subdomain, path, &message, false);
+                return GateDecision::Respond(GateResponse::json(
+                    StatusCode::PAYMENT_REQUIRED,
+                    serde_json::to_vec(&json!({
+                        "error": "verification_failed",
+                        "message": message,
+                        "retryable": false,
+                    }))
+                    .unwrap_or_default(),
+                ));
+            }
+        };
+        let matching: Vec<&Mpp> = mpps
+            .iter()
+            .copied()
+            .filter(|mpp| mpp_accepts_currency(mpp, &paid_currency))
+            .collect();
+        if matching.is_empty() {
+            let accepted = mpps
+                .iter()
+                .map(|mpp| mpp.currency())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let message = format!(
+                "Credential currency `{paid_currency}` is not accepted by this endpoint (accepted: {accepted})"
+            );
+            telemetry::record_settlement_error("mpp/charge", subdomain, path, &message, false);
+            return GateDecision::Respond(GateResponse::json(
+                StatusCode::PAYMENT_REQUIRED,
+                serde_json::to_vec(&json!({
+                    "error": "verification_failed",
+                    "message": message,
+                    "retryable": false,
+                }))
+                .unwrap_or_default(),
+            ));
+        }
+
         let mut last_error = None;
-        for mpp in &mpps {
+        for mpp in matching {
             // Audit: verify against the challenge WE would issue (rebuilt from our
             // own price + splits), not the values echoed in the credential.
             let expected = match mpp.charge_with_options(
@@ -1575,6 +1621,11 @@ impl<S: PaymentState> PaymentGate<S> {
 /// (vs. Bearer/Basic/… tokens meant for the upstream).
 fn is_payment_authorization(auth: &&str) -> bool {
     auth.len() >= 8 && auth[..8].eq_ignore_ascii_case("payment ")
+}
+
+/// Whether `mpp` settles the currency a credential was paid in.
+fn mpp_accepts_currency(mpp: &Mpp, currency: &str) -> bool {
+    crate::server::payment::same_currency(mpp.currency(), currency, mpp.network())
 }
 
 fn upto_settle_amount(min_usd: Option<f64>, ceiling_usd: f64, max_amount: u64) -> u64 {
@@ -2699,6 +2750,35 @@ mod tests {
                 GateDecision::Passthrough
             ));
         }
+    }
+
+    fn mainnet_mpp(currency: &str) -> pay_kit::mpp::server::Mpp {
+        pay_kit::mpp::server::Mpp::new(pay_kit::mpp::server::Config {
+            recipient: "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY".to_string(),
+            currency: currency.to_string(),
+            decimals: 6,
+            network: "mainnet".to_string(),
+            rpc_url: Some("http://127.0.0.1:1/never".to_string()),
+            challenge_binding_secret: Some("test-secret-key-do-not-use-32b-pad".to_string()),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn mpp_accepts_currency_matches_by_mint_or_symbol() {
+        let usdc = pay_types::stablecoin_mints::USDC_MAINNET;
+        let usdg = pay_types::stablecoin_mints::USDG_MAINNET;
+        let by_mint = mainnet_mpp(usdc);
+        assert!(mpp_accepts_currency(&by_mint, usdc));
+        assert!(mpp_accepts_currency(&by_mint, "USDC"));
+        assert!(!mpp_accepts_currency(&by_mint, usdg));
+        assert!(!mpp_accepts_currency(&by_mint, "USDG"));
+
+        let by_symbol = mainnet_mpp("USDC");
+        assert!(mpp_accepts_currency(&by_symbol, usdc));
+        assert!(mpp_accepts_currency(&by_symbol, "usdc"));
+        assert!(!mpp_accepts_currency(&by_symbol, usdg));
     }
 
     #[tokio::test]

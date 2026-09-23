@@ -1320,20 +1320,7 @@ impl SessionMpp {
 
     /// Whether a challenge currency identifies this session backend's mint.
     pub fn accepts_currency(&self, currency: &str) -> bool {
-        if self.currency().eq_ignore_ascii_case(currency) {
-            return true;
-        }
-        let network = Some(self.session_config.network.as_str());
-        matches!(
-            (
-                pay_kit::mpp::protocol::solana::resolve_stablecoin_mint(
-                    &self.session_config.currency,
-                    network,
-                ),
-                pay_kit::mpp::protocol::solana::resolve_stablecoin_mint(currency, network),
-            ),
-            (Some(configured), Some(advertised)) if configured == advertised
-        )
+        crate::server::payment::same_currency(self.currency(), currency, self.network())
     }
 
     /// Create from a [`SessionConfig`] and an HMAC secret key.
