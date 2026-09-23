@@ -71,11 +71,6 @@ configures the selected ACP adapter to use it, and passes ACP JSON-RPC through
 stdin/stdout unchanged. Headless clients may set `PAY_ACP_PROVIDER` and
 `PAY_ACP_MODEL` instead of passing flags.
 
-When Buzz Desktop is installed, `pay setup` and `pay setup --update` offer to
-register a **Pay + Goose/Claude Code/Codex** custom harness. Setup discovers
-compatible providers and models, then writes an idempotent `pay-acp` definition
-to Buzz's custom harness settings.
-
 ### 🛠️ Payment debugging and simulations
 
 `pay` ships with an embedded Payment Debugger — a local web UI that visualizes every 402 challenge-response cycle as a sequence diagram. See exactly which headers were sent, which protocol was used (MPP or x402), and where things went wrong.

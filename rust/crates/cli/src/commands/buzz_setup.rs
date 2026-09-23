@@ -84,10 +84,20 @@ enum HarnessWriteResult {
     Updated,
 }
 
+/// Setup hook for registering Pay as a Buzz ACP harness.
+///
+/// Temporarily disabled while the onboarding flow is being polished.
+pub(crate) fn maybe_configure() {
+    // TODO: Re-enable Buzz ACP harness configuration once it is ready to return
+    // to the onboarding flow.
+    // configure_if_available();
+}
+
 /// Detect Buzz Desktop and offer to register a deterministic Pay-backed ACP
 /// harness. Setup remains successful when this optional integration is skipped
 /// or cannot be configured.
-pub(crate) fn maybe_configure() {
+#[allow(dead_code)]
+fn configure_if_available() {
     let Some(app_data_dir) = detect_buzz_app_data_dir() else {
         return;
     };
