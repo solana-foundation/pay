@@ -128,7 +128,11 @@ fn main() {
     });
 
     // MCP server — needs its own runtime, exit early
-    if matches!(command, Command::Mcp(_)) {
+    if let Command::Mcp(mcp) = &command {
+        let options = mcp.options().unwrap_or_else(|err| {
+            eprintln!("MCP server error: {err}");
+            std::process::exit(1);
+        });
         let mcp_seq = std::sync::atomic::AtomicUsize::new(0);
         let rt = match tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -144,7 +148,7 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        if let Err(err) = rt.block_on(pay_mcp::run_server(&pay_mcp::McpOptions::default())) {
+        if let Err(err) = rt.block_on(pay_mcp::run_server(&options)) {
             eprintln!("MCP server error: {err}");
             std::process::exit(1);
         }
@@ -612,6 +616,28 @@ mod tests {
                 assert_eq!(cmd.recipient, "ludo");
             }
             _ => panic!("expected send command"),
+        }
+    }
+
+    #[test]
+    fn mcp_permission_flags_reach_server_options() {
+        let opts = Opts::try_parse_from([
+            "pay",
+            "mcp",
+            "--allow-origin",
+            "https://api.example.com",
+            "--allow-network",
+            "mainnet",
+            "--max-payment",
+            "$1.00",
+        ])
+        .unwrap();
+
+        match opts.command {
+            Some(Command::Mcp(command)) => {
+                assert!(command.options().unwrap().permissions.is_some());
+            }
+            _ => panic!("expected mcp command"),
         }
     }
 

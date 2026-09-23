@@ -31,7 +31,7 @@ pub struct McpCommand {
 }
 
 impl McpCommand {
-    pub fn options(self) -> Result<pay_mcp::McpOptions, String> {
+    pub fn options(&self) -> Result<pay_mcp::McpOptions, String> {
         let has_inline = !self.allowed_origins.is_empty()
             || !self.allowed_networks.is_empty()
             || self.max_payment.is_some()
@@ -41,24 +41,24 @@ impl McpCommand {
             return Ok(pay_mcp::McpOptions::default());
         }
 
-        let mut config = match self.permissions {
-            Some(path) => pay_mcp::PermissionConfig::from_yaml_file(&path)?,
+        let mut config = match &self.permissions {
+            Some(path) => pay_mcp::PermissionConfig::from_yaml_file(path)?,
             None => pay_mcp::PermissionConfig::default(),
         };
         if !self.allowed_origins.is_empty() {
             config
                 .origins
                 .get_or_insert_with(Vec::new)
-                .extend(self.allowed_origins);
+                .extend(self.allowed_origins.iter().cloned());
         }
         if !self.allowed_networks.is_empty() {
             config
                 .networks
                 .get_or_insert_with(Vec::new)
-                .extend(self.allowed_networks);
+                .extend(self.allowed_networks.iter().cloned());
         }
-        if let Some(cap) = self.max_payment {
-            config.max_payment = Some(cap);
+        if let Some(cap) = &self.max_payment {
+            config.max_payment = Some(cap.clone());
             config.unlimited_amount = false;
         }
         if self.unlimited_amount {
