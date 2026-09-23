@@ -582,6 +582,22 @@ fn truncate_to_char_boundary(value: &str, max_bytes: usize) -> &str {
     &value[..end]
 }
 
+/// Whether `candidate` names the same token as `configured` on `network`:
+/// the same string, or a symbol and a mint address that resolve to one mint.
+pub fn same_currency(configured: &str, candidate: &str, network: &str) -> bool {
+    if configured.eq_ignore_ascii_case(candidate) {
+        return true;
+    }
+    let network = Some(network);
+    matches!(
+        (
+            pay_kit::mpp::resolve_stablecoin_mint(configured, network),
+            pay_kit::mpp::resolve_stablecoin_mint(candidate, network),
+        ),
+        (Some(a), Some(b)) if a == b
+    )
+}
+
 pub fn readable_verification_message(error: &pay_kit::mpp::server::VerificationError) -> String {
     let message = error.to_string();
     if message.contains("Fee payer cannot authorize the SPL payment transfer") {
