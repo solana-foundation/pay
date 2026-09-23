@@ -5,7 +5,7 @@
 //! a hosted server where every call belongs to a different tenant. A
 //! [`PayContext`] turns a request into a [`CallScope`]: the accounts to
 //! use, the overrides, and how approval works. [`LocalContext`] reproduces
-//! the laptop behaviour; pay-cloud supplies a tenant context.
+//! the laptop behaviour; pay-connect supplies a tenant context.
 
 use std::sync::Arc;
 
@@ -32,6 +32,8 @@ pub struct CallScope {
     pub rpc_url_override: Option<String>,
     /// How a signature gets approved for this caller.
     pub approval: Arc<dyn ApprovalPolicy>,
+    /// Optional fail-closed payment permissions configured for local MCP.
+    pub payment_permissions: Option<Arc<crate::McpPermissions>>,
     /// Whether `curl` may read a local file as the request body. Only a
     /// process on the user's own machine has files to read.
     pub body_files: bool,
@@ -90,12 +92,14 @@ impl ApprovalPolicy for LocalApproval {
 /// overrides the CLI sets, the platform prompt.
 pub struct LocalContext {
     accounts: Arc<FileAccountsStore>,
+    permissions: Option<Arc<crate::McpPermissions>>,
 }
 
 impl Default for LocalContext {
     fn default() -> Self {
         Self {
             accounts: Arc::new(FileAccountsStore::default_path()),
+            permissions: None,
         }
     }
 }
@@ -103,6 +107,11 @@ impl Default for LocalContext {
 impl LocalContext {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_permissions(mut self, permissions: Option<crate::McpPermissions>) -> Self {
+        self.permissions = permissions.map(Arc::new);
+        self
     }
 }
 
@@ -123,6 +132,7 @@ impl PayContext for LocalContext {
             account_override: env_non_empty("PAY_ACTIVE_ACCOUNT"),
             rpc_url_override: env_non_empty("PAY_RPC_URL"),
             approval: Arc::new(LocalApproval),
+            payment_permissions: self.permissions.clone(),
             body_files: true,
         })
     }
@@ -140,6 +150,7 @@ mod tests {
             account_override: None,
             rpc_url_override: Some("http://127.0.0.1:8899".to_string()),
             approval: Arc::new(LocalApproval),
+            payment_permissions: None,
             body_files: true,
         };
         assert_eq!(

@@ -1,10 +1,10 @@
 //! `/mcp`: the pay tools over MCP streamable HTTP, behind a bearer token.
 //!
 //! This is the hosted connector's front door. An MCP host (Grok, Claude,
-//! ChatGPT, Cursor) is pointed at `https://cloud.pay.sh/mcp` and gets the
+//! ChatGPT, Cursor) is pointed at `https://connect.pay.sh/mcp` and gets the
 //! same tools `pay mcp` serves on stdio, with the request authenticated per
 //! call: an OAuth access token from [`crate::oauth`], or one of the static
-//! tokens in `PAY_CLOUD_MCP_TOKENS` for hosts that only take a header. A
+//! tokens in `PAY_CONNECT_MCP_TOKENS` for hosts that only take a header. A
 //! refusal is a 401 with the RFC 9728 `WWW-Authenticate` pointer that
 //! starts the OAuth discovery.
 //!
@@ -24,16 +24,16 @@ use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 use sha2::{Digest, Sha256};
 
 /// `1` mounts the connector and its OAuth server.
-pub const ENABLE_ENV: &str = "PAY_CLOUD_MCP";
+pub const ENABLE_ENV: &str = "PAY_CONNECT_MCP";
 /// Optional comma-separated static bearer tokens.
-pub const TOKENS_ENV: &str = "PAY_CLOUD_MCP_TOKENS";
-pub const ALLOWED_HOSTS_ENV: &str = "PAY_CLOUD_MCP_ALLOWED_HOSTS";
+pub const TOKENS_ENV: &str = "PAY_CONNECT_MCP_TOKENS";
+pub const ALLOWED_HOSTS_ENV: &str = "PAY_CONNECT_MCP_ALLOWED_HOSTS";
 /// DEV ONLY: a static token whose tenant serves every request that does
 /// not carry a valid token of its own. With it set the endpoint never
 /// answers 401, so a host sees a plain unauthenticated MCP server and
 /// never enters an OAuth state it cannot finish. Never set it on a public
 /// deployment.
-pub const ANONYMOUS_TOKEN_ENV: &str = "PAY_CLOUD_DEV_ANONYMOUS_TOKEN";
+pub const ANONYMOUS_TOKEN_ENV: &str = "PAY_CONNECT_DEV_ANONYMOUS_TOKEN";
 pub const PATH: &str = "/mcp";
 
 /// Who a request acts for. Today the fingerprint of the static token that
@@ -100,9 +100,9 @@ impl Config {
         self.anonymous.as_ref()
     }
 
-    /// `None` unless `PAY_CLOUD_MCP` is on: the endpoint is not mounted.
-    /// `PAY_CLOUD_MCP_TOKENS` adds comma-separated static tokens;
-    /// `PAY_CLOUD_MCP_ALLOWED_HOSTS` (comma-separated) replaces the hosts
+    /// `None` unless `PAY_CONNECT_MCP` is on: the endpoint is not mounted.
+    /// `PAY_CONNECT_MCP_TOKENS` adds comma-separated static tokens;
+    /// `PAY_CONNECT_MCP_ALLOWED_HOSTS` (comma-separated) replaces the hosts
     /// derived from the public URL.
     pub fn from_env(public_url: &str) -> Option<Self> {
         let enabled = std::env::var(ENABLE_ENV)
@@ -267,7 +267,7 @@ fn unauthorized(cfg: &Config) -> Response {
     );
     let body = serde_json::json!({
         "error": "unauthorized",
-        "message": "A bearer token for cloud.pay.sh is required.",
+        "message": "A bearer token for connect.pay.sh is required.",
     });
     let mut response = (StatusCode::UNAUTHORIZED, axum::Json(body)).into_response();
     response.headers_mut().insert(
@@ -359,14 +359,14 @@ pub(crate) mod tests {
 
     #[test]
     fn config_derives_allowed_hosts_from_the_public_url() {
-        let cfg = Config::new("https://cloud.pay.sh/", vec!["t".into(), "".into()]);
-        assert_eq!(cfg.public_url, "https://cloud.pay.sh");
-        assert!(cfg.allowed_hosts.contains(&"cloud.pay.sh".to_string()));
+        let cfg = Config::new("https://connect.pay.sh/", vec!["t".into(), "".into()]);
+        assert_eq!(cfg.public_url, "https://connect.pay.sh");
+        assert!(cfg.allowed_hosts.contains(&"connect.pay.sh".to_string()));
         assert!(cfg.allowed_hosts.contains(&"127.0.0.1".to_string()));
         assert_eq!(cfg.token_count(), 1, "empty tokens are dropped");
         assert_eq!(
             cfg.resource_metadata_url(),
-            "https://cloud.pay.sh/.well-known/oauth-protected-resource"
+            "https://connect.pay.sh/.well-known/oauth-protected-resource"
         );
 
         let local = Config::new("http://127.0.0.1:8402", vec![]);

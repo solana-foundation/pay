@@ -643,7 +643,7 @@ pub trait AccountsStore: Send + Sync {
     fn save(&self, file: &AccountsFile) -> Result<()>;
 
     /// Where this store's remote accounts keep their credentials. The
-    /// platform secret store by default; pay-cloud's tenant stores carry
+    /// platform secret store by default; pay-connect's tenant stores carry
     /// their own so the same signing paths serve both.
     fn credential_source(&self) -> &dyn crate::remote::CredentialSource {
         &crate::remote::PlatformCredentials

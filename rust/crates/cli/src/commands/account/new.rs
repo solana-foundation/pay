@@ -76,9 +76,9 @@ pub fn create_account(
 ) -> pay_core::Result<(String, &'static str)> {
     let backend_id = resolve_backend(backend)?;
 
-    if backend_id == crate::commands::cloud_onboard::CLOUD_BACKEND_FLAG {
+    if backend_id == crate::commands::connect_onboard::CONNECT_BACKEND_FLAG {
         return Err(pay_core::Error::Config(
-            "The browser-linked remote wallet is set up with `pay setup --backend cloud`."
+            "The browser-linked remote wallet is set up with `pay setup --backend connect`."
                 .to_string(),
         ));
     }
@@ -629,7 +629,7 @@ fn available_backends_hint() -> String {
 
     std::iter::once(platform.flag())
         .chain(std::iter::once(
-            crate::commands::cloud_onboard::CLOUD_BACKEND_FLAG,
+            crate::commands::connect_onboard::CONNECT_BACKEND_FLAG,
         ))
         .chain(pay_core::remote::providers().map(|p| p.flag()))
         .map(|id| format!("'{id}'"))
@@ -740,12 +740,32 @@ pub fn pick_backend() -> pay_core::Result<String> {
         }
     }
 
+    fn local_opt(backend: &dyn pay_core::backend::SigningBackend) -> Opt {
+        let platform = if cfg!(target_os = "macos") {
+            "macOS"
+        } else if cfg!(target_os = "windows") {
+            "Windows"
+        } else {
+            "Linux"
+        };
+
+        Opt {
+            id: backend.flag(),
+            name: "Local wallet".to_string(),
+            detail: format!(
+                "use {} on {platform}, {}",
+                backend.display_name(),
+                backend.description()
+            ),
+        }
+    }
+
     // The OS-native store comes first. Linux without a reachable keyring
     // falls back to the plain file; Windows without Hello offers nothing.
     let platform = pay_core::backend::platform().filter(|p| p.is_available());
     let mut options: Vec<Opt> = match platform {
-        Some(p) => vec![opt(p)],
-        None if cfg!(target_os = "linux") => vec![opt(&pay_core::backend::File)],
+        Some(p) => vec![local_opt(p)],
+        None if cfg!(target_os = "linux") => vec![local_opt(&pay_core::backend::File)],
         None => Vec::new(),
     };
 
@@ -755,9 +775,9 @@ pub fn pick_backend() -> pay_core::Result<String> {
     // a picker entry: the browser flow is the remote wallet.
     if platform.is_some() {
         options.push(Opt {
-            id: crate::commands::cloud_onboard::CLOUD_BACKEND_FLAG,
-            name: crate::commands::cloud_onboard::CLOUD_BACKEND_NAME.to_string(),
-            detail: crate::commands::cloud_onboard::CLOUD_BACKEND_DETAIL.to_string(),
+            id: crate::commands::connect_onboard::CONNECT_BACKEND_FLAG,
+            name: crate::commands::connect_onboard::CONNECT_BACKEND_NAME.to_string(),
+            detail: crate::commands::connect_onboard::CONNECT_BACKEND_DETAIL.to_string(),
         });
     }
 
@@ -841,6 +861,19 @@ pub fn save_account_remote(
     pubkey: &str,
     wallet_id: &str,
 ) -> pay_core::Result<()> {
+    save_account_remote_with_auth(name, provider_id, pubkey, wallet_id, true)
+}
+
+/// Register a remote account with an explicit local approval gate. Hosted
+/// pay-connect wallets enforce approval server-side, so their bearer token is
+/// read from the OS secret store without presenting a second local prompt.
+pub fn save_account_remote_with_auth(
+    name: &str,
+    provider_id: &str,
+    pubkey: &str,
+    wallet_id: &str,
+    auth_required: bool,
+) -> pay_core::Result<()> {
     let mut accounts = pay_core::accounts::AccountsFile::load()?;
     accounts.upsert(
         pay_core::accounts::MAINNET_NETWORK,
@@ -849,7 +882,7 @@ pub fn save_account_remote(
             backend: pay_core::accounts::BackendKind::Remote,
             provider: Some(provider_id.to_string()),
             active: false,
-            auth_required: Some(true),
+            auth_required: Some(auth_required),
             pubkey: Some(pubkey.to_string()),
             vault: None,
             account: Some(wallet_id.to_string()),

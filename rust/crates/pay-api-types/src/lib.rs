@@ -2,6 +2,7 @@
 //!
 //! Anything in here is part of the public wire format — change with care.
 
+use std::collections::BTreeMap;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
@@ -61,6 +62,27 @@ pub struct StablecoinBalances {
     pub address: String,
     pub network: Network,
     pub balances: Vec<StablecoinBalance>,
+    /// Program-backed USD credits keyed by the credit program address.
+    #[serde(default)]
+    pub credits: BTreeMap<String, CreditBalance>,
+    /// True when token balances were fetched successfully but the independent
+    /// credit-program lookup failed. An empty `credits` map is not authoritative
+    /// when this is set.
+    #[serde(default)]
+    pub credits_unavailable: bool,
+}
+
+/// One on-chain credit allowance for a customer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreditBalance {
+    /// PDAs holding the customer's allowance records.
+    pub accounts: Vec<String>,
+    pub currency: String,
+    pub decimals: u8,
+    /// Raw on-chain amount as a string — preserves u64 precision in JSON.
+    pub raw_amount: String,
+    /// Human-readable amount (`raw_amount / 10^decimals`).
+    pub ui_amount: f64,
 }
 
 /// Wire response of `/v1/receipt`.

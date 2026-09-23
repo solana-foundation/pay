@@ -7,6 +7,7 @@
 //! *trailing* extension TLV data after the base 165 bytes, so the layout is
 //! identical for our purposes.
 
+use std::collections::BTreeMap;
 use std::str::FromStr;
 
 use pay_api_types::{Network, StablecoinBalance, StablecoinBalances};
@@ -108,6 +109,8 @@ pub async fn fetch_stablecoin_balances(
         address: owner.to_string(),
         network,
         balances,
+        credits: BTreeMap::new(),
+        credits_unavailable: false,
     })
 }
 

@@ -31,6 +31,7 @@
 #[cfg(feature = "ledger")]
 pub mod ledger;
 pub mod openfort;
+pub mod payconnect;
 pub mod privy;
 
 use std::collections::BTreeMap;
@@ -45,6 +46,7 @@ use crate::{Error, Result};
 
 /// The registered remote backends, by [`RemoteProvider::id`].
 static PROVIDERS: &[&dyn RemoteProvider] = &[
+    &payconnect::PayConnect,
     &openfort::Openfort,
     &privy::Privy,
     #[cfg(feature = "ledger")]
@@ -69,7 +71,7 @@ pub fn providers() -> impl Iterator<Item = &'static dyn RemoteProvider> {
 /// Where an account's remote credentials come from.
 ///
 /// The CLI reads them from the platform secret store behind Touch ID;
-/// pay-cloud holds them per tenant. An [`AccountsStore`](crate::accounts::AccountsStore)
+/// pay-connect holds them per tenant. An [`AccountsStore`](crate::accounts::AccountsStore)
 /// names its source, so the same signing paths serve both without knowing
 /// which one they are on. The source applies `gate` before handing the
 /// credentials out: that is where a spending policy or a prompt runs.
@@ -114,7 +116,7 @@ impl CredentialSource for PlatformCredentials {
     }
 }
 
-/// Credentials held in memory, gated on every load. pay-cloud's per-tenant
+/// Credentials held in memory, gated on every load. pay-connect's per-tenant
 /// source, and a test double.
 pub struct MemoryCredentials {
     credentials: Credentials,

@@ -1,4 +1,4 @@
-//! The MCP hosts that connect to pay-cloud, and how each one authenticates.
+//! The MCP hosts that connect to pay-connect, and how each one authenticates.
 //!
 //! Every host is an OAuth client of this server, so the protocol is one:
 //! discovery, registration, PKCE, tokens. What differs per host is the
@@ -83,7 +83,7 @@ impl HostProfile {
     }
 }
 
-/// The hosts pay-cloud knows, in the order they are tried. A host that
+/// The hosts pay-connect knows, in the order they are tried. A host that
 /// matches none is `GENERIC`, served exactly like the others.
 pub static HOSTS: &[HostProfile] = &[
     HostProfile {

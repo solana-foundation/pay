@@ -31,7 +31,7 @@ impl PayMcp {
         Self::with_context(Arc::new(LocalContext::new()))
     }
 
-    /// A server whose calls are resolved by `context`; pay-cloud's per-tenant
+    /// A server whose calls are resolved by `context`; pay-connect's per-tenant
     /// server.
     pub fn with_context(context: Arc<dyn PayContext>) -> Self {
         Self {
@@ -136,13 +136,15 @@ not enough to make a precise paid-call plan.
         tools::get_catalog_entry::run(params).await
     }
 
-    #[tool(description = r#"Get the balance of the active pay account.
+    #[tool(
+        description = r#"Get wallet and credit balances for the active pay account.
 
-Returns stablecoin balances for the currently configured account. Paid API
-calls spend supported stablecoins such as USDC, USDT, PYUSD, CASH, or USDG; the account does
-not need SOL for network fees because server-side fee payers handle fees and
-setup costs. Use this to check available funds before making paid API calls.
-"#)]
+Returns wallet-owned stablecoins and program-backed USD credits for the
+currently configured account. Paid API calls can spend supported balances; the
+account does not need SOL for network fees because server-side fee payers handle
+fees and setup costs. Use this to check available funds before making paid API calls.
+"#
+    )]
     async fn get_balance(
         &self,
         Parameters(params): Parameters<tools::get_balance::Params>,

@@ -3,11 +3,10 @@ pub mod acp;
 mod acp_middleware;
 pub(crate) mod agent;
 pub(crate) mod agent_args;
-mod buzz_setup;
 pub mod catalog;
 pub mod claude;
-pub mod cloud_onboard;
 pub mod codex;
+pub mod connect_onboard;
 pub mod curl;
 pub mod docs;
 pub mod fanout;
@@ -15,6 +14,7 @@ pub mod fetch;
 pub mod goose;
 pub mod help;
 pub mod http;
+pub mod mcp;
 pub(crate) mod payer_proxy;
 pub mod qodercli;
 pub mod send;
@@ -56,9 +56,9 @@ pub enum Command {
     Acp(acp::AcpCommand),
     /// Run Claude Code with 402 payment support.
     Claude(claude::ClaudeCommand),
-    /// Link this terminal to pay-cloud from the browser (preview).
+    /// Link this terminal to pay-connect from the browser (preview).
     #[command(hide = true)]
-    CloudOnboard(cloud_onboard::CloudOnboardCommand),
+    ConnectOnboard(connect_onboard::ConnectOnboardCommand),
     /// Run Codex with 402 payment support.
     Codex(codex::CodexCommand),
     /// Run Goose with 402 payment support.
@@ -118,7 +118,7 @@ pub enum Command {
     #[command(alias = "add", short_flag = 'i')]
     Install(skills::install::InstallCommand),
     /// Start the MCP server (for Claude Code, Cursor, etc.)
-    Mcp,
+    Mcp(mcp::McpCommand),
     /// Generate documentation artifacts (e.g. the provider-spec JSON Schema).
     Docs {
         #[command(subcommand)]
@@ -174,7 +174,7 @@ impl Command {
             | Command::Fanout(_)
             | Command::Topup(_) => true,
             Command::Setup(_)
-            | Command::CloudOnboard(_)
+            | Command::ConnectOnboard(_)
             | Command::Account { .. }
             | Command::Whoami(_)
             | Command::Skills { .. }
@@ -184,7 +184,7 @@ impl Command {
             | Command::Server { .. }
             | Command::Gate { .. }
             | Command::Docs { .. }
-            | Command::Mcp => false,
+            | Command::Mcp(_) => false,
         }
     }
 
@@ -210,12 +210,12 @@ impl Command {
             | Command::Send(_)
             | Command::Fanout(_)
             | Command::Setup(_)
-            | Command::CloudOnboard(_)
+            | Command::ConnectOnboard(_)
             | Command::Topup(_)
             | Command::Server { .. }
             | Command::Gate { .. }
             | Command::Docs { .. } => ToolKind::Mcp,
-            Command::Mcp => ToolKind::Mcp,
+            Command::Mcp(_) => ToolKind::Mcp,
         }
     }
 }
@@ -271,7 +271,7 @@ impl Command {
             }
             Command::Fanout(cmd) => return cmd.run(network_override, account_override, verbose),
             Command::Setup(cmd) => return cmd.run(),
-            Command::CloudOnboard(cmd) => return cmd.run(),
+            Command::ConnectOnboard(cmd) => return cmd.run(),
             Command::Topup(cmd) => return cmd.run(),
             Command::Server { command } => {
                 return command.run(keypair_override, account_override, sandbox);
@@ -279,7 +279,8 @@ impl Command {
             Command::Gate { command } => {
                 return command.run(keypair_override, account_override, sandbox);
             }
-            Command::Mcp => {
+            Command::Mcp(cmd) => {
+                let options = cmd.options().map_err(pay_core::Error::Config)?;
                 let rt = tokio::runtime::Builder::new_multi_thread()
                     .enable_all()
                     .build()
@@ -287,7 +288,7 @@ impl Command {
                         pay_core::Error::Config(format!("Failed to create runtime: {e}"))
                     })?;
                 return rt
-                    .block_on(pay_mcp::run_server(&pay_mcp::McpOptions::default()))
+                    .block_on(pay_mcp::run_server(&options))
                     .map_err(pay_core::Error::Config);
             }
             Command::Claude(cmd) => std::process::exit(cmd.run(
@@ -2537,7 +2538,10 @@ mod tests {
 
     #[test]
     fn tool_kind_mcp() {
-        assert!(matches!(Command::Mcp.tool_kind(), ToolKind::Mcp));
+        assert!(matches!(
+            Command::Mcp(mcp::McpCommand::default()).tool_kind(),
+            ToolKind::Mcp
+        ));
     }
 
     #[test]

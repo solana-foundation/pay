@@ -346,6 +346,9 @@ pub enum RedirectPolicy {
 /// (e.g. parsing a 402 challenge body, which is always JSON).
 #[derive(Debug, Clone)]
 pub struct RawResponse {
+    /// Effective response URL after redirects. Permission checks must use
+    /// this URL rather than the caller-supplied URL that initiated the chain.
+    pub url: String,
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
@@ -453,7 +456,7 @@ pub fn fetch_request_with_body_for(
             raw.status
         )));
     }
-    Ok(raw_to_outcome(raw, url))
+    Ok(raw_to_outcome(raw))
 }
 
 /// Fetch a URL, detecting 402 + MPP challenges.
@@ -466,7 +469,7 @@ pub fn fetch(url: &str, extra_headers: &[(String, String)]) -> Result<RunOutcome
         None,
         RedirectPolicy::Follow,
     )?;
-    Ok(raw_to_outcome(raw, url))
+    Ok(raw_to_outcome(raw))
 }
 
 /// Fetch a URL and return the raw status/headers/body — no 402 classification.
@@ -522,11 +525,11 @@ pub fn fetch_raw_with_body_for(
     )
 }
 
-fn raw_to_outcome(raw: RawResponse, url: &str) -> RunOutcome {
+fn raw_to_outcome(raw: RawResponse) -> RunOutcome {
     if raw.status == 402 {
         // 402 challenge bodies are always JSON-as-text per spec; the
         // text view is correct here.
-        return runner::classify_402(&raw.headers, Some(&raw.body_text()), url);
+        return runner::classify_402(&raw.headers, Some(&raw.body_text()), &raw.url);
     }
     let exit_code = if raw.status >= 400 { 1 } else { 0 };
     let content_type = raw.content_type().map(str::to_string);
@@ -589,6 +592,11 @@ fn fetch_raw_with_method(
     let resp = req
         .send()
         .map_err(|e| Error::Mpp(format!("Request failed: {e}")))?;
+    // A debugger proxy represents the upstream URL on the caller's behalf;
+    // otherwise reqwest exposes the final URL after its redirect chain.
+    let response_url = forward_header
+        .clone()
+        .unwrap_or_else(|| resp.url().to_string());
     let status = resp.status().as_u16();
 
     let headers: Vec<(String, String)> = resp
@@ -614,6 +622,7 @@ fn fetch_raw_with_method(
     debug!(status, "Fetch complete");
 
     Ok(RawResponse {
+        url: response_url,
         status,
         headers,
         body,
@@ -693,6 +702,32 @@ mod tests {
 
         let result = fetch(&format!("{base_url}/paid"), &[]).unwrap();
         assert!(matches!(result, RunOutcome::UnknownPaymentRequired { .. }));
+    }
+
+    #[test]
+    fn fetch_402_uses_redirect_destination_as_resource_url() {
+        let paid = axum::Router::new().route(
+            "/paid",
+            axum::routing::get(|| async { (axum::http::StatusCode::PAYMENT_REQUIRED, "pay up") }),
+        );
+        let paid_url = start_server(paid);
+        let destination = format!("{paid_url}/paid");
+        let redirect = axum::Router::new().route(
+            "/start",
+            axum::routing::get(move || {
+                let destination = destination.clone();
+                async move { axum::response::Redirect::temporary(&destination) }
+            }),
+        );
+        let redirect_url = start_server(redirect);
+
+        let result = fetch(&format!("{redirect_url}/start"), &[]).unwrap();
+        match result {
+            RunOutcome::UnknownPaymentRequired { resource_url, .. } => {
+                assert_eq!(resource_url, format!("{paid_url}/paid"));
+            }
+            _ => panic!("Expected UnknownPaymentRequired"),
+        }
     }
 
     #[test]
@@ -1002,6 +1037,7 @@ mod tests {
     #[test]
     fn body_text_replaces_invalid_utf8() {
         let raw = RawResponse {
+            url: "https://example.test".to_string(),
             status: 200,
             headers: vec![],
             body: vec![0xFF, 0xFE, b'h', b'i'],
@@ -1014,6 +1050,7 @@ mod tests {
     #[test]
     fn content_type_lookup_is_case_insensitive() {
         let raw = RawResponse {
+            url: "https://example.test".to_string(),
             status: 200,
             headers: vec![("Content-Type".to_string(), "image/jpeg".to_string())],
             body: vec![],
@@ -1025,6 +1062,7 @@ mod tests {
     #[test]
     fn mime_type_strips_parameters() {
         let raw = RawResponse {
+            url: "https://example.test".to_string(),
             status: 200,
             headers: vec![(
                 "content-type".to_string(),
@@ -1038,6 +1076,7 @@ mod tests {
     #[test]
     fn mime_type_empty_when_header_missing() {
         let raw = RawResponse {
+            url: "https://example.test".to_string(),
             status: 200,
             headers: vec![],
             body: vec![],

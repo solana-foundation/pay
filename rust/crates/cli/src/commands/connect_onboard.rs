@@ -1,18 +1,17 @@
-//! Loopback onboarding: link this terminal to pay-cloud from the browser.
+//! Loopback onboarding: link this terminal to pay-connect from the browser.
 //!
 //! Same shape as `gh auth login`:
 //!
 //! 1. Generate `state` and a PKCE verifier/challenge (RFC 7636 S256).
 //! 2. Bind an ephemeral `127.0.0.1` listener with a single `GET /callback`.
-//! 3. Open `{cloud_url}/onboard?callback=…&state=…&code_challenge=…` in the
+//! 3. Open `{connect_url}/v1/cli?callback=…&state=…&code_challenge=…` in the
 //!    browser (the URL is also printed so it can be copied).
-//! 4. pay-cloud redirects the browser to the callback with a one-time
+//! 4. pay-connect redirects the browser to the callback with a one-time
 //!    `code`; the handler checks `state` and hands the code back.
-//! 5. `POST {cloud_url}/v1/onboard/exchange` with the code and verifier.
+//! 5. `POST {connect_url}/v1/cli/complete` with the code and verifier.
 //!
-//! Milestone 1: the exchange returns a `pending` stub — no wallet material
-//! is provisioned yet. This module is not wired into `pay setup`; the hidden
-//! `pay cloud-onboard` subcommand drives it for development.
+//! The hidden `pay connect-onboard` subcommand exposes the same flow directly
+//! for development.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -43,34 +42,34 @@ const HEALTH_TIMEOUT: Duration = Duration::from_secs(3);
 const LOOPBACK_IP: Ipv4Addr = Ipv4Addr::LOCALHOST;
 /// Set to skip `webbrowser::open` (headless shells, scripted tests).
 const NO_BROWSER_ENV: &str = "PAY_NO_BROWSER";
-/// Overrides the pay-cloud base URL.
-const CLOUD_URL_ENV: &str = "PAY_CLOUD_URL";
-/// Set to anything but `0`/`false` to target a `pay-cloud` running locally
-/// on its default port. `PAY_CLOUD_URL` wins when both are set.
-const CLOUD_LOCAL_ENV: &str = "PAY_CLOUD_LOCAL";
-/// Production pay-cloud.
-const DEFAULT_CLOUD_URL: &str = "https://cloud.pay.sh";
-/// Where `cargo run -p pay-cloud` listens by default.
-const LOCAL_CLOUD_URL: &str = "http://127.0.0.1:8402";
+/// Overrides the pay-connect base URL.
+const CONNECT_URL_ENV: &str = "PAY_CONNECT_URL";
+/// Set to anything but `0`/`false` to target a `pay-connect` running locally
+/// on its default port. `PAY_CONNECT_URL` wins when both are set.
+const CONNECT_LOCAL_ENV: &str = "PAY_CONNECT_LOCAL";
+/// Production pay-connect.
+const DEFAULT_CONNECT_URL: &str = "https://connect.pay.sh";
+/// Where `cargo run -p pay-connect` listens by default.
+const LOCAL_CONNECT_URL: &str = "http://127.0.0.1:8402";
 
 /// `--backend` value that selects the browser-linked remote wallet in
 /// `pay setup` and `pay account new`.
-pub const CLOUD_BACKEND_FLAG: &str = "cloud";
-/// Picker name and detail for the remote wallet.
-pub const CLOUD_BACKEND_NAME: &str = "Remote wallet";
-pub const CLOUD_BACKEND_DETAIL: &str =
-    "sign in from your browser; funds and approvals live at cloud.pay.sh";
+pub const CONNECT_BACKEND_FLAG: &str = "connect";
+/// Picker name and detail for the cloud wallet.
+pub const CONNECT_BACKEND_NAME: &str = "Cloud wallet";
+pub const CONNECT_BACKEND_DETAIL: &str =
+    "sign in from your browser; funds and approvals live at connect.pay.sh";
 
-/// pay-cloud base URL: `PAY_CLOUD_URL` when set, else the local server when
-/// `PAY_CLOUD_LOCAL` is on, else production.
-pub fn default_cloud_url() -> String {
-    cloud_url_from(
-        std::env::var(CLOUD_URL_ENV).ok().as_deref(),
-        std::env::var(CLOUD_LOCAL_ENV).ok().as_deref(),
+/// pay-connect base URL: `PAY_CONNECT_URL` when set, else the local server when
+/// `PAY_CONNECT_LOCAL` is on, else production.
+pub fn default_connect_url() -> String {
+    connect_url_from(
+        std::env::var(CONNECT_URL_ENV).ok().as_deref(),
+        std::env::var(CONNECT_LOCAL_ENV).ok().as_deref(),
     )
 }
 
-fn cloud_url_from(url: Option<&str>, local: Option<&str>) -> String {
+fn connect_url_from(url: Option<&str>, local: Option<&str>) -> String {
     if let Some(url) = url
         .map(|v| v.trim().trim_end_matches('/'))
         .filter(|v| !v.is_empty())
@@ -81,15 +80,15 @@ fn cloud_url_from(url: Option<&str>, local: Option<&str>) -> String {
         .map(str::trim)
         .is_some_and(|v| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"));
     if local_on {
-        LOCAL_CLOUD_URL.to_string()
+        LOCAL_CONNECT_URL.to_string()
     } else {
-        DEFAULT_CLOUD_URL.to_string()
+        DEFAULT_CONNECT_URL.to_string()
     }
 }
 
-/// `pay setup --backend cloud`: link this terminal through the browser.
+/// `pay setup --backend connect`: link this terminal through the browser.
 ///
-/// A `ready` result is a wallet provisioned by pay-cloud on the user's own
+/// A `ready` result is a wallet provisioned by pay-connect on the user's own
 /// custody account; it is registered exactly like `pay account new
 /// --backend <provider>` would: credentials in the platform secret store,
 /// the account in `accounts.yml`, after the provider confirms the address.
@@ -99,7 +98,7 @@ fn cloud_url_from(url: Option<&str>, local: Option<&str>) -> String {
 /// Returns the account's address so setup can go on to fund it.
 pub fn run_setup_onboarding(account: &str, force: bool) -> pay_core::Result<String> {
     let result = run_loopback_onboarding(&OnboardRequest {
-        cloud_url: default_cloud_url(),
+        connect_url: default_connect_url(),
         account: account.to_string(),
     })?;
     ensure_ready(&result)?;
@@ -123,7 +122,7 @@ fn ensure_ready(result: &OnboardResult) -> pay_core::Result<()> {
         .map(|m| format!(" {m}"))
         .unwrap_or_default();
     Err(pay_core::Error::Config(format!(
-        "pay-cloud did not hand over a wallet (status: {status}).{detail} \
+        "pay-connect did not hand over a wallet (status: {status}).{detail} \
          Nothing was saved; run `pay setup` again."
     )))
 }
@@ -137,7 +136,7 @@ pub fn store_provisioned_wallet(
 ) -> pay_core::Result<String> {
     let provider = pay_core::remote::provider(&result.provider).ok_or_else(|| {
         pay_core::Error::Config(format!(
-            "pay-cloud returned a wallet for `{}`, which this build of pay does not support \
+            "pay-connect returned a wallet for `{}`, which this build of pay does not support \
              (known: {}). Update pay and run `pay setup` again.",
             result.provider,
             pay_core::remote::provider_ids().join(", ")
@@ -147,18 +146,18 @@ pub fn store_provisioned_wallet(
         .wallet_id
         .as_deref()
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| pay_core::Error::Config("pay-cloud returned no wallet id.".to_string()))?;
+        .ok_or_else(|| pay_core::Error::Config("pay-connect returned no wallet id.".to_string()))?;
     let expected_pubkey = result
         .pubkey
         .as_deref()
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
-            pay_core::Error::Config("pay-cloud returned no wallet address.".to_string())
+            pay_core::Error::Config("pay-connect returned no wallet address.".to_string())
         })?;
     for field in provider.credential_fields() {
         if !result.credentials.contains_key(field.key) {
             return Err(pay_core::Error::Config(format!(
-                "pay-cloud returned no `{}` credential for {}.",
+                "pay-connect returned no `{}` credential for {}.",
                 field.key,
                 provider.display_name()
             )));
@@ -181,7 +180,7 @@ pub fn store_provisioned_wallet(
     let pubkey = pay_core::remote::fetch_wallet_address(provider, &result.credentials, wallet_id)?;
     if pubkey != expected_pubkey {
         return Err(pay_core::Error::Config(format!(
-            "{} resolves wallet `{wallet_id}` to {pubkey}, but pay-cloud reported {expected_pubkey}. \
+            "{} resolves wallet `{wallet_id}` to {pubkey}, but pay-connect reported {expected_pubkey}. \
              Nothing was saved.",
             provider.display_name()
         )));
@@ -190,7 +189,13 @@ pub fn store_provisioned_wallet(
     let ks = super::account::new::platform_credential_keystore()?;
     let intent = pay_core::keystore::AuthIntent::create_account(account);
     pay_core::remote::store_credentials(&ks, account, &result.credentials, &intent)?;
-    super::account::new::save_account_remote(account, provider.id(), &pubkey, wallet_id)?;
+    super::account::new::save_account_remote_with_auth(
+        account,
+        provider.id(),
+        &pubkey,
+        wallet_id,
+        false,
+    )?;
 
     let mut body = format!(
         "Account `{account}` signs through {}.\nAddress: {pubkey}\nWallet: {wallet_id}",
@@ -199,7 +204,7 @@ pub fn store_provisioned_wallet(
     if let Some(project) = result.project_id.as_deref().filter(|p| !p.is_empty()) {
         body.push_str(&format!("\nProject: {project}"));
     }
-    components::print_notice(components::NoticeLevel::Info, "Remote wallet ready", &body);
+    components::print_notice(components::NoticeLevel::Info, "Cloud wallet ready", &body);
     Ok(pubkey)
 }
 
@@ -225,13 +230,13 @@ fn print_result(result: &OnboardResult) {
 }
 
 pub struct OnboardRequest {
-    /// pay-cloud base URL, e.g. `http://127.0.0.1:8402`.
-    pub cloud_url: String,
+    /// pay-connect base URL, e.g. `http://127.0.0.1:8402`.
+    pub connect_url: String,
     /// Account name being linked (informational for now).
     pub account: String,
 }
 
-/// Response of `POST /v1/onboard/exchange`. Every field defaults so the
+/// Response of `POST /v1/cli/complete`. Every field defaults so the
 /// server can grow the payload without breaking older CLIs.
 ///
 /// `status: "ready"` carries a provisioned wallet: `provider` is a
@@ -265,10 +270,10 @@ impl OnboardResult {
     }
 }
 
-/// Link this terminal to pay-cloud from the browser (preview).
+/// Link this terminal to pay-connect from the browser (preview).
 #[derive(clap::Args)]
-pub struct CloudOnboardCommand {
-    /// pay-cloud base URL. Defaults to `PAY_CLOUD_URL`, else production.
+pub struct ConnectOnboardCommand {
+    /// pay-connect base URL. Defaults to `PAY_CONNECT_URL`, else production.
     #[arg(long)]
     pub url: Option<String>,
 
@@ -277,10 +282,10 @@ pub struct CloudOnboardCommand {
     pub account: String,
 }
 
-impl CloudOnboardCommand {
+impl ConnectOnboardCommand {
     pub fn run(self) -> pay_core::Result<()> {
         let result = run_loopback_onboarding(&OnboardRequest {
-            cloud_url: self.url.unwrap_or_else(default_cloud_url),
+            connect_url: self.url.unwrap_or_else(default_connect_url),
             account: self.account,
         })?;
         print_result(&result);
@@ -291,8 +296,8 @@ impl CloudOnboardCommand {
 /// Run the full browser round-trip synchronously and return the exchange
 /// result.
 pub fn run_loopback_onboarding(req: &OnboardRequest) -> pay_core::Result<OnboardResult> {
-    let cloud_url = req.cloud_url.trim_end_matches('/').to_string();
-    check_cloud_reachable(&cloud_url)?;
+    let connect_url = req.connect_url.trim_end_matches('/').to_string();
+    check_connect_reachable(&connect_url)?;
     let pkce = Pkce::generate();
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -302,7 +307,7 @@ pub fn run_loopback_onboarding(req: &OnboardRequest) -> pay_core::Result<Onboard
     let code = rt.block_on(async {
         let listener = bind_callback_listener(&pkce.state, Expect::Code).await?;
         let url = build_browser_url(&BrowserUrlParams {
-            cloud_url: &cloud_url,
+            connect_url: &connect_url,
             callback: &listener.callback_url(),
             state: &pkce.state,
             code_challenge: &pkce.code_challenge,
@@ -319,38 +324,38 @@ pub fn run_loopback_onboarding(req: &OnboardRequest) -> pay_core::Result<Onboard
     // The blocking reqwest client must not be used inside a tokio context.
     drop(rt);
 
-    exchange_code(&cloud_url, &code, &pkce.code_verifier)
+    exchange_code(&connect_url, &code, &pkce.code_verifier)
 }
 
-/// Confirm pay-cloud answers before binding a listener or opening the
+/// Confirm pay-connect answers before binding a listener or opening the
 /// browser, so a stopped local server is one clear error instead of a
 /// browser tab that cannot connect and a CLI that waits ten minutes.
-fn check_cloud_reachable(cloud_url: &str) -> pay_core::Result<()> {
+fn check_connect_reachable(connect_url: &str) -> pay_core::Result<()> {
     let client = reqwest::blocking::Client::builder()
         .timeout(HEALTH_TIMEOUT)
         .build()
         .map_err(|e| pay_core::Error::Config(format!("http client: {e}")))?;
-    let health = format!("{cloud_url}/health");
+    let health = format!("{connect_url}/health");
     match client.get(&health).send() {
         Ok(response) if response.status().is_success() => Ok(()),
         Ok(response) => Err(pay_core::Error::Config(format!(
-            "pay-cloud at {cloud_url} answered {} on /health. {}",
+            "pay-connect at {connect_url} answered {} on /health. {}",
             response.status(),
-            unreachable_hint(cloud_url)
+            unreachable_hint(connect_url)
         ))),
         Err(e) => Err(pay_core::Error::Config(format!(
-            "Cannot reach pay-cloud at {cloud_url}: {e}. {}",
-            unreachable_hint(cloud_url)
+            "Cannot reach pay-connect at {connect_url}: {e}. {}",
+            unreachable_hint(connect_url)
         ))),
     }
 }
 
-fn unreachable_hint(cloud_url: &str) -> String {
-    if cloud_url == LOCAL_CLOUD_URL {
-        "Start the local server first: `cargo run -p pay-cloud` (from rust/), then retry."
+fn unreachable_hint(connect_url: &str) -> String {
+    if connect_url == LOCAL_CONNECT_URL {
+        "Start the local server first: `cargo run -p pay-connect` (from rust/), then retry."
             .to_string()
     } else {
-        format!("Check the URL, or set {CLOUD_LOCAL_ENV}=1 to use a local pay-cloud.")
+        format!("Check the URL, or set {CONNECT_LOCAL_ENV}=1 to use a local pay-connect.")
     }
 }
 
@@ -389,7 +394,7 @@ pub fn pkce_challenge(verifier: &str) -> String {
 // ── Browser URL ───────────────────────────────────────────────────────────
 
 pub struct BrowserUrlParams<'a> {
-    pub cloud_url: &'a str,
+    pub connect_url: &'a str,
     pub callback: &'a str,
     pub state: &'a str,
     pub code_challenge: &'a str,
@@ -398,11 +403,11 @@ pub struct BrowserUrlParams<'a> {
     pub cli: &'a str,
 }
 
-/// `{cloud_url}/onboard?callback=…&state=…&code_challenge=…&account=…&host=…&cli=…`
+/// `{connect_url}/v1/cli?callback=…&state=…&code_challenge=…&account=…&host=…&cli=…`
 pub fn build_browser_url(p: &BrowserUrlParams<'_>) -> String {
     format!(
-        "{}/onboard?callback={}&state={}&code_challenge={}&account={}&host={}&cli={}",
-        p.cloud_url.trim_end_matches('/'),
+        "{}/v1/cli?callback={}&state={}&code_challenge={}&account={}&host={}&cli={}",
+        p.connect_url.trim_end_matches('/'),
         urlencoding::encode(p.callback),
         urlencoding::encode(p.state),
         urlencoding::encode(p.code_challenge),
@@ -440,13 +445,15 @@ pub struct CallbackQuery {
     pub payment_id: Option<String>,
     #[serde(default)]
     pub signature: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 /// What a `/callback` hit must carry to complete the flow that opened the
 /// browser.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Expect {
-    /// An authorization code from pay-cloud's onboarding exchange.
+    /// An authorization code from pay-connect's onboarding exchange.
     Code,
     /// A Coinflow payment id from the funding page.
     Payment,
@@ -456,9 +463,10 @@ pub enum Expect {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Accepted {
     Code(String),
+    Denied(String),
     Payment {
         payment_id: String,
-        /// On-chain signature, when pay-cloud already knew it.
+        /// On-chain signature, when pay-connect already knew it.
         signature: Option<String>,
     },
 }
@@ -477,7 +485,13 @@ pub fn accept_callback(
     }
     let present = |v: &Option<String>| v.as_deref().filter(|s| !s.is_empty()).map(str::to_string);
     match expect {
-        Expect::Code => present(&q.code).map(Accepted::Code).ok_or("missing code"),
+        Expect::Code => {
+            if let Some(error) = present(&q.error) {
+                Ok(Accepted::Denied(error))
+            } else {
+                present(&q.code).map(Accepted::Code).ok_or("missing code")
+            }
+        }
         Expect::Payment => present(&q.payment_id)
             .map(|payment_id| Accepted::Payment {
                 payment_id,
@@ -618,6 +632,9 @@ impl CallbackListener {
     pub async fn wait_for_code(self, timeout: Duration) -> pay_core::Result<String> {
         match self.wait_for(timeout).await? {
             Accepted::Code(code) => Ok(code),
+            Accepted::Denied(error) => Err(pay_core::Error::Config(format!(
+                "Cloud wallet setup was cancelled ({error})."
+            ))),
             Accepted::Payment { .. } => Err(pay_core::Error::Config(
                 "loopback callback delivered a payment where a code was expected".to_string(),
             )),
@@ -631,9 +648,9 @@ impl CallbackListener {
 /// clearing 3-D Secure can take a while.
 pub const FUNDING_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
-/// Query for `{cloud}/fund`, the card-purchase page.
+/// Query for `{connect}/fund`, the card-purchase page.
 pub struct FundUrlParams<'a> {
-    pub cloud_url: &'a str,
+    pub connect_url: &'a str,
     pub address: &'a str,
     /// Loopback URL the page returns to; `None` when nobody is waiting.
     pub callback: Option<&'a str>,
@@ -643,8 +660,8 @@ pub struct FundUrlParams<'a> {
 }
 
 pub fn build_fund_url(p: &FundUrlParams<'_>) -> String {
-    let mut url = reqwest::Url::parse(&format!("{}/fund", p.cloud_url.trim_end_matches('/')))
-        .expect("cloud url should parse");
+    let mut url = reqwest::Url::parse(&format!("{}/fund", p.connect_url.trim_end_matches('/')))
+        .expect("connect URL should parse");
     {
         let mut q = url.query_pairs_mut();
         q.append_pair("address", p.address);
@@ -678,9 +695,9 @@ pub struct FundingSession {
 impl FundingSession {
     /// Bind the loopback listener, build the page URL and open the browser.
     /// Returns once the URL is known; the wait continues in the background.
-    pub fn open(cloud_url: &str, address: &str, account: &str) -> pay_core::Result<Self> {
-        let cloud_url = cloud_url.trim_end_matches('/').to_string();
-        check_cloud_reachable(&cloud_url)?;
+    pub fn open(connect_url: &str, address: &str, account: &str) -> pay_core::Result<Self> {
+        let connect_url = connect_url.trim_end_matches('/').to_string();
+        check_connect_reachable(&connect_url)?;
         let state = random_token();
         let (url_tx, url_rx) = std::sync::mpsc::channel::<pay_core::Result<String>>();
         let (outcome_tx, outcome_rx) = std::sync::mpsc::channel();
@@ -710,7 +727,7 @@ impl FundingSession {
                             }
                         };
                         let url = build_fund_url(&FundUrlParams {
-                            cloud_url: &cloud_url,
+                            connect_url: &connect_url,
                             address: &address,
                             callback: Some(&listener.callback_url()),
                             state: Some(&state),
@@ -727,7 +744,7 @@ impl FundingSession {
                                     payment_id,
                                     signature,
                                 },
-                                Accepted::Code(_) => {
+                                Accepted::Code(_) | Accepted::Denied(_) => {
                                     unreachable!("listener bound with Expect::Payment")
                                 }
                             },
@@ -753,10 +770,10 @@ impl FundingSession {
 
 // ── Exchange ──────────────────────────────────────────────────────────────
 
-/// `POST {cloud_url}/v1/onboard/exchange`. Must be called outside a tokio
+/// `POST {connect_url}/v1/cli/complete`. Must be called outside a tokio
 /// runtime (blocking client).
 pub fn exchange_code(
-    cloud_url: &str,
+    connect_url: &str,
     code: &str,
     code_verifier: &str,
 ) -> pay_core::Result<OnboardResult> {
@@ -770,34 +787,36 @@ pub fn exchange_code(
         .no_proxy()
         .timeout(EXCHANGE_TIMEOUT)
         .build()
-        .map_err(|e| pay_core::Error::Config(format!("pay-cloud HTTP client: {e}")))?;
+        .map_err(|e| pay_core::Error::Config(format!("pay-connect HTTP client: {e}")))?;
     let body = serde_json::json!({ "code": code, "code_verifier": code_verifier });
     let res = client
         .post(format!(
-            "{}/v1/onboard/exchange",
-            cloud_url.trim_end_matches('/')
+            "{}/v1/cli/complete",
+            connect_url.trim_end_matches('/')
         ))
         .header(header::CONTENT_TYPE, "application/json")
         .body(serde_json::to_vec(&body).expect("static JSON shape"))
         .send()
-        .map_err(|e| pay_core::Error::Config(format!("pay-cloud exchange request failed: {e}")))?;
+        .map_err(|e| {
+            pay_core::Error::Config(format!("pay-connect exchange request failed: {e}"))
+        })?;
     let status = res.status();
     let bytes = res
         .bytes()
-        .map_err(|e| pay_core::Error::Config(format!("pay-cloud exchange read failed: {e}")))?;
+        .map_err(|e| pay_core::Error::Config(format!("pay-connect exchange read failed: {e}")))?;
 
     if !status.is_success() {
         let message = serde_json::from_slice::<ErrorBody>(&bytes)
             .ok()
             .and_then(|e| e.message)
             .filter(|m| !m.is_empty())
-            .unwrap_or_else(|| format!("pay-cloud exchange failed: HTTP {status}"));
+            .unwrap_or_else(|| format!("pay-connect exchange failed: HTTP {status}"));
         return Err(pay_core::Error::Config(message));
     }
 
     serde_json::from_slice(&bytes).map_err(|e| {
         pay_core::Error::Config(format!(
-            "pay-cloud exchange returned an unexpected body: {e}"
+            "pay-connect exchange returned an unexpected body: {e}"
         ))
     })
 }
@@ -833,7 +852,7 @@ mod tests {
     }
 
     #[test]
-    fn unreachable_cloud_fails_before_opening_anything() {
+    fn unreachable_connect_fails_before_opening_anything() {
         // Bind and immediately drop a port so nothing listens on it.
         let port = std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
@@ -842,33 +861,33 @@ mod tests {
             .port();
         let url = format!("http://127.0.0.1:{port}");
         let err = run_loopback_onboarding(&OnboardRequest {
-            cloud_url: url.clone(),
+            connect_url: url.clone(),
             account: "t".into(),
         })
         .err()
         .map(|e| e.to_string())
         .expect("must fail fast");
-        assert!(err.contains("Cannot reach pay-cloud"), "{err}");
+        assert!(err.contains("Cannot reach pay-connect"), "{err}");
         assert!(err.contains(&url), "{err}");
-        assert!(err.contains("PAY_CLOUD_LOCAL"), "{err}");
+        assert!(err.contains("PAY_CONNECT_LOCAL"), "{err}");
         assert_eq!(
-            unreachable_hint(LOCAL_CLOUD_URL),
-            "Start the local server first: `cargo run -p pay-cloud` (from rust/), then retry."
+            unreachable_hint(LOCAL_CONNECT_URL),
+            "Start the local server first: `cargo run -p pay-connect` (from rust/), then retry."
         );
     }
 
     #[test]
-    fn cloud_url_prefers_explicit_then_local_then_production() {
-        assert_eq!(cloud_url_from(None, None), DEFAULT_CLOUD_URL);
-        assert_eq!(cloud_url_from(None, Some("1")), LOCAL_CLOUD_URL);
-        assert_eq!(cloud_url_from(None, Some("true")), LOCAL_CLOUD_URL);
-        assert_eq!(cloud_url_from(None, Some("0")), DEFAULT_CLOUD_URL);
-        assert_eq!(cloud_url_from(None, Some("false")), DEFAULT_CLOUD_URL);
+    fn connect_url_prefers_explicit_then_local_then_production() {
+        assert_eq!(connect_url_from(None, None), DEFAULT_CONNECT_URL);
+        assert_eq!(connect_url_from(None, Some("1")), LOCAL_CONNECT_URL);
+        assert_eq!(connect_url_from(None, Some("true")), LOCAL_CONNECT_URL);
+        assert_eq!(connect_url_from(None, Some("0")), DEFAULT_CONNECT_URL);
+        assert_eq!(connect_url_from(None, Some("false")), DEFAULT_CONNECT_URL);
         assert_eq!(
-            cloud_url_from(Some("http://127.0.0.1:9000/"), Some("1")),
+            connect_url_from(Some("http://127.0.0.1:9000/"), Some("1")),
             "http://127.0.0.1:9000"
         );
-        assert_eq!(cloud_url_from(Some("  "), None), DEFAULT_CLOUD_URL);
+        assert_eq!(connect_url_from(Some("  "), None), DEFAULT_CONNECT_URL);
     }
     use axum::Json;
     use axum::routing::post;
@@ -907,7 +926,7 @@ mod tests {
     #[test]
     fn browser_url_is_percent_encoded() {
         let url = build_browser_url(&BrowserUrlParams {
-            cloud_url: "http://127.0.0.1:8402/",
+            connect_url: "http://127.0.0.1:8402/",
             callback: "http://127.0.0.1:53211/callback",
             state: "st_ate-1234567890",
             code_challenge: RFC_CHALLENGE,
@@ -918,7 +937,7 @@ mod tests {
         assert_eq!(
             url,
             format!(
-                "http://127.0.0.1:8402/onboard?callback=http%3A%2F%2F127.0.0.1%3A53211%2Fcallback\
+                "http://127.0.0.1:8402/v1/cli?callback=http%3A%2F%2F127.0.0.1%3A53211%2Fcallback\
 &state=st_ate-1234567890&code_challenge={RFC_CHALLENGE}&account=my%20account%26x&host=ludo%27s%20mbp&cli=0.29.0"
             )
         );
@@ -950,6 +969,15 @@ mod tests {
         assert_eq!(
             accept_callback(Expect::Code, &q(Some(""), Some("s")), "s"),
             Err("missing code")
+        );
+        let denied = CallbackQuery {
+            state: Some("s".to_string()),
+            error: Some("access_denied".to_string()),
+            ..CallbackQuery::default()
+        };
+        assert_eq!(
+            accept_callback(Expect::Code, &denied, "s"),
+            Ok(Accepted::Denied("access_denied".to_string()))
         );
     }
 
@@ -994,7 +1022,7 @@ mod tests {
     #[test]
     fn fund_url_carries_the_address_and_the_return_path() {
         let url = build_fund_url(&FundUrlParams {
-            cloud_url: "http://127.0.0.1:8402/",
+            connect_url: "http://127.0.0.1:8402/",
             address: "CcZFhGwFVkZevr555EZJpWbeq4irboT6zHfrSKWKCy3Z",
             callback: Some("http://127.0.0.1:53211/callback"),
             state: Some("st4te"),
@@ -1015,7 +1043,7 @@ mod tests {
         assert_eq!(q["cli"], "0.29.0");
 
         let bare = build_fund_url(&FundUrlParams {
-            cloud_url: "https://cloud.pay.sh",
+            connect_url: "https://connect.pay.sh",
             address: "CcZFhGwFVkZevr555EZJpWbeq4irboT6zHfrSKWKCy3Z",
             callback: None,
             state: None,
@@ -1105,12 +1133,12 @@ mod tests {
     #[test]
     fn exchange_parses_success_response() {
         let app = Router::new().route(
-            "/v1/onboard/exchange",
+            "/v1/cli/complete",
             post(|Json(body): Json<serde_json::Value>| async move {
                 assert_eq!(body["code"], "c0de");
                 assert_eq!(body["code_verifier"], RFC_VERIFIER);
                 Json(serde_json::json!({
-                    "provider": "pay-cloud",
+                    "provider": "pay-connect",
                     "status": "pending",
                     "email": "a@b.co",
                     "network": "mainnet",
@@ -1122,7 +1150,7 @@ mod tests {
         let base = spawn_stub(app);
 
         let result = exchange_code(&format!("{base}/"), "c0de", RFC_VERIFIER).unwrap();
-        assert_eq!(result.provider, "pay-cloud");
+        assert_eq!(result.provider, "pay-connect");
         assert_eq!(result.status, "pending");
         assert_eq!(result.email, "a@b.co");
         assert_eq!(result.network, "mainnet");
@@ -1135,7 +1163,7 @@ mod tests {
     #[test]
     fn exchange_surfaces_server_error_message() {
         let app = Router::new().route(
-            "/v1/onboard/exchange",
+            "/v1/cli/complete",
             post(|| async {
                 (
                     StatusCode::BAD_REQUEST,
@@ -1158,7 +1186,7 @@ mod tests {
     #[test]
     fn exchange_falls_back_to_http_status_without_message() {
         let app = Router::new().route(
-            "/v1/onboard/exchange",
+            "/v1/cli/complete",
             post(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "boom") }),
         );
         let base = spawn_stub(app);

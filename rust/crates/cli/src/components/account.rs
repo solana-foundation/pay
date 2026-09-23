@@ -16,11 +16,11 @@ pub fn format_account_header(name_rendered: &str, network: &str, pubkey: &str) -
     )
 }
 
-/// Print one stablecoin balance per line under `indent`. When all balances
+/// Print one stablecoin or credit balance per line under `indent`. When all balances
 /// are zero, prints nothing and returns `false` — callers use the return
 /// value to decide whether to surface a trailing "run `pay topup`" note.
 pub fn print_balances(balances: &AccountBalances, indent: &str) -> bool {
-    if balances.tokens.is_empty() {
+    if balances.tokens.is_empty() && balances.credits.is_empty() {
         return false;
     }
     for t in &balances.tokens {
@@ -29,6 +29,14 @@ pub fn print_balances(balances: &AccountBalances, indent: &str) -> bool {
             "{indent}- {:<6} {}",
             symbol,
             format!("{:.2}", t.ui_amount).green()
+        );
+    }
+    for credit in &balances.credits {
+        eprintln!(
+            "{indent}- {:<6} {} {}",
+            credit.currency,
+            format!("{:.2}", credit.ui_amount).green(),
+            "credits".dimmed()
         );
     }
     true

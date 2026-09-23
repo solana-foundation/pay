@@ -1,26 +1,28 @@
 # Buying the first stablecoins: replacing MoonPay with Coinflow
 
-Status: F1 built on `feat/pay-cloud`, 2026-09-16. Sandbox probed with the
-Solana Foundation merchant key (`.env` at the repo root, gitignored). Ludo is
-working with Coinflow support on the merchant settings below.
+Status: updated 2026-09-22. Coinflow checkout configuration, server APIs, and
+the funding UI now live in the separate `solana-foundation/pay-web-ui`
+repository. `pay-connect` only redirects browsers to that app and probes
+pay-api to decide whether funding is needed. The original design investigation
+is retained below for context.
 
 Scope: the funding step that follows account creation, for every backend
 (platform keystore, Ledger, remote wallet). The user has a Solana address
 and no stablecoins; they should be able to pay with a card and see USDC
 land at that address without leaving pay's own surfaces.
 
-## What is built (F1)
+## What is built
 
-- pay-cloud `funding` module (`coinflow` cargo feature, on by default):
-  `POST /api/fund/start`, `POST /api/fund/webhook`, `GET /api/fund/{id}`,
+- pay-web-ui owns `POST /api/onramp/start`, `POST /api/onramp/webhook`,
+  `GET /api/onramp/{id}`, and the card submission route. They are
   configured by `COINFLOW_API_KEY`, `COINFLOW_ENV`, `COINFLOW_MERCHANT_ID`,
   `COINFLOW_WEBHOOK_KEY`, `COINFLOW_SETTLE_TO_CUSTOMER`. Without the key the
-  endpoints answer 503 and the server says so at startup. The checkout link
+  endpoints answer 503. The checkout link
   is minted server-side with amount, USDC settlement, card rails, our
   `webhookInfo` and a 30-minute expiry fixed; `destination` is added when
   customer settlement is on. Tested against a mock Coinflow and live against
   the sandbox.
-- `/fund` page in the web-ui cloud app: amount presets, the exact fee table
+- `/onramp` in pay-web-ui: amount presets, the exact fee table
   from Coinflow's quote, Coinflow's hosted checkout in an iframe (origin
   pinned to the environment), then a progress log that waits up to 20 s for
   the webhook-reported signature before returning to the CLI callback with
@@ -29,10 +31,12 @@ land at that address without leaving pay's own surfaces.
   `pay setup` from the MoonPay redirect to the funding page, opened through
   the same loopback listener as onboarding (`Expect::Payment`). The TUI
   shows "Card charged" when the page returns and attaches the signature to
-  the balance detection. `pay setup --backend cloud` now runs the funding
+  the balance detection. `pay setup --backend connect` now runs the funding
   step after the wallet is registered, like every other backend. MoonPay
   stays the default until the Coinflow path is verified with real
   settlement.
+- pay-connect has no Coinflow feature, credentials, or webhook state. Its
+  legacy `/fund` entry point redirects to pay-web-ui's `/onramp` page.
 
 ## Merchant settings to request from Coinflow
 
@@ -42,13 +46,13 @@ land at that address without leaving pay's own surfaces.
    network fees, so the customer pays exactly the subtotal. Confirm that
    with a third-party destination the fee is taken from pay's Coinflow
    Wallet or invoiced, and the destination still receives the full amount.
-   pay-cloud can then subsidize only the first top-up by adding a
+   pay-connect can then subsidize only the first top-up by adding a
    `customPayInFees` line for later purchases, locked in the checkout token.
-3. A webhook endpoint (`https://cloud.pay.sh/api/fund/webhook`) with an
+3. A webhook endpoint (`https://pay.sh/api/onramp/webhook`) with an
    `Authorization` value we generate, mirrored into `COINFLOW_WEBHOOK_KEY`.
 4. Direct card entry on our own pages (the SDK's `CoinflowCardNumberInput`
    and `CoinflowCvvInput`, TokenEx fields) needs the page origins on the
-   merchant's referrer allowlist: `https://pay.sh`, `https://cloud.pay.sh`
+   merchant's referrer allowlist: `https://pay.sh`, `https://connect.pay.sh`
    and `http://localhost:3000` for development. Verified 2026-09-18: the
    sandbox merchant answers `Referrer … not allowed for merchant
    solana-foundation` (HTTP 401) on `POST /api/tokenize/iframe/config` for
@@ -63,7 +67,7 @@ land at that address without leaving pay's own surfaces.
 | --- | --- | --- |
 | `pay setup` / `pay topup` TUI | "Buy stablecoins" opens the browser at pay-api `GET /v1/onramp/start`, which redirects to `buy.moonpay.com` with `walletAddress` prefilled; the TUI polls balances through pay-api until USDC shows up | Full hop to MoonPay: MoonPay account, MoonPay KYC, MoonPay UI. Completion is inferred from the balance, never confirmed. |
 | MCP `topup` tool | Returns a Solana Pay QR, or a bare provider URL (Coinbase, PayPal, Venmo) | The agent can only say "go buy USDC somewhere and send it here". |
-| pay-cloud onboarding page | No funding step. The provider callback returns to the terminal straight after the wallet is created. | The plan's "fund" page was going to reuse the MoonPay redirect. |
+| pay-connect onboarding page | No funding step. The provider callback returns to the terminal straight after the wallet is created. | The plan's "fund" page was going to reuse the MoonPay redirect. |
 
 pay-api carries `MoonpayConfig`, the redirect builder, a static completion
 page and onramp metrics.
@@ -126,15 +130,18 @@ Facts verified against the sandbox on 2026-09-16, merchant id
   which mint, is not documented; to be tested once destination settlement is
   enabled.
 
-## Proposal: one funding page in pay-cloud, used by both doors
+## Historical proposal: one funding page in pay-connect
 
-The web onboarding flow and the TUI already share one server (pay-cloud)
+This section describes the superseded in-service design. The implementation
+now lives in pay-web-ui as described above.
+
+The web onboarding flow and the TUI already share one server (pay-connect)
 and one loopback pattern (the `gh auth login` style callback). The funding
-step joins them: pay-cloud owns the Coinflow key, renders one terminal-styled
+step joins them: pay-connect owns the Coinflow key, renders one terminal-styled
 funding page, and reports completion to whoever opened it.
 
 ```text
- pay setup / pay topup ──open──▶ cloud.pay.sh/fund?address&callback&state ──▶ CoinflowPurchase (PCI iframe)
+ pay setup / pay topup ──open──▶ connect.pay.sh/fund?address&callback&state ──▶ CoinflowPurchase (PCI iframe)
         ▲                                        │                                     │
         │   callback ?state&payment_id&signature  │ POST /api/fund/start (session key,  │ onSuccess(paymentId)
         └────────────────────────────────────────┤  jwt-token: destination=address)     ▼
@@ -142,7 +149,7 @@ funding page, and reports completion to whoever opened it.
  onboarding page ── "Wallet created" ──▶ /fund … ─┘ (same page, then "Return to your terminal")
 ```
 
-### pay-cloud: `funding` module behind a `coinflow` cargo feature
+### pay-connect: `funding` module behind a `coinflow` cargo feature
 
 - `POST /api/fund/start { address, cents, callback?, state? }`: validates the
   address and amount (presets 10/20/50 USD, min $2), mints a session key with
@@ -153,7 +160,7 @@ funding page, and reports completion to whoever opened it.
   checkoutJwtToken, totals, env, merchantId }` to the page.
 - `POST /api/fund/webhook`: verifies the dashboard `Authorization` value,
   dedupes by event id, records `paymentId → { status, signature, wallet }`.
-  In-memory with a TTL for v0; Postgres when pay-cloud gets persistence
+  In-memory with a TTL for v0; Postgres when pay-connect gets persistence
   (milestone 2). The CLI does not depend on it: it also keeps the balance
   poll it has today.
 - `GET /api/fund/{paymentId}`: `pending | disbursed { signature } | failed`.
@@ -180,10 +187,10 @@ funding page, and reports completion to whoever opened it.
 ### CLI: `pay setup`, `pay topup`, MCP `topup`
 
 - "Buy stablecoins" opens `{cloud}/fund?address&callback&state` through the
-  loopback module `cloud_onboard` already has (bind, PKCE not needed here,
+  loopback module `connect_onboard` already has (bind, PKCE not needed here,
   `state` only). It waits on either the callback (`payment_id`, `signature`)
   or the existing balance poll, whichever first, and prints the explorer
-  link when it has a signature. `PAY_CLOUD_LOCAL` / `PAY_CLOUD_URL` apply as
+  link when it has a signature. `PAY_CONNECT_LOCAL` / `PAY_CONNECT_URL` apply as
   they do for onboarding. The mobile-wallet Solana Pay QR remains the second
   option.
 - Because only the address is needed, the same code path serves local,
@@ -219,7 +226,7 @@ onboarding flow.
 5. Limits: per purchase, per card, per customer, per day; and what
    chargeback protection needs from us (`chargebackProtectionData`, the
    device script on our page).
-6. Apple Pay and Google Pay domain verification for `cloud.pay.sh`.
+6. Apple Pay and Google Pay domain verification for `connect.pay.sh`.
 
 ## If Coinflow will not enable destination settlement
 
@@ -233,7 +240,7 @@ fallback, not the plan.
 ## Milestones
 
 - **F1** Ask Coinflow (questions above). In parallel: `funding` module in
-  pay-cloud and the `/fund` page against sandbox settling to the merchant
+  pay-connect and the `/fund` page against sandbox settling to the merchant
   wallet, to get the UX right; TUI "Buy stablecoins" points at `/fund`
   behind `PAY_ONRAMP=coinflow`; MoonPay path untouched.
 - **F2** Destination settlement enabled: lock `destination` in the JWT,

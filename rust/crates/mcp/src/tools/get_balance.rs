@@ -5,7 +5,7 @@ use serde::Deserialize;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct Params {
-    /// Network to check. Defaults to "mainnet".
+    /// Network whose wallet and credit balances to check. Defaults to "mainnet".
     #[schemars(
         description = "Network slug (e.g. \"mainnet\", \"localnet\"). Defaults to mainnet."
     )]
@@ -64,8 +64,15 @@ pub async fn run(
         lines.push(format!("{label}: {:.2}", token.ui_amount));
     }
 
-    if balances.tokens.is_empty() {
-        lines.push("No token balances found.".to_string());
+    for credit in &balances.credits {
+        lines.push(format!(
+            "{} credits: {:.2} (program {})",
+            credit.currency, credit.ui_amount, credit.program_id
+        ));
+    }
+
+    if balances.tokens.is_empty() && balances.credits.is_empty() {
+        lines.push("No token or credit balances found.".to_string());
     }
 
     Ok(CallToolResult::success(vec![rmcp::model::Content::text(

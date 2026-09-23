@@ -1,5 +1,5 @@
 //! Interactive top-up flow: option selection, Solana Pay QR rendering with
-//! stable sizing, onramp launch (MoonPay redirect or the pay-cloud funding
+//! stable sizing, onramp launch (MoonPay redirect or the pay-connect funding
 //! page), and stablecoin balance polling.
 
 use std::io;
@@ -267,7 +267,7 @@ enum TopupFocus {
     Methods,
 }
 
-/// Who sells the stablecoins. `PAY_ONRAMP=coinflow` opens pay-cloud's
+/// Who sells the stablecoins. `PAY_ONRAMP=coinflow` opens pay.sh's
 /// funding page (card, Apple Pay, Google Pay through Coinflow, settled to
 /// the account's address); MoonPay stays the default until that path is
 /// verified end to end and the pay-api redirect is retired.
@@ -315,14 +315,14 @@ impl OnrampProvider {
     }
 
     /// Where the purchase happens: the pay-api gateway (MoonPay redirect)
-    /// or pay-cloud (funding page).
+    /// or pay-connect (funding page).
     fn host(self) -> String {
         match self {
             Self::Moonpay => std::env::var("PAY_ONRAMP_HOST")
                 .unwrap_or_else(|_| DEFAULT_ONRAMP_HOST.to_string())
                 .trim_end_matches('/')
                 .to_string(),
-            Self::Coinflow => crate::commands::cloud_onboard::default_cloud_url(),
+            Self::Coinflow => crate::commands::connect_onboard::default_connect_url(),
         }
     }
 }
@@ -751,7 +751,7 @@ struct OnrampSession {
     payment_method: OnrampPaymentMethod,
     /// The funding page's loopback listener (Coinflow only); MoonPay has
     /// no return channel, so the balance poll is the only signal.
-    funding: Option<crate::commands::cloud_onboard::FundingSession>,
+    funding: Option<crate::commands::connect_onboard::FundingSession>,
 }
 
 #[derive(Clone, Copy)]
@@ -1679,7 +1679,7 @@ fn launch_onramp_session(
         }
         OnrampProvider::Coinflow => {
             let funding =
-                crate::commands::cloud_onboard::FundingSession::open(&host, pubkey, account_name)
+                crate::commands::connect_onboard::FundingSession::open(&host, pubkey, account_name)
                     .map_err(|err| err.to_string())?;
             Ok(OnrampSession {
                 url: funding.url.clone(),

@@ -15,9 +15,10 @@ use std::time::{Duration, Instant};
 
 use hmac::{Hmac, Mac};
 use pay_core::accounts::{Account, AccountsFile, AccountsStore, BackendKind, MAINNET_NETWORK};
+use pay_core::keystore::{AuthGate, AuthIntent, USD_MINOR_UNITS_PER_DOLLAR};
 use pay_core::remote::{CredentialSource, Credentials, MemoryCredentials};
 use pay_mcp::context::{CallScope, PayContext};
-use pay_mcp::policy::{MemoryLedger, PolicyApproval, SpendLedger, SpendPolicy};
+use pay_mcp::policy::{MemoryLedger, PolicyApproval, PolicyGate, SpendLedger, SpendPolicy};
 use rmcp::service::{RequestContext, RoleServer};
 
 use crate::mcp::Tenant;
@@ -61,7 +62,7 @@ pub struct TenantRecord {
     pub subject: String,
     /// Account name shown in prompts and receipts.
     pub account_name: String,
-    /// Remote provider id (`openfort`).
+    /// Remote provider id (`privy`).
     pub provider: String,
     /// Provider-side wallet id.
     pub wallet_id: String,
@@ -73,19 +74,6 @@ pub struct TenantRecord {
 }
 
 impl TenantRecord {
-    /// A tenant for a wallet the onboarding driver just provisioned.
-    pub fn from_wallet(subject: &str, wallet: &crate::drivers::ProvisionedWallet) -> Self {
-        Self {
-            subject: subject.to_string(),
-            account_name: CONNECTOR_ACCOUNT.to_string(),
-            provider: wallet.provider.to_string(),
-            wallet_id: wallet.wallet_id.clone(),
-            pubkey: wallet.address.clone(),
-            credentials: wallet.credentials.clone(),
-            policy: DEFAULT_POLICY,
-        }
-    }
-
     /// The `accounts.yml` entry this tenant would have on a laptop: a remote
     /// account gated by policy (`auth_required` on, so the override applies).
     fn account(&self) -> Account {
@@ -123,6 +111,29 @@ pub struct TenantRegistry {
     cookie_key: [u8; 32],
 }
 
+/// An allowance reservation that is automatically released unless a wallet
+/// provider actually returns a signature.
+pub struct SpendReservation {
+    subject: String,
+    amount: u64,
+    ledger: Arc<dyn SpendLedger>,
+    committed: bool,
+}
+
+impl SpendReservation {
+    pub fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for SpendReservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.ledger.release(&self.subject, self.amount);
+        }
+    }
+}
+
 impl Default for TenantRegistry {
     fn default() -> Self {
         Self::with_ledger(Arc::new(MemoryLedger::new()))
@@ -145,6 +156,32 @@ impl TenantRegistry {
             ledger,
             cookie_key,
         }
+    }
+
+    /// Apply a tenant's hosted spending policy to a transaction whose amount
+    /// has already been derived from its instructions, not supplied by the
+    /// caller. Successful authorization reserves the amount in the ledger.
+    pub fn reserve_cli_transaction(
+        &self,
+        tenant: &TenantRecord,
+        amount_minor: u64,
+    ) -> Result<SpendReservation, String> {
+        let whole = amount_minor / USD_MINOR_UNITS_PER_DOLLAR;
+        let fraction = amount_minor % USD_MINOR_UNITS_PER_DOLLAR;
+        let amount = format!("${whole}.{fraction:04}");
+        PolicyGate::new(&tenant.subject, tenant.policy, self.ledger.clone())
+            .authenticate(&AuthIntent::authorize_payment_details(
+                &amount,
+                "hosted CLI transaction",
+                "connect.pay.sh",
+            ))
+            .map_err(|error| error.to_string())?;
+        Ok(SpendReservation {
+            subject: tenant.subject.clone(),
+            amount: amount_minor,
+            ledger: self.ledger.clone(),
+            committed: false,
+        })
     }
 
     fn mac_hex(&self, purpose: &[u8], value: &str) -> String {
@@ -202,7 +239,7 @@ impl TenantRegistry {
     /// Bind link completion to the browser that deliberately opened the
     /// confirmation view. Only the ticket hash is placed in the cookie.
     pub fn link_cookie(&self, ticket: &str, secure: bool) -> axum::http::HeaderValue {
-        let ticket_hash = crate::onboard::sha256_hex(ticket);
+        let ticket_hash = crate::protocol::sha256_hex(ticket);
         cookie::set(
             cookie::LINK_NAME,
             &self.sign_cookie_value(b"link", &ticket_hash),
@@ -215,13 +252,13 @@ impl TenantRegistry {
             return false;
         };
         self.verify_cookie_value(b"link", &signed).as_deref()
-            == Some(crate::onboard::sha256_hex(ticket).as_str())
+            == Some(crate::protocol::sha256_hex(ticket).as_str())
     }
 
     /// A fresh ticket for `subject`; `None` when the table is full of live
     /// tickets. The plaintext goes into the tool error, only its hash stays.
     pub fn mint_link(&self, subject: &str) -> Option<String> {
-        let ticket = crate::onboard::random_token();
+        let ticket = crate::protocol::random_token();
         let now = Instant::now();
         let mut links = self.links.lock().unwrap();
         links.retain(|_, t| now.saturating_duration_since(t.created_at) <= LINK_TTL);
@@ -232,7 +269,7 @@ impl TenantRegistry {
             return None;
         }
         links.insert(
-            crate::onboard::sha256_hex(&ticket),
+            crate::protocol::sha256_hex(&ticket),
             LinkTicket {
                 subject: subject.to_string(),
                 created_at: now,
@@ -245,7 +282,7 @@ impl TenantRegistry {
     /// The subject a live ticket is for, without consuming it.
     pub fn peek_link(&self, ticket: &str) -> Option<String> {
         let links = self.links.lock().unwrap();
-        let t = links.get(&crate::onboard::sha256_hex(ticket))?;
+        let t = links.get(&crate::protocol::sha256_hex(ticket))?;
         (!t.claimed && Instant::now().saturating_duration_since(t.created_at) <= LINK_TTL)
             .then(|| t.subject.clone())
     }
@@ -253,7 +290,7 @@ impl TenantRegistry {
     /// Reserve a live ticket before external provisioning. Dropping the
     /// claim releases it for a retry; committing consumes it.
     pub(crate) fn claim_link<'a>(&'a self, ticket: &str) -> Option<LinkClaim<'a>> {
-        let key = crate::onboard::sha256_hex(ticket);
+        let key = crate::protocol::sha256_hex(ticket);
         let mut links = self.links.lock().unwrap();
         let entry = links.get_mut(&key)?;
         if entry.claimed || Instant::now().saturating_duration_since(entry.created_at) > LINK_TTL {
@@ -490,7 +527,7 @@ impl CloudContext {
                  card), then ask again. Browsing the catalog works without a wallet."
             ),
             None => "This connection has no wallet yet. Finish setting up your pay account at \
-                     cloud.pay.sh, then try again."
+                     connect.pay.sh, then try again."
                 .to_string(),
         }
     }
@@ -526,6 +563,7 @@ impl PayContext for CloudContext {
                 policy: record.policy,
                 ledger: self.registry.ledger.clone(),
             }),
+            payment_permissions: None,
             // The server has no access to the caller's files.
             body_files: false,
         })
@@ -545,7 +583,7 @@ mod tests {
         TenantRecord {
             subject: subject.to_string(),
             account_name: "grok".to_string(),
-            provider: "openfort".to_string(),
+            provider: "test-provider".to_string(),
             wallet_id: "acc_1".to_string(),
             pubkey: "CcZFhGwFVkZevr555EZJpWbeq4irboT6zHfrSKWKCy3Z".to_string(),
             credentials,
@@ -560,7 +598,7 @@ mod tests {
         let (name, account) = file.account_for_network(MAINNET_NETWORK).unwrap();
         assert_eq!(name, "grok");
         assert_eq!(account.backend, BackendKind::Remote);
-        assert_eq!(account.provider.as_deref(), Some("openfort"));
+        assert_eq!(account.provider.as_deref(), Some("test-provider"));
         assert_eq!(account.account.as_deref(), Some("acc_1"));
         assert!(
             account.auth_required_for_network(MAINNET_NETWORK),
@@ -572,7 +610,7 @@ mod tests {
             .credential_source()
             .load(
                 "grok",
-                "openfort",
+                "test-provider",
                 Gate::Disabled,
                 &AuthIntent::default_payment(),
             )
@@ -631,9 +669,9 @@ mod tests {
 
     #[test]
     fn subjects_are_stable_opaque_and_provider_scoped() {
-        let a = subject_for("openfort", "pro_123");
-        assert_eq!(a, subject_for("openfort", "pro_123"));
-        assert_ne!(a, subject_for("openfort", "pro_124"));
+        let a = subject_for("test-provider", "account_123");
+        assert_eq!(a, subject_for("test-provider", "account_123"));
+        assert_ne!(a, subject_for("test-provider", "account_124"));
         assert_ne!(a, subject_for("circle", "pro_123"));
         assert!(a.starts_with("sub_") && a.len() == 36, "{a}");
         assert!(!a.contains("pro_123"));
@@ -708,6 +746,25 @@ mod tests {
         assert!(registry.get("sub_2").is_none());
         assert!(registry.remove("sub_1").is_some());
         assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn failed_signing_releases_reserved_allowance() {
+        let ledger = Arc::new(MemoryLedger::new());
+        let registry = TenantRegistry::with_ledger(ledger.clone());
+        let tenant = record("sub_1");
+
+        {
+            let _failed = registry.reserve_cli_transaction(&tenant, 10_000).unwrap();
+            assert_eq!(ledger.spent_today("sub_1"), 10_000);
+        }
+        assert_eq!(ledger.spent_today("sub_1"), 0);
+
+        registry
+            .reserve_cli_transaction(&tenant, 10_000)
+            .unwrap()
+            .commit();
+        assert_eq!(ledger.spent_today("sub_1"), 10_000);
     }
 
     // ── Through /mcp ───────────────────────────────────────────────────
