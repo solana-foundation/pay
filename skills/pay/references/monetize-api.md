@@ -18,7 +18,7 @@ Pay has two developer-facing parts:
 Start with a scaffold:
 
 ```sh
-pay server scaffold paywall.yml
+pay gate scaffold paywall.yml
 ```
 
 A minimal proxy spec:

@@ -85,13 +85,8 @@ pub enum Command {
     Setup(setup::SetupCommand),
     /// Import funds from Venmo, PayPal, or a mobile wallet.
     Topup(topup::TopupCommand),
-    /// Manage gateway demos, paywall specs, and subscription plans.
-    #[command(alias = "serve")]
-    Server {
-        #[command(subcommand)]
-        command: server::ServerCommand,
-    },
-    /// Gate APIs or local inference with stablecoin payments.
+    /// Gate APIs, local demos, or inference with stablecoin payments.
+    #[command(alias = "serve", alias = "server")]
     Gate {
         #[command(subcommand)]
         command: server::GateCommand,
@@ -144,7 +139,6 @@ pub enum ToolKind {
 impl Command {
     pub fn otlp_sidecar(&self) -> Option<&str> {
         match self {
-            Command::Server { command } => command.otlp_sidecar(),
             Command::Gate { command } => command.otlp_sidecar(),
             _ => None,
         }
@@ -181,7 +175,6 @@ impl Command {
             | Command::Subscriptions { .. }
             | Command::Catalog { .. }
             | Command::Install(_)
-            | Command::Server { .. }
             | Command::Gate { .. }
             | Command::Docs { .. }
             | Command::Mcp(_) => false,
@@ -212,7 +205,6 @@ impl Command {
             | Command::Setup(_)
             | Command::ConnectOnboard(_)
             | Command::Topup(_)
-            | Command::Server { .. }
             | Command::Gate { .. }
             | Command::Docs { .. } => ToolKind::Mcp,
             Command::Mcp(_) => ToolKind::Mcp,
@@ -273,9 +265,6 @@ impl Command {
             Command::Setup(cmd) => return cmd.run(),
             Command::ConnectOnboard(cmd) => return cmd.run(),
             Command::Topup(cmd) => return cmd.run(),
-            Command::Server { command } => {
-                return command.run(keypair_override, account_override, sandbox);
-            }
             Command::Gate { command } => {
                 return command.run(keypair_override, account_override, sandbox);
             }

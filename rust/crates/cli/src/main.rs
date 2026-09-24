@@ -314,7 +314,7 @@ fn main() {
                 | Command::Mcp(_)
         ) {
         None
-    } else if matches!(command, Command::Server { .. } | Command::Gate { .. }) {
+    } else if matches!(command, Command::Gate { .. }) {
         config.legacy_keypair_source()
     } else if matches!(command, Command::Topup(_)) {
         config.default_active_account_name()
@@ -715,14 +715,35 @@ mod tests {
     }
 
     #[test]
-    fn serve_inference_remains_as_a_hidden_migration_alias() {
+    fn serve_is_a_hidden_alias_for_gate() {
         let opts = Opts::try_parse_from(["pay", "serve", "inference", "rates.yml"]).unwrap();
 
         match opts.command {
-            Some(Command::Server {
-                command: commands::server::ServerCommand::Inference(cmd),
+            Some(Command::Gate {
+                command: commands::server::GateCommand::Inference(cmd),
             }) => assert_eq!(cmd.rates.as_deref(), Some("rates.yml")),
-            _ => panic!("expected legacy serve inference command"),
+            _ => panic!("expected serve alias to route to gate inference"),
+        }
+
+        let root = Opts::command();
+        let gate = root
+            .get_subcommands()
+            .find(|command| command.get_name() == "gate")
+            .unwrap();
+        assert!(gate.get_all_aliases().any(|alias| alias == "serve"));
+        assert!(!gate.get_visible_aliases().any(|alias| alias == "serve"));
+    }
+
+    #[test]
+    fn gate_demo_and_serve_demo_route_to_the_same_command() {
+        for command_name in ["gate", "serve"] {
+            let opts = Opts::try_parse_from(["pay", command_name, "demo"]).unwrap();
+            assert!(matches!(
+                opts.command,
+                Some(Command::Gate {
+                    command: commands::server::GateCommand::Demo(_),
+                })
+            ));
         }
     }
 
@@ -743,8 +764,8 @@ mod tests {
         let opts = Opts::try_parse_from(["pay", "server", "start", "paywall.yml"]).unwrap();
 
         match opts.command {
-            Some(Command::Server {
-                command: commands::server::ServerCommand::Start(cmd),
+            Some(Command::Gate {
+                command: commands::server::GateCommand::Start(cmd),
             }) => assert_eq!(cmd.paywall, "paywall.yml"),
             _ => panic!("expected legacy server start command"),
         }
@@ -765,8 +786,8 @@ mod tests {
         .unwrap();
 
         match opts.command {
-            Some(Command::Server {
-                command: commands::server::ServerCommand::Start(cmd),
+            Some(Command::Gate {
+                command: commands::server::GateCommand::Start(cmd),
             }) => {
                 assert_eq!(cmd.tls_cert.as_deref(), Some("/etc/pay/tls/server.crt"));
                 assert_eq!(cmd.tls_key.as_deref(), Some("/etc/pay/tls/server.key"));
@@ -794,14 +815,19 @@ mod tests {
 
     #[test]
     fn scaffold_defaults_to_paywall_yml() {
-        let opts = Opts::try_parse_from(["pay", "server", "scaffold"]).unwrap();
+        let opts = Opts::try_parse_from(["pay", "gate", "scaffold"]).unwrap();
 
         match opts.command {
-            Some(Command::Server {
-                command: commands::server::ServerCommand::Scaffold(cmd),
+            Some(Command::Gate {
+                command: commands::server::GateCommand::Scaffold(cmd),
             }) => assert_eq!(cmd.output, "paywall.yml"),
-            _ => panic!("expected server scaffold command"),
+            _ => panic!("expected gate scaffold command"),
         }
+    }
+
+    #[test]
+    fn obsolete_plans_command_is_rejected() {
+        assert!(Opts::try_parse_from(["pay", "serve", "plans", "publish"]).is_err());
     }
 
     #[test]

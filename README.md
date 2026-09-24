@@ -105,7 +105,7 @@ pay gate api paywall.yml --debugger
 pay --sandbox gate inference rates.yml
 
 # Or run the bundled demo (sandbox + debugger + sample endpoints)
-pay server demo
+pay gate demo
 ```
 
 A [public debugger](https://debugger.pay.sh) is also available.

@@ -253,8 +253,8 @@ pub fn build_handler(
 ) -> Result<SubscriptionServer> {
     let plan_id = spec.plan_id.clone().ok_or_else(|| {
         Error::Config(
-            "subscription endpoint is missing `plan_id`. Run `pay server plans publish` \
-                 to publish the on-chain Plan and write its address back into pay-demo.yaml."
+            "subscription endpoint is missing `plan_id`. Start it with `pay gate api \
+             <paywall.yml>` to publish the on-chain Plan and write its metadata back."
                 .into(),
         )
     })?;

@@ -1,4 +1,4 @@
-//! `pay server demo` — start the gateway with a bundled demo paywall.
+//! `pay gate demo` — start the gateway with a bundled demo paywall.
 //!
 //! Extracts the embedded playground API spec to `./pay-demo.yaml` in the
 //! current working directory, then invokes `pay gate api` with sandbox and

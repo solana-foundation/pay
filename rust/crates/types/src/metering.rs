@@ -1120,7 +1120,7 @@ pub struct Endpoint {
 ///
 /// The shape is deliberately small: it captures only what a developer can
 /// reasonably write by hand. The on-chain `Plan` PDA is published
-/// separately by `pay server plans publish`, which writes its address back
+/// by `pay gate api`, which writes its address back
 /// into `plan_id` once it exists.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SubscriptionEndpoint {
@@ -1151,25 +1151,25 @@ pub struct SubscriptionEndpoint {
     pub expires_at: Option<String>,
 
     /// Base58 of the on-chain `Plan` PDA (the spec's `externalId`). Empty
-    /// at author time; populated in place by `pay server plans publish`.
+    /// at author time; populated in place by `pay gate api`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_id: Option<String>,
 
     /// The numeric `plan_id` (u64) the on-chain program reads from
     /// `SubscribeData`. The string `plan_id` above is the PDA derived
-    /// from this number + the operator wallet. `pay server plans publish`
+    /// from this number + the operator wallet. `pay gate api`
     /// writes both at the same time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_id_numeric: Option<u64>,
 
     /// Plan PDA bump seed. Saves the on-chain `Subscribe` instruction a
-    /// `find_program_address` call. Written by `pay server plans publish`.
+    /// `find_program_address` call. Written by `pay gate api`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_bump: Option<u8>,
 
     /// Plan's on-chain `created_at` unix timestamp. Set by the program
     /// when the Plan account is created; written into the YAML after
-    /// `pay server plans publish` broadcasts and reads back the new
+    /// `pay gate api` broadcasts and reads back the new
     /// account. Must be passed verbatim into `SubscribeData` or the
     /// program rejects with a terms mismatch.
     #[serde(default, skip_serializing_if = "Option::is_none")]

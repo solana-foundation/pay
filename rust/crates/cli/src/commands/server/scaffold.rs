@@ -1,4 +1,4 @@
-//! `pay server scaffold` — generate a starter paywall YAML spec.
+//! `pay gate scaffold` — generate a starter paywall YAML spec.
 
 /// Generate a starter paywall YAML spec file.
 #[derive(clap::Args)]
