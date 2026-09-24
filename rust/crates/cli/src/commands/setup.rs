@@ -117,11 +117,18 @@ impl SetupCommand {
             return Ok(());
         }
 
-        // Validate backend availability before writing agent configuration.
-        // This still keeps integrations before account creation and funding,
-        // without leaving MCP entries behind when backend preflight fails.
-        let backend = super::account::new::resolve_backend(self.backend.as_deref())?;
-        install_agent_integrations();
+        // Keep agent integration setup before the interactive wallet choice,
+        // while still rejecting unavailable explicit or interactive backends
+        // before writing any configuration.
+        let backend = if let Some(backend) = self.backend.as_deref() {
+            let backend = super::account::new::resolve_backend(Some(backend))?;
+            install_agent_integrations();
+            backend
+        } else {
+            super::account::new::ensure_backend_picker_available()?;
+            install_agent_integrations();
+            super::account::new::resolve_backend(None)?
+        };
 
         // Browser-linked remote wallet: the page owns sign-in and custody
         // choice, so none of the local keypair steps below apply. Nothing

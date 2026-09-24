@@ -843,8 +843,8 @@ fn backend_picker_options(
     options
 }
 
-/// Interactive backend picker. Returns the backend id string.
-pub fn pick_backend() -> pay_core::Result<String> {
+/// Check that interactive backend selection can run without showing its prompt.
+pub fn ensure_backend_picker_available() -> pay_core::Result<()> {
     let has_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
     if !has_tty {
         return Err(pay_core::Error::Config(format!(
@@ -866,6 +866,16 @@ pub fn pick_backend() -> pay_core::Result<String> {
             "No supported keystore backend is available on this system.".to_string(),
         ));
     }
+
+    Ok(())
+}
+
+/// Interactive backend picker. Returns the backend id string.
+pub fn pick_backend() -> pay_core::Result<String> {
+    ensure_backend_picker_available()?;
+
+    let platform = pay_core::backend::platform().filter(|p| p.is_available());
+    let options = backend_picker_options(platform);
 
     // Two aligned columns: the backend name, then what it means for the
     // user, dimmed. The theme highlights the whole active row.
