@@ -1668,7 +1668,7 @@ impl StartCommand {
                 return Err(pay_core::Error::Config(
                     "operator.fee_payer is `true` but no fee payer signer is configured.\n\n\
                      In sandbox mode, start the server with `pay --sandbox gate api ...` \
-                     (or use `pay -s server demo`).\n\
+                     (or use `pay gate demo`).\n\
                      In production, set `operator.signer` in the YAML (`backend: env`, \
                      `backend: account`, `backend: file`, or a gcp-kms signer in a \
                      gcp_kms build) or set `operator.fee_payer: false` \

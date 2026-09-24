@@ -1,4 +1,4 @@
-//! `pay server plans publish` — publish on-chain `Plan` PDAs for every
+//! `pay plans publish` — derive on-chain `Plan` PDAs for every
 //! subscription endpoint declared in a pay-demo.yaml.
 //!
 //! v0 surface: derives the deterministic Plan PDA per endpoint from the
@@ -16,6 +16,8 @@ use owo_colors::OwoColorize;
 use pay_core::server::subscription::compute_plan_id_numeric;
 use pay_kit::mpp::program::subscriptions::{default_program_id, find_plan_pda, plan_id_seed};
 use solana_pubkey::Pubkey;
+
+use super::atomic_write;
 
 #[derive(clap::Args)]
 pub struct PublishCommand {
@@ -53,11 +55,14 @@ impl PublishCommand {
         let owner_str = if let Some(o) = self.owner.clone() {
             o
         } else {
-            let operator = api.operator.as_ref().ok_or_else(|| {
+            let mut operator = api.operator.clone().ok_or_else(|| {
                 pay_core::Error::Config(
                     "spec has no `operator:` block; pass --owner <pubkey> instead".to_string(),
                 )
             })?;
+            operator
+                .resolve_env_templates("operator")
+                .map_err(pay_core::Error::Config)?;
             operator.recipient.clone().ok_or_else(|| {
                 pay_core::Error::Config(
                     "spec has no `operator.recipient`; pass --owner <pubkey> to specify the Plan owner".to_string(),
@@ -131,9 +136,7 @@ impl PublishCommand {
 
         if self.write {
             let updated = write_back_plan_ids(&raw, &rows)?;
-            std::fs::write(&self.spec, updated).map_err(|e| {
-                pay_core::Error::Config(format!("Failed to write {}: {e}", self.spec.display()))
-            })?;
+            atomic_write(&self.spec, &updated)?;
             eprintln!(
                 "{} {}",
                 "Wrote plan_id values into".green(),
@@ -180,6 +183,7 @@ fn write_back_plan_ids(yaml: &str, rows: &[PlanRow]) -> pay_core::Result<String>
     let mut inside_subscription = false;
     let mut subscription_indent: Option<usize> = None;
     let mut wrote_plan_id_for_current = false;
+    let mut updated_paths = std::collections::HashSet::new();
 
     for line in yaml.lines() {
         let stripped = line.trim_start();
@@ -187,7 +191,10 @@ fn write_back_plan_ids(yaml: &str, rows: &[PlanRow]) -> pay_core::Result<String>
 
         // Track the current endpoint via `path:` lines under the
         // `endpoints:` list.
-        if let Some(rest) = stripped.strip_prefix("path:") {
+        if let Some(rest) = stripped
+            .strip_prefix("path:")
+            .or_else(|| stripped.strip_prefix("- path:"))
+        {
             let path_value = rest.trim().trim_matches('"').trim_matches('\'').to_string();
             current_path = Some(path_value);
             inside_subscription = false;
@@ -212,6 +219,7 @@ fn write_back_plan_ids(yaml: &str, rows: &[PlanRow]) -> pay_core::Result<String>
                 out.push_str("plan_id: ");
                 out.push_str(plan);
                 out.push('\n');
+                updated_paths.insert(path.to_string());
                 continue;
             }
         } else if inside_subscription
@@ -231,6 +239,7 @@ fn write_back_plan_ids(yaml: &str, rows: &[PlanRow]) -> pay_core::Result<String>
                 out.push_str("plan_id: ");
                 out.push_str(plan);
                 out.push('\n');
+                updated_paths.insert(path.to_string());
             }
             inside_subscription = false;
             subscription_indent = None;
@@ -252,6 +261,19 @@ fn write_back_plan_ids(yaml: &str, rows: &[PlanRow]) -> pay_core::Result<String>
         out.push_str("plan_id: ");
         out.push_str(plan);
         out.push('\n');
+        updated_paths.insert(path.to_string());
+    }
+
+    let missing: Vec<&str> = by_path
+        .keys()
+        .copied()
+        .filter(|path| !updated_paths.contains(*path))
+        .collect();
+    if !missing.is_empty() {
+        return Err(pay_core::Error::Config(format!(
+            "Failed to write plan_id for endpoint(s): {}",
+            missing.join(", ")
+        )));
     }
 
     Ok(out)
@@ -309,5 +331,38 @@ mod tests {
         assert!(out.contains("plan_id: PlanXYZ"));
         // Other endpoints stay intact.
         assert!(out.contains("metering:"));
+    }
+
+    #[test]
+    fn write_back_supports_inline_list_item_paths() {
+        let yaml = "endpoints:\n  - path: api/v1/pro\n    method: GET\n    subscription:\n      period: 30d\n      currency: USDC\n";
+        let rows = vec![PlanRow {
+            method: "GET".into(),
+            path: "api/v1/pro".into(),
+            period: "30d".into(),
+            currency: "USDC".into(),
+            derived_plan: "PlanXYZ".into(),
+            existing_plan: None,
+        }];
+
+        let out = write_back_plan_ids(yaml, &rows).unwrap();
+
+        assert!(out.contains("plan_id: PlanXYZ"), "{out}");
+    }
+
+    #[test]
+    fn write_back_errors_when_an_endpoint_cannot_be_matched() {
+        let rows = vec![PlanRow {
+            method: "GET".into(),
+            path: "api/v1/missing".into(),
+            period: "30d".into(),
+            currency: "USDC".into(),
+            derived_plan: "PlanXYZ".into(),
+            existing_plan: None,
+        }];
+
+        let error = write_back_plan_ids("endpoints: []\n", &rows).unwrap_err();
+
+        assert!(error.to_string().contains("api/v1/missing"));
     }
 }

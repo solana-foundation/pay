@@ -85,16 +85,16 @@ pub enum Command {
     Setup(setup::SetupCommand),
     /// Import funds from Venmo, PayPal, or a mobile wallet.
     Topup(topup::TopupCommand),
-    /// Manage gateway demos, paywall specs, and subscription plans.
-    #[command(alias = "serve")]
-    Server {
-        #[command(subcommand)]
-        command: server::ServerCommand,
-    },
-    /// Gate APIs or local inference with stablecoin payments.
+    /// Gate APIs, local demos, or inference with stablecoin payments.
+    #[command(alias = "serve", alias = "server")]
     Gate {
         #[command(subcommand)]
         command: server::GateCommand,
+    },
+    /// Preview and prepare subscription Plan addresses without starting a gateway.
+    Plans {
+        #[command(subcommand)]
+        command: server::PlansCommand,
     },
     /// Browse, search, and inspect API providers from the skills catalog.
     Skills {
@@ -144,7 +144,6 @@ pub enum ToolKind {
 impl Command {
     pub fn otlp_sidecar(&self) -> Option<&str> {
         match self {
-            Command::Server { command } => command.otlp_sidecar(),
             Command::Gate { command } => command.otlp_sidecar(),
             _ => None,
         }
@@ -181,8 +180,8 @@ impl Command {
             | Command::Subscriptions { .. }
             | Command::Catalog { .. }
             | Command::Install(_)
-            | Command::Server { .. }
             | Command::Gate { .. }
+            | Command::Plans { .. }
             | Command::Docs { .. }
             | Command::Mcp(_) => false,
         }
@@ -212,8 +211,8 @@ impl Command {
             | Command::Setup(_)
             | Command::ConnectOnboard(_)
             | Command::Topup(_)
-            | Command::Server { .. }
             | Command::Gate { .. }
+            | Command::Plans { .. }
             | Command::Docs { .. } => ToolKind::Mcp,
             Command::Mcp(_) => ToolKind::Mcp,
         }
@@ -273,12 +272,12 @@ impl Command {
             Command::Setup(cmd) => return cmd.run(),
             Command::ConnectOnboard(cmd) => return cmd.run(),
             Command::Topup(cmd) => return cmd.run(),
-            Command::Server { command } => {
-                return command.run(keypair_override, account_override, sandbox);
-            }
             Command::Gate { command } => {
                 return command.run(keypair_override, account_override, sandbox);
             }
+            Command::Plans { command } => match command {
+                server::PlansCommand::Publish(cmd) => return cmd.run(),
+            },
             Command::Mcp(cmd) => {
                 let options = cmd.options().map_err(pay_core::Error::Config)?;
                 let rt = tokio::runtime::Builder::new_multi_thread()
