@@ -4,8 +4,7 @@
 //! current working directory, then invokes `pay gate api` with sandbox and
 //! debugger implied.
 
-use crate::commands::server::start::StartCommand;
-use std::io::Write;
+use crate::commands::server::{atomic_write, start::StartCommand};
 
 const DEMO_PAYWALL: &str = include_str!("../../../../../playground-api.yaml");
 const LEGACY_BUNDLED_PLAN: &str = r#"      plan_id: 2steskyRfLpeetnbgpbUZP1CsE7Ve4SijNYK5gZnWdm7
@@ -51,7 +50,7 @@ impl DemoCommand {
         if !paywall_path.exists() {
             let challenge_secret = bs58::encode(rand::random::<[u8; 32]>()).into_string();
             let rendered = DEMO_PAYWALL.replace("${MPP_SECRET_KEY}", &challenge_secret);
-            write_demo_paywall(&paywall_path, &rendered)?;
+            atomic_write(&paywall_path, &rendered)?;
         } else {
             // A previous bundled template accidentally included Plan metadata
             // published for a developer wallet. Remove only that exact legacy
@@ -62,7 +61,7 @@ impl DemoCommand {
             })?;
             let migrated = migrate_legacy_bundled_plan(&current);
             if migrated != current {
-                write_demo_paywall(&paywall_path, &migrated)?;
+                atomic_write(&paywall_path, &migrated)?;
             }
         }
 
@@ -97,32 +96,6 @@ fn migrate_legacy_bundled_plan(yaml: &str) -> String {
     let legacy_crlf = LEGACY_BUNDLED_PLAN.replace('\n', "\r\n");
     yaml.replace(&legacy_crlf, "")
         .replace(LEGACY_BUNDLED_PLAN, "")
-}
-
-fn write_demo_paywall(path: &std::path::Path, contents: &str) -> pay_core::Result<()> {
-    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-    let mut temp = tempfile::Builder::new()
-        .prefix(".pay-demo.yaml.")
-        .tempfile_in(parent)
-        .map_err(|e| pay_core::Error::Config(format!("Failed to stage pay-demo.yaml: {e}")))?;
-
-    if let Ok(metadata) = std::fs::metadata(path) {
-        temp.as_file()
-            .set_permissions(metadata.permissions())
-            .map_err(|e| {
-                pay_core::Error::Config(format!(
-                    "Failed to preserve pay-demo.yaml permissions: {e}"
-                ))
-            })?;
-    }
-
-    temp.write_all(contents.as_bytes())
-        .and_then(|_| temp.as_file().sync_all())
-        .map_err(|e| pay_core::Error::Config(format!("Failed to stage pay-demo.yaml: {e}")))?;
-    temp.persist(path).map_err(|e| {
-        pay_core::Error::Config(format!("Failed to replace pay-demo.yaml: {}", e.error))
-    })?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -202,7 +175,7 @@ mod tests {
         let path = directory.path().join("pay-demo.yaml");
         std::fs::write(&path, "old").unwrap();
 
-        write_demo_paywall(&path, "new").unwrap();
+        atomic_write(&path, "new").unwrap();
 
         assert_eq!(std::fs::read_to_string(path).unwrap(), "new");
     }

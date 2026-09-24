@@ -8,6 +8,7 @@ pub mod scaffold;
 pub mod start;
 
 use clap::Subcommand;
+use std::io::Write;
 
 #[derive(Subcommand)]
 pub enum GateCommand {
@@ -29,6 +30,33 @@ pub enum GateCommand {
 pub enum PlansCommand {
     /// Preview Plan PDAs and optionally write them into the paywall YAML.
     Publish(plans::PublishCommand),
+}
+
+pub(crate) fn atomic_write(path: &std::path::Path, contents: &str) -> pay_core::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let mut temp = tempfile::Builder::new()
+        .prefix(".pay-write.")
+        .tempfile_in(parent)
+        .map_err(|e| pay_core::Error::Config(format!("Failed to stage {}: {e}", path.display())))?;
+
+    if let Ok(metadata) = std::fs::metadata(path) {
+        temp.as_file()
+            .set_permissions(metadata.permissions())
+            .map_err(|e| {
+                pay_core::Error::Config(format!(
+                    "Failed to preserve permissions for {}: {e}",
+                    path.display()
+                ))
+            })?;
+    }
+
+    temp.write_all(contents.as_bytes())
+        .and_then(|_| temp.as_file().sync_all())
+        .map_err(|e| pay_core::Error::Config(format!("Failed to stage {}: {e}", path.display())))?;
+    temp.persist(path).map_err(|e| {
+        pay_core::Error::Config(format!("Failed to replace {}: {}", path.display(), e.error))
+    })?;
+    Ok(())
 }
 
 impl GateCommand {
