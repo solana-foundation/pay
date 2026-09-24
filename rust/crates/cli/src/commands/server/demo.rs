@@ -5,6 +5,7 @@
 //! debugger implied.
 
 use crate::commands::server::start::StartCommand;
+use std::io::Write;
 
 const DEMO_PAYWALL: &str = include_str!("../../../../../playground-api.yaml");
 const LEGACY_BUNDLED_PLAN: &str = r#"      plan_id: 2steskyRfLpeetnbgpbUZP1CsE7Ve4SijNYK5gZnWdm7
@@ -50,9 +51,7 @@ impl DemoCommand {
         if !paywall_path.exists() {
             let challenge_secret = bs58::encode(rand::random::<[u8; 32]>()).into_string();
             let rendered = DEMO_PAYWALL.replace("${MPP_SECRET_KEY}", &challenge_secret);
-            std::fs::write(&paywall_path, rendered).map_err(|e| {
-                pay_core::Error::Config(format!("Failed to write pay-demo.yaml: {e}"))
-            })?;
+            write_demo_paywall(&paywall_path, &rendered)?;
         } else {
             // A previous bundled template accidentally included Plan metadata
             // published for a developer wallet. Remove only that exact legacy
@@ -63,9 +62,7 @@ impl DemoCommand {
             })?;
             let migrated = migrate_legacy_bundled_plan(&current);
             if migrated != current {
-                std::fs::write(&paywall_path, migrated).map_err(|e| {
-                    pay_core::Error::Config(format!("Failed to update pay-demo.yaml: {e}"))
-                })?;
+                write_demo_paywall(&paywall_path, &migrated)?;
             }
         }
 
@@ -97,7 +94,35 @@ impl DemoCommand {
 }
 
 fn migrate_legacy_bundled_plan(yaml: &str) -> String {
-    yaml.replace(LEGACY_BUNDLED_PLAN, "")
+    let legacy_crlf = LEGACY_BUNDLED_PLAN.replace('\n', "\r\n");
+    yaml.replace(&legacy_crlf, "")
+        .replace(LEGACY_BUNDLED_PLAN, "")
+}
+
+fn write_demo_paywall(path: &std::path::Path, contents: &str) -> pay_core::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let mut temp = tempfile::Builder::new()
+        .prefix(".pay-demo.yaml.")
+        .tempfile_in(parent)
+        .map_err(|e| pay_core::Error::Config(format!("Failed to stage pay-demo.yaml: {e}")))?;
+
+    if let Ok(metadata) = std::fs::metadata(path) {
+        temp.as_file()
+            .set_permissions(metadata.permissions())
+            .map_err(|e| {
+                pay_core::Error::Config(format!(
+                    "Failed to preserve pay-demo.yaml permissions: {e}"
+                ))
+            })?;
+    }
+
+    temp.write_all(contents.as_bytes())
+        .and_then(|_| temp.as_file().sync_all())
+        .map_err(|e| pay_core::Error::Config(format!("Failed to stage pay-demo.yaml: {e}")))?;
+    temp.persist(path).map_err(|e| {
+        pay_core::Error::Config(format!("Failed to replace pay-demo.yaml: {}", e.error))
+    })?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -155,9 +180,30 @@ mod tests {
     }
 
     #[test]
+    fn migrates_plan_metadata_with_crlf_line_endings() {
+        let yaml =
+            format!("subscription:\n{LEGACY_BUNDLED_PLAN}  period: 1d\n").replace('\n', "\r\n");
+
+        let migrated = migrate_legacy_bundled_plan(&yaml);
+
+        assert_eq!(migrated, "subscription:\r\n  period: 1d\r\n");
+    }
+
+    #[test]
     fn preserves_user_published_plan_metadata() {
         let yaml = "subscription:\n  plan_id: user-plan\n  plan_id_numeric: 42\n  plan_bump: 1\n  plan_created_at: 2\n";
 
         assert_eq!(migrate_legacy_bundled_plan(yaml), yaml);
+    }
+
+    #[test]
+    fn atomically_replaces_an_existing_demo_paywall() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pay-demo.yaml");
+        std::fs::write(&path, "old").unwrap();
+
+        write_demo_paywall(&path, "new").unwrap();
+
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "new");
     }
 }

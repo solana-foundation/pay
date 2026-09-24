@@ -299,6 +299,7 @@ fn main() {
                 | Command::Skills { .. }
                 | Command::Subscriptions { .. }
                 | Command::Catalog { .. }
+                | Command::Plans { .. }
                 | Command::Install(_)
                 | Command::Send(_)
                 | Command::Fanout(_)
@@ -828,6 +829,29 @@ mod tests {
     #[test]
     fn obsolete_plans_command_is_rejected() {
         assert!(Opts::try_parse_from(["pay", "serve", "plans", "publish"]).is_err());
+    }
+
+    #[test]
+    fn plans_publish_is_a_top_level_offline_workflow() {
+        let opts = Opts::try_parse_from([
+            "pay",
+            "plans",
+            "publish",
+            "--spec",
+            "paywall.yml",
+            "--write",
+        ])
+        .unwrap();
+
+        match opts.command {
+            Some(Command::Plans {
+                command: commands::server::PlansCommand::Publish(cmd),
+            }) => {
+                assert_eq!(cmd.spec, std::path::PathBuf::from("paywall.yml"));
+                assert!(cmd.write);
+            }
+            _ => panic!("expected top-level plans publish command"),
+        }
     }
 
     #[test]

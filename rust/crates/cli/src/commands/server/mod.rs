@@ -2,6 +2,7 @@ pub mod demo;
 pub mod inference;
 pub mod local_registration;
 pub(crate) mod payments;
+pub mod plans;
 pub(crate) mod provider_registration;
 pub mod scaffold;
 pub mod start;
@@ -22,6 +23,12 @@ pub enum GateCommand {
     /// Legacy alias for `pay gate api`.
     #[command(hide = true)]
     Start(start::StartCommand),
+}
+
+#[derive(Subcommand)]
+pub enum PlansCommand {
+    /// Preview Plan PDAs and optionally write them into the paywall YAML.
+    Publish(plans::PublishCommand),
 }
 
 impl GateCommand {

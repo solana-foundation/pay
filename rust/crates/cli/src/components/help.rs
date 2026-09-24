@@ -9,7 +9,7 @@ Options:
 pub const SUPPORTED_PASS_THROUGH_COMMANDS: &[&str] = &[
     "curl", "wget", "http", "claude", "codex", "goose", "qodercli", "whoami",
 ];
-pub const DEVELOPER_COMMANDS: &[&str] = &["gate", "catalog"];
+pub const DEVELOPER_COMMANDS: &[&str] = &["gate", "plans", "catalog"];
 pub const AGENT_COMMANDS: &[&str] = &["mcp", "skills"];
 pub const ACCOUNT_MANAGEMENT_COMMANDS: &[&str] =
     &["topup", "account", "setup", "send", "subscriptions"];
@@ -21,6 +21,7 @@ Supported pass-through:
 
 Developers:
   \x1b[1mgate\x1b[0m:    Gate APIs, local demos, or inference with stablecoin payments
+  \x1b[1mplans\x1b[0m:   Preview and prepare subscription Plan addresses offline
   \x1b[1mcatalog\x1b[0m: Make your API discoverable in pay's public catalog
 
 Agents:

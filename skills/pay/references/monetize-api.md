@@ -21,6 +21,10 @@ Start with a scaffold:
 pay gate scaffold paywall.yml
 ```
 
+To preview subscription Plan addresses without starting the gateway, run
+`pay plans publish --spec paywall.yml`. Add `--write` to pin the derived
+addresses after publishing the Plans through your external workflow.
+
 A minimal proxy spec:
 
 ```yaml
