@@ -7,6 +7,11 @@
 use crate::commands::server::start::StartCommand;
 
 const DEMO_PAYWALL: &str = include_str!("../../../../../playground-api.yaml");
+const LEGACY_BUNDLED_PLAN: &str = r#"      plan_id: 2steskyRfLpeetnbgpbUZP1CsE7Ve4SijNYK5gZnWdm7
+      plan_id_numeric: 8769999984541905
+      plan_bump: 253
+      plan_created_at: 1789072924
+"#;
 
 #[derive(clap::Args)]
 pub struct DemoCommand {
@@ -48,6 +53,20 @@ impl DemoCommand {
             std::fs::write(&paywall_path, rendered).map_err(|e| {
                 pay_core::Error::Config(format!("Failed to write pay-demo.yaml: {e}"))
             })?;
+        } else {
+            // A previous bundled template accidentally included Plan metadata
+            // published for a developer wallet. Remove only that exact legacy
+            // block so existing demos recover while user-published Plans stay
+            // pinned across restarts.
+            let current = std::fs::read_to_string(&paywall_path).map_err(|e| {
+                pay_core::Error::Config(format!("Failed to read pay-demo.yaml: {e}"))
+            })?;
+            let migrated = migrate_legacy_bundled_plan(&current);
+            if migrated != current {
+                std::fs::write(&paywall_path, migrated).map_err(|e| {
+                    pay_core::Error::Config(format!("Failed to update pay-demo.yaml: {e}"))
+                })?;
+            }
         }
 
         // Demo mode always runs on sandbox. Default to hosted Surfpool;
@@ -75,6 +94,10 @@ impl DemoCommand {
         };
         cmd.run(legacy_signer_source, account_override, true)
     }
+}
+
+fn migrate_legacy_bundled_plan(yaml: &str) -> String {
+    yaml.replace(LEGACY_BUNDLED_PLAN, "")
 }
 
 #[cfg(test)]
@@ -105,5 +128,36 @@ mod tests {
                 .subscription
                 .is_some()
         );
+
+        let subscription = api
+            .endpoints
+            .iter()
+            .find_map(|endpoint| endpoint.subscription.as_ref())
+            .unwrap();
+        assert!(subscription.plan_id.is_none());
+        assert!(subscription.plan_id_numeric.is_none());
+        assert!(subscription.plan_bump.is_none());
+        assert!(subscription.plan_created_at.is_none());
+    }
+
+    #[test]
+    fn migrates_plan_metadata_from_broken_bundled_demo() {
+        let yaml = format!(
+            "operator:\n  challenge_binding_secret: keep-me\nsubscription:\n{LEGACY_BUNDLED_PLAN}  period: 1d\n"
+        );
+
+        let migrated = migrate_legacy_bundled_plan(&yaml);
+
+        assert_eq!(
+            migrated,
+            "operator:\n  challenge_binding_secret: keep-me\nsubscription:\n  period: 1d\n"
+        );
+    }
+
+    #[test]
+    fn preserves_user_published_plan_metadata() {
+        let yaml = "subscription:\n  plan_id: user-plan\n  plan_id_numeric: 42\n  plan_bump: 1\n  plan_created_at: 2\n";
+
+        assert_eq!(migrate_legacy_bundled_plan(yaml), yaml);
     }
 }
