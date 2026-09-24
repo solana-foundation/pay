@@ -889,6 +889,128 @@ fn sniff_media_mime(bytes: &[u8]) -> Option<&'static str> {
 /// octet streams — round-trip without UTF-8 mangling.
 type PaidFetchResult = (Vec<u8>, Option<String>);
 
+fn hardware_address_matches(expected: Option<&str>, actual: &str) -> bool {
+    expected.is_none_or(|expected| actual == expected)
+}
+
+fn prepare_hardware_account(
+    store: &dyn pay_core::accounts::AccountsStore,
+    network: &str,
+    account_override: Option<String>,
+    peer: Option<&rmcp::Peer<rmcp::service::RoleServer>>,
+) -> Result<Option<String>, pay_core::Error> {
+    let accounts = store.load()?;
+    let selected = match account_override.as_deref() {
+        Some(name) => accounts
+            .named_account_for_network(network, name)
+            .or_else(|| {
+                (network != pay_core::accounts::MAINNET_NETWORK)
+                    .then(|| {
+                        accounts
+                            .named_account_for_network(pay_core::accounts::MAINNET_NETWORK, name)
+                    })
+                    .flatten()
+                    .filter(|account| account.backend == pay_core::accounts::BackendKind::Remote)
+            })
+            .map(|account| (name.to_string(), account)),
+        None => accounts
+            .account_for_network(network)
+            .map(|(name, account)| (name.to_string(), account)),
+    };
+    let Some((selected_name, selected_account)) = selected else {
+        return Ok(account_override);
+    };
+    let backend = selected_account.descriptor()?;
+    if backend.custody() != pay_core::backend::Custody::Hardware {
+        return Ok(account_override);
+    }
+    let provider_id = selected_account.provider.as_deref().ok_or_else(|| {
+        pay_core::Error::Config(format!(
+            "Hardware account `{selected_name}` is missing its provider."
+        ))
+    })?;
+    let provider = pay_core::remote::provider(provider_id).ok_or_else(|| {
+        pay_core::Error::Config(format!(
+            "Hardware provider `{provider_id}` is not available in this build."
+        ))
+    })?;
+    let wallet_id = selected_account.account.as_deref().ok_or_else(|| {
+        pay_core::Error::Config(format!(
+            "Hardware account `{selected_name}` is missing its wallet id."
+        ))
+    })?;
+
+    // Being attached does not mean the device is ready: it may still be
+    // locked. Only skip elicitation after an actual account connection works.
+    if backend.is_available()
+        && let Ok(signer) = provider.connect(&pay_core::remote::Credentials::new(), wallet_id)
+        && hardware_address_matches(
+            selected_account.pubkey.as_deref(),
+            &signer.pubkey().to_string(),
+        )
+    {
+        return Ok(account_override);
+    }
+
+    let alternatives = accounts
+        .accounts
+        .get(network)
+        .into_iter()
+        .flat_map(|network_accounts| network_accounts.iter())
+        .filter(|(name, account)| {
+            *name != &selected_name
+                && account.pubkey.is_some()
+                && account.descriptor().is_ok_and(|candidate| {
+                    candidate.custody() != pay_core::backend::Custody::Hardware
+                        || candidate.is_available()
+                })
+        })
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+
+    let Some(peer) = peer.filter(|peer| crate::context::peer_supports_elicitation(peer)) else {
+        let alternative_hint = if alternatives.is_empty() {
+            String::new()
+        } else {
+            format!(" Available alternatives: {}.", alternatives.join(", "))
+        };
+        return Err(pay_core::Error::PaymentRejected(format!(
+            "Payment requires a hardware wallet. Plug in your Ledger and unlock it.{alternative_hint}"
+        )));
+    };
+
+    loop {
+        match crate::auth::choose_hardware_account(peer, &selected_name, &alternatives)
+            .map_err(pay_core::Error::PaymentRejected)?
+        {
+            crate::auth::HardwareAccountChoice::UseAccount(name) => return Ok(Some(name)),
+            crate::auth::HardwareAccountChoice::ConnectDevice => {
+                let connected = provider
+                    .connect_interactive_for(
+                        &pay_core::remote::Credentials::new(),
+                        wallet_id,
+                        std::time::Duration::from_secs(1),
+                    )
+                    .map_err(|error| {
+                        pay_core::Error::PaymentRejected(format!(
+                            "Could not connect hardware account `{selected_name}`: {error}"
+                        ))
+                    })?;
+                if connected.as_ref().is_some_and(|signer| {
+                    hardware_address_matches(
+                        selected_account.pubkey.as_deref(),
+                        &signer.pubkey().to_string(),
+                    )
+                }) {
+                    return Ok(account_override);
+                }
+                // The device was not usable within the visible attempt. Ask
+                // again instead of polling forever after the dialog closes.
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn do_paid_fetch(
     method: &str,
@@ -931,7 +1053,7 @@ fn do_paid_fetch(
 
     let store: &dyn pay_core::accounts::AccountsStore = scope.accounts.as_ref();
     let network_override = scope.network_override.clone();
-    let account_override = scope.account_override.clone();
+    let mut account_override = scope.account_override.clone();
 
     // SIWMPP pre-attach: if a cached authenticate token covers this URL
     // (URL-prefix match against a tracked Active subscription with a
@@ -970,6 +1092,10 @@ fn do_paid_fetch(
         account_override.as_deref(),
     )?;
     let outcome = outcome.for_signer_support(signer_support);
+    if let Some(payment_network) = outcome.payment_network(network_override.as_deref())? {
+        account_override =
+            prepare_hardware_account(store, &payment_network, account_override, peer.as_ref())?;
+    }
 
     // A reused authorization that receives a 402 is no longer trustworthy.
     // Drop it before negotiating a fresh session from the server challenge.
@@ -1459,6 +1585,13 @@ fn interpret_retry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hardware_account_connection_must_match_saved_address() {
+        assert!(hardware_address_matches(None, "connected"));
+        assert!(hardware_address_matches(Some("saved"), "saved"));
+        assert!(!hardware_address_matches(Some("saved"), "different"));
+    }
 
     #[test]
     fn params_deserialize_minimal() {

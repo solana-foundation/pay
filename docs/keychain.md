@@ -79,11 +79,13 @@ a keypair; `accounts.yml` gets `keystore: remote, provider: <id>, account:
 ## Hardware wallets: Ledger
 
 `remote::ledger` (cargo feature `ledger` on pay-core and the CLI) wraps
-solana-keychain's `LedgerSigner`. It is a `RemoteProvider` with no credential
-fields: nothing is stored in the secret store, `accounts.yml` holds the
-derivation path as the wallet id plus the cached address, and the device is
-the approval. `pay setup --backend ledger` reads the first two standard
-derivation paths and lets the user pick.
+solana-keychain's `LedgerSigner`. The macOS CLI target enables this feature by
+default so Homebrew source builds include Ledger support; other targets opt in
+with `--features ledger`, and release binaries enable it on every target. It is
+a `RemoteProvider` with no credential fields: nothing is stored in the secret
+store, `accounts.yml` holds the derivation path as the wallet id plus the cached
+address, and the device is the approval. `pay setup --backend ledger` reads the
+first two standard derivation paths and lets the user pick.
 
 Two consequences flow from the attributes rather than from special cases:
 
@@ -106,9 +108,9 @@ Two consequences flow from the attributes rather than from special cases:
   that names the backend. Verified end to end: a Ledger paid a 0.045 USDC
   Gemini image charge on mainnet after skipping the session.
 
-The feature is opt-in because `hidapi` links IOKit on macOS, hid on Windows
-and libudev on Linux. Linux builds need `libudev-dev` and a udev rule for the
-device.
+The feature is opt-in outside macOS because `hidapi` links IOKit on macOS, hid
+on Windows and libudev on Linux. Linux builds need `libudev-dev` and a udev rule
+for the device.
 
 ## Tests
 

@@ -87,6 +87,7 @@ impl SetupCommand {
         // wallet. The MoonPay/onramp TUI is intentionally skipped — the
         // code is the funding source.
         if let Some(code) = &self.redeem {
+            install_agent_integrations();
             return self.run_redeem(&account_name, code);
         }
 
@@ -116,9 +117,11 @@ impl SetupCommand {
             return Ok(());
         }
 
-        // Resolve the backend first so an unavailable headless Secret Service
-        // does not leave MCP/agent configuration partially installed.
+        // Validate backend availability before writing agent configuration.
+        // This still keeps integrations before account creation and funding,
+        // without leaving MCP entries behind when backend preflight fails.
         let backend = super::account::new::resolve_backend(self.backend.as_deref())?;
+        install_agent_integrations();
 
         // Browser-linked remote wallet: the page owns sign-in and custody
         // choice, so none of the local keypair steps below apply. Nothing
@@ -131,14 +134,9 @@ impl SetupCommand {
                 &account_name,
                 super::connect_onboard::CONNECT_BACKEND_NAME,
                 false,
+                false,
             );
         }
-
-        // Offer to install the agent skill if npx is available.
-        maybe_install_skill();
-
-        // Install MCP configs into Claude / Codex / Claude Desktop.
-        install_mcp_configs();
 
         let (pubkey, backend_name) = super::account::new::create_account(
             &account_name,
@@ -159,6 +157,7 @@ impl SetupCommand {
             &account_name,
             backend_name,
             !has_biometric_backend(),
+            backend == "ledger",
         )
     }
 
@@ -178,8 +177,6 @@ impl SetupCommand {
         {
             (pk, true)
         } else {
-            maybe_install_skill();
-            install_mcp_configs();
             let (pk, _backend_name) = super::account::new::create_account(
                 account_name,
                 self.backend.as_deref(),
@@ -228,12 +225,18 @@ fn fund_new_account(
     account_name: &str,
     backend_name: &str,
     skip_tui: bool,
+    skip_topup_when_funded: bool,
 ) -> pay_core::Result<()> {
     let config = pay_core::Config::load().unwrap_or_default();
     let rpc_url = config
         .rpc_url
         .clone()
         .unwrap_or_else(pay_core::balance::mainnet_rpc_url);
+    if skip_topup_when_funded && let Some(balances) = existing_stablecoin_balances(&rpc_url, pubkey)
+    {
+        print_setup_already_funded(backend_name, &balances);
+        return Ok(());
+    }
     let completion = if skip_tui {
         None
     } else {
@@ -245,6 +248,49 @@ fn fund_new_account(
         print_setup_aborted(account_name, backend_name);
     }
     Ok(())
+}
+
+fn existing_stablecoin_balances(
+    rpc_url: &str,
+    pubkey: &str,
+) -> Option<pay_core::client::balance::AccountBalances> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    let balances = runtime
+        .block_on(pay_core::balance::get_stablecoin_balances(rpc_url, pubkey))
+        .ok()?;
+    has_stablecoin_balance(&balances).then_some(balances)
+}
+
+fn has_stablecoin_balance(balances: &pay_core::client::balance::AccountBalances) -> bool {
+    !balances.tokens_unavailable && balances.tokens.iter().any(|token| token.raw_amount > 0)
+}
+
+fn print_setup_already_funded(
+    backend_name: &str,
+    balances: &pay_core::client::balance::AccountBalances,
+) {
+    let held = balances
+        .tokens
+        .iter()
+        .filter(|token| token.raw_amount > 0)
+        .map(|token| {
+            let amount = format!("{:.6}", token.ui_amount)
+                .trim_end_matches('0')
+                .trim_end_matches('.')
+                .to_string();
+            format!("{amount} {}", token.symbol_or(&token.mint))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    crate::components::print_notice(
+        crate::components::NoticeLevel::Success,
+        "Setup complete",
+        &format!("Account secured in {backend_name}\nExisting balance: {held}\nTop-up skipped"),
+    );
+    print_ready_hint();
 }
 
 fn has_biometric_backend() -> bool {
@@ -461,11 +507,15 @@ fn shorten_pubkey(pk: &str) -> String {
 /// `pay setup --update`: refresh agent integrations without creating an account.
 fn run_update() -> pay_core::Result<()> {
     eprintln!();
-    maybe_install_skill();
-    install_mcp_configs();
+    install_agent_integrations();
     eprintln!("  {}", "Update complete.".dimmed());
     eprintln!();
     Ok(())
+}
+
+fn install_agent_integrations() {
+    maybe_install_skill();
+    install_mcp_configs();
 }
 
 // ── MCP config installation ────────────────────────────────────────────────
@@ -1011,6 +1061,25 @@ pub(crate) fn install_linux_polkit_policy_if_needed() -> pay_core::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ledger_topup_is_skipped_only_for_an_available_nonzero_stablecoin_balance() {
+        let mut balances = pay_core::client::balance::AccountBalances::default();
+        assert!(!has_stablecoin_balance(&balances));
+
+        balances
+            .tokens
+            .push(pay_core::client::balance::TokenBalance {
+                mint: pay_types::stablecoin_mints::USDC_MAINNET.to_string(),
+                raw_amount: 1,
+                ui_amount: 0.000_001,
+                symbol: Some("USDC".to_string()),
+            });
+        assert!(has_stablecoin_balance(&balances));
+
+        balances.tokens_unavailable = true;
+        assert!(!has_stablecoin_balance(&balances));
+    }
 
     #[test]
     fn codex_mcp_entry_includes_enabled_tools() {

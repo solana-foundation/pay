@@ -5125,6 +5125,7 @@ dependencies = [
  "mime_guess",
  "openssl-sys",
  "opentelemetry",
+ "owo-colors",
  "pay-keystore",
  "pay-types",
  "percent-encoding",

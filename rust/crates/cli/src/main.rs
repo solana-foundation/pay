@@ -522,7 +522,26 @@ fn init_logging(
     } else {
         "warn,solana_remote_wallet=off"
     };
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default));
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(default))
+        // Apply these even when RUST_LOG is set. Device discovery probes are
+        // expected to fail while a Ledger is locked; the interactive spinner
+        // owns that state and retries without alarming the user.
+        .add_directive(
+            "solana_remote_wallet=off"
+                .parse()
+                .expect("valid log directive"),
+        )
+        .add_directive(
+            "solana_keychain=error"
+                .parse()
+                .expect("valid log directive"),
+        )
+        .add_directive(
+            // solana-remote-wallet always scans for Trezor devices too. Its
+            // optional localhost Bridge being absent is not a Ledger error.
+            "trezor_client=off".parse().expect("valid log directive"),
+        );
 
     if let Some(sidecar) = otlp_sidecar {
         return match observability::init_otlp(sidecar, filter) {

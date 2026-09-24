@@ -28,7 +28,13 @@ pub async fn run_server(opts: &McpOptions) -> Result<(), String> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::DEBUG.into()),
+                .add_directive(tracing::Level::DEBUG.into())
+                .add_directive("trezor_client=off".parse().expect("valid log directive"))
+                .add_directive(
+                    "solana_remote_wallet=off"
+                        .parse()
+                        .expect("valid log directive"),
+                ),
         )
         .with_writer(std::io::stderr)
         .with_ansi(false)

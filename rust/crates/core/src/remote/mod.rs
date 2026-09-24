@@ -36,6 +36,7 @@ pub mod privy;
 
 use std::collections::BTreeMap;
 
+use owo_colors::OwoColorize;
 use pay_kit::solana_keychain::TransactionSigner;
 
 use crate::accounts::Account;
@@ -220,6 +221,15 @@ pub trait RemoteProvider: SigningBackend {
     /// Return only wallets the provider can actually sign for.
     fn discover(&self, credentials: &Credentials) -> Result<Vec<RemoteWallet>>;
 
+    /// Interactive variant of wallet discovery.
+    ///
+    /// Most providers fail immediately like [`discover`](Self::discover).
+    /// Hardware backends may wait for a device to be connected and become
+    /// usable while the CLI presents a progress indicator.
+    fn discover_interactive(&self, credentials: &Credentials) -> Result<Vec<RemoteWallet>> {
+        self.discover(credentials)
+    }
+
     /// What to tell the user when [`discover`](Self::discover) finds no
     /// usable wallet — typically how to create one.
     fn no_wallets_hint(&self) -> &'static str;
@@ -230,6 +240,31 @@ pub trait RemoteProvider: SigningBackend {
         credentials: &Credentials,
         wallet_id: &str,
     ) -> Result<Box<dyn TransactionSigner>>;
+
+    /// Interactive variant of signer connection.
+    ///
+    /// Hardware backends may wait for the selected device to be connected and
+    /// ready. Non-hardware providers retain the immediate behavior.
+    fn connect_interactive(
+        &self,
+        credentials: &Credentials,
+        wallet_id: &str,
+    ) -> Result<Box<dyn TransactionSigner>> {
+        self.connect(credentials, wallet_id)
+    }
+
+    /// Try an interactive hardware connection for at most `timeout`.
+    ///
+    /// `None` means the device did not become ready before the deadline. Most
+    /// providers make one immediate attempt; hardware providers can poll.
+    fn connect_interactive_for(
+        &self,
+        credentials: &Credentials,
+        wallet_id: &str,
+        _timeout: std::time::Duration,
+    ) -> Result<Option<Box<dyn TransactionSigner>>> {
+        self.connect(credentials, wallet_id).map(Some)
+    }
 }
 
 // ── Credential storage ──────────────────────────────────────────────────────
@@ -375,9 +410,24 @@ pub fn load_remote_signer_from(
         Credentials::new()
     };
 
-    let signer = provider
-        .connect(&credentials, &wallet_id)
-        .map_err(|e| explain_connect_failure(provider, &credentials, &wallet_id, name, e))?;
+    let wait_for_hardware = provider.custody() == crate::backend::Custody::Hardware
+        && std::io::IsTerminal::is_terminal(&std::io::stderr());
+    if wait_for_hardware {
+        eprintln!(
+            "{}",
+            format!(
+                "Waiting for {}… Plug it in and unlock it. Ctrl+C to cancel.",
+                provider.display_name()
+            )
+            .dimmed()
+        );
+    }
+    let signer = (if wait_for_hardware {
+        provider.connect_interactive(&credentials, &wallet_id)
+    } else {
+        provider.connect(&credentials, &wallet_id)
+    })
+    .map_err(|e| explain_connect_failure(provider, &credentials, &wallet_id, name, e))?;
 
     let address = signer.pubkey().to_string();
     if let Some(expected) = account.pubkey.as_deref()

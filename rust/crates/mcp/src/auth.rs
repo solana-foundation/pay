@@ -32,6 +32,7 @@ use pay_keystore::{AuthGate, AuthIntent, Error as KeystoreError};
 use rmcp::Peer;
 use rmcp::model::{
     CreateElicitationRequestParams, CreateElicitationResult, ElicitationAction, ElicitationSchema,
+    EnumSchema,
 };
 use rmcp::service::RoleServer;
 use tokio::runtime::Handle;
@@ -82,6 +83,101 @@ pub async fn confirm_file_upload(
 /// `elicitation/create` instead of a platform biometric prompt.
 pub struct ElicitationAuth {
     peer: Peer<RoleServer>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HardwareAccountChoice {
+    ConnectDevice,
+    UseAccount(String),
+}
+
+fn build_hardware_account_request(
+    selected_account: &str,
+    alternatives: &[String],
+) -> (CreateElicitationRequestParams, String) {
+    let connect_value = format!("Connect {selected_account} (Ledger)");
+    let (message, schema) = if alternatives.is_empty() {
+        (
+            "Payment requires a hardware wallet. Plug in and unlock your Ledger. Select Accept when the device is ready."
+                .to_string(),
+            ElicitationSchema::builder()
+                .build()
+                .expect("static hardware-wallet confirmation schema"),
+        )
+    } else {
+        let mut values = vec![connect_value.clone()];
+        values.extend(alternatives.iter().map(|name| format!("Use {name}")));
+        (
+            "Payment requires a hardware wallet. Plug in and unlock your Ledger, then choose its account when the device is ready—or choose another configured account."
+                .to_string(),
+            ElicitationSchema::builder()
+                .required_enum_schema("choice", EnumSchema::builder(values).build())
+                .build()
+                .expect("static hardware-account choice schema"),
+        )
+    };
+    (
+        CreateElicitationRequestParams::FormElicitationParams {
+            meta: None,
+            message,
+            requested_schema: schema,
+        },
+        connect_value,
+    )
+}
+
+fn interpret_hardware_account_choice(
+    result: CreateElicitationResult,
+    connect_value: &str,
+    alternatives: &[String],
+) -> Result<HardwareAccountChoice, String> {
+    match result.action {
+        ElicitationAction::Accept => {
+            if alternatives.is_empty() {
+                return Ok(HardwareAccountChoice::ConnectDevice);
+            }
+            let choice = result
+                .content
+                .as_ref()
+                .and_then(|content| content.get("choice"))
+                .and_then(|choice| choice.as_str())
+                .ok_or_else(|| "Wallet choice was accepted without a selection.".to_string())?;
+            if choice == connect_value {
+                return Ok(HardwareAccountChoice::ConnectDevice);
+            }
+            alternatives
+                .iter()
+                .find(|name| choice == format!("Use {name}"))
+                .cloned()
+                .map(HardwareAccountChoice::UseAccount)
+                .ok_or_else(|| "Wallet choice did not match an available account.".to_string())
+        }
+        ElicitationAction::Decline => Err("The user declined to choose a wallet.".to_string()),
+        ElicitationAction::Cancel => Err("The user cancelled wallet selection.".to_string()),
+    }
+}
+
+/// Ask the user how to proceed when the selected hardware wallet is not
+/// attached. The choice is made before any payment is signed.
+pub fn choose_hardware_account(
+    peer: &Peer<RoleServer>,
+    selected_account: &str,
+    alternatives: &[String],
+) -> Result<HardwareAccountChoice, String> {
+    let (params, connect_value) = build_hardware_account_request(selected_account, alternatives);
+    let peer = peer.clone();
+    let outcome: Result<CreateElicitationResult, rmcp::ServiceError> =
+        tokio::task::block_in_place(|| {
+            Handle::current().block_on(async move {
+                tokio::time::timeout(ELICITATION_TIMEOUT, peer.create_elicitation(params))
+                    .await
+                    .map_err(|_| rmcp::ServiceError::Timeout {
+                        timeout: ELICITATION_TIMEOUT,
+                    })?
+            })
+        });
+    let result = outcome.map_err(|error| format!("Could not ask which wallet to use: {error}"))?;
+    interpret_hardware_account_choice(result, &connect_value, alternatives)
 }
 
 impl ElicitationAuth {
@@ -272,6 +368,92 @@ mod tests {
         assert!(message.contains("1024 bytes"));
         assert!(message.contains("POST"));
         assert!(message.contains("https://api.example.com/upload"));
+    }
+
+    #[test]
+    fn hardware_account_request_names_ledger_and_alternatives() {
+        let alternatives = vec!["backup".to_string(), "travel".to_string()];
+        let (req, connect_value) = build_hardware_account_request("ledger-main", &alternatives);
+        let CreateElicitationRequestParams::FormElicitationParams {
+            message,
+            requested_schema,
+            ..
+        } = req
+        else {
+            panic!("expected a form elicitation request");
+        };
+
+        assert_eq!(connect_value, "Connect ledger-main (Ledger)");
+        assert!(message.contains("Payment requires a hardware wallet"));
+        assert!(message.contains("choose another configured account"));
+
+        let json = serde_json::to_value(requested_schema).expect("schema should serialize");
+        let choices = &json["properties"]["choice"]["enum"];
+        assert_eq!(
+            choices,
+            &serde_json::json!(["Connect ledger-main (Ledger)", "Use backup", "Use travel"])
+        );
+    }
+
+    #[test]
+    fn hardware_account_request_without_alternatives_has_no_required_choice() {
+        let (req, _) = build_hardware_account_request("ledger-main", &[]);
+        let CreateElicitationRequestParams::FormElicitationParams {
+            message,
+            requested_schema,
+            ..
+        } = req
+        else {
+            panic!("expected a form elicitation request");
+        };
+
+        assert_eq!(
+            message,
+            "Payment requires a hardware wallet. Plug in and unlock your Ledger. Select Accept when the device is ready."
+        );
+        let json = serde_json::to_value(requested_schema).expect("schema should serialize");
+        assert_eq!(json["properties"], serde_json::json!({}));
+        assert!(json.get("required").is_none());
+    }
+
+    #[test]
+    fn accepting_without_alternatives_connects_the_ledger() {
+        let choice = interpret_hardware_account_choice(
+            result(ElicitationAction::Accept, None),
+            "Connect ledger-main (Ledger)",
+            &[],
+        );
+        assert_eq!(choice, Ok(HardwareAccountChoice::ConnectDevice));
+    }
+
+    #[test]
+    fn hardware_account_choice_can_use_an_alternative() {
+        let alternatives = vec!["backup".to_string()];
+        let choice = interpret_hardware_account_choice(
+            result(
+                ElicitationAction::Accept,
+                Some(serde_json::json!({ "choice": "Use backup" })),
+            ),
+            "Connect ledger-main (Ledger)",
+            &alternatives,
+        );
+        assert_eq!(
+            choice,
+            Ok(HardwareAccountChoice::UseAccount("backup".to_string()))
+        );
+    }
+
+    #[test]
+    fn hardware_account_choice_rejects_missing_or_unknown_selection() {
+        let alternatives = vec!["backup".to_string()];
+        for content in [None, Some(serde_json::json!({ "choice": "Use unknown" }))] {
+            let choice = interpret_hardware_account_choice(
+                result(ElicitationAction::Accept, content),
+                "Connect ledger-main (Ledger)",
+                &alternatives,
+            );
+            assert!(choice.is_err());
+        }
     }
 
     fn result(

@@ -42,6 +42,36 @@ pub fn parse_headers(headers: &[(String, String)]) -> Vec<Challenge> {
     )
 }
 
+/// Resolve the pay account-network slug advertised by an MPP challenge.
+///
+/// All Solana MPP intents carry their network in `methodDetails`, so this
+/// deliberately decodes only that common envelope instead of guessing from
+/// the caller's currently active account.
+pub fn challenge_network(challenge: &Challenge, network_override: Option<&str>) -> Result<String> {
+    if let Some(network) = network_override {
+        return Ok(network.to_string());
+    }
+
+    let request: serde_json::Value = challenge
+        .request
+        .decode()
+        .map_err(|e| Error::Mpp(format!("Failed to decode challenge request: {e}")))?;
+    let details = request.get("methodDetails");
+    let network = details
+        .and_then(|value| value.get("network"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("mainnet");
+    let blockhash = details
+        .and_then(|value| value.get("recentBlockhash"))
+        .and_then(serde_json::Value::as_str);
+
+    if blockhash.is_some_and(|value| value.starts_with(SURFPOOL_BLOCKHASH_PREFIX)) {
+        Ok("localnet".to_string())
+    } else {
+        Ok(normalize_network(network).to_string())
+    }
+}
+
 /// Build a signed credential and return the `Authorization` header value
 /// alongside an optional `ResolvedEphemeral` notice that the caller should
 /// render if `Some` (signals "we just generated a fresh ephemeral wallet
