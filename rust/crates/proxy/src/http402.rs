@@ -10,14 +10,11 @@
 //! This is the production data plane: Pingora fronts everything, axum is demoted
 //! to an internal control-plane upstream.
 //!
-//! ## Deferred (documented)
-//! - **Body-signing auth**: request bodies stream to the upstream unbuffered, so
-//!   auth schemes that digest the body (HMAC / `AccessToken` `body_digest`) can't
-//!   be signed here — those requests are **refused with 501** in
-//!   [`Http402Gate::plan_upstream`] (loud + logged) rather than silently forwarded
-//!   with a signature computed over an empty body. Header / Bearer / OAuth2 /
-//!   QueryParam auth, and HMAC that doesn't digest the body, all work. Lifting
-//!   this needs request-body buffering before the upstream connect.
+//! ## Buffered paths
+//! - **Body-signing auth**: auth schemes that digest the body (HMAC /
+//!   `AccessToken` `body_digest`) need the complete request before the upstream
+//!   connect. Those requests use the bounded buffered path; all other auth keeps
+//!   using Pingora's native streaming path.
 //! - **Response metering**: Delegated MPP sessions and x402 `upto` share the
 //!   buffered response-metering path so usage is rated once and settlement is
 //!   persisted before release.
@@ -215,34 +212,15 @@ impl<S: PaymentState> Http402Gate<S> {
                 .await;
             return Ok(true);
         };
-        // The body is streamed unbuffered (see module docs), so we can't compute
-        // a body-digest signature here. Refuse loudly rather than forward a
-        // request signed over an empty body (which the upstream would reject with
-        // an opaque 401/403). Header / Bearer / OAuth2 / QueryParam auth, and
-        // HMAC that doesn't digest the body, are unaffected.
+        // Body-digest auth needs the complete request before auth preparation.
+        // Keep the common case on Pingora's native streaming path and route only
+        // these endpoints through the bounded reqwest adapter.
         if routing_signs_request_body(api, path) {
-            tracing::error!(
-                path,
-                "refusing request: upstream auth signs the request body, which the pingora data \
-                 plane does not support (body is streamed, not buffered)"
-            );
-            // On a `Forward` the x402 `exact` payment already settled on-chain
-            // (the gate settles in verify), so this 501 must still carry the
-            // PAYMENT-RESPONSE receipt — otherwise the client is charged with no
-            // proof. Drain it (and refund any `upto` channel) onto the response.
-            let mut resp = GateResponse::json(
-                StatusCode::NOT_IMPLEMENTED,
-                Bytes::from_static(
-                    b"{\"error\":\"unsupported_auth\",\"message\":\"This endpoint's upstream \
-                      auth signs the request body, which the gateway does not yet support.\"}",
-                ),
-            );
-            resp.headers
-                .extend(self.drain_payment_headers(ctx, false).await);
-            write_gate_response(session, resp).await?;
-            return Ok(true);
+            return self
+                .forward_buffered(session, ctx, path, host, method, uri, headers)
+                .await;
         }
-        // No body-signing auth → an empty placeholder body is safe for prep.
+        // No body-signing auth: an empty placeholder body is safe for prep.
         match prepare_upstream(api, method, uri, headers, &[]).await {
             Ok(UpstreamPlan::Forward(prepared)) => {
                 ctx.target = Some(target_from_prepared(prepared, api.subdomain.clone()));
@@ -288,8 +266,8 @@ impl<S: PaymentState> Http402Gate<S> {
     /// Settle/refund pending payment side-effects and collect the headers that
     /// must ride the response: refund an open `upto` channel and surface the
     /// x402 `exact` `PAYMENT-RESPONSE` receipt. Used by every terminal path that
-    /// `response_filter` doesn't reach (respond-mode, the body-signing 501
-    /// refusal, and connect/proxy failures) so a settled payment always returns
+    /// `response_filter` doesn't reach (respond-mode and connect/proxy failures)
+    /// so a settled payment always returns
     /// its proof. `served_ok` decides debit vs full refund for `upto`.
     async fn drain_payment_headers(
         &self,
@@ -381,7 +359,7 @@ impl<S: PaymentState> Http402Gate<S> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn forward_response_metered_buffered(
+    async fn forward_buffered(
         &self,
         session: &mut Session,
         ctx: &mut Ctx,
@@ -407,7 +385,7 @@ impl<S: PaymentState> Http402Gate<S> {
         let body = match read_downstream_body(session, BUFFERED_REQUEST_BODY_LIMIT).await {
             Ok(body) => body,
             Err(e) => {
-                tracing::warn!(error = %e, "failed to buffer response-metered request body");
+                tracing::warn!(error = %e, "failed to buffer request body");
                 let extra = self.drain_payment_headers(ctx, false).await;
                 write_buffered_response(
                     session,
@@ -445,7 +423,10 @@ impl<S: PaymentState> Http402Gate<S> {
                     .and_then(|pending| pending.settlement.as_deref())
             })
             .map(|plan| metering::upto_response_body_limit(&plan.metering))
-            .unwrap_or(DEFAULT_RESPONSE_BODY_LIMIT);
+            // Body-signing endpoints are buffered for request preparation, not
+            // response metering. Allow their normal API responses up to the same
+            // bounded size as their requests.
+            .unwrap_or(BUFFERED_REQUEST_BODY_LIMIT);
 
         let client = reqwest::Client::new();
         let mut upstream_req = client.request(
@@ -504,7 +485,7 @@ impl<S: PaymentState> Http402Gate<S> {
                     prepared.url.as_str(),
                     &e.to_string(),
                 );
-                tracing::warn!(error = %e, "failed to buffer response-metered body");
+                tracing::warn!(error = %e, "failed to buffer upstream response body");
                 let extra = self.drain_payment_headers(ctx, false).await;
                 write_buffered_response(
                     session,
@@ -551,10 +532,7 @@ impl<S: PaymentState> Http402Gate<S> {
             )
             .await;
         write_buffered_response(session, status, response_headers, body, extra).await?;
-        tracing::debug!(
-            path,
-            "served payment via buffered response-metered proxy path"
-        );
+        tracing::debug!(path, "served via buffered proxy path");
         Ok(true)
     }
 
@@ -784,7 +762,7 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                     });
                 if delegated_session || response_metered_upto {
                     return self
-                        .forward_response_metered_buffered(
+                        .forward_buffered(
                             session,
                             ctx,
                             &path,
