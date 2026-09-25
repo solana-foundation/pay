@@ -538,6 +538,14 @@ fn init_logging(
                 .expect("valid log directive"),
         )
         .add_directive(
+            // Ledger connection failures are returned as structured pay
+            // errors. Logging them here duplicates the final message and can
+            // redraw the same warning through an interactive spinner.
+            "solana_keychain::ledger=off"
+                .parse()
+                .expect("valid log directive"),
+        )
+        .add_directive(
             // solana-remote-wallet always scans for Trezor devices too. Its
             // optional localhost Bridge being absent is not a Ledger error.
             "trezor_client=off".parse().expect("valid log directive"),
