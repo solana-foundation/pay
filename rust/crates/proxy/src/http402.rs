@@ -184,6 +184,9 @@ impl<S: PaymentState> Http402Gate<S> {
     /// Prepare a request whose upstream authentication depends on its body.
     /// Kept on the gate so the buffered route has a focused regression seam:
     /// tests can prove the exact bytes read from downstream reach auth prep.
+    // The response-shaped error is consumed immediately by `forward_buffered`;
+    // boxing it would add allocation and obscure the existing response path.
+    #[allow(clippy::result_large_err)]
     async fn prepare_buffered_request(
         &self,
         api: &ApiSpec,

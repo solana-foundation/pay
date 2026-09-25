@@ -983,10 +983,10 @@ fn render_topup_selector(
 /// banner. Pure: separated from the render path so we can unit-test it.
 fn scan_banner_text(account_name: &str, amount_pos: usize) -> String {
     if amount_pos == 0 {
-        format!("Scan to send any amount of USDC to @{account_name}")
+        format!("Scan to add any amount of API credits to @{account_name}")
     } else {
         let amount = amount_pos as f64 * TOPUP_STEP_USDC;
-        format!("Scan to send ${amount:.0} USDC to @{account_name}")
+        format!("Scan to add ${amount:.0} in API credits to @{account_name}")
     }
 }
 
@@ -1935,7 +1935,7 @@ mod tests {
     fn scan_banner_text_uses_dollar_amount_for_nonzero_pos() {
         assert_eq!(
             scan_banner_text("default", 3),
-            "Scan to send $3 USDC to @default"
+            "Scan to add $3 in API credits to @default"
         );
     }
 
@@ -1943,7 +1943,7 @@ mod tests {
     fn scan_banner_text_handles_any_amount() {
         assert_eq!(
             scan_banner_text("default", 0),
-            "Scan to send any amount of USDC to @default"
+            "Scan to add any amount of API credits to @default"
         );
     }
 
