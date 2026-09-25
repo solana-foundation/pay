@@ -26,7 +26,7 @@ bincode = { workspace = true }
 clap = { workspace = true }
 http = { version = "1", optional = true }
 hmac = "0.12"
-jsonwebtoken = { version = "9", optional = true }
+jsonwebtoken = { version = "10", optional = true }
 pay-core = { workspace = true, optional = true }
 pay-kit = { workspace = true }
 pay-mcp = { workspace = true, optional = true }
