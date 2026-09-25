@@ -594,7 +594,21 @@ impl<S: PaymentState> Http402Gate<S> {
                 }
                 Err(error) => {
                     tracing::warn!(%error, "streaming body-signing upstream response failed");
-                    break;
+                    observer.finish();
+                    if let Some(log_id) = ctx.log.as_ref().and_then(|log| log.log_id) {
+                        self.state.record_exchange_update(log_id, &observer.usage);
+                    }
+                    ctx.buffered_usage = Some(observer.usage);
+                    // Headers and possibly body bytes are already downstream,
+                    // so a replacement HTTP error is impossible. Return a
+                    // read error without writing the final body marker; Pingora
+                    // will terminate the downstream stream instead of making a
+                    // truncated response look like a clean EOF.
+                    return Err(pingora::Error::because(
+                        pingora::ErrorType::ReadError,
+                        "body-signing upstream stream failed",
+                        error,
+                    ));
                 }
             }
         }
