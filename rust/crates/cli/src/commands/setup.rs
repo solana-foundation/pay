@@ -126,8 +126,12 @@ impl SetupCommand {
             backend
         } else {
             super::account::new::ensure_backend_picker_available()?;
-            install_agent_integrations();
-            super::account::new::resolve_backend(None)?
+            if prompt_skill_install() {
+                install_skill_for_agents();
+            }
+            let backend = super::account::new::resolve_backend(None)?;
+            install_mcp_configs();
+            backend
         };
 
         // Browser-linked remote wallet: the page owns sign-in and custody
@@ -521,7 +525,14 @@ fn run_update() -> pay_core::Result<()> {
 }
 
 fn install_agent_integrations() {
-    maybe_install_skill();
+    let install_skill = prompt_skill_install();
+    apply_agent_integrations(install_skill);
+}
+
+fn apply_agent_integrations(install_skill: bool) {
+    if install_skill {
+        install_skill_for_agents();
+    }
     install_mcp_configs();
 }
 
@@ -953,8 +964,8 @@ fn item_string_array(item: Option<&Item>) -> Option<Vec<&str>> {
 
 // ── Skill installation ─────────────────────────────────────────────────────
 
-/// If `npx` is on PATH, offer to install the pay agent skill for coding agents.
-fn maybe_install_skill() {
+/// If `npx` is on PATH, ask whether to install the pay agent skill.
+fn prompt_skill_install() -> bool {
     let npx_bin = if cfg!(windows) { "npx.cmd" } else { "npx" };
     let has_npx = std::process::Command::new(npx_bin)
         .arg("--version")
@@ -964,19 +975,19 @@ fn maybe_install_skill() {
         .is_ok_and(|s| s.success());
 
     if !has_npx {
-        return;
+        return false;
     }
 
     eprintln!();
-    let install = Confirm::with_theme(&dialoguer::theme::ColorfulTheme::default())
+    Confirm::with_theme(&dialoguer::theme::ColorfulTheme::default())
         .with_prompt("Install pay skill for your coding agents? (Claude Code, Cursor, …)")
         .default(true)
         .interact()
-        .unwrap_or(false);
+        .unwrap_or(false)
+}
 
-    if !install {
-        return;
-    }
+fn install_skill_for_agents() {
+    let npx_bin = if cfg!(windows) { "npx.cmd" } else { "npx" };
 
     eprintln!();
     let status = std::process::Command::new(npx_bin)
