@@ -476,6 +476,28 @@ impl<S: PaymentState> Http402Gate<S> {
             );
         }
         let response_headers = filtered_response_headers(upstream.headers());
+        if is_streamed_response(&response_headers)
+            && ctx.upto.is_none()
+            && ctx.session.is_none()
+            && ctx.batch.is_none()
+        {
+            let extra = self
+                .drain_payment_headers_with_response(
+                    ctx,
+                    status.is_success(),
+                    Some(status),
+                    &response_headers,
+                    None,
+                )
+                .await;
+            self.stream_buffered_upstream(session, ctx, status, response_headers, upstream, extra)
+                .await?;
+            tracing::debug!(
+                path,
+                "served streaming response via body-signing proxy path"
+            );
+            return Ok(true);
+        }
         let body = match collect_reqwest_body(upstream, response_limit).await {
             Ok(body) => body,
             Err(e) => {
@@ -534,6 +556,55 @@ impl<S: PaymentState> Http402Gate<S> {
         write_buffered_response(session, status, response_headers, body, extra).await?;
         tracing::debug!(path, "served via buffered proxy path");
         Ok(true)
+    }
+
+    async fn stream_buffered_upstream(
+        &self,
+        session: &mut Session,
+        ctx: &mut Ctx,
+        status: StatusCode,
+        headers: HeaderMap,
+        upstream: reqwest::Response,
+        extra: Vec<(HeaderName, HeaderValue)>,
+    ) -> pingora::Result<()> {
+        let mut out = ResponseHeader::build(status.as_u16(), None)?;
+        for (name, value) in headers {
+            let Some(name) = name else {
+                continue;
+            };
+            out.append_header(name, value)?;
+        }
+        for (name, value) in extra {
+            let _ = out.append_header(name, value);
+        }
+        session.write_response_header(Box::new(out), false).await?;
+
+        let request_start = ctx
+            .log
+            .as_ref()
+            .map(|log| log.start)
+            .unwrap_or_else(std::time::Instant::now);
+        let mut observer = crate::observer::StreamObserver::new(true);
+        let mut stream = upstream.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(chunk) => {
+                    observer.on_chunk(&chunk, request_start);
+                    session.write_response_body(Some(chunk), false).await?;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "streaming body-signing upstream response failed");
+                    break;
+                }
+            }
+        }
+        observer.finish();
+        if let Some(log_id) = ctx.log.as_ref().and_then(|log| log.log_id) {
+            self.state.record_exchange_update(log_id, &observer.usage);
+        }
+        ctx.buffered_usage = Some(observer.usage);
+        session.write_response_body(None, true).await?;
+        Ok(())
     }
 
     fn observe_buffered_metered_response(&self, ctx: &mut Ctx, headers: &HeaderMap, body: &[u8]) {

@@ -1086,16 +1086,16 @@ fn do_paid_fetch(
     }
 
     let outcome = fetch_request(&initial_headers)?;
+    if let Some(payment_network) = outcome.payment_network(network_override.as_deref())? {
+        account_override =
+            prepare_hardware_account(store, &payment_network, account_override, peer.as_ref())?;
+    }
     let signer_support = outcome.configured_signer_support(
         store,
         network_override.as_deref(),
         account_override.as_deref(),
     )?;
     let outcome = outcome.for_signer_support(signer_support);
-    if let Some(payment_network) = outcome.payment_network(network_override.as_deref())? {
-        account_override =
-            prepare_hardware_account(store, &payment_network, account_override, peer.as_ref())?;
-    }
 
     // A reused authorization that receives a 402 is no longer trustworthy.
     // Drop it before negotiating a fresh session from the server challenge.
