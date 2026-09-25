@@ -28,7 +28,7 @@ const COMMIT_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const COMMIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const LIFECYCLE_TOUCH_INTERVAL: Duration = Duration::from_secs(30);
 
-type BoxError = Box<dyn StdError + Send + Sync>;
+pub type BoxError = Box<dyn StdError + Send + Sync>;
 
 /// Session data attached by the payment middleware to a paid upstream retry.
 #[derive(Clone)]
@@ -158,7 +158,7 @@ pub struct SessionStreamMeter {
 /// The meter owns the session's capacity lease for the lifetime of the body.
 /// Each cumulative usage increase is signed and persisted before the bytes
 /// that exposed it are released to the client.
-pub(crate) struct DelegatedSessionStreamMeter {
+pub struct DelegatedSessionStreamMeter {
     forward: SessionForward,
     gate: SessionUsageGate,
     accumulator: StreamUsageAccumulator,
@@ -170,7 +170,7 @@ pub(crate) struct DelegatedSessionStreamMeter {
 }
 
 impl DelegatedSessionStreamMeter {
-    pub(crate) fn from_forward(forward: SessionForward) -> Result<Self, BoxError> {
+    pub fn from_forward(forward: SessionForward) -> Result<Self, BoxError> {
         let plan = forward.settlement.as_deref().ok_or_else(|| {
             box_error(std::io::Error::other(
                 "delegated stream forward is missing its settlement plan",
@@ -208,7 +208,7 @@ impl DelegatedSessionStreamMeter {
         })
     }
 
-    pub(crate) fn supports(forward: &SessionForward) -> bool {
+    pub fn supports(forward: &SessionForward) -> bool {
         let Some(plan) = forward.settlement.as_deref() else {
             return false;
         };
@@ -347,6 +347,23 @@ impl DelegatedSessionStreamMeter {
             .touch_channel_unconfirmed(self.forward.channel_id.clone());
         self.next_lifecycle_touch = now + LIFECYCLE_TOUCH_INTERVAL;
     }
+
+    /// Meter and durably authorize one response chunk before it is released.
+    pub async fn authorize_chunk(&mut self, chunk: &[u8], is_sse: bool) -> Result<(), BoxError> {
+        self.touch_channel_if_due();
+        if let Some(decision) = self.observe_chunk(chunk, is_sse)? {
+            self.settle(decision).await?;
+        }
+        Ok(())
+    }
+
+    /// Persist any final cumulative usage before the response stream closes.
+    pub async fn finish_stream(&mut self) -> Result<(), BoxError> {
+        if let Some(decision) = self.finish()? {
+            self.settle(decision).await?;
+        }
+        Ok(())
+    }
 }
 
 impl SessionStreamMeter {
@@ -456,17 +473,11 @@ where
         futures_util::pin_mut!(stream);
         while let Some(next) = stream.next().await {
             let chunk = next.map_err(box_error)?;
-            meter.touch_channel_if_due();
-            let decision = meter.observe_chunk(&chunk, is_sse)?;
-            if let Some(decision) = decision {
-                meter.settle(decision).await?;
-            }
+            meter.authorize_chunk(&chunk, is_sse).await?;
             yield chunk;
         }
 
-        if let Some(decision) = meter.finish().map_err(box_error)? {
-            meter.settle(decision).await?;
-        }
+        meter.finish_stream().await?;
     }
 }
 
@@ -514,6 +525,7 @@ struct StreamUsageAccumulator {
     spec: SessionMeterSpec,
     hints: SessionUsageHints,
     sse: SseUsageDecoder,
+    ndjson: NdjsonUsageDecoder,
     output_bytes: u64,
     output_chars: u64,
     output_words: u64,
@@ -529,6 +541,7 @@ impl StreamUsageAccumulator {
             spec,
             hints,
             sse: SseUsageDecoder::default(),
+            ndjson: NdjsonUsageDecoder::default(),
             output_bytes: 0,
             output_chars: 0,
             output_words: 0,
@@ -550,13 +563,16 @@ impl StreamUsageAccumulator {
 
         if is_sse {
             changed |= self.observe_sse_chunk(chunk);
-        } else if observes_unit(&self.spec, BillingUnit::Characters) {
-            let text = String::from_utf8_lossy(chunk);
-            self.output_chars = self
-                .output_chars
-                .saturating_add(text.chars().count() as u64);
-            self.output_words = self.output_words.saturating_add(count_words(&text));
-            changed = true;
+        } else {
+            changed |= self.observe_ndjson_chunk(chunk);
+            if observes_unit(&self.spec, BillingUnit::Characters) {
+                let text = String::from_utf8_lossy(chunk);
+                self.output_chars = self
+                    .output_chars
+                    .saturating_add(text.chars().count() as u64);
+                self.output_words = self.output_words.saturating_add(count_words(&text));
+                changed = true;
+            }
         }
 
         self.observed |= changed;
@@ -580,26 +596,39 @@ impl StreamUsageAccumulator {
                 continue;
             };
 
-            let text_chars = streamed_text_char_count(&value);
-            if text_chars > 0 {
-                self.output_chars = self.output_chars.saturating_add(text_chars);
-                self.output_words = self
-                    .output_words
-                    .saturating_add(streamed_text_word_count(&value));
-                changed = true;
-            }
-
-            if let Some(input) = provider_token_quantity(&value, MeterDirection::Input) {
-                self.input_tokens = self.input_tokens.max(input);
-                changed = true;
-            }
-
-            if let Some(output) = provider_token_quantity(&value, MeterDirection::Output) {
-                self.output_tokens = self.output_tokens.max(output);
-                changed = true;
-            }
+            changed |= self.observe_stream_value(&value);
         }
 
+        changed
+    }
+
+    fn observe_ndjson_chunk(&mut self, chunk: &[u8]) -> bool {
+        let Ok(values) = self.ndjson.push_chunk(chunk) else {
+            return false;
+        };
+        values.iter().fold(false, |changed, value| {
+            changed | self.observe_stream_value(value)
+        })
+    }
+
+    fn observe_stream_value(&mut self, value: &Value) -> bool {
+        let mut changed = false;
+        let text_chars = streamed_text_char_count(value);
+        if text_chars > 0 {
+            self.output_chars = self.output_chars.saturating_add(text_chars);
+            self.output_words = self
+                .output_words
+                .saturating_add(streamed_text_word_count(value));
+            changed = true;
+        }
+        if let Some(input) = provider_token_quantity(value, MeterDirection::Input) {
+            self.input_tokens = self.input_tokens.max(input);
+            changed = true;
+        }
+        if let Some(output) = provider_token_quantity(value, MeterDirection::Output) {
+            self.output_tokens = self.output_tokens.max(output);
+            changed = true;
+        }
         changed
     }
 
@@ -659,6 +688,28 @@ struct SseUsageDecoder {
 #[derive(Debug, Clone)]
 struct SseUsageEvent {
     data: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct NdjsonUsageDecoder {
+    buffer: String,
+}
+
+impl NdjsonUsageDecoder {
+    fn push_chunk(&mut self, chunk: &[u8]) -> Result<Vec<Value>, std::str::Utf8Error> {
+        self.buffer.push_str(std::str::from_utf8(chunk)?);
+        let mut values = Vec::new();
+        while let Some(index) = self.buffer.find('\n') {
+            let line = self.buffer[..index].trim().to_string();
+            self.buffer.drain(..=index);
+            if !line.is_empty()
+                && let Ok(value) = serde_json::from_str(&line)
+            {
+                values.push(value);
+            }
+        }
+        Ok(values)
+    }
 }
 
 impl SseUsageDecoder {
@@ -1003,6 +1054,32 @@ mod tests {
         assert_eq!(
             observation.get(MeterDirection::Output, BillingUnit::QuotaUnits),
             Some(3)
+        );
+    }
+
+    #[test]
+    fn ndjson_accumulator_observes_usage_across_chunk_boundaries() {
+        let spec = SessionMeterSpec::new([
+            SessionMeterDimension::required(MeterDirection::Input, BillingUnit::Tokens, 1, 1),
+            SessionMeterDimension::required(MeterDirection::Output, BillingUnit::Tokens, 1, 1),
+        ]);
+        let mut accumulator = StreamUsageAccumulator::new(spec, SessionUsageHints::default());
+
+        assert!(!accumulator.observe_chunk(br#"{"usage":{"prompt_tokens":8,"comple"#, false));
+        assert!(accumulator.observe_chunk(
+            br#"tion_tokens":5}}
+"#,
+            false,
+        ));
+        let observation = accumulator.observation();
+
+        assert_eq!(
+            observation.get(MeterDirection::Input, BillingUnit::Tokens),
+            Some(8)
+        );
+        assert_eq!(
+            observation.get(MeterDirection::Output, BillingUnit::Tokens),
+            Some(5)
         );
     }
 

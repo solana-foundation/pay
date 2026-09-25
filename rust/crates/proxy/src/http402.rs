@@ -15,9 +15,10 @@
 //!   `AccessToken` `body_digest`) need the complete request before the upstream
 //!   connect. Those requests use the bounded buffered path; all other auth keeps
 //!   using Pingora's native streaming path.
-//! - **Response metering**: Delegated MPP sessions and x402 `upto` share the
-//!   buffered response-metering path so usage is rated once and settlement is
-//!   persisted before release.
+//! - **Response metering**: delegated MPP SSE/NDJSON responses are rated and
+//!   authorized incrementally before each chunk is released. Responses whose
+//!   pricing cannot be observed safely in-stream, including x402 `upto`, stay
+//!   on the bounded response-metering path.
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
@@ -34,6 +35,7 @@ use pay_core::server::metering::{self, UptoSettlementPlan};
 use pay_core::server::proxy::{
     STRIP_HEADERS, UpstreamPlan, prepare_upstream, routing_signs_request_body,
 };
+use pay_core::server::session_stream::DelegatedSessionStreamMeter;
 use pay_core::server::telemetry;
 use pay_kit::x402::server::VerifiedUptoOpen;
 use pay_types::metering::ApiSpec;
@@ -76,9 +78,9 @@ pub struct Ctx {
     /// lets pay-kit attach the complete representation after end-of-stream.
     batch_cache: Option<BatchForward>,
     batch_response: Option<BatchResponseCapture>,
-    /// A delegated MPP session opened pre-serve. Responses are buffered and
-    /// rated with the same usage pipeline as x402 `upto`, then the gateway
-    /// signs and persists the cumulative voucher before returning the body.
+    /// A delegated MPP session opened pre-serve. Observable streams authorize
+    /// cumulative usage before each chunk is released; other responses are
+    /// buffered and settled before the body is returned.
     session: Option<SessionForward>,
     /// Present only for payment-backed forwards. Consumed by `logging`, where
     /// Pingora exposes the final downstream status for every forwarding path.
@@ -496,9 +498,13 @@ impl<S: PaymentState> Http402Gate<S> {
             );
         }
         let response_headers = filtered_response_headers(upstream.headers());
+        let delegated_stream = ctx
+            .session
+            .as_ref()
+            .is_some_and(DelegatedSessionStreamMeter::supports);
         if is_streamed_response(&response_headers)
             && ctx.upto.is_none()
-            && ctx.session.is_none()
+            && (ctx.session.is_none() || delegated_stream)
             && ctx.batch.is_none()
         {
             let extra = self
@@ -587,6 +593,19 @@ impl<S: PaymentState> Http402Gate<S> {
         upstream: reqwest::Response,
         extra: Vec<(HeaderName, HeaderValue)>,
     ) -> pingora::Result<()> {
+        let is_sse = is_sse_response(&headers);
+        let mut delegated_meter = match ctx.session.take() {
+            Some(forward) => Some(DelegatedSessionStreamMeter::from_forward(forward).map_err(
+                |error| {
+                    pingora::Error::because(
+                        pingora::ErrorType::InternalError,
+                        "configure delegated response stream metering",
+                        error,
+                    )
+                },
+            )?),
+            None => None,
+        };
         let mut out = ResponseHeader::build(status.as_u16(), None)?;
         for (name, value) in headers {
             let Some(name) = name else {
@@ -610,6 +629,18 @@ impl<S: PaymentState> Http402Gate<S> {
             match chunk {
                 Ok(chunk) => {
                     observer.on_chunk(&chunk, request_start);
+                    if let Some(meter) = delegated_meter.as_mut() {
+                        meter
+                            .authorize_chunk(&chunk, is_sse)
+                            .await
+                            .map_err(|error| {
+                                pingora::Error::because(
+                                    pingora::ErrorType::ReadError,
+                                    "authorize delegated response stream chunk",
+                                    error,
+                                )
+                            })?;
+                    }
                     session.write_response_body(Some(chunk), false).await?;
                 }
                 Err(error) => {
@@ -631,6 +662,15 @@ impl<S: PaymentState> Http402Gate<S> {
                     ));
                 }
             }
+        }
+        if let Some(meter) = delegated_meter.as_mut() {
+            meter.finish_stream().await.map_err(|error| {
+                pingora::Error::because(
+                    pingora::ErrorType::ReadError,
+                    "finish delegated response stream metering",
+                    error,
+                )
+            })?;
         }
         observer.finish();
         if let Some(log_id) = ctx.log.as_ref().and_then(|log| log.log_id) {
@@ -1389,6 +1429,17 @@ fn is_streamed_response(headers: &HeaderMap) -> bool {
             ct.starts_with("text/event-stream") || ct.starts_with("application/x-ndjson")
         })
         .unwrap_or(false)
+}
+
+fn is_sse_response(headers: &HeaderMap) -> bool {
+    headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|content_type| {
+            content_type
+                .split(';')
+                .any(|part| part.trim().eq_ignore_ascii_case("text/event-stream"))
+        })
 }
 
 async fn write_buffered_response(
