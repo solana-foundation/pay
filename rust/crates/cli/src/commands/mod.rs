@@ -1705,7 +1705,7 @@ fn pay_channel_and_retry(
         );
     }
 
-    let store = pay_core::accounts::FileAccountsStore::default_path();
+    let store = interactive_accounts_store();
     let built_payment = build(&store)?;
 
     if let Some(resolved) = built_payment.ephemeral_notice {
@@ -1834,7 +1834,7 @@ fn pay_x402_siwx_and_retry(
         eprintln!("{}", "Signing in...".dimmed());
     }
 
-    let store = pay_core::accounts::FileAccountsStore::default_path();
+    let store = interactive_accounts_store();
     let built_payment = x402::build_siwx_auth_header(
         challenge,
         &store,
@@ -1896,7 +1896,7 @@ fn pay_session_and_retry(
         );
     }
 
-    let store = pay_core::accounts::FileAccountsStore::default_path();
+    let store = interactive_accounts_store();
     let (_handle, auth_header) = pay_core::session::open_payment_channel_session_header(
         challenge,
         request,

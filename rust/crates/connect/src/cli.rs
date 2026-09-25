@@ -42,8 +42,13 @@ struct Pending {
 
 #[derive(Clone)]
 enum PendingKind {
-    Link { code_challenge: String },
-    Topup { address: String },
+    Link {
+        code_challenge: String,
+    },
+    Topup {
+        address: String,
+        payment_method: Option<String>,
+    },
 }
 
 struct Grant {
@@ -243,6 +248,8 @@ pub struct TopupQuery {
     account: Option<String>,
     #[serde(default)]
     cli: Option<String>,
+    #[serde(default)]
+    method: Option<String>,
 }
 
 /// Reserve a direct CLI top-up and enter `/connect` without wallet sign-in.
@@ -260,6 +267,9 @@ pub async fn start_topup(
             )
         })?
         .to_string();
+    let payment_method = query
+        .method
+        .filter(|method| matches!(method.as_str(), "card" | "apple-pay" | "google-pay"));
     let id = random_token();
     state.cli().insert_pending(
         id.clone(),
@@ -268,6 +278,7 @@ pub async fn start_topup(
             state: query.state,
             kind: PendingKind::Topup {
                 address: address.clone(),
+                payment_method,
             },
             created_at: Instant::now(),
         },
@@ -290,6 +301,8 @@ pub struct PendingView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wallet_address: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub payment_method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub privy: Option<PrivyLogin>,
 }
 
@@ -299,13 +312,18 @@ pub async fn pending_view(
     headers: HeaderMap,
 ) -> Result<Json<PendingView>, ApiError> {
     let pending = state.cli().pending(&id).ok_or_else(unknown_request)?;
-    if let PendingKind::Topup { address } = pending.kind {
+    if let PendingKind::Topup {
+        address,
+        payment_method,
+    } = pending.kind
+    {
         return Ok(Json(PendingView {
             client_name: "pay CLI",
             scope: "cli",
             intent: "topup",
             has_wallet: true,
             wallet_address: Some(address),
+            payment_method,
             privy: None,
         }));
     }
@@ -319,6 +337,7 @@ pub async fn pending_view(
         intent: "link",
         has_wallet: wallet.is_some(),
         wallet_address: wallet.map(|wallet| wallet.pubkey.clone()),
+        payment_method: None,
         privy: privy_login(&state),
     }))
 }
@@ -417,6 +436,16 @@ pub async fn complete_topup(
         return Err(ApiError::bad_request(
             "invalid_request",
             "A valid payment ID is required.",
+        ));
+    }
+    let pending = state.cli().pending(&id).ok_or_else(unknown_request)?;
+    let PendingKind::Topup { address, .. } = &pending.kind else {
+        return Err(unknown_request());
+    };
+    if !state.wallet_probe().has_funds(address).await {
+        return Err(ApiError::bad_request(
+            "payment_pending",
+            "Funding has not settled for this account yet.",
         ));
     }
     let pending = state
@@ -824,14 +853,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_topup_bypasses_privy_and_returns_payment_to_cli() {
-        let app = crate::router(state());
+    async fn unsettled_topup_cannot_be_completed_or_consumed() {
+        let app =
+            crate::router(state().with_wallet_probe(std::sync::Arc::new(crate::FixedProbe(true))));
         let start = app
             .clone()
             .oneshot(
                 Request::builder()
                     .uri(format!(
-                        "/cli?address={ADDRESS}&callback=http%3A%2F%2F127.0.0.1%3A53211%2Fcallback&state={STATE}&account=ludo&cli=0.29.0"
+                        "/cli?address={ADDRESS}&callback=http%3A%2F%2F127.0.0.1%3A53211%2Fcallback&state={STATE}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let page = url::Url::parse(start.headers()[header::LOCATION].to_str().unwrap()).unwrap();
+        let request_id = page
+            .query_pairs()
+            .find(|(key, _)| key == "cli")
+            .map(|(_, value)| value.into_owned())
+            .unwrap();
+
+        let completion = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/cli/{request_id}/topup"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"payment_id":"forged"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, body) = json(completion).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "payment_pending");
+
+        let still_pending = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/cli/{request_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(still_pending.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn direct_topup_bypasses_privy_and_returns_payment_to_cli() {
+        let app =
+            crate::router(state().with_wallet_probe(std::sync::Arc::new(crate::FixedProbe(false))));
+        let start = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/cli?address={ADDRESS}&callback=http%3A%2F%2F127.0.0.1%3A53211%2Fcallback&state={STATE}&account=ludo&cli=0.29.0&method=google-pay"
                     ))
                     .body(Body::empty())
                     .unwrap(),
@@ -860,6 +941,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["intent"], "topup");
         assert_eq!(body["wallet_address"], ADDRESS);
+        assert_eq!(body["payment_method"], "google-pay");
         assert!(body.get("privy").is_none());
 
         let complete = app

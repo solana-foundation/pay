@@ -54,7 +54,7 @@ impl NewCommand {
             .rpc_url
             .clone()
             .unwrap_or_else(pay_core::balance::mainnet_rpc_url);
-        let completion = crate::tui::run_topup_flow(&pubkey, &rpc_url, &self.name)?;
+        let completion = crate::tui::run_topup_flow(&pubkey, &rpc_url, &self.name, true)?;
         print_next_steps(
             &self.name,
             backend_name,

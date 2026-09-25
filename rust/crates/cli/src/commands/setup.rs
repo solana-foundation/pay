@@ -248,7 +248,7 @@ fn fund_new_account(
     let completion = if skip_tui {
         None
     } else {
-        crate::tui::run_topup_flow(pubkey, &rpc_url, account_name)?
+        crate::tui::run_topup_flow(pubkey, &rpc_url, account_name, true)?
     };
     if let Some(completion) = completion {
         print_setup_success(backend_name, &completion, &rpc_url);

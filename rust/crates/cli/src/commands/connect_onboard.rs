@@ -663,6 +663,7 @@ pub struct FundUrlParams<'a> {
     pub state: Option<&'a str>,
     pub account: &'a str,
     pub cli: &'a str,
+    pub method: Option<&'a str>,
 }
 
 pub fn build_fund_url(p: &FundUrlParams<'_>) -> String {
@@ -679,6 +680,9 @@ pub fn build_fund_url(p: &FundUrlParams<'_>) -> String {
         }
         q.append_pair("account", p.account);
         q.append_pair("cli", p.cli);
+        if let Some(method) = p.method {
+            q.append_pair("method", method);
+        }
     }
     url.into()
 }
@@ -701,13 +705,19 @@ pub struct FundingSession {
 impl FundingSession {
     /// Bind the loopback listener, build the page URL and open the browser.
     /// Returns once the URL is known; the wait continues in the background.
-    pub fn open(connect_url: &str, address: &str, account: &str) -> pay_core::Result<Self> {
+    pub fn open(
+        connect_url: &str,
+        address: &str,
+        account: &str,
+        method: &str,
+    ) -> pay_core::Result<Self> {
         let connect_url = connect_url.trim_end_matches('/').to_string();
         check_connect_reachable(&connect_url)?;
         let state = random_token();
         let (url_tx, url_rx) = std::sync::mpsc::channel::<pay_core::Result<String>>();
         let (outcome_tx, outcome_rx) = std::sync::mpsc::channel();
-        let (address, account) = (address.to_string(), account.to_string());
+        let (address, account, method) =
+            (address.to_string(), account.to_string(), method.to_string());
         std::thread::Builder::new()
             .name("pay-fund-callback".into())
             .spawn(move || {
@@ -739,6 +749,7 @@ impl FundingSession {
                             state: Some(&state),
                             account: &account,
                             cli: env!("CARGO_PKG_VERSION"),
+                            method: Some(&method),
                         });
                         let _ = url_tx.send(Ok(url));
                         Some(listener.wait_for(FUNDING_TIMEOUT).await.map(
@@ -1034,6 +1045,7 @@ mod tests {
             state: Some("st4te"),
             account: "ledger-test",
             cli: "0.29.0",
+            method: Some("google-pay"),
         });
         let parsed = reqwest::Url::parse(&url).unwrap();
         assert_eq!(
@@ -1047,6 +1059,7 @@ mod tests {
         assert_eq!(q["state"], "st4te");
         assert_eq!(q["account"], "ledger-test");
         assert_eq!(q["cli"], "0.29.0");
+        assert_eq!(q["method"], "google-pay");
 
         let bare = build_fund_url(&FundUrlParams {
             connect_url: "https://connect.pay.sh",
@@ -1055,6 +1068,7 @@ mod tests {
             state: None,
             account: "default",
             cli: "0.29.0",
+            method: None,
         });
         assert!(!bare.contains("callback="));
         assert!(!bare.contains("state="));

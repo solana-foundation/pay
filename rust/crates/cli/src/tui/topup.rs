@@ -290,6 +290,14 @@ impl OnrampPaymentMethod {
         }
     }
 
+    fn query_value(self) -> &'static str {
+        match self {
+            Self::ApplePay => "apple-pay",
+            Self::GooglePay => "google-pay",
+            Self::Card => "card",
+        }
+    }
+
     /// Brand-color background used when this option is selected.
     fn brand_color(self) -> Color {
         match self {
@@ -363,6 +371,7 @@ pub fn run_topup_flow(
     pubkey: &str,
     rpc_url: &str,
     account_name: &str,
+    allow_redemption: bool,
 ) -> pay_core::Result<Option<TopupCompletion>> {
     let onramp_host = resolve_onramp_host();
     if !std::io::IsTerminal::is_terminal(&std::io::stderr()) {
@@ -372,8 +381,16 @@ pub fn run_topup_flow(
         return Ok(None);
     }
 
-    let result =
-        with_terminal(|terminal| run_topup(terminal, pubkey, rpc_url, account_name, &onramp_host))?;
+    let result = with_terminal(|terminal| {
+        run_topup(
+            terminal,
+            pubkey,
+            rpc_url,
+            account_name,
+            &onramp_host,
+            allow_redemption,
+        )
+    })?;
 
     Ok(result.map(|d| TopupCompletion {
         received: d.received,
@@ -443,6 +460,7 @@ fn run_topup(
     rpc_url: &str,
     account_name: &str,
     onramp_host: &str,
+    allow_redemption: bool,
 ) -> io::Result<Option<TopupDetected>> {
     let options = TopupOption::all();
     let mut selected = 0usize;
@@ -640,6 +658,13 @@ fn run_topup(
                             }
                         }
                     } else if options[selected] == TopupOption::RedeemCode {
+                        if !allow_redemption {
+                            redeem_error = Some(
+                                "Code redemption is available only for mainnet accounts."
+                                    .to_string(),
+                            );
+                            continue;
+                        }
                         let code = redeem_code.trim();
                         if code.is_empty() {
                             redeem_error = Some("Enter a redemption code first.".to_string());
@@ -712,7 +737,9 @@ fn run_topup(
                         let _ = open_url(&session.url);
                     }
                 }
-                KeyCode::Char('r') | KeyCode::Char('R') => {
+                KeyCode::Char('r') | KeyCode::Char('R')
+                    if options[selected] != TopupOption::RedeemCode =>
+                {
                     // Restart the cycle: resets the 5s delay and 5min window
                     // so polling resumes (or unstalls) regardless of state.
                     poll.reset_cycle(Instant::now());
@@ -1697,9 +1724,13 @@ fn launch_onramp_session(
     payment_method: OnrampPaymentMethod,
 ) -> Result<OnrampSession, String> {
     let host = onramp_host.trim_end_matches('/');
-    let funding =
-        crate::commands::connect_onboard::FundingSession::open(host, pubkey, account_name)
-            .map_err(|err| err.to_string())?;
+    let funding = crate::commands::connect_onboard::FundingSession::open(
+        host,
+        pubkey,
+        account_name,
+        payment_method.query_value(),
+    )
+    .map_err(|err| err.to_string())?;
     Ok(OnrampSession {
         url: funding.url.clone(),
         payment_method,
