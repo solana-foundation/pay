@@ -46,7 +46,7 @@ indicatif = "0.17"
 chrono = "0.4"
 
 # MCP
-rmcp = { version = "1.4", features = ["server", "transport-io", "elicitation", "schemars"] }
+rmcp = { version = "2.1", features = ["server", "transport-io", "elicitation", "schemars"] }
 schemars = "0.8"
 
 # TUI
