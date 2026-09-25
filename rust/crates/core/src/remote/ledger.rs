@@ -45,9 +45,10 @@ fn config(derivation_path: &str, confirm_on_device: bool) -> LedgerConfig {
     LedgerConfig {
         derivation_path: Some(derivation_path.to_string()),
         confirm_pubkey_on_device: confirm_on_device,
-        // Interactive CLI: launch the Solana app for the user rather than
-        // telling them to navigate the device by hand.
-        auto_open_app: true,
+        // Current Ledger firmware opens the Solana app after unlock. Keeping
+        // this disabled also avoids solana-keychain's internal 20-attempt
+        // auto-launch retry when an already-open app is incompatible.
+        auto_open_app: false,
         ..LedgerConfig::default()
     }
 }
