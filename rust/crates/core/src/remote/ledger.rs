@@ -64,6 +64,15 @@ fn config_with_timeout(
 }
 
 fn explain(err: SignerError, what: &str) -> Error {
+    if let SignerError::NotAvailable(detail) = &err
+        && app_configuration_is_incompatible(detail)
+    {
+        return Error::Config(format!(
+            "Could not {what} on the Ledger: this pay build cannot parse the Solana app's configuration. \
+             The device is fine; unlocking or reconnecting it will not help. Update pay when \
+             Solana app 1.16 support is available, or use a compatible Ledger app or device."
+        ));
+    }
     Error::Config(format!(
         "Could not {what} on the Ledger: {err}\n\
          Plug the device in and unlock it, then retry."
@@ -87,10 +96,18 @@ fn discover_wallets() -> std::result::Result<Vec<RemoteWallet>, SignerError> {
     Ok(wallets)
 }
 
+fn app_configuration_is_incompatible(detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    detail.contains("configuration format this build")
+        || detail.contains("newer solana-remote-wallet")
+}
+
 fn discovery_error_is_retryable(err: &SignerError) -> bool {
     match err {
         SignerError::NotAvailable(detail) => {
-            !detail.contains("multiple Ledger") && !detail.contains("HID subsystem is unavailable")
+            !detail.contains("multiple Ledger")
+                && !detail.contains("HID subsystem is unavailable")
+                && !app_configuration_is_incompatible(detail)
         }
         _ => false,
     }
@@ -294,8 +311,29 @@ mod tests {
         assert!(!discovery_error_is_retryable(&SignerError::NotAvailable(
             "the Ledger HID subsystem is unavailable".to_string()
         )));
+        assert!(!discovery_error_is_retryable(&SignerError::NotAvailable(
+            "the Ledger's Solana app speaks a configuration format this build of \
+             solana-remote-wallet cannot parse; this needs a newer solana-remote-wallet"
+                .to_string()
+        )));
         assert!(!discovery_error_is_retryable(&SignerError::ConfigError(
             "invalid derivation path".to_string()
         )));
+    }
+
+    #[test]
+    fn incompatible_solana_app_error_does_not_suggest_reconnecting() {
+        let error = explain(
+            SignerError::NotAvailable(
+                "the Ledger's Solana app speaks a configuration format this build of \
+                 solana-remote-wallet cannot parse; this needs a newer solana-remote-wallet"
+                    .to_string(),
+            ),
+            "read the first account",
+        );
+        let message = error.to_string();
+        assert!(message.contains("device is fine"));
+        assert!(message.contains("Solana app 1.16 support"));
+        assert!(!message.contains("Plug the device in"));
     }
 }
