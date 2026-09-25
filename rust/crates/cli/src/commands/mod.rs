@@ -83,7 +83,7 @@ pub enum Command {
     Fanout(fanout::FanoutCommand),
     /// Generate a keypair, store it, and fund your account.
     Setup(setup::SetupCommand),
-    /// Import funds from Venmo, PayPal, or a mobile wallet.
+    /// Buy API credits, redeem a code, or transfer from a mobile wallet.
     Topup(topup::TopupCommand),
     /// Gate APIs, local demos, or inference with stablecoin payments.
     #[command(alias = "serve", alias = "server")]
@@ -406,7 +406,7 @@ fn handle_outcome(
     // Let the paying account's backend veto an offer it cannot sign (a Ledger
     // and an operator-signed session) before we commit to it.
     let signer_support = outcome.configured_signer_support(
-        &pay_core::accounts::FileAccountsStore::default_path(),
+        &interactive_accounts_store(),
         network_override,
         account_override,
     )?;
@@ -1374,6 +1374,13 @@ struct PaymentRetryContext<'a, 'tool> {
     verbose: bool,
 }
 
+const HARDWARE_CONNECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn interactive_accounts_store() -> pay_core::accounts::FileAccountsStore {
+    pay_core::accounts::FileAccountsStore::default_path()
+        .with_hardware_connection_timeout(HARDWARE_CONNECTION_TIMEOUT)
+}
+
 fn pay_mpp_and_retry(
     challenges: &[mpp::Challenge],
     resource_url: &str,
@@ -1386,7 +1393,7 @@ fn pay_mpp_and_retry(
         eprintln!("{}", "Paying...".dimmed());
     }
 
-    let store = pay_core::accounts::FileAccountsStore::default_path();
+    let store = interactive_accounts_store();
     let challenge = mpp::select_challenge_by_balance(
         challenges,
         &store,
@@ -1451,7 +1458,7 @@ fn pay_subscription_and_retry(
         eprintln!("{}", "Activating subscription...".dimmed());
     }
 
-    let store = pay_core::accounts::FileAccountsStore::default_path();
+    let store = interactive_accounts_store();
     let built = sub_client::build_credential_with_authenticate(
         challenge,
         authenticate_challenge,
@@ -1636,7 +1643,7 @@ fn pay_x402_and_retry(
         eprintln!("{}", "Paying...".dimmed());
     }
 
-    let store = pay_core::accounts::FileAccountsStore::default_path();
+    let store = interactive_accounts_store();
     let built_payment = x402::build_payment(
         challenge,
         &store,
@@ -1698,7 +1705,7 @@ fn pay_channel_and_retry(
         );
     }
 
-    let store = pay_core::accounts::FileAccountsStore::default_path();
+    let store = interactive_accounts_store();
     let built_payment = build(&store)?;
 
     if let Some(resolved) = built_payment.ephemeral_notice {
@@ -1827,7 +1834,7 @@ fn pay_x402_siwx_and_retry(
         eprintln!("{}", "Signing in...".dimmed());
     }
 
-    let store = pay_core::accounts::FileAccountsStore::default_path();
+    let store = interactive_accounts_store();
     let built_payment = x402::build_siwx_auth_header(
         challenge,
         &store,
@@ -1889,7 +1896,7 @@ fn pay_session_and_retry(
         );
     }
 
-    let store = pay_core::accounts::FileAccountsStore::default_path();
+    let store = interactive_accounts_store();
     let (_handle, auth_header) = pay_core::session::open_payment_channel_session_header(
         challenge,
         request,

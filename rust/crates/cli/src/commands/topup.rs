@@ -1,6 +1,6 @@
 use crate::components;
 
-/// Import funds from Venmo, PayPal, or a mobile wallet.
+/// Buy API credits, redeem a code, or transfer from a mobile wallet.
 #[derive(clap::Args)]
 pub struct TopupCommand {
     /// Account to fund: a configured account name, or a Solana address.
@@ -35,7 +35,12 @@ impl TopupCommand {
         let (pubkey, account_name) =
             resolve_destination(self.account.as_deref(), &accounts, network)?;
 
-        match crate::tui::run_topup_flow(&pubkey, &rpc_url, &account_name)? {
+        match crate::tui::run_topup_flow(
+            &pubkey,
+            &rpc_url,
+            &account_name,
+            network == pay_core::accounts::MAINNET_NETWORK,
+        )? {
             Some(completion) => print_topup_success(&completion, network, &rpc_url),
             None => print_topup_aborted(&account_name),
         }

@@ -68,6 +68,34 @@ pub struct BuiltPayment {
     pub ephemeral_notice: Option<ResolvedEphemeral>,
 }
 
+/// Resolve the pay account-network slug for an x402 exact challenge.
+pub fn challenge_network(challenge: &Challenge, network_override: Option<&str>) -> String {
+    if let Some(network) = network_override {
+        return network.to_string();
+    }
+    let requirements = &challenge.requirements;
+    if requirements
+        .recent_blockhash
+        .as_deref()
+        .is_some_and(|value| value.starts_with(crate::client::mpp::SURFPOOL_BLOCKHASH_PREFIX))
+    {
+        return "localnet".to_string();
+    }
+    normalize_network(
+        requirements
+            .cluster
+            .as_deref()
+            .unwrap_or(requirements.network.as_str()),
+    )
+}
+
+/// Resolve a CAIP-2 network from an x402 scheme to a pay account slug.
+pub fn scheme_network(network: &str, network_override: Option<&str>) -> String {
+    network_override
+        .map(str::to_string)
+        .unwrap_or_else(|| normalize_network(network))
+}
+
 /// Try to parse an x402 challenge from headers and/or body.
 /// Defaults to preferring Solana mainnet when multiple chains are offered.
 pub fn parse(headers: &[(String, String)], body: Option<&str>) -> Option<Challenge> {

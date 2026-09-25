@@ -648,11 +648,21 @@ pub trait AccountsStore: Send + Sync {
     fn credential_source(&self) -> &dyn crate::remote::CredentialSource {
         &crate::remote::PlatformCredentials
     }
+
+    /// How long an explicitly interactive caller wants to wait for hardware.
+    ///
+    /// Library and server callers fail immediately by default. Foreground CLI
+    /// commands opt in with a bounded deadline so an embedded proxy cannot
+    /// accumulate threads waiting forever merely because stderr is a TTY.
+    fn hardware_connection_timeout(&self) -> Option<std::time::Duration> {
+        None
+    }
 }
 
 /// On-disk YAML store at `~/.config/pay/accounts.yml`.
 pub struct FileAccountsStore {
     path: PathBuf,
+    hardware_connection_timeout: Option<std::time::Duration>,
 }
 
 impl FileAccountsStore {
@@ -660,6 +670,7 @@ impl FileAccountsStore {
     pub fn default_path() -> Self {
         Self {
             path: PathBuf::from(shellexpand::tilde(ACCOUNTS_FILE).into_owned()),
+            hardware_connection_timeout: None,
         }
     }
 
@@ -672,7 +683,16 @@ impl FileAccountsStore {
 
     /// Store rooted at an explicit path (used by tests and non-default deployments).
     pub fn at(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            hardware_connection_timeout: None,
+        }
+    }
+
+    /// Opt this foreground store into a bounded hardware-wallet wait.
+    pub fn with_hardware_connection_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.hardware_connection_timeout = Some(timeout);
+        self
     }
 
     pub fn path(&self) -> &PathBuf {
@@ -708,6 +728,10 @@ impl AccountsStore for FileAccountsStore {
             .map_err(|e| Error::Config(format!("YAML serialize: {e}")))?;
         write_private(&self.path, yaml.as_bytes())
             .map_err(|e| Error::Config(format!("Failed to write {}: {e}", self.path.display())))
+    }
+
+    fn hardware_connection_timeout(&self) -> Option<std::time::Duration> {
+        self.hardware_connection_timeout
     }
 }
 

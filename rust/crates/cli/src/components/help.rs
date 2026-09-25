@@ -29,7 +29,7 @@ Agents:
   \x1b[1mskills\x1b[0m: Browse, search, and inspect API providers from the skills catalog
 
 Account management:
-  \x1b[1mtopup\x1b[0m:         Import funds from Venmo, PayPal, or a mobile wallet.
+  \x1b[1mtopup\x1b[0m:         Buy API credits, redeem a code, or transfer funds.
   \x1b[1maccount\x1b[0m:       Manage accounts (new, import, list, default, remove, export)
   \x1b[1msetup\x1b[0m:         Generate a keypair, store it, and fund your account
   \x1b[1msend\x1b[0m:          Send stablecoins to a recipient address

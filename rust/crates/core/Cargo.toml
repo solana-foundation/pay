@@ -36,6 +36,7 @@ async-stream = "0.3"
 futures-util = "0.3"
 openssl-sys = { version = "0.9", optional = true }
 pay-types = { workspace = true }
+owo-colors = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

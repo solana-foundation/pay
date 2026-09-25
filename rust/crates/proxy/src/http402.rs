@@ -10,17 +10,15 @@
 //! This is the production data plane: Pingora fronts everything, axum is demoted
 //! to an internal control-plane upstream.
 //!
-//! ## Deferred (documented)
-//! - **Body-signing auth**: request bodies stream to the upstream unbuffered, so
-//!   auth schemes that digest the body (HMAC / `AccessToken` `body_digest`) can't
-//!   be signed here — those requests are **refused with 501** in
-//!   [`Http402Gate::plan_upstream`] (loud + logged) rather than silently forwarded
-//!   with a signature computed over an empty body. Header / Bearer / OAuth2 /
-//!   QueryParam auth, and HMAC that doesn't digest the body, all work. Lifting
-//!   this needs request-body buffering before the upstream connect.
-//! - **Response metering**: Delegated MPP sessions and x402 `upto` share the
-//!   buffered response-metering path so usage is rated once and settlement is
-//!   persisted before release.
+//! ## Buffered paths
+//! - **Body-signing auth**: auth schemes that digest the body (HMAC /
+//!   `AccessToken` `body_digest`) need the complete request before the upstream
+//!   connect. Those requests use the bounded buffered path; all other auth keeps
+//!   using Pingora's native streaming path.
+//! - **Response metering**: delegated MPP SSE/NDJSON responses are rated and
+//!   authorized incrementally before each chunk is released. Responses whose
+//!   pricing cannot be observed safely in-stream, including x402 `upto`, stay
+//!   on the bounded response-metering path.
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
@@ -37,6 +35,7 @@ use pay_core::server::metering::{self, UptoSettlementPlan};
 use pay_core::server::proxy::{
     STRIP_HEADERS, UpstreamPlan, prepare_upstream, routing_signs_request_body,
 };
+use pay_core::server::session_stream::DelegatedSessionStreamMeter;
 use pay_core::server::telemetry;
 use pay_kit::x402::server::VerifiedUptoOpen;
 use pay_types::metering::ApiSpec;
@@ -79,9 +78,9 @@ pub struct Ctx {
     /// lets pay-kit attach the complete representation after end-of-stream.
     batch_cache: Option<BatchForward>,
     batch_response: Option<BatchResponseCapture>,
-    /// A delegated MPP session opened pre-serve. Responses are buffered and
-    /// rated with the same usage pipeline as x402 `upto`, then the gateway
-    /// signs and persists the cumulative voucher before returning the body.
+    /// A delegated MPP session opened pre-serve. Observable streams authorize
+    /// cumulative usage before each chunk is released; other responses are
+    /// buffered and settled before the body is returned.
     session: Option<SessionForward>,
     /// Present only for payment-backed forwards. Consumed by `logging`, where
     /// Pingora exposes the final downstream status for every forwarding path.
@@ -184,6 +183,23 @@ impl<S: PaymentState> Http402Gate<S> {
             .or_else(|| if apis.len() == 1 { apis.first() } else { None })
     }
 
+    /// Prepare a request whose upstream authentication depends on its body.
+    /// Kept on the gate so the buffered route has a focused regression seam:
+    /// tests can prove the exact bytes read from downstream reach auth prep.
+    // The response-shaped error is consumed immediately by `forward_buffered`;
+    // boxing it would add allocation and obscure the existing response path.
+    #[allow(clippy::result_large_err)]
+    async fn prepare_buffered_request(
+        &self,
+        api: &ApiSpec,
+        method: &http::Method,
+        uri: &Uri,
+        headers: &http::HeaderMap,
+        body: &[u8],
+    ) -> Result<UpstreamPlan, axum::response::Response> {
+        prepare_upstream(api, method, uri, headers, body).await
+    }
+
     /// Plan the upstream for a Forward/Passthrough decision: control-plane → the
     /// internal axum service; otherwise resolve + `prepare_upstream`. Returns
     /// `Ok(true)` if a response was written here (respond-mode / not-found /
@@ -215,34 +231,15 @@ impl<S: PaymentState> Http402Gate<S> {
                 .await;
             return Ok(true);
         };
-        // The body is streamed unbuffered (see module docs), so we can't compute
-        // a body-digest signature here. Refuse loudly rather than forward a
-        // request signed over an empty body (which the upstream would reject with
-        // an opaque 401/403). Header / Bearer / OAuth2 / QueryParam auth, and
-        // HMAC that doesn't digest the body, are unaffected.
+        // Body-digest auth needs the complete request before auth preparation.
+        // Keep the common case on Pingora's native streaming path and route only
+        // these endpoints through the bounded reqwest adapter.
         if routing_signs_request_body(api, path) {
-            tracing::error!(
-                path,
-                "refusing request: upstream auth signs the request body, which the pingora data \
-                 plane does not support (body is streamed, not buffered)"
-            );
-            // On a `Forward` the x402 `exact` payment already settled on-chain
-            // (the gate settles in verify), so this 501 must still carry the
-            // PAYMENT-RESPONSE receipt — otherwise the client is charged with no
-            // proof. Drain it (and refund any `upto` channel) onto the response.
-            let mut resp = GateResponse::json(
-                StatusCode::NOT_IMPLEMENTED,
-                Bytes::from_static(
-                    b"{\"error\":\"unsupported_auth\",\"message\":\"This endpoint's upstream \
-                      auth signs the request body, which the gateway does not yet support.\"}",
-                ),
-            );
-            resp.headers
-                .extend(self.drain_payment_headers(ctx, false).await);
-            write_gate_response(session, resp).await?;
-            return Ok(true);
+            return self
+                .forward_buffered(session, ctx, path, host, method, uri, headers)
+                .await;
         }
-        // No body-signing auth → an empty placeholder body is safe for prep.
+        // No body-signing auth: an empty placeholder body is safe for prep.
         match prepare_upstream(api, method, uri, headers, &[]).await {
             Ok(UpstreamPlan::Forward(prepared)) => {
                 ctx.target = Some(target_from_prepared(prepared, api.subdomain.clone()));
@@ -288,8 +285,8 @@ impl<S: PaymentState> Http402Gate<S> {
     /// Settle/refund pending payment side-effects and collect the headers that
     /// must ride the response: refund an open `upto` channel and surface the
     /// x402 `exact` `PAYMENT-RESPONSE` receipt. Used by every terminal path that
-    /// `response_filter` doesn't reach (respond-mode, the body-signing 501
-    /// refusal, and connect/proxy failures) so a settled payment always returns
+    /// `response_filter` doesn't reach (respond-mode and connect/proxy failures)
+    /// so a settled payment always returns
     /// its proof. `served_ok` decides debit vs full refund for `upto`.
     async fn drain_payment_headers(
         &self,
@@ -381,7 +378,7 @@ impl<S: PaymentState> Http402Gate<S> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn forward_response_metered_buffered(
+    async fn forward_buffered(
         &self,
         session: &mut Session,
         ctx: &mut Ctx,
@@ -407,7 +404,7 @@ impl<S: PaymentState> Http402Gate<S> {
         let body = match read_downstream_body(session, BUFFERED_REQUEST_BODY_LIMIT).await {
             Ok(body) => body,
             Err(e) => {
-                tracing::warn!(error = %e, "failed to buffer response-metered request body");
+                tracing::warn!(error = %e, "failed to buffer request body");
                 let extra = self.drain_payment_headers(ctx, false).await;
                 write_buffered_response(
                     session,
@@ -421,7 +418,10 @@ impl<S: PaymentState> Http402Gate<S> {
             }
         };
 
-        let prepared = match prepare_upstream(api, method, uri, headers, body.as_ref()).await {
+        let prepared = match self
+            .prepare_buffered_request(api, method, uri, headers, body.as_ref())
+            .await
+        {
             Ok(UpstreamPlan::Respond(resp)) => {
                 self.finish_buffered_axum_response(session, ctx, resp)
                     .await?;
@@ -445,7 +445,10 @@ impl<S: PaymentState> Http402Gate<S> {
                     .and_then(|pending| pending.settlement.as_deref())
             })
             .map(|plan| metering::upto_response_body_limit(&plan.metering))
-            .unwrap_or(DEFAULT_RESPONSE_BODY_LIMIT);
+            // Body-signing endpoints are buffered for request preparation, not
+            // response metering. Allow their normal API responses up to the same
+            // bounded size as their requests.
+            .unwrap_or(BUFFERED_REQUEST_BODY_LIMIT);
 
         let client = reqwest::Client::new();
         let mut upstream_req = client.request(
@@ -495,6 +498,32 @@ impl<S: PaymentState> Http402Gate<S> {
             );
         }
         let response_headers = filtered_response_headers(upstream.headers());
+        let delegated_stream = ctx
+            .session
+            .as_ref()
+            .is_some_and(DelegatedSessionStreamMeter::supports);
+        if is_streamed_response(&response_headers)
+            && ctx.upto.is_none()
+            && (ctx.session.is_none() || delegated_stream)
+            && ctx.batch.is_none()
+        {
+            let extra = self
+                .drain_payment_headers_with_response(
+                    ctx,
+                    status.is_success(),
+                    Some(status),
+                    &response_headers,
+                    None,
+                )
+                .await;
+            self.stream_buffered_upstream(session, ctx, status, response_headers, upstream, extra)
+                .await?;
+            tracing::debug!(
+                path,
+                "served streaming response via body-signing proxy path"
+            );
+            return Ok(true);
+        }
         let body = match collect_reqwest_body(upstream, response_limit).await {
             Ok(body) => body,
             Err(e) => {
@@ -504,7 +533,7 @@ impl<S: PaymentState> Http402Gate<S> {
                     prepared.url.as_str(),
                     &e.to_string(),
                 );
-                tracing::warn!(error = %e, "failed to buffer response-metered body");
+                tracing::warn!(error = %e, "failed to buffer upstream response body");
                 let extra = self.drain_payment_headers(ctx, false).await;
                 write_buffered_response(
                     session,
@@ -551,11 +580,105 @@ impl<S: PaymentState> Http402Gate<S> {
             )
             .await;
         write_buffered_response(session, status, response_headers, body, extra).await?;
-        tracing::debug!(
-            path,
-            "served payment via buffered response-metered proxy path"
-        );
+        tracing::debug!(path, "served via buffered proxy path");
         Ok(true)
+    }
+
+    async fn stream_buffered_upstream(
+        &self,
+        session: &mut Session,
+        ctx: &mut Ctx,
+        status: StatusCode,
+        headers: HeaderMap,
+        upstream: reqwest::Response,
+        extra: Vec<(HeaderName, HeaderValue)>,
+    ) -> pingora::Result<()> {
+        let is_sse = is_sse_response(&headers);
+        let mut delegated_meter = match ctx.session.take() {
+            Some(forward) => Some(DelegatedSessionStreamMeter::from_forward(forward).map_err(
+                |error| {
+                    pingora::Error::because(
+                        pingora::ErrorType::InternalError,
+                        "configure delegated response stream metering",
+                        error,
+                    )
+                },
+            )?),
+            None => None,
+        };
+        let mut out = ResponseHeader::build(status.as_u16(), None)?;
+        for (name, value) in headers {
+            let Some(name) = name else {
+                continue;
+            };
+            out.append_header(name, value)?;
+        }
+        for (name, value) in extra {
+            let _ = out.append_header(name, value);
+        }
+        session.write_response_header(Box::new(out), false).await?;
+
+        let request_start = ctx
+            .log
+            .as_ref()
+            .map(|log| log.start)
+            .unwrap_or_else(std::time::Instant::now);
+        let mut observer = crate::observer::StreamObserver::new(true);
+        let mut stream = upstream.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(chunk) => {
+                    observer.on_chunk(&chunk, request_start);
+                    if let Some(meter) = delegated_meter.as_mut() {
+                        meter
+                            .authorize_chunk(&chunk, is_sse)
+                            .await
+                            .map_err(|error| {
+                                pingora::Error::because(
+                                    pingora::ErrorType::ReadError,
+                                    "authorize delegated response stream chunk",
+                                    error,
+                                )
+                            })?;
+                    }
+                    session.write_response_body(Some(chunk), false).await?;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "streaming body-signing upstream response failed");
+                    observer.finish();
+                    if let Some(log_id) = ctx.log.as_ref().and_then(|log| log.log_id) {
+                        self.state.record_exchange_update(log_id, &observer.usage);
+                    }
+                    ctx.buffered_usage = Some(observer.usage);
+                    // Headers and possibly body bytes are already downstream,
+                    // so a replacement HTTP error is impossible. Return a
+                    // read error without writing the final body marker; Pingora
+                    // will terminate the downstream stream instead of making a
+                    // truncated response look like a clean EOF.
+                    return Err(pingora::Error::because(
+                        pingora::ErrorType::ReadError,
+                        "body-signing upstream stream failed",
+                        error,
+                    ));
+                }
+            }
+        }
+        if let Some(meter) = delegated_meter.as_mut() {
+            meter.finish_stream(is_sse).await.map_err(|error| {
+                pingora::Error::because(
+                    pingora::ErrorType::ReadError,
+                    "finish delegated response stream metering",
+                    error,
+                )
+            })?;
+        }
+        observer.finish();
+        if let Some(log_id) = ctx.log.as_ref().and_then(|log| log.log_id) {
+            self.state.record_exchange_update(log_id, &observer.usage);
+        }
+        ctx.buffered_usage = Some(observer.usage);
+        session.write_response_body(None, true).await?;
+        Ok(())
     }
 
     fn observe_buffered_metered_response(&self, ctx: &mut Ctx, headers: &HeaderMap, body: &[u8]) {
@@ -784,7 +907,7 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                     });
                 if delegated_session || response_metered_upto {
                     return self
-                        .forward_response_metered_buffered(
+                        .forward_buffered(
                             session,
                             ctx,
                             &path,
@@ -1308,6 +1431,17 @@ fn is_streamed_response(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
+fn is_sse_response(headers: &HeaderMap) -> bool {
+    headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|content_type| {
+            content_type
+                .split(';')
+                .any(|part| part.trim().eq_ignore_ascii_case("text/event-stream"))
+        })
+}
+
 async fn write_buffered_response(
     session: &mut Session,
     status: StatusCode,
@@ -1400,11 +1534,92 @@ async fn write_axum_response(
 #[cfg(test)]
 mod tests {
     use super::{
-        BatchResponseCapture, MAX_BATCH_CACHED_RESPONSE_BYTES, buffered_upstream_headers,
-        filtered_response_headers, is_control_plane, is_streamed_response,
+        BatchResponseCapture, Http402Gate, MAX_BATCH_CACHED_RESPONSE_BYTES,
+        buffered_upstream_headers, filtered_response_headers, is_control_plane,
+        is_streamed_response,
     };
     use http::{HeaderMap, HeaderValue, StatusCode, header};
+    use pay_core::PaymentState;
     use pay_core::server::gate::delegated_session_receipt_annotation;
+    use pay_core::server::proxy::UpstreamPlan;
+    use pay_types::metering::{
+        AccountingMode, ApiCategory, ApiSpec, AuthConfig, HmacAlgorithm, HmacCanonicalComponent,
+        HmacCanonicalConfig, HmacDigestAlgorithm, HmacEncoding, HmacPrepareBinding,
+        HmacPrepareValue, HmacSignatureConfig, HmacSignatureDestination, HmacTarget,
+        HmacTargetType, RoutingConfig,
+    };
+
+    #[derive(Clone)]
+    struct BodySigningState {
+        apis: Vec<ApiSpec>,
+    }
+
+    impl PaymentState for BodySigningState {
+        fn apis(&self) -> &[ApiSpec] {
+            &self.apis
+        }
+
+        fn mpp(&self) -> Option<&pay_kit::mpp::server::Mpp> {
+            None
+        }
+    }
+
+    fn body_signing_api() -> ApiSpec {
+        ApiSpec {
+            name: "body signing test".to_string(),
+            subdomain: "signed".to_string(),
+            title: "Body signing test".to_string(),
+            description: String::new(),
+            category: ApiCategory::AiMl,
+            version: "1.0".to_string(),
+            env: std::collections::HashMap::new(),
+            routing: RoutingConfig::Proxy {
+                url: "https://upstream.example".to_string(),
+                path_rewrites: vec![],
+                auth: Some(Box::new(AuthConfig::Hmac {
+                    algorithm: HmacAlgorithm::Sha256,
+                    // PATH is guaranteed in the test process and its value is
+                    // irrelevant; this test asserts the body-derived header.
+                    secret_from_env: "PATH".to_string(),
+                    secret_suffix: None,
+                    key_id_from_env: None,
+                    prepare: vec![HmacPrepareBinding {
+                        target: HmacTarget {
+                            kind: HmacTargetType::Header,
+                            name: "Content-MD5".to_string(),
+                        },
+                        value: HmacPrepareValue::BodyDigest {
+                            algorithm: HmacDigestAlgorithm::Md5,
+                            encoding: HmacEncoding::Base64,
+                        },
+                    }],
+                    canonical: HmacCanonicalConfig {
+                        join_with: "\n".to_string(),
+                        components: vec![HmacCanonicalComponent::Header {
+                            name: "Content-MD5".to_string(),
+                        }],
+                    },
+                    signature: HmacSignatureConfig {
+                        encoding: HmacEncoding::Base64,
+                        destination: HmacSignatureDestination {
+                            kind: HmacTargetType::Header,
+                            name: "Authorization".to_string(),
+                            template: "HMAC {signature}".to_string(),
+                        },
+                    },
+                })),
+            },
+            accounting: AccountingMode::Pooled,
+            endpoints: vec![],
+            free_tier: None,
+            quotas: None,
+            notes: None,
+            operator: None,
+            session: None,
+            batch_settlement: None,
+            recipients: std::collections::HashMap::new(),
+        }
+    }
 
     #[test]
     fn control_plane_paths_are_not_tracked() {
@@ -1531,6 +1746,34 @@ mod tests {
             http::HeaderValue::from_static("application/json"),
         );
         assert!(!is_streamed_response(&json));
+    }
+
+    #[tokio::test]
+    async fn http402_gate_prepares_body_digest_from_buffered_body() {
+        let gate = Http402Gate::new(
+            BodySigningState {
+                apis: vec![body_signing_api()],
+            },
+            "127.0.0.1:1",
+        );
+        let api = gate.resolve_api("signed.example").expect("API resolves");
+        let plan = gate
+            .prepare_buffered_request(
+                api,
+                &http::Method::POST,
+                &"/v1/generate".parse().unwrap(),
+                &HeaderMap::new(),
+                b"hello",
+            )
+            .await
+            .expect("request prepares");
+        let UpstreamPlan::Forward(prepared) = plan else {
+            panic!("free body-signing route should forward");
+        };
+
+        assert!(prepared.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("content-md5") && value == "XUFAKrxLKna5cZ2REBfFkg=="
+        }));
     }
 
     #[test]

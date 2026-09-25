@@ -27,8 +27,9 @@ use crate::server::session_metering::{
 const COMMIT_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const COMMIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const LIFECYCLE_TOUCH_INTERVAL: Duration = Duration::from_secs(30);
+const MAX_NDJSON_RECORD_BYTES: usize = 1024 * 1024;
 
-type BoxError = Box<dyn StdError + Send + Sync>;
+pub type BoxError = Box<dyn StdError + Send + Sync>;
 
 /// Session data attached by the payment middleware to a paid upstream retry.
 #[derive(Clone)]
@@ -158,7 +159,7 @@ pub struct SessionStreamMeter {
 /// The meter owns the session's capacity lease for the lifetime of the body.
 /// Each cumulative usage increase is signed and persisted before the bytes
 /// that exposed it are released to the client.
-pub(crate) struct DelegatedSessionStreamMeter {
+pub struct DelegatedSessionStreamMeter {
     forward: SessionForward,
     gate: SessionUsageGate,
     accumulator: StreamUsageAccumulator,
@@ -170,7 +171,7 @@ pub(crate) struct DelegatedSessionStreamMeter {
 }
 
 impl DelegatedSessionStreamMeter {
-    pub(crate) fn from_forward(forward: SessionForward) -> Result<Self, BoxError> {
+    pub fn from_forward(forward: SessionForward) -> Result<Self, BoxError> {
         let plan = forward.settlement.as_deref().ok_or_else(|| {
             box_error(std::io::Error::other(
                 "delegated stream forward is missing its settlement plan",
@@ -208,7 +209,7 @@ impl DelegatedSessionStreamMeter {
         })
     }
 
-    pub(crate) fn supports(forward: &SessionForward) -> bool {
+    pub fn supports(forward: &SessionForward) -> bool {
         let Some(plan) = forward.settlement.as_deref() else {
             return false;
         };
@@ -227,7 +228,7 @@ impl DelegatedSessionStreamMeter {
         is_sse: bool,
     ) -> Result<Option<SessionGateDecision>, BoxError> {
         let output_chars_before = self.accumulator.output_chars;
-        if !self.accumulator.observe_chunk(chunk, is_sse) {
+        if !self.accumulator.observe_chunk(chunk, is_sse)? {
             return Ok(None);
         }
         if self.authorization_exhausted {
@@ -249,7 +250,10 @@ impl DelegatedSessionStreamMeter {
             .map_err(box_error)
     }
 
-    fn finish(&mut self) -> MeteringResult<Option<SessionGateDecision>> {
+    fn finish(&mut self, is_sse: bool) -> MeteringResult<Option<SessionGateDecision>> {
+        if !is_sse && self.accumulator.finish_ndjson()? {
+            self.current = self.accumulator.observation();
+        }
         if !self.accumulator.has_observation() || self.authorization_exhausted {
             return Ok(None);
         }
@@ -347,6 +351,23 @@ impl DelegatedSessionStreamMeter {
             .touch_channel_unconfirmed(self.forward.channel_id.clone());
         self.next_lifecycle_touch = now + LIFECYCLE_TOUCH_INTERVAL;
     }
+
+    /// Meter and durably authorize one response chunk before it is released.
+    pub async fn authorize_chunk(&mut self, chunk: &[u8], is_sse: bool) -> Result<(), BoxError> {
+        self.touch_channel_if_due();
+        if let Some(decision) = self.observe_chunk(chunk, is_sse)? {
+            self.settle(decision).await?;
+        }
+        Ok(())
+    }
+
+    /// Persist any final cumulative usage before the response stream closes.
+    pub async fn finish_stream(&mut self, is_sse: bool) -> Result<(), BoxError> {
+        if let Some(decision) = self.finish(is_sse)? {
+            self.settle(decision).await?;
+        }
+        Ok(())
+    }
 }
 
 impl SessionStreamMeter {
@@ -376,7 +397,7 @@ impl SessionStreamMeter {
         chunk: &[u8],
         is_sse: bool,
     ) -> MeteringResult<Option<SessionGateDecision>> {
-        if !self.accumulator.observe_chunk(chunk, is_sse) {
+        if !self.accumulator.observe_chunk(chunk, is_sse)? {
             return Ok(None);
         }
 
@@ -386,7 +407,10 @@ impl SessionStreamMeter {
             .map(Some)
     }
 
-    pub fn finish(&mut self) -> MeteringResult<Option<SessionGateDecision>> {
+    pub fn finish(&mut self, is_sse: bool) -> MeteringResult<Option<SessionGateDecision>> {
+        if !is_sse && self.accumulator.finish_ndjson()? {
+            self.current = self.accumulator.observation();
+        }
         if !self.accumulator.has_observation() {
             return Ok(None);
         }
@@ -432,7 +456,7 @@ where
             yield chunk;
         }
 
-        if let Some(decision) = meter.finish().map_err(box_error)? {
+        if let Some(decision) = meter.finish(is_sse).map_err(box_error)? {
             settle_decision(&mut meter, decision).await?;
         }
     }
@@ -456,17 +480,11 @@ where
         futures_util::pin_mut!(stream);
         while let Some(next) = stream.next().await {
             let chunk = next.map_err(box_error)?;
-            meter.touch_channel_if_due();
-            let decision = meter.observe_chunk(&chunk, is_sse)?;
-            if let Some(decision) = decision {
-                meter.settle(decision).await?;
-            }
+            meter.authorize_chunk(&chunk, is_sse).await?;
             yield chunk;
         }
 
-        if let Some(decision) = meter.finish().map_err(box_error)? {
-            meter.settle(decision).await?;
-        }
+        meter.finish_stream(is_sse).await?;
     }
 }
 
@@ -514,6 +532,8 @@ struct StreamUsageAccumulator {
     spec: SessionMeterSpec,
     hints: SessionUsageHints,
     sse: SseUsageDecoder,
+    ndjson: NdjsonUsageDecoder,
+    ndjson_utf8_tail: Vec<u8>,
     output_bytes: u64,
     output_chars: u64,
     output_words: u64,
@@ -529,6 +549,8 @@ impl StreamUsageAccumulator {
             spec,
             hints,
             sse: SseUsageDecoder::default(),
+            ndjson: NdjsonUsageDecoder::default(),
+            ndjson_utf8_tail: Vec::new(),
             output_bytes: 0,
             output_chars: 0,
             output_words: 0,
@@ -539,7 +561,7 @@ impl StreamUsageAccumulator {
         }
     }
 
-    fn observe_chunk(&mut self, chunk: &[u8], is_sse: bool) -> bool {
+    fn observe_chunk(&mut self, chunk: &[u8], is_sse: bool) -> MeteringResult<bool> {
         self.output_bytes = self.output_bytes.saturating_add(chunk.len() as u64);
         self.request_seen = true;
 
@@ -550,17 +572,18 @@ impl StreamUsageAccumulator {
 
         if is_sse {
             changed |= self.observe_sse_chunk(chunk);
-        } else if observes_unit(&self.spec, BillingUnit::Characters) {
-            let text = String::from_utf8_lossy(chunk);
-            self.output_chars = self
-                .output_chars
-                .saturating_add(text.chars().count() as u64);
-            self.output_words = self.output_words.saturating_add(count_words(&text));
-            changed = true;
+        } else {
+            changed |= self.observe_ndjson_chunk(chunk)?;
+            if observes_unit(&self.spec, BillingUnit::Characters) {
+                self.output_chars = self
+                    .output_chars
+                    .saturating_add(count_stream_utf8_chars(&mut self.ndjson_utf8_tail, chunk)?);
+                changed = true;
+            }
         }
 
         self.observed |= changed;
-        changed
+        Ok(changed)
     }
 
     fn observe_sse_chunk(&mut self, chunk: &[u8]) -> bool {
@@ -580,26 +603,51 @@ impl StreamUsageAccumulator {
                 continue;
             };
 
-            let text_chars = streamed_text_char_count(&value);
-            if text_chars > 0 {
-                self.output_chars = self.output_chars.saturating_add(text_chars);
-                self.output_words = self
-                    .output_words
-                    .saturating_add(streamed_text_word_count(&value));
-                changed = true;
-            }
-
-            if let Some(input) = provider_token_quantity(&value, MeterDirection::Input) {
-                self.input_tokens = self.input_tokens.max(input);
-                changed = true;
-            }
-
-            if let Some(output) = provider_token_quantity(&value, MeterDirection::Output) {
-                self.output_tokens = self.output_tokens.max(output);
-                changed = true;
-            }
+            changed |= self.observe_stream_value(&value, true);
         }
 
+        changed
+    }
+
+    fn observe_ndjson_chunk(&mut self, chunk: &[u8]) -> MeteringResult<bool> {
+        let values = self.ndjson.push_chunk(chunk)?;
+        Ok(values.iter().fold(false, |changed, value| {
+            changed | self.observe_stream_value(value, false)
+        }))
+    }
+
+    fn finish_ndjson(&mut self) -> MeteringResult<bool> {
+        if !self.ndjson_utf8_tail.is_empty() {
+            return Err(
+                crate::server::session_metering::SessionMeteringError::InvalidStream(
+                    "NDJSON stream ended inside a UTF-8 character".to_string(),
+                ),
+            );
+        }
+        let value = self.ndjson.finish()?;
+        Ok(value.is_some_and(|value| self.observe_stream_value(&value, false)))
+    }
+
+    fn observe_stream_value(&mut self, value: &Value, count_text_characters: bool) -> bool {
+        let mut changed = false;
+        let text_chars = streamed_text_char_count(value);
+        if text_chars > 0 {
+            if count_text_characters {
+                self.output_chars = self.output_chars.saturating_add(text_chars);
+            }
+            self.output_words = self
+                .output_words
+                .saturating_add(streamed_text_word_count(value));
+            changed = true;
+        }
+        if let Some(input) = provider_token_quantity(value, MeterDirection::Input) {
+            self.input_tokens = self.input_tokens.max(input);
+            changed = true;
+        }
+        if let Some(output) = provider_token_quantity(value, MeterDirection::Output) {
+            self.output_tokens = self.output_tokens.max(output);
+            changed = true;
+        }
         changed
     }
 
@@ -659,6 +707,72 @@ struct SseUsageDecoder {
 #[derive(Debug, Clone)]
 struct SseUsageEvent {
     data: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct NdjsonUsageDecoder {
+    buffer: Vec<u8>,
+}
+
+impl NdjsonUsageDecoder {
+    fn push_chunk(&mut self, chunk: &[u8]) -> MeteringResult<Vec<Value>> {
+        self.buffer.extend_from_slice(chunk);
+        let mut values = Vec::new();
+        while let Some(index) = self.buffer.iter().position(|byte| *byte == b'\n') {
+            let line = self.buffer[..index].to_vec();
+            self.buffer.drain(..=index);
+            if let Some(value) = parse_ndjson_record(&line)? {
+                values.push(value);
+            }
+        }
+        if self.buffer.len() > MAX_NDJSON_RECORD_BYTES {
+            return Err(
+                crate::server::session_metering::SessionMeteringError::InvalidStream(format!(
+                    "NDJSON record exceeds {MAX_NDJSON_RECORD_BYTES} bytes"
+                )),
+            );
+        }
+        Ok(values)
+    }
+
+    fn finish(&mut self) -> MeteringResult<Option<Value>> {
+        let line = std::mem::take(&mut self.buffer);
+        parse_ndjson_record(&line)
+    }
+}
+
+fn parse_ndjson_record(line: &[u8]) -> MeteringResult<Option<Value>> {
+    let line = std::str::from_utf8(line).map_err(|error| {
+        crate::server::session_metering::SessionMeteringError::InvalidStream(error.to_string())
+    })?;
+    let line = line.trim();
+    if line.is_empty() {
+        return Ok(None);
+    }
+    Ok(serde_json::from_str(line).ok())
+}
+
+fn count_stream_utf8_chars(tail: &mut Vec<u8>, chunk: &[u8]) -> MeteringResult<u64> {
+    tail.extend_from_slice(chunk);
+    match std::str::from_utf8(tail) {
+        Ok(text) => {
+            let count = text.chars().count() as u64;
+            tail.clear();
+            Ok(count)
+        }
+        Err(error) if error.error_len().is_none() => {
+            let valid = error.valid_up_to();
+            let count = std::str::from_utf8(&tail[..valid])
+                .expect("valid_up_to must delimit valid UTF-8")
+                .chars()
+                .count() as u64;
+            tail.drain(..valid);
+            Ok(count)
+        }
+        Err(error) => Err(
+            crate::server::session_metering::SessionMeteringError::InvalidStream(error.to_string()),
+        ),
+    }
 }
 
 impl SseUsageDecoder {
@@ -944,12 +1058,14 @@ mod tests {
         );
         let mut accumulator = StreamUsageAccumulator::new(spec, hints);
 
-        let changed = accumulator.observe_chunk(
-            br#"data: {"usageMetadata":{"promptTokenCount":27,"candidatesTokenCount":448}}
+        let changed = accumulator
+            .observe_chunk(
+                br#"data: {"usageMetadata":{"promptTokenCount":27,"candidatesTokenCount":448}}
 
 "#,
-            true,
-        );
+                true,
+            )
+            .unwrap();
         let observation = accumulator.observation();
 
         assert!(changed);
@@ -987,12 +1103,14 @@ mod tests {
         );
         let mut accumulator = StreamUsageAccumulator::new(spec, hints);
 
-        let changed = accumulator.observe_chunk(
-            br#"data: {"usage":{"prompt_tokens":8,"completion_tokens":5,"total_tokens":13}}
+        let changed = accumulator
+            .observe_chunk(
+                br#"data: {"usage":{"prompt_tokens":8,"completion_tokens":5,"total_tokens":13}}
 
 "#,
-            true,
-        );
+                true,
+            )
+            .unwrap();
         let observation = accumulator.observation();
 
         assert!(changed);
@@ -1004,6 +1122,122 @@ mod tests {
             observation.get(MeterDirection::Output, BillingUnit::QuotaUnits),
             Some(3)
         );
+    }
+
+    #[test]
+    fn ndjson_accumulator_observes_usage_across_chunk_boundaries() {
+        let spec = SessionMeterSpec::new([
+            SessionMeterDimension::required(MeterDirection::Input, BillingUnit::Tokens, 1, 1),
+            SessionMeterDimension::required(MeterDirection::Output, BillingUnit::Tokens, 1, 1),
+        ]);
+        let mut accumulator = StreamUsageAccumulator::new(spec, SessionUsageHints::default());
+
+        assert!(
+            !accumulator
+                .observe_chunk(br#"{"usage":{"prompt_tokens":8,"comple"#, false)
+                .unwrap()
+        );
+        assert!(
+            accumulator
+                .observe_chunk(
+                    br#"tion_tokens":5}}
+"#,
+                    false,
+                )
+                .unwrap()
+        );
+        let observation = accumulator.observation();
+
+        assert_eq!(
+            observation.get(MeterDirection::Input, BillingUnit::Tokens),
+            Some(8)
+        );
+        assert_eq!(
+            observation.get(MeterDirection::Output, BillingUnit::Tokens),
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn ndjson_character_meter_counts_wire_text_once() {
+        let spec = SessionMeterSpec::new([SessionMeterDimension::required(
+            MeterDirection::Output,
+            BillingUnit::Characters,
+            1,
+            1,
+        )]);
+        let mut accumulator = StreamUsageAccumulator::new(spec, SessionUsageHints::default());
+        let line = b"{\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n";
+
+        assert!(accumulator.observe_chunk(line, false).unwrap());
+        assert_eq!(
+            accumulator
+                .observation()
+                .get(MeterDirection::Output, BillingUnit::Characters),
+            Some(std::str::from_utf8(line).unwrap().chars().count() as u64)
+        );
+    }
+
+    #[test]
+    fn ndjson_decoder_preserves_utf8_split_between_chunks() {
+        let spec = SessionMeterSpec::new([SessionMeterDimension::required(
+            MeterDirection::Output,
+            BillingUnit::Tokens,
+            1,
+            1,
+        )]);
+        let mut accumulator = StreamUsageAccumulator::new(spec, SessionUsageHints::default());
+        let line = b"{\"note\":\"\xF0\x9F\x99\x82\",\"usage\":{\"completion_tokens\":5}}\n";
+        let split = line.iter().position(|byte| *byte == 0xF0).unwrap() + 1;
+
+        assert!(!accumulator.observe_chunk(&line[..split], false).unwrap());
+        assert!(accumulator.observe_chunk(&line[split..], false).unwrap());
+        assert_eq!(
+            accumulator
+                .observation()
+                .get(MeterDirection::Output, BillingUnit::Tokens),
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn ndjson_decoder_flushes_final_record_without_newline() {
+        let spec = SessionMeterSpec::new([SessionMeterDimension::required(
+            MeterDirection::Output,
+            BillingUnit::Tokens,
+            1,
+            1,
+        )]);
+        let mut accumulator = StreamUsageAccumulator::new(spec, SessionUsageHints::default());
+
+        assert!(
+            !accumulator
+                .observe_chunk(br#"{"usage":{"completion_tokens":5}}"#, false)
+                .unwrap()
+        );
+        assert!(accumulator.finish_ndjson().unwrap());
+        assert_eq!(
+            accumulator
+                .observation()
+                .get(MeterDirection::Output, BillingUnit::Tokens),
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn ndjson_decoder_rejects_oversized_unfinished_record() {
+        let spec = SessionMeterSpec::new([SessionMeterDimension::required(
+            MeterDirection::Output,
+            BillingUnit::Bytes,
+            1,
+            1,
+        )]);
+        let mut accumulator = StreamUsageAccumulator::new(spec, SessionUsageHints::default());
+
+        let error = accumulator
+            .observe_chunk(&vec![b'x'; MAX_NDJSON_RECORD_BYTES + 1], false)
+            .unwrap_err();
+        assert!(error.to_string().contains("NDJSON record exceeds"));
     }
 
     #[test]
@@ -1028,7 +1262,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             let mut accumulator =
                 StreamUsageAccumulator::new(spec.clone(), SessionUsageHints::default());
 
-            assert!(accumulator.observe_chunk(chunk, true));
+            assert!(accumulator.observe_chunk(chunk, true).unwrap());
             assert_eq!(accumulator.observed_input_tokens(), Some(8));
             assert_eq!(
                 accumulator
@@ -1049,12 +1283,14 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
         )]);
         let mut accumulator = StreamUsageAccumulator::new(spec, SessionUsageHints::default());
 
-        let changed = accumulator.observe_chunk(
-            br#"data: {"choices":[{"delta":{"content":"one two three"}}]}
+        let changed = accumulator
+            .observe_chunk(
+                br#"data: {"choices":[{"delta":{"content":"one two three"}}]}
 
 "#,
-            true,
-        );
+                true,
+            )
+            .unwrap();
 
         assert!(changed);
         assert_eq!(
@@ -1089,7 +1325,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
 
 "#,
             true,
-        );
+        ).unwrap();
 
         assert!(changed);
         assert_eq!(
@@ -1119,12 +1355,14 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
         );
         let mut accumulator = StreamUsageAccumulator::new(spec, hints);
 
-        let changed = accumulator.observe_chunk(
-            br#"data: {"candidates":[{"content":{"parts":[{"text":"one two three four"}]}}]}
+        let changed = accumulator
+            .observe_chunk(
+                br#"data: {"candidates":[{"content":{"parts":[{"text":"one two three four"}]}}]}
 
 "#,
-            true,
-        );
+                true,
+            )
+            .unwrap();
 
         assert!(changed);
         assert_eq!(

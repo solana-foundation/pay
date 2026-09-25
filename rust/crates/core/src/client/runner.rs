@@ -568,6 +568,34 @@ impl RunOutcome {
         )
     }
 
+    /// Account-network slug the selected payment offer will sign on.
+    ///
+    /// This comes from the 402 challenge rather than the currently active
+    /// account, which may belong to an unrelated network.
+    pub fn payment_network(&self, network_override: Option<&str>) -> Result<Option<String>> {
+        let network = match self {
+            RunOutcome::MppChallenge { challenge, .. }
+            | RunOutcome::SessionChallenge { challenge, .. }
+            | RunOutcome::SubscriptionChallenge { challenge, .. } => {
+                mpp::challenge_network(challenge, network_override)?
+            }
+            RunOutcome::X402Challenge { challenge, .. } => {
+                x402::challenge_network(challenge, network_override)
+            }
+            RunOutcome::X402UptoChallenge { challenge, .. } => {
+                x402::scheme_network(&challenge.requirements.network, network_override)
+            }
+            RunOutcome::X402BatchChallenge { challenge, .. } => {
+                x402::scheme_network(&challenge.requirements.network, network_override)
+            }
+            RunOutcome::X402SignInChallenge { challenge, .. } => {
+                x402::sign_in_chain(challenge, network_override)?.1
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(network))
+    }
+
     /// Swap a payment offer `backend` cannot sign for the next offer on the
     /// same 402, so the choice follows what the signer can do rather than
     /// failing at signing time.
@@ -1858,6 +1886,17 @@ HTTP request sent, awaiting response...
 
         let outcome = classify_402(&headers, None, "https://example.com/resource");
         assert!(matches!(outcome, RunOutcome::MppChallenge { .. }));
+        assert_eq!(
+            outcome.payment_network(None).unwrap().as_deref(),
+            Some("devnet")
+        );
+        assert_eq!(
+            outcome
+                .payment_network(Some("localnet"))
+                .unwrap()
+                .as_deref(),
+            Some("localnet")
+        );
     }
 
     #[test]

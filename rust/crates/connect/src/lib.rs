@@ -75,6 +75,10 @@ pub trait WalletProbe: Send + Sync {
     /// True when the wallet is known to hold nothing. Unsure means false:
     /// an outage must never insert a detour.
     async fn holds_nothing(&self, address: &str) -> bool;
+
+    /// True only when a successful lookup confirms that the wallet is funded.
+    /// Unlike `holds_nothing`, an outage must fail closed for completion.
+    async fn has_funds(&self, address: &str) -> bool;
 }
 
 /// pay-api's stablecoin balance endpoint (`PAY_API_URL`), five-second cap.
@@ -97,6 +101,24 @@ impl WalletProbe for PayApiProbe {
             }
             Err(_) => {
                 tracing::info!(%address, "balance lookup timed out; assuming funded");
+                false
+            }
+        }
+    }
+
+    async fn has_funds(&self, address: &str) -> bool {
+        let rpc = pay_core::client::subscription::default_rpc_url_for_network(
+            pay_core::accounts::MAINNET_NETWORK,
+        );
+        let lookup = pay_core::client::balance::get_stablecoin_balances(&rpc, address);
+        match tokio::time::timeout(std::time::Duration::from_secs(5), lookup).await {
+            Ok(Ok(balances)) => !balances_hold_nothing(&balances),
+            Ok(Err(e)) => {
+                tracing::info!(%address, error = %e, "balance lookup failed; funding remains pending");
+                false
+            }
+            Err(_) => {
+                tracing::info!(%address, "balance lookup timed out; funding remains pending");
                 false
             }
         }
@@ -157,6 +179,10 @@ pub struct FixedProbe(pub bool);
 impl WalletProbe for FixedProbe {
     async fn holds_nothing(&self, _address: &str) -> bool {
         self.0
+    }
+
+    async fn has_funds(&self, _address: &str) -> bool {
+        !self.0
     }
 }
 
@@ -269,6 +295,7 @@ pub fn router(state: AppState) -> Router {
     let router = Router::new()
         .route("/health", get(health))
         .route("/", get(redirect_pages_root))
+        .route("/cli", get(cli::start_topup))
         .route("/fund", get(redirect_fund))
         .route("/authorize", get(redirect_authorize));
     // Metadata at the root and at the RFC 9728 / RFC 8414 path-based
@@ -310,6 +337,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/cli/{request}", get(cli::pending_view))
         .route("/api/cli/{request}/approve", post(cli::approve))
         .route("/api/cli/{request}/deny", post(cli::deny))
+        .route("/api/cli/{request}/topup", post(cli::complete_topup))
         .route("/v1/wallets", get(wallet_api::list))
         .route(
             "/v1/wallets/{wallet}/sign-transaction",

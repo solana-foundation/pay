@@ -2,6 +2,7 @@
 .vscode
 .DS_Store
 .worktrees/
+specs-drafts/
 
 # TypeScript
 node_modules

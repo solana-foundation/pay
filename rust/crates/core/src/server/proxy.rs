@@ -77,10 +77,9 @@ pub fn resolve_routing<'a>(api: &'a ApiSpec, path: &str) -> &'a RoutingConfig {
 /// AccessToken `prepare` binding with `body_digest`)? Such schemes can only be
 /// signed correctly when the full body is available before the upstream connect.
 ///
-/// The axum path always has the buffered body, so it's fine there. The pingora
-/// data plane streams the body unbuffered and signs against an empty placeholder,
-/// which would silently produce a wrong signature — it uses this to refuse such
-/// requests loudly instead.
+/// The axum path always has the buffered body. The Pingora data plane uses this
+/// signal to select its bounded request-buffering adapter instead of preparing a
+/// signature against an empty placeholder body.
 pub fn routing_signs_request_body(api: &ApiSpec, path: &str) -> bool {
     use pay_types::metering::{AuthConfig, HmacPrepareValue};
     let prepares = match resolve_routing(api, path).auth() {

@@ -54,7 +54,7 @@ impl NewCommand {
             .rpc_url
             .clone()
             .unwrap_or_else(pay_core::balance::mainnet_rpc_url);
-        let completion = crate::tui::run_topup_flow(&pubkey, &rpc_url, &self.name)?;
+        let completion = crate::tui::run_topup_flow(&pubkey, &rpc_url, &self.name, true)?;
         print_next_steps(
             &self.name,
             backend_name,
@@ -303,10 +303,10 @@ fn choose_wallet(
             require_tty("backend wallet choice")?;
             let labels: Vec<String> = wallets
                 .iter()
-                .map(|w| format!("{}  ({})", w.address, w.id))
+                .map(|wallet| wallet_choice_label(provider, wallet))
                 .collect();
             let choice = Select::with_theme(theme)
-                .with_prompt(format!("Which {}?", provider.display_name()))
+                .with_prompt("Select account")
                 .items(&labels)
                 .default(0)
                 .interact()
@@ -318,6 +318,23 @@ fn choose_wallet(
                 .id)
         }
     }
+}
+
+fn wallet_choice_label(
+    provider: &dyn pay_core::remote::RemoteProvider,
+    wallet: &pay_core::remote::RemoteWallet,
+) -> String {
+    let name = if provider.id() == "ledger" {
+        match wallet.id.as_str() {
+            "m/44'/501'/0'" => "Ledger Live account (recommended)",
+            "m/44'/501'/0'/0'" => "Legacy Solana CLI account",
+            _ => "Ledger account",
+        }
+    } else {
+        "Account"
+    };
+    let detail = format!("{}  {}", wallet.address, wallet.id);
+    format!("{name}  {}", detail.dimmed())
 }
 
 /// Connect a wallet held by a remote signing backend as a pay account.
@@ -381,7 +398,10 @@ fn create_remote_account(
         .iter()
         .any(|f| inputs.credential(provider, f).is_none())
         && std::io::IsTerminal::is_terminal(&std::io::stderr());
-    if will_prompt || !provider.requires_credentials() {
+    let waits_for_hardware = provider.custody() == pay_core::backend::Custody::Hardware
+        && inputs.wallet_id.is_none()
+        && std::io::IsTerminal::is_terminal(&std::io::stderr());
+    if (will_prompt || !provider.requires_credentials()) && !waits_for_hardware {
         eprintln!();
         eprintln!("  {}", provider.credentials_hint());
     }
@@ -415,7 +435,7 @@ fn create_remote_account(
         None => {
             let wallets = match discovered {
                 Some(wallets) => wallets,
-                None => provider.discover(&credentials)?,
+                None => discover_wallets_for_setup(provider, &credentials, waits_for_hardware)?,
             };
             choose_wallet(wallets, provider, &theme)?
         }
@@ -435,6 +455,35 @@ fn create_remote_account(
     save_account_remote(name, provider.id(), &pubkey, &wallet_id)?;
 
     Ok((pubkey, display))
+}
+
+fn discover_wallets_for_setup(
+    provider: &dyn pay_core::remote::RemoteProvider,
+    credentials: &pay_core::remote::Credentials,
+    wait_for_hardware: bool,
+) -> pay_core::Result<Vec<pay_core::remote::RemoteWallet>> {
+    if !wait_for_hardware {
+        return provider.discover(credentials);
+    }
+
+    eprintln!();
+    let spinner = indicatif::ProgressBar::new_spinner().with_style(
+        indicatif::ProgressStyle::with_template("  {spinner:.green} {msg}")
+            .expect("static template")
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+    );
+    spinner.set_message(format!(
+        "Plug in your {} and unlock it…  Ctrl+C to cancel",
+        provider.display_name()
+    ));
+    spinner.enable_steady_tick(std::time::Duration::from_millis(80));
+
+    let result = provider.discover_interactive(credentials);
+    spinner.finish_and_clear();
+    if result.is_ok() {
+        eprintln!("  {} {} connected", "✔".green(), provider.display_name());
+    }
+    result
 }
 
 /// Prompt for one credential, masked when the provider marks it secret.
@@ -715,8 +764,87 @@ pub fn resolve_op_account() -> pay_core::Result<Option<String>> {
     }
 }
 
-/// Interactive backend picker. Returns the backend id string.
-pub fn pick_backend() -> pay_core::Result<String> {
+struct BackendPickerOption {
+    id: &'static str,
+    name: String,
+    detail: String,
+}
+
+fn backend_picker_option(backend: &dyn pay_core::backend::SigningBackend) -> BackendPickerOption {
+    let (name, detail) = if backend.id() == "ledger" {
+        ("Hardware wallet", "requires Ledger device")
+    } else {
+        (backend.display_name(), backend.description())
+    };
+
+    BackendPickerOption {
+        id: backend.flag(),
+        name: name.to_string(),
+        detail: detail.to_string(),
+    }
+}
+
+fn local_backend_picker_option(
+    backend: &dyn pay_core::backend::SigningBackend,
+) -> BackendPickerOption {
+    let platform = if cfg!(target_os = "macos") {
+        "macOS"
+    } else if cfg!(target_os = "windows") {
+        "Windows"
+    } else {
+        "Linux"
+    };
+
+    BackendPickerOption {
+        id: backend.flag(),
+        name: "Local wallet".to_string(),
+        detail: format!(
+            "use {} on {platform}, {}",
+            backend.display_name(),
+            backend.description()
+        ),
+    }
+}
+
+fn backend_picker_options(
+    platform: Option<&dyn pay_core::backend::LocalKeystoreBackend>,
+) -> Vec<BackendPickerOption> {
+    // The OS-native store comes first. Linux without a reachable keyring
+    // falls back to the plain file; Windows without Hello offers nothing.
+    let mut options = match platform {
+        Some(backend) => vec![local_backend_picker_option(backend)],
+        None if cfg!(target_os = "linux") => {
+            vec![local_backend_picker_option(&pay_core::backend::File)]
+        }
+        None => Vec::new(),
+    };
+
+    // Hardware wallets need no secret store at all, so they are offered
+    // whenever this build includes them, plugged in or not. Keep this choice
+    // directly after the local wallet so it is second during macOS setup.
+    options.extend(
+        pay_core::remote::providers()
+            .filter(|p| p.custody() == pay_core::backend::Custody::Hardware)
+            .map(|p| backend_picker_option(p)),
+    );
+
+    // The remote wallet is set up from the browser; its token lives in the
+    // platform secret store, so only offer it when one is available. A
+    // bring-your-own custody provider (`--backend openfort`) is a flag, not
+    // a picker entry: the browser flow is the remote wallet.
+    if platform.is_some() {
+        options.push(BackendPickerOption {
+            id: crate::commands::connect_onboard::CONNECT_BACKEND_FLAG,
+            name: crate::commands::connect_onboard::CONNECT_BACKEND_NAME.to_string(),
+            detail: crate::commands::connect_onboard::CONNECT_BACKEND_DETAIL.to_string(),
+        });
+    }
+
+    options
+}
+
+/// Check that interactive backend selection can run without showing its prompt.
+pub fn ensure_backend_picker_available() -> pay_core::Result<()> {
     let has_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
     if !has_tty {
         return Err(pay_core::Error::Config(format!(
@@ -726,68 +854,8 @@ pub fn pick_backend() -> pay_core::Result<String> {
         )));
     }
 
-    struct Opt {
-        id: &'static str,
-        name: String,
-        detail: String,
-    }
-
-    fn opt(backend: &dyn pay_core::backend::SigningBackend) -> Opt {
-        Opt {
-            id: backend.flag(),
-            name: backend.display_name().to_string(),
-            detail: backend.description().to_string(),
-        }
-    }
-
-    fn local_opt(backend: &dyn pay_core::backend::SigningBackend) -> Opt {
-        let platform = if cfg!(target_os = "macos") {
-            "macOS"
-        } else if cfg!(target_os = "windows") {
-            "Windows"
-        } else {
-            "Linux"
-        };
-
-        Opt {
-            id: backend.flag(),
-            name: "Local wallet".to_string(),
-            detail: format!(
-                "use {} on {platform}, {}",
-                backend.display_name(),
-                backend.description()
-            ),
-        }
-    }
-
-    // The OS-native store comes first. Linux without a reachable keyring
-    // falls back to the plain file; Windows without Hello offers nothing.
     let platform = pay_core::backend::platform().filter(|p| p.is_available());
-    let mut options: Vec<Opt> = match platform {
-        Some(p) => vec![local_opt(p)],
-        None if cfg!(target_os = "linux") => vec![local_opt(&pay_core::backend::File)],
-        None => Vec::new(),
-    };
-
-    // The remote wallet is set up from the browser; its token lives in the
-    // platform secret store, so only offer it when one is available. A
-    // bring-your-own custody provider (`--backend openfort`) is a flag, not
-    // a picker entry: the browser flow is the remote wallet.
-    if platform.is_some() {
-        options.push(Opt {
-            id: crate::commands::connect_onboard::CONNECT_BACKEND_FLAG,
-            name: crate::commands::connect_onboard::CONNECT_BACKEND_NAME.to_string(),
-            detail: crate::commands::connect_onboard::CONNECT_BACKEND_DETAIL.to_string(),
-        });
-    }
-
-    // Hardware wallets need no secret store at all, so they are offered
-    // whenever this build includes them, plugged in or not.
-    options.extend(
-        pay_core::remote::providers()
-            .filter(|p| p.custody() == pay_core::backend::Custody::Hardware)
-            .map(|p| opt(p)),
-    );
+    let options = backend_picker_options(platform);
 
     if options.is_empty() {
         #[cfg(target_os = "linux")]
@@ -798,6 +866,16 @@ pub fn pick_backend() -> pay_core::Result<String> {
             "No supported keystore backend is available on this system.".to_string(),
         ));
     }
+
+    Ok(())
+}
+
+/// Interactive backend picker. Returns the backend id string.
+pub fn pick_backend() -> pay_core::Result<String> {
+    ensure_backend_picker_available()?;
+
+    let platform = pay_core::backend::platform().filter(|p| p.is_available());
+    let options = backend_picker_options(platform);
 
     // Two aligned columns: the backend name, then what it means for the
     // user, dimmed. The theme highlights the whole active row.
@@ -1047,6 +1125,42 @@ mod tests {
             file_backend_path("server"),
             pay_core::accounts::FileAccountsStore::default_keypair_path("server")
         );
+    }
+
+    #[cfg(any(feature = "ledger", target_os = "macos"))]
+    #[test]
+    fn ledger_is_presented_as_a_hardware_wallet_and_second() {
+        let option = backend_picker_option(&pay_core::remote::ledger::Ledger);
+
+        assert_eq!(option.id, "ledger");
+        assert_eq!(option.name, "Hardware wallet");
+        assert_eq!(option.detail, "requires Ledger device");
+
+        let options = backend_picker_options(pay_core::backend::platform());
+        assert_eq!(options[1].id, "ledger");
+    }
+
+    #[cfg(any(feature = "ledger", target_os = "macos"))]
+    #[test]
+    fn ledger_account_choices_explain_the_derivation_convention() {
+        let default_wallet = pay_core::remote::RemoteWallet {
+            id: "m/44'/501'/0'".to_string(),
+            address: "CcZFhGwFVkZevr555EZJpWbeq4irboT6zHfrSKWKCy3Z".to_string(),
+        };
+        let legacy_wallet = pay_core::remote::RemoteWallet {
+            id: "m/44'/501'/0'/0'".to_string(),
+            address: "DroagdVQo8VRRZeNjqMYLgtMA2xZJo1f4VEVAApJc74g".to_string(),
+        };
+
+        let default_label = wallet_choice_label(&pay_core::remote::ledger::Ledger, &default_wallet);
+        let legacy_label = wallet_choice_label(&pay_core::remote::ledger::Ledger, &legacy_wallet);
+
+        assert!(default_label.contains("Ledger Live account (recommended)"));
+        assert!(default_label.contains(&default_wallet.address));
+        assert!(default_label.contains(&default_wallet.id));
+        assert!(legacy_label.contains("Legacy Solana CLI account"));
+        assert!(legacy_label.contains(&legacy_wallet.address));
+        assert!(legacy_label.contains(&legacy_wallet.id));
     }
 
     #[test]

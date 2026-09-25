@@ -87,6 +87,7 @@ impl SetupCommand {
         // wallet. The MoonPay/onramp TUI is intentionally skipped — the
         // code is the funding source.
         if let Some(code) = &self.redeem {
+            install_agent_integrations();
             return self.run_redeem(&account_name, code);
         }
 
@@ -116,9 +117,22 @@ impl SetupCommand {
             return Ok(());
         }
 
-        // Resolve the backend first so an unavailable headless Secret Service
-        // does not leave MCP/agent configuration partially installed.
-        let backend = super::account::new::resolve_backend(self.backend.as_deref())?;
+        // Keep agent integration setup before the interactive wallet choice,
+        // while still rejecting unavailable explicit or interactive backends
+        // before writing any configuration.
+        let backend = if let Some(backend) = self.backend.as_deref() {
+            let backend = super::account::new::resolve_backend(Some(backend))?;
+            install_agent_integrations();
+            backend
+        } else {
+            super::account::new::ensure_backend_picker_available()?;
+            if prompt_skill_install() {
+                install_skill_for_agents();
+            }
+            let backend = super::account::new::resolve_backend(None)?;
+            install_mcp_configs();
+            backend
+        };
 
         // Browser-linked remote wallet: the page owns sign-in and custody
         // choice, so none of the local keypair steps below apply. Nothing
@@ -131,14 +145,9 @@ impl SetupCommand {
                 &account_name,
                 super::connect_onboard::CONNECT_BACKEND_NAME,
                 false,
+                false,
             );
         }
-
-        // Offer to install the agent skill if npx is available.
-        maybe_install_skill();
-
-        // Install MCP configs into Claude / Codex / Claude Desktop.
-        install_mcp_configs();
 
         let (pubkey, backend_name) = super::account::new::create_account(
             &account_name,
@@ -159,6 +168,7 @@ impl SetupCommand {
             &account_name,
             backend_name,
             !has_biometric_backend(),
+            backend == "ledger",
         )
     }
 
@@ -178,8 +188,6 @@ impl SetupCommand {
         {
             (pk, true)
         } else {
-            maybe_install_skill();
-            install_mcp_configs();
             let (pk, _backend_name) = super::account::new::create_account(
                 account_name,
                 self.backend.as_deref(),
@@ -193,10 +201,7 @@ impl SetupCommand {
         // 2. POST to pay-api's `/v1/redeem`. Honors `PAY_API_URL` via
         //    the same helper the `/v1/send` client uses, so override
         //    semantics match the rest of the CLI.
-        let api_url = pay_core::client::balance::pay_api_url();
-        let api_url = api_url.trim().trim_end_matches('/');
-
-        let response = match post_redeem(api_url, code, &pubkey) {
+        let response = match redeem_to_address(code, &pubkey) {
             Ok(r) => r,
             Err(e) if !used_existing => {
                 // The keypair was created moments ago and is now
@@ -228,16 +233,22 @@ fn fund_new_account(
     account_name: &str,
     backend_name: &str,
     skip_tui: bool,
+    skip_topup_when_funded: bool,
 ) -> pay_core::Result<()> {
     let config = pay_core::Config::load().unwrap_or_default();
     let rpc_url = config
         .rpc_url
         .clone()
         .unwrap_or_else(pay_core::balance::mainnet_rpc_url);
+    if skip_topup_when_funded && let Some(balances) = existing_stablecoin_balances(&rpc_url, pubkey)
+    {
+        print_setup_already_funded(backend_name, &balances);
+        return Ok(());
+    }
     let completion = if skip_tui {
         None
     } else {
-        crate::tui::run_topup_flow(pubkey, &rpc_url, account_name)?
+        crate::tui::run_topup_flow(pubkey, &rpc_url, account_name, true)?
     };
     if let Some(completion) = completion {
         print_setup_success(backend_name, &completion, &rpc_url);
@@ -245,6 +256,49 @@ fn fund_new_account(
         print_setup_aborted(account_name, backend_name);
     }
     Ok(())
+}
+
+fn existing_stablecoin_balances(
+    rpc_url: &str,
+    pubkey: &str,
+) -> Option<pay_core::client::balance::AccountBalances> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    let balances = runtime
+        .block_on(pay_core::balance::get_stablecoin_balances(rpc_url, pubkey))
+        .ok()?;
+    has_stablecoin_balance(&balances).then_some(balances)
+}
+
+fn has_stablecoin_balance(balances: &pay_core::client::balance::AccountBalances) -> bool {
+    !balances.tokens_unavailable && balances.tokens.iter().any(|token| token.raw_amount > 0)
+}
+
+fn print_setup_already_funded(
+    backend_name: &str,
+    balances: &pay_core::client::balance::AccountBalances,
+) {
+    let held = balances
+        .tokens
+        .iter()
+        .filter(|token| token.raw_amount > 0)
+        .map(|token| {
+            let amount = format!("{:.6}", token.ui_amount)
+                .trim_end_matches('0')
+                .trim_end_matches('.')
+                .to_string();
+            format!("{amount} {}", token.symbol_or(&token.mint))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    crate::components::print_notice(
+        crate::components::NoticeLevel::Success,
+        "Setup complete",
+        &format!("Account secured in {backend_name}\nExisting balance: {held}\nTop-up skipped"),
+    );
+    print_ready_hint();
 }
 
 fn has_biometric_backend() -> bool {
@@ -317,15 +371,24 @@ fn setup_aborted_body(account_name: &str, backend_name: &str) -> String {
 // ── Activation-campaign redemption ─────────────────────────────────────────
 
 #[derive(serde::Deserialize, Debug)]
-struct RedeemSuccess {
-    signature: String,
-    destination: String,
+pub(crate) struct RedeemSuccess {
+    pub(crate) signature: String,
+    pub(crate) destination: String,
     /// USDC funded by the activation campaign, formatted by pay-api
     /// (e.g. `"$0.10"`). Optional so older API versions still
     /// deserialize cleanly — the success notice just elides the
     /// amount when missing.
     #[serde(default)]
-    amount: Option<String>,
+    pub(crate) amount: Option<String>,
+}
+
+/// Redeem an activation code into an account that already exists.
+///
+/// Shared by `pay setup --redeem` and the top-up TUI so both paths use the
+/// same endpoint, timeout, validation, and error copy.
+pub(crate) fn redeem_to_address(code: &str, destination: &str) -> pay_core::Result<RedeemSuccess> {
+    let api_url = pay_core::client::balance::pay_api_url();
+    post_redeem(api_url.trim().trim_end_matches('/'), code, destination)
 }
 
 /// Pay-api may return a non-2xx with `{ "error": "...", "signature": "..." }`
@@ -461,11 +524,22 @@ fn shorten_pubkey(pk: &str) -> String {
 /// `pay setup --update`: refresh agent integrations without creating an account.
 fn run_update() -> pay_core::Result<()> {
     eprintln!();
-    maybe_install_skill();
-    install_mcp_configs();
+    install_agent_integrations();
     eprintln!("  {}", "Update complete.".dimmed());
     eprintln!();
     Ok(())
+}
+
+fn install_agent_integrations() {
+    let install_skill = prompt_skill_install();
+    apply_agent_integrations(install_skill);
+}
+
+fn apply_agent_integrations(install_skill: bool) {
+    if install_skill {
+        install_skill_for_agents();
+    }
+    install_mcp_configs();
 }
 
 // ── MCP config installation ────────────────────────────────────────────────
@@ -896,8 +970,8 @@ fn item_string_array(item: Option<&Item>) -> Option<Vec<&str>> {
 
 // ── Skill installation ─────────────────────────────────────────────────────
 
-/// If `npx` is on PATH, offer to install the pay agent skill for coding agents.
-fn maybe_install_skill() {
+/// If `npx` is on PATH, ask whether to install the pay agent skill.
+fn prompt_skill_install() -> bool {
     let npx_bin = if cfg!(windows) { "npx.cmd" } else { "npx" };
     let has_npx = std::process::Command::new(npx_bin)
         .arg("--version")
@@ -907,19 +981,19 @@ fn maybe_install_skill() {
         .is_ok_and(|s| s.success());
 
     if !has_npx {
-        return;
+        return false;
     }
 
     eprintln!();
-    let install = Confirm::with_theme(&dialoguer::theme::ColorfulTheme::default())
+    Confirm::with_theme(&dialoguer::theme::ColorfulTheme::default())
         .with_prompt("Install pay skill for your coding agents? (Claude Code, Cursor, …)")
         .default(true)
         .interact()
-        .unwrap_or(false);
+        .unwrap_or(false)
+}
 
-    if !install {
-        return;
-    }
+fn install_skill_for_agents() {
+    let npx_bin = if cfg!(windows) { "npx.cmd" } else { "npx" };
 
     eprintln!();
     let status = std::process::Command::new(npx_bin)
@@ -1011,6 +1085,25 @@ pub(crate) fn install_linux_polkit_policy_if_needed() -> pay_core::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ledger_topup_is_skipped_only_for_an_available_nonzero_stablecoin_balance() {
+        let mut balances = pay_core::client::balance::AccountBalances::default();
+        assert!(!has_stablecoin_balance(&balances));
+
+        balances
+            .tokens
+            .push(pay_core::client::balance::TokenBalance {
+                mint: pay_types::stablecoin_mints::USDC_MAINNET.to_string(),
+                raw_amount: 1,
+                ui_amount: 0.000_001,
+                symbol: Some("USDC".to_string()),
+            });
+        assert!(has_stablecoin_balance(&balances));
+
+        balances.tokens_unavailable = true;
+        assert!(!has_stablecoin_balance(&balances));
+    }
 
     #[test]
     fn codex_mcp_entry_includes_enabled_tools() {

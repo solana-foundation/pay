@@ -245,13 +245,14 @@ pub fn load_signer_for_network_with_intent_and_override(
     let file = store.load()?;
     match select_account(&file, network, account_override)? {
         AccountSelection::Configured { name, account } => {
-            let signer = load_signer_from_account_with_source(
+            let signer = load_signer_from_account_with_source_and_hardware_timeout(
                 store.credential_source(),
                 &account,
                 &name,
                 network,
                 intent,
                 auth_override,
+                store.hardware_connection_timeout(),
             )?;
             Ok((signer, None))
         }
@@ -562,14 +563,36 @@ pub fn load_signer_from_account_with_source(
     intent: &AuthIntent,
     auth_override: AuthOverride,
 ) -> Result<ResolvedSigner> {
+    load_signer_from_account_with_source_and_hardware_timeout(
+        source,
+        account,
+        name,
+        network,
+        intent,
+        auth_override,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_signer_from_account_with_source_and_hardware_timeout(
+    source: &dyn crate::remote::CredentialSource,
+    account: &Account,
+    name: &str,
+    network: &str,
+    intent: &AuthIntent,
+    auth_override: AuthOverride,
+    hardware_timeout: Option<std::time::Duration>,
+) -> Result<ResolvedSigner> {
     if account.backend == BackendKind::Remote {
-        return crate::remote::load_remote_signer_from(
+        return crate::remote::load_remote_signer_from_with_hardware_timeout(
             source,
             account,
             name,
             network,
             intent,
             auth_override,
+            hardware_timeout,
         );
     }
 
