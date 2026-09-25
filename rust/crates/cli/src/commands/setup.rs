@@ -201,10 +201,7 @@ impl SetupCommand {
         // 2. POST to pay-api's `/v1/redeem`. Honors `PAY_API_URL` via
         //    the same helper the `/v1/send` client uses, so override
         //    semantics match the rest of the CLI.
-        let api_url = pay_core::client::balance::pay_api_url();
-        let api_url = api_url.trim().trim_end_matches('/');
-
-        let response = match post_redeem(api_url, code, &pubkey) {
+        let response = match redeem_to_address(code, &pubkey) {
             Ok(r) => r,
             Err(e) if !used_existing => {
                 // The keypair was created moments ago and is now
@@ -374,15 +371,24 @@ fn setup_aborted_body(account_name: &str, backend_name: &str) -> String {
 // ── Activation-campaign redemption ─────────────────────────────────────────
 
 #[derive(serde::Deserialize, Debug)]
-struct RedeemSuccess {
-    signature: String,
-    destination: String,
+pub(crate) struct RedeemSuccess {
+    pub(crate) signature: String,
+    pub(crate) destination: String,
     /// USDC funded by the activation campaign, formatted by pay-api
     /// (e.g. `"$0.10"`). Optional so older API versions still
     /// deserialize cleanly — the success notice just elides the
     /// amount when missing.
     #[serde(default)]
-    amount: Option<String>,
+    pub(crate) amount: Option<String>,
+}
+
+/// Redeem an activation code into an account that already exists.
+///
+/// Shared by `pay setup --redeem` and the top-up TUI so both paths use the
+/// same endpoint, timeout, validation, and error copy.
+pub(crate) fn redeem_to_address(code: &str, destination: &str) -> pay_core::Result<RedeemSuccess> {
+    let api_url = pay_core::client::balance::pay_api_url();
+    post_redeem(api_url.trim().trim_end_matches('/'), code, destination)
 }
 
 /// Pay-api may return a non-2xx with `{ "error": "...", "signature": "..." }`

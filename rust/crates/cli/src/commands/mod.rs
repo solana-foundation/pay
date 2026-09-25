@@ -83,7 +83,7 @@ pub enum Command {
     Fanout(fanout::FanoutCommand),
     /// Generate a keypair, store it, and fund your account.
     Setup(setup::SetupCommand),
-    /// Import funds from Venmo, PayPal, or a mobile wallet.
+    /// Buy API credits, redeem a code, or transfer from a mobile wallet.
     Topup(topup::TopupCommand),
     /// Gate APIs, local demos, or inference with stablecoin payments.
     #[command(alias = "serve", alias = "server")]

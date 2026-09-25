@@ -1,6 +1,6 @@
 use crate::components;
 
-/// Import funds from Venmo, PayPal, or a mobile wallet.
+/// Buy API credits, redeem a code, or transfer from a mobile wallet.
 #[derive(clap::Args)]
 pub struct TopupCommand {
     /// Account to fund: a configured account name, or a Solana address.

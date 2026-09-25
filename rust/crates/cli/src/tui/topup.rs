@@ -1,10 +1,7 @@
 //! Interactive top-up flow: option selection, Solana Pay QR rendering with
-//! stable sizing, onramp launch (MoonPay redirect or the pay-connect funding
-//! page), and stablecoin balance polling.
+//! stable sizing, pay-connect funding, and stablecoin balance polling.
 
 use std::io;
-use std::io::Write;
-use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -227,28 +224,29 @@ const TOPUP_MAX_STEPS: usize = 25;
 const TOPUP_STEP_USDC: f64 = 1.0;
 const TOPUP_AMOUNT_LABEL_WIDTH: usize = 3;
 const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-/// Production onramp host — same gateway that serves the pay-api, just a
-/// different path (`/v1/onramp/start`). Reuses `pay_core::balance::DEFAULT_PAY_API_URL`
-/// so the two stay in sync if the host ever moves.
-const DEFAULT_ONRAMP_HOST: &str = pay_core::client::balance::DEFAULT_PAY_API_URL;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TopupOption {
     TransferFromExistingAccount,
-    BuyStablecoins,
+    BuyApiCredits,
+    RedeemCode,
 }
 
 impl TopupOption {
-    fn all() -> [Self; 2] {
-        // Buy stablecoins is the recommended flow for new users — list it first
+    fn all() -> [Self; 3] {
+        // Buying API credits is the recommended flow for new users — list it first
         // so it's the default-highlighted card.
-        [Self::BuyStablecoins, Self::TransferFromExistingAccount]
+        [
+            Self::BuyApiCredits,
+            Self::TransferFromExistingAccount,
+            Self::RedeemCode,
+        ]
     }
 
     fn title(self) -> &'static str {
         match self {
             Self::TransferFromExistingAccount => "Top-up from Mobile wallet",
-            Self::BuyStablecoins => "Buy stablecoins",
+            Self::BuyApiCredits => "Buy API Credits",
+            Self::RedeemCode => "Redeem code",
         }
     }
 
@@ -257,7 +255,8 @@ impl TopupOption {
     fn brand_color(self) -> Color {
         match self {
             Self::TransferFromExistingAccount => SOLANA_PURPLE,
-            Self::BuyStablecoins => SOLANA_GREEN,
+            Self::BuyApiCredits => SOLANA_GREEN,
+            Self::RedeemCode => Color::Cyan,
         }
     }
 }
@@ -267,110 +266,34 @@ enum TopupFocus {
     Methods,
 }
 
-/// Who sells the stablecoins. `PAY_ONRAMP=coinflow` opens pay.sh's
-/// funding page (card, Apple Pay, Google Pay through Coinflow, settled to
-/// the account's address); MoonPay stays the default until that path is
-/// verified end to end and the pay-api redirect is retired.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum OnrampProvider {
-    Moonpay,
-    Coinflow,
-}
-
-const ONRAMP_PROVIDER_ENV: &str = "PAY_ONRAMP";
-
-impl OnrampProvider {
-    fn from_env_value(value: Option<&str>) -> Self {
-        match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
-            Some("coinflow") => Self::Coinflow,
-            _ => Self::Moonpay,
-        }
-    }
-
-    /// The provider for this process, read once.
-    fn current() -> Self {
-        static CURRENT: std::sync::OnceLock<OnrampProvider> = std::sync::OnceLock::new();
-        *CURRENT.get_or_init(|| {
-            Self::from_env_value(std::env::var(ONRAMP_PROVIDER_ENV).ok().as_deref())
-        })
-    }
-
-    fn display_name(self) -> &'static str {
-        match self {
-            Self::Moonpay => "MoonPay",
-            Self::Coinflow => "pay.sh",
-        }
-    }
-
-    /// Payment methods offered, first one preselected.
-    fn methods(self) -> &'static [OnrampPaymentMethod] {
-        match self {
-            Self::Moonpay => &[
-                OnrampPaymentMethod::Paypal,
-                OnrampPaymentMethod::Venmo,
-                OnrampPaymentMethod::ApplePay,
-            ],
-            Self::Coinflow => &[OnrampPaymentMethod::Card],
-        }
-    }
-
-    /// Where the purchase happens: the pay-api gateway (MoonPay redirect)
-    /// or pay-connect (funding page).
-    fn host(self) -> String {
-        match self {
-            Self::Moonpay => std::env::var("PAY_ONRAMP_HOST")
-                .unwrap_or_else(|_| DEFAULT_ONRAMP_HOST.to_string())
-                .trim_end_matches('/')
-                .to_string(),
-            Self::Coinflow => crate::commands::connect_onboard::default_connect_url(),
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OnrampPaymentMethod {
-    Paypal,
-    Venmo,
     ApplePay,
-    /// Card, Apple Pay or Google Pay, chosen on the funding page itself.
+    GooglePay,
     Card,
 }
 
 impl OnrampPaymentMethod {
     fn default() -> Self {
-        OnrampProvider::current().methods()[0]
+        Self::Card
     }
 
     fn all() -> &'static [Self] {
-        OnrampProvider::current().methods()
+        &[Self::Card, Self::ApplePay, Self::GooglePay]
     }
 
     fn title(self) -> &'static str {
         match self {
-            Self::Paypal => "PayPal",
-            Self::Venmo => "Venmo",
             Self::ApplePay => "Apple Pay",
-            Self::Card => "Pay by card",
-        }
-    }
-
-    fn query_value(self) -> &'static str {
-        match self {
-            Self::Paypal => "paypal",
-            Self::Venmo => "venmo",
-            Self::ApplePay => "apple_pay",
-            Self::Card => "card",
+            Self::GooglePay => "Google Pay",
+            Self::Card => "Card payment",
         }
     }
 
     /// Brand-color background used when this option is selected.
     fn brand_color(self) -> Color {
         match self {
-            // Approximations of each brand's primary color, dimmed slightly
-            // so they read OK on the dark TUI background.
-            Self::Paypal => Color::Rgb(255, 196, 57),
-            Self::Venmo => Color::Rgb(0, 140, 255),
-            Self::ApplePay | Self::Card => Color::White,
+            Self::ApplePay | Self::GooglePay | Self::Card => Color::White,
         }
     }
 
@@ -378,8 +301,7 @@ impl OnrampPaymentMethod {
     /// dark on light brand backgrounds (Apple Pay), white otherwise.
     fn brand_text_color(self) -> Color {
         match self {
-            Self::Paypal | Self::Venmo => Color::White,
-            Self::ApplePay | Self::Card => Color::Black,
+            Self::ApplePay | Self::GooglePay | Self::Card => Color::Black,
         }
     }
 
@@ -400,22 +322,18 @@ impl OnrampPaymentMethod {
     }
 }
 
-/// Where the "Buy stablecoins" option sends the browser, for the current
-/// provider. Trailing slashes are stripped so callers can `format!` without
-/// double-slash hazards.
+/// Where "Buy API Credits" sends the browser.
 fn resolve_onramp_host() -> String {
-    OnrampProvider::current().host()
+    crate::commands::connect_onboard::default_connect_url()
 }
 
 /// Run the interactive top-up TUI for an account.
 ///
 /// Presents two options to the user:
 ///
-/// 1. **Buy stablecoins** (default) — copies the destination wallet address to
-///    the clipboard, shows a brief launch animation, then opens the
-///    `/v1/onramp/start` endpoint on the gateway in the user's browser.
-///    `PAY_ONRAMP_HOST` controls the host, defaulting to
-///    `DEFAULT_ONRAMP_HOST` (the production gateway).
+/// 1. **Buy API Credits** (default) — opens pay.sh's card, Apple Pay, and
+///    Google Pay checkout for the destination account. Because this flow did
+///    not create a cloud wallet, the checkout collects the buyer's email.
 /// 2. **Top-up from mobile wallet** — renders a USDC Solana Pay QR code that
 ///    any Solana wallet can scan, while polling pay-api for incoming
 ///    stablecoin balance changes against `pubkey`.
@@ -533,10 +451,12 @@ fn run_topup(
     let mut amount_pos: usize = 3; // default $3
     let mut last_amount_pos = amount_pos;
 
-    // Active onramp session (set after the user hits Enter on "Buy stablecoins").
+    // Active onramp session (set after the user hits Enter on "Buy API Credits").
     let mut onramp: Option<OnrampSession> = None;
     let mut onramp_notice: Option<String> = None;
     let mut onramp_error: Option<String> = None;
+    let mut redeem_code = String::new();
+    let mut redeem_error: Option<String> = None;
     // Signature reported by the funding page, attached to the detection
     // once the balance poll sees the USDC land.
     let mut pending_tx_hash: Option<String> = None;
@@ -574,10 +494,10 @@ fn run_topup(
             match outcome {
                 Ok(outcome) => {
                     onramp_notice = Some(match outcome.signature.as_deref() {
-                        Some(sig) => {
-                            format!("Card charged. USDC sent in {sig}; waiting for it to land…")
-                        }
-                        None => "Card charged. Waiting for the USDC to land…".to_string(),
+                        Some(sig) => format!(
+                            "Payment approved in {sig}; waiting for your credits to arrive…"
+                        ),
+                        None => "Payment approved. Waiting for your credits to arrive…".to_string(),
                     });
                     onramp_error = None;
                     pending_tx_hash = outcome.signature;
@@ -639,13 +559,24 @@ fn run_topup(
                 onramp.as_ref(),
                 onramp_notice.as_deref(),
                 onramp_error.as_deref(),
+                &redeem_code,
+                redeem_error.as_deref(),
             );
         })?;
         first_frame_drawn = true;
 
-        if event::poll(Duration::from_millis(50))?
-            && let Event::Key(key) = event::read()?
-        {
+        if event::poll(Duration::from_millis(50))? {
+            let input_event = event::read()?;
+            if let Event::Paste(text) = &input_event
+                && options[selected] == TopupOption::RedeemCode
+            {
+                redeem_code.push_str(text.trim());
+                redeem_error = None;
+                continue;
+            }
+            let Event::Key(key) = input_event else {
+                continue;
+            };
             if key.kind != KeyEventKind::Press {
                 continue;
             }
@@ -661,7 +592,7 @@ fn run_topup(
                 KeyCode::Left => {
                     if options[selected] == TopupOption::TransferFromExistingAccount {
                         amount_pos = amount_pos.saturating_sub(1);
-                    } else if options[selected] == TopupOption::BuyStablecoins && onramp.is_none() {
+                    } else if options[selected] == TopupOption::BuyApiCredits && onramp.is_none() {
                         payment_method = payment_method.previous();
                     }
                 }
@@ -670,14 +601,13 @@ fn run_topup(
                         && amount_pos < TOPUP_MAX_STEPS
                     {
                         amount_pos += 1;
-                    } else if options[selected] == TopupOption::BuyStablecoins && onramp.is_none() {
+                    } else if options[selected] == TopupOption::BuyApiCredits && onramp.is_none() {
                         payment_method = payment_method.next();
                     }
                 }
                 KeyCode::Enter => {
-                    if options[selected] == TopupOption::BuyStablecoins {
+                    if options[selected] == TopupOption::BuyApiCredits {
                         if onramp.is_none() {
-                            let copied_to_clipboard = copy_to_clipboard(pubkey).is_ok();
                             animate_onramp_launch(
                                 terminal,
                                 TopupLaunchView {
@@ -690,7 +620,6 @@ fn run_topup(
                                     amount_pos,
                                     payment_method,
                                 },
-                                copied_to_clipboard,
                             )?;
                             match launch_onramp_session(
                                 onramp_host,
@@ -710,15 +639,75 @@ fn run_topup(
                                 }
                             }
                         }
+                    } else if options[selected] == TopupOption::RedeemCode {
+                        let code = redeem_code.trim();
+                        if code.is_empty() {
+                            redeem_error = Some("Enter a redemption code first.".to_string());
+                            continue;
+                        }
+                        terminal.draw(|frame| {
+                            render_topup_selector(
+                                frame,
+                                frame.area(),
+                                pubkey,
+                                account_name,
+                                &options,
+                                selected,
+                                focus,
+                                &status,
+                                amount_pos,
+                                payment_method,
+                                None,
+                                onramp.as_ref(),
+                                onramp_notice.as_deref(),
+                                onramp_error.as_deref(),
+                                &redeem_code,
+                                Some("Redeeming code…"),
+                            );
+                        })?;
+                        match crate::commands::setup::redeem_to_address(code, pubkey) {
+                            Ok(receipt) if receipt.destination == pubkey => {
+                                let ui_amount = receipt
+                                    .amount
+                                    .as_deref()
+                                    .and_then(parse_redeemed_usd_amount)
+                                    .unwrap_or_default();
+                                return Ok(Some(TopupDetected {
+                                    received: ReceivedFunds {
+                                        sol_lamports: 0,
+                                        tokens: if ui_amount > 0.0 {
+                                            vec![pay_core::client::balance::ReceivedToken {
+                                                mint: USDC_MINT.to_string(),
+                                                ui_amount,
+                                                symbol: Some("API credits".to_string()),
+                                            }]
+                                        } else {
+                                            Vec::new()
+                                        },
+                                    },
+                                    tx_hash: Some(receipt.signature),
+                                }));
+                            }
+                            Ok(receipt) => {
+                                redeem_error = Some(format!(
+                                    "The gateway funded {}, not this account.",
+                                    receipt.destination
+                                ));
+                            }
+                            Err(error) => redeem_error = Some(error.to_string()),
+                        }
                     } else {
                         return Ok(None);
                     }
                 }
+                KeyCode::Backspace if options[selected] == TopupOption::RedeemCode => {
+                    redeem_code.pop();
+                    redeem_error = None;
+                }
                 KeyCode::Char('r') | KeyCode::Char('R')
-                    if options[selected] == TopupOption::BuyStablecoins && onramp.is_some() =>
+                    if options[selected] == TopupOption::BuyApiCredits && onramp.is_some() =>
                 {
-                    // Reopen the gateway onramp URL. The server will create a
-                    // fresh MoonPay checkout session for the new request.
+                    // Reopen the pay.sh checkout URL.
                     if let Some(session) = onramp.as_ref() {
                         let _ = open_url(&session.url);
                     }
@@ -727,6 +716,13 @@ fn run_topup(
                     // Restart the cycle: resets the 5s delay and 5min window
                     // so polling resumes (or unstalls) regardless of state.
                     poll.reset_cycle(Instant::now());
+                }
+                KeyCode::Char(ch)
+                    if options[selected] == TopupOption::RedeemCode
+                        && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    redeem_code.push(ch);
+                    redeem_error = None;
                 }
                 KeyCode::Char('q') | KeyCode::Esc => {
                     return Ok(None);
@@ -749,8 +745,7 @@ struct BlinkState {
 struct OnrampSession {
     url: String,
     payment_method: OnrampPaymentMethod,
-    /// The funding page's loopback listener (Coinflow only); MoonPay has
-    /// no return channel, so the balance poll is the only signal.
+    /// The funding page's loopback listener.
     funding: Option<crate::commands::connect_onboard::FundingSession>,
 }
 
@@ -803,6 +798,8 @@ fn blink_checkmark(
                 onramp,
                 onramp_notice,
                 onramp_error,
+                "",
+                None,
             );
         })?;
         std::thread::sleep(Duration::from_millis(300));
@@ -813,30 +810,12 @@ fn blink_checkmark(
 fn animate_onramp_launch(
     terminal: &mut Terminal<TuiBackend>,
     view: TopupLaunchView<'_>,
-    copied_to_clipboard: bool,
 ) -> io::Result<()> {
-    let provider = OnrampProvider::current();
-    let name = provider.display_name();
-    let frames: Vec<String> = match (provider, copied_to_clipboard) {
-        (OnrampProvider::Moonpay, true) => vec![
-            "Copying wallet address.".to_string(),
-            "Copying wallet address..".to_string(),
-            format!("Wallet address copied. Paste it into {name} when asked which wallet to fund."),
-            format!("Wallet address copied. Opening {name}..."),
-        ],
-        (OnrampProvider::Moonpay, false) => vec![
-            "Clipboard copy unavailable.".to_string(),
-            format!("When {name} asks which wallet to fund, paste the pubkey shown above."),
-            format!("Opening {name} with this wallet address locked in.."),
-            format!("Opening {name} with this wallet address locked in..."),
-        ],
-        // The funding page is fixed to this address; nothing to paste.
-        (OnrampProvider::Coinflow, _) => vec![
-            format!("Opening {name} to buy USDC for this address."),
-            format!("Opening {name} to buy USDC for this address.."),
-            format!("Opening {name} to buy USDC for this address..."),
-        ],
-    };
+    let frames = [
+        "Opening pay.sh to buy API credits.",
+        "Opening pay.sh to buy API credits..",
+        "Opening pay.sh to buy API credits...",
+    ];
 
     for notice in &frames {
         terminal.draw(|frame| {
@@ -855,6 +834,8 @@ fn animate_onramp_launch(
                 None,
                 None,
                 Some(notice),
+                None,
+                "",
                 None,
             );
         })?;
@@ -880,6 +861,8 @@ fn render_topup_selector(
     onramp: Option<&OnrampSession>,
     onramp_notice: Option<&str>,
     onramp_error: Option<&str>,
+    redeem_code: &str,
+    redeem_error: Option<&str>,
 ) {
     frame.render_widget(Clear, area);
     frame.render_widget(
@@ -964,7 +947,7 @@ fn render_topup_selector(
         TopupOption::TransferFromExistingAccount => {
             render_qr_detail(frame, right[1], pubkey, account_name, amount_pos, blink)
         }
-        TopupOption::BuyStablecoins => render_buy_stablecoins_detail(
+        TopupOption::BuyApiCredits => render_buy_stablecoins_detail(
             frame,
             right[1],
             pubkey,
@@ -975,11 +958,14 @@ fn render_topup_selector(
             onramp_notice,
             onramp_error,
         ),
+        TopupOption::RedeemCode => {
+            render_redeem_code_detail(frame, right[1], redeem_code, redeem_error)
+        }
     }
 
     // Top banner — only rendered when the polling cycle has stalled; the
     // QR view's scan-instruction now lives in the slider title.
-    if matches!(status, PollStatus::Stalled) {
+    if active != TopupOption::RedeemCode && matches!(status, PollStatus::Stalled) {
         render_stalled_banner(frame, right[0]);
     }
 
@@ -1131,6 +1117,81 @@ fn render_qr_detail(
     frame.render_widget(address, split[4]);
 }
 
+fn render_redeem_code_detail(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    code: &str,
+    error: Option<&str>,
+) {
+    frame.render_widget(
+        Block::default().style(Style::default().bg(TOPUP_MAIN_BG)),
+        area,
+    );
+    let width = 64.min(area.width);
+    let height = 11.min(area.height);
+    let panel = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    let chunks = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Length(3),
+        Constraint::Length(1),
+        Constraint::Min(2),
+    ])
+    .split(panel);
+
+    frame.render_widget(
+        Paragraph::new("Enter your activation code")
+            .style(Style::default().fg(Color::White).bold())
+            .centered(),
+        chunks[0],
+    );
+    let input = Paragraph::new(if code.is_empty() {
+        "Paste or type code"
+    } else {
+        code
+    })
+    .style(Style::default().fg(if code.is_empty() {
+        Color::DarkGray
+    } else {
+        Color::White
+    }))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Cyan))
+            .padding(Padding::horizontal(1)),
+    );
+    frame.render_widget(input, chunks[1]);
+
+    let help = error.unwrap_or("The code will fund this account directly.");
+    frame.render_widget(
+        Paragraph::new(help)
+            .style(Style::default().fg(if error.is_some() {
+                Color::Yellow
+            } else {
+                Color::DarkGray
+            }))
+            .centered()
+            .wrap(ratatui::widgets::Wrap { trim: true }),
+        chunks[3],
+    );
+}
+
+fn parse_redeemed_usd_amount(amount: &str) -> Option<f64> {
+    amount
+        .trim()
+        .strip_prefix('$')
+        .unwrap_or(amount.trim())
+        .replace(',', "")
+        .parse()
+        .ok()
+}
+
 /// Build the slider title for the QR view — e.g.
 /// ` Top-up amount: $3 (← → to adjust) `. Pure helper so we can unit-test
 /// the wording without spinning up a Frame.
@@ -1196,19 +1257,19 @@ fn render_buy_stablecoins_detail(
 const PAYMENT_BUTTON_WIDTH: u16 = 18;
 /// Horizontal gap between adjacent payment-method buttons.
 const PAYMENT_BUTTON_GAP: u16 = 2;
-/// Max width of the centered "What are stablecoins?" info panel. The panel
+/// Max width of the centered API-credit explainer. The panel
 /// is also capped to the available area width.
 const STABLECOIN_PANEL_MAX_WIDTH: u16 = 128;
 /// Reassuring explainer aimed at non-crypto users. One entry per line so we
 /// control exactly where breaks happen — the info panel renders as-is, no
 /// auto-wrap, so nothing can smash sentences together at narrow widths.
 const STABLECOIN_DESCRIPTION_LINES: &[&str] = &[
-    "Stablecoins are digital dollars: each one equals $1 USD, fully backed and regulated.",
-    "They're high-resolution money — divisible down to micro-cents ($0.000001), so APIs can charge precisely what they deliver.",
-    "They move at internet speed: send and settle in seconds, anywhere in the world.",
+    "API credits let pay-enabled tools purchase calls without managing API keys or subscriptions.",
+    "Choose an amount in the secure pay.sh checkout, then pay by card, Apple Pay, or Google Pay.",
+    "Credits are added to this account and can be spent across pay-enabled APIs.",
 ];
 
-/// Render the "Buy stablecoins" pane: title + explainer info panel, three
+/// Render the "Buy API Credits" pane: explainer, payment choices, and action.
 /// brand-coloured payment-method buttons, and a short action description.
 /// Used both before launch (the "press Enter to open …" prompt) and after
 /// launch (a spinner + "Waiting for {method} payment …" line) so the
@@ -1271,7 +1332,7 @@ fn render_buy_stablecoins_intro(
     };
     let info_block = Block::default()
         .title(Span::styled(
-            " What are stablecoins? ",
+            " How API credits work ",
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
@@ -1437,31 +1498,20 @@ fn render_buy_stablecoins_intro(
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    match OnrampProvider::current() {
-                        OnrampProvider::Moonpay => format!(
-                            " to open {} and convert dollars to USDC.",
-                            payment_method.title()
-                        ),
-                        OnrampProvider::Coinflow => {
-                            " to buy USDC with a card, Apple Pay or Google Pay.".to_string()
-                        }
-                    },
+                    " to choose an amount and pay by card, Apple Pay, or Google Pay.",
                     Style::default().fg(Color::Gray),
                 ),
             ])
             .centered(),
             Line::from(vec![
-                Span::styled(
-                    "On Solana, funds arrive at ",
-                    Style::default().fg(Color::Gray),
-                ),
+                Span::styled("Credits are added to ", Style::default().fg(Color::Gray)),
                 Span::styled(
                     pubkey.to_string(),
                     Style::default()
                         .fg(Color::Green)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(" within a second.", Style::default().fg(Color::Gray)),
+                Span::styled(" after payment.", Style::default().fg(Color::Gray)),
             ])
             .centered(),
         ];
@@ -1599,13 +1649,19 @@ fn render_topup_controls(
         TopupOption::TransferFromExistingAccount => {
             &[("↑ ↓", "move"), ("← →", "amount"), ("Esc", "skip")]
         }
-        TopupOption::BuyStablecoins if onramp_active => {
+        TopupOption::BuyApiCredits if onramp_active => {
             &[("↑ ↓", "move"), ("r", "reopen"), ("Esc", "abort")]
         }
-        TopupOption::BuyStablecoins => &[
+        TopupOption::BuyApiCredits => &[
             ("↑ ↓", "move"),
             ("← →", payment_method.title()),
             ("Enter", "copy + open"),
+            ("Esc", "skip"),
+        ],
+        TopupOption::RedeemCode => &[
+            ("type", "code"),
+            ("Backspace", "delete"),
+            ("Enter", "redeem"),
             ("Esc", "skip"),
         ],
     };
@@ -1633,32 +1689,6 @@ fn render_topup_controls(
     controls_bar(frame, area, entries, Some(Line::from(status_spans)));
 }
 
-fn build_onramp_redirect_url(host: &str) -> String {
-    format!("{host}/v1/onramp/complete")
-}
-
-/// Compose the onramp URL we open in the browser. Points at the gateway's
-/// `/v1/onramp/start` endpoint, which redirects to MoonPay with the server-side
-/// API key + currency defaults applied.
-fn build_onramp_url(
-    host: &str,
-    pubkey: &str,
-    payment_method: Option<OnrampPaymentMethod>,
-) -> String {
-    let base = format!("{}/v1/onramp/start", host.trim_end_matches('/'));
-    let redirect_url = build_onramp_redirect_url(host);
-    let mut url = reqwest::Url::parse(&base).expect("onramp URL should parse");
-    {
-        let mut query = url.query_pairs_mut();
-        query.append_pair("walletAddress", pubkey);
-        query.append_pair("redirectURL", &redirect_url);
-        if let Some(payment_method) = payment_method {
-            query.append_pair("paymentMethod", payment_method.query_value());
-        }
-    }
-    url.into()
-}
-
 /// Launch a fresh onramp session in the browser.
 fn launch_onramp_session(
     onramp_host: &str,
@@ -1666,92 +1696,19 @@ fn launch_onramp_session(
     account_name: &str,
     payment_method: OnrampPaymentMethod,
 ) -> Result<OnrampSession, String> {
-    let host = onramp_host.trim_end_matches('/').to_string();
-    match OnrampProvider::current() {
-        OnrampProvider::Moonpay => {
-            let url = build_onramp_url(&host, pubkey, Some(payment_method));
-            open_url(&url).map_err(|err| format!("failed to open onramp: {err}"))?;
-            Ok(OnrampSession {
-                url,
-                payment_method,
-                funding: None,
-            })
-        }
-        OnrampProvider::Coinflow => {
-            let funding =
-                crate::commands::connect_onboard::FundingSession::open(&host, pubkey, account_name)
-                    .map_err(|err| err.to_string())?;
-            Ok(OnrampSession {
-                url: funding.url.clone(),
-                payment_method,
-                funding: Some(funding),
-            })
-        }
-    }
+    let host = onramp_host.trim_end_matches('/');
+    let funding =
+        crate::commands::connect_onboard::FundingSession::open(host, pubkey, account_name)
+            .map_err(|err| err.to_string())?;
+    Ok(OnrampSession {
+        url: funding.url.clone(),
+        payment_method,
+        funding: Some(funding),
+    })
 }
 
 fn open_url(url: &str) -> io::Result<()> {
     webbrowser::open(url).map_err(io::Error::other)
-}
-
-fn pipe_to_command(program: &str, args: &[&str], text: &str) -> io::Result<()> {
-    let mut child = ProcessCommand::new(program)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(text.as_bytes())?;
-    }
-
-    let status = child.wait()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!(
-            "{program} exited with status {status}"
-        )))
-    }
-}
-
-fn copy_to_clipboard(text: &str) -> io::Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        return pipe_to_command("pbcopy", &[], text);
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        return pipe_to_command("cmd", &["/C", "clip"], text);
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let commands: &[(&str, &[&str])] = &[
-            ("wl-copy", &[]),
-            ("xclip", &["-selection", "clipboard"]),
-            ("xsel", &["--clipboard", "--input"]),
-        ];
-        let mut last_err = None;
-        for (program, args) in commands {
-            match pipe_to_command(program, args, text) {
-                Ok(()) => return Ok(()),
-                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
-                Err(err) => last_err = Some(err),
-            }
-        }
-        return Err(last_err.unwrap_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "no clipboard command available")
-        }));
-    }
-
-    #[allow(unreachable_code)]
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "clipboard copy is not supported on this platform",
-    ))
 }
 
 #[cfg(test)]
@@ -2082,87 +2039,30 @@ mod tests {
         assert_eq!(topup_qr_version(pubkey).unwrap(), max_code.version());
     }
 
-    // ── onramp URLs ────────────────────────────────────────────────────
-
     #[test]
-    fn build_onramp_redirect_url_targets_done_page() {
+    fn api_credit_payment_methods_match_pay_connect_checkout() {
         assert_eq!(
-            build_onramp_redirect_url("https://api.gateway-402.com"),
-            "https://api.gateway-402.com/v1/onramp/complete"
+            OnrampPaymentMethod::all(),
+            &[
+                OnrampPaymentMethod::Card,
+                OnrampPaymentMethod::ApplePay,
+                OnrampPaymentMethod::GooglePay,
+            ]
         );
+        assert_eq!(OnrampPaymentMethod::default(), OnrampPaymentMethod::Card);
     }
 
     #[test]
-    fn onramp_provider_defaults_to_moonpay_until_opted_in() {
-        assert_eq!(
-            OnrampProvider::from_env_value(None),
-            OnrampProvider::Moonpay
-        );
-        assert_eq!(
-            OnrampProvider::from_env_value(Some("")),
-            OnrampProvider::Moonpay
-        );
-        assert_eq!(
-            OnrampProvider::from_env_value(Some("moonpay")),
-            OnrampProvider::Moonpay
-        );
-        assert_eq!(
-            OnrampProvider::from_env_value(Some(" Coinflow ")),
-            OnrampProvider::Coinflow
-        );
-        assert_eq!(
-            OnrampProvider::Coinflow.methods(),
-            &[OnrampPaymentMethod::Card]
-        );
-        assert_eq!(OnrampProvider::Moonpay.methods().len(), 3);
+    fn topup_menu_puts_redeem_code_third() {
+        let options = TopupOption::all();
+        assert_eq!(options[0].title(), "Buy API Credits");
+        assert_eq!(options[2].title(), "Redeem code");
     }
 
     #[test]
-    fn build_onramp_url_targets_gateway_with_fixed_params() {
-        let url = build_onramp_url(
-            "https://api.gateway-402.com",
-            "wallet123",
-            Some(OnrampPaymentMethod::Paypal),
-        );
-        let parsed = reqwest::Url::parse(&url).expect("onramp URL should parse");
-        let query = parsed
-            .query_pairs()
-            .collect::<std::collections::HashMap<_, _>>();
-
-        assert_eq!(parsed.host_str(), Some("api.gateway-402.com"));
-        assert_eq!(parsed.path(), "/v1/onramp/start");
-        assert_eq!(query.get("walletAddress"), Some(&"wallet123".into()));
-        assert_eq!(
-            query.get("redirectURL"),
-            Some(&"https://api.gateway-402.com/v1/onramp/complete".into())
-        );
-        assert_eq!(query.get("paymentMethod"), Some(&"paypal".into()));
-        assert!(!query.contains_key("apiKey"));
-        assert!(!query.contains_key("currencyCode"));
-        assert!(!query.contains_key("baseCurrencyAmount"));
-        assert!(!query.contains_key("externalTransactionId"));
-        assert!(!query.contains_key("account"));
-    }
-
-    #[test]
-    fn build_onramp_url_omits_payment_method_when_absent() {
-        let url = build_onramp_url("https://api.gateway-402.com", "wallet123", None);
-        let parsed = reqwest::Url::parse(&url).expect("onramp URL should parse");
-        let query = parsed
-            .query_pairs()
-            .collect::<std::collections::HashMap<_, _>>();
-
-        assert_eq!(parsed.path(), "/v1/onramp/start");
-        assert!(!query.contains_key("paymentMethod"));
-    }
-
-    #[test]
-    fn default_onramp_host_matches_pay_api_host() {
-        // Both the balance API and the onramp endpoint live on the same
-        // gateway — keep them locked to a single source of truth.
-        assert_eq!(
-            DEFAULT_ONRAMP_HOST,
-            pay_core::client::balance::DEFAULT_PAY_API_URL
-        );
+    fn redeemed_amount_parses_api_display_value() {
+        assert_eq!(parse_redeemed_usd_amount("$0.10"), Some(0.1));
+        assert_eq!(parse_redeemed_usd_amount("$1,250.00"), Some(1250.0));
+        assert_eq!(parse_redeemed_usd_amount("unknown"), None);
     }
 }
