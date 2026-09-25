@@ -5171,6 +5171,7 @@ dependencies = [
  "pay-types",
  "serde_json",
  "solana-pay-kit",
+ "tempfile",
 ]
 
 [[package]]
