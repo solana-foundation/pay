@@ -232,14 +232,14 @@ enum TopupOption {
 }
 
 impl TopupOption {
-    fn all() -> [Self; 3] {
+    fn all(allow_redemption: bool) -> Vec<Self> {
         // Buying API credits is the recommended flow for new users — list it first
         // so it's the default-highlighted card.
-        [
-            Self::BuyApiCredits,
-            Self::TransferFromExistingAccount,
-            Self::RedeemCode,
-        ]
+        let mut options = vec![Self::BuyApiCredits, Self::TransferFromExistingAccount];
+        if allow_redemption {
+            options.push(Self::RedeemCode);
+        }
+        options
     }
 
     fn title(self) -> &'static str {
@@ -462,7 +462,7 @@ fn run_topup(
     onramp_host: &str,
     allow_redemption: bool,
 ) -> io::Result<Option<TopupDetected>> {
-    let options = TopupOption::all();
+    let options = TopupOption::all(allow_redemption);
     let mut selected = 0usize;
     let mut payment_method = OnrampPaymentMethod::default();
     let focus = TopupFocus::Methods;
@@ -2085,9 +2085,16 @@ mod tests {
 
     #[test]
     fn topup_menu_puts_redeem_code_third() {
-        let options = TopupOption::all();
+        let options = TopupOption::all(true);
         assert_eq!(options[0].title(), "Buy API Credits");
         assert_eq!(options[2].title(), "Redeem code");
+    }
+
+    #[test]
+    fn topup_menu_hides_redeem_code_when_unavailable() {
+        let options = TopupOption::all(false);
+        assert_eq!(options.len(), 2);
+        assert!(!options.contains(&TopupOption::RedeemCode));
     }
 
     #[test]
