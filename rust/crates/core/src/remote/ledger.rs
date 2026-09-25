@@ -104,14 +104,20 @@ fn app_configuration_is_incompatible(detail: &str) -> bool {
 }
 
 fn discovery_error_is_retryable(err: &SignerError) -> bool {
-    match err {
-        SignerError::NotAvailable(detail) => {
-            !detail.contains("multiple Ledger")
-                && !detail.contains("HID subsystem is unavailable")
-                && !app_configuration_is_incompatible(detail)
-        }
-        _ => false,
-    }
+    let SignerError::NotAvailable(detail) = err else {
+        return false;
+    };
+    let detail = detail.to_ascii_lowercase();
+
+    // Keep this as an allowlist of the transient states emitted by
+    // solana-keychain. NotAvailable also covers permanent configuration
+    // failures (no udev access, multiple devices, unsupported app versions),
+    // which must be returned instead of turning into an endless poll.
+    detail == "no ledger device found"
+        || detail.contains("ledger is busy with another operation")
+        || detail.contains("the ledger is locked")
+        || detail.starts_with("ledger did not answer.")
+        || detail.starts_with("ledger is not reachable.")
 }
 
 impl SigningBackend for Ledger {
@@ -306,8 +312,15 @@ mod tests {
         assert!(discovery_error_is_retryable(&SignerError::NotAvailable(
             "the Ledger is locked".to_string()
         )));
+        assert!(discovery_error_is_retryable(&SignerError::NotAvailable(
+            "Ledger is busy with another operation or awaiting on-device confirmation".to_string()
+        )));
+        assert!(discovery_error_is_retryable(&SignerError::NotAvailable(
+            "Ledger did not answer. It is either locked, or another application is holding it"
+                .to_string()
+        )));
         assert!(!discovery_error_is_retryable(&SignerError::NotAvailable(
-            "multiple Ledger devices attached".to_string()
+            "2 Ledger devices connected; pass host_device_path to select one".to_string()
         )));
         assert!(!discovery_error_is_retryable(&SignerError::NotAvailable(
             "the Ledger HID subsystem is unavailable".to_string()

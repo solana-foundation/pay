@@ -386,6 +386,28 @@ pub fn load_remote_signer_from(
     intent: &AuthIntent,
     auth_override: AuthOverride,
 ) -> Result<ResolvedSigner> {
+    load_remote_signer_from_with_hardware_timeout(
+        source,
+        account,
+        name,
+        network,
+        intent,
+        auth_override,
+        None,
+    )
+}
+
+/// [`load_remote_signer_from`] with an explicit, bounded hardware wait.
+#[allow(clippy::too_many_arguments)]
+pub fn load_remote_signer_from_with_hardware_timeout(
+    source: &dyn CredentialSource,
+    account: &Account,
+    name: &str,
+    network: &str,
+    intent: &AuthIntent,
+    auth_override: AuthOverride,
+    hardware_timeout: Option<std::time::Duration>,
+) -> Result<ResolvedSigner> {
     let provider = account_provider(account, name)?;
 
     let wallet_id = account.account.clone().ok_or_else(|| {
@@ -410,9 +432,9 @@ pub fn load_remote_signer_from(
         Credentials::new()
     };
 
-    let wait_for_hardware = provider.custody() == crate::backend::Custody::Hardware
-        && std::io::IsTerminal::is_terminal(&std::io::stderr());
-    if wait_for_hardware {
+    let hardware_timeout =
+        hardware_timeout.filter(|_| provider.custody() == crate::backend::Custody::Hardware);
+    if hardware_timeout.is_some() {
         eprintln!(
             "{}",
             format!(
@@ -422,8 +444,17 @@ pub fn load_remote_signer_from(
             .dimmed()
         );
     }
-    let signer = (if wait_for_hardware {
-        provider.connect_interactive(&credentials, &wallet_id)
+    let signer = (if let Some(timeout) = hardware_timeout {
+        provider
+            .connect_interactive_for(&credentials, &wallet_id, timeout)
+            .and_then(|signer| {
+                signer.ok_or_else(|| {
+                    Error::Config(format!(
+                        "Timed out waiting for {}. Plug it in, unlock it, and retry.",
+                        provider.display_name()
+                    ))
+                })
+            })
     } else {
         provider.connect(&credentials, &wallet_id)
     })

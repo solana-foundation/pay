@@ -1374,6 +1374,13 @@ struct PaymentRetryContext<'a, 'tool> {
     verbose: bool,
 }
 
+const HARDWARE_CONNECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn interactive_accounts_store() -> pay_core::accounts::FileAccountsStore {
+    pay_core::accounts::FileAccountsStore::default_path()
+        .with_hardware_connection_timeout(HARDWARE_CONNECTION_TIMEOUT)
+}
+
 fn pay_mpp_and_retry(
     challenges: &[mpp::Challenge],
     resource_url: &str,
@@ -1386,7 +1393,7 @@ fn pay_mpp_and_retry(
         eprintln!("{}", "Paying...".dimmed());
     }
 
-    let store = pay_core::accounts::FileAccountsStore::default_path();
+    let store = interactive_accounts_store();
     let challenge = mpp::select_challenge_by_balance(
         challenges,
         &store,
@@ -1451,7 +1458,7 @@ fn pay_subscription_and_retry(
         eprintln!("{}", "Activating subscription...".dimmed());
     }
 
-    let store = pay_core::accounts::FileAccountsStore::default_path();
+    let store = interactive_accounts_store();
     let built = sub_client::build_credential_with_authenticate(
         challenge,
         authenticate_challenge,
@@ -1636,7 +1643,7 @@ fn pay_x402_and_retry(
         eprintln!("{}", "Paying...".dimmed());
     }
 
-    let store = pay_core::accounts::FileAccountsStore::default_path();
+    let store = interactive_accounts_store();
     let built_payment = x402::build_payment(
         challenge,
         &store,
