@@ -181,6 +181,20 @@ impl<S: PaymentState> Http402Gate<S> {
             .or_else(|| if apis.len() == 1 { apis.first() } else { None })
     }
 
+    /// Prepare a request whose upstream authentication depends on its body.
+    /// Kept on the gate so the buffered route has a focused regression seam:
+    /// tests can prove the exact bytes read from downstream reach auth prep.
+    async fn prepare_buffered_request(
+        &self,
+        api: &ApiSpec,
+        method: &http::Method,
+        uri: &Uri,
+        headers: &http::HeaderMap,
+        body: &[u8],
+    ) -> Result<UpstreamPlan, axum::response::Response> {
+        prepare_upstream(api, method, uri, headers, body).await
+    }
+
     /// Plan the upstream for a Forward/Passthrough decision: control-plane → the
     /// internal axum service; otherwise resolve + `prepare_upstream`. Returns
     /// `Ok(true)` if a response was written here (respond-mode / not-found /
@@ -399,7 +413,10 @@ impl<S: PaymentState> Http402Gate<S> {
             }
         };
 
-        let prepared = match prepare_upstream(api, method, uri, headers, body.as_ref()).await {
+        let prepared = match self
+            .prepare_buffered_request(api, method, uri, headers, body.as_ref())
+            .await
+        {
             Ok(UpstreamPlan::Respond(resp)) => {
                 self.finish_buffered_axum_response(session, ctx, resp)
                     .await?;
@@ -1463,11 +1480,92 @@ async fn write_axum_response(
 #[cfg(test)]
 mod tests {
     use super::{
-        BatchResponseCapture, MAX_BATCH_CACHED_RESPONSE_BYTES, buffered_upstream_headers,
-        filtered_response_headers, is_control_plane, is_streamed_response,
+        BatchResponseCapture, Http402Gate, MAX_BATCH_CACHED_RESPONSE_BYTES,
+        buffered_upstream_headers, filtered_response_headers, is_control_plane,
+        is_streamed_response,
     };
     use http::{HeaderMap, HeaderValue, StatusCode, header};
+    use pay_core::PaymentState;
     use pay_core::server::gate::delegated_session_receipt_annotation;
+    use pay_core::server::proxy::UpstreamPlan;
+    use pay_types::metering::{
+        AccountingMode, ApiCategory, ApiSpec, AuthConfig, HmacAlgorithm, HmacCanonicalComponent,
+        HmacCanonicalConfig, HmacDigestAlgorithm, HmacEncoding, HmacPrepareBinding,
+        HmacPrepareValue, HmacSignatureConfig, HmacSignatureDestination, HmacTarget,
+        HmacTargetType, RoutingConfig,
+    };
+
+    #[derive(Clone)]
+    struct BodySigningState {
+        apis: Vec<ApiSpec>,
+    }
+
+    impl PaymentState for BodySigningState {
+        fn apis(&self) -> &[ApiSpec] {
+            &self.apis
+        }
+
+        fn mpp(&self) -> Option<&pay_kit::mpp::server::Mpp> {
+            None
+        }
+    }
+
+    fn body_signing_api() -> ApiSpec {
+        ApiSpec {
+            name: "body signing test".to_string(),
+            subdomain: "signed".to_string(),
+            title: "Body signing test".to_string(),
+            description: String::new(),
+            category: ApiCategory::AiMl,
+            version: "1.0".to_string(),
+            env: std::collections::HashMap::new(),
+            routing: RoutingConfig::Proxy {
+                url: "https://upstream.example".to_string(),
+                path_rewrites: vec![],
+                auth: Some(Box::new(AuthConfig::Hmac {
+                    algorithm: HmacAlgorithm::Sha256,
+                    // PATH is guaranteed in the test process and its value is
+                    // irrelevant; this test asserts the body-derived header.
+                    secret_from_env: "PATH".to_string(),
+                    secret_suffix: None,
+                    key_id_from_env: None,
+                    prepare: vec![HmacPrepareBinding {
+                        target: HmacTarget {
+                            kind: HmacTargetType::Header,
+                            name: "Content-MD5".to_string(),
+                        },
+                        value: HmacPrepareValue::BodyDigest {
+                            algorithm: HmacDigestAlgorithm::Md5,
+                            encoding: HmacEncoding::Base64,
+                        },
+                    }],
+                    canonical: HmacCanonicalConfig {
+                        join_with: "\n".to_string(),
+                        components: vec![HmacCanonicalComponent::Header {
+                            name: "Content-MD5".to_string(),
+                        }],
+                    },
+                    signature: HmacSignatureConfig {
+                        encoding: HmacEncoding::Base64,
+                        destination: HmacSignatureDestination {
+                            kind: HmacTargetType::Header,
+                            name: "Authorization".to_string(),
+                            template: "HMAC {signature}".to_string(),
+                        },
+                    },
+                })),
+            },
+            accounting: AccountingMode::Pooled,
+            endpoints: vec![],
+            free_tier: None,
+            quotas: None,
+            notes: None,
+            operator: None,
+            session: None,
+            batch_settlement: None,
+            recipients: std::collections::HashMap::new(),
+        }
+    }
 
     #[test]
     fn control_plane_paths_are_not_tracked() {
@@ -1594,6 +1692,34 @@ mod tests {
             http::HeaderValue::from_static("application/json"),
         );
         assert!(!is_streamed_response(&json));
+    }
+
+    #[tokio::test]
+    async fn http402_gate_prepares_body_digest_from_buffered_body() {
+        let gate = Http402Gate::new(
+            BodySigningState {
+                apis: vec![body_signing_api()],
+            },
+            "127.0.0.1:1",
+        );
+        let api = gate.resolve_api("signed.example").expect("API resolves");
+        let plan = gate
+            .prepare_buffered_request(
+                api,
+                &http::Method::POST,
+                &"/v1/generate".parse().unwrap(),
+                &HeaderMap::new(),
+                b"hello",
+            )
+            .await
+            .expect("request prepares");
+        let UpstreamPlan::Forward(prepared) = plan else {
+            panic!("free body-signing route should forward");
+        };
+
+        assert!(prepared.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("content-md5") && value == "XUFAKrxLKna5cZ2REBfFkg=="
+        }));
     }
 
     #[test]
