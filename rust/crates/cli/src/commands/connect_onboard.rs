@@ -524,20 +524,25 @@ async fn callback_handler(
 }
 
 /// Minimal self-contained page shown in the browser tab after the redirect.
-fn page(heading: &str, body: &str) -> String {
+fn page(heading: &str, body: &str, icon: &str) -> String {
     format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Pay</title>\
 <style>body{{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;\
-font-family:Inter,system-ui,-apple-system,sans-serif;background:#fff;color:#111}}\
-main{{text-align:center;padding:24px}}h1{{font-size:28px;margin:0 0 12px}}\
-p{{color:#666;font-size:18px;margin:0}}</style></head>\
-<body><main><h1>{heading}</h1><p>{body}</p></main></body></html>"
+font-family:Inter,system-ui,-apple-system,sans-serif;background:#09090b;color:#fafafa}}\
+main{{text-align:center;padding:24px}}.icon{{display:flex;justify-content:center;margin:0 auto 28px}}\
+.icon svg{{width:56px;height:56px;stroke:#fff}}h1{{font-size:28px;margin:0 0 12px}}\
+p{{color:#a1a1aa;font-size:18px;margin:0}}code{{color:#fafafa}}</style></head>\
+<body><main>{icon}<h1>{heading}</h1><p>{body}</p></main></body></html>"
     )
 }
 
 fn success_page() -> String {
-    page("You're all set.", "You can return to your terminal.")
+    page(
+        "You're all set.",
+        "You can return to your terminal.",
+        "<div class=\"icon\" aria-hidden=\"true\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><rect x=\"3\" y=\"4\" width=\"18\" height=\"16\" rx=\"2\"/><path d=\"m7 9 3 3-3 3\"/><path d=\"M13 15h4\"/></svg></div>",
+    )
 }
 
 fn error_page(reason: &str) -> String {
@@ -546,6 +551,7 @@ fn error_page(reason: &str) -> String {
         &format!(
             "This link could not be verified ({reason}). Return to your terminal and run <code>pay setup</code> again."
         ),
+        "",
     )
 }
 
@@ -648,7 +654,7 @@ impl CallbackListener {
 /// clearing 3-D Secure can take a while.
 pub const FUNDING_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
-/// Query for `{connect}/fund`, the card-purchase page.
+/// Query for `{connect}/cli`, the CLI card-purchase entrypoint.
 pub struct FundUrlParams<'a> {
     pub connect_url: &'a str,
     pub address: &'a str,
@@ -660,7 +666,7 @@ pub struct FundUrlParams<'a> {
 }
 
 pub fn build_fund_url(p: &FundUrlParams<'_>) -> String {
-    let mut url = reqwest::Url::parse(&format!("{}/fund", p.connect_url.trim_end_matches('/')))
+    let mut url = reqwest::Url::parse(&format!("{}/cli", p.connect_url.trim_end_matches('/')))
         .expect("connect URL should parse");
     {
         let mut q = url.query_pairs_mut();
@@ -1034,7 +1040,7 @@ mod tests {
             parsed.origin().ascii_serialization(),
             "http://127.0.0.1:8402"
         );
-        assert_eq!(parsed.path(), "/fund");
+        assert_eq!(parsed.path(), "/cli");
         let q: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
         assert_eq!(q["address"], "CcZFhGwFVkZevr555EZJpWbeq4irboT6zHfrSKWKCy3Z");
         assert_eq!(q["callback"], "http://127.0.0.1:53211/callback");
@@ -1087,7 +1093,10 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(res.status(), reqwest::StatusCode::OK);
-            assert!(res.text().await.unwrap().contains("You're all set"));
+            let page = res.text().await.unwrap();
+            assert!(page.contains("You're all set"));
+            assert!(page.contains("background:#09090b"));
+            assert!(page.contains("<svg"));
 
             let code = listener
                 .wait_for_code(Duration::from_secs(5))

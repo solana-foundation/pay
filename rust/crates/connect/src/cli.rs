@@ -8,6 +8,7 @@
 //! credentials never leave this service.
 
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -17,9 +18,10 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use serde::{Deserialize, Serialize};
+use solana_pubkey::Pubkey;
 
 use crate::AppState;
-use crate::oauth::{PrivyLogin, approve_with_privy, privy_login};
+use crate::oauth::{FundNext, PrivyLogin, approve_with_privy, privy_login};
 use crate::protocol::{
     ApiError, pkce_challenge, random_token, redirect_url, sha256_hex, validate_callback,
     validate_code_challenge, validate_state,
@@ -34,8 +36,14 @@ const MAX_ROWS: usize = 4096;
 struct Pending {
     callback: String,
     state: String,
-    code_challenge: String,
+    kind: PendingKind,
     created_at: Instant,
+}
+
+#[derive(Clone)]
+enum PendingKind {
+    Link { code_challenge: String },
+    Topup { address: String },
 }
 
 struct Grant {
@@ -75,7 +83,14 @@ impl Store {
     }
 
     fn approve(&self, id: &str, subject: String) -> Option<(Pending, String)> {
-        let pending = self.pending.lock().unwrap().remove(id)?;
+        let mut rows = self.pending.lock().unwrap();
+        let pending = rows.get(id)?;
+        let PendingKind::Link { code_challenge } = &pending.kind else {
+            return None;
+        };
+        let code_challenge = code_challenge.clone();
+        let pending = rows.remove(id)?;
+        drop(rows);
         if Instant::now().saturating_duration_since(pending.created_at) > REQUEST_TTL {
             return None;
         }
@@ -92,7 +107,7 @@ impl Store {
             sha256_hex(&code),
             Grant {
                 subject,
-                code_challenge: pending.code_challenge.clone(),
+                code_challenge,
                 created_at: Instant::now(),
             },
         );
@@ -100,9 +115,28 @@ impl Store {
     }
 
     fn deny(&self, id: &str) -> Option<Pending> {
-        let pending = self.pending.lock().unwrap().remove(id)?;
+        let mut rows = self.pending.lock().unwrap();
+        if !matches!(rows.get(id)?.kind, PendingKind::Link { .. }) {
+            return None;
+        }
+        let pending = rows.remove(id)?;
         (Instant::now().saturating_duration_since(pending.created_at) <= REQUEST_TTL)
             .then_some(pending)
+    }
+
+    fn complete_topup(&self, id: &str) -> Option<Pending> {
+        let mut rows = self.pending.lock().unwrap();
+        if !matches!(rows.get(id)?.kind, PendingKind::Topup { .. }) {
+            return None;
+        }
+        let pending = rows.remove(id)?;
+        (Instant::now().saturating_duration_since(pending.created_at) <= REQUEST_TTL)
+            .then_some(pending)
+    }
+
+    fn is_link_pending(&self, id: &str) -> bool {
+        self.pending(id)
+            .is_some_and(|pending| matches!(pending.kind, PendingKind::Link { .. }))
     }
 
     fn exchange(&self, code: &str, verifier: &str) -> Option<String> {
@@ -185,7 +219,9 @@ pub async fn start(
         Pending {
             callback: query.callback,
             state: query.state,
-            code_challenge: query.code_challenge,
+            kind: PendingKind::Link {
+                code_challenge: query.code_challenge,
+            },
             created_at: Instant::now(),
         },
     )?;
@@ -198,10 +234,58 @@ pub async fn start(
     Ok(Redirect::to(&state.cli_page_url(&id)))
 }
 
+#[derive(Deserialize)]
+pub struct TopupQuery {
+    address: String,
+    callback: String,
+    state: String,
+    #[serde(default)]
+    account: Option<String>,
+    #[serde(default)]
+    cli: Option<String>,
+}
+
+/// Reserve a direct CLI top-up and enter `/connect` without wallet sign-in.
+pub async fn start_topup(
+    State(state): State<AppState>,
+    Query(query): Query<TopupQuery>,
+) -> Result<Redirect, ApiError> {
+    validate_callback(&query.callback)?;
+    validate_state(&query.state)?;
+    let address = Pubkey::from_str(&query.address)
+        .map_err(|_| {
+            ApiError::bad_request(
+                "invalid_address",
+                "A valid Solana wallet address is required.",
+            )
+        })?
+        .to_string();
+    let id = random_token();
+    state.cli().insert_pending(
+        id.clone(),
+        Pending {
+            callback: query.callback,
+            state: query.state,
+            kind: PendingKind::Topup {
+                address: address.clone(),
+            },
+            created_at: Instant::now(),
+        },
+    )?;
+    tracing::info!(
+        account = query.account.as_deref().unwrap_or("-"),
+        cli = query.cli.as_deref().unwrap_or("-"),
+        %address,
+        "CLI top-up started"
+    );
+    Ok(Redirect::to(&state.cli_page_url(&id)))
+}
+
 #[derive(Serialize)]
 pub struct PendingView {
     pub client_name: &'static str,
     pub scope: &'static str,
+    pub intent: &'static str,
     pub has_wallet: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wallet_address: Option<String>,
@@ -214,7 +298,17 @@ pub async fn pending_view(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<PendingView>, ApiError> {
-    state.cli().pending(&id).ok_or_else(unknown_request)?;
+    let pending = state.cli().pending(&id).ok_or_else(unknown_request)?;
+    if let PendingKind::Topup { address } = pending.kind {
+        return Ok(Json(PendingView {
+            client_name: "pay CLI",
+            scope: "cli",
+            intent: "topup",
+            has_wallet: true,
+            wallet_address: Some(address),
+            privy: None,
+        }));
+    }
     let wallet = state
         .tenants()
         .subject_from_cookie(&headers)
@@ -222,6 +316,7 @@ pub async fn pending_view(
     Ok(Json(PendingView {
         client_name: "pay CLI",
         scope: "cli",
+        intent: "link",
         has_wallet: wallet.is_some(),
         wallet_address: wallet.map(|wallet| wallet.pubkey.clone()),
         privy: privy_login(&state),
@@ -230,7 +325,10 @@ pub async fn pending_view(
 
 #[derive(Serialize)]
 pub struct Decision {
-    pub redirect: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redirect: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fund: Option<FundNext>,
 }
 
 pub async fn approve(
@@ -238,6 +336,9 @@ pub async fn approve(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
+    if !state.cli().is_link_pending(&id) {
+        return Err(unknown_request());
+    }
     let bearer = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -261,12 +362,28 @@ pub async fn approve(
             false,
         ),
     };
+    if let Some(fund) = funding_next(&state, &id, &subject, fresh_login).await? {
+        tracing::info!(subject = %subject, address = %fund.address, "empty CLI wallet: funding before approval");
+        let mut response = Json(Decision {
+            redirect: None,
+            fund: Some(fund),
+        })
+        .into_response();
+        response.headers_mut().insert(
+            header::SET_COOKIE,
+            state
+                .tenants()
+                .subject_cookie(&subject, state.public_url().starts_with("https://")),
+        );
+        return Ok(response);
+    }
     let (pending, code) = state
         .cli()
         .approve(&id, subject.clone())
         .ok_or_else(unknown_request)?;
     let mut response = Json(Decision {
-        redirect: redirect_url(&pending.callback, &code, &pending.state),
+        redirect: Some(redirect_url(&pending.callback, &code, &pending.state)),
+        fund: None,
     })
     .into_response();
     if fresh_login {
@@ -280,6 +397,73 @@ pub async fn approve(
     Ok(response)
 }
 
+#[derive(Deserialize)]
+pub struct TopupCompleteRequest {
+    payment_id: String,
+    #[serde(default)]
+    signature: Option<String>,
+}
+
+/// Return a settled direct top-up to the CLI loopback listener.
+pub async fn complete_topup(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Result<Json<Decision>, ApiError> {
+    let request: TopupCompleteRequest = serde_json::from_slice(&body).map_err(|error| {
+        ApiError::bad_request("invalid_request", format!("invalid JSON body: {error}"))
+    })?;
+    if request.payment_id.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "invalid_request",
+            "A valid payment ID is required.",
+        ));
+    }
+    let pending = state
+        .cli()
+        .complete_topup(&id)
+        .ok_or_else(unknown_request)?;
+    let mut callback = url::Url::parse(&pending.callback).expect("validated CLI callback");
+    let mut query = callback.query_pairs_mut();
+    query
+        .append_pair("payment_id", request.payment_id.trim())
+        .append_pair("state", &pending.state);
+    if let Some(signature) = request
+        .signature
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        query.append_pair("signature", signature);
+    }
+    drop(query);
+    Ok(Json(Decision {
+        redirect: Some(callback.into()),
+        fund: None,
+    }))
+}
+
+async fn funding_next(
+    state: &AppState,
+    id: &str,
+    subject: &str,
+    fresh_login: bool,
+) -> Result<Option<FundNext>, ApiError> {
+    if !fresh_login {
+        return Ok(None);
+    }
+    let tenant = state.tenants().get(subject).ok_or_else(unknown_request)?;
+    if !state.wallet_probe().holds_nothing(&tenant.pubkey).await {
+        return Ok(None);
+    }
+    if !state.cli().is_link_pending(id) {
+        return Err(unknown_request());
+    }
+    Ok(Some(FundNext {
+        address: tenant.pubkey.clone(),
+        request: id.to_string(),
+    }))
+}
+
 pub async fn deny(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -291,7 +475,8 @@ pub async fn deny(
         .append_pair("error", "access_denied")
         .append_pair("state", &pending.state);
     Ok(Json(Decision {
-        redirect: callback.into(),
+        redirect: Some(callback.into()),
+        fund: None,
     }))
 }
 
@@ -475,6 +660,7 @@ mod tests {
         let (status, body) = json(view).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["client_name"], "pay CLI");
+        assert_eq!(body["intent"], "link");
         assert_eq!(body["has_wallet"], true);
         assert_eq!(body["wallet_address"], ADDRESS);
 
@@ -602,6 +788,100 @@ mod tests {
         let (status, body) = json(replay).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"], "invalid_grant");
+    }
+
+    #[tokio::test]
+    async fn fresh_empty_wallet_keeps_cli_request_pending_for_funding() {
+        let state = state().with_wallet_probe(std::sync::Arc::new(crate::FixedProbe(true)));
+        state
+            .cli()
+            .insert_pending(
+                "request-to-fund".to_string(),
+                Pending {
+                    callback: CALLBACK.to_string(),
+                    state: STATE.to_string(),
+                    kind: PendingKind::Link {
+                        code_challenge: pkce_challenge(VERIFIER),
+                    },
+                    created_at: Instant::now(),
+                },
+            )
+            .unwrap();
+
+        let fund = funding_next(&state, "request-to-fund", SUBJECT, true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fund.address, ADDRESS);
+        assert_eq!(fund.request, "request-to-fund");
+        assert!(state.cli().pending("request-to-fund").is_some());
+        assert!(
+            funding_next(&state, "request-to-fund", SUBJECT, false)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_topup_bypasses_privy_and_returns_payment_to_cli() {
+        let app = crate::router(state());
+        let start = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/cli?address={ADDRESS}&callback=http%3A%2F%2F127.0.0.1%3A53211%2Fcallback&state={STATE}&account=ludo&cli=0.29.0"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(start.status(), StatusCode::SEE_OTHER);
+        let page = url::Url::parse(start.headers()[header::LOCATION].to_str().unwrap()).unwrap();
+        let request_id = page
+            .query_pairs()
+            .find(|(key, _)| key == "cli")
+            .map(|(_, value)| value.into_owned())
+            .unwrap();
+
+        let view = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/cli/{request_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, body) = json(view).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["intent"], "topup");
+        assert_eq!(body["wallet_address"], ADDRESS);
+        assert!(body.get("privy").is_none());
+
+        let complete = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/cli/{request_id}/topup"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"payment_id":"payment_123","signature":"sig_123"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, body) = json(complete).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let callback = url::Url::parse(body["redirect"].as_str().unwrap()).unwrap();
+        let query: HashMap<_, _> = callback.query_pairs().into_owned().collect();
+        assert_eq!(query["payment_id"], "payment_123");
+        assert_eq!(query["signature"], "sig_123");
+        assert_eq!(query["state"], STATE);
     }
 
     #[test]

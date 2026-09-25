@@ -269,6 +269,7 @@ pub fn router(state: AppState) -> Router {
     let router = Router::new()
         .route("/health", get(health))
         .route("/", get(redirect_pages_root))
+        .route("/cli", get(cli::start_topup))
         .route("/fund", get(redirect_fund))
         .route("/authorize", get(redirect_authorize));
     // Metadata at the root and at the RFC 9728 / RFC 8414 path-based
@@ -310,6 +311,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/cli/{request}", get(cli::pending_view))
         .route("/api/cli/{request}/approve", post(cli::approve))
         .route("/api/cli/{request}/deny", post(cli::deny))
+        .route("/api/cli/{request}/topup", post(cli::complete_topup))
         .route("/v1/wallets", get(wallet_api::list))
         .route(
             "/v1/wallets/{wallet}/sign-transaction",
