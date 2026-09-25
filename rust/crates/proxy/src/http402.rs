@@ -664,7 +664,7 @@ impl<S: PaymentState> Http402Gate<S> {
             }
         }
         if let Some(meter) = delegated_meter.as_mut() {
-            meter.finish_stream().await.map_err(|error| {
+            meter.finish_stream(is_sse).await.map_err(|error| {
                 pingora::Error::because(
                     pingora::ErrorType::ReadError,
                     "finish delegated response stream metering",

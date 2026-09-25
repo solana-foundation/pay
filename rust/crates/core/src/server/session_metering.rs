@@ -48,6 +48,8 @@ pub enum SessionMeteringError {
     },
     #[error("integer overflow while rating {context}")]
     Overflow { context: &'static str },
+    #[error("invalid streamed usage: {0}")]
+    InvalidStream(String),
 }
 
 pub type Result<T> = std::result::Result<T, SessionMeteringError>;
