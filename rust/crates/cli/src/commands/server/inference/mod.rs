@@ -163,6 +163,9 @@ pub struct InferenceState {
     x402_upto: Option<pay_kit::x402::server::X402Upto>,
     fee_payer_signer: Option<Arc<dyn TransactionSigner>>,
     fee_payer_wallet: Option<FeePayerWallet>,
+    /// Non-blocking billing-event export sink — `None` unless
+    /// `PAY_BILLING_REDIS_URL` is configured. See `super::billing_export`.
+    billing: Option<super::billing_export::BillingSink>,
 }
 
 impl InferenceState {
@@ -228,6 +231,11 @@ impl PaymentState for InferenceState {
         // tracked — id continuity is what ties the two together).
         if let (Some(log_id), Some(usage)) = (exchange.log_id, exchange.usage.as_ref()) {
             self.pdb.update_exchange(log_id, usage_to_info(usage));
+        }
+        if let Some(billing) = &self.billing
+            && let Some(event) = pay_core::BillingEvent::from_exchange(&exchange)
+        {
+            billing.report(event);
         }
         let entry = pay_pdb::types::LogEntry {
             id: exchange.log_id.unwrap_or_else(|| self.pdb.next_log_id()),
@@ -786,6 +794,7 @@ impl InferenceCommand {
             x402_upto,
             fee_payer_signer,
             fee_payer_wallet,
+            billing: super::billing_export::BillingSink::from_env(),
         };
         Ok((internal_addr, state))
     }
@@ -1084,6 +1093,7 @@ mod tests {
             x402_upto: None,
             fee_payer_signer: None,
             fee_payer_wallet: None,
+            billing: None,
         }
     }
 
@@ -1304,6 +1314,7 @@ models:
                 tokens_completion: Some(214),
                 tokens_per_sec: Some(41.2),
             }),
+            charge: None,
         });
 
         let flows = state.pdb.correlation.lock().unwrap().snapshot();
@@ -1343,6 +1354,7 @@ models:
             x402_upto: None,
             fee_payer_signer: None,
             fee_payer_wallet: None,
+            billing: None,
         };
 
         let log_id = state.record_request_start(&pay_core::RequestStart {

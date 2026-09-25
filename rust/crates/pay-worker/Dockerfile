@@ -16,15 +16,17 @@ COPY . .
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
-    cargo build --release -p pay-worker --bin close-channels --bin settle-sessions && \
+    cargo build --release -p pay-worker --bin close-channels --bin settle-sessions --bin report-billing-events && \
     cp /app/target/release/close-channels /close-channels && \
-    cp /app/target/release/settle-sessions /settle-sessions
+    cp /app/target/release/settle-sessions /settle-sessions && \
+    cp /app/target/release/report-billing-events /report-billing-events
 
 # ---- runtime ----------------------------------------------------------------
 FROM gcr.io/distroless/cc-debian12:nonroot
 WORKDIR /app
 COPY --from=builder /close-channels /usr/local/bin/close-channels
 COPY --from=builder /settle-sessions /usr/local/bin/settle-sessions
+COPY --from=builder /report-billing-events /usr/local/bin/report-billing-events
 COPY crates/pay-worker/config/ ./config/
 
 ENV RUST_LOG=info

@@ -114,10 +114,120 @@ pub struct ReceiptAnnotation {
 
 /// Bounded telemetry context carried from payment verification to the adapter's
 /// final upstream response. Authentication-only forwards leave this absent.
+///
+/// For charge-style schemes (`mpp/charge`, `x402/exact`, `x402/batch`) every
+/// field is final at construction. For usage-metered schemes (`x402/upto`,
+/// `mpp/session`) `status`/`payment` start as [`crate::ChargeStatus::NotCharged`]
+/// / `None` and are overwritten in place once post-response settlement
+/// resolves the actual amount — `logging()` reads whatever is current at that
+/// point, so a request that never reaches its deferred settlement hook
+/// (client disconnect, upstream failure) reports "not charged" rather than a
+/// stale or fabricated amount.
 pub struct PaidRequestTelemetry {
     pub protocol: &'static str,
     pub subdomain: String,
+    /// `None` for flows outside the per-call metering model entirely (mpp
+    /// subscription authenticate/activation) — these never produce a
+    /// [`pay_core::ChargeOutcome`] at all, distinct from a metered request
+    /// that simply wasn't charged.
+    pub scheme: Option<pay_types::metering::Scheme>,
+    pub status: crate::ChargeStatus,
     pub payment: Option<telemetry::PaymentAmount>,
+    pub unit: Option<String>,
+    pub quantity: Option<u64>,
+}
+
+impl PaidRequestTelemetry {
+    /// A charge-style construction: the amount is final now. `protocol` is
+    /// derived from `scheme` — the two must never disagree.
+    fn charged(
+        subdomain: String,
+        scheme: pay_types::metering::Scheme,
+        payment: Option<telemetry::PaymentAmount>,
+        unit: Option<String>,
+        quantity: Option<u64>,
+    ) -> Self {
+        Self {
+            protocol: scheme.label(),
+            subdomain,
+            scheme: Some(scheme),
+            status: if payment.is_some() {
+                crate::ChargeStatus::Charged
+            } else {
+                crate::ChargeStatus::NotCharged
+            },
+            payment,
+            unit,
+            quantity,
+        }
+    }
+
+    /// A usage-metered construction: the amount is not known yet, pending a
+    /// post-response settlement hook that overwrites `status`/`payment` in
+    /// place.
+    fn pending(subdomain: String, scheme: pay_types::metering::Scheme) -> Self {
+        Self {
+            protocol: scheme.label(),
+            subdomain,
+            scheme: Some(scheme),
+            status: crate::ChargeStatus::NotCharged,
+            payment: None,
+            unit: None,
+            quantity: None,
+        }
+    }
+
+    /// Outside the per-call metering model entirely (subscription auth).
+    fn unmetered(protocol: &'static str, subdomain: String) -> Self {
+        Self {
+            protocol,
+            subdomain,
+            scheme: None,
+            status: crate::ChargeStatus::NotCharged,
+            payment: None,
+            unit: None,
+            quantity: None,
+        }
+    }
+
+    /// Convert to the generic [`pay_core::ChargeOutcome`] hosts see via
+    /// [`crate::PaymentState::record_exchange`]. `None` when the request sat
+    /// entirely outside the per-call metering model (subscription auth) —
+    /// distinct from a metered request that simply wasn't charged.
+    pub fn into_charge_outcome(self) -> Option<crate::ChargeOutcome> {
+        let scheme = self.scheme?;
+        Some(crate::ChargeOutcome {
+            subdomain: self.subdomain,
+            scheme,
+            status: self.status,
+            currency: self.payment.as_ref().map(|p| p.currency.clone()),
+            amount_usd: self.payment.as_ref().map(|p| p.ui_amount),
+            unit: self.unit,
+            quantity: self.quantity,
+        })
+    }
+}
+
+/// Outcome of a post-response (deferred) settlement attempt — `x402/upto`,
+/// `x402/batch`, or delegated `mpp/session` streaming usage. Carries both the
+/// receipt header to attach to the response and the billing outcome the
+/// caller writes back into `ctx.paid_request` for [`pay_core::ChargeOutcome`]
+/// reporting.
+pub struct DeferredSettlement {
+    pub header: Option<(HeaderName, HeaderValue)>,
+    pub status: crate::ChargeStatus,
+    pub payment: Option<telemetry::PaymentAmount>,
+}
+
+impl DeferredSettlement {
+    /// No settlement backend configured, or nothing to report.
+    fn none() -> Self {
+        Self {
+            header: None,
+            status: crate::ChargeStatus::NotCharged,
+            payment: None,
+        }
+    }
 }
 
 /// Session-stream metering context for a forwarded session request. The
@@ -216,6 +326,25 @@ pub fn delegated_session_receipt_annotation(
     })
 }
 
+/// Outcome of rating and persisting a delegated-session response, alongside
+/// the billing outcome for `ctx.paid_request`/[`pay_core::ChargeOutcome`]
+/// reporting.
+pub struct DelegatedSessionSettlement {
+    pub receipt: Option<ReceiptAnnotation>,
+    pub status: crate::ChargeStatus,
+    pub payment: Option<telemetry::PaymentAmount>,
+}
+
+impl DelegatedSessionSettlement {
+    fn none(status: crate::ChargeStatus) -> Self {
+        Self {
+            receipt: None,
+            status,
+            payment: None,
+        }
+    }
+}
+
 /// Rate and persist a delegated-session response before releasing it.
 ///
 /// Consuming `pending` also consumes its capacity lease. The lease's drop
@@ -224,9 +353,11 @@ pub async fn settle_delegated_session(
     pending: SessionForward,
     response_headers: &HeaderMap,
     response_body: Option<&[u8]>,
-) -> Result<Option<ReceiptAnnotation>, String> {
+) -> Result<DelegatedSessionSettlement, String> {
     let Some(plan) = pending.settlement.as_deref() else {
-        return Ok(None);
+        return Ok(DelegatedSessionSettlement::none(
+            crate::ChargeStatus::NotCharged,
+        ));
     };
     let actual = metering::upto_actual_amount_from_response(
         plan,
@@ -245,7 +376,9 @@ pub async fn settle_delegated_session(
             channel = %pending.channel_id,
             "delegated MPP session response rated at zero"
         );
-        return Ok(None);
+        return Ok(DelegatedSessionSettlement::none(
+            crate::ChargeStatus::Refunded,
+        ));
     }
 
     let acceptance = pending
@@ -263,7 +396,11 @@ pub async fn settle_delegated_session(
     let authorized = pending
         .committed_base_units
         .saturating_add(pending.available_base_units);
-    delegated_session_receipt_annotation(
+    let payment = Some(telemetry::PaymentAmount {
+        currency: pending.handle.currency().to_string(),
+        ui_amount: actual.usd,
+    });
+    let receipt = delegated_session_receipt_annotation(
         pending.handle.network(),
         pending.handle.currency(),
         &pending.channel_id,
@@ -272,7 +409,12 @@ pub async fn settle_delegated_session(
         authorized,
         acceptance.idle_timeout_seconds,
     )
-    .map(Some)
+    .map_err(|error| error.to_string())?;
+    Ok(DelegatedSessionSettlement {
+        receipt: Some(receipt),
+        status: crate::ChargeStatus::Charged,
+        payment,
+    })
 }
 
 /// An x402 `upto` channel opened (and confirmed on-chain) before the resource
@@ -373,16 +515,23 @@ impl<S: PaymentState> PaymentGate<S> {
             return GateDecision::Passthrough;
         }
 
-        let subdomain = req.host.unwrap_or("").split('.').next().unwrap_or("");
+        let requested_subdomain = req.host.unwrap_or("").split('.').next().unwrap_or("");
         let accepts_html = req.accept.is_some_and(mpp_html::accepts_html);
 
         let apis = self.state.apis();
-        let api = match apis.iter().find(|a| a.subdomain == subdomain) {
+        let api = match apis.iter().find(|a| a.subdomain == requested_subdomain) {
             Some(api) => api,
             // Single-API mode: one configured API serves any subdomain.
             None if apis.len() == 1 => &apis[0],
             None => return GateDecision::Passthrough,
         };
+        // Always attribute telemetry/billing to the resolved API's own
+        // declared identity, not the caller-supplied Host header verbatim:
+        // in single-API mode any Host is accepted (`api` can legitimately
+        // differ from `requested_subdomain`), so recording the unverified
+        // header here would let a caller misattribute consumption under an
+        // arbitrary, self-chosen label.
+        let subdomain = api.subdomain.as_str();
 
         // Service worker for the HTML payment-link UI — before metering lookup
         // so it works for any path/method.
@@ -857,9 +1006,12 @@ impl<S: PaymentState> PaymentGate<S> {
             ..Default::default()
         };
         let variant = variant_hint_from_path(path);
-        let amount = crate::server::payment::charge_amount_from_price(
-            metering::resolve_price(meter, &props, variant.as_deref(), None).as_ref(),
-        );
+        let resolved = metering::resolve_price(meter, &props, variant.as_deref(), None);
+        let amount = crate::server::payment::charge_amount_from_price(resolved.as_ref());
+        let unit = resolved
+            .as_ref()
+            .and_then(|p| p.dimensions.first())
+            .map(|d| d.unit.clone());
         let payment = amount
             .parse()
             .ok()
@@ -927,11 +1079,13 @@ impl<S: PaymentState> PaymentGate<S> {
                     }),
                     upto: None,
                     batch: None,
-                    paid_request: Some(PaidRequestTelemetry {
-                        protocol: "x402/exact",
-                        subdomain: subdomain.to_string(),
+                    paid_request: Some(PaidRequestTelemetry::charged(
+                        subdomain.to_string(),
+                        pay_types::metering::Scheme::X402Exact,
                         payment,
-                    }),
+                        unit,
+                        None,
+                    )),
                 }
             }
             Err(e) => reject(e.to_string()),
@@ -986,11 +1140,10 @@ impl<S: PaymentState> PaymentGate<S> {
                             ceiling_usd,
                         },
                     })),
-                    paid_request: Some(PaidRequestTelemetry {
-                        protocol: "x402/upto",
-                        subdomain: subdomain.to_string(),
-                        payment: None,
-                    }),
+                    paid_request: Some(PaidRequestTelemetry::pending(
+                        subdomain.to_string(),
+                        pay_types::metering::Scheme::X402Upto,
+                    )),
                 }
             }
             Err(e) => {
@@ -1185,11 +1338,14 @@ impl<S: PaymentState> PaymentGate<S> {
                     payment: payment.clone(),
                 },
             })),
-            paid_request: Some(PaidRequestTelemetry {
-                protocol: "x402/batch",
-                subdomain: subdomain.to_string(),
-                payment,
-            }),
+            // The amount here is the authorized/anticipated charge; the
+            // actual commit happens post-response via `finish_commit`
+            // (`settle_batch` in the gate), which overwrites `ctx.paid_request`
+            // with the final outcome — mirrors `x402/upto`.
+            paid_request: Some(PaidRequestTelemetry::pending(
+                subdomain.to_string(),
+                pay_types::metering::Scheme::X402BatchSettlement,
+            )),
         }
     }
 
@@ -1330,11 +1486,10 @@ impl<S: PaymentState> PaymentGate<S> {
                     receipt: None,
                     upto: None,
                     batch: None,
-                    paid_request: Some(PaidRequestTelemetry {
-                        protocol: "mpp/subscription",
-                        subdomain: subdomain.to_string(),
-                        payment: None,
-                    }),
+                    paid_request: Some(PaidRequestTelemetry::unmetered(
+                        "mpp/subscription",
+                        subdomain.to_string(),
+                    )),
                 };
             }
             return challenge_402(None);
@@ -1372,11 +1527,10 @@ impl<S: PaymentState> PaymentGate<S> {
                     }),
                     upto: None,
                     batch: None,
-                    paid_request: Some(PaidRequestTelemetry {
-                        protocol: "mpp/subscription",
-                        subdomain: subdomain.to_string(),
-                        payment: None,
-                    }),
+                    paid_request: Some(PaidRequestTelemetry::unmetered(
+                        "mpp/subscription",
+                        subdomain.to_string(),
+                    )),
                 }
             }
             Err(e) => {
@@ -1436,9 +1590,12 @@ impl<S: PaymentState> PaymentGate<S> {
             ..Default::default()
         };
         let variant = variant_hint_from_path(path);
-        let amount = crate::server::payment::charge_amount_from_price(
-            metering::resolve_price(meter, &props, variant.as_deref(), None).as_ref(),
-        );
+        let resolved = metering::resolve_price(meter, &props, variant.as_deref(), None);
+        let amount = crate::server::payment::charge_amount_from_price(resolved.as_ref());
+        let unit = resolved
+            .as_ref()
+            .and_then(|p| p.dimensions.first())
+            .map(|d| d.unit.clone());
         // Reconstruct a URI for split-rule query params (splits price off the request).
         let uri = reconstruct_uri(path, req.query);
         let external_id = match mpp_charge_payment_external_id(&credential, resource) {
@@ -1579,11 +1736,13 @@ impl<S: PaymentState> PaymentGate<S> {
                         }),
                         upto: None,
                         batch: None,
-                        paid_request: Some(PaidRequestTelemetry {
-                            protocol: "mpp/charge",
-                            subdomain: subdomain.to_string(),
+                        paid_request: Some(PaidRequestTelemetry::charged(
+                            subdomain.to_string(),
+                            pay_types::metering::Scheme::MppCharge,
                             payment,
-                        }),
+                            unit,
+                            None,
+                        )),
                     };
                 }
                 Err(e) => last_error = Some(e),
@@ -1766,16 +1925,16 @@ pub async fn settle_batch<S: PaymentState>(
     forward: BatchForward,
     served_ok: bool,
     cached: Option<pay_kit::core::store::CachedUpstreamResponse>,
-) -> Option<(HeaderName, HeaderValue)> {
+) -> DeferredSettlement {
     if !served_ok {
         release_batch(state, forward).await;
-        return None;
+        return DeferredSettlement::none();
     }
-    let header = commit_batch(state, &forward).await;
+    let outcome = commit_batch(state, &forward).await;
     if let Some(cached) = cached {
         cache_batch_response(state, &forward, cached).await;
     }
-    header
+    outcome
 }
 
 /// Commit a successfully served batch authorization while retaining its
@@ -1783,8 +1942,10 @@ pub async fn settle_batch<S: PaymentState>(
 pub async fn commit_batch<S: PaymentState>(
     state: &S,
     forward: &BatchForward,
-) -> Option<(HeaderName, HeaderValue)> {
-    let batch = state.x402_batch()?;
+) -> DeferredSettlement {
+    let Some(batch) = state.x402_batch() else {
+        return DeferredSettlement::none();
+    };
     let telemetry_context = &forward.telemetry;
     let channel_id = forward.outcome.channel_id.clone();
     let channel_config = forward.outcome.payload().channel_config();
@@ -1867,11 +2028,14 @@ pub async fn commit_batch<S: PaymentState>(
                     );
                 }
             }
-            match batch.settlement_header(&settlement) {
-                Ok((name, value)) => Some((
-                    HeaderName::from_bytes(name.as_bytes()).ok()?,
-                    HeaderValue::from_str(&value).ok()?,
-                )),
+            let header = match batch.settlement_header(&settlement) {
+                Ok((name, value)) => match (
+                    HeaderName::from_bytes(name.as_bytes()),
+                    HeaderValue::from_str(&value),
+                ) {
+                    (Ok(n), Ok(v)) => Some((n, v)),
+                    _ => None,
+                },
                 Err(e) => {
                     telemetry::record_settlement_error(
                         "x402/batch",
@@ -1882,6 +2046,20 @@ pub async fn commit_batch<S: PaymentState>(
                     );
                     None
                 }
+            };
+            // The batch's amount was already known at verify time
+            // (`telemetry_context.payment`) — `finish_commit` succeeding
+            // means it is now actually charged, not just authorized.
+            let payment = telemetry_context.payment.clone();
+            let status = if payment.is_some() {
+                crate::ChargeStatus::Charged
+            } else {
+                crate::ChargeStatus::NotCharged
+            };
+            DeferredSettlement {
+                header,
+                status,
+                payment,
             }
         }
         Err(e) => {
@@ -1894,7 +2072,11 @@ pub async fn commit_batch<S: PaymentState>(
                 &e.to_string(),
                 true,
             );
-            None
+            DeferredSettlement {
+                header: None,
+                status: crate::ChargeStatus::Failed,
+                payment: None,
+            }
         }
     }
 }
@@ -1937,8 +2119,10 @@ pub async fn cache_batch_response<S: PaymentState>(
 /// Settle an x402 `upto` channel after the resource was served (the adapter's
 /// post-response hook). Debits `settle_amount` (the configured `min`, or the
 /// full ceiling when unset — clamped to `open.max_amount`) on a successful
-/// serve, refunds the full deposit (settle `0`) on failure, and returns the
-/// `PAYMENT-RESPONSE` receipt header to set on the response.
+/// serve, refunds the full deposit (settle `0`) on failure, and returns a
+/// [`DeferredSettlement`] carrying the `PAYMENT-RESPONSE` receipt header to
+/// set on the response alongside the billing outcome for
+/// `ctx.paid_request`/[`pay_core::ChargeOutcome`] reporting.
 ///
 /// Routes through the shared batched-settlement worker (`settle_actual_deferred`):
 /// concurrent settlements pack into one operator-signed tx that is **sent
@@ -1954,8 +2138,10 @@ pub async fn settle_upto<S: PaymentState>(
     settle_amount: u64,
     served_ok: bool,
     telemetry_context: UptoPaymentTelemetry,
-) -> Option<(HeaderName, HeaderValue)> {
-    let upto = state.x402_upto()?;
+) -> DeferredSettlement {
+    let Some(upto) = state.x402_upto() else {
+        return DeferredSettlement::none();
+    };
     // Settle the configured voucher (clamped to the ceiling) on success, full
     // refund (`0`) on failure.
     let amount = if served_ok {
@@ -1969,23 +2155,34 @@ pub async fn settle_upto<S: PaymentState>(
     match upto.settle_actual_deferred(&open, amount).await {
         Ok(settlement) => {
             tracing::Span::current().record("tx_sig", settlement.transaction.as_str());
-            if let Some(ui_amount) = amount_usd {
+            let payment = amount_usd.map(|ui_amount| telemetry::PaymentAmount {
+                currency: "USD".to_string(),
+                ui_amount,
+            });
+            if let Some(payment) = payment.as_ref() {
                 telemetry::record_payment_collected(
                     "x402/upto",
                     &telemetry_context.subdomain,
                     &telemetry_context.path,
-                    Some(&telemetry::PaymentAmount {
-                        currency: "USD".to_string(),
-                        ui_amount,
-                    }),
+                    Some(payment),
                     &settlement.transaction,
                 );
             }
-            match upto.settlement_header(&settlement) {
-                Ok((name, value)) => Some((
-                    HeaderName::from_bytes(name.as_bytes()).ok()?,
-                    HeaderValue::from_str(&value).ok()?,
-                )),
+            let status = if payment.is_some() {
+                crate::ChargeStatus::Charged
+            } else {
+                crate::ChargeStatus::Refunded
+            };
+            let header = match upto.settlement_header(&settlement) {
+                Ok((name, value)) => {
+                    match (
+                        HeaderName::from_bytes(name.as_bytes()),
+                        HeaderValue::from_str(&value),
+                    ) {
+                        (Ok(n), Ok(v)) => Some((n, v)),
+                        _ => None,
+                    }
+                }
                 Err(e) => {
                     telemetry::record_settlement_error(
                         "x402/upto",
@@ -1996,6 +2193,11 @@ pub async fn settle_upto<S: PaymentState>(
                     );
                     None
                 }
+            };
+            DeferredSettlement {
+                header,
+                status,
+                payment,
             }
         }
         Err(e) => {
@@ -2006,7 +2208,11 @@ pub async fn settle_upto<S: PaymentState>(
                 &e.to_string(),
                 true,
             );
-            None
+            DeferredSettlement {
+                header: None,
+                status: crate::ChargeStatus::Failed,
+                payment: None,
+            }
         }
     }
 }
@@ -2024,7 +2230,7 @@ pub async fn settle_upto_metered<S: PaymentState>(
     response_headers: &http::HeaderMap,
     response_body: Option<&[u8]>,
     telemetry_context: UptoPaymentTelemetry,
-) -> Option<(HeaderName, HeaderValue)> {
+) -> DeferredSettlement {
     if !served_ok {
         return settle_upto(state, open, 0, false, telemetry_context).await;
     }
@@ -2252,36 +2458,49 @@ async fn session_authorized(
                     .map(|reference| session_receipt_annotation(sm.network(), reference)),
                 upto: None,
                 batch: None,
-                paid_request: Some(PaidRequestTelemetry {
-                    protocol: "mpp/session",
-                    subdomain: subdomain.to_string(),
-                    payment: None,
-                }),
+                // Response-metered (delegated) session usage: the delta for
+                // this request is only known once bytes have streamed back.
+                // The session-stream metering layer overwrites
+                // `ctx.paid_request` in place when it finalizes, mirroring
+                // `x402/upto`.
+                paid_request: Some(PaidRequestTelemetry::pending(
+                    subdomain.to_string(),
+                    pay_types::metering::Scheme::MppSession,
+                )),
             }
         }
         Ok(SessionOutcome::Voucher {
             channel_id,
             cumulative,
-        }) => GateDecision::Forward {
-            session: handle.map(|h| {
-                Box::new(SessionForward {
-                    handle: h,
-                    channel_id,
-                    committed_base_units: cumulative,
-                    settlement: None,
-                    available_base_units: 0,
-                    _reservation: None,
-                })
-            }),
-            receipt: None,
-            upto: None,
-            batch: None,
-            paid_request: Some(PaidRequestTelemetry {
-                protocol: "mpp/session",
-                subdomain: subdomain.to_string(),
-                payment: None,
-            }),
-        },
+            charged,
+        }) => {
+            let payment = Some(telemetry::PaymentAmount {
+                currency: sm.currency().to_string(),
+                ui_amount: charged as f64 / 10_f64.powi(sm.decimals() as i32),
+            });
+            GateDecision::Forward {
+                session: handle.map(|h| {
+                    Box::new(SessionForward {
+                        handle: h,
+                        channel_id,
+                        committed_base_units: cumulative,
+                        settlement: None,
+                        available_base_units: 0,
+                        _reservation: None,
+                    })
+                }),
+                receipt: None,
+                upto: None,
+                batch: None,
+                paid_request: Some(PaidRequestTelemetry::charged(
+                    subdomain.to_string(),
+                    pay_types::metering::Scheme::MppSession,
+                    payment,
+                    None,
+                    None,
+                )),
+            }
+        }
         Ok(SessionOutcome::Closed { signature, .. }) => {
             let receipt_url = signature
                 .as_deref()
@@ -2550,6 +2769,140 @@ mod tests {
         );
         assert_eq!(upto_collected_amount_usd(0.10, 0, 100_000), None);
         assert_eq!(upto_collected_amount_usd(0.10, 1, 0), None);
+    }
+
+    // ── Generic billing event: `PaidRequestTelemetry` -> `ChargeOutcome` ──
+    // Every scheme, charge-style and usage-metered alike, must round-trip
+    // through this mapping the same way regardless of payment protocol.
+
+    #[test]
+    fn every_scheme_label_round_trips_through_protocol_string() {
+        // Guards the `Scheme::label()` <-> tracing/metrics `protocol` string
+        // convention every call site in this file relies on.
+        assert_eq!(pay_types::metering::Scheme::MppCharge.label(), "mpp/charge");
+        assert_eq!(
+            pay_types::metering::Scheme::MppSession.label(),
+            "mpp/session"
+        );
+        assert_eq!(pay_types::metering::Scheme::X402Exact.label(), "x402/exact");
+        assert_eq!(pay_types::metering::Scheme::X402Upto.label(), "x402/upto");
+        assert_eq!(
+            pay_types::metering::Scheme::X402BatchSettlement.label(),
+            "x402/batch"
+        );
+    }
+
+    #[test]
+    fn charged_construction_with_a_known_amount_reports_charged() {
+        let payment = Some(telemetry::PaymentAmount {
+            currency: "USD".to_string(),
+            ui_amount: 0.05,
+        });
+        let outcome = PaidRequestTelemetry::charged(
+            "sub".to_string(),
+            pay_types::metering::Scheme::X402Exact,
+            payment,
+            Some("requests".to_string()),
+            None,
+        )
+        .into_charge_outcome()
+        .expect("charge-style schemes always produce an outcome");
+
+        assert_eq!(outcome.scheme, pay_types::metering::Scheme::X402Exact);
+        assert_eq!(outcome.status, crate::ChargeStatus::Charged);
+        assert_eq!(outcome.currency.as_deref(), Some("USD"));
+        assert_eq!(outcome.amount_usd, Some(0.05));
+        assert_eq!(outcome.unit.as_deref(), Some("requests"));
+    }
+
+    #[test]
+    fn charged_construction_without_an_amount_reports_not_charged() {
+        // A resolved-but-zero (or unresolved) price at verify time must never
+        // read as a fabricated charge.
+        let outcome = PaidRequestTelemetry::charged(
+            "sub".to_string(),
+            pay_types::metering::Scheme::MppCharge,
+            None,
+            None,
+            None,
+        )
+        .into_charge_outcome()
+        .expect("still inside the metering model");
+
+        assert_eq!(outcome.status, crate::ChargeStatus::NotCharged);
+        assert_eq!(outcome.amount_usd, None);
+        assert_eq!(outcome.currency, None);
+    }
+
+    #[test]
+    fn pending_construction_reports_not_charged_until_settlement_resolves_it() {
+        // Mirrors what `logging()` would see for `x402/upto`/`x402/batch`/
+        // delegated `mpp/session` if a deferred settlement hook never ran
+        // (client disconnect, upstream failure) — never a fabricated amount.
+        let outcome =
+            PaidRequestTelemetry::pending("sub".to_string(), pay_types::metering::Scheme::X402Upto)
+                .into_charge_outcome()
+                .expect("usage-metered schemes are still inside the metering model");
+
+        assert_eq!(outcome.scheme, pay_types::metering::Scheme::X402Upto);
+        assert_eq!(outcome.status, crate::ChargeStatus::NotCharged);
+        assert_eq!(outcome.amount_usd, None);
+    }
+
+    #[test]
+    fn deferred_settlement_mutation_resolves_pending_to_its_final_state() {
+        // What `apply_deferred_settlement` (pay-proxy) does to `ctx.paid_request`
+        // once `settle_upto`/`settle_batch` resolve — modeled here at the
+        // `PaidRequestTelemetry` level since that mutation is exactly
+        // `status`/`payment` assignment.
+        let mut telemetry =
+            PaidRequestTelemetry::pending("sub".to_string(), pay_types::metering::Scheme::X402Upto);
+        telemetry.status = crate::ChargeStatus::Charged;
+        telemetry.payment = Some(telemetry::PaymentAmount {
+            currency: "USD".to_string(),
+            ui_amount: 0.02,
+        });
+
+        let outcome = telemetry
+            .into_charge_outcome()
+            .expect("still inside the metering model");
+        assert_eq!(outcome.status, crate::ChargeStatus::Charged);
+        assert_eq!(outcome.amount_usd, Some(0.02));
+
+        // A `!served_ok` settlement resolves to a refund, not a charge.
+        let mut refunded = PaidRequestTelemetry::pending(
+            "sub".to_string(),
+            pay_types::metering::Scheme::X402BatchSettlement,
+        );
+        refunded.status = crate::ChargeStatus::Refunded;
+        let outcome = refunded
+            .into_charge_outcome()
+            .expect("still inside the metering model");
+        assert_eq!(outcome.status, crate::ChargeStatus::Refunded);
+        assert_eq!(outcome.amount_usd, None);
+
+        // A settlement attempt that errors after serving is `Failed`, not
+        // silently reported as a refund or a charge.
+        let mut failed = PaidRequestTelemetry::pending(
+            "sub".to_string(),
+            pay_types::metering::Scheme::MppSession,
+        );
+        failed.status = crate::ChargeStatus::Failed;
+        let outcome = failed
+            .into_charge_outcome()
+            .expect("still inside the metering model");
+        assert_eq!(outcome.status, crate::ChargeStatus::Failed);
+    }
+
+    #[test]
+    fn unmetered_construction_produces_no_charge_outcome_at_all() {
+        // Subscription authenticate/activation sits outside the per-call
+        // metering model entirely — `None`, not `NotCharged` — so a reporting
+        // pipeline can tell "nothing to report" apart from "reportable, but
+        // free."
+        let outcome = PaidRequestTelemetry::unmetered("mpp/subscription", "sub".to_string())
+            .into_charge_outcome();
+        assert!(outcome.is_none());
     }
 
     #[test]

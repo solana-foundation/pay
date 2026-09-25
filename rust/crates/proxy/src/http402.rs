@@ -28,9 +28,10 @@ use futures_util::StreamExt;
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use pay_core::PaymentState;
 use pay_core::server::gate::{
-    BatchForward, GateDecision, GateRequest, GateResponse, MAX_BATCH_CACHED_RESPONSE_BYTES,
-    PaidRequestTelemetry, PaymentGate, ReceiptAnnotation, SessionForward, UptoPaymentTelemetry,
-    batch_cached_response, cache_batch_response, commit_batch, release_batch, settle_batch,
+    BatchForward, DeferredSettlement, GateDecision, GateRequest, GateResponse,
+    MAX_BATCH_CACHED_RESPONSE_BYTES, PaidRequestTelemetry, PaymentGate, ReceiptAnnotation,
+    SessionForward, UptoPaymentTelemetry, batch_cached_response, cache_batch_response,
+    commit_batch, release_batch, settle_batch,
     settle_delegated_session as settle_delegated_session_forward, settle_upto, settle_upto_metered,
 };
 use pay_core::server::metering::{self, UptoSettlementPlan};
@@ -316,15 +317,17 @@ impl<S: PaymentState> Http402Gate<S> {
             // release immediately.
             ctx.session.take();
         }
-        if let Some(pending) = ctx.upto.take()
-            && let Some((n, v)) = self
+        if let Some(pending) = ctx.upto.take() {
+            let outcome = self
                 .settle_pending_upto(pending, served_ok, response_headers, response_body)
-                .await
-        {
-            extra.push((n, v));
+                .await;
+            apply_deferred_settlement(ctx, &outcome);
+            if let Some((n, v)) = outcome.header {
+                extra.push((n, v));
+            }
         }
-        if let Some(pending) = ctx.batch.take()
-            && let Some((n, v)) = settle_batch(
+        if let Some(pending) = ctx.batch.take() {
+            let outcome = settle_batch(
                 &self.state,
                 pending,
                 served_ok,
@@ -333,9 +336,11 @@ impl<S: PaymentState> Http402Gate<S> {
                     .filter(|(_, body)| body.len() <= MAX_BATCH_CACHED_RESPONSE_BYTES)
                     .map(|(status, body)| batch_cached_response(status, response_headers, body)),
             )
-            .await
-        {
-            extra.push((n, v));
+            .await;
+            apply_deferred_settlement(ctx, &outcome);
+            if let Some((n, v)) = outcome.header {
+                extra.push((n, v));
+            }
         }
         if let Some(receipt) = ctx.receipt.take() {
             extra.extend(receipt.headers);
@@ -353,7 +358,7 @@ impl<S: PaymentState> Http402Gate<S> {
         served_ok: bool,
         response_headers: &HeaderMap,
         response_body: Option<&[u8]>,
-    ) -> Option<(HeaderName, HeaderValue)> {
+    ) -> DeferredSettlement {
         match pending.settlement {
             Some(plan) => {
                 settle_upto_metered(
@@ -598,7 +603,14 @@ impl<S: PaymentState> Http402Gate<S> {
         let Some(pending) = ctx.session.take() else {
             return Ok(None);
         };
-        settle_delegated_session_forward(pending, response_headers, Some(response_body)).await
+        let outcome =
+            settle_delegated_session_forward(pending, response_headers, Some(response_body))
+                .await?;
+        if let Some(paid_request) = ctx.paid_request.as_mut() {
+            paid_request.status = outcome.status;
+            paid_request.payment = outcome.payment;
+        }
+        Ok(outcome.receipt)
     }
 
     async fn finish_buffered_axum_response(
@@ -925,10 +937,11 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
         // only covers fixed-amount plans.
         if let Some(pending) = ctx.upto.take() {
             let served_ok = upstream_response.status.is_success();
-            if let Some((name, value)) = self
+            let outcome = self
                 .settle_pending_upto(pending, served_ok, &upstream_response.headers, None)
-                .await
-            {
+                .await;
+            apply_deferred_settlement(ctx, &outcome);
+            if let Some((name, value)) = outcome.header {
                 let _ = upstream_response.insert_header(name.clone(), value.clone());
                 ctx.logged_payment_headers.push((name, value));
             }
@@ -940,7 +953,9 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
         if let Some(pending) = ctx.batch.take() {
             let served_ok = upstream_response.status.is_success();
             if served_ok {
-                if let Some((name, value)) = commit_batch(&self.state, &pending).await {
+                let outcome = commit_batch(&self.state, &pending).await;
+                apply_deferred_settlement(ctx, &outcome);
+                if let Some((name, value)) = outcome.header {
                     let _ = upstream_response.insert_header(name.clone(), value.clone());
                     ctx.logged_payment_headers.push((name, value));
                 }
@@ -995,10 +1010,14 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
         Ok(None)
     }
 
-    /// Emit the completed exchange to the Payment Debugger. Pingora is the data
-    /// plane, so the old axum `logging_middleware` never sees proxied traffic —
-    /// this is what keeps PDB populated. Fires for every request (short-circuit
-    /// 402s included); control-plane paths were filtered out at capture time.
+    /// Emit the completed exchange via [`PaymentState::record_exchange`] —
+    /// this is what keeps the Payment Debugger populated (Pingora is the data
+    /// plane, so the old axum `logging_middleware` never sees proxied
+    /// traffic), and it's also where a metered request's final
+    /// [`pay_core::ChargeOutcome`] (built from `ctx.paid_request`) reaches
+    /// hosts, for reporting pricing/usage regardless of scheme. Fires for
+    /// every request (short-circuit 402s included); control-plane paths were
+    /// filtered out at capture time.
     async fn logging(&self, session: &mut Session, error: Option<&pingora::Error>, ctx: &mut Ctx)
     where
         Self::CTX: Send + Sync,
@@ -1020,14 +1039,18 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
         // Covers cancellation/disconnect paths that bypassed all explicit
         // drains. Dropping the session releases its capacity lease.
         ctx.session.take();
-        if let Some(pending) = ctx.upto.take()
-            && let Some(header) = self
+        if let Some(pending) = ctx.upto.take() {
+            let outcome = self
                 .settle_pending_upto(pending, false, &HeaderMap::new(), None)
-                .await
-        {
-            deferred_payment_headers.push(header);
+                .await;
+            apply_deferred_settlement(ctx, &outcome);
+            if let Some(header) = outcome.header {
+                deferred_payment_headers.push(header);
+            }
         }
-        if let Some(paid_request) = ctx.paid_request.take() {
+        // Read (not take) — `HttpExchange` below still needs it to build the
+        // `ChargeOutcome`.
+        if let Some(paid_request) = ctx.paid_request.as_ref() {
             let status = session
                 .response_written()
                 .and_then(|response| StatusCode::from_u16(response.status.as_u16()).ok())
@@ -1046,6 +1069,10 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                 paid_request.payment.as_ref(),
             );
         }
+        let charge = ctx
+            .paid_request
+            .take()
+            .and_then(PaidRequestTelemetry::into_charge_outcome);
         let Some(log) = ctx.log.take() else {
             return;
         };
@@ -1074,6 +1101,7 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
             client_ip: log.client_ip,
             log_id: log.log_id,
             usage,
+            charge,
         });
     }
 
@@ -1161,6 +1189,20 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
             error_code: code,
             can_reuse_downstream: false,
         }
+    }
+}
+
+/// Write a deferred (post-response) settlement outcome back into
+/// `ctx.paid_request` in place. `x402/upto`, `x402/batch`, and delegated
+/// `mpp/session` construct their `PaidRequestTelemetry` as `pending` at
+/// verify time (the amount isn't known yet); this is the only place that
+/// resolves it to its final `Charged`/`Refunded`/`Failed` state before
+/// `logging()` reads it. A no-op if the request was never tracked (control
+/// plane, `records_http_exchanges() == false`).
+fn apply_deferred_settlement(ctx: &mut Ctx, outcome: &DeferredSettlement) {
+    if let Some(paid_request) = ctx.paid_request.as_mut() {
+        paid_request.status = outcome.status;
+        paid_request.payment = outcome.payment.clone();
     }
 }
 

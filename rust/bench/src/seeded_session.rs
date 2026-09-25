@@ -385,6 +385,7 @@ mod tests {
         let SessionOutcome::Voucher {
             channel_id,
             cumulative,
+            ..
         } = fixture.session.process(&header).await.unwrap()
         else {
             panic!("expected voucher outcome");
