@@ -12,6 +12,10 @@ path = "src/bin/close_channels.rs"
 name = "settle-sessions"
 path = "src/bin/settle_sessions.rs"
 
+[[bin]]
+name = "report-billing-events"
+path = "src/bin/report_billing_events.rs"
+
 [dependencies]
 # Reuse pay-api's core (RPC client, Channel decode helpers, ATA derivation,
 # stablecoin/token-program resolution). Keeps one implementation of the
