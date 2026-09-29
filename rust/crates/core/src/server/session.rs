@@ -1067,13 +1067,23 @@ impl SessionLifecycleRunloop {
             .into_iter()
             .filter(|state| !state.sealed && state.close_requested_at.is_none())
             .filter_map(|state| {
-                state
+                let owned = state
                     .lifecycle
                     .as_ref()
-                    .filter(|lifecycle| {
-                        self.owns_lifecycle(lifecycle) && lifecycle.close_after <= now_ms
-                    })
-                    .map(|_| state.channel_id)
+                    .is_some_and(|lifecycle| self.owns_lifecycle(lifecycle));
+                let close_after = state
+                    .lifecycle
+                    .as_ref()
+                    .map(|lifecycle| lifecycle.close_after);
+                tracing::debug!(
+                    channel_id = %state.channel_id,
+                    owned,
+                    close_after,
+                    now_ms,
+                    "payment-channel idle-close check"
+                );
+                (owned && close_after.is_some_and(|close_after| close_after <= now_ms))
+                    .then_some(state.channel_id)
             })
             .collect::<Vec<_>>();
 
@@ -2290,6 +2300,53 @@ fn decode_voucher_signature(signature: &str) -> Result<[u8; 64]> {
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
+
+/// The channel payout for an operator-signed (delegated) session.
+///
+/// The operator signs the vouchers and settles the channel, and the program
+/// pays the channel's recipient, so that recipient must be the operator. The
+/// configured recipient's share moves into the distribution splits instead:
+/// whatever the explicit splits leave over, added to its own split if it
+/// already has one. A recipient that is the operator needs no change.
+pub fn delegated_session_channel_payout(
+    recipient: &str,
+    operator: &str,
+    mut splits: Vec<pay_kit::mpp::server::session::Split>,
+) -> crate::Result<(String, Vec<pay_kit::mpp::server::session::Split>)> {
+    if recipient == operator {
+        return Ok((recipient.to_string(), splits));
+    }
+
+    let recipient = solana_pubkey::Pubkey::from_str(recipient).map_err(|e| {
+        crate::Error::Config(format!(
+            "delegated session recipient is not a valid Solana pubkey: {e}"
+        ))
+    })?;
+    let explicit_bps = splits
+        .iter()
+        .try_fold(0_u16, |total, split| total.checked_add(split.bps))
+        .ok_or_else(|| {
+            crate::Error::Config("delegated session split basis points overflow".to_string())
+        })?;
+    let primary_bps = 10_000_u16
+        .checked_sub(explicit_bps)
+        .ok_or_else(|| crate::Error::Config("delegated session splits exceed 100%".to_string()))?;
+
+    if let Some(existing) = splits.iter_mut().find(|split| split.recipient == recipient) {
+        existing.bps = existing.bps.checked_add(primary_bps).ok_or_else(|| {
+            crate::Error::Config(
+                "delegated session recipient split basis points overflow".to_string(),
+            )
+        })?;
+    } else {
+        splits.push(pay_kit::mpp::server::session::Split {
+            recipient,
+            bps: primary_bps,
+        });
+    }
+
+    Ok((operator.to_string(), splits))
+}
 
 #[cfg(test)]
 mod tests {

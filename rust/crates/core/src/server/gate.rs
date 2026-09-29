@@ -536,9 +536,16 @@ impl<S: PaymentState> PaymentGate<S> {
             }
         }
 
-        // x402 credential (PAYMENT-SIGNATURE / X-PAYMENT) → dispatch by scheme.
+        // x402 credential (PAYMENT-SIGNATURE / X-PAYMENT) → dispatch by the
+        // scheme the payment names. An endpoint may offer several x402
+        // schemes at once; the payer answered exactly one of those
+        // challenges, and only that verifier can read its payload. A header
+        // that names no scheme falls through the handlers in priority order.
         if let Some(pay_header) = req.x402_payment {
-            if accepted.contains(&Scheme::X402Exact)
+            let named = x402_payment_scheme(pay_header);
+            let wants = |scheme: &str| named.as_deref().is_none_or(|s| s == scheme);
+            if wants(pay_kit::x402::exact::EXACT_SCHEME)
+                && accepted.contains(&Scheme::X402Exact)
                 && let Some(x402) = self.state.x402()
             {
                 let resource = endpoint.and_then(|e| e.resource.as_deref());
@@ -546,7 +553,8 @@ impl<S: PaymentState> PaymentGate<S> {
                     .x402_exact_verify(x402, meter, req, path, pay_header, subdomain, resource)
                     .await;
             }
-            if accepted.contains(&Scheme::X402BatchSettlement)
+            if wants(pay_kit::x402::batch_settlement::BATCH_SETTLEMENT_SCHEME)
+                && accepted.contains(&Scheme::X402BatchSettlement)
                 && let Some(batch) = self.state.x402_batch()
             {
                 let resource = endpoint.and_then(|e| e.resource.as_deref());
@@ -554,7 +562,8 @@ impl<S: PaymentState> PaymentGate<S> {
                     .x402_batch_verify(batch, meter, req, path, pay_header, subdomain, resource)
                     .await;
             }
-            if accepted.contains(&Scheme::X402Upto)
+            if wants(pay_kit::x402::upto::UPTO_SCHEME)
+                && accepted.contains(&Scheme::X402Upto)
                 && let Some(upto) = self.state.x402_upto()
             {
                 return self
@@ -2131,6 +2140,21 @@ fn mpp_charge_payment_external_id(
 }
 
 /// Path-only variant hint (e.g. `/models/{name}:action` → `name`).
+/// The scheme an x402 payment header answers: `accepted.scheme` of the v2
+/// envelope, or `scheme` of a v1 payload. `None` when the header is not
+/// readable JSON, which the scheme verifiers report in their own words.
+fn x402_payment_scheme(header: &str) -> Option<String> {
+    let decoded =
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, header.trim()).ok()?;
+    let payload: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    payload
+        .get("accepted")
+        .and_then(|a| a.get("scheme"))
+        .or_else(|| payload.get("scheme"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
 fn variant_hint_from_path(path: &str) -> Option<String> {
     let parts: Vec<&str> = path.split('/').collect();
     for (i, part) in parts.iter().enumerate() {
@@ -2487,6 +2511,29 @@ mod tests {
         assert_eq!(
             receipt.headers[0].1.to_str().unwrap(),
             "https://pay.sh/receipt/open_signature"
+        );
+    }
+
+    #[test]
+    fn an_x402_payment_names_the_scheme_that_verifies_it() {
+        let encode = |json: serde_json::Value| {
+            base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                json.to_string().as_bytes(),
+            )
+        };
+        let v2 = encode(serde_json::json!({
+            "x402Version": 2,
+            "accepted": { "scheme": "upto", "network": "solana:x" },
+            "payload": {},
+        }));
+        assert_eq!(x402_payment_scheme(&v2).as_deref(), Some("upto"));
+        let v1 = encode(serde_json::json!({ "x402Version": 1, "scheme": "exact" }));
+        assert_eq!(x402_payment_scheme(&v1).as_deref(), Some("exact"));
+        assert_eq!(x402_payment_scheme("not base64!"), None);
+        assert_eq!(
+            x402_payment_scheme(&encode(serde_json::json!({ "x": 1 }))),
+            None
         );
     }
 

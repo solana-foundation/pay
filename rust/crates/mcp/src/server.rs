@@ -163,6 +163,10 @@ create a QR code for adding funds to Pay. The user must choose the top-up method
 code. When `method` is `onramp`, the user must also specify the provider
 (`coinbase`, `paypal`, or `venmo`). This tool does not spend funds or initiate
 a purchase; it only renders the QR PNG and returns the funding address.
+
+Depositing is one of two ways to fund an empty balance. The other is
+`sell_inference`: earn stablecoins by serving this agent's inference for a
+while. When the balance is empty, offer both and let the user choose.
 "#
     )]
     async fn topup(
@@ -172,6 +176,38 @@ a purchase; it only renders the QR PNG and returns the funding address.
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let scope = self.context.scope(&ctx)?;
         tools::topup::run(params, &scope).await
+    }
+
+    #[tool(description = r#"Earn stablecoins by selling this agent's inference.
+
+Creates a paid, OpenAI-compatible endpoint on pay-connect
+(`/endpoints/<id>/v1/chat/completions`) and starts a worker on this machine
+that answers each request with a local agent (claude, codex or goose) in the
+chosen directory. Buyers pay per request or per token in USDC, and the money
+lands in the active Pay account, so `get_balance` shows earnings as they
+settle. The endpoint stays up while the worker runs; stop it with
+`action: "stop"`.
+
+This is the counterpart of `topup`. When `get_balance` shows an empty or
+insufficient balance, present both options instead of assuming a deposit:
+"top up now" (`topup`), or "serve inference for a while to earn it"
+(`sell_inference`), typically priced below what the same model costs upstream
+so buyers come. Let the user choose; never create an endpoint without asking,
+since it publishes a URL and lets strangers run prompts through an agent on
+this machine. Pick a flat `price_per_request_usd` unless the user wants
+per-token pricing; a few cents per request earns a typical API budget in a few
+dozen requests.
+
+Actions: `create` (default), `status`, `reprice`, `stop`. Local `pay mcp`
+only: a hosted session has no machine to serve from.
+"#)]
+    async fn sell_inference(
+        &self,
+        Parameters(params): Parameters<tools::sell_inference::Params>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let scope = self.context.scope(&ctx)?;
+        tools::sell_inference::run(params, Some(ctx.peer), &scope).await
     }
 
     #[tool(description = r#"Create or validate a pay-skills provider listing.
@@ -238,6 +274,10 @@ mod tests {
         assert!(instructions.contains("Failure Recipes"));
         assert!(instructions.contains("402"));
         assert!(instructions.contains("Never answer \"Can pay do X\" from memory"));
+        assert!(
+            instructions.contains("sell_inference"),
+            "an empty balance has two answers"
+        );
     }
 
     #[test]
@@ -256,6 +296,8 @@ mod tests {
         assert!(source.contains("present the catalog grouped"));
         assert!(source.contains("Generate a top-up QR code PNG"));
         assert!(source.contains("must also specify the provider"));
+        assert!(source.contains("counterpart of `topup`"));
+        assert!(source.contains("never create an endpoint without asking"));
         assert!(source.contains("tie-breaker guidance"));
         assert!(source.contains("local wallet approval"));
         assert!(source.contains("does not need SOL for network fees"));

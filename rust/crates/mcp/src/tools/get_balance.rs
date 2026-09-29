@@ -74,6 +74,18 @@ pub async fn run(
     if balances.tokens.is_empty() && balances.credits.is_empty() {
         lines.push("No token or credit balances found.".to_string());
     }
+    let nothing_to_spend = !balances.tokens_unavailable
+        && !balances.credits_unavailable
+        && balances.tokens.iter().all(|t| t.raw_amount == 0)
+        && balances.credits.iter().all(|c| c.raw_amount == 0);
+    if nothing_to_spend {
+        lines.push(
+            "The balance is empty. Two ways to fund it: `topup` deposits stablecoins, \
+             `sell_inference` earns them by serving this agent's inference for a while. \
+             Offer both and let the user choose."
+                .to_string(),
+        );
+    }
 
     Ok(CallToolResult::success(vec![rmcp::model::Content::text(
         lines.join("\n"),

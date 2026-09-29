@@ -17,6 +17,7 @@ pub mod http;
 pub mod mcp;
 pub(crate) mod payer_proxy;
 pub mod qodercli;
+pub mod sell;
 pub mod send;
 pub mod server;
 pub mod setup;
@@ -117,6 +118,11 @@ pub enum Command {
     /// Add a provider source (shorthand for `skills add`).
     #[command(alias = "add", short_flag = 'i')]
     Install(skills::install::InstallCommand),
+    /// Sell your agent's inference through a paid OpenAI-compatible endpoint.
+    Sell {
+        #[command(subcommand)]
+        command: sell::SellCommand,
+    },
     /// Start the MCP server (for Claude Code, Cursor, etc.)
     Mcp(mcp::McpCommand),
     /// Generate documentation artifacts (e.g. the provider-spec JSON Schema).
@@ -183,6 +189,7 @@ impl Command {
             | Command::Gate { .. }
             | Command::Plans { .. }
             | Command::Docs { .. }
+            | Command::Sell { .. }
             | Command::Mcp(_) => false,
         }
     }
@@ -213,6 +220,7 @@ impl Command {
             | Command::Topup(_)
             | Command::Gate { .. }
             | Command::Plans { .. }
+            | Command::Sell { .. }
             | Command::Docs { .. } => ToolKind::Mcp,
             Command::Mcp(_) => ToolKind::Mcp,
         }
@@ -316,6 +324,7 @@ impl Command {
             )?),
             Command::Acp(cmd) => std::process::exit(cmd.run(account_override, network_override)?),
             Command::Docs { command } => return command.run(),
+            Command::Sell { command } => return command.run(),
             _ => {}
         }
 

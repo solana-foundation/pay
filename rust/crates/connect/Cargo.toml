@@ -10,19 +10,24 @@ name = "pay-connect"
 path = "src/main.rs"
 
 [features]
-default = ["mcp", "privy"]
+default = ["mcp", "privy", "sell"]
 # The hosted connector: pay's MCP tools over streamable HTTP at `/mcp`.
 mcp = ["dep:rmcp", "dep:pay-mcp", "dep:pay-core", "dep:http"]
 # Privy as the connector's login and wallet: the consent page signs the
 # user in with Privy, pay-connect verifies the token, and the user's Privy
 # wallet (with pay's key as a signer) becomes the tenant's wallet.
 privy = ["mcp", "dep:reqwest", "dep:jsonwebtoken", "dep:p256"]
+# `sell_inference`: sellers' paid OpenAI-shaped endpoints, queued for their
+# agents, gated by the payment middleware with per-seller backends.
+sell = ["mcp", "pay-core/server", "dep:bs58", "dep:futures-util", "dep:pay-types", "dep:tower", "dep:uuid"]
 
 [dependencies]
 async-trait = "0.1"
 axum = { workspace = true }
 base64 = { workspace = true }
 bincode = { workspace = true }
+bs58 = { workspace = true, optional = true }
+futures-util = { version = "0.3", optional = true }
 clap = { workspace = true }
 http = { version = "1", optional = true }
 hmac = "0.12"
@@ -30,6 +35,7 @@ jsonwebtoken = { version = "9", optional = true }
 pay-core = { workspace = true, optional = true }
 pay-kit = { workspace = true }
 pay-mcp = { workspace = true, optional = true }
+pay-types = { workspace = true, optional = true }
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "pem", "std"], optional = true }
 rand = { workspace = true }
 rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"], optional = true }
@@ -42,11 +48,14 @@ solana-pubkey = { workspace = true }
 solana-transaction = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "net", "time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "net", "sync", "time"] }
+tower = { version = "0.5", features = ["util"], optional = true }
 tower-http = { version = "0.6", features = ["trace", "cors"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 url = "2"
+uuid = { workspace = true, optional = true }
 
 [dev-dependencies]
+ed25519-dalek = { workspace = true }
 tower = { version = "0.5", features = ["util"] }

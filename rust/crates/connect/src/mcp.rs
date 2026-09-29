@@ -174,7 +174,8 @@ pub struct Auth {
 }
 
 impl Auth {
-    fn authenticate(&self, bearer: &str) -> Option<Tenant> {
+    /// The tenant a bearer stands for: an OAuth access token, else a static token.
+    pub fn authenticate(&self, bearer: &str) -> Option<Tenant> {
         self.oauth
             .as_ref()
             .and_then(|store| store.authenticate(bearer))
