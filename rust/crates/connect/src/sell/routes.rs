@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -35,6 +36,14 @@ use crate::protocol::ApiError;
 
 /// Most endpoints one process holds.
 pub const MAX_ENDPOINTS: usize = 256;
+/// The most a seller may set out to earn on one endpoint, in USD. Selling
+/// inference is for covering a small balance, not running a business, and
+/// the platform fronts the gas for every request.
+pub const MAX_EARN_CAP_USD: f64 = 2.0;
+/// Least earn cap accepted.
+pub const MIN_EARN_CAP_USD: f64 = 0.01;
+/// Earnings are counted in millionths of a dollar.
+const USD_MICRO: f64 = 1_000_000.0;
 /// How long a buyer waits for a worker to claim the request.
 pub const CLAIM_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long a non-streaming buyer waits for the whole answer.
@@ -99,6 +108,21 @@ impl EndpointRegistry {
 
     fn insert(&self, entry: Arc<EndpointEntry>) -> Result<(), ApiError> {
         let mut endpoints = self.lock();
+        if let Some(open) = endpoints
+            .values()
+            .find(|e| e.owner == entry.owner && !e.is_closed())
+        {
+            // One open endpoint per seller bounds what the platform fronts.
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "endpoint_exists",
+                format!(
+                    "You already have an open endpoint, {}. Stop it first, or let it reach its cap.",
+                    open.id
+                ),
+            )
+            .with_details(json!({ "endpoint_id": open.id })));
+        }
         if endpoints.len() >= MAX_ENDPOINTS {
             return Err(ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -137,11 +161,44 @@ pub struct EndpointEntry {
     token_hash: [u8; 32],
     pub queue: Arc<EndpointQueue>,
     live: RwLock<Arc<Live>>,
+    /// Stop taking requests once this much has been earned (micro-USD).
+    earn_cap_micro: u64,
+    /// What answered requests have earned so far (micro-USD).
+    earned_micro: AtomicU64,
+    /// Set when the cap is reached: buyers get 410, the worker drains what
+    /// is already parked and then exits.
+    closed: AtomicBool,
 }
 
 impl EndpointEntry {
     fn live(&self) -> Arc<Live> {
         self.live.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    pub fn earn_cap_usd(&self) -> f64 {
+        self.earn_cap_micro as f64 / USD_MICRO
+    }
+
+    pub fn earned_usd(&self) -> f64 {
+        self.earned_micro.load(Ordering::Relaxed) as f64 / USD_MICRO
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Relaxed)
+    }
+
+    /// Count one answered request; closes the endpoint at the cap.
+    fn record_earning(&self, usd: f64) {
+        let micro = (usd.max(0.0) * USD_MICRO).round() as u64;
+        let total = self.earned_micro.fetch_add(micro, Ordering::Relaxed) + micro;
+        if total >= self.earn_cap_micro && !self.closed.swap(true, Ordering::Relaxed) {
+            tracing::info!(
+                endpoint = %self.id,
+                earned_usd = total as f64 / USD_MICRO,
+                cap_usd = self.earn_cap_usd(),
+                "sell_inference endpoint reached its earn cap; closing"
+            );
+        }
     }
 
     pub fn sale(&self) -> SellInference {
@@ -154,6 +211,37 @@ impl EndpointEntry {
             .zip(self.token_hash.iter())
             .fold(0u8, |acc, (a, b)| acc | (a ^ b))
             == 0
+    }
+}
+
+/// What one answered request earned, from its pricing and the worker's
+/// final event: the flat price, or the reported token usage at the model's
+/// rates. Unknown usage under per-token pricing earns nothing here; the
+/// gate refunds it too.
+fn request_earnings(
+    pricing: &SellPricing,
+    model: Option<&str>,
+    final_event: Option<&Value>,
+) -> f64 {
+    match pricing {
+        SellPricing::PerRequest { usd } => *usd,
+        SellPricing::PerToken { rates, max_usd } => {
+            let usage = final_event.and_then(|e| e.get("usage"));
+            let tokens = |key: &str| {
+                usage
+                    .and_then(|u| u.get(key))
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0)
+            };
+            let rate = model
+                .and_then(|m| rates.resolve(m))
+                .or(rates.default)
+                .or_else(|| rates.per_model.values().next().copied());
+            let Some(rate) = rate else { return 0.0 };
+            let usd = tokens("prompt_tokens") / 1e6 * rate.input_per_1m
+                + tokens("completion_tokens") / 1e6 * rate.output_per_1m;
+            usd.min(*max_usd)
+        }
     }
 }
 
@@ -276,6 +364,9 @@ pub struct CreateEndpoint {
     /// Idle seconds before a buyer's session channel closes and settles.
     #[serde(default)]
     pub session_idle_close_secs: Option<u32>,
+    /// Stop selling once this much has been earned, in USD. Required; at
+    /// most [`MAX_EARN_CAP_USD`].
+    pub earn_cap_usd: f64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -296,6 +387,11 @@ pub struct EndpointView {
     pub network: String,
     pub currencies: Vec<String>,
     pub queue: QueueDepth,
+    /// Selling stops once `earned_usd` reaches this.
+    pub earn_cap_usd: f64,
+    pub earned_usd: f64,
+    /// The cap was reached; buyers get 410 and the worker is winding down.
+    pub closed: bool,
     /// Only on creation. Whoever holds it drains the queue.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub owner_token: Option<String>,
@@ -415,6 +511,9 @@ fn view_of(state: &SellState, entry: &EndpointEntry, owner_token: Option<String>
         network: sale.network.clone(),
         currencies: sale.currencies.clone(),
         queue: QueueDepth { waiting, claimed },
+        earn_cap_usd: entry.earn_cap_usd(),
+        earned_usd: entry.earned_usd(),
+        closed: entry.is_closed(),
         owner_token,
     }
 }
@@ -445,6 +544,18 @@ async fn create(
     let creator = bearer(&headers)
         .and_then(|token| state.creators.authenticate(token))
         .ok_or_else(unauthorized)?;
+    if !input.earn_cap_usd.is_finite()
+        || input.earn_cap_usd < MIN_EARN_CAP_USD
+        || input.earn_cap_usd > MAX_EARN_CAP_USD
+    {
+        return Err(ApiError::bad_request(
+            "invalid_earn_cap",
+            format!(
+                "earn_cap_usd must be between {MIN_EARN_CAP_USD} and {MAX_EARN_CAP_USD} USD, got {}",
+                input.earn_cap_usd
+            ),
+        ));
+    }
     let recipient = input.recipient.or(creator.wallet).ok_or_else(|| {
         ApiError::bad_request(
             "recipient_required",
@@ -473,7 +584,7 @@ async fn create(
             .unwrap_or(pay_core::sell_inference::DEFAULT_SESSION_IDLE_CLOSE_SECS),
     };
     let owner_token = mint_owner_token();
-    let entry = Arc::new_cyclic(|_| EndpointEntry {
+    let entry = Arc::new(EndpointEntry {
         id: id.clone(),
         owner: creator.subject,
         token_hash: token_hash(&owner_token),
@@ -482,6 +593,9 @@ async fn create(
             sale: sale.clone(),
             gated: Router::new(),
         })),
+        earn_cap_micro: (input.earn_cap_usd * USD_MICRO).round() as u64,
+        earned_micro: AtomicU64::new(0),
+        closed: AtomicBool::new(false),
     });
     let live = live_for(&state, &entry, sale)?;
     *entry.live.write().unwrap_or_else(|p| p.into_inner()) = live;
@@ -535,6 +649,9 @@ async fn next_request(
     Query(query): Query<PollQuery>,
 ) -> Result<Response, ApiError> {
     let entry = owned(&state, &id, &headers)?;
+    if entry.is_closed() && entry.queue.depth() == (0, 0) {
+        return Err(endpoint_closed(&entry));
+    }
     let wait = Duration::from_secs(query.wait.unwrap_or(30)).min(MAX_POLL_WAIT);
     match entry.queue.next(wait).await {
         Some(request) => {
@@ -548,6 +665,23 @@ async fn next_request(
         }
         None => Ok(StatusCode::NO_CONTENT.into_response()),
     }
+}
+
+/// 410 for a worker or buyer of an endpoint that earned its cap.
+fn endpoint_closed(entry: &EndpointEntry) -> ApiError {
+    ApiError::new(
+        StatusCode::GONE,
+        "endpoint_closed",
+        format!(
+            "This endpoint reached its earn cap (${:.2} of ${:.2}) and no longer takes requests.",
+            entry.earned_usd(),
+            entry.earn_cap_usd()
+        ),
+    )
+    .with_details(json!({
+        "earned_usd": entry.earned_usd(),
+        "earn_cap_usd": entry.earn_cap_usd(),
+    }))
 }
 
 fn queue_error(error: QueueError) -> ApiError {
@@ -591,10 +725,19 @@ async fn complete(
     Json(input): Json<Complete>,
 ) -> Result<StatusCode, ApiError> {
     let entry = owned(&state, &id, &headers)?;
+    let sale = entry.sale();
+    let model = input
+        .event
+        .as_ref()
+        .and_then(|e| e.get("model"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let earned = request_earnings(&sale.pricing, model.as_deref(), input.event.as_ref());
     entry
         .queue
         .complete(&request, input.event)
         .map_err(queue_error)?;
+    entry.record_earning(earned);
     Ok(StatusCode::OK)
 }
 
@@ -627,6 +770,14 @@ async fn dispatch(
             "No such endpoint.",
         );
     };
+    if entry.is_closed() {
+        // Before the payment gate: a closed endpoint charges nobody.
+        return openai_error(
+            StatusCode::GONE,
+            "endpoint_closed",
+            "This endpoint reached its earning cap and no longer takes requests.",
+        );
+    }
     let router = entry.live().gated.clone();
     match router.oneshot(req).await {
         Ok(response) => response,
@@ -874,12 +1025,15 @@ mod tests {
         let status = res.status();
         let headers = res.headers().clone();
         let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
-        let json = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        // Extractor rejections are plain text; keep them readable in asserts.
+        let json = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()));
         (status, headers, json)
     }
 
     fn per_request(usd: f64) -> Value {
-        json!({ "pricing": { "per_request_usd": usd }, "model": "agent", "network": "devnet" })
+        json!({ "pricing": { "per_request_usd": usd }, "model": "agent", "network": "devnet",
+                "earn_cap_usd": 1.0 })
     }
 
     async fn create_endpoint(app: &Router, body: Value) -> (String, String) {
@@ -1327,6 +1481,207 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_earn_cap_is_required_bounded_and_one_endpoint_per_seller() {
+        let state = state();
+        let app = router(state.clone());
+        for (cap, needle) in [
+            (json!(null), "earn_cap_usd"),
+            (json!(0.0), "between"),
+            (json!(5.0), "between"),
+        ] {
+            let mut body = per_request(0.02);
+            body["earn_cap_usd"] = cap;
+            let (status, _, err) = send(
+                &app,
+                Method::POST,
+                "/v1/endpoints",
+                Some("creator"),
+                Some(body),
+            )
+            .await;
+            assert!(
+                status == StatusCode::BAD_REQUEST || status == StatusCode::UNPROCESSABLE_ENTITY,
+                "{status} {err}"
+            );
+            assert!(err.to_string().contains(needle), "{err}");
+        }
+
+        let (id, token) = create_endpoint(&app, per_request(0.02)).await;
+        let (status, _, err) = send(
+            &app,
+            Method::POST,
+            "/v1/endpoints",
+            Some("creator"),
+            Some(per_request(0.02)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{err}");
+        assert_eq!(err["error"], "endpoint_exists");
+        assert_eq!(err["details"]["endpoint_id"], id);
+
+        // Stopping frees the slot.
+        send(
+            &app,
+            Method::DELETE,
+            &format!("/v1/endpoints/{id}"),
+            Some(&token),
+            None,
+        )
+        .await;
+        let (status, _, _) = send(
+            &app,
+            Method::POST,
+            "/v1/endpoints",
+            Some("creator"),
+            Some(per_request(0.02)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reaching_the_cap_closes_the_endpoint_for_buyers_and_then_the_worker() {
+        let state = state();
+        let app = router(state.clone());
+        let mut body = per_request(0.02);
+        body["earn_cap_usd"] = json!(0.03);
+        let (id, token) = create_endpoint(&app, body).await;
+
+        let answer = |n: u32| {
+            let (app, state, id, token) = (app.clone(), state.clone(), id.clone(), token.clone());
+            async move {
+                let buyer_task = tokio::spawn(buyer(
+                    &state,
+                    &id,
+                    json!({ "model": "agent", "messages": [] }),
+                ));
+                let (_, _, next) = send(
+                    &app,
+                    Method::GET,
+                    &format!("/v1/endpoints/{id}/queue/next?wait=5"),
+                    Some(&token),
+                    None,
+                )
+                .await;
+                let rid = next["request_id"].as_str().unwrap();
+                let (status, _, _) = send(
+                    &app,
+                    Method::POST,
+                    &format!("/v1/endpoints/{id}/requests/{rid}/complete"),
+                    Some(&token),
+                    Some(
+                        json!({ "event": { "object": "chat.completion", "choices": [], "n": n } }),
+                    ),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK);
+                buyer_task.await.unwrap()
+            }
+        };
+
+        assert_eq!(answer(1).await.status(), StatusCode::OK);
+        let (_, _, view) = send(
+            &app,
+            Method::GET,
+            &format!("/v1/endpoints/{id}"),
+            Some(&token),
+            None,
+        )
+        .await;
+        assert_eq!(view["earned_usd"], 0.02);
+        assert_eq!(view["closed"], false);
+
+        // The second answer crosses the cap: the buyer in flight is served,
+        // then the endpoint is closed.
+        assert_eq!(answer(2).await.status(), StatusCode::OK);
+        let (_, _, view) = send(
+            &app,
+            Method::GET,
+            &format!("/v1/endpoints/{id}"),
+            Some(&token),
+            None,
+        )
+        .await;
+        assert_eq!(view["earned_usd"], 0.04);
+        assert_eq!(view["closed"], true);
+
+        // Buyers are turned away before the payment gate.
+        let (status, _, body) = send(
+            &app,
+            Method::POST,
+            &format!("/endpoints/{id}/v1/chat/completions"),
+            None,
+            Some(json!({ "model": "agent", "messages": [] })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::GONE, "{body}");
+        assert_eq!(body["error"]["code"], "endpoint_closed");
+
+        // The worker's next poll tells it to stop.
+        let (status, _, body) = send(
+            &app,
+            Method::GET,
+            &format!("/v1/endpoints/{id}/queue/next?wait=0"),
+            Some(&token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::GONE, "{body}");
+        assert_eq!(body["error"], "endpoint_closed");
+
+        // The seller may open a new one now.
+        let (status, _, _) = send(
+            &app,
+            Method::POST,
+            "/v1/endpoints",
+            Some("creator"),
+            Some(per_request(0.02)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    #[test]
+    fn earnings_follow_the_pricing() {
+        assert_eq!(
+            request_earnings(&SellPricing::PerRequest { usd: 0.02 }, None, None),
+            0.02
+        );
+        let per_token = SellPricing::PerToken {
+            rates: PricingConfig {
+                default: Some(TokenRate {
+                    input_per_1m: 1.0,
+                    output_per_1m: 3.0,
+                }),
+                per_model: [(
+                    "fast".to_string(),
+                    TokenRate {
+                        input_per_1m: 0.5,
+                        output_per_1m: 0.5,
+                    },
+                )]
+                .into(),
+            },
+            max_usd: 0.25,
+        };
+        let big =
+            json!({ "usage": { "prompt_tokens": 1_000_000, "completion_tokens": 1_000_000 } });
+        assert_eq!(
+            request_earnings(&per_token, None, Some(&big)),
+            0.25,
+            "capped"
+        );
+        let small = json!({ "usage": { "prompt_tokens": 10_000, "completion_tokens": 10_000 } });
+        assert!((request_earnings(&per_token, None, Some(&small)) - 0.04).abs() < 1e-9);
+        assert!((request_earnings(&per_token, Some("fast"), Some(&small)) - 0.01).abs() < 1e-9);
+        assert_eq!(
+            request_earnings(&per_token, None, None),
+            0.0,
+            "no usage, nothing counted"
+        );
     }
 
     #[test]

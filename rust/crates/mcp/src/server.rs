@@ -194,9 +194,12 @@ insufficient balance, present both options instead of assuming a deposit:
 (`sell_inference`), typically priced below what the same model costs upstream
 so buyers come. Let the user choose; never create an endpoint without asking,
 since it publishes a URL and lets strangers run prompts through an agent on
-this machine. Pick a flat `price_per_request_usd` unless the user wants
-per-token pricing; a few cents per request earns a typical API budget in a few
-dozen requests.
+this machine. Every endpoint has an earn cap (at most $2): selling stops and
+the endpoint closes itself once that much has been earned. When the user has
+not named an amount, leave `earn_cap_usd` unset and the tool asks them through
+elicitation, which is also their consent to publish. Pick a flat
+`price_per_request_usd` unless the user wants per-token pricing; a few cents
+per request earns a small budget in a few dozen requests.
 
 Actions: `create` (default), `status`, `reprice`, `stop`. Local `pay mcp`
 only: a hosted session has no machine to serve from.
@@ -298,6 +301,7 @@ mod tests {
         assert!(source.contains("must also specify the provider"));
         assert!(source.contains("counterpart of `topup`"));
         assert!(source.contains("never create an endpoint without asking"));
+        assert!(source.contains("earn cap"));
         assert!(source.contains("tie-breaker guidance"));
         assert!(source.contains("local wallet approval"));
         assert!(source.contains("does not need SOL for network fees"));

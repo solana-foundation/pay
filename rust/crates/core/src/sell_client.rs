@@ -140,6 +140,9 @@ pub struct SellRecord {
     pub chat_completions_url: String,
     pub recipient: String,
     pub pricing: Value,
+    /// Selling stops once this much has been earned, in USD.
+    #[serde(default)]
+    pub earn_cap_usd: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -169,6 +172,10 @@ impl SellRecord {
             chat_completions_url: field("chat_completions_url")?,
             recipient: field("recipient")?,
             pricing: view.get("pricing").cloned().unwrap_or(Value::Null),
+            earn_cap_usd: view
+                .get("earn_cap_usd")
+                .and_then(Value::as_f64)
+                .unwrap_or_default(),
             harness: None,
             cwd: None,
             worker_pid: None,

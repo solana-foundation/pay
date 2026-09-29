@@ -74,13 +74,23 @@ fn http() -> pay_core::Result<reqwest::blocking::Client> {
         .map_err(|e| pay_core::Error::Config(format!("http client: {e}")))
 }
 
-/// pay-connect's JSON error envelope, or the raw body.
-fn api_error(status: reqwest::StatusCode, body: &str) -> pay_core::Error {
-    let message = serde_json::from_str::<Value>(body)
+/// Prefix of the error a closed endpoint produces, so the serve loop can
+/// tell "done" from "broken".
+const CLOSED_MARKER: &str = "endpoint closed: ";
+
+fn api_message(body: &str) -> String {
+    serde_json::from_str::<Value>(body)
         .ok()
         .and_then(|v| v.get("message").and_then(Value::as_str).map(str::to_string))
-        .unwrap_or_else(|| body.trim().to_string());
-    pay_core::Error::Config(format!("pay-connect answered {status}: {message}"))
+        .unwrap_or_else(|| body.trim().to_string())
+}
+
+/// pay-connect's JSON error envelope, or the raw body.
+fn api_error(status: reqwest::StatusCode, body: &str) -> pay_core::Error {
+    pay_core::Error::Config(format!(
+        "pay-connect answered {status}: {}",
+        api_message(body)
+    ))
 }
 
 // ── create ────────────────────────────────────────────────────────────────
@@ -103,6 +113,11 @@ pub struct CreateCommand {
     /// Most one request may cost with `--price-per-token`.
     #[arg(long, value_name = "USD")]
     pub max_usd: Option<f64>,
+
+    /// Stop selling once this much has been earned, in USD (at most 2.00).
+    /// Selling inference covers a small balance; it is not a business.
+    #[arg(long, value_name = "USD")]
+    pub earn_cap: f64,
 
     /// Where buyers pay you (base58). Defaults to your connected wallet.
     #[arg(long)]
@@ -183,6 +198,7 @@ impl CreateCommand {
             "currencies": self.currencies,
             "network": self.network,
             "session_idle_close_secs": self.session_idle_close_secs,
+            "earn_cap_usd": self.earn_cap,
         });
         let response = http()?
             .post(format!("{url}/v1/endpoints"))
@@ -221,6 +237,10 @@ impl CreateCommand {
         println!("  base_url      {}", field("base_url"));
         println!("  model         {}", field("model"));
         println!("  recipient     {}", field("recipient"));
+        println!(
+            "  earn cap      ${} (the endpoint closes itself when reached)",
+            view["earn_cap_usd"].as_f64().unwrap_or_default()
+        );
         println!(
             "  schemes       {}",
             view["schemes"]
@@ -388,8 +408,18 @@ impl ServeCommand {
             if self.max_requests.is_some_and(|max| answered >= max) {
                 return Ok(());
             }
-            let Some(request) = worker.api.next_request()? else {
-                continue;
+            let request = match worker.api.next_request() {
+                Ok(Some(request)) => request,
+                Ok(None) => continue,
+                Err(error) if error.to_string().contains(CLOSED_MARKER) => {
+                    eprintln!(
+                        "{} {}",
+                        "Done.".green().bold(),
+                        error.to_string().replace(CLOSED_MARKER, "")
+                    );
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
             };
             let started = Instant::now();
             eprint!("· {} ", request.request_id.dimmed());
@@ -471,6 +501,13 @@ impl Api {
                     .json()
                     .map_err(|e| pay_core::Error::Config(format!("bad queue item: {e}")))?;
                 Ok(Some(next))
+            }
+            reqwest::StatusCode::GONE => {
+                let text = response.text().unwrap_or_default();
+                Err(pay_core::Error::Config(format!(
+                    "{CLOSED_MARKER}{}",
+                    api_message(&text)
+                )))
             }
             status => {
                 let text = response.text().unwrap_or_default();

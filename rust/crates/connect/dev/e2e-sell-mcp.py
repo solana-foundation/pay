@@ -60,6 +60,8 @@ def main() -> int:
             "recipient": os.environ["SELL_RECIPIENT"],
             "network": "localnet",
             "session_idle_close_secs": 5,
+            # Two $0.02 answers cross this; the third buyer gets 410.
+            "earn_cap_usd": 0.03,
         })
     elif endpoint_id:
         args["endpoint_id"] = endpoint_id

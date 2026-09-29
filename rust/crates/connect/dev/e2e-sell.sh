@@ -109,7 +109,7 @@ ok "up (log: $TMP/connect.log)"
 step "pay sell create (\$$PRICE per request, paid to the seller)"
 VIEW="$("$BIN/pay" sell create --connect-url "$CONNECT" --token "$CREATOR" \
   --model e2e-agent --price "$PRICE" --recipient "$SELLER" --network localnet \
-  --session-idle-close-secs "$IDLE_CLOSE_SECS" --json)"
+  --session-idle-close-secs "$IDLE_CLOSE_SECS" --earn-cap 2.00 --json)"
 ID="$(jq -r .id <<<"$VIEW")"
 OWNER_TOKEN="$(jq -r .owner_token <<<"$VIEW")"
 CHAT_URL="$(jq -r .chat_completions_url <<<"$VIEW")"
@@ -189,7 +189,16 @@ ok "three paid requests settled to the seller"
 grep -c answered "$TMP/serve.log" | xargs -I{} echo "  worker answered {} requests"
 
 # ── 8. The same through the MCP tool: `pay mcp` creates an endpoint, spawns
-# its own worker, a buyer pays, then status and stop.
+# its own worker, a buyer pays, then status and stop. A seller may hold one
+# open endpoint at a time, so the CLI one is stopped first.
+step "One open endpoint per seller"
+CODE="$(curl -sS -o "$TMP/409.json" -w '%{http_code}' -X POST "$CONNECT/v1/endpoints" \
+  -H "Authorization: Bearer $CREATOR" -H 'content-type: application/json' \
+  -d "{\"pricing\":{\"per_request_usd\":0.02},\"model\":\"x\",\"recipient\":\"$SELLER\",\"network\":\"localnet\",\"earn_cap_usd\":1}")"
+[ "$CODE" = 409 ] || { cat "$TMP/409.json"; fail "expected 409 for a second open endpoint, got $CODE"; }
+curl -sS -f -X DELETE "$CONNECT/v1/endpoints/$ID" -H "Authorization: Bearer $OWNER_TOKEN" >/dev/null || fail "could not stop the CLI endpoint"
+ok "second endpoint refused with 409; CLI endpoint $ID stopped"
+
 step "sell_inference over MCP"
 export PAY_CONNECT_URL="$CONNECT" PAY_CONNECT_TOKEN="$CREATOR" PAY_SELL_DIR="$TMP/sell" \
   SELL_RECIPIENT="$SELLER" MCP_LOG="$TMP/mcp.log"
@@ -208,7 +217,22 @@ echo "$OUT" | jq -e '.choices[0].message.content == "paid through the mcp endpoi
 ok "buyer paid and got: $(jq -r '.choices[0].message.content' <<<"$OUT")"
 STATUS="$(python3 "$ROOT/rust/crates/connect/dev/e2e-sell-mcp.py" "$BIN/pay" status "$MCP_ID")" || fail "status failed"
 grep -q "worker: running" <<<"$STATUS" || { echo "$STATUS"; fail "status does not show a running worker"; }
-ok "status: $(grep '^queue' <<<"$STATUS"), $(grep '^worker' <<<"$STATUS")"
+grep -q 'earned: \$0.02 of \$0.03' <<<"$STATUS" || { echo "$STATUS"; fail "status does not show earnings against the cap"; }
+ok "status: $(grep '^earned' <<<"$STATUS"), $(grep '^worker' <<<"$STATUS")"
+
+# The second answered request crosses the $0.03 cap: the endpoint closes
+# itself, buyers get 410 without being charged, and the worker exits.
+OUT="$("$BIN/pay" --local --mpp curl -sS -X POST "$MCP_URL" -H 'content-type: application/json' \
+  -d '{"model":"mcp-agent","messages":[{"role":"user","content":"second"}]}')" || fail "second purchase failed"
+echo "$OUT" | jq -e '.choices[0].message.content == "second"' >/dev/null || { echo "$OUT"; fail "second answer wrong"; }
+CODE="$(curl -sS -o "$TMP/410.json" -w '%{http_code}' -X POST "$MCP_URL" -H 'content-type: application/json' -d '{"model":"mcp-agent","messages":[]}')"
+[ "$CODE" = 410 ] || { cat "$TMP/410.json"; fail "expected 410 after the cap, got $CODE"; }
+for _ in $(seq 1 20); do grep -q "Done." "$PAY_SELL_DIR/$MCP_ID.log" && break; sleep 1; done
+grep -q "Done." "$PAY_SELL_DIR/$MCP_ID.log" || { tail -5 "$PAY_SELL_DIR/$MCP_ID.log"; fail "the worker did not exit after the cap"; }
+STATUS="$(python3 "$ROOT/rust/crates/connect/dev/e2e-sell-mcp.py" "$BIN/pay" status "$MCP_ID")" || fail "status failed"
+grep -q "closed, the cap was reached" <<<"$STATUS" || { echo "$STATUS"; fail "status does not report the closed endpoint"; }
+ok "cap reached: buyers get 410, worker exited, $(grep '^earned' <<<"$STATUS")"
+
 STOP="$(python3 "$ROOT/rust/crates/connect/dev/e2e-sell-mcp.py" "$BIN/pay" stop "$MCP_ID")" || fail "stop failed"
 grep -q "endpoint deleted" <<<"$STOP" || { echo "$STOP"; fail "stop did not delete the endpoint"; }
 CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$MCP_URL" -H 'content-type: application/json' -d '{}')"

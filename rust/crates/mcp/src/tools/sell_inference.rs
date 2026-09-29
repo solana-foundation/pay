@@ -9,7 +9,9 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use pay_core::sell_client::{EndpointsApi, SellRecord, default_connect_url};
-use rmcp::model::CallToolResult;
+use rmcp::model::{
+    CallToolResult, CreateElicitationRequestParams, ElicitationAction, ElicitationSchema,
+};
 use rmcp::schemars;
 use rmcp::service::{Peer, RoleServer};
 use schemars::JsonSchema;
@@ -22,6 +24,13 @@ use crate::context::CallScope;
 const CREATOR_TOKEN_ENV: &str = "PAY_CONNECT_TOKEN";
 const PAYCONNECT_PROVIDER: &str = "payconnect";
 const DEFAULT_MODEL: &str = "pay-agent";
+/// The most one endpoint may set out to earn, mirroring pay-connect's bound.
+pub const MAX_EARN_CAP_USD: f64 = 2.0;
+pub const MIN_EARN_CAP_USD: f64 = 0.01;
+/// A payee already holding this much is not out of funds; the tool declines
+/// so the agent spends what is there instead of publishing an endpoint.
+pub const ALREADY_FUNDED_USD: f64 = 2.0;
+const ELICITATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -106,6 +115,12 @@ pub struct Params {
     /// most recently created one on this machine.
     #[serde(default)]
     pub endpoint_id: Option<String>,
+    /// Stop selling once this much has been earned, in USD (0.01 to 2.00).
+    /// The endpoint closes itself when reached. When omitted, the user is
+    /// asked through elicitation; pass it only when the user already named
+    /// an amount.
+    #[serde(default)]
+    pub earn_cap_usd: Option<f64>,
 }
 
 pub async fn run(
@@ -257,6 +272,39 @@ async fn create(
         .filter(|m| !m.is_empty())
         .unwrap_or_else(|| DEFAULT_MODEL.to_string());
     let token = creator_token(scope, peer.as_ref())?;
+    already_funded_check(scope, &network, &recipient).await?;
+
+    let earn_cap_usd = match params.earn_cap_usd {
+        Some(cap) => cap,
+        None => {
+            let peer = peer
+                .as_ref()
+                .filter(|p| crate::context::peer_supports_elicitation(p))
+                .ok_or_else(|| {
+                    format!(
+                        "earn_cap_usd is required: ask the user how much to earn before the \
+                         endpoint closes itself (for example 0.50, 1.00 or 2.00 USD; at most \
+                         {MAX_EARN_CAP_USD}), then call again with it."
+                    )
+                })?;
+            elicit_earn_cap(
+                peer,
+                &EarnCapPrompt {
+                    price: describe_pricing(&pricing),
+                    model: &model,
+                    harness,
+                    cwd: &cwd,
+                    recipient: &recipient,
+                },
+            )
+            .await?
+        }
+    };
+    if !earn_cap_usd.is_finite() || !(MIN_EARN_CAP_USD..=MAX_EARN_CAP_USD).contains(&earn_cap_usd) {
+        return Err(format!(
+            "earn_cap_usd must be between {MIN_EARN_CAP_USD} and {MAX_EARN_CAP_USD} USD, got {earn_cap_usd}"
+        ));
+    }
 
     let api = EndpointsApi::new(default_connect_url()).map_err(|e| e.to_string())?;
     let body = json!({
@@ -267,6 +315,7 @@ async fn create(
         "recipient": recipient,
         "network": network,
         "session_idle_close_secs": params.session_idle_close_secs,
+        "earn_cap_usd": earn_cap_usd,
     });
     let view = api.create(&token, &body).await.map_err(|e| e.to_string())?;
     let mut record =
@@ -310,17 +359,20 @@ async fn create(
         })
         .unwrap_or_default();
     Ok(format!(
-        "Selling inference.\n\
+        "Selling inference until ${cap:.2} has been earned.\n\
          endpoint_id: {id}\n\
          base_url: {base} (OpenAI-compatible; buyers set model \"{model}\")\n\
          price: {price}\n\
          payment schemes: {schemes}\n\
          paid to: {recipient} ({recipient_note})\n\
+         earn cap: ${cap:.2}; the endpoint closes itself when reached and the worker exits\n\
          worker: pay sell serve, pid {pid}, harness {harness}, cwd {cwd}\n\
          log: {log}\n\n\
          Requests are answered by an agent running here, so keep this machine on while \
          serving. Buyers are charged only for answered requests. Share the base_url and \
-         model with buyers; stop with sell_inference {{action: \"stop\"}}.",
+         model with buyers; check progress with sell_inference {{action: \"status\"}} and \
+         stop early with {{action: \"stop\"}}.",
+        cap = record.earn_cap_usd,
         id = record.id,
         base = record.base_url,
         model = record.model,
@@ -331,6 +383,98 @@ async fn create(
         cwd = cwd.display(),
         log = record.log_path.clone().unwrap_or_default(),
     ))
+}
+
+/// Decline when the payee already holds enough: selling inference is for
+/// covering an empty balance, and the platform fronts the gas. This is
+/// guidance in the tool, not a rule pay-connect can enforce, since a seller
+/// may name any payee.
+async fn already_funded_check(
+    scope: &CallScope,
+    network: &str,
+    recipient: &str,
+) -> Result<(), String> {
+    let rpc_url = scope.rpc_url(network);
+    let balances =
+        match pay_core::client::balance::get_stablecoin_balances(&rpc_url, recipient).await {
+            Ok(balances) => balances,
+            // An outage must not block earning; the server still bounds the cap.
+            Err(error) => {
+                tracing::info!(%error, "payee balance lookup failed; continuing");
+                return Ok(());
+            }
+        };
+    let held: f64 = balances
+        .tokens
+        .iter()
+        .map(|t| t.ui_amount)
+        .chain(balances.credits.iter().map(|c| c.ui_amount))
+        .sum();
+    if held >= ALREADY_FUNDED_USD {
+        return Err(format!(
+            "{recipient} already holds ${held:.2} in stablecoins and credits. Selling inference \
+             is for covering an empty balance; spend what is there instead, or top up if more \
+             is needed."
+        ));
+    }
+    Ok(())
+}
+
+struct EarnCapPrompt<'a> {
+    price: String,
+    model: &'a str,
+    harness: Harness,
+    cwd: &'a std::path::Path,
+    recipient: &'a str,
+}
+
+/// Ask the user how much to earn. Accepting the form is also the consent to
+/// publish the endpoint, so the message says exactly what that means.
+async fn elicit_earn_cap(
+    peer: &Peer<RoleServer>,
+    prompt: &EarnCapPrompt<'_>,
+) -> Result<f64, String> {
+    let schema = ElicitationSchema::builder()
+        .required_number("earn_cap_usd", MIN_EARN_CAP_USD, MAX_EARN_CAP_USD)
+        .build()
+        .map_err(|e| format!("elicitation schema: {e}"))?;
+    let message = format!(
+        "Sell this agent's inference to earn stablecoins? This publishes a paid \
+         OpenAI-compatible endpoint that strangers can call; each request is answered by \
+         {harness} running in {cwd}, priced at {price} and paid to {recipient}. \
+         Buyers use model \"{model}\". How much should it earn before closing itself? \
+         Enter the amount in USD, for example 0.50, 1.00 or 2.00 (at most {max}).",
+        harness = prompt.harness.as_str(),
+        cwd = prompt.cwd.display(),
+        price = prompt.price,
+        recipient = prompt.recipient,
+        model = prompt.model,
+        max = MAX_EARN_CAP_USD,
+    );
+    let params = CreateElicitationRequestParams::FormElicitationParams {
+        meta: None,
+        message,
+        requested_schema: schema,
+    };
+    let outcome = tokio::time::timeout(ELICITATION_TIMEOUT, peer.create_elicitation(params))
+        .await
+        .map_err(|_| "Timed out waiting for the earn cap.".to_string())?
+        .map_err(|e| format!("Could not ask for the earn cap: {e}"))?;
+    match outcome.action {
+        ElicitationAction::Accept => outcome
+            .content
+            .as_ref()
+            .and_then(|c| c.get("earn_cap_usd"))
+            .and_then(|v| {
+                v.as_f64().or_else(|| {
+                    v.as_str()
+                        .and_then(|s| s.trim().trim_start_matches('$').parse().ok())
+                })
+            })
+            .ok_or_else(|| "The form came back without an earn cap.".to_string()),
+        ElicitationAction::Decline => Err("The user declined to sell inference.".to_string()),
+        ElicitationAction::Cancel => Err("The user cancelled selling inference.".to_string()),
+    }
 }
 
 /// Start `pay sell serve` detached, logging to the record's log file.
@@ -448,8 +592,15 @@ async fn status(params: Params) -> Result<String, String> {
         ),
         None => "not started".to_string(),
     };
+    let earned = view["earned_usd"].as_f64().unwrap_or(0.0);
+    let cap = view["earn_cap_usd"].as_f64().unwrap_or(record.earn_cap_usd);
+    let progress = if view["closed"].as_bool().unwrap_or(false) {
+        format!("${earned:.2} of ${cap:.2}; closed, the cap was reached and the worker is exiting")
+    } else {
+        format!("${earned:.2} of ${cap:.2}")
+    };
     Ok(format!(
-        "endpoint_id: {}\nbase_url: {}\nmodel: {}\nprice: {}\npaid to: {}\nqueue: {} waiting, {} being answered\nworker: {}\nlog: {}",
+        "endpoint_id: {}\nbase_url: {}\nmodel: {}\nprice: {}\npaid to: {}\nearned: {}\nqueue: {} waiting, {} being answered\nworker: {}\nlog: {}",
         record.id,
         record.base_url,
         record.model,
@@ -460,6 +611,7 @@ async fn status(params: Params) -> Result<String, String> {
                 .unwrap_or(record.pricing.clone())
         ),
         record.recipient,
+        progress,
         view["queue"]["waiting"].as_u64().unwrap_or(0),
         view["queue"]["claimed"].as_u64().unwrap_or(0),
         worker,
