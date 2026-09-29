@@ -197,7 +197,10 @@ since it publishes a URL and lets strangers run prompts through an agent on
 this machine. Every endpoint has an earn cap (at most $2): selling stops and
 the endpoint closes itself once that much has been earned. When the user has
 not named an amount, leave `earn_cap_usd` unset and the tool asks them through
-elicitation, which is also their consent to publish. Pick a flat
+elicitation, which is also their consent to publish. The serving agent runs
+in an empty directory with tools refused, so buyers cannot reach the seller's
+files; `cwd` and `allow_tools` lift that and are spelled out in the
+elicitation. Pick a flat
 `price_per_request_usd` unless the user wants per-token pricing; a few cents
 per request earns a small budget in a few dozen requests.
 

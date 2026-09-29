@@ -12,11 +12,24 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
+use pay_core::sell_inference::SellPricing;
 use serde_json::Value;
 use tokio::sync::{Notify, mpsc};
 
 /// Most unclaimed requests one endpoint holds; beyond it, callers get 503.
 pub const MAX_WAITING: usize = 64;
+
+/// The terms a request was admitted under. Pricing can change while a
+/// request waits; what the buyer paid for is what the endpoint earns.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Admission {
+    pub pricing: SellPricing,
+    /// The model the buyer asked for, from the request body.
+    pub model: Option<String>,
+    /// The most this request can earn: the flat price, or the per-token
+    /// ceiling. Reserved against the earn cap until the request finishes.
+    pub expected_usd: f64,
+}
 
 /// What the client asked, as the worker receives it.
 #[derive(Debug, Clone)]
@@ -27,6 +40,15 @@ pub struct ParkedRequest {
     /// Whether the client asked for SSE.
     pub stream: bool,
     pub parked_at: Instant,
+    pub admission: Admission,
+}
+
+/// How a claimed request ended.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Completion {
+    pub admission: Admission,
+    /// Whether the buyer was still there to receive the final event.
+    pub delivered: bool,
 }
 
 /// One step of the worker's answer.
@@ -82,6 +104,7 @@ impl EndpointQueue {
         &self,
         body: Bytes,
         stream: bool,
+        admission: Admission,
     ) -> Result<(String, mpsc::UnboundedReceiver<Event>), QueueError> {
         let mut inner = self.lock();
         if inner.waiting.len() >= MAX_WAITING {
@@ -95,6 +118,7 @@ impl EndpointQueue {
                 body,
                 stream,
                 parked_at: Instant::now(),
+                admission,
             },
             tx,
         });
@@ -104,10 +128,15 @@ impl EndpointQueue {
     }
 
     /// The client stopped waiting before a worker claimed the request.
-    pub fn abandon(&self, id: &str) {
+    /// Returns what it was admitted under, so the reservation can go.
+    pub fn abandon(&self, id: &str) -> Option<Admission> {
         let mut inner = self.lock();
-        inner.waiting.retain(|p| p.request.id != id);
-        inner.claimed.remove(id);
+        let waiting = inner.waiting.iter().position(|p| p.request.id == id);
+        let parked = match waiting {
+            Some(index) => inner.waiting.remove(index),
+            None => inner.claimed.remove(id),
+        };
+        parked.map(|p| p.request.admission)
     }
 
     /// Claim the oldest waiting request, waiting up to `timeout` for one.
@@ -153,7 +182,7 @@ impl EndpointQueue {
     }
 
     /// Finish a claimed request.
-    pub fn complete(&self, id: &str, final_event: Option<Value>) -> Result<(), QueueError> {
+    pub fn complete(&self, id: &str, final_event: Option<Value>) -> Result<Completion, QueueError> {
         self.finish(id, Event::Complete(final_event))
     }
 
@@ -163,7 +192,7 @@ impl EndpointQueue {
         id: &str,
         status: u16,
         message: impl Into<String>,
-    ) -> Result<(), QueueError> {
+    ) -> Result<Completion, QueueError> {
         self.finish(
             id,
             Event::Fail {
@@ -173,10 +202,14 @@ impl EndpointQueue {
         )
     }
 
-    fn finish(&self, id: &str, event: Event) -> Result<(), QueueError> {
+    fn finish(&self, id: &str, event: Event) -> Result<Completion, QueueError> {
         let mut inner = self.lock();
         let parked = inner.claimed.remove(id).ok_or(QueueError::Unknown)?;
-        parked.tx.send(event).map_err(|_| QueueError::Gone)
+        let delivered = parked.tx.send(event).is_ok();
+        Ok(Completion {
+            admission: parked.request.admission,
+            delivered,
+        })
     }
 
     /// (waiting, claimed) counts.
@@ -191,22 +224,35 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn admission() -> Admission {
+        Admission {
+            pricing: SellPricing::PerRequest { usd: 0.02 },
+            model: Some("agent".into()),
+            expected_usd: 0.02,
+        }
+    }
+
     #[tokio::test]
     async fn a_worker_claims_streams_and_completes_in_order() {
         let queue = EndpointQueue::default();
-        let (id, mut rx) = queue.park(Bytes::from_static(b"{}"), true).unwrap();
+        let (id, mut rx) = queue
+            .park(Bytes::from_static(b"{}"), true, admission())
+            .unwrap();
         assert_eq!(queue.depth(), (1, 0));
 
         let claimed = queue.next(Duration::from_secs(1)).await.unwrap();
         assert_eq!(claimed.id, id);
         assert!(claimed.stream);
+        assert_eq!(claimed.admission, admission());
         assert_eq!(queue.depth(), (0, 1));
         assert_eq!(rx.recv().await, Some(Event::Claimed));
 
         queue
             .push(&id, vec![json!({"n": 1}), json!({"n": 2})])
             .unwrap();
-        queue.complete(&id, Some(json!({"usage": {}}))).unwrap();
+        let completion = queue.complete(&id, Some(json!({"usage": {}}))).unwrap();
+        assert!(completion.delivered);
+        assert_eq!(completion.admission, admission());
         assert_eq!(rx.recv().await, Some(Event::Chunk(json!({"n": 1}))));
         assert_eq!(rx.recv().await, Some(Event::Chunk(json!({"n": 2}))));
         assert_eq!(
@@ -228,16 +274,16 @@ mod tests {
             tokio::spawn(async move { queue.next(Duration::from_secs(5)).await })
         };
         tokio::time::sleep(Duration::from_millis(20)).await;
-        let (id, _rx) = queue.park(Bytes::new(), false).unwrap();
+        let (id, _rx) = queue.park(Bytes::new(), false, admission()).unwrap();
         assert_eq!(waiter.await.unwrap().unwrap().id, id);
     }
 
     #[tokio::test]
     async fn a_departed_client_is_skipped_and_reported() {
         let queue = EndpointQueue::default();
-        let (gone, rx) = queue.park(Bytes::new(), false).unwrap();
+        let (gone, rx) = queue.park(Bytes::new(), false, admission()).unwrap();
         drop(rx);
-        let (live, mut live_rx) = queue.park(Bytes::new(), false).unwrap();
+        let (live, mut live_rx) = queue.park(Bytes::new(), false, admission()).unwrap();
 
         let claimed = queue.next(Duration::from_secs(1)).await.unwrap();
         assert_eq!(
@@ -253,24 +299,26 @@ mod tests {
             Err(QueueError::Gone),
             "pushing to a client that left says so"
         );
-        // Finishing still clears the slot.
-        assert_eq!(queue.fail(&live, 502, "x"), Err(QueueError::Gone));
+        // Finishing still clears the slot and says the buyer never saw it.
+        let completion = queue.fail(&live, 502, "x").unwrap();
+        assert!(!completion.delivered);
         assert_eq!(queue.depth(), (0, 0));
     }
 
     #[tokio::test]
     async fn abandon_removes_a_waiting_request_and_the_queue_is_bounded() {
         let queue = EndpointQueue::default();
-        let (id, _rx) = queue.park(Bytes::new(), false).unwrap();
-        queue.abandon(&id);
+        let (id, _rx) = queue.park(Bytes::new(), false, admission()).unwrap();
+        assert_eq!(queue.abandon(&id), Some(admission()));
+        assert_eq!(queue.abandon(&id), None);
         assert_eq!(queue.depth(), (0, 0));
 
         let mut receivers = Vec::new();
         for _ in 0..MAX_WAITING {
-            receivers.push(queue.park(Bytes::new(), false).unwrap());
+            receivers.push(queue.park(Bytes::new(), false, admission()).unwrap());
         }
         assert_eq!(
-            queue.park(Bytes::new(), false).map(|_| ()),
+            queue.park(Bytes::new(), false, admission()).map(|_| ()),
             Err(QueueError::Full)
         );
     }

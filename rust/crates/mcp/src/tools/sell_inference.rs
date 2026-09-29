@@ -94,9 +94,16 @@ pub struct Params {
     /// Which local agent answers. Defaults to claude.
     #[serde(default)]
     pub harness: Option<Harness>,
-    /// Directory the serving agent works in. Defaults to the current directory.
+    /// Directory the serving agent works in. Defaults to an empty directory
+    /// of its own, so buyers cannot reach the seller's files. Set it only
+    /// when the seller wants buyers working in a specific project.
     #[serde(default)]
     pub cwd: Option<String>,
+    /// Let the serving agent use tools (files, shell, network) when its
+    /// harness asks permission. Off by default: buyers get answers from what
+    /// the agent knows, and permission requests are refused.
+    #[serde(default)]
+    pub allow_tools: bool,
     /// Where buyers pay (base58). Defaults to the active Pay account.
     #[serde(default)]
     pub recipient: Option<String>,
@@ -259,12 +266,15 @@ async fn create(
         ),
     };
     let harness = params.harness.unwrap_or_default();
+    // No cwd means the worker isolates the agent in an empty directory.
     let cwd = match params.cwd.clone() {
-        Some(dir) => PathBuf::from(dir),
-        None => std::env::current_dir().map_err(|e| format!("current directory: {e}"))?,
+        Some(dir) => Some(
+            std::fs::canonicalize(PathBuf::from(&dir))
+                .map_err(|e| format!("cwd `{dir}` is not usable: {e}"))?,
+        ),
+        None => None,
     };
-    let cwd = std::fs::canonicalize(&cwd)
-        .map_err(|e| format!("cwd `{}` is not usable: {e}", cwd.display()))?;
+    let allow_tools = params.allow_tools;
     let model = params
         .model
         .clone()
@@ -293,7 +303,8 @@ async fn create(
                     price: describe_pricing(&pricing),
                     model: &model,
                     harness,
-                    cwd: &cwd,
+                    cwd: cwd.as_deref(),
+                    allow_tools,
                     recipient: &recipient,
                 },
             )
@@ -321,12 +332,12 @@ async fn create(
     let mut record =
         SellRecord::from_created(api.connect_url(), &view).map_err(|e| e.to_string())?;
     record.harness = Some(harness.as_str().to_string());
-    record.cwd = Some(cwd.to_string_lossy().to_string());
+    record.cwd = cwd.as_ref().map(|c| c.to_string_lossy().to_string());
     record
         .save()
         .map_err(|e| format!("could not save the endpoint record: {e}"))?;
 
-    let spawn = spawn_worker(&record, harness, &cwd);
+    let spawn = spawn_worker(&record, harness, cwd.as_deref(), allow_tools);
     match spawn {
         Ok((pid, log)) => {
             record.worker_pid = Some(pid);
@@ -366,7 +377,7 @@ async fn create(
          payment schemes: {schemes}\n\
          paid to: {recipient} ({recipient_note})\n\
          earn cap: ${cap:.2}; the endpoint closes itself when reached and the worker exits\n\
-         worker: pay sell serve, pid {pid}, harness {harness}, cwd {cwd}\n\
+         worker: pay sell serve, pid {pid}, harness {harness}, {isolation}\n\
          log: {log}\n\n\
          Requests are answered by an agent running here, so keep this machine on while \
          serving. Buyers are charged only for answered requests. Share the base_url and \
@@ -380,7 +391,7 @@ async fn create(
         recipient = record.recipient,
         pid = record.worker_pid.unwrap_or_default(),
         harness = harness.as_str(),
-        cwd = cwd.display(),
+        isolation = describe_isolation(cwd.as_deref(), allow_tools),
         log = record.log_path.clone().unwrap_or_default(),
     ))
 }
@@ -424,8 +435,23 @@ struct EarnCapPrompt<'a> {
     price: String,
     model: &'a str,
     harness: Harness,
-    cwd: &'a std::path::Path,
+    cwd: Option<&'a std::path::Path>,
+    allow_tools: bool,
     recipient: &'a str,
+}
+
+/// Where and with what powers the serving agent runs, in words.
+fn describe_isolation(cwd: Option<&std::path::Path>, allow_tools: bool) -> String {
+    let place = match cwd {
+        Some(dir) => format!("in {}", dir.display()),
+        None => "in an empty, isolated directory".to_string(),
+    };
+    let tools = if allow_tools {
+        "with tools ALLOWED, so buyers can make it read and change files there"
+    } else {
+        "with tools refused"
+    };
+    format!("{place} {tools}")
 }
 
 /// Ask the user how much to earn. Accepting the form is also the consent to
@@ -441,11 +467,11 @@ async fn elicit_earn_cap(
     let message = format!(
         "Sell this agent's inference to earn stablecoins? This publishes a paid \
          OpenAI-compatible endpoint that strangers can call; each request is answered by \
-         {harness} running in {cwd}, priced at {price} and paid to {recipient}. \
+         {harness} running {isolation}, priced at {price} and paid to {recipient}. \
          Buyers use model \"{model}\". How much should it earn before closing itself? \
          Enter the amount in USD, for example 0.50, 1.00 or 2.00 (at most {max}).",
         harness = prompt.harness.as_str(),
-        cwd = prompt.cwd.display(),
+        isolation = describe_isolation(prompt.cwd, prompt.allow_tools),
         price = prompt.price,
         recipient = prompt.recipient,
         model = prompt.model,
@@ -481,7 +507,8 @@ async fn elicit_earn_cap(
 fn spawn_worker(
     record: &SellRecord,
     harness: Harness,
-    cwd: &std::path::Path,
+    cwd: Option<&std::path::Path>,
+    allow_tools: bool,
 ) -> Result<(u32, PathBuf), String> {
     let exe = std::env::current_exe().map_err(|e| format!("locate the pay binary: {e}"))?;
     let log_path = SellRecord::log_path_for(&record.id);
@@ -503,14 +530,20 @@ fn spawn_worker(
             harness.as_str(),
             "--connect-url",
             &record.connect_url,
-            "--cwd",
         ])
-        .arg(cwd)
-        .env("PAY_SELL_OWNER_TOKEN", &record.owner_token)
-        .current_dir(cwd)
+        // The worker reads the owner token from the record on disk; the
+        // token never enters an environment the agent could inherit.
+        .env_remove("PAY_SELL_OWNER_TOKEN")
+        .env_remove(CREATOR_TOKEN_ENV)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err));
+    if let Some(cwd) = cwd {
+        command.arg("--cwd").arg(cwd).current_dir(cwd);
+    }
+    if allow_tools {
+        command.arg("--allow-tools");
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;

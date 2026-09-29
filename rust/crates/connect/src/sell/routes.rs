@@ -31,7 +31,7 @@ use tokio::sync::mpsc;
 use tower::ServiceExt;
 
 use super::backends::{EndpointBackends, Operator};
-use super::queue::{EndpointQueue, Event, QueueError};
+use super::queue::{Admission, EndpointQueue, Event, QueueError};
 use crate::protocol::ApiError;
 
 /// Most endpoints one process holds.
@@ -95,6 +95,11 @@ impl SellState {
 #[derive(Default)]
 pub struct EndpointRegistry {
     endpoints: Mutex<HashMap<String, Arc<EndpointEntry>>>,
+    /// Payment backends of repriced or deleted endpoints. Their session
+    /// lifecycles keep pushing watermarks and closing idle channels for
+    /// buyers who paid under them; dropping them would strand those
+    /// channels. Freed only when the process exits.
+    retired: Mutex<Vec<Arc<Live>>>,
 }
 
 impl EndpointRegistry {
@@ -135,7 +140,17 @@ impl EndpointRegistry {
     }
 
     fn remove(&self, id: &str) -> Option<Arc<EndpointEntry>> {
-        self.lock().remove(id)
+        let removed = self.lock().remove(id)?;
+        let mut retired = self.retired.lock().unwrap_or_else(|p| p.into_inner());
+        retired.push(removed.live());
+        retired.extend(std::mem::take(&mut *removed.retired()));
+        Some(removed)
+    }
+
+    /// Backends kept alive for channels opened under old prices or on
+    /// deleted endpoints.
+    pub fn retired_backends(&self) -> usize {
+        self.retired.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
 
     pub fn len(&self) -> usize {
@@ -161,12 +176,18 @@ pub struct EndpointEntry {
     token_hash: [u8; 32],
     pub queue: Arc<EndpointQueue>,
     live: RwLock<Arc<Live>>,
+    /// Backends replaced by a reprice, kept so their channels still settle.
+    retired: Mutex<Vec<Arc<Live>>>,
     /// Stop taking requests once this much has been earned (micro-USD).
     earn_cap_micro: u64,
     /// What answered requests have earned so far (micro-USD).
     earned_micro: AtomicU64,
-    /// Set when the cap is reached: buyers get 410, the worker drains what
-    /// is already parked and then exits.
+    /// The most that admitted, unfinished requests can still earn
+    /// (micro-USD). Counted against the cap so admitted work never carries
+    /// it past the cap by more than the requests already in flight.
+    reserved_micro: AtomicU64,
+    /// Set when earned plus reserved reaches the cap: buyers get 410, the
+    /// worker drains what is already parked and then exits. Final.
     closed: AtomicBool,
 }
 
@@ -183,22 +204,62 @@ impl EndpointEntry {
         self.earned_micro.load(Ordering::Relaxed) as f64 / USD_MICRO
     }
 
+    pub fn pending_usd(&self) -> f64 {
+        self.reserved_micro.load(Ordering::Relaxed) as f64 / USD_MICRO
+    }
+
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Relaxed)
     }
 
-    /// Count one answered request; closes the endpoint at the cap.
-    fn record_earning(&self, usd: f64) {
-        let micro = (usd.max(0.0) * USD_MICRO).round() as u64;
-        let total = self.earned_micro.fetch_add(micro, Ordering::Relaxed) + micro;
-        if total >= self.earn_cap_micro && !self.closed.swap(true, Ordering::Relaxed) {
+    fn retired(&self) -> std::sync::MutexGuard<'_, Vec<Arc<Live>>> {
+        self.retired.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn micro(usd: f64) -> u64 {
+        (usd.max(0.0) * USD_MICRO).round() as u64
+    }
+
+    /// Close once what is earned plus what is still owed reaches the cap.
+    fn check_cap(&self) {
+        let earned = self.earned_micro.load(Ordering::Relaxed);
+        let reserved = self.reserved_micro.load(Ordering::Relaxed);
+        if earned.saturating_add(reserved) >= self.earn_cap_micro
+            && !self.closed.swap(true, Ordering::Relaxed)
+        {
             tracing::info!(
                 endpoint = %self.id,
-                earned_usd = total as f64 / USD_MICRO,
+                earned_usd = earned as f64 / USD_MICRO,
+                pending_usd = reserved as f64 / USD_MICRO,
                 cap_usd = self.earn_cap_usd(),
                 "sell_inference endpoint reached its earn cap; closing"
             );
         }
+    }
+
+    /// A paid request was parked: hold its ceiling against the cap.
+    fn reserve(&self, expected_usd: f64) {
+        self.reserved_micro
+            .fetch_add(Self::micro(expected_usd), Ordering::Relaxed);
+        self.check_cap();
+    }
+
+    /// A parked request went away unanswered.
+    fn release(&self, expected_usd: f64) {
+        let micro = Self::micro(expected_usd);
+        let _ = self
+            .reserved_micro
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |r| {
+                Some(r.saturating_sub(micro))
+            });
+    }
+
+    /// An answered request: its reservation becomes what it actually earned.
+    fn settle(&self, expected_usd: f64, earned_usd: f64) {
+        self.release(expected_usd);
+        self.earned_micro
+            .fetch_add(Self::micro(earned_usd), Ordering::Relaxed);
+        self.check_cap();
     }
 
     pub fn sale(&self) -> SellInference {
@@ -387,9 +448,12 @@ pub struct EndpointView {
     pub network: String,
     pub currencies: Vec<String>,
     pub queue: QueueDepth,
-    /// Selling stops once `earned_usd` reaches this.
+    /// Selling stops once `earned_usd` plus `pending_usd` reaches this.
     pub earn_cap_usd: f64,
+    /// Earned by answered requests.
     pub earned_usd: f64,
+    /// The most that admitted, unfinished requests can still earn.
+    pub pending_usd: f64,
     /// The cap was reached; buyers get 410 and the worker is winding down.
     pub closed: bool,
     /// Only on creation. Whoever holds it drains the queue.
@@ -513,6 +577,7 @@ fn view_of(state: &SellState, entry: &EndpointEntry, owner_token: Option<String>
         queue: QueueDepth { waiting, claimed },
         earn_cap_usd: entry.earn_cap_usd(),
         earned_usd: entry.earned_usd(),
+        pending_usd: entry.pending_usd(),
         closed: entry.is_closed(),
         owner_token,
     }
@@ -593,8 +658,10 @@ async fn create(
             sale: sale.clone(),
             gated: Router::new(),
         })),
+        retired: Mutex::new(Vec::new()),
         earn_cap_micro: (input.earn_cap_usd * USD_MICRO).round() as u64,
         earned_micro: AtomicU64::new(0),
+        reserved_micro: AtomicU64::new(0),
         closed: AtomicBool::new(false),
     });
     let live = live_for(&state, &entry, sale)?;
@@ -626,7 +693,14 @@ async fn update(
     let mut sale = entry.sale();
     sale.pricing = input.pricing.into();
     let live = live_for(&state, &entry, sale)?;
-    *entry.live.write().unwrap_or_else(|p| p.into_inner()) = live;
+    // The old backends stay alive: channels opened under the old price
+    // keep their watermark pushes and idle closes. Requests already parked
+    // keep the pricing they were admitted under.
+    let old = std::mem::replace(
+        &mut *entry.live.write().unwrap_or_else(|p| p.into_inner()),
+        live,
+    );
+    entry.retired().push(old);
     tracing::info!(endpoint = %id, "sell_inference pricing updated");
     Ok(Json(view_of(&state, &entry, None)))
 }
@@ -725,19 +799,25 @@ async fn complete(
     Json(input): Json<Complete>,
 ) -> Result<StatusCode, ApiError> {
     let entry = owned(&state, &id, &headers)?;
-    let sale = entry.sale();
-    let model = input
-        .event
-        .as_ref()
-        .and_then(|e| e.get("model"))
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let earned = request_earnings(&sale.pricing, model.as_deref(), input.event.as_ref());
-    entry
+    let event = input.event.clone();
+    let completion = entry
         .queue
         .complete(&request, input.event)
         .map_err(queue_error)?;
-    entry.record_earning(earned);
+    let admission = completion.admission;
+    if !completion.delivered {
+        // The buyer left; nothing was served, so nothing is earned.
+        entry.release(admission.expected_usd);
+        return Err(queue_error(QueueError::Gone));
+    }
+    // Earnings follow what the buyer was admitted under: the pricing at
+    // the time and the model they asked for, whatever the worker reports.
+    let earned = request_earnings(
+        &admission.pricing,
+        admission.model.as_deref(),
+        event.as_ref(),
+    );
+    entry.settle(admission.expected_usd, earned);
     Ok(StatusCode::OK)
 }
 
@@ -748,10 +828,14 @@ async fn fail(
     Json(input): Json<Fail>,
 ) -> Result<StatusCode, ApiError> {
     let entry = owned(&state, &id, &headers)?;
-    entry
+    let completion = entry
         .queue
         .fail(&request, input.status.unwrap_or(502), input.message)
         .map_err(queue_error)?;
+    entry.release(completion.admission.expected_usd);
+    if !completion.delivered {
+        return Err(queue_error(QueueError::Gone));
+    }
     Ok(StatusCode::OK)
 }
 
@@ -810,8 +894,13 @@ async fn models(State(entry): State<Arc<EndpointEntry>>) -> Json<Value> {
 
 /// Park the request and relay the worker's answer.
 pub async fn chat_completions(State(entry): State<Arc<EndpointEntry>>, body: Bytes) -> Response {
-    let stream = match serde_json::from_slice::<Value>(&body) {
-        Ok(json) => json.get("stream").and_then(Value::as_bool).unwrap_or(false),
+    let (stream, model) = match serde_json::from_slice::<Value>(&body) {
+        Ok(json) => (
+            json.get("stream").and_then(Value::as_bool).unwrap_or(false),
+            json.get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        ),
         Err(e) => {
             return openai_error(
                 StatusCode::BAD_REQUEST,
@@ -820,7 +909,15 @@ pub async fn chat_completions(State(entry): State<Arc<EndpointEntry>>, body: Byt
             );
         }
     };
-    let (id, mut rx) = match entry.queue.park(body, stream) {
+    // The terms this request was paid under, fixed now.
+    let pricing = entry.sale().pricing;
+    let admission = Admission {
+        expected_usd: pricing.max_usd(),
+        pricing,
+        model,
+    };
+    let expected_usd = admission.expected_usd;
+    let (id, mut rx) = match entry.queue.park(body, stream, admission) {
         Ok(parked) => parked,
         Err(QueueError::Full) => {
             return openai_error(
@@ -831,6 +928,7 @@ pub async fn chat_completions(State(entry): State<Arc<EndpointEntry>>, body: Byt
         }
         Err(other) => return openai_error(StatusCode::BAD_GATEWAY, "queue", &other.to_string()),
     };
+    entry.reserve(expected_usd);
 
     // No answer starts until a worker takes the request.
     match tokio::time::timeout(CLAIM_TIMEOUT, rx.recv()).await {
@@ -838,11 +936,15 @@ pub async fn chat_completions(State(entry): State<Arc<EndpointEntry>>, body: Byt
         Ok(Some(other)) => {
             // A worker that skips the claim event is not one of ours.
             tracing::warn!(?other, "unexpected event before claim");
-            entry.queue.abandon(&id);
+            if entry.queue.abandon(&id).is_some() {
+                entry.release(expected_usd);
+            }
             return openai_error(StatusCode::BAD_GATEWAY, "protocol", "worker protocol error");
         }
         Ok(None) | Err(_) => {
-            entry.queue.abandon(&id);
+            if entry.queue.abandon(&id).is_some() {
+                entry.release(expected_usd);
+            }
             return openai_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "no_worker",
@@ -1642,6 +1744,158 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::CREATED);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repricing_keeps_admitted_terms_and_old_backends_alive() {
+        let state = state();
+        let app = router(state.clone());
+        let (id, token) = create_endpoint(&app, per_request(0.02)).await;
+
+        // A buyer is admitted at $0.02 and waits.
+        let buyer_task = tokio::spawn(buyer(
+            &state,
+            &id,
+            json!({ "model": "agent", "messages": [] }),
+        ));
+        let (_, _, next) = send(
+            &app,
+            Method::GET,
+            &format!("/v1/endpoints/{id}/queue/next?wait=5"),
+            Some(&token),
+            None,
+        )
+        .await;
+        let rid = next["request_id"].as_str().unwrap().to_string();
+        let (_, _, view) = send(
+            &app,
+            Method::GET,
+            &format!("/v1/endpoints/{id}"),
+            Some(&token),
+            None,
+        )
+        .await;
+        assert_eq!(
+            view["pending_usd"], 0.02,
+            "admitted work is held against the cap"
+        );
+
+        // The seller reprices while it waits.
+        let (status, _, _) = send(
+            &app,
+            Method::PATCH,
+            &format!("/v1/endpoints/{id}"),
+            Some(&token),
+            Some(json!({ "pricing": { "per_request_usd": 0.5 } })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let entry = state.registry.get(&id).unwrap();
+        assert_eq!(
+            entry.retired().len(),
+            1,
+            "old backends are kept, not dropped"
+        );
+
+        send(
+            &app,
+            Method::POST,
+            &format!("/v1/endpoints/{id}/requests/{rid}/complete"),
+            Some(&token),
+            Some(json!({ "event": { "object": "chat.completion", "choices": [] } })),
+        )
+        .await;
+        assert_eq!(buyer_task.await.unwrap().status(), StatusCode::OK);
+        let (_, _, view) = send(
+            &app,
+            Method::GET,
+            &format!("/v1/endpoints/{id}"),
+            Some(&token),
+            None,
+        )
+        .await;
+        assert_eq!(
+            view["earned_usd"], 0.02,
+            "earned at the admitted price, not the new one"
+        );
+        assert_eq!(view["pending_usd"], 0.0);
+
+        // Deleting keeps every backend around for its open channels.
+        send(
+            &app,
+            Method::DELETE,
+            &format!("/v1/endpoints/{id}"),
+            Some(&token),
+            None,
+        )
+        .await;
+        assert_eq!(state.registry.retired_backends(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn per_token_earnings_use_the_model_the_buyer_asked_for() {
+        let state = state();
+        let app = router(state.clone());
+        let (id, token) = create_endpoint(
+            &app,
+            json!({ "pricing": { "per_token": {
+                "default": { "in": 1.0, "out": 1.0 },
+                "models": { "fast": { "in": 0.1, "out": 0.1 } },
+                "max_usd": 0.25 } },
+                "model": "agent", "network": "devnet", "earn_cap_usd": 1.0 }),
+        )
+        .await;
+        let buyer_task = tokio::spawn(buyer(
+            &state,
+            &id,
+            json!({ "model": "fast", "messages": [] }),
+        ));
+        let (_, _, next) = send(
+            &app,
+            Method::GET,
+            &format!("/v1/endpoints/{id}/queue/next?wait=5"),
+            Some(&token),
+            None,
+        )
+        .await;
+        let rid = next["request_id"].as_str().unwrap().to_string();
+        let (_, _, view) = send(
+            &app,
+            Method::GET,
+            &format!("/v1/endpoints/{id}"),
+            Some(&token),
+            None,
+        )
+        .await;
+        assert_eq!(
+            view["pending_usd"], 0.25,
+            "per-token work reserves its ceiling"
+        );
+        // The worker reports the wrong model; the buyer's request wins.
+        send(
+            &app,
+            Method::POST,
+            &format!("/v1/endpoints/{id}/requests/{rid}/complete"),
+            Some(&token),
+            Some(
+                json!({ "event": { "object": "chat.completion", "model": "agent", "choices": [],
+                "usage": { "prompt_tokens": 100_000, "completion_tokens": 100_000 } } }),
+            ),
+        )
+        .await;
+        buyer_task.await.unwrap();
+        let (_, _, view) = send(
+            &app,
+            Method::GET,
+            &format!("/v1/endpoints/{id}"),
+            Some(&token),
+            None,
+        )
+        .await;
+        assert!(
+            (view["earned_usd"].as_f64().unwrap() - 0.02).abs() < 1e-9,
+            "{view}"
+        );
     }
 
     #[test]
