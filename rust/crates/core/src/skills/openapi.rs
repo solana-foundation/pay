@@ -27,6 +27,12 @@ use tracing::debug;
 use crate::{Error, Result};
 
 const HTTP_METHODS: &[&str] = &["get", "post", "put", "patch", "delete"];
+
+/// Methods that may carry an `operationId`. Includes verbs the catalog does
+/// not otherwise advertise so a HEAD/OPTIONS/TRACE duplicate is not silent.
+const OPERATION_ID_METHODS: &[&str] = &[
+    "get", "put", "post", "delete", "options", "head", "patch", "trace",
+];
 const FETCH_TIMEOUT_SECS: u64 = 15;
 const MAX_SCHEMA_DEPTH: u32 = 6;
 const MAX_COMMITTED_OPENAPI_BYTES: u64 = 1_048_576;
@@ -565,6 +571,11 @@ pub fn validate_committed_openapi_document(
         )));
     }
 
+    if is_openapi3_document(doc) {
+        findings.extend(validate_local_refs(doc));
+        findings.extend(validate_unique_operation_ids(doc));
+    }
+
     findings.extend(validate_server_urls(doc, service_url, sandbox_service_url));
     findings
 }
@@ -861,6 +872,311 @@ fn collect_remote_refs(value: &Value, refs: &mut Vec<String>) {
         }
         _ => {}
     }
+}
+
+fn is_skipped_local_ref(reference: &str) -> bool {
+    reference.starts_with("http://")
+        || reference.starts_with("https://")
+        || !reference.starts_with('#')
+}
+
+fn validate_local_refs(doc: &Value) -> Vec<CatalogFinding> {
+    let mut findings = Vec::new();
+    collect_local_ref_findings(doc, doc, "", &mut findings);
+    findings
+}
+
+fn collect_local_ref_findings(
+    node: &Value,
+    root: &Value,
+    location: &str,
+    findings: &mut Vec<CatalogFinding>,
+) {
+    match node {
+        Value::Object(map) => {
+            for (key, value) in map {
+                let child_loc = if location.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{location}.{key}")
+                };
+                // `example` is always a payload. `examples` is an OpenAPI
+                // map of Example Objects at media type, parameter, header,
+                // or `components.examples`. JSON Schema `examples` is a value
+                // array. Vendor-extension `examples` is payload even when it
+                // is an object (`x-documentation.examples.raw`).
+                if key == "example" {
+                    continue;
+                }
+                if key == "examples" {
+                    if is_openapi_examples_map(location) {
+                        collect_example_object_refs(value, root, &child_loc, findings);
+                    }
+                    continue;
+                }
+                if key == "$ref"
+                    && let Some(reference) = value.as_str()
+                    && !is_skipped_local_ref(reference)
+                    && let Err(reason) = check_local_ref(reference, root)
+                {
+                    let at = if location.is_empty() {
+                        "$".to_string()
+                    } else {
+                        location.to_string()
+                    };
+                    findings.push(CatalogFinding::error(format!(
+                        "OpenAPI document contains unresolved local `$ref` `{reference}` at `{at}`\n  \
+                         {reason}"
+                    )));
+                }
+                collect_local_ref_findings(value, root, &child_loc, findings);
+            }
+        }
+        Value::Array(values) => {
+            for (index, value) in values.iter().enumerate() {
+                let child_loc = if location.is_empty() {
+                    format!("[{index}]")
+                } else {
+                    format!("{location}[{index}]")
+                };
+                collect_local_ref_findings(value, root, &child_loc, findings);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// True when this parent is a location whose `examples` field is an
+/// OpenAPI map of Example Objects or Reference Objects, not payload.
+///
+/// OpenAPI 3.0/3.1 put that map on a Media Type Object, a Parameter Object
+/// (`in` is required), a Header Object, and `components.examples`. A vendor
+/// extension such as `x-documentation.examples` is not one of those, even if
+/// its values look like `$ref`.
+fn is_openapi_examples_map(parent: &str) -> bool {
+    // Vendor extensions (`x-…`) are payload. Dotted media types such as
+    // `application/vnd.x-widget+json` contain a `.` that is not a location
+    // separator, so they must not be treated as an `x-` extension.
+    if location_segments(parent).any(|seg| seg.starts_with("x-")) {
+        return false;
+    }
+    // Media Type Object lives at `….content.<media-type>`; its `examples`
+    // map is OpenAPI, not the `content` object itself.
+    if parent == "components" || parent.contains(".content.") {
+        return true;
+    }
+    // Header Object: `headers`, `headers.<name>`, or `headers.<name>.schema`
+    // is not this map. Parameter Object: `parameters`, `parameters[i]`, or
+    // `components.parameters.<name>`.
+    location_segments(parent).any(|seg| {
+        seg == "parameters"
+            || seg.starts_with("parameters[")
+            || seg == "headers"
+            || seg.starts_with("headers[")
+    })
+}
+
+/// Split a document location on `.` separators, keeping a media-type token
+/// (the segment after `content`) intact so `application/vnd.x-widget+json`
+/// is one segment.
+fn location_segments(location: &str) -> impl Iterator<Item = &str> {
+    let mut rest = location;
+    let mut pending_media = false;
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        if pending_media {
+            pending_media = false;
+            let (media, after) = split_media_type(rest);
+            rest = after;
+            return Some(media);
+        }
+        let (seg, after) = rest.split_once('.').unwrap_or((rest, ""));
+        rest = after;
+        if seg == "content" {
+            pending_media = true;
+        }
+        Some(seg)
+    })
+}
+
+/// A media type runs until the next location key, not the next dot inside
+/// the type itself (`application/vnd.x-widget+json`).
+///
+/// Known Media Type Object fields (`.examples`, `.schema`, `.example`,
+/// `.encoding`) end the type. A vendor extension does too, but only as its
+/// own segment (`application/json.x-documentation`). A dotted subtype such
+/// as `vnd.x-widget+json` is not an extension: the `+` keeps it inside the
+/// media type.
+fn split_media_type(rest: &str) -> (&str, &str) {
+    const TAILS: &[&str] = &[".examples", ".schema", ".example", ".encoding"];
+    let mut cut = rest.len();
+    for tail in TAILS {
+        if let Some(at) = rest.find(tail) {
+            let boundary = at + tail.len();
+            if boundary == rest.len() || rest[boundary..].starts_with('.') {
+                cut = cut.min(at);
+            }
+        }
+    }
+    let mut search = rest;
+    let mut base = 0;
+    while let Some(dot) = search.find('.') {
+        let at = base + dot;
+        let segment = search[dot + 1..].split('.').next().unwrap_or("");
+        if is_vendor_extension_segment(segment) {
+            cut = cut.min(at);
+            break;
+        }
+        base = at + 1;
+        search = &rest[base..];
+    }
+    let (media, after) = rest.split_at(cut);
+    (media, after.strip_prefix('.').unwrap_or(after))
+}
+
+/// OpenAPI vendor-extension keys are a single `x-` segment. `x-widget+json`
+/// is a media subtype, not an extension.
+fn is_vendor_extension_segment(segment: &str) -> bool {
+    let Some(name) = segment.strip_prefix("x-") else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// OpenAPI `examples` maps (media type, parameter, or `components.examples`)
+/// hold Example Objects or Reference Objects. JSON Schema `examples` is an
+/// array of raw values and must stay skipped.
+fn collect_example_object_refs(
+    node: &Value,
+    root: &Value,
+    location: &str,
+    findings: &mut Vec<CatalogFinding>,
+) {
+    let Value::Object(map) = node else {
+        return;
+    };
+    for (name, example) in map {
+        let child_loc = format!("{location}.{name}");
+        let Some(example) = example.as_object() else {
+            continue;
+        };
+        if let Some(reference) = example.get("$ref").and_then(Value::as_str)
+            && !is_skipped_local_ref(reference)
+            && let Err(reason) = check_local_ref(reference, root)
+        {
+            findings.push(CatalogFinding::error(format!(
+                "OpenAPI document contains unresolved local `$ref` `{reference}` at `{child_loc}`\n  \
+                 {reason}"
+            )));
+        }
+    }
+}
+
+fn check_local_ref(reference: &str, root: &Value) -> std::result::Result<(), String> {
+    let Some(pointer) = reference.strip_prefix('#') else {
+        return Err("local $ref must start with '#'".into());
+    };
+    if !pointer.is_empty() && !pointer.starts_with('/') {
+        return Err("JSON Pointer must be empty or start with '/'".into());
+    }
+    let decoded = percent_decode_pointer(pointer)?;
+    validate_pointer_escapes(&decoded)?;
+    if root.pointer(&decoded).is_none() {
+        return Err("target does not exist".into());
+    }
+    Ok(())
+}
+
+/// OpenAPI `$ref` fragments percent-encode characters that are illegal in a
+/// URI fragment (`Foo.Bar` → `Foo%2EBar`). `Value::pointer` expects the
+/// decoded JSON Pointer, including `~0` / `~1` escapes.
+fn percent_decode_pointer(pointer: &str) -> std::result::Result<String, String> {
+    let bytes = pointer.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return Err("malformed percent-encoding in JSON Pointer".into());
+            }
+            let hi = hex_nibble(bytes[i + 1])?;
+            let lo = hex_nibble(bytes[i + 2])?;
+            out.push((hi << 4) | lo);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).map_err(|_| "JSON Pointer percent-decoding is not UTF-8".into())
+}
+
+fn hex_nibble(byte: u8) -> std::result::Result<u8, String> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err("malformed percent-encoding in JSON Pointer".into()),
+    }
+}
+
+fn validate_pointer_escapes(pointer: &str) -> std::result::Result<(), String> {
+    let mut chars = pointer.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '~' {
+            match chars.next() {
+                Some('0') | Some('1') => {}
+                _ => {
+                    return Err(
+                        "malformed JSON Pointer escape (expected ~0 or ~1)".into(),
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_unique_operation_ids(doc: &Value) -> Vec<CatalogFinding> {
+    let mut findings = Vec::new();
+    let Some(paths) = doc.get("paths").and_then(Value::as_object) else {
+        return findings;
+    };
+    let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for (path, item) in paths {
+        let Some(item_obj) = item.as_object() else {
+            continue;
+        };
+        for &method in OPERATION_ID_METHODS {
+            let Some(id) = item_obj
+                .get(method)
+                .and_then(|op| op.get("operationId"))
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            let id = id.trim();
+            if id.is_empty() {
+                continue;
+            }
+            let location = format!("paths.{path}.{method}");
+            if let Some(first) = seen.get(id) {
+                findings.push(CatalogFinding::error(format!(
+                    "OpenAPI operationId `{id}` is duplicated\n  \
+                     first: `{first}`\n  \
+                     also: `{location}`"
+                )));
+            } else {
+                seen.insert(id.to_string(), location);
+            }
+        }
+    }
+    findings
 }
 
 fn validate_server_urls(
@@ -3434,6 +3750,427 @@ mod tests {
     }
 
     // ── Operation-documentation tests ──
+
+    #[test]
+    fn committed_openapi_validation_accepts_resolvable_local_ref() {
+        let doc = json!({
+            "openapi": "3.1.0",
+            "paths": {},
+            "components": {
+                "schemas": {
+                    "User": { "type": "object" },
+                    "Alias": { "$ref": "#/components/schemas/User" }
+                }
+            }
+        });
+        let source = OpenapiSource::Content { content: doc.to_string() };
+        let findings = validate_committed_openapi_document(&source, &doc, None, "https://api.example.com", None);
+        assert!(
+            !findings.iter().any(|f| f.severity == CatalogFindingSeverity::Error),
+            "expected no errors, got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn committed_openapi_validation_accepts_escaped_json_pointer_tokens() {
+        let doc = json!({
+            "openapi": "3.1.0",
+            "paths": {},
+            "components": {
+                "schemas": {
+                    "a/b": { "type": "string" },
+                    "a~b": { "type": "string" },
+                    "UsesSlash": { "$ref": "#/components/schemas/a~1b" },
+                    "UsesTilde": { "$ref": "#/components/schemas/a~0b" }
+                }
+            }
+        });
+        let source = OpenapiSource::Content { content: doc.to_string() };
+        let findings = validate_committed_openapi_document(&source, &doc, None, "https://api.example.com", None);
+        assert!(
+            !findings.iter().any(|f| f.message.contains("unresolved local")),
+            "escaped pointers should resolve, got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn committed_openapi_validation_rejects_missing_local_ref() {
+        let doc = json!({
+            "openapi": "3.1.0",
+            "paths": {},
+            "components": {
+                "schemas": {
+                    "Alias": { "$ref": "#/components/schemas/Missing" }
+                }
+            }
+        });
+        let source = OpenapiSource::Content { content: doc.to_string() };
+        let findings = validate_committed_openapi_document(&source, &doc, None, "https://api.example.com", None);
+        assert!(
+            findings.iter().any(|f| {
+                f.severity == CatalogFindingSeverity::Error
+                    && f.message.contains("#/components/schemas/Missing")
+                    && f.message.contains("components.schemas.Alias")
+            }),
+            "expected missing-target error, got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn committed_openapi_validation_rejects_malformed_local_pointer() {
+        let doc = json!({
+            "openapi": "3.1.0",
+            "paths": {},
+            "components": {
+                "schemas": {
+                    "BadEscape": { "$ref": "#/foo~2" },
+                    "NoSlash": { "$ref": "#foo" }
+                }
+            }
+        });
+        let source = OpenapiSource::Content { content: doc.to_string() };
+        let findings = validate_committed_openapi_document(&source, &doc, None, "https://api.example.com", None);
+        let messages: Vec<_> = findings.iter().map(|f| f.message.as_str()).collect();
+        assert!(
+            messages.iter().any(|m| m.contains("#/foo~2") && m.contains("malformed")),
+            "expected malformed escape error, got: {findings:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("#foo") && m.contains("start with '/'")),
+            "expected missing-slash pointer error, got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn committed_openapi_validation_accepts_literal_ref_in_examples() {
+        let doc = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/echo": {
+                    "post": {
+                        "summary": "Echo a payload that may contain a ref field",
+                        "requestBody": {
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/Envelope" },
+                                    "example": { "$ref": "not-a-schema-pointer" }
+                                }
+                            }
+                        },
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": {
+                                    "application/json": {
+                                        "schema": { "$ref": "#/components/schemas/Envelope" },
+                                        "examples": {
+                                            "sample": { "value": { "$ref": "also-data" } }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "components": {
+                "schemas": {
+                    "Envelope": { "type": "object" }
+                }
+            }
+        });
+        let source = OpenapiSource::Content { content: doc.to_string() };
+        let findings = validate_committed_openapi_document(&source, &doc, None, "https://api.example.com", None);
+        assert!(
+            !findings.iter().any(|f| f.message.contains("unresolved local")),
+            "example $ref fields are data, got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn committed_openapi_validation_rejects_unresolved_example_object_refs() {
+        let doc = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/echo": {
+                    "get": {
+                        "summary": "Echo with a referenced example",
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": {
+                                    "application/json": {
+                                        "schema": { "type": "object" },
+                                        "examples": {
+                                            "sample": { "$ref": "#/components/examples/Missing" },
+                                            "inline": { "value": { "$ref": "payload-data" } }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "components": {
+                "examples": {
+                    "Broken": { "$ref": "#/components/examples/AlsoMissing" }
+                }
+            }
+        });
+        let source = OpenapiSource::Content { content: doc.to_string() };
+        let findings = validate_committed_openapi_document(&source, &doc, None, "https://api.example.com", None);
+        let messages: Vec<_> = findings.iter().map(|f| f.message.as_str()).collect();
+        assert!(
+            messages.iter().any(|m| m.contains("#/components/examples/Missing")
+                && m.contains("responses.200.content.application/json.examples.sample")),
+            "expected media-type example ref error, got: {findings:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("#/components/examples/AlsoMissing")
+                && m.contains("components.examples.Broken")),
+            "expected components.examples ref error, got: {findings:?}"
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("payload-data")),
+            "example value $ref is payload, got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn committed_openapi_validation_accepts_literal_ref_in_extension_examples() {
+        let doc = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/echo": {
+                    "get": {
+                        "summary": "Echo",
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": {
+                                    "application/json": {
+                                        "schema": { "type": "object" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "x-documentation": {
+                "examples": {
+                    "raw": { "$ref": "not-a-schema-pointer" }
+                }
+            }
+        });
+        let source = OpenapiSource::Content { content: doc.to_string() };
+        let findings = validate_committed_openapi_document(&source, &doc, None, "https://api.example.com", None);
+        assert!(
+            !findings.iter().any(|f| f.message.contains("unresolved local")
+                || f.message.contains("not-a-schema-pointer")),
+            "vendor-extension examples are payload, got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn committed_openapi_validation_accepts_literal_ref_in_media_type_extension() {
+        // `x-documentation` under a Media Type Object is a vendor extension,
+        // not part of the media type. A literal `$ref` in its payload must
+        // not fail catalog check. A sibling OpenAPI `examples` map still does.
+        let doc = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/widgets": {
+                    "get": {
+                        "summary": "List widgets",
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": {
+                                    "application/json": {
+                                        "schema": { "type": "object" },
+                                        "x-documentation": {
+                                            "examples": {
+                                                "raw": { "$ref": "not-a-schema-pointer" }
+                                            }
+                                        }
+                                    },
+                                    "application/vnd.x-widget+json": {
+                                        "schema": { "type": "object" },
+                                        "examples": {
+                                            "sample": { "$ref": "#/components/examples/MissingMedia" }
+                                        },
+                                        "x-documentation": {
+                                            "examples": {
+                                                "raw": { "$ref": "also-payload" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let source = OpenapiSource::Content { content: doc.to_string() };
+        let findings = validate_committed_openapi_document(&source, &doc, None, "https://api.example.com", None);
+        let messages: Vec<&str> = findings.iter().map(|f| f.message.as_str()).collect();
+        assert!(
+            !messages.iter().any(|m| m.contains("not-a-schema-pointer") || m.contains("also-payload")),
+            "media-type extension examples are payload, got: {findings:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("#/components/examples/MissingMedia")
+                && m.contains("application/vnd.x-widget+json.examples.sample")),
+            "dotted media-type example ref should still fail, got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn committed_openapi_validation_rejects_unresolved_header_and_dotted_media_example_refs() {
+        let doc = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/widgets": {
+                    "get": {
+                        "summary": "List widgets",
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "headers": {
+                                    "Rate-Limit": {
+                                        "schema": { "type": "integer" },
+                                        "examples": {
+                                            "sample": { "$ref": "#/components/examples/MissingHeader" }
+                                        }
+                                    }
+                                },
+                                "content": {
+                                    "application/vnd.x-widget+json": {
+                                        "schema": { "type": "object" },
+                                        "examples": {
+                                            "sample": { "$ref": "#/components/examples/MissingMedia" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let source = OpenapiSource::Content { content: doc.to_string() };
+        let findings = validate_committed_openapi_document(&source, &doc, None, "https://api.example.com", None);
+        let messages: Vec<&str> = findings.iter().map(|f| f.message.as_str()).collect();
+        assert!(
+            messages.iter().any(|m| m.contains("#/components/examples/MissingHeader")
+                && m.contains("responses.200.headers.Rate-Limit.examples.sample")),
+            "expected header example ref error, got: {findings:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("#/components/examples/MissingMedia")
+                && m.contains("application/vnd.x-widget+json.examples.sample")),
+            "expected dotted media-type example ref error, got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn committed_openapi_validation_accepts_percent_encoded_local_ref() {
+        let doc = json!({
+            "openapi": "3.1.0",
+            "paths": {},
+            "components": {
+                "schemas": {
+                    "Foo.Bar": { "type": "string" },
+                    "Alias": { "$ref": "#/components/schemas/Foo%2EBar" }
+                }
+            }
+        });
+        let source = OpenapiSource::Content { content: doc.to_string() };
+        let findings = validate_committed_openapi_document(&source, &doc, None, "https://api.example.com", None);
+        assert!(
+            !findings.iter().any(|f| f.message.contains("unresolved local")),
+            "percent-encoded pointers should resolve, got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn committed_openapi_validation_rejects_duplicate_operation_ids() {
+        let doc = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/a": { "get": { "operationId": "listThings", "summary": "List the available things now" } },
+                "/b": { "post": { "operationId": "listThings", "summary": "Create a thing from the payload" } }
+            }
+        });
+        let source = OpenapiSource::Content { content: doc.to_string() };
+        let findings = validate_committed_openapi_document(&source, &doc, None, "https://api.example.com", None);
+        assert!(
+            findings.iter().any(|f| {
+                f.severity == CatalogFindingSeverity::Error
+                    && f.message.contains("operationId `listThings`")
+                    && f.message.contains("paths./a.get")
+                    && f.message.contains("paths./b.post")
+            }),
+            "expected duplicate operationId error, got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn committed_openapi_validation_rejects_duplicate_operation_ids_on_head_options_trace() {
+        for method in ["head", "options", "trace"] {
+            let doc = json!({
+                "openapi": "3.1.0",
+                "paths": {
+                    "/a": {
+                        "get": { "operationId": "listThings", "summary": "List the available things now" },
+                        method: { "operationId": "listThings" }
+                    }
+                }
+            });
+            let source = OpenapiSource::Content { content: doc.to_string() };
+            let findings = validate_committed_openapi_document(&source, &doc, None, "https://api.example.com", None);
+            assert!(
+                findings.iter().any(|f| f.message.contains("operationId `listThings`") && f.message.contains(method)),
+                "expected duplicate via {method}, got: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn committed_openapi_validation_ignores_blank_operation_ids() {
+        let doc = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/a": { "get": { "operationId": "   " } },
+                "/b": { "post": { "operationId": "" } }
+            }
+        });
+        let source = OpenapiSource::Content { content: doc.to_string() };
+        let findings = validate_committed_openapi_document(&source, &doc, None, "https://api.example.com", None);
+        assert!(
+            !findings.iter().any(|f| f.message.contains("operationId")),
+            "blank operationIds are out of scope, got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn committed_openapi_validation_skips_discovery_docs() {
+        let doc = json!({
+            "kind": "discovery#restDescription",
+            "resources": {
+                "files": { "methods": { "get": { "httpMethod": "GET", "path": "files" } } }
+            }
+        });
+        let source = OpenapiSource::Content { content: doc.to_string() };
+        let findings = validate_committed_openapi_document(&source, &doc, None, "https://api.example.com", None);
+        assert!(
+            !findings.iter().any(|f| f.message.contains("operationId") || f.message.contains("unresolved local")),
+            "discovery docs must be unchanged, got: {findings:?}"
+        );
+    }
 
     #[test]
     fn operation_doc_validation_flags_undeclared_path_placeholder() {
