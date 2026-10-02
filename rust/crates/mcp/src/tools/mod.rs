@@ -8,7 +8,7 @@ pub mod sell_inference;
 pub mod topup;
 
 pub(crate) fn tool_error(message: impl Into<String>) -> rmcp::model::CallToolResult {
-    rmcp::model::CallToolResult::error(vec![rmcp::model::Content::text(message.into())])
+    rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(message.into())])
 }
 
 #[cfg(test)]

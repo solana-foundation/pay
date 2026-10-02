@@ -1,6 +1,8 @@
+#![allow(deprecated)] // Keep serving roots to legacy MCP clients during version negotiation.
+
 use base64::{Engine, engine::general_purpose};
 use pay_core::client::fetch::{RedirectPolicy, RequestBody};
-use rmcp::model::{CallToolResult, Content, RawResource, Root};
+use rmcp::model::{CallToolResult, ContentBlock as Content, Resource as RawResource, Root};
 use rmcp::schemars;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -680,7 +682,7 @@ fn resource_link_for_file(path: &str, mime: &str, bytes: usize) -> Content {
         .to_string();
     let mut resource = RawResource::new(format!("file://{path}"), name);
     resource.mime_type = Some(mime.to_string());
-    resource.size = u32::try_from(bytes).ok();
+    resource.size = u64::try_from(bytes).ok();
     Content::resource_link(resource)
 }
 
@@ -1305,7 +1307,7 @@ fn do_paid_fetch(
                 commit_batch_settlement(
                     session_cache,
                     &corrective.requirements,
-                    &retry.voucher,
+                    &retry.submission,
                     &outcome,
                 );
                 return interpret_retry(outcome);
@@ -1314,7 +1316,7 @@ fn do_paid_fetch(
             commit_batch_settlement(
                 session_cache,
                 &challenge.requirements,
-                &built.voucher,
+                &built.submission,
                 &outcome,
             );
             interpret_retry(outcome)
@@ -1549,7 +1551,7 @@ fn is_user_rejection(reason: &str) -> bool {
 fn commit_batch_settlement(
     session_cache: &SessionCache,
     requirements: &pay_core::client::batch::Requirements,
-    voucher: &pay_core::client::batch::Voucher,
+    submission: &pay_core::client::batch::Submission,
     outcome: &pay_core::client::runner::RunOutcome,
 ) {
     let pay_core::client::runner::RunOutcome::Completed {
@@ -1560,10 +1562,10 @@ fn commit_batch_settlement(
     };
     if let Err(error) = session_cache.batch_channels.apply_settlement_from_headers(
         requirements,
-        voucher,
+        submission,
         response_headers,
     ) {
-        tracing::warn!(%error, "batch-settlement receipt not adopted; the next request retries the same voucher");
+        tracing::warn!(%error, "batch-settlement receipt not adopted; the next request retries the same credential");
     }
 }
 
@@ -2270,7 +2272,7 @@ mod tests {
             .find_map(|c| c.as_resource_link())
             .expect("resource_link");
         assert_eq!(link.mime_type.as_deref(), Some("application/pdf"));
-        assert_eq!(link.size, Some(body.len() as u32));
+        assert_eq!(link.size, Some(body.len() as u64));
         let _ = std::fs::remove_file(path);
     }
 

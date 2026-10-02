@@ -3,7 +3,7 @@
 //! Each tool's logic and params live in `tools/<name>.rs`.
 
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ProtocolVersion, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, ProtocolVersion, ServerCapabilities, ServerConfig};
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use std::sync::Arc;
@@ -243,8 +243,8 @@ For detailed authoring guidance, use the Pay skill reference
 
 #[tool_handler]
 impl ServerHandler for PayMcp {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_protocol_version(ProtocolVersion::V_2025_06_18)
             .with_server_info(
                 rmcp::model::Implementation::new("pay", env!("CARGO_PKG_VERSION"))

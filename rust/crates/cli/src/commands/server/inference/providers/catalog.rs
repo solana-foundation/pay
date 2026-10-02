@@ -2,18 +2,19 @@
 //!
 //! A [`CatalogProvider`] wraps one catalog entry (fqn + title + service_url +
 //! endpoints/pricing) behind the same [`InferenceProvider`] trait the local
-//! servers implement, so `pay claude` can list hosted gateways next to
+//! servers implement, so `pay acp` can list hosted gateways next to
 //! Ollama & co. Endpoints, models, and pricing all come from catalog data —
 //! nothing about the upstream API is hardcoded here.
 
 use super::{Dialect, InferenceProvider, PaidEndpoint, PricingHint, get_json};
 
-/// Hosted catalog providers appended to the `pay claude` picker by default.
+/// Hosted catalog providers appended to the `pay acp` picker by default.
 /// An fqn that doesn't resolve (e.g. a skill still being authored) is
 /// skipped silently, so it lights up as soon as it is published.
 pub const DEFAULT_CATALOG_FQNS: &[&str] = &[
     "solana-foundation/alibaba/modelstudio",
     "solana-foundation/google/generativelanguage",
+    "blockrun/blockrun",
 ];
 
 const OPENAI_RESOURCE: &str = "openai";
@@ -1101,6 +1102,24 @@ mod tests {
         assert_eq!(
             CatalogProvider::from_service(&blockrun_service()).dialect(),
             Dialect::OpenAiCompat
+        );
+    }
+
+    #[test]
+    fn picker_includes_blockrun_by_default() {
+        let catalog: pay_core::skills::Catalog = serde_json::from_value(serde_json::json!({
+            "version": "1",
+            "providers": []
+        }))
+        .unwrap();
+
+        assert_eq!(
+            picker_catalog_fqns(&catalog),
+            [
+                "solana-foundation/alibaba/modelstudio",
+                "solana-foundation/google/generativelanguage",
+                "blockrun/blockrun",
+            ]
         );
     }
 

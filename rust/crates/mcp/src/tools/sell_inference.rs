@@ -10,7 +10,8 @@ use std::process::{Command, Stdio};
 
 use pay_core::sell_client::{EndpointsApi, SellRecord, default_connect_url};
 use rmcp::model::{
-    CallToolResult, CreateElicitationRequestParams, ElicitationAction, ElicitationSchema,
+    CallToolResult, ElicitRequestParams as CreateElicitationRequestParams, ElicitationAction,
+    ElicitationSchema,
 };
 use rmcp::schemars;
 use rmcp::service::{Peer, RoleServer};
@@ -148,7 +149,7 @@ pub async fn run(
         Action::Stop => stop(params).await,
     };
     Ok(match outcome {
-        Ok(text) => CallToolResult::success(vec![rmcp::model::Content::text(text)]),
+        Ok(text) => CallToolResult::success(vec![rmcp::model::ContentBlock::text(text)]),
         Err(message) => super::tool_error(message),
     })
 }
@@ -500,6 +501,7 @@ async fn elicit_earn_cap(
             .ok_or_else(|| "The form came back without an earn cap.".to_string()),
         ElicitationAction::Decline => Err("The user declined to sell inference.".to_string()),
         ElicitationAction::Cancel => Err("The user cancelled selling inference.".to_string()),
+        _ => Err("The MCP client returned an unsupported earn-cap action.".to_string()),
     }
 }
 

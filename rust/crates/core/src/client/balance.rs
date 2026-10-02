@@ -2,10 +2,11 @@
 //!
 //! - SOL is fetched directly from a Solana JSON-RPC endpoint (`getBalance` /
 //!   `getMultipleAccounts`).
-//! - Token balances come from the **pay-api** stablecoin service
+//! - Token balances normally come from the **pay-api** stablecoin service
 //!   (`GET /v1/balance/stablecoins`). pay-api derives ATAs locally and does a
 //!   single `getMultipleAccounts` call against its own configured RPC, so we
 //!   pay one HTTP round trip here rather than scanning every token account.
+//!   A direct Solana RPC lookup across SPL Token and Token-2022 is the fallback.
 //!
 //! Environment variables:
 //! - `PAY_MAINNET_RPC_URL` — override the default Solana mainnet RPC.
@@ -13,7 +14,10 @@
 
 use pay_types::Stablecoin;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+
+const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+const TOKEN_2022_PROGRAM: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 
 /// Default pay-api host. Override with `PAY_API_URL`.
 pub const DEFAULT_PAY_API_URL: &str = "https://api.pay.sh";
@@ -240,6 +244,105 @@ async fn fetch_stablecoins_via_api(
     Ok(parse_api_balances(parsed))
 }
 
+/// Read supported stablecoins directly from Solana when pay-api is
+/// unavailable. Both token programs are queried because USDPT uses Token-2022
+/// while the other currently supported mainnet stablecoins use SPL Token.
+async fn fetch_stablecoins_via_rpc(
+    client: &reqwest::Client,
+    rpc_url: &str,
+    pubkey: &str,
+) -> crate::Result<Vec<TokenBalance>> {
+    let mut responses = Vec::with_capacity(2);
+    for program_id in [TOKEN_PROGRAM, TOKEN_2022_PROGRAM] {
+        responses.push(
+            rpc_call(
+                client,
+                rpc_url,
+                "getTokenAccountsByOwner",
+                serde_json::json!([
+                    pubkey,
+                    { "programId": program_id },
+                    { "encoding": "jsonParsed", "commitment": "confirmed" }
+                ]),
+            )
+            .await?,
+        );
+    }
+    Ok(parse_rpc_stablecoin_balances(&responses))
+}
+
+fn parse_rpc_stablecoin_balances(responses: &[serde_json::Value]) -> Vec<TokenBalance> {
+    let mut amounts = BTreeMap::<String, u64>::new();
+    for response in responses {
+        let Some(accounts) = response["result"]["value"].as_array() else {
+            continue;
+        };
+        for account in accounts {
+            let info = &account["account"]["data"]["parsed"]["info"];
+            let Some(mint) = info["mint"].as_str() else {
+                continue;
+            };
+            if Stablecoin::from_mint(mint).is_none() {
+                continue;
+            }
+            let Some(raw) = info["tokenAmount"]["amount"]
+                .as_str()
+                .and_then(|value| value.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            *amounts.entry(mint.to_string()).or_default() += raw;
+        }
+    }
+    amounts
+        .into_iter()
+        .filter(|(_, raw_amount)| *raw_amount > 0)
+        .map(|(mint, raw_amount)| {
+            let currency = Stablecoin::from_mint(&mint).expect("known mint was filtered above");
+            TokenBalance {
+                mint,
+                raw_amount,
+                ui_amount: raw_amount as f64 / 10_f64.powi(i32::from(currency.decimals())),
+                symbol: Some(currency.symbol().to_string()),
+            }
+        })
+        .collect()
+}
+
+async fn fetch_stablecoins_with_rpc_fallback(
+    client: &reqwest::Client,
+    rpc_url: &str,
+    pubkey: &str,
+) -> (ApiBalances, bool) {
+    match fetch_stablecoins_via_api(client, &pay_api_url(), pubkey, infer_network(rpc_url)).await {
+        Ok(balances) => (balances, false),
+        Err(api_error) => match fetch_stablecoins_via_rpc(client, rpc_url, pubkey).await {
+            Ok(tokens) => {
+                tracing::debug!(error = %api_error, "pay-api unreachable; used direct RPC stablecoin fallback");
+                (
+                    ApiBalances {
+                        tokens,
+                        credits: Vec::new(),
+                        credits_unavailable: true,
+                    },
+                    false,
+                )
+            }
+            Err(rpc_error) => {
+                tracing::debug!(%api_error, %rpc_error, "stablecoin balance lookup unavailable from pay-api and RPC");
+                (
+                    ApiBalances {
+                        tokens: Vec::new(),
+                        credits: Vec::new(),
+                        credits_unavailable: true,
+                    },
+                    true,
+                )
+            }
+        },
+    }
+}
+
 fn parse_api_balances(parsed: ApiResponse) -> ApiBalances {
     let tokens = parsed
         .balances
@@ -320,22 +423,7 @@ pub async fn get_balances(rpc_url: &str, pubkey: &str) -> crate::Result<AccountB
     let sol_lamports = sol_resp["result"]["value"].as_u64().unwrap_or(0);
 
     let (api_balances, tokens_unavailable) =
-        match fetch_stablecoins_via_api(&client, &pay_api_url(), pubkey, infer_network(rpc_url))
-            .await
-        {
-            Ok(balances) => (balances, false),
-            Err(e) => {
-                tracing::debug!(error = %e, "pay-api unreachable; returning empty token balances");
-                (
-                    ApiBalances {
-                        tokens: Vec::new(),
-                        credits: Vec::new(),
-                        credits_unavailable: true,
-                    },
-                    true,
-                )
-            }
-        };
+        fetch_stablecoins_with_rpc_fallback(&client, rpc_url, pubkey).await;
 
     Ok(AccountBalances {
         sol_lamports,
@@ -356,22 +444,7 @@ pub async fn get_stablecoin_balances(
 ) -> crate::Result<AccountBalances> {
     let client = balance_client()?;
     let (api_balances, tokens_unavailable) =
-        match fetch_stablecoins_via_api(&client, &pay_api_url(), pubkey, infer_network(rpc_url))
-            .await
-        {
-            Ok(balances) => (balances, false),
-            Err(e) => {
-                tracing::debug!(error = %e, "pay-api unreachable; returning empty token balances");
-                (
-                    ApiBalances {
-                        tokens: Vec::new(),
-                        credits: Vec::new(),
-                        credits_unavailable: true,
-                    },
-                    true,
-                )
-            }
-        };
+        fetch_stablecoins_with_rpc_fallback(&client, rpc_url, pubkey).await;
 
     Ok(AccountBalances {
         sol_lamports: 0,
@@ -652,6 +725,38 @@ mod tests {
         assert_eq!(balances.tokens.len(), 1);
         assert!(balances.credits.is_empty());
         assert!(balances.credits_unavailable);
+    }
+
+    #[test]
+    fn rpc_fallback_aggregates_known_stablecoins_and_ignores_unknown_tokens() {
+        let response = serde_json::json!({
+            "result": { "value": [
+                {
+                    "account": { "data": { "parsed": { "info": {
+                        "mint": pay_types::stablecoin_mints::USDC_MAINNET,
+                        "tokenAmount": { "amount": "46072908" }
+                    }}}}
+                },
+                {
+                    "account": { "data": { "parsed": { "info": {
+                        "mint": pay_types::stablecoin_mints::USDC_MAINNET,
+                        "tokenAmount": { "amount": "1000000" }
+                    }}}}
+                },
+                {
+                    "account": { "data": { "parsed": { "info": {
+                        "mint": "UnknownMint1111111111111111111111111111111",
+                        "tokenAmount": { "amount": "999999999" }
+                    }}}}
+                }
+            ]}
+        });
+
+        let balances = parse_rpc_stablecoin_balances(&[response]);
+        assert_eq!(balances.len(), 1);
+        assert_eq!(balances[0].symbol.as_deref(), Some("USDC"));
+        assert_eq!(balances[0].raw_amount, 47_072_908);
+        assert!((balances[0].ui_amount - 47.072_908).abs() < f64::EPSILON);
     }
 
     #[test]

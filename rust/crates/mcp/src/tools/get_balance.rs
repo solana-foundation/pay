@@ -71,8 +71,18 @@ pub async fn run(
         ));
     }
 
-    if balances.tokens.is_empty() && balances.credits.is_empty() {
-        lines.push("No token or credit balances found.".to_string());
+    if balances.tokens_unavailable {
+        lines.push(
+            "Stablecoin balances unavailable: both pay-api and Solana RPC lookups failed."
+                .to_string(),
+        );
+    } else if balances.tokens.is_empty() {
+        lines.push("No stablecoin balances found.".to_string());
+    }
+    if balances.credits_unavailable {
+        lines.push("Program credit balances unavailable from pay-api.".to_string());
+    } else if balances.credits.is_empty() {
+        lines.push("No program credit balances found.".to_string());
     }
     let nothing_to_spend = !balances.tokens_unavailable
         && !balances.credits_unavailable
@@ -87,7 +97,7 @@ pub async fn run(
         );
     }
 
-    Ok(CallToolResult::success(vec![rmcp::model::Content::text(
-        lines.join("\n"),
-    )]))
+    Ok(CallToolResult::success(vec![
+        rmcp::model::ContentBlock::text(lines.join("\n")),
+    ]))
 }

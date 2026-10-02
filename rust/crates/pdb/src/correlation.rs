@@ -651,14 +651,18 @@ impl FlowCorrelation {
                 ),
                 Protocol::Session => session_event_detail(session_update.as_ref())
                     .unwrap_or_else(|| "session action verified".into()),
-                Protocol::X402 => "x-payment-response verified".into(),
+                Protocol::X402 => x402_payment_event(entry)
+                    .map(|(_, detail)| detail)
+                    .unwrap_or_else(|| "x-payment-response verified".into()),
             };
             flow.events.push(FlowEvent {
                 ts: now.clone(),
-                message: if matches!(protocol, Protocol::Session) {
-                    session_accepted_message(session_update.as_ref())
-                } else {
-                    "Payment accepted".into()
+                message: match protocol {
+                    Protocol::Session => session_accepted_message(session_update.as_ref()),
+                    Protocol::X402 => x402_payment_event(entry)
+                        .map(|(message, _)| message)
+                        .unwrap_or_else(|| "Payment accepted".into()),
+                    Protocol::Mpp | Protocol::Http => "Payment accepted".into(),
                 },
                 detail: Some(detail),
             });
@@ -994,6 +998,142 @@ fn x402_scheme_from_payment(encoded: &str) -> Option<String> {
     let payload = json.get("payload")?;
     (payload.get("channelId").is_some() || payload.get("profile").is_some())
         .then(|| "upto".to_string())
+}
+
+/// Human-readable batch-settlement action from the paid request. The payer
+/// proxy records headers without buffering the response body, so these details
+/// remain available for streaming inference requests.
+fn x402_payment_event(entry: &LogEntry) -> Option<(String, String)> {
+    let payment = ["payment-signature", "x-payment"]
+        .into_iter()
+        .find_map(|key| {
+            entry
+                .req_headers
+                .get(key)
+                .and_then(|value| decode_json_value(value))
+        })?;
+    if value_string(
+        payment
+            .get("accepted")
+            .and_then(|accepted| accepted.get("scheme")),
+    )
+    .as_deref()
+        != Some("batch-settlement")
+    {
+        return None;
+    }
+
+    let payload = payment.get("payload")?;
+    let kind = payload.get("type")?.as_str()?;
+    let (message, mut parts) = match kind {
+        "deposit" => {
+            let deposit = payload.get("deposit")?;
+            let action = deposit
+                .get("transaction")
+                .and_then(serde_json::Value::as_str)
+                .and_then(batch_deposit_action)
+                .unwrap_or("Channel funded");
+            let mut parts = Vec::new();
+            if let Some(amount) = value_string(deposit.get("amount")) {
+                parts.push(format!("deposit {}", display_batch_amount(&amount)));
+            }
+            (action.to_string(), parts)
+        }
+        "authorization" => {
+            let authorization = payload.get("authorization")?;
+            let mut parts = Vec::new();
+            if let Some(amount) = value_string(authorization.get("authorizedAmount")) {
+                parts.push(format!(
+                    "authorized ceiling {}",
+                    display_batch_amount(&amount)
+                ));
+            }
+            ("Server authorization accepted".to_string(), parts)
+        }
+        "voucher" => {
+            let mut parts = Vec::new();
+            if let Some(amount) = value_string(
+                payload
+                    .get("voucher")
+                    .and_then(|voucher| voucher.get("maxClaimableAmount")),
+            ) {
+                parts.push(format!(
+                    "cumulative voucher {}",
+                    display_batch_amount(&amount)
+                ));
+            }
+            ("Voucher accepted".to_string(), parts)
+        }
+        "refund" => ("Channel refund requested".to_string(), Vec::new()),
+        _ => return None,
+    };
+
+    let credential = payload
+        .get("authorization")
+        .or_else(|| payload.get("voucher"));
+    if kind == "deposit" {
+        if let Some(amount) = credential
+            .and_then(|value| value.get("authorizedAmount"))
+            .and_then(|value| value_string(Some(value)))
+        {
+            parts.push(format!(
+                "authorized ceiling {}",
+                display_batch_amount(&amount)
+            ));
+        } else if let Some(amount) = credential
+            .and_then(|value| value.get("maxClaimableAmount"))
+            .and_then(|value| value_string(Some(value)))
+        {
+            parts.push(format!(
+                "cumulative voucher {}",
+                display_batch_amount(&amount)
+            ));
+        }
+    }
+    if let Some(channel_id) = credential
+        .and_then(|value| value.get("channelId"))
+        .and_then(|value| value_string(Some(value)))
+    {
+        parts.push(format!("channel {channel_id}"));
+    }
+
+    let detail = if parts.is_empty() {
+        "batch-settlement payment verified".to_string()
+    } else {
+        format!("batch-settlement: {}", parts.join("; "))
+    };
+    Some((message, detail))
+}
+
+fn display_batch_amount(raw: &str) -> String {
+    format_stable_amount(raw).unwrap_or_else(|| format!("{raw} base units"))
+}
+
+/// Inspect the payment-channels program instruction in a deposit transaction.
+/// `open` is discriminator 1 and `top_up` is discriminator 3.
+fn batch_deposit_action(transaction: &str) -> Option<&'static str> {
+    const PAYMENT_CHANNELS_PROGRAM: &str = "CHNLxYvVA28MJP9PrFuDXccuoGXAx7jBacfLEkahyGsX";
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(transaction)
+        .ok()?;
+    let transaction: solana_transaction::versioned::VersionedTransaction =
+        wincode::deserialize(&bytes).ok()?;
+    let keys = transaction.message.static_account_keys();
+    transaction
+        .message
+        .instructions()
+        .iter()
+        .find_map(|instruction| {
+            let program = keys.get(usize::from(instruction.program_id_index))?;
+            if program.to_string() != PAYMENT_CHANNELS_PROGRAM {
+                return None;
+            }
+            match instruction.data.first() {
+                Some(1) => Some("Channel opened"),
+                Some(3) => Some("Channel topped up"),
+                _ => None,
+            }
+        })
 }
 
 fn is_internal_path(path: &str) -> bool {
@@ -2099,6 +2239,57 @@ mod tests {
         let flows = engine.snapshot();
         assert!(matches!(flows[0].protocol, Protocol::X402));
         assert_eq!(flows[0].scheme.as_deref(), Some("upto"));
+    }
+
+    #[test]
+    fn batch_settlement_retry_describes_server_authorization() {
+        let (tx, _rx) = broadcast::channel(16);
+        let mut engine = FlowCorrelation::new(tx);
+
+        let mut challenge = make_entry("POST", "/v1/chat/completions", 402);
+        challenge.res_headers.insert(
+            "payment-required".into(),
+            encode_json(serde_json::json!({
+                "x402Version": 2,
+                "accepts": [{
+                    "scheme": "batch-settlement",
+                    "amount": "4098",
+                    "asset": "USDC"
+                }]
+            })),
+        );
+        engine.ingest(challenge);
+
+        let mut retry = make_entry("POST", "/v1/chat/completions", 200);
+        retry.req_headers.insert(
+            "payment-signature".into(),
+            encode_json(serde_json::json!({
+                "x402Version": 2,
+                "accepted": { "scheme": "batch-settlement" },
+                "payload": {
+                    "type": "authorization",
+                    "channelConfig": { "payer": "payer" },
+                    "authorization": {
+                        "type": "proof",
+                        "channelId": "channel-1",
+                        "authorizedAmount": "4098"
+                    }
+                }
+            })),
+        );
+        engine.ingest(retry);
+
+        let flows = engine.snapshot();
+        assert_eq!(flows.len(), 1);
+        assert_eq!(flows[0].scheme.as_deref(), Some("batch-settlement"));
+        let accepted = flows[0]
+            .events
+            .iter()
+            .find(|event| event.message == "Server authorization accepted")
+            .expect("decoded batch action");
+        let detail = accepted.detail.as_deref().expect("batch action detail");
+        assert!(detail.contains("0.0041 USDC"));
+        assert!(detail.contains("channel channel-1"));
     }
 
     #[test]

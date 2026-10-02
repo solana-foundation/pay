@@ -2376,6 +2376,7 @@ mod tests {
                 commitment_id: Some("chan:5000".to_string()),
                 charged_amount: Some("1000".to_string()),
                 channel_state: None,
+                voucher: None,
             }),
         };
         let batch = match test_batch_handler() {
