@@ -809,34 +809,64 @@ impl SessionLifecycleRunloop {
     }
 
     async fn run(mut self) {
+        let mut accepting_commands = true;
         loop {
             if let Some((delay, close_due)) = self.next_wakeup() {
-                tokio::select! {
-                    command = self.rx.recv() => {
-                        if !self.handle_command(command).await {
-                            break;
+                if accepting_commands {
+                    tokio::select! {
+                        command = self.rx.recv() => {
+                            if command.is_some() {
+                                self.handle_command(command).await;
+                            } else {
+                                accepting_commands = false;
+                                if !self.has_unfinished_channels().await {
+                                    break;
+                                }
+                            }
+                        }
+                        _ = tokio::time::sleep(delay) => {
+                            self.run_due_work(close_due).await;
                         }
                     }
-                    _ = tokio::time::sleep(delay) => {
-                        if close_due
-                            && self.reconciliation == SessionLifecycleReconciliation::Embedded
-                        {
-                            self.reconcile_persisted_ownership().await;
-                            self.close_due_channels().await;
-                        }
-                        self.push_due_watermarks().await;
+                } else {
+                    tokio::time::sleep(delay).await;
+                    self.run_due_work(close_due).await;
+                    if !self.has_unfinished_channels().await {
+                        break;
                     }
                 }
-            } else {
+            } else if accepting_commands {
                 let command = self.rx.recv().await;
-                if !self.handle_command(command).await {
+                if command.is_some() {
+                    self.handle_command(command).await;
+                } else {
                     break;
                 }
+            } else {
+                break;
             }
         }
     }
 
-    async fn handle_command(&mut self, command: Option<SessionLifecycleCommand>) -> bool {
+    async fn run_due_work(&mut self, close_due: bool) {
+        if close_due && self.reconciliation == SessionLifecycleReconciliation::Embedded {
+            self.reconcile_persisted_ownership().await;
+            self.close_due_channels().await;
+        }
+        self.push_due_watermarks().await;
+    }
+
+    async fn has_unfinished_channels(&self) -> bool {
+        match self.runtime.channel_store.list_channels().await {
+            Ok(states) => states.into_iter().any(|state| !state.sealed),
+            Err(error) => {
+                tracing::warn!(%error, "failed to inspect detached payment-channel lifecycle");
+                true
+            }
+        }
+    }
+
+    async fn handle_command(&mut self, command: Option<SessionLifecycleCommand>) {
         match command {
             Some(SessionLifecycleCommand::Configure {
                 close_delay,
@@ -853,7 +883,6 @@ impl SessionLifecycleRunloop {
                 if reconciliation == SessionLifecycleReconciliation::Embedded {
                     self.reconcile_persisted_ownership().await;
                 }
-                true
             }
             Some(SessionLifecycleCommand::Touch {
                 channel_id,
@@ -869,7 +898,7 @@ impl SessionLifecycleRunloop {
                         )
                         .await
                         else {
-                            return true;
+                            return;
                         };
                         result
                     }
@@ -884,9 +913,8 @@ impl SessionLifecycleRunloop {
                     );
                 }
                 let _ = response.send(result);
-                true
             }
-            None => false,
+            None => {}
         }
     }
 

@@ -51,6 +51,14 @@ pub struct Completion {
     pub delivered: bool,
 }
 
+/// Result of one worker poll. Admissions whose buyers left before claim are
+/// returned so the endpoint can release their earn-cap reservations.
+#[derive(Debug, Clone)]
+pub struct Next {
+    pub request: Option<ParkedRequest>,
+    pub abandoned: Vec<Admission>,
+}
+
 /// One step of the worker's answer.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
@@ -140,30 +148,47 @@ impl EndpointQueue {
     }
 
     /// Claim the oldest waiting request, waiting up to `timeout` for one.
-    pub async fn next(&self, timeout: Duration) -> Option<ParkedRequest> {
+    pub async fn next(&self, timeout: Duration) -> Next {
         let deadline = Instant::now() + timeout;
         loop {
+            let mut abandoned = Vec::new();
             {
                 let mut inner = self.lock();
                 while let Some(parked) = inner.waiting.pop_front() {
                     // A client that left before being claimed is skipped.
                     if parked.tx.send(Event::Claimed).is_err() {
+                        abandoned.push(parked.request.admission);
                         continue;
                     }
                     let request = parked.request.clone();
                     inner.claimed.insert(request.id.clone(), parked);
-                    return Some(request);
+                    return Next {
+                        request: Some(request),
+                        abandoned,
+                    };
                 }
+            }
+            if !abandoned.is_empty() {
+                return Next {
+                    request: None,
+                    abandoned,
+                };
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return None;
+                return Next {
+                    request: None,
+                    abandoned: Vec::new(),
+                };
             }
             if tokio::time::timeout(remaining, self.parked.notified())
                 .await
                 .is_err()
             {
-                return None;
+                return Next {
+                    request: None,
+                    abandoned: Vec::new(),
+                };
             }
         }
     }
@@ -240,7 +265,7 @@ mod tests {
             .unwrap();
         assert_eq!(queue.depth(), (1, 0));
 
-        let claimed = queue.next(Duration::from_secs(1)).await.unwrap();
+        let claimed = queue.next(Duration::from_secs(1)).await.request.unwrap();
         assert_eq!(claimed.id, id);
         assert!(claimed.stream);
         assert_eq!(claimed.admission, admission());
@@ -267,7 +292,13 @@ mod tests {
     #[tokio::test]
     async fn next_waits_for_a_request_and_gives_up_on_time() {
         let queue = std::sync::Arc::new(EndpointQueue::default());
-        assert!(queue.next(Duration::from_millis(20)).await.is_none());
+        assert!(
+            queue
+                .next(Duration::from_millis(20))
+                .await
+                .request
+                .is_none()
+        );
 
         let waiter = {
             let queue = queue.clone();
@@ -275,7 +306,7 @@ mod tests {
         };
         tokio::time::sleep(Duration::from_millis(20)).await;
         let (id, _rx) = queue.park(Bytes::new(), false, admission()).unwrap();
-        assert_eq!(waiter.await.unwrap().unwrap().id, id);
+        assert_eq!(waiter.await.unwrap().request.unwrap().id, id);
     }
 
     #[tokio::test]
@@ -285,7 +316,9 @@ mod tests {
         drop(rx);
         let (live, mut live_rx) = queue.park(Bytes::new(), false, admission()).unwrap();
 
-        let claimed = queue.next(Duration::from_secs(1)).await.unwrap();
+        let next = queue.next(Duration::from_secs(1)).await;
+        assert_eq!(next.abandoned, vec![admission()]);
+        let claimed = next.request.unwrap();
         assert_eq!(
             claimed.id, live,
             "the abandoned request is never handed out"
