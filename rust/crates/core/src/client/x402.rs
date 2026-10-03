@@ -677,9 +677,6 @@ pub fn recover_batch_channel(
     use pay_kit::x402::client::batch_settlement as batch_client;
 
     let requirements = &challenge.requirements;
-    if cache.get(requirements)?.is_some() {
-        return Ok(());
-    }
     let offer = ChannelOffer {
         network: &requirements.network,
         amount: &requirements.amount,
@@ -691,6 +688,9 @@ pub fn recover_batch_channel(
     let Some(payer) = configured_channel_payer(store, &route.network, account_override)? else {
         return Ok(());
     };
+    if cache.get_for_payer(requirements, &payer)?.is_some() {
+        return Ok(());
+    }
     let rpc = RpcClient::new(route.rpc_url);
     let policy = blockrun_server_signed_policy();
     let terms = batch_client::resolve_terms_with_policy(&rpc, requirements, None, Some(&policy))
@@ -731,7 +731,19 @@ pub fn build_batch_payment(
     let price = requirements
         .amount()
         .map_err(|e| Error::Mpp(format!("invalid batch-settlement amount: {e}")))?;
-    let mut existing = cache.get(requirements)?;
+    let offer = ChannelOffer {
+        network: &requirements.network,
+        amount: &requirements.amount,
+        asset: &requirements.asset,
+        channel_escrow: false,
+        recent_blockhash: requirements.extra.recent_blockhash.as_deref(),
+    };
+    let route = resolve_channel_route(&offer, network_override)?;
+    let selected_payer = configured_channel_payer(store, &route.network, account_override)?;
+    let mut existing = match selected_payer.as_ref() {
+        Some(payer) => cache.get_for_payer(requirements, payer)?,
+        None => cache.get(requirements)?,
+    };
     let minimum_deposit = requirements
         .extra
         .min_deposit

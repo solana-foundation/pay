@@ -7,16 +7,17 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use axum::Router;
-use axum::body::{Body, Bytes};
+use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
-use axum::{Json, middleware};
+use axum::{Extension, Json, middleware};
 use base64::Engine;
 use futures_util::StreamExt;
 use pay_core::pricing::{PricingConfig, TokenRate};
@@ -159,6 +160,30 @@ struct Live {
 struct BuyerState {
     entry: Arc<EndpointEntry>,
     sale: SellInference,
+}
+
+/// Admission reserved before the payment gate. The handler marks it claimed
+/// as soon as it takes responsibility for parking or releasing it.
+#[derive(Clone)]
+struct ReservedAdmission {
+    admission: Admission,
+    claimed: Arc<AtomicBool>,
+}
+
+/// Releases a pre-gate reservation when payment is rejected or the request is
+/// cancelled before the paid handler takes ownership.
+struct ReservationGuard {
+    entry: Arc<EndpointEntry>,
+    expected_usd: f64,
+    claimed: Arc<AtomicBool>,
+}
+
+impl Drop for ReservationGuard {
+    fn drop(&mut self) {
+        if !self.claimed.load(Ordering::Acquire) {
+            self.entry.release(self.expected_usd);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -839,7 +864,7 @@ async fn fail(
 async fn dispatch(
     State(state): State<Arc<SellState>>,
     Path((id, _rest)): Path<(String, String)>,
-    req: Request,
+    mut req: Request,
 ) -> Response {
     let Some(entry) = state.registry.get(&id) else {
         return openai_error(
@@ -856,7 +881,50 @@ async fn dispatch(
             "This endpoint reached its earning cap and no longer takes requests.",
         );
     }
-    let router = entry.live().gated.clone();
+    let live = entry.live();
+    let mut _reservation_guard = None;
+    if req.method() == axum::http::Method::POST
+        && req.uri().path() == format!("/{}", live.sale.chat_path())
+    {
+        let (parts, body) = req.into_parts();
+        let body = match to_bytes(body, MAX_REQUEST_BYTES).await {
+            Ok(body) => body,
+            Err(error) => {
+                return openai_error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "request_too_large",
+                    &error.to_string(),
+                );
+            }
+        };
+        let admission = match admission_for(&live.sale, &body) {
+            Ok(admission) => admission,
+            Err(error) => {
+                return openai_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    &format!("request body is not JSON: {error}"),
+                );
+            }
+        };
+        if !entry.try_reserve(admission.expected_usd) {
+            return openai_error(
+                StatusCode::GONE,
+                "earn_cap_reserved",
+                "This endpoint has no unreserved earning capacity right now.",
+            );
+        }
+        let claimed = Arc::new(AtomicBool::new(false));
+        _reservation_guard = Some(ReservationGuard {
+            entry: entry.clone(),
+            expected_usd: admission.expected_usd,
+            claimed: claimed.clone(),
+        });
+        req = Request::from_parts(parts, Body::from(body));
+        req.extensions_mut()
+            .insert(ReservedAdmission { admission, claimed });
+    }
+    let router = live.gated.clone();
     match router.oneshot(req).await {
         Ok(response) => response,
         Err(never) => match never {},
@@ -886,14 +954,27 @@ async fn models(State(state): State<Arc<BuyerState>>) -> Json<Value> {
 }
 
 /// Park the request and relay the worker's answer.
-async fn chat_completions(State(state): State<Arc<BuyerState>>, body: Bytes) -> Response {
-    let (stream, model) = match serde_json::from_slice::<Value>(&body) {
-        Ok(json) => (
-            json.get("stream").and_then(Value::as_bool).unwrap_or(false),
-            json.get("model")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-        ),
+fn admission_for(sale: &SellInference, body: &[u8]) -> Result<Admission, serde_json::Error> {
+    let json = serde_json::from_slice::<Value>(body)?;
+    let model = json
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let pricing = sale.pricing.clone();
+    Ok(Admission {
+        expected_usd: pricing.max_usd(),
+        pricing,
+        model,
+    })
+}
+
+async fn chat_completions(
+    State(state): State<Arc<BuyerState>>,
+    reserved: Option<Extension<ReservedAdmission>>,
+    body: Bytes,
+) -> Response {
+    let stream = match serde_json::from_slice::<Value>(&body) {
+        Ok(json) => json.get("stream").and_then(Value::as_bool).unwrap_or(false),
         Err(e) => {
             return openai_error(
                 StatusCode::BAD_REQUEST,
@@ -902,21 +983,33 @@ async fn chat_completions(State(state): State<Arc<BuyerState>>, body: Bytes) -> 
             );
         }
     };
-    // The terms this request was paid under, fixed now.
-    let pricing = state.sale.pricing.clone();
-    let admission = Admission {
-        expected_usd: pricing.max_usd(),
-        pricing,
-        model,
+    let admission = match reserved {
+        Some(Extension(reserved)) => {
+            reserved.claimed.store(true, Ordering::Release);
+            reserved.admission
+        }
+        None => {
+            let admission = match admission_for(&state.sale, &body) {
+                Ok(admission) => admission,
+                Err(error) => {
+                    return openai_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request",
+                        &format!("request body is not JSON: {error}"),
+                    );
+                }
+            };
+            if !state.entry.try_reserve(admission.expected_usd) {
+                return openai_error(
+                    StatusCode::GONE,
+                    "earn_cap_reserved",
+                    "This endpoint has no unreserved earning capacity right now.",
+                );
+            }
+            admission
+        }
     };
     let expected_usd = admission.expected_usd;
-    if !state.entry.try_reserve(expected_usd) {
-        return openai_error(
-            StatusCode::GONE,
-            "earn_cap_reserved",
-            "This endpoint has no unreserved earning capacity right now.",
-        );
-    }
     let (id, mut rx) = match state.entry.queue.park(body, stream, admission) {
         Ok(parked) => parked,
         Err(QueueError::Full) => {
@@ -1263,7 +1356,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_buyer_without_payment_is_challenged_and_the_model_list_is_free() {
-        let app = router(state());
+        let state = state();
+        let app = router(state.clone());
         let (id, _) = create_endpoint(&app, per_request(0.02)).await;
 
         let (status, headers, body) = send(
@@ -1275,6 +1369,11 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "{body}");
+        assert_eq!(
+            state.registry.get(&id).unwrap().pending_usd(),
+            0.0,
+            "a rejected payment challenge must release its pre-gate reservation"
+        );
         let www: Vec<&str> = headers
             .get_all(header::WWW_AUTHENTICATE)
             .iter()
@@ -1390,6 +1489,7 @@ mod tests {
         let sale = entry.sale();
         chat_completions(
             State(Arc::new(BuyerState { entry, sale })),
+            None,
             Bytes::from(body.to_string()),
         )
     }
@@ -1546,6 +1646,7 @@ mod tests {
                 sale: entry.sale(),
                 entry: entry.clone(),
             })),
+            None,
             Bytes::from_static(b"nope"),
         )
         .await;
@@ -1896,6 +1997,56 @@ mod tests {
         )
         .await;
         assert_eq!(view["earned_usd"], 0.02);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reserved_capacity_rejects_the_next_buyer_before_the_payment_gate() {
+        let state = state();
+        let app = router(state.clone());
+        let mut body = per_request(0.02);
+        body["earn_cap_usd"] = json!(0.02);
+        let (id, token) = create_endpoint(&app, body).await;
+
+        let first_buyer = tokio::spawn(buyer(
+            &state,
+            &id,
+            json!({ "model": "agent", "messages": [] }),
+        ));
+        for _ in 0..100 {
+            if state.registry.get(&id).unwrap().pending_usd() == 0.02 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        let (status, headers, response) = send(
+            &app,
+            Method::POST,
+            &format!("/endpoints/{id}/v1/chat/completions"),
+            None,
+            Some(json!({ "model": "agent", "messages": [] })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::GONE, "{response}");
+        assert_eq!(response["error"]["code"], "earn_cap_reserved");
+        assert!(headers.get(header::WWW_AUTHENTICATE).is_none());
+        assert!(
+            headers
+                .get(pay_kit::x402::PAYMENT_REQUIRED_HEADER)
+                .is_none()
+        );
+
+        first_buyer.abort();
+        let _ = first_buyer.await;
+        let (status, _, _) = send(
+            &app,
+            Method::GET,
+            &format!("/v1/endpoints/{id}/queue/next?wait=0"),
+            Some(&token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
     }
 
     #[tokio::test(flavor = "multi_thread")]

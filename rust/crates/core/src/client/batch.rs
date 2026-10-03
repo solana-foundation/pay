@@ -124,6 +124,25 @@ impl BatchChannelCache {
         Ok(channels.get(&cache_key(requirements)).cloned())
     }
 
+    /// Return the cached channel only when it belongs to the payer selected
+    /// for this request. Switching accounts invalidates both channel state and
+    /// its resident signer, even when the server offer itself is unchanged.
+    pub fn get_for_payer(
+        &self,
+        requirements: &BatchRequirements,
+        payer: &solana_pubkey::Pubkey,
+    ) -> Result<Option<BatchChannel>> {
+        let channel = self.get(requirements)?;
+        if channel
+            .as_ref()
+            .is_some_and(|channel| channel.config().payer != payer.to_string())
+        {
+            self.remove(requirements)?;
+            return Ok(None);
+        }
+        Ok(channel)
+    }
+
     /// Remember a channel opened for this offer.
     pub fn insert(&self, requirements: &BatchRequirements, channel: BatchChannel) -> Result<()> {
         let mut channels = self.lock()?;
@@ -327,6 +346,7 @@ fn decode_settlement(headers: &[(String, String)]) -> Option<BatchSettlementResp
 mod tests {
     use super::*;
     use pay_kit::x402::batch_settlement::{BatchChannelConfig, BatchExtra};
+    use pay_kit::x402::solana_keychain::SolanaSigner;
 
     fn requirements(pay_to: &str, fee_payer: &str) -> BatchRequirements {
         BatchRequirements {
@@ -443,7 +463,7 @@ mod tests {
     }
 
     #[test]
-    fn funded_channel_signer_is_reused_until_the_channel_is_removed() {
+    fn funded_channel_signer_is_reused_only_for_the_same_payer() {
         const KEYPAIR: [u8; 64] = [
             41, 99, 180, 88, 51, 57, 48, 80, 61, 63, 219, 75, 176, 49, 116, 254, 227, 176, 196,
             204, 122, 47, 166, 133, 155, 252, 217, 0, 253, 17, 49, 143, 47, 94, 121, 167, 195, 136,
@@ -461,10 +481,37 @@ mod tests {
         cache
             .insert_signer(&requirements, Arc::clone(&signer))
             .unwrap();
+        cache
+            .insert(
+                &requirements,
+                BatchChannel::new(
+                    solana_pubkey::Pubkey::new_unique(),
+                    BatchChannelConfig {
+                        payer: signer.pubkey().to_string(),
+                        payer_authorizer: signer.pubkey().to_string(),
+                        receiver: requirements.pay_to.clone(),
+                        receiver_authorizer: None,
+                        token: requirements.asset.clone(),
+                        withdraw_delay: requirements.extra.withdraw_delay,
+                        salt: "1".to_string(),
+                        open_slot: 1,
+                        voucher_signer: None,
+                    },
+                    0,
+                    10_000,
+                ),
+            )
+            .unwrap();
         let reused = cache.signer(&requirements).unwrap().unwrap();
         assert!(Arc::ptr_eq(&signer, &reused));
 
-        cache.remove(&requirements).unwrap();
+        assert!(
+            cache
+                .get_for_payer(&requirements, &solana_pubkey::Pubkey::new_unique())
+                .unwrap()
+                .is_none()
+        );
+        assert!(cache.get(&requirements).unwrap().is_none());
         assert!(cache.signer(&requirements).unwrap().is_none());
     }
 }

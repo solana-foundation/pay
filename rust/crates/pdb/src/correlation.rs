@@ -14,6 +14,39 @@ const FLOW_TIMEOUT_MS: u64 = 60_000;
 const MAX_FLOWS: usize = 200;
 const X402_PAYMENT_RESPONSE_HEADER: &str = "payment-response";
 const X402_LEGACY_PAYMENT_RESPONSE_HEADER: &str = "x-payment-response";
+const REDACTED: &str = "[REDACTED]";
+
+/// Keep header names available to the debugger UI while ensuring bearer
+/// tokens, payment proofs, receipts, and cookies never enter a serialized
+/// flow or SSE event. Correlation derives its safe metadata from the original
+/// `LogEntry` before these copies are retained.
+fn redacted_headers(headers: &HashMap<String, String>) -> HashMap<String, String> {
+    headers
+        .iter()
+        .map(|(name, value)| {
+            let sensitive = matches!(
+                name.to_ascii_lowercase().as_str(),
+                "authorization"
+                    | "proxy-authorization"
+                    | "payment-signature"
+                    | "x-payment"
+                    | "payment-response"
+                    | "x-payment-response"
+                    | "payment-receipt"
+                    | "cookie"
+                    | "set-cookie"
+            );
+            (
+                name.clone(),
+                if sensitive {
+                    REDACTED.to_string()
+                } else {
+                    value.clone()
+                },
+            )
+        })
+        .collect()
+}
 
 #[derive(Debug, Clone, Copy)]
 enum Phase {
@@ -249,7 +282,7 @@ impl FlowCorrelation {
             flow.scheme = flow_scheme(&entry, protocol, None);
             flow.status = FlowStatus::PaymentRequired;
             flow.updated_at = now.clone();
-            flow.challenge_headers = Some(entry.res_headers.clone());
+            flow.challenge_headers = Some(redacted_headers(&entry.res_headers));
             flow.amount = extract_amount(&entry);
             flow.steps = build_steps(&protocol);
             flow.steps[0].ts = Some(started);
@@ -273,7 +306,10 @@ impl FlowCorrelation {
         flow.status = exchange_status(entry.status);
         flow.updated_at = now.clone();
         flow.duration_ms = elapsed_ms(&flow.started_at, now).unwrap_or(entry.ms);
-        flow.response_headers = Some(entry.res_headers.clone());
+        if !entry.req_headers.is_empty() {
+            flow.payment_headers = Some(redacted_headers(&entry.req_headers));
+        }
+        flow.response_headers = Some(redacted_headers(&entry.res_headers));
         flow.response_body = entry.res_body.clone();
         // A settled MPP payment on this exchange — drives the stablecoin
         // series in the TUI/web charts.
@@ -420,7 +456,7 @@ impl FlowCorrelation {
             ],
             challenge_headers: None,
             payment_headers: None,
-            response_headers: Some(entry.res_headers.clone()),
+            response_headers: Some(redacted_headers(&entry.res_headers)),
             response_body: entry.res_body.clone(),
             inference: None,
         };
@@ -576,7 +612,7 @@ impl FlowCorrelation {
                     detail: Some(challenge_detail),
                 },
             ],
-            challenge_headers: Some(entry.res_headers.clone()),
+            challenge_headers: Some(redacted_headers(&entry.res_headers)),
             payment_headers: None,
             response_headers: None,
             response_body: None,
@@ -625,9 +661,9 @@ impl FlowCorrelation {
         } else {
             None
         };
-        flow.payment_headers = Some(entry.req_headers.clone());
+        flow.payment_headers = Some(redacted_headers(&entry.req_headers));
         flow.payer = extract_payer(&entry.req_headers);
-        flow.response_headers = Some(entry.res_headers.clone());
+        flow.response_headers = Some(redacted_headers(&entry.res_headers));
         flow.response_body = entry.res_body.clone();
         flow.updated_at = now.clone();
         flow.duration_ms = entry.ms;
@@ -638,17 +674,7 @@ impl FlowCorrelation {
                 flow.session = session_update.clone();
             }
             let detail = match protocol {
-                Protocol::Mpp | Protocol::Http => format!(
-                    "payment-receipt: {}",
-                    truncate(
-                        entry
-                            .res_headers
-                            .get("payment-receipt")
-                            .map(|s| s.as_str())
-                            .unwrap_or(""),
-                        120
-                    )
-                ),
+                Protocol::Mpp | Protocol::Http => "payment receipt verified".to_string(),
                 Protocol::Session => session_event_detail(session_update.as_ref())
                     .unwrap_or_else(|| "session action verified".into()),
                 Protocol::X402 => x402_payment_event(entry)
@@ -742,7 +768,7 @@ impl FlowCorrelation {
             }],
             challenge_headers: None,
             payment_headers: None,
-            response_headers: Some(entry.res_headers.clone()),
+            response_headers: Some(redacted_headers(&entry.res_headers)),
             response_body: entry.res_body.clone(),
             inference: None,
         };
@@ -785,11 +811,11 @@ impl FlowCorrelation {
             return false;
         };
 
-        flow.payment_headers = Some(entry.req_headers.clone());
+        flow.payment_headers = Some(redacted_headers(&entry.req_headers));
         if let Some(payer) = extract_payer(&entry.req_headers) {
             flow.payer = Some(payer);
         }
-        flow.response_headers = Some(entry.res_headers.clone());
+        flow.response_headers = Some(redacted_headers(&entry.res_headers));
         flow.response_body = entry.res_body.clone();
         flow.updated_at = now.clone();
         flow.duration_ms = elapsed_ms(&flow.started_at, now)
@@ -2664,14 +2690,15 @@ mod tests {
 
         let mut done = make_entry("POST", "/v1/messages", 200);
         done.id = 2;
-        done.req_headers.insert(
-            "payment-signature".into(),
-            x402_payment_signature("payer-wallet-x402"),
-        );
-        done.res_headers.insert(
-            X402_PAYMENT_RESPONSE_HEADER.into(),
-            x402_payment_response("1234"),
-        );
+        let payment_proof = x402_payment_signature("payer-wallet-x402");
+        let payment_receipt = x402_payment_response("1234");
+        let upstream_authorization = "Bearer upstream-secret".to_string();
+        done.req_headers
+            .insert("payment-signature".into(), payment_proof.clone());
+        done.req_headers
+            .insert("authorization".into(), upstream_authorization.clone());
+        done.res_headers
+            .insert(X402_PAYMENT_RESPONSE_HEADER.into(), payment_receipt.clone());
         engine.ingest(done);
 
         let flows = engine.snapshot();
@@ -2686,6 +2713,22 @@ mod tests {
                 .unwrap()
                 .contains_key(X402_PAYMENT_RESPONSE_HEADER)
         );
+        assert_eq!(
+            flow.payment_headers.as_ref().unwrap()["payment-signature"],
+            REDACTED
+        );
+        assert_eq!(
+            flow.payment_headers.as_ref().unwrap()["authorization"],
+            REDACTED
+        );
+        assert_eq!(
+            flow.response_headers.as_ref().unwrap()[X402_PAYMENT_RESPONSE_HEADER],
+            REDACTED
+        );
+        let serialized = serde_json::to_string(flow).unwrap();
+        assert!(!serialized.contains(&payment_proof));
+        assert!(!serialized.contains(&payment_receipt));
+        assert!(!serialized.contains(&upstream_authorization));
 
         let connections = engine.connections_snapshot();
         assert_eq!(connections.len(), 1);
