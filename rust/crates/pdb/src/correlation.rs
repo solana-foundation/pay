@@ -14,6 +14,39 @@ const FLOW_TIMEOUT_MS: u64 = 60_000;
 const MAX_FLOWS: usize = 200;
 const X402_PAYMENT_RESPONSE_HEADER: &str = "payment-response";
 const X402_LEGACY_PAYMENT_RESPONSE_HEADER: &str = "x-payment-response";
+const REDACTED: &str = "[REDACTED]";
+
+/// Keep header names available to the debugger UI while ensuring bearer
+/// tokens, payment proofs, receipts, and cookies never enter a serialized
+/// flow or SSE event. Correlation derives its safe metadata from the original
+/// `LogEntry` before these copies are retained.
+fn redacted_headers(headers: &HashMap<String, String>) -> HashMap<String, String> {
+    headers
+        .iter()
+        .map(|(name, value)| {
+            let sensitive = matches!(
+                name.to_ascii_lowercase().as_str(),
+                "authorization"
+                    | "proxy-authorization"
+                    | "payment-signature"
+                    | "x-payment"
+                    | "payment-response"
+                    | "x-payment-response"
+                    | "payment-receipt"
+                    | "cookie"
+                    | "set-cookie"
+            );
+            (
+                name.clone(),
+                if sensitive {
+                    REDACTED.to_string()
+                } else {
+                    value.clone()
+                },
+            )
+        })
+        .collect()
+}
 
 #[derive(Debug, Clone, Copy)]
 enum Phase {
@@ -249,7 +282,7 @@ impl FlowCorrelation {
             flow.scheme = flow_scheme(&entry, protocol, None);
             flow.status = FlowStatus::PaymentRequired;
             flow.updated_at = now.clone();
-            flow.challenge_headers = Some(entry.res_headers.clone());
+            flow.challenge_headers = Some(redacted_headers(&entry.res_headers));
             flow.amount = extract_amount(&entry);
             flow.steps = build_steps(&protocol);
             flow.steps[0].ts = Some(started);
@@ -273,7 +306,10 @@ impl FlowCorrelation {
         flow.status = exchange_status(entry.status);
         flow.updated_at = now.clone();
         flow.duration_ms = elapsed_ms(&flow.started_at, now).unwrap_or(entry.ms);
-        flow.response_headers = Some(entry.res_headers.clone());
+        if !entry.req_headers.is_empty() {
+            flow.payment_headers = Some(redacted_headers(&entry.req_headers));
+        }
+        flow.response_headers = Some(redacted_headers(&entry.res_headers));
         flow.response_body = entry.res_body.clone();
         // A settled MPP payment on this exchange — drives the stablecoin
         // series in the TUI/web charts.
@@ -420,7 +456,7 @@ impl FlowCorrelation {
             ],
             challenge_headers: None,
             payment_headers: None,
-            response_headers: Some(entry.res_headers.clone()),
+            response_headers: Some(redacted_headers(&entry.res_headers)),
             response_body: entry.res_body.clone(),
             inference: None,
         };
@@ -576,7 +612,7 @@ impl FlowCorrelation {
                     detail: Some(challenge_detail),
                 },
             ],
-            challenge_headers: Some(entry.res_headers.clone()),
+            challenge_headers: Some(redacted_headers(&entry.res_headers)),
             payment_headers: None,
             response_headers: None,
             response_body: None,
@@ -625,9 +661,9 @@ impl FlowCorrelation {
         } else {
             None
         };
-        flow.payment_headers = Some(entry.req_headers.clone());
+        flow.payment_headers = Some(redacted_headers(&entry.req_headers));
         flow.payer = extract_payer(&entry.req_headers);
-        flow.response_headers = Some(entry.res_headers.clone());
+        flow.response_headers = Some(redacted_headers(&entry.res_headers));
         flow.response_body = entry.res_body.clone();
         flow.updated_at = now.clone();
         flow.duration_ms = entry.ms;
@@ -638,27 +674,21 @@ impl FlowCorrelation {
                 flow.session = session_update.clone();
             }
             let detail = match protocol {
-                Protocol::Mpp | Protocol::Http => format!(
-                    "payment-receipt: {}",
-                    truncate(
-                        entry
-                            .res_headers
-                            .get("payment-receipt")
-                            .map(|s| s.as_str())
-                            .unwrap_or(""),
-                        120
-                    )
-                ),
+                Protocol::Mpp | Protocol::Http => "payment receipt verified".to_string(),
                 Protocol::Session => session_event_detail(session_update.as_ref())
                     .unwrap_or_else(|| "session action verified".into()),
-                Protocol::X402 => "x-payment-response verified".into(),
+                Protocol::X402 => x402_payment_event(entry)
+                    .map(|(_, detail)| detail)
+                    .unwrap_or_else(|| "x-payment-response verified".into()),
             };
             flow.events.push(FlowEvent {
                 ts: now.clone(),
-                message: if matches!(protocol, Protocol::Session) {
-                    session_accepted_message(session_update.as_ref())
-                } else {
-                    "Payment accepted".into()
+                message: match protocol {
+                    Protocol::Session => session_accepted_message(session_update.as_ref()),
+                    Protocol::X402 => x402_payment_event(entry)
+                        .map(|(message, _)| message)
+                        .unwrap_or_else(|| "Payment accepted".into()),
+                    Protocol::Mpp | Protocol::Http => "Payment accepted".into(),
                 },
                 detail: Some(detail),
             });
@@ -738,7 +768,7 @@ impl FlowCorrelation {
             }],
             challenge_headers: None,
             payment_headers: None,
-            response_headers: Some(entry.res_headers.clone()),
+            response_headers: Some(redacted_headers(&entry.res_headers)),
             response_body: entry.res_body.clone(),
             inference: None,
         };
@@ -781,11 +811,11 @@ impl FlowCorrelation {
             return false;
         };
 
-        flow.payment_headers = Some(entry.req_headers.clone());
+        flow.payment_headers = Some(redacted_headers(&entry.req_headers));
         if let Some(payer) = extract_payer(&entry.req_headers) {
             flow.payer = Some(payer);
         }
-        flow.response_headers = Some(entry.res_headers.clone());
+        flow.response_headers = Some(redacted_headers(&entry.res_headers));
         flow.response_body = entry.res_body.clone();
         flow.updated_at = now.clone();
         flow.duration_ms = elapsed_ms(&flow.started_at, now)
@@ -994,6 +1024,142 @@ fn x402_scheme_from_payment(encoded: &str) -> Option<String> {
     let payload = json.get("payload")?;
     (payload.get("channelId").is_some() || payload.get("profile").is_some())
         .then(|| "upto".to_string())
+}
+
+/// Human-readable batch-settlement action from the paid request. The payer
+/// proxy records headers without buffering the response body, so these details
+/// remain available for streaming inference requests.
+fn x402_payment_event(entry: &LogEntry) -> Option<(String, String)> {
+    let payment = ["payment-signature", "x-payment"]
+        .into_iter()
+        .find_map(|key| {
+            entry
+                .req_headers
+                .get(key)
+                .and_then(|value| decode_json_value(value))
+        })?;
+    if value_string(
+        payment
+            .get("accepted")
+            .and_then(|accepted| accepted.get("scheme")),
+    )
+    .as_deref()
+        != Some("batch-settlement")
+    {
+        return None;
+    }
+
+    let payload = payment.get("payload")?;
+    let kind = payload.get("type")?.as_str()?;
+    let (message, mut parts) = match kind {
+        "deposit" => {
+            let deposit = payload.get("deposit")?;
+            let action = deposit
+                .get("transaction")
+                .and_then(serde_json::Value::as_str)
+                .and_then(batch_deposit_action)
+                .unwrap_or("Channel funded");
+            let mut parts = Vec::new();
+            if let Some(amount) = value_string(deposit.get("amount")) {
+                parts.push(format!("deposit {}", display_batch_amount(&amount)));
+            }
+            (action.to_string(), parts)
+        }
+        "authorization" => {
+            let authorization = payload.get("authorization")?;
+            let mut parts = Vec::new();
+            if let Some(amount) = value_string(authorization.get("authorizedAmount")) {
+                parts.push(format!(
+                    "authorized ceiling {}",
+                    display_batch_amount(&amount)
+                ));
+            }
+            ("Server authorization accepted".to_string(), parts)
+        }
+        "voucher" => {
+            let mut parts = Vec::new();
+            if let Some(amount) = value_string(
+                payload
+                    .get("voucher")
+                    .and_then(|voucher| voucher.get("maxClaimableAmount")),
+            ) {
+                parts.push(format!(
+                    "cumulative voucher {}",
+                    display_batch_amount(&amount)
+                ));
+            }
+            ("Voucher accepted".to_string(), parts)
+        }
+        "refund" => ("Channel refund requested".to_string(), Vec::new()),
+        _ => return None,
+    };
+
+    let credential = payload
+        .get("authorization")
+        .or_else(|| payload.get("voucher"));
+    if kind == "deposit" {
+        if let Some(amount) = credential
+            .and_then(|value| value.get("authorizedAmount"))
+            .and_then(|value| value_string(Some(value)))
+        {
+            parts.push(format!(
+                "authorized ceiling {}",
+                display_batch_amount(&amount)
+            ));
+        } else if let Some(amount) = credential
+            .and_then(|value| value.get("maxClaimableAmount"))
+            .and_then(|value| value_string(Some(value)))
+        {
+            parts.push(format!(
+                "cumulative voucher {}",
+                display_batch_amount(&amount)
+            ));
+        }
+    }
+    if let Some(channel_id) = credential
+        .and_then(|value| value.get("channelId"))
+        .and_then(|value| value_string(Some(value)))
+    {
+        parts.push(format!("channel {channel_id}"));
+    }
+
+    let detail = if parts.is_empty() {
+        "batch-settlement payment verified".to_string()
+    } else {
+        format!("batch-settlement: {}", parts.join("; "))
+    };
+    Some((message, detail))
+}
+
+fn display_batch_amount(raw: &str) -> String {
+    format_stable_amount(raw).unwrap_or_else(|| format!("{raw} base units"))
+}
+
+/// Inspect the payment-channels program instruction in a deposit transaction.
+/// `open` is discriminator 1 and `top_up` is discriminator 3.
+fn batch_deposit_action(transaction: &str) -> Option<&'static str> {
+    const PAYMENT_CHANNELS_PROGRAM: &str = "CHNLxYvVA28MJP9PrFuDXccuoGXAx7jBacfLEkahyGsX";
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(transaction)
+        .ok()?;
+    let transaction: solana_transaction::versioned::VersionedTransaction =
+        wincode::deserialize(&bytes).ok()?;
+    let keys = transaction.message.static_account_keys();
+    transaction
+        .message
+        .instructions()
+        .iter()
+        .find_map(|instruction| {
+            let program = keys.get(usize::from(instruction.program_id_index))?;
+            if program.to_string() != PAYMENT_CHANNELS_PROGRAM {
+                return None;
+            }
+            match instruction.data.first() {
+                Some(1) => Some("Channel opened"),
+                Some(3) => Some("Channel topped up"),
+                _ => None,
+            }
+        })
 }
 
 fn is_internal_path(path: &str) -> bool {
@@ -2102,6 +2268,57 @@ mod tests {
     }
 
     #[test]
+    fn batch_settlement_retry_describes_server_authorization() {
+        let (tx, _rx) = broadcast::channel(16);
+        let mut engine = FlowCorrelation::new(tx);
+
+        let mut challenge = make_entry("POST", "/v1/chat/completions", 402);
+        challenge.res_headers.insert(
+            "payment-required".into(),
+            encode_json(serde_json::json!({
+                "x402Version": 2,
+                "accepts": [{
+                    "scheme": "batch-settlement",
+                    "amount": "4098",
+                    "asset": "USDC"
+                }]
+            })),
+        );
+        engine.ingest(challenge);
+
+        let mut retry = make_entry("POST", "/v1/chat/completions", 200);
+        retry.req_headers.insert(
+            "payment-signature".into(),
+            encode_json(serde_json::json!({
+                "x402Version": 2,
+                "accepted": { "scheme": "batch-settlement" },
+                "payload": {
+                    "type": "authorization",
+                    "channelConfig": { "payer": "payer" },
+                    "authorization": {
+                        "type": "proof",
+                        "channelId": "channel-1",
+                        "authorizedAmount": "4098"
+                    }
+                }
+            })),
+        );
+        engine.ingest(retry);
+
+        let flows = engine.snapshot();
+        assert_eq!(flows.len(), 1);
+        assert_eq!(flows[0].scheme.as_deref(), Some("batch-settlement"));
+        let accepted = flows[0]
+            .events
+            .iter()
+            .find(|event| event.message == "Server authorization accepted")
+            .expect("decoded batch action");
+        let detail = accepted.detail.as_deref().expect("batch action detail");
+        assert!(detail.contains("0.0041 USDC"));
+        assert!(detail.contains("channel channel-1"));
+    }
+
+    #[test]
     fn max_flows_eviction() {
         let (tx, _rx) = broadcast::channel(256);
         let mut engine = FlowCorrelation::new(tx);
@@ -2473,14 +2690,15 @@ mod tests {
 
         let mut done = make_entry("POST", "/v1/messages", 200);
         done.id = 2;
-        done.req_headers.insert(
-            "payment-signature".into(),
-            x402_payment_signature("payer-wallet-x402"),
-        );
-        done.res_headers.insert(
-            X402_PAYMENT_RESPONSE_HEADER.into(),
-            x402_payment_response("1234"),
-        );
+        let payment_proof = x402_payment_signature("payer-wallet-x402");
+        let payment_receipt = x402_payment_response("1234");
+        let upstream_authorization = "Bearer upstream-secret".to_string();
+        done.req_headers
+            .insert("payment-signature".into(), payment_proof.clone());
+        done.req_headers
+            .insert("authorization".into(), upstream_authorization.clone());
+        done.res_headers
+            .insert(X402_PAYMENT_RESPONSE_HEADER.into(), payment_receipt.clone());
         engine.ingest(done);
 
         let flows = engine.snapshot();
@@ -2495,6 +2713,22 @@ mod tests {
                 .unwrap()
                 .contains_key(X402_PAYMENT_RESPONSE_HEADER)
         );
+        assert_eq!(
+            flow.payment_headers.as_ref().unwrap()["payment-signature"],
+            REDACTED
+        );
+        assert_eq!(
+            flow.payment_headers.as_ref().unwrap()["authorization"],
+            REDACTED
+        );
+        assert_eq!(
+            flow.response_headers.as_ref().unwrap()[X402_PAYMENT_RESPONSE_HEADER],
+            REDACTED
+        );
+        let serialized = serde_json::to_string(flow).unwrap();
+        assert!(!serialized.contains(&payment_proof));
+        assert!(!serialized.contains(&payment_receipt));
+        assert!(!serialized.contains(&upstream_authorization));
 
         let connections = engine.connections_snapshot();
         assert_eq!(connections.len(), 1);

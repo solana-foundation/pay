@@ -4,10 +4,11 @@ pub mod get_balance;
 pub mod get_catalog_entry;
 pub mod list_catalog;
 pub mod search_catalog;
+pub mod sell_inference;
 pub mod topup;
 
 pub(crate) fn tool_error(message: impl Into<String>) -> rmcp::model::CallToolResult {
-    rmcp::model::CallToolResult::error(vec![rmcp::model::Content::text(message.into())])
+    rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(message.into())])
 }
 
 #[cfg(test)]

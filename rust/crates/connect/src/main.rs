@@ -101,6 +101,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             state
         }
     };
+    #[cfg(feature = "sell")]
+    let state = match pay_connect::sell::Operator::from_env()? {
+        Some(operator) => {
+            operator.spawn_blockhash_refresh();
+            info!(
+                operator = %operator.pubkey(),
+                rpc = %operator.rpc_url,
+                "sell_inference enabled: endpoints under /endpoints/<id>/v1"
+            );
+            state.with_sell(operator)
+        }
+        None => {
+            info!(
+                "sell_inference disabled: set {}, {} and {} to enable",
+                pay_connect::sell::backends::KEYPAIR_ENV,
+                pay_connect::sell::backends::RPC_URL_ENV,
+                pay_connect::sell::backends::SECRET_ENV
+            );
+            state
+        }
+    };
     // One line per request at INFO: a host's failed handshake is
     // diagnosed from these, so they must not hide behind a debug filter.
     let trace = TraceLayer::new_for_http()

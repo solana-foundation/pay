@@ -1,8 +1,16 @@
-//! ACP middleware primitives for Pay.
+//! ACP primitives for Pay.
 //!
-//! The crate observes the stable ACP frames needed for delivery decisions while
-//! callers continue forwarding the original bytes. Unknown and vendor-specific
-//! messages therefore remain transparent.
+//! Two roles. As middleware, the crate observes the stable ACP frames needed
+//! for delivery decisions while callers continue forwarding the original
+//! bytes; unknown and vendor-specific messages remain transparent. As a
+//! client ([`client`]), pay drives an agent itself: it spawns the adapter,
+//! opens a session, and consumes prompt turns as event streams.
+
+pub mod client;
+
+pub use client::{
+    AgentClient, Error as ClientError, Initialized, PermissionPolicy, StopReason, Turn, TurnEvent,
+};
 
 use std::collections::{HashMap, HashSet};
 

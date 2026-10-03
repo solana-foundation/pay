@@ -4845,7 +4845,7 @@ checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
 
 [[package]]
 name = "pay"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -4908,16 +4908,17 @@ dependencies = [
 
 [[package]]
 name = "pay-acp"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "serde",
  "serde_json",
+ "thiserror 2.0.20",
  "uuid",
 ]
 
 [[package]]
 name = "pay-api"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -4960,7 +4961,7 @@ dependencies = [
 
 [[package]]
 name = "pay-api-core"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "base64 0.22.1",
  "bincode",
@@ -4988,7 +4989,7 @@ dependencies = [
 
 [[package]]
 name = "pay-api-types"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "schemars 0.8.22",
  "serde",
@@ -4998,7 +4999,7 @@ dependencies = [
 
 [[package]]
 name = "pay-bench"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5063,19 +5064,23 @@ dependencies = [
 
 [[package]]
 name = "pay-connect"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
  "bincode",
+ "bs58",
  "clap",
+ "ed25519-dalek",
+ "futures-util",
  "hmac 0.12.1",
  "http 1.5.0",
  "jsonwebtoken 9.3.1",
  "p256",
  "pay-core",
  "pay-mcp",
+ "pay-types",
  "rand 0.8.8",
  "reqwest 0.12.28",
  "rmcp",
@@ -5094,11 +5099,12 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "uuid",
 ]
 
 [[package]]
 name = "pay-core"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -5165,7 +5171,7 @@ dependencies = [
 
 [[package]]
 name = "pay-integration"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "base64 0.22.1",
  "pay-core",
@@ -5176,7 +5182,7 @@ dependencies = [
 
 [[package]]
 name = "pay-keystore"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "bs58",
  "secret-service",
@@ -5193,7 +5199,7 @@ dependencies = [
 
 [[package]]
 name = "pay-mcp"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "base64 0.22.1",
  "crc32fast",
@@ -5219,7 +5225,7 @@ dependencies = [
 
 [[package]]
 name = "pay-pdb"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -5242,7 +5248,7 @@ dependencies = [
 
 [[package]]
 name = "pay-proxy"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5263,7 +5269,7 @@ dependencies = [
 
 [[package]]
 name = "pay-types"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "schemars 0.8.22",
  "serde",
@@ -5274,7 +5280,7 @@ dependencies = [
 
 [[package]]
 name = "pay-worker"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -6518,18 +6524,19 @@ checksum = "3582f63211428f83597b51b2ddb88e2a91a9d52d12831f9d08f5e624e8977422"
 
 [[package]]
 name = "rmcp"
-version = "1.8.0"
+version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d1f571c72940a19d9532fe52dbea8bc9912bf1d766c2970bb824056b86f3f59"
+checksum = "fae7019994ae0fe4ada40b732f798f3ff26f0f04facb1477f1bf37eb4f18a2d3"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "chrono",
  "futures",
  "http 1.5.0",
  "http-body",
  "http-body-util",
+ "indexmap 2.14.1",
  "pastey",
  "pin-project-lite",
  "rand 0.10.2",
@@ -6550,15 +6557,15 @@ dependencies = [
 
 [[package]]
 name = "rmcp-macros"
-version = "1.8.0"
+version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1aad0035b69380782d78ea95b508327e6deaa2235909053e596eea8f27b5e1d5"
+checksum = "c7e66877136e969d5a2d561ee5841b17717a0619aebd64abb47a2a2f46e34683"
 dependencies = [
- "darling 0.23.0",
+ "darling 0.24.1",
  "proc-macro2",
  "quote",
  "serde_json",
- "syn 2.0.119",
+ "syn 3.0.4",
 ]
 
 [[package]]
@@ -8646,8 +8653,8 @@ dependencies = [
 
 [[package]]
 name = "solana-pay-kit"
-version = "0.9.0"
-source = "git+https://github.com/solana-foundation/pay-kit.git?rev=85da4856fd0fb6745051f4a8cfd4bd682b9bf5e2#85da4856fd0fb6745051f4a8cfd4bd682b9bf5e2"
+version = "0.10.0"
+source = "git+https://github.com/solana-foundation/pay-kit.git?rev=262c6b9a#262c6b9a9f8b9d7b339e1ea83fe1b5a852f90ff5"
 dependencies = [
  "async-trait",
  "base64 0.22.1",

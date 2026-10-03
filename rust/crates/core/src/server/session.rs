@@ -809,34 +809,64 @@ impl SessionLifecycleRunloop {
     }
 
     async fn run(mut self) {
+        let mut accepting_commands = true;
         loop {
             if let Some((delay, close_due)) = self.next_wakeup() {
-                tokio::select! {
-                    command = self.rx.recv() => {
-                        if !self.handle_command(command).await {
-                            break;
+                if accepting_commands {
+                    tokio::select! {
+                        command = self.rx.recv() => {
+                            if command.is_some() {
+                                self.handle_command(command).await;
+                            } else {
+                                accepting_commands = false;
+                                if !self.has_unfinished_channels().await {
+                                    break;
+                                }
+                            }
+                        }
+                        _ = tokio::time::sleep(delay) => {
+                            self.run_due_work(close_due).await;
                         }
                     }
-                    _ = tokio::time::sleep(delay) => {
-                        if close_due
-                            && self.reconciliation == SessionLifecycleReconciliation::Embedded
-                        {
-                            self.reconcile_persisted_ownership().await;
-                            self.close_due_channels().await;
-                        }
-                        self.push_due_watermarks().await;
+                } else {
+                    tokio::time::sleep(delay).await;
+                    self.run_due_work(close_due).await;
+                    if !self.has_unfinished_channels().await {
+                        break;
                     }
                 }
-            } else {
+            } else if accepting_commands {
                 let command = self.rx.recv().await;
-                if !self.handle_command(command).await {
+                if command.is_some() {
+                    self.handle_command(command).await;
+                } else {
                     break;
                 }
+            } else {
+                break;
             }
         }
     }
 
-    async fn handle_command(&mut self, command: Option<SessionLifecycleCommand>) -> bool {
+    async fn run_due_work(&mut self, close_due: bool) {
+        if close_due && self.reconciliation == SessionLifecycleReconciliation::Embedded {
+            self.reconcile_persisted_ownership().await;
+            self.close_due_channels().await;
+        }
+        self.push_due_watermarks().await;
+    }
+
+    async fn has_unfinished_channels(&self) -> bool {
+        match self.runtime.channel_store.list_channels().await {
+            Ok(states) => states.into_iter().any(|state| !state.sealed),
+            Err(error) => {
+                tracing::warn!(%error, "failed to inspect detached payment-channel lifecycle");
+                true
+            }
+        }
+    }
+
+    async fn handle_command(&mut self, command: Option<SessionLifecycleCommand>) {
         match command {
             Some(SessionLifecycleCommand::Configure {
                 close_delay,
@@ -853,7 +883,6 @@ impl SessionLifecycleRunloop {
                 if reconciliation == SessionLifecycleReconciliation::Embedded {
                     self.reconcile_persisted_ownership().await;
                 }
-                true
             }
             Some(SessionLifecycleCommand::Touch {
                 channel_id,
@@ -869,7 +898,7 @@ impl SessionLifecycleRunloop {
                         )
                         .await
                         else {
-                            return true;
+                            return;
                         };
                         result
                     }
@@ -884,9 +913,8 @@ impl SessionLifecycleRunloop {
                     );
                 }
                 let _ = response.send(result);
-                true
             }
-            None => false,
+            None => {}
         }
     }
 
@@ -1067,13 +1095,23 @@ impl SessionLifecycleRunloop {
             .into_iter()
             .filter(|state| !state.sealed && state.close_requested_at.is_none())
             .filter_map(|state| {
-                state
+                let owned = state
                     .lifecycle
                     .as_ref()
-                    .filter(|lifecycle| {
-                        self.owns_lifecycle(lifecycle) && lifecycle.close_after <= now_ms
-                    })
-                    .map(|_| state.channel_id)
+                    .is_some_and(|lifecycle| self.owns_lifecycle(lifecycle));
+                let close_after = state
+                    .lifecycle
+                    .as_ref()
+                    .map(|lifecycle| lifecycle.close_after);
+                tracing::debug!(
+                    channel_id = %state.channel_id,
+                    owned,
+                    close_after,
+                    now_ms,
+                    "payment-channel idle-close check"
+                );
+                (owned && close_after.is_some_and(|close_after| close_after <= now_ms))
+                    .then_some(state.channel_id)
             })
             .collect::<Vec<_>>();
 
@@ -2290,6 +2328,53 @@ fn decode_voucher_signature(signature: &str) -> Result<[u8; 64]> {
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
+
+/// The channel payout for an operator-signed (delegated) session.
+///
+/// The operator signs the vouchers and settles the channel, and the program
+/// pays the channel's recipient, so that recipient must be the operator. The
+/// configured recipient's share moves into the distribution splits instead:
+/// whatever the explicit splits leave over, added to its own split if it
+/// already has one. A recipient that is the operator needs no change.
+pub fn delegated_session_channel_payout(
+    recipient: &str,
+    operator: &str,
+    mut splits: Vec<pay_kit::mpp::server::session::Split>,
+) -> crate::Result<(String, Vec<pay_kit::mpp::server::session::Split>)> {
+    if recipient == operator {
+        return Ok((recipient.to_string(), splits));
+    }
+
+    let recipient = solana_pubkey::Pubkey::from_str(recipient).map_err(|e| {
+        crate::Error::Config(format!(
+            "delegated session recipient is not a valid Solana pubkey: {e}"
+        ))
+    })?;
+    let explicit_bps = splits
+        .iter()
+        .try_fold(0_u16, |total, split| total.checked_add(split.bps))
+        .ok_or_else(|| {
+            crate::Error::Config("delegated session split basis points overflow".to_string())
+        })?;
+    let primary_bps = 10_000_u16
+        .checked_sub(explicit_bps)
+        .ok_or_else(|| crate::Error::Config("delegated session splits exceed 100%".to_string()))?;
+
+    if let Some(existing) = splits.iter_mut().find(|split| split.recipient == recipient) {
+        existing.bps = existing.bps.checked_add(primary_bps).ok_or_else(|| {
+            crate::Error::Config(
+                "delegated session recipient split basis points overflow".to_string(),
+            )
+        })?;
+    } else {
+        splits.push(pay_kit::mpp::server::session::Split {
+            recipient,
+            bps: primary_bps,
+        });
+    }
+
+    Ok((operator.to_string(), splits))
+}
 
 #[cfg(test)]
 mod tests {

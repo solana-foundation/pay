@@ -10,9 +10,9 @@
 //!    at [`MAX_BODY_BYTES`]) so it can be replayed.
 //! 2. When the upstream answers `402 Payment Required`, the proxy satisfies
 //!    the configured payment protocol and retries the buffered request once.
-//!    Hosted inference routes can require an MPP delegated session; the
-//!    resulting channel authorization is cached for the lifetime of the agent
-//!    process so subsequent completions do not create new on-chain payments.
+//!    Stateful MPP sessions and client-signed x402 batch-settlement channels
+//!    are cached for the lifetime of the agent process so subsequent
+//!    completions can reuse them.
 //! 3. Response bodies stream back ([`Body::from_stream`]).
 //! 4. If payment fails for any reason (mainnet challenge under
 //!    `--sandbox`, insufficient funds, signer errors, …) the original 402
@@ -76,7 +76,7 @@ pub struct PayerProxy {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PaymentProtocol {
     /// Preserve the generic payer behavior: MPP charge first, then x402
-    /// `upto`, then x402 `exact`.
+    /// `upto`, `batch-settlement`, then `exact`.
     Auto,
     /// Require a delegated MPP session and never fall back to x402.
     MppSession,
@@ -127,6 +127,14 @@ struct PayerState {
     /// requests because the server reserves a session's remaining capacity
     /// while it meters a response.
     session_authorization: Arc<tokio::sync::Mutex<Option<String>>>,
+    /// Batch vouchers advance a shared cumulative watermark. Serialize each
+    /// challenge/retry cycle so concurrent agent requests cannot sign the same
+    /// next watermark before either response confirms it.
+    batch_payment_lock: Arc<tokio::sync::Mutex<()>>,
+    batch_channels: pay_core::client::batch::BatchChannelCache,
+    /// Shared in-process Payment Debugger, present under `pay --debugger`.
+    /// Logging directly avoids buffering SSE through the debugger forwarder.
+    pdb: Option<pay_pdb::PdbState>,
     session_opener: SessionOpener,
     client: reqwest::Client,
     store: Arc<dyn AccountsStore>,
@@ -181,6 +189,9 @@ impl PayerState {
             require_payment: upstream.require_payment,
             payment_protocol: upstream.payment_protocol,
             session_authorization: Arc::new(tokio::sync::Mutex::new(None)),
+            batch_payment_lock: Arc::new(tokio::sync::Mutex::new(())),
+            batch_channels: pay_core::client::batch::BatchChannelCache::new(),
+            pdb: crate::debugger_proxy::pdb_state(),
             session_opener: build_session_authorization,
             client,
             store,
@@ -193,6 +204,12 @@ impl PayerState {
     #[cfg(test)]
     fn with_session_opener(mut self, session_opener: SessionOpener) -> Self {
         self.session_opener = session_opener;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_pdb(mut self, pdb: pay_pdb::PdbState) -> Self {
+        self.pdb = Some(pdb);
         self
     }
 }
@@ -556,6 +573,7 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
         .cloned()
         .collect();
 
+    let mut batch_payment_guard = None;
     let payment = if state.payment_protocol == PaymentProtocol::MppSession {
         let Some(challenge) = mpp_challenges.into_iter().find(|challenge| {
             challenge.method.as_str() == "solana" && challenge.intent.as_str() == "session"
@@ -569,13 +587,18 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
         };
         let state = state.clone();
         tokio::task::spawn_blocking(move || {
-            (state.session_opener)(&state, &challenge)
-                .map(|(payment, authorization)| (payment, Some(authorization)))
+            (state.session_opener)(&state, &challenge).map(|(headers, authorization)| {
+                PreparedPayment {
+                    headers,
+                    new_session_authorization: Some(authorization),
+                    batch_settlement: None,
+                }
+            })
         })
         .await
     } else if !charge_challenges.is_empty() {
         // Scheme precedence in auto mode: MPP charge first, then x402 upto,
-        // then x402 exact.
+        // batch-settlement, and finally exact.
         // `select_challenge_by_balance` / `build_credential` spin their own
         // runtimes and may block on RPC + signing — keep them off the async
         // workers.
@@ -583,7 +606,7 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
         let resource_url = url.clone();
         tokio::task::spawn_blocking(move || {
             build_payment_authorization(&state, &charge_challenges, &resource_url)
-                .map(|payment| (payment, None))
+                .map(PreparedPayment::stateless)
         })
         .await
     } else if let Some(upto) = parse_upto_challenge(&resp_headers, &resp_body) {
@@ -592,7 +615,19 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
         let state = state.clone();
         let resource_url = url.clone();
         tokio::task::spawn_blocking(move || {
-            build_upto_authorization(&state, &upto, &resource_url).map(|payment| (payment, None))
+            build_upto_authorization(&state, &upto, &resource_url).map(PreparedPayment::stateless)
+        })
+        .await
+    } else if let Some(batch) = parse_batch_challenge(&resp_headers, &resp_body) {
+        // Keep the proxy aligned with the shared 402 classifier: a reusable
+        // batch-settlement channel is preferred to a one-shot exact transfer.
+        // Hold the lock through the paid response so its confirmed cumulative
+        // watermark is visible before another request signs the next voucher.
+        batch_payment_guard = Some(state.batch_payment_lock.clone().lock_owned().await);
+        let state = state.clone();
+        let resource_url = url.clone();
+        tokio::task::spawn_blocking(move || {
+            build_batch_authorization(&state, &batch, &resource_url)
         })
         .await
     } else if let Some(exact) = parse_exact_challenge(&resp_headers, &resp_body) {
@@ -602,7 +637,7 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
         let state = state.clone();
         let resource_url = url.clone();
         tokio::task::spawn_blocking(move || {
-            build_exact_authorization(&state, &exact, &resource_url).map(|payment| (payment, None))
+            build_exact_authorization(&state, &exact, &resource_url).map(PreparedPayment::stateless)
         })
         .await
     } else {
@@ -610,7 +645,7 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
         return buffered_response(status, &resp_headers, resp_body);
     };
 
-    let (payment, new_session_authorization) = match payment {
+    let payment = match payment {
         Ok(Ok(payment)) => payment,
         Ok(Err(e)) => {
             tracing::warn!(%url, error = %e, "payer proxy: could not pay 402 — passing it through");
@@ -622,8 +657,105 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
         }
     };
     tracing::info!(%url, "payer proxy: 402 paid — retrying once with payment credential");
-    match send_upstream(&state, &method, &url, &headers, body, Some(&payment)).await {
+    match send_upstream(
+        &state,
+        &method,
+        &url,
+        &headers,
+        body.clone(),
+        Some(&payment.headers),
+    )
+    .await
+    {
         Ok(retry) => {
+            // A lost settlement receipt can leave the server one watermark
+            // ahead of us. Batch corrective 402s carry a signed proof of the
+            // accepted state; adopt it and rebuild once. This also lets the
+            // rebuilt payment choose `deposit` (top-up) when the corrected
+            // cumulative no longer fits in the funded channel.
+            if retry.status() == StatusCode::PAYMENT_REQUIRED && payment.batch_settlement.is_some()
+            {
+                let retry_headers = retry.headers().clone();
+                let retry_body = match retry.bytes().await {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        tracing::warn!(%url, %error, "payer proxy: failed to read batch corrective 402");
+                        return buffered_response(status, &resp_headers, resp_body);
+                    }
+                };
+                if let Some(corrective) = parse_batch_challenge(&retry_headers, &retry_body)
+                    && corrective.error.is_some()
+                    && state
+                        .batch_channels
+                        .adopt_corrective(&corrective.requirements)
+                        .is_ok_and(|adopted| adopted.is_some())
+                {
+                    tracing::info!(%url, "payer proxy: adopted batch-settlement corrective state — rebuilding payment");
+                    let retry_state = state.clone();
+                    let retry_resource_url = url.clone();
+                    let corrected_payment = tokio::task::spawn_blocking(move || {
+                        build_batch_authorization(&retry_state, &corrective, &retry_resource_url)
+                    })
+                    .await;
+                    let corrected_payment = match corrected_payment {
+                        Ok(Ok(payment)) => payment,
+                        Ok(Err(error)) => {
+                            tracing::warn!(%url, %error, "payer proxy: could not rebuild corrected batch payment");
+                            drop(batch_payment_guard.take());
+                            return buffered_response(
+                                StatusCode::PAYMENT_REQUIRED,
+                                &retry_headers,
+                                retry_body,
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!(%url, %error, "payer proxy: corrected batch payment task failed");
+                            drop(batch_payment_guard.take());
+                            return buffered_response(
+                                StatusCode::PAYMENT_REQUIRED,
+                                &retry_headers,
+                                retry_body,
+                            );
+                        }
+                    };
+                    let corrected_retry = send_upstream(
+                        &state,
+                        &method,
+                        &url,
+                        &headers,
+                        body,
+                        Some(&corrected_payment.headers),
+                    )
+                    .await;
+                    let corrected_retry = match corrected_retry {
+                        Ok(response) => response,
+                        Err(error) => {
+                            tracing::warn!(%url, %error, "payer proxy: corrected batch retry failed");
+                            drop(batch_payment_guard.take());
+                            return buffered_response(
+                                StatusCode::PAYMENT_REQUIRED,
+                                &retry_headers,
+                                retry_body,
+                            );
+                        }
+                    };
+                    if corrected_retry.status() != StatusCode::PAYMENT_REQUIRED
+                        && let Some(batch) = corrected_payment.batch_settlement.as_ref()
+                    {
+                        apply_batch_settlement(&state, batch, corrected_retry.headers());
+                    }
+                    drop(batch_payment_guard.take());
+                    return deliver(corrected_retry, translated, session_authorization.take())
+                        .await;
+                }
+                drop(batch_payment_guard.take());
+                return buffered_response(StatusCode::PAYMENT_REQUIRED, &retry_headers, retry_body);
+            }
+            if retry.status() != StatusCode::PAYMENT_REQUIRED
+                && let Some(batch) = payment.batch_settlement.as_ref()
+            {
+                apply_batch_settlement(&state, batch, retry.headers());
+            }
             // Only adopt the new credential once a request has actually gone
             // through on it. Caching it before this point risks stranding a
             // credential for a channel whose open transaction never landed
@@ -636,10 +768,11 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
                 }
             } else if let (Some(cache), Some(authorization)) = (
                 session_authorization.as_mut(),
-                new_session_authorization.as_ref(),
+                payment.new_session_authorization.as_ref(),
             ) {
                 **cache = Some(authorization.clone());
             }
+            drop(batch_payment_guard.take());
             deliver(retry, translated, session_authorization.take()).await
         }
         Err(e) => {
@@ -651,6 +784,28 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
             // may never have opened.
             tracing::warn!(%url, error = %e, "payer proxy: paid retry failed — preserving the prior session and returning the original 402");
             buffered_response(status, &resp_headers, resp_body)
+        }
+    }
+}
+
+fn apply_batch_settlement(state: &PayerState, batch: &BatchSettlementAttempt, headers: &HeaderMap) {
+    let response_headers = header_pairs(headers);
+    match state.batch_channels.apply_settlement_from_headers(
+        &batch.requirements,
+        &batch.submission,
+        &response_headers,
+    ) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            if let Err(error) = state
+                .batch_channels
+                .reserve_authorization_without_receipt(&batch.requirements, &batch.submission)
+            {
+                tracing::warn!(%error, "payer proxy: batch-settlement response had no receipt and its authorization ceiling could not be reserved");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "payer proxy: batch-settlement receipt not adopted; the next request will retry the same authorization");
         }
     }
 }
@@ -735,17 +890,19 @@ fn parse_upto_challenge(
     resp_headers: &HeaderMap,
     resp_body: &Bytes,
 ) -> Option<pay_core::client::x402::UptoChallenge> {
-    let headers: Vec<(String, String)> = resp_headers
-        .iter()
-        .filter_map(|(name, value)| {
-            value
-                .to_str()
-                .ok()
-                .map(|value| (name.as_str().to_string(), value.to_string()))
-        })
-        .collect();
+    let headers = header_pairs(resp_headers);
     let body = std::str::from_utf8(resp_body).ok();
     pay_core::client::x402::parse_upto(&headers, body)
+}
+
+/// Parse an x402 `batch-settlement` challenge before the lenient exact parser.
+fn parse_batch_challenge(
+    resp_headers: &HeaderMap,
+    resp_body: &Bytes,
+) -> Option<pay_core::client::x402::BatchChallenge> {
+    let headers = header_pairs(resp_headers);
+    let body = std::str::from_utf8(resp_body).ok();
+    pay_core::client::x402::parse_batch(&headers, body)
 }
 
 /// Parse an x402 `exact` challenge after the preferred `upto` parser has had
@@ -755,7 +912,13 @@ fn parse_exact_challenge(
     resp_headers: &HeaderMap,
     resp_body: &Bytes,
 ) -> Option<pay_core::client::x402::Challenge> {
-    let headers: Vec<(String, String)> = resp_headers
+    let headers = header_pairs(resp_headers);
+    let body = std::str::from_utf8(resp_body).ok();
+    pay_core::client::x402::parse(&headers, body)
+}
+
+fn header_pairs(headers: &HeaderMap) -> Vec<(String, String)> {
+    headers
         .iter()
         .filter_map(|(name, value)| {
             value
@@ -763,9 +926,7 @@ fn parse_exact_challenge(
                 .ok()
                 .map(|value| (name.as_str().to_string(), value.to_string()))
         })
-        .collect();
-    let body = std::str::from_utf8(resp_body).ok();
-    pay_core::client::x402::parse(&headers, body)
+        .collect()
 }
 
 /// Normalize newer OpenAI Chat Completions fields for broadly compatible
@@ -969,6 +1130,27 @@ struct PaidHeaders {
     headers: Vec<(String, String)>,
 }
 
+struct PreparedPayment {
+    headers: PaidHeaders,
+    new_session_authorization: Option<String>,
+    batch_settlement: Option<BatchSettlementAttempt>,
+}
+
+impl PreparedPayment {
+    fn stateless(headers: PaidHeaders) -> Self {
+        Self {
+            headers,
+            new_session_authorization: None,
+            batch_settlement: None,
+        }
+    }
+}
+
+struct BatchSettlementAttempt {
+    requirements: pay_core::client::batch::Requirements,
+    submission: pay_core::client::batch::Submission,
+}
+
 impl PaidHeaders {
     /// The MPP charge credential goes into `Authorization: Payment …`.
     fn mpp(credential: String) -> Self {
@@ -1104,8 +1286,71 @@ fn build_upto_authorization(
     Ok(PaidHeaders::x402(built.headers))
 }
 
+/// Build a stateful x402 batch-settlement payment and retain the submitted
+/// voucher so the paid response can advance the shared channel watermark.
+fn build_batch_authorization(
+    state: &PayerState,
+    challenge: &pay_core::client::x402::BatchChallenge,
+    resource_url: &str,
+) -> pay_core::Result<PreparedPayment> {
+    if let Some(cap) = state.per_request_cap_base_units {
+        let amount: u128 = challenge.requirements.amount.parse().map_err(|_| {
+            pay_core::Error::Mpp(format!(
+                "x402 batch-settlement challenge advertised a non-numeric amount: {}",
+                challenge.requirements.amount
+            ))
+        })?;
+        if amount > cap {
+            return Err(pay_core::Error::Mpp(format!(
+                "x402 batch-settlement amount {amount} (base units of {}) exceeds the payer's per-request budget {cap}",
+                challenge.requirements.asset
+            )));
+        }
+    }
+
+    // The proxy owns channel lifecycle across model requests. Recover public
+    // on-chain state before the builder decides whether this request is a
+    // steady-state authorization or requires an escrow top-up.
+    pay_core::client::x402::recover_batch_channel(
+        challenge,
+        state.store.as_ref(),
+        &state.batch_channels,
+        state.network_override.as_deref(),
+        state.account_override.as_deref(),
+    )?;
+
+    let built = pay_core::client::x402::build_batch_payment(
+        challenge,
+        state.store.as_ref(),
+        &state.batch_channels,
+        None,
+        state.network_override.as_deref(),
+        state.account_override.as_deref(),
+        Some(resource_url),
+        None,
+    )?;
+
+    if let Some(resolved) = built.payment.ephemeral_notice {
+        tracing::info!(
+            network = %resolved.network,
+            pubkey = resolved.account.pubkey.as_deref().unwrap_or("(unknown)"),
+            "payer proxy: generated ephemeral wallet"
+        );
+    }
+
+    Ok(PreparedPayment {
+        headers: PaidHeaders::x402(built.payment.headers),
+        new_session_authorization: None,
+        batch_settlement: Some(BatchSettlementAttempt {
+            requirements: challenge.requirements.clone(),
+            submission: built.submission,
+        }),
+    })
+}
+
 /// Sign a one-shot x402 `exact` payment and return its retry headers. This is
-/// the final auto-mode fallback after MPP charge and x402 `upto`.
+/// the final auto-mode fallback after MPP charge, x402 `upto`, and
+/// `batch-settlement`.
 fn build_exact_authorization(
     state: &PayerState,
     challenge: &pay_core::client::x402::Challenge,
@@ -1156,6 +1401,7 @@ async fn send_upstream(
     body: Bytes,
     payment: Option<&PaidHeaders>,
 ) -> reqwest::Result<reqwest::Response> {
+    let started = std::time::Instant::now();
     let mut fwd = HeaderMap::new();
     for (name, value) in headers {
         if is_hop_by_hop_request_header(name.as_str()) {
@@ -1181,13 +1427,58 @@ async fn send_upstream(
         }
     }
 
-    state
+    let pdb_request_headers = state.pdb.as_ref().map(|_| pdb_header_map(&fwd));
+    let result = state
         .client
         .request(method.clone(), url)
         .headers(fwd)
         .body(body)
         .send()
-        .await
+        .await;
+
+    if let (Some(pdb), Some(req_headers)) = (&state.pdb, pdb_request_headers) {
+        let (status, res_headers, res_body) = match &result {
+            Ok(response) => (
+                response.status().as_u16(),
+                pdb_header_map(response.headers()),
+                None,
+            ),
+            Err(error) => (
+                StatusCode::BAD_GATEWAY.as_u16(),
+                std::collections::HashMap::new(),
+                Some(error.to_string()),
+            ),
+        };
+        let entry = pay_pdb::types::LogEntry {
+            id: pdb.next_log_id(),
+            ts: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            method: method.to_string(),
+            path: url.to_string(),
+            status,
+            ms: started.elapsed().as_millis() as u64,
+            req_headers,
+            res_headers,
+            res_body,
+            client_ip: "payer-proxy".to_string(),
+        };
+        if let Ok(mut correlation) = pdb.correlation.lock() {
+            correlation.ingest(entry);
+        }
+    }
+
+    result
+}
+
+fn pdb_header_map(headers: &HeaderMap) -> std::collections::HashMap<String, String> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_ascii_lowercase(), value.to_string()))
+        })
+        .collect()
 }
 
 /// Stream an upstream response back to the client without buffering —
@@ -1460,6 +1751,33 @@ mod tests {
         base64::engine::general_purpose::STANDARD.encode(envelope.to_string().as_bytes())
     }
 
+    /// A mixed offer like BlockRun's: both exact and batch-settlement are
+    /// valid, but the payer must choose the reusable batch channel.
+    fn exact_and_batch_challenge_header(amount: &str) -> String {
+        use base64::Engine;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(exact_challenge_header(amount))
+            .unwrap();
+        let mut envelope: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+        envelope["accepts"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "scheme": "batch-settlement",
+                "network": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                "amount": amount,
+                "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                "payTo": "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY",
+                "maxTimeoutSeconds": 300,
+                "extra": {
+                    "feePayer": "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
+                    "withdrawDelay": 3600,
+                    "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+                }
+            }));
+        base64::engine::general_purpose::STANDARD.encode(envelope.to_string().as_bytes())
+    }
+
     async fn spawn_server(app: Router) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1586,6 +1904,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn payer_proxy_records_upstream_payment_challenge_in_pdb() {
+        use base64::Engine;
+        let required = base64::engine::general_purpose::STANDARD.encode(
+            serde_json::json!({
+                "x402Version": 2,
+                "accepts": []
+            })
+            .to_string(),
+        );
+        let upstream = spawn_server(Router::new().fallback(any(move || {
+            let required = required.clone();
+            async move {
+                (
+                    StatusCode::PAYMENT_REQUIRED,
+                    [("payment-required", required)],
+                    "payment required",
+                )
+            }
+        })))
+        .await;
+        let pdb = pay_pdb::PdbState::new(serde_json::json!({}));
+        let store: Arc<dyn AccountsStore> = Arc::new(MemoryAccountsStore::new());
+        let state = Arc::new(
+            PayerState::new(
+                PayerUpstream {
+                    base_url: upstream,
+                    host_header: None,
+                    dialect: Dialect::OpenAiCompat,
+                    chat_path: "api/v1/chat/completions".to_string(),
+                    responses_path: "v1/responses".to_string(),
+                    require_payment: false,
+                    payment_protocol: PaymentProtocol::Auto,
+                },
+                store,
+                None,
+                None,
+            )
+            .unwrap()
+            .with_pdb(pdb.clone()),
+        );
+        let payer = spawn_server(router(state)).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("{payer}/v1/chat/completions"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+
+        let flows = pdb.correlation.lock().unwrap().snapshot();
+        assert_eq!(flows.len(), 1);
+        assert!(matches!(flows[0].protocol, pay_pdb::types::Protocol::X402));
+        assert_eq!(flows[0].status, pay_pdb::types::FlowStatus::PaymentRequired);
+        assert!(flows[0].resource.ends_with("/api/v1/chat/completions"));
+    }
+
+    #[tokio::test]
     async fn direct_openai_responses_uses_declared_provider_path() {
         let upstream = spawn_server(Router::new().route(
             "/v1/responses",
@@ -1623,6 +1999,23 @@ mod tests {
         assert_eq!(
             challenge.requirements.resource,
             "http://127.0.0.1/v1/messages"
+        );
+    }
+
+    #[test]
+    fn parses_batch_from_mixed_exact_and_batch_offer() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "payment-required",
+            HeaderValue::from_str(&exact_and_batch_challenge_header("1000")).unwrap(),
+        );
+
+        let challenge = parse_batch_challenge(&headers, &Bytes::new()).unwrap();
+        assert_eq!(challenge.requirements.scheme, "batch-settlement");
+        assert_eq!(challenge.requirements.amount, "1000");
+        assert!(
+            parse_exact_challenge(&headers, &Bytes::new()).is_some(),
+            "the exact fallback also parses, so branch order enforces batch preference"
         );
     }
 
@@ -1885,8 +2278,8 @@ mod tests {
         );
     }
 
-    /// Stub that offers only x402 `exact`, matching BlockRun's payment
-    /// protocol, then accepts the signed retry.
+    /// Stub that offers only x402 `exact`, covering the final fallback, then
+    /// accepts the signed retry.
     fn exact_stub(seen: Arc<Mutex<StubSeen>>, amount: &'static str) -> Router {
         Router::new().fallback(any(move |req: Request| {
             let seen = seen.clone();

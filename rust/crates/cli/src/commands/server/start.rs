@@ -1157,44 +1157,13 @@ fn resolve_session_splits(
     Ok(splits)
 }
 
+/// See [`pay_core::server::session::delegated_session_channel_payout`].
 fn delegated_session_channel_payout(
     recipient: &str,
     operator: &str,
-    mut splits: Vec<pay_kit::mpp::server::session::Split>,
+    splits: Vec<pay_kit::mpp::server::session::Split>,
 ) -> pay_core::Result<(String, Vec<pay_kit::mpp::server::session::Split>)> {
-    if recipient == operator {
-        return Ok((recipient.to_string(), splits));
-    }
-
-    let recipient = solana_pubkey::Pubkey::from_str(recipient).map_err(|e| {
-        pay_core::Error::Config(format!(
-            "delegated session recipient is not a valid Solana pubkey: {e}"
-        ))
-    })?;
-    let explicit_bps = splits
-        .iter()
-        .try_fold(0_u16, |total, split| total.checked_add(split.bps))
-        .ok_or_else(|| {
-            pay_core::Error::Config("delegated session split basis points overflow".to_string())
-        })?;
-    let primary_bps = 10_000_u16.checked_sub(explicit_bps).ok_or_else(|| {
-        pay_core::Error::Config("delegated session splits exceed 100%".to_string())
-    })?;
-
-    if let Some(existing) = splits.iter_mut().find(|split| split.recipient == recipient) {
-        existing.bps = existing.bps.checked_add(primary_bps).ok_or_else(|| {
-            pay_core::Error::Config(
-                "delegated session recipient split basis points overflow".to_string(),
-            )
-        })?;
-    } else {
-        splits.push(pay_kit::mpp::server::session::Split {
-            recipient,
-            bps: primary_bps,
-        });
-    }
-
-    Ok((operator.to_string(), splits))
+    pay_core::server::session::delegated_session_channel_payout(recipient, operator, splits)
 }
 
 fn account_env_var(account: &str) -> Option<&str> {

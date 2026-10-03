@@ -83,6 +83,7 @@ struct BatchHandle {
     voucher_key: SigningKey,
     base: u64,
     charged_cumulative: u64,
+    deposit: u64,
 }
 
 /// Per-channel signing state shared between the background signer thread
@@ -593,6 +594,7 @@ impl BenchScheme for BatchSettlement {
                 voucher_key,
                 base,
                 charged_cumulative,
+                deposit: reused.deposit,
             };
             self.handles.lock().unwrap().insert(ctx.index, handle);
             return Ok(UserSetup {
@@ -633,6 +635,7 @@ impl BenchScheme for BatchSettlement {
             // The deposit's first voucher already charged one `base`; the
             // steady-state stream continues monotonically above it.
             charged_cumulative: terms.amount,
+            deposit: self.deposit_base,
         };
         let setup = UserSetup {
             channel_id: Some(channel_id.clone()),
@@ -739,6 +742,7 @@ impl BenchScheme for BatchSettlement {
                 config: handle.config,
                 requirements: handle.requirements,
                 cumulative: handle.charged_cumulative,
+                deposit: handle.deposit,
                 base: handle.base,
                 method: ctx.endpoint.method.clone(),
                 url: ctx.endpoint.url.clone(),
@@ -788,6 +792,7 @@ impl BenchScheme for BatchSettlement {
             config: handle.config,
             requirements: handle.requirements,
             cumulative: handle.charged_cumulative,
+            deposit: handle.deposit,
             base: handle.base,
             method: ctx.endpoint.method.clone(),
             url: ctx.endpoint.url.clone(),
@@ -962,6 +967,7 @@ struct BatchSource {
     /// meaningful in the direct/presigned paths (no `state`) — background-signer
     /// mode tracks this in the shared `state` instead.
     cumulative: u64,
+    deposit: u64,
     base: u64,
     method: String,
     url: String,
@@ -1062,8 +1068,12 @@ impl RequestSource for BatchSource {
         let Some(corrective) = corrective_requirements_from_challenge(status, header) else {
             return;
         };
-        let mut proof_channel =
-            BatchChannel::new(self.channel_id, self.config.clone(), self.cumulative, 0);
+        let mut proof_channel = BatchChannel::new(
+            self.channel_id,
+            self.config.clone(),
+            self.cumulative,
+            self.deposit,
+        );
         let corrected = match proof_channel.adopt_corrective_state(&corrective) {
             Ok(corrected) => corrected,
             Err(error) => {
@@ -1203,6 +1213,7 @@ mod tests {
                 voucher_signer: None,
                 operator: None,
                 max_idle_secs: None,
+                min_deposit: None,
                 channel_state: None,
                 voucher_state: None,
             },
@@ -1224,6 +1235,7 @@ mod tests {
             config,
             requirements,
             cumulative: 12,
+            deposit: 5_000_000,
             base: 1,
             method: "GET".to_string(),
             url: "https://example.test".to_string(),
@@ -1316,6 +1328,7 @@ mod tests {
                 voucher_signer: None,
                 operator: None,
                 max_idle_secs: None,
+                min_deposit: None,
                 channel_state: None,
                 voucher_state: None,
             },

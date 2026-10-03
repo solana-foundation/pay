@@ -58,7 +58,7 @@ impl AcpHarness {
         }
     }
 
-    fn adapter_program(self) -> &'static str {
+    pub(crate) fn adapter_program(self) -> &'static str {
         match self {
             Self::Goose => "goose",
             Self::Claude => "claude-agent-acp",
@@ -66,7 +66,7 @@ impl AcpHarness {
         }
     }
 
-    fn install_hint(self) -> &'static str {
+    pub(crate) fn install_hint(self) -> &'static str {
         match self {
             Self::Goose => {
                 "Install Goose: https://block.github.io/goose/docs/getting-started/installation"
@@ -239,7 +239,7 @@ fn codex_acp_env(
 }
 
 #[cfg(not(windows))]
-fn adapter_command(harness: AcpHarness) -> Command {
+pub(crate) fn adapter_command(harness: AcpHarness) -> Command {
     Command::new(harness.adapter_program())
 }
 
@@ -247,7 +247,7 @@ fn adapter_command(harness: AcpHarness) -> Command {
 // cmd.exe while keeping stdin/stdout inherited so ACP JSON-RPC remains
 // transparent. Goose is a native executable and does not need the shell.
 #[cfg(windows)]
-fn adapter_command(harness: AcpHarness) -> Command {
+pub(crate) fn adapter_command(harness: AcpHarness) -> Command {
     if harness == AcpHarness::Goose {
         return Command::new(harness.adapter_program());
     }

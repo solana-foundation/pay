@@ -32,6 +32,8 @@ pub mod oauth;
 #[cfg(feature = "privy")]
 pub mod privy;
 pub mod protocol;
+#[cfg(feature = "sell")]
+pub mod sell;
 #[cfg(feature = "mcp")]
 pub mod tenants;
 #[cfg(feature = "mcp")]
@@ -64,6 +66,9 @@ pub struct AppState {
     /// Answers "does this wallet hold anything to pay with" after a sign-in.
     #[cfg(feature = "mcp")]
     wallet_probe: Arc<dyn WalletProbe>,
+    /// `sell_inference` endpoints; `None` until an operator is configured.
+    #[cfg(feature = "sell")]
+    sell: Option<Arc<sell::Operator>>,
 }
 
 /// Whether a wallet holds any stablecoin, asked after a sign-in to decide
@@ -204,7 +209,16 @@ impl AppState {
             privy: None,
             #[cfg(feature = "mcp")]
             wallet_probe: Arc::new(PayApiProbe),
+            #[cfg(feature = "sell")]
+            sell: None,
         }
+    }
+
+    /// Serve `sell_inference` endpoints, signed for by `operator`.
+    #[cfg(feature = "sell")]
+    pub fn with_sell(mut self, operator: sell::Operator) -> Self {
+        self.sell = Some(Arc::new(operator));
+        self
     }
 
     /// Decide "empty wallet" differently (tests).
@@ -361,10 +375,31 @@ pub fn router(state: AppState) -> Router {
             ) as Arc<dyn pay_mcp::PayContext>,
         )
     });
+    #[cfg(feature = "sell")]
+    let sell = state.sell.clone().map(|operator| {
+        let creators: Arc<dyn sell::routes::CreatorAuth> = Arc::new(Creators {
+            cli: state.cli.clone(),
+            tenants: state.tenants.clone(),
+            mcp: state.mcp.clone().map(|cfg| mcp::Auth {
+                cfg,
+                oauth: state.oauth.clone(),
+            }),
+        });
+        Arc::new(sell::SellState::new(
+            operator,
+            state.public_url.clone(),
+            creators,
+        ))
+    });
     let router = router.with_state(state);
     #[cfg(feature = "mcp")]
     let router = match mcp {
         Some((auth, context)) => router.merge(mcp::router(auth, context)),
+        None => router,
+    };
+    #[cfg(feature = "sell")]
+    let router = match sell {
+        Some(sell) => router.merge(sell::router(sell)),
         None => router,
     };
     // Hosts and their browsers call the OAuth endpoints cross-origin;
@@ -392,6 +427,31 @@ pub fn router(state: AppState) -> Router {
         ])
         .max_age(std::time::Duration::from_secs(600));
     router.fallback(get(not_found)).layer(cors)
+}
+
+/// Who may create a `sell_inference` endpoint: a linked CLI's token, or a
+/// connector bearer. Either way the tenant's wallet is the default payee.
+#[cfg(feature = "sell")]
+struct Creators {
+    cli: Arc<cli::Store>,
+    tenants: Arc<tenants::TenantRegistry>,
+    mcp: Option<mcp::Auth>,
+}
+
+#[cfg(feature = "sell")]
+impl sell::routes::CreatorAuth for Creators {
+    fn authenticate(&self, bearer: &str) -> Option<sell::routes::Creator> {
+        let subject = self
+            .cli
+            .authenticate(bearer)
+            .or_else(|| self.mcp.as_ref()?.authenticate(bearer).map(|t| t.id))?;
+        let wallet = self
+            .tenants
+            .get(&subject)
+            .filter(|t| !t.pubkey.is_empty())
+            .map(|t| t.pubkey.clone());
+        Some(sell::routes::Creator { subject, wallet })
+    }
 }
 
 async fn health() -> axum::Json<serde_json::Value> {

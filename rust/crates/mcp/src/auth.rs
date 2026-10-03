@@ -31,8 +31,8 @@ use std::time::Duration;
 use pay_keystore::{AuthGate, AuthIntent, Error as KeystoreError};
 use rmcp::Peer;
 use rmcp::model::{
-    CreateElicitationRequestParams, CreateElicitationResult, ElicitationAction, ElicitationSchema,
-    EnumSchema,
+    ElicitRequestParams as CreateElicitationRequestParams, ElicitResult as CreateElicitationResult,
+    ElicitationAction, ElicitationSchema, EnumSchema,
 };
 use rmcp::service::RoleServer;
 use tokio::runtime::Handle;
@@ -76,6 +76,7 @@ pub async fn confirm_file_upload(
         }
         ElicitationAction::Decline => Err("The user declined to send the local file.".to_string()),
         ElicitationAction::Cancel => Err("The user cancelled sending the local file.".to_string()),
+        _ => Err("The MCP client returned an unsupported approval action.".to_string()),
     }
 }
 
@@ -154,6 +155,7 @@ fn interpret_hardware_account_choice(
         }
         ElicitationAction::Decline => Err("The user declined to choose a wallet.".to_string()),
         ElicitationAction::Cancel => Err("The user cancelled wallet selection.".to_string()),
+        _ => Err("The MCP client returned an unsupported wallet action.".to_string()),
     }
 }
 
@@ -262,6 +264,9 @@ fn interpret_elicitation_outcome(
             )),
             ElicitationAction::Cancel => Err(KeystoreError::AuthDenied(
                 "user cancelled the request via the MCP client".to_string(),
+            )),
+            _ => Err(KeystoreError::AuthDenied(
+                "MCP client returned an unsupported elicitation action".to_string(),
             )),
         },
         Err(err) => Err(KeystoreError::AuthDenied(format!(
@@ -460,10 +465,10 @@ mod tests {
         action: ElicitationAction,
         content: Option<serde_json::Value>,
     ) -> CreateElicitationResult {
-        CreateElicitationResult {
-            action,
-            content,
-            meta: None,
+        let result = CreateElicitationResult::new(action);
+        match content {
+            Some(content) => result.with_content(content),
+            None => result,
         }
     }
 
