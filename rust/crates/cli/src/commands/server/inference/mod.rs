@@ -1320,7 +1320,12 @@ models:
                 .as_ref()
                 .and_then(|headers| headers.get("payment-response"))
                 .map(String::as_str),
-            Some("receipt-signature")
+            Some("[REDACTED]")
+        );
+        assert!(
+            !serde_json::to_string(&flows[0])
+                .unwrap()
+                .contains("receipt-signature")
         );
     }
 
