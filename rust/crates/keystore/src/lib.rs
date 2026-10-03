@@ -7,6 +7,8 @@
 //! The `Keystore` struct composes them with shared logic (keypair validation, pubkey separation).
 
 pub mod auth;
+#[cfg(any(test, target_os = "macos"))]
+mod bounded_process;
 mod error;
 pub mod store;
 

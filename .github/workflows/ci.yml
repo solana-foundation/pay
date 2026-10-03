@@ -87,6 +87,22 @@ jobs:
           key: check-windows
       - run: cargo check -p pay --features ledger
 
+  # The Touch ID gate is cfg(macos), so Linux Rust jobs cannot compile or test it.
+  macos-keystore-test:
+    name: macOS keystore tests
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: ./rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: keystore-macos
+      - run: cargo test -p pay-keystore
+
   # ── Rust tests + coverage ──
   rust-test:
     name: Rust tests + coverage
