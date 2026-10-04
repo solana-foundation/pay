@@ -297,6 +297,26 @@ impl FlowCorrelation {
         let _ = self.tx.send(SseMessage::FlowUpdated { flow: flow.clone() });
     }
 
+    /// Attach a payer-owned channel snapshot after local settlement tracking.
+    /// This covers streaming x402 providers that omit `PAYMENT-RESPONSE`: the
+    /// HTTP capture still identifies the channel, while the payer cache is the
+    /// authoritative source for its funded and reserved amounts.
+    pub fn enrich_payment_channel(&mut self, incoming: PaymentDetails) {
+        let Some(channel_id) = incoming.channel_id.as_deref() else {
+            return;
+        };
+        let Some(flow) = self.flows.iter_mut().rfind(|flow| {
+            flow.payment
+                .as_ref()
+                .and_then(|payment| payment.channel_id.as_deref())
+                == Some(channel_id)
+        }) else {
+            return;
+        };
+        flow.payment = merge_payment_details(flow.payment.take(), Some(incoming));
+        let _ = self.tx.send(SseMessage::FlowUpdated { flow: flow.clone() });
+    }
+
     /// Enrich the newest matching flow after a proxied response body finishes
     /// streaming. This keeps token accounting off the hot path: callers can
     /// forward chunks immediately and submit only a bounded response tail.
@@ -2787,6 +2807,18 @@ mod tests {
         assert_eq!(payment.action.as_deref(), Some("authorization"));
         assert_eq!(payment.channel_id.as_deref(), Some("channel-1"));
         assert_eq!(payment.authorized_amount.as_deref(), Some("0.0041 USDC"));
+
+        engine.enrich_payment_channel(PaymentDetails {
+            channel_id: Some("channel-1".into()),
+            charge_amount: Some("4098".into()),
+            channel_balance: Some("12294".into()),
+            charged_cumulative_amount: Some("4098".into()),
+            ..PaymentDetails::default()
+        });
+        let flows = engine.snapshot();
+        let payment = flows[0].payment.as_ref().expect("enriched payment");
+        assert_eq!(payment.channel_balance.as_deref(), Some("12294"));
+        assert_eq!(payment.charged_cumulative_amount.as_deref(), Some("4098"));
     }
 
     #[test]

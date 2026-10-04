@@ -101,6 +101,14 @@ impl PdbState {
             .update_exchange(log_id, inference);
     }
 
+    /// Attach a safe payer-owned payment-channel snapshot to its latest flow.
+    pub fn enrich_payment_channel(&self, payment: types::PaymentDetails) {
+        self.correlation
+            .lock()
+            .unwrap()
+            .enrich_payment_channel(payment);
+    }
+
     /// Attach usage metadata parsed after a proxied response stream finishes.
     pub fn enrich_inference_response(
         &self,

@@ -837,6 +837,23 @@ fn apply_batch_settlement(state: &PayerState, batch: &BatchSettlementAttempt, he
             tracing::warn!(%error, "payer proxy: batch-settlement receipt not adopted; the next request will retry the same authorization");
         }
     }
+
+    let Some(pdb) = state.pdb.as_ref() else {
+        return;
+    };
+    let Ok(Some(channel)) = state.batch_channels.get(&batch.requirements) else {
+        return;
+    };
+    pdb.enrich_payment_channel(pay_pdb::types::PaymentDetails {
+        network: Some(batch.requirements.network.clone()),
+        asset: Some(batch.requirements.asset.clone()),
+        channel_id: Some(channel.channel_id().to_string()),
+        recipient: Some(batch.requirements.pay_to.clone()),
+        charge_amount: Some(batch.requirements.amount.clone()),
+        channel_balance: Some(channel.deposit().to_string()),
+        charged_cumulative_amount: Some(channel.charged_cumulative_amount().to_string()),
+        ..pay_pdb::types::PaymentDetails::default()
+    });
 }
 
 fn cached_session_error_text(body: &[u8]) -> String {
