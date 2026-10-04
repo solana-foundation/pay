@@ -19,7 +19,7 @@ interface ChallengeSection {
 /** A debugger-safe projection of one decoded HTTP 402 challenge header. */
 export interface DecodedChallengeHeader {
   readonly name: string;
-  readonly protocol: "MPP" | "x402";
+  readonly protocol: "MPP" | "x402" | "HTTP";
   readonly rawValue: string;
   readonly sections: ChallengeSection[];
   readonly decodeError?: string;
@@ -165,6 +165,10 @@ function parseAuthParameters(value: string): Record<string, string> {
   return parameters;
 }
 
+function authScheme(value: string): string | null {
+  return /^\s*([^\s,]+)/.exec(value)?.[1] ?? null;
+}
+
 function decodeMppHeader(name: string, rawValue: string): DecodedChallengeHeader {
   const parameters = parseAuthParameters(rawValue);
   const handshake = Object.fromEntries(
@@ -223,13 +227,73 @@ function decodeX402Header(name: string, rawValue: string): DecodedChallengeHeade
   return { name, protocol: "x402", rawValue, sections };
 }
 
+function decodeAuthenticateHeader(
+  name: string,
+  rawValue: string,
+): DecodedChallengeHeader {
+  const scheme = authScheme(rawValue);
+  if (scheme?.toLowerCase() === "payment") {
+    return decodeMppHeader(name, rawValue);
+  }
+
+  const parameters = parseAuthParameters(rawValue);
+  if (scheme?.toLowerCase() === "x402") {
+    const requirements = parameters.requirements;
+    if (!requirements) {
+      return {
+        name,
+        protocol: "x402",
+        rawValue,
+        sections: [
+          {
+            title: "Challenge",
+            facts: [{ label: "Authentication scheme", value: scheme }],
+          },
+        ],
+        decodeError: "The X402 challenge does not contain a requirements parameter.",
+      };
+    }
+
+    const decoded = decodeX402Header(name, requirements);
+    return {
+      ...decoded,
+      rawValue,
+      sections: [
+        {
+          title: "Challenge",
+          facts: [
+            { label: "Authentication scheme", value: scheme },
+            { label: "Carrier", value: "WWW-Authenticate" },
+          ],
+        },
+        ...decoded.sections,
+      ],
+      decodeError: decoded.decodeError
+        ? "The X402 requirements parameter could not be decoded as JSON or base64 JSON."
+        : undefined,
+    };
+  }
+
+  return {
+    name,
+    protocol: "HTTP",
+    rawValue,
+    sections: [
+      {
+        title: "Challenge",
+        facts: flattenFacts({ scheme: scheme ?? "unknown", ...parameters }),
+      },
+    ],
+  };
+}
+
 /** Decode one supported HTTP 402 challenge header without trusting its contents. */
 export function decodeChallengeHeader(
   name: string,
   rawValue: string,
 ): DecodedChallengeHeader {
   return name.toLowerCase() === "www-authenticate"
-    ? decodeMppHeader(name, rawValue)
+    ? decodeAuthenticateHeader(name, rawValue)
     : decodeX402Header(name, rawValue);
 }
 

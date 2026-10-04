@@ -99,6 +99,39 @@ describe("challenge header decoding", () => {
     });
   });
 
+  it("recognizes an X402 WWW-Authenticate compatibility challenge", () => {
+    const requirements = base64UrlJson({
+      x402Version: 2,
+      accepts: [
+        {
+          scheme: "batch-settlement",
+          network: "solana:mainnet",
+          amount: "5030",
+          asset: "USDC",
+          payTo: "recipient-wallet",
+        },
+      ],
+    });
+    const decoded = decodeChallengeHeader(
+      "www-authenticate",
+      `X402 requirements="${requirements}"`,
+    );
+
+    expect(decoded.protocol).toBe("x402");
+    expect(decoded.sections.map((section) => section.title)).toEqual([
+      "Challenge",
+      "Envelope",
+      "Offer 1",
+    ]);
+    expect(facts(decoded)).toMatchObject({
+      "Authentication scheme": "X402",
+      Carrier: "WWW-Authenticate",
+      "X402 Version": "2",
+      Scheme: "batch-settlement",
+      Amount: "0.00503 USDC (5030 base units)",
+    });
+  });
+
   it("shows a 16 by 16 raw preview and a copy control", () => {
     const raw = "a".repeat(48);
     const html = renderToStaticMarkup(
