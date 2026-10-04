@@ -3,6 +3,7 @@ import type { ReactNode } from "react";
 import type { PaymentFlow } from "../types";
 import { EventLog } from "./EventLog";
 import { ReceiptLink } from "./ReceiptLink";
+import { ChallengeHeaders } from "./ChallengeHeaders";
 
 type Tab =
   | "inference"
@@ -128,10 +129,7 @@ function PaymentPanel({
       )}
       {visualization}
       <h4>402 challenge headers</h4>
-      <HeaderTable
-        headers={flow.challengeHeaders}
-        empty="No payment challenge was captured."
-      />
+      <ChallengeHeaders headers={flow.challengeHeaders} />
       <p className="inspector-security-note">
         Signatures, authorization tokens, receipts, and cookies are redacted.
       </p>
