@@ -108,12 +108,14 @@ impl PdbState {
         resource: &str,
         response_headers: std::collections::HashMap<String, String>,
         response_body: String,
+        observed: Option<InferenceInfo>,
     ) {
         self.correlation.lock().unwrap().enrich_inference_response(
             client_ip,
             resource,
             response_headers,
             response_body,
+            observed,
         );
     }
 

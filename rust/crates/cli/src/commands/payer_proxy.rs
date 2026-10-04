@@ -348,10 +348,9 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
         }
     };
 
-    // Normalize OpenAI Chat Completions before the send/402 loop so paid
-    // retries replay the exact same compatible body. Goose uses the newer
-    // `developer` role for GPT-5, while some compatible providers only
-    // accept the older `system` role.
+    // Normalize OpenAI-compatible requests before the send/402 loop so paid
+    // retries replay the exact same body. Besides adapting Goose's newer
+    // `developer` role, debugger runs request the final streamed usage chunk.
     let body = normalize_openai_chat_request(&state, &method, &path, &body);
 
     // Anthropic → OpenAI request translation for OpenAI-compatible
@@ -967,27 +966,52 @@ fn normalize_openai_chat_request(
     path: &str,
     body: &Bytes,
 ) -> Bytes {
-    if state.dialect != Dialect::OpenAiCompat
-        || method != Method::POST
-        || path != "/v1/chat/completions"
-    {
+    if state.dialect != Dialect::OpenAiCompat || method != Method::POST {
+        return body.clone();
+    }
+
+    let openai_stream_endpoint = matches!(
+        path.trim_end_matches('/'),
+        "/v1/chat/completions" | "/v1/completions"
+    );
+    if !openai_stream_endpoint {
         return body.clone();
     }
 
     let Ok(mut request) = serde_json::from_slice::<serde_json::Value>(body) else {
         return body.clone();
     };
-    let Some(messages) = request
-        .get_mut("messages")
-        .and_then(serde_json::Value::as_array_mut)
-    else {
-        return body.clone();
-    };
-
     let mut changed = false;
-    for message in messages {
-        if message.get("role").and_then(|role| role.as_str()) == Some("developer") {
-            message["role"] = serde_json::Value::String("system".to_string());
+    if path.trim_end_matches('/') == "/v1/chat/completions"
+        && let Some(messages) = request
+            .get_mut("messages")
+            .and_then(serde_json::Value::as_array_mut)
+    {
+        for message in messages {
+            if message.get("role").and_then(|role| role.as_str()) == Some("developer") {
+                message["role"] = serde_json::Value::String("system".to_string());
+                changed = true;
+            }
+        }
+    }
+
+    if state.pdb.is_some()
+        && request.get("stream").and_then(serde_json::Value::as_bool) == Some(true)
+        && let Some(object) = request.as_object_mut()
+    {
+        let stream_options = object
+            .entry("stream_options")
+            .or_insert_with(|| serde_json::json!({}));
+        if !stream_options.is_object() {
+            *stream_options = serde_json::json!({});
+        }
+        if let Some(options) = stream_options.as_object_mut()
+            && options
+                .get("include_usage")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+        {
+            options.insert("include_usage".into(), serde_json::Value::Bool(true));
             changed = true;
         }
     }
@@ -1036,6 +1060,9 @@ fn translate_request(
 type SessionAuthorizationGuard = tokio::sync::OwnedMutexGuard<Option<String>>;
 type PdbInferenceCapture = (pay_pdb::PdbState, String);
 
+#[derive(Clone, Copy)]
+struct PdbRequestStarted(std::time::Instant);
+
 fn pdb_inference_capture(state: &PayerState, resource: &str) -> Option<PdbInferenceCapture> {
     state
         .pdb
@@ -1064,6 +1091,7 @@ fn finish_inference_capture(
     capture: Option<PdbInferenceCapture>,
     headers: &HeaderMap,
     body: &[u8],
+    observed: Option<pay_core::InferenceUsage>,
 ) {
     let Some((pdb, resource)) = capture else {
         return;
@@ -1074,6 +1102,20 @@ fn finish_inference_capture(
         &resource,
         pdb_header_map(headers),
         response_body,
+        observed.map(|usage| pay_pdb::types::InferenceInfo {
+            provider: String::new(),
+            model: usage.model,
+            endpoint_kind: None,
+            streamed: usage.streamed,
+            tokens_prompt: usage.tokens_prompt,
+            tokens_completion: usage.tokens_completion,
+            tokens_cached: None,
+            tokens_reasoning: None,
+            response_id: None,
+            finish_reason: None,
+            ttft_ms: usage.ttft_ms,
+            tokens_per_sec: usage.tokens_per_sec,
+        }),
     );
 }
 
@@ -1105,6 +1147,11 @@ async fn translate_json_response(
     resp: reqwest::Response,
     inference_capture: Option<PdbInferenceCapture>,
 ) -> Response {
+    let request_started = resp
+        .extensions()
+        .get::<PdbRequestStarted>()
+        .map(|started| started.0)
+        .unwrap_or_else(std::time::Instant::now);
     let status = resp.status();
     let upstream_headers = resp.headers().clone();
     let bytes = match resp.bytes().await {
@@ -1118,7 +1165,15 @@ async fn translate_json_response(
                 .into_response();
         }
     };
-    finish_inference_capture(inference_capture, &upstream_headers, &bytes);
+    let mut observer = pay_proxy::observer::StreamObserver::new(false);
+    observer.on_chunk(&bytes, request_started);
+    observer.finish();
+    finish_inference_capture(
+        inference_capture,
+        &upstream_headers,
+        &bytes,
+        Some(observer.usage),
+    );
     let openai: serde_json::Value = match serde_json::from_slice(&bytes) {
         Ok(value) => value,
         Err(e) => {
@@ -1154,6 +1209,11 @@ fn translate_stream_response(
     session_guard: Option<SessionAuthorizationGuard>,
     inference_capture: Option<PdbInferenceCapture>,
 ) -> Response {
+    let request_started = resp
+        .extensions()
+        .get::<PdbRequestStarted>()
+        .map(|started| started.0)
+        .unwrap_or_else(std::time::Instant::now);
     let status = resp.status();
     let upstream_headers = resp.headers().clone();
     let inference_headers = upstream_headers.clone();
@@ -1162,21 +1222,29 @@ fn translate_stream_response(
         let mut resp = resp;
         let mut translator = translate::StreamTranslator::new();
         let mut inference_tail = Vec::new();
+        let mut observer = pay_proxy::observer::StreamObserver::new(true);
         loop {
             match resp.chunk().await {
                 Ok(Some(chunk)) => {
                     retain_inference_tail(&mut inference_tail, &chunk);
+                    observer.on_chunk(&chunk, request_started);
                     let out = translator.push(&chunk);
                     if !out.is_empty() {
                         yield Ok::<_, std::io::Error>(Bytes::from(out));
                     }
                 }
                 Ok(None) => {
+                    observer.finish();
                     let out = translator.finish();
                     if !out.is_empty() {
                         yield Ok(Bytes::from(out));
                     }
-                    finish_inference_capture(inference_capture, &inference_headers, &inference_tail);
+                    finish_inference_capture(
+                        inference_capture,
+                        &inference_headers,
+                        &inference_tail,
+                        Some(observer.usage),
+                    );
                     break;
                 }
                 Err(e) => {
@@ -1520,13 +1588,17 @@ async fn send_upstream(
         }
         Some(captured)
     });
-    let result = state
+    let mut result = state
         .client
         .request(method.clone(), url)
         .headers(fwd)
         .body(body)
         .send()
         .await;
+
+    if let Ok(response) = &mut result {
+        response.extensions_mut().insert(PdbRequestStarted(started));
+    }
 
     if let (Some(pdb), Some(req_headers)) = (&state.pdb, pdb_request_headers) {
         let (status, res_headers, res_body) = match &result {
@@ -1581,9 +1653,20 @@ fn stream_response(
     session_guard: Option<SessionAuthorizationGuard>,
     inference_capture: Option<PdbInferenceCapture>,
 ) -> Response {
+    let request_started = resp
+        .extensions()
+        .get::<PdbRequestStarted>()
+        .map(|started| started.0)
+        .unwrap_or_else(std::time::Instant::now);
     let status = resp.status();
     let headers = resp.headers().clone();
     let inference_headers = headers.clone();
+    let streamed = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value.contains("text/event-stream") || value.contains("application/x-ndjson")
+        });
 
     let mut builder = Response::builder().status(status);
     if let Some(dst) = builder.headers_mut() {
@@ -1593,17 +1676,21 @@ fn stream_response(
         let _session_guard = session_guard;
         let mut resp = resp;
         let mut inference_tail = Vec::new();
+        let mut observer = pay_proxy::observer::StreamObserver::new(streamed);
         loop {
             match resp.chunk().await {
                 Ok(Some(chunk)) => {
                     retain_inference_tail(&mut inference_tail, &chunk);
+                    observer.on_chunk(&chunk, request_started);
                     yield Ok::<_, std::io::Error>(chunk);
                 }
                 Ok(None) => {
+                    observer.finish();
                     finish_inference_capture(
                         inference_capture,
                         &inference_headers,
                         &inference_tail,
+                        Some(observer.usage),
                     );
                     break;
                 }
@@ -1975,24 +2062,33 @@ mod tests {
             }),
         ))
         .await;
-        let payer = spawn_payer_with(
-            PayerUpstream {
-                base_url: upstream,
-                host_header: None,
-                dialect: Dialect::OpenAiCompat,
-                chat_path: "api/v1/chat/completions".to_string(),
-                responses_path: "v1/responses".to_string(),
-                require_payment: false,
-                payment_protocol: PaymentProtocol::Auto,
-            },
-            None,
-        )
-        .await;
+        let pdb = pay_pdb::PdbState::new(serde_json::json!({}));
+        let store: Arc<dyn AccountsStore> = Arc::new(MemoryAccountsStore::new());
+        let state = Arc::new(
+            PayerState::new(
+                PayerUpstream {
+                    base_url: upstream,
+                    host_header: None,
+                    dialect: Dialect::OpenAiCompat,
+                    chat_path: "api/v1/chat/completions".to_string(),
+                    responses_path: "v1/responses".to_string(),
+                    require_payment: false,
+                    payment_protocol: PaymentProtocol::Auto,
+                },
+                store,
+                None,
+                None,
+            )
+            .unwrap()
+            .with_pdb(pdb),
+        );
+        let payer = spawn_server(router(state)).await;
 
         let response = reqwest::Client::new()
             .post(format!("{payer}/v1/chat/completions"))
             .json(&serde_json::json!({
                 "model": "openai/gpt-5.6-sol",
+                "stream": true,
                 "messages": [
                     { "role": "developer", "content": "You are Goose." },
                     { "role": "user", "content": "test" }
@@ -2007,6 +2103,7 @@ mod tests {
         let body = seen.lock().unwrap().clone().unwrap();
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][1]["role"], "user");
+        assert_eq!(body["stream_options"]["include_usage"], true);
     }
 
     #[tokio::test]

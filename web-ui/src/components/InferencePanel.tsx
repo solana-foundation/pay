@@ -24,8 +24,8 @@ export function InferencePanel({ flow, providers }: Props) {
 
   const tokens =
     inf.tokensPrompt == null && inf.tokensCompletion == null
-      ? "—"
-      : `${inf.tokensPrompt ?? "—"} prompt / ${inf.tokensCompletion ?? "—"} completion`;
+      ? null
+      : `${inf.tokensPrompt ?? "not reported"} input / ${inf.tokensCompletion ?? "not reported"} output`;
   const totalTokens =
     inf.tokensPrompt != null || inf.tokensCompletion != null
       ? (inf.tokensPrompt ?? 0) + (inf.tokensCompletion ?? 0)
@@ -43,32 +43,29 @@ export function InferencePanel({ flow, providers }: Props) {
         )}
       </h3>
       {/* Model is the headline; provider is the muted secondary row. */}
-      <Row
-        label="Model"
-        value={
-          inf.model ? (
+      {inf.model && (
+        <Row
+          label="Model"
+          value={
             <ModelBadge
               model={inf.model}
               provider={inf.provider}
               providers={providers}
             />
-          ) : (
-            "—"
-          )
-        }
-      />
+          }
+        />
+      )}
       <Row
         label="Provider"
         value={<span className="inference-muted">{inf.provider}</span>}
       />
       <Row label="Endpoint" value={inf.endpointKind ?? "other"} />
       <Row label="Streamed" value={inf.streamed ? "yes" : "no"} />
-      <Row
-        label="Time to first token"
-        value={inf.ttftMs != null ? `${inf.ttftMs}ms` : "—"}
-      />
-      <Row label="Tokens" value={tokens} />
-      <Row label="Total tokens" value={totalTokens ?? "—"} />
+      {inf.ttftMs != null && (
+        <Row label="Time to first token" value={`${inf.ttftMs}ms`} />
+      )}
+      {tokens && <Row label="Tokens" value={tokens} />}
+      {totalTokens != null && <Row label="Total tokens" value={totalTokens} />}
       {(inf.tokensCached != null || inf.tokensReasoning != null) && (
         <Row
           label="Token details"
@@ -77,7 +74,9 @@ export function InferencePanel({ flow, providers }: Props) {
       )}
       {inf.finishReason && <Row label="Finish reason" value={inf.finishReason} />}
       {inf.responseId && <Row label="Response ID" value={inf.responseId} />}
-      <Row label="Throughput" value={formatTokPerSec(inf.tokensPerSec) ?? "—"} />
+      {inf.tokensPerSec != null && (
+        <Row label="Throughput" value={formatTokPerSec(inf.tokensPerSec)} />
+      )}
     </div>
   );
 }

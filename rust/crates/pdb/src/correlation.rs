@@ -306,6 +306,7 @@ impl FlowCorrelation {
         resource: &str,
         response_headers: HashMap<String, String>,
         response_body: String,
+        observed: Option<InferenceInfo>,
     ) {
         let entry = LogEntry {
             id: 0,
@@ -320,7 +321,13 @@ impl FlowCorrelation {
             res_body: Some(response_body),
             client_ip: client_ip.into(),
         };
-        let Some(incoming) = inference_from_exchange(&entry) else {
+        let parsed = inference_from_exchange(&entry);
+        let Some(incoming) = (match (parsed, observed) {
+            (Some(parsed), Some(observed)) => Some(merge_inference(parsed, observed)),
+            (Some(parsed), None) => Some(parsed),
+            (None, Some(observed)) => Some(observed),
+            (None, None) => None,
+        }) else {
             return;
         };
         let Some(flow) = self
@@ -3093,6 +3100,7 @@ mod tests {
                 "data: [DONE]\n\n"
             )
             .into(),
+            None,
         );
 
         let flows = engine.snapshot();
@@ -3100,6 +3108,60 @@ mod tests {
         assert_eq!(inference.tokens_prompt, Some(9));
         assert_eq!(inference.tokens_completion, Some(3));
         assert_eq!(inference.response_id.as_deref(), Some("chatcmpl-stream"));
+    }
+
+    #[test]
+    fn streamed_observer_enriches_x402_flow_without_provider_usage() {
+        let (tx, _rx) = broadcast::channel(16);
+        let mut engine = FlowCorrelation::new(tx);
+        let resource = "https://sol.blockrun.ai/api/v1/chat/completions";
+
+        let mut challenge = make_entry("POST", resource, 402);
+        challenge.req_body = Some(r#"{"model":"luna","stream":true}"#.into());
+        challenge.res_headers.insert(
+            "payment-required".into(),
+            encode_json(serde_json::json!({
+                "x402Version": 2,
+                "accepts": [{ "scheme": "batch-settlement", "amount": "4098" }]
+            })),
+        );
+        engine.ingest(challenge);
+
+        let mut retry = make_entry("POST", resource, 200);
+        retry.req_body = Some(r#"{"model":"luna","stream":true}"#.into());
+        retry.req_headers.insert(
+            "payment-signature".into(),
+            encode_json(serde_json::json!({
+                "x402Version": 2,
+                "accepted": { "scheme": "batch-settlement" },
+                "payload": {}
+            })),
+        );
+        engine.ingest(retry);
+
+        engine.enrich_inference_response(
+            "127.0.0.1",
+            resource,
+            HashMap::from([("content-type".into(), "text/event-stream".into())]),
+            "data: [DONE]\n\n".into(),
+            Some(InferenceInfo {
+                model: Some("luna-2026-10".into()),
+                streamed: true,
+                tokens_completion: Some(17),
+                ttft_ms: Some(210),
+                tokens_per_sec: Some(38.2),
+                ..InferenceInfo::default()
+            }),
+        );
+
+        let flows = engine.snapshot();
+        assert_eq!(flows.len(), 1);
+        let inference = flows[0].inference.as_ref().expect("inference metadata");
+        assert_eq!(inference.provider, "sol.blockrun.ai");
+        assert_eq!(inference.model.as_deref(), Some("luna-2026-10"));
+        assert_eq!(inference.tokens_completion, Some(17));
+        assert_eq!(inference.ttft_ms, Some(210));
+        assert_eq!(inference.tokens_per_sec, Some(38.2));
     }
 
     #[test]
