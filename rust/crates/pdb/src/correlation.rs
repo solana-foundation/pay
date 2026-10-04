@@ -1428,6 +1428,12 @@ fn merge_payment_details(
             deposit_amount: incoming.deposit_amount.or(existing.deposit_amount),
             authorized_amount: incoming.authorized_amount.or(existing.authorized_amount),
             voucher_amount: incoming.voucher_amount.or(existing.voucher_amount),
+            charge_amount: incoming.charge_amount.or(existing.charge_amount),
+            channel_balance: incoming.channel_balance.or(existing.channel_balance),
+            charged_cumulative_amount: incoming
+                .charged_cumulative_amount
+                .or(existing.charged_cumulative_amount),
+            total_claimed: incoming.total_claimed.or(existing.total_claimed),
             settlement_amount: incoming.settlement_amount.or(existing.settlement_amount),
             settlement_reference: incoming
                 .settlement_reference
@@ -1474,6 +1480,7 @@ fn payment_details(entry: &LogEntry) -> Option<PaymentDetails> {
         details.network = value_string(offer.get("network"));
         details.asset = value_string(offer.get("asset"));
         details.recipient = value_string(offer.get("payTo"));
+        details.charge_amount = value_string(offer.get("amount"));
     }
     if let Some(payment) = payment.as_ref() {
         let accepted = payment.get("accepted");
@@ -1482,6 +1489,8 @@ fn payment_details(entry: &LogEntry) -> Option<PaymentDetails> {
             .or_else(|| value_string(payment.get("network")));
         details.asset = value_string(accepted.and_then(|v| v.get("asset")))
             .or_else(|| value_string(payment.get("asset")));
+        details.charge_amount =
+            value_string(accepted.and_then(|v| v.get("amount"))).or(details.charge_amount);
 
         if let Some(payload) = payload {
             let kind = value_string(payload.get("type"));
@@ -1538,6 +1547,21 @@ fn payment_details(entry: &LogEntry) -> Option<PaymentDetails> {
 
     if let Some(receipt) = receipt.as_ref() {
         details.network = value_string(receipt.get("network")).or(details.network);
+        if let Some(extra) = receipt.get("extra") {
+            details.charge_amount =
+                value_string(extra.get("chargedAmount")).or(details.charge_amount);
+        }
+        if let Some(channel_state) = receipt
+            .get("extra")
+            .and_then(|extra| extra.get("channelState"))
+        {
+            details.channel_id =
+                value_string(channel_state.get("channelId")).or(details.channel_id);
+            details.channel_balance = value_string(channel_state.get("balance"));
+            details.charged_cumulative_amount =
+                value_string(channel_state.get("chargedCumulativeAmount"));
+            details.total_claimed = value_string(channel_state.get("totalClaimed"));
+        }
         details.settlement_amount =
             value_string(receipt.get("amount")).map(|amount| display_batch_amount(&amount));
         details.settlement_reference = settlement_reference(receipt);
@@ -2988,6 +3012,17 @@ mod tests {
             "transaction": "settlement-signature-x402",
             "network": "solana-localnet",
             "amount": amount,
+            "extra": {
+                "commitmentId": "channel-1:3000",
+                "chargedAmount": amount,
+                "channelState": {
+                    "channelId": "channel-1",
+                    "balance": "10000",
+                    "totalClaimed": "1000",
+                    "withdrawRequestedAt": 0,
+                    "chargedCumulativeAmount": "3000"
+                }
+            }
         }))
     }
 
@@ -3320,6 +3355,10 @@ mod tests {
         assert_eq!(payment.channel_id.as_deref(), Some("channel-1"));
         assert_eq!(payment.recipient.as_deref(), Some("provider-wallet-x402"));
         assert_eq!(payment.voucher_amount.as_deref(), Some("0.1000 USDC"));
+        assert_eq!(payment.charge_amount.as_deref(), Some("1234"));
+        assert_eq!(payment.channel_balance.as_deref(), Some("10000"));
+        assert_eq!(payment.charged_cumulative_amount.as_deref(), Some("3000"));
+        assert_eq!(payment.total_claimed.as_deref(), Some("1000"));
         assert_eq!(payment.settlement_amount.as_deref(), Some("0.0012 USDC"));
         assert_eq!(
             payment.settlement_reference.as_deref(),

@@ -194,6 +194,18 @@ pub struct PaymentDetails {
     /// Human-readable cumulative maximum claimable by the latest voucher.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub voucher_amount: Option<String>,
+    /// Fixed charge for this request in atomic units.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub charge_amount: Option<String>,
+    /// Current channel deposit ceiling in atomic units, as reported by the server.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel_balance: Option<String>,
+    /// Server's latest accepted cumulative charge in atomic units.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub charged_cumulative_amount: Option<String>,
+    /// Cumulative amount already claimed onchain, in atomic units.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_claimed: Option<String>,
     /// Human-readable amount reported by the settlement receipt.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub settlement_amount: Option<String>,

@@ -113,6 +113,36 @@ describe("paymentChannels", () => {
     });
   });
 
+  it("uses the server channel snapshot for authorization-only requests", () => {
+    const channels = paymentChannels([
+      flow({
+        payment: {
+          channelId: "channel-1",
+          action: "authorization",
+          authorizedAmount: "0.0050 USDC",
+          chargeAmount: "1296",
+          channelBalance: "15090",
+          chargedCumulativeAmount: "1296",
+          totalClaimed: "0",
+          asset: "USDC",
+        },
+      }),
+    ]);
+
+    expect(channels[0]).toMatchObject({
+      deposited: "0.01509 USDC",
+      consumed: "0.001296 USDC",
+      remaining: "0.013794 USDC",
+      requestPrice: "0.001296 USDC",
+      remainingRequests: 10,
+      capacityTicks: 11,
+      usedTicks: 1,
+      requestsPerTick: 1,
+    });
+    expect(channels[0].usagePercent).toBeCloseTo(8.58, 2);
+    expect(channels[0].requests[0].amount).toBe("0.001296 USDC");
+  });
+
   it("searches channel metadata and request paths", () => {
     const [channel] = paymentChannels([
       flow({

@@ -1,5 +1,6 @@
 import { useState } from "react";
 import type { ReactNode } from "react";
+import { formatUnits } from "../lib/format";
 import type { PaymentFlow } from "../types";
 import { EventLog } from "./EventLog";
 import { ReceiptLink } from "./ReceiptLink";
@@ -88,6 +89,9 @@ function PaymentPanel({
 }) {
   const payment = flow.payment;
   const session = flow.session;
+  const requestCharge = payment?.chargeAmount
+    ? formatUnits(payment.chargeAmount, 6, payment.asset ?? "USDC")
+    : undefined;
   const hasDetails = payment || session || flow.amount || flow.payer;
   return (
     <div className="inspector-scroll payment-panel">
@@ -96,7 +100,7 @@ function PaymentPanel({
           <Fact label="Protocol" value={flow.protocol.toUpperCase()} />
           <Fact label="Scheme" value={flow.scheme} />
           <Fact label="Action" value={payment?.action ?? session?.action} />
-          <Fact label="Amount" value={flow.amount} />
+          <Fact label="Amount" value={requestCharge ?? flow.amount} />
           <Fact label="Payer" value={flow.payer ?? session?.payer} />
           <Fact label="Recipient" value={payment?.recipient ?? session?.recipient} />
           <Fact label="Network" value={payment?.network} />
@@ -116,6 +120,34 @@ function PaymentPanel({
           <Fact
             label="Voucher"
             value={payment?.voucherAmount ?? session?.cumulative}
+          />
+          <Fact
+            label="Channel balance"
+            value={
+              payment?.channelBalance
+                ? formatUnits(payment.channelBalance, 6, payment.asset ?? "USDC")
+                : undefined
+            }
+          />
+          <Fact
+            label="Committed"
+            value={
+              payment?.chargedCumulativeAmount
+                ? formatUnits(
+                    payment.chargedCumulativeAmount,
+                    6,
+                    payment.asset ?? "USDC",
+                  )
+                : undefined
+            }
+          />
+          <Fact
+            label="Claimed onchain"
+            value={
+              payment?.totalClaimed
+                ? formatUnits(payment.totalClaimed, 6, payment.asset ?? "USDC")
+                : undefined
+            }
           />
           <Fact label="Vouchers" value={session?.voucherCount} />
           <Fact label="Settled" value={payment?.settlementAmount} />

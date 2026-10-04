@@ -32,6 +32,11 @@ export interface PaymentChannel {
   readonly consumed?: string;
   readonly remaining?: string;
   readonly usagePercent?: number;
+  readonly requestPrice?: string;
+  readonly remainingRequests?: number;
+  readonly capacityTicks?: number;
+  readonly usedTicks?: number;
+  readonly requestsPerTick?: number;
   readonly startedAt: string;
   readonly updatedAt: string;
   readonly requests: ChannelRequest[];
@@ -56,6 +61,10 @@ function maximum(values: Array<bigint | undefined>): bigint | undefined {
   return known.length > 0
     ? known.reduce((highest, value) => (value > highest ? value : highest))
     : undefined;
+}
+
+function safeCount(value: bigint): number {
+  return Number(value > BigInt(Number.MAX_SAFE_INTEGER) ? BigInt(Number.MAX_SAFE_INTEGER) : value);
 }
 
 function normalizeAction(flow: PaymentFlow): Pick<ChannelRequest, "action" | "actionLabel"> {
@@ -88,15 +97,18 @@ function requestAmount(flow: PaymentFlow): string | undefined {
   } else if (action === "voucher" || action === "commit") {
     amount = flow.payment?.voucherAmount ?? flow.session?.cumulative;
   } else if (action === "authorization") {
-    amount = flow.payment?.authorizedAmount ?? flow.session?.approvedAmount;
+    amount =
+      flow.payment?.chargeAmount ??
+      flow.payment?.authorizedAmount ??
+      flow.session?.approvedAmount;
   } else {
     amount = flow.payment?.settlementAmount ?? flow.amount;
   }
-  if (flow.session && amount && /^\d+$/.test(amount)) {
+  if (amount && /^\d+$/.test(amount)) {
     return formatUnits(
       amount,
-      flow.session.decimals ?? 6,
-      flow.session.currency ?? "USDC",
+      flow.session?.decimals ?? 6,
+      flow.session?.currency ?? flow.payment?.asset ?? "USDC",
     );
   }
   return amount;
@@ -128,8 +140,12 @@ function summarizeChannel(id: string, flows: PaymentFlow[]): PaymentChannel {
   const paymentDeposits = ordered.map((flow) =>
     stableBaseUnits(flow.payment?.depositAmount, decimals),
   );
+  const reportedBalance = maximum(
+    ordered.map((flow) => stableBaseUnits(flow.payment?.channelBalance, decimals)),
+  );
   const deposited = isX402
-    ? paymentDeposits
+    ? reportedBalance ??
+      paymentDeposits
         .filter((value): value is bigint => value !== undefined)
         .reduce<bigint | undefined>((sum, value) => (sum ?? 0n) + value, undefined)
     : maximum(
@@ -142,7 +158,12 @@ function summarizeChannel(id: string, flows: PaymentFlow[]): PaymentChannel {
       );
   const consumed = maximum(
     ordered.map((flow) =>
-      stableBaseUnits(flow.payment?.voucherAmount ?? flow.session?.cumulative, decimals),
+      stableBaseUnits(
+        flow.payment?.chargedCumulativeAmount ??
+          flow.payment?.voucherAmount ??
+          flow.session?.cumulative,
+        decimals,
+      ),
     ),
   );
   const remaining =
@@ -154,6 +175,36 @@ function summarizeChannel(id: string, flows: PaymentFlow[]): PaymentChannel {
   const usagePercent =
     deposited !== undefined && deposited > 0n && consumed !== undefined
       ? Math.min(100, Number((consumed * 10_000n) / deposited) / 100)
+      : undefined;
+  const latestCharge = [...ordered]
+    .reverse()
+    .map((flow) => stableBaseUnits(flow.payment?.chargeAmount ?? flow.amount, decimals))
+    .find((amount) => amount !== undefined && amount > 0n);
+  const totalRequests =
+    isX402 && deposited !== undefined && latestCharge !== undefined
+      ? deposited / latestCharge
+      : undefined;
+  const remainingRequests =
+    remaining !== undefined && latestCharge !== undefined
+      ? remaining / latestCharge
+      : undefined;
+  const capacityTicks =
+    totalRequests !== undefined && totalRequests > 0n
+      ? Math.min(24, safeCount(totalRequests))
+      : undefined;
+  const requestsPerTick =
+    capacityTicks !== undefined && totalRequests !== undefined
+      ? Math.max(1, Math.ceil(safeCount(totalRequests) / capacityTicks))
+      : undefined;
+  const usedTicks =
+    capacityTicks !== undefined && totalRequests !== undefined && remainingRequests !== undefined
+      ? Math.min(
+          capacityTicks,
+          Math.round(
+            ((safeCount(totalRequests) - safeCount(remainingRequests)) / safeCount(totalRequests)) *
+              capacityTicks,
+          ),
+        )
       : undefined;
 
   return {
@@ -169,6 +220,15 @@ function summarizeChannel(id: string, flows: PaymentFlow[]): PaymentChannel {
     consumed: consumed === undefined ? undefined : formatUnits(consumed.toString(), decimals, currency),
     remaining: remaining === undefined ? undefined : formatUnits(remaining.toString(), decimals, currency),
     usagePercent,
+    requestPrice:
+      latestCharge === undefined
+        ? undefined
+        : formatUnits(latestCharge.toString(), decimals, currency),
+    remainingRequests:
+      remainingRequests === undefined ? undefined : safeCount(remainingRequests),
+    capacityTicks,
+    usedTicks,
+    requestsPerTick,
     startedAt: ordered[0].startedAt,
     updatedAt: latest.updatedAt,
     requests: ordered.map((flow) => ({

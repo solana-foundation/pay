@@ -107,6 +107,10 @@ export interface PaymentDetails {
   depositAmount?: string;
   authorizedAmount?: string;
   voucherAmount?: string;
+  chargeAmount?: string;
+  channelBalance?: string;
+  chargedCumulativeAmount?: string;
+  totalClaimed?: string;
   settlementAmount?: string;
   settlementReference?: string;
   receiptStatus?: string;

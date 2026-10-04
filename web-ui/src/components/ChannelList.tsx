@@ -16,12 +16,58 @@ function time(value: string): string {
 }
 
 function capacityLabel(percent: number | undefined): string {
-  if (percent === undefined) return "Capacity requires a captured deposit";
+  if (percent === undefined) return "Capacity snapshot not captured";
   return `${percent.toFixed(percent < 1 ? 2 : percent % 1 === 0 ? 0 : 1)}% used`;
 }
 
 function requestDescription(flow: PaymentFlow): string | undefined {
   return flow.inference?.model ?? flow.inference?.provider;
+}
+
+function ChannelAutonomy({ channel }: { readonly channel: PaymentChannel }) {
+  if (channel.protocol !== "x402") return null;
+  const known =
+    channel.remainingRequests !== undefined &&
+    channel.requestPrice !== undefined &&
+    channel.capacityTicks !== undefined &&
+    channel.usedTicks !== undefined;
+  const requestLabel = known
+    ? `${channel.remainingRequests} request${channel.remainingRequests === 1 ? "" : "s"} left`
+    : "Autonomy unknown";
+  const detail = known
+    ? `at the latest ${channel.requestPrice} charge`
+    : "waiting for a channel snapshot";
+  const tickMeaning =
+    known && (channel.requestsPerTick ?? 1) > 1
+      ? `; each tick represents about ${channel.requestsPerTick} requests`
+      : "";
+  const capacityTicks = channel.capacityTicks ?? 0;
+  const usedTicks = channel.usedTicks ?? 0;
+
+  return (
+    <div className={`channel-autonomy${known ? "" : " unknown"}`}>
+      <div className="channel-autonomy-copy">
+        <strong>{requestLabel}</strong>
+        <span>{detail}</span>
+      </div>
+      {known && (
+        <div
+          className="channel-autonomy-meter"
+          role="progressbar"
+          aria-label="Estimated request autonomy"
+          aria-valuemin={0}
+          aria-valuemax={capacityTicks}
+          aria-valuenow={capacityTicks - usedTicks}
+          aria-valuetext={`${requestLabel} ${detail}${tickMeaning}`}
+          title={`Green ticks are estimated requests remaining${tickMeaning}`}
+        >
+          {Array.from({ length: capacityTicks }, (_, index) => (
+            <span className={index < usedTicks ? "used" : "available"} key={index} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
 }
 
 interface Props {
@@ -55,6 +101,7 @@ export function ChannelList({ channels, selectedId, onSelect, providers }: Props
                 <span>{channel.id}</span>
               </div>
             </div>
+            <ChannelAutonomy channel={channel} />
             <div className={`channel-state ${channel.state}`}>
               <span aria-hidden="true" />
               {channel.state}
@@ -72,8 +119,8 @@ export function ChannelList({ channels, selectedId, onSelect, providers }: Props
                 <dd>{channel.deposited ?? "Not captured"}</dd>
               </div>
               <div>
-                <dt>Claimable</dt>
-                <dd>{channel.consumed ?? "No voucher yet"}</dd>
+                <dt>Committed</dt>
+                <dd>{channel.consumed ?? "Not captured"}</dd>
               </div>
               <div>
                 <dt>Requests</dt>
