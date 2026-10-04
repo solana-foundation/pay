@@ -155,6 +155,7 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
                                     uf.telemetry,
                                 )
                                 .await
+                                .header
                                 {
                                     parts.headers.append(n, v);
                                 }
@@ -176,6 +177,7 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
                                     uf.telemetry,
                                 )
                                 .await
+                                .header
                                 {
                                     builder = builder.header(n, v);
                                 }
@@ -197,6 +199,7 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
                         uf.telemetry,
                     )
                     .await
+                    .header
                     {
                         response.headers_mut().append(n, v);
                     }
@@ -208,6 +211,7 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
                     uf.telemetry,
                 )
                 .await
+                .header
                 {
                     response.headers_mut().append(n, v);
                 }
@@ -251,7 +255,9 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
                     }
                 }
                 if let Some((n, v)) =
-                    crate::server::gate::settle_batch(&state, *bf, served_ok, cached).await
+                    crate::server::gate::settle_batch(&state, *bf, served_ok, cached)
+                        .await
+                        .header
                 {
                     response.headers_mut().append(n, v);
                 }
@@ -408,8 +414,8 @@ async fn settle_axum_delegated_response(
 
     match crate::server::gate::settle_delegated_session(forward, &parts.headers, Some(&bytes)).await
     {
-        Ok(receipt) => {
-            if let Some(receipt) = receipt {
+        Ok(outcome) => {
+            if let Some(receipt) = outcome.receipt {
                 for (name, value) in receipt.headers {
                     parts.headers.append(name, value);
                 }

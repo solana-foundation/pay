@@ -4880,6 +4880,7 @@ dependencies = [
  "qrcode",
  "rand 0.8.8",
  "ratatui",
+ "redis",
  "reqwest 0.12.28",
  "schemars 0.8.22",
  "serde",
