@@ -6,18 +6,10 @@ import { ReceiptLink } from "./ReceiptLink";
 
 type Tab =
   | "inference"
-  | "splits"
-  | "channel"
   | "request"
   | "payment"
   | "response"
   | "events";
-
-export interface InspectorVisual {
-  id: "inference" | "splits" | "channel";
-  label: string;
-  content: ReactNode;
-}
 
 function prettyBody(body: string): string {
   try {
@@ -86,12 +78,18 @@ function RequestPanel({ flow }: { flow: PaymentFlow }) {
   );
 }
 
-function PaymentPanel({ flow }: { flow: PaymentFlow }) {
+function PaymentPanel({
+  flow,
+  visualization,
+}: {
+  flow: PaymentFlow;
+  visualization?: ReactNode;
+}) {
   const payment = flow.payment;
   const session = flow.session;
   const hasDetails = payment || session || flow.amount || flow.payer;
   return (
-    <div className="inspector-scroll">
+    <div className="inspector-scroll payment-panel">
       {hasDetails ? (
         <div className="inspector-facts payment-facts">
           <Fact label="Protocol" value={flow.protocol.toUpperCase()} />
@@ -128,6 +126,7 @@ function PaymentPanel({ flow }: { flow: PaymentFlow }) {
       {payment?.settlementReference && (
         <ReceiptLink flow={flow} label="Open settlement receipt" />
       )}
+      {visualization}
       <h4>402 challenge headers</h4>
       <HeaderTable
         headers={flow.challengeHeaders}
@@ -164,32 +163,40 @@ function ResponsePanel({ flow }: { flow: PaymentFlow }) {
 
 export function FlowInspector({
   flow,
-  visuals = [],
+  inference,
+  paymentVisualization,
 }: {
   flow: PaymentFlow;
-  visuals?: InspectorVisual[];
+  inference?: ReactNode;
+  paymentVisualization?: ReactNode;
 }) {
   const [tab, setTab] = useState<Tab>(
-    visuals[0]?.id ??
-      (flow.protocol === "http" && !flow.payment ? "request" : "payment"),
+    inference
+      ? "inference"
+      : flow.protocol === "http" && !flow.payment
+        ? "request"
+        : "payment",
   );
   const tabs: Array<{ id: Tab; label: string; count?: number }> = [
-    ...visuals.map(({ id, label }) => ({ id, label })),
-    { id: "request", label: "Request" },
+    ...(inference ? [{ id: "inference" as const, label: "Inference" }] : []),
     { id: "payment", label: "Payment" },
+    { id: "request", label: "Request" },
     { id: "response", label: "Response" },
     { id: "events", label: "Events", count: flow.events.length },
   ];
+  const selectedTab = tabs.some((item) => item.id === tab)
+    ? tab
+    : tabs[0].id;
 
   return (
     <section className="detail-panel" aria-label="Flow inspector">
       <div className="detail-tabs" role="tablist" aria-label="Flow details">
         {tabs.map((item) => (
           <button
-            className={`detail-tab${tab === item.id ? " active" : ""}`}
+            className={`detail-tab${selectedTab === item.id ? " active" : ""}`}
             type="button"
             role="tab"
-            aria-selected={tab === item.id}
+            aria-selected={selectedTab === item.id}
             aria-controls={`flow-panel-${item.id}`}
             id={`flow-tab-${item.id}`}
             onClick={() => setTab(item.id)}
@@ -205,14 +212,16 @@ export function FlowInspector({
       <div
         className="detail-tab-panel"
         role="tabpanel"
-        id={`flow-panel-${tab}`}
-        aria-labelledby={`flow-tab-${tab}`}
+        id={`flow-panel-${selectedTab}`}
+        aria-labelledby={`flow-tab-${selectedTab}`}
       >
-        {visuals.find((visual) => visual.id === tab)?.content}
-        {tab === "request" && <RequestPanel flow={flow} />}
-        {tab === "payment" && <PaymentPanel flow={flow} />}
-        {tab === "response" && <ResponsePanel flow={flow} />}
-        {tab === "events" && <EventLog events={flow.events} />}
+        {selectedTab === "inference" && inference}
+        {selectedTab === "payment" && (
+          <PaymentPanel flow={flow} visualization={paymentVisualization} />
+        )}
+        {selectedTab === "request" && <RequestPanel flow={flow} />}
+        {selectedTab === "response" && <ResponsePanel flow={flow} />}
+        {selectedTab === "events" && <EventLog events={flow.events} />}
       </div>
     </section>
   );

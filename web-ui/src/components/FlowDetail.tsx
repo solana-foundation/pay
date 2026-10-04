@@ -1,6 +1,6 @@
 import type { PaymentFlow, ProviderSummary } from "../types";
 import { SequenceDiagram } from "./SequenceDiagram";
-import { FlowInspector, type InspectorVisual } from "./FlowInspector";
+import { FlowInspector } from "./FlowInspector";
 import { PaymentSplits } from "./PaymentSplits";
 import { hasReceiptLink, ReceiptLink } from "./ReceiptLink";
 import { SessionChannel } from "./SessionChannel";
@@ -20,27 +20,14 @@ export function FlowDetail({ flow, providers }: Props) {
   // completed diagram; anything carrying payment data keeps today's diagram.
   const simplified = flow.inference && !hasPaymentData(flow);
   const steps = simplified ? inferenceSteps(flow) : flow.steps;
-  const visuals: InspectorVisual[] = [];
-  if (flow.inference) {
-    visuals.push({
-      id: "inference",
-      label: "Inference",
-      content: <InferencePanel flow={flow} providers={providers} />,
-    });
-  }
-  if (flow.session) {
-    visuals.push({
-      id: "channel",
-      label: "Channel",
-      content: <SessionChannel flow={flow} />,
-    });
-  } else if (hasPaymentData(flow)) {
-    visuals.push({
-      id: "splits",
-      label: "Splits",
-      content: <PaymentSplits flow={flow} success={success} />,
-    });
-  }
+  const inference = flow.inference ? (
+    <InferencePanel flow={flow} providers={providers} />
+  ) : undefined;
+  const paymentVisualization = flow.session ? (
+    <SessionChannel flow={flow} />
+  ) : hasPaymentData(flow) ? (
+    <PaymentSplits flow={flow} success={success} />
+  ) : undefined;
   return (
     <div className={`flow-detail${flow.session ? " has-session" : ""}`}>
       <SequenceDiagram
@@ -49,7 +36,11 @@ export function FlowDetail({ flow, providers }: Props) {
         success={success}
         deliveredContent={receiptLink}
       />
-      <FlowInspector flow={flow} visuals={visuals} />
+      <FlowInspector
+        flow={flow}
+        inference={inference}
+        paymentVisualization={paymentVisualization}
+      />
     </div>
   );
 }

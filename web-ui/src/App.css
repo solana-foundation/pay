@@ -771,10 +771,15 @@ body {
   overflow: hidden;
 }
 
-.detail-tab-panel > .splits,
-.detail-tab-panel > .session-channel,
 .detail-tab-panel > .inference-panel {
   height: 100%;
+}
+
+.payment-panel > .splits,
+.payment-panel > .session-channel {
+  padding: 18px 0 0;
+  overflow: visible;
+  border-right: 0;
 }
 
 .inspector-scroll {
