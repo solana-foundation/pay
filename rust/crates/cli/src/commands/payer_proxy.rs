@@ -1428,6 +1428,17 @@ async fn send_upstream(
     }
 
     let pdb_request_headers = state.pdb.as_ref().map(|_| pdb_header_map(&fwd));
+    let pdb_request_body = state.pdb.as_ref().and_then(|_| {
+        if body.is_empty() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&body);
+        let mut captured: String = text.chars().take(4096).collect();
+        if text.chars().count() > 4096 {
+            captured.push('…');
+        }
+        Some(captured)
+    });
     let result = state
         .client
         .request(method.clone(), url)
@@ -1457,6 +1468,7 @@ async fn send_upstream(
             status,
             ms: started.elapsed().as_millis() as u64,
             req_headers,
+            req_body: pdb_request_body,
             res_headers,
             res_body,
             client_ip: "payer-proxy".to_string(),

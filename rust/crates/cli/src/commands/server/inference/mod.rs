@@ -237,6 +237,7 @@ impl PaymentState for InferenceState {
             status: exchange.status,
             ms: exchange.ms,
             req_headers: exchange.req_headers.into_iter().collect(),
+            req_body: None,
             res_headers: exchange.res_headers.into_iter().collect(),
             res_body: None,
             client_ip: exchange.client_ip,

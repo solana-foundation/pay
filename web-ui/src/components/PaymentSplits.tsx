@@ -58,9 +58,86 @@ interface AuthenticateChallenge {
 
 type ParsedChallenge = PaymentChallenge | AuthenticateChallenge;
 
-function parseChallenge(flow: PaymentFlow): ParsedChallenge | null {
-  const wwwAuth = flow.challengeHeaders?.["www-authenticate"];
-  if (!wwwAuth) return null;
+interface X402Offer {
+  scheme?: string;
+  amount?: string | number;
+  payTo?: string;
+  extra?: {
+    decimals?: number;
+    feePayer?: string;
+  };
+}
+
+interface X402Envelope {
+  accepts?: X402Offer[];
+  offers?: X402Offer[];
+}
+
+function headerValue(
+  headers: Record<string, string> | undefined,
+  name: string,
+): string | undefined {
+  const lower = name.toLowerCase();
+  return Object.entries(headers ?? {}).find(
+    ([key]) => key.toLowerCase() === lower,
+  )?.[1];
+}
+
+function parseX402Challenge(flow: PaymentFlow): PaymentChallenge | null {
+  const encoded =
+    headerValue(flow.challengeHeaders, "payment-required") ??
+    headerValue(flow.challengeHeaders, "x-payment-required");
+  let envelope: X402Envelope | null = null;
+  if (encoded) {
+    const decoded = base64urlDecode(encoded);
+    try {
+      envelope = JSON.parse(decoded || encoded) as X402Envelope;
+    } catch {
+      envelope = null;
+    }
+  }
+  if (!envelope && flow.responseBody) {
+    try {
+      envelope = JSON.parse(flow.responseBody) as X402Envelope;
+    } catch {
+      envelope = null;
+    }
+  }
+
+  const offers = envelope?.accepts ?? envelope?.offers ?? [];
+  const offer =
+    offers.find((candidate) => candidate.scheme === flow.scheme) ??
+    offers[0];
+  const recipient = offer?.payTo ?? flow.payment?.recipient;
+  const rawAmount = offer?.amount;
+  const decimals = offer?.extra?.decimals ?? 6;
+  const totalAmount =
+    rawAmount != null
+      ? Number(rawAmount) / Math.pow(10, decimals)
+      : Number.parseFloat(flow.amount ?? "");
+  if (!recipient || !Number.isFinite(totalAmount)) return null;
+
+  return {
+    kind: "payment",
+    totalAmount,
+    recipients: [
+      {
+        label:
+          flow.scheme === "batch-settlement"
+            ? "Channel recipient"
+            : "Recipient",
+        address: recipient,
+        amount: totalAmount,
+      },
+    ],
+    feePayerKey: offer?.extra?.feePayer,
+    payerAddress: flow.payer,
+  };
+}
+
+export function parseChallenge(flow: PaymentFlow): ParsedChallenge | null {
+  const wwwAuth = headerValue(flow.challengeHeaders, "www-authenticate");
+  if (!wwwAuth) return parseX402Challenge(flow);
   const intent = wwwAuth.match(/intent="([^"]*)"/)?.[1];
   const match = wwwAuth.match(/request="([^"]+)"/);
   if (!match) return null;

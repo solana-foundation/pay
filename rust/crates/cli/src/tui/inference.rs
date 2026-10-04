@@ -1037,11 +1037,13 @@ mod tests {
             protocol: Protocol::Http,
             scheme: None,
             resource: "/v1/chat/completions".to_string(),
+            method: Some("POST".to_string()),
             status,
             client_ip: "::1".to_string(),
             started_at: "2026-07-01T12:01:22.101Z".to_string(),
             updated_at: "2026-07-01T12:01:24.020Z".to_string(),
             duration_ms: 1919,
+            response_status: Some(200),
             amount: None,
             steps: vec![],
             events: vec![
@@ -1059,7 +1061,9 @@ mod tests {
             challenge_headers: None,
             payer: None,
             session: None,
+            payment: None,
             payment_headers: None,
+            request_body: None,
             response_headers: None,
             response_body: None,
             inference: provider.map(|slug| InferenceInfo {

@@ -28,6 +28,12 @@ fn redacted_headers(headers: &HashMap<String, String>) -> HashMap<String, String
                 name.to_ascii_lowercase().as_str(),
                 "authorization"
                     | "proxy-authorization"
+                    | "x-api-key"
+                    | "api-key"
+                    | "apikey"
+                    | "x-auth-token"
+                    | "x-access-token"
+                    | "x-goog-api-key"
                     | "payment-signature"
                     | "x-payment"
                     | "payment-response"
@@ -46,6 +52,41 @@ fn redacted_headers(headers: &HashMap<String, String>) -> HashMap<String, String
             )
         })
         .collect()
+}
+
+fn redacted_request_body(body: Option<&str>) -> Option<String> {
+    let body = body?;
+    let Ok(mut json) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Some(body.to_string());
+    };
+    fn redact(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(object) => {
+                for (key, value) in object {
+                    let key = key.to_ascii_lowercase().replace('-', "_");
+                    if matches!(
+                        key.as_str(),
+                        "authorization"
+                            | "api_key"
+                            | "apikey"
+                            | "access_token"
+                            | "refresh_token"
+                            | "password"
+                            | "secret"
+                            | "client_secret"
+                    ) {
+                        *value = serde_json::Value::String(REDACTED.into());
+                    } else {
+                        redact(value);
+                    }
+                }
+            }
+            serde_json::Value::Array(values) => values.iter_mut().for_each(redact),
+            _ => {}
+        }
+    }
+    redact(&mut json);
+    serde_json::to_string(&json).ok()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -202,14 +243,17 @@ impl FlowCorrelation {
             protocol: Protocol::Http,
             scheme: None,
             resource: start.path.clone(),
+            method: Some(start.method.clone()),
             status: FlowStatus::InProgress,
             client_ip: start.client_ip,
             started_at: start.ts.clone(),
             updated_at: start.ts.clone(),
             duration_ms: 0,
+            response_status: None,
             amount: None,
             payer: None,
             session: None,
+            payment: None,
             steps: exchange_steps(&start.ts),
             events: vec![FlowEvent {
                 ts: start.ts,
@@ -218,6 +262,7 @@ impl FlowCorrelation {
             }],
             challenge_headers: None,
             payment_headers: None,
+            request_body: None,
             response_headers: None,
             response_body: None,
             inference: start.inference,
@@ -281,9 +326,16 @@ impl FlowCorrelation {
             flow.protocol = protocol;
             flow.scheme = flow_scheme(&entry, protocol, None);
             flow.status = FlowStatus::PaymentRequired;
+            flow.response_status = Some(entry.status);
             flow.updated_at = now.clone();
+            if !entry.req_headers.is_empty() {
+                flow.payment_headers = Some(redacted_headers(&entry.req_headers));
+            }
+            flow.request_body = redacted_request_body(entry.req_body.as_deref());
             flow.challenge_headers = Some(redacted_headers(&entry.res_headers));
+            flow.response_body = entry.res_body.clone();
             flow.amount = extract_amount(&entry);
+            flow.payment = payment_details(&entry);
             flow.steps = build_steps(&protocol);
             flow.steps[0].ts = Some(started);
             flow.events.push(FlowEvent {
@@ -304,11 +356,14 @@ impl FlowCorrelation {
         }
 
         flow.status = exchange_status(entry.status);
+        flow.method = Some(entry.method.clone());
+        flow.response_status = Some(entry.status);
         flow.updated_at = now.clone();
         flow.duration_ms = elapsed_ms(&flow.started_at, now).unwrap_or(entry.ms);
         if !entry.req_headers.is_empty() {
             flow.payment_headers = Some(redacted_headers(&entry.req_headers));
         }
+        flow.request_body = redacted_request_body(entry.req_body.as_deref());
         flow.response_headers = Some(redacted_headers(&entry.res_headers));
         flow.response_body = entry.res_body.clone();
         // A settled MPP payment on this exchange — drives the stablecoin
@@ -317,6 +372,7 @@ impl FlowCorrelation {
             flow.amount = Some(amount);
             flow.payer = extract_payer(&entry.req_headers);
         }
+        flow.payment = merge_payment_details(flow.payment.take(), payment_details(&entry));
         // Merged challenge+retry flows carry the 4-step payment diagram;
         // plain exchanges keep their 2-step one.
         if flow.steps.len() == 4 {
@@ -430,14 +486,17 @@ impl FlowCorrelation {
             protocol: Protocol::Http,
             scheme: None,
             resource: entry.path.clone(),
+            method: Some(entry.method.clone()),
             status: exchange_status(entry.status),
             client_ip: entry.client_ip.clone(),
             started_at: now.clone(),
             updated_at: now.clone(),
             duration_ms: entry.ms,
+            response_status: Some(entry.status),
             amount,
             payer,
             session: None,
+            payment: payment_details(entry),
             steps: exchange_steps(now),
             events: vec![
                 FlowEvent {
@@ -455,7 +514,9 @@ impl FlowCorrelation {
                 },
             ],
             challenge_headers: None,
-            payment_headers: None,
+            payment_headers: (!entry.req_headers.is_empty())
+                .then(|| redacted_headers(&entry.req_headers)),
+            request_body: redacted_request_body(entry.req_body.as_deref()),
             response_headers: Some(redacted_headers(&entry.res_headers)),
             response_body: entry.res_body.clone(),
             inference: None,
@@ -591,14 +652,17 @@ impl FlowCorrelation {
             protocol,
             scheme: flow_scheme(entry, protocol, None),
             resource: entry.path.clone(),
+            method: Some(entry.method.clone()),
             status: FlowStatus::PaymentRequired,
             client_ip: entry.client_ip.clone(),
             started_at: now.clone(),
             updated_at: now.clone(),
             duration_ms: 0,
+            response_status: Some(entry.status),
             amount,
             payer: None,
             session,
+            payment: payment_details(entry),
             steps,
             events: vec![
                 FlowEvent {
@@ -613,9 +677,11 @@ impl FlowCorrelation {
                 },
             ],
             challenge_headers: Some(redacted_headers(&entry.res_headers)),
-            payment_headers: None,
+            payment_headers: (!entry.req_headers.is_empty())
+                .then(|| redacted_headers(&entry.req_headers)),
+            request_body: redacted_request_body(entry.req_body.as_deref()),
             response_headers: None,
-            response_body: None,
+            response_body: entry.res_body.clone(),
             inference: None,
         };
 
@@ -662,6 +728,10 @@ impl FlowCorrelation {
             None
         };
         flow.payment_headers = Some(redacted_headers(&entry.req_headers));
+        flow.request_body = redacted_request_body(entry.req_body.as_deref());
+        flow.method = Some(entry.method.clone());
+        flow.response_status = Some(entry.status);
+        flow.payment = merge_payment_details(flow.payment.take(), payment_details(entry));
         flow.payer = extract_payer(&entry.req_headers);
         flow.response_headers = Some(redacted_headers(&entry.res_headers));
         flow.response_body = entry.res_body.clone();
@@ -743,14 +813,17 @@ impl FlowCorrelation {
             protocol,
             scheme: flow_scheme(entry, protocol, None),
             resource: entry.path.clone(),
+            method: Some(entry.method.clone()),
             status: FlowStatus::ResourceDelivered,
             client_ip: entry.client_ip.clone(),
             started_at: now.clone(),
             updated_at: now.clone(),
             duration_ms: entry.ms,
+            response_status: Some(entry.status),
             amount: None,
             payer: extract_payer(&entry.req_headers),
             session: session.clone(),
+            payment: payment_details(entry),
             steps,
             events: vec![FlowEvent {
                 ts: now.clone(),
@@ -767,7 +840,9 @@ impl FlowCorrelation {
                 }),
             }],
             challenge_headers: None,
-            payment_headers: None,
+            payment_headers: (!entry.req_headers.is_empty())
+                .then(|| redacted_headers(&entry.req_headers)),
+            request_body: redacted_request_body(entry.req_body.as_deref()),
             response_headers: Some(redacted_headers(&entry.res_headers)),
             response_body: entry.res_body.clone(),
             inference: None,
@@ -812,6 +887,10 @@ impl FlowCorrelation {
         };
 
         flow.payment_headers = Some(redacted_headers(&entry.req_headers));
+        flow.request_body = redacted_request_body(entry.req_body.as_deref());
+        flow.method = Some(entry.method.clone());
+        flow.response_status = Some(entry.status);
+        flow.payment = merge_payment_details(flow.payment.take(), payment_details(entry));
         if let Some(payer) = extract_payer(&entry.req_headers) {
             flow.payer = Some(payer);
         }
@@ -1129,6 +1208,167 @@ fn x402_payment_event(entry: &LogEntry) -> Option<(String, String)> {
         format!("batch-settlement: {}", parts.join("; "))
     };
     Some((message, detail))
+}
+
+fn merge_payment_details(
+    existing: Option<PaymentDetails>,
+    incoming: Option<PaymentDetails>,
+) -> Option<PaymentDetails> {
+    match (existing, incoming) {
+        (None, None) => None,
+        (Some(details), None) | (None, Some(details)) => Some(details),
+        (Some(existing), Some(incoming)) => Some(PaymentDetails {
+            action: incoming.action.or(existing.action),
+            network: incoming.network.or(existing.network),
+            asset: incoming.asset.or(existing.asset),
+            channel_id: incoming.channel_id.or(existing.channel_id),
+            recipient: incoming.recipient.or(existing.recipient),
+            deposit_amount: incoming.deposit_amount.or(existing.deposit_amount),
+            authorized_amount: incoming.authorized_amount.or(existing.authorized_amount),
+            voucher_amount: incoming.voucher_amount.or(existing.voucher_amount),
+            settlement_amount: incoming.settlement_amount.or(existing.settlement_amount),
+            settlement_reference: incoming
+                .settlement_reference
+                .or(existing.settlement_reference),
+            receipt_status: incoming.receipt_status.or(existing.receipt_status),
+        }),
+    }
+}
+
+/// Decode payment credentials transiently into debugger-safe facts. The raw
+/// signature, transaction bytes, and authorization token are never retained.
+fn payment_details(entry: &LogEntry) -> Option<PaymentDetails> {
+    let payment = ["payment-signature", "x-payment"]
+        .into_iter()
+        .find_map(|key| {
+            entry
+                .req_headers
+                .get(key)
+                .and_then(|value| decode_json_value(value))
+        });
+    let receipt = x402_settlement_response(entry);
+    let offer = ["payment-required", "x-payment-required"]
+        .into_iter()
+        .find_map(|key| {
+            entry
+                .res_headers
+                .get(key)
+                .and_then(|value| decode_json_value(value))
+                .and_then(|required| {
+                    required
+                        .get("accepts")
+                        .or_else(|| required.get("offers"))?
+                        .as_array()?
+                        .first()
+                        .cloned()
+                })
+        });
+    if payment.is_none() && receipt.is_none() && offer.is_none() {
+        return None;
+    }
+
+    let mut details = PaymentDetails::default();
+    if let Some(offer) = offer.as_ref() {
+        details.network = value_string(offer.get("network"));
+        details.asset = value_string(offer.get("asset"));
+        details.recipient = value_string(offer.get("payTo"));
+    }
+    if let Some(payment) = payment.as_ref() {
+        let accepted = payment.get("accepted");
+        let payload = payment.get("payload");
+        details.network = value_string(accepted.and_then(|v| v.get("network")))
+            .or_else(|| value_string(payment.get("network")));
+        details.asset = value_string(accepted.and_then(|v| v.get("asset")))
+            .or_else(|| value_string(payment.get("asset")));
+
+        if let Some(payload) = payload {
+            let kind = value_string(payload.get("type"));
+            let credential = payload
+                .get("authorization")
+                .or_else(|| payload.get("voucher"));
+            details.channel_id = value_string(payload.get("channelId"))
+                .or_else(|| value_string(credential.and_then(|v| v.get("channelId"))));
+            details.deposit_amount = value_string(
+                payload
+                    .get("deposit")
+                    .and_then(|deposit| deposit.get("amount")),
+            )
+            .map(|amount| display_batch_amount(&amount));
+            details.authorized_amount = value_string(
+                payload
+                    .get("authorization")
+                    .and_then(|authorization| authorization.get("authorizedAmount")),
+            )
+            .or_else(|| {
+                value_string(
+                    payload
+                        .get("deposit")
+                        .and_then(|deposit| deposit.get("authorization"))
+                        .and_then(|authorization| authorization.get("authorizedAmount")),
+                )
+            })
+            .map(|amount| display_batch_amount(&amount));
+            details.voucher_amount = value_string(
+                payload
+                    .get("voucher")
+                    .and_then(|voucher| voucher.get("maxClaimableAmount")),
+            )
+            .or_else(|| value_string(payload.get("maxClaimableAmount")))
+            .or_else(|| value_string(payload.get("maxAmount")))
+            .map(|amount| display_batch_amount(&amount));
+            details.action = match kind.as_deref() {
+                Some("deposit") => payload
+                    .get("deposit")
+                    .and_then(|deposit| deposit.get("transaction"))
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(batch_deposit_action)
+                    .map(|action| action.to_ascii_lowercase())
+                    .or_else(|| Some("channel funded".into())),
+                Some("authorization") => Some("authorization".into()),
+                Some("voucher") => Some("voucher".into()),
+                Some("refund") => Some("refund".into()),
+                Some(other) => Some(other.to_string()),
+                None if details.channel_id.is_some() => Some("voucher".into()),
+                None => None,
+            };
+        }
+    }
+
+    if let Some(receipt) = receipt.as_ref() {
+        details.network = value_string(receipt.get("network")).or(details.network);
+        details.settlement_amount =
+            value_string(receipt.get("amount")).map(|amount| display_batch_amount(&amount));
+        details.settlement_reference = settlement_reference(receipt);
+        details.receipt_status = value_string(receipt.get("status")).or_else(|| {
+            receipt
+                .get("success")
+                .and_then(serde_json::Value::as_bool)
+                .map(|success| if success { "success" } else { "failed" }.to_string())
+        });
+    }
+
+    Some(details)
+}
+
+fn settlement_reference(receipt: &serde_json::Value) -> Option<String> {
+    for key in [
+        "settlementSignature",
+        "settlementTransaction",
+        "transaction",
+        "transactionId",
+        "txSignature",
+        "signature",
+    ] {
+        if let Some(reference) = value_string(receipt.get(key)) {
+            return Some(reference);
+        }
+    }
+    for container in ["settlement", "receipt"] {
+        if let Some(reference) = receipt.get(container).and_then(settlement_reference) {
+            return Some(reference);
+        }
+    }
+    None
 }
 
 fn display_batch_amount(raw: &str) -> String {
@@ -1869,6 +2109,7 @@ mod tests {
             status,
             ms: 50,
             req_headers: HashMap::new(),
+            req_body: None,
             res_headers: HashMap::new(),
             res_body: None,
             client_ip: "127.0.0.1".into(),
@@ -2316,6 +2557,10 @@ mod tests {
         let detail = accepted.detail.as_deref().expect("batch action detail");
         assert!(detail.contains("0.0041 USDC"));
         assert!(detail.contains("channel channel-1"));
+        let payment = flows[0].payment.as_ref().expect("safe payment details");
+        assert_eq!(payment.action.as_deref(), Some("authorization"));
+        assert_eq!(payment.channel_id.as_deref(), Some("channel-1"));
+        assert_eq!(payment.authorized_amount.as_deref(), Some("0.0041 USDC"));
     }
 
     #[test]
@@ -2517,6 +2762,7 @@ mod tests {
                 "network": "solana-localnet",
                 "amount": amount,
                 "asset": "USDC",
+                "payTo": "provider-wallet-x402",
             }]
         }))
     }
@@ -2693,10 +2939,15 @@ mod tests {
         let payment_proof = x402_payment_signature("payer-wallet-x402");
         let payment_receipt = x402_payment_response("1234");
         let upstream_authorization = "Bearer upstream-secret".to_string();
+        let upstream_api_key = "upstream-api-key-secret".to_string();
+        done.req_body =
+            Some(r#"{"model":"luna","api_key":"body-api-key-secret","messages":[]}"#.into());
         done.req_headers
             .insert("payment-signature".into(), payment_proof.clone());
         done.req_headers
             .insert("authorization".into(), upstream_authorization.clone());
+        done.req_headers
+            .insert("x-api-key".into(), upstream_api_key.clone());
         done.res_headers
             .insert(X402_PAYMENT_RESPONSE_HEADER.into(), payment_receipt.clone());
         engine.ingest(done);
@@ -2707,6 +2958,20 @@ mod tests {
         assert_eq!(flow.status, FlowStatus::ResourceDelivered);
         assert_eq!(flow.amount.as_deref(), Some("0.0012 USDC"));
         assert_eq!(flow.payer.as_deref(), Some("payer-wallet-x402"));
+        let request_body = flow.request_body.as_deref().expect("request body");
+        assert!(request_body.contains("luna"));
+        assert!(request_body.contains(REDACTED));
+        assert!(!request_body.contains("body-api-key-secret"));
+        let payment = flow.payment.as_ref().expect("safe payment details");
+        assert_eq!(payment.action.as_deref(), Some("voucher"));
+        assert_eq!(payment.channel_id.as_deref(), Some("channel-1"));
+        assert_eq!(payment.recipient.as_deref(), Some("provider-wallet-x402"));
+        assert_eq!(payment.voucher_amount.as_deref(), Some("0.1000 USDC"));
+        assert_eq!(payment.settlement_amount.as_deref(), Some("0.0012 USDC"));
+        assert_eq!(
+            payment.settlement_reference.as_deref(),
+            Some("settlement-signature-x402")
+        );
         assert!(
             flow.response_headers
                 .as_ref()
@@ -2722,6 +2987,10 @@ mod tests {
             REDACTED
         );
         assert_eq!(
+            flow.payment_headers.as_ref().unwrap()["x-api-key"],
+            REDACTED
+        );
+        assert_eq!(
             flow.response_headers.as_ref().unwrap()[X402_PAYMENT_RESPONSE_HEADER],
             REDACTED
         );
@@ -2729,6 +2998,7 @@ mod tests {
         assert!(!serialized.contains(&payment_proof));
         assert!(!serialized.contains(&payment_receipt));
         assert!(!serialized.contains(&upstream_authorization));
+        assert!(!serialized.contains(&upstream_api_key));
 
         let connections = engine.connections_snapshot();
         assert_eq!(connections.len(), 1);

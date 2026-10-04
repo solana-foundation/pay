@@ -165,6 +165,14 @@ async fn forward_and_log(req: Request<Body>, pdb: pay_pdb::PdbState) -> Response
             return (StatusCode::BAD_REQUEST, format!("read body: {e}")).into_response();
         }
     };
+    let request_body_for_log = (!body_bytes.is_empty()).then(|| {
+        let text = String::from_utf8_lossy(&body_bytes);
+        let mut captured: String = text.chars().take(4096).collect();
+        if text.chars().count() > 4096 {
+            captured.push('…');
+        }
+        captured
+    });
 
     let log_id = pdb.next_log_id();
     let start = std::time::Instant::now();
@@ -219,6 +227,7 @@ async fn forward_and_log(req: Request<Body>, pdb: pay_pdb::PdbState) -> Response
                     .iter()
                     .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
                     .collect(),
+                req_body: request_body_for_log.clone(),
                 res_headers: res_headers.clone(),
                 res_body: Some(res_body_for_log),
                 client_ip: "mcp".to_string(),
@@ -245,6 +254,7 @@ async fn forward_and_log(req: Request<Body>, pdb: pay_pdb::PdbState) -> Response
                 status: 502,
                 ms: elapsed_ms,
                 req_headers: Default::default(),
+                req_body: request_body_for_log,
                 res_headers: Default::default(),
                 res_body: Some(e.to_string()),
                 client_ip: "mcp".to_string(),

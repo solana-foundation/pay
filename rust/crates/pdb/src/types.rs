@@ -150,6 +150,49 @@ pub struct InferenceInfo {
     pub tokens_per_sec: Option<f64>,
 }
 
+// ── Safe payment inspection metadata ──
+
+/// Non-secret facts decoded from payment credentials and settlement receipts.
+/// Raw credentials remain redacted; this is the debugger-safe projection used
+/// to explain channel actions and vouchers in the UI.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaymentDetails {
+    /// Human-readable channel operation, such as `voucher` or `channel topped up`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    /// Settlement network identifier advertised by x402.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+    /// Asset symbol or mint identifier advertised by the payment offer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub asset: Option<String>,
+    /// Public payment-channel account identifier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<String>,
+    /// Public recipient advertised by the selected payment offer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recipient: Option<String>,
+    /// Human-readable amount deposited while opening or topping up a channel.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deposit_amount: Option<String>,
+    /// Human-readable server-authorized spending ceiling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorized_amount: Option<String>,
+    /// Human-readable cumulative maximum claimable by the latest voucher.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voucher_amount: Option<String>,
+    /// Human-readable amount reported by the settlement receipt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settlement_amount: Option<String>,
+    /// Public settlement transaction signature used for receipt navigation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settlement_reference: Option<String>,
+    /// Settlement status reported by the receipt, such as `success`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receipt_status: Option<String>,
+}
+
 /// Discovered local inference provider, broadcast to UIs on (re)probe.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -195,11 +238,17 @@ pub struct PaymentFlow {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scheme: Option<String>,
     pub resource: String,
+    /// HTTP method used for the proxied request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
     pub status: FlowStatus,
     pub client_ip: String,
     pub started_at: String,
     pub updated_at: String,
     pub duration_ms: u64,
+    /// Final upstream HTTP status, or the latest handshake status in progress.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_status: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub amount: Option<String>,
     pub steps: Vec<FlowStep>,
@@ -211,7 +260,12 @@ pub struct PaymentFlow {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session: Option<SessionInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub payment: Option<PaymentDetails>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub payment_headers: Option<HashMap<String, String>>,
+    /// Captured request payload, truncated by the proxy and with common secret fields redacted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_body: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_headers: Option<HashMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -314,6 +368,8 @@ pub struct LogEntry {
     pub status: u16,
     pub ms: u64,
     pub req_headers: HashMap<String, String>,
+    /// Optional request payload captured by a debugger-aware proxy.
+    pub req_body: Option<String>,
     pub res_headers: HashMap<String, String>,
     pub res_body: Option<String>,
     pub client_ip: String,

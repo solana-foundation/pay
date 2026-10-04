@@ -11,6 +11,7 @@ export type {
   ProviderSummary,
   ModelPricingSummary,
   InferenceInfo,
+  PaymentDetails,
   ConnectionSummary,
   SSEMessage,
 } from "../api/types";

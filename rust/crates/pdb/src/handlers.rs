@@ -135,6 +135,7 @@ pub async fn inject_fake_flow(State(state): State<PdbState>) -> impl IntoRespons
         status: 402,
         ms: 12,
         req_headers: HashMap::new(),
+        req_body: None,
         res_headers,
         res_body: None,
         client_ip: "192.168.1.42".to_string(),
@@ -163,6 +164,7 @@ pub async fn inject_fake_flow(State(state): State<PdbState>) -> impl IntoRespons
             status: 200,
             ms: 842,
             req_headers: retry_req,
+            req_body: None,
             res_headers: retry_res,
             res_body: Some(r#"{"mint":"FakeNFTMintxxxxxxxxxxxxxxxxxxxxxxxx"}"#.to_string()),
             client_ip: "192.168.1.42".to_string(),
@@ -205,6 +207,7 @@ pub async fn inject_fake_flow(State(state): State<PdbState>) -> impl IntoRespons
             status: 402,
             ms: 8,
             req_headers: HashMap::new(),
+            req_body: None,
             res_headers: failed_res_headers,
             res_body: None,
             client_ip: "10.0.0.5".to_string(),
@@ -224,6 +227,7 @@ pub async fn inject_fake_flow(State(state): State<PdbState>) -> impl IntoRespons
             status: 500,
             ms: 1204,
             req_headers: retry_req,
+            req_body: None,
             res_headers: HashMap::new(),
             res_body: Some(
                 r#"{"error":"Transaction simulation failed: insufficient funds for fee"}"#

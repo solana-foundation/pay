@@ -1,6 +1,6 @@
 import type { PaymentFlow, ProviderSummary } from "../types";
 import { SequenceDiagram } from "./SequenceDiagram";
-import { EventLog } from "./EventLog";
+import { FlowInspector } from "./FlowInspector";
 import { PaymentSplits } from "./PaymentSplits";
 import { hasReceiptLink, ReceiptLink } from "./ReceiptLink";
 import { SessionChannel } from "./SessionChannel";
@@ -20,6 +20,18 @@ export function FlowDetail({ flow, providers }: Props) {
   // completed diagram; anything carrying payment data keeps today's diagram.
   const simplified = flow.inference && !hasPaymentData(flow);
   const steps = simplified ? inferenceSteps(flow) : flow.steps;
+  const visual = flow.inference ? (
+    <InferencePanel flow={flow} providers={providers} />
+  ) : flow.session ? (
+    <SessionChannel flow={flow} />
+  ) : (
+    <PaymentSplits flow={flow} success={success} />
+  );
+  const visualLabel = flow.inference
+    ? "Inference"
+    : flow.session
+      ? "Channel"
+      : "Splits";
   return (
     <div className={`flow-detail${flow.session ? " has-session" : ""}`}>
       <SequenceDiagram
@@ -28,16 +40,7 @@ export function FlowDetail({ flow, providers }: Props) {
         success={success}
         deliveredContent={receiptLink}
       />
-      <div className="flow-middle">
-        {flow.inference ? (
-          <InferencePanel flow={flow} providers={providers} />
-        ) : flow.session ? (
-          <SessionChannel flow={flow} />
-        ) : (
-          <PaymentSplits flow={flow} success={success} />
-        )}
-      </div>
-      <EventLog events={flow.events} />
+      <FlowInspector flow={flow} visual={visual} visualLabel={visualLabel} />
     </div>
   );
 }

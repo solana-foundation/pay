@@ -58,21 +58,28 @@ export function responseHeader(flow: PaymentFlow, name: string): string | null {
 
 /** Decode the flow's settlement response header, or null. */
 export function parseReceipt(flow: PaymentFlow): Receipt | null {
+  const safeReceipt = flow.payment?.settlementReference
+    ? {
+        reference: flow.payment.settlementReference,
+        network: flow.payment.network,
+        status: flow.payment.receiptStatus,
+      }
+    : null;
   const header =
     responseHeader(flow, "payment-receipt") ||
     responseHeader(flow, "payment-response") ||
     responseHeader(flow, "x-payment-response");
-  if (!header) return null;
+  if (!header || header === "[REDACTED]") return safeReceipt;
   const decoded = base64urlDecode(header);
   for (const candidate of [decoded, header]) {
     if (!candidate) continue;
     try {
-      return JSON.parse(candidate) as Receipt;
+      return { ...safeReceipt, ...(JSON.parse(candidate) as Receipt) };
     } catch {
       // Continue: x402 exact may return a direct settlement reference.
     }
   }
-  return { reference: header };
+  return { ...safeReceipt, reference: header };
 }
 
 /** Whether this flow used a reusable subscription proof rather than activation. */

@@ -24,6 +24,24 @@ function flowWithHeaders(responseHeaders: Record<string, string>): PaymentFlow {
 }
 
 describe("receipt parsing", () => {
+  it("uses the safe settlement reference when receipt headers are redacted", () => {
+    const href = receiptLinkHref(
+      {
+        ...flowWithHeaders({ "payment-response": "[REDACTED]" }),
+        payment: {
+          settlementReference: "safe-settlement-signature",
+          network: "solana-localnet",
+          receiptStatus: "success",
+        },
+      },
+      null,
+    );
+
+    expect(href).toBe(
+      "https://pay.sh/receipt/safe-settlement-signature?network=sandbox&view=advanced",
+    );
+  });
+
   it("reads x402 payment-response transaction signatures", () => {
     const receipt = parseReceipt(
       flowWithHeaders({

@@ -94,6 +94,20 @@ export interface InferenceInfo {
   tokensPerSec?: number;
 }
 
+export interface PaymentDetails {
+  action?: string;
+  network?: string;
+  asset?: string;
+  channelId?: string;
+  recipient?: string;
+  depositAmount?: string;
+  authorizedAmount?: string;
+  voucherAmount?: string;
+  settlementAmount?: string;
+  settlementReference?: string;
+  receiptStatus?: string;
+}
+
 // ── Connection (inference mode grouping) ──
 
 export interface ConnectionSummary {
@@ -121,20 +135,24 @@ export interface PaymentFlow {
   // "exact"/"upto"/"batch-settlement" (x402). Rendered as "PROTOCOL:SCHEME".
   scheme?: string;
   resource: string; // URL path, e.g. "/mpp/quote/GOOG"
+  method?: string;
   status: FlowStatus;
   clientIp: string;
   startedAt: string; // ISO
   updatedAt: string; // ISO
   durationMs: number;
+  responseStatus?: number;
   amount?: string;
   payer?: string;
   session?: SessionInfo;
+  payment?: PaymentDetails;
   inference?: InferenceInfo;
   steps: FlowStep[];
   events: FlowEvent[];
   // Raw data for detail inspection
   challengeHeaders?: Record<string, string>;
   paymentHeaders?: Record<string, string>;
+  requestBody?: string | null;
   responseHeaders?: Record<string, string>;
   responseBody?: string | null;
 }
