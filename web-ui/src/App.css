@@ -544,7 +544,8 @@ body {
   background: var(--bg-raised);
   display: grid;
   grid-template-columns: 220px minmax(0, 1fr);
-  height: min(560px, calc(100vh - 180px));
+  height: calc(100vh - 180px);
+  height: calc(100dvh - 180px);
   min-height: 300px;
   overflow: hidden;
   animation: slideDown 0.15s ease;
