@@ -158,6 +158,31 @@ body {
   letter-spacing: 0.04em;
 }
 
+.view-toggle {
+  display: inline-flex;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.toolbar .view-toggle button {
+  padding: 3px 9px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  color: var(--fg-muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.toolbar .view-toggle button.active {
+  background: var(--bg);
+  color: var(--fg);
+  box-shadow: 0 0 0 1px var(--border);
+}
+
 .toolbar .count {
   color: var(--fg-muted);
   font-size: 12px;
@@ -225,6 +250,278 @@ body {
   text-align: center;
   padding: 48px 24px;
   font-size: 14px;
+}
+
+/* ── Channel View ── */
+
+.channel-list-view {
+  flex: 1;
+  min-height: 0;
+  padding: 16px;
+  overflow-y: auto;
+  background: var(--bg-raised);
+}
+
+.channel-card {
+  margin: 0 auto 14px;
+  max-width: 1180px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  overflow: hidden;
+}
+
+.channel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 13px 16px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.channel-identity {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.channel-identity > div {
+  min-width: 0;
+}
+
+.channel-identity h3 {
+  margin: 0 0 2px;
+  color: var(--fg);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.channel-identity div > span {
+  display: block;
+  max-width: 620px;
+  overflow: hidden;
+  color: var(--fg-muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.channel-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--fg-muted);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.channel-state > span {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.channel-state.open {
+  color: var(--green);
+}
+
+.channel-state.failed {
+  color: var(--red);
+}
+
+.channel-state.closed {
+  color: var(--fg-secondary);
+}
+
+.channel-capacity {
+  display: grid;
+  grid-template-columns: minmax(170px, 0.8fr) minmax(420px, 2fr);
+  gap: 12px 28px;
+  padding: 16px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.channel-capacity-primary span,
+.channel-metrics dt {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--fg-muted);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.channel-capacity-primary strong {
+  color: var(--green);
+  font-family: var(--font-mono);
+  font-size: 22px;
+  font-weight: 600;
+}
+
+.channel-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.channel-metrics dd {
+  margin: 0;
+  overflow: hidden;
+  color: var(--fg);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.channel-capacity-track {
+  grid-column: 1 / -1;
+  height: 5px;
+  border-radius: 3px;
+  background: var(--surface);
+  overflow: hidden;
+}
+
+.channel-capacity-track > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--yellow);
+}
+
+.channel-capacity > p {
+  grid-column: 1 / -1;
+  margin-top: -6px;
+  color: var(--fg-muted);
+  font-size: 10px;
+}
+
+.channel-parties {
+  display: flex;
+  gap: 24px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--fg-muted);
+  font-size: 10px;
+}
+
+.channel-parties code {
+  margin-left: 4px;
+  color: var(--fg-secondary);
+  font-size: 10px;
+}
+
+.channel-requests h4 {
+  padding: 10px 16px 7px;
+  color: var(--fg-secondary);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.channel-request-row {
+  display: grid;
+  grid-template-columns: 94px 112px minmax(180px, 1fr) 120px 156px;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 9px 16px;
+  border: 0;
+  border-top: 1px solid var(--border-subtle);
+  background: transparent;
+  color: var(--fg);
+  font-family: var(--font);
+  text-align: left;
+  cursor: pointer;
+}
+
+.channel-request-row:hover,
+.channel-request-row.selected {
+  background: var(--surface);
+}
+
+.channel-request-row:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.channel-request-row time,
+.channel-request-amount {
+  color: var(--fg-muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.channel-action {
+  justify-self: start;
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--fg-secondary);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.channel-action.open,
+.channel-action.topup {
+  border-color: var(--yellow);
+  color: var(--yellow);
+}
+
+.channel-action.voucher,
+.channel-action.commit {
+  border-color: var(--green);
+  color: var(--green);
+}
+
+.channel-action.close,
+.channel-action.refund {
+  border-color: var(--red);
+  color: var(--red);
+}
+
+.channel-request-resource {
+  min-width: 0;
+}
+
+.channel-request-resource strong,
+.channel-request-resource small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.channel-request-resource strong {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.channel-request-resource small {
+  margin-top: 2px;
+  color: var(--fg-muted);
+  font-size: 10px;
+}
+
+.channel-request-amount {
+  color: var(--yellow);
+  text-align: right;
+}
+
+.channel-request > .flow-detail {
+  border-top: 1px solid var(--border);
 }
 
 /* ── Flow Row (compact) ── */
@@ -1973,6 +2270,23 @@ a.splits-label-name.splits-addr-link:hover {
   .flow-detail,
   .flow-detail.has-session {
     grid-template-columns: 190px minmax(0, 1fr);
+  }
+
+  .channel-capacity {
+    grid-template-columns: 1fr;
+  }
+
+  .channel-capacity-track,
+  .channel-capacity > p {
+    grid-column: 1;
+  }
+
+  .channel-request-row {
+    grid-template-columns: 80px 100px minmax(160px, 1fr) 100px;
+  }
+
+  .channel-request-row .status-indicator {
+    display: none;
   }
 }
 

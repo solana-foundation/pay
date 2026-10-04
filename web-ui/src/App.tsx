@@ -3,10 +3,12 @@ import { useFlows } from "./hooks/useFlows";
 import { useTheme } from "./hooks/useTheme";
 import { ConfigProvider, useAppMode, useConfig } from "./hooks/useConfig";
 import { Header } from "./components/Header";
-import { Toolbar, type FilterMode } from "./components/Toolbar";
+import { Toolbar, type FilterMode, type ViewMode } from "./components/Toolbar";
 import { FlowList } from "./components/FlowList";
+import { ChannelList } from "./components/ChannelList";
 import { Sidebar } from "./components/Sidebar";
 import { ProviderSidebar } from "./components/ProviderSidebar";
+import { channelMatches, paymentChannels } from "./lib/channels";
 
 function AppInner() {
   const config = useConfig();
@@ -18,6 +20,7 @@ function AppInner() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [mode, setMode] = useState<FilterMode>("all");
   const [search, setSearch] = useState("");
+  const [viewMode, setViewMode] = useState<ViewMode>("flows");
   const [sidebarOpen, setSidebarOpen] = useState(() => {
     const stored = localStorage.getItem("sidebarOpen");
     return stored === null ? true : stored === "true";
@@ -40,16 +43,21 @@ function AppInner() {
     prevFlowCount.current = flows.length;
   }, [flows]);
 
+  const scopedFlows = useMemo(() => {
+    return flows.filter((f) => {
+      if (mode === "mine" && viewerIp && f.clientIp !== viewerIp) return false;
+      if (mode === "errors" && f.status !== "failed") return false;
+      return true;
+    });
+  }, [flows, mode, viewerIp]);
+
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
-    return flows.filter((f) => {
+    return scopedFlows.filter((f) => {
       if (inference) {
         if (!q) return true;
         return f.inference?.model?.toLowerCase().includes(q) ?? false;
       }
-
-      if (mode === "mine" && viewerIp && f.clientIp !== viewerIp) return false;
-      if (mode === "errors" && f.status !== "failed") return false;
       if (q) {
         if (
           !f.resource.toLowerCase().includes(q) &&
@@ -59,23 +67,37 @@ function AppInner() {
       }
       return true;
     });
-  }, [flows, mode, viewerIp, search, inference]);
+  }, [scopedFlows, search, inference]);
+
+  const allChannels = useMemo(() => paymentChannels(flows), [flows]);
+  const visibleChannels = useMemo(
+    () => paymentChannels(scopedFlows).filter((channel) => channelMatches(channel, search)),
+    [scopedFlows, search],
+  );
 
   // Inference mode groups by connection and filters that grouped list by
   // model name only. undefined outside inference mode keeps FlowList flat.
   const visibleConnections = useMemo(() => {
-    if (!inference) return undefined;
+    if (!inference || viewMode === "channels") return undefined;
     const q = search.trim().toLowerCase();
     if (!q) return connections;
     return connections.filter((c) =>
       c.models?.some((model) => model.toLowerCase().includes(q)),
     );
-  }, [inference, connections, search]);
+  }, [inference, connections, search, viewMode]);
 
-  const toolbarCount = inference
-    ? (visibleConnections?.length ?? 0)
-    : filtered.length;
-  const toolbarTotal = inference ? connections.length : flows.length;
+  const toolbarCount =
+    viewMode === "channels"
+      ? visibleChannels.length
+      : inference
+        ? (visibleConnections?.length ?? 0)
+        : filtered.length;
+  const toolbarTotal =
+    viewMode === "channels"
+      ? allChannels.length
+      : inference
+        ? connections.length
+        : flows.length;
 
   return (
     <div className="app">
@@ -101,14 +123,25 @@ function AppInner() {
           total={toolbarTotal}
           onClear={clear}
           connected={connected}
+          viewMode={viewMode}
+          onViewModeChange={setViewMode}
         />
-        <FlowList
-          flows={filtered}
-          selectedId={selectedId}
-          onSelect={handleSelect}
-          providers={inference ? providers : undefined}
-          connections={visibleConnections}
-        />
+        {viewMode === "channels" ? (
+          <ChannelList
+            channels={visibleChannels}
+            selectedId={selectedId}
+            onSelect={handleSelect}
+            providers={inference ? providers : undefined}
+          />
+        ) : (
+          <FlowList
+            flows={filtered}
+            selectedId={selectedId}
+            onSelect={handleSelect}
+            providers={inference ? providers : undefined}
+            connections={visibleConnections}
+          />
+        )}
       </div>
       <div className={`sidebar${sidebarOpen ? "" : " collapsed"}`}>
         {inference ? <ProviderSidebar providers={providers} /> : <Sidebar />}

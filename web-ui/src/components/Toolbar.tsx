@@ -1,4 +1,5 @@
 type FilterMode = "all" | "mine" | "errors";
+export type ViewMode = "flows" | "channels";
 
 interface Props {
   inference?: boolean;
@@ -10,6 +11,8 @@ interface Props {
   total: number;
   onClear: () => void;
   connected: boolean;
+  viewMode: ViewMode;
+  onViewModeChange: (view: ViewMode) => void;
 }
 
 export function Toolbar({
@@ -22,11 +25,30 @@ export function Toolbar({
   total,
   onClear,
   connected,
+  viewMode,
+  onViewModeChange,
 }: Props) {
-  const unit = inference ? "connections" : "flows";
+  const unit = viewMode === "channels" ? "channels" : inference ? "connections" : "flows";
   return (
     <div className="toolbar">
-      <h2>{inference ? "Connections" : "Flows"}</h2>
+      <div className="view-toggle" role="group" aria-label="Debugger view">
+        <button
+          className={viewMode === "flows" ? "active" : ""}
+          type="button"
+          aria-pressed={viewMode === "flows"}
+          onClick={() => onViewModeChange("flows")}
+        >
+          {inference ? "Connections" : "Flows"}
+        </button>
+        <button
+          className={viewMode === "channels" ? "active" : ""}
+          type="button"
+          aria-pressed={viewMode === "channels"}
+          onClick={() => onViewModeChange("channels")}
+        >
+          Channels
+        </button>
+      </div>
       <span className="count">
         {connected
           ? `${count} / ${total} ${unit}`
@@ -34,7 +56,13 @@ export function Toolbar({
       </span>
       <input
         className="filter"
-        placeholder={inference ? "Filter by model..." : "Filter by path..."}
+        placeholder={
+          viewMode === "channels"
+            ? "Filter channels..."
+            : inference
+              ? "Filter by model..."
+              : "Filter by path..."
+        }
         value={search}
         onChange={(e) => onSearchChange(e.target.value)}
       />
