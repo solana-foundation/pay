@@ -101,6 +101,22 @@ impl PdbState {
             .update_exchange(log_id, inference);
     }
 
+    /// Attach usage metadata parsed after a proxied response stream finishes.
+    pub fn enrich_inference_response(
+        &self,
+        client_ip: &str,
+        resource: &str,
+        response_headers: std::collections::HashMap<String, String>,
+        response_body: String,
+    ) {
+        self.correlation.lock().unwrap().enrich_inference_response(
+            client_ip,
+            resource,
+            response_headers,
+            response_body,
+        );
+    }
+
     /// Record and broadcast the current provider fleet (discovery/watch task).
     pub fn set_providers(&self, providers: Vec<ProviderSummary>) {
         *self.providers.lock().unwrap() = providers.clone();

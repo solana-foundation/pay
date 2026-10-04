@@ -86,10 +86,14 @@ export interface ModelPricingSummary {
 export interface InferenceInfo {
   provider: string; // slug
   model?: string;
-  endpointKind?: "chat" | "completion" | "embeddings" | "other";
+  endpointKind?: "chat" | "completion" | "responses" | "embeddings" | "other";
   streamed: boolean;
   tokensPrompt?: number;
   tokensCompletion?: number;
+  tokensCached?: number;
+  tokensReasoning?: number;
+  responseId?: string;
+  finishReason?: string;
   ttftMs?: number;
   tokensPerSec?: number;
 }

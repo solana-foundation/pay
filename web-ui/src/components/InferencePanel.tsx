@@ -26,6 +26,10 @@ export function InferencePanel({ flow, providers }: Props) {
     inf.tokensPrompt == null && inf.tokensCompletion == null
       ? "—"
       : `${inf.tokensPrompt ?? "—"} prompt / ${inf.tokensCompletion ?? "—"} completion`;
+  const totalTokens =
+    inf.tokensPrompt != null || inf.tokensCompletion != null
+      ? (inf.tokensPrompt ?? 0) + (inf.tokensCompletion ?? 0)
+      : null;
 
   return (
     <div className="inference-panel">
@@ -64,6 +68,15 @@ export function InferencePanel({ flow, providers }: Props) {
         value={inf.ttftMs != null ? `${inf.ttftMs}ms` : "—"}
       />
       <Row label="Tokens" value={tokens} />
+      <Row label="Total tokens" value={totalTokens ?? "—"} />
+      {(inf.tokensCached != null || inf.tokensReasoning != null) && (
+        <Row
+          label="Token details"
+          value={`${inf.tokensCached ?? "—"} cached / ${inf.tokensReasoning ?? "—"} reasoning`}
+        />
+      )}
+      {inf.finishReason && <Row label="Finish reason" value={inf.finishReason} />}
+      {inf.responseId && <Row label="Response ID" value={inf.responseId} />}
       <Row label="Throughput" value={formatTokPerSec(inf.tokensPerSec) ?? "—"} />
     </div>
   );

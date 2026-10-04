@@ -144,6 +144,18 @@ pub struct InferenceInfo {
     pub tokens_prompt: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens_completion: Option<u64>,
+    /// Prompt/input tokens served from a provider cache, when reported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_cached: Option<u64>,
+    /// Completion/output tokens used for model reasoning, when reported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_reasoning: Option<u64>,
+    /// Provider response identifier, such as an OpenAI completion id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_id: Option<String>,
+    /// Terminal generation reason reported by the first choice/output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ttft_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -429,6 +441,10 @@ mod tests {
             streamed: true,
             tokens_prompt: Some(12),
             tokens_completion: Some(214),
+            tokens_cached: Some(4),
+            tokens_reasoning: Some(8),
+            response_id: Some("chatcmpl-123".into()),
+            finish_reason: Some("stop".into()),
             ttft_ms: Some(182),
             tokens_per_sec: Some(41.2),
         };
@@ -437,6 +453,10 @@ mod tests {
         assert_eq!(json["endpointKind"], "chat");
         assert_eq!(json["tokensPrompt"], 12);
         assert_eq!(json["tokensCompletion"], 214);
+        assert_eq!(json["tokensCached"], 4);
+        assert_eq!(json["tokensReasoning"], 8);
+        assert_eq!(json["responseId"], "chatcmpl-123");
+        assert_eq!(json["finishReason"], "stop");
         assert_eq!(json["ttftMs"], 182);
         assert_eq!(json["tokensPerSec"], 41.2);
         // Empty optionals are omitted, not null.

@@ -1075,6 +1075,7 @@ mod tests {
                 tokens_completion: Some(214),
                 ttft_ms: Some(182),
                 tokens_per_sec: Some(41.2),
+                ..Default::default()
             }),
         }
     }

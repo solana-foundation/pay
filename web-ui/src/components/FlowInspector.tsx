@@ -4,7 +4,20 @@ import type { PaymentFlow } from "../types";
 import { EventLog } from "./EventLog";
 import { ReceiptLink } from "./ReceiptLink";
 
-type Tab = "visual" | "request" | "payment" | "response" | "events";
+type Tab =
+  | "inference"
+  | "splits"
+  | "channel"
+  | "request"
+  | "payment"
+  | "response"
+  | "events";
+
+export interface InspectorVisual {
+  id: "inference" | "splits" | "channel";
+  label: string;
+  content: ReactNode;
+}
 
 function prettyBody(body: string): string {
   try {
@@ -151,18 +164,17 @@ function ResponsePanel({ flow }: { flow: PaymentFlow }) {
 
 export function FlowInspector({
   flow,
-  visual,
-  visualLabel = "Splits",
+  visuals = [],
 }: {
   flow: PaymentFlow;
-  visual?: ReactNode;
-  visualLabel?: string;
+  visuals?: InspectorVisual[];
 }) {
   const [tab, setTab] = useState<Tab>(
-    visual ? "visual" : flow.protocol === "http" && !flow.payment ? "request" : "payment",
+    visuals[0]?.id ??
+      (flow.protocol === "http" && !flow.payment ? "request" : "payment"),
   );
   const tabs: Array<{ id: Tab; label: string; count?: number }> = [
-    ...(visual ? [{ id: "visual" as const, label: visualLabel }] : []),
+    ...visuals.map(({ id, label }) => ({ id, label })),
     { id: "request", label: "Request" },
     { id: "payment", label: "Payment" },
     { id: "response", label: "Response" },
@@ -196,7 +208,7 @@ export function FlowInspector({
         id={`flow-panel-${tab}`}
         aria-labelledby={`flow-tab-${tab}`}
       >
-        {tab === "visual" && visual}
+        {visuals.find((visual) => visual.id === tab)?.content}
         {tab === "request" && <RequestPanel flow={flow} />}
         {tab === "payment" && <PaymentPanel flow={flow} />}
         {tab === "response" && <ResponsePanel flow={flow} />}

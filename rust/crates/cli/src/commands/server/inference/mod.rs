@@ -387,6 +387,10 @@ fn usage_to_info(usage: &pay_core::InferenceUsage) -> InferenceInfo {
         streamed: usage.streamed,
         tokens_prompt: usage.tokens_prompt,
         tokens_completion: usage.tokens_completion,
+        tokens_cached: None,
+        tokens_reasoning: None,
+        response_id: None,
+        finish_reason: None,
         ttft_ms: usage.ttft_ms,
         tokens_per_sec: usage.tokens_per_sec,
     }

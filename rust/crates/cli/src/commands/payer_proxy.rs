@@ -418,7 +418,13 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
             };
             return (StatusCode::BAD_GATEWAY, message).into_response();
         }
-        return deliver(first, translated, session_authorization.take()).await;
+        return deliver(
+            first,
+            translated,
+            session_authorization.take(),
+            pdb_inference_capture(&state, &url),
+        )
+        .await;
     }
 
     // Buffer the 402 so it can be passed through untouched when payment
@@ -472,7 +478,13 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
             }
         };
         if retried.status() != StatusCode::PAYMENT_REQUIRED {
-            return deliver(retried, translated, session_authorization.take()).await;
+            return deliver(
+                retried,
+                translated,
+                session_authorization.take(),
+                pdb_inference_capture(&state, &url),
+            )
+            .await;
         }
         status = retried.status();
         resp_headers = retried.headers().clone();
@@ -538,7 +550,13 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
                 )
                     .into_response();
             }
-            return deliver(refreshed, translated, session_authorization.take()).await;
+            return deliver(
+                refreshed,
+                translated,
+                session_authorization.take(),
+                pdb_inference_capture(&state, &url),
+            )
+            .await;
         }
 
         status = refreshed.status();
@@ -745,8 +763,13 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
                         apply_batch_settlement(&state, batch, corrected_retry.headers());
                     }
                     drop(batch_payment_guard.take());
-                    return deliver(corrected_retry, translated, session_authorization.take())
-                        .await;
+                    return deliver(
+                        corrected_retry,
+                        translated,
+                        session_authorization.take(),
+                        pdb_inference_capture(&state, &url),
+                    )
+                    .await;
                 }
                 drop(batch_payment_guard.take());
                 return buffered_response(StatusCode::PAYMENT_REQUIRED, &retry_headers, retry_body);
@@ -773,7 +796,13 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
                 **cache = Some(authorization.clone());
             }
             drop(batch_payment_guard.take());
-            deliver(retry, translated, session_authorization.take()).await
+            deliver(
+                retry,
+                translated,
+                session_authorization.take(),
+                pdb_inference_capture(&state, &url),
+            )
+            .await
         }
         Err(e) => {
             // A transport failure here means we don't know whether the paid
@@ -1005,14 +1034,57 @@ fn translate_request(
 /// buffered JSON) when the request was translated and succeeded,
 /// streamed passthrough otherwise.
 type SessionAuthorizationGuard = tokio::sync::OwnedMutexGuard<Option<String>>;
+type PdbInferenceCapture = (pay_pdb::PdbState, String);
+
+fn pdb_inference_capture(state: &PayerState, resource: &str) -> Option<PdbInferenceCapture> {
+    state
+        .pdb
+        .as_ref()
+        .map(|pdb| (pdb.clone(), resource.to_string()))
+}
+
+fn retain_inference_tail(buffer: &mut Vec<u8>, chunk: &[u8]) {
+    const CAPTURE_LIMIT: usize = 256 * 1024;
+    if chunk.len() >= CAPTURE_LIMIT {
+        buffer.clear();
+        buffer.extend_from_slice(&chunk[chunk.len() - CAPTURE_LIMIT..]);
+        return;
+    }
+    let overflow = buffer
+        .len()
+        .saturating_add(chunk.len())
+        .saturating_sub(CAPTURE_LIMIT);
+    if overflow > 0 {
+        buffer.drain(..overflow);
+    }
+    buffer.extend_from_slice(chunk);
+}
+
+fn finish_inference_capture(
+    capture: Option<PdbInferenceCapture>,
+    headers: &HeaderMap,
+    body: &[u8],
+) {
+    let Some((pdb, resource)) = capture else {
+        return;
+    };
+    let response_body = String::from_utf8_lossy(body).into_owned();
+    pdb.enrich_inference_response(
+        "payer-proxy",
+        &resource,
+        pdb_header_map(headers),
+        response_body,
+    );
+}
 
 async fn deliver(
     resp: reqwest::Response,
     translated: bool,
     session_guard: Option<SessionAuthorizationGuard>,
+    inference_capture: Option<PdbInferenceCapture>,
 ) -> Response {
     if !translated || !resp.status().is_success() {
-        return stream_response(resp, session_guard);
+        return stream_response(resp, session_guard, inference_capture);
     }
     let is_sse = resp
         .headers()
@@ -1020,16 +1092,19 @@ async fn deliver(
         .and_then(|value| value.to_str().ok())
         .is_some_and(|ct| ct.contains("text/event-stream"));
     if is_sse {
-        translate_stream_response(resp, session_guard)
+        translate_stream_response(resp, session_guard, inference_capture)
     } else {
-        translate_json_response(resp).await
+        translate_json_response(resp, inference_capture).await
     }
 }
 
 /// Buffer an OpenAI `chat.completion` JSON response and return the
 /// Anthropic message envelope. Falls back to raw passthrough when the
 /// body isn't JSON.
-async fn translate_json_response(resp: reqwest::Response) -> Response {
+async fn translate_json_response(
+    resp: reqwest::Response,
+    inference_capture: Option<PdbInferenceCapture>,
+) -> Response {
     let status = resp.status();
     let upstream_headers = resp.headers().clone();
     let bytes = match resp.bytes().await {
@@ -1043,6 +1118,7 @@ async fn translate_json_response(resp: reqwest::Response) -> Response {
                 .into_response();
         }
     };
+    finish_inference_capture(inference_capture, &upstream_headers, &bytes);
     let openai: serde_json::Value = match serde_json::from_slice(&bytes) {
         Ok(value) => value,
         Err(e) => {
@@ -1076,16 +1152,20 @@ async fn translate_json_response(resp: reqwest::Response) -> Response {
 fn translate_stream_response(
     resp: reqwest::Response,
     session_guard: Option<SessionAuthorizationGuard>,
+    inference_capture: Option<PdbInferenceCapture>,
 ) -> Response {
     let status = resp.status();
     let upstream_headers = resp.headers().clone();
+    let inference_headers = upstream_headers.clone();
     let stream_body = Body::from_stream(async_stream::stream! {
         let _session_guard = session_guard;
         let mut resp = resp;
         let mut translator = translate::StreamTranslator::new();
+        let mut inference_tail = Vec::new();
         loop {
             match resp.chunk().await {
                 Ok(Some(chunk)) => {
+                    retain_inference_tail(&mut inference_tail, &chunk);
                     let out = translator.push(&chunk);
                     if !out.is_empty() {
                         yield Ok::<_, std::io::Error>(Bytes::from(out));
@@ -1096,6 +1176,7 @@ fn translate_stream_response(
                     if !out.is_empty() {
                         yield Ok(Bytes::from(out));
                     }
+                    finish_inference_capture(inference_capture, &inference_headers, &inference_tail);
                     break;
                 }
                 Err(e) => {
@@ -1498,9 +1579,11 @@ fn pdb_header_map(headers: &HeaderMap) -> std::collections::HashMap<String, Stri
 fn stream_response(
     resp: reqwest::Response,
     session_guard: Option<SessionAuthorizationGuard>,
+    inference_capture: Option<PdbInferenceCapture>,
 ) -> Response {
     let status = resp.status();
     let headers = resp.headers().clone();
+    let inference_headers = headers.clone();
 
     let mut builder = Response::builder().status(status);
     if let Some(dst) = builder.headers_mut() {
@@ -1509,10 +1592,21 @@ fn stream_response(
     let stream_body = Body::from_stream(async_stream::stream! {
         let _session_guard = session_guard;
         let mut resp = resp;
+        let mut inference_tail = Vec::new();
         loop {
             match resp.chunk().await {
-                Ok(Some(chunk)) => yield Ok::<_, std::io::Error>(chunk),
-                Ok(None) => break,
+                Ok(Some(chunk)) => {
+                    retain_inference_tail(&mut inference_tail, &chunk);
+                    yield Ok::<_, std::io::Error>(chunk);
+                }
+                Ok(None) => {
+                    finish_inference_capture(
+                        inference_capture,
+                        &inference_headers,
+                        &inference_tail,
+                    );
+                    break;
+                }
                 Err(error) => {
                     yield Err(std::io::Error::other(error));
                     break;

@@ -297,6 +297,54 @@ impl FlowCorrelation {
         let _ = self.tx.send(SseMessage::FlowUpdated { flow: flow.clone() });
     }
 
+    /// Enrich the newest matching flow after a proxied response body finishes
+    /// streaming. This keeps token accounting off the hot path: callers can
+    /// forward chunks immediately and submit only a bounded response tail.
+    pub fn enrich_inference_response(
+        &mut self,
+        client_ip: &str,
+        resource: &str,
+        response_headers: HashMap<String, String>,
+        response_body: String,
+    ) {
+        let entry = LogEntry {
+            id: 0,
+            ts: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            method: "POST".into(),
+            path: resource.into(),
+            status: 200,
+            ms: 0,
+            req_headers: HashMap::new(),
+            req_body: None,
+            res_headers: response_headers,
+            res_body: Some(response_body),
+            client_ip: client_ip.into(),
+        };
+        let Some(incoming) = inference_from_exchange(&entry) else {
+            return;
+        };
+        let Some(flow) = self
+            .flows
+            .iter_mut()
+            .rfind(|flow| flow.client_ip == client_ip && flow.resource == resource)
+        else {
+            return;
+        };
+        flow.inference = Some(match flow.inference.take() {
+            Some(existing) => {
+                let mut incoming = incoming;
+                if !existing.provider.is_empty() {
+                    incoming.provider = existing.provider.clone();
+                }
+                merge_inference(existing, incoming)
+            }
+            None => incoming,
+        });
+        flow.response_body = entry.res_body;
+        flow.updated_at = entry.ts;
+        let _ = self.tx.send(SseMessage::FlowUpdated { flow: flow.clone() });
+    }
+
     /// Completion path for `AllExchanges` mode: close the in-flight flow
     /// opened by `begin_exchange`, or record a completed one-shot flow if no
     /// start was seen (e.g. traffic that bypassed the start hook).
@@ -336,6 +384,7 @@ impl FlowCorrelation {
             flow.response_body = entry.res_body.clone();
             flow.amount = extract_amount(&entry);
             flow.payment = payment_details(&entry);
+            merge_exchange_inference(flow, &entry);
             flow.steps = build_steps(&protocol);
             flow.steps[0].ts = Some(started);
             flow.events.push(FlowEvent {
@@ -373,6 +422,7 @@ impl FlowCorrelation {
             flow.payer = extract_payer(&entry.req_headers);
         }
         flow.payment = merge_payment_details(flow.payment.take(), payment_details(&entry));
+        merge_exchange_inference(flow, &entry);
         // Merged challenge+retry flows carry the 4-step payment diagram;
         // plain exchanges keep their 2-step one.
         if flow.steps.len() == 4 {
@@ -519,7 +569,7 @@ impl FlowCorrelation {
             request_body: redacted_request_body(entry.req_body.as_deref()),
             response_headers: Some(redacted_headers(&entry.res_headers)),
             response_body: entry.res_body.clone(),
-            inference: None,
+            inference: inference_from_exchange(entry),
         };
         complete_exchange_steps(&mut flow, now);
 
@@ -682,7 +732,7 @@ impl FlowCorrelation {
             request_body: redacted_request_body(entry.req_body.as_deref()),
             response_headers: None,
             response_body: entry.res_body.clone(),
-            inference: None,
+            inference: inference_from_exchange(entry),
         };
 
         self.add_flow(flow.clone());
@@ -732,6 +782,7 @@ impl FlowCorrelation {
         flow.method = Some(entry.method.clone());
         flow.response_status = Some(entry.status);
         flow.payment = merge_payment_details(flow.payment.take(), payment_details(entry));
+        merge_exchange_inference(flow, entry);
         flow.payer = extract_payer(&entry.req_headers);
         flow.response_headers = Some(redacted_headers(&entry.res_headers));
         flow.response_body = entry.res_body.clone();
@@ -845,7 +896,7 @@ impl FlowCorrelation {
             request_body: redacted_request_body(entry.req_body.as_deref()),
             response_headers: Some(redacted_headers(&entry.res_headers)),
             response_body: entry.res_body.clone(),
-            inference: None,
+            inference: inference_from_exchange(entry),
         };
 
         self.add_flow(flow.clone());
@@ -891,6 +942,7 @@ impl FlowCorrelation {
         flow.method = Some(entry.method.clone());
         flow.response_status = Some(entry.status);
         flow.payment = merge_payment_details(flow.payment.take(), payment_details(entry));
+        merge_exchange_inference(flow, entry);
         if let Some(payer) = extract_payer(&entry.req_headers) {
             flow.payer = Some(payer);
         }
@@ -980,9 +1032,152 @@ fn merge_inference(existing: InferenceInfo, incoming: InferenceInfo) -> Inferenc
         streamed: incoming.streamed || existing.streamed,
         tokens_prompt: incoming.tokens_prompt.or(existing.tokens_prompt),
         tokens_completion: incoming.tokens_completion.or(existing.tokens_completion),
+        tokens_cached: incoming.tokens_cached.or(existing.tokens_cached),
+        tokens_reasoning: incoming.tokens_reasoning.or(existing.tokens_reasoning),
+        response_id: incoming.response_id.or(existing.response_id),
+        finish_reason: incoming.finish_reason.or(existing.finish_reason),
         ttft_ms: incoming.ttft_ms.or(existing.ttft_ms),
         tokens_per_sec: incoming.tokens_per_sec.or(existing.tokens_per_sec),
     }
+}
+
+fn merge_exchange_inference(flow: &mut PaymentFlow, entry: &LogEntry) {
+    let Some(mut incoming) = inference_from_exchange(entry) else {
+        return;
+    };
+    flow.inference = Some(match flow.inference.take() {
+        Some(existing) => {
+            // Provider discovery has a stable catalog slug; prefer it over a
+            // generic host inferred from the proxied request URL.
+            if !existing.provider.is_empty() {
+                incoming.provider = existing.provider.clone();
+            }
+            merge_inference(existing, incoming)
+        }
+        None => incoming,
+    });
+}
+
+fn inference_from_exchange(entry: &LogEntry) -> Option<InferenceInfo> {
+    let endpoint_kind = inference_endpoint_kind(&entry.path)?;
+    let request = entry
+        .req_body
+        .as_deref()
+        .and_then(|body| serde_json::from_str::<serde_json::Value>(body).ok());
+    let response = entry.res_body.as_deref().and_then(inference_response_json);
+    let usage = response
+        .as_ref()
+        .and_then(|response| response.get("usage"))
+        .or_else(|| {
+            response
+                .as_ref()
+                .and_then(|response| response.get("response"))
+                .and_then(|response| response.get("usage"))
+        });
+
+    let tokens_prompt = usage.and_then(|usage| {
+        value_u64(usage.get("prompt_tokens")).or_else(|| value_u64(usage.get("input_tokens")))
+    });
+    let tokens_completion = usage.and_then(|usage| {
+        value_u64(usage.get("completion_tokens")).or_else(|| value_u64(usage.get("output_tokens")))
+    });
+    let tokens_cached = usage.and_then(|usage| {
+        usage
+            .get("prompt_tokens_details")
+            .or_else(|| usage.get("input_tokens_details"))
+            .and_then(|details| value_u64(details.get("cached_tokens")))
+    });
+    let tokens_reasoning = usage.and_then(|usage| {
+        usage
+            .get("completion_tokens_details")
+            .or_else(|| usage.get("output_tokens_details"))
+            .and_then(|details| value_u64(details.get("reasoning_tokens")))
+    });
+    let finish_reason = response.as_ref().and_then(|response| {
+        response
+            .get("choices")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|choices| choices.first())
+            .and_then(|choice| value_string(choice.get("finish_reason")))
+            .or_else(|| value_string(response.get("stop_reason")))
+            .or_else(|| value_string(response.get("status")))
+    });
+
+    Some(InferenceInfo {
+        provider: inference_provider(&entry.path),
+        model: response
+            .as_ref()
+            .and_then(|response| value_string(response.get("model")))
+            .or_else(|| {
+                request
+                    .as_ref()
+                    .and_then(|request| value_string(request.get("model")))
+            }),
+        endpoint_kind: Some(endpoint_kind.to_string()),
+        streamed: request
+            .as_ref()
+            .and_then(|request| request.get("stream"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or_else(|| {
+                entry
+                    .res_headers
+                    .get("content-type")
+                    .is_some_and(|value| value.starts_with("text/event-stream"))
+            }),
+        tokens_prompt,
+        tokens_completion,
+        tokens_cached,
+        tokens_reasoning,
+        response_id: response
+            .as_ref()
+            .and_then(|response| value_string(response.get("id"))),
+        finish_reason,
+        ttft_ms: None,
+        tokens_per_sec: None,
+    })
+}
+
+fn inference_endpoint_kind(resource: &str) -> Option<&'static str> {
+    let path = resource.split('?').next().unwrap_or(resource);
+    if path.contains("/chat/completions") || path.ends_with("/messages") {
+        Some("chat")
+    } else if path.contains("/completions") {
+        Some("completion")
+    } else if path.contains("/responses") {
+        Some("responses")
+    } else if path.contains("/embeddings") {
+        Some("embeddings")
+    } else {
+        None
+    }
+}
+
+fn inference_provider(resource: &str) -> String {
+    resource
+        .split_once("://")
+        .map(|(_, rest)| rest.split('/').next().unwrap_or(rest))
+        .filter(|host| !host.is_empty())
+        .unwrap_or("openai-compatible")
+        .to_string()
+}
+
+fn inference_response_json(body: &str) -> Option<serde_json::Value> {
+    serde_json::from_str(body).ok().or_else(|| {
+        body.lines().rev().find_map(|line| {
+            let data = line.trim().strip_prefix("data:")?.trim();
+            (data != "[DONE]")
+                .then(|| serde_json::from_str(data).ok())
+                .flatten()
+        })
+    })
+}
+
+fn value_u64(value: Option<&serde_json::Value>) -> Option<u64> {
+    value.and_then(|value| {
+        value
+            .as_u64()
+            .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+    })
 }
 
 /// 2xx/3xx delivered, everything else failed. (402 cannot occur on
@@ -2809,6 +3004,102 @@ mod tests {
             "settled charge must surface as the flow amount (drives the \
              stablecoin chart)"
         );
+    }
+
+    #[test]
+    fn openai_compatible_exchange_extracts_model_and_token_usage() {
+        let (tx, _rx) = broadcast::channel(16);
+        let mut engine = FlowCorrelation::with_mode(tx, CorrelationMode::AllExchanges);
+        let mut done = make_entry(
+            "POST",
+            "https://api.blockrun.ai/api/v1/chat/completions",
+            200,
+        );
+        done.req_body = Some(
+            serde_json::json!({
+                "model": "luna",
+                "stream": false,
+                "messages": [{"role": "user", "content": "hello"}]
+            })
+            .to_string(),
+        );
+        done.res_body = Some(
+            serde_json::json!({
+                "id": "chatcmpl-123",
+                "model": "luna-2026-10-01",
+                "choices": [{"finish_reason": "stop"}],
+                "usage": {
+                    "prompt_tokens": 12,
+                    "completion_tokens": 34,
+                    "prompt_tokens_details": {"cached_tokens": 4},
+                    "completion_tokens_details": {"reasoning_tokens": 8}
+                }
+            })
+            .to_string(),
+        );
+
+        engine.ingest(done);
+
+        let flows = engine.snapshot();
+        let inference = flows[0].inference.as_ref().expect("inference metadata");
+        assert_eq!(inference.provider, "api.blockrun.ai");
+        assert_eq!(inference.model.as_deref(), Some("luna-2026-10-01"));
+        assert_eq!(inference.endpoint_kind.as_deref(), Some("chat"));
+        assert!(!inference.streamed);
+        assert_eq!(inference.tokens_prompt, Some(12));
+        assert_eq!(inference.tokens_completion, Some(34));
+        assert_eq!(inference.tokens_cached, Some(4));
+        assert_eq!(inference.tokens_reasoning, Some(8));
+        assert_eq!(inference.response_id.as_deref(), Some("chatcmpl-123"));
+        assert_eq!(inference.finish_reason.as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn responses_api_usage_shape_extracts_input_and_output_tokens() {
+        let entry = LogEntry {
+            path: "/v1/responses".into(),
+            req_body: Some(r#"{"model":"gpt-5","stream":true}"#.into()),
+            res_body: Some(
+                r#"{"id":"resp-1","status":"completed","usage":{"input_tokens":20,"output_tokens":7}}"#
+                    .into(),
+            ),
+            ..make_entry("POST", "/v1/responses", 200)
+        };
+
+        let inference = inference_from_exchange(&entry).expect("responses metadata");
+        assert_eq!(inference.endpoint_kind.as_deref(), Some("responses"));
+        assert!(inference.streamed);
+        assert_eq!(inference.tokens_prompt, Some(20));
+        assert_eq!(inference.tokens_completion, Some(7));
+        assert_eq!(inference.finish_reason.as_deref(), Some("completed"));
+    }
+
+    #[test]
+    fn streamed_usage_enriches_the_existing_paid_flow() {
+        let (tx, _rx) = broadcast::channel(16);
+        let mut engine = FlowCorrelation::with_mode(tx, CorrelationMode::AllExchanges);
+        let resource = "https://api.blockrun.ai/api/v1/chat/completions";
+        let mut done = make_entry("POST", resource, 200);
+        done.req_body = Some(r#"{"model":"luna","stream":true}"#.into());
+        engine.ingest(done);
+
+        engine.enrich_inference_response(
+            "127.0.0.1",
+            resource,
+            HashMap::from([("content-type".into(), "text/event-stream".into())]),
+            concat!(
+                "data: {\"id\":\"chatcmpl-stream\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+                "data: {\"id\":\"chatcmpl-stream\",\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":3}}\n\n",
+                "data: [DONE]\n\n"
+            )
+            .into(),
+        );
+
+        let flows = engine.snapshot();
+        let inference = flows[0].inference.as_ref().expect("stream usage");
+        assert_eq!(inference.tokens_prompt, Some(9));
+        assert_eq!(inference.tokens_completion, Some(3));
+        assert_eq!(inference.response_id.as_deref(), Some("chatcmpl-stream"));
     }
 
     #[test]
