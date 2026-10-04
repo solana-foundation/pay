@@ -367,6 +367,7 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
             false,
         ),
     };
+    let inference_capture = pdb_inference_capture(&state, &url, &body);
 
     // A delegated session is shared across every request made by this agent
     // process. Keep the guard until the gateway has accepted and metered this
@@ -421,7 +422,7 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
             first,
             translated,
             session_authorization.take(),
-            pdb_inference_capture(&state, &url),
+            inference_capture.clone(),
         )
         .await;
     }
@@ -481,7 +482,7 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
                 retried,
                 translated,
                 session_authorization.take(),
-                pdb_inference_capture(&state, &url),
+                inference_capture.clone(),
             )
             .await;
         }
@@ -553,7 +554,7 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
                 refreshed,
                 translated,
                 session_authorization.take(),
-                pdb_inference_capture(&state, &url),
+                inference_capture.clone(),
             )
             .await;
         }
@@ -766,7 +767,7 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
                         corrected_retry,
                         translated,
                         session_authorization.take(),
-                        pdb_inference_capture(&state, &url),
+                        inference_capture.clone(),
                     )
                     .await;
                 }
@@ -799,7 +800,7 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
                 retry,
                 translated,
                 session_authorization.take(),
-                pdb_inference_capture(&state, &url),
+                inference_capture,
             )
             .await
         }
@@ -1058,16 +1059,29 @@ fn translate_request(
 /// buffered JSON) when the request was translated and succeeded,
 /// streamed passthrough otherwise.
 type SessionAuthorizationGuard = tokio::sync::OwnedMutexGuard<Option<String>>;
-type PdbInferenceCapture = (pay_pdb::PdbState, String);
+#[derive(Clone)]
+struct PdbInferenceCapture {
+    pdb: pay_pdb::PdbState,
+    resource: String,
+    streamed: bool,
+}
 
 #[derive(Clone, Copy)]
 struct PdbRequestStarted(std::time::Instant);
 
-fn pdb_inference_capture(state: &PayerState, resource: &str) -> Option<PdbInferenceCapture> {
-    state
-        .pdb
-        .as_ref()
-        .map(|pdb| (pdb.clone(), resource.to_string()))
+fn pdb_inference_capture(
+    state: &PayerState,
+    resource: &str,
+    request_body: &[u8],
+) -> Option<PdbInferenceCapture> {
+    state.pdb.as_ref().map(|pdb| PdbInferenceCapture {
+        pdb: pdb.clone(),
+        resource: resource.to_string(),
+        streamed: serde_json::from_slice::<serde_json::Value>(request_body)
+            .ok()
+            .and_then(|request| request.get("stream").and_then(serde_json::Value::as_bool))
+            .unwrap_or(false),
+    })
 }
 
 fn retain_inference_tail(buffer: &mut Vec<u8>, chunk: &[u8]) {
@@ -1093,7 +1107,7 @@ fn finish_inference_capture(
     body: &[u8],
     observed: Option<pay_core::InferenceUsage>,
 ) {
-    let Some((pdb, resource)) = capture else {
+    let Some(PdbInferenceCapture { pdb, resource, .. }) = capture else {
         return;
     };
     let response_body = String::from_utf8_lossy(body).into_owned();
@@ -1117,6 +1131,24 @@ fn finish_inference_capture(
             tokens_per_sec: usage.tokens_per_sec,
         }),
     );
+}
+
+fn finish_observed_inference(
+    capture: &mut Option<PdbInferenceCapture>,
+    headers: &HeaderMap,
+    body: &[u8],
+    observer: &mut pay_proxy::observer::StreamObserver,
+) {
+    if capture.is_none() {
+        return;
+    }
+    observer.finish();
+    finish_inference_capture(capture.take(), headers, body, Some(observer.usage.clone()));
+}
+
+fn contains_sse_done(body: &[u8]) -> bool {
+    body.windows(b"data: [DONE]".len())
+        .any(|window| window == b"data: [DONE]")
 }
 
 async fn deliver(
@@ -1220,6 +1252,7 @@ fn translate_stream_response(
     let stream_body = Body::from_stream(async_stream::stream! {
         let _session_guard = session_guard;
         let mut resp = resp;
+        let mut inference_capture = inference_capture;
         let mut translator = translate::StreamTranslator::new();
         let mut inference_tail = Vec::new();
         let mut observer = pay_proxy::observer::StreamObserver::new(true);
@@ -1229,21 +1262,28 @@ fn translate_stream_response(
                     retain_inference_tail(&mut inference_tail, &chunk);
                     observer.on_chunk(&chunk, request_started);
                     let out = translator.push(&chunk);
+                    if contains_sse_done(&inference_tail) {
+                        finish_observed_inference(
+                            &mut inference_capture,
+                            &inference_headers,
+                            &inference_tail,
+                            &mut observer,
+                        );
+                    }
                     if !out.is_empty() {
                         yield Ok::<_, std::io::Error>(Bytes::from(out));
                     }
                 }
                 Ok(None) => {
-                    observer.finish();
                     let out = translator.finish();
                     if !out.is_empty() {
                         yield Ok(Bytes::from(out));
                     }
-                    finish_inference_capture(
-                        inference_capture,
+                    finish_observed_inference(
+                        &mut inference_capture,
                         &inference_headers,
                         &inference_tail,
-                        Some(observer.usage),
+                        &mut observer,
                     );
                     break;
                 }
@@ -1577,17 +1617,10 @@ async fn send_upstream(
     }
 
     let pdb_request_headers = state.pdb.as_ref().map(|_| pdb_header_map(&fwd));
-    let pdb_request_body = state.pdb.as_ref().and_then(|_| {
-        if body.is_empty() {
-            return None;
-        }
-        let text = String::from_utf8_lossy(&body);
-        let mut captured: String = text.chars().take(4096).collect();
-        if text.chars().count() > 4096 {
-            captured.push('…');
-        }
-        Some(captured)
-    });
+    let pdb_request_body = state
+        .pdb
+        .as_ref()
+        .and_then(|_| capture_pdb_request_body(&body));
     let mut result = state
         .client
         .request(method.clone(), url)
@@ -1634,6 +1667,43 @@ async fn send_upstream(
     result
 }
 
+/// Keep captured JSON valid when prompts exceed the debugger limit so its
+/// top-level inference metadata remains parseable. Large prompt/tool payloads
+/// are represented by a compact marker instead of leaving malformed JSON.
+fn capture_pdb_request_body(body: &[u8]) -> Option<String> {
+    const CAPTURE_LIMIT: usize = 4096;
+    if body.is_empty() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(body);
+    if text.chars().count() <= CAPTURE_LIMIT {
+        return Some(text.into_owned());
+    }
+
+    if let Ok(mut request) = serde_json::from_slice::<serde_json::Value>(body)
+        && let Some(object) = request.as_object_mut()
+    {
+        for key in ["messages", "input", "prompt", "tools"] {
+            if let Some(value) = object.get_mut(key) {
+                let bytes = serde_json::to_vec(value).map_or(0, |encoded| encoded.len());
+                *value = serde_json::json!({
+                    "debuggerElided": true,
+                    "originalBytes": bytes,
+                });
+            }
+        }
+        if let Ok(captured) = serde_json::to_string(&request)
+            && captured.chars().count() <= CAPTURE_LIMIT
+        {
+            return Some(captured);
+        }
+    }
+
+    let mut captured: String = text.chars().take(CAPTURE_LIMIT).collect();
+    captured.push('…');
+    Some(captured)
+}
+
 fn pdb_header_map(headers: &HeaderMap) -> std::collections::HashMap<String, String> {
     headers
         .iter()
@@ -1661,12 +1731,15 @@ fn stream_response(
     let status = resp.status();
     let headers = resp.headers().clone();
     let inference_headers = headers.clone();
-    let streamed = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| {
-            value.contains("text/event-stream") || value.contains("application/x-ndjson")
-        });
+    let streamed = inference_capture
+        .as_ref()
+        .is_some_and(|capture| capture.streamed)
+        || headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value.contains("text/event-stream") || value.contains("application/x-ndjson")
+            });
 
     let mut builder = Response::builder().status(status);
     if let Some(dst) = builder.headers_mut() {
@@ -1675,6 +1748,7 @@ fn stream_response(
     let stream_body = Body::from_stream(async_stream::stream! {
         let _session_guard = session_guard;
         let mut resp = resp;
+        let mut inference_capture = inference_capture;
         let mut inference_tail = Vec::new();
         let mut observer = pay_proxy::observer::StreamObserver::new(streamed);
         loop {
@@ -1682,15 +1756,22 @@ fn stream_response(
                 Ok(Some(chunk)) => {
                     retain_inference_tail(&mut inference_tail, &chunk);
                     observer.on_chunk(&chunk, request_started);
+                    if streamed && contains_sse_done(&inference_tail) {
+                        finish_observed_inference(
+                            &mut inference_capture,
+                            &inference_headers,
+                            &inference_tail,
+                            &mut observer,
+                        );
+                    }
                     yield Ok::<_, std::io::Error>(chunk);
                 }
                 Ok(None) => {
-                    observer.finish();
-                    finish_inference_capture(
-                        inference_capture,
+                    finish_observed_inference(
+                        &mut inference_capture,
                         &inference_headers,
                         &inference_tail,
-                        Some(observer.usage),
+                        &mut observer,
                     );
                     break;
                 }
@@ -3409,6 +3490,95 @@ mod tests {
             rest.extend_from_slice(&chunk);
         }
         assert_eq!(&rest[..], b"data: two\n\n");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn debugger_finalizes_inference_at_sse_done_without_waiting_for_eof() {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|| async {
+                let stream = async_stream::stream! {
+                    yield Ok::<_, std::io::Error>(Bytes::from_static(concat!(
+                        "data: {\"id\":\"chatcmpl-1\",\"model\":\"luna\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+                        "data: {\"id\":\"chatcmpl-1\",\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":3}}\n\n",
+                        "data: [DONE]\n\n",
+                    ).as_bytes()));
+                    std::future::pending::<()>().await;
+                };
+                Response::builder()
+                    .status(StatusCode::OK)
+                    // Some compatible providers omit the SSE content type.
+                    .header(header::CONTENT_TYPE, "text/plain")
+                    .body(Body::from_stream(stream))
+                    .unwrap()
+            }),
+        );
+        let upstream = spawn_server(app).await;
+        let pdb = pay_pdb::PdbState::with_mode(
+            serde_json::json!({}),
+            pay_pdb::correlation::CorrelationMode::AllExchanges,
+        );
+        let store: Arc<dyn AccountsStore> = Arc::new(MemoryAccountsStore::new());
+        let state = Arc::new(
+            PayerState::new(
+                PayerUpstream {
+                    base_url: upstream,
+                    host_header: None,
+                    dialect: Dialect::OpenAiCompat,
+                    chat_path: "v1/chat/completions".to_string(),
+                    responses_path: "v1/responses".to_string(),
+                    require_payment: false,
+                    payment_protocol: PaymentProtocol::Auto,
+                },
+                store,
+                None,
+                None,
+            )
+            .unwrap()
+            .with_pdb(pdb.clone()),
+        );
+        let payer = spawn_server(router(state)).await;
+
+        let mut response = reqwest::Client::new()
+            .post(format!("{payer}/v1/chat/completions"))
+            .json(&serde_json::json!({
+                "model": "luna",
+                "stream": true,
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
+            .send()
+            .await
+            .unwrap();
+        let chunk = tokio::time::timeout(Duration::from_secs(5), response.chunk())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(contains_sse_done(&chunk));
+        drop(response); // Deliberately never poll the upstream body to EOF.
+
+        let flows = pdb.correlation.lock().unwrap().snapshot();
+        let inference = flows[0].inference.as_ref().expect("inference metadata");
+        assert_eq!(inference.model.as_deref(), Some("luna"));
+        assert_eq!(inference.tokens_prompt, Some(9));
+        assert_eq!(inference.tokens_completion, Some(3));
+        assert!(inference.ttft_ms.is_some());
+    }
+
+    #[test]
+    fn large_debugger_request_capture_preserves_inference_metadata() {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "model": "luna",
+            "stream": true,
+            "messages": [{"role": "user", "content": "x".repeat(8_192)}],
+        }))
+        .unwrap();
+
+        let captured = capture_pdb_request_body(&body).expect("captured request");
+        let parsed: serde_json::Value = serde_json::from_str(&captured).unwrap();
+        assert_eq!(parsed["model"], "luna");
+        assert_eq!(parsed["stream"], true);
+        assert_eq!(parsed["messages"]["debuggerElided"], true);
     }
 
     // ── OpenAI-compat dialect loopback ─────────────────────────────────────
