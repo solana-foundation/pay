@@ -13,7 +13,7 @@ use rmcp::model::{
     ServerConfig,
 };
 use rmcp::service::{RequestContext, RoleServer};
-use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
+use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use serde::Serialize;
@@ -198,16 +198,9 @@ pub fn router(
     gateway_domain: String,
     allowed_hosts: Vec<String>,
 ) -> Router {
-    // Every compute tool call is self-contained and tenant identity comes from
-    // the verified payment boundary, not MCP connection state. Stateless JSON
-    // responses therefore scale safely across Cloud Run instances and avoid
-    // exposing or logging an MCP session identifier.
-    let transport = StreamableHttpServerConfig::default()
-        .with_allowed_hosts(allowed_hosts)
-        .with_legacy_session_mode(false)
-        .with_json_response(true);
+    let transport = StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts);
     let mcp_drivers = drivers.clone();
-    let service: StreamableHttpService<ComputeMcp, NeverSessionManager> =
+    let service: StreamableHttpService<ComputeMcp, LocalSessionManager> =
         StreamableHttpService::new(
             move || Ok(ComputeMcp::new(mcp_drivers.clone())),
             Default::default(),
