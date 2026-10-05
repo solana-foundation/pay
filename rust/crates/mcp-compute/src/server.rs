@@ -27,7 +27,7 @@ use crate::types::{
 
 pub const VERIFIED_PAYER_HEADER: &str = "x-pay-verified-payer";
 pub const ORIGINAL_HOST_HEADER: &str = "x-pay-original-host";
-pub const USAGE_HEADER: &str = "x-pay-compute-microusd";
+pub const USAGE_HEADER: &str = "x-pay-gcp-cpu-microusd";
 const MAX_GATEWAY_BODY_BYTES: usize = 10 * 1024 * 1024;
 
 #[derive(Clone)]
@@ -180,8 +180,8 @@ impl ServerHandler for ComputeMcp {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_protocol_version(ProtocolVersion::V_2025_06_18)
             .with_server_info(
-                Implementation::new("pay-compute", env!("CARGO_PKG_VERSION"))
-                    .with_title("Pay Compute"),
+                Implementation::new("pay-gcp-cpu", env!("CARGO_PKG_VERSION"))
+                    .with_title("Pay GCP CPU"),
             )
             .with_instructions("Deploy and invoke payer-isolated serverless compute through pluggable provider drivers.")
     }
@@ -338,7 +338,7 @@ async fn gateway_invoke_inner(
     }
     builder = builder
         .header(USAGE_HEADER, invocation.billed_micro_usd)
-        .header("x-pay-compute-elapsed-ms", invocation.elapsed_ms);
+        .header("x-pay-gcp-cpu-elapsed-ms", invocation.elapsed_ms);
     builder.body(Body::from(invocation.body)).map_err(|error| {
         ComputeError::Provider(format!("failed to build invocation response: {error}"))
     })

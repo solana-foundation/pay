@@ -424,7 +424,7 @@ impl GoogleCloudFunctionsDriver {
             let lower = name.to_ascii_lowercase();
             if matches!(
                 lower.as_str(),
-                "authorization" | "host" | "cookie" | "content-length" | "x-pay-compute-microusd"
+                "authorization" | "host" | "cookie" | "content-length" | "x-pay-gcp-cpu-microusd"
             ) || lower.starts_with("payment-")
                 || lower.starts_with("x-payment")
             {

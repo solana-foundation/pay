@@ -17,7 +17,7 @@ struct Args {
     #[arg(
         long,
         env = "COMPUTE_GATEWAY_DOMAIN",
-        default_value = "compute.gateway-402.com"
+        default_value = "cpu.gcp.gateway-402.com"
     )]
     gateway_domain: String,
     #[arg(long, env = "COMPUTE_ALLOWED_HOSTS", value_delimiter = ',')]
