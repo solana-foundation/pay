@@ -1559,6 +1559,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
                 inferred_usage: None,
             },
             10,
+            solana_pubkey::Pubkey::new_unique().to_string(),
             reservation,
         );
         let meter = DelegatedSessionStreamMeter::from_forward(forward).unwrap();

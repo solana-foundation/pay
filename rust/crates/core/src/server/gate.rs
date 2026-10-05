@@ -133,6 +133,9 @@ pub struct SessionForward {
     pub settlement: Option<Box<metering::UptoSettlementPlan>>,
     /// Remaining channel capacity available to the metered delivery.
     pub available_base_units: u64,
+    /// Payer identity verified by the reusable session proof. Internal
+    /// upstream services use this as their tenant boundary.
+    pub verified_payer: Option<String>,
     /// Releases the exclusive capacity reservation on every terminal path.
     _reservation: Option<DelegatedCapacityLease>,
 }
@@ -144,6 +147,7 @@ impl SessionForward {
         committed_base_units: u64,
         settlement: metering::UptoSettlementPlan,
         available_base_units: u64,
+        verified_payer: String,
         reservation: DelegatedCapacityLease,
     ) -> Self {
         Self {
@@ -152,6 +156,7 @@ impl SessionForward {
             committed_base_units,
             settlement: Some(Box::new(settlement)),
             available_base_units,
+            verified_payer: Some(verified_payer),
             _reservation: Some(reservation),
         }
     }
@@ -2270,6 +2275,7 @@ async fn session_authorized(
                     state.cumulative,
                     settlement,
                     available_base_units,
+                    state.payer.clone(),
                     reservation,
                 ))),
                 receipt: signature
@@ -2294,6 +2300,7 @@ async fn session_authorized(
                     committed_base_units: cumulative,
                     settlement: None,
                     available_base_units: 0,
+                    verified_payer: None,
                     _reservation: None,
                 })
             }),

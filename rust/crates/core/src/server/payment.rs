@@ -5,7 +5,7 @@
 //! - Payment header → verify with solana-mpp, then forward upstream
 
 use axum::body::Body;
-use axum::http::{HeaderMap, Request, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, Request, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use http_body::Body as _;
@@ -39,6 +39,11 @@ pub async fn payment_middleware<S: PaymentState>(
 async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next) -> Response {
     use crate::server::gate::{GateDecision, GateRequest, PaymentGate};
 
+    let mut req = req;
+    // These headers are an internal trust boundary. Always discard caller
+    // values before payment evaluation; only a successfully verified MPP
+    // session may add them back below.
+    strip_internal_identity_headers(req.headers_mut());
     let method = req.method().clone();
     let uri = req.uri().clone();
     let headers = req.headers().clone();
@@ -95,10 +100,11 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
             batch,
             paid_request,
         } => {
-            let mut req = req;
             let mut delegated_session = None;
+            let mut verified_payer = None;
             if let Some(sf) = session {
                 let mut sf = *sf;
+                verified_payer = sf.verified_payer.clone();
                 if sf.settlement.is_some() {
                     // Delegated sessions are settled from the completed
                     // response below. The client-voucher stream context waits
@@ -126,6 +132,16 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
                         sf.channel_id,
                         sf.committed_base_units,
                     ));
+                }
+            }
+            if let Some(payer) = verified_payer
+                && let Ok(value) = HeaderValue::from_str(&payer)
+            {
+                req.headers_mut().insert("x-pay-verified-payer", value);
+                if let Some(host) = host.as_deref()
+                    && let Ok(value) = HeaderValue::from_str(host)
+                {
+                    req.headers_mut().insert("x-pay-original-host", value);
                 }
             }
             let mut response = next.run(req).await;
@@ -277,6 +293,11 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
         }
         GateDecision::Passthrough => next.run(req).await,
     }
+}
+
+fn strip_internal_identity_headers(headers: &mut HeaderMap) {
+    headers.remove("x-pay-verified-payer");
+    headers.remove("x-pay-original-host");
 }
 
 /// Read the model selected by OpenAI/Anthropic-compatible JSON requests and
@@ -657,6 +678,23 @@ mod tests {
     use super::*;
 
     const SPLIT_RECIPIENT: &str = "CNR1b172rotbSG6kCpfR76KB2ios2y7X4p8yEEc7pjLu";
+
+    #[test]
+    fn caller_cannot_spoof_internal_compute_identity() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-pay-verified-payer", HeaderValue::from_static("attacker"));
+        headers.insert(
+            "x-pay-original-host",
+            HeaderValue::from_static("attacker.example"),
+        );
+        headers.insert("host", HeaderValue::from_static("function.compute.example"));
+
+        strip_internal_identity_headers(&mut headers);
+
+        assert!(!headers.contains_key("x-pay-verified-payer"));
+        assert!(!headers.contains_key("x-pay-original-host"));
+        assert_eq!(headers.get("host").unwrap(), "function.compute.example");
+    }
 
     fn configured_charge_splits() -> (pay_types::metering::ApiSpec, pay_types::metering::Metering) {
         let spec: pay_types::metering::ProviderSpec = serde_yml::from_str(&format!(

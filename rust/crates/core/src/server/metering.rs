@@ -108,6 +108,22 @@ fn path_matches(pattern: &str, path: &str) -> bool {
     let pattern_parts: Vec<&str> = pattern.split('/').collect();
     let path_parts: Vec<&str> = path.split('/').collect();
 
+    // A final `{*name}` segment is a recursive wildcard. It matches one or
+    // more remaining segments while preserving the existing `{name}`
+    // single-segment behavior used by provider API specs.
+    if let Some(last) = pattern_parts.last()
+        && last.starts_with("{*")
+        && last.ends_with('}')
+    {
+        if path_parts.len() < pattern_parts.len() {
+            return false;
+        }
+        return pattern_parts[..pattern_parts.len() - 1]
+            .iter()
+            .zip(path_parts.iter())
+            .all(|(pat, actual)| path_segment_matches(pat, actual));
+    }
+
     if pattern_parts.len() != path_parts.len() {
         return false;
     }
@@ -115,23 +131,20 @@ fn path_matches(pattern: &str, path: &str) -> bool {
     pattern_parts
         .iter()
         .zip(path_parts.iter())
-        .all(|(pat, actual)| {
-            if pat.starts_with('{') && pat.ends_with('}') {
-                // Wildcard segment — matches anything
-                true
-            } else if pat.contains('{') {
-                // Partial wildcard like "{modelsId}:generateContent"
-                // Split on the first '{' and match the suffix
-                if let Some(suffix_start) = pat.find('}') {
-                    let suffix = &pat[suffix_start + 1..];
-                    actual.ends_with(suffix)
-                } else {
-                    false
-                }
-            } else {
-                pat == actual
-            }
-        })
+        .all(|(pat, actual)| path_segment_matches(pat, actual))
+}
+
+fn path_segment_matches(pattern: &str, actual: &str) -> bool {
+    if pattern.starts_with('{') && pattern.ends_with('}') {
+        true
+    } else if pattern.contains('{') {
+        // Partial wildcard like "{modelsId}:generateContent".
+        pattern
+            .find('}')
+            .is_some_and(|end| actual.ends_with(&pattern[end + 1..]))
+    } else {
+        pattern == actual
+    }
 }
 
 /// Context for resolving a price — includes accounting state.
@@ -1066,6 +1079,14 @@ mod tests {
     fn test_path_matches_different_lengths() {
         assert!(!path_matches("v1/a/b", "v1/a"));
         assert!(!path_matches("v1/a", "v1/a/b"));
+    }
+
+    #[test]
+    fn test_path_matches_recursive_final_wildcard() {
+        assert!(path_matches("{*path}", "v1/jobs/42"));
+        assert!(path_matches("v1/{*path}", "v1/jobs/42"));
+        assert!(!path_matches("v1/{*path}", "v1"));
+        assert!(!path_matches("v1/{*path}", "v2/jobs/42"));
     }
 
     #[test]
