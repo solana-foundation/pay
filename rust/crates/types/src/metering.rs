@@ -189,8 +189,11 @@ impl RoutingConfig {
     /// Resolve `${VAR}` placeholders in routing fields.
     pub fn resolve_env_templates(&mut self, context: &str) -> Result<(), String> {
         match self {
-            Self::Proxy { url, .. } => {
+            Self::Proxy { url, auth, .. } => {
                 *url = resolve_env_templates_in_string(url, &format!("{context}.url"))?;
+                if let Some(auth) = auth {
+                    auth.resolve_env_templates(&format!("{context}.auth"))?;
+                }
             }
             Self::Respond {} => {}
         }
@@ -417,6 +420,26 @@ pub enum AuthConfig {
         #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
         headers: std::collections::HashMap<String, EnvRef>,
     },
+}
+
+impl AuthConfig {
+    /// Resolve deploy-time `${VAR}` placeholders in upstream auth fields.
+    pub fn resolve_env_templates(&mut self, context: &str) -> Result<(), String> {
+        if let Self::Oauth2 {
+            token_url,
+            audience,
+            ..
+        } = self
+        {
+            *token_url =
+                resolve_env_templates_in_string(token_url, &format!("{context}.token_url"))?;
+            if let Some(audience) = audience {
+                *audience =
+                    resolve_env_templates_in_string(audience, &format!("{context}.audience"))?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -3222,6 +3245,7 @@ mod tests {
     fn api_spec_resolve_env_templates_updates_deploy_time_fields() {
         let suffix = std::process::id();
         let upstream_var = format!("_PAY_TEST_UPSTREAM_{suffix}");
+        let audience_var = format!("_PAY_TEST_AUDIENCE_{suffix}");
         let recipient_var = format!("_PAY_TEST_RECIPIENT_{suffix}");
         let rpc_var = format!("_PAY_TEST_RPC_{suffix}");
         let signer_path_var = format!("_PAY_TEST_SIGNER_PATH_{suffix}");
@@ -3229,6 +3253,7 @@ mod tests {
 
         unsafe {
             std::env::set_var(&upstream_var, " https://api.example.com ");
+            std::env::set_var(&audience_var, "https://private.example.com");
             std::env::set_var(
                 &recipient_var,
                 "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY",
@@ -3249,6 +3274,10 @@ version: v1
 routing:
   type: proxy
   url: "${{{upstream_var}}}/v1"
+  auth:
+    method: oauth2
+    token_url: gcp_metadata_identity
+    audience: "${{{audience_var}}}"
 operator:
   recipient: "${{{recipient_var}}}"
   rpc_url: "${{{rpc_var}}}"
@@ -3268,6 +3297,16 @@ endpoints:
         spec.resolve_env_templates().unwrap();
 
         assert_eq!(spec.routing.display_url(), "https://api.example.com/v1");
+        let RoutingConfig::Proxy { auth, .. } = &spec.routing else {
+            panic!("expected proxy routing");
+        };
+        let Some(auth) = auth else {
+            panic!("expected proxy auth");
+        };
+        let AuthConfig::Oauth2 { audience, .. } = auth.as_ref() else {
+            panic!("expected oauth2 auth");
+        };
+        assert_eq!(audience.as_deref(), Some("https://private.example.com"));
         let operator = spec.operator.as_ref().unwrap();
         assert_eq!(
             operator.recipient.as_deref(),
@@ -3285,6 +3324,7 @@ endpoints:
 
         unsafe {
             std::env::remove_var(&upstream_var);
+            std::env::remove_var(&audience_var);
             std::env::remove_var(&recipient_var);
             std::env::remove_var(&rpc_var);
             std::env::remove_var(&signer_path_var);

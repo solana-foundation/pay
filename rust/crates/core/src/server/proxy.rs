@@ -47,6 +47,41 @@ pub const STRIP_HEADERS: &[&str] = &[
     "x-payment",
 ];
 
+/// Return an upstream URL that is safe to attach to logs and traces.
+///
+/// Query values may contain API keys, signed URLs, or user credentials, so the
+/// observability boundary keeps parameter names for diagnosis but never their
+/// values.
+pub fn upstream_url_for_logging(url: &reqwest::Url) -> String {
+    let mut safe = url.clone();
+    if url.query().is_some() {
+        let names = url
+            .query_pairs()
+            .map(|(name, _)| name.into_owned())
+            .collect::<Vec<_>>();
+        safe.set_query(None);
+        for name in names {
+            safe.query_pairs_mut().append_pair(&name, "[REDACTED]");
+        }
+    }
+    safe.to_string()
+}
+
+/// Format a reqwest failure without allowing its attached URL to expose query
+/// credentials in logs, traces, telemetry, or downstream error responses.
+pub fn upstream_error_for_logging(error: &reqwest::Error) -> String {
+    let mut safe = error.to_string();
+    if let Some(url) = error.url() {
+        safe = redact_url_in_error(&safe, url);
+    }
+    safe
+}
+
+/// Remove query values from an arbitrary error string that may embed `url`.
+pub fn redact_url_in_error(error: &str, url: &reqwest::Url) -> String {
+    error.replace(url.as_str(), &upstream_url_for_logging(url))
+}
+
 /// Percent-encode every ASCII byte except RFC 3986 unreserved characters.
 const RFC3986_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'-')
@@ -144,7 +179,7 @@ pub async fn forward_request_with_session_metering(
     for (name, value) in &prepared.headers {
         upstream_req = upstream_req.header(name.as_str(), value);
     }
-    let upstream_url = prepared.url.to_string();
+    let upstream_url = upstream_url_for_logging(&prepared.url);
 
     // Forward body. Always set content-length for POST/PUT/PATCH
     // (some upstreams like Google APIs require it even when empty).
@@ -155,9 +190,10 @@ pub async fn forward_request_with_session_metering(
     }
 
     let upstream_resp = upstream_req.send().await.map_err(|e| {
-        telemetry::record_upstream_error(&api.subdomain, uri.path(), &upstream_url, &e.to_string());
-        tracing::error!(error = %e, upstream = %upstream_url, "Upstream request failed");
-        error_response(StatusCode::BAD_GATEWAY, &format!("Upstream error: {e}"))
+        let error = upstream_error_for_logging(&e);
+        telemetry::record_upstream_error(&api.subdomain, uri.path(), &upstream_url, &error);
+        tracing::error!(%error, upstream = %upstream_url, "Upstream request failed");
+        error_response(StatusCode::BAD_GATEWAY, "Upstream request failed")
     })?;
 
     // Build response.
@@ -269,13 +305,14 @@ pub async fn prepare_upstream(
         .upstream_url(path_and_query)
         .expect("Proxy routing must have a URL");
     let mut prepared = PreparedUpstreamRequest::new(&upstream_url).map_err(|e| {
-        telemetry::record_upstream_error(&api.subdomain, uri.path(), &upstream_url, &e);
+        telemetry::record_upstream_error(&api.subdomain, uri.path(), "[invalid upstream URL]", &e);
         error_response(StatusCode::BAD_GATEWAY, &e)
     })?;
 
+    let upstream_log_url = upstream_url_for_logging(&prepared.url);
     tracing::debug!(
         subdomain = %api.subdomain,
-        upstream = %prepared.url,
+        upstream = %upstream_log_url,
         "Forwarding request"
     );
 
@@ -305,7 +342,7 @@ pub async fn prepare_upstream(
                 telemetry::record_upstream_error(
                     &api.subdomain,
                     uri.path(),
-                    prepared.url.as_str(),
+                    &upstream_url_for_logging(&prepared.url),
                     &e,
                 );
                 error_response(StatusCode::BAD_GATEWAY, &e)
@@ -340,7 +377,7 @@ pub async fn prepare_upstream(
                     telemetry::record_upstream_error(
                         &api.subdomain,
                         uri.path(),
-                        prepared.url.as_str(),
+                        &upstream_url_for_logging(&prepared.url),
                         &format!("OAuth2 token error: {e}"),
                     );
                     tracing::error!(error = %e, "Failed to fetch OAuth2 token");
@@ -362,7 +399,7 @@ pub async fn prepare_upstream(
                     telemetry::record_upstream_error(
                         &api.subdomain,
                         uri.path(),
-                        prepared.url.as_str(),
+                        &upstream_url_for_logging(&prepared.url),
                         &e,
                     );
                     error_response(StatusCode::BAD_GATEWAY, &e)
@@ -422,10 +459,25 @@ pub fn error_response(status: StatusCode, message: &str) -> Response {
         .unwrap()
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PreparedUpstreamRequest {
     pub url: reqwest::Url,
     pub headers: Vec<(String, String)>,
+}
+
+impl std::fmt::Debug for PreparedUpstreamRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let header_names = self
+            .headers
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>();
+        formatter
+            .debug_struct("PreparedUpstreamRequest")
+            .field("url", &upstream_url_for_logging(&self.url))
+            .field("header_names", &header_names)
+            .finish()
+    }
 }
 
 impl PreparedUpstreamRequest {
@@ -1040,7 +1092,7 @@ async fn fetch_access_token(fetch: &AccessTokenFetchConfig) -> Result<FetchedTok
         .await
         .map_err(|e| format!("Access token response read failed: {e}"))?;
     if !status.is_success() {
-        return Err(format!("Access token request failed with {status}: {text}"));
+        return Err(format!("Access token request failed with {status}"));
     }
 
     let body: serde_json::Value =
@@ -1262,7 +1314,7 @@ async fn fetch_oauth2_token(
     let access_token = body["access_token"]
         .as_str()
         .map(|s| s.to_string())
-        .ok_or_else(|| format!("No access_token in response: {body}"))?;
+        .ok_or_else(|| "OAuth2 response did not contain an access_token".to_string())?;
     let expires_in_secs = body["expires_in"].as_u64().unwrap_or(3600);
 
     Ok(FetchedToken {
@@ -1340,7 +1392,7 @@ async fn fetch_gcp_metadata_token(
     let access_token = body["access_token"]
         .as_str()
         .map(|s| s.to_string())
-        .ok_or_else(|| format!("No access_token: {body}"))?;
+        .ok_or_else(|| "ADC response did not contain an access_token".to_string())?;
     let expires_in_secs = body["expires_in"].as_u64().unwrap_or(3600);
 
     tracing::debug!("OAuth2 token from ADC");
@@ -1373,10 +1425,7 @@ async fn fetch_gcp_metadata_identity_token(
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!(
-            "GCP metadata identity endpoint returned {status}: {body}"
-        ));
+        return Err(format!("GCP metadata identity endpoint returned {status}"));
     }
 
     let token = resp
@@ -1429,6 +1478,38 @@ mod tests {
         HmacSignatureDestination, HmacStringEncoding, HmacTarget, HmacTargetType,
         HmacTimestampFormat, HttpMethod, RoutingConfig,
     };
+
+    #[test]
+    fn upstream_log_url_redacts_every_query_value() {
+        let url = reqwest::Url::parse(
+            "https://api.example.com/v1?key=super-secret&cursor=also-sensitive",
+        )
+        .unwrap();
+
+        let safe = upstream_url_for_logging(&url);
+
+        assert!(safe.contains("key=%5BREDACTED%5D"));
+        assert!(safe.contains("cursor=%5BREDACTED%5D"));
+        assert!(!safe.contains("super-secret"));
+        assert!(!safe.contains("also-sensitive"));
+    }
+
+    #[test]
+    fn prepared_request_debug_never_exposes_credentials() {
+        let request = PreparedUpstreamRequest {
+            url: reqwest::Url::parse("https://api.example.com/v1?key=query-secret").unwrap(),
+            headers: vec![(
+                "authorization".to_string(),
+                "Bearer header-secret".to_string(),
+            )],
+        };
+
+        let debug = format!("{request:?}");
+
+        assert!(debug.contains("authorization"));
+        assert!(!debug.contains("query-secret"));
+        assert!(!debug.contains("header-secret"));
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 

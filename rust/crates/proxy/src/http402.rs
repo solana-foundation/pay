@@ -33,7 +33,8 @@ use pay_core::server::gate::{
 };
 use pay_core::server::metering::{self, UptoSettlementPlan};
 use pay_core::server::proxy::{
-    STRIP_HEADERS, UpstreamPlan, prepare_upstream, routing_signs_request_body,
+    STRIP_HEADERS, UpstreamPlan, prepare_upstream, redact_url_in_error, routing_signs_request_body,
+    upstream_error_for_logging, upstream_url_for_logging,
 };
 use pay_core::server::session_stream::DelegatedSessionStreamMeter;
 use pay_core::server::telemetry;
@@ -467,13 +468,10 @@ impl<S: PaymentState> Http402Gate<S> {
         let upstream = match upstream_req.send().await {
             Ok(resp) => resp,
             Err(e) => {
-                telemetry::record_upstream_error(
-                    &api.subdomain,
-                    uri.path(),
-                    prepared.url.as_str(),
-                    &e.to_string(),
-                );
-                tracing::error!(error = %e, upstream = %prepared.url, "buffered upstream request failed");
+                let error = upstream_error_for_logging(&e);
+                let upstream = upstream_url_for_logging(&prepared.url);
+                telemetry::record_upstream_error(&api.subdomain, uri.path(), &upstream, &error);
+                tracing::error!(%error, %upstream, "buffered upstream request failed");
                 let extra = self.drain_payment_headers(ctx, false).await;
                 write_buffered_response(
                     session,
@@ -493,7 +491,7 @@ impl<S: PaymentState> Http402Gate<S> {
             telemetry::record_upstream_error(
                 &api.subdomain,
                 uri.path(),
-                prepared.url.as_str(),
+                &upstream_url_for_logging(&prepared.url),
                 &format!("upstream returned {status}"),
             );
         }
@@ -527,13 +525,14 @@ impl<S: PaymentState> Http402Gate<S> {
         let body = match collect_reqwest_body(upstream, response_limit).await {
             Ok(body) => body,
             Err(e) => {
+                let error = redact_url_in_error(&e.to_string(), &prepared.url);
                 telemetry::record_upstream_error(
                     &api.subdomain,
                     uri.path(),
-                    prepared.url.as_str(),
-                    &e.to_string(),
+                    &upstream_url_for_logging(&prepared.url),
+                    &error,
                 );
-                tracing::warn!(error = %e, "failed to buffer upstream response body");
+                tracing::warn!(%error, "failed to buffer upstream response body");
                 let extra = self.drain_payment_headers(ctx, false).await;
                 write_buffered_response(
                     session,
@@ -1297,10 +1296,12 @@ fn header_pairs(headers: &HeaderMap) -> Vec<(String, String)> {
     headers
         .iter()
         .map(|(k, v)| {
-            (
-                k.as_str().to_string(),
-                String::from_utf8_lossy(v.as_bytes()).into_owned(),
-            )
+            let value = if is_sensitive_log_header(k.as_str()) {
+                "[REDACTED]".to_string()
+            } else {
+                String::from_utf8_lossy(v.as_bytes()).into_owned()
+            };
+            (k.as_str().to_string(), value)
         })
         .collect()
 }
@@ -1309,12 +1310,33 @@ fn header_pairs_from_owned(headers: Vec<(HeaderName, HeaderValue)>) -> Vec<(Stri
     headers
         .into_iter()
         .map(|(k, v)| {
-            (
-                k.as_str().to_string(),
-                String::from_utf8_lossy(v.as_bytes()).into_owned(),
-            )
+            let value = if is_sensitive_log_header(k.as_str()) {
+                "[REDACTED]".to_string()
+            } else {
+                String::from_utf8_lossy(v.as_bytes()).into_owned()
+            };
+            (k.as_str().to_string(), value)
         })
         .collect()
+}
+
+fn is_sensitive_log_header(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "authorization"
+            | "proxy-authorization"
+            | "cookie"
+            | "set-cookie"
+            | "payment-signature"
+            | "x-payment"
+            | "x-api-key"
+            | "api-key"
+            | "x-goog-api-key"
+            | "mcp-session-id"
+    ) || name.ends_with("-token")
+        || name.ends_with("-secret")
+        || name.ends_with("-credential")
 }
 
 fn is_control_plane(path: &str) -> bool {
@@ -1330,7 +1352,7 @@ fn target_from_prepared(
     subdomain: String,
 ) -> Target {
     let url = prepared.url;
-    let upstream = url.to_string();
+    let upstream = upstream_url_for_logging(&url);
     let tls = url.scheme() == "https";
     let host = url.host_str().unwrap_or("").to_string();
     let port = url
@@ -1535,7 +1557,7 @@ async fn write_axum_response(
 mod tests {
     use super::{
         BatchResponseCapture, Http402Gate, MAX_BATCH_CACHED_RESPONSE_BYTES,
-        buffered_upstream_headers, filtered_response_headers, is_control_plane,
+        buffered_upstream_headers, filtered_response_headers, header_pairs, is_control_plane,
         is_streamed_response,
     };
     use http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -1693,6 +1715,55 @@ mod tests {
         }));
         assert!(headers.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case("content-type") && value == "application/json"
+        }));
+    }
+
+    #[test]
+    fn debugger_header_capture_redacts_credentials() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer secret"),
+        );
+        headers.insert(
+            "payment-signature",
+            HeaderValue::from_static("signed-payment"),
+        );
+        headers.insert(
+            "mcp-session-id",
+            HeaderValue::from_static("session-capability"),
+        );
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+
+        let captured = header_pairs(&headers);
+
+        assert!(
+            captured
+                .iter()
+                .any(|(name, value)| { name == "authorization" && value == "[REDACTED]" })
+        );
+        assert!(
+            captured
+                .iter()
+                .any(|(name, value)| { name == "payment-signature" && value == "[REDACTED]" })
+        );
+        assert!(
+            captured
+                .iter()
+                .any(|(name, value)| { name == "mcp-session-id" && value == "[REDACTED]" })
+        );
+        assert!(
+            captured
+                .iter()
+                .any(|(name, value)| { name == "content-type" && value == "application/json" })
+        );
+        assert!(!captured.iter().any(|(_, value)| {
+            value.contains("secret")
+                || value.contains("signed-payment")
+                || value.contains("session-capability")
         }));
     }
 
