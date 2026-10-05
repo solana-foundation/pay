@@ -134,15 +134,8 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
                     ));
                 }
             }
-            if let Some(payer) = verified_payer
-                && let Ok(value) = HeaderValue::from_str(&payer)
-            {
-                req.headers_mut().insert("x-pay-verified-payer", value);
-                if let Some(host) = host.as_deref()
-                    && let Ok(value) = HeaderValue::from_str(host)
-                {
-                    req.headers_mut().insert("x-pay-original-host", value);
-                }
+            if let Some(payer) = verified_payer {
+                inject_verified_payer_headers(req.headers_mut(), &payer, host.as_deref());
             }
             let mut response = next.run(req).await;
             if let Some(sf) = delegated_session {
@@ -295,9 +288,27 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
     }
 }
 
-fn strip_internal_identity_headers(headers: &mut HeaderMap) {
+pub fn strip_internal_identity_headers(headers: &mut HeaderMap) {
     headers.remove("x-pay-verified-payer");
     headers.remove("x-pay-original-host");
+}
+
+/// Attach identity headers only after the payment gate has authenticated the
+/// payer. Both HTTP data planes share this helper so an upstream cannot observe
+/// caller-supplied identity at this internal trust boundary.
+pub fn inject_verified_payer_headers(
+    headers: &mut HeaderMap,
+    payer: &str,
+    original_host: Option<&str>,
+) {
+    if let Ok(value) = HeaderValue::from_str(payer) {
+        headers.insert("x-pay-verified-payer", value);
+        if let Some(host) = original_host
+            && let Ok(value) = HeaderValue::from_str(host)
+        {
+            headers.insert("x-pay-original-host", value);
+        }
+    }
 }
 
 /// Read the model selected by OpenAI/Anthropic-compatible JSON requests and
@@ -694,6 +705,32 @@ mod tests {
         assert!(!headers.contains_key("x-pay-verified-payer"));
         assert!(!headers.contains_key("x-pay-original-host"));
         assert_eq!(headers.get("host").unwrap(), "function.compute.example");
+    }
+
+    #[test]
+    fn verified_compute_identity_is_injected_after_spoofed_values_are_removed() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-pay-verified-payer", HeaderValue::from_static("attacker"));
+        headers.insert(
+            "x-pay-original-host",
+            HeaderValue::from_static("attacker.example"),
+        );
+
+        strip_internal_identity_headers(&mut headers);
+        inject_verified_payer_headers(
+            &mut headers,
+            "verified-payer",
+            Some("hello.cpu.gcp.gateway-402.com"),
+        );
+
+        assert_eq!(
+            headers.get("x-pay-verified-payer").unwrap(),
+            "verified-payer"
+        );
+        assert_eq!(
+            headers.get("x-pay-original-host").unwrap(),
+            "hello.cpu.gcp.gateway-402.com"
+        );
     }
 
     fn configured_charge_splits() -> (pay_types::metering::ApiSpec, pay_types::metering::Metering) {

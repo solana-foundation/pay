@@ -32,6 +32,7 @@ use pay_core::server::gate::{
     settle_delegated_session as settle_delegated_session_forward, settle_upto, settle_upto_metered,
 };
 use pay_core::server::metering::{self, UptoSettlementPlan};
+use pay_core::server::payment::{inject_verified_payer_headers, strip_internal_identity_headers};
 use pay_core::server::proxy::{
     STRIP_HEADERS, UpstreamPlan, prepare_upstream, redact_url_in_error, routing_signs_request_body,
     upstream_error_for_logging, upstream_url_for_logging,
@@ -794,7 +795,11 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
         let rh = session.req_header();
         let method = rh.method.clone();
         let uri = rh.uri.clone();
-        let headers = rh.headers.clone();
+        let mut headers = rh.headers.clone();
+        // These headers cross an internal trust boundary. Discard caller
+        // values before both payment evaluation and observability capture;
+        // only a successfully verified delegated session may restore them.
+        strip_internal_identity_headers(&mut headers);
 
         let path = uri.path().trim_start_matches('/').to_string();
         ctx.request_path = format!("/{path}");
@@ -867,6 +872,12 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                 batch,
                 paid_request,
             } => {
+                if let Some(payer) = session_forward
+                    .as_ref()
+                    .and_then(|pending| pending.verified_payer.as_deref())
+                {
+                    inject_verified_payer_headers(&mut headers, payer, host.as_deref());
+                }
                 ctx.receipt = receipt;
                 ctx.paid_request = paid_request;
                 // x402 `batch-settlement`: the voucher is verified and the
