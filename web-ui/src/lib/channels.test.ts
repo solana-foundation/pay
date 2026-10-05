@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { PaymentFlow } from "../types";
-import { channelMatches, paymentChannels } from "./channels";
+import { channelMatches, paymentChannels, scopedPaymentChannels } from "./channels";
 
 function flow(overrides: Partial<PaymentFlow>): PaymentFlow {
   return {
@@ -157,5 +157,60 @@ describe("paymentChannels", () => {
     expect(channelMatches(channel, "channel-solana")).toBe(true);
     expect(channelMatches(channel, "chat/completions")).toBe(true);
     expect(channelMatches(channel, "missing")).toBe(false);
+  });
+
+  it("keeps full channel history when a status filter matches one request", () => {
+    const opened = flow({
+      id: "open",
+      payment: { channelId: "channel-1", action: "channel opened", depositAmount: "10000" },
+    });
+    const failed = flow({
+      id: "failed",
+      status: "failed",
+      startedAt: "2026-10-04T00:00:02.000Z",
+      updatedAt: "2026-10-04T00:00:03.000Z",
+      payment: { channelId: "channel-1", action: "voucher", voucherAmount: "1000" },
+    });
+
+    const visible = scopedPaymentChannels(paymentChannels([opened, failed]), [failed], "");
+
+    expect(visible).toHaveLength(1);
+    expect(visible[0].requests.map(({ flow }) => flow.id)).toEqual(["open", "failed"]);
+  });
+
+  it("does not advertise spendable capacity after a channel closes", () => {
+    const channels = paymentChannels([
+      flow({
+        id: "open",
+        payment: {
+          channelId: "channel-1",
+          action: "channel opened",
+          channelBalance: "10000",
+          chargeAmount: "1000",
+          chargedCumulativeAmount: "2000",
+        },
+      }),
+      flow({
+        id: "refund",
+        startedAt: "2026-10-04T00:00:02.000Z",
+        updatedAt: "2026-10-04T00:00:03.000Z",
+        payment: {
+          channelId: "channel-1",
+          action: "refund",
+          channelBalance: "10000",
+          chargeAmount: "1000",
+          chargedCumulativeAmount: "2000",
+        },
+      }),
+    ]);
+
+    expect(channels[0]).toMatchObject({
+      state: "closed",
+      remaining: "0 USDC",
+      remainingRequests: 0,
+      usagePercent: 100,
+      capacityTicks: 10,
+      usedTicks: 10,
+    });
   });
 });

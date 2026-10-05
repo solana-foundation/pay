@@ -57,7 +57,7 @@ fn redacted_headers(headers: &HashMap<String, String>) -> HashMap<String, String
 fn redacted_request_body(body: Option<&str>) -> Option<String> {
     let body = body?;
     let Ok(mut json) = serde_json::from_str::<serde_json::Value>(body) else {
-        return Some(body.to_string());
+        return Some(REDACTED.to_string());
     };
     fn redact(value: &mut serde_json::Value) {
         match value {
@@ -115,6 +115,10 @@ pub struct FlowCorrelation {
     /// `AllExchanges` mode: maps in-flight log id → flow id (stable across
     /// ring-buffer eviction, unlike indices).
     open_exchanges: HashMap<u64, String>,
+    /// Stable log id → flow id mapping retained after an exchange completes.
+    /// Response bodies may finish out of order for concurrent requests to the
+    /// same resource, so URL/client matching is not sufficient.
+    exchange_flows: HashMap<u64, String>,
     /// `AllExchanges` mode: per-connection aggregates, keyed by payer wallet
     /// (paid traffic) or client ip/host (unpaid). Bounded.
     connections: HashMap<String, ConnectionSummary>,
@@ -141,6 +145,7 @@ impl FlowCorrelation {
             flows: Vec::new(),
             flow_index: HashMap::new(),
             open_exchanges: HashMap::new(),
+            exchange_flows: HashMap::new(),
             connections: HashMap::new(),
             pending_challenges: HashMap::new(),
             connection_id_counter: 0,
@@ -193,6 +198,13 @@ impl FlowCorrelation {
             Phase::Challenge => self.create_flow(&entry, protocol),
             Phase::Retry => self.handle_retry(&entry, protocol),
         }
+        if let Some(flow) = self
+            .flows
+            .iter()
+            .rfind(|flow| flow.client_ip == entry.client_ip && flow.resource == entry.path)
+        {
+            self.exchange_flows.insert(entry.id, flow.id.clone());
+        }
     }
 
     // ── AllExchanges mode ──
@@ -215,7 +227,8 @@ impl FlowCorrelation {
             && let Some(flow_id) = self.pop_pending_challenge(&start.client_ip, &start.path)
             && let Some(flow) = self.flows.iter_mut().find(|f| f.id == flow_id)
         {
-            self.open_exchanges.insert(start.id, flow_id);
+            self.open_exchanges.insert(start.id, flow_id.clone());
+            self.exchange_flows.insert(start.id, flow_id);
             flow.status = FlowStatus::PaymentReceived;
             flow.updated_at = start.ts.clone();
             if let Some(incoming) = start.inference {
@@ -237,6 +250,7 @@ impl FlowCorrelation {
         self.flow_id_counter += 1;
         let id = format!("flow-{}", self.flow_id_counter);
         self.open_exchanges.insert(start.id, id.clone());
+        self.exchange_flows.insert(start.id, id.clone());
 
         let flow = PaymentFlow {
             id,
@@ -317,12 +331,12 @@ impl FlowCorrelation {
         let _ = self.tx.send(SseMessage::FlowUpdated { flow: flow.clone() });
     }
 
-    /// Enrich the newest matching flow after a proxied response body finishes
+    /// Enrich the exact flow after a proxied response body finishes
     /// streaming. This keeps token accounting off the hot path: callers can
     /// forward chunks immediately and submit only a bounded response tail.
     pub fn enrich_inference_response(
         &mut self,
-        client_ip: &str,
+        log_id: u64,
         resource: &str,
         response_headers: HashMap<String, String>,
         response_body: String,
@@ -339,7 +353,7 @@ impl FlowCorrelation {
             req_body: None,
             res_headers: response_headers,
             res_body: Some(response_body),
-            client_ip: client_ip.into(),
+            client_ip: "payer-proxy".into(),
         };
         let parsed = inference_from_exchange(&entry);
         let Some(incoming) = (match (parsed, observed) {
@@ -350,11 +364,10 @@ impl FlowCorrelation {
         }) else {
             return;
         };
-        let Some(flow) = self
-            .flows
-            .iter_mut()
-            .rfind(|flow| flow.client_ip == client_ip && flow.resource == resource)
-        else {
+        let Some(flow_id) = self.exchange_flows.get(&log_id) else {
+            return;
+        };
+        let Some(flow) = self.flows.iter_mut().find(|flow| &flow.id == flow_id) else {
             return;
         };
         flow.inference = Some(match flow.inference.take() {
@@ -551,6 +564,7 @@ impl FlowCorrelation {
     fn create_completed_exchange(&mut self, entry: &LogEntry) {
         self.flow_id_counter += 1;
         let id = format!("flow-{}", self.flow_id_counter);
+        self.exchange_flows.insert(entry.id, id.clone());
         let now = &entry.ts;
         let amount = paid_exchange_amount(entry);
         let payer = amount
@@ -1030,6 +1044,10 @@ impl FlowCorrelation {
 
         if self.flows.len() > MAX_FLOWS {
             let removed = self.flows.remove(0);
+            self.open_exchanges
+                .retain(|_, flow_id| flow_id != &removed.id);
+            self.exchange_flows
+                .retain(|_, flow_id| flow_id != &removed.id);
             self.flow_index
                 .remove(&flow_key(&removed.client_ip, &removed.resource));
             // Shift all indices down by 1
@@ -1397,7 +1415,12 @@ fn x402_payment_event(entry: &LogEntry) -> Option<(String, String)> {
 
     let credential = payload
         .get("authorization")
-        .or_else(|| payload.get("voucher"));
+        .or_else(|| payload.get("voucher"))
+        .or_else(|| {
+            payload
+                .get("deposit")
+                .and_then(|deposit| deposit.get("authorization"))
+        });
     if kind == "deposit" {
         if let Some(amount) = credential
             .and_then(|value| value.get("authorizedAmount"))
@@ -1509,6 +1532,8 @@ fn payment_details(entry: &LogEntry) -> Option<PaymentDetails> {
             .or_else(|| value_string(payment.get("network")));
         details.asset = value_string(accepted.and_then(|v| v.get("asset")))
             .or_else(|| value_string(payment.get("asset")));
+        details.recipient =
+            value_string(accepted.and_then(|v| v.get("payTo"))).or(details.recipient);
         details.charge_amount =
             value_string(accepted.and_then(|v| v.get("amount"))).or(details.charge_amount);
 
@@ -1516,7 +1541,12 @@ fn payment_details(entry: &LogEntry) -> Option<PaymentDetails> {
             let kind = value_string(payload.get("type"));
             let credential = payload
                 .get("authorization")
-                .or_else(|| payload.get("voucher"));
+                .or_else(|| payload.get("voucher"))
+                .or_else(|| {
+                    payload
+                        .get("deposit")
+                        .and_then(|deposit| deposit.get("authorization"))
+                });
             details.channel_id = value_string(payload.get("channelId"))
                 .or_else(|| value_string(credential.and_then(|v| v.get("channelId"))));
             details.deposit_amount = value_string(
@@ -3158,7 +3188,7 @@ mod tests {
         engine.ingest(done);
 
         engine.enrich_inference_response(
-            "127.0.0.1",
+            1,
             resource,
             HashMap::from([("content-type".into(), "text/event-stream".into())]),
             concat!(
@@ -3175,6 +3205,87 @@ mod tests {
         assert_eq!(inference.tokens_prompt, Some(9));
         assert_eq!(inference.tokens_completion, Some(3));
         assert_eq!(inference.response_id.as_deref(), Some("chatcmpl-stream"));
+    }
+
+    #[test]
+    fn streamed_usage_is_correlated_by_log_id_when_responses_finish_out_of_order() {
+        let (tx, _rx) = broadcast::channel(16);
+        let mut engine = FlowCorrelation::with_mode(tx, CorrelationMode::AllExchanges);
+        let resource = "/v1/chat/completions";
+
+        engine.begin_exchange(make_start(10, "POST", resource));
+        engine.begin_exchange(make_start(11, "POST", resource));
+        let mut first = make_entry("POST", resource, 200);
+        first.id = 10;
+        engine.ingest(first);
+        let mut second = make_entry("POST", resource, 200);
+        second.id = 11;
+        engine.ingest(second);
+
+        for (id, tokens) in [(11, 22), (10, 10)] {
+            engine.enrich_inference_response(
+                id,
+                resource,
+                HashMap::new(),
+                "{}".into(),
+                Some(InferenceInfo {
+                    tokens_completion: Some(tokens),
+                    ..InferenceInfo::default()
+                }),
+            );
+        }
+
+        let flows = engine.snapshot();
+        assert_eq!(
+            flows[0].inference.as_ref().unwrap().tokens_completion,
+            Some(10)
+        );
+        assert_eq!(
+            flows[1].inference.as_ref().unwrap().tokens_completion,
+            Some(22)
+        );
+    }
+
+    #[test]
+    fn malformed_request_bodies_are_redacted_fail_closed() {
+        assert_eq!(
+            redacted_request_body(Some(r#"{"api_key":"secret"#)).as_deref(),
+            Some(REDACTED),
+        );
+    }
+
+    #[test]
+    fn payment_details_use_accepted_recipient_and_nested_deposit_channel() {
+        let mut entry = make_entry("POST", "/paid", 200);
+        entry.req_headers.insert(
+            "payment-signature".into(),
+            encode_json(serde_json::json!({
+                "x402Version": 2,
+                "accepted": {
+                    "scheme": "batch-settlement",
+                    "payTo": "paid-recipient"
+                },
+                "payload": {
+                    "type": "deposit",
+                    "deposit": {
+                        "amount": "10000",
+                        "authorization": { "channelId": "nested-channel" }
+                    }
+                }
+            })),
+        );
+        entry.res_headers.insert(
+            "payment-required".into(),
+            encode_json(serde_json::json!({
+                "accepts": [{ "payTo": "offered-recipient" }]
+            })),
+        );
+
+        let details = payment_details(&entry).expect("payment details");
+        assert_eq!(details.recipient.as_deref(), Some("paid-recipient"));
+        assert_eq!(details.channel_id.as_deref(), Some("nested-channel"));
+        let (_, event) = x402_payment_event(&entry).expect("deposit event");
+        assert!(event.contains("channel nested-channel"));
     }
 
     #[test]
@@ -3207,7 +3318,7 @@ mod tests {
         engine.ingest(retry);
 
         engine.enrich_inference_response(
-            "127.0.0.1",
+            1,
             resource,
             HashMap::from([("content-type".into(), "text/event-stream".into())]),
             "data: [DONE]\n\n".into(),

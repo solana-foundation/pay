@@ -1084,7 +1084,10 @@ struct PdbInferenceCapture {
 }
 
 #[derive(Clone, Copy)]
-struct PdbRequestStarted(std::time::Instant);
+struct PdbRequestStarted {
+    started: std::time::Instant,
+    log_id: Option<u64>,
+}
 
 fn pdb_inference_capture(
     state: &PayerState,
@@ -1120,6 +1123,7 @@ fn retain_inference_tail(buffer: &mut Vec<u8>, chunk: &[u8]) {
 
 fn finish_inference_capture(
     capture: Option<PdbInferenceCapture>,
+    log_id: Option<u64>,
     headers: &HeaderMap,
     body: &[u8],
     observed: Option<pay_core::InferenceUsage>,
@@ -1127,9 +1131,12 @@ fn finish_inference_capture(
     let Some(PdbInferenceCapture { pdb, resource, .. }) = capture else {
         return;
     };
+    let Some(log_id) = log_id else {
+        return;
+    };
     let response_body = String::from_utf8_lossy(body).into_owned();
     pdb.enrich_inference_response(
-        "payer-proxy",
+        log_id,
         &resource,
         pdb_header_map(headers),
         response_body,
@@ -1152,6 +1159,7 @@ fn finish_inference_capture(
 
 fn finish_observed_inference(
     capture: &mut Option<PdbInferenceCapture>,
+    log_id: Option<u64>,
     headers: &HeaderMap,
     body: &[u8],
     observer: &mut pay_proxy::observer::StreamObserver,
@@ -1160,12 +1168,21 @@ fn finish_observed_inference(
         return;
     }
     observer.finish();
-    finish_inference_capture(capture.take(), headers, body, Some(observer.usage.clone()));
+    finish_inference_capture(
+        capture.take(),
+        log_id,
+        headers,
+        body,
+        Some(observer.usage.clone()),
+    );
 }
 
 fn contains_sse_done(body: &[u8]) -> bool {
-    body.windows(b"data: [DONE]".len())
-        .any(|window| window == b"data: [DONE]")
+    body.split(|byte| *byte == b'\n').any(|line| {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        line.strip_prefix(b"data:")
+            .is_some_and(|data| data.trim_ascii() == b"[DONE]")
+    })
 }
 
 async fn deliver(
@@ -1196,10 +1213,9 @@ async fn translate_json_response(
     resp: reqwest::Response,
     inference_capture: Option<PdbInferenceCapture>,
 ) -> Response {
-    let request_started = resp
-        .extensions()
-        .get::<PdbRequestStarted>()
-        .map(|started| started.0)
+    let request_context = resp.extensions().get::<PdbRequestStarted>().copied();
+    let request_started = request_context
+        .map(|context| context.started)
         .unwrap_or_else(std::time::Instant::now);
     let status = resp.status();
     let upstream_headers = resp.headers().clone();
@@ -1219,6 +1235,7 @@ async fn translate_json_response(
     observer.finish();
     finish_inference_capture(
         inference_capture,
+        request_context.and_then(|context| context.log_id),
         &upstream_headers,
         &bytes,
         Some(observer.usage),
@@ -1258,11 +1275,11 @@ fn translate_stream_response(
     session_guard: Option<SessionAuthorizationGuard>,
     inference_capture: Option<PdbInferenceCapture>,
 ) -> Response {
-    let request_started = resp
-        .extensions()
-        .get::<PdbRequestStarted>()
-        .map(|started| started.0)
+    let request_context = resp.extensions().get::<PdbRequestStarted>().copied();
+    let request_started = request_context
+        .map(|context| context.started)
         .unwrap_or_else(std::time::Instant::now);
+    let pdb_log_id = request_context.and_then(|context| context.log_id);
     let status = resp.status();
     let upstream_headers = resp.headers().clone();
     let inference_headers = upstream_headers.clone();
@@ -1282,6 +1299,7 @@ fn translate_stream_response(
                     if contains_sse_done(&inference_tail) {
                         finish_observed_inference(
                             &mut inference_capture,
+                            pdb_log_id,
                             &inference_headers,
                             &inference_tail,
                             &mut observer,
@@ -1298,6 +1316,7 @@ fn translate_stream_response(
                     }
                     finish_observed_inference(
                         &mut inference_capture,
+                        pdb_log_id,
                         &inference_headers,
                         &inference_tail,
                         &mut observer,
@@ -1634,6 +1653,7 @@ async fn send_upstream(
     }
 
     let pdb_request_headers = state.pdb.as_ref().map(|_| pdb_header_map(&fwd));
+    let pdb_log_id = state.pdb.as_ref().map(pay_pdb::PdbState::next_log_id);
     let pdb_request_body = state
         .pdb
         .as_ref()
@@ -1647,7 +1667,10 @@ async fn send_upstream(
         .await;
 
     if let Ok(response) = &mut result {
-        response.extensions_mut().insert(PdbRequestStarted(started));
+        response.extensions_mut().insert(PdbRequestStarted {
+            started,
+            log_id: pdb_log_id,
+        });
     }
 
     if let (Some(pdb), Some(req_headers)) = (&state.pdb, pdb_request_headers) {
@@ -1664,7 +1687,7 @@ async fn send_upstream(
             ),
         };
         let entry = pay_pdb::types::LogEntry {
-            id: pdb.next_log_id(),
+            id: pdb_log_id.expect("PDB log id exists when PDB state exists"),
             ts: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             method: method.to_string(),
             path: url.to_string(),
@@ -1740,11 +1763,11 @@ fn stream_response(
     session_guard: Option<SessionAuthorizationGuard>,
     inference_capture: Option<PdbInferenceCapture>,
 ) -> Response {
-    let request_started = resp
-        .extensions()
-        .get::<PdbRequestStarted>()
-        .map(|started| started.0)
+    let request_context = resp.extensions().get::<PdbRequestStarted>().copied();
+    let request_started = request_context
+        .map(|context| context.started)
         .unwrap_or_else(std::time::Instant::now);
+    let pdb_log_id = request_context.and_then(|context| context.log_id);
     let status = resp.status();
     let headers = resp.headers().clone();
     let inference_headers = headers.clone();
@@ -1776,6 +1799,7 @@ fn stream_response(
                     if streamed && contains_sse_done(&inference_tail) {
                         finish_observed_inference(
                             &mut inference_capture,
+                            pdb_log_id,
                             &inference_headers,
                             &inference_tail,
                             &mut observer,
@@ -1786,6 +1810,7 @@ fn stream_response(
                 Ok(None) => {
                     finish_observed_inference(
                         &mut inference_capture,
+                        pdb_log_id,
                         &inference_headers,
                         &inference_tail,
                         &mut observer,
@@ -3596,6 +3621,16 @@ mod tests {
         assert_eq!(parsed["model"], "luna");
         assert_eq!(parsed["stream"], true);
         assert_eq!(parsed["messages"]["debuggerElided"], true);
+    }
+
+    #[test]
+    fn sse_done_requires_a_complete_data_field() {
+        assert!(contains_sse_done(b"data: [DONE]\n\n"));
+        assert!(contains_sse_done(b"data:[DONE]\r\n\r\n"));
+        assert!(!contains_sse_done(
+            br#"data: {"content":"literal data: [DONE] inside JSON"}\n\n"#,
+        ));
+        assert!(!contains_sse_done(b"data: [DONE] trailing\n\n"));
     }
 
     // ── OpenAI-compat dialect loopback ─────────────────────────────────────

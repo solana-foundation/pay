@@ -8,7 +8,7 @@ import { FlowList } from "./components/FlowList";
 import { ChannelList } from "./components/ChannelList";
 import { Sidebar } from "./components/Sidebar";
 import { ProviderSidebar } from "./components/ProviderSidebar";
-import { channelMatches, paymentChannels } from "./lib/channels";
+import { paymentChannels, scopedPaymentChannels } from "./lib/channels";
 
 function AppInner() {
   const config = useConfig();
@@ -71,8 +71,8 @@ function AppInner() {
 
   const allChannels = useMemo(() => paymentChannels(flows), [flows]);
   const visibleChannels = useMemo(
-    () => paymentChannels(scopedFlows).filter((channel) => channelMatches(channel, search)),
-    [scopedFlows, search],
+    () => scopedPaymentChannels(allChannels, scopedFlows, search),
+    [allChannels, scopedFlows, search],
   );
 
   // Inference mode groups by connection and filters that grouped list by
