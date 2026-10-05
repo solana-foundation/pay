@@ -44,6 +44,7 @@ pub struct GoogleConfig {
     pub identity_token: Option<String>,
     pub allow_unauthenticated_invoke: bool,
     pub function_service_account: Option<String>,
+    pub build_service_account: Option<String>,
 }
 
 impl GoogleConfig {
@@ -72,6 +73,7 @@ impl GoogleConfig {
             identity_token: env_nonempty("COMPUTE_GOOGLE_ID_TOKEN"),
             allow_unauthenticated_invoke: env_flag("COMPUTE_GOOGLE_UNAUTHENTICATED_INVOKE"),
             function_service_account: env_nonempty("COMPUTE_GOOGLE_FUNCTION_SERVICE_ACCOUNT"),
+            build_service_account: env_nonempty("COMPUTE_GOOGLE_BUILD_SERVICE_ACCOUNT"),
         })
     }
 }
@@ -371,16 +373,25 @@ impl GoogleCloudFunctionsDriver {
         if let Some(email) = &self.config.function_service_account {
             service.insert("serviceAccountEmail".into(), json!(email));
         }
+        let mut build = serde_json::Map::new();
+        build.insert("runtime".into(), json!(request.runtime.runtime));
+        build.insert("entryPoint".into(), json!(request.runtime.entrypoint));
+        build.insert("source".into(), json!({ "storageSource": storage_source }));
+        if let Some(email) = &self.config.build_service_account {
+            build.insert(
+                "serviceAccount".into(),
+                json!(format!(
+                    "projects/{}/serviceAccounts/{email}",
+                    self.config.project
+                )),
+            );
+        }
         Ok(json!({
             "name": resource_name,
             "description": options.description.unwrap_or_else(|| "Managed by Pay compute MCP".into()),
             "environment": "GEN_2",
             "labels": labels,
-            "buildConfig": {
-                "runtime": request.runtime.runtime,
-                "entryPoint": request.runtime.entrypoint,
-                "source": { "storageSource": storage_source }
-            },
+            "buildConfig": Value::Object(build),
             "serviceConfig": Value::Object(service)
         }))
     }
