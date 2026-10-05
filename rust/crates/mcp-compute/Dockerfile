@@ -8,9 +8,7 @@ RUN apt-get update \
 
 COPY . .
 
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/app/target \
-    cargo build --release -p mcp-compute --bin mcp-compute && \
+RUN cargo build --release -p mcp-compute --bin mcp-compute && \
     cp /app/target/release/mcp-compute /mcp-compute
 
 FROM gcr.io/distroless/cc-debian12:nonroot
