@@ -3,13 +3,6 @@ use std::collections::BTreeMap;
 use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Tenant {
-    pub payer: String,
-    pub key: String,
-    pub channel_id: String,
-}
-
 fn default_driver() -> String {
     "google-cloud-scheduler".into()
 }
@@ -24,7 +17,7 @@ fn default_page_size() -> u32 {
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
-pub struct ComputeTarget {
+pub struct TriggerTarget {
     /// Compute driver that owns the target. Currently `google-cloud-functions`.
     pub provider: String,
     /// Payer-owned logical deployment name or full provider resource name.
@@ -34,17 +27,27 @@ pub struct ComputeTarget {
     pub path: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TriggerConfiguration {
+    /// Invoke the target on a five-field Unix-cron schedule.
+    Schedule {
+        /// Five-field Unix cron expression, for example `*/5 * * * *`.
+        cron: String,
+        /// IANA timezone. Defaults to `Etc/UTC`.
+        #[serde(default = "default_timezone")]
+        timezone: String,
+    },
+}
+
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
-pub struct CreateJobRequest {
+pub struct CreateTriggerRequest {
     #[serde(default = "default_driver")]
     pub driver: String,
     pub name: String,
     pub region: Option<String>,
-    /// Five-field Unix cron expression.
-    pub cron: String,
-    #[serde(default = "default_timezone")]
-    pub timezone: String,
-    pub target: ComputeTarget,
+    pub configuration: TriggerConfiguration,
+    pub target: TriggerTarget,
     #[serde(default)]
     pub input: serde_json::Value,
     #[serde(default)]
@@ -52,7 +55,7 @@ pub struct CreateJobRequest {
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
-pub struct JobRequest {
+pub struct TriggerRequest {
     #[serde(default = "default_driver")]
     pub driver: String,
     pub id: String,
@@ -60,7 +63,7 @@ pub struct JobRequest {
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
-pub struct ListJobsRequest {
+pub struct ListTriggersRequest {
     #[serde(default = "default_driver")]
     pub driver: String,
     pub region: Option<String>,
@@ -70,7 +73,7 @@ pub struct ListJobsRequest {
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
-pub struct DriverCapabilities {
+pub struct TriggerDriverCapabilities {
     pub driver: String,
     pub display_name: String,
     pub operations: Vec<String>,
@@ -79,30 +82,29 @@ pub struct DriverCapabilities {
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
-pub struct Job {
+pub struct Trigger {
     pub driver: String,
     pub id: String,
     pub name: String,
     pub region: String,
-    pub cron: String,
-    pub timezone: String,
+    pub configuration: TriggerConfiguration,
     pub state: String,
     pub target: String,
     pub updated_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
-pub struct JobList {
-    pub jobs: Vec<Job>,
+pub struct TriggerList {
+    pub triggers: Vec<Trigger>,
     pub next_page_token: Option<String>,
 }
 
 /// Trusted payload embedded in a provider scheduler target. It is accepted
 /// only together with the executor proof and consumes prepaid run capacity.
 #[derive(Clone, Debug, Deserialize)]
-pub struct ExecuteJobRequest {
+pub struct ExecuteTriggerRequest {
     pub driver: String,
-    pub job_resource: String,
+    pub trigger_resource: String,
     pub channel_lease: String,
     pub origin: String,
     pub path: String,

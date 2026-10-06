@@ -2,38 +2,37 @@
 
 use std::sync::Arc;
 
-use mcp_compute::ComputeDriver;
 use mcp_compute::google::{GoogleCloudFunctionsDriver, GoogleConfig};
+use mcp_compute::trigger_google::{GoogleTriggerConfig, GoogleTriggerDriver};
+use mcp_compute::{ComputeDriver, TriggerDriver};
 use mcp_data::DataDriver;
 use mcp_data::firestore::{FirestoreConfig, FirestoreDriver};
-use mcp_jobs::JobDriver;
-use mcp_jobs::google::{GoogleJobsConfig, GoogleJobsDriver};
 
 use crate::error::JobError;
 
 const COMPUTE_DRIVER: &str = "google-cloud-functions";
 const DATA_DRIVER: &str = "gcp-firestore";
-const JOBS_DRIVER: &str = "google-cloud-scheduler";
+const TRIGGER_DRIVER: &str = "google-cloud-scheduler";
 
 #[derive(Default)]
 pub struct ResourceCleaner {
     compute: Vec<Arc<dyn ComputeDriver>>,
     data: Vec<Arc<dyn DataDriver>>,
-    jobs: Vec<Arc<dyn JobDriver>>,
+    triggers: Vec<Arc<dyn TriggerDriver>>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct CleanupSummary {
     pub compute_resources: usize,
     pub data_resources: usize,
-    pub job_resources: usize,
+    pub trigger_resources: usize,
 }
 
 impl ResourceCleaner {
     /// Build exactly the configured provider drivers. An unknown or
     /// misconfigured driver aborts startup so production cannot silently leak
     /// resources after a channel becomes unusable.
-    pub fn from_env() -> Result<Self, JobError> {
+    pub async fn from_env() -> Result<Self, JobError> {
         let configured = std::env::var("PAY_RESOURCE_CLEANUP_DRIVERS").unwrap_or_default();
         let mut cleaner = Self::default();
         for driver in configured
@@ -56,11 +55,12 @@ impl ResourceCleaner {
                     )
                     .map_err(|error| JobError::Config(error.to_string()))?,
                 )),
-                JOBS_DRIVER => cleaner.jobs.push(Arc::new(
-                    GoogleJobsDriver::new(
-                        GoogleJobsConfig::from_env()
+                TRIGGER_DRIVER => cleaner.triggers.push(Arc::new(
+                    GoogleTriggerDriver::new(
+                        GoogleTriggerConfig::from_env()
                             .map_err(|error| JobError::Config(error.to_string()))?,
                     )
+                    .await
                     .map_err(|error| JobError::Config(error.to_string()))?,
                 )),
                 other => {
@@ -74,7 +74,7 @@ impl ResourceCleaner {
     }
 
     pub fn is_enabled(&self) -> bool {
-        !self.compute.is_empty() || !self.data.is_empty() || !self.jobs.is_empty()
+        !self.compute.is_empty() || !self.data.is_empty() || !self.triggers.is_empty()
     }
 
     pub async fn cleanup_channel(&self, channel_id: &str) -> Result<CleanupSummary, JobError> {
@@ -91,11 +91,11 @@ impl ResourceCleaner {
                 .await
                 .map_err(|error| JobError::Config(format!("data cleanup: {error}")))?;
         }
-        for driver in &self.jobs {
-            summary.job_resources += driver
+        for driver in &self.triggers {
+            summary.trigger_resources += driver
                 .cleanup_channel(channel_id)
                 .await
-                .map_err(|error| JobError::Config(format!("jobs cleanup: {error}")))?;
+                .map_err(|error| JobError::Config(format!("trigger cleanup: {error}")))?;
         }
         Ok(summary)
     }

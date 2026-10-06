@@ -18,7 +18,8 @@
     "max_instances": 2
   },
   "access": {
-    "exposure": "gateway"
+    "exposure": "gateway",
+    "public_paths": ["/"]
   },
   "service_bindings": [
     {
@@ -31,14 +32,6 @@
       "read": true,
       "write": true,
       "lease_seconds": 2592000
-    }
-  ],
-  "triggers": [
-    {
-      "kind": "schedule",
-      "cron": "*/5 * * * *",
-      "timezone": "America/New_York",
-      "path": "/refresh"
     }
   ]
 }

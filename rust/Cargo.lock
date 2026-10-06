@@ -4023,6 +4023,7 @@ dependencies = [
  "clap",
  "futures-util",
  "http 1.5.0",
+ "redis",
  "reqwest 0.12.28",
  "rmcp",
  "schemars 1.2.2",
@@ -4063,30 +4064,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
-]
-
-[[package]]
-name = "mcp-jobs"
-version = "0.30.0"
-dependencies = [
- "async-trait",
- "axum",
- "base64 0.22.1",
- "bs58",
- "bytes",
- "clap",
- "http 1.5.0",
- "redis",
- "reqwest 0.12.28",
- "rmcp",
- "schemars 1.2.2",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "thiserror 2.0.20",
- "tokio",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -5409,7 +5386,6 @@ dependencies = [
  "futures",
  "mcp-compute",
  "mcp-data",
- "mcp-jobs",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry-semantic-conventions",

@@ -9,11 +9,12 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 
-use crate::driver::{ExecutionResponse, JobDriver, JobError, Result};
-use crate::types::{
-    CreateJobRequest, DriverCapabilities, ExecuteJobRequest, Job, JobList, JobRequest,
-    ListJobsRequest, Tenant,
+use crate::trigger_driver::{Result, TriggerDriver, TriggerError, TriggerExecutionResponse};
+use crate::trigger_types::{
+    CreateTriggerRequest, ExecuteTriggerRequest, ListTriggersRequest, Trigger,
+    TriggerConfiguration, TriggerDriverCapabilities, TriggerList, TriggerRequest,
 };
+use crate::types::Tenant;
 
 pub const DRIVER_ID: &str = "google-cloud-scheduler";
 const SCHEDULER_API: &str = "https://cloudscheduler.googleapis.com";
@@ -27,7 +28,7 @@ const MAX_BUDGETED_CPU: f64 = 1.0;
 const MAX_EXECUTION_RESPONSE_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Debug)]
-pub struct GoogleJobsConfig {
+pub struct GoogleTriggerConfig {
     pub project: String,
     pub default_region: String,
     pub scheduler_api_base: String,
@@ -39,48 +40,57 @@ pub struct GoogleJobsConfig {
     pub executor_proof: String,
 }
 
-impl GoogleJobsConfig {
+impl GoogleTriggerConfig {
     pub fn from_env() -> Result<Self> {
         let value = |name: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
-        let project = value("JOBS_GOOGLE_PROJECT")
+        let project = value("COMPUTE_TRIGGER_GOOGLE_PROJECT")
             .or_else(|| value("GOOGLE_CLOUD_PROJECT"))
             .ok_or_else(|| {
-                JobError::Configuration(
-                    "JOBS_GOOGLE_PROJECT or GOOGLE_CLOUD_PROJECT must be set".into(),
+                TriggerError::Configuration(
+                    "COMPUTE_TRIGGER_GOOGLE_PROJECT or GOOGLE_CLOUD_PROJECT must be set".into(),
                 )
             })?;
         Ok(Self {
             project,
-            default_region: value("JOBS_GOOGLE_REGION").unwrap_or_else(|| "us-central1".into()),
-            scheduler_api_base: value("JOBS_GOOGLE_SCHEDULER_API_BASE")
+            default_region: value("COMPUTE_TRIGGER_GOOGLE_REGION")
+                .unwrap_or_else(|| "us-central1".into()),
+            scheduler_api_base: value("COMPUTE_TRIGGER_GOOGLE_SCHEDULER_API_BASE")
                 .unwrap_or_else(|| SCHEDULER_API.into())
                 .trim_end_matches('/')
                 .into(),
-            functions_api_base: value("JOBS_GOOGLE_FUNCTIONS_API_BASE")
+            functions_api_base: value("COMPUTE_TRIGGER_GOOGLE_FUNCTIONS_API_BASE")
                 .unwrap_or_else(|| FUNCTIONS_API.into())
                 .trim_end_matches('/')
                 .into(),
-            metadata_base: value("JOBS_GOOGLE_METADATA_BASE")
+            metadata_base: value("COMPUTE_TRIGGER_GOOGLE_METADATA_BASE")
                 .unwrap_or_else(|| METADATA_API.into())
                 .trim_end_matches('/')
                 .into(),
-            access_token: value("JOBS_GOOGLE_ACCESS_TOKEN")
+            access_token: value("COMPUTE_TRIGGER_GOOGLE_ACCESS_TOKEN")
                 .or_else(|| value("GOOGLE_OAUTH_ACCESS_TOKEN")),
-            redis_url: value("JOBS_REDIS_URL")
-                .ok_or_else(|| JobError::Configuration("JOBS_REDIS_URL must be set".into()))?,
-            executor_url: value("JOBS_EXECUTOR_URL")
-                .ok_or_else(|| JobError::Configuration("JOBS_EXECUTOR_URL must be set".into()))?
+            redis_url: value("COMPUTE_TRIGGER_REDIS_URL")
+                .or_else(|| value("PAY_SESSION_REDIS_URL"))
+                .ok_or_else(|| {
+                    TriggerError::Configuration(
+                        "COMPUTE_TRIGGER_REDIS_URL or PAY_SESSION_REDIS_URL must be set".into(),
+                    )
+                })?,
+            executor_url: value("COMPUTE_TRIGGER_EXECUTOR_URL")
+                .ok_or_else(|| {
+                    TriggerError::Configuration("COMPUTE_TRIGGER_EXECUTOR_URL must be set".into())
+                })?
                 .trim_end_matches('/')
                 .into(),
-            executor_proof: value("JOBS_EXECUTOR_PROOF")
-                .ok_or_else(|| JobError::Configuration("JOBS_EXECUTOR_PROOF must be set".into()))?,
+            executor_proof: value("COMPUTE_TRIGGER_EXECUTOR_PROOF").ok_or_else(|| {
+                TriggerError::Configuration("COMPUTE_TRIGGER_EXECUTOR_PROOF must be set".into())
+            })?,
         })
     }
 }
 
 #[derive(Clone)]
-pub struct GoogleJobsDriver {
-    config: Arc<GoogleJobsConfig>,
+pub struct GoogleTriggerDriver {
+    config: Arc<GoogleTriggerConfig>,
     client: reqwest::Client,
     token: Arc<RwLock<Option<(String, Instant)>>>,
     budgets: redis::aio::ConnectionManager,
@@ -92,13 +102,13 @@ struct MetadataToken {
     expires_in: u64,
 }
 
-impl GoogleJobsDriver {
-    pub async fn new(config: GoogleJobsConfig) -> Result<Self> {
+impl GoogleTriggerDriver {
+    pub async fn new(config: GoogleTriggerConfig) -> Result<Self> {
         validate_segment("project", &config.project)?;
         validate_segment("region", &config.default_region)?;
         if config.executor_proof.len() < 32 {
-            return Err(JobError::Configuration(
-                "JOBS_EXECUTOR_PROOF must contain at least 32 bytes".into(),
+            return Err(TriggerError::Configuration(
+                "COMPUTE_TRIGGER_EXECUTOR_PROOF must contain at least 32 bytes".into(),
             ));
         }
         let redis = redis::Client::open(config.redis_url.clone())?;
@@ -130,12 +140,16 @@ impl GoogleJobsDriver {
         if !status.is_success() {
             return Err(provider_error(status, &bytes));
         }
-        String::from_utf8(bytes.to_vec())
-            .map_err(|_| JobError::Provider("metadata returned a non-UTF-8 identity token".into()))
+        String::from_utf8(bytes.to_vec()).map_err(|_| {
+            TriggerError::Provider("metadata returned a non-UTF-8 identity token".into())
+        })
     }
 
     fn budget_key(resource: &str) -> String {
-        format!("pay:jobs:budget:{:x}", Sha256::digest(resource.as_bytes()))
+        format!(
+            "pay:compute:trigger-budget:{:x}",
+            Sha256::digest(resource.as_bytes())
+        )
     }
 
     async fn fund_budget(&self, resource: &str, channel: &str) -> Result<()> {
@@ -245,7 +259,7 @@ return redis.call('HINCRBY', KEYS[1], 'remaining', -1)
         if status.is_success() {
             Ok(value)
         } else {
-            Err(JobError::Provider(format!(
+            Err(TriggerError::Provider(format!(
                 "Google API returned {status}: {value}"
             )))
         }
@@ -255,8 +269,8 @@ return redis.call('HINCRBY', KEYS[1], 'remaining', -1)
         let region = requested.unwrap_or(&self.config.default_region);
         validate_segment("region", region)?;
         if region != self.config.default_region {
-            return Err(JobError::InvalidRequest(format!(
-                "this jobs driver is configured for region `{}`",
+            return Err(TriggerError::InvalidRequest(format!(
+                "this trigger driver is configured for region `{}`",
                 self.config.default_region
             )));
         }
@@ -264,20 +278,24 @@ return redis.call('HINCRBY', KEYS[1], 'remaining', -1)
     }
 
     fn physical_name(&self, tenant: &Tenant, name: &str) -> Result<String> {
-        validate_segment("job name", name)?;
-        Ok(format!("job-{}-{name}", tenant.key))
+        validate_segment("trigger name", name)?;
+        Ok(format!("trigger-{}-{name}", tenant.key))
     }
 
     fn resource(&self, region: &str, id: &str) -> Result<String> {
         let physical = id.rsplit('/').next().unwrap_or(id);
-        validate_segment("job ID", physical)?;
+        validate_segment("trigger ID", physical)?;
         Ok(format!(
             "projects/{}/locations/{region}/jobs/{physical}",
             self.config.project
         ))
     }
 
-    async fn owned_job(&self, tenant: &Tenant, request: &JobRequest) -> Result<(String, Value)> {
+    async fn owned_trigger(
+        &self,
+        tenant: &Tenant,
+        request: &TriggerRequest,
+    ) -> Result<(String, Value)> {
         let region = self.region(request.region.as_deref())?;
         let resource = self.resource(region, &request.id)?;
         let value = self
@@ -290,16 +308,103 @@ return redis.call('HINCRBY', KEYS[1], 'remaining', -1)
         require_owner(&value, tenant)?;
         Ok((region.into(), value))
     }
+
+    async fn cleanup_markers(&self, markers: &[String]) -> Result<usize> {
+        let region = &self.config.default_region;
+        let mut resources = Vec::new();
+        let mut page_token = None;
+        loop {
+            let mut url = reqwest::Url::parse(&format!(
+                "{}/v1/projects/{}/locations/{region}/jobs",
+                self.config.scheduler_api_base, self.config.project
+            ))
+            .map_err(|error| TriggerError::Configuration(error.to_string()))?;
+            url.query_pairs_mut().append_pair("pageSize", "500");
+            if let Some(token) = page_token.as_deref() {
+                url.query_pairs_mut().append_pair("pageToken", token);
+            }
+            let value = self.require(Method::GET, url.into(), None).await?;
+            for trigger in value
+                .get("jobs")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if trigger
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .is_some_and(|description| {
+                        markers.iter().all(|marker| description.contains(marker))
+                    })
+                    && let Some(name) = trigger.get("name").and_then(Value::as_str)
+                {
+                    resources.push(name.to_string());
+                }
+            }
+            page_token = value
+                .get("nextPageToken")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
+            if page_token.is_none() {
+                break;
+            }
+        }
+
+        let mut deleted = 0;
+        for name in resources {
+            let (status, current) = self
+                .request(
+                    Method::GET,
+                    format!("{}/v1/{name}", self.config.scheduler_api_base),
+                    None,
+                )
+                .await?;
+            if status == StatusCode::NOT_FOUND {
+                continue;
+            }
+            if !status.is_success() {
+                return Err(TriggerError::Provider(format!(
+                    "Google API returned {status}: {current}"
+                )));
+            }
+            if !current
+                .get("description")
+                .and_then(Value::as_str)
+                .is_some_and(|description| {
+                    markers.iter().all(|marker| description.contains(marker))
+                })
+            {
+                continue;
+            }
+            let (status, value) = self
+                .request(
+                    Method::DELETE,
+                    format!("{}/v1/{name}", self.config.scheduler_api_base),
+                    None,
+                )
+                .await?;
+            if status.is_success() || status == StatusCode::NOT_FOUND {
+                self.delete_budget(&name).await?;
+                deleted += 1;
+            } else {
+                return Err(TriggerError::Provider(format!(
+                    "Google API returned {status}: {value}"
+                )));
+            }
+        }
+        Ok(deleted)
+    }
 }
 
 #[async_trait]
-impl JobDriver for GoogleJobsDriver {
+impl TriggerDriver for GoogleTriggerDriver {
     fn id(&self) -> &'static str {
         DRIVER_ID
     }
 
-    fn capabilities(&self) -> DriverCapabilities {
-        DriverCapabilities {
+    fn capabilities(&self) -> TriggerDriverCapabilities {
+        TriggerDriverCapabilities {
             driver: DRIVER_ID.into(),
             display_name: "Google Cloud Scheduler".into(),
             operations: vec![
@@ -316,11 +421,14 @@ impl JobDriver for GoogleJobsDriver {
         }
     }
 
-    async fn create(&self, tenant: &Tenant, request: CreateJobRequest) -> Result<Job> {
-        validate_schedule(&request.cron, &request.timezone, &request.target.path)?;
+    async fn create(&self, tenant: &Tenant, request: CreateTriggerRequest) -> Result<Trigger> {
+        let (cron, timezone) = match &request.configuration {
+            TriggerConfiguration::Schedule { cron, timezone } => (cron, timezone),
+        };
+        validate_schedule(cron, timezone, &request.target.path)?;
         if request.target.provider != "google-cloud-functions" {
-            return Err(JobError::InvalidRequest(
-                "Google Cloud Scheduler requires a google-cloud-functions target".into(),
+            return Err(TriggerError::InvalidRequest(
+                "Google schedule triggers require a google-cloud-functions target".into(),
             ));
         }
         let region = self.region(request.region.as_deref())?;
@@ -357,7 +465,7 @@ impl JobDriver for GoogleJobsDriver {
         let origin = function
             .pointer("/serviceConfig/uri")
             .and_then(Value::as_str)
-            .ok_or_else(|| JobError::Provider("target function has no service URI".into()))?;
+            .ok_or_else(|| TriggerError::Provider("target function has no service URI".into()))?;
         let physical = self.physical_name(tenant, &request.name)?;
         let resource = self.resource(region, &physical)?;
         let channel = lease_key(&tenant.channel_id)?;
@@ -372,7 +480,7 @@ impl JobDriver for GoogleJobsDriver {
             require_owner(&existing, tenant)?;
             require_channel(&existing, &channel)?;
         } else if existing_status != StatusCode::NOT_FOUND {
-            return Err(JobError::Provider(format!(
+            return Err(TriggerError::Provider(format!(
                 "Google API returned {existing_status}: {existing}"
             )));
         }
@@ -392,7 +500,7 @@ impl JobDriver for GoogleJobsDriver {
         headers.insert("content-type".into(), "application/json".into());
         let executor_body = json!({
             "driver": DRIVER_ID,
-            "job_resource": resource,
+            "trigger_resource": resource,
             "channel_lease": channel,
             "origin": origin,
             "path": request.target.path,
@@ -401,16 +509,16 @@ impl JobDriver for GoogleJobsDriver {
         });
         let body = json!({
             "name": resource,
-            "description": format!("managed-by=mcp-jobs;pay-tenant={};pay-channel={channel};pay-name={};prepaid-runs={PREPAID_RUNS}", tenant.key, request.name),
-            "schedule": request.cron,
-            "timeZone": request.timezone,
+            "description": format!("managed-by=mcp-compute;resource=trigger;pay-tenant={};pay-channel={channel};pay-name={};pay-target={target_name};prepaid-runs={PREPAID_RUNS}", tenant.key, request.name),
+            "schedule": cron,
+            "timeZone": timezone,
             "retryConfig": { "retryCount": 0 },
             "httpTarget": {
-                "uri": format!("{}/internal/run", self.config.executor_url),
+                "uri": format!("{}/internal/triggers/run", self.config.executor_url),
                 "httpMethod": "POST",
                 "headers": {
                     "content-type": "application/json",
-                    "x-pay-job-executor-proof": self.config.executor_proof,
+                    "x-compute-trigger-proof": self.config.executor_proof,
                 },
                 "body": base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&executor_body)?),
             }
@@ -433,7 +541,7 @@ impl JobDriver for GoogleJobsDriver {
         } else if status.is_success() {
             value
         } else {
-            return Err(JobError::Provider(format!(
+            return Err(TriggerError::Provider(format!(
                 "Google API returned {status}: {value}"
             )));
         };
@@ -447,37 +555,37 @@ impl JobDriver for GoogleJobsDriver {
                 .await;
             return Err(error);
         }
-        job_from_value(&value, region)
+        trigger_from_value(&value, region)
     }
 
-    async fn get(&self, tenant: &Tenant, request: JobRequest) -> Result<Job> {
-        let (region, value) = self.owned_job(tenant, &request).await?;
-        job_from_value(&value, &region)
+    async fn get(&self, tenant: &Tenant, request: TriggerRequest) -> Result<Trigger> {
+        let (region, value) = self.owned_trigger(tenant, &request).await?;
+        trigger_from_value(&value, &region)
     }
 
-    async fn list(&self, tenant: &Tenant, request: ListJobsRequest) -> Result<JobList> {
+    async fn list(&self, tenant: &Tenant, request: ListTriggersRequest) -> Result<TriggerList> {
         let region = self.region(request.region.as_deref())?;
         let mut url = reqwest::Url::parse(&format!(
             "{}/v1/projects/{}/locations/{region}/jobs",
             self.config.scheduler_api_base, self.config.project
         ))
-        .map_err(|e| JobError::Configuration(e.to_string()))?;
+        .map_err(|e| TriggerError::Configuration(e.to_string()))?;
         url.query_pairs_mut()
             .append_pair("pageSize", &request.page_size.clamp(1, 100).to_string());
         if let Some(token) = request.page_token {
             url.query_pairs_mut().append_pair("pageToken", &token);
         }
         let value = self.require(Method::GET, url.into(), None).await?;
-        let jobs = value
+        let triggers = value
             .get("jobs")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
             .filter(|value| require_owner(value, tenant).is_ok())
-            .filter_map(|value| job_from_value(value, region).ok())
+            .filter_map(|value| trigger_from_value(value, region).ok())
             .collect();
-        Ok(JobList {
-            jobs,
+        Ok(TriggerList {
+            triggers,
             next_page_token: value
                 .get("nextPageToken")
                 .and_then(Value::as_str)
@@ -485,18 +593,18 @@ impl JobDriver for GoogleJobsDriver {
         })
     }
 
-    async fn pause(&self, tenant: &Tenant, request: JobRequest) -> Result<Job> {
+    async fn pause(&self, tenant: &Tenant, request: TriggerRequest) -> Result<Trigger> {
         action(self, tenant, request, "pause").await
     }
-    async fn resume(&self, tenant: &Tenant, request: JobRequest) -> Result<Job> {
+    async fn resume(&self, tenant: &Tenant, request: TriggerRequest) -> Result<Trigger> {
         action(self, tenant, request, "resume").await
     }
-    async fn run_now(&self, tenant: &Tenant, request: JobRequest) -> Result<Job> {
+    async fn run_now(&self, tenant: &Tenant, request: TriggerRequest) -> Result<Trigger> {
         action(self, tenant, request, "run").await
     }
 
-    async fn delete(&self, tenant: &Tenant, request: JobRequest) -> Result<()> {
-        let (region, _) = self.owned_job(tenant, &request).await?;
+    async fn delete(&self, tenant: &Tenant, request: TriggerRequest) -> Result<()> {
+        let (region, _) = self.owned_trigger(tenant, &request).await?;
         let resource = self.resource(&region, &request.id)?;
         self.require(
             Method::DELETE,
@@ -508,102 +616,50 @@ impl JobDriver for GoogleJobsDriver {
         Ok(())
     }
 
-    async fn cleanup_channel(&self, channel_id: &str) -> Result<usize> {
-        let marker = format!("pay-channel={}", lease_key(channel_id)?);
-        let region = &self.config.default_region;
-        let mut resources = Vec::new();
-        let mut page_token = None;
-        loop {
-            let mut url = reqwest::Url::parse(&format!(
-                "{}/v1/projects/{}/locations/{region}/jobs",
-                self.config.scheduler_api_base, self.config.project
-            ))
-            .map_err(|error| JobError::Configuration(error.to_string()))?;
-            url.query_pairs_mut().append_pair("pageSize", "500");
-            if let Some(token) = page_token.as_deref() {
-                url.query_pairs_mut().append_pair("pageToken", token);
-            }
-            let value = self.require(Method::GET, url.into(), None).await?;
-            for job in value
-                .get("jobs")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                if job
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .is_some_and(|d| d.contains(&marker))
-                    && let Some(name) = job.get("name").and_then(Value::as_str)
-                {
-                    resources.push(name.to_string());
-                }
-            }
-            page_token = value
-                .get("nextPageToken")
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned);
-            if page_token.is_none() {
-                break;
-            }
+    async fn cleanup_target(
+        &self,
+        tenant: &Tenant,
+        provider: &str,
+        id: &str,
+        region: Option<&str>,
+    ) -> Result<usize> {
+        if provider != "google-cloud-functions" {
+            return Ok(0);
         }
-        let mut deleted = 0;
-        for name in resources {
-            let (status, current) = self
-                .request(
-                    Method::GET,
-                    format!("{}/v1/{name}", self.config.scheduler_api_base),
-                    None,
-                )
-                .await?;
-            if status == StatusCode::NOT_FOUND {
-                continue;
-            }
-            if !status.is_success() {
-                return Err(JobError::Provider(format!(
-                    "Google API returned {status}: {current}"
-                )));
-            }
-            if !current
-                .get("description")
-                .and_then(Value::as_str)
-                .is_some_and(|description| description.contains(&marker))
-            {
-                continue;
-            }
-            let (status, value) = self
-                .request(
-                    Method::DELETE,
-                    format!("{}/v1/{name}", self.config.scheduler_api_base),
-                    None,
-                )
-                .await?;
-            if status.is_success() || status == StatusCode::NOT_FOUND {
-                self.delete_budget(&name).await?;
-                deleted += 1;
-            } else {
-                return Err(JobError::Provider(format!(
-                    "Google API returned {status}: {value}"
-                )));
-            }
-        }
-        Ok(deleted)
+        let target_name = if id.contains('/') {
+            parse_function_resource(id, &self.config.project, region)?.1
+        } else if id.starts_with("gcf-") {
+            validate_segment("target ID", id)?;
+            id.to_string()
+        } else {
+            validate_segment("target ID", id)?;
+            format!("gcf-{}-{id}", tenant.key)
+        };
+        self.cleanup_markers(&[
+            format!("pay-tenant={};", tenant.key),
+            format!("pay-target={target_name};"),
+        ])
+        .await
     }
 
-    async fn execute(&self, request: ExecuteJobRequest) -> Result<ExecutionResponse> {
+    async fn cleanup_channel(&self, channel_id: &str) -> Result<usize> {
+        self.cleanup_markers(&[format!("pay-channel={};", lease_key(channel_id)?)])
+            .await
+    }
+
+    async fn execute(&self, request: ExecuteTriggerRequest) -> Result<TriggerExecutionResponse> {
         let region = self.region(None)?;
         let expected_prefix = format!(
-            "projects/{}/locations/{region}/jobs/job-",
+            "projects/{}/locations/{region}/jobs/trigger-",
             self.config.project
         );
-        if !request.job_resource.starts_with(&expected_prefix) {
-            return Err(JobError::InvalidRequest(
-                "executor job resource is outside the configured project and region".into(),
+        if !request.trigger_resource.starts_with(&expected_prefix) {
+            return Err(TriggerError::InvalidRequest(
+                "executor trigger resource is outside the configured project and region".into(),
             ));
         }
         if !self
-            .consume_budget(&request.job_resource, &request.channel_lease)
+            .consume_budget(&request.trigger_resource, &request.channel_lease)
             .await?
         {
             let _ = self
@@ -611,20 +667,21 @@ impl JobDriver for GoogleJobsDriver {
                     Method::POST,
                     format!(
                         "{}/v1/{}:pause",
-                        self.config.scheduler_api_base, request.job_resource
+                        self.config.scheduler_api_base, request.trigger_resource
                     ),
                     Some(&json!({})),
                 )
                 .await;
-            return Err(JobError::InvalidRequest(
+            return Err(TriggerError::InvalidRequest(
                 "prepaid execution budget is exhausted or expired".into(),
             ));
         }
         validate_schedule("* * * * *", "Etc/UTC", &request.path)?;
-        let mut url = reqwest::Url::parse(&request.origin)
-            .map_err(|error| JobError::InvalidRequest(format!("invalid target origin: {error}")))?;
+        let mut url = reqwest::Url::parse(&request.origin).map_err(|error| {
+            TriggerError::InvalidRequest(format!("invalid target origin: {error}"))
+        })?;
         if url.scheme() != "https" {
-            return Err(JobError::InvalidRequest(
+            return Err(TriggerError::InvalidRequest(
                 "target origin must use HTTPS".into(),
             ));
         }
@@ -658,17 +715,17 @@ impl JobDriver for GoogleJobsDriver {
             .content_length()
             .is_some_and(|length| length > MAX_EXECUTION_RESPONSE_BYTES)
         {
-            return Err(JobError::Provider(
+            return Err(TriggerError::Provider(
                 "scheduled function response exceeds 1 MiB".into(),
             ));
         }
         let body = response.bytes().await?;
         if body.len() as u64 > MAX_EXECUTION_RESPONSE_BYTES {
-            return Err(JobError::Provider(
+            return Err(TriggerError::Provider(
                 "scheduled function response exceeds 1 MiB".into(),
             ));
         }
-        Ok(ExecutionResponse {
+        Ok(TriggerExecutionResponse {
             status,
             headers,
             body,
@@ -677,12 +734,12 @@ impl JobDriver for GoogleJobsDriver {
 }
 
 async fn action(
-    driver: &GoogleJobsDriver,
+    driver: &GoogleTriggerDriver,
     tenant: &Tenant,
-    request: JobRequest,
+    request: TriggerRequest,
     verb: &str,
-) -> Result<Job> {
-    let (region, _) = driver.owned_job(tenant, &request).await?;
+) -> Result<Trigger> {
+    let (region, _) = driver.owned_trigger(tenant, &request).await?;
     let resource = driver.resource(&region, &request.id)?;
     let value = driver
         .require(
@@ -691,7 +748,7 @@ async fn action(
             Some(&json!({})),
         )
         .await?;
-    job_from_value(&value, &region)
+    trigger_from_value(&value, &region)
 }
 
 fn require_owner(value: &Value, tenant: &Tenant) -> Result<()> {
@@ -703,8 +760,8 @@ fn require_owner(value: &Value, tenant: &Tenant) -> Result<()> {
     {
         Ok(())
     } else {
-        Err(JobError::InvalidRequest(
-            "job is not owned by the verified payer".into(),
+        Err(TriggerError::InvalidRequest(
+            "trigger is not owned by the verified payer".into(),
         ))
     }
 }
@@ -718,8 +775,8 @@ fn require_channel(value: &Value, expected: &str) -> Result<()> {
     {
         Ok(())
     } else {
-        Err(JobError::InvalidRequest(
-            "an existing job cannot move between funding channels".into(),
+        Err(TriggerError::InvalidRequest(
+            "an existing trigger cannot move between funding channels".into(),
         ))
     }
 }
@@ -736,14 +793,14 @@ fn parse_function_resource(
         || parts[4] != "functions"
         || parts[1] != expected_project
     {
-        return Err(JobError::InvalidRequest(
+        return Err(TriggerError::InvalidRequest(
             "target ID must be a function in the configured Google project".into(),
         ));
     }
     validate_segment("target region", parts[3])?;
     validate_segment("target ID", parts[5])?;
     if requested_region.is_some_and(|region| region != parts[3]) {
-        return Err(JobError::InvalidRequest(
+        return Err(TriggerError::InvalidRequest(
             "target.region conflicts with the region in target.id".into(),
         ));
     }
@@ -756,7 +813,7 @@ fn require_function_owner(value: &Value, tenant: &Tenant) -> Result<()> {
     {
         Ok(())
     } else {
-        Err(JobError::InvalidRequest(
+        Err(TriggerError::InvalidRequest(
             "target function is not owned by the verified payer".into(),
         ))
     }
@@ -785,8 +842,8 @@ fn validate_budgeted_function(value: &Value) -> Result<()> {
         || memory_mib > MAX_BUDGETED_MEMORY_MIB
         || cpu > MAX_BUDGETED_CPU
     {
-        return Err(JobError::InvalidRequest(format!(
-            "prepaid jobs require target limits of at most {MAX_BUDGETED_TIMEOUT_SECONDS}s, \
+        return Err(TriggerError::InvalidRequest(format!(
+            "prepaid triggers require target limits of at most {MAX_BUDGETED_TIMEOUT_SECONDS}s, \
              {MAX_BUDGETED_MEMORY_MIB:.0} MiB, and {MAX_BUDGETED_CPU:.0} vCPU"
         )));
     }
@@ -806,11 +863,11 @@ fn parse_memory_mib(value: &str) -> Option<f64> {
     value.parse().ok()
 }
 
-fn job_from_value(value: &Value, region: &str) -> Result<Job> {
+fn trigger_from_value(value: &Value, region: &str) -> Result<Trigger> {
     let id = value
         .get("name")
         .and_then(Value::as_str)
-        .ok_or_else(|| JobError::Provider("job response has no name".into()))?;
+        .ok_or_else(|| TriggerError::Provider("trigger response has no name".into()))?;
     let description = value
         .get("description")
         .and_then(Value::as_str)
@@ -819,21 +876,23 @@ fn job_from_value(value: &Value, region: &str) -> Result<Job> {
         .split(';')
         .find_map(|p| p.strip_prefix("pay-name="))
         .unwrap_or_else(|| id.rsplit('/').next().unwrap_or(id));
-    Ok(Job {
+    Ok(Trigger {
         driver: DRIVER_ID.into(),
         id: id.into(),
         name: name.into(),
         region: region.into(),
-        cron: value
-            .get("schedule")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .into(),
-        timezone: value
-            .get("timeZone")
-            .and_then(Value::as_str)
-            .unwrap_or("Etc/UTC")
-            .into(),
+        configuration: TriggerConfiguration::Schedule {
+            cron: value
+                .get("schedule")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .into(),
+            timezone: value
+                .get("timeZone")
+                .and_then(Value::as_str)
+                .unwrap_or("Etc/UTC")
+                .into(),
+        },
         state: value
             .get("state")
             .and_then(Value::as_str)
@@ -853,19 +912,21 @@ fn job_from_value(value: &Value, region: &str) -> Result<Job> {
 
 fn validate_schedule(cron: &str, timezone: &str, path: &str) -> Result<()> {
     if cron.len() > 128 || cron.split_ascii_whitespace().count() != 5 {
-        return Err(JobError::InvalidRequest(
+        return Err(TriggerError::InvalidRequest(
             "cron must contain five fields".into(),
         ));
     }
     if timezone.is_empty() || timezone.len() > 128 || timezone.contains(['\r', '\n']) {
-        return Err(JobError::InvalidRequest("timezone is invalid".into()));
+        return Err(TriggerError::InvalidRequest("timezone is invalid".into()));
     }
     if !path.starts_with('/')
         || path.starts_with("//")
         || path.contains("..")
         || path.contains(['\r', '\n'])
     {
-        return Err(JobError::InvalidRequest("target path is invalid".into()));
+        return Err(TriggerError::InvalidRequest(
+            "target path is invalid".into(),
+        ));
     }
     Ok(())
 }
@@ -877,7 +938,7 @@ fn validate_segment(label: &str, value: &str) -> Result<()> {
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
     {
-        return Err(JobError::InvalidRequest(format!(
+        return Err(TriggerError::InvalidRequest(format!(
             "{label} must use lowercase letters, digits, and hyphens"
         )));
     }
@@ -889,7 +950,7 @@ fn lease_key(channel_id: &str) -> Result<String> {
         || channel_id.len() > 128
         || !channel_id.bytes().all(|b| b.is_ascii_alphanumeric())
     {
-        return Err(JobError::InvalidRequest(
+        return Err(TriggerError::InvalidRequest(
             "verified payment channel is invalid".into(),
         ));
     }
@@ -903,11 +964,11 @@ fn unix_seconds() -> Result<u64> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
-        .map_err(|_| JobError::Configuration("system clock is before the Unix epoch".into()))
+        .map_err(|_| TriggerError::Configuration("system clock is before the Unix epoch".into()))
 }
 
-fn provider_error(status: StatusCode, bytes: &[u8]) -> JobError {
-    JobError::Provider(format!(
+fn provider_error(status: StatusCode, bytes: &[u8]) -> TriggerError {
+    TriggerError::Provider(format!(
         "Google metadata returned {status}: {}",
         String::from_utf8_lossy(bytes)
     ))
@@ -954,16 +1015,16 @@ mod tests {
     }
 
     #[test]
-    fn job_updates_cannot_move_funding_channels() {
+    fn trigger_updates_cannot_move_funding_channels() {
         let value = json!({
-            "description": "managed-by=mcp-jobs;pay-channel=old;pay-name=weather"
+            "description": "managed-by=mcp-compute;resource=trigger;pay-channel=old;pay-name=weather"
         });
         assert!(require_channel(&value, "old").is_ok());
         assert!(require_channel(&value, "new").is_err());
     }
 
     #[test]
-    fn prepaid_jobs_reject_unbounded_function_cost() {
+    fn prepaid_triggers_reject_unbounded_function_cost() {
         let bounded = json!({
             "serviceConfig": {
                 "timeoutSeconds": 60,

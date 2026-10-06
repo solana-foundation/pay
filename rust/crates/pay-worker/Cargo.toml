@@ -19,7 +19,6 @@ path = "src/bin/settle_sessions.rs"
 pay-api-core = { path = "../pay-api-core" }
 mcp-compute = { path = "../mcp-compute" }
 mcp-data = { path = "../mcp-data" }
-mcp-jobs = { path = "../mcp-jobs" }
 
 base64 = "0.22"
 axum = { workspace = true }

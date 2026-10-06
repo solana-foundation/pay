@@ -107,37 +107,6 @@ pub struct ServiceBindingSpec {
     pub lease_seconds: Option<u32>,
 }
 
-/// Portable event trigger. Drivers reconcile these together with the
-/// deployment so the same contract can target other compute providers later.
-#[derive(Clone, Debug, Deserialize, JsonSchema)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum TriggerSpec {
-    /// Invoke the function with POST on a Unix-cron schedule.
-    Schedule {
-        /// Five-field Unix cron expression, for example `*/5 * * * *`.
-        cron: String,
-        /// IANA timezone. Defaults to `Etc/UTC`.
-        #[serde(default = "default_schedule_timezone")]
-        timezone: String,
-        /// Function path invoked by the scheduler. Defaults to `/`.
-        #[serde(default = "default_schedule_path")]
-        path: String,
-        /// Deprecated compatibility field. Scheduled jobs use provider
-        /// workload identity to invoke the private function origin and never
-        /// persist a caller payment credential.
-        #[serde(default)]
-        authorization: Option<String>,
-    },
-}
-
-fn default_schedule_timezone() -> String {
-    "Etc/UTC".into()
-}
-
-fn default_schedule_path() -> String {
-    "/".into()
-}
-
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 pub struct DeployRequest {
     /// Driver ID returned by `providers`.
@@ -159,9 +128,6 @@ pub struct DeployRequest {
     /// binding capability is returned in the MCP response.
     #[serde(default)]
     pub service_bindings: Vec<ServiceBindingSpec>,
-    /// Provider-neutral triggers reconciled with the deployment.
-    #[serde(default)]
-    pub triggers: Vec<TriggerSpec>,
     /// Namespaced provider escape hatch. Unknown fields are rejected by the
     /// selected driver rather than silently ignored.
     #[serde(default)]
@@ -309,39 +275,4 @@ pub struct GatewayInvocation {
     pub body: bytes::Bytes,
     pub elapsed_ms: u64,
     pub billed_micro_usd: u64,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn schedule_authorization_is_only_a_compatibility_input() {
-        let request = DeployRequest {
-            provider: default_provider(),
-            name: "weather".into(),
-            region: None,
-            source: SourceInput::Inline {
-                files: BTreeMap::new(),
-            },
-            runtime: RuntimeSpec {
-                runtime: "nodejs22".into(),
-                entrypoint: "weather".into(),
-            },
-            limits: ResourceLimits::default(),
-            environment: BTreeMap::new(),
-            access: AccessPolicy::default(),
-            service_bindings: Vec::new(),
-            triggers: vec![TriggerSpec::Schedule {
-                cron: "*/5 * * * *".into(),
-                timezone: default_schedule_timezone(),
-                path: default_schedule_path(),
-                authorization: Some("Payment attacker".into()),
-            }],
-            provider_options: serde_json::Value::Null,
-        };
-
-        let TriggerSpec::Schedule { authorization, .. } = &request.triggers[0];
-        assert_eq!(authorization.as_deref(), Some("Payment attacker"));
-    }
 }

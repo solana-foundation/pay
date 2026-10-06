@@ -636,6 +636,7 @@ impl FlowCorrelation {
         };
         complete_exchange_steps(&mut flow, now);
 
+        self.exchange_flows.insert(entry.id, flow.id.clone());
         self.add_flow(flow.clone());
         let _ = self.tx.send(SseMessage::FlowCreated { flow: flow.clone() });
         self.record_connection(entry, &flow);

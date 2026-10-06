@@ -5,7 +5,9 @@ use clap::Parser;
 use mcp_compute::binding::DataBindingClient;
 use mcp_compute::driver::ComputeDriver;
 use mcp_compute::google::{GoogleCloudFunctionsDriver, GoogleConfig};
-use mcp_compute::{DriverRegistry, server};
+use mcp_compute::trigger_driver::TriggerDriver;
+use mcp_compute::trigger_google::{GoogleTriggerConfig, GoogleTriggerDriver};
+use mcp_compute::{DriverRegistry, TriggerDriverRegistry, server};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -39,6 +41,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let google = GoogleCloudFunctionsDriver::new(GoogleConfig::from_env()?)?;
     let bindings = DataBindingClient::from_env(google.clone())?;
     let drivers = DriverRegistry::new([Arc::new(google) as Arc<dyn ComputeDriver>])?;
+    let trigger_driver = Arc::new(GoogleTriggerDriver::new(GoogleTriggerConfig::from_env()?).await?)
+        as Arc<dyn TriggerDriver>;
+    let trigger_drivers = TriggerDriverRegistry::new([trigger_driver])?;
+    let executor_proof = std::env::var("COMPUTE_TRIGGER_EXECUTOR_PROOF")
+        .map_err(|_| "COMPUTE_TRIGGER_EXECUTOR_PROOF must be set")?
+        .into_bytes();
+    if executor_proof.len() < 32 {
+        return Err("COMPUTE_TRIGGER_EXECUTOR_PROOF must contain at least 32 bytes".into());
+    }
     let allowed_hosts = if args.disable_host_validation {
         Vec::new()
     } else if args.allowed_hosts.is_empty() {
@@ -50,7 +61,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(address = %args.bind, "compute MCP listening");
     axum::serve(
         listener,
-        server::router(drivers, args.gateway_domain, allowed_hosts, bindings),
+        server::router(
+            drivers,
+            trigger_drivers,
+            args.gateway_domain,
+            allowed_hosts,
+            bindings,
+            executor_proof,
+        ),
     )
     .await?;
     Ok(())

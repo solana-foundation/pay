@@ -17,14 +17,13 @@ use crate::driver::{ComputeDriver, ComputeError, Result};
 use crate::types::{
     ComputeOperation, DeployRequest, Deployment, DeploymentList, DriverCapabilities, Exposure,
     GatewayInvocation, GatewayInvokeRequest, InvocationResult, InvokeRequest, ListRequest,
-    OperationState, ResourceRequest, ResourceState, SourceInput, Tenant, TriggerSpec,
+    OperationState, ResourceRequest, ResourceState, SourceInput, Tenant,
 };
 
 pub const DRIVER_ID: &str = "google-cloud-functions";
 pub const GATEWAY_PREFIX: &str = "gcf-";
 const DEFAULT_API_BASE: &str = "https://cloudfunctions.googleapis.com";
 const DEFAULT_METADATA_BASE: &str = "http://metadata.google.internal/computeMetadata/v1";
-const DEFAULT_SCHEDULER_API_BASE: &str = "https://cloudscheduler.googleapis.com";
 const MAX_SOURCE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_SOURCE_FILES: usize = 256;
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
@@ -48,8 +47,6 @@ pub struct GoogleConfig {
     pub allow_unauthenticated_invoke: bool,
     pub function_service_account: Option<String>,
     pub build_service_account: Option<String>,
-    pub scheduler_api_base: String,
-    pub scheduler_service_account: Option<String>,
     pub gateway_domain: String,
 }
 
@@ -80,11 +77,6 @@ impl GoogleConfig {
             allow_unauthenticated_invoke: env_flag("COMPUTE_GOOGLE_UNAUTHENTICATED_INVOKE"),
             function_service_account: env_nonempty("COMPUTE_GOOGLE_FUNCTION_SERVICE_ACCOUNT"),
             build_service_account: env_nonempty("COMPUTE_GOOGLE_BUILD_SERVICE_ACCOUNT"),
-            scheduler_api_base: env_nonempty("COMPUTE_GOOGLE_SCHEDULER_API_BASE")
-                .unwrap_or_else(|| DEFAULT_SCHEDULER_API_BASE.into())
-                .trim_end_matches('/')
-                .to_string(),
-            scheduler_service_account: env_nonempty("COMPUTE_GOOGLE_SCHEDULER_SERVICE_ACCOUNT"),
             gateway_domain: env_nonempty("COMPUTE_GATEWAY_DOMAIN")
                 .unwrap_or_else(|| "cpu.gcp.gateway-402.com".into()),
         })
@@ -239,103 +231,6 @@ impl GoogleCloudFunctionsDriver {
             return Err(json_provider_error(status, &value));
         }
         Ok(value)
-    }
-
-    fn scheduler_job_name(&self, region: &str, physical_name: &str) -> String {
-        format!(
-            "projects/{}/locations/{region}/jobs/{physical_name}",
-            self.config.project
-        )
-    }
-
-    async fn reconcile_triggers(
-        &self,
-        region: &str,
-        physical_name: &str,
-        triggers: &[TriggerSpec],
-    ) -> Result<()> {
-        if triggers.is_empty() && self.config.scheduler_service_account.is_none() {
-            return Ok(());
-        }
-        if triggers.len() > 1 {
-            return Err(ComputeError::InvalidRequest(
-                "Google Cloud Functions currently supports at most one schedule trigger".into(),
-            ));
-        }
-        let job_name = self.scheduler_job_name(region, physical_name);
-        let job_url = format!("{}/v1/{job_name}", self.config.scheduler_api_base);
-        let Some(trigger) = triggers.first() else {
-            let (status, body) = self.send_json(Method::DELETE, job_url, None).await?;
-            if status != StatusCode::NOT_FOUND && !status.is_success() {
-                return Err(json_provider_error(status, &body));
-            }
-            return Ok(());
-        };
-        let TriggerSpec::Schedule {
-            cron,
-            timezone,
-            path,
-            authorization: _,
-        } = trigger;
-        validate_schedule(cron, timezone, path)?;
-        let service_account = self
-            .config
-            .scheduler_service_account
-            .as_deref()
-            .ok_or_else(|| {
-                ComputeError::Configuration(
-                    "COMPUTE_GOOGLE_SCHEDULER_SERVICE_ACCOUNT is required for schedule triggers"
-                        .into(),
-                )
-            })?;
-        let audience = format!(
-            "https://{region}-{}.cloudfunctions.net/{physical_name}",
-            self.config.project
-        );
-        let target_uri = format!("{audience}{path}");
-        let body = json!({
-            "name": job_name,
-            "schedule": cron,
-            "timeZone": timezone,
-            "attemptDeadline": "300s",
-            "httpTarget": {
-                "uri": target_uri,
-                "httpMethod": "POST",
-                "headers": {
-                    "content-type": "application/json",
-                    "x-pay-job": physical_name
-                },
-                "oidcToken": {
-                    "serviceAccountEmail": service_account,
-                    "audience": audience
-                },
-                "body": base64::engine::general_purpose::STANDARD.encode(b"{}")
-            }
-        });
-        let (status, existing) = self.send_json(Method::GET, job_url.clone(), None).await?;
-        match status {
-            StatusCode::OK => {
-                self.require_json(
-                    Method::PATCH,
-                    format!("{job_url}?updateMask=schedule,timeZone,httpTarget,attemptDeadline"),
-                    Some(&body),
-                )
-                .await?;
-            }
-            StatusCode::NOT_FOUND => {
-                self.require_json(
-                    Method::POST,
-                    format!(
-                        "{}/v1/projects/{}/locations/{region}/jobs",
-                        self.config.scheduler_api_base, self.config.project
-                    ),
-                    Some(&body),
-                )
-                .await?;
-            }
-            _ => return Err(json_provider_error(status, &existing)),
-        }
-        Ok(())
     }
 
     fn region<'a>(&'a self, requested: Option<&'a str>) -> Result<&'a str> {
@@ -637,7 +532,7 @@ impl ComputeDriver for GoogleCloudFunctionsDriver {
             default_region: self.config.default_region.clone(),
             notes: vec![
                 "Deployments are second-generation HTTP functions.".into(),
-                "Recurring execution is configured through the jobs MCP so every run is prepaid and budgeted.".into(),
+                "Attach prepaid schedule triggers with this compute MCP after deployment succeeds.".into(),
                 "Provider origins stay private; invocation is performed by this MCP.".into(),
                 "Public gateway invocation supports exact x402 and MPP payments; timeout_seconds controls execution lifetime.".into(),
             ],
@@ -647,12 +542,6 @@ impl ComputeDriver for GoogleCloudFunctionsDriver {
     async fn deploy(&self, tenant: &Tenant, request: DeployRequest) -> Result<ComputeOperation> {
         validate_function_name(&request.name)?;
         validate_runtime(&request.runtime.runtime, &request.runtime.entrypoint)?;
-        if !request.triggers.is_empty() {
-            return Err(ComputeError::InvalidRequest(
-                "inline schedules are disabled; create a prepaid recurring job through the jobs MCP"
-                    .into(),
-            ));
-        }
         let region = self.region(request.region.as_deref())?.to_string();
         if request.access.exposure == Exposure::Gateway && region != self.config.default_region {
             return Err(ComputeError::InvalidRequest(format!(
@@ -711,19 +600,7 @@ impl ComputeDriver for GoogleCloudFunctionsDriver {
             )
             .await?
         };
-        let mut normalized = normalize_operation(operation)?;
-        if let Err(error) = self
-            .reconcile_triggers(&region, physical_name, &request.triggers)
-            .await
-        {
-            let mut metadata = normalized.metadata.as_object().cloned().unwrap_or_default();
-            metadata.insert(
-                "trigger_reconciliation_error".into(),
-                Value::String(error.to_string()),
-            );
-            normalized.metadata = Value::Object(metadata);
-        }
-        Ok(normalized)
+        normalize_operation(operation)
     }
 
     async fn get(&self, tenant: &Tenant, request: ResourceRequest) -> Result<Deployment> {
@@ -783,13 +660,6 @@ impl ComputeDriver for GoogleCloudFunctionsDriver {
             )
             .await?;
         require_tenant_label(tenant, &existing)?;
-        let physical_name = resource.rsplit('/').next().ok_or_else(|| {
-            ComputeError::Configuration("function resource omitted its name".into())
-        })?;
-        let region = resource.split('/').nth(3).ok_or_else(|| {
-            ComputeError::Configuration("function resource omitted its region".into())
-        })?;
-        self.reconcile_triggers(region, physical_name, &[]).await?;
         let value = self
             .require_json(
                 Method::DELETE,
@@ -1224,43 +1094,6 @@ fn validate_runtime(runtime: &str, entrypoint: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_schedule(cron: &str, timezone: &str, path: &str) -> Result<()> {
-    if cron.len() > 128
-        || cron.split_ascii_whitespace().count() != 5
-        || !cron.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric()
-                || byte.is_ascii_whitespace()
-                || matches!(byte, b'*' | b'/' | b'-' | b',' | b'?')
-        })
-    {
-        return Err(ComputeError::InvalidRequest(
-            "schedule cron must be a five-field Unix cron expression".into(),
-        ));
-    }
-    if timezone.is_empty()
-        || timezone.len() > 64
-        || !timezone
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'_' | b'-' | b'+'))
-    {
-        return Err(ComputeError::InvalidRequest(
-            "schedule timezone must be a valid IANA timezone name".into(),
-        ));
-    }
-    if !path.starts_with('/')
-        || path.starts_with("//")
-        || path.len() > 256
-        || path.contains(['?', '#'])
-        || path.split('/').any(|segment| segment == "..")
-    {
-        return Err(ComputeError::InvalidRequest(
-            "schedule path must be an absolute function path without query, fragment, or `..`"
-                .into(),
-        ));
-    }
-    Ok(())
-}
-
 fn validate_public_paths(paths: &[String]) -> Result<Vec<String>> {
     if paths.is_empty() || paths.len() > 32 {
         return Err(ComputeError::InvalidRequest(
@@ -1537,9 +1370,6 @@ mod tests {
                             "labels": { "pay-tenant": "0123456789abcdef" }
                         }),
                     ),
-                    ("DELETE", "/v1/projects/project/locations/us-central1/jobs/gcf-0123456789abcdef-weather") => {
-                        json_response(StatusCode::NOT_FOUND, json!({}))
-                    }
                     ("DELETE", "/v2/projects/project/locations/us-central1/functions/gcf-0123456789abcdef-weather") => json_response(
                         StatusCode::OK,
                         json!({ "name": "projects/project/locations/us-central1/operations/delete-weather" }),
@@ -1561,8 +1391,6 @@ mod tests {
             allow_unauthenticated_invoke: false,
             function_service_account: None,
             build_service_account: None,
-            scheduler_api_base: base,
-            scheduler_service_account: Some("scheduler@example.invalid".into()),
             gateway_domain: "cpu.example.invalid".into(),
         })
         .unwrap();
@@ -1612,14 +1440,6 @@ mod tests {
         assert!(apply_relative_path(&mut url, "//attacker.example/x").is_err());
         apply_relative_path(&mut url, "/v1?q=yes").unwrap();
         assert_eq!(url.as_str(), "https://service.run.app/v1?q=yes");
-    }
-
-    #[test]
-    fn schedules_require_portable_safe_values() {
-        assert!(validate_schedule("*/5 * * * *", "America/New_York", "/refresh").is_ok());
-        assert!(validate_schedule("* * * *", "Etc/UTC", "/").is_err());
-        assert!(validate_schedule("*/5 * * * *", "Etc/UTC", "//attacker").is_err());
-        assert!(validate_schedule("*/5 * * * *", "Etc/UTC", "/../admin").is_err());
     }
 
     #[test]

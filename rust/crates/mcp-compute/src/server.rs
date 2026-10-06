@@ -2,10 +2,10 @@ use std::collections::BTreeMap;
 
 use axum::body::{Body, to_bytes};
 use axum::extract::{Request, State};
-use axum::http::{HeaderName, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -20,6 +20,10 @@ use sha2::{Digest, Sha256};
 
 use crate::binding::DataBindingClient;
 use crate::driver::{ComputeError, DriverRegistry};
+use crate::trigger_driver::TriggerDriverRegistry;
+use crate::trigger_types::{
+    CreateTriggerRequest, ExecuteTriggerRequest, ListTriggersRequest, TriggerRequest,
+};
 use crate::types::{
     DeployRequest, GatewayInvokeRequest, InvokeRequest, ListRequest, OperationRequest,
     ResourceRequest, Tenant,
@@ -30,20 +34,27 @@ pub const VERIFIED_CHANNEL_HEADER: &str = "x-pay-verified-channel";
 pub const ORIGINAL_HOST_HEADER: &str = "x-pay-original-host";
 pub const USAGE_HEADER: &str = "x-pay-gcp-cpu-microusd";
 const MAX_GATEWAY_BODY_BYTES: usize = 10 * 1024 * 1024;
+const TRIGGER_EXECUTOR_PROOF_HEADER: &str = "x-compute-trigger-proof";
 
 #[derive(Clone)]
 pub struct ComputeMcp {
     #[allow(dead_code)]
     tool_router: rmcp::handler::server::router::tool::ToolRouter<Self>,
     drivers: DriverRegistry,
+    trigger_drivers: TriggerDriverRegistry,
     bindings: Option<DataBindingClient>,
 }
 
 impl ComputeMcp {
-    pub fn new(drivers: DriverRegistry, bindings: Option<DataBindingClient>) -> Self {
+    pub fn new(
+        drivers: DriverRegistry,
+        trigger_drivers: TriggerDriverRegistry,
+        bindings: Option<DataBindingClient>,
+    ) -> Self {
         Self {
             tool_router: Self::tool_router(),
             drivers,
+            trigger_drivers,
             bindings,
         }
     }
@@ -58,8 +69,8 @@ impl ComputeMcp {
             })
     }
 
-    fn result<T: Serialize>(
-        result: crate::driver::Result<T>,
+    fn result<T: Serialize, E: std::fmt::Display>(
+        result: Result<T, E>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let envelope = match result {
             Ok(value) => serde_json::json!({ "success": value, "error": null }),
@@ -77,11 +88,14 @@ impl ComputeMcp {
         description = "List configured serverless compute drivers and their capabilities. Call this before deploying when provider, runtime, timeout, or source support is uncertain."
     )]
     async fn providers(&self) -> Result<CallToolResult, rmcp::ErrorData> {
-        Self::result(Ok(self.drivers.capabilities()))
+        Self::result::<_, std::convert::Infallible>(Ok(serde_json::json!({
+            "workloads": self.drivers.capabilities(),
+            "triggers": self.trigger_drivers.capabilities(),
+        })))
     }
 
     #[tool(
-        description = "Create or update a payer-owned serverless deployment. Source may be inline UTF-8 files or a base64 ZIP. Deprecated inline schedules invoke the private origin with provider workload identity; prefer the jobs MCP for new automation. Managed service bindings inject scoped data access. Gateway exposure creates a stable paid public hostname and exposes only access.public_paths, so internal job paths must be omitted. The returned operation is asynchronous; poll operation_status until it succeeds."
+        description = "Create or update a payer-owned serverless workload. Source may be inline UTF-8 files or a base64 ZIP. Managed service bindings inject scoped data access. Gateway exposure creates a stable paid public hostname and exposes only access.public_paths, so internal trigger paths must be omitted. After deployment succeeds, use create_trigger to attach schedules or other invocation modes."
     )]
     async fn deploy(
         &self,
@@ -89,10 +103,6 @@ impl ComputeMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let tenant = Self::tenant(&ctx)?;
-        for trigger in &mut request.triggers {
-            let crate::types::TriggerSpec::Schedule { authorization, .. } = trigger;
-            *authorization = None;
-        }
         let binding_result = async {
             if request.service_bindings.is_empty() {
                 return Ok(());
@@ -121,7 +131,7 @@ impl ComputeMcp {
         }
         .await;
         if let Err(error) = binding_result {
-            return Self::result::<serde_json::Value>(Err(error));
+            return Self::result::<serde_json::Value, _>(Err(error));
         }
         let result = match self.drivers.get(&request.provider) {
             Ok(driver) => driver.deploy(&tenant, request).await,
@@ -163,7 +173,7 @@ impl ComputeMcp {
     }
 
     #[tool(
-        description = "Delete a payer-owned compute deployment. The returned operation is asynchronous; poll operation_status until it succeeds."
+        description = "Delete a payer-owned compute workload and all triggers attached to it. The returned workload operation is asynchronous; poll operation_status until it succeeds."
     )]
     async fn delete(
         &self,
@@ -171,6 +181,18 @@ impl ComputeMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let tenant = Self::tenant(&ctx)?;
+        if let Err(error) = self
+            .trigger_drivers
+            .cleanup_target(
+                &tenant,
+                &request.provider,
+                &request.id,
+                request.region.as_deref(),
+            )
+            .await
+        {
+            return Self::result::<serde_json::Value, _>(Err(error));
+        }
         let result = match self.drivers.get(&request.provider) {
             Ok(driver) => driver.delete(&tenant, request).await,
             Err(error) => Err(error),
@@ -209,6 +231,110 @@ impl ComputeMcp {
         };
         Self::result(result)
     }
+
+    #[tool(
+        description = "Attach or update a payer-owned trigger for an existing compute workload. A schedule trigger invokes only the target's private path, strips payment credentials, and prepays a bounded execution budget. Deploy the target workload and wait for operation_status to succeed before calling this tool."
+    )]
+    async fn create_trigger(
+        &self,
+        Parameters(request): Parameters<CreateTriggerRequest>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let tenant = Self::tenant(&ctx)?;
+        let result = match self.trigger_drivers.get(&request.driver) {
+            Ok(driver) => driver.create(&tenant, request).await,
+            Err(error) => Err(error),
+        };
+        Self::result(result)
+    }
+
+    #[tool(description = "Get one payer-owned compute trigger.")]
+    async fn get_trigger(
+        &self,
+        Parameters(request): Parameters<TriggerRequest>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let tenant = Self::tenant(&ctx)?;
+        let result = match self.trigger_drivers.get(&request.driver) {
+            Ok(driver) => driver.get(&tenant, request).await,
+            Err(error) => Err(error),
+        };
+        Self::result(result)
+    }
+
+    #[tool(description = "List compute triggers owned by the verified payer.")]
+    async fn list_triggers(
+        &self,
+        Parameters(request): Parameters<ListTriggersRequest>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let tenant = Self::tenant(&ctx)?;
+        let result = match self.trigger_drivers.get(&request.driver) {
+            Ok(driver) => driver.list(&tenant, request).await,
+            Err(error) => Err(error),
+        };
+        Self::result(result)
+    }
+
+    #[tool(description = "Pause a payer-owned compute trigger.")]
+    async fn pause_trigger(
+        &self,
+        Parameters(request): Parameters<TriggerRequest>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let tenant = Self::tenant(&ctx)?;
+        let result = match self.trigger_drivers.get(&request.driver) {
+            Ok(driver) => driver.pause(&tenant, request).await,
+            Err(error) => Err(error),
+        };
+        Self::result(result)
+    }
+
+    #[tool(description = "Resume a payer-owned compute trigger with its remaining prepaid budget.")]
+    async fn resume_trigger(
+        &self,
+        Parameters(request): Parameters<TriggerRequest>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let tenant = Self::tenant(&ctx)?;
+        let result = match self.trigger_drivers.get(&request.driver) {
+            Ok(driver) => driver.resume(&tenant, request).await,
+            Err(error) => Err(error),
+        };
+        Self::result(result)
+    }
+
+    #[tool(
+        description = "Run a payer-owned compute trigger immediately without changing its configuration."
+    )]
+    async fn run_trigger(
+        &self,
+        Parameters(request): Parameters<TriggerRequest>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let tenant = Self::tenant(&ctx)?;
+        let result = match self.trigger_drivers.get(&request.driver) {
+            Ok(driver) => driver.run_now(&tenant, request).await,
+            Err(error) => Err(error),
+        };
+        Self::result(result)
+    }
+
+    #[tool(
+        description = "Delete a payer-owned compute trigger and its remaining execution budget."
+    )]
+    async fn delete_trigger(
+        &self,
+        Parameters(request): Parameters<TriggerRequest>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let tenant = Self::tenant(&ctx)?;
+        let result = match self.trigger_drivers.get(&request.driver) {
+            Ok(driver) => driver.delete(&tenant, request).await,
+            Err(error) => Err(error),
+        };
+        Self::result(result)
+    }
 }
 
 #[tool_handler]
@@ -220,28 +346,39 @@ impl ServerHandler for ComputeMcp {
                 Implementation::new("pay-gcp-cpu", env!("CARGO_PKG_VERSION"))
                     .with_title("Pay GCP CPU"),
             )
-            .with_instructions("Deploy and invoke payer-isolated serverless compute through pluggable provider drivers.")
+            .with_instructions("Deploy payer-isolated serverless workloads and attach portable invocation triggers through pluggable provider drivers.")
     }
 }
 
 #[derive(Clone)]
 struct AppState {
     drivers: DriverRegistry,
+    trigger_drivers: TriggerDriverRegistry,
     gateway_domain: String,
+    executor_proof: Vec<u8>,
 }
 
 pub fn router(
     drivers: DriverRegistry,
+    trigger_drivers: TriggerDriverRegistry,
     gateway_domain: String,
     allowed_hosts: Vec<String>,
     bindings: Option<DataBindingClient>,
+    executor_proof: Vec<u8>,
 ) -> Router {
     let transport = StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts);
     let mcp_drivers = drivers.clone();
+    let mcp_trigger_drivers = trigger_drivers.clone();
     let mcp_bindings = bindings.clone();
     let service: StreamableHttpService<ComputeMcp, LocalSessionManager> =
         StreamableHttpService::new(
-            move || Ok(ComputeMcp::new(mcp_drivers.clone(), mcp_bindings.clone())),
+            move || {
+                Ok(ComputeMcp::new(
+                    mcp_drivers.clone(),
+                    mcp_trigger_drivers.clone(),
+                    mcp_bindings.clone(),
+                ))
+            },
             Default::default(),
             transport,
         );
@@ -250,12 +387,64 @@ pub fn router(
         .layer(middleware::from_fn(verified_tenant));
     Router::new()
         .route("/__402/health", get(health))
+        .route("/internal/triggers/run", post(execute_trigger))
         .merge(mcp)
         .fallback(gateway_invoke)
         .with_state(AppState {
             drivers,
+            trigger_drivers,
             gateway_domain,
+            executor_proof,
         })
+}
+
+async fn execute_trigger(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ExecuteTriggerRequest>,
+) -> Response {
+    let valid_proof = headers
+        .get(TRIGGER_EXECUTOR_PROOF_HEADER)
+        .is_some_and(|value| constant_time_eq(value.as_bytes(), &state.executor_proof));
+    if !valid_proof {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "trigger_executor_proof_required" })),
+        )
+            .into_response();
+    }
+    let driver = match state.trigger_drivers.get(&request.driver) {
+        Ok(driver) => driver,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response();
+        }
+    };
+    match driver.execute(request).await {
+        Ok(execution) => {
+            let mut response = Response::builder().status(execution.status);
+            for (name, value) in execution.headers {
+                response = response.header(name, value);
+            }
+            response
+                .body(Body::from(execution.body))
+                .unwrap_or_else(|error| {
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({ "error": error.to_string() })),
+                    )
+                        .into_response()
+                })
+        }
+        Err(error) => (
+            StatusCode::PAYMENT_REQUIRED,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -446,9 +635,19 @@ fn validate_channel_id(channel_id: &str) -> crate::driver::Result<&str> {
     Ok(channel_id)
 }
 
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+            == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tower::ServiceExt;
 
     #[test]
     fn gateway_path_selects_deployment_and_preserves_query() {
@@ -470,9 +669,9 @@ mod tests {
 
     #[test]
     fn tool_results_are_structured_without_json_text_duplication() {
-        let result = ComputeMcp::result::<serde_json::Value>(Ok(serde_json::json!({
-            "value": 42
-        })))
+        let result = ComputeMcp::result::<serde_json::Value, std::convert::Infallible>(Ok(
+            serde_json::json!({ "value": 42 }),
+        ))
         .unwrap();
 
         assert!(result.content.is_empty());
@@ -493,5 +692,52 @@ mod tests {
         assert_eq!(tenant.key.len(), 16);
         assert_ne!(tenant.key, payer);
         assert_eq!(tenant, tenant_from_payer(&payer).unwrap());
+    }
+
+    #[tokio::test]
+    async fn trigger_executor_requires_the_internal_proof() {
+        let app = router(
+            DriverRegistry::default(),
+            TriggerDriverRegistry::default(),
+            "cpu.example.invalid".into(),
+            Vec::new(),
+            None,
+            b"correct-proof-that-is-at-least-32-bytes".to_vec(),
+        );
+        let body = serde_json::json!({
+            "driver": "missing",
+            "trigger_resource": "projects/project/locations/us-central1/jobs/trigger-test",
+            "channel_lease": "lease",
+            "origin": "https://function.example.invalid",
+            "path": "/refresh"
+        })
+        .to_string();
+
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::post("/internal/triggers/run")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let authorized = app
+            .oneshot(
+                Request::post("/internal/triggers/run")
+                    .header("content-type", "application/json")
+                    .header(
+                        TRIGGER_EXECUTOR_PROOF_HEADER,
+                        "correct-proof-that-is-at-least-32-bytes",
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authorized.status(), StatusCode::BAD_REQUEST);
     }
 }

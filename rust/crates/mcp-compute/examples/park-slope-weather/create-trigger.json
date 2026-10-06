@@ -1,0 +1,14 @@
+{
+  "driver": "google-cloud-scheduler",
+  "name": "park-slope-weather-refresh",
+  "configuration": {
+    "kind": "schedule",
+    "cron": "*/5 * * * *",
+    "timezone": "America/New_York"
+  },
+  "target": {
+    "provider": "google-cloud-functions",
+    "id": "park-slope-weather",
+    "path": "/refresh"
+  }
+}

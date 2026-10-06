@@ -19,6 +19,7 @@ clap = { workspace = true, features = ["env"] }
 futures-util = "0.3"
 http = "1"
 reqwest = { workspace = true, features = ["json"] }
+redis = { version = "0.32", features = ["aio", "tokio-comp", "connection-manager"] }
 rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
 schemars = "1.2"
 serde = { workspace = true }

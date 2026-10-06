@@ -438,7 +438,7 @@ impl SettlementRuntime {
         let signer = build_fee_payer_signer(&config.send.fee_payer).await?;
         let operator = signer.pubkey();
         let confirm_timeout = Duration::from_secs(config.confirm_timeout_seconds);
-        let resource_cleaner = ResourceCleaner::from_env()?;
+        let resource_cleaner = ResourceCleaner::from_env().await?;
         let resource_cleanup_interval = Duration::from_secs(require_positive_u64(
             "PAY_RESOURCE_CLEANUP_INTERVAL_SECONDS",
             parse_u64_env(
@@ -1455,7 +1455,7 @@ async fn ensure_resource_cleanup(
         .resource_cleaner
         .cleanup_channel(&state.channel_id)
         .await?;
-    let resources = summary.compute_resources + summary.data_resources + summary.job_resources;
+    let resources = summary.compute_resources + summary.data_resources + summary.trigger_resources;
     let quiet_ms = u64::try_from(runtime.resource_cleanup_quiet.as_millis()).unwrap_or(u64::MAX);
     let updated = store
         .update_channel(
@@ -1474,7 +1474,7 @@ async fn ensure_resource_cleanup(
         channel_id = %state.channel_id,
         compute_resources = summary.compute_resources,
         data_resources = summary.data_resources,
-        job_resources = summary.job_resources,
+        trigger_resources = summary.trigger_resources,
         "garbage-collected resources funded by unusable session channel"
     );
     Ok(updated.extra.contains_key(RESOURCE_CLEANUP_COMPLETED_AT))
