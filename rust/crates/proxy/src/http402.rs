@@ -876,11 +876,15 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                 batch,
                 paid_request,
             } => {
-                if let Some(payer) = session_forward
-                    .as_ref()
-                    .and_then(|pending| pending.verified_payer.as_deref())
+                if let Some(pending) = session_forward.as_ref()
+                    && let Some(payer) = pending.verified_payer.as_deref()
                 {
-                    inject_verified_payer_headers(&mut headers, payer, host.as_deref());
+                    inject_verified_payer_headers(
+                        &mut headers,
+                        payer,
+                        host.as_deref(),
+                        Some(&pending.channel_id),
+                    );
                 }
                 ctx.receipt = receipt;
                 ctx.paid_request = paid_request;
