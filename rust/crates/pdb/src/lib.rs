@@ -127,6 +127,30 @@ impl PdbState {
         );
     }
 
+    /// Attach response metadata to the exact proxy exchange identified by its
+    /// log id, avoiding URL-based races between concurrent requests.
+    pub fn enrich_inference_response_for_exchange(
+        &self,
+        log_id: u64,
+        client_ip: &str,
+        resource: &str,
+        response_headers: std::collections::HashMap<String, String>,
+        response_body: String,
+        observed: Option<InferenceInfo>,
+    ) {
+        self.correlation
+            .lock()
+            .unwrap()
+            .enrich_inference_response_for_exchange(
+                Some(log_id),
+                client_ip,
+                resource,
+                response_headers,
+                response_body,
+                observed,
+            );
+    }
+
     /// Record and broadcast the current provider fleet (discovery/watch task).
     pub fn set_providers(&self, providers: Vec<ProviderSummary>) {
         *self.providers.lock().unwrap() = providers.clone();

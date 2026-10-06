@@ -133,6 +133,9 @@ pub struct SessionForward {
     pub settlement: Option<Box<metering::UptoSettlementPlan>>,
     /// Remaining channel capacity available to the metered delivery.
     pub available_base_units: u64,
+    /// Total channel authorization, used in receipt metadata even when this
+    /// request reserves only its configured per-request ceiling.
+    pub authorized_base_units: u64,
     /// Payer identity verified by the reusable session proof. Internal
     /// upstream services use this as their tenant boundary.
     pub verified_payer: Option<String>,
@@ -146,7 +149,7 @@ impl SessionForward {
         channel_id: String,
         committed_base_units: u64,
         settlement: metering::UptoSettlementPlan,
-        available_base_units: u64,
+        capacity_base_units: (u64, u64),
         verified_payer: String,
         reservation: DelegatedCapacityLease,
     ) -> Self {
@@ -155,7 +158,8 @@ impl SessionForward {
             channel_id,
             committed_base_units,
             settlement: Some(Box::new(settlement)),
-            available_base_units,
+            available_base_units: capacity_base_units.0,
+            authorized_base_units: capacity_base_units.1,
             verified_payer: Some(verified_payer),
             _reservation: Some(reservation),
         }
@@ -265,9 +269,7 @@ pub async fn settle_delegated_session(
         usd = actual.usd,
         "delegated MPP session voucher accepted"
     );
-    let authorized = pending
-        .committed_base_units
-        .saturating_add(pending.available_base_units);
+    let authorized = pending.authorized_base_units;
     delegated_session_receipt_annotation(
         pending.handle.network(),
         pending.handle.currency(),
@@ -2232,8 +2234,15 @@ async fn session_authorized(
                     .unwrap_or_default(),
                 ));
             }
+            let per_request_base_units = meter
+                .upto
+                .as_ref()
+                .and_then(|upto| upto.max_usd)
+                .map(|usd| (usd * 10_f64.powi(sm.decimals() as i32)).ceil() as u64)
+                .unwrap_or(available_base_units)
+                .min(available_base_units);
             let reservation = match handle
-                .reserve_delegated_capacity(&state.channel_id, available_base_units)
+                .reserve_delegated_capacity(&state.channel_id, per_request_base_units)
                 .await
             {
                 Ok(Some(reservation)) => reservation,
@@ -2260,7 +2269,7 @@ async fn session_authorized(
                 ..Default::default()
             };
             let variant = variant_hint_from_path(path);
-            let ceiling_usd = available_base_units as f64 / 10_f64.powi(sm.decimals() as i32);
+            let ceiling_usd = per_request_base_units as f64 / 10_f64.powi(sm.decimals() as i32);
             let settlement = metering::UptoSettlementPlan {
                 metering: meter.clone(),
                 variant_hint: variant,
@@ -2274,7 +2283,7 @@ async fn session_authorized(
                     state.channel_id,
                     state.cumulative,
                     settlement,
-                    available_base_units,
+                    (per_request_base_units, state.deposit),
                     state.payer.clone(),
                     reservation,
                 ))),
@@ -2300,6 +2309,7 @@ async fn session_authorized(
                     committed_base_units: cumulative,
                     settlement: None,
                     available_base_units: 0,
+                    authorized_base_units: cumulative,
                     verified_payer: None,
                     _reservation: None,
                 })

@@ -596,19 +596,40 @@ fn record_for(params: &Params) -> Result<SellRecord, String> {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorkerLiveness {
+    Alive,
+    Dead,
+    Unknown,
+}
+
 #[cfg(unix)]
-fn worker_alive(pid: u32) -> bool {
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+fn worker_liveness(record: &SellRecord) -> WorkerLiveness {
+    let Some(pid) = record.worker_pid else {
+        return WorkerLiveness::Dead;
+    };
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .stdout(Stdio::piped())
+        .output();
+    match output {
+        Ok(output) if !output.status.success() => WorkerLiveness::Dead,
+        Ok(output) => {
+            let command = String::from_utf8_lossy(&output.stdout);
+            let expected = format!("sell serve {}", record.id);
+            if command.contains(&expected) {
+                WorkerLiveness::Alive
+            } else {
+                WorkerLiveness::Dead
+            }
+        }
+        Err(_) => WorkerLiveness::Unknown,
+    }
 }
 
 #[cfg(not(unix))]
-fn worker_alive(_pid: u32) -> bool {
-    false
+fn worker_liveness(_record: &SellRecord) -> WorkerLiveness {
+    WorkerLiveness::Unknown
 }
 
 async fn status(params: Params) -> Result<String, String> {
@@ -618,14 +639,17 @@ async fn status(params: Params) -> Result<String, String> {
         .view(&record.owner_token, &record.id)
         .await
         .map_err(|e| e.to_string())?;
-    let worker = match record.worker_pid {
-        Some(pid) if worker_alive(pid) => format!("running (pid {pid})"),
-        Some(pid) => format!(
+    let worker = match (record.worker_pid, worker_liveness(&record)) {
+        (Some(pid), WorkerLiveness::Alive) => format!("running (pid {pid})"),
+        (Some(pid), WorkerLiveness::Dead) => format!(
             "not running (pid {pid} is gone; restart with `pay sell serve {} --harness {}`)",
             record.id,
             record.harness.as_deref().unwrap_or("claude")
         ),
-        None => "not started".to_string(),
+        (Some(pid), WorkerLiveness::Unknown) => {
+            format!("unknown (could not verify worker pid {pid})")
+        }
+        (None, _) => "not started".to_string(),
     };
     let earned = view["earned_usd"].as_f64().unwrap_or(0.0);
     let cap = view["earn_cap_usd"].as_f64().unwrap_or(record.earn_cap_usd);
@@ -683,21 +707,37 @@ async fn reprice(params: Params) -> Result<String, String> {
 async fn stop(params: Params) -> Result<String, String> {
     let record = record_for(&params)?;
     let mut notes = Vec::new();
-    #[cfg(unix)]
-    if let Some(pid) = record.worker_pid
-        && worker_alive(pid)
-    {
-        let _ = Command::new("kill")
-            .arg(pid.to_string())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        notes.push(format!("worker pid {pid} stopped"));
-    }
     let api = EndpointsApi::new(&record.connect_url).map_err(|e| e.to_string())?;
-    match api.delete(&record.owner_token, &record.id).await {
-        Ok(()) => notes.push("endpoint deleted".to_string()),
-        Err(e) => notes.push(format!("endpoint not deleted: {e}")),
+    api.delete(&record.owner_token, &record.id)
+        .await
+        .map_err(|e| {
+            format!(
+                "Endpoint {} was not deleted: {e}. Its local record and owner token were preserved; retry stop.",
+                record.id
+            )
+        })?;
+    notes.push("endpoint deleted".to_string());
+    #[cfg(unix)]
+    if let Some(pid) = record.worker_pid {
+        match worker_liveness(&record) {
+            WorkerLiveness::Alive => {
+                let stopped = Command::new("kill")
+                    .arg(pid.to_string())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success());
+                notes.push(if stopped {
+                    format!("worker pid {pid} stopped")
+                } else {
+                    format!("worker pid {pid} could not be stopped")
+                });
+            }
+            WorkerLiveness::Dead => notes.push(format!("worker pid {pid} was already gone")),
+            WorkerLiveness::Unknown => notes.push(format!(
+                "worker pid {pid} was not signaled because its identity could not be verified"
+            )),
+        }
     }
     SellRecord::remove(&record.id).map_err(|e| e.to_string())?;
     Ok(format!(

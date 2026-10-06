@@ -49,6 +49,7 @@ pub struct GoogleConfig {
     pub build_service_account: Option<String>,
     pub scheduler_api_base: String,
     pub scheduler_service_account: Option<String>,
+    pub gateway_domain: String,
 }
 
 impl GoogleConfig {
@@ -83,6 +84,8 @@ impl GoogleConfig {
                 .trim_end_matches('/')
                 .to_string(),
             scheduler_service_account: env_nonempty("COMPUTE_GOOGLE_SCHEDULER_SERVICE_ACCOUNT"),
+            gateway_domain: env_nonempty("COMPUTE_GATEWAY_DOMAIN")
+                .unwrap_or_else(|| "cpu.gcp.gateway-402.com".into()),
         })
     }
 }
@@ -237,13 +240,6 @@ impl GoogleCloudFunctionsDriver {
         Ok(value)
     }
 
-    fn function_origin(&self, region: &str, physical_name: &str) -> String {
-        format!(
-            "https://{}-{}.cloudfunctions.net/{physical_name}",
-            region, self.config.project
-        )
-    }
-
     fn scheduler_job_name(&self, region: &str, physical_name: &str) -> String {
         format!(
             "projects/{}/locations/{region}/jobs/{physical_name}",
@@ -278,9 +274,15 @@ impl GoogleCloudFunctionsDriver {
             cron,
             timezone,
             path,
+            authorization,
         } = trigger;
-        validate_schedule(cron, timezone, path)?;
-        let service_account = self
+        let authorization = authorization.as_deref().ok_or_else(|| {
+            ComputeError::InvalidRequest(
+                "schedule triggers require deploying through a reusable MPP session".into(),
+            )
+        })?;
+        validate_schedule(cron, timezone, path, authorization)?;
+        let _service_account = self
             .config
             .scheduler_service_account
             .as_deref()
@@ -290,8 +292,10 @@ impl GoogleCloudFunctionsDriver {
                         .into(),
                 )
             })?;
-        let origin = self.function_origin(region, physical_name);
-        let target_uri = format!("{}{}", origin, path);
+        let target_uri = format!(
+            "https://{}/{physical_name}{}",
+            self.config.gateway_domain, path
+        );
         let body = json!({
             "name": job_name,
             "schedule": cron,
@@ -302,13 +306,10 @@ impl GoogleCloudFunctionsDriver {
                 "httpMethod": "POST",
                 "headers": {
                     "content-type": "application/json",
-                    "x-pay-trigger": "schedule"
+                    "x-pay-trigger": "schedule",
+                    "authorization": authorization
                 },
-                "body": base64::engine::general_purpose::STANDARD.encode(b"{}"),
-                "oidcToken": {
-                    "serviceAccountEmail": service_account,
-                    "audience": origin
-                }
+                "body": base64::engine::general_purpose::STANDARD.encode(b"{}")
             }
         });
         let (status, existing) = self.send_json(Method::GET, job_url.clone(), None).await?;
@@ -650,6 +651,11 @@ impl ComputeDriver for GoogleCloudFunctionsDriver {
         validate_function_name(&request.name)?;
         validate_runtime(&request.runtime.runtime, &request.runtime.entrypoint)?;
         validate_triggers(&request.triggers)?;
+        if !request.triggers.is_empty() && self.config.scheduler_service_account.is_none() {
+            return Err(ComputeError::Configuration(
+                "COMPUTE_GOOGLE_SCHEDULER_SERVICE_ACCOUNT is required for schedule triggers".into(),
+            ));
+        }
         let region = self.region(request.region.as_deref())?.to_string();
         if request.access.exposure == Exposure::Gateway && region != self.config.default_region {
             return Err(ComputeError::InvalidRequest(format!(
@@ -693,9 +699,19 @@ impl ComputeDriver for GoogleCloudFunctionsDriver {
             )
             .await?
         };
-        self.reconcile_triggers(&region, physical_name, &request.triggers)
-            .await?;
-        normalize_operation(operation)
+        let mut normalized = normalize_operation(operation)?;
+        if let Err(error) = self
+            .reconcile_triggers(&region, physical_name, &request.triggers)
+            .await
+        {
+            let mut metadata = normalized.metadata.as_object().cloned().unwrap_or_default();
+            metadata.insert(
+                "trigger_reconciliation_error".into(),
+                Value::String(error.to_string()),
+            );
+            normalized.metadata = Value::Object(metadata);
+        }
+        Ok(normalized)
     }
 
     async fn get(&self, tenant: &Tenant, request: ResourceRequest) -> Result<Deployment> {
@@ -1092,13 +1108,19 @@ fn validate_triggers(triggers: &[TriggerSpec]) -> Result<()> {
             cron,
             timezone,
             path,
+            authorization,
         } = trigger;
-        validate_schedule(cron, timezone, path)?;
+        let authorization = authorization.as_deref().ok_or_else(|| {
+            ComputeError::InvalidRequest(
+                "schedule triggers require deploying through a reusable MPP session".into(),
+            )
+        })?;
+        validate_schedule(cron, timezone, path, authorization)?;
     }
     Ok(())
 }
 
-fn validate_schedule(cron: &str, timezone: &str, path: &str) -> Result<()> {
+fn validate_schedule(cron: &str, timezone: &str, path: &str, authorization: &str) -> Result<()> {
     if cron.len() > 128
         || cron.split_ascii_whitespace().count() != 5
         || !cron.bytes().all(|byte| {
@@ -1130,6 +1152,14 @@ fn validate_schedule(cron: &str, timezone: &str, path: &str) -> Result<()> {
         return Err(ComputeError::InvalidRequest(
             "schedule path must be an absolute function path without query, fragment, or `..`"
                 .into(),
+        ));
+    }
+    if !authorization.starts_with("Payment ")
+        || authorization.len() > 16 * 1024
+        || authorization.contains(['\r', '\n'])
+    {
+        return Err(ComputeError::InvalidRequest(
+            "schedule authorization must be a reusable MPP Payment credential".into(),
         ));
     }
     Ok(())
@@ -1367,9 +1397,11 @@ mod tests {
 
     #[test]
     fn schedules_require_portable_safe_values() {
-        assert!(validate_schedule("*/5 * * * *", "America/New_York", "/refresh").is_ok());
-        assert!(validate_schedule("* * * *", "Etc/UTC", "/").is_err());
-        assert!(validate_schedule("*/5 * * * *", "Etc/UTC", "//attacker").is_err());
-        assert!(validate_schedule("*/5 * * * *", "Etc/UTC", "/../admin").is_err());
+        let auth = "Payment session-credential";
+        assert!(validate_schedule("*/5 * * * *", "America/New_York", "/refresh", auth).is_ok());
+        assert!(validate_schedule("* * * *", "Etc/UTC", "/", auth).is_err());
+        assert!(validate_schedule("*/5 * * * *", "Etc/UTC", "//attacker", auth).is_err());
+        assert!(validate_schedule("*/5 * * * *", "Etc/UTC", "/../admin", auth).is_err());
+        assert!(validate_schedule("*/5 * * * *", "Etc/UTC", "/", "Bearer token").is_err());
     }
 }

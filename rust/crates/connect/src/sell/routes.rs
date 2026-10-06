@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 
 use axum::Router;
@@ -158,7 +158,7 @@ struct Live {
 /// same `Live` generation prevents a concurrent reprice from splitting the
 /// price the buyer paid from the price reserved and recorded as earnings.
 struct BuyerState {
-    entry: Arc<EndpointEntry>,
+    entry: Weak<EndpointEntry>,
     sale: SellInference,
 }
 
@@ -181,6 +181,22 @@ struct ReservationGuard {
 impl Drop for ReservationGuard {
     fn drop(&mut self) {
         if !self.claimed.load(Ordering::Acquire) {
+            self.entry.release(self.expected_usd);
+        }
+    }
+}
+
+/// Releases a claimed request if its buyer response is dropped before the
+/// worker completes or fails it.
+struct ClaimedRequestGuard {
+    entry: Arc<EndpointEntry>,
+    request_id: String,
+    expected_usd: f64,
+}
+
+impl Drop for ClaimedRequestGuard {
+    fn drop(&mut self) {
+        if self.entry.queue.abandon(&self.request_id).is_some() {
             self.entry.release(self.expected_usd);
         }
     }
@@ -317,7 +333,20 @@ fn request_earnings(
             let rate = model
                 .and_then(|m| rates.resolve(m))
                 .or(rates.default)
-                .or_else(|| rates.per_model.values().next().copied());
+                .or_else(|| {
+                    (!rates.per_model.is_empty()).then(|| {
+                        rates.per_model.values().fold(
+                            TokenRate {
+                                input_per_1m: 0.0,
+                                output_per_1m: 0.0,
+                            },
+                            |highest, rate| TokenRate {
+                                input_per_1m: highest.input_per_1m.max(rate.input_per_1m),
+                                output_per_1m: highest.output_per_1m.max(rate.output_per_1m),
+                            },
+                        )
+                    })
+                });
             let Some(rate) = rate else { return 0.0 };
             let usd = tokens("prompt_tokens") / 1e6 * rate.input_per_1m
                 + tokens("completion_tokens") / 1e6 * rate.output_per_1m;
@@ -618,7 +647,7 @@ fn live_for(
             payment_middleware::<EndpointBackends>,
         ))
         .with_state(Arc::new(BuyerState {
-            entry: entry.clone(),
+            entry: Arc::downgrade(entry),
             sale: sale.clone(),
         }));
     Ok(Arc::new(Live { sale, gated }))
@@ -973,6 +1002,13 @@ async fn chat_completions(
     reserved: Option<Extension<ReservedAdmission>>,
     body: Bytes,
 ) -> Response {
+    let Some(entry) = state.entry.upgrade() else {
+        return openai_error(
+            StatusCode::GONE,
+            "endpoint_deleted",
+            "This endpoint is no longer available.",
+        );
+    };
     let stream = match serde_json::from_slice::<Value>(&body) {
         Ok(json) => json.get("stream").and_then(Value::as_bool).unwrap_or(false),
         Err(e) => {
@@ -999,7 +1035,7 @@ async fn chat_completions(
                     );
                 }
             };
-            if !state.entry.try_reserve(admission.expected_usd) {
+            if !entry.try_reserve(admission.expected_usd) {
                 return openai_error(
                     StatusCode::GONE,
                     "earn_cap_reserved",
@@ -1010,10 +1046,10 @@ async fn chat_completions(
         }
     };
     let expected_usd = admission.expected_usd;
-    let (id, mut rx) = match state.entry.queue.park(body, stream, admission) {
+    let (id, mut rx) = match entry.queue.park(body, stream, admission) {
         Ok(parked) => parked,
         Err(QueueError::Full) => {
-            state.entry.release(expected_usd);
+            entry.release(expected_usd);
             return openai_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "queue_full",
@@ -1021,7 +1057,7 @@ async fn chat_completions(
             );
         }
         Err(other) => {
-            state.entry.release(expected_usd);
+            entry.release(expected_usd);
             return openai_error(StatusCode::BAD_GATEWAY, "queue", &other.to_string());
         }
     };
@@ -1032,14 +1068,14 @@ async fn chat_completions(
         Ok(Some(other)) => {
             // A worker that skips the claim event is not one of ours.
             tracing::warn!(?other, "unexpected event before claim");
-            if state.entry.queue.abandon(&id).is_some() {
-                state.entry.release(expected_usd);
+            if entry.queue.abandon(&id).is_some() {
+                entry.release(expected_usd);
             }
             return openai_error(StatusCode::BAD_GATEWAY, "protocol", "worker protocol error");
         }
         Ok(None) | Err(_) => {
-            if state.entry.queue.abandon(&id).is_some() {
-                state.entry.release(expected_usd);
+            if entry.queue.abandon(&id).is_some() {
+                entry.release(expected_usd);
             }
             return openai_error(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1049,14 +1085,22 @@ async fn chat_completions(
         }
     }
 
+    let guard = ClaimedRequestGuard {
+        entry,
+        request_id: id,
+        expected_usd,
+    };
     if stream {
-        stream_response(rx)
+        stream_response(rx, guard)
     } else {
-        buffered_response(rx).await
+        buffered_response(rx, guard).await
     }
 }
 
-async fn buffered_response(mut rx: mpsc::UnboundedReceiver<Event>) -> Response {
+async fn buffered_response(
+    mut rx: mpsc::UnboundedReceiver<Event>,
+    _guard: ClaimedRequestGuard,
+) -> Response {
     let deadline = tokio::time::Instant::now() + RESPONSE_TIMEOUT;
     loop {
         match tokio::time::timeout_at(deadline, rx.recv()).await {
@@ -1097,15 +1141,15 @@ fn sse(value: &Value) -> Bytes {
     Bytes::from(format!("data: {value}\n\n"))
 }
 
-fn stream_response(rx: mpsc::UnboundedReceiver<Event>) -> Response {
+fn stream_response(rx: mpsc::UnboundedReceiver<Event>, guard: ClaimedRequestGuard) -> Response {
     let done = Bytes::from_static(b"data: [DONE]\n\n");
-    let frames = futures_util::stream::unfold(Some(rx), move |rx| {
+    let frames = futures_util::stream::unfold(Some((rx, guard)), move |state| {
         let done = done.clone();
         async move {
-            let mut rx = rx?;
+            let (mut rx, guard) = state?;
             let (frame, next) = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, rx.recv()).await {
-                Ok(Some(Event::Claimed)) => (Bytes::new(), Some(rx)),
-                Ok(Some(Event::Chunk(chunk))) => (sse(&chunk), Some(rx)),
+                Ok(Some(Event::Claimed)) => (Bytes::new(), Some((rx, guard))),
+                Ok(Some(Event::Chunk(chunk))) => (sse(&chunk), Some((rx, guard))),
                 Ok(Some(Event::Complete(Some(last)))) => {
                     let mut frame = sse(&last).to_vec();
                     frame.extend_from_slice(&done);
@@ -1309,12 +1353,7 @@ mod tests {
         assert_eq!(view["pricing"], json!({ "per_request_usd": 0.02 }));
         assert_eq!(
             view["schemes"],
-            json!([
-                "mpp-charge",
-                "mpp-session",
-                "x402-upto",
-                "x402-batch-settlement"
-            ])
+            json!(["mpp-session", "x402-upto", "x402-batch-settlement"])
         );
         let token = view["owner_token"].as_str().unwrap();
         assert!(token.starts_with("pso_"), "{token}");
@@ -1383,10 +1422,7 @@ mod tests {
             www.iter().any(|v| v.contains("intent=\"session\"")),
             "{www:?}"
         );
-        assert!(
-            www.iter().any(|v| v.contains("intent=\"charge\"")),
-            "{www:?}"
-        );
+        assert!(!www.iter().any(|v| v.contains("intent=\"charge\"")));
         // x402 upto challenges from the cached blockhash. Batch-settlement
         // needs RPC for its challenge and is absent offline; the backends
         // test covers that it is built and wired.
@@ -1488,7 +1524,10 @@ mod tests {
         let entry = state.registry.get(id).unwrap();
         let sale = entry.sale();
         chat_completions(
-            State(Arc::new(BuyerState { entry, sale })),
+            State(Arc::new(BuyerState {
+                entry: Arc::downgrade(&entry),
+                sale,
+            })),
             None,
             Bytes::from(body.to_string()),
         )
@@ -1644,7 +1683,7 @@ mod tests {
         let response = chat_completions(
             State(Arc::new(BuyerState {
                 sale: entry.sale(),
-                entry: entry.clone(),
+                entry: Arc::downgrade(&entry),
             })),
             None,
             Bytes::from_static(b"nope"),

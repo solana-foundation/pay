@@ -60,7 +60,6 @@ impl SellPricing {
     pub fn schemes(&self) -> Vec<Scheme> {
         match self {
             Self::PerRequest { .. } => vec![
-                Scheme::MppCharge,
                 Scheme::MppSession,
                 Scheme::X402Upto,
                 Scheme::X402BatchSettlement,
@@ -444,7 +443,6 @@ mod tests {
         assert_eq!(
             metering.schemes.as_deref().unwrap(),
             [
-                Scheme::MppCharge,
                 Scheme::MppSession,
                 Scheme::X402Upto,
                 Scheme::X402BatchSettlement,
@@ -608,7 +606,7 @@ mod tests {
         let yaml = serde_yml::to_string(&sale.api_spec()).unwrap();
         let mut parsed: ApiSpec = serde_yml::from_str(&yaml).unwrap();
         parsed.apply_scheme_defaults();
-        assert_eq!(chat_metering(&parsed).accepted_schemes().len(), 4, "{yaml}");
+        assert_eq!(chat_metering(&parsed).accepted_schemes().len(), 3, "{yaml}");
         assert!(pay_types::metering::validate_api_spec(&parsed).is_empty());
     }
 }
@@ -807,16 +805,13 @@ mod gate_tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_flat_price_challenges_with_all_four_schemes() {
+    async fn a_flat_price_challenges_with_answered_only_schemes() {
         let (mpp, x402) = challenge(&sale(SellPricing::PerRequest { usd: 0.02 })).await;
         assert!(
             mpp.iter().any(|v| v.contains("intent=\"session\"")),
             "{mpp:?}"
         );
-        assert!(
-            mpp.iter().any(|v| v.contains("intent=\"charge\"")),
-            "{mpp:?}"
-        );
+        assert!(!mpp.iter().any(|v| v.contains("intent=\"charge\"")));
         assert_eq!(x402.len(), 2, "upto and batch-settlement: {x402:?}");
     }
 

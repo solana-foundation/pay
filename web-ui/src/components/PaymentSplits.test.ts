@@ -48,4 +48,29 @@ describe("payment split parsing", () => {
       },
     ]);
   });
+
+  it("uses the x402 offer when a mixed challenge also has MPP", () => {
+    const flow = x402Flow({
+      x402Version: 2,
+      accepts: [
+        {
+          scheme: "batch-settlement",
+          amount: "100000",
+          payTo: "x402-recipient",
+        },
+      ],
+    });
+    flow.challengeHeaders = {
+      ...flow.challengeHeaders,
+      "www-authenticate": `Payment request="${btoa(
+        JSON.stringify({ amount: "9000000", recipient: "mpp-recipient" }),
+      )}"`,
+    };
+
+    const parsed = parseChallenge(flow);
+    expect(parsed?.kind).toBe("payment");
+    if (parsed?.kind !== "payment") throw new Error("expected payment split");
+    expect(parsed.totalAmount).toBe(0.1);
+    expect(parsed.recipients[0]?.address).toBe("x402-recipient");
+  });
 });

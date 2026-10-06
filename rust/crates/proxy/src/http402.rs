@@ -1311,11 +1311,7 @@ fn header_pairs(headers: &HeaderMap) -> Vec<(String, String)> {
     headers
         .iter()
         .map(|(k, v)| {
-            let value = if is_sensitive_log_header(k.as_str()) {
-                "[REDACTED]".to_string()
-            } else {
-                String::from_utf8_lossy(v.as_bytes()).into_owned()
-            };
+            let value = String::from_utf8_lossy(v.as_bytes()).into_owned();
             (k.as_str().to_string(), value)
         })
         .collect()
@@ -1325,11 +1321,7 @@ fn header_pairs_from_owned(headers: Vec<(HeaderName, HeaderValue)>) -> Vec<(Stri
     headers
         .into_iter()
         .map(|(k, v)| {
-            let value = if is_sensitive_log_header(k.as_str()) {
-                "[REDACTED]".to_string()
-            } else {
-                String::from_utf8_lossy(v.as_bytes()).into_owned()
-            };
+            let value = String::from_utf8_lossy(v.as_bytes()).into_owned();
             (k.as_str().to_string(), value)
         })
         .collect()
@@ -1337,41 +1329,21 @@ fn header_pairs_from_owned(headers: Vec<(HeaderName, HeaderValue)>) -> Vec<(Stri
 
 fn request_host(headers: &HeaderMap, uri: &Uri) -> Option<String> {
     headers
-        .get(http::header::HOST)
+        // The external load balancer preserves the public TLS hostname here
+        // before Cloud Run rewrites Host/authority to its backend name.
+        .get("x-pay-forwarded-host")
         .and_then(|value| value.to_str().ok())
         .map(str::to_string)
+        .or_else(|| {
+            headers
+                .get(http::header::HOST)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        })
         .or_else(|| {
             uri.authority()
                 .map(|authority| authority.as_str().to_string())
         })
-        // Google Cloud Run rewrites Host for serverless NEG backends. The
-        // external load balancer restores the client TLS SNI in this dedicated
-        // backend header so wildcard gateway routing remains available.
-        .or_else(|| {
-            headers
-                .get("x-pay-forwarded-host")
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_string)
-        })
-}
-
-fn is_sensitive_log_header(name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
-    matches!(
-        name.as_str(),
-        "authorization"
-            | "proxy-authorization"
-            | "cookie"
-            | "set-cookie"
-            | "payment-signature"
-            | "x-payment"
-            | "x-api-key"
-            | "api-key"
-            | "x-goog-api-key"
-            | "mcp-session-id"
-    ) || name.ends_with("-token")
-        || name.ends_with("-secret")
-        || name.ends_with("-credential")
 }
 
 fn is_control_plane(path: &str) -> bool {
@@ -1653,6 +1625,10 @@ mod tests {
     fn request_host_accepts_load_balancer_forwarded_host() {
         let mut headers = HeaderMap::new();
         headers.insert(
+            http::header::HOST,
+            HeaderValue::from_static("rewritten-backend.run.app"),
+        );
+        headers.insert(
             "x-pay-forwarded-host",
             HeaderValue::from_static("worker.cpu.gcp.gateway-402.com"),
         );
@@ -1797,7 +1773,7 @@ mod tests {
     }
 
     #[test]
-    fn debugger_header_capture_redacts_credentials() {
+    fn debugger_header_capture_preserves_credentials_for_safe_projection() {
         let mut headers = HeaderMap::new();
         headers.insert(
             header::AUTHORIZATION,
@@ -1821,28 +1797,23 @@ mod tests {
         assert!(
             captured
                 .iter()
-                .any(|(name, value)| { name == "authorization" && value == "[REDACTED]" })
+                .any(|(name, value)| { name == "authorization" && value == "Bearer secret" })
         );
         assert!(
             captured
                 .iter()
-                .any(|(name, value)| { name == "payment-signature" && value == "[REDACTED]" })
+                .any(|(name, value)| { name == "payment-signature" && value == "signed-payment" })
         );
         assert!(
             captured
                 .iter()
-                .any(|(name, value)| { name == "mcp-session-id" && value == "[REDACTED]" })
+                .any(|(name, value)| { name == "mcp-session-id" && value == "session-capability" })
         );
         assert!(
             captured
                 .iter()
                 .any(|(name, value)| { name == "content-type" && value == "application/json" })
         );
-        assert!(!captured.iter().any(|(_, value)| {
-            value.contains("secret")
-                || value.contains("signed-payment")
-                || value.contains("session-capability")
-        }));
     }
 
     #[test]

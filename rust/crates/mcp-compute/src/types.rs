@@ -102,6 +102,12 @@ pub enum TriggerSpec {
         /// Function path invoked by the scheduler. Defaults to `/`.
         #[serde(default = "default_schedule_path")]
         path: String,
+        /// Reusable MPP session authorization for the paid gateway. Each run
+        /// is metered against that session and stops executing when its funded
+        /// channel is exhausted or expires. The MCP fills this from the
+        /// current paid session; callers normally omit it.
+        #[serde(default)]
+        authorization: Option<String>,
     },
 }
 
@@ -141,6 +147,18 @@ pub struct DeployRequest {
     /// selected driver rather than silently ignored.
     #[serde(default)]
     pub provider_options: serde_json::Value,
+}
+
+impl DeployRequest {
+    pub fn supply_schedule_authorization(&mut self, value: Option<&str>) {
+        let Some(value) = value else { return };
+        for trigger in &mut self.triggers {
+            let TriggerSpec::Schedule { authorization, .. } = trigger;
+            if authorization.is_none() {
+                *authorization = Some(value.to_string());
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]

@@ -165,14 +165,8 @@ async fn forward_and_log(req: Request<Body>, pdb: pay_pdb::PdbState) -> Response
             return (StatusCode::BAD_REQUEST, format!("read body: {e}")).into_response();
         }
     };
-    let request_body_for_log = (!body_bytes.is_empty()).then(|| {
-        let text = String::from_utf8_lossy(&body_bytes);
-        let mut captured: String = text.chars().take(4096).collect();
-        if text.chars().count() > 4096 {
-            captured.push('…');
-        }
-        captured
-    });
+    let request_body_for_log =
+        (!body_bytes.is_empty()).then(|| String::from_utf8_lossy(&body_bytes).into_owned());
 
     let log_id = pdb.next_log_id();
     let start = std::time::Instant::now();

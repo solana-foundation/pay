@@ -1558,7 +1558,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
                 ceiling_usd: 0.001,
                 inferred_usage: None,
             },
-            10,
+            (10, 1_000),
             solana_pubkey::Pubkey::new_unique().to_string(),
             reservation,
         );

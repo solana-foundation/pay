@@ -136,6 +136,14 @@ function parseX402Challenge(flow: PaymentFlow): PaymentChallenge | null {
 }
 
 export function parseChallenge(flow: PaymentFlow): ParsedChallenge | null {
+  if (
+    flow.protocol === "x402" ||
+    flow.scheme === "exact" ||
+    flow.scheme === "upto" ||
+    flow.scheme === "batch-settlement"
+  ) {
+    return parseX402Challenge(flow);
+  }
   const wwwAuth = headerValue(flow.challengeHeaders, "www-authenticate");
   if (!wwwAuth) return parseX402Challenge(flow);
   const intent = wwwAuth.match(/intent="([^"]*)"/)?.[1];

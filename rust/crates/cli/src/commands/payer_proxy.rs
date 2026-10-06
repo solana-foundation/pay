@@ -760,7 +760,12 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
                     if corrected_retry.status() != StatusCode::PAYMENT_REQUIRED
                         && let Some(batch) = corrected_payment.batch_settlement.as_ref()
                     {
-                        apply_batch_settlement(&state, batch, corrected_retry.headers());
+                        apply_batch_settlement(
+                            &state,
+                            batch,
+                            corrected_retry.status(),
+                            corrected_retry.headers(),
+                        );
                     }
                     drop(batch_payment_guard.take());
                     return deliver(
@@ -777,7 +782,7 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
             if retry.status() != StatusCode::PAYMENT_REQUIRED
                 && let Some(batch) = payment.batch_settlement.as_ref()
             {
-                apply_batch_settlement(&state, batch, retry.headers());
+                apply_batch_settlement(&state, batch, retry.status(), retry.headers());
             }
             // Only adopt the new credential once a request has actually gone
             // through on it. Caching it before this point risks stranding a
@@ -817,7 +822,12 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
     }
 }
 
-fn apply_batch_settlement(state: &PayerState, batch: &BatchSettlementAttempt, headers: &HeaderMap) {
+fn apply_batch_settlement(
+    state: &PayerState,
+    batch: &BatchSettlementAttempt,
+    status: StatusCode,
+    headers: &HeaderMap,
+) {
     let response_headers = header_pairs(headers);
     match state.batch_channels.apply_settlement_from_headers(
         &batch.requirements,
@@ -825,7 +835,7 @@ fn apply_batch_settlement(state: &PayerState, batch: &BatchSettlementAttempt, he
         &response_headers,
     ) {
         Ok(Some(_)) => {}
-        Ok(None) => {
+        Ok(None) if status.is_success() => {
             if let Err(error) = state
                 .batch_channels
                 .reserve_authorization_without_receipt(&batch.requirements, &batch.submission)
@@ -833,6 +843,7 @@ fn apply_batch_settlement(state: &PayerState, batch: &BatchSettlementAttempt, he
                 tracing::warn!(%error, "payer proxy: batch-settlement response had no receipt and its authorization ceiling could not be reserved");
             }
         }
+        Ok(None) => {}
         Err(error) => {
             tracing::warn!(%error, "payer proxy: batch-settlement receipt not adopted; the next request will retry the same authorization");
         }
@@ -1081,10 +1092,13 @@ struct PdbInferenceCapture {
     pdb: pay_pdb::PdbState,
     resource: String,
     streamed: bool,
+    log_id: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
 struct PdbRequestStarted(std::time::Instant);
+#[derive(Clone, Copy)]
+struct PdbRequestLogId(u64);
 
 fn pdb_inference_capture(
     state: &PayerState,
@@ -1094,6 +1108,7 @@ fn pdb_inference_capture(
     state.pdb.as_ref().map(|pdb| PdbInferenceCapture {
         pdb: pdb.clone(),
         resource: resource.to_string(),
+        log_id: None,
         streamed: serde_json::from_slice::<serde_json::Value>(request_body)
             .ok()
             .and_then(|request| request.get("stream").and_then(serde_json::Value::as_bool))
@@ -1124,30 +1139,48 @@ fn finish_inference_capture(
     body: &[u8],
     observed: Option<pay_core::InferenceUsage>,
 ) {
-    let Some(PdbInferenceCapture { pdb, resource, .. }) = capture else {
+    let Some(PdbInferenceCapture {
+        pdb,
+        resource,
+        log_id,
+        ..
+    }) = capture
+    else {
         return;
     };
     let response_body = String::from_utf8_lossy(body).into_owned();
-    pdb.enrich_inference_response(
-        "payer-proxy",
-        &resource,
-        pdb_header_map(headers),
-        response_body,
-        observed.map(|usage| pay_pdb::types::InferenceInfo {
-            provider: String::new(),
-            model: usage.model,
-            endpoint_kind: None,
-            streamed: usage.streamed,
-            tokens_prompt: usage.tokens_prompt,
-            tokens_completion: usage.tokens_completion,
-            tokens_cached: None,
-            tokens_reasoning: None,
-            response_id: None,
-            finish_reason: None,
-            ttft_ms: usage.ttft_ms,
-            tokens_per_sec: usage.tokens_per_sec,
-        }),
-    );
+    let inference = observed.map(|usage| pay_pdb::types::InferenceInfo {
+        provider: String::new(),
+        model: usage.model,
+        endpoint_kind: None,
+        streamed: usage.streamed,
+        tokens_prompt: usage.tokens_prompt,
+        tokens_completion: usage.tokens_completion,
+        tokens_cached: None,
+        tokens_reasoning: None,
+        response_id: None,
+        finish_reason: None,
+        ttft_ms: usage.ttft_ms,
+        tokens_per_sec: usage.tokens_per_sec,
+    });
+    if let Some(log_id) = log_id {
+        pdb.enrich_inference_response_for_exchange(
+            log_id,
+            "payer-proxy",
+            &resource,
+            pdb_header_map(headers),
+            response_body,
+            inference,
+        );
+    } else {
+        pdb.enrich_inference_response(
+            "payer-proxy",
+            &resource,
+            pdb_header_map(headers),
+            response_body,
+            inference,
+        );
+    }
 }
 
 fn finish_observed_inference(
@@ -1172,8 +1205,11 @@ async fn deliver(
     resp: reqwest::Response,
     translated: bool,
     session_guard: Option<SessionAuthorizationGuard>,
-    inference_capture: Option<PdbInferenceCapture>,
+    mut inference_capture: Option<PdbInferenceCapture>,
 ) -> Response {
+    if let Some(capture) = inference_capture.as_mut() {
+        capture.log_id = resp.extensions().get::<PdbRequestLogId>().map(|id| id.0);
+    }
     if !translated || !resp.status().is_success() {
         return stream_response(resp, session_guard, inference_capture);
     }
@@ -1638,6 +1674,7 @@ async fn send_upstream(
         .pdb
         .as_ref()
         .and_then(|_| capture_pdb_request_body(&body));
+    let pdb_log_id = state.pdb.as_ref().map(|pdb| pdb.next_log_id());
     let mut result = state
         .client
         .request(method.clone(), url)
@@ -1648,6 +1685,9 @@ async fn send_upstream(
 
     if let Ok(response) = &mut result {
         response.extensions_mut().insert(PdbRequestStarted(started));
+        if let Some(log_id) = pdb_log_id {
+            response.extensions_mut().insert(PdbRequestLogId(log_id));
+        }
     }
 
     if let (Some(pdb), Some(req_headers)) = (&state.pdb, pdb_request_headers) {
@@ -1664,7 +1704,7 @@ async fn send_upstream(
             ),
         };
         let entry = pay_pdb::types::LogEntry {
-            id: pdb.next_log_id(),
+            id: pdb_log_id.unwrap_or_else(|| pdb.next_log_id()),
             ts: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             method: method.to_string(),
             path: url.to_string(),

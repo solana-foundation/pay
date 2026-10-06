@@ -497,18 +497,28 @@ impl DataDriver for FirestoreDriver {
         tenant: &Tenant,
         request: DocumentStoreRequest,
     ) -> Result<()> {
-        let store = self.require_ready_store(tenant, &request.id).await?;
+        let store = self.require_store(tenant, &request.id).await?;
         let physical_id = store_physical_id(&store)?;
         let policy = firestore_string(&store, "reclaimPolicy").unwrap_or("delete");
-        self.require_json(
-            Method::PATCH,
-            format!(
-                "{}?updateMask.fieldPaths=phase",
-                self.store_url(tenant, physical_id)?
-            ),
-            Some(&json!({ "fields": { "phase": { "stringValue": "deleting" } } })),
-        )
-        .await?;
+        match firestore_string(&store, "phase").unwrap_or("ready") {
+            "ready" => {
+                self.require_json(
+                    Method::PATCH,
+                    format!(
+                        "{}?updateMask.fieldPaths=phase",
+                        self.store_url(tenant, physical_id)?
+                    ),
+                    Some(&json!({ "fields": { "phase": { "stringValue": "deleting" } } })),
+                )
+                .await?;
+            }
+            "deleting" => {}
+            phase => {
+                return Err(DataError::Provider(format!(
+                    "document store is in `{phase}` phase"
+                )));
+            }
+        }
         if policy == "delete" {
             self.delete_documents(tenant, physical_id).await?;
         }

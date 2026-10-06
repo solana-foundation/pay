@@ -57,7 +57,8 @@ fn redacted_headers(headers: &HashMap<String, String>) -> HashMap<String, String
 fn redacted_request_body(body: Option<&str>) -> Option<String> {
     let body = body?;
     let Ok(mut json) = serde_json::from_str::<serde_json::Value>(body) else {
-        return Some(body.to_string());
+        // An opaque body cannot be inspected reliably for nested credentials.
+        return None;
     };
     fn redact(value: &mut serde_json::Value) {
         match value {
@@ -86,7 +87,12 @@ fn redacted_request_body(body: Option<&str>) -> Option<String> {
         }
     }
     redact(&mut json);
-    serde_json::to_string(&json).ok()
+    let redacted = serde_json::to_string(&json).ok()?;
+    let mut captured: String = redacted.chars().take(4096).collect();
+    if redacted.chars().count() > 4096 {
+        captured.push('…');
+    }
+    Some(captured)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -115,6 +121,8 @@ pub struct FlowCorrelation {
     /// `AllExchanges` mode: maps in-flight log id → flow id (stable across
     /// ring-buffer eviction, unlike indices).
     open_exchanges: HashMap<u64, String>,
+    /// Completed payment exchanges keyed by request log id.
+    exchange_flows: HashMap<u64, String>,
     /// `AllExchanges` mode: per-connection aggregates, keyed by payer wallet
     /// (paid traffic) or client ip/host (unpaid). Bounded.
     connections: HashMap<String, ConnectionSummary>,
@@ -141,6 +149,7 @@ impl FlowCorrelation {
             flows: Vec::new(),
             flow_index: HashMap::new(),
             open_exchanges: HashMap::new(),
+            exchange_flows: HashMap::new(),
             connections: HashMap::new(),
             pending_challenges: HashMap::new(),
             connection_id_counter: 0,
@@ -328,6 +337,25 @@ impl FlowCorrelation {
         response_body: String,
         observed: Option<InferenceInfo>,
     ) {
+        self.enrich_inference_response_for_exchange(
+            None,
+            client_ip,
+            resource,
+            response_headers,
+            response_body,
+            observed,
+        );
+    }
+
+    pub fn enrich_inference_response_for_exchange(
+        &mut self,
+        log_id: Option<u64>,
+        client_ip: &str,
+        resource: &str,
+        response_headers: HashMap<String, String>,
+        response_body: String,
+        observed: Option<InferenceInfo>,
+    ) {
         let entry = LogEntry {
             id: 0,
             ts: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
@@ -350,11 +378,13 @@ impl FlowCorrelation {
         }) else {
             return;
         };
-        let Some(flow) = self
-            .flows
-            .iter_mut()
-            .rfind(|flow| flow.client_ip == client_ip && flow.resource == resource)
-        else {
+        let exact_flow_id = log_id.and_then(|id| self.exchange_flows.get(&id)).cloned();
+        let Some(flow) = self.flows.iter_mut().rfind(|flow| {
+            exact_flow_id.as_ref().map_or(
+                flow.client_ip == client_ip && flow.resource == resource,
+                |id| &flow.id == id,
+            )
+        }) else {
             return;
         };
         flow.inference = Some(match flow.inference.take() {
@@ -762,6 +792,7 @@ impl FlowCorrelation {
             inference: inference_from_exchange(entry),
         };
 
+        self.exchange_flows.insert(entry.id, flow.id.clone());
         self.add_flow(flow.clone());
         let _ = self.tx.send(SseMessage::FlowCreated { flow });
     }
@@ -779,6 +810,8 @@ impl FlowCorrelation {
             self.create_standalone_delivery(entry, protocol);
             return;
         };
+        self.exchange_flows
+            .insert(entry.id, self.flows[idx].id.clone());
 
         let flow = &mut self.flows[idx];
         if flow.status != FlowStatus::PaymentRequired {
@@ -926,6 +959,7 @@ impl FlowCorrelation {
             inference: inference_from_exchange(entry),
         };
 
+        self.exchange_flows.insert(entry.id, flow.id.clone());
         self.add_flow(flow.clone());
         let _ = self.tx.send(SseMessage::FlowCreated { flow });
     }
@@ -1030,6 +1064,8 @@ impl FlowCorrelation {
 
         if self.flows.len() > MAX_FLOWS {
             let removed = self.flows.remove(0);
+            self.exchange_flows
+                .retain(|_, flow_id| flow_id != &removed.id);
             self.flow_index
                 .remove(&flow_key(&removed.client_ip, &removed.resource));
             // Shift all indices down by 1
@@ -1475,6 +1511,10 @@ fn payment_details(entry: &LogEntry) -> Option<PaymentDetails> {
                 .and_then(|value| decode_json_value(value))
         });
     let receipt = x402_settlement_response(entry);
+    let mpp_receipt = entry
+        .res_headers
+        .get("payment-receipt")
+        .and_then(|value| decode_json_value(value));
     let offer = ["payment-required", "x-payment-required"]
         .into_iter()
         .find_map(|key| {
@@ -1491,7 +1531,7 @@ fn payment_details(entry: &LogEntry) -> Option<PaymentDetails> {
                         .cloned()
                 })
         });
-    if payment.is_none() && receipt.is_none() && offer.is_none() {
+    if payment.is_none() && receipt.is_none() && mpp_receipt.is_none() && offer.is_none() {
         return None;
     }
 
@@ -1590,6 +1630,25 @@ fn payment_details(entry: &LogEntry) -> Option<PaymentDetails> {
                 .get("success")
                 .and_then(serde_json::Value::as_bool)
                 .map(|success| if success { "success" } else { "failed" }.to_string())
+        });
+    }
+    if let Some(receipt) = mpp_receipt.as_ref() {
+        details.network = value_string(receipt.get("network")).or(details.network);
+        details.asset = value_string(receipt.get("currency")).or(details.asset);
+        details.settlement_amount = value_string(receipt.get("amount"))
+            .map(|amount| display_batch_amount(&amount))
+            .or(details.settlement_amount);
+        details.settlement_reference = settlement_reference(receipt).or_else(|| {
+            value_string(receipt.get("reference")).or_else(|| {
+                receipt
+                    .get("receipt")
+                    .and_then(|value| value_string(value.get("reference")))
+            })
+        });
+        details.receipt_status = value_string(receipt.get("status")).or_else(|| {
+            receipt
+                .get("receipt")
+                .and_then(|value| value_string(value.get("status")))
         });
     }
 
@@ -3824,5 +3883,87 @@ mod tests {
 
         let payer = extract_payer(&headers);
         assert_eq!(payer.as_deref(), Some(key.to_string().as_str()));
+    }
+
+    #[test]
+    fn long_json_bodies_are_redacted_before_truncation() {
+        let body = serde_json::json!({
+            "api_key": "sk-secret-value",
+            "prompt": "x".repeat(8_000),
+        })
+        .to_string();
+        let captured = redacted_request_body(Some(&body)).expect("valid JSON is retained");
+        assert!(!captured.contains("sk-secret-value"));
+        assert!(captured.contains(REDACTED));
+        assert!(captured.chars().count() <= 4097);
+        assert!(redacted_request_body(Some("not-json secret")).is_none());
+    }
+
+    #[test]
+    fn mpp_receipt_keeps_safe_navigation_metadata() {
+        let mut entry = make_entry("POST", "/paid", 200);
+        entry.res_headers.insert(
+            "payment-receipt".into(),
+            encode_json(serde_json::json!({
+                "network": "solana-mainnet",
+                "currency": "USDC",
+                "amount": "1000",
+                "receipt": {"reference": "tx-signature", "status": "success"}
+            })),
+        );
+        let details = payment_details(&entry).expect("receipt details");
+        assert_eq!(
+            details.settlement_reference.as_deref(),
+            Some("tx-signature")
+        );
+        assert_eq!(details.receipt_status.as_deref(), Some("success"));
+    }
+
+    #[test]
+    fn delayed_enrichment_uses_the_exact_exchange_id() {
+        let (tx, _rx) = broadcast::channel(16);
+        let mut engine = FlowCorrelation::new(tx);
+        for (challenge_id, retry_id) in [(1, 2), (3, 4)] {
+            let mut challenge = make_entry("POST", "/v1/chat/completions", 402);
+            challenge.id = challenge_id;
+            challenge.res_headers.insert(
+                "www-authenticate".into(),
+                "Payment realm=\"test\", intent=\"charge\"".into(),
+            );
+            engine.ingest(challenge);
+            let mut retry = make_entry("POST", "/v1/chat/completions", 200);
+            retry.id = retry_id;
+            retry
+                .req_headers
+                .insert("authorization".into(), charge_authorization("1000", 6));
+            retry
+                .res_headers
+                .insert("payment-receipt".into(), encode_json(serde_json::json!({})));
+            engine.ingest(retry);
+        }
+
+        engine.enrich_inference_response_for_exchange(
+            Some(2),
+            "127.0.0.1",
+            "/v1/chat/completions",
+            HashMap::new(),
+            r#"{"model":"older-response"}"#.into(),
+            None,
+        );
+        let flows = engine.snapshot();
+        assert_eq!(
+            flows[0]
+                .inference
+                .as_ref()
+                .and_then(|info| info.model.as_deref()),
+            Some("older-response")
+        );
+        assert_ne!(
+            flows[1]
+                .inference
+                .as_ref()
+                .and_then(|info| info.model.as_deref()),
+            Some("older-response")
+        );
     }
 }

@@ -404,18 +404,15 @@ mod tests {
     /// Every backend the paywall asks for exists and can issue its
     /// challenge with no RPC in reach.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_flat_price_builds_all_four_backends_that_can_challenge() {
+    async fn a_flat_price_builds_answered_only_backends_that_can_challenge() {
         let backends = EndpointBackends::build(
             &sale(SellPricing::PerRequest { usd: 0.02 }),
             &operator(),
             "https://connect.test",
         )
         .unwrap();
-        assert_eq!(backends.mpps().len(), 1);
+        assert!(backends.mpps().is_empty());
         assert_eq!(backends.session_mpp_handles().len(), 1);
-        backends.mpps()[0]
-            .charge_with_options("0.02", Default::default())
-            .expect("charge challenge");
         backends.session_mpp_handles()[0]
             .challenge_header(Some(20_000))
             .expect("session challenge");
