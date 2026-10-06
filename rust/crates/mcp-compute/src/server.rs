@@ -9,8 +9,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, ContentBlock as Content, Implementation, ProtocolVersion, ServerCapabilities,
-    ServerConfig,
+    CallToolResult, Implementation, ProtocolVersion, ServerCapabilities, ServerConfig,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -55,16 +54,16 @@ impl ComputeMcp {
             })
     }
 
-    async fn result<T: Serialize>(
+    fn result<T: Serialize>(
         result: crate::driver::Result<T>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let envelope = match result {
             Ok(value) => serde_json::json!({ "success": value, "error": null }),
             Err(error) => serde_json::json!({ "success": null, "error": error.to_string() }),
         };
-        Ok(CallToolResult::success(vec![Content::text(
-            envelope.to_string(),
-        )]))
+        let mut response = CallToolResult::structured(envelope);
+        response.content.clear();
+        Ok(response)
     }
 }
 
@@ -74,7 +73,7 @@ impl ComputeMcp {
         description = "List configured serverless compute drivers and their capabilities. Call this before deploying when provider, runtime, timeout, or source support is uncertain."
     )]
     async fn providers(&self) -> Result<CallToolResult, rmcp::ErrorData> {
-        Self::result(Ok(self.drivers.capabilities())).await
+        Self::result(Ok(self.drivers.capabilities()))
     }
 
     #[tool(
@@ -90,7 +89,7 @@ impl ComputeMcp {
             Ok(driver) => driver.deploy(&tenant, request).await,
             Err(error) => Err(error),
         };
-        Self::result(result).await
+        Self::result(result)
     }
 
     #[tool(
@@ -106,7 +105,7 @@ impl ComputeMcp {
             Ok(driver) => driver.get(&tenant, request).await,
             Err(error) => Err(error),
         };
-        Self::result(result).await
+        Self::result(result)
     }
 
     #[tool(
@@ -122,7 +121,7 @@ impl ComputeMcp {
             Ok(driver) => driver.list(&tenant, request).await,
             Err(error) => Err(error),
         };
-        Self::result(result).await
+        Self::result(result)
     }
 
     #[tool(
@@ -138,7 +137,7 @@ impl ComputeMcp {
             Ok(driver) => driver.delete(&tenant, request).await,
             Err(error) => Err(error),
         };
-        Self::result(result).await
+        Self::result(result)
     }
 
     #[tool(
@@ -154,7 +153,7 @@ impl ComputeMcp {
             Ok(driver) => driver.operation(&tenant, &request.id).await,
             Err(error) => Err(error),
         };
-        Self::result(result).await
+        Self::result(result)
     }
 
     #[tool(
@@ -170,7 +169,7 @@ impl ComputeMcp {
             Ok(driver) => driver.invoke(&tenant, request).await,
             Err(error) => Err(error),
         };
-        Self::result(result).await
+        Self::result(result)
     }
 }
 
@@ -367,6 +366,24 @@ fn tenant_from_payer(payer: &str) -> crate::driver::Result<Tenant> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_results_are_structured_without_json_text_duplication() {
+        let result = ComputeMcp::result::<serde_json::Value>(Ok(serde_json::json!({
+            "value": 42
+        })))
+        .unwrap();
+
+        assert!(result.content.is_empty());
+        assert_eq!(result.is_error, Some(false));
+        assert_eq!(
+            result.structured_content,
+            Some(serde_json::json!({
+                "success": { "value": 42 },
+                "error": null
+            }))
+        );
+    }
 
     #[test]
     fn tenant_key_is_stable_and_not_the_pubkey() {
