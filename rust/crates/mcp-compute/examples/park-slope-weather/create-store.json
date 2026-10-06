@@ -1,0 +1,9 @@
+{
+  "driver": "gcp-firestore",
+  "class": "document/serverless",
+  "name": "park-slope-weather",
+  "reclaim_policy": "delete",
+  "access": {
+    "gateway_reads": false
+  }
+}

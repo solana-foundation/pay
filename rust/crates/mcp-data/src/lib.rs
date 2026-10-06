@@ -3,7 +3,6 @@
 pub mod binding;
 pub mod driver;
 pub mod firestore;
-pub mod secrets;
 pub mod server;
 pub mod types;
 

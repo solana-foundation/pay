@@ -1,0 +1,44 @@
+{
+  "provider": "google-cloud-functions",
+  "name": "park-slope-weather",
+  "source": {
+    "kind": "inline",
+    "files": {
+      "index.js": "<contents of index.js>",
+      "package.json": "<contents of package.json>"
+    }
+  },
+  "runtime": {
+    "runtime": "nodejs22",
+    "entrypoint": "worker"
+  },
+  "limits": {
+    "timeout_seconds": 60,
+    "memory_mb": 256,
+    "max_instances": 2
+  },
+  "access": {
+    "exposure": "gateway"
+  },
+  "service_bindings": [
+    {
+      "name": "weather",
+      "service": {
+        "kind": "document_store",
+        "driver": "gcp-firestore",
+        "id": "park-slope-weather"
+      },
+      "read": true,
+      "write": true,
+      "lease_seconds": 2592000
+    }
+  ],
+  "triggers": [
+    {
+      "kind": "schedule",
+      "cron": "*/5 * * * *",
+      "timezone": "America/New_York",
+      "path": "/refresh"
+    }
+  ]
+}

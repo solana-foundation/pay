@@ -37,7 +37,10 @@ pub struct CreateBindingRequest {
 #[derive(Clone, Debug, Serialize)]
 pub struct CreateBindingResponse {
     pub url_path: String,
-    pub secret_id: String,
+    /// Revision-pinned capability returned only to the authenticated compute
+    /// control plane. It is injected into that function revision and is never
+    /// exposed by either MCP response.
+    pub capability: String,
     pub expires_at: u64,
 }
 
@@ -45,6 +48,16 @@ pub struct IssuedBinding {
     pub url_path: String,
     pub capability: String,
     pub expires_at: u64,
+}
+
+impl From<IssuedBinding> for CreateBindingResponse {
+    fn from(binding: IssuedBinding) -> Self {
+        Self {
+            url_path: binding.url_path,
+            capability: binding.capability,
+            expires_at: binding.expires_at,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -4021,6 +4021,7 @@ dependencies = [
  "bs58",
  "bytes",
  "clap",
+ "futures-util",
  "http 1.5.0",
  "reqwest 0.12.28",
  "rmcp",

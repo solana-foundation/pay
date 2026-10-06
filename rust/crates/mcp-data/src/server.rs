@@ -22,13 +22,13 @@ use crate::binding::{
     INTERNAL_PROOF_HEADER,
 };
 use crate::driver::{DataError, DriverRegistry};
-use crate::secrets::BindingSecretStore;
 use crate::types::{
     CreateDocumentStoreRequest, DocumentRequest, DocumentStoreRequest, GatewayReadRequest,
     ListDocumentStoresRequest, PutDocumentRequest, Tenant,
 };
 
 pub const VERIFIED_PAYER_HEADER: &str = "x-pay-verified-payer";
+pub const PROXY_PROOF_HEADER: &str = "x-pay-proxy-proof";
 pub const ORIGINAL_HOST_HEADER: &str = "x-pay-original-host";
 pub const USAGE_HEADER: &str = "x-pay-gcp-data-microusd";
 
@@ -204,7 +204,6 @@ struct AppState {
     drivers: DriverRegistry,
     gateway_domain: Arc<str>,
     bindings: BindingIssuer,
-    binding_secrets: BindingSecretStore,
 }
 
 pub fn router(
@@ -212,7 +211,6 @@ pub fn router(
     gateway_domain: String,
     allowed_hosts: Vec<String>,
     bindings: BindingIssuer,
-    binding_secrets: BindingSecretStore,
 ) -> Router {
     let transport = StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts);
     let mcp_drivers = drivers.clone();
@@ -221,9 +219,17 @@ pub fn router(
         Default::default(),
         transport,
     );
+    let state = AppState {
+        drivers,
+        gateway_domain: gateway_domain.into(),
+        bindings,
+    };
     let mcp = Router::new()
         .nest_service("/mcp", service)
-        .layer(middleware::from_fn(verified_tenant));
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            verified_tenant,
+        ));
     Router::new()
         .route("/__402/health", get(health))
         .route("/__402/bind", post(create_binding))
@@ -235,11 +241,26 @@ pub fn router(
         )
         .merge(mcp)
         .fallback(gateway_read)
+        .with_state(state)
+}
+
+/// Capability-authenticated data plane for deployed workloads. This router is
+/// deliberately narrow: it cannot issue capabilities, serve MCP, or publish
+/// paid gateway reads.
+pub fn runtime_router(drivers: DriverRegistry, bindings: BindingIssuer) -> Router {
+    Router::new()
+        .route("/__402/health", get(health))
+        .route(
+            "/__402/bindings/{store_id}/{key}",
+            get(binding_get_document)
+                .put(binding_put_document)
+                .delete(binding_delete_document),
+        )
+        .fallback(|| async { StatusCode::NOT_FOUND })
         .with_state(AppState {
             drivers,
-            gateway_domain: gateway_domain.into(),
+            gateway_domain: Arc::from(""),
             bindings,
-            binding_secrets,
         })
 }
 
@@ -270,11 +291,7 @@ async fn create_binding(
             )
             .await?;
         request.store_id = store.id;
-        let issued = state.bindings.issue(tenant.key.clone(), &request)?;
-        state
-            .binding_secrets
-            .store(&tenant.key, &request, issued)
-            .await
+        Ok(state.bindings.issue(tenant.key, &request)?.into())
     }
     .await;
     internal_response(result)
@@ -411,18 +428,27 @@ fn internal_response<T: Serialize>(result: crate::driver::Result<T>) -> Response
     }
 }
 
-async fn verified_tenant(mut request: Request, next: Next) -> Response {
+async fn verified_tenant(
+    State(state): State<AppState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let proxy_verified = request
+        .headers()
+        .get(PROXY_PROOF_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|proof| state.bindings.verify_internal_proof(proof).is_ok());
     let tenant = request
         .headers()
         .get(VERIFIED_PAYER_HEADER)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| tenant_from_payer(value).ok());
-    match tenant {
-        Some(tenant) => {
+    match (proxy_verified, tenant) {
+        (true, Some(tenant)) => {
             request.extensions_mut().insert(tenant);
             next.run(request).await
         }
-        None => (
+        _ => (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({ "error": "verified_payer_required" })),
         )
@@ -516,6 +542,8 @@ fn tenant_from_payer(payer: &str) -> crate::driver::Result<Tenant> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use tower::ServiceExt;
 
     #[test]
     fn tool_results_are_structured_without_text_duplication() {
@@ -539,5 +567,72 @@ mod tests {
         assert_eq!(tenant.key.len(), 16);
         assert_ne!(tenant.key, payer);
         assert_eq!(tenant, tenant_from_payer(&payer).unwrap());
+    }
+
+    #[tokio::test]
+    async fn runtime_plane_does_not_expose_control_routes() {
+        let app = runtime_router(
+            DriverRegistry::default(),
+            BindingIssuer::new(vec![7; 32], vec![9; 32]).unwrap(),
+        );
+        for path in ["/mcp", "/__402/bind"] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/__402/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn payer_identity_requires_the_proxy_proof() {
+        let state = AppState {
+            drivers: DriverRegistry::default(),
+            gateway_domain: Arc::from("example.invalid"),
+            bindings: BindingIssuer::new(vec![7; 32], vec![b'x'; 32]).unwrap(),
+        };
+        let app = Router::new()
+            .route("/", get(|| async { StatusCode::OK }))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                verified_tenant,
+            ))
+            .with_state(state);
+        let payer = bs58::encode([11_u8; 32]).into_string();
+        let without_proof = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(VERIFIED_PAYER_HEADER, &payer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(without_proof.status(), StatusCode::UNAUTHORIZED);
+        let with_proof = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(VERIFIED_PAYER_HEADER, payer)
+                    .header(PROXY_PROOF_HEADER, "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(with_proof.status(), StatusCode::OK);
     }
 }
