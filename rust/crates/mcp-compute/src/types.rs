@@ -65,6 +65,29 @@ pub struct AccessPolicy {
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
+pub struct DataServiceRef {
+    /// Portable data-service kind. Currently `document_store`.
+    pub kind: String,
+    /// Provider driver ID returned by the data MCP, such as `gcp-firestore`.
+    pub driver: String,
+    /// Payer-owned logical name or physical data-service ID.
+    pub id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+pub struct ServiceBindingSpec {
+    /// Binding name used to derive `PAY_BINDING_<NAME>_*` environment keys.
+    pub name: String,
+    pub service: DataServiceRef,
+    #[serde(default)]
+    pub read: bool,
+    #[serde(default)]
+    pub write: bool,
+    /// Capability lifetime. Defaults to 24 hours and is capped at 30 days.
+    pub lease_seconds: Option<u32>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
 pub struct DeployRequest {
     /// Driver ID returned by `providers`.
     #[serde(default = "default_provider")]
@@ -81,6 +104,13 @@ pub struct DeployRequest {
     pub environment: BTreeMap<String, String>,
     #[serde(default)]
     pub access: AccessPolicy,
+    /// Managed-service bindings resolved and injected service-to-service. No
+    /// binding capability is returned in the MCP response.
+    #[serde(default)]
+    pub service_bindings: Vec<ServiceBindingSpec>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) resolved_binding_secrets: BTreeMap<String, String>,
     /// Namespaced provider escape hatch. Unknown fields are rejected by the
     /// selected driver rather than silently ignored.
     #[serde(default)]

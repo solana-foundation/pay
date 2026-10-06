@@ -1,5 +1,6 @@
 //! Provider-neutral MCP control plane for short-lived serverless compute.
 
+pub mod binding;
 pub mod driver;
 pub mod google;
 pub mod server;

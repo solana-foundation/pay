@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use clap::Parser;
+use mcp_compute::binding::DataBindingClient;
 use mcp_compute::driver::ComputeDriver;
 use mcp_compute::google::{GoogleCloudFunctionsDriver, GoogleConfig};
 use mcp_compute::{DriverRegistry, server};
@@ -35,9 +36,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_ansi(false)
         .init();
     let args = Args::parse();
-    let google = Arc::new(GoogleCloudFunctionsDriver::new(GoogleConfig::from_env()?)?)
-        as Arc<dyn ComputeDriver>;
-    let drivers = DriverRegistry::new([google])?;
+    let google = GoogleCloudFunctionsDriver::new(GoogleConfig::from_env()?)?;
+    let bindings = DataBindingClient::from_env(google.clone())?;
+    let drivers = DriverRegistry::new([Arc::new(google) as Arc<dyn ComputeDriver>])?;
     let allowed_hosts = if args.disable_host_validation {
         Vec::new()
     } else if args.allowed_hosts.is_empty() {
@@ -49,7 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(address = %args.bind, "compute MCP listening");
     axum::serve(
         listener,
-        server::router(drivers, args.gateway_domain, allowed_hosts),
+        server::router(drivers, args.gateway_domain, allowed_hosts, bindings),
     )
     .await?;
     Ok(())
