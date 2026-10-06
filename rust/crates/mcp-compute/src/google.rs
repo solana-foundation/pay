@@ -510,21 +510,6 @@ impl GoogleCloudFunctionsDriver {
         }))
     }
 
-    async fn function_exists(&self, resource_name: &str) -> Result<bool> {
-        let (status, value) = self
-            .send_json(
-                Method::GET,
-                format!("{}/v2/{resource_name}", self.config.api_base),
-                None,
-            )
-            .await?;
-        match status {
-            StatusCode::OK => Ok(true),
-            StatusCode::NOT_FOUND => Ok(false),
-            _ => Err(json_provider_error(status, &value)),
-        }
-    }
-
     async fn invoke_origin(
         &self,
         deployment: &Deployment,
@@ -677,19 +662,25 @@ impl ComputeDriver for GoogleCloudFunctionsDriver {
                 ComputeError::InvalidRequest(format!("invalid Google provider_options: {error}"))
             })?
         };
+        let (status, current) = self
+            .send_json(
+                Method::GET,
+                format!("{}/v2/{resource_name}", self.config.api_base),
+                None,
+            )
+            .await?;
+        let exists = match status {
+            StatusCode::OK => {
+                require_tenant_label(tenant, &current)?;
+                require_channel_lease(&tenant.channel_id, &current)?;
+                true
+            }
+            StatusCode::NOT_FOUND => false,
+            _ => return Err(json_provider_error(status, &current)),
+        };
         let storage = self.source_storage(&request, &region).await?;
         let function = self.function_body(tenant, &request, &resource_name, storage, options)?;
-        let exists = self.function_exists(&resource_name).await?;
         let operation = if exists {
-            let current = self
-                .require_json(
-                    Method::GET,
-                    format!("{}/v2/{resource_name}", self.config.api_base),
-                    None,
-                )
-                .await?;
-            require_tenant_label(tenant, &current)?;
-            require_channel_lease(&tenant.channel_id, &current)?;
             self.require_json(
                 Method::PATCH,
                 format!(
