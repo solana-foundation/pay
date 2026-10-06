@@ -1344,6 +1344,15 @@ fn request_host(headers: &HeaderMap, uri: &Uri) -> Option<String> {
             uri.authority()
                 .map(|authority| authority.as_str().to_string())
         })
+        // Google Cloud Run rewrites Host for serverless NEG backends. The
+        // external load balancer restores the client TLS SNI in this dedicated
+        // backend header so wildcard gateway routing remains available.
+        .or_else(|| {
+            headers
+                .get("x-pay-forwarded-host")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        })
 }
 
 fn is_sensitive_log_header(name: &str) -> bool {
@@ -1637,6 +1646,21 @@ mod tests {
         assert_eq!(
             request_host(&headers, &uri).as_deref(),
             Some("explicit.example")
+        );
+    }
+
+    #[test]
+    fn request_host_accepts_load_balancer_forwarded_host() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-pay-forwarded-host",
+            HeaderValue::from_static("worker.cpu.gcp.gateway-402.com"),
+        );
+        let uri: Uri = "/latest".parse().unwrap();
+
+        assert_eq!(
+            request_host(&headers, &uri).as_deref(),
+            Some("worker.cpu.gcp.gateway-402.com")
         );
     }
 
