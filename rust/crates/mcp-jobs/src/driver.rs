@@ -5,7 +5,8 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::types::{
-    CreateJobRequest, DriverCapabilities, Job, JobList, JobRequest, ListJobsRequest, Tenant,
+    CreateJobRequest, DriverCapabilities, ExecuteJobRequest, Job, JobList, JobRequest,
+    ListJobsRequest, Tenant,
 };
 
 #[derive(Debug, Error)]
@@ -22,9 +23,17 @@ pub enum JobError {
     Transport(#[from] reqwest::Error),
     #[error("response serialization failed: {0}")]
     Serialization(#[from] serde_json::Error),
+    #[error("execution budget store failed: {0}")]
+    BudgetStore(#[from] redis::RedisError),
 }
 
 pub type Result<T> = std::result::Result<T, JobError>;
+
+pub struct ExecutionResponse {
+    pub status: u16,
+    pub headers: BTreeMap<String, String>,
+    pub body: bytes::Bytes,
+}
 
 #[async_trait]
 pub trait JobDriver: Send + Sync {
@@ -38,6 +47,7 @@ pub trait JobDriver: Send + Sync {
     async fn run_now(&self, tenant: &Tenant, request: JobRequest) -> Result<Job>;
     async fn delete(&self, tenant: &Tenant, request: JobRequest) -> Result<()>;
     async fn cleanup_channel(&self, channel_id: &str) -> Result<usize>;
+    async fn execute(&self, request: ExecuteJobRequest) -> Result<ExecutionResponse>;
 }
 
 #[derive(Clone, Default)]

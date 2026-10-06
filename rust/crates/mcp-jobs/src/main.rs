@@ -28,13 +28,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
     let args = Args::parse();
     let driver =
-        Arc::new(GoogleJobsDriver::new(GoogleJobsConfig::from_env()?)?) as Arc<dyn JobDriver>;
+        Arc::new(GoogleJobsDriver::new(GoogleJobsConfig::from_env()?).await?) as Arc<dyn JobDriver>;
     let drivers = DriverRegistry::new([driver])?;
     let proof = std::env::var("JOBS_PROXY_PROOF")
         .map_err(|_| "JOBS_PROXY_PROOF must be set")?
         .into_bytes();
     if proof.len() < 32 {
         return Err("JOBS_PROXY_PROOF must contain at least 32 bytes".into());
+    }
+    let executor_proof = std::env::var("JOBS_EXECUTOR_PROOF")
+        .map_err(|_| "JOBS_EXECUTOR_PROOF must be set")?
+        .into_bytes();
+    if executor_proof.len() < 32 {
+        return Err("JOBS_EXECUTOR_PROOF must contain at least 32 bytes".into());
     }
     let allowed_hosts = if args.disable_host_validation {
         vec![]
@@ -45,6 +51,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let listener = tokio::net::TcpListener::bind(args.bind).await?;
     tracing::info!(address=%args.bind,"jobs service listening");
-    axum::serve(listener, server::router(drivers, proof, allowed_hosts)).await?;
+    axum::serve(
+        listener,
+        server::router(drivers, proof, executor_proof, allowed_hosts),
+    )
+    .await?;
     Ok(())
 }

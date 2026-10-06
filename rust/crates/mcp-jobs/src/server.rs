@@ -2,7 +2,7 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -16,11 +16,12 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::driver::DriverRegistry;
-use crate::types::{CreateJobRequest, JobRequest, ListJobsRequest, Tenant};
+use crate::types::{CreateJobRequest, ExecuteJobRequest, JobRequest, ListJobsRequest, Tenant};
 
 const PAYER: &str = "x-pay-verified-payer";
 const CHANNEL: &str = "x-pay-verified-channel";
 const PROOF: &str = "x-pay-proxy-proof";
+const EXECUTOR_PROOF: &str = "x-pay-job-executor-proof";
 
 #[derive(Clone)]
 pub struct JobsMcp {
@@ -175,27 +176,87 @@ impl ServerHandler for JobsMcp {
 #[derive(Clone)]
 struct AppState {
     proof: Vec<u8>,
+    executor_proof: Vec<u8>,
+    drivers: DriverRegistry,
 }
 
-pub fn router(drivers: DriverRegistry, proof: Vec<u8>, allowed_hosts: Vec<String>) -> Router {
+pub fn router(
+    drivers: DriverRegistry,
+    proof: Vec<u8>,
+    executor_proof: Vec<u8>,
+    allowed_hosts: Vec<String>,
+) -> Router {
     let transport = StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts);
+    let mcp_drivers = drivers.clone();
     let service: StreamableHttpService<JobsMcp, LocalSessionManager> = StreamableHttpService::new(
-        move || Ok(JobsMcp::new(drivers.clone())),
+        move || Ok(JobsMcp::new(mcp_drivers.clone())),
         Default::default(),
         transport,
     );
-    let state = AppState { proof };
+    let state = AppState {
+        proof,
+        executor_proof,
+        drivers,
+    };
+    let protected =
+        Router::new()
+            .nest_service("/mcp", service)
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                verified_tenant,
+            ));
     Router::new()
         .route(
             "/__402/health",
             get(|| async { Json(serde_json::json!({"status":"ok"})) }),
         )
-        .nest_service("/mcp", service)
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            verified_tenant,
-        ))
+        .route("/internal/run", post(execute_job))
+        .merge(protected)
         .with_state(state)
+}
+
+async fn execute_job(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ExecuteJobRequest>,
+) -> Response {
+    let valid_proof = headers
+        .get(EXECUTOR_PROOF)
+        .map(|value| constant_time_eq(value.as_bytes(), &state.executor_proof))
+        .unwrap_or(false);
+    if !valid_proof {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error":"executor_proof_required"})),
+        )
+            .into_response();
+    }
+    let driver = match state.drivers.get(&request.driver) {
+        Ok(driver) => driver,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error":error.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    match driver.execute(request).await {
+        Ok(execution) => {
+            let mut response = axum::response::Response::builder().status(execution.status);
+            for (name, value) in execution.headers {
+                response = response.header(name, value);
+            }
+            response
+                .body(axum::body::Body::from(execution.body))
+                .unwrap()
+        }
+        Err(error) => (
+            StatusCode::PAYMENT_REQUIRED,
+            Json(serde_json::json!({"error":error.to_string()})),
+        )
+            .into_response(),
+    }
 }
 
 async fn verified_tenant(

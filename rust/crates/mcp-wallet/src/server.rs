@@ -110,16 +110,19 @@ pub fn router(drivers: DriverRegistry, proof: Vec<u8>, allowed_hosts: Vec<String
         transport,
     );
     let state = AppState { proof };
+    let protected =
+        Router::new()
+            .nest_service("/mcp", service)
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                verified_tenant,
+            ));
     Router::new()
         .route(
             "/__402/health",
             get(|| async { Json(serde_json::json!({"status":"ok"})) }),
         )
-        .nest_service("/mcp", service)
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            verified_tenant,
-        ))
+        .merge(protected)
         .with_state(state)
 }
 async fn verified_tenant(

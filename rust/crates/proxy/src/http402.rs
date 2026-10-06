@@ -32,12 +32,10 @@ use pay_core::server::gate::{
     settle_delegated_session as settle_delegated_session_forward, settle_upto, settle_upto_metered,
 };
 use pay_core::server::metering::{self, UptoSettlementPlan};
-use pay_core::server::payment::{
-    inject_original_host_header, inject_verified_payer_headers, strip_internal_identity_headers,
-};
+use pay_core::server::payment::{TrustedPaymentIdentity, strip_internal_identity_headers};
 use pay_core::server::proxy::{
-    STRIP_HEADERS, UpstreamPlan, prepare_upstream, redact_url_in_error, routing_signs_request_body,
-    upstream_error_for_logging, upstream_url_for_logging,
+    STRIP_HEADERS, UpstreamPlan, prepare_upstream_with_identity, redact_url_in_error,
+    routing_signs_request_body, upstream_error_for_logging, upstream_url_for_logging,
 };
 use pay_core::server::session_stream::DelegatedSessionStreamMeter;
 use pay_core::server::telemetry;
@@ -109,6 +107,7 @@ pub struct Ctx {
     /// Normalized request path retained for paid-request and upstream-error
     /// metrics even when debugger exchange logging is disabled.
     request_path: String,
+    trusted_identity: Option<TrustedPaymentIdentity>,
 }
 
 struct PendingUpto {
@@ -200,8 +199,9 @@ impl<S: PaymentState> Http402Gate<S> {
         uri: &Uri,
         headers: &http::HeaderMap,
         body: &[u8],
+        trusted_identity: Option<&TrustedPaymentIdentity>,
     ) -> Result<UpstreamPlan, axum::response::Response> {
-        prepare_upstream(api, method, uri, headers, body).await
+        prepare_upstream_with_identity(api, method, uri, headers, body, trusted_identity).await
     }
 
     /// Plan the upstream for a Forward/Passthrough decision: control-plane → the
@@ -244,7 +244,16 @@ impl<S: PaymentState> Http402Gate<S> {
                 .await;
         }
         // No body-signing auth: an empty placeholder body is safe for prep.
-        match prepare_upstream(api, method, uri, headers, &[]).await {
+        match prepare_upstream_with_identity(
+            api,
+            method,
+            uri,
+            headers,
+            &[],
+            ctx.trusted_identity.as_ref(),
+        )
+        .await
+        {
             Ok(UpstreamPlan::Forward(prepared)) => {
                 ctx.target = Some(target_from_prepared(prepared, api.subdomain.clone()));
                 Ok(false)
@@ -423,7 +432,14 @@ impl<S: PaymentState> Http402Gate<S> {
         };
 
         let prepared = match self
-            .prepare_buffered_request(api, method, uri, headers, body.as_ref())
+            .prepare_buffered_request(
+                api,
+                method,
+                uri,
+                headers,
+                body.as_ref(),
+                ctx.trusted_identity.as_ref(),
+            )
             .await
         {
             Ok(UpstreamPlan::Respond(resp)) => {
@@ -790,6 +806,7 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
             buffered_usage: None,
             logged_payment_headers: Vec::new(),
             request_path: String::new(),
+            trusted_identity: None,
         }
     }
 
@@ -878,17 +895,15 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                 batch,
                 paid_request,
             } => {
-                inject_original_host_header(&mut headers, host.as_deref());
-                if let Some(pending) = session_forward.as_ref()
-                    && let Some(payer) = pending.verified_payer.as_deref()
-                {
-                    inject_verified_payer_headers(
-                        &mut headers,
-                        payer,
-                        None,
-                        Some(&pending.channel_id),
-                    );
-                }
+                ctx.trusted_identity = Some(TrustedPaymentIdentity {
+                    payer: session_forward
+                        .as_ref()
+                        .and_then(|pending| pending.verified_payer.clone()),
+                    channel_id: session_forward
+                        .as_ref()
+                        .map(|pending| pending.channel_id.clone()),
+                    original_host: host.clone(),
+                });
                 ctx.receipt = receipt;
                 ctx.paid_request = paid_request;
                 // x402 `batch-settlement`: the voucher is verified and the
@@ -1891,6 +1906,7 @@ mod tests {
                 &"/v1/generate".parse().unwrap(),
                 &HeaderMap::new(),
                 b"hello",
+                None,
             )
             .await
             .expect("request prepares");

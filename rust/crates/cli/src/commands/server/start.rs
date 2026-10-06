@@ -2597,16 +2597,21 @@ impl StartCommand {
                             .extensions
                             .get::<pay_core::server::session_stream::SessionStreamContext>()
                             .cloned();
+                        let trusted_identity = parts
+                            .extensions
+                            .get::<pay_core::server::payment::TrustedPaymentIdentity>()
+                            .cloned();
                         let bytes = axum::body::to_bytes(body, 10 * 1024 * 1024)
                             .await
                             .unwrap_or_default();
-                        pay_core::server::proxy::forward_request_with_session_metering(
+                        pay_core::server::proxy::forward_request_with_session_metering_and_identity(
                             &api,
                             parts.method,
                             &parts.uri,
                             &parts.headers,
                             bytes,
                             session_context,
+                            trusted_identity.as_ref(),
                         )
                         .await
                         .unwrap_or_else(|e| e)

@@ -18,6 +18,16 @@ use crate::server::telemetry;
 
 const MAX_DELEGATED_MODEL_HINT_BODY_BYTES: usize = 10 * 1024 * 1024;
 
+/// Identity minted by the payment gate after caller-supplied internal headers
+/// have been discarded. Keeping it in request extensions prevents the generic
+/// proxy layer from having to trust values from the public header map.
+#[derive(Clone, Debug, Default)]
+pub struct TrustedPaymentIdentity {
+    pub payer: Option<String>,
+    pub channel_id: Option<String>,
+    pub original_host: Option<String>,
+}
+
 /// Axum middleware that gates metered endpoints behind MPP payment.
 pub async fn payment_middleware<S: PaymentState>(
     axum::extract::State(state): axum::extract::State<S>,
@@ -136,15 +146,11 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
                     ));
                 }
             }
-            inject_original_host_header(req.headers_mut(), host.as_deref());
-            if let Some(payer) = verified_payer {
-                inject_verified_payer_headers(
-                    req.headers_mut(),
-                    &payer,
-                    None,
-                    verified_channel.as_deref(),
-                );
-            }
+            req.extensions_mut().insert(TrustedPaymentIdentity {
+                payer: verified_payer,
+                channel_id: verified_channel,
+                original_host: host,
+            });
             let mut response = next.run(req).await;
             if let Some(sf) = delegated_session {
                 response = settle_axum_delegated_response(sf, response).await;

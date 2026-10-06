@@ -96,3 +96,18 @@ pub struct JobList {
     pub jobs: Vec<Job>,
     pub next_page_token: Option<String>,
 }
+
+/// Trusted payload embedded in a provider scheduler target. It is accepted
+/// only together with the executor proof and consumes prepaid run capacity.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ExecuteJobRequest {
+    pub driver: String,
+    pub job_resource: String,
+    pub channel_lease: String,
+    pub origin: String,
+    pub path: String,
+    #[serde(default)]
+    pub input: serde_json::Value,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+}

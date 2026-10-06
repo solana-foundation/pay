@@ -177,7 +177,11 @@ pub enum SessionOutcome {
         signature: Option<String>,
     },
     /// `voucher` accepted — channel id + new settled cumulative (base units).
-    Voucher { channel_id: String, cumulative: u64 },
+    Voucher {
+        channel_id: String,
+        cumulative: u64,
+        verified_payer: Option<String>,
+    },
     /// `close` accepted — `SealParams` carries what's needed to submit the
     /// on-chain settle+seal + distribute transactions.
     Closed {
@@ -1963,9 +1967,17 @@ impl SessionMpp {
                 );
                 self.record_committed_watermark(channel_id.clone(), cumulative);
                 self.touch_channel(channel_id.clone()).await?;
+                let verified_payer = self
+                    .operator_runtime
+                    .channel_store
+                    .get_channel(&channel_id)
+                    .await
+                    .map_err(|error| Error::Mpp(format!("read verified session payer: {error}")))?
+                    .map(|state| state.payer);
                 Ok(SessionOutcome::Voucher {
                     channel_id,
                     cumulative,
+                    verified_payer,
                 })
             }
 

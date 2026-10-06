@@ -14,9 +14,11 @@ async-trait = "0.1"
 axum = { workspace = true }
 base64 = { workspace = true }
 bs58 = { workspace = true }
+bytes = "1"
 clap = { workspace = true, features = ["env"] }
 http = "1"
 reqwest = { workspace = true, features = ["json"] }
+redis = { version = "0.32", features = ["aio", "tokio-comp", "connection-manager"] }
 rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
 schemars = "1.2"
 serde = { workspace = true }

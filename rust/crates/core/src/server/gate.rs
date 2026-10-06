@@ -2301,6 +2301,7 @@ async fn session_authorized(
         Ok(SessionOutcome::Voucher {
             channel_id,
             cumulative,
+            verified_payer,
         }) => GateDecision::Forward {
             session: handle.map(|h| {
                 Box::new(SessionForward {
@@ -2310,7 +2311,7 @@ async fn session_authorized(
                     settlement: None,
                     available_base_units: 0,
                     authorized_base_units: cumulative,
-                    verified_payer: None,
+                    verified_payer,
                     _reservation: None,
                 })
             }),

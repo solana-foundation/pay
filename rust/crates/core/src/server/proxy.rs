@@ -29,6 +29,7 @@ use sha2::{Sha256, Sha512};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+use crate::server::payment::TrustedPaymentIdentity;
 use crate::server::session_stream::{self, SessionStreamContext};
 use crate::server::{metering, payment, telemetry};
 
@@ -172,7 +173,38 @@ pub async fn forward_request_with_session_metering(
     body: Bytes,
     session_context: Option<SessionStreamContext>,
 ) -> Result<Response, Response> {
-    let prepared = match prepare_upstream(api, &method, uri, headers, body.as_ref()).await? {
+    forward_request_with_session_metering_and_identity(
+        api,
+        method,
+        uri,
+        headers,
+        body,
+        session_context,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments, clippy::result_large_err)]
+pub async fn forward_request_with_session_metering_and_identity(
+    api: &ApiSpec,
+    method: Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    body: Bytes,
+    session_context: Option<SessionStreamContext>,
+    trusted_identity: Option<&TrustedPaymentIdentity>,
+) -> Result<Response, Response> {
+    let prepared = match prepare_upstream_with_identity(
+        api,
+        &method,
+        uri,
+        headers,
+        body.as_ref(),
+        trusted_identity,
+    )
+    .await?
+    {
         UpstreamPlan::Respond(resp) => return Ok(resp),
         UpstreamPlan::Forward(prepared) => prepared,
     };
@@ -276,6 +308,18 @@ pub async fn prepare_upstream(
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<UpstreamPlan, Response> {
+    prepare_upstream_with_identity(api, method, uri, headers, body, None).await
+}
+
+#[allow(clippy::result_large_err)]
+pub async fn prepare_upstream_with_identity(
+    api: &ApiSpec,
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    body: &[u8],
+    trusted_identity: Option<&TrustedPaymentIdentity>,
+) -> Result<UpstreamPlan, Response> {
     let path_and_query = uri
         .path_and_query()
         .map(|pq| pq.as_str())
@@ -330,6 +374,29 @@ pub async fn prepare_upstream(
         }
         if let Ok(v) = value.to_str() {
             prepared.add_forwarded_header(name_str, v);
+        }
+    }
+
+    if let Some(identity) = trusted_identity {
+        let mut trusted_headers = HeaderMap::new();
+        payment::inject_original_host_header(
+            &mut trusted_headers,
+            identity.original_host.as_deref(),
+        );
+        if let Some(payer) = identity.payer.as_deref() {
+            payment::inject_verified_payer_headers(
+                &mut trusted_headers,
+                payer,
+                None,
+                identity.channel_id.as_deref(),
+            );
+        }
+        for (name, value) in trusted_headers {
+            if let Some(name) = name
+                && let Ok(value) = value.to_str()
+            {
+                prepared.add_forwarded_header(name.as_str(), value);
+            }
         }
     }
 
@@ -1896,6 +1963,50 @@ mod tests {
         assert!(STRIP_HEADERS.contains(&"x-pay-verified-payer"));
         assert!(STRIP_HEADERS.contains(&"x-pay-verified-channel"));
         assert!(STRIP_HEADERS.contains(&"x-pay-original-host"));
+    }
+
+    #[tokio::test]
+    async fn trusted_payment_identity_replaces_spoofed_forwarding_headers() {
+        let api = make_api("test");
+        let mut headers = HeaderMap::new();
+        headers.insert("x-pay-verified-payer", HeaderValue::from_static("attacker"));
+        headers.insert(
+            "x-pay-verified-channel",
+            HeaderValue::from_static("attacker"),
+        );
+        headers.insert(
+            "x-pay-original-host",
+            HeaderValue::from_static("evil.example"),
+        );
+        let identity = TrustedPaymentIdentity {
+            payer: Some("trusted-payer".into()),
+            channel_id: Some("trusted-channel".into()),
+            original_host: Some("worker.cpu.gcp.gateway-402.com".into()),
+        };
+        let UpstreamPlan::Forward(prepared) = prepare_upstream_with_identity(
+            &api,
+            &Method::POST,
+            &"/summary".parse().unwrap(),
+            &headers,
+            &[],
+            Some(&identity),
+        )
+        .await
+        .unwrap() else {
+            panic!("expected proxy forwarding");
+        };
+        assert_eq!(
+            prepared.header_value("x-pay-verified-payer"),
+            Some("trusted-payer")
+        );
+        assert_eq!(
+            prepared.header_value("x-pay-verified-channel"),
+            Some("trusted-channel")
+        );
+        assert_eq!(
+            prepared.header_value("x-pay-original-host"),
+            Some("worker.cpu.gcp.gateway-402.com")
+        );
     }
 
     #[test]

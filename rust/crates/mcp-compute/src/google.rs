@@ -627,7 +627,6 @@ impl ComputeDriver for GoogleCloudFunctionsDriver {
             source_kinds: vec!["inline".into(), "zip_base64".into()],
             operations: vec![
                 "deploy".into(),
-                "schedule".into(),
                 "get".into(),
                 "list".into(),
                 "invoke".into(),
@@ -638,7 +637,7 @@ impl ComputeDriver for GoogleCloudFunctionsDriver {
             default_region: self.config.default_region.clone(),
             notes: vec![
                 "Deployments are second-generation HTTP functions.".into(),
-                "One portable Unix-cron schedule trigger may be reconciled per deployment.".into(),
+                "Recurring execution is configured through the jobs MCP so every run is prepaid and budgeted.".into(),
                 "Provider origins stay private; invocation is performed by this MCP.".into(),
                 "Public gateway invocation supports exact x402 and MPP payments; timeout_seconds controls execution lifetime.".into(),
             ],
@@ -648,10 +647,10 @@ impl ComputeDriver for GoogleCloudFunctionsDriver {
     async fn deploy(&self, tenant: &Tenant, request: DeployRequest) -> Result<ComputeOperation> {
         validate_function_name(&request.name)?;
         validate_runtime(&request.runtime.runtime, &request.runtime.entrypoint)?;
-        validate_triggers(&request.triggers)?;
-        if !request.triggers.is_empty() && self.config.scheduler_service_account.is_none() {
-            return Err(ComputeError::Configuration(
-                "COMPUTE_GOOGLE_SCHEDULER_SERVICE_ACCOUNT is required for schedule triggers".into(),
+        if !request.triggers.is_empty() {
+            return Err(ComputeError::InvalidRequest(
+                "inline schedules are disabled; create a prepaid recurring job through the jobs MCP"
+                    .into(),
             ));
         }
         let region = self.region(request.region.as_deref())?.to_string();
@@ -1221,24 +1220,6 @@ fn validate_runtime(runtime: &str, entrypoint: &str) -> Result<()> {
                 "invalid {label} `{value}`"
             )));
         }
-    }
-    Ok(())
-}
-
-fn validate_triggers(triggers: &[TriggerSpec]) -> Result<()> {
-    if triggers.len() > 1 {
-        return Err(ComputeError::InvalidRequest(
-            "Google Cloud Functions currently supports at most one schedule trigger".into(),
-        ));
-    }
-    for trigger in triggers {
-        let TriggerSpec::Schedule {
-            cron,
-            timezone,
-            path,
-            authorization: _,
-        } = trigger;
-        validate_schedule(cron, timezone, path)?;
     }
     Ok(())
 }

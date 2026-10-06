@@ -378,7 +378,13 @@ impl FlowCorrelation {
         }) else {
             return;
         };
-        let exact_flow_id = log_id.and_then(|id| self.exchange_flows.get(&id)).cloned();
+        let exact_flow_id = match log_id {
+            Some(id) => match self.exchange_flows.get(&id) {
+                Some(flow_id) => Some(flow_id.clone()),
+                None => return,
+            },
+            None => None,
+        };
         let Some(flow) = self.flows.iter_mut().rfind(|flow| {
             exact_flow_id.as_ref().map_or(
                 flow.client_ip == client_ip && flow.resource == resource,
@@ -3941,6 +3947,24 @@ mod tests {
                 .insert("payment-receipt".into(), encode_json(serde_json::json!({})));
             engine.ingest(retry);
         }
+
+        engine.enrich_inference_response_for_exchange(
+            Some(999),
+            "127.0.0.1",
+            "/v1/chat/completions",
+            HashMap::new(),
+            r#"{"model":"must-not-fallback"}"#.into(),
+            None,
+        );
+        assert!(
+            engine.snapshot().iter().all(|flow| {
+                flow.inference
+                    .as_ref()
+                    .and_then(|info| info.model.as_deref())
+                    != Some("must-not-fallback")
+            }),
+            "an unknown exact exchange id must not update a URL-matched flow"
+        );
 
         engine.enrich_inference_response_for_exchange(
             Some(2),
