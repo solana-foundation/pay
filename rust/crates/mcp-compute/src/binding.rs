@@ -13,6 +13,7 @@ const INTERNAL_PROOF_HEADER: &str = "x-pay-data-binding-proof";
 #[derive(Clone)]
 pub struct DataBindingClient {
     base_url: Arc<str>,
+    runtime_url: Arc<str>,
     internal_proof: Arc<str>,
     google: GoogleCloudFunctionsDriver,
     client: reqwest::Client,
@@ -33,13 +34,12 @@ struct BindingRequest<'a> {
 #[derive(Deserialize)]
 struct BindingResponse {
     url_path: String,
-    secret_id: String,
+    capability: String,
     expires_at: u64,
 }
 
 pub struct ResolvedBindings {
     pub environment: BTreeMap<String, String>,
-    pub secrets: BTreeMap<String, String>,
 }
 
 impl DataBindingClient {
@@ -53,15 +53,38 @@ impl DataBindingClient {
                     .into(),
             )
         })?;
+        let runtime_url = env_nonempty("COMPUTE_DATA_RUNTIME_URL").ok_or_else(|| {
+            ComputeError::Configuration(
+                "COMPUTE_DATA_RUNTIME_URL is required when COMPUTE_DATA_SERVICE_URL is set".into(),
+            )
+        })?;
         let base_url = base_url.trim_end_matches('/').to_string();
-        url::Url::parse(&base_url).map_err(|_| {
+        let parsed = url::Url::parse(&base_url).map_err(|_| {
             ComputeError::Configuration("COMPUTE_DATA_SERVICE_URL must be an absolute URL".into())
         })?;
+        if parsed.scheme() != "https" || parsed.host_str().is_none() {
+            return Err(ComputeError::Configuration(
+                "COMPUTE_DATA_SERVICE_URL must be an HTTPS origin".into(),
+            ));
+        }
+        let runtime_url = runtime_url.trim_end_matches('/').to_string();
+        let parsed_runtime = url::Url::parse(&runtime_url).map_err(|_| {
+            ComputeError::Configuration("COMPUTE_DATA_RUNTIME_URL must be an absolute URL".into())
+        })?;
+        if parsed_runtime.scheme() != "https" || parsed_runtime.host_str().is_none() {
+            return Err(ComputeError::Configuration(
+                "COMPUTE_DATA_RUNTIME_URL must be an HTTPS origin".into(),
+            ));
+        }
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
         Ok(Some(Self {
             base_url: base_url.into(),
+            runtime_url: runtime_url.into(),
             internal_proof: internal_proof.into(),
             google,
-            client: reqwest::Client::new(),
+            client,
         }))
     }
 
@@ -72,7 +95,6 @@ impl DataBindingClient {
         bindings: &[ServiceBindingSpec],
     ) -> Result<ResolvedBindings> {
         let mut environment = BTreeMap::new();
-        let mut secrets = BTreeMap::new();
         let mut names = BTreeSet::new();
         for binding in bindings {
             let env_name = binding_environment_name(&binding.name)?;
@@ -125,21 +147,18 @@ impl DataBindingClient {
             }
             environment.insert(
                 format!("PAY_BINDING_{env_name}_URL"),
-                format!("{}{}", self.base_url, response.url_path),
+                format!("{}{}", self.runtime_url, response.url_path),
             );
-            secrets.insert(
+            environment.insert(
                 format!("PAY_BINDING_{env_name}_CAPABILITY"),
-                response.secret_id,
+                response.capability,
             );
             environment.insert(
                 format!("PAY_BINDING_{env_name}_EXPIRES_AT"),
                 response.expires_at.to_string(),
             );
         }
-        Ok(ResolvedBindings {
-            environment,
-            secrets,
-        })
+        Ok(ResolvedBindings { environment })
     }
 }
 

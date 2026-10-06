@@ -16,6 +16,7 @@ base64 = { workspace = true }
 bs58 = { workspace = true }
 bytes = "1"
 clap = { workspace = true, features = ["env"] }
+futures-util = "0.3"
 http = "1"
 reqwest = { workspace = true, features = ["json"] }
 rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }

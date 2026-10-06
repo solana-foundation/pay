@@ -5,7 +5,6 @@ use clap::Parser;
 use mcp_data::binding::BindingIssuer;
 use mcp_data::driver::DataDriver;
 use mcp_data::firestore::{FirestoreConfig, FirestoreDriver};
-use mcp_data::secrets::BindingSecretStore;
 use mcp_data::{DriverRegistry, server};
 
 #[derive(Debug, Parser)]
@@ -26,6 +25,11 @@ struct Args {
     allowed_hosts: Vec<String>,
     #[arg(long, env = "DATA_DISABLE_HOST_VALIDATION", default_value_t = false)]
     disable_host_validation: bool,
+    /// Serve only capability-authenticated workload data routes. This mode is
+    /// safe to expose without Cloud Run IAM because it has no MCP or binding
+    /// issuance endpoint.
+    #[arg(long, env = "DATA_RUNTIME_ONLY", default_value_t = false)]
+    runtime_only: bool,
 }
 
 #[tokio::main]
@@ -45,7 +49,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|_| "DATA_BINDING_INTERNAL_PROOF must be set")?
         .into_bytes();
     let bindings = BindingIssuer::new(binding_key, internal_proof)?;
-    let binding_secrets = BindingSecretStore::from_env()?;
     let allowed_hosts = if args.disable_host_validation {
         Vec::new()
     } else if args.allowed_hosts.is_empty() {
@@ -54,17 +57,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.allowed_hosts
     };
     let listener = tokio::net::TcpListener::bind(args.bind).await?;
-    tracing::info!(address = %args.bind, "data MCP listening");
-    axum::serve(
-        listener,
-        server::router(
-            drivers,
-            args.gateway_domain,
-            allowed_hosts,
-            bindings,
-            binding_secrets,
-        ),
-    )
-    .await?;
+    tracing::info!(address = %args.bind, runtime_only = args.runtime_only, "data service listening");
+    let app = if args.runtime_only {
+        server::runtime_router(drivers, bindings)
+    } else {
+        server::router(drivers, args.gateway_domain, allowed_hosts, bindings)
+    };
+    axum::serve(listener, app).await?;
     Ok(())
 }

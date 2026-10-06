@@ -80,7 +80,7 @@ impl ComputeMcp {
     }
 
     #[tool(
-        description = "Create or update a payer-owned serverless deployment. Source may be inline UTF-8 files or a base64 ZIP. The returned operation is asynchronous; poll operation_status until it succeeds."
+        description = "Create or update a payer-owned serverless deployment. Source may be inline UTF-8 files or a base64 ZIP. Optional provider-neutral schedule triggers invoke private worker paths, managed service bindings inject scoped data access, and gateway exposure creates a stable paid public hostname. The returned operation is asynchronous; poll operation_status until it succeeds."
     )]
     async fn deploy(
         &self,
@@ -112,7 +112,6 @@ impl ComputeMcp {
                 .resolve(&tenant, &workload_id, &request.service_bindings)
                 .await?;
             request.environment.extend(resolved.environment);
-            request.resolved_binding_secrets.extend(resolved.secrets);
             Ok(())
         }
         .await;

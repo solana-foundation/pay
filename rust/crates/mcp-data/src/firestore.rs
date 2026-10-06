@@ -195,6 +195,28 @@ impl FirestoreDriver {
         }
     }
 
+    fn physical_id_from_name(&self, tenant: &Tenant, name: &str) -> String {
+        format!("{GATEWAY_PREFIX}{}-{name}", tenant.key)
+    }
+
+    fn store_resource_name(&self, tenant: &Tenant, id: &str) -> Result<String> {
+        Ok(format!(
+            "projects/{}/databases/{}/documents/pay-data/{}/documentStores/{}",
+            self.config.project,
+            self.config.database,
+            tenant.key,
+            self.physical_id(tenant, id)?
+        ))
+    }
+
+    fn document_resource_name(&self, tenant: &Tenant, store_id: &str, key: &str) -> Result<String> {
+        validate_key(key)?;
+        Ok(format!(
+            "{}/documents/{key}",
+            self.store_resource_name(tenant, store_id)?
+        ))
+    }
+
     fn store_url(&self, tenant: &Tenant, id: &str) -> Result<String> {
         Ok(format!(
             "{}/pay-data/{}/documentStores/{}",
@@ -223,6 +245,49 @@ impl FirestoreDriver {
     async fn require_store(&self, tenant: &Tenant, id: &str) -> Result<Value> {
         self.require_json(Method::GET, self.store_url(tenant, id)?, None)
             .await
+    }
+
+    async fn require_ready_store(&self, tenant: &Tenant, id: &str) -> Result<Value> {
+        let store = self.require_store(tenant, id).await?;
+        if !matches!(firestore_string(&store, "phase"), None | Some("ready")) {
+            return Err(DataError::InvalidRequest(
+                "document store is not ready for operations".into(),
+            ));
+        }
+        Ok(store)
+    }
+
+    async fn commit_document_write(
+        &self,
+        _tenant: &Tenant,
+        store: &Value,
+        write: Value,
+    ) -> Result<Value> {
+        let store_name = store
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| DataError::Provider("store omitted resource name".into()))?;
+        let update_time = store
+            .get("updateTime")
+            .and_then(Value::as_str)
+            .ok_or_else(|| DataError::Provider("store omitted updateTime".into()))?;
+        self.require_json(
+            Method::POST,
+            format!(
+                "{}/v1/projects/{}/databases/{}/documents:commit",
+                self.config.api_base, self.config.project, self.config.database
+            ),
+            Some(&json!({
+                "writes": [
+                    {
+                        "verify": store_name,
+                        "currentDocument": { "updateTime": update_time }
+                    },
+                    write
+                ]
+            })),
+        )
+        .await
     }
 
     async fn get_document_from_store(
@@ -339,7 +404,33 @@ impl DataDriver for FirestoreDriver {
                 DataError::InvalidRequest(format!("invalid Firestore driver_options: {error}"))
             })?
         };
-        let physical_id = self.physical_id(tenant, &request.name)?;
+        let physical_id = self.physical_id_from_name(tenant, &request.name);
+        let store_url = self.store_url(tenant, &physical_id)?;
+        let (status, existing) = self.send_json(Method::GET, store_url.clone(), None).await?;
+        let mut write_url = url::Url::parse(&store_url)
+            .map_err(|error| DataError::Configuration(error.to_string()))?;
+        match status {
+            StatusCode::OK => {
+                if firestore_string(&existing, "phase") == Some("deleting") {
+                    return Err(DataError::InvalidRequest(
+                        "document store is being deleted; retry after deletion completes".into(),
+                    ));
+                }
+                let update_time = existing
+                    .get("updateTime")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| DataError::Provider("store omitted updateTime".into()))?;
+                write_url
+                    .query_pairs_mut()
+                    .append_pair("currentDocument.updateTime", update_time);
+            }
+            StatusCode::NOT_FOUND => {
+                write_url
+                    .query_pairs_mut()
+                    .append_pair("currentDocument.exists", "false");
+            }
+            _ => return Err(provider_error(status, &existing)),
+        }
         let body = json!({
             "fields": {
                 "logicalName": { "stringValue": request.name },
@@ -348,15 +439,12 @@ impl DataDriver for FirestoreDriver {
                 "region": { "stringValue": region },
                 "reclaimPolicy": { "stringValue": reclaim_policy_name(&request.reclaim_policy) },
                 "gatewayReads": { "booleanValue": request.access.gateway_reads },
-                "tenant": { "stringValue": tenant.key }
+                "tenant": { "stringValue": tenant.key },
+                "phase": { "stringValue": "ready" }
             }
         });
         let value = self
-            .require_json(
-                Method::PATCH,
-                self.store_url(tenant, &physical_id)?,
-                Some(&body),
-            )
+            .require_json(Method::PATCH, write_url.into(), Some(&body))
             .await?;
         normalize_store(value)
     }
@@ -409,9 +497,18 @@ impl DataDriver for FirestoreDriver {
         tenant: &Tenant,
         request: DocumentStoreRequest,
     ) -> Result<()> {
-        let store = self.require_store(tenant, &request.id).await?;
+        let store = self.require_ready_store(tenant, &request.id).await?;
         let physical_id = store_physical_id(&store)?;
         let policy = firestore_string(&store, "reclaimPolicy").unwrap_or("delete");
+        self.require_json(
+            Method::PATCH,
+            format!(
+                "{}?updateMask.fieldPaths=phase",
+                self.store_url(tenant, physical_id)?
+            ),
+            Some(&json!({ "fields": { "phase": { "stringValue": "deleting" } } })),
+        )
+        .await?;
         if policy == "delete" {
             self.delete_documents(tenant, physical_id).await?;
         }
@@ -425,13 +522,13 @@ impl DataDriver for FirestoreDriver {
     }
 
     async fn get_document(&self, tenant: &Tenant, request: DocumentRequest) -> Result<Document> {
-        let store = self.require_store(tenant, &request.store_id).await?;
+        let store = self.require_ready_store(tenant, &request.store_id).await?;
         let id = store_physical_id(&store)?;
         self.get_document_from_store(tenant, id, &request.key).await
     }
 
     async fn put_document(&self, tenant: &Tenant, request: PutDocumentRequest) -> Result<Document> {
-        let store = self.require_store(tenant, &request.store_id).await?;
+        let store = self.require_ready_store(tenant, &request.store_id).await?;
         let id = store_physical_id(&store)?;
         let payload = serde_json::to_string(&request.value)?;
         if payload.len() > MAX_DOCUMENT_BYTES {
@@ -439,31 +536,39 @@ impl DataDriver for FirestoreDriver {
                 "document exceeds {MAX_DOCUMENT_BYTES} bytes after JSON serialization"
             )));
         }
-        let value = self
-            .require_json(
-                Method::PATCH,
-                self.document_url(tenant, id, &request.key)?,
-                Some(&json!({
-                    "fields": { "payload": { "stringValue": payload } }
-                })),
+        let document_name = self.document_resource_name(tenant, id, &request.key)?;
+        let result = self
+            .commit_document_write(
+                tenant,
+                &store,
+                json!({
+                    "update": {
+                        "name": document_name,
+                        "fields": { "payload": { "stringValue": payload } }
+                    }
+                }),
             )
             .await?;
-        normalize_document(id, &request.key, value)
+        let updated_at = result
+            .pointer("/writeResults/1/updateTime")
+            .or_else(|| result.get("commitTime"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        Ok(Document {
+            store_id: id.to_string(),
+            key: request.key,
+            value: request.value,
+            created_at: None,
+            updated_at,
+        })
     }
 
     async fn delete_document(&self, tenant: &Tenant, request: DocumentRequest) -> Result<()> {
-        let store = self.require_store(tenant, &request.store_id).await?;
+        let store = self.require_ready_store(tenant, &request.store_id).await?;
         let id = store_physical_id(&store)?;
-        let (status, response) = self
-            .send_json(
-                Method::DELETE,
-                self.document_url(tenant, id, &request.key)?,
-                None,
-            )
+        let document_name = self.document_resource_name(tenant, id, &request.key)?;
+        self.commit_document_write(tenant, &store, json!({ "delete": document_name }))
             .await?;
-        if !status.is_success() {
-            return Err(provider_error(status, &response));
-        }
         Ok(())
     }
 
@@ -474,7 +579,7 @@ impl DataDriver for FirestoreDriver {
             payer: String::new(),
             key: tenant_key.to_string(),
         };
-        let store = self.require_store(&tenant, &request.store_id).await?;
+        let store = self.require_ready_store(&tenant, &request.store_id).await?;
         if firestore_bool(&store, "gatewayReads") != Some(true) {
             return Err(DataError::InvalidRequest(
                 "store owner has not published paid gateway reads".into(),
@@ -509,18 +614,29 @@ fn normalize_store(value: Value) -> Result<DocumentStore> {
         Some("retain") => ReclaimPolicy::Retain,
         _ => ReclaimPolicy::Delete,
     };
+    let phase = match firestore_string(&value, "phase") {
+        Some("deleting") => ResourcePhase::Deleting,
+        Some("failed") => ResourcePhase::Failed,
+        _ => ResourcePhase::Ready,
+    };
+    let ready = matches!(phase, ResourcePhase::Ready);
     Ok(DocumentStore {
         driver: DRIVER_ID.into(),
         class: CLASS_ID.into(),
         id: id.clone(),
         name,
         region,
-        phase: ResourcePhase::Ready,
+        phase,
         conditions: vec![Condition {
             kind: "Ready".into(),
-            status: true,
-            reason: "Reconciled".into(),
-            message: "Document store namespace is ready".into(),
+            status: ready,
+            reason: if ready { "Reconciled" } else { "Deleting" }.into(),
+            message: if ready {
+                "Document store namespace is ready"
+            } else {
+                "Document store namespace is being deleted"
+            }
+            .into(),
         }],
         reclaim_policy,
         gateway_id: (firestore_bool(&value, "gatewayReads") == Some(true)).then_some(id),
@@ -686,6 +802,10 @@ mod tests {
         assert_eq!(
             driver.physical_id(&tenant, "weather").unwrap(),
             "fds-0123456789abcdef-weather"
+        );
+        assert_eq!(
+            driver.physical_id_from_name(&tenant, "fds-weather"),
+            "fds-0123456789abcdef-fds-weather"
         );
         assert!(
             driver
