@@ -304,22 +304,28 @@ async fn gateway_invoke_inner(
         .headers()
         .get(ORIGINAL_HOST_HEADER)
         .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| {
-            ComputeError::InvalidRequest("trusted original host header is missing".into())
-        })?
-        .split(':')
-        .next()
-        .unwrap_or_default();
-    let suffix = format!(".{}", state.gateway_domain);
-    let deployment_id = host
-        .strip_suffix(&suffix)
-        .filter(|label| !label.is_empty() && !label.contains('.'))
-        .ok_or_else(|| {
-            ComputeError::InvalidRequest(
-                "host is not a deployment below the compute gateway domain".into(),
-            )
-        })?
-        .to_string();
+        .and_then(|host| host.split(':').next());
+    let (deployment_id, gateway_path) = if let Some(host) = host {
+        let suffix = format!(".{}", state.gateway_domain);
+        let deployment_id = host
+            .strip_suffix(&suffix)
+            .filter(|label| !label.is_empty() && !label.contains('.'))
+            .ok_or_else(|| {
+                ComputeError::InvalidRequest(
+                    "host is not a deployment below the compute gateway domain".into(),
+                )
+            })?
+            .to_string();
+        let path = request
+            .uri()
+            .path_and_query()
+            .map(|value| value.as_str())
+            .unwrap_or("/")
+            .to_string();
+        (deployment_id, path)
+    } else {
+        gateway_path_target(request.uri())?
+    };
     let driver = state.drivers.for_gateway(&deployment_id)?;
     let (parts, body) = request.into_parts();
     let body = to_bytes(body, MAX_GATEWAY_BODY_BYTES)
@@ -354,12 +360,7 @@ async fn gateway_invoke_inner(
         .invoke_gateway(GatewayInvokeRequest {
             deployment_id,
             method: parts.method.to_string(),
-            path_and_query: parts
-                .uri
-                .path_and_query()
-                .map(|value| value.as_str())
-                .unwrap_or("/")
-                .to_string(),
+            path_and_query: gateway_path,
             headers,
             body,
         })
@@ -376,6 +377,22 @@ async fn gateway_invoke_inner(
     builder.body(Body::from(invocation.body)).map_err(|error| {
         ComputeError::Provider(format!("failed to build invocation response: {error}"))
     })
+}
+
+fn gateway_path_target(uri: &axum::http::Uri) -> crate::driver::Result<(String, String)> {
+    let path = uri.path().trim_start_matches('/');
+    let (deployment_id, remainder) = path.split_once('/').unwrap_or((path, ""));
+    if deployment_id.is_empty() || deployment_id.contains('.') {
+        return Err(ComputeError::InvalidRequest(
+            "gateway path must begin with a deployment ID".into(),
+        ));
+    }
+    let mut upstream_path = format!("/{remainder}");
+    if let Some(query) = uri.query() {
+        upstream_path.push('?');
+        upstream_path.push_str(query);
+    }
+    Ok((deployment_id.to_string(), upstream_path))
 }
 
 fn tenant_from_payer(payer: &str) -> crate::driver::Result<Tenant> {
@@ -401,6 +418,24 @@ fn tenant_from_payer(payer: &str) -> crate::driver::Result<Tenant> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gateway_path_selects_deployment_and_preserves_query() {
+        let uri: axum::http::Uri = "/gcf-tenant-weather/latest?units=metric".parse().unwrap();
+        assert_eq!(
+            gateway_path_target(&uri).unwrap(),
+            (
+                "gcf-tenant-weather".to_string(),
+                "/latest?units=metric".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn gateway_path_rejects_an_empty_selector() {
+        let uri: axum::http::Uri = "/".parse().unwrap();
+        assert!(gateway_path_target(&uri).is_err());
+    }
 
     #[test]
     fn tool_results_are_structured_without_json_text_duplication() {
