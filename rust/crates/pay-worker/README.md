@@ -54,6 +54,10 @@ hand-copied program logic or account layout.
 | `SETTLEMENT_LOCK_TTL_SECONDS` | no | `300` | TTL for each scheme's independent reconciliation lease. |
 | `RUN_ONCE` | no | `true` | Keep one-shot behavior for manual Cloud Run Job executions. Set to `false` for the continuous worker. |
 | `SETTLEMENT_INTERVAL_SECONDS` | no | `10` | Delay between complete MPP and x402 reconciliation sweeps when `RUN_ONCE=false`. Set this to `240` for a four-minute x402 settlement clock. |
+| `PAY_RESOURCE_CLEANUP_DRIVERS` | no | empty | Comma-separated cleanup drivers: `google-cloud-functions`, `gcp-firestore`. Unknown entries fail startup instead of silently leaking resources. |
+| `PAY_RESOURCE_CLEANUP_INTERVAL_SECONDS` | no | `60` | Minimum delay between provider cleanup scans for one channel. |
+| `PAY_RESOURCE_CLEANUP_QUIET_SECONDS` | no | `7200` | Repeated-empty-scan window before the Redis retry anchor may be removed. |
+| `PAY_RESOURCE_CLEANUP_EMPTY_GRACE_SECONDS` | no | `600` | Delay after the last activity before a fully spent but still-open channel is collected, allowing an in-flight top-up to preserve its resources. |
 
 The fee-payer keys intentionally share pay-api's `send.fee_payer.*` env names so
 a single Doppler config drives both. Job-specific overrides use the `JOBS_`
@@ -116,10 +120,21 @@ and batch namespaces can progress independently.
 For MPP sessions it cursor-scans the session namespace, skips sealed and
 pull-mode records, and fetches every candidate channel from Solana. If a
 push-channel account is already absent at confirmed commitment, the worker
-deletes its terminal Redis record immediately. For active channels it submits
-a voucher only when the stored cumulative amount is strictly greater than the
-on-chain watermark. For idle channels it atomically claims the still-due Redis
-deadline, settles the latest voucher, seals, and distributes the channel.
+deletes its terminal Redis record after resource cleanup completes. For active
+channels it submits a voucher only when the stored cumulative amount is
+strictly greater than the on-chain watermark. For idle channels it atomically
+claims the still-due Redis deadline, settles the latest voucher, seals, and
+distributes the channel.
+
+The same sweep garbage-collects provider resources leased to an MPP channel
+once it is spent, closing, sealed, or absent on-chain. Compute functions,
+schedule triggers, and managed document stores carry a one-way hash of the
+verified channel ID. Cleanup is provider-driver based and retry-safe. The
+spent-channel grace prevents cleanup racing a top-up. The
+worker retains the Redis record as its retry anchor and requires a configurable
+quiet window of repeated empty scans before declaring cleanup complete; this
+prevents an accepted asynchronous deployment from appearing after one empty
+scan and escaping collection.
 
 For x402 batch settlement it uses the same one-fetch/one-candidate pipeline:
 claim every newer stored voucher and distribute the delta committed by the

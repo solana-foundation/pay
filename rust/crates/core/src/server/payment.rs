@@ -102,9 +102,11 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
         } => {
             let mut delegated_session = None;
             let mut verified_payer = None;
+            let mut verified_channel = None;
             if let Some(sf) = session {
                 let mut sf = *sf;
                 verified_payer = sf.verified_payer.clone();
+                verified_channel = Some(sf.channel_id.clone());
                 if sf.settlement.is_some() {
                     // Delegated sessions are settled from the completed
                     // response below. The client-voucher stream context waits
@@ -135,7 +137,12 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
                 }
             }
             if let Some(payer) = verified_payer {
-                inject_verified_payer_headers(req.headers_mut(), &payer, host.as_deref());
+                inject_verified_payer_headers(
+                    req.headers_mut(),
+                    &payer,
+                    host.as_deref(),
+                    verified_channel.as_deref(),
+                );
             }
             let mut response = next.run(req).await;
             if let Some(sf) = delegated_session {
@@ -290,6 +297,7 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
 
 pub fn strip_internal_identity_headers(headers: &mut HeaderMap) {
     headers.remove("x-pay-verified-payer");
+    headers.remove("x-pay-verified-channel");
     headers.remove("x-pay-original-host");
 }
 
@@ -300,9 +308,15 @@ pub fn inject_verified_payer_headers(
     headers: &mut HeaderMap,
     payer: &str,
     original_host: Option<&str>,
+    channel_id: Option<&str>,
 ) {
     if let Ok(value) = HeaderValue::from_str(payer) {
         headers.insert("x-pay-verified-payer", value);
+        if let Some(channel_id) = channel_id
+            && let Ok(value) = HeaderValue::from_str(channel_id)
+        {
+            headers.insert("x-pay-verified-channel", value);
+        }
         if let Some(host) = original_host
             && let Ok(value) = HeaderValue::from_str(host)
         {
@@ -695,6 +709,10 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-pay-verified-payer", HeaderValue::from_static("attacker"));
         headers.insert(
+            "x-pay-verified-channel",
+            HeaderValue::from_static("attacker-channel"),
+        );
+        headers.insert(
             "x-pay-original-host",
             HeaderValue::from_static("attacker.example"),
         );
@@ -703,6 +721,7 @@ mod tests {
         strip_internal_identity_headers(&mut headers);
 
         assert!(!headers.contains_key("x-pay-verified-payer"));
+        assert!(!headers.contains_key("x-pay-verified-channel"));
         assert!(!headers.contains_key("x-pay-original-host"));
         assert_eq!(headers.get("host").unwrap(), "function.compute.example");
     }
@@ -721,8 +740,13 @@ mod tests {
             &mut headers,
             "verified-payer",
             Some("hello.cpu.gcp.gateway-402.com"),
+            Some("verified-channel"),
         );
 
+        assert_eq!(
+            headers.get("x-pay-verified-channel").unwrap(),
+            "verified-channel"
+        );
         assert_eq!(
             headers.get("x-pay-verified-payer").unwrap(),
             "verified-payer"

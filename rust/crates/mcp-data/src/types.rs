@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 pub struct Tenant {
     pub payer: String,
     pub key: String,
+    /// Payment channel funding resources created by this control-plane call.
+    pub channel_id: String,
 }
 
 fn default_driver() -> String {

@@ -40,6 +40,9 @@ pub trait ComputeDriver: Send + Sync {
     async fn operation(&self, tenant: &Tenant, id: &str) -> Result<ComputeOperation>;
     async fn invoke(&self, tenant: &Tenant, request: InvokeRequest) -> Result<InvocationResult>;
     async fn invoke_gateway(&self, request: GatewayInvokeRequest) -> Result<GatewayInvocation>;
+    /// Delete all provider resources funded by `channel_id`. This must be
+    /// idempotent because the lifecycle worker retries until it succeeds.
+    async fn cleanup_channel(&self, channel_id: &str) -> Result<usize>;
 }
 
 #[derive(Clone, Default)]
@@ -132,6 +135,9 @@ mod tests {
         }
         async fn invoke_gateway(&self, _: GatewayInvokeRequest) -> Result<GatewayInvocation> {
             unreachable!()
+        }
+        async fn cleanup_channel(&self, _: &str) -> Result<usize> {
+            Ok(0)
         }
     }
 

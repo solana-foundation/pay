@@ -24,6 +24,7 @@ use pay_kit::mpp::solana_keychain::TransactionSigner;
 use pay_worker::channel::{self, STATUS_CLOSING, STATUS_DISTRIBUTED, STATUS_OPEN, STATUS_SEALED};
 use pay_worker::config::Config;
 use pay_worker::error::JobError;
+use pay_worker::resource_cleanup::ResourceCleaner;
 use pay_worker::signer::build_fee_payer_signer;
 use pay_worker::telemetry::{self, SettleSessionsMetrics};
 use solana_pubkey::Pubkey;
@@ -41,6 +42,12 @@ const DEFAULT_X402_SETTLEMENT_MAX_IDLE_SECONDS: u64 = 300;
 const DEFAULT_X402_SNAPSHOT_MAX_AGE_SECONDS: u64 = 30;
 const DEFAULT_X402_RECONCILIATION_CONCURRENCY: u64 = 64;
 const DEFAULT_PORT: u64 = 8080;
+const RESOURCE_CLEANUP_COMPLETED_AT: &str = "pay_resource_cleanup_completed_at";
+const RESOURCE_CLEANUP_LAST_AT: &str = "pay_resource_cleanup_last_at";
+const RESOURCE_CLEANUP_EMPTY_SINCE: &str = "pay_resource_cleanup_empty_since";
+const DEFAULT_RESOURCE_CLEANUP_INTERVAL_SECONDS: u64 = 60;
+const DEFAULT_RESOURCE_CLEANUP_QUIET_SECONDS: u64 = 7200;
+const DEFAULT_RESOURCE_CLEANUP_EMPTY_GRACE_SECONDS: u64 = 600;
 
 struct LeaseHeartbeat {
     cancel: CancellationToken,
@@ -371,6 +378,10 @@ struct SettlementRuntime {
     signer: Arc<dyn TransactionSigner>,
     operator: Pubkey,
     confirm_timeout: Duration,
+    resource_cleaner: ResourceCleaner,
+    resource_cleanup_interval: Duration,
+    resource_cleanup_quiet: Duration,
+    resource_cleanup_empty_grace: Duration,
 }
 
 struct ChannelRuntime {
@@ -429,6 +440,25 @@ impl SettlementRuntime {
         let signer = build_fee_payer_signer(&config.send.fee_payer).await?;
         let operator = signer.pubkey();
         let confirm_timeout = Duration::from_secs(config.confirm_timeout_seconds);
+        let resource_cleaner = ResourceCleaner::from_env()?;
+        let resource_cleanup_interval = Duration::from_secs(require_positive_u64(
+            "PAY_RESOURCE_CLEANUP_INTERVAL_SECONDS",
+            parse_u64_env(
+                "PAY_RESOURCE_CLEANUP_INTERVAL_SECONDS",
+                DEFAULT_RESOURCE_CLEANUP_INTERVAL_SECONDS,
+            )?,
+        )?);
+        let resource_cleanup_quiet = Duration::from_secs(require_positive_u64(
+            "PAY_RESOURCE_CLEANUP_QUIET_SECONDS",
+            parse_u64_env(
+                "PAY_RESOURCE_CLEANUP_QUIET_SECONDS",
+                DEFAULT_RESOURCE_CLEANUP_QUIET_SECONDS,
+            )?,
+        )?);
+        let resource_cleanup_empty_grace = Duration::from_secs(parse_u64_env(
+            "PAY_RESOURCE_CLEANUP_EMPTY_GRACE_SECONDS",
+            DEFAULT_RESOURCE_CLEANUP_EMPTY_GRACE_SECONDS,
+        )?);
 
         let session = if let Some(redis_url) = session_redis_url.as_ref() {
             let redis_prefix = optional_env("PAY_MPP_REDIS_PREFIX")
@@ -513,6 +543,10 @@ impl SettlementRuntime {
             signer,
             operator,
             confirm_timeout,
+            resource_cleaner,
+            resource_cleanup_interval,
+            resource_cleanup_quiet,
+            resource_cleanup_empty_grace,
         })
     }
 }
@@ -603,6 +637,21 @@ async fn run_session(runtime: &SettlementRuntime) -> Result<SettleSessionsMetric
             scanned_state
         };
 
+        let resource_state = state.clone();
+        let cleanup_ready =
+            match ensure_resource_cleanup(runtime, &session.store, &state, false).await {
+                Ok(ready) => ready,
+                Err(error) => {
+                    failures += 1;
+                    warn!(
+                        channel_id = %state.channel_id,
+                        %error,
+                        "failed to garbage-collect channel-funded resources; will retry"
+                    );
+                    false
+                }
+            };
+
         match reconcile_channel(
             &runtime.rpc,
             &runtime.rpc_url,
@@ -652,12 +701,39 @@ async fn run_session(runtime: &SettlementRuntime) -> Result<SettleSessionsMetric
                     }
                     StoreDisposition::Delete => {
                         finalized += 1;
+                        let cleanup_ready = if resource_cleanup_required(
+                            &resource_state,
+                            unix_now_millis(),
+                            runtime.resource_cleanup_empty_grace,
+                        ) {
+                            cleanup_ready
+                        } else {
+                            match ensure_resource_cleanup(
+                                runtime,
+                                &session.store,
+                                &resource_state,
+                                true,
+                            )
+                            .await
+                            {
+                                Ok(ready) => ready,
+                                Err(error) => {
+                                    failures += 1;
+                                    warn!(
+                                        channel_id = %result.channel_id,
+                                        %error,
+                                        "failed to garbage-collect resources for absent channel; will retry"
+                                    );
+                                    false
+                                }
+                            }
+                        };
                         if runtime.dry_run {
                             info!(
                                 channel_id = %result.channel_id,
                                 "would delete Redis session for absent on-chain channel"
                             );
-                        } else {
+                        } else if cleanup_ready {
                             match session.store.delete_channel(&result.channel_id).await {
                                 Ok(()) => info!(
                                     channel_id = %result.channel_id,
@@ -672,6 +748,11 @@ async fn run_session(runtime: &SettlementRuntime) -> Result<SettleSessionsMetric
                                     );
                                 }
                             }
+                        } else {
+                            warn!(
+                                channel_id = %result.channel_id,
+                                "retaining Redis session until resource cleanup succeeds"
+                            );
                         }
                     }
                 }
@@ -1301,6 +1382,112 @@ fn log_summary(metrics: &SettleSessionsMetrics) {
         duration_ms = (metrics.duration_seconds * 1_000.0) as u64,
         "settle-sessions summary"
     );
+}
+
+fn resource_cleanup_required(state: &ChannelState, now_ms: u64, empty_grace: Duration) -> bool {
+    let empty_grace_ms = u64::try_from(empty_grace.as_millis()).unwrap_or(u64::MAX);
+    state.sealed
+        || state.close_requested_at.is_some()
+        || state.final_cumulative.is_some()
+        || (state.deposit > 0
+            && state.cumulative >= state.deposit
+            && now_ms.saturating_sub(state.last_activity_at) >= empty_grace_ms)
+}
+
+fn cleanup_timestamp(state: &ChannelState, key: &str) -> Option<u64> {
+    state.extra.get(key).and_then(serde_json::Value::as_u64)
+}
+
+fn record_resource_cleanup(
+    state: &mut ChannelState,
+    now_ms: u64,
+    quiet_ms: u64,
+    resources: usize,
+) -> bool {
+    state.extra.insert(
+        RESOURCE_CLEANUP_LAST_AT.into(),
+        serde_json::Value::from(now_ms),
+    );
+    if resources == 0 {
+        let empty_since = cleanup_timestamp(state, RESOURCE_CLEANUP_EMPTY_SINCE).unwrap_or(now_ms);
+        state.extra.insert(
+            RESOURCE_CLEANUP_EMPTY_SINCE.into(),
+            serde_json::Value::from(empty_since),
+        );
+        if now_ms.saturating_sub(empty_since) >= quiet_ms {
+            state.extra.insert(
+                RESOURCE_CLEANUP_COMPLETED_AT.into(),
+                serde_json::Value::from(now_ms),
+            );
+        }
+    } else {
+        state.extra.remove(RESOURCE_CLEANUP_EMPTY_SINCE);
+    }
+    state.extra.contains_key(RESOURCE_CLEANUP_COMPLETED_AT)
+}
+
+async fn ensure_resource_cleanup(
+    runtime: &SettlementRuntime,
+    store: &RedisChannelStore,
+    state: &ChannelState,
+    force: bool,
+) -> Result<bool, JobError> {
+    if (!force
+        && !resource_cleanup_required(
+            state,
+            unix_now_millis(),
+            runtime.resource_cleanup_empty_grace,
+        ))
+        || !runtime.resource_cleaner.is_enabled()
+    {
+        return Ok(true);
+    }
+    if state.extra.contains_key(RESOURCE_CLEANUP_COMPLETED_AT) {
+        return Ok(true);
+    }
+    if runtime.dry_run {
+        info!(
+            channel_id = %state.channel_id,
+            "would garbage-collect resources funded by unusable session channel"
+        );
+        return Ok(false);
+    }
+
+    let now_ms = unix_now_millis();
+    let interval_ms =
+        u64::try_from(runtime.resource_cleanup_interval.as_millis()).unwrap_or(u64::MAX);
+    if cleanup_timestamp(state, RESOURCE_CLEANUP_LAST_AT)
+        .is_some_and(|last| now_ms.saturating_sub(last) < interval_ms)
+    {
+        return Ok(false);
+    }
+
+    let summary = runtime
+        .resource_cleaner
+        .cleanup_channel(&state.channel_id)
+        .await?;
+    let resources = summary.compute_resources + summary.data_resources;
+    let quiet_ms = u64::try_from(runtime.resource_cleanup_quiet.as_millis()).unwrap_or(u64::MAX);
+    let updated = store
+        .update_channel(
+            &state.channel_id,
+            Box::new(move |current| {
+                let mut state = current.ok_or_else(|| {
+                    StoreError::Internal("channel disappeared during resource cleanup".into())
+                })?;
+                record_resource_cleanup(&mut state, now_ms, quiet_ms, resources);
+                Ok(state)
+            }),
+        )
+        .await
+        .map_err(|error| JobError::Config(format!("mark resource cleanup complete: {error}")))?;
+    info!(
+        channel_id = %state.channel_id,
+        compute_resources = summary.compute_resources,
+        data_resources = summary.data_resources,
+        "garbage-collected resources funded by unusable session channel"
+    );
+    Ok(updated.extra.contains_key(RESOURCE_CLEANUP_COMPLETED_AT))
 }
 
 #[derive(Default)]
@@ -2435,6 +2622,43 @@ mod tests {
             schema_version: pay_kit::mpp::CHANNEL_STATE_SCHEMA_VERSION,
             extra: Default::default(),
         }
+    }
+
+    #[test]
+    fn resource_cleanup_is_due_when_channel_is_spent_or_terminal() {
+        let mut state = channel_state();
+        let grace = Duration::from_millis(500);
+        assert!(!resource_cleanup_required(&state, 1_000, grace));
+
+        state.deposit = 10;
+        state.cumulative = 10;
+        state.last_activity_at = 750;
+        assert!(!resource_cleanup_required(&state, 1_000, grace));
+        assert!(resource_cleanup_required(&state, 1_250, grace));
+
+        state.extra.insert(
+            RESOURCE_CLEANUP_COMPLETED_AT.into(),
+            serde_json::Value::from(1),
+        );
+        assert!(resource_cleanup_required(&state, 1_250, grace));
+
+        state.extra.clear();
+        state.cumulative = 0;
+        state.close_requested_at = Some(1);
+        assert!(resource_cleanup_required(&state, 1_000, grace));
+    }
+
+    #[test]
+    fn resource_cleanup_requires_a_quiet_window_and_resets_when_resources_reappear() {
+        let mut state = channel_state();
+        assert!(!record_resource_cleanup(&mut state, 1_000, 500, 0));
+        assert!(!record_resource_cleanup(&mut state, 1_400, 500, 0));
+
+        assert!(!record_resource_cleanup(&mut state, 1_500, 500, 1));
+        assert!(cleanup_timestamp(&state, RESOURCE_CLEANUP_EMPTY_SINCE).is_none());
+
+        assert!(!record_resource_cleanup(&mut state, 2_000, 500, 0));
+        assert!(record_resource_cleanup(&mut state, 2_500, 500, 0));
     }
 
     #[test]

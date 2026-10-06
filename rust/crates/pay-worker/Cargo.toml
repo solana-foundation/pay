@@ -17,6 +17,8 @@ path = "src/bin/settle_sessions.rs"
 # stablecoin/token-program resolution). Keeps one implementation of the
 # Solana JSON-RPC plumbing and the on-chain account shapes.
 pay-api-core = { path = "../pay-api-core" }
+mcp-compute = { path = "../mcp-compute" }
+mcp-data = { path = "../mcp-data" }
 
 base64 = "0.22"
 axum = { workspace = true }

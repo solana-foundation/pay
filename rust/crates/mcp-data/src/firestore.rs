@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use reqwest::{Method, StatusCode};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 
 use crate::driver::{DataDriver, DataError, Result};
@@ -440,6 +441,7 @@ impl DataDriver for FirestoreDriver {
                 "reclaimPolicy": { "stringValue": reclaim_policy_name(&request.reclaim_policy) },
                 "gatewayReads": { "booleanValue": request.access.gateway_reads },
                 "tenant": { "stringValue": tenant.key },
+                "payChannel": { "stringValue": channel_lease_key(&tenant.channel_id)? },
                 "phase": { "stringValue": "ready" }
             }
         });
@@ -588,6 +590,7 @@ impl DataDriver for FirestoreDriver {
         let tenant = Tenant {
             payer: String::new(),
             key: tenant_key.to_string(),
+            channel_id: String::new(),
         };
         let store = self.require_ready_store(&tenant, &request.store_id).await?;
         if firestore_bool(&store, "gatewayReads") != Some(true) {
@@ -609,6 +612,57 @@ impl DataDriver for FirestoreDriver {
             document,
             billed_micro_usd,
         })
+    }
+
+    async fn cleanup_channel(&self, channel_id: &str) -> Result<usize> {
+        let lease_key = channel_lease_key(channel_id)?;
+        let url = format!(
+            "{}/v1/projects/{}/databases/{}/documents:runQuery",
+            self.config.api_base, self.config.project, self.config.database
+        );
+        let value = self
+            .require_json(
+                Method::POST,
+                url,
+                Some(&json!({
+                    "structuredQuery": {
+                        "from": [{ "collectionId": "documentStores", "allDescendants": true }],
+                        "where": {
+                            "fieldFilter": {
+                                "field": { "fieldPath": "payChannel" },
+                                "op": "EQUAL",
+                                "value": { "stringValue": lease_key }
+                            }
+                        }
+                    }
+                })),
+            )
+            .await?;
+        let stores = value
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.get("document"))
+            .cloned()
+            .collect::<Vec<_>>();
+        for store in &stores {
+            let tenant_key = firestore_string(store, "tenant")
+                .ok_or_else(|| DataError::Provider("store omitted tenant".into()))?;
+            let id = store_physical_id(store)?.to_string();
+            self.delete_document_store(
+                &Tenant {
+                    payer: String::new(),
+                    key: tenant_key.to_string(),
+                    channel_id: channel_id.to_string(),
+                },
+                DocumentStoreRequest {
+                    driver: DRIVER_ID.into(),
+                    id,
+                },
+            )
+            .await?;
+        }
+        Ok(stores.len())
     }
 }
 
@@ -782,6 +836,19 @@ fn validate_owned_store_id(tenant: &Tenant, id: &str) -> Result<()> {
     Ok(())
 }
 
+fn channel_lease_key(channel_id: &str) -> Result<String> {
+    if channel_id.is_empty() {
+        return Err(DataError::InvalidRequest(
+            "resource creation requires a verified payment channel".into(),
+        ));
+    }
+    let digest = Sha256::digest(channel_id.as_bytes());
+    Ok(digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
 fn provider_error(status: StatusCode, value: &Value) -> DataError {
     let message = value
         .pointer("/error/message")
@@ -793,12 +860,104 @@ fn provider_error(status: StatusCode, value: &Value) -> DataError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::Request;
+    use axum::response::Response;
+
+    fn json_response(status: StatusCode, value: Value) -> Response {
+        Response::builder()
+            .status(status)
+            .header("content-type", "application/json")
+            .body(Body::from(value.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cleanup_deletes_document_stores_leased_to_the_channel() {
+        let lease_key = channel_lease_key("verifiedchannel").unwrap();
+        let store_path = "/v1/projects/project/databases/(default)/documents/pay-data/0123456789abcdef/documentStores/fds-0123456789abcdef-weather";
+        let document = json!({
+            "name": "projects/project/databases/(default)/documents/pay-data/0123456789abcdef/documentStores/fds-0123456789abcdef-weather",
+            "fields": {
+                "logicalName": { "stringValue": "weather" },
+                "driver": { "stringValue": DRIVER_ID },
+                "class": { "stringValue": CLASS_ID },
+                "region": { "stringValue": "us-central1" },
+                "reclaimPolicy": { "stringValue": "delete" },
+                "gatewayReads": { "booleanValue": false },
+                "tenant": { "stringValue": "0123456789abcdef" },
+                "payChannel": { "stringValue": lease_key },
+                "phase": { "stringValue": "ready" }
+            }
+        });
+        let app = Router::new().fallback(move |request: Request<Body>| {
+            let document = document.clone();
+            let lease_key = lease_key.clone();
+            async move {
+                let method = request.method().clone();
+                let path = request.uri().path().to_string();
+                match (method.as_str(), path.as_str()) {
+                    ("POST", "/v1/projects/project/databases/(default)/documents:runQuery") => {
+                        let body = axum::body::to_bytes(request.into_body(), 64 * 1024)
+                            .await
+                            .unwrap();
+                        let body: Value = serde_json::from_slice(&body).unwrap();
+                        if body.pointer("/structuredQuery/from/0/collectionId")
+                            != Some(&Value::String("documentStores".into()))
+                            || body.pointer("/structuredQuery/where/fieldFilter/value/stringValue")
+                                != Some(&Value::String(lease_key))
+                        {
+                            return json_response(StatusCode::BAD_REQUEST, json!({}));
+                        }
+                        json_response(StatusCode::OK, json!([{ "document": document }]))
+                    }
+                    ("GET", path) if path == store_path => json_response(StatusCode::OK, document),
+                    ("PATCH", path) if path == store_path => {
+                        json_response(StatusCode::OK, json!({}))
+                    }
+                    ("GET", path) if path == format!("{store_path}/documents") => {
+                        json_response(StatusCode::OK, json!({}))
+                    }
+                    ("DELETE", path) if path == store_path => {
+                        json_response(StatusCode::OK, json!({}))
+                    }
+                    _ => json_response(StatusCode::NOT_FOUND, json!({ "path": path })),
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let driver = FirestoreDriver::new(FirestoreConfig {
+            project: "project".into(),
+            database: "(default)".into(),
+            region: "us-central1".into(),
+            api_base: base,
+            metadata_base: "http://metadata.invalid".into(),
+            access_token: Some("token".into()),
+        })
+        .unwrap();
+
+        assert_eq!(driver.cleanup_channel("verifiedchannel").await.unwrap(), 1);
+        server.abort();
+    }
+
+    #[test]
+    fn channel_ids_map_to_stable_lease_keys() {
+        assert_eq!(
+            channel_lease_key("verifiedchannel").unwrap(),
+            "8e8a355d709e16245dcd6748262bec1a"
+        );
+        assert!(channel_lease_key("").is_err());
+    }
 
     #[test]
     fn store_ids_are_tenant_scoped() {
         let tenant = Tenant {
             payer: "payer".into(),
             key: "0123456789abcdef".into(),
+            channel_id: "channel".into(),
         };
         let config = FirestoreConfig {
             project: "project".into(),

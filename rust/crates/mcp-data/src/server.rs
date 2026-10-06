@@ -28,6 +28,7 @@ use crate::types::{
 };
 
 pub const VERIFIED_PAYER_HEADER: &str = "x-pay-verified-payer";
+pub const VERIFIED_CHANNEL_HEADER: &str = "x-pay-verified-channel";
 pub const PROXY_PROOF_HEADER: &str = "x-pay-proxy-proof";
 pub const ORIGINAL_HOST_HEADER: &str = "x-pay-original-host";
 pub const USAGE_HEADER: &str = "x-pay-gcp-data-microusd";
@@ -315,6 +316,7 @@ async fn binding_get_document(
                 &Tenant {
                     payer: String::new(),
                     key: capability.tenant,
+                    channel_id: String::new(),
                 },
                 DocumentRequest {
                     driver: capability.driver,
@@ -347,6 +349,7 @@ async fn binding_put_document(
                 &Tenant {
                     payer: String::new(),
                     key: capability.tenant,
+                    channel_id: String::new(),
                 },
                 PutDocumentRequest {
                     driver: capability.driver,
@@ -379,6 +382,7 @@ async fn binding_delete_document(
                 &Tenant {
                     payer: String::new(),
                     key: capability.tenant,
+                    channel_id: String::new(),
                 },
                 DocumentRequest {
                     driver: capability.driver,
@@ -442,7 +446,14 @@ async fn verified_tenant(
         .headers()
         .get(VERIFIED_PAYER_HEADER)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| tenant_from_payer(value).ok());
+        .and_then(|payer| {
+            let channel_id = request
+                .headers()
+                .get(VERIFIED_CHANNEL_HEADER)?
+                .to_str()
+                .ok()?;
+            tenant_from_verified_session(payer, channel_id).ok()
+        });
     match (proxy_verified, tenant) {
         (true, Some(tenant)) => {
             request.extensions_mut().insert(tenant);
@@ -519,6 +530,12 @@ async fn gateway_read_inner(state: AppState, request: Request) -> crate::driver:
     Ok(response)
 }
 
+fn tenant_from_verified_session(payer: &str, channel_id: &str) -> crate::driver::Result<Tenant> {
+    let mut tenant = tenant_from_payer(payer)?;
+    tenant.channel_id = validate_channel_id(channel_id)?.to_string();
+    Ok(tenant)
+}
+
 fn tenant_from_payer(payer: &str) -> crate::driver::Result<Tenant> {
     let decoded = bs58::decode(payer)
         .into_vec()
@@ -536,7 +553,20 @@ fn tenant_from_payer(payer: &str) -> crate::driver::Result<Tenant> {
     Ok(Tenant {
         payer: payer.to_string(),
         key,
+        channel_id: String::new(),
     })
+}
+
+fn validate_channel_id(channel_id: &str) -> crate::driver::Result<&str> {
+    if channel_id.is_empty()
+        || channel_id.len() > 128
+        || !channel_id.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    {
+        return Err(DataError::InvalidRequest(
+            "verified payment channel is invalid".into(),
+        ));
+    }
+    Ok(channel_id)
 }
 
 #[cfg(test)]
@@ -627,6 +657,7 @@ mod tests {
                 Request::builder()
                     .uri("/")
                     .header(VERIFIED_PAYER_HEADER, payer)
+                    .header(VERIFIED_CHANNEL_HEADER, "verifiedchannel")
                     .header(PROXY_PROOF_HEADER, "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
                     .body(Body::empty())
                     .unwrap(),

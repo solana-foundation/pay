@@ -63,6 +63,9 @@ pub trait DataDriver: Send + Sync {
     async fn put_document(&self, tenant: &Tenant, request: PutDocumentRequest) -> Result<Document>;
     async fn delete_document(&self, tenant: &Tenant, request: DocumentRequest) -> Result<()>;
     async fn read_gateway(&self, request: GatewayReadRequest) -> Result<GatewayRead>;
+    /// Delete or reclaim all provider resources funded by `channel_id`. This
+    /// must be idempotent because the lifecycle worker retries failures.
+    async fn cleanup_channel(&self, channel_id: &str) -> Result<usize>;
 }
 
 #[derive(Clone, Default)]

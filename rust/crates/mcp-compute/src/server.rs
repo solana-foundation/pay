@@ -26,6 +26,7 @@ use crate::types::{
 };
 
 pub const VERIFIED_PAYER_HEADER: &str = "x-pay-verified-payer";
+pub const VERIFIED_CHANNEL_HEADER: &str = "x-pay-verified-channel";
 pub const ORIGINAL_HOST_HEADER: &str = "x-pay-original-host";
 pub const USAGE_HEADER: &str = "x-pay-gcp-cpu-microusd";
 const MAX_GATEWAY_BODY_BYTES: usize = 10 * 1024 * 1024;
@@ -265,12 +266,19 @@ async fn health() -> Json<serde_json::Value> {
 }
 
 async fn verified_tenant(mut request: Request, next: Next) -> Response {
-    let payer = request
+    let tenant = request
         .headers()
         .get(VERIFIED_PAYER_HEADER)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| tenant_from_payer(value).ok());
-    match payer {
+        .and_then(|payer| {
+            let channel_id = request
+                .headers()
+                .get(VERIFIED_CHANNEL_HEADER)?
+                .to_str()
+                .ok()?;
+            tenant_from_verified_session(payer, channel_id).ok()
+        });
+    match tenant {
         Some(tenant) => {
             request.extensions_mut().insert(tenant);
             next.run(request).await
@@ -402,6 +410,12 @@ fn gateway_path_target(uri: &axum::http::Uri) -> crate::driver::Result<(String, 
     Ok((deployment_id.to_string(), upstream_path))
 }
 
+fn tenant_from_verified_session(payer: &str, channel_id: &str) -> crate::driver::Result<Tenant> {
+    let mut tenant = tenant_from_payer(payer)?;
+    tenant.channel_id = validate_channel_id(channel_id)?.to_string();
+    Ok(tenant)
+}
+
 fn tenant_from_payer(payer: &str) -> crate::driver::Result<Tenant> {
     let decoded = bs58::decode(payer)
         .into_vec()
@@ -419,7 +433,20 @@ fn tenant_from_payer(payer: &str) -> crate::driver::Result<Tenant> {
     Ok(Tenant {
         payer: payer.to_string(),
         key,
+        channel_id: String::new(),
     })
+}
+
+fn validate_channel_id(channel_id: &str) -> crate::driver::Result<&str> {
+    if channel_id.is_empty()
+        || channel_id.len() > 128
+        || !channel_id.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    {
+        return Err(ComputeError::InvalidRequest(
+            "verified payment channel is invalid".into(),
+        ));
+    }
+    Ok(channel_id)
 }
 
 #[cfg(test)]

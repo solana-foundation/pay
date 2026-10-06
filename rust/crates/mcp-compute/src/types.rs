@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 pub struct Tenant {
     pub payer: String,
     pub key: String,
+    /// Payment channel funding resources created by this control-plane call.
+    pub channel_id: String,
 }
 
 fn default_provider() -> String {
@@ -105,7 +107,7 @@ pub enum TriggerSpec {
         /// Reusable MPP session authorization for the paid gateway. Each run
         /// is metered against that session and stops executing when its funded
         /// channel is exhausted or expires. The MCP fills this from the
-        /// current paid session; callers normally omit it.
+        /// current paid session and ignores caller-supplied values.
         #[serde(default)]
         authorization: Option<String>,
     },
@@ -151,12 +153,12 @@ pub struct DeployRequest {
 
 impl DeployRequest {
     pub fn supply_schedule_authorization(&mut self, value: Option<&str>) {
-        let Some(value) = value else { return };
         for trigger in &mut self.triggers {
             let TriggerSpec::Schedule { authorization, .. } = trigger;
-            if authorization.is_none() {
-                *authorization = Some(value.to_string());
-            }
+            // The schedule and resource lease must be funded by the same
+            // verified session as this deployment. Never trust an MCP payload
+            // to select a different reusable bearer credential.
+            *authorization = value.map(str::to_string);
         }
     }
 }
@@ -302,4 +304,44 @@ pub struct GatewayInvocation {
     pub body: bytes::Bytes,
     pub elapsed_ms: u64,
     pub billed_micro_usd: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verified_session_overrides_caller_supplied_schedule_credential() {
+        let mut request = DeployRequest {
+            provider: default_provider(),
+            name: "weather".into(),
+            region: None,
+            source: SourceInput::Inline {
+                files: BTreeMap::new(),
+            },
+            runtime: RuntimeSpec {
+                runtime: "nodejs22".into(),
+                entrypoint: "weather".into(),
+            },
+            limits: ResourceLimits::default(),
+            environment: BTreeMap::new(),
+            access: AccessPolicy::default(),
+            service_bindings: Vec::new(),
+            triggers: vec![TriggerSpec::Schedule {
+                cron: "*/5 * * * *".into(),
+                timezone: default_schedule_timezone(),
+                path: default_schedule_path(),
+                authorization: Some("Payment attacker".into()),
+            }],
+            provider_options: serde_json::Value::Null,
+        };
+
+        request.supply_schedule_authorization(Some("Payment verified"));
+        let TriggerSpec::Schedule { authorization, .. } = &request.triggers[0];
+        assert_eq!(authorization.as_deref(), Some("Payment verified"));
+
+        request.supply_schedule_authorization(None);
+        let TriggerSpec::Schedule { authorization, .. } = &request.triggers[0];
+        assert!(authorization.is_none());
+    }
 }

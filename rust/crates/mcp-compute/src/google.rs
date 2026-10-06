@@ -9,6 +9,7 @@ use futures_util::StreamExt;
 use reqwest::{Method, StatusCode};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 use zip::write::SimpleFileOptions;
 
@@ -413,6 +414,7 @@ impl GoogleCloudFunctionsDriver {
 
     fn function_body(
         &self,
+        tenant: &Tenant,
         request: &DeployRequest,
         resource_name: &str,
         storage_source: Value,
@@ -447,6 +449,7 @@ impl GoogleCloudFunctionsDriver {
         );
         labels.insert("pay-name".into(), request.name.clone());
         labels.insert("pay-exposure".into(), exposure.into());
+        labels.insert("pay-channel".into(), channel_lease_key(&tenant.channel_id)?);
         if request.limits.min_instances.unwrap_or(0) != 0 {
             return Err(ComputeError::InvalidRequest(
                 "min_instances is not supported yet because idle instance cost cannot be attributed to an invocation; use 0 or omit it".into(),
@@ -675,7 +678,7 @@ impl ComputeDriver for GoogleCloudFunctionsDriver {
             })?
         };
         let storage = self.source_storage(&request, &region).await?;
-        let function = self.function_body(&request, &resource_name, storage, options)?;
+        let function = self.function_body(tenant, &request, &resource_name, storage, options)?;
         let exists = self.function_exists(&resource_name).await?;
         let operation = if exists {
             self.require_json(
@@ -899,6 +902,73 @@ impl ComputeDriver for GoogleCloudFunctionsDriver {
         )
         .await
     }
+
+    async fn cleanup_channel(&self, channel_id: &str) -> Result<usize> {
+        let lease_key = channel_lease_key(channel_id)?;
+        let mut page_token: Option<String> = None;
+        let mut resources = Vec::new();
+        loop {
+            let mut url = url::Url::parse(&format!(
+                "{}/v2/projects/{}/locations/-/functions",
+                self.config.api_base, self.config.project
+            ))
+            .map_err(|error| ComputeError::Configuration(error.to_string()))?;
+            url.query_pairs_mut().append_pair("pageSize", "1000");
+            if let Some(token) = page_token.as_deref() {
+                url.query_pairs_mut().append_pair("pageToken", token);
+            }
+            let value = self.require_json(Method::GET, url.into(), None).await?;
+            resources.extend(
+                value
+                    .get("functions")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter(|function| {
+                        function
+                            .pointer("/labels/pay-channel")
+                            .and_then(Value::as_str)
+                            == Some(lease_key.as_str())
+                            && function
+                                .pointer("/labels/managed-by")
+                                .and_then(Value::as_str)
+                                == Some("mcp-compute")
+                    })
+                    .filter_map(|function| {
+                        function
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    }),
+            );
+            page_token = value
+                .get("nextPageToken")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .filter(|token| !token.is_empty());
+            if page_token.is_none() {
+                break;
+            }
+        }
+
+        for resource in &resources {
+            let tenant = Tenant {
+                payer: String::new(),
+                key: tenant_label_from_resource(resource)?,
+                channel_id: channel_id.to_string(),
+            };
+            self.delete(
+                &tenant,
+                ResourceRequest {
+                    provider: DRIVER_ID.into(),
+                    id: resource.clone(),
+                    region: None,
+                },
+            )
+            .await?;
+        }
+        Ok(resources.len())
+    }
 }
 
 fn source_zip(source: &SourceInput) -> Result<Vec<u8>> {
@@ -1043,6 +1113,19 @@ fn validate_owned_function_name(tenant: &Tenant, name: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn channel_lease_key(channel_id: &str) -> Result<String> {
+    if channel_id.is_empty() {
+        return Err(ComputeError::InvalidRequest(
+            "resource deployment requires a verified payment channel".into(),
+        ));
+    }
+    let digest = Sha256::digest(channel_id.as_bytes());
+    Ok(digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 fn tenant_label_from_resource(resource: &str) -> Result<String> {
@@ -1367,6 +1450,91 @@ fn json_provider_error(status: StatusCode, value: &Value) -> ComputeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::Request;
+    use axum::response::Response;
+
+    fn json_response(status: StatusCode, value: Value) -> Response {
+        Response::builder()
+            .status(status)
+            .header("content-type", "application/json")
+            .body(Body::from(value.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cleanup_deletes_only_functions_leased_to_the_channel() {
+        let lease_key = channel_lease_key("verifiedchannel").unwrap();
+        let app = Router::new().fallback(move |request: Request<Body>| {
+            let lease_key = lease_key.clone();
+            async move {
+                let path = request.uri().path();
+                match (request.method().as_str(), path) {
+                    ("GET", "/v2/projects/project/locations/-/functions") => json_response(
+                        StatusCode::OK,
+                        json!({
+                            "functions": [
+                                {
+                                    "name": "projects/project/locations/us-central1/functions/gcf-0123456789abcdef-weather",
+                                    "labels": { "managed-by": "mcp-compute", "pay-channel": lease_key }
+                                },
+                                {
+                                    "name": "projects/project/locations/us-central1/functions/gcf-fedcba9876543210-other",
+                                    "labels": { "managed-by": "mcp-compute", "pay-channel": "other" }
+                                }
+                            ]
+                        }),
+                    ),
+                    ("GET", "/v2/projects/project/locations/us-central1/functions/gcf-0123456789abcdef-weather") => json_response(
+                        StatusCode::OK,
+                        json!({
+                            "name": "projects/project/locations/us-central1/functions/gcf-0123456789abcdef-weather",
+                            "labels": { "pay-tenant": "0123456789abcdef" }
+                        }),
+                    ),
+                    ("DELETE", "/v1/projects/project/locations/us-central1/jobs/gcf-0123456789abcdef-weather") => {
+                        json_response(StatusCode::NOT_FOUND, json!({}))
+                    }
+                    ("DELETE", "/v2/projects/project/locations/us-central1/functions/gcf-0123456789abcdef-weather") => json_response(
+                        StatusCode::OK,
+                        json!({ "name": "projects/project/locations/us-central1/operations/delete-weather" }),
+                    ),
+                    _ => json_response(StatusCode::NOT_FOUND, json!({ "path": path })),
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let driver = GoogleCloudFunctionsDriver::new(GoogleConfig {
+            project: "project".into(),
+            default_region: "us-central1".into(),
+            api_base: base.clone(),
+            metadata_base: "http://metadata.invalid".into(),
+            access_token: Some("token".into()),
+            identity_token: None,
+            allow_unauthenticated_invoke: false,
+            function_service_account: None,
+            build_service_account: None,
+            scheduler_api_base: base,
+            scheduler_service_account: Some("scheduler@example.invalid".into()),
+            gateway_domain: "cpu.example.invalid".into(),
+        })
+        .unwrap();
+
+        assert_eq!(driver.cleanup_channel("verifiedchannel").await.unwrap(), 1);
+        server.abort();
+    }
+
+    #[test]
+    fn channel_ids_map_to_stable_label_safe_lease_keys() {
+        assert_eq!(
+            channel_lease_key("verifiedchannel").unwrap(),
+            "8e8a355d709e16245dcd6748262bec1a"
+        );
+        assert!(channel_lease_key("").is_err());
+    }
 
     #[test]
     fn inline_source_is_zipped_and_rejects_traversal() {

@@ -5362,6 +5362,8 @@ dependencies = [
  "figment",
  "five8",
  "futures",
+ "mcp-compute",
+ "mcp-data",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry-semantic-conventions",
