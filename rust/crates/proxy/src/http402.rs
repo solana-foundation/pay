@@ -804,7 +804,11 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
         let path = uri.path().trim_start_matches('/').to_string();
         ctx.request_path = format!("/{path}");
         let str_h = |n: &str| headers.get(n).and_then(|v| v.to_str().ok());
-        let host = str_h("host").map(str::to_string);
+        // HTTP/2 carries the request host in `:authority`, which Pingora
+        // exposes on the URI rather than in the regular header map. Preserve
+        // that hostname for routing and for the trusted upstream identity
+        // header used by wildcard compute/data gateways.
+        let host = request_host(&headers, &uri);
 
         // Capture request-side facts for the PDB exchange emitted in `logging`.
         // Skip the control plane's own paths (`/__402/*`, `/openapi.json`,
@@ -1331,6 +1335,17 @@ fn header_pairs_from_owned(headers: Vec<(HeaderName, HeaderValue)>) -> Vec<(Stri
         .collect()
 }
 
+fn request_host(headers: &HeaderMap, uri: &Uri) -> Option<String> {
+    headers
+        .get(http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| {
+            uri.authority()
+                .map(|authority| authority.as_str().to_string())
+        })
+}
+
 fn is_sensitive_log_header(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     matches!(
@@ -1569,9 +1584,9 @@ mod tests {
     use super::{
         BatchResponseCapture, Http402Gate, MAX_BATCH_CACHED_RESPONSE_BYTES,
         buffered_upstream_headers, filtered_response_headers, header_pairs, is_control_plane,
-        is_streamed_response,
+        is_streamed_response, request_host,
     };
-    use http::{HeaderMap, HeaderValue, StatusCode, header};
+    use http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
     use pay_core::PaymentState;
     use pay_core::server::gate::delegated_session_receipt_annotation;
     use pay_core::server::proxy::UpstreamPlan;
@@ -1595,6 +1610,34 @@ mod tests {
         fn mpp(&self) -> Option<&pay_kit::mpp::server::Mpp> {
             None
         }
+    }
+
+    #[test]
+    fn request_host_falls_back_to_http2_authority() {
+        let headers = HeaderMap::new();
+        let uri: Uri = "https://worker.cpu.gcp.gateway-402.com/latest"
+            .parse()
+            .unwrap();
+
+        assert_eq!(
+            request_host(&headers, &uri).as_deref(),
+            Some("worker.cpu.gcp.gateway-402.com")
+        );
+    }
+
+    #[test]
+    fn request_host_prefers_explicit_host_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::HOST,
+            HeaderValue::from_static("explicit.example"),
+        );
+        let uri: Uri = "https://authority.example/latest".parse().unwrap();
+
+        assert_eq!(
+            request_host(&headers, &uri).as_deref(),
+            Some("explicit.example")
+        );
     }
 
     fn body_signing_api() -> ApiSpec {
