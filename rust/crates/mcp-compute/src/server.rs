@@ -18,6 +18,7 @@ use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+use crate::binding::DataBindingClient;
 use crate::driver::{ComputeError, DriverRegistry};
 use crate::types::{
     DeployRequest, GatewayInvokeRequest, InvokeRequest, ListRequest, OperationRequest,
@@ -34,13 +35,15 @@ pub struct ComputeMcp {
     #[allow(dead_code)]
     tool_router: rmcp::handler::server::router::tool::ToolRouter<Self>,
     drivers: DriverRegistry,
+    bindings: Option<DataBindingClient>,
 }
 
 impl ComputeMcp {
-    pub fn new(drivers: DriverRegistry) -> Self {
+    pub fn new(drivers: DriverRegistry, bindings: Option<DataBindingClient>) -> Self {
         Self {
             tool_router: Self::tool_router(),
             drivers,
+            bindings,
         }
     }
 
@@ -81,10 +84,41 @@ impl ComputeMcp {
     )]
     async fn deploy(
         &self,
-        Parameters(request): Parameters<DeployRequest>,
+        Parameters(mut request): Parameters<DeployRequest>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let tenant = Self::tenant(&ctx)?;
+        let binding_result = async {
+            if request.service_bindings.is_empty() {
+                return Ok(());
+            }
+            if request
+                .environment
+                .keys()
+                .any(|key| key.starts_with("PAY_BINDING_"))
+            {
+                return Err(ComputeError::InvalidRequest(
+                    "environment keys beginning with `PAY_BINDING_` are reserved for managed service bindings"
+                        .into(),
+                ));
+            }
+            let resolver = self.bindings.as_ref().ok_or_else(|| {
+                ComputeError::Configuration(
+                    "managed service bindings are not configured for this compute service".into(),
+                )
+            })?;
+            let workload_id = format!("{}-{}", tenant.key, request.name);
+            let resolved = resolver
+                .resolve(&tenant, &workload_id, &request.service_bindings)
+                .await?;
+            request.environment.extend(resolved.environment);
+            request.resolved_binding_secrets.extend(resolved.secrets);
+            Ok(())
+        }
+        .await;
+        if let Err(error) = binding_result {
+            return Self::result::<serde_json::Value>(Err(error));
+        }
         let result = match self.drivers.get(&request.provider) {
             Ok(driver) => driver.deploy(&tenant, request).await,
             Err(error) => Err(error),
@@ -196,12 +230,14 @@ pub fn router(
     drivers: DriverRegistry,
     gateway_domain: String,
     allowed_hosts: Vec<String>,
+    bindings: Option<DataBindingClient>,
 ) -> Router {
     let transport = StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts);
     let mcp_drivers = drivers.clone();
+    let mcp_bindings = bindings.clone();
     let service: StreamableHttpService<ComputeMcp, LocalSessionManager> =
         StreamableHttpService::new(
-            move || Ok(ComputeMcp::new(mcp_drivers.clone())),
+            move || Ok(ComputeMcp::new(mcp_drivers.clone(), mcp_bindings.clone())),
             Default::default(),
             transport,
         );

@@ -134,10 +134,10 @@ impl GoogleCloudFunctionsDriver {
         if let Some(token) = &self.config.access_token {
             return Ok(token.clone());
         }
-        if let Some(cached) = self.token.read().await.as_ref() {
-            if Instant::now() < cached.refresh_after {
-                return Ok(cached.value.clone());
-            }
+        if let Some(cached) = self.token.read().await.as_ref()
+            && Instant::now() < cached.refresh_after
+        {
+            return Ok(cached.value.clone());
         }
         let url = format!(
             "{}/instance/service-accounts/default/token",
@@ -164,7 +164,7 @@ impl GoogleCloudFunctionsDriver {
         Ok(token.access_token)
     }
 
-    async fn identity_token(&self, audience: &str) -> Result<Option<String>> {
+    pub(crate) async fn identity_token(&self, audience: &str) -> Result<Option<String>> {
         if self.config.allow_unauthenticated_invoke {
             return Ok(None);
         }
@@ -345,6 +345,21 @@ impl GoogleCloudFunctionsDriver {
         service.insert("timeoutSeconds".into(), json!(timeout));
         service.insert("ingressSettings".into(), json!(ingress));
         service.insert("environmentVariables".into(), json!(request.environment));
+        if !request.resolved_binding_secrets.is_empty() {
+            let secrets: Vec<Value> = request
+                .resolved_binding_secrets
+                .iter()
+                .map(|(key, secret)| {
+                    json!({
+                        "key": key,
+                        "projectId": self.config.project,
+                        "secret": secret,
+                        "version": "latest"
+                    })
+                })
+                .collect();
+            service.insert("secretEnvironmentVariables".into(), json!(secrets));
+        }
         if let Some(memory) = request.limits.memory_mb {
             if !(128..=32768).contains(&memory) {
                 return Err(ComputeError::InvalidRequest(
