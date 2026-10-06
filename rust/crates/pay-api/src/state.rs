@@ -8,7 +8,8 @@ use pay_api_types::Network;
 use pay_kit::mpp::server::{self, ConfidentialHandle, ConfidentialWorkerConfig};
 
 use crate::config::{
-    Config, FeePayerConfig, MoonpayConfig, NetworkConfig, SendConfig, SubscriptionsConfig,
+    ChannelsConfig, Config, FeePayerConfig, MoonpayConfig, NetworkConfig, SendConfig,
+    SubscriptionsConfig,
 };
 use crate::endpoints::redeem::RedemptionState;
 use crate::endpoints::transfer_batches::PushState;
@@ -31,6 +32,9 @@ pub struct AppState {
     /// `send.fee_payer` so a single deployment shares one KMS-backed
     /// signer across both endpoints.
     pub subscriptions_fee_payer: FeePayerConfig,
+    pub channels: ChannelsConfig,
+    pub channels_challenge_binding_secret: Option<String>,
+    pub channels_fee_payer: FeePayerConfig,
     /// Resolved `/v1/redeem` settings. `None` when `redemption.enabled`
     /// is false; the handler returns 503 in that case.
     pub redemption: Option<RedemptionState>,
@@ -64,6 +68,10 @@ impl AppState {
             .subscriptions_challenge_binding_secret()
             .map(str::to_string);
         let subscriptions_fee_payer = config.effective_subscriptions_fee_payer();
+        let channels_challenge_binding_secret = config
+            .channels_challenge_binding_secret()
+            .map(str::to_string);
+        let channels_fee_payer = config.effective_channels_fee_payer();
 
         let redemption = if config.redemption.enabled {
             Some(RedemptionState::from_config(&config.redemption)?)
@@ -89,6 +97,9 @@ impl AppState {
             subscriptions: config.subscriptions.clone(),
             subscriptions_challenge_binding_secret,
             subscriptions_fee_payer,
+            channels: config.channels.clone(),
+            channels_challenge_binding_secret,
+            channels_fee_payer,
             redemption,
             confidential,
             push,

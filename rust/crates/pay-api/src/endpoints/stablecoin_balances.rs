@@ -5,7 +5,9 @@ use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use pay_api_core::{Error, fetch_credit_balances, fetch_stablecoin_balances};
+use pay_api_core::{
+    Error, fetch_committable_channel_balances, fetch_credit_balances, fetch_stablecoin_balances,
+};
 use pay_api_types::Network;
 use serde::Deserialize;
 use serde_json::json;
@@ -33,9 +35,10 @@ pub async fn handler(
         .map_err(ApiError)?;
     let rpc_url = state.rpc_url_for(network).map_err(ApiError)?;
 
-    let (balances, credits) = tokio::join!(
+    let (balances, credits, channel_balances) = tokio::join!(
         fetch_stablecoin_balances(&state.rpc, rpc_url, &owner, network, &state.stablecoins),
-        fetch_credit_balances(&state.rpc, rpc_url, &owner, network, &state.credit_programs,)
+        fetch_credit_balances(&state.rpc, rpc_url, &owner, network, &state.credit_programs,),
+        fetch_committable_channel_balances(&state.rpc, rpc_url, &owner, &state.stablecoins),
     );
     let mut balances = balances.map_err(ApiError)?;
     match credits {
@@ -47,6 +50,18 @@ pub async fn handler(
                 address = %owner,
                 ?network,
                 "credit balance lookup failed; returning token balances"
+            );
+        }
+    }
+    match channel_balances {
+        Ok(channel_balances) => balances.committable_channel_balances = channel_balances,
+        Err(error) => {
+            balances.channel_balances_unavailable = true;
+            warn!(
+                %error,
+                address = %owner,
+                ?network,
+                "payment-channel balance lookup failed; returning wallet balances"
             );
         }
     }

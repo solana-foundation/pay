@@ -236,6 +236,10 @@ pub fn format_balance_display(
                     credit.ui_amount, credit.currency
                 ));
             }
+            for channel in &bal.committable_channels {
+                let label = channel.symbol_or(&channel.mint[..8]);
+                parts.push(format!("{:.2} {label} in channels", channel.ui_amount));
+            }
             if parts.is_empty() {
                 explorer_link(pubkey, rpc_url)
             } else {

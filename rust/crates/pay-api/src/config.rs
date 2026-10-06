@@ -44,6 +44,10 @@ pub struct Config {
     #[serde(default)]
     pub subscriptions: SubscriptionsConfig,
 
+    /// Sponsored payment-channel lifecycle operations.
+    #[serde(default)]
+    pub channels: ChannelsConfig,
+
     /// `/v1/redeem` activation-campaign configuration. Reuses
     /// `send.fee_payer.*` as the hot wallet that holds the USDC pool
     /// and signs payouts.
@@ -301,6 +305,45 @@ fn default_cancel_estimated_fee_lamports() -> u64 {
 
 fn default_confirm_timeout_seconds() -> u64 {
     30
+}
+
+/// `/v1/channels/*` sponsorship configuration. The operator pays SOL for the
+/// requested lifecycle transaction and receives the cost-equivalent amount in
+/// the selected stablecoin through an MPP charge.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ChannelsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_channels_realm")]
+    pub realm: String,
+    #[serde(default)]
+    pub mpp_challenge_binding_secret: Option<String>,
+    #[serde(default = "default_cancel_estimated_fee_lamports")]
+    pub estimated_fee_lamports: u64,
+    #[serde(default = "default_sol_price_asset")]
+    pub sol_price_asset: String,
+    #[serde(default)]
+    pub fee_payer: FeePayerConfig,
+    #[serde(default = "default_confirm_timeout_seconds")]
+    pub confirm_timeout_seconds: u64,
+}
+
+impl Default for ChannelsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            realm: default_channels_realm(),
+            mpp_challenge_binding_secret: None,
+            estimated_fee_lamports: default_cancel_estimated_fee_lamports(),
+            sol_price_asset: default_sol_price_asset(),
+            fee_payer: FeePayerConfig::default(),
+            confirm_timeout_seconds: default_confirm_timeout_seconds(),
+        }
+    }
+}
+
+fn default_channels_realm() -> String {
+    "pay-api channels".to_string()
 }
 
 /// `/v1/redeem` config. Hot wallet is shared with `/v1/send` —
@@ -827,6 +870,27 @@ impl Config {
         }
     }
 
+    pub fn channels_challenge_binding_secret(&self) -> Option<&str> {
+        self.channels
+            .mpp_challenge_binding_secret
+            .as_deref()
+            .or(self.send.mpp_challenge_binding_secret.as_deref())
+    }
+
+    pub fn effective_channels_fee_payer(&self) -> FeePayerConfig {
+        fn nonblank(value: &Option<String>) -> Option<&str> {
+            value.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        }
+        FeePayerConfig {
+            key_name: nonblank(&self.channels.fee_payer.key_name)
+                .or_else(|| nonblank(&self.send.fee_payer.key_name))
+                .map(str::to_string),
+            pubkey: nonblank(&self.channels.fee_payer.pubkey)
+                .or_else(|| nonblank(&self.send.fee_payer.pubkey))
+                .map(str::to_string),
+        }
+    }
+
     fn validate(&self) -> Result<(), ConfigError> {
         if self.networks.is_empty() {
             return Err(ConfigError::Invalid(
@@ -988,6 +1052,39 @@ impl Config {
             if self.subscriptions.confirm_timeout_seconds == 0 {
                 return Err(ConfigError::Invalid(
                     "subscriptions.confirm_timeout_seconds must be greater than zero".into(),
+                ));
+            }
+        }
+        if self.channels.enabled {
+            if self
+                .channels_challenge_binding_secret()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+            {
+                return Err(ConfigError::Invalid(
+                    "channels.mpp_challenge_binding_secret (or send.mpp_challenge_binding_secret) is required when channels.enabled is true".into(),
+                ));
+            }
+            let effective = self.effective_channels_fee_payer();
+            if effective
+                .key_name
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+                || effective.pubkey.as_deref().unwrap_or("").trim().is_empty()
+            {
+                return Err(ConfigError::Invalid(
+                    "channels.fee_payer key_name and pubkey (or send.fee_payer) are required when channels.enabled is true".into(),
+                ));
+            }
+            if self.channels.estimated_fee_lamports == 0
+                || self.channels.confirm_timeout_seconds == 0
+                || self.channels.sol_price_asset.trim().is_empty()
+            {
+                return Err(ConfigError::Invalid(
+                    "channels fee estimate, confirmation timeout, and SOL price asset must be configured".into(),
                 ));
             }
         }

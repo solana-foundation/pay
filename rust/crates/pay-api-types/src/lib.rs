@@ -62,6 +62,16 @@ pub struct StablecoinBalances {
     pub address: String,
     pub network: Network,
     pub balances: Vec<StablecoinBalance>,
+    /// Sum, by mint, of the still-committable escrow in this payer's open
+    /// payment channels (`deposit - settled`). Kept separate from wallet-owned
+    /// balances because these funds are already held by channel PDAs.
+    #[serde(default)]
+    pub committable_channel_balances: Vec<StablecoinBalance>,
+    /// True when wallet balances were fetched but the independent payment-
+    /// channel scan failed. An empty channel balance list is not authoritative
+    /// when this is set.
+    #[serde(default)]
+    pub channel_balances_unavailable: bool,
     /// Program-backed USD credits keyed by the credit program address.
     #[serde(default)]
     pub credits: BTreeMap<String, CreditBalance>,

@@ -11,6 +11,8 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 
 use pay_api_types::{Network, StablecoinBalance, StablecoinBalances};
+use pay_kit::core::payment_channels::PAYMENT_CHANNELS_PROGRAM_ID;
+use pay_kit::generated::payment_channels::accounts::Channel;
 use serde::{Deserialize, Serialize};
 use solana_pubkey::Pubkey;
 
@@ -109,9 +111,60 @@ pub async fn fetch_stablecoin_balances(
         address: owner.to_string(),
         network,
         balances,
+        committable_channel_balances: Vec::new(),
+        channel_balances_unavailable: false,
         credits: BTreeMap::new(),
         credits_unavailable: false,
     })
+}
+
+const CHANNEL_ACCOUNT_SIZE: usize = 256;
+const CHANNEL_PAYER_OFFSET: usize = 88;
+const CHANNEL_STATUS_OPEN: u8 = 0;
+
+/// Sum the escrow that can still be committed in all open channels owned by
+/// `payer`. A payer memcmp keeps the scan scoped to one wallet; decoding then
+/// filters by status and configured stablecoin mint.
+pub async fn fetch_committable_channel_balances(
+    client: &RpcClient,
+    rpc_url: &str,
+    payer: &Pubkey,
+    coins: &[Stablecoin],
+) -> Result<Vec<StablecoinBalance>> {
+    let accounts = client
+        .get_program_accounts_filtered(
+            rpc_url,
+            PAYMENT_CHANNELS_PROGRAM_ID,
+            CHANNEL_ACCOUNT_SIZE,
+            CHANNEL_PAYER_OFFSET,
+            payer.as_ref(),
+        )
+        .await?;
+    let mut totals = BTreeMap::<Pubkey, u64>::new();
+    for account in accounts {
+        let channel = Channel::from_bytes(&account.data).map_err(|_| Error::RpcMalformed)?;
+        if channel.status != CHANNEL_STATUS_OPEN {
+            continue;
+        }
+        let mint = Pubkey::from(channel.mint.to_bytes());
+        let available = channel.deposit.saturating_sub(channel.settlement.settled);
+        let total = totals.entry(mint).or_default();
+        *total = total.saturating_add(available);
+    }
+
+    Ok(coins
+        .iter()
+        .map(|coin| {
+            let raw = totals.get(&coin.mint).copied().unwrap_or_default();
+            StablecoinBalance {
+                symbol: coin.symbol.clone(),
+                mint: coin.mint.to_string(),
+                decimals: coin.decimals,
+                raw_amount: raw.to_string(),
+                ui_amount: ui_amount(raw, coin.decimals),
+            }
+        })
+        .collect())
 }
 
 /// SPL Token / Token-2022 base account: amount is a u64 LE at offset 64.
@@ -131,6 +184,7 @@ fn ui_amount(raw: u64, decimals: u8) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pay_kit::generated::payment_channels::types::SettlementWatermarks;
 
     #[test]
     fn parse_amount_zero() {
@@ -190,5 +244,42 @@ mod tests {
         assert_eq!(p, TokenProgram::SplToken);
         let p: TokenProgram = serde_json::from_str("\"token_2022\"").unwrap();
         assert_eq!(p, TokenProgram::Token2022);
+    }
+
+    #[test]
+    fn channel_scan_constants_match_generated_account_layout() {
+        let payer = Pubkey::new_unique();
+        let address = |value: Pubkey| solana_address::Address::from(value.to_bytes());
+        let channel = Channel {
+            discriminator: 1,
+            version: 1,
+            bump: 255,
+            status: CHANNEL_STATUS_OPEN,
+            salt: 7,
+            deposit: 1_000_000,
+            settlement: SettlementWatermarks {
+                settled: 250_000,
+                payout_watermark: 100_000,
+            },
+            closure_started_at: 0,
+            payer_withdrawn_at: 0,
+            grace_period: 60,
+            distribution_hash: [0; 32],
+            payer: address(payer),
+            payee: address(Pubkey::new_unique()),
+            authorized_signer: address(Pubkey::new_unique()),
+            mint: address(Pubkey::new_unique()),
+            rent_payer: address(Pubkey::new_unique()),
+            open_slot: 42,
+        };
+        let encoded = borsh::to_vec(&channel).unwrap();
+
+        assert_eq!(encoded.len(), CHANNEL_ACCOUNT_SIZE);
+        assert_eq!(
+            &encoded[CHANNEL_PAYER_OFFSET..CHANNEL_PAYER_OFFSET + 32],
+            payer.as_ref()
+        );
+        let decoded = Channel::from_bytes(&encoded).unwrap();
+        assert_eq!(decoded.deposit - decoded.settlement.settled, 750_000);
     }
 }
