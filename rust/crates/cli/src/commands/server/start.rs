@@ -4272,6 +4272,21 @@ currencies:
     }
 
     #[test]
+    fn surfpool_prep_notice_body_redacts_rpc_credentials() {
+        let secret = "must-not-reach-logs";
+        let body = surfpool_prep_notice_body(
+            &format!("https://user:{secret}@rpc.example/v1/{secret}?api-key={secret}"),
+            &[],
+            &[],
+            &[],
+            false,
+        );
+
+        assert_eq!(body, "rpc: https://rpc.example");
+        assert!(!body.contains(secret));
+    }
+
+    #[test]
     fn stable_token_account_requirements_resolve_stable_mints_and_programs() {
         let configs = vec![
             resolve_currency("USDC", "localnet"),

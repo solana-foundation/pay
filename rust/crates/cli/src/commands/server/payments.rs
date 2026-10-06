@@ -122,6 +122,29 @@ pub(crate) struct PayoutRecipientTarget {
     pub(crate) pubkey: solana_pubkey::Pubkey,
 }
 
+/// Return a safe label for an RPC endpoint.
+///
+/// RPC URLs commonly carry API keys in their query string, userinfo, or path.
+/// Startup notices and errors are routinely exported to centralized logging,
+/// so they must never contain the configured URL verbatim.
+fn rpc_endpoint_label(rpc_url: &str) -> String {
+    let Ok(url) = reqwest::Url::parse(rpc_url) else {
+        return "<configured RPC endpoint>".to_string();
+    };
+    let Some(host) = url.host_str() else {
+        return "<configured RPC endpoint>".to_string();
+    };
+    let host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    match url.port() {
+        Some(port) => format!("{}://{host}:{port}", url.scheme()),
+        None => format!("{}://{host}", url.scheme()),
+    }
+}
+
 pub(crate) fn surfpool_funding_targets(
     recipient: &str,
     operator_pubkey: Option<&str>,
@@ -151,7 +174,7 @@ pub(crate) fn surfpool_prep_notice_body(
     stable_requirements: &[StableTokenAccountRequirement],
     auto_fund: bool,
 ) -> String {
-    let mut lines = vec![format!("rpc: {rpc_url}")];
+    let mut lines = vec![format!("rpc: {}", rpc_endpoint_label(rpc_url))];
     for target in targets {
         let wallet_action = if auto_fund && target.requires_sol {
             "funding"
@@ -275,13 +298,14 @@ pub(crate) async fn validate_funding_target_balances(
     targets: &[SurfpoolFundingTarget],
 ) -> pay_core::Result<Vec<FundingTargetBalance>> {
     let client = reqwest::Client::new();
+    let rpc_endpoint = rpc_endpoint_label(rpc_url);
     let mut balances = Vec::with_capacity(targets.len());
     for target in targets {
         let lamports = fetch_lamports(&client, rpc_url, &target.address).await?;
         if lamports == 0 {
             if target.requires_sol {
                 return Err(pay_core::Error::Config(format!(
-                    "{} wallet has 0 SOL\n{}\non `{network}` via {rpc_url}\n\n\
+                    "{} wallet has 0 SOL\n{}\non `{network}` via {rpc_endpoint}\n\n\
                      Startup aborted because payment configuration is not usable \
                      until this wallet exists on chain. Fund this address and \
                      restart the server.",
@@ -292,7 +316,7 @@ pub(crate) async fn validate_funding_target_balances(
                 crate::components::NoticeLevel::Warning,
                 "Payment recipient has 0 SOL",
                 &format!(
-                    "{}\non `{network}` via {rpc_url}\n\n\
+                    "{}\non `{network}` via {rpc_endpoint}\n\n\
                      Startup will continue because recipients do not sign or pay \
                      rent for stable token account creation.",
                     target.address
@@ -317,6 +341,7 @@ async fn fetch_lamports(
     rpc_url: &str,
     pubkey: &str,
 ) -> pay_core::Result<u64> {
+    let rpc_endpoint = rpc_endpoint_label(rpc_url);
     let resp = client
         .post(rpc_url)
         .json(&serde_json::json!({
@@ -329,28 +354,28 @@ async fn fetch_lamports(
         .await
         .map_err(|e| {
             pay_core::Error::Config(format!(
-                "Failed to fetch SOL balance for `{pubkey}` via {rpc_url}: {e}"
+                "Failed to fetch SOL balance for `{pubkey}` via {rpc_endpoint}: {e}"
             ))
         })?;
     let status = resp.status();
     if !status.is_success() {
         return Err(pay_core::Error::Config(format!(
-            "Failed to fetch SOL balance for `{pubkey}` via {rpc_url}: HTTP {status}"
+            "Failed to fetch SOL balance for `{pubkey}` via {rpc_endpoint}: HTTP {status}"
         )));
     }
     let value = resp.json::<serde_json::Value>().await.map_err(|e| {
         pay_core::Error::Config(format!(
-            "Invalid getBalance response for `{pubkey}` via {rpc_url}: {e}"
+            "Invalid getBalance response for `{pubkey}` via {rpc_endpoint}: {e}"
         ))
     })?;
     if let Some(err) = value.get("error") {
         return Err(pay_core::Error::Config(format!(
-            "getBalance failed for `{pubkey}` via {rpc_url}: {err}"
+            "getBalance failed for `{pubkey}` via {rpc_endpoint}: {err}"
         )));
     }
     value["result"]["value"].as_u64().ok_or_else(|| {
         pay_core::Error::Config(format!(
-            "getBalance response for `{pubkey}` via {rpc_url} did not include result.value"
+            "getBalance response for `{pubkey}` via {rpc_endpoint} did not include result.value"
         ))
     })
 }
@@ -411,6 +436,7 @@ pub(crate) async fn ensure_payout_recipient_token_accounts(
         None
     };
     let payer = signer.as_ref().map(|signer| signer.pubkey());
+    let rpc_endpoint = rpc_endpoint_label(rpc_url);
     let rpc = pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient::new(rpc_url.to_string());
     for recipient in recipients {
         for requirement in stable_requirements {
@@ -446,7 +472,7 @@ pub(crate) async fn ensure_payout_recipient_token_accounts(
                      mint: {}\n\
                      ata: {ata}\n\
                      network: {network}\n\
-                     rpc: {rpc_url}\n\n\
+                     rpc: {rpc_endpoint}\n\n\
                      Create this associated token account, or use the Surfpool \
                      localnet sandbox where pay can create it automatically.",
                     requirement.mint
