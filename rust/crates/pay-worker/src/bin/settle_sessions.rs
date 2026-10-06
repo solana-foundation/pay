@@ -1945,6 +1945,55 @@ async fn reconcile_batch_channel(
                 target_settled,
             )
         }
+        STATUS_CLOSING if now < onchain.close_deadline() => {
+            let onchain_signer = Pubkey::from(onchain.channel.authorized_signer.to_bytes());
+            let (signature, target_settled, expires_at) = close_voucher(
+                &state,
+                onchain.channel.settlement.settled,
+                &onchain_signer,
+                now,
+            )?;
+            instructions.extend(
+                payment_channels::build_settle_and_seal_instructions(
+                    operator,
+                    &channel_id,
+                    &onchain_signer,
+                    signature.as_ref(),
+                    target_settled,
+                    expires_at,
+                    &payment_channels::default_program_id(),
+                )
+                .map_err(|error| {
+                    JobError::TxBuild(format!("settle-and-seal instruction: {error}"))
+                })?,
+            );
+            let token_program = token_programs
+                .get(&onchain.mint())
+                .copied()
+                .ok_or_else(|| {
+                    JobError::TxBuild(format!(
+                        "token program unavailable for batch channel mint {}",
+                        onchain.mint()
+                    ))
+                })?;
+            let preimage = channel::recover_distribution_preimage(rpc, rpc_url, &onchain).await?;
+            instructions.push(
+                channel::build_distribute_ix(&onchain, treasury_owner, &token_program, &preimage).0,
+            );
+            (
+                BatchCandidateKind::FinalizeClose,
+                BatchStoreAction::MarkFinalized,
+                inventory_snapshot(
+                    true,
+                    STATUS_DISTRIBUTED,
+                    target_settled,
+                    target_settled,
+                    state.cumulative,
+                    &onchain.mint(),
+                ),
+                target_settled,
+            )
+        }
         STATUS_CLOSING if now >= onchain.close_deadline() => {
             instructions.push(channel::build_seal_ix(&channel_id));
             let token_program = token_programs
@@ -2142,7 +2191,12 @@ async fn reconcile_channel(
         });
     }
 
-    if channel_close_due(&state, now_ms) {
+    // A payer may request close directly through pay-api, so the on-chain
+    // state is authoritative even when this worker's Redis lifecycle did not
+    // initiate the close. Settle the newest voucher and distribute promptly.
+    if channel_close_due(&state, now_ms)
+        || matches!(onchain.channel.status, STATUS_CLOSING | STATUS_SEALED)
+    {
         let candidate = build_idle_close_candidate(
             rpc,
             rpc_url,
@@ -2330,7 +2384,10 @@ async fn build_idle_close_candidate(
     }
 
     let mut instructions = match onchain.channel.status {
-        STATUS_OPEN => {
+        status
+            if status == STATUS_OPEN
+                || (status == STATUS_CLOSING && now < onchain.close_deadline()) =>
+        {
             let onchain_signer = Pubkey::from(onchain.channel.authorized_signer.to_bytes());
             let (signature, cumulative, expires_at) = close_voucher(
                 state,
@@ -2353,7 +2410,6 @@ async fn build_idle_close_candidate(
         STATUS_CLOSING if now >= onchain.close_deadline() => {
             vec![channel::build_seal_ix(&onchain.address)]
         }
-        STATUS_CLOSING => return Ok(None),
         STATUS_DISTRIBUTED => return Ok(None),
         status => {
             return Err(JobError::TxBuild(format!(

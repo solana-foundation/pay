@@ -1,3 +1,4 @@
+pub mod channels;
 pub mod health;
 pub mod onramp;
 pub mod receipt;

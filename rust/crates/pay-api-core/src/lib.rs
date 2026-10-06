@@ -18,4 +18,7 @@ pub use pay_api_types::{
 };
 pub use receipt::{apply_confirmation_status, build_receipt, build_receipt_skeleton};
 pub use rpc::RpcClient;
-pub use stablecoin::{Stablecoin, StablecoinSpec, TokenProgram, fetch_stablecoin_balances};
+pub use stablecoin::{
+    Stablecoin, StablecoinSpec, TokenProgram, fetch_committable_channel_balances,
+    fetch_stablecoin_balances,
+};

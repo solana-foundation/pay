@@ -52,6 +52,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(endpoints::receipt::handler_by_path),
         )
         .route("/v1/send", post(endpoints::send::handler))
+        .route(
+            "/v1/channels/close",
+            post(endpoints::channels::close_handler),
+        )
         .route("/v1/redeem", post(endpoints::redeem::handler))
         .route(
             "/v1/subscriptions/cancel",

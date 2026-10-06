@@ -831,6 +831,8 @@ mod tests {
                 "USDT",
             )],
             credits: vec![],
+            committable_channels: vec![],
+            channel_balances_unavailable: false,
             credits_unavailable: false,
             tokens_unavailable: false,
         };
@@ -851,6 +853,8 @@ mod tests {
                 "USDG",
             )],
             credits: vec![],
+            committable_channels: vec![],
+            channel_balances_unavailable: false,
             credits_unavailable: false,
             tokens_unavailable: false,
         };
@@ -891,6 +895,8 @@ mod tests {
                 ),
             ],
             credits: vec![],
+            committable_channels: vec![],
+            channel_balances_unavailable: false,
             credits_unavailable: false,
             tokens_unavailable: false,
         };
@@ -927,6 +933,8 @@ mod tests {
                 ),
             ],
             credits: vec![],
+            committable_channels: vec![],
+            channel_balances_unavailable: false,
             credits_unavailable: false,
             tokens_unavailable: false,
         };
@@ -950,6 +958,8 @@ mod tests {
                 "USDT",
             )],
             credits: vec![],
+            committable_channels: vec![],
+            channel_balances_unavailable: false,
             credits_unavailable: false,
             tokens_unavailable: false,
         };

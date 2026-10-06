@@ -575,6 +575,8 @@ mod tests {
                 })
                 .collect(),
             credits: vec![],
+            committable_channels: vec![],
+            channel_balances_unavailable: false,
             credits_unavailable: false,
             tokens_unavailable: false,
         }

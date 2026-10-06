@@ -95,6 +95,9 @@ pub struct AccountBalances {
     pub sol_lamports: u64,
     pub tokens: Vec<TokenBalance>,
     pub credits: Vec<CreditBalance>,
+    /// Still-committable escrow held in open payment channels, grouped by mint.
+    pub committable_channels: Vec<TokenBalance>,
+    pub channel_balances_unavailable: bool,
     /// True when pay-api returned token balances but could not determine
     /// program-backed credit balances.
     pub credits_unavailable: bool,
@@ -177,6 +180,10 @@ impl ReceivedFunds {
 struct ApiResponse {
     balances: Vec<ApiBalance>,
     #[serde(default)]
+    committable_channel_balances: Vec<ApiBalance>,
+    #[serde(default)]
+    channel_balances_unavailable: bool,
+    #[serde(default)]
     credits: std::collections::BTreeMap<String, ApiCredit>,
     #[serde(default)]
     credits_unavailable: bool,
@@ -205,6 +212,8 @@ struct ApiCredit {
 
 struct ApiBalances {
     tokens: Vec<TokenBalance>,
+    committable_channels: Vec<TokenBalance>,
+    channel_balances_unavailable: bool,
     credits: Vec<CreditBalance>,
     credits_unavailable: bool,
 }
@@ -322,6 +331,8 @@ async fn fetch_stablecoins_with_rpc_fallback(
                 (
                     ApiBalances {
                         tokens,
+                        committable_channels: Vec::new(),
+                        channel_balances_unavailable: true,
                         credits: Vec::new(),
                         credits_unavailable: true,
                     },
@@ -333,6 +344,8 @@ async fn fetch_stablecoins_with_rpc_fallback(
                 (
                     ApiBalances {
                         tokens: Vec::new(),
+                        committable_channels: Vec::new(),
+                        channel_balances_unavailable: true,
                         credits: Vec::new(),
                         credits_unavailable: true,
                     },
@@ -368,6 +381,11 @@ fn parse_api_balances(parsed: ApiResponse) -> ApiBalances {
             })
         })
         .collect();
+    let committable_channels = parsed
+        .committable_channel_balances
+        .into_iter()
+        .filter_map(api_token_balance)
+        .collect();
     let credits = parsed
         .credits
         .into_iter()
@@ -387,9 +405,28 @@ fn parse_api_balances(parsed: ApiResponse) -> ApiBalances {
         .collect();
     ApiBalances {
         tokens,
+        committable_channels,
+        channel_balances_unavailable: parsed.channel_balances_unavailable,
         credits,
         credits_unavailable: parsed.credits_unavailable,
     }
+}
+
+fn api_token_balance(balance: ApiBalance) -> Option<TokenBalance> {
+    let raw_amount = balance.raw_amount.parse().ok()?;
+    if raw_amount == 0 {
+        return None;
+    }
+    let symbol = balance
+        .symbol
+        .filter(|symbol| !symbol.trim().is_empty())
+        .or_else(|| mint_symbol(&balance.mint).map(str::to_string));
+    Some(TokenBalance {
+        mint: balance.mint,
+        raw_amount,
+        ui_amount: balance.ui_amount,
+        symbol,
+    })
 }
 
 // ── public API ──────────────────────────────────────────────────────────────
@@ -429,6 +466,8 @@ pub async fn get_balances(rpc_url: &str, pubkey: &str) -> crate::Result<AccountB
         sol_lamports,
         tokens: api_balances.tokens,
         credits: api_balances.credits,
+        committable_channels: api_balances.committable_channels,
+        channel_balances_unavailable: api_balances.channel_balances_unavailable,
         credits_unavailable: api_balances.credits_unavailable,
         tokens_unavailable,
     })
@@ -450,6 +489,8 @@ pub async fn get_stablecoin_balances(
         sol_lamports: 0,
         tokens: api_balances.tokens,
         credits: api_balances.credits,
+        committable_channels: api_balances.committable_channels,
+        channel_balances_unavailable: api_balances.channel_balances_unavailable,
         credits_unavailable: api_balances.credits_unavailable,
         tokens_unavailable,
     })
@@ -796,6 +837,8 @@ mod tests {
             sol_lamports: 1_000_000,
             tokens: vec![],
             credits: vec![],
+            committable_channels: vec![],
+            channel_balances_unavailable: false,
             credits_unavailable: false,
             tokens_unavailable: false,
         };
@@ -803,6 +846,8 @@ mod tests {
             sol_lamports: 2_000_000,
             tokens: vec![],
             credits: vec![],
+            committable_channels: vec![],
+            channel_balances_unavailable: false,
             credits_unavailable: false,
             tokens_unavailable: false,
         };
@@ -817,6 +862,8 @@ mod tests {
             sol_lamports: 2_000_000,
             tokens: vec![],
             credits: vec![],
+            committable_channels: vec![],
+            channel_balances_unavailable: false,
             credits_unavailable: false,
             tokens_unavailable: false,
         };
@@ -824,6 +871,8 @@ mod tests {
             sol_lamports: 1_000_000,
             tokens: vec![],
             credits: vec![],
+            committable_channels: vec![],
+            channel_balances_unavailable: false,
             credits_unavailable: false,
             tokens_unavailable: false,
         };
@@ -842,6 +891,8 @@ mod tests {
                 symbol: Some("USDC".to_string()),
             }],
             credits: vec![],
+            committable_channels: vec![],
+            channel_balances_unavailable: false,
             credits_unavailable: false,
             tokens_unavailable: false,
         };
@@ -854,6 +905,8 @@ mod tests {
                 symbol: Some("USDC".to_string()),
             }],
             credits: vec![],
+            committable_channels: vec![],
+            channel_balances_unavailable: false,
             credits_unavailable: false,
             tokens_unavailable: false,
         };
@@ -869,6 +922,8 @@ mod tests {
             sol_lamports: 0,
             tokens: vec![],
             credits: vec![],
+            committable_channels: vec![],
+            channel_balances_unavailable: false,
             credits_unavailable: false,
             tokens_unavailable: false,
         };
@@ -881,6 +936,8 @@ mod tests {
                 symbol: None,
             }],
             credits: vec![],
+            committable_channels: vec![],
+            channel_balances_unavailable: false,
             credits_unavailable: false,
             tokens_unavailable: false,
         };
@@ -900,6 +957,8 @@ mod tests {
                 symbol: Some("USDC".to_string()),
             }],
             credits: vec![],
+            committable_channels: vec![],
+            channel_balances_unavailable: false,
             credits_unavailable: false,
             tokens_unavailable: false,
         };
@@ -917,6 +976,8 @@ mod tests {
             sol_lamports: 0,
             tokens: vec![],
             credits: vec![],
+            committable_channels: vec![],
+            channel_balances_unavailable: false,
             credits_unavailable: false,
             tokens_unavailable: true,
         };
@@ -929,6 +990,8 @@ mod tests {
                 symbol: Some("USDC".to_string()),
             }],
             credits: vec![],
+            committable_channels: vec![],
+            channel_balances_unavailable: false,
             credits_unavailable: false,
             tokens_unavailable: false,
         };
@@ -949,6 +1012,8 @@ mod tests {
                 symbol: Some("USDC".to_string()),
             }],
             credits: vec![],
+            committable_channels: vec![],
+            channel_balances_unavailable: false,
             credits_unavailable: false,
             tokens_unavailable: false,
         };
@@ -956,6 +1021,8 @@ mod tests {
             sol_lamports: 0,
             tokens: vec![],
             credits: vec![],
+            committable_channels: vec![],
+            channel_balances_unavailable: false,
             credits_unavailable: false,
             tokens_unavailable: true,
         };
@@ -971,6 +1038,8 @@ mod tests {
             sol_lamports: 100,
             tokens: vec![],
             credits: vec![],
+            committable_channels: vec![],
+            channel_balances_unavailable: false,
             credits_unavailable: false,
             tokens_unavailable: true,
         };
@@ -978,6 +1047,8 @@ mod tests {
             sol_lamports: 1_000,
             tokens: vec![],
             credits: vec![],
+            committable_channels: vec![],
+            channel_balances_unavailable: false,
             credits_unavailable: false,
             tokens_unavailable: true,
         };

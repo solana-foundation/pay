@@ -136,6 +136,7 @@ function summarizeChannel(id: string, flows: PaymentFlow[]): PaymentChannel {
   const decimals = latest.session?.decimals ?? 6;
   const rawCurrency = latest.session?.currency ?? latest.payment?.asset ?? "USDC";
   const currency = currencyLabel(rawCurrency);
+  const state = channelState(ordered);
 
   const paymentDeposits = ordered.map((flow) =>
     stableBaseUnits(flow.payment?.depositAmount, decimals),
@@ -166,14 +167,17 @@ function summarizeChannel(id: string, flows: PaymentFlow[]): PaymentChannel {
       ),
     ),
   );
-  const remaining =
+  const calculatedRemaining =
     deposited !== undefined && consumed !== undefined
       ? deposited > consumed
         ? deposited - consumed
         : 0n
       : deposited;
+  const remaining = state === "closed" && deposited !== undefined ? 0n : calculatedRemaining;
   const usagePercent =
-    deposited !== undefined && deposited > 0n && consumed !== undefined
+    state === "closed" && deposited !== undefined && deposited > 0n
+      ? 100
+      : deposited !== undefined && deposited > 0n && consumed !== undefined
       ? Math.min(100, Number((consumed * 10_000n) / deposited) / 100)
       : undefined;
   const latestCharge = [...ordered]
@@ -211,7 +215,7 @@ function summarizeChannel(id: string, flows: PaymentFlow[]): PaymentChannel {
     id,
     protocol: isX402 ? "x402" : "mpp",
     scheme: isX402 ? "batch-settlement" : "session",
-    state: channelState(ordered),
+    state,
     currency,
     decimals,
     payer: latest.payer ?? latest.session?.payer,
@@ -250,6 +254,18 @@ export function paymentChannels(flows: PaymentFlow[]): PaymentChannel[] {
   return [...grouped.entries()]
     .map(([id, channelFlows]) => summarizeChannel(id, channelFlows))
     .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+}
+
+/** Select channels matching scoped flows while retaining each channel's full history. */
+export function scopedPaymentChannels(
+  allChannels: PaymentChannel[],
+  scopedFlows: PaymentFlow[],
+  query: string,
+): PaymentChannel[] {
+  const scopedIds = new Set(scopedFlows.map(channelId).filter((id): id is string => Boolean(id)));
+  return allChannels.filter(
+    (channel) => scopedIds.has(channel.id) && channelMatches(channel, query),
+  );
 }
 
 /** Match a channel or any of its requests against debugger search text. */

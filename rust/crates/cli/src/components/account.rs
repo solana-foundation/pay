@@ -20,7 +20,10 @@ pub fn format_account_header(name_rendered: &str, network: &str, pubkey: &str) -
 /// are zero, prints nothing and returns `false` — callers use the return
 /// value to decide whether to surface a trailing "run `pay topup`" note.
 pub fn print_balances(balances: &AccountBalances, indent: &str) -> bool {
-    if balances.tokens.is_empty() && balances.credits.is_empty() {
+    if balances.tokens.is_empty()
+        && balances.credits.is_empty()
+        && balances.committable_channels.is_empty()
+    {
         return false;
     }
     for t in &balances.tokens {
@@ -37,6 +40,14 @@ pub fn print_balances(balances: &AccountBalances, indent: &str) -> bool {
             credit.currency,
             format!("{:.2}", credit.ui_amount).green(),
             "credits".dimmed()
+        );
+    }
+    for channel in &balances.committable_channels {
+        eprintln!(
+            "{indent}- {:<6} {} {}",
+            channel.symbol_or("?"),
+            format!("{:.2}", channel.ui_amount).green(),
+            "available in channels".dimmed()
         );
     }
     true

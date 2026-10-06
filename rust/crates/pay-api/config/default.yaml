@@ -86,6 +86,18 @@ send:
     label: Fee payer refund
     memo: fee-payer-refund
 
+# Sponsored payment-channel lifecycle operations. The payer signs the close
+# request, while pay-api pays SOL gas and receives the equivalent USD fee.
+channels:
+  enabled: false
+  realm: pay-api channels
+  sol_price_asset: So11111111111111111111111111111111111111112
+  estimated_fee_lamports: 10000
+  confirm_timeout_seconds: 30
+  fee_payer:
+    key_name:
+    pubkey:
+
 # Activation-campaign redemption. Reuses `send.fee_payer.*` as the hot
 # wallet that signs Transfer + Memo. Redis provides the atomic durable claim;
 # The history provider detects redemptions made before the claim store was introduced.
