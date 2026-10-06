@@ -4066,6 +4066,49 @@ dependencies = [
 ]
 
 [[package]]
+name = "mcp-jobs"
+version = "0.30.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "bs58",
+ "clap",
+ "http 1.5.0",
+ "reqwest 0.12.28",
+ "rmcp",
+ "schemars 1.2.2",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "mcp-wallet"
+version = "0.30.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "bs58",
+ "clap",
+ "http 1.5.0",
+ "reqwest 0.12.28",
+ "rmcp",
+ "schemars 1.2.2",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "md-5"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5364,6 +5407,7 @@ dependencies = [
  "futures",
  "mcp-compute",
  "mcp-data",
+ "mcp-jobs",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry-semantic-conventions",

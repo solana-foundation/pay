@@ -6,22 +6,27 @@ use mcp_compute::ComputeDriver;
 use mcp_compute::google::{GoogleCloudFunctionsDriver, GoogleConfig};
 use mcp_data::DataDriver;
 use mcp_data::firestore::{FirestoreConfig, FirestoreDriver};
+use mcp_jobs::JobDriver;
+use mcp_jobs::google::{GoogleJobsConfig, GoogleJobsDriver};
 
 use crate::error::JobError;
 
 const COMPUTE_DRIVER: &str = "google-cloud-functions";
 const DATA_DRIVER: &str = "gcp-firestore";
+const JOBS_DRIVER: &str = "google-cloud-scheduler";
 
 #[derive(Default)]
 pub struct ResourceCleaner {
     compute: Vec<Arc<dyn ComputeDriver>>,
     data: Vec<Arc<dyn DataDriver>>,
+    jobs: Vec<Arc<dyn JobDriver>>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct CleanupSummary {
     pub compute_resources: usize,
     pub data_resources: usize,
+    pub job_resources: usize,
 }
 
 impl ResourceCleaner {
@@ -51,6 +56,13 @@ impl ResourceCleaner {
                     )
                     .map_err(|error| JobError::Config(error.to_string()))?,
                 )),
+                JOBS_DRIVER => cleaner.jobs.push(Arc::new(
+                    GoogleJobsDriver::new(
+                        GoogleJobsConfig::from_env()
+                            .map_err(|error| JobError::Config(error.to_string()))?,
+                    )
+                    .map_err(|error| JobError::Config(error.to_string()))?,
+                )),
                 other => {
                     return Err(JobError::Config(format!(
                         "unknown PAY_RESOURCE_CLEANUP_DRIVERS entry: {other}"
@@ -62,7 +74,7 @@ impl ResourceCleaner {
     }
 
     pub fn is_enabled(&self) -> bool {
-        !self.compute.is_empty() || !self.data.is_empty()
+        !self.compute.is_empty() || !self.data.is_empty() || !self.jobs.is_empty()
     }
 
     pub async fn cleanup_channel(&self, channel_id: &str) -> Result<CleanupSummary, JobError> {
@@ -78,6 +90,12 @@ impl ResourceCleaner {
                 .cleanup_channel(channel_id)
                 .await
                 .map_err(|error| JobError::Config(format!("data cleanup: {error}")))?;
+        }
+        for driver in &self.jobs {
+            summary.job_resources += driver
+                .cleanup_channel(channel_id)
+                .await
+                .map_err(|error| JobError::Config(format!("jobs cleanup: {error}")))?;
         }
         Ok(summary)
     }

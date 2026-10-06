@@ -81,7 +81,7 @@ impl ComputeMcp {
     }
 
     #[tool(
-        description = "Create or update a payer-owned serverless deployment. Source may be inline UTF-8 files or a base64 ZIP. Optional provider-neutral schedule triggers reuse the current funded MPP session and invoke through the paid gateway, managed service bindings inject scoped data access, and gateway exposure creates a stable paid public hostname. The returned operation is asynchronous; poll operation_status until it succeeds."
+        description = "Create or update a payer-owned serverless deployment. Source may be inline UTF-8 files or a base64 ZIP. Deprecated inline schedules invoke the private origin with provider workload identity; prefer the jobs MCP for new automation. Managed service bindings inject scoped data access. Gateway exposure creates a stable paid public hostname and exposes only access.public_paths, so internal job paths must be omitted. The returned operation is asynchronous; poll operation_status until it succeeds."
     )]
     async fn deploy(
         &self,
@@ -89,13 +89,10 @@ impl ComputeMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let tenant = Self::tenant(&ctx)?;
-        let session_authorization = ctx
-            .extensions
-            .get::<http::request::Parts>()
-            .and_then(|parts| parts.headers.get(http::header::AUTHORIZATION))
-            .and_then(|value| value.to_str().ok())
-            .filter(|value| value.starts_with("Payment "));
-        request.supply_schedule_authorization(session_authorization);
+        for trigger in &mut request.triggers {
+            let crate::types::TriggerSpec::Schedule { authorization, .. } = trigger;
+            *authorization = None;
+        }
         let binding_result = async {
             if request.service_bindings.is_empty() {
                 return Ok(());

@@ -136,11 +136,12 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
                     ));
                 }
             }
+            inject_original_host_header(req.headers_mut(), host.as_deref());
             if let Some(payer) = verified_payer {
                 inject_verified_payer_headers(
                     req.headers_mut(),
                     &payer,
-                    host.as_deref(),
+                    None,
                     verified_channel.as_deref(),
                 );
             }
@@ -322,6 +323,17 @@ pub fn inject_verified_payer_headers(
         {
             headers.insert("x-pay-original-host", value);
         }
+    }
+}
+
+/// Preserve the request host selected by the trusted edge after caller-supplied
+/// internal headers have been removed. Resource routing needs this for every
+/// accepted payment scheme, including x402 requests that have no session payer.
+pub fn inject_original_host_header(headers: &mut HeaderMap, original_host: Option<&str>) {
+    if let Some(host) = original_host
+        && let Ok(value) = HeaderValue::from_str(host)
+    {
+        headers.insert("x-pay-original-host", value);
     }
 }
 
@@ -755,6 +767,17 @@ mod tests {
             headers.get("x-pay-original-host").unwrap(),
             "hello.cpu.gcp.gateway-402.com"
         );
+    }
+
+    #[test]
+    fn original_host_is_injected_without_a_session_payer() {
+        let mut headers = HeaderMap::new();
+        inject_original_host_header(&mut headers, Some("hello.cpu.gcp.gateway-402.com"));
+        assert_eq!(
+            headers.get("x-pay-original-host").unwrap(),
+            "hello.cpu.gcp.gateway-402.com"
+        );
+        assert!(!headers.contains_key("x-pay-verified-payer"));
     }
 
     fn configured_charge_splits() -> (pay_types::metering::ApiSpec, pay_types::metering::Metering) {

@@ -45,6 +45,12 @@ pub const STRIP_HEADERS: &[&str] = &[
     // which could log or leak it (the gate accepts the credential via either
     // `PAYMENT-SIGNATURE` or `X-PAYMENT`).
     "x-payment",
+    // Internal identity and routing metadata is minted only after payment
+    // verification. Pingora forwards its native request header separately
+    // from the sanitized HeaderMap, so these must be removed there too.
+    "x-pay-verified-payer",
+    "x-pay-verified-channel",
+    "x-pay-original-host",
 ];
 
 /// Return an upstream URL that is safe to attach to logs and traces.
@@ -1887,6 +1893,9 @@ mod tests {
         // x402 credential headers must never be forwarded upstream.
         assert!(STRIP_HEADERS.contains(&"payment-signature"));
         assert!(STRIP_HEADERS.contains(&"x-payment"));
+        assert!(STRIP_HEADERS.contains(&"x-pay-verified-payer"));
+        assert!(STRIP_HEADERS.contains(&"x-pay-verified-channel"));
+        assert!(STRIP_HEADERS.contains(&"x-pay-original-host"));
     }
 
     #[test]

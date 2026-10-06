@@ -275,15 +275,10 @@ impl GoogleCloudFunctionsDriver {
             cron,
             timezone,
             path,
-            authorization,
+            authorization: _,
         } = trigger;
-        let authorization = authorization.as_deref().ok_or_else(|| {
-            ComputeError::InvalidRequest(
-                "schedule triggers require deploying through a reusable MPP session".into(),
-            )
-        })?;
-        validate_schedule(cron, timezone, path, authorization)?;
-        let _service_account = self
+        validate_schedule(cron, timezone, path)?;
+        let service_account = self
             .config
             .scheduler_service_account
             .as_deref()
@@ -293,10 +288,11 @@ impl GoogleCloudFunctionsDriver {
                         .into(),
                 )
             })?;
-        let target_uri = format!(
-            "https://{}/{physical_name}{}",
-            self.config.gateway_domain, path
+        let audience = format!(
+            "https://{region}-{}.cloudfunctions.net/{physical_name}",
+            self.config.project
         );
+        let target_uri = format!("{audience}{path}");
         let body = json!({
             "name": job_name,
             "schedule": cron,
@@ -307,8 +303,11 @@ impl GoogleCloudFunctionsDriver {
                 "httpMethod": "POST",
                 "headers": {
                     "content-type": "application/json",
-                    "x-pay-trigger": "schedule",
-                    "authorization": authorization
+                    "x-pay-job": physical_name
+                },
+                "oidcToken": {
+                    "serviceAccountEmail": service_account,
+                    "audience": audience
                 },
                 "body": base64::engine::general_purpose::STANDARD.encode(b"{}")
             }
@@ -455,10 +454,21 @@ impl GoogleCloudFunctionsDriver {
                 "min_instances is not supported yet because idle instance cost cannot be attributed to an invocation; use 0 or omit it".into(),
             ));
         }
+        let mut environment = request.environment.clone();
+        if environment.contains_key("PAY_INTERNAL_PUBLIC_PATHS") {
+            return Err(ComputeError::InvalidRequest(
+                "PAY_INTERNAL_PUBLIC_PATHS is reserved by the compute gateway".into(),
+            ));
+        }
+        let public_paths = validate_public_paths(&request.access.public_paths)?;
+        environment.insert(
+            "PAY_INTERNAL_PUBLIC_PATHS".into(),
+            serde_json::to_string(&public_paths)?,
+        );
         let mut service = serde_json::Map::new();
         service.insert("timeoutSeconds".into(), json!(timeout));
         service.insert("ingressSettings".into(), json!(ingress));
-        service.insert("environmentVariables".into(), json!(request.environment));
+        service.insert("environmentVariables".into(), json!(environment));
         if let Some(memory) = request.limits.memory_mb {
             if !(128..=32768).contains(&memory) {
                 return Err(ComputeError::InvalidRequest(
@@ -891,6 +901,20 @@ impl ComputeDriver for GoogleCloudFunctionsDriver {
                 "deployment owner has not enabled paid gateway exposure".into(),
             ));
         }
+        let public_paths = value
+            .pointer("/serviceConfig/environmentVariables/PAY_INTERNAL_PUBLIC_PATHS")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ComputeError::Provider("deployment has no explicit paid gateway path policy".into())
+            })?;
+        let public_paths: Vec<String> = serde_json::from_str(public_paths).map_err(|_| {
+            ComputeError::Provider("deployment paid gateway path policy is invalid".into())
+        })?;
+        if !path_is_public(&public_paths, &request.path_and_query) {
+            return Err(ComputeError::InvalidRequest(
+                "requested path is not published by the deployment owner".into(),
+            ));
+        }
         let deployment = normalize_deployment(value)?;
         self.invoke_origin(
             &deployment,
@@ -1212,19 +1236,14 @@ fn validate_triggers(triggers: &[TriggerSpec]) -> Result<()> {
             cron,
             timezone,
             path,
-            authorization,
+            authorization: _,
         } = trigger;
-        let authorization = authorization.as_deref().ok_or_else(|| {
-            ComputeError::InvalidRequest(
-                "schedule triggers require deploying through a reusable MPP session".into(),
-            )
-        })?;
-        validate_schedule(cron, timezone, path, authorization)?;
+        validate_schedule(cron, timezone, path)?;
     }
     Ok(())
 }
 
-fn validate_schedule(cron: &str, timezone: &str, path: &str, authorization: &str) -> Result<()> {
+fn validate_schedule(cron: &str, timezone: &str, path: &str) -> Result<()> {
     if cron.len() > 128
         || cron.split_ascii_whitespace().count() != 5
         || !cron.bytes().all(|byte| {
@@ -1258,15 +1277,38 @@ fn validate_schedule(cron: &str, timezone: &str, path: &str, authorization: &str
                 .into(),
         ));
     }
-    if !authorization.starts_with("Payment ")
-        || authorization.len() > 16 * 1024
-        || authorization.contains(['\r', '\n'])
-    {
+    Ok(())
+}
+
+fn validate_public_paths(paths: &[String]) -> Result<Vec<String>> {
+    if paths.is_empty() || paths.len() > 32 {
         return Err(ComputeError::InvalidRequest(
-            "schedule authorization must be a reusable MPP Payment credential".into(),
+            "gateway exposure requires between 1 and 32 public paths".into(),
         ));
     }
-    Ok(())
+    let mut normalized = paths.to_vec();
+    normalized.sort();
+    normalized.dedup();
+    for path in &normalized {
+        if !path.starts_with('/')
+            || path.starts_with("//")
+            || path.len() > 256
+            || path.contains(['?', '#', '\r', '\n'])
+            || path.split('/').any(|segment| segment == "..")
+        {
+            return Err(ComputeError::InvalidRequest(format!(
+                "public gateway path `{path}` must be an exact safe absolute path"
+            )));
+        }
+    }
+    Ok(normalized)
+}
+
+fn path_is_public(public_paths: &[String], path_and_query: &str) -> bool {
+    let requested_path = path_and_query
+        .split_once('?')
+        .map_or(path_and_query, |(path, _)| path);
+    public_paths.iter().any(|path| path == requested_path)
 }
 
 fn normalize_deployment(value: Value) -> Result<Deployment> {
@@ -1593,11 +1635,22 @@ mod tests {
 
     #[test]
     fn schedules_require_portable_safe_values() {
-        let auth = "Payment session-credential";
-        assert!(validate_schedule("*/5 * * * *", "America/New_York", "/refresh", auth).is_ok());
-        assert!(validate_schedule("* * * *", "Etc/UTC", "/", auth).is_err());
-        assert!(validate_schedule("*/5 * * * *", "Etc/UTC", "//attacker", auth).is_err());
-        assert!(validate_schedule("*/5 * * * *", "Etc/UTC", "/../admin", auth).is_err());
-        assert!(validate_schedule("*/5 * * * *", "Etc/UTC", "/", "Bearer token").is_err());
+        assert!(validate_schedule("*/5 * * * *", "America/New_York", "/refresh").is_ok());
+        assert!(validate_schedule("* * * *", "Etc/UTC", "/").is_err());
+        assert!(validate_schedule("*/5 * * * *", "Etc/UTC", "//attacker").is_err());
+        assert!(validate_schedule("*/5 * * * *", "Etc/UTC", "/../admin").is_err());
+    }
+
+    #[test]
+    fn public_paths_are_explicit_and_cannot_publish_traversal() {
+        assert_eq!(
+            validate_public_paths(&["/summary".into(), "/summary".into()]).unwrap(),
+            vec!["/summary"]
+        );
+        assert!(validate_public_paths(&[]).is_err());
+        assert!(validate_public_paths(&["/../refresh".into()]).is_err());
+        assert!(validate_public_paths(&["/summary?admin=true".into()]).is_err());
+        assert!(path_is_public(&["/summary".into()], "/summary?limit=5"));
+        assert!(!path_is_public(&["/summary".into()], "/refresh"));
     }
 }

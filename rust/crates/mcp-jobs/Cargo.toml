@@ -1,0 +1,28 @@
+[package]
+name = "mcp-jobs"
+description = "Provider-neutral paid background jobs MCP with typed drivers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mcp-jobs"
+path = "src/main.rs"
+
+[dependencies]
+async-trait = "0.1"
+axum = { workspace = true }
+base64 = { workspace = true }
+bs58 = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+http = "1"
+reqwest = { workspace = true, features = ["json"] }
+rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
+schemars = "1.2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

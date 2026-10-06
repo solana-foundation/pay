@@ -32,7 +32,9 @@ use pay_core::server::gate::{
     settle_delegated_session as settle_delegated_session_forward, settle_upto, settle_upto_metered,
 };
 use pay_core::server::metering::{self, UptoSettlementPlan};
-use pay_core::server::payment::{inject_verified_payer_headers, strip_internal_identity_headers};
+use pay_core::server::payment::{
+    inject_original_host_header, inject_verified_payer_headers, strip_internal_identity_headers,
+};
 use pay_core::server::proxy::{
     STRIP_HEADERS, UpstreamPlan, prepare_upstream, redact_url_in_error, routing_signs_request_body,
     upstream_error_for_logging, upstream_url_for_logging,
@@ -876,13 +878,14 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                 batch,
                 paid_request,
             } => {
+                inject_original_host_header(&mut headers, host.as_deref());
                 if let Some(pending) = session_forward.as_ref()
                     && let Some(payer) = pending.verified_payer.as_deref()
                 {
                     inject_verified_payer_headers(
                         &mut headers,
                         payer,
-                        host.as_deref(),
+                        None,
                         Some(&pending.channel_id),
                     );
                 }

@@ -1455,7 +1455,7 @@ async fn ensure_resource_cleanup(
         .resource_cleaner
         .cleanup_channel(&state.channel_id)
         .await?;
-    let resources = summary.compute_resources + summary.data_resources;
+    let resources = summary.compute_resources + summary.data_resources + summary.job_resources;
     let quiet_ms = u64::try_from(runtime.resource_cleanup_quiet.as_millis()).unwrap_or(u64::MAX);
     let updated = store
         .update_channel(
@@ -1474,6 +1474,7 @@ async fn ensure_resource_cleanup(
         channel_id = %state.channel_id,
         compute_resources = summary.compute_resources,
         data_resources = summary.data_resources,
+        job_resources = summary.job_resources,
         "garbage-collected resources funded by unusable session channel"
     );
     Ok(updated.extra.contains_key(RESOURCE_CLEANUP_COMPLETED_AT))

@@ -1163,24 +1163,21 @@ fn finish_inference_capture(
         ttft_ms: usage.ttft_ms,
         tokens_per_sec: usage.tokens_per_sec,
     });
-    if let Some(log_id) = log_id {
-        pdb.enrich_inference_response_for_exchange(
-            log_id,
-            "payer-proxy",
-            &resource,
-            pdb_header_map(headers),
-            response_body,
-            inference,
-        );
-    } else {
-        pdb.enrich_inference_response(
-            "payer-proxy",
-            &resource,
-            pdb_header_map(headers),
-            response_body,
-            inference,
-        );
-    }
+    // Correlate only by the exact request-log ID minted for this exchange.
+    // Falling back to "the latest matching request" races concurrent calls
+    // to the same resource and can attach usage or response bodies to the
+    // wrong flow.
+    let Some(log_id) = log_id else {
+        return;
+    };
+    pdb.enrich_inference_response_for_exchange(
+        log_id,
+        "payer-proxy",
+        &resource,
+        pdb_header_map(headers),
+        response_body,
+        inference,
+    );
 }
 
 fn finish_observed_inference(

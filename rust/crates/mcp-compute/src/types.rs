@@ -60,10 +60,28 @@ pub enum Exposure {
     Gateway,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
 pub struct AccessPolicy {
     #[serde(default)]
     pub exposure: Exposure,
+    /// Exact HTTP paths exposed through the paid public gateway. Internal job
+    /// paths such as `/refresh` must be omitted. Defaults to `/` for backward
+    /// compatibility when gateway exposure is selected.
+    #[serde(default = "default_public_paths")]
+    pub public_paths: Vec<String>,
+}
+
+fn default_public_paths() -> Vec<String> {
+    vec!["/".into()]
+}
+
+impl Default for AccessPolicy {
+    fn default() -> Self {
+        Self {
+            exposure: Exposure::McpOnly,
+            public_paths: default_public_paths(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -104,10 +122,9 @@ pub enum TriggerSpec {
         /// Function path invoked by the scheduler. Defaults to `/`.
         #[serde(default = "default_schedule_path")]
         path: String,
-        /// Reusable MPP session authorization for the paid gateway. Each run
-        /// is metered against that session and stops executing when its funded
-        /// channel is exhausted or expires. The MCP fills this from the
-        /// current paid session and ignores caller-supplied values.
+        /// Deprecated compatibility field. Scheduled jobs use provider
+        /// workload identity to invoke the private function origin and never
+        /// persist a caller payment credential.
         #[serde(default)]
         authorization: Option<String>,
     },
@@ -149,18 +166,6 @@ pub struct DeployRequest {
     /// selected driver rather than silently ignored.
     #[serde(default)]
     pub provider_options: serde_json::Value,
-}
-
-impl DeployRequest {
-    pub fn supply_schedule_authorization(&mut self, value: Option<&str>) {
-        for trigger in &mut self.triggers {
-            let TriggerSpec::Schedule { authorization, .. } = trigger;
-            // The schedule and resource lease must be funded by the same
-            // verified session as this deployment. Never trust an MCP payload
-            // to select a different reusable bearer credential.
-            *authorization = value.map(str::to_string);
-        }
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -311,8 +316,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn verified_session_overrides_caller_supplied_schedule_credential() {
-        let mut request = DeployRequest {
+    fn schedule_authorization_is_only_a_compatibility_input() {
+        let request = DeployRequest {
             provider: default_provider(),
             name: "weather".into(),
             region: None,
@@ -336,12 +341,7 @@ mod tests {
             provider_options: serde_json::Value::Null,
         };
 
-        request.supply_schedule_authorization(Some("Payment verified"));
         let TriggerSpec::Schedule { authorization, .. } = &request.triggers[0];
-        assert_eq!(authorization.as_deref(), Some("Payment verified"));
-
-        request.supply_schedule_authorization(None);
-        let TriggerSpec::Schedule { authorization, .. } = &request.triggers[0];
-        assert!(authorization.is_none());
+        assert_eq!(authorization.as_deref(), Some("Payment attacker"));
     }
 }

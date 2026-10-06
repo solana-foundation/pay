@@ -660,7 +660,12 @@ impl Worker {
                 loop {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     match turn.recv_timeout(remaining.min(CHUNK_FLUSH)) {
-                        Ok(TurnEvent::Text(text)) => reply.text(&text)?,
+                        Ok(TurnEvent::Text(text)) => {
+                            if let Err(error) = reply.text(&text) {
+                                let _ = agent.cancel(&session);
+                                return Err(error);
+                            }
+                        }
                         Ok(TurnEvent::Thought(_)) | Ok(TurnEvent::ToolCall { .. }) => {}
                         Ok(TurnEvent::Done(reason)) => break reason,
                         Ok(TurnEvent::Failed(error)) => {
@@ -673,7 +678,10 @@ impl Worker {
                                     "agent turn exceeded the time limit".to_string(),
                                 ));
                             }
-                            reply.flush()?;
+                            if let Err(error) = reply.flush() {
+                                let _ = agent.cancel(&session);
+                                return Err(error);
+                            }
                         }
                         Err(error) => {
                             return Err(pay_core::Error::Config(format!("agent turn: {error}")));
