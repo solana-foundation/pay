@@ -2193,6 +2193,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ed25519-zebra"
+version = "4.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "775765289f7c6336c18d3d66127527820dd45ffd9eb3b6b8ee4708590e6c20f5"
+dependencies = [
+ "curve25519-dalek",
+ "ed25519",
+ "rand_core 0.6.4",
+ "sha2 0.10.9",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
 name = "either"
 version = "1.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2429,7 +2443,7 @@ version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23f76610e969fa1784327ded240f1e28a3fd9520c9cec93b636fcf62dd37f772"
 dependencies = [
- "five8_core 1.0.0",
+ "five8_core 0.1.2",
 ]
 
 [[package]]
@@ -2438,7 +2452,7 @@ version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1a0f1728185f277989ca573a402716ae0beaaea3f76a8ff87ef9dd8fb19436c5"
 dependencies = [
- "five8_core 1.0.0",
+ "five8_core 0.1.2",
 ]
 
 [[package]]
@@ -5616,7 +5630,7 @@ dependencies = [
  "serde",
  "serde_yaml",
  "sfv",
- "socket2 0.6.5",
+ "socket2 0.4.10",
  "strum 0.26.3",
  "strum_macros 0.26.4",
  "tokio",
@@ -5702,7 +5716,7 @@ dependencies = [
  "arrayvec",
  "async-channel",
  "flurry",
- "hashbrown 0.17.1",
+ "hashbrown 0.16.1",
  "log",
  "parking_lot",
  "rand 0.8.8",
@@ -6021,7 +6035,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -6559,7 +6573,7 @@ dependencies = [
  "quinn",
  "rustls",
  "rustls-pki-types",
- "rustls-platform-verifier 0.7.0",
+ "rustls-platform-verifier 0.6.2",
  "serde",
  "serde_json",
  "serde_urlencoded",
@@ -8427,14 +8441,15 @@ dependencies = [
 
 [[package]]
 name = "solana-keychain"
-version = "2.0.0-beta.1"
-source = "git+https://github.com/solana-foundation/solana-keychain?rev=6461a18cc39d4700d589b1eb981f8ddd71c09e8d#6461a18cc39d4700d589b1eb981f8ddd71c09e8d"
+version = "2.0.0"
+source = "git+https://github.com/solana-foundation/solana-keychain?rev=44b479df245167ca3b3a4e04d6d907146306d342#44b479df245167ca3b3a4e04d6d907146306d342"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bincode",
  "bs58",
  "chrono",
+ "ed25519-zebra",
  "getrandom 0.2.17",
  "getrandom 0.3.4",
  "google-cloud-auth",
@@ -8752,7 +8767,7 @@ dependencies = [
 [[package]]
 name = "solana-pay-kit"
 version = "0.10.0"
-source = "git+https://github.com/solana-foundation/pay-kit.git?rev=262c6b9a#262c6b9a9f8b9d7b339e1ea83fe1b5a852f90ff5"
+source = "git+https://github.com/solana-foundation/pay-kit.git?rev=9f47b85f#9f47b85f245a0f34a77a2ae762adc94c5a1feeea"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
