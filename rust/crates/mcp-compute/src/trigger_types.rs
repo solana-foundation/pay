@@ -106,7 +106,8 @@ pub struct ExecuteTriggerRequest {
     pub driver: String,
     pub trigger_resource: String,
     pub channel_lease: String,
-    pub origin: String,
+    pub target_resource: String,
+    pub tenant_key: String,
     pub path: String,
     #[serde(default)]
     pub input: serde_json::Value,

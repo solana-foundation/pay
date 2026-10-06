@@ -708,7 +708,8 @@ mod tests {
             "driver": "missing",
             "trigger_resource": "projects/project/locations/us-central1/jobs/trigger-test",
             "channel_lease": "lease",
-            "origin": "https://function.example.invalid",
+            "target_resource": "projects/project/locations/us-central1/functions/gcf-tenant-test",
+            "tenant_key": "tenant",
             "path": "/refresh"
         })
         .to_string();

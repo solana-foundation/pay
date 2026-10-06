@@ -3,6 +3,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use base64::Engine;
+use futures_util::StreamExt;
 use reqwest::{Method, StatusCode};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -462,10 +463,6 @@ impl TriggerDriver for GoogleTriggerDriver {
             .await?;
         require_function_owner(&function, tenant)?;
         validate_budgeted_function(&function)?;
-        let origin = function
-            .pointer("/serviceConfig/uri")
-            .and_then(Value::as_str)
-            .ok_or_else(|| TriggerError::Provider("target function has no service URI".into()))?;
         let physical = self.physical_name(tenant, &request.name)?;
         let resource = self.resource(region, &physical)?;
         let channel = lease_key(&tenant.channel_id)?;
@@ -502,7 +499,8 @@ impl TriggerDriver for GoogleTriggerDriver {
             "driver": DRIVER_ID,
             "trigger_resource": resource,
             "channel_lease": channel,
-            "origin": origin,
+            "target_resource": function_resource,
+            "tenant_key": tenant.key,
             "path": request.target.path,
             "input": request.input,
             "headers": headers,
@@ -677,20 +675,32 @@ impl TriggerDriver for GoogleTriggerDriver {
             ));
         }
         validate_schedule("* * * * *", "Etc/UTC", &request.path)?;
-        let mut url = reqwest::Url::parse(&request.origin).map_err(|error| {
-            TriggerError::InvalidRequest(format!("invalid target origin: {error}"))
-        })?;
-        if url.scheme() != "https" {
+        let (target_region, target_name) =
+            parse_function_resource(&request.target_resource, &self.config.project, None)?;
+        let target_resource = format!(
+            "projects/{}/locations/{target_region}/functions/{target_name}",
+            self.config.project
+        );
+        if target_resource != request.target_resource {
             return Err(TriggerError::InvalidRequest(
-                "target origin must use HTTPS".into(),
+                "executor target resource is not canonical".into(),
             ));
         }
-        url.set_path(&format!(
-            "{}{}",
-            url.path().trim_end_matches('/'),
-            request.path
-        ));
-        let token = self.identity_token(&request.origin).await?;
+        let function = self
+            .require(
+                Method::GET,
+                format!("{}/v2/{target_resource}", self.config.functions_api_base),
+                None,
+            )
+            .await?;
+        require_function_tenant(&function, &request.tenant_key)?;
+        validate_budgeted_function(&function)?;
+        let origin = function
+            .pointer("/serviceConfig/uri")
+            .and_then(Value::as_str)
+            .ok_or_else(|| TriggerError::Provider("target function has no service URI".into()))?;
+        let url = target_url(origin, &request.path)?;
+        let token = self.identity_token(origin).await?;
         let mut outgoing = self.client.post(url).bearer_auth(token);
         for (name, value) in request.headers {
             outgoing = outgoing.header(name, value);
@@ -719,16 +729,21 @@ impl TriggerDriver for GoogleTriggerDriver {
                 "scheduled function response exceeds 1 MiB".into(),
             ));
         }
-        let body = response.bytes().await?;
-        if body.len() as u64 > MAX_EXECUTION_RESPONSE_BYTES {
-            return Err(TriggerError::Provider(
-                "scheduled function response exceeds 1 MiB".into(),
-            ));
+        let mut body = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            if body.len().saturating_add(chunk.len()) > MAX_EXECUTION_RESPONSE_BYTES as usize {
+                return Err(TriggerError::Provider(
+                    "scheduled function response exceeds 1 MiB".into(),
+                ));
+            }
+            body.extend_from_slice(&chunk);
         }
         Ok(TriggerExecutionResponse {
             status,
             headers,
-            body,
+            body: body.into(),
         })
     }
 }
@@ -808,8 +823,13 @@ fn parse_function_resource(
 }
 
 fn require_function_owner(value: &Value, tenant: &Tenant) -> Result<()> {
+    require_function_tenant(value, &tenant.key)
+}
+
+fn require_function_tenant(value: &Value, tenant_key: &str) -> Result<()> {
+    validate_segment("tenant key", tenant_key)?;
     if value.pointer("/labels/managed-by").and_then(Value::as_str) == Some("mcp-compute")
-        && value.pointer("/labels/pay-tenant").and_then(Value::as_str) == Some(&tenant.key)
+        && value.pointer("/labels/pay-tenant").and_then(Value::as_str) == Some(tenant_key)
     {
         Ok(())
     } else {
@@ -922,13 +942,29 @@ fn validate_schedule(cron: &str, timezone: &str, path: &str) -> Result<()> {
     if !path.starts_with('/')
         || path.starts_with("//")
         || path.contains("..")
-        || path.contains(['\r', '\n'])
+        || path.contains(['\r', '\n', '#'])
     {
         return Err(TriggerError::InvalidRequest(
             "target path is invalid".into(),
         ));
     }
     Ok(())
+}
+
+fn target_url(origin: &str, target_path: &str) -> Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(origin)
+        .map_err(|error| TriggerError::InvalidRequest(format!("invalid target origin: {error}")))?;
+    if url.scheme() != "https" {
+        return Err(TriggerError::InvalidRequest(
+            "target origin must use HTTPS".into(),
+        ));
+    }
+    let (path, query) = target_path
+        .split_once('?')
+        .map_or((target_path, None), |(path, query)| (path, Some(query)));
+    url.set_path(&format!("{}{}", url.path().trim_end_matches('/'), path));
+    url.set_query(query);
+    Ok(url)
 }
 
 fn validate_segment(label: &str, value: &str) -> Result<()> {
@@ -983,6 +1019,20 @@ mod tests {
         assert!(validate_schedule("*/5 * * * *", "America/New_York", "/refresh").is_ok());
         assert!(validate_schedule("* * * *", "Etc/UTC", "/").is_err());
         assert!(validate_schedule("*/5 * * * *", "Etc/UTC", "//evil").is_err());
+        assert!(validate_schedule("*/5 * * * *", "Etc/UTC", "/refresh#fragment").is_err());
+    }
+
+    #[test]
+    fn target_urls_preserve_query_parameters() {
+        let url = target_url(
+            "https://function.example.invalid",
+            "/refresh?units=metric&limit=1",
+        )
+        .unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://function.example.invalid/refresh?units=metric&limit=1"
+        );
     }
 
     #[test]
