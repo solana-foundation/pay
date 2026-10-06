@@ -57,7 +57,6 @@ hand-copied program logic or account layout.
 | `PAY_RESOURCE_CLEANUP_DRIVERS` | no | empty | Comma-separated cleanup drivers: `google-cloud-functions`, `gcp-firestore`. Unknown entries fail startup instead of silently leaking resources. |
 | `PAY_RESOURCE_CLEANUP_INTERVAL_SECONDS` | no | `60` | Minimum delay between provider cleanup scans for one channel. |
 | `PAY_RESOURCE_CLEANUP_QUIET_SECONDS` | no | `7200` | Repeated-empty-scan window before the Redis retry anchor may be removed. |
-| `PAY_RESOURCE_CLEANUP_EMPTY_GRACE_SECONDS` | no | `600` | Delay after the last activity before a fully spent but still-open channel is collected, allowing an in-flight top-up to preserve its resources. |
 
 The fee-payer keys intentionally share pay-api's `send.fee_payer.*` env names so
 a single Doppler config drives both. Job-specific overrides use the `JOBS_`
@@ -130,7 +129,7 @@ The same sweep garbage-collects provider resources leased to an MPP channel
 once it is spent, closing, sealed, or absent on-chain. Compute functions,
 schedule triggers, and managed document stores carry a one-way hash of the
 verified channel ID. Cleanup is provider-driver based and retry-safe. The
-spent-channel grace prevents cleanup racing a top-up. The
+store-backed close deadline prevents cleanup racing a top-up. The
 worker retains the Redis record as its retry anchor and requires a configurable
 quiet window of repeated empty scans before declaring cleanup complete; this
 prevents an accepted asynchronous deployment from appearing after one empty

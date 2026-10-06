@@ -417,6 +417,7 @@ impl DataDriver for FirestoreDriver {
                         "document store is being deleted; retry after deletion completes".into(),
                     ));
                 }
+                require_channel_lease(&tenant.channel_id, &existing)?;
                 let update_time = existing
                     .get("updateTime")
                     .and_then(Value::as_str)
@@ -849,6 +850,18 @@ fn channel_lease_key(channel_id: &str) -> Result<String> {
         .collect())
 }
 
+fn require_channel_lease(channel_id: &str, value: &Value) -> Result<()> {
+    let expected = channel_lease_key(channel_id)?;
+    if let Some(existing) = firestore_string(value, "payChannel")
+        && existing != expected
+    {
+        return Err(DataError::InvalidRequest(
+            "document store is leased to a different payment channel; use a new name".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn provider_error(status: StatusCode, value: &Value) -> DataError {
     let message = value
         .pointer("/error/message")
@@ -950,6 +963,13 @@ mod tests {
             "8e8a355d709e16245dcd6748262bec1a"
         );
         assert!(channel_lease_key("").is_err());
+        assert!(
+            require_channel_lease(
+                "verifiedchannel",
+                &json!({ "fields": { "payChannel": { "stringValue": "other" } } })
+            )
+            .is_err()
+        );
     }
 
     #[test]

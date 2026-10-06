@@ -681,6 +681,15 @@ impl ComputeDriver for GoogleCloudFunctionsDriver {
         let function = self.function_body(tenant, &request, &resource_name, storage, options)?;
         let exists = self.function_exists(&resource_name).await?;
         let operation = if exists {
+            let current = self
+                .require_json(
+                    Method::GET,
+                    format!("{}/v2/{resource_name}", self.config.api_base),
+                    None,
+                )
+                .await?;
+            require_tenant_label(tenant, &current)?;
+            require_channel_lease(&tenant.channel_id, &current)?;
             self.require_json(
                 Method::PATCH,
                 format!(
@@ -918,6 +927,15 @@ impl ComputeDriver for GoogleCloudFunctionsDriver {
                 url.query_pairs_mut().append_pair("pageToken", token);
             }
             let value = self.require_json(Method::GET, url.into(), None).await?;
+            if value
+                .get("unreachable")
+                .and_then(Value::as_array)
+                .is_some_and(|locations| !locations.is_empty())
+            {
+                return Err(ComputeError::Provider(
+                    "Google could not scan every function location during channel cleanup".into(),
+                ));
+            }
             resources.extend(
                 value
                     .get("functions")
@@ -1151,6 +1169,18 @@ fn require_tenant_label(tenant: &Tenant, value: &Value) -> Result<()> {
             "deployment was not found for this payer".into(),
         ))
     }
+}
+
+fn require_channel_lease(channel_id: &str, value: &Value) -> Result<()> {
+    let expected = channel_lease_key(channel_id)?;
+    if let Some(existing) = value.pointer("/labels/pay-channel").and_then(Value::as_str)
+        && existing != expected
+    {
+        return Err(ComputeError::InvalidRequest(
+            "deployment is leased to a different payment channel; use a new name".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn require_operation_tenant(tenant: &Tenant, value: &Value) -> Result<()> {
@@ -1534,6 +1564,13 @@ mod tests {
             "8e8a355d709e16245dcd6748262bec1a"
         );
         assert!(channel_lease_key("").is_err());
+        assert!(
+            require_channel_lease(
+                "verifiedchannel",
+                &json!({ "labels": { "pay-channel": "other" } })
+            )
+            .is_err()
+        );
     }
 
     #[test]

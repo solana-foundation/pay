@@ -47,7 +47,6 @@ const RESOURCE_CLEANUP_LAST_AT: &str = "pay_resource_cleanup_last_at";
 const RESOURCE_CLEANUP_EMPTY_SINCE: &str = "pay_resource_cleanup_empty_since";
 const DEFAULT_RESOURCE_CLEANUP_INTERVAL_SECONDS: u64 = 60;
 const DEFAULT_RESOURCE_CLEANUP_QUIET_SECONDS: u64 = 7200;
-const DEFAULT_RESOURCE_CLEANUP_EMPTY_GRACE_SECONDS: u64 = 600;
 
 struct LeaseHeartbeat {
     cancel: CancellationToken,
@@ -381,7 +380,6 @@ struct SettlementRuntime {
     resource_cleaner: ResourceCleaner,
     resource_cleanup_interval: Duration,
     resource_cleanup_quiet: Duration,
-    resource_cleanup_empty_grace: Duration,
 }
 
 struct ChannelRuntime {
@@ -454,10 +452,6 @@ impl SettlementRuntime {
                 "PAY_RESOURCE_CLEANUP_QUIET_SECONDS",
                 DEFAULT_RESOURCE_CLEANUP_QUIET_SECONDS,
             )?,
-        )?);
-        let resource_cleanup_empty_grace = Duration::from_secs(parse_u64_env(
-            "PAY_RESOURCE_CLEANUP_EMPTY_GRACE_SECONDS",
-            DEFAULT_RESOURCE_CLEANUP_EMPTY_GRACE_SECONDS,
         )?);
 
         let session = if let Some(redis_url) = session_redis_url.as_ref() {
@@ -546,7 +540,6 @@ impl SettlementRuntime {
             resource_cleaner,
             resource_cleanup_interval,
             resource_cleanup_quiet,
-            resource_cleanup_empty_grace,
         })
     }
 }
@@ -704,7 +697,6 @@ async fn run_session(runtime: &SettlementRuntime) -> Result<SettleSessionsMetric
                         let cleanup_ready = if resource_cleanup_required(
                             &resource_state,
                             unix_now_millis(),
-                            runtime.resource_cleanup_empty_grace,
                         ) {
                             cleanup_ready
                         } else {
@@ -1384,14 +1376,16 @@ fn log_summary(metrics: &SettleSessionsMetrics) {
     );
 }
 
-fn resource_cleanup_required(state: &ChannelState, now_ms: u64, empty_grace: Duration) -> bool {
-    let empty_grace_ms = u64::try_from(empty_grace.as_millis()).unwrap_or(u64::MAX);
+fn resource_cleanup_required(state: &ChannelState, now_ms: u64) -> bool {
     state.sealed
         || state.close_requested_at.is_some()
         || state.final_cumulative.is_some()
         || (state.deposit > 0
             && state.cumulative >= state.deposit
-            && now_ms.saturating_sub(state.last_activity_at) >= empty_grace_ms)
+            && state
+                .lifecycle
+                .as_ref()
+                .is_some_and(|lifecycle| lifecycle.close_after <= now_ms))
 }
 
 fn cleanup_timestamp(state: &ChannelState, key: &str) -> Option<u64> {
@@ -1432,12 +1426,7 @@ async fn ensure_resource_cleanup(
     state: &ChannelState,
     force: bool,
 ) -> Result<bool, JobError> {
-    if (!force
-        && !resource_cleanup_required(
-            state,
-            unix_now_millis(),
-            runtime.resource_cleanup_empty_grace,
-        ))
+    if (!force && !resource_cleanup_required(state, unix_now_millis()))
         || !runtime.resource_cleaner.is_enabled()
     {
         return Ok(true);
@@ -2627,25 +2616,27 @@ mod tests {
     #[test]
     fn resource_cleanup_is_due_when_channel_is_spent_or_terminal() {
         let mut state = channel_state();
-        let grace = Duration::from_millis(500);
-        assert!(!resource_cleanup_required(&state, 1_000, grace));
+        assert!(!resource_cleanup_required(&state, 1_000));
 
         state.deposit = 10;
         state.cumulative = 10;
-        state.last_activity_at = 750;
-        assert!(!resource_cleanup_required(&state, 1_000, grace));
-        assert!(resource_cleanup_required(&state, 1_250, grace));
+        state.lifecycle = Some(ChannelLifecycle {
+            owner: "worker".into(),
+            close_after: 1_250,
+        });
+        assert!(!resource_cleanup_required(&state, 1_000));
+        assert!(resource_cleanup_required(&state, 1_250));
 
         state.extra.insert(
             RESOURCE_CLEANUP_COMPLETED_AT.into(),
             serde_json::Value::from(1),
         );
-        assert!(resource_cleanup_required(&state, 1_250, grace));
+        assert!(resource_cleanup_required(&state, 1_250));
 
         state.extra.clear();
         state.cumulative = 0;
         state.close_requested_at = Some(1);
-        assert!(resource_cleanup_required(&state, 1_000, grace));
+        assert!(resource_cleanup_required(&state, 1_000));
     }
 
     #[test]
