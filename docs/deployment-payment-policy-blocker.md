@@ -59,8 +59,14 @@ The combined implementation passed:
 - Explicit Redis reservation/close contention and durable-constructor tests.
 - Strict Clippy for the affected Pay crates and formatting/whitespace checks.
 
-This verifies local fixtures and instruction construction, not deployed provider
-integration or live on-chain settlement. Existing kit-wide Clippy findings are
+The [generic platform harness](../rust/crates/integration/README.md) additionally
+executes funded gateway requests and the actual settlement worker against Redis
+and the payment program on an offline local validator. It asserts recipient
+balance changes, refunds, persisted policy terms, and no double payment across
+competing/repeated worker processes. Run it with `just deployment-test`.
+
+This verifies local program execution, not deployed provider integration or
+mainnet settlement. Existing kit-wide Clippy findings are
 not represented as a clean strict lint result. Debugger web assets were absent
 during local Rust validation; release images must contain the intended UI assets.
 

@@ -63,6 +63,47 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy --workspace --all-targets --features pay/ledger,pay-core/ledger -- -D warnings
 
+  deployment-payments:
+    name: Deployment payments (local chain)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@just
+      - uses: ./.github/actions/install-surfpool
+      - name: Install local test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y redis-server libssl-dev pkg-config cmake
+          curl --fail --location --silent --show-error \
+            https://release.anza.xyz/v3.1.13/install --output "${RUNNER_TEMP}/install-anza.sh"
+          sh "${RUNNER_TEMP}/install-anza.sh"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: deployment-e2e
+      - run: just deployment-test-safety
+      - run: just deployment-test-program
+      - run: just deployment-test
+      - name: Upload local service diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-payment-diagnostics
+          path: |
+            rust/target/deployment-e2e/*.log
+            rust/target/deployment-e2e/*.fixture.json
+          if-no-files-found: ignore
+
   # ── Windows Rust check ──
   rust-windows-check:
     name: Rust check (Windows)

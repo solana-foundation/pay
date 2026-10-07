@@ -5,6 +5,40 @@ version.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+deployment-e2e = [
+    "pay-core/test-support",
+    "pay-core/redis-session-store",
+    "dep:pay-proxy",
+    "dep:pingora",
+    "dep:axum",
+    "dep:tokio",
+    "dep:reqwest",
+    "dep:async-trait",
+    "dep:ed25519-dalek",
+    "dep:rand",
+    "dep:solana-pubkey",
+    "dep:solana-commitment-config",
+    "dep:uuid",
+]
+
+[[test]]
+name = "deployment_policy_e2e"
+required-features = ["deployment-e2e"]
+
+[dependencies]
+pay-proxy = { workspace = true, optional = true }
+pingora = { version = "0.9", default-features = false, features = ["proxy", "rustls"], optional = true }
+axum = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["macros", "net", "sync", "time", "process"], optional = true }
+reqwest = { workspace = true, features = ["json"], optional = true }
+async-trait = { version = "0.1", optional = true }
+ed25519-dalek = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
+solana-pubkey = { workspace = true, optional = true }
+solana-commitment-config = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
+
 [dev-dependencies]
 pay-core = { workspace = true, features = ["server"] }
 pay-types = { workspace = true }

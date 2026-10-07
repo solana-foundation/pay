@@ -17,6 +17,9 @@ server = ["dep:axum", "dep:http"]
 otel = ["dep:opentelemetry", "dep:tracing-opentelemetry"]
 # Gate network-dependent integration tests (e.g. OpenAPI smoke tests).
 network_tests = []
+# Loopback-only transport injection for the platform integration harness.
+# No environment variable enables these constructors.
+test-support = ["server"]
 # Build OpenSSL from source for cross-compilation (no system libssl-dev needed).
 # Activates openssl-sys/vendored which is pulled in transitively by
 # solana-rpc-client → reqwest → native-tls → openssl-sys.

@@ -102,6 +102,8 @@ pub struct DeploymentPolicyResolver {
     domain: String,
     client: reqwest::Client,
     in_flight: Arc<Semaphore>,
+    #[cfg(feature = "test-support")]
+    metadata_endpoint: Option<String>,
 }
 
 impl DeploymentPolicyResolver {
@@ -165,7 +167,32 @@ impl DeploymentPolicyResolver {
             domain: domain.into(),
             client,
             in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            #[cfg(feature = "test-support")]
+            metadata_endpoint: None,
         })
+    }
+
+    /// Redirect only transport to local fixtures while retaining identity-token
+    /// fetching, audience, policy validation, bounds, and redirect restrictions.
+    #[cfg(feature = "test-support")]
+    pub fn with_loopback_test_endpoints(
+        mut self,
+        policy: std::net::SocketAddr,
+        metadata: std::net::SocketAddr,
+    ) -> Result<Self, PolicyError> {
+        if !policy.ip().is_loopback()
+            || !metadata.ip().is_loopback()
+            || policy.port() == 0
+            || metadata.port() == 0
+        {
+            return Err(PolicyError::Configuration);
+        }
+        self.endpoint = reqwest::Url::parse(&format!("http://{policy}/__402/payment-policy"))
+            .map_err(|_| PolicyError::Configuration)?;
+        self.metadata_endpoint = Some(format!(
+            "http://{metadata}/computeMetadata/v1/instance/service-accounts/default/identity"
+        ));
+        Ok(self)
     }
 
     /// Pass the single HTTP Host/authority, never x-forwarded-host. Reject
@@ -202,10 +229,7 @@ impl DeploymentPolicyResolver {
             .try_acquire()
             .map_err(|_| PolicyError::Unavailable)?;
         tokio::time::timeout(DEADLINE, async {
-            let identity =
-                super::proxy::fetch_gcp_metadata_identity_token(&self.client, &self.audience)
-                    .await
-                    .map_err(|_| PolicyError::Unavailable)?;
+            let identity = self.fetch_identity().await?;
             if identity.expires_in_secs <= DEADLINE.as_secs() {
                 return Err(PolicyError::Unavailable);
             }
@@ -214,6 +238,22 @@ impl DeploymentPolicyResolver {
         })
         .await
         .map_err(|_| PolicyError::Unavailable)?
+    }
+
+    async fn fetch_identity(&self) -> Result<super::proxy::FetchedToken, PolicyError> {
+        #[cfg(feature = "test-support")]
+        if let Some(endpoint) = &self.metadata_endpoint {
+            return super::proxy::fetch_gcp_metadata_identity_token_at(
+                &self.client,
+                &self.audience,
+                endpoint,
+            )
+            .await
+            .map_err(|_| PolicyError::Unavailable);
+        }
+        super::proxy::fetch_gcp_metadata_identity_token(&self.client, &self.audience)
+            .await
+            .map_err(|_| PolicyError::Unavailable)
     }
 
     async fn fetch_policy(
@@ -460,6 +500,42 @@ mod tests {
 
     fn validate(value: &Value) -> Result<ResolvedDeploymentPolicy, PolicyError> {
         resolver().validate_response(HOST, &serde_json::to_vec(value).unwrap(), NOW)
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn test_transport_is_loopback_only_and_preserves_policy_authority() {
+        let policy = "127.0.0.1:12345".parse().unwrap();
+        let metadata = "[::1]:12346".parse().unwrap();
+        let local = resolver()
+            .with_loopback_test_endpoints(policy, metadata)
+            .unwrap();
+        assert_eq!(local.audience, "https://compute.run.app");
+        assert_eq!(local.domain, "compute.example");
+        assert_eq!(
+            local.endpoint.as_str(),
+            "http://127.0.0.1:12345/__402/payment-policy"
+        );
+        assert!(local.classify_host(HOST).is_ok());
+        assert!(local.classify_host("foreign.example").is_err());
+        for rejected in [
+            "0.0.0.0:12345",
+            "192.0.2.1:12345",
+            "[::]:12345",
+            "127.0.0.1:0",
+        ] {
+            let rejected = rejected.parse().unwrap();
+            assert!(
+                resolver()
+                    .with_loopback_test_endpoints(rejected, metadata)
+                    .is_err()
+            );
+            assert!(
+                resolver()
+                    .with_loopback_test_endpoints(policy, rejected)
+                    .is_err()
+            );
+        }
     }
 
     #[test]

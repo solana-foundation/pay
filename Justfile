@@ -89,6 +89,18 @@ test:
     cd typescript && pnpm --filter @solana/pay test
     cd rust && cargo test --workspace
 
+# Build the pinned local payment-program fixture (downloads source, no deployment).
+deployment-test-program:
+    python3 -B rust/crates/integration/scripts/build_payment_channels.py
+
+# Check local runner isolation and timeout cleanup without a validator.
+deployment-test-safety:
+    python3 -B -m unittest discover -s rust/crates/integration/scripts -p 'test_*.py'
+
+# Exercise deployment payments on disposable loopback Surfpool and Redis.
+deployment-test:
+    python3 -B rust/crates/integration/scripts/run_deployment_e2e.py
+
 # Build a target: `just build`, `just build pay`, `just build web-ui`
 build target='all':
     #!/usr/bin/env bash

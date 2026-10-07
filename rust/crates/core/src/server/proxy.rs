@@ -1486,8 +1486,21 @@ pub(super) async fn fetch_gcp_metadata_identity_token(
     client: &reqwest::Client,
     audience: &str,
 ) -> Result<FetchedToken, String> {
+    fetch_gcp_metadata_identity_token_at(
+        client,
+        audience,
+        "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity",
+    )
+    .await
+}
+
+pub(super) async fn fetch_gcp_metadata_identity_token_at(
+    client: &reqwest::Client,
+    audience: &str,
+    endpoint: &str,
+) -> Result<FetchedToken, String> {
     let resp = client
-        .get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity")
+        .get(endpoint)
         .query(&[("audience", audience)])
         .header("Metadata-Flavor", "Google")
         .timeout(std::time::Duration::from_secs(2))
