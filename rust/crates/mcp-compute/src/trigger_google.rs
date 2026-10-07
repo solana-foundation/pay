@@ -507,7 +507,7 @@ impl TriggerDriver for GoogleTriggerDriver {
         });
         let body = json!({
             "name": resource,
-            "description": format!("managed-by=mcp-compute;resource=trigger;pay-tenant={};pay-channel={channel};pay-name={};pay-target={target_name};prepaid-runs={PREPAID_RUNS}", tenant.key, request.name),
+            "description": format!("managed-by=mcp-compute;resource=trigger;pay-tenant={};pay-channel={channel};pay-name={};pay-target-region={target_region};pay-target={target_name};prepaid-runs={PREPAID_RUNS}", tenant.key, request.name),
             "schedule": cron,
             "timeZone": timezone,
             "retryConfig": { "retryCount": 0 },
@@ -624,17 +624,25 @@ impl TriggerDriver for GoogleTriggerDriver {
         if provider != "google-cloud-functions" {
             return Ok(0);
         }
-        let target_name = if id.contains('/') {
-            parse_function_resource(id, &self.config.project, region)?.1
+        let (target_region, target_name) = if id.contains('/') {
+            parse_function_resource(id, &self.config.project, region)?
         } else if id.starts_with("gcf-") {
+            let target_region = region.unwrap_or(&self.config.default_region);
+            validate_segment("target region", target_region)?;
             validate_segment("target ID", id)?;
-            id.to_string()
+            (target_region.to_string(), id.to_string())
         } else {
+            let target_region = region.unwrap_or(&self.config.default_region);
+            validate_segment("target region", target_region)?;
             validate_segment("target ID", id)?;
-            format!("gcf-{}-{id}", tenant.key)
+            (
+                target_region.to_string(),
+                format!("gcf-{}-{id}", tenant.key),
+            )
         };
         self.cleanup_markers(&[
             format!("pay-tenant={};", tenant.key),
+            format!("pay-target-region={target_region};"),
             format!("pay-target={target_name};"),
         ])
         .await
@@ -1062,6 +1070,27 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn target_cleanup_markers_include_region() {
+        let description = "managed-by=mcp-compute;resource=trigger;pay-tenant=tenant;pay-target-region=europe-west1;pay-target=gcf-tenant-weather;";
+        let europe_markers = [
+            "pay-tenant=tenant;",
+            "pay-target-region=europe-west1;",
+            "pay-target=gcf-tenant-weather;",
+        ];
+        let us_markers = [
+            "pay-tenant=tenant;",
+            "pay-target-region=us-central1;",
+            "pay-target=gcf-tenant-weather;",
+        ];
+        assert!(
+            europe_markers
+                .iter()
+                .all(|marker| description.contains(marker))
+        );
+        assert!(!us_markers.iter().all(|marker| description.contains(marker)));
     }
 
     #[test]
