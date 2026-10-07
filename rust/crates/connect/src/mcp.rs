@@ -205,7 +205,7 @@ pub fn router(auth: Auth, context: Arc<dyn pay_mcp::PayContext>) -> Router {
         StreamableHttpServerConfig::default().with_allowed_hosts(auth.cfg.allowed_hosts.clone());
     let service: StreamableHttpService<pay_mcp::PayMcp, LocalSessionManager> =
         StreamableHttpService::new(
-            move || Ok(pay_mcp::PayMcp::with_context(context.clone())),
+            move || Ok(pay_mcp::PayMcp::with_hosted_context(context.clone())),
             Default::default(),
             transport,
         );
@@ -459,6 +459,12 @@ pub(crate) mod tests {
             json!("pay"),
             "{body}"
         );
+        assert!(
+            !init[0]["result"]["instructions"]
+                .as_str()
+                .unwrap()
+                .contains("sell_inference")
+        );
 
         let (status, _, _) = mcp_post(&app, Some("tok-alpha"), Some(&session), INITIALIZED).await;
         assert_eq!(status, StatusCode::ACCEPTED);
@@ -480,6 +486,18 @@ pub(crate) mod tests {
         ] {
             assert!(tools.contains(&expected.to_string()), "{tools:?}");
         }
+        assert!(!tools.iter().any(|name| name == "sell_inference"));
+        assert!(
+            !body.contains("sell_inference"),
+            "tool metadata must not recommend it"
+        );
+
+        let call = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"sell_inference","arguments":{}}}"#;
+        let (status, _, body) = mcp_post(&app, Some("tok-alpha"), Some(&session), call).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let response = sse_json(&body);
+        assert_eq!(response[0]["error"]["code"], -32602, "{body}");
+        assert_eq!(response[0]["error"]["message"], "tool not found", "{body}");
     }
 
     #[tokio::test]

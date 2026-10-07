@@ -300,6 +300,7 @@ fn main() {
                 | Command::Subscriptions { .. }
                 | Command::Catalog { .. }
                 | Command::Plans { .. }
+                | Command::Sell { .. }
                 | Command::Install(_)
                 | Command::Send(_)
                 | Command::Fanout(_)

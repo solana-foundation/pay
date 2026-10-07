@@ -279,6 +279,29 @@ pub fn upto_response_body_limit(metering: &Metering) -> usize {
         .unwrap_or(DEFAULT_LIMIT)
 }
 
+/// A request-only meter has an indivisible price, unlike consumable tokens.
+/// Return it only when no response, variant, or accounting state is needed.
+pub(super) fn flat_request_price(metering: &Metering) -> Option<f64> {
+    if metering.dimensions.is_empty() || !metering.variants.is_empty() {
+        return None;
+    }
+    let mut usd = 0.0;
+    for dimension in &metering.dimensions {
+        if dimension.direction != MeterDirection::Usage
+            || dimension.unit != BillingUnit::Requests
+            || dimension.meter.is_some()
+            || dimension.period.is_some()
+            || dimension.tiers.len() != 1
+            || dimension.tiers[0].condition.is_some()
+            || dimension.tiers[0].up_to.is_some()
+        {
+            return None;
+        }
+        usd += dimension.tiers[0].price_usd / dimension.scale.max(1) as f64;
+    }
+    Some(usd.max(upto_min_usd(metering).unwrap_or(0.0)))
+}
+
 pub fn upto_actual_amount_from_response(
     plan: &UptoSettlementPlan,
     max_amount: u64,
@@ -380,12 +403,9 @@ fn extract_and_price_usage(
     let json = if body_still_needed {
         let body =
             body.ok_or_else(|| UptoUsageError::MissingUsage("response body unavailable".into()))?;
-        Some(
-            serde_json::from_slice::<serde_json::Value>(body)
-                .map_err(|e| UptoUsageError::InvalidJson(e.to_string()))?,
-        )
+        response_usage_documents(headers, body)?
     } else {
-        None
+        vec![]
     };
 
     let mut priced_props = *props;
@@ -393,8 +413,9 @@ fn extract_and_price_usage(
         priced_props.context_length = inferred_usage
             .and_then(|usage| usage.tokens_prompt)
             .or_else(|| {
-                json.as_ref()
-                    .and_then(|json| provider_token_quantity(json, MeterDirection::Input))
+                json.iter()
+                    .rev()
+                    .find_map(|json| provider_token_quantity(json, MeterDirection::Input))
             });
     }
     let prices = resolve_price(metering, &priced_props, variant_hint, None)
@@ -407,17 +428,42 @@ fn extract_and_price_usage(
             .get(idx)
             .map(|d| d.price_usd)
             .unwrap_or(0.0);
-        let quantity = extract_dimension_quantity(
-            dim,
-            preset,
-            &priced_props,
-            headers,
-            json.as_ref(),
-            inferred_usage,
-        )?;
+        let extract = |json| {
+            extract_dimension_quantity(dim, preset, &priced_props, headers, json, inferred_usage)
+        };
+        // Stream usage is cumulative, not additive. Providers may report input
+        // and output in different events; use the last observation of each.
+        let quantity = json
+            .iter()
+            .rev()
+            .find_map(|json| extract(Some(json)).ok())
+            .map(Ok)
+            .unwrap_or_else(|| extract(None))?;
         total += quantity as f64 / dim.scale.max(1) as f64 * price;
     }
     Ok(total)
+}
+
+fn response_usage_documents(
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<Vec<serde_json::Value>, UptoUsageError> {
+    let is_sse = headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/event-stream"))
+        });
+    if !is_sse {
+        return serde_json::from_slice(body)
+            .map(|json| vec![json])
+            .map_err(|error| UptoUsageError::InvalidJson(error.to_string()));
+    }
+    crate::server::session_stream::sse_json_documents(body)
+        .map_err(|error| UptoUsageError::InvalidJson(error.to_string()))
 }
 
 /// The observer count for a token or quota-unit dimension, if any.
@@ -1807,6 +1853,100 @@ mod tests {
 
         assert_eq!(actual.usd, 0.05);
         assert_eq!(actual.base_units, 50_000);
+    }
+
+    #[test]
+    fn upto_sse_usage_matches_json_and_selects_request_variant() {
+        let mut metering = upto_metering(
+            vec![
+                usage_dim(
+                    MeterDirection::Input,
+                    BillingUnit::Tokens,
+                    1_000_000,
+                    1.0,
+                    None,
+                ),
+                usage_dim(
+                    MeterDirection::Output,
+                    BillingUnit::Tokens,
+                    1_000_000,
+                    1.0,
+                    None,
+                ),
+            ],
+            Some(pay_types::metering::UptoMetering {
+                max_usd: Some(1.0),
+                missing_usage: MissingUsagePolicy::Refund,
+                usage_preset: Some("openai-compatible".into()),
+                ..Default::default()
+            }),
+        );
+        metering.variants.push(MeterVariant {
+            param: "model".into(),
+            value: "premium".into(),
+            description: None,
+            dimensions: vec![
+                usage_dim(
+                    MeterDirection::Input,
+                    BillingUnit::Tokens,
+                    1_000_000,
+                    10.0,
+                    None,
+                ),
+                usage_dim(
+                    MeterDirection::Output,
+                    BillingUnit::Tokens,
+                    1_000_000,
+                    10.0,
+                    None,
+                ),
+            ],
+        });
+        let mut plan = settlement_plan(metering, 1.0);
+        plan.variant_hint = Some("premium".into());
+        let json = br#"{"usage":{"prompt_tokens":1000,"completion_tokens":1000}}"#;
+        let expected =
+            upto_actual_amount_from_response(&plan, 1_000_000, &HeaderMap::new(), Some(json))
+                .unwrap();
+        assert_eq!(expected.base_units, 20_000);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            "text/event-stream; charset=utf-8".parse().unwrap(),
+        );
+        let body = b": keepalive\r\n\r\ndata: {\"choices\":[]}\r\n\r\ndata: {\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":500}}\r\n\r\ndata: {\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":1000}}\r\n\r\ndata: [DONE]\r\n\r\n";
+        assert_eq!(
+            upto_actual_amount_from_response(&plan, 1_000_000, &headers, Some(body)).unwrap(),
+            expected
+        );
+        assert_eq!(
+            upto_actual_amount_from_response(
+                &plan,
+                1_000_000,
+                &headers,
+                Some(b"data: {\"error\":\"worker_failed\"}\n\n")
+            )
+            .unwrap()
+            .base_units,
+            0
+        );
+    }
+
+    #[test]
+    fn flat_request_meter_has_an_indivisible_admission_price() {
+        let mut meter = upto_metering(
+            vec![usage_dim(
+                MeterDirection::Usage,
+                BillingUnit::Requests,
+                1,
+                0.75,
+                None,
+            )],
+            None,
+        );
+        assert_eq!(flat_request_price(&meter), Some(0.75));
+        meter.dimensions[0].unit = BillingUnit::Tokens;
+        assert_eq!(flat_request_price(&meter), None);
     }
 
     #[test]

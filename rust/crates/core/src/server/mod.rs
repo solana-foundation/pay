@@ -4,6 +4,9 @@ pub mod accounting;
 pub mod authenticate;
 
 #[cfg(feature = "server")]
+pub mod completion_stream;
+
+#[cfg(feature = "server")]
 pub mod deployment_policy;
 
 #[cfg(feature = "server")]

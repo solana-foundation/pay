@@ -1990,8 +1990,13 @@ mod tests {
                     signature: "signature".into(),
                 },
                 confirmed_deposit: None,
+                attempt: Default::default(),
             },
         };
+        state
+            .batch_channels
+            .register_submission(&batch.requirements, &batch.submission)
+            .unwrap();
         let charged = || {
             state
                 .batch_channels
@@ -2011,8 +2016,8 @@ mod tests {
         apply_batch_settlement(&state, &batch, StatusCode::OK, &HeaderMap::new());
         assert_eq!(
             charged(),
-            4_000,
-            "successful receiptless requests reserve their ceiling"
+            3_000,
+            "successful receiptless requests must not manufacture confirmed spend"
         );
     }
 

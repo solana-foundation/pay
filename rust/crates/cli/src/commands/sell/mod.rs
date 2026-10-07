@@ -107,7 +107,7 @@ pub struct CreateCommand {
     #[arg(long)]
     pub model: String,
 
-    /// Flat price per request, in USD. Offers every payment scheme.
+    /// Flat price per completed request, in USD.
     #[arg(long, value_name = "USD", conflicts_with = "price_per_token")]
     pub price: Option<f64>,
 
@@ -656,42 +656,61 @@ impl Worker {
                 let mut turn = agent
                     .prompt(&session, &prompt)
                     .map_err(|e| pay_core::Error::Config(format!("agent prompt: {e}")))?;
-                let deadline = Instant::now() + TURN_TIMEOUT;
-                loop {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    match turn.recv_timeout(remaining.min(CHUNK_FLUSH)) {
-                        Ok(TurnEvent::Text(text)) => {
-                            if let Err(error) = reply.text(&text) {
-                                let _ = agent.cancel(&session);
-                                return Err(error);
-                            }
-                        }
-                        Ok(TurnEvent::Thought(_)) | Ok(TurnEvent::ToolCall { .. }) => {}
-                        Ok(TurnEvent::Done(reason)) => break reason,
-                        Ok(TurnEvent::Failed(error)) => {
-                            return Err(pay_core::Error::Config(format!("agent turn: {error}")));
-                        }
-                        Err(pay_acp::ClientError::Timeout) => {
-                            if remaining.is_zero() {
-                                let _ = agent.cancel(&session);
-                                return Err(pay_core::Error::Config(
-                                    "agent turn exceeded the time limit".to_string(),
-                                ));
-                            }
-                            if let Err(error) = reply.flush() {
-                                let _ = agent.cancel(&session);
-                                return Err(error);
-                            }
-                        }
-                        Err(error) => {
-                            return Err(pay_core::Error::Config(format!("agent turn: {error}")));
-                        }
-                    }
-                }
+                answer_turn(
+                    &agent,
+                    &session,
+                    &mut turn,
+                    &mut reply,
+                    Instant::now() + TURN_TIMEOUT,
+                )?
             }
         };
         let chars = reply.finish(&reason)?;
         Ok(Outcome { chars, reason })
+    }
+}
+
+fn answer_turn(
+    agent: &AgentClient,
+    session: &str,
+    turn: &mut pay_acp::Turn,
+    reply: &mut Reply<'_>,
+    deadline: Instant,
+) -> pay_core::Result<StopReason> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        // A zero-duration receive still returns queued events, including Done.
+        if remaining.is_zero() {
+            let _ = agent.cancel(session);
+            return Err(pay_core::Error::Config(
+                "agent turn exceeded the time limit".to_string(),
+            ));
+        }
+        match turn.recv_timeout(remaining.min(CHUNK_FLUSH)) {
+            Ok(TurnEvent::Text(text)) => {
+                if let Err(error) = reply.text(&text) {
+                    let _ = agent.cancel(session);
+                    return Err(error);
+                }
+            }
+            Ok(TurnEvent::Thought(_)) | Ok(TurnEvent::ToolCall { .. }) => {}
+            Ok(TurnEvent::Done(reason)) => return Ok(reason),
+            Ok(TurnEvent::Failed(error)) => {
+                return Err(pay_core::Error::Config(format!("agent turn: {error}")));
+            }
+            Err(pay_acp::ClientError::Timeout) => {
+                if Instant::now() >= deadline {
+                    continue;
+                }
+                if let Err(error) = reply.flush() {
+                    let _ = agent.cancel(session);
+                    return Err(error);
+                }
+            }
+            Err(error) => {
+                return Err(pay_core::Error::Config(format!("agent turn: {error}")));
+            }
+        }
     }
 }
 
@@ -889,6 +908,155 @@ fn flatten_messages(body: &Value) -> pay_core::Result<(String, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_agent(queued: bool) -> (AgentClient, std::thread::JoinHandle<Vec<Value>>) {
+        use std::io::{BufRead, BufReader};
+
+        let (agent_input, client_output) = std::io::pipe().unwrap();
+        let (client_input, mut agent_output) = std::io::pipe().unwrap();
+        let task = std::thread::spawn(move || {
+            let mut observed = Vec::new();
+            for line in BufReader::new(agent_input).lines() {
+                let frame: Value = serde_json::from_str(&line.unwrap()).unwrap();
+                match frame["method"].as_str().unwrap() {
+                    "session/new" => {
+                        writeln!(
+                            agent_output,
+                            "{}",
+                            json!({"jsonrpc": "2.0", "id": frame["id"], "result": {"sessionId": "s1"}})
+                        )
+                        .unwrap();
+                    }
+                    "session/prompt" if queued => {
+                        writeln!(
+                            agent_output,
+                            "{}",
+                            json!({
+                                "jsonrpc": "2.0", "method": "session/update",
+                                "params": {"sessionId": "s1", "update": {
+                                    "sessionUpdate": "agent_message_chunk",
+                                    "content": {"type": "text", "text": "answer"}
+                                }}
+                            })
+                        )
+                        .unwrap();
+                        writeln!(
+                            agent_output,
+                            "{}",
+                            json!({"jsonrpc": "2.0", "id": frame["id"], "result": {"stopReason": "end_turn"}})
+                        )
+                        .unwrap();
+                    }
+                    "session/prompt" | "session/cancel" => {}
+                    method => panic!("unexpected ACP method {method}"),
+                }
+                agent_output.flush().unwrap();
+                observed.push(frame);
+            }
+            observed
+        });
+        (
+            AgentClient::connect(client_input, client_output, PermissionPolicy::RejectAll),
+            task,
+        )
+    }
+
+    #[test]
+    fn expired_turns_cancel_without_consuming_queued_text_or_done() {
+        for (queued, consume_text) in [(false, false), (true, false), (true, true)] {
+            let (agent, task) = test_agent(queued);
+            let session = agent.new_session(std::path::Path::new(".")).unwrap();
+            let mut turn = agent.prompt(&session, "answer").unwrap();
+            // An RPC round trip ensures all preceding turn events are queued.
+            agent.new_session(std::path::Path::new(".")).unwrap();
+            if consume_text {
+                assert!(matches!(
+                    turn.recv_timeout(Duration::ZERO).unwrap(),
+                    TurnEvent::Text(_)
+                ));
+            }
+            let api = Api {
+                http: http().unwrap(),
+                base: "http://127.0.0.1:1".into(),
+                token: "fixture".into(),
+            };
+            let request = NextRequest {
+                request_id: "req_deadline".into(),
+                stream: false,
+                body: json!({}),
+            };
+            let mut reply = Reply::new(&api, &request, "agent".into(), 0);
+            let result = answer_turn(
+                &agent,
+                &session,
+                &mut turn,
+                &mut reply,
+                Instant::now() - Duration::from_millis(1),
+            );
+            assert!(result.unwrap_err().to_string().contains("time limit"));
+            assert!(reply.content.is_empty());
+            match (queued, consume_text) {
+                (true, false) => assert!(matches!(
+                    turn.recv_timeout(Duration::ZERO).unwrap(),
+                    TurnEvent::Text(_)
+                )),
+                (true, true) => assert!(matches!(
+                    turn.recv_timeout(Duration::ZERO).unwrap(),
+                    TurnEvent::Done(_)
+                )),
+                _ => assert!(matches!(
+                    turn.recv_timeout(Duration::ZERO),
+                    Err(pay_acp::ClientError::Timeout)
+                )),
+            }
+            drop(agent);
+            let observed = task.join().unwrap();
+            assert_eq!(
+                observed
+                    .iter()
+                    .filter(|frame| frame["method"] == "session/cancel")
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn queued_turn_completes_before_its_deadline() {
+        let (agent, task) = test_agent(true);
+        let session = agent.new_session(std::path::Path::new(".")).unwrap();
+        let mut turn = agent.prompt(&session, "answer").unwrap();
+        let api = Api {
+            http: http().unwrap(),
+            base: "http://127.0.0.1:1".into(),
+            token: "fixture".into(),
+        };
+        let request = NextRequest {
+            request_id: "req_deadline".into(),
+            stream: false,
+            body: json!({}),
+        };
+        let mut reply = Reply::new(&api, &request, "agent".into(), 0);
+        assert_eq!(
+            answer_turn(
+                &agent,
+                &session,
+                &mut turn,
+                &mut reply,
+                Instant::now() + TURN_TIMEOUT
+            )
+            .unwrap(),
+            StopReason::EndTurn
+        );
+        assert_eq!(reply.content, "answer");
+        drop(agent);
+        assert!(
+            task.join()
+                .unwrap()
+                .iter()
+                .all(|frame| frame["method"] != "session/cancel")
+        );
+    }
 
     #[test]
     fn a_single_user_message_is_the_prompt_itself() {
