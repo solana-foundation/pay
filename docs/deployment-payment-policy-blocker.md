@@ -3,8 +3,8 @@
 Status: implemented and locally validated; production enablement remains blocked.
 
 Pay pins `solana-pay-kit` to
-`1181a247cc35ba356c7af509c501413c0aee3c57`
-([pay-kit #362](https://github.com/solana-foundation/pay-kit/pull/362)).
+`4c29fba423d94dbb088147ba47533d54034812bb`,
+the merged `main` commit for [pay-kit #362](https://github.com/solana-foundation/pay-kit/pull/362).
 The locked build no longer needs a local Cargo override.
 
 ## Implemented boundaries
