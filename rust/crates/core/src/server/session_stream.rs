@@ -1385,6 +1385,33 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
         assert!(!has_stream_observable_dimension(&spec));
     }
 
+    #[test]
+    fn gemini_first_stream_event_fits_an_authorized_quarter_dollar_session() {
+        let mut input = dimension(MeterDirection::Input, BillingUnit::Tokens, None);
+        input.scale = 1_000_000;
+        input.tiers[0].price_usd = 0.345;
+        let mut output = dimension(MeterDirection::Output, BillingUnit::Tokens, None);
+        output.scale = 1_000_000;
+        output.tiers[0].price_usd = 2.875;
+        let metering = metering(vec![input, output]);
+        let spec = spec_from_metering(&metering, SessionMeteringContext::new()).unwrap();
+        let mut accumulator =
+            StreamUsageAccumulator::new(spec.clone(), SessionUsageHints::default());
+        assert!(accumulator
+            .observe_chunk(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"What\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n",
+                true,
+            )
+            .unwrap());
+        let mut gate = SessionUsageGate::new(spec, StablecoinSettlement::usdc(), 0, 1).unwrap();
+        let decision = gate
+            .observe(accumulator.observation(), GateMode::Streaming)
+            .unwrap();
+
+        assert_eq!(decision.target_cumulative_base_units(), 3);
+        assert!(decision.target_cumulative_base_units() <= 250_000);
+    }
+
     fn stream_test_blockhash_cache() -> BlockhashCache {
         let cache = BlockhashCache::new();
         cache.set(

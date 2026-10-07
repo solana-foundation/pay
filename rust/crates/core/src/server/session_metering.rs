@@ -133,9 +133,9 @@ pub fn spec_from_metering(
 
 /// Price for one billable usage dimension.
 ///
-/// `price_micro_usd` is charged per `scale` units. For example, Gemini-style
-/// output pricing of $0.000005 per 2 tokens is represented as:
-/// `scale = 2`, `price_micro_usd = 5`.
+/// `price_micro_usd` is quoted per `scale` units. Token and provider-metered
+/// usage is prorated over the cumulative quantity before rounding to microUSD;
+/// discrete units such as requests are billed in whole blocks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionMeterDimension {
     pub direction: MeterDirection,
@@ -143,6 +143,7 @@ pub struct SessionMeterDimension {
     pub scale: u64,
     pub price_micro_usd: u64,
     pub required: bool,
+    aggregate: bool,
 }
 
 impl SessionMeterDimension {
@@ -158,6 +159,7 @@ impl SessionMeterDimension {
             scale,
             price_micro_usd,
             required: true,
+            aggregate: unit == BillingUnit::Tokens,
         }
     }
 
@@ -173,6 +175,7 @@ impl SessionMeterDimension {
             scale,
             price_micro_usd,
             required: false,
+            aggregate: unit == BillingUnit::Tokens,
         }
     }
 }
@@ -230,6 +233,8 @@ pub struct RatedUsageDelta {
     pub previous_micro_usd: u64,
     pub current_micro_usd: u64,
     pub delta_micro_usd: u64,
+    /// Independently rounded dimension diagnostics. The total is rounded once
+    /// after combining aggregate dimensions, so it need not equal their sum.
     pub lines: Vec<RatedDimensionDelta>,
 }
 
@@ -246,6 +251,95 @@ pub struct RatedDimensionDelta {
     pub price_micro_usd: u64,
 }
 
+/// Sum quoted fractional microUSD exactly across dimensions. Round once at
+/// settlement without floating-point money. The legacy x402 float path can
+/// still differ by one microUSD on an exact half-way amount.
+struct FractionalAmount {
+    whole: u128,
+    numerator: u128,
+    denominator: u128,
+}
+
+impl Default for FractionalAmount {
+    fn default() -> Self {
+        Self {
+            whole: 0,
+            numerator: 0,
+            denominator: 1,
+        }
+    }
+}
+
+impl FractionalAmount {
+    fn add(&mut self, units: u64, dimension: &SessionMeterDimension) -> Result<()> {
+        let overflow = || SessionMeteringError::Overflow {
+            context: "total dimension rating",
+        };
+        if !dimension.aggregate {
+            self.whole = self
+                .whole
+                .checked_add(rate_units(units, dimension)? as u128)
+                .ok_or_else(overflow)?;
+            return Ok(());
+        }
+
+        let scale = dimension.scale as u128;
+        let quoted = (units as u128)
+            .checked_mul(dimension.price_micro_usd as u128)
+            .ok_or_else(overflow)?;
+        self.whole = self
+            .whole
+            .checked_add(quoted / scale)
+            .ok_or_else(overflow)?;
+        let remainder = quoted % scale;
+        if remainder == 0 {
+            return Ok(());
+        }
+        let divisor = gcd(self.denominator, scale);
+        let common = self
+            .denominator
+            .checked_mul(scale / divisor)
+            .ok_or_else(overflow)?;
+        let numerator = self
+            .numerator
+            .checked_mul(scale / divisor)
+            .and_then(|left| {
+                remainder
+                    .checked_mul(self.denominator / divisor)
+                    .and_then(|right| left.checked_add(right))
+            })
+            .ok_or_else(overflow)?;
+        self.whole = self
+            .whole
+            .checked_add(numerator / common)
+            .ok_or_else(overflow)?;
+        self.numerator = numerator % common;
+        self.denominator = common;
+        Ok(())
+    }
+
+    fn round(&self) -> Result<u64> {
+        let rounded = self
+            .whole
+            .checked_add(u128::from(
+                self.numerator >= self.denominator / 2 + self.denominator % 2,
+            ))
+            .ok_or(SessionMeteringError::Overflow {
+                context: "total rounding",
+            })?;
+        u64::try_from(rounded).map_err(|_| SessionMeteringError::Overflow {
+            context: "total rounding",
+        })
+    }
+}
+
+fn gcd(mut left: u128, mut right: u128) -> u128 {
+    while right != 0 {
+        (left, right) = (right, left % right);
+    }
+    left
+}
+
 /// Rate a cumulative usage observation by subtracting cumulative rated values.
 ///
 /// This is the crucial behavior for streaming: a provider may emit usage in
@@ -259,8 +353,8 @@ pub fn rate_observation(
 ) -> Result<RatedUsageDelta> {
     spec.validate()?;
 
-    let mut previous_total = 0u64;
-    let mut current_total = 0u64;
+    let mut previous_total = FractionalAmount::default();
+    let mut current_total = FractionalAmount::default();
     let mut lines = Vec::with_capacity(spec.dimensions.len());
 
     for dimension in &spec.dimensions {
@@ -295,17 +389,8 @@ pub fn rate_observation(
             },
         )?;
 
-        previous_total = previous_total.checked_add(previous_micro_usd).ok_or(
-            SessionMeteringError::Overflow {
-                context: "previous total",
-            },
-        )?;
-        current_total =
-            current_total
-                .checked_add(current_micro_usd)
-                .ok_or(SessionMeteringError::Overflow {
-                    context: "current total",
-                })?;
+        previous_total.add(previous_units, dimension)?;
+        current_total.add(current_units, dimension)?;
 
         lines.push(RatedDimensionDelta {
             direction: dimension.direction,
@@ -320,6 +405,8 @@ pub fn rate_observation(
         });
     }
 
+    let previous_total = previous_total.round()?;
+    let current_total = current_total.round()?;
     let delta_micro_usd =
         current_total
             .checked_sub(previous_total)
@@ -550,12 +637,20 @@ fn rate_units(units: u64, dimension: &SessionMeterDimension) -> Result<u64> {
         });
     }
 
-    let billable_blocks = ceil_div(units as u128, dimension.scale as u128)?;
-    let amount = billable_blocks
+    let numerator = (units as u128)
         .checked_mul(dimension.price_micro_usd as u128)
         .ok_or(SessionMeteringError::Overflow {
             context: "dimension rating",
         })?;
+    let amount = if dimension.aggregate {
+        ceil_div(numerator, dimension.scale as u128)?
+    } else {
+        ceil_div(units as u128, dimension.scale as u128)?
+            .checked_mul(dimension.price_micro_usd as u128)
+            .ok_or(SessionMeteringError::Overflow {
+                context: "dimension rating",
+            })?
+    };
     u64::try_from(amount).map_err(|_| SessionMeteringError::Overflow {
         context: "dimension rating",
     })
@@ -605,12 +700,14 @@ fn dimension_from_metering(
             unit: dimension.unit,
         })?;
     let price_micro_usd = price_usd_to_micro_usd(tier.price_usd)?;
-    Ok(SessionMeterDimension::required(
+    let mut rated = SessionMeterDimension::required(
         dimension.direction,
         dimension.unit,
         dimension.scale,
         price_micro_usd,
-    ))
+    );
+    rated.aggregate |= dimension.meter.is_some();
+    Ok(rated)
 }
 
 fn price_usd_to_micro_usd(price_usd: f64) -> Result<u64> {
@@ -648,7 +745,7 @@ fn ceil_div(numerator: u128, denominator: u128) -> Result<u128> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pay_types::metering::PriceTier;
+    use pay_types::metering::{PriceTier, UsageMeter, UsageMeterSource};
 
     fn gemini_spec() -> SessionMeterSpec {
         SessionMeterSpec::new([
@@ -971,10 +1068,189 @@ endpoints:
 
         let rated = rate_observation(&gemini_spec(), &UsageObservation::new(), &current).unwrap();
 
-        assert_eq!(rated.current_micro_usd, 1129);
-        assert_eq!(rated.delta_micro_usd, 1129);
+        assert_eq!(rated.current_micro_usd, 1128);
+        assert_eq!(rated.delta_micro_usd, 1128);
         assert_eq!(rated.lines[0].current_micro_usd, 9);
         assert_eq!(rated.lines[1].current_micro_usd, 1120);
+    }
+
+    #[test]
+    fn per_million_token_prices_are_prorated_before_cumulative_rounding() {
+        let spec = SessionMeterSpec::new([
+            SessionMeterDimension::required(
+                MeterDirection::Input,
+                BillingUnit::Tokens,
+                1_000_000,
+                345_000,
+            ),
+            SessionMeterDimension::required(
+                MeterDirection::Output,
+                BillingUnit::Tokens,
+                1_000_000,
+                2_875_000,
+            ),
+        ]);
+        let first = UsageObservation::new()
+            .with(MeterDirection::Input, BillingUnit::Tokens, 1)
+            .with(MeterDirection::Output, BillingUnit::Tokens, 1);
+        let next = UsageObservation::new()
+            .with(MeterDirection::Input, BillingUnit::Tokens, 50)
+            .with(MeterDirection::Output, BillingUnit::Tokens, 100);
+        let halfway = UsageObservation::new()
+            .with(MeterDirection::Input, BillingUnit::Tokens, 225)
+            .with(MeterDirection::Output, BillingUnit::Tokens, 1);
+        let full_million = UsageObservation::new()
+            .with(MeterDirection::Input, BillingUnit::Tokens, 1_000_000)
+            .with(MeterDirection::Output, BillingUnit::Tokens, 1_000_000);
+
+        assert_eq!(
+            rate_observation(&spec, &UsageObservation::new(), &first)
+                .unwrap()
+                .current_micro_usd,
+            3
+        );
+        let rated = rate_observation(&spec, &first, &next).unwrap();
+        assert_eq!(rated.current_micro_usd, 305);
+        assert_eq!(rated.delta_micro_usd, 302);
+        assert_eq!(
+            rate_observation(&spec, &UsageObservation::new(), &halfway)
+                .unwrap()
+                .current_micro_usd,
+            81
+        );
+        assert_eq!(
+            rate_observation(&spec, &next, &full_million)
+                .unwrap()
+                .current_micro_usd,
+            3_220_000
+        );
+    }
+
+    #[test]
+    fn session_and_x402_agree_on_gemini_aggregate_token_prices() {
+        let mut input =
+            one_tier_dimension(MeterDirection::Input, BillingUnit::Tokens, 1_000_000, 0.345);
+        input.meter = Some(UsageMeter {
+            source: UsageMeterSource::ResponseJson,
+            path: Some("/usage/prompt_tokens".into()),
+            header: None,
+        });
+        let mut output = one_tier_dimension(
+            MeterDirection::Output,
+            BillingUnit::Tokens,
+            1_000_000,
+            2.875,
+        );
+        output.meter = Some(UsageMeter {
+            source: UsageMeterSource::ResponseJson,
+            path: Some("/usage/completion_tokens".into()),
+            header: None,
+        });
+        let metering = metering_with_dimensions(vec![input, output]);
+        let spec = spec_from_metering(&metering, SessionMeteringContext::new()).unwrap();
+        let x402 = crate::server::metering::UptoSettlementPlan {
+            metering,
+            variant_hint: None,
+            request_properties: RequestProperties::default(),
+            ceiling_usd: 0.25,
+            inferred_usage: None,
+        };
+
+        for (input, output, expected) in [(1, 1, 3), (50, 100, 305)] {
+            let observation = UsageObservation::new()
+                .with(MeterDirection::Input, BillingUnit::Tokens, input)
+                .with(MeterDirection::Output, BillingUnit::Tokens, output);
+            let session_amount = rate_observation(&spec, &UsageObservation::new(), &observation)
+                .unwrap()
+                .current_micro_usd;
+            let body = serde_json::json!({
+                "usage": {"prompt_tokens": input, "completion_tokens": output}
+            })
+            .to_string();
+            let x402_amount = crate::server::metering::upto_actual_amount_from_response(
+                &x402,
+                250_000,
+                &http::HeaderMap::new(),
+                Some(body.as_bytes()),
+            )
+            .unwrap()
+            .base_units;
+            assert_eq!((session_amount, x402_amount), (expected, expected));
+        }
+    }
+
+    #[test]
+    fn combines_sub_micro_usd_dimensions_before_rounding() {
+        let spec = SessionMeterSpec::new([
+            SessionMeterDimension::required(MeterDirection::Input, BillingUnit::Tokens, 1_000, 400),
+            SessionMeterDimension::required(
+                MeterDirection::Output,
+                BillingUnit::Tokens,
+                1_000,
+                400,
+            ),
+        ]);
+        let observation = UsageObservation::new()
+            .with(MeterDirection::Input, BillingUnit::Tokens, 1)
+            .with(MeterDirection::Output, BillingUnit::Tokens, 1);
+        let rated = rate_observation(&spec, &UsageObservation::new(), &observation).unwrap();
+
+        assert_eq!(rated.current_micro_usd, 1);
+        assert_eq!(
+            rated
+                .lines
+                .iter()
+                .map(|line| line.current_micro_usd)
+                .sum::<u64>(),
+            2
+        );
+    }
+
+    #[test]
+    fn provider_metered_usage_is_prorated_but_request_blocks_remain_discrete() {
+        let mut provider_bytes =
+            one_tier_dimension(MeterDirection::Output, BillingUnit::Bytes, 1_000, 0.005);
+        provider_bytes.meter = Some(UsageMeter {
+            source: UsageMeterSource::ResponseJson,
+            path: Some("/usage/bytes".into()),
+            header: None,
+        });
+        let metered = spec_from_metering(
+            &metering_with_dimensions(vec![provider_bytes]),
+            SessionMeteringContext::new(),
+        )
+        .unwrap();
+        let requests = spec_from_metering(
+            &metering_with_dimensions(vec![one_tier_dimension(
+                MeterDirection::Usage,
+                BillingUnit::Requests,
+                10,
+                0.005,
+            )]),
+            SessionMeteringContext::new(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            rate_observation(
+                &metered,
+                &UsageObservation::new(),
+                &UsageObservation::new().with(MeterDirection::Output, BillingUnit::Bytes, 1),
+            )
+            .unwrap()
+            .current_micro_usd,
+            5
+        );
+        assert_eq!(
+            rate_observation(
+                &requests,
+                &UsageObservation::new(),
+                &UsageObservation::new().with(MeterDirection::Usage, BillingUnit::Requests, 1),
+            )
+            .unwrap()
+            .current_micro_usd,
+            5_000
+        );
     }
 
     #[test]
@@ -995,17 +1271,17 @@ endpoints:
             rate_observation(&spec, &zero, &one)
                 .unwrap()
                 .delta_micro_usd,
-            5
+            3
         );
         assert_eq!(
             rate_observation(&spec, &one, &two).unwrap().delta_micro_usd,
-            0
+            2
         );
         assert_eq!(
             rate_observation(&spec, &two, &three)
                 .unwrap()
                 .delta_micro_usd,
-            5
+            3
         );
     }
 
@@ -1120,8 +1396,8 @@ endpoints:
         let decision = gate.observe(current, GateMode::Streaming).unwrap();
 
         assert!(decision.requires_voucher());
-        assert_eq!(decision.target_cumulative_base_units(), 114);
-        assert_eq!(decision.outstanding_base_units(), 14);
+        assert_eq!(decision.target_cumulative_base_units(), 113);
+        assert_eq!(decision.outstanding_base_units(), 13);
     }
 
     #[test]
