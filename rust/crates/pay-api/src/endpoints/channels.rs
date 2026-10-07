@@ -37,6 +37,13 @@ const PAYMENT_RECEIPT_HEADER: HeaderName = HeaderName::from_static("payment-rece
 const COMPUTE_BUDGET_PROGRAM_ID: &str = "ComputeBudget111111111111111111111111111111";
 const MEMO_PROGRAM_ID: &str = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr";
 const STATUS_OPEN: u8 = 0;
+const COMPUTE_UNIT_LIMIT_DISCRIMINATOR: u8 = 2;
+const COMPUTE_UNIT_PRICE_DISCRIMINATOR: u8 = 3;
+const LAMPORTS_PER_SIGNATURE: u64 = 5_000;
+/// Runtime default compute budget for each non-compute-budget instruction
+/// when the transaction does not set an explicit limit.
+const DEFAULT_INSTRUCTION_COMPUTE_UNIT_LIMIT: u32 = 200_000;
+const MAX_COMPUTE_UNIT_LIMIT: u32 = 1_400_000;
 
 #[derive(Debug, Deserialize)]
 pub struct CloseRequest {
@@ -266,7 +273,7 @@ fn resolve_request(state: &AppState, request: &CloseRequest) -> Result<ResolvedC
 
     let (parsed, channel) = match request.tx.as_deref().filter(|tx| !tx.trim().is_empty()) {
         Some(tx) => {
-            let parsed = parse_close_tx(tx, &fee_payer)?;
+            let parsed = parse_close_tx(tx, &fee_payer, state.channels.estimated_fee_lamports)?;
             let channel = parsed.channel;
             (Some(parsed), channel)
         }
@@ -294,7 +301,11 @@ fn resolve_request(state: &AppState, request: &CloseRequest) -> Result<ResolvedC
     })
 }
 
-fn parse_close_tx(tx_b64: &str, expected_fee_payer: &str) -> Result<ParsedCloseTx, Error> {
+fn parse_close_tx(
+    tx_b64: &str,
+    expected_fee_payer: &str,
+    max_fee_lamports: u64,
+) -> Result<ParsedCloseTx, Error> {
     use base64::Engine;
     let raw = base64::engine::general_purpose::STANDARD
         .decode(tx_b64.trim())
@@ -331,6 +342,12 @@ fn parse_close_tx(tx_b64: &str, expected_fee_payer: &str) -> Result<ParsedCloseT
     if close_ix.accounts.len() != 2 {
         return Err(Error::InvalidPaymentCredential);
     }
+    // The caller picks the compute budget, but the sponsor is reimbursed a
+    // fixed amount. Refuse to co-sign anything the reimbursement does not
+    // cover instead of letting repeated closes drain the fee payer.
+    if sponsored_fee_lamports(&tx)? > max_fee_lamports {
+        return Err(Error::InvalidPaymentCredential);
+    }
     let payer_index = usize::from(close_ix.accounts[0]);
     let channel_index = usize::from(close_ix.accounts[1]);
     let payer = *keys
@@ -357,6 +374,52 @@ fn parse_close_tx(tx_b64: &str, expected_fee_payer: &str) -> Result<ParsedCloseT
         return Err(Error::InvalidPaymentCredential);
     }
     Ok(ParsedCloseTx { tx, payer, channel })
+}
+
+/// Total lamports the sponsor pays for `tx`: the per-signature base fee plus
+/// any priority fee requested through compute-budget instructions. Fails
+/// closed on compute-budget instructions this endpoint does not model, so an
+/// unrecognised request is never co-signed under a fixed reimbursement.
+fn sponsored_fee_lamports(tx: &VersionedTransaction) -> Result<u64, Error> {
+    let keys = tx.message.static_account_keys();
+    let compute = Pubkey::from_str(COMPUTE_BUDGET_PROGRAM_ID).expect("valid program id");
+    let mut unit_limit = None;
+    let mut unit_price = None;
+    let mut billed_instructions = 0u32;
+    for instruction in tx.message.instructions() {
+        let program = *keys
+            .get(usize::from(instruction.program_id_index))
+            .ok_or(Error::InvalidPaymentCredential)?;
+        if program != compute {
+            billed_instructions += 1;
+            continue;
+        }
+        let data = instruction.data.as_slice();
+        match (data.first().copied(), data.len()) {
+            (Some(COMPUTE_UNIT_LIMIT_DISCRIMINATOR), 5) if unit_limit.is_none() => {
+                unit_limit = Some(u32::from_le_bytes(
+                    data[1..5].try_into().expect("length checked"),
+                ));
+            }
+            (Some(COMPUTE_UNIT_PRICE_DISCRIMINATOR), 9) if unit_price.is_none() => {
+                unit_price = Some(u64::from_le_bytes(
+                    data[1..9].try_into().expect("length checked"),
+                ));
+            }
+            _ => return Err(Error::InvalidPaymentCredential),
+        }
+    }
+    let unit_limit = unit_limit
+        .unwrap_or_else(|| {
+            DEFAULT_INSTRUCTION_COMPUTE_UNIT_LIMIT.saturating_mul(billed_instructions)
+        })
+        .min(MAX_COMPUTE_UNIT_LIMIT);
+    let priority_fee = unit_price.map_or(0u128, |price| {
+        (u128::from(unit_limit) * u128::from(price)).div_ceil(1_000_000)
+    });
+    let signatures = u64::from(tx.message.header().num_required_signatures);
+    let total = u128::from(LAMPORTS_PER_SIGNATURE.saturating_mul(signatures)) + priority_fee;
+    u64::try_from(total).map_err(|_| Error::InvalidPaymentCredential)
 }
 
 async fn validate_open_channel(state: &AppState, resolved: &ResolvedClose) -> Result<(), Error> {
@@ -506,5 +569,89 @@ impl IntoResponse for ApiError {
             Json(serde_json::json!({ "error": self.0.to_string() })),
         )
             .into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solana_instruction::{AccountMeta, Instruction};
+
+    fn close_tx(budget: Vec<Instruction>) -> VersionedTransaction {
+        let fee_payer = Pubkey::new_unique();
+        let payer = Pubkey::new_unique();
+        let channel = Pubkey::new_unique();
+        let close = Instruction {
+            program_id: Pubkey::from_str(PAYMENT_CHANNELS_PROGRAM_ID).unwrap(),
+            accounts: vec![
+                AccountMeta::new(payer, true),
+                AccountMeta::new(channel, false),
+            ],
+            data: vec![REQUEST_CLOSE_DISCRIMINATOR],
+        };
+        let mut instructions = budget;
+        instructions.push(close);
+        pay_kit::core::tx::build_unsigned_unchecked(
+            pay_kit::core::tx::TxVersion::V0,
+            &fee_payer,
+            &instructions,
+            solana_hash::Hash::default(),
+            None,
+        )
+        .unwrap()
+    }
+
+    fn budget(data: Vec<u8>) -> Instruction {
+        Instruction {
+            program_id: Pubkey::from_str(COMPUTE_BUDGET_PROGRAM_ID).unwrap(),
+            accounts: vec![],
+            data,
+        }
+    }
+
+    fn unit_limit(limit: u32) -> Instruction {
+        let mut data = vec![COMPUTE_UNIT_LIMIT_DISCRIMINATOR];
+        data.extend_from_slice(&limit.to_le_bytes());
+        budget(data)
+    }
+
+    fn unit_price(micro_lamports: u64) -> Instruction {
+        let mut data = vec![COMPUTE_UNIT_PRICE_DISCRIMINATOR];
+        data.extend_from_slice(&micro_lamports.to_le_bytes());
+        budget(data)
+    }
+
+    #[test]
+    fn sponsored_fee_is_the_signature_fee_without_a_priority_fee() {
+        // Fee payer plus channel payer: two signatures at 5 000 lamports.
+        assert_eq!(sponsored_fee_lamports(&close_tx(vec![])).unwrap(), 10_000);
+        assert_eq!(
+            sponsored_fee_lamports(&close_tx(vec![unit_limit(50_000)])).unwrap(),
+            10_000
+        );
+    }
+
+    #[test]
+    fn sponsored_fee_adds_the_caller_selected_priority_fee() {
+        // 50 000 CU at 1 lamport per CU (1 000 000 micro-lamports).
+        let tx = close_tx(vec![unit_limit(50_000), unit_price(1_000_000)]);
+        assert_eq!(sponsored_fee_lamports(&tx).unwrap(), 60_000);
+        // Without an explicit limit the runtime bills the default budget for
+        // the single close instruction.
+        let tx = close_tx(vec![unit_price(1_000_000)]);
+        assert_eq!(sponsored_fee_lamports(&tx).unwrap(), 210_000);
+        // The limit is capped at the runtime maximum before pricing.
+        let tx = close_tx(vec![unit_limit(u32::MAX), unit_price(1_000_000)]);
+        assert_eq!(sponsored_fee_lamports(&tx).unwrap(), 1_410_000);
+    }
+
+    #[test]
+    fn sponsored_fee_rejects_unmodelled_or_repeated_compute_budget_instructions() {
+        // RequestHeapFrame is not priced here, so it fails closed.
+        let mut heap = vec![1u8];
+        heap.extend_from_slice(&65_536u32.to_le_bytes());
+        assert!(sponsored_fee_lamports(&close_tx(vec![budget(heap)])).is_err());
+        assert!(sponsored_fee_lamports(&close_tx(vec![unit_price(1), unit_price(2)])).is_err());
+        assert!(sponsored_fee_lamports(&close_tx(vec![budget(vec![3, 0, 0])])).is_err());
     }
 }
