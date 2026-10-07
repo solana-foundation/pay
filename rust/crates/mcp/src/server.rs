@@ -12,7 +12,6 @@ use crate::context::{LocalContext, PayContext};
 use crate::tools;
 
 pub struct PayMcp {
-    #[allow(dead_code)]
     tool_router: rmcp::handler::server::router::tool::ToolRouter<Self>,
     session_cache: Arc<tools::curl::SessionCache>,
     context: Arc<dyn PayContext>,
@@ -31,14 +30,21 @@ impl PayMcp {
         Self::with_context(Arc::new(LocalContext::new()))
     }
 
-    /// A server whose calls are resolved by `context`; pay-connect's per-tenant
-    /// server.
+    /// A server whose calls are resolved by `context`, with local tools enabled.
+    /// Hosted deployments must use [`Self::with_hosted_context`].
     pub fn with_context(context: Arc<dyn PayContext>) -> Self {
         Self {
             tool_router: Self::tool_router(),
             session_cache: Arc::new(tools::curl::SessionCache::default()),
             context,
         }
+    }
+
+    /// Hosted connectors cannot launch an inference worker on the user's machine.
+    pub fn with_hosted_context(context: Arc<dyn PayContext>) -> Self {
+        let mut server = Self::with_context(context);
+        server.tool_router.disable_route("sell_inference");
+        server
     }
 
     #[tool(
@@ -151,7 +157,7 @@ fees and setup costs. Use this to check available funds before making paid API c
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let scope = self.context.scope(&ctx)?;
-        tools::get_balance::run(params, &scope).await
+        tools::get_balance::run(params, &scope, self.tool_router.has_route("sell_inference")).await
     }
 
     #[tool(
@@ -163,10 +169,6 @@ create a QR code for adding funds to Pay. The user must choose the top-up method
 code. When `method` is `onramp`, the user must also specify the provider
 (`coinbase`, `paypal`, or `venmo`). This tool does not spend funds or initiate
 a purchase; it only renders the QR PNG and returns the funding address.
-
-Depositing is one of two ways to fund an empty balance. The other is
-`sell_inference`: earn stablecoins by serving this agent's inference for a
-while. When the balance is empty, offer both and let the user choose.
 "#
     )]
     async fn topup(
@@ -241,7 +243,7 @@ For detailed authoring guidance, use the Pay skill reference
     }
 }
 
-#[tool_handler]
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for PayMcp {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
@@ -251,7 +253,11 @@ impl ServerHandler for PayMcp {
                     .with_title("Pay")
                     .with_website_url("https://pay.sh"),
             )
-            .with_instructions(pay_core::instructions::INSTRUCTIONS)
+            .with_instructions(if self.tool_router.has_route("sell_inference") {
+                pay_core::instructions::INSTRUCTIONS
+            } else {
+                pay_core::instructions::HOSTED_INSTRUCTIONS
+            })
     }
 }
 
@@ -291,6 +297,32 @@ mod tests {
         let mcp = PayMcp::new();
         let info = mcp.get_info();
         assert_eq!(info.protocol_version, ProtocolVersion::V_2025_06_18);
+    }
+
+    #[test]
+    fn only_local_servers_expose_inference_selling() {
+        let local = PayMcp::new();
+        assert!(local.tool_router.has_route("sell_inference"));
+        let hosted = PayMcp::with_hosted_context(Arc::new(LocalContext::new()));
+        assert!(!hosted.tool_router.has_route("sell_inference"));
+        assert!(hosted.tool_router.is_disabled("sell_inference"));
+        assert!(
+            !hosted
+                .get_info()
+                .instructions
+                .unwrap()
+                .contains("sell_inference")
+        );
+        for tool in hosted.tool_router.list_all() {
+            assert_ne!(tool.name, "sell_inference");
+            assert!(
+                !tool
+                    .description
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("sell_inference")
+            );
+        }
     }
 
     #[test]

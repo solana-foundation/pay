@@ -35,4 +35,6 @@ url = "2"
 zip = { version = "4", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
+rcgen = "0.14"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tower = { version = "0.5", features = ["util"] }

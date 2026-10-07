@@ -3,4 +3,12 @@
 //!
 //! Edit `instructions.md` to update.
 
-pub const INSTRUCTIONS: &str = include_str!("instructions.md");
+/// Instructions shared by local and hosted MCP servers.
+pub const HOSTED_INSTRUCTIONS: &str = include_str!("instructions.md");
+
+/// Local servers additionally expose tools that run on the user's machine.
+pub const INSTRUCTIONS: &str = concat!(
+    include_str!("instructions.md"),
+    "\n",
+    include_str!("instructions-local.md")
+);

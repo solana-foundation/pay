@@ -303,7 +303,59 @@ impl FirestoreDriver {
         normalize_document(store_id, key, value)
     }
 
-    async fn delete_documents(&self, tenant: &Tenant, store_id: &str) -> Result<()> {
+    async fn delete_store_snapshot(&self, tenant: &Tenant, store: &Value) -> Result<()> {
+        let physical_id = store_physical_id(store)?;
+        let policy = firestore_string(store, "reclaimPolicy").unwrap_or("delete");
+        let mut url = url::Url::parse(&self.store_url(tenant, physical_id)?)
+            .map_err(|error| DataError::Configuration(error.to_string()))?;
+        let update_time = store
+            .get("updateTime")
+            .and_then(Value::as_str)
+            .ok_or_else(|| DataError::Provider("store omitted updateTime".into()))?;
+        url.query_pairs_mut()
+            .append_pair("currentDocument.updateTime", update_time);
+        // Never refresh this snapshot: a concurrent deleter can finish and the
+        // owner can recreate the same path while this operation is suspended.
+        let deleting = match firestore_string(store, "phase").unwrap_or("ready") {
+            "ready" => {
+                url.query_pairs_mut()
+                    .append_pair("updateMask.fieldPaths", "phase");
+                self.require_json(
+                    Method::PATCH,
+                    url.into(),
+                    Some(&json!({ "fields": { "phase": { "stringValue": "deleting" } } })),
+                )
+                .await?
+            }
+            "deleting" => store.clone(),
+            phase => {
+                return Err(DataError::Provider(format!(
+                    "document store is in `{phase}` phase"
+                )));
+            }
+        };
+        let update_time = deleting
+            .get("updateTime")
+            .and_then(Value::as_str)
+            .ok_or_else(|| DataError::Provider("store omitted updateTime".into()))?;
+        if policy == "delete" {
+            self.delete_documents(tenant, physical_id, &deleting)
+                .await?;
+        }
+        let mut url = url::Url::parse(&self.store_url(tenant, physical_id)?)
+            .map_err(|error| DataError::Configuration(error.to_string()))?;
+        url.query_pairs_mut()
+            .append_pair("currentDocument.updateTime", update_time);
+        self.require_json(Method::DELETE, url.into(), None).await?;
+        Ok(())
+    }
+
+    async fn delete_documents(
+        &self,
+        tenant: &Tenant,
+        store_id: &str,
+        deleting: &Value,
+    ) -> Result<()> {
         let mut page_token: Option<String> = None;
         let mut deleted = 0;
         loop {
@@ -325,16 +377,10 @@ impl FirestoreDriver {
                     .get("name")
                     .and_then(Value::as_str)
                     .ok_or_else(|| DataError::Provider("Firestore document omitted name".into()))?;
-                let (status, response) = self
-                    .send_json(
-                        Method::DELETE,
-                        format!("{}/v1/{name}", self.config.api_base),
-                        None,
-                    )
+                // The parent fence and child delete must be atomic. A separate
+                // check would still allow deletion of a replacement's child.
+                self.commit_document_write(tenant, deleting, json!({ "delete": name }))
                     .await?;
-                if !status.is_success() {
-                    return Err(provider_error(status, &response));
-                }
                 deleted += 1;
                 if deleted > MAX_DELETE_DOCUMENTS {
                     return Err(DataError::InvalidRequest(format!(
@@ -501,37 +547,7 @@ impl DataDriver for FirestoreDriver {
         request: DocumentStoreRequest,
     ) -> Result<()> {
         let store = self.require_store(tenant, &request.id).await?;
-        let physical_id = store_physical_id(&store)?;
-        let policy = firestore_string(&store, "reclaimPolicy").unwrap_or("delete");
-        match firestore_string(&store, "phase").unwrap_or("ready") {
-            "ready" => {
-                self.require_json(
-                    Method::PATCH,
-                    format!(
-                        "{}?updateMask.fieldPaths=phase",
-                        self.store_url(tenant, physical_id)?
-                    ),
-                    Some(&json!({ "fields": { "phase": { "stringValue": "deleting" } } })),
-                )
-                .await?;
-            }
-            "deleting" => {}
-            phase => {
-                return Err(DataError::Provider(format!(
-                    "document store is in `{phase}` phase"
-                )));
-            }
-        }
-        if policy == "delete" {
-            self.delete_documents(tenant, physical_id).await?;
-        }
-        let (status, response) = self
-            .send_json(Method::DELETE, self.store_url(tenant, physical_id)?, None)
-            .await?;
-        if !status.is_success() {
-            return Err(provider_error(status, &response));
-        }
-        Ok(())
+        self.delete_store_snapshot(tenant, &store).await
     }
 
     async fn get_document(&self, tenant: &Tenant, request: DocumentRequest) -> Result<Document> {
@@ -649,17 +665,14 @@ impl DataDriver for FirestoreDriver {
         for store in &stores {
             let tenant_key = firestore_string(store, "tenant")
                 .ok_or_else(|| DataError::Provider("store omitted tenant".into()))?;
-            let id = store_physical_id(store)?.to_string();
-            self.delete_document_store(
+            require_channel_lease(channel_id, store)?;
+            self.delete_store_snapshot(
                 &Tenant {
                     payer: String::new(),
                     key: tenant_key.to_string(),
                     channel_id: channel_id.to_string(),
                 },
-                DocumentStoreRequest {
-                    driver: DRIVER_ID.into(),
-                    id,
-                },
+                store,
             )
             .await?;
         }
@@ -871,6 +884,9 @@ fn provider_error(status: StatusCode, value: &Value) -> DataError {
 }
 
 #[cfg(test)]
+mod race_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use axum::Router;
@@ -878,7 +894,7 @@ mod tests {
     use axum::http::Request;
     use axum::response::Response;
 
-    fn json_response(status: StatusCode, value: Value) -> Response {
+    pub(super) fn json_response(status: StatusCode, value: Value) -> Response {
         Response::builder()
             .status(status)
             .header("content-type", "application/json")
@@ -892,6 +908,7 @@ mod tests {
         let store_path = "/v1/projects/project/databases/(default)/documents/pay-data/0123456789abcdef/documentStores/fds-0123456789abcdef-weather";
         let document = json!({
             "name": "projects/project/databases/(default)/documents/pay-data/0123456789abcdef/documentStores/fds-0123456789abcdef-weather",
+            "updateTime": "2026-01-01T00:00:00Z",
             "fields": {
                 "logicalName": { "stringValue": "weather" },
                 "driver": { "stringValue": DRIVER_ID },
@@ -927,7 +944,7 @@ mod tests {
                     }
                     ("GET", path) if path == store_path => json_response(StatusCode::OK, document),
                     ("PATCH", path) if path == store_path => {
-                        json_response(StatusCode::OK, json!({}))
+                        json_response(StatusCode::OK, document)
                     }
                     ("GET", path) if path == format!("{store_path}/documents") => {
                         json_response(StatusCode::OK, json!({}))

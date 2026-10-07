@@ -20,6 +20,7 @@ fn default_network() -> String {
 pub async fn run(
     params: Params,
     scope: &crate::context::CallScope,
+    sell_inference_available: bool,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
     // A forced network wins over the parameter, as it does for payments.
     let network = scope.network_override.clone().unwrap_or(params.network);
@@ -89,15 +90,32 @@ pub async fn run(
         && balances.tokens.iter().all(|t| t.raw_amount == 0)
         && balances.credits.iter().all(|c| c.raw_amount == 0);
     if nothing_to_spend {
-        lines.push(
-            "The balance is empty. Two ways to fund it: `topup` deposits stablecoins, \
-             `sell_inference` earns them by serving this agent's inference for a while. \
-             Offer both and let the user choose."
-                .to_string(),
-        );
+        lines.push(empty_balance_guidance(sell_inference_available).to_string());
     }
 
     Ok(CallToolResult::success(vec![
         rmcp::model::ContentBlock::text(lines.join("\n")),
     ]))
+}
+
+fn empty_balance_guidance(sell_inference_available: bool) -> &'static str {
+    if sell_inference_available {
+        "The balance is empty. Two ways to fund it: `topup` deposits stablecoins, \
+         `sell_inference` earns them by serving this agent's inference for a while. \
+         Offer both and let the user choose."
+    } else {
+        "The balance is empty. Use `topup` to deposit stablecoins."
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn funding_guidance_only_recommends_available_tools() {
+        assert!(empty_balance_guidance(true).contains("sell_inference"));
+        assert!(!empty_balance_guidance(false).contains("sell_inference"));
+        assert!(empty_balance_guidance(false).contains("topup"));
+    }
 }

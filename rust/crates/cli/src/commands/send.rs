@@ -409,7 +409,9 @@ fn balances_for_sender(
         let _ = rt.block_on(pay_core::sandbox::fund_via_surfpool(rpc_url, sender));
     }
 
-    rt.block_on(pay_core::balance::get_stablecoin_balances(rpc_url, sender))
+    rt.block_on(pay_core::balance::get_spendable_stablecoin_balances(
+        rpc_url, sender,
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

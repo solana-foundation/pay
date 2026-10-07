@@ -4087,6 +4087,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn signed_flat_request_rejects_insufficient_session_capacity_before_forwarding() {
+        use crate::sell_inference::{SellInference, SellPricing};
+        use crate::server::gate::{GateDecision, GateRequest, PaymentGate};
+
+        #[derive(Clone)]
+        struct State {
+            apis: Vec<pay_types::metering::ApiSpec>,
+            session: Arc<SessionMpp>,
+        }
+        impl crate::PaymentState for State {
+            fn apis(&self) -> &[pay_types::metering::ApiSpec] {
+                &self.apis
+            }
+            fn mpp(&self) -> Option<&pay_kit::mpp::server::Mpp> {
+                None
+            }
+            fn session_mpp_handle(&self) -> Option<Arc<SessionMpp>> {
+                Some(self.session.clone())
+            }
+        }
+
+        let (session, challenge, channel, proof, _) = operator_session_with_bound_channel().await;
+        let price_units = 750_000;
+        let price_usd = price_units as f64 / 10_f64.powi(session.decimals() as i32);
+        let sale = SellInference {
+            endpoint_id: "flat-capacity".into(),
+            recipient: session.session_config.recipient.clone(),
+            network: "localnet".into(),
+            currencies: vec!["USDC".into()],
+            pricing: SellPricing::PerRequest { usd: price_usd },
+            model: "test".into(),
+            title: "test".into(),
+            description: String::new(),
+            upstream_url: "http://127.0.0.1:1".into(),
+            session_cap_usd: 1.0,
+            session_idle_close_secs: 600,
+        };
+        let path = sale.chat_path();
+        let session = Arc::new(session);
+        let state = State {
+            apis: vec![sale.api_spec()],
+            session: session.clone(),
+        };
+        let handle = SessionHandle::new(channel, test_session_signer(), challenge)
+            .with_authentication(proof);
+        let authorization = handle.use_header().await.unwrap();
+        let request = GateRequest {
+            method: &http::Method::POST,
+            path: &path,
+            host: None,
+            accept: None,
+            authorization: Some(&authorization),
+            content_length: None,
+            query: None,
+            x402_payment: None,
+        };
+        let gate = PaymentGate::new(state);
+        // A full request fits initially. Dropping the forward releases its lease.
+        assert!(matches!(
+            gate.evaluate(&request).await,
+            GateDecision::Forward { .. }
+        ));
+        let store = &session.operator_runtime.channel_store;
+        let mut saved = store
+            .get_channel(&channel.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        saved.cumulative = price_units;
+        store
+            .update_channel(&channel.to_string(), Box::new(move |_| Ok(saved.clone())))
+            .await
+            .unwrap();
+        let GateDecision::Respond(response) = gate.evaluate(&request).await else {
+            panic!("flat request must not be forwarded with only 250,000 units left");
+        };
+        assert_eq!(response.status, http::StatusCode::PAYMENT_REQUIRED);
+        assert!(String::from_utf8_lossy(&response.body).contains("session_cap_exhausted"));
+        assert_eq!(
+            store
+                .get_channel(&channel.to_string())
+                .await
+                .unwrap()
+                .unwrap()
+                .cumulative,
+            price_units
+        );
+    }
+
+    #[tokio::test]
     async fn use_authenticates_the_proof_bound_at_open() {
         let (session, challenge, channel, proof, _payer) =
             operator_session_with_bound_channel().await;

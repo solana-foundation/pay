@@ -1997,7 +1997,27 @@ pub async fn commit_batch<S: PaymentState>(
     state: &S,
     forward: &BatchForward,
 ) -> Option<(HeaderName, HeaderValue)> {
-    let batch = state.x402_batch()?;
+    commit_batch_result(state, forward).await.ok().flatten()
+}
+
+/// Keep confirmed charging distinct from optional receipt encoding.
+pub(super) async fn settle_batch_confirmed<S: PaymentState>(
+    state: &S,
+    forward: BatchForward,
+    cached: Option<pay_kit::core::store::CachedUpstreamResponse>,
+) -> Result<Option<(HeaderName, HeaderValue)>, String> {
+    let receipt = commit_batch_result(state, &forward).await?;
+    if let Some(cached) = cached {
+        cache_batch_response(state, &forward, cached).await;
+    }
+    Ok(receipt)
+}
+
+async fn commit_batch_result<S: PaymentState>(
+    state: &S,
+    forward: &BatchForward,
+) -> Result<Option<(HeaderName, HeaderValue)>, String> {
+    let batch = state.x402_batch().ok_or("batch backend unavailable")?;
     let telemetry_context = &forward.telemetry;
     let channel_id = forward.outcome.channel_id.clone();
     let channel_config = forward.outcome.payload().channel_config();
@@ -2081,10 +2101,9 @@ pub async fn commit_batch<S: PaymentState>(
                 }
             }
             match batch.settlement_header(&settlement) {
-                Ok((name, value)) => Some((
-                    HeaderName::from_bytes(name.as_bytes()).ok()?,
-                    HeaderValue::from_str(&value).ok()?,
-                )),
+                Ok((name, value)) => Ok(HeaderName::from_bytes(name.as_bytes())
+                    .ok()
+                    .zip(HeaderValue::from_str(&value).ok())),
                 Err(e) => {
                     telemetry::record_settlement_error(
                         "x402/batch",
@@ -2093,7 +2112,7 @@ pub async fn commit_batch<S: PaymentState>(
                         &e.to_string(),
                         true,
                     );
-                    None
+                    Ok(None)
                 }
             }
         }
@@ -2107,7 +2126,7 @@ pub async fn commit_batch<S: PaymentState>(
                 &e.to_string(),
                 true,
             );
-            None
+            Err(e.to_string())
         }
     }
 }
@@ -2433,8 +2452,13 @@ async fn session_authorized(
                 ));
             };
             let available_base_units = state.deposit.saturating_sub(state.cumulative);
+            let indivisible_price = match pricing {
+                SessionPricing::Fixed(amount) => Some(amount),
+                SessionPricing::Metered(meter) => metering::flat_request_price(meter)
+                    .map(|usd| (usd * 10_f64.powi(sm.decimals() as i32)).ceil() as u64),
+            };
             if available_base_units == 0
-                || matches!(pricing, SessionPricing::Fixed(amount) if amount > available_base_units)
+                || indivisible_price.is_some_and(|amount| amount > available_base_units)
             {
                 return GateDecision::Respond(GateResponse::json(
                     StatusCode::PAYMENT_REQUIRED,

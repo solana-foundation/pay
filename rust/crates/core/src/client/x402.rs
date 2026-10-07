@@ -685,10 +685,18 @@ pub fn recover_batch_channel(
         recent_blockhash: requirements.extra.recent_blockhash.as_deref(),
     };
     let route = resolve_channel_route(&offer, network_override)?;
-    let Some(payer) = configured_channel_payer(store, &route.network, account_override)? else {
+    let selected = configured_channel_payer(store, &route.network, account_override)?;
+    let existing = cache.get(requirements)?;
+    let Some(payer) = selected.or_else(|| {
+        existing
+            .as_ref()
+            .and_then(|channel| channel.config().payer.parse().ok())
+    }) else {
         return Ok(());
     };
-    if cache.get_for_payer(requirements, &payer)?.is_some() {
+    if cache.get_for_payer(requirements, &payer)?.is_some()
+        && !cache.has_pending_funding(requirements)?
+    {
         return Ok(());
     }
     let rpc = RpcClient::new(route.rpc_url);
@@ -698,7 +706,10 @@ pub fn recover_batch_channel(
     if let Some(channel) = batch_client::discover_channel(&rpc, &payer, requirements, &terms)
         .map_err(|e| Error::Mpp(format!("Failed to discover batch channel: {e}")))?
     {
-        cache.insert(requirements, channel)?;
+        cache.insert_recovered(requirements, channel)?;
+    }
+    if cache.has_pending_funding(requirements)? {
+        return Err(crate::client::batch::pending_funding_error());
     }
     Ok(())
 }
@@ -727,6 +738,9 @@ pub fn build_batch_payment(
 ) -> Result<BuiltBatchPayment> {
     use pay_kit::x402::client::batch_settlement as batch_client;
 
+    // Resolve ambiguous funding before wallet approval or building another
+    // transaction. Discovery is public-key-only and also repairs lost receipts.
+    recover_batch_channel(challenge, store, cache, network_override, account_override)?;
     let requirements = &challenge.requirements;
     let price = requirements
         .amount()
@@ -806,6 +820,9 @@ pub fn build_batch_payment(
     if existing.is_none() {
         existing = batch_client::discover_channel(&rpc, &signer.pubkey(), requirements, &terms)
             .map_err(|e| Error::Mpp(format!("Failed to discover batch channel: {e}")))?;
+        if let Some(channel) = &existing {
+            cache.insert_recovered(requirements, channel.clone())?;
+        }
     }
 
     let (channel, payload, submission) = match existing {
@@ -867,7 +884,8 @@ pub fn build_batch_payment(
                     open_slot,
                 ))
                 .map_err(|e| Error::Mpp(format!("Failed to build batch deposit: {e}")))?;
-            let submission = crate::client::batch::Submission::from_payload(&payload)?;
+            let submission = crate::client::batch::Submission::from_payload(&payload)?
+                .with_confirmed_deposit(deposit);
             (channel, payload, submission)
         }
     };
@@ -876,6 +894,7 @@ pub fn build_batch_payment(
     cache.insert_signer(requirements, signer.clone())?;
     let header = batch_client::encode_payment_header(requirements, payload)
         .map_err(|e| Error::Mpp(format!("Failed to encode batch payment: {e}")))?;
+    cache.register_submission(requirements, &submission)?;
     Ok(BuiltBatchPayment {
         payment: BuiltPayment {
             headers: vec![(X402_V2_PAYMENT_HEADER, header)],

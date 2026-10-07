@@ -260,24 +260,58 @@ async fn fetch_stablecoins_via_rpc(
     client: &reqwest::Client,
     rpc_url: &str,
     pubkey: &str,
+    spendable_only: bool,
 ) -> crate::Result<Vec<TokenBalance>> {
     let mut responses = Vec::with_capacity(2);
     for program_id in [TOKEN_PROGRAM, TOKEN_2022_PROGRAM] {
-        responses.push(
-            rpc_call(
-                client,
-                rpc_url,
-                "getTokenAccountsByOwner",
-                serde_json::json!([
-                    pubkey,
-                    { "programId": program_id },
-                    { "encoding": "jsonParsed", "commitment": "confirmed" }
-                ]),
-            )
-            .await?,
-        );
+        let mut response = rpc_call(
+            client,
+            rpc_url,
+            "getTokenAccountsByOwner",
+            serde_json::json!([
+                pubkey,
+                { "programId": program_id },
+                { "encoding": "jsonParsed", "commitment": "confirmed" }
+            ]),
+        )
+        .await?;
+        if spendable_only {
+            retain_associated_token_accounts(&mut response, pubkey, program_id)?;
+        }
+        responses.push(response);
     }
     Ok(parse_rpc_stablecoin_balances(&responses))
+}
+
+fn retain_associated_token_accounts(
+    response: &mut serde_json::Value,
+    owner: &str,
+    token_program: &str,
+) -> crate::Result<()> {
+    use solana_pubkey::Pubkey;
+    use std::str::FromStr;
+
+    let owner = Pubkey::from_str(owner).map_err(|e| crate::Error::Config(e.to_string()))?;
+    let token_program =
+        Pubkey::from_str(token_program).map_err(|e| crate::Error::Config(e.to_string()))?;
+    let associated_program = Pubkey::from_str("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
+        .expect("associated token program is valid");
+    if let Some(accounts) = response["result"]["value"].as_array_mut() {
+        accounts.retain(|account| {
+            let Some(mint) = account["account"]["data"]["parsed"]["info"]["mint"]
+                .as_str()
+                .and_then(|mint| Pubkey::from_str(mint).ok())
+            else {
+                return false;
+            };
+            let (ata, _) = Pubkey::find_program_address(
+                &[owner.as_ref(), token_program.as_ref(), mint.as_ref()],
+                &associated_program,
+            );
+            account["pubkey"].as_str() == Some(ata.to_string().as_str())
+        });
+    }
+    Ok(())
 }
 
 fn parse_rpc_stablecoin_balances(responses: &[serde_json::Value]) -> Vec<TokenBalance> {
@@ -322,37 +356,50 @@ async fn fetch_stablecoins_with_rpc_fallback(
     client: &reqwest::Client,
     rpc_url: &str,
     pubkey: &str,
+    spendable_only: bool,
 ) -> (ApiBalances, bool) {
-    match fetch_stablecoins_via_api(client, &pay_api_url(), pubkey, infer_network(rpc_url)).await {
+    fetch_stablecoins_from_endpoints(client, &pay_api_url(), rpc_url, pubkey, spendable_only).await
+}
+
+async fn fetch_stablecoins_from_endpoints(
+    client: &reqwest::Client,
+    api_url: &str,
+    rpc_url: &str,
+    pubkey: &str,
+    spendable_only: bool,
+) -> (ApiBalances, bool) {
+    match fetch_stablecoins_via_api(client, api_url, pubkey, infer_network(rpc_url)).await {
         Ok(balances) => (balances, false),
-        Err(api_error) => match fetch_stablecoins_via_rpc(client, rpc_url, pubkey).await {
-            Ok(tokens) => {
-                tracing::debug!(error = %api_error, "pay-api unreachable; used direct RPC stablecoin fallback");
-                (
-                    ApiBalances {
-                        tokens,
-                        committable_channels: Vec::new(),
-                        channel_balances_unavailable: true,
-                        credits: Vec::new(),
-                        credits_unavailable: true,
-                    },
-                    false,
-                )
+        Err(api_error) => {
+            match fetch_stablecoins_via_rpc(client, rpc_url, pubkey, spendable_only).await {
+                Ok(tokens) => {
+                    tracing::debug!(error = %api_error, "pay-api unreachable; used direct RPC stablecoin fallback");
+                    (
+                        ApiBalances {
+                            tokens,
+                            committable_channels: Vec::new(),
+                            channel_balances_unavailable: true,
+                            credits: Vec::new(),
+                            credits_unavailable: true,
+                        },
+                        false,
+                    )
+                }
+                Err(rpc_error) => {
+                    tracing::debug!(%api_error, %rpc_error, "stablecoin balance lookup unavailable from pay-api and RPC");
+                    (
+                        ApiBalances {
+                            tokens: Vec::new(),
+                            committable_channels: Vec::new(),
+                            channel_balances_unavailable: true,
+                            credits: Vec::new(),
+                            credits_unavailable: true,
+                        },
+                        true,
+                    )
+                }
             }
-            Err(rpc_error) => {
-                tracing::debug!(%api_error, %rpc_error, "stablecoin balance lookup unavailable from pay-api and RPC");
-                (
-                    ApiBalances {
-                        tokens: Vec::new(),
-                        committable_channels: Vec::new(),
-                        channel_balances_unavailable: true,
-                        credits: Vec::new(),
-                        credits_unavailable: true,
-                    },
-                    true,
-                )
-            }
-        },
+        }
     }
 }
 
@@ -460,7 +507,7 @@ pub async fn get_balances(rpc_url: &str, pubkey: &str) -> crate::Result<AccountB
     let sol_lamports = sol_resp["result"]["value"].as_u64().unwrap_or(0);
 
     let (api_balances, tokens_unavailable) =
-        fetch_stablecoins_with_rpc_fallback(&client, rpc_url, pubkey).await;
+        fetch_stablecoins_with_rpc_fallback(&client, rpc_url, pubkey, false).await;
 
     Ok(AccountBalances {
         sol_lamports,
@@ -473,17 +520,36 @@ pub async fn get_balances(rpc_url: &str, pubkey: &str) -> crate::Result<AccountB
     })
 }
 
-/// Fetch only stablecoin balances via pay-api.
+/// Fetch stablecoin holdings via pay-api, with an owner-account RPC fallback.
 ///
-/// This is used by top-up flows where SOL transfers are intentionally ignored
-/// and startup should not pay for an extra direct Solana RPC round trip.
+/// This skips the SOL lookup. The fallback includes custom token accounts for
+/// display; payment selection must use [`get_spendable_stablecoin_balances`].
 pub async fn get_stablecoin_balances(
     rpc_url: &str,
     pubkey: &str,
 ) -> crate::Result<AccountBalances> {
+    stablecoin_balances(rpc_url, pubkey, false).await
+}
+
+/// Fetch balances available to payment builders, which debit associated token accounts.
+///
+/// pay-api already returns ATA balances. Unlike display balances, the RPC
+/// fallback excludes custom token accounts for both SPL Token and Token-2022.
+pub async fn get_spendable_stablecoin_balances(
+    rpc_url: &str,
+    pubkey: &str,
+) -> crate::Result<AccountBalances> {
+    stablecoin_balances(rpc_url, pubkey, true).await
+}
+
+async fn stablecoin_balances(
+    rpc_url: &str,
+    pubkey: &str,
+    spendable_only: bool,
+) -> crate::Result<AccountBalances> {
     let client = balance_client()?;
     let (api_balances, tokens_unavailable) =
-        fetch_stablecoins_with_rpc_fallback(&client, rpc_url, pubkey).await;
+        fetch_stablecoins_with_rpc_fallback(&client, rpc_url, pubkey, spendable_only).await;
 
     Ok(AccountBalances {
         sol_lamports: 0,
@@ -582,12 +648,22 @@ async fn fetch_stablecoin_balances_batch_into(
     pubkeys: &[String],
     balances: &mut HashMap<String, AccountBalances>,
 ) {
-    let api = pay_api_url();
+    fetch_stablecoin_balances_batch_from_api(client, &pay_api_url(), rpc_url, pubkeys, balances)
+        .await;
+}
+
+async fn fetch_stablecoin_balances_batch_from_api(
+    client: &reqwest::Client,
+    api: &str,
+    rpc_url: &str,
+    pubkeys: &[String],
+    balances: &mut HashMap<String, AccountBalances>,
+) {
     let network = infer_network(rpc_url);
     let mut set = tokio::task::JoinSet::new();
     for pk in pubkeys {
         let client = client.clone();
-        let api = api.clone();
+        let api = api.to_string();
         let pk = pk.clone();
         set.spawn(async move {
             (
@@ -602,6 +678,8 @@ async fn fetch_stablecoin_balances_batch_into(
             Ok(api_balances) => {
                 if let Some(entry) = balances.get_mut(&pk) {
                     entry.tokens = api_balances.tokens;
+                    entry.committable_channels = api_balances.committable_channels;
+                    entry.channel_balances_unavailable = api_balances.channel_balances_unavailable;
                     entry.credits = api_balances.credits;
                     entry.credits_unavailable = api_balances.credits_unavailable;
                 }
@@ -611,6 +689,7 @@ async fn fetch_stablecoin_balances_batch_into(
                 if let Some(entry) = balances.get_mut(&pk) {
                     entry.tokens_unavailable = true;
                     entry.credits_unavailable = true;
+                    entry.channel_balances_unavailable = true;
                 }
             }
         }
@@ -656,6 +735,146 @@ async fn rpc_call(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn http_fixture(
+        responses: Vec<(u16, serde_json::Value)>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            for (status, response) in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut buffer = [0; 4096];
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    assert_ne!(count, 0);
+                    request.extend_from_slice(&buffer[..count]);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]);
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                let body = response.to_string();
+                let reply = format!(
+                    "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        (url, task)
+    }
+
+    #[tokio::test]
+    async fn batch_api_preserves_channel_balances_and_availability() {
+        let response = serde_json::json!({
+            "balances": [],
+            "committable_channel_balances": [{
+                "mint": Stablecoin::Usdc.mint(None).to_string(),
+                "raw_amount": "700", "ui_amount": 0.0007, "symbol": "USDC"
+            }],
+            "channel_balances_unavailable": true
+        });
+        let (api, task) = http_fixture(vec![
+            (200, response.clone()),
+            (200, response),
+            (503, serde_json::json!({})),
+        ])
+        .await;
+        let client = balance_client().unwrap();
+        let single = fetch_stablecoins_via_api(&client, &api, "payer", "mainnet")
+            .await
+            .unwrap();
+        let keys = vec!["payer".to_string()];
+        let mut batch = HashMap::from([("payer".to_string(), AccountBalances::default())]);
+        fetch_stablecoin_balances_batch_from_api(&client, &api, "mainnet", &keys, &mut batch).await;
+        assert_eq!(single.committable_channels.len(), 1);
+        assert_eq!(
+            batch["payer"].committable_channels[0].raw_amount,
+            single.committable_channels[0].raw_amount
+        );
+        assert_eq!(
+            batch["payer"].channel_balances_unavailable,
+            single.channel_balances_unavailable
+        );
+        let mut failed = HashMap::from([("payer".to_string(), AccountBalances::default())]);
+        fetch_stablecoin_balances_batch_from_api(&client, &api, "mainnet", &keys, &mut failed)
+            .await;
+        assert!(failed["payer"].channel_balances_unavailable);
+        assert!(failed["payer"].tokens_unavailable);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rpc_fallback_keeps_custom_holdings_for_display_but_not_funding() {
+        use solana_pubkey::Pubkey;
+        use std::str::FromStr;
+        let owner = Pubkey::new_unique();
+        let token_program = Pubkey::from_str(TOKEN_PROGRAM).unwrap();
+        let associated_program =
+            Pubkey::from_str("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL").unwrap();
+        let account = |currency: Stablecoin, raw: &str, custom: bool| {
+            let mint = currency.mint(None).to_string();
+            let mint_key = Pubkey::from_str(&mint).unwrap();
+            let ata = Pubkey::find_program_address(
+                &[owner.as_ref(), token_program.as_ref(), mint_key.as_ref()],
+                &associated_program,
+            )
+            .0;
+            serde_json::json!({
+                "pubkey": if custom { Pubkey::new_unique().to_string() } else { ata.to_string() },
+                "account": {"data": {"parsed": {"info": {"mint": mint, "tokenAmount": {"amount": raw}}}}}
+            })
+        };
+        let tokens = serde_json::json!({"result": {"value": [
+            account(Stablecoin::Usdc, "10000000", true),
+            account(Stablecoin::Usdc, "0", false),
+            account(Stablecoin::Usdt, "2000000", false)
+        ]}});
+        let empty = serde_json::json!({"result": {"value": []}});
+        let (api, api_task) = http_fixture(vec![(503, serde_json::json!({})); 2]).await;
+        let (rpc, rpc_task) = http_fixture(vec![
+            (200, tokens.clone()),
+            (200, empty.clone()),
+            (200, tokens),
+            (200, empty),
+        ])
+        .await;
+        let client = balance_client().unwrap();
+        let (display, unavailable) =
+            fetch_stablecoins_from_endpoints(&client, &api, &rpc, &owner.to_string(), false).await;
+        assert!(!unavailable);
+        assert_eq!(display.tokens.len(), 2);
+        assert_eq!(
+            display
+                .tokens
+                .iter()
+                .find(|t| t.is_symbol("USDC"))
+                .unwrap()
+                .raw_amount,
+            10_000_000
+        );
+        let (funding, unavailable) =
+            fetch_stablecoins_from_endpoints(&client, &api, &rpc, &owner.to_string(), true).await;
+        assert!(!unavailable);
+        assert_eq!(funding.tokens.len(), 1);
+        assert!(funding.tokens[0].is_symbol("USDT"));
+        assert_eq!(funding.tokens[0].raw_amount, 2_000_000);
+        api_task.await.unwrap();
+        rpc_task.await.unwrap();
+    }
 
     #[test]
     fn mint_symbol_usdc() {

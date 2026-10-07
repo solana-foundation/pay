@@ -775,20 +775,26 @@ impl GoogleCloudFunctionsDriver {
         })?;
         apply_relative_path(&mut url, path_and_query)?;
         let mut outgoing = self.client.request(parse_method(method)?, url);
-        if let Some(token) = self.identity_token(origin).await? {
-            outgoing = outgoing.bearer_auth(token);
-        }
         for (name, value) in headers {
             let lower = name.to_ascii_lowercase();
             if matches!(
                 lower.as_str(),
-                "authorization" | "host" | "cookie" | "content-length" | "x-pay-gcp-cpu-microusd"
+                "authorization"
+                    | "x-serverless-authorization"
+                    | "host"
+                    | "cookie"
+                    | "content-length"
+                    | "x-pay-gcp-cpu-microusd"
             ) || lower.starts_with("payment-")
                 || lower.starts_with("x-payment")
             {
                 continue;
             }
             outgoing = outgoing.header(name, value);
+        }
+        if let Some(token) = self.identity_token(origin).await? {
+            // Cloud Run removes this token's signature before tenant code sees it.
+            outgoing = outgoing.header("X-Serverless-Authorization", format!("Bearer {token}"));
         }
         if !body.is_empty() {
             outgoing = outgoing.body(body);

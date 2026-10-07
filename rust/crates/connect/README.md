@@ -19,6 +19,10 @@ The hosted half of pay. One axum server, a separately deployed frontend, and fou
 
 Everything below runs locally. State is in memory and lost on restart.
 
+The hosted `/mcp` connector does not expose or dispatch `sell_inference`.
+That tool remains available through local `pay mcp`; the `pay sell` CLI
+commands and seller HTTP endpoints are separate and remain enabled.
+
 ## Try it
 
 ```sh
@@ -78,6 +82,29 @@ Try it end to end without the browser:
 ```sh
 cargo run -p pay -- connect-onboard --url http://127.0.0.1:8402
 ```
+
+## Seller streaming payments
+
+Seller chat requests with `stream: true` negotiate a channel payment through
+the 402 challenge. Flat-price streams accept x402 batch settlement or MPP
+sessions. Token-priced streams accept MPP sessions; the current batch path
+supports fixed prices only. Non-streaming requests can also use x402 upto.
+
+Chunks are delivered live. For flat pricing, opening the stream or delivering
+partial text does not charge the answer. Explicit worker completion commits
+the charge before the terminal success frame is delivered. Failure or
+cancellation before completion releases the reservation without charging.
+An already-earned commit continues if the client disconnects during settlement.
+
+A live batch response has no final settlement receipt in its initial headers.
+Replaying the same completed authorization returns the cached SSE response and
+receipt without serving or charging again. Capture is limited to 1 MiB; larger
+responses retain payment-result-only replay. Corrective challenges also expose
+the signed channel watermark.
+
+Initial batch setup keeps pay-kit's existing timing: signed setup is verified
+before serving, but the deposit transaction broadcasts at successful commit.
+Reusing an already-funded channel does not need that opening transaction.
 
 ## JSON endpoints
 

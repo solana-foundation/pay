@@ -717,10 +717,17 @@ impl TriggerDriver for GoogleTriggerDriver {
             .ok_or_else(|| TriggerError::Provider("target function has no service URI".into()))?;
         let url = target_url(origin, &request.path)?;
         let token = self.identity_token(origin).await?;
-        let mut outgoing = self.client.post(url).bearer_auth(token);
+        let mut outgoing = self.client.post(url);
         for (name, value) in request.headers {
+            if name.eq_ignore_ascii_case("authorization")
+                || name.eq_ignore_ascii_case("x-serverless-authorization")
+            {
+                continue;
+            }
             outgoing = outgoing.header(name, value);
         }
+        // Cloud Run removes this token's signature before tenant code sees it.
+        outgoing = outgoing.header("X-Serverless-Authorization", format!("Bearer {token}"));
         let response = outgoing.json(&request.input).send().await?;
         let status = response.status().as_u16();
         let headers = response
@@ -1025,6 +1032,10 @@ fn provider_error(status: StatusCode, bytes: &[u8]) -> TriggerError {
         String::from_utf8_lossy(bytes)
     ))
 }
+
+#[cfg(test)]
+#[path = "google_auth_tests.rs"]
+mod auth_tests;
 
 #[cfg(test)]
 mod tests {

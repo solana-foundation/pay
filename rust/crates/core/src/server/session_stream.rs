@@ -791,6 +791,19 @@ impl SseUsageDecoder {
     }
 }
 
+pub(super) fn sse_json_documents(body: &[u8]) -> Result<Vec<Value>, std::str::Utf8Error> {
+    let text = std::str::from_utf8(body)?
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    // Unlike incremental decoding, a bounded buffered response can be scanned
+    // once without repeatedly shifting the remaining stream in a String.
+    Ok(text
+        .split("\n\n")
+        .filter_map(|block| parse_sse_event(block).data)
+        .filter_map(|data| serde_json::from_str(&data).ok())
+        .collect())
+}
+
 fn parse_sse_event(block: &str) -> SseUsageEvent {
     let mut data = vec![];
     for line in block.lines() {

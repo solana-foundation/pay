@@ -47,16 +47,18 @@ pub struct ParkedRequest {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Completion {
     pub admission: Admission,
+    /// Streaming requests may keep resource accounting owned by the response.
+    pub stream: bool,
     /// Whether the buyer was still there to receive the final event.
     pub delivered: bool,
 }
 
-/// Result of one worker poll. Admissions whose buyers left before claim are
-/// returned so the endpoint can release their earn-cap reservations.
+/// Result of one worker poll. Requests whose buyers left before claim retain
+/// their delivery mode so the endpoint can identify the reservation owner.
 #[derive(Debug, Clone)]
 pub struct Next {
     pub request: Option<ParkedRequest>,
-    pub abandoned: Vec<Admission>,
+    pub abandoned: Vec<ParkedRequest>,
 }
 
 /// One step of the worker's answer.
@@ -157,7 +159,7 @@ impl EndpointQueue {
                 while let Some(parked) = inner.waiting.pop_front() {
                     // A client that left before being claimed is skipped.
                     if parked.tx.send(Event::Claimed).is_err() {
-                        abandoned.push(parked.request.admission);
+                        abandoned.push(parked.request);
                         continue;
                     }
                     let request = parked.request.clone();
@@ -233,6 +235,7 @@ impl EndpointQueue {
         let delivered = parked.tx.send(event).is_ok();
         Ok(Completion {
             admission: parked.request.admission,
+            stream: parked.request.stream,
             delivered,
         })
     }
@@ -317,7 +320,8 @@ mod tests {
         let (live, mut live_rx) = queue.park(Bytes::new(), false, admission()).unwrap();
 
         let next = queue.next(Duration::from_secs(1)).await;
-        assert_eq!(next.abandoned, vec![admission()]);
+        assert_eq!(next.abandoned.len(), 1);
+        assert_eq!(next.abandoned[0].admission, admission());
         let claimed = next.request.unwrap();
         assert_eq!(
             claimed.id, live,

@@ -332,6 +332,29 @@ impl EndpointBackends {
     pub fn spec(&self) -> &ApiSpec {
         &self.apis[0]
     }
+
+    /// A stream must use a reusable channel. Keep the same backend instances
+    /// and channel stores; only the request's advertised/accepted schemes differ.
+    pub fn streaming(&self) -> Self {
+        let mut streaming = self.clone();
+        let mut apis = self.apis.as_ref().clone();
+        for endpoint in apis.iter_mut().flat_map(|api| &mut api.endpoints) {
+            if let Some(meter) = &mut endpoint.metering {
+                meter.schemes = Some(
+                    meter
+                        .accepted_schemes()
+                        .into_iter()
+                        .filter(|scheme| {
+                            matches!(scheme, Scheme::MppSession | Scheme::X402BatchSettlement)
+                        })
+                        .collect(),
+                );
+            }
+        }
+        streaming.apis = Arc::new(apis);
+        streaming.upto = None;
+        streaming
+    }
 }
 
 impl PaymentState for EndpointBackends {
@@ -367,6 +390,37 @@ mod tests {
     use pay_core::sell_inference::SellPricing;
 
     const RECIPIENT: &str = "Cs2zdfUNonRdRGsiZUQQLdTxzxVvJZmgiX2mpLYKuEqP";
+
+    #[test]
+    fn streaming_view_keeps_channel_backends_but_removes_upto() {
+        let backends = EndpointBackends::build(
+            &sale(SellPricing::PerRequest { usd: 0.02 }),
+            &operator(),
+            "https://connect.test",
+        )
+        .unwrap();
+        let streaming = backends.streaming();
+        let meter = streaming
+            .spec()
+            .endpoints
+            .iter()
+            .find_map(|endpoint| endpoint.metering.as_ref())
+            .unwrap();
+        assert_eq!(
+            meter.accepted_schemes(),
+            vec![Scheme::MppSession, Scheme::X402BatchSettlement]
+        );
+        assert!(streaming.x402_upto().is_none());
+        assert!(backends.x402_upto().is_some());
+        assert!(Arc::ptr_eq(
+            backends.sessions.first().unwrap(),
+            streaming.sessions.first().unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            backends.batch.as_ref().unwrap(),
+            streaming.batch.as_ref().unwrap()
+        ));
+    }
 
     fn operator() -> Operator {
         let sk = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]);
