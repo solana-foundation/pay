@@ -576,10 +576,14 @@ impl IntoResponse for ApiError {
 mod tests {
     use super::*;
     use solana_instruction::{AccountMeta, Instruction};
+    use solana_keypair::{Keypair, Signer};
 
     fn close_tx(budget: Vec<Instruction>) -> VersionedTransaction {
+        close_tx_for_payer(budget, Pubkey::new_unique())
+    }
+
+    fn close_tx_for_payer(budget: Vec<Instruction>, payer: Pubkey) -> VersionedTransaction {
         let fee_payer = Pubkey::new_unique();
-        let payer = Pubkey::new_unique();
         let channel = Pubkey::new_unique();
         let close = Instruction {
             program_id: Pubkey::from_str(PAYMENT_CHANNELS_PROGRAM_ID).unwrap(),
@@ -653,5 +657,34 @@ mod tests {
         assert!(sponsored_fee_lamports(&close_tx(vec![budget(heap)])).is_err());
         assert!(sponsored_fee_lamports(&close_tx(vec![unit_price(1), unit_price(2)])).is_err());
         assert!(sponsored_fee_lamports(&close_tx(vec![budget(vec![3, 0, 0])])).is_err());
+    }
+
+    #[test]
+    fn parse_close_tx_enforces_the_sponsor_fee_cap_on_signed_requests() {
+        let payer = Keypair::new();
+        for budget in [
+            vec![],
+            vec![unit_limit(50_000), unit_price(1_000_000)],
+            vec![unit_price(1_000_000)],
+            vec![unit_limit(u32::MAX), unit_price(1_000_000)],
+            vec![unit_limit(1), unit_price(1)],
+        ] {
+            let mut tx = close_tx_for_payer(budget, payer.pubkey());
+            let keys = tx.message.static_account_keys();
+            let fee_payer = keys[0].to_string();
+            let payer_index = keys.iter().position(|key| key == &payer.pubkey()).unwrap();
+            tx.signatures[payer_index] = payer.sign_message(&tx.message.serialize());
+            let encoded = pay_kit::core::tx::encode(&tx).unwrap();
+            let fee = sponsored_fee_lamports(&tx).unwrap();
+
+            assert!(matches!(
+                parse_close_tx(&encoded, &fee_payer, fee - 1),
+                Err(Error::InvalidPaymentCredential)
+            ));
+            let parsed = parse_close_tx(&encoded, &fee_payer, fee).unwrap();
+            assert_eq!(parsed.payer, payer.pubkey());
+            assert_eq!(parsed.tx.signatures, tx.signatures);
+            assert_eq!(parsed.tx.signatures[0], Signature::default());
+        }
     }
 }

@@ -801,6 +801,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_is_public_while_mcp_requires_verified_identity() {
+        let app = router(
+            DriverRegistry::default(),
+            TriggerDriverRegistry::default(),
+            "cpu.example.invalid".into(),
+            Vec::new(),
+            None,
+            b"correct-proof-that-is-at-least-32-bytes".to_vec(),
+        );
+        for (path, expected) in [
+            ("/__402/health", StatusCode::OK),
+            ("/mcp", StatusCode::UNAUTHORIZED),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{path}");
+        }
+    }
+
+    #[tokio::test]
     async fn trigger_executor_requires_the_internal_proof() {
         let app = router(
             DriverRegistry::default(),

@@ -38,6 +38,9 @@ struct FixtureState {
     deleting: bool,
     fail_policy_writes: usize,
     fail_after_provider_delete: bool,
+    fail_reads_after_provider_delete: bool,
+    fail_provider_lookup_after_delete: bool,
+    fail_policy_reads: bool,
     conflict_purge: bool,
     revision: u64,
     actions: Vec<String>,
@@ -209,6 +212,12 @@ async fn serve_fixture(state: Arc<Mutex<FixtureState>>, request: Request) -> Res
                 state.fail_policy_writes += 1;
                 state.fail_after_provider_delete = false;
             }
+            if state.fail_reads_after_provider_delete {
+                state.fail_policy_reads = true;
+            }
+            if state.fail_provider_lookup_after_delete {
+                state.provider_get_error = Some(StatusCode::SERVICE_UNAVAILABLE);
+            }
             return Json(
                 json!({"name": "projects/project/locations/us-central1/operations/deletion"}),
             )
@@ -241,6 +250,9 @@ async fn serve_fixture(state: Arc<Mutex<FixtureState>>, request: Request) -> Res
         return Json(result).into_response();
     }
     if method == Method::GET {
+        if state.fail_policy_reads {
+            return response(StatusCode::SERVICE_UNAVAILABLE, json!({}));
+        }
         return state
             .documents
             .get(name)
@@ -373,6 +385,75 @@ impl Fixture {
 }
 
 #[tokio::test]
+async fn invocation_does_not_follow_redirects_or_wait_for_oversized_body_eof() {
+    let fixture = Fixture::new(false).await;
+    let app = Router::new().fallback(|request: Request| async move {
+        match request.uri().path() {
+            "/redirect" => Response::builder()
+                .status(StatusCode::FOUND)
+                .header("location", "/credentials")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+            "/credentials" => panic!("invocation must never follow a function redirect"),
+            "/oversized" => {
+                let chunks = futures_util::stream::iter(
+                    (0..=MAX_RESPONSE_BYTES / 65536)
+                        .map(|_| Ok::<_, std::io::Error>(bytes::Bytes::from(vec![0; 65536]))),
+                )
+                .chain(futures_util::stream::pending());
+                Response::new(axum::body::Body::from_stream(chunks))
+            }
+            _ => panic!("unexpected invocation path"),
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let deployment = Deployment {
+        provider: DRIVER_ID.into(),
+        id: fixture.identity.resource_name.clone(),
+        name: "weather".into(),
+        region: "us-central1".into(),
+        state: ResourceState::Ready,
+        provider_url: Some(origin),
+        gateway_id: None,
+        created_at: Some(CREATED.into()),
+        updated_at: None,
+        metadata: Value::Null,
+    };
+    let redirected = fixture
+        .driver
+        .invoke_origin(
+            &deployment,
+            "GET",
+            "/redirect",
+            BTreeMap::from([("Metadata-Flavor".into(), "Google".into())]),
+            bytes::Bytes::new(),
+            30,
+        )
+        .await
+        .unwrap();
+    assert_eq!(redirected.status, 302);
+    let oversized = tokio::time::timeout(
+        Duration::from_secs(5),
+        fixture.driver.invoke_origin(
+            &deployment,
+            "GET",
+            "/oversized",
+            BTreeMap::new(),
+            bytes::Bytes::new(),
+            30,
+        ),
+    )
+    .await
+    .expect("response limit must be enforced before EOF");
+    assert!(
+        matches!(oversized, Err(ComputeError::Provider(message)) if message.contains("response exceeded"))
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn explicit_delete_retires_before_provider_and_retry_is_idempotent() {
     let fixture = Fixture::new(true).await;
     let before = fixture.stored().unwrap().policy.unwrap();
@@ -467,13 +548,16 @@ async fn failures_before_and_after_provider_delete_retain_a_permanent_fence() {
         state.provider_delete_error = None;
         state.fail_after_provider_delete = true;
     }
-    assert!(
-        fixture
-            .driver
-            .delete(&fixture.tenant(), fixture.request())
-            .await
-            .is_err()
+    let operation = fixture
+        .driver
+        .delete(&fixture.tenant(), fixture.request())
+        .await
+        .unwrap();
+    assert_eq!(
+        operation.id,
+        "projects/project/locations/us-central1/operations/deletion"
     );
+    assert!(matches!(operation.state, OperationState::Pending));
     assert!(fixture.stored().unwrap().absent_since.is_none());
     fixture
         .driver
@@ -483,6 +567,42 @@ async fn failures_before_and_after_provider_delete_retain_a_permanent_fence() {
     fixture.driver.reconcile_orphans(false).await.unwrap();
     assert!(fixture.stored().unwrap().absent_since.is_some());
     assert_eq!(fixture.stored().unwrap().policy.unwrap().version, 2);
+}
+
+#[tokio::test]
+async fn accepted_delete_preserves_operation_when_followup_reads_fail() {
+    for provider_failure in [false, true] {
+        let fixture = Fixture::new(true).await;
+        {
+            let mut state = fixture.state.lock().unwrap();
+            state.fail_reads_after_provider_delete = !provider_failure;
+            state.fail_provider_lookup_after_delete = provider_failure;
+        }
+        let operation = fixture
+            .driver
+            .delete(&fixture.tenant(), fixture.request())
+            .await
+            .unwrap();
+        assert_eq!(
+            operation.id,
+            "projects/project/locations/us-central1/operations/deletion"
+        );
+        assert!(matches!(operation.state, OperationState::Pending));
+        assert!(fixture.stored().unwrap().retired);
+        assert!(fixture.stored().unwrap().absent_since.is_none());
+        {
+            let mut state = fixture.state.lock().unwrap();
+            assert!(
+                !state
+                    .functions
+                    .contains_key(&fixture.identity.resource_name)
+            );
+            state.fail_policy_reads = false;
+            state.provider_get_error = None;
+        }
+        assert_eq!(fixture.driver.reconcile_orphans(false).await.unwrap(), 1);
+        assert!(fixture.stored().unwrap().absent_since.is_some());
+    }
 }
 
 #[tokio::test]

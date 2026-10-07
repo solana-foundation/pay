@@ -956,6 +956,98 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn deletion_resumes_and_stale_writes_use_atomic_preconditions() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let commits = Arc::new(AtomicUsize::new(0));
+        let observed = commits.clone();
+        let store_name = "projects/project/databases/(default)/documents/pay-data/0123456789abcdef/documentStores/fds-0123456789abcdef-weather";
+        let store = json!({
+            "name": store_name, "updateTime": "2026-01-01T00:00:00Z",
+            "fields": {
+                "phase": { "stringValue": "deleting" },
+                "reclaimPolicy": { "stringValue": "delete" }
+            }
+        });
+        let deleting = store.clone();
+        let app = Router::new().fallback(move |request: Request<Body>| {
+            let store = deleting.clone();
+            let observed = observed.clone();
+            async move {
+                match request.method().as_str() {
+                    "GET" if request.uri().path().ends_with("/documents") => {
+                        json_response(StatusCode::OK, json!({}))
+                    }
+                    "GET" => json_response(StatusCode::OK, store),
+                    "DELETE" => json_response(StatusCode::OK, json!({})),
+                    "POST" => {
+                        let body = axum::body::to_bytes(request.into_body(), 65536)
+                            .await
+                            .unwrap();
+                        let body: Value = serde_json::from_slice(&body).unwrap();
+                        assert_eq!(body["writes"][0]["verify"], store_name);
+                        assert_eq!(
+                            body["writes"][0]["currentDocument"]["updateTime"],
+                            "2026-01-01T00:00:00Z"
+                        );
+                        assert_eq!(body["writes"].as_array().unwrap().len(), 2);
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        json_response(
+                            StatusCode::CONFLICT,
+                            json!({ "error": { "message": "stale parent" } }),
+                        )
+                    }
+                    _ => panic!("resuming deletion must not reset the parent phase"),
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let driver = FirestoreDriver::new(FirestoreConfig {
+            project: "project".into(),
+            database: "(default)".into(),
+            region: "us-central1".into(),
+            api_base: base,
+            metadata_base: "http://metadata.invalid".into(),
+            access_token: Some("token".into()),
+        })
+        .unwrap();
+        let tenant = Tenant {
+            payer: "payer".into(),
+            key: "0123456789abcdef".into(),
+            channel_id: "channel".into(),
+        };
+        assert!(
+            driver
+                .require_ready_store(&tenant, "weather")
+                .await
+                .is_err()
+        );
+        driver
+            .delete_document_store(
+                &tenant,
+                DocumentStoreRequest {
+                    driver: DRIVER_ID.into(),
+                    id: "weather".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            driver
+                .commit_document_write(
+                    &tenant,
+                    &store,
+                    json!({ "delete": format!("{store_name}/documents/key") })
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(commits.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
     #[test]
     fn channel_ids_map_to_stable_lease_keys() {
         assert_eq!(

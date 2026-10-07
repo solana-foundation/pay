@@ -359,9 +359,22 @@ impl GoogleCloudFunctionsDriver {
             return Err(json_provider_error(status, &value));
         };
         if let (Some(identity), Some(repository)) = (identity, &self.policies) {
-            let token = self.access_token().await?;
-            if let Some(stored) = repository.load(&token, &identity).await? {
-                self.reconcile_policy(&stored, false, policy_now()?).await?;
+            // Retirement above is mandatory before deletion. After acceptance,
+            // cleanup is best effort: reconciliation can retry it, but the
+            // caller must retain the operation ID needed to track deletion.
+            let cleanup: Result<()> = async {
+                let token = self.access_token().await?;
+                if let Some(stored) = repository.load(&token, &identity).await? {
+                    self.reconcile_policy(&stored, false, policy_now()?).await?;
+                }
+                Ok(())
+            }
+            .await;
+            if cleanup.is_err() {
+                tracing::warn!(
+                    operation_id = %operation.id,
+                    "accepted compute deletion deferred policy cleanup to reconciliation"
+                );
             }
         }
         Ok(operation)

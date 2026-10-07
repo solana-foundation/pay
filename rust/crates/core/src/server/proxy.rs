@@ -1486,6 +1486,9 @@ pub(super) async fn fetch_gcp_metadata_identity_token(
     client: &reqwest::Client,
     audience: &str,
 ) -> Result<FetchedToken, String> {
+    // Cloud Run's platform-local metadata endpoint uses HTTP, not public
+    // HTTPS. This fixed hostname is not the external service receiving the
+    // token; that service is authenticated separately with the bound audience.
     fetch_gcp_metadata_identity_token_at(
         client,
         audience,
@@ -2027,9 +2030,34 @@ mod tests {
             prepared.header_value("x-pay-original-host"),
             Some("worker.cpu.gcp.gateway-402.com")
         );
+
+        let identity = TrustedPaymentIdentity {
+            payer: None,
+            channel_id: None,
+            original_host: Some("worker.cpu.gcp.gateway-402.com".into()),
+        };
+        let UpstreamPlan::Forward(prepared) = prepare_upstream_with_identity(
+            &api,
+            &Method::POST,
+            &"/summary".parse().unwrap(),
+            &headers,
+            &[],
+            Some(&identity),
+        )
+        .await
+        .unwrap() else {
+            panic!("expected proxy forwarding");
+        };
+        assert_eq!(prepared.header_value("x-pay-verified-payer"), None);
+        assert_eq!(prepared.header_value("x-pay-verified-channel"), None);
+        assert_eq!(
+            prepared.header_value("x-pay-original-host"),
+            Some("worker.cpu.gcp.gateway-402.com")
+        );
     }
 
     #[test]
+    #[serial_test::serial(alibaba_hmac_env)]
     fn generic_hmac_reproduces_alibaba_signature() {
         let body = br#"{"FormatType":"text","SourceLanguage":"en","TargetLanguage":"zh","SourceText":"Hello"}"#;
         let mut prepared = PreparedUpstreamRequest::new(
@@ -2531,6 +2559,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(alibaba_hmac_env)]
     async fn forward_request_injects_hmac_auth() {
         #[derive(Debug, Clone, Default)]
         struct CapturedRequest {

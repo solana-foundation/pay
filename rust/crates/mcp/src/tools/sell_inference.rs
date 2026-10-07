@@ -706,7 +706,17 @@ async fn reprice(params: Params) -> Result<String, String> {
 
 async fn stop(params: Params) -> Result<String, String> {
     let record = record_for(&params)?;
-    let mut notes = Vec::new();
+    stop_remote(&record).await?;
+    SellRecord::remove(&record.id).map_err(|e| e.to_string())?;
+    Ok(format!(
+        "Stopped selling on {}: endpoint deleted; the worker exits after its current request or queue poll. Earnings already settled stay in {}.",
+        record.id, record.recipient
+    ))
+}
+
+async fn stop_remote(record: &SellRecord) -> Result<(), String> {
+    // A saved PID is not a process handle: even ps followed by kill races
+    // with PID reuse. Deleting the endpoint makes the worker exit on polling.
     let api = EndpointsApi::new(&record.connect_url).map_err(|e| e.to_string())?;
     api.delete(&record.owner_token, &record.id)
         .await
@@ -715,42 +725,52 @@ async fn stop(params: Params) -> Result<String, String> {
                 "Endpoint {} was not deleted: {e}. Its local record and owner token were preserved; retry stop.",
                 record.id
             )
-        })?;
-    notes.push("endpoint deleted".to_string());
-    #[cfg(unix)]
-    if let Some(pid) = record.worker_pid {
-        match worker_liveness(&record) {
-            WorkerLiveness::Alive => {
-                let stopped = Command::new("kill")
-                    .arg(pid.to_string())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .is_ok_and(|status| status.success());
-                notes.push(if stopped {
-                    format!("worker pid {pid} stopped")
-                } else {
-                    format!("worker pid {pid} could not be stopped")
-                });
-            }
-            WorkerLiveness::Dead => notes.push(format!("worker pid {pid} was already gone")),
-            WorkerLiveness::Unknown => notes.push(format!(
-                "worker pid {pid} was not signaled because its identity could not be verified"
-            )),
-        }
-    }
-    SellRecord::remove(&record.id).map_err(|e| e.to_string())?;
-    Ok(format!(
-        "Stopped selling on {}: {}. Earnings already settled stay in {}.",
-        record.id,
-        notes.join(", "),
-        record.recipient
-    ))
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stopping_never_signals_a_saved_pid_and_preserves_remote_errors() {
+        use std::io::{Read, Write};
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        for status in ["204 No Content", "500 Internal Server Error"] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut bytes = [0; 4096];
+                let count = stream.read(&mut bytes).unwrap();
+                assert!(
+                    String::from_utf8_lossy(&bytes[..count])
+                        .starts_with("DELETE /v1/endpoints/test ")
+                );
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+            });
+            let mut record = SellRecord::from_created(
+                &base,
+                &json!({
+                    "id": "test", "owner_token": "owner", "model": "agent",
+                    "base_url": base, "chat_completions_url": base, "recipient": "recipient"
+                }),
+            )
+            .unwrap();
+            record.worker_pid = Some(child.id());
+            let result = stop_remote(&record).await;
+            assert_eq!(result.is_ok(), status.starts_with("204"));
+            assert!(child.try_wait().unwrap().is_none());
+            server.join().unwrap();
+        }
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
 
     #[test]
     fn pricing_is_flat_or_per_token_never_both() {

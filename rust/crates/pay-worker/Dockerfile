@@ -5,7 +5,7 @@
 # `context: rust`, `file: crates/pay-worker/Dockerfile`.
 
 # ---- builder ----------------------------------------------------------------
-FROM rust:1.89-slim-bookworm AS builder
+FROM rust:1.95-slim-bookworm AS builder
 WORKDIR /app
 
 RUN apt-get update \
@@ -16,7 +16,7 @@ COPY . .
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
-    cargo build --release -p pay-worker --bin close-channels --bin settle-sessions --bin reconcile-resources && \
+    cargo build --locked --release -p pay-worker --bin close-channels --bin settle-sessions --bin reconcile-resources && \
     cp /app/target/release/close-channels /close-channels && \
     cp /app/target/release/settle-sessions /settle-sessions && \
     cp /app/target/release/reconcile-resources /reconcile-resources

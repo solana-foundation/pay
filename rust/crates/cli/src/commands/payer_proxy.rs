@@ -1929,6 +1929,93 @@ mod tests {
         assert_eq!(PAYER_PROXY_BIND_IP, Ipv4Addr::LOCALHOST);
     }
 
+    #[test]
+    fn receiptless_failed_batch_responses_do_not_consume_escrow() {
+        use pay_core::client::batch::{Authorization, Submission};
+        use pay_kit::x402::batch_settlement::BatchChannelConfig;
+        use pay_kit::x402::client::batch_settlement::BatchChannel;
+
+        let state = PayerState::new(
+            PayerUpstream {
+                base_url: "http://127.0.0.1:1".into(),
+                host_header: None,
+                dialect: Dialect::Anthropic,
+                chat_path: "v1/chat/completions".into(),
+                responses_path: "v1/responses".into(),
+                require_payment: false,
+                payment_protocol: PaymentProtocol::Auto,
+            },
+            Arc::new(MemoryAccountsStore::new()),
+            None,
+            None,
+        )
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "payment-required",
+            exact_and_batch_challenge_header("1000").parse().unwrap(),
+        );
+        let requirements = parse_batch_challenge(&headers, &Bytes::new())
+            .unwrap()
+            .requirements;
+        let channel_id = solana_pubkey::Pubkey::new_unique();
+        let config = BatchChannelConfig {
+            payer: "payer".into(),
+            payer_authorizer: "operator".into(),
+            receiver: requirements.pay_to.clone(),
+            receiver_authorizer: None,
+            token: requirements.asset.clone(),
+            withdraw_delay: requirements.extra.withdraw_delay,
+            salt: "1".into(),
+            open_slot: 1,
+            voucher_signer: Some("server".into()),
+        };
+        state
+            .batch_channels
+            .insert(
+                &requirements,
+                BatchChannel::new(channel_id, config, 3_000, 5_000),
+            )
+            .unwrap();
+        let batch = BatchSettlementAttempt {
+            requirements,
+            submission: Submission::Authorization {
+                authorization: Authorization {
+                    kind: "proof".into(),
+                    channel_id: channel_id.to_string(),
+                    payer: "payer".into(),
+                    request_id: "request".into(),
+                    authorized_amount: "1000".into(),
+                    expires_at: i64::MAX,
+                    signature: "signature".into(),
+                },
+                confirmed_deposit: None,
+            },
+        };
+        let charged = || {
+            state
+                .batch_channels
+                .get(&batch.requirements)
+                .unwrap()
+                .unwrap()
+                .charged_cumulative_amount()
+        };
+        for status in [
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            apply_batch_settlement(&state, &batch, status, &HeaderMap::new());
+            assert_eq!(charged(), 3_000, "receiptless {status} must not spend");
+        }
+        apply_batch_settlement(&state, &batch, StatusCode::OK, &HeaderMap::new());
+        assert_eq!(
+            charged(),
+            4_000,
+            "successful receiptless requests reserve their ceiling"
+        );
+    }
+
     /// One case per real `session_failed` rejection the server can produce
     /// for a stale cached credential (see `pay_core::server::session`'s
     /// `verify_use_authentication` and `verify_challenge_echo`). Every one

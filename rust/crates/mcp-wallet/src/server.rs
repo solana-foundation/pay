@@ -253,6 +253,28 @@ mod resolver_tests {
     use super::*;
 
     #[tokio::test]
+    async fn health_is_public_while_mcp_requires_verified_identity() {
+        let app = router(
+            DriverRegistry::default(),
+            b"wallet-proxy-proof-at-least-32-bytes".to_vec(),
+            Vec::new(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        for (path, expected) in [
+            ("/__402/health", StatusCode::OK),
+            ("/mcp", StatusCode::UNAUTHORIZED),
+        ] {
+            let response = client.get(format!("{origin}{path}")).send().await.unwrap();
+            assert_eq!(response.status(), expected, "{path}");
+        }
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
     async fn public_proxy_proof_cannot_resolve_another_owners_wallets() {
         let resolver_proof = "resolver-only-proof-at-least-32-bytes";
         let app = recipient_router(

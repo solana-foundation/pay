@@ -1819,7 +1819,9 @@ mod tests {
             "x-pay-forwarded-host",
             HeaderValue::from_static("worker.cpu.gcp.gateway-402.com"),
         );
-        let uri: Uri = "/latest".parse().unwrap();
+        let uri: Uri = "https://rewritten-authority.run.app/latest"
+            .parse()
+            .unwrap();
 
         assert_eq!(
             request_host(&headers, &uri).as_deref(),

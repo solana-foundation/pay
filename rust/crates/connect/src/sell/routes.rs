@@ -186,7 +186,7 @@ impl Drop for ReservationGuard {
     }
 }
 
-/// Releases a claimed request if its buyer response is dropped before the
+/// Releases a parked request if its buyer response is dropped before the
 /// worker completes or fails it.
 struct ClaimedRequestGuard {
     entry: Arc<EndpointEntry>,
@@ -1062,21 +1062,21 @@ async fn chat_completions(
         }
     };
 
+    // Own cleanup before the first await: cancellation can race with claim.
+    let guard = ClaimedRequestGuard {
+        entry,
+        request_id: id,
+        expected_usd,
+    };
     // No answer starts until a worker takes the request.
     match tokio::time::timeout(CLAIM_TIMEOUT, rx.recv()).await {
         Ok(Some(Event::Claimed)) => {}
         Ok(Some(other)) => {
             // A worker that skips the claim event is not one of ours.
             tracing::warn!(?other, "unexpected event before claim");
-            if entry.queue.abandon(&id).is_some() {
-                entry.release(expected_usd);
-            }
             return openai_error(StatusCode::BAD_GATEWAY, "protocol", "worker protocol error");
         }
         Ok(None) | Err(_) => {
-            if entry.queue.abandon(&id).is_some() {
-                entry.release(expected_usd);
-            }
             return openai_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "no_worker",
@@ -1085,11 +1085,6 @@ async fn chat_completions(
         }
     }
 
-    let guard = ClaimedRequestGuard {
-        entry,
-        request_id: id,
-        expected_usd,
-    };
     if stream {
         stream_response(rx, guard)
     } else {
@@ -2249,6 +2244,94 @@ mod tests {
         )
         .await;
         assert_eq!(second.await.unwrap().status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn unknown_models_use_componentwise_highest_rates() {
+        let pricing = SellPricing::PerToken {
+            rates: PricingConfig {
+                default: None,
+                per_model: [
+                    (
+                        "input".into(),
+                        TokenRate {
+                            input_per_1m: 9.0,
+                            output_per_1m: 1.0,
+                        },
+                    ),
+                    (
+                        "output".into(),
+                        TokenRate {
+                            input_per_1m: 1.0,
+                            output_per_1m: 9.0,
+                        },
+                    ),
+                ]
+                .into(),
+            },
+            max_usd: 0.25,
+        };
+        let usage = json!({ "usage": { "prompt_tokens": 10_000, "completion_tokens": 10_000 } });
+        for model in [None, Some("unknown")] {
+            assert!((request_earnings(&pricing, model, Some(&usage)) - 0.18).abs() < 1e-9);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deleted_endpoints_do_not_retain_their_router() {
+        let state = state();
+        let app = router(state.clone());
+        let (id, token) = create_endpoint(&app, per_request(0.02)).await;
+        let weak = Arc::downgrade(&state.registry.get(&id).unwrap());
+        let (status, _, _) = send(
+            &app,
+            Method::DELETE,
+            &format!("/v1/endpoints/{id}"),
+            Some(&token),
+            None,
+        )
+        .await;
+        assert!(status.is_success());
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn disconnected_claimed_buyers_release_capacity() {
+        for stream in [false, true] {
+            let state = state();
+            let app = router(state.clone());
+            let (id, token) = create_endpoint(&app, per_request(0.02)).await;
+            let mut response = Box::pin(buyer(
+                &state,
+                &id,
+                json!({ "model": "agent", "messages": [], "stream": stream }),
+            ));
+            assert!(futures_util::poll!(response.as_mut()).is_pending());
+            let (status, _, next) = send(
+                &app,
+                Method::GET,
+                &format!("/v1/endpoints/{id}/queue/next?wait=0"),
+                Some(&token),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let entry = state.registry.get(&id).unwrap();
+            assert!(entry.pending_usd() > 0.0);
+            if stream {
+                drop(response.await);
+            } else {
+                // Drop before the buyer can consume the claim notification.
+                drop(response);
+            }
+            assert_eq!(entry.pending_usd(), 0.0);
+            assert!(
+                entry
+                    .queue
+                    .abandon(next["request_id"].as_str().unwrap())
+                    .is_none()
+            );
+        }
     }
 
     #[test]

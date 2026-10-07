@@ -5,7 +5,7 @@
 # resolve. CI sets `context: rust`, `file: crates/pay-api/Dockerfile`.
 
 # ---- builder ----------------------------------------------------------------
-FROM rust:1.89-slim-bookworm AS builder
+FROM rust:1.95-slim-bookworm AS builder
 WORKDIR /app
 
 RUN apt-get update \
@@ -16,7 +16,7 @@ COPY . .
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
-    cargo build --release -p pay-api --bin pay-api && \
+    cargo build --locked --release -p pay-api --bin pay-api && \
     cp /app/target/release/pay-api /pay-api
 
 # ---- runtime ----------------------------------------------------------------
