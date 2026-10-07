@@ -883,10 +883,6 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
         let method = rh.method.clone();
         let uri = rh.uri.clone();
         let mut headers = rh.headers.clone();
-        // These headers cross an internal trust boundary. Discard caller
-        // values before both payment evaluation and observability capture;
-        // only a successfully verified delegated session may restore them.
-        strip_internal_identity_headers(&mut headers);
 
         let path = match pay_core::server::gate::gate_path(uri.path()) {
             Ok(path) => path.to_string(),
@@ -896,10 +892,18 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
             }
         };
         ctx.request_path = format!("/{path}");
+        // Cloud Run's serverless NEG rewrites Host to run.app. In deployment
+        // mode require the original Host inserted by the CPU load balancer,
+        // which overwrites any client-supplied header of the same name.
+        let host = if self.deployment_policy_resolver.is_some() {
+            gateway_host(&headers, &uri)
+        } else {
+            request_host(&headers, &uri)
+        };
+        // Discard internal headers before payment evaluation and observability
+        // capture. Only authenticated identity may be restored upstream.
+        strip_internal_identity_headers(&mut headers);
         let str_h = |n: &str| headers.get(n).and_then(|v| v.to_str().ok());
-        // Only the actual HTTP Host/:authority is eligible for payment
-        // identity. Forwarded-host headers are caller-controlled.
-        let host = request_host(&headers, &uri);
 
         // Capture request-side facts for the PDB exchange emitted in `logging`.
         // Skip the control plane's own paths (`/__402/*`, `/openapi.json`,
@@ -1439,6 +1443,16 @@ fn request_host(headers: &HeaderMap, uri: &Uri) -> Option<String> {
     }
 }
 
+fn gateway_host(headers: &HeaderMap, uri: &Uri) -> Option<String> {
+    request_host(headers, uri)?;
+    let mut values = headers.get_all("x-pay-gateway-host").iter();
+    let host = values.next()?.to_str().ok()?;
+    if values.next().is_some() {
+        return None;
+    }
+    Some(host.to_string())
+}
+
 fn is_control_plane(path: &str) -> bool {
     path.is_empty()
         || path.starts_with("__402/")
@@ -1650,8 +1664,8 @@ async fn write_axum_response(
 mod tests {
     use super::{
         BatchResponseCapture, Http402Gate, MAX_BATCH_CACHED_RESPONSE_BYTES,
-        buffered_upstream_headers, filtered_response_headers, header_pairs, is_control_plane,
-        is_streamed_response, request_host,
+        buffered_upstream_headers, filtered_response_headers, gateway_host, header_pairs,
+        is_control_plane, is_streamed_response, request_host,
     };
     use http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
     use pay_core::PaymentState;
@@ -1832,6 +1846,46 @@ mod tests {
             HeaderValue::from_static("worker.cpu.gcp.gateway-402.com"),
         );
         assert_eq!(request_host(&headers, &"/latest".parse().unwrap()), None);
+    }
+
+    #[test]
+    fn deployment_requires_overwritten_gateway_host() {
+        let uri: Uri = "https://rewritten-backend.run.app/latest".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::HOST,
+            HeaderValue::from_static("rewritten-backend.run.app"),
+        );
+        headers.insert(
+            "x-pay-forwarded-host",
+            HeaderValue::from_static("attacker.cpu.gcp.gateway-402.com"),
+        );
+        assert_eq!(gateway_host(&headers, &uri), None);
+        headers.insert(
+            "x-pay-gateway-host",
+            HeaderValue::from_static("worker.cpu.gcp.gateway-402.com"),
+        );
+        assert_eq!(
+            gateway_host(&headers, &uri).as_deref(),
+            Some("worker.cpu.gcp.gateway-402.com")
+        );
+        headers.append(
+            "x-pay-gateway-host",
+            HeaderValue::from_static("attacker.cpu.gcp.gateway-402.com"),
+        );
+        assert_eq!(gateway_host(&headers, &uri), None);
+        headers.remove("x-pay-gateway-host");
+        headers.insert(
+            "x-pay-gateway-host",
+            HeaderValue::from_static("worker.cpu.gcp.gateway-402.com"),
+        );
+        assert_eq!(
+            gateway_host(
+                &headers,
+                &"https://conflicting.run.app/latest".parse().unwrap()
+            ),
+            None
+        );
     }
 
     fn body_signing_api() -> ApiSpec {

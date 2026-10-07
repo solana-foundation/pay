@@ -420,7 +420,10 @@ impl Harness {
         let mut request = self
             .client
             .get(format!("{}/invoke", self.gateway.url))
-            .header("host", host);
+            // This direct Pingora fixture has no load balancer: simulate the
+            // LB-overwritten original Host and Cloud Run's rewritten Host.
+            .header("host", "backend.run.app")
+            .header("x-pay-gateway-host", host);
         if let Some(auth) = authorization {
             request = request.header("authorization", auth);
         }

@@ -363,6 +363,7 @@ pub fn strip_internal_identity_headers(headers: &mut HeaderMap) {
     headers.remove("x-pay-verified-payer");
     headers.remove("x-pay-verified-channel");
     headers.remove("x-pay-original-host");
+    headers.remove("x-pay-gateway-host");
     headers.remove("x-pay-wallet-resolver-proof");
     headers.remove("x-pay-payment-policy");
     headers.remove("x-pay-payment-policy-version");
@@ -919,6 +920,7 @@ mod tests {
     fn caller_cannot_forward_internal_policy_credentials() {
         let mut headers = HeaderMap::new();
         let internal = [
+            "x-pay-gateway-host",
             "x-pay-wallet-resolver-proof",
             "x-pay-payment-policy",
             "x-pay-payment-policy-version",

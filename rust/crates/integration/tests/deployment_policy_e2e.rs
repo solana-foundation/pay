@@ -281,7 +281,8 @@ async fn deployment_policy_http_funding_isolation_failure_and_reconnect() {
     let response = harness
         .client
         .get(format!("{}/invoke", harness.gateway.url))
-        .header("host", HOST_A)
+        .header("host", "backend.run.app")
+        .header("x-pay-gateway-host", HOST_A)
         .header("payment-signature", "invalid-x402-payment")
         .send()
         .await
@@ -348,7 +349,8 @@ async fn deployment_policy_http_funding_isolation_failure_and_reconnect() {
     let response = harness
         .client
         .get(format!("{}/.well-known/pay", harness.gateway.url))
-        .header("host", HOST_A)
+        .header("host", "backend.run.app")
+        .header("x-pay-gateway-host", HOST_A)
         .send()
         .await
         .unwrap();

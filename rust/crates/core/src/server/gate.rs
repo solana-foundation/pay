@@ -551,6 +551,11 @@ impl<S: PaymentState> PaymentGate<S> {
         use pay_kit::mpp::server::html as mpp_html;
 
         let path = req.path;
+        // Cloud Run probes this local-only control-plane response using its
+        // internal Host. It never forwards to a deployment or authorizes work.
+        if req.method == Method::GET && path == "__402/health" && req.query.is_none() {
+            return GateDecision::Passthrough;
+        }
         if let Some(resolver) = self.deployment_policy_resolver.as_deref() {
             match req.host.map(|host| resolver.classify_host(host)) {
                 Some(Ok(PolicyHost::Apex)) => {}
@@ -3054,6 +3059,47 @@ mod tests {
             assert!(matches!(
                 gate.evaluate(&req(&Method::GET, path)).await,
                 GateDecision::Passthrough
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn deployment_mode_only_exempts_the_exact_get_health_probe() {
+        let resolver = DeploymentPolicyResolver::new(
+            "https://compute.example/__402/payment-policy",
+            "https://compute.example",
+            "cpu.gcp.gateway-402.com",
+        )
+        .unwrap();
+        let gate =
+            PaymentGate::new(EmptyState).with_deployment_policy_resolver(Some(Arc::new(resolver)));
+
+        for host in [
+            None,
+            Some("internal.run.app"),
+            Some("test.cpu.gcp.gateway-402.com"),
+        ] {
+            let mut probe = req(&Method::GET, "__402/health");
+            probe.host = host;
+            assert!(matches!(
+                gate.evaluate(&probe).await,
+                GateDecision::Passthrough
+            ));
+        }
+
+        for (method, path, query) in [
+            (Method::POST, "__402/health", None),
+            (Method::GET, "__402/health", Some("probe=1")),
+            (Method::GET, "__402/health/other", None),
+            (Method::GET, "__402/payment-policy", None),
+            (Method::GET, "openapi.json", None),
+        ] {
+            let mut request = req(&method, path);
+            request.host = Some("internal.run.app");
+            request.query = query;
+            assert!(matches!(
+                gate.evaluate(&request).await,
+                GateDecision::Respond(response) if response.status == StatusCode::BAD_REQUEST
             ));
         }
     }
