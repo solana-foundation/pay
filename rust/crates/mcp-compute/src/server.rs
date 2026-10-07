@@ -181,22 +181,32 @@ impl ComputeMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let tenant = Self::tenant(&ctx)?;
+        let driver = match self.drivers.get(&request.provider) {
+            Ok(driver) => driver,
+            Err(error) => return Self::result::<serde_json::Value, _>(Err(error)),
+        };
+        let deployment = match driver.get(&tenant, request.clone()).await {
+            Ok(deployment) => deployment,
+            Err(error) => return Self::result::<serde_json::Value, _>(Err(error)),
+        };
+        let canonical = ResourceRequest {
+            provider: deployment.provider,
+            id: deployment.id,
+            region: Some(deployment.region),
+        };
         if let Err(error) = self
             .trigger_drivers
             .cleanup_target(
                 &tenant,
-                &request.provider,
-                &request.id,
-                request.region.as_deref(),
+                &canonical.provider,
+                &canonical.id,
+                canonical.region.as_deref(),
             )
             .await
         {
             return Self::result::<serde_json::Value, _>(Err(error));
         }
-        let result = match self.drivers.get(&request.provider) {
-            Ok(driver) => driver.delete(&tenant, request).await,
-            Err(error) => Err(error),
-        };
+        let result = driver.delete(&tenant, canonical).await;
         Self::result(result)
     }
 

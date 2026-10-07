@@ -627,12 +627,20 @@ impl TriggerDriver for GoogleTriggerDriver {
         let (target_region, target_name) = if id.contains('/') {
             parse_function_resource(id, &self.config.project, region)?
         } else if id.starts_with("gcf-") {
-            let target_region = region.unwrap_or(&self.config.default_region);
+            let target_region = region.ok_or_else(|| {
+                TriggerError::InvalidRequest(
+                    "canonical target region is required for trigger cleanup".into(),
+                )
+            })?;
             validate_segment("target region", target_region)?;
             validate_segment("target ID", id)?;
             (target_region.to_string(), id.to_string())
         } else {
-            let target_region = region.unwrap_or(&self.config.default_region);
+            let target_region = region.ok_or_else(|| {
+                TriggerError::InvalidRequest(
+                    "canonical target region is required for trigger cleanup".into(),
+                )
+            })?;
             validate_segment("target region", target_region)?;
             validate_segment("target ID", id)?;
             (
