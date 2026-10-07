@@ -1440,7 +1440,12 @@ fn x402_payment_event(entry: &LogEntry) -> Option<(String, String)> {
 
     let credential = payload
         .get("authorization")
-        .or_else(|| payload.get("voucher"));
+        .or_else(|| payload.get("voucher"))
+        .or_else(|| {
+            payload
+                .get("deposit")
+                .and_then(|deposit| deposit.get("authorization"))
+        });
     if kind == "deposit" {
         if let Some(amount) = credential
             .and_then(|value| value.get("authorizedAmount"))
@@ -1556,6 +1561,8 @@ fn payment_details(entry: &LogEntry) -> Option<PaymentDetails> {
             .or_else(|| value_string(payment.get("network")));
         details.asset = value_string(accepted.and_then(|v| v.get("asset")))
             .or_else(|| value_string(payment.get("asset")));
+        details.recipient =
+            value_string(accepted.and_then(|v| v.get("payTo"))).or(details.recipient);
         details.charge_amount =
             value_string(accepted.and_then(|v| v.get("amount"))).or(details.charge_amount);
 
@@ -1563,7 +1570,12 @@ fn payment_details(entry: &LogEntry) -> Option<PaymentDetails> {
             let kind = value_string(payload.get("type"));
             let credential = payload
                 .get("authorization")
-                .or_else(|| payload.get("voucher"));
+                .or_else(|| payload.get("voucher"))
+                .or_else(|| {
+                    payload
+                        .get("deposit")
+                        .and_then(|deposit| deposit.get("authorization"))
+                });
             details.channel_id = value_string(payload.get("channelId"))
                 .or_else(|| value_string(credential.and_then(|v| v.get("channelId"))));
             details.deposit_amount = value_string(
@@ -3241,6 +3253,40 @@ mod tests {
         assert_eq!(inference.tokens_prompt, Some(9));
         assert_eq!(inference.tokens_completion, Some(3));
         assert_eq!(inference.response_id.as_deref(), Some("chatcmpl-stream"));
+    }
+
+    #[test]
+    fn payment_details_use_accepted_recipient_and_nested_deposit_channel() {
+        let mut entry = make_entry("POST", "/paid", 200);
+        entry.req_headers.insert(
+            "payment-signature".into(),
+            encode_json(serde_json::json!({
+                "x402Version": 2,
+                "accepted": {
+                    "scheme": "batch-settlement",
+                    "payTo": "paid-recipient"
+                },
+                "payload": {
+                    "type": "deposit",
+                    "deposit": {
+                        "amount": "10000",
+                        "authorization": { "channelId": "nested-channel" }
+                    }
+                }
+            })),
+        );
+        entry.res_headers.insert(
+            "payment-required".into(),
+            encode_json(serde_json::json!({
+                "accepts": [{ "payTo": "offered-recipient" }]
+            })),
+        );
+
+        let details = payment_details(&entry).expect("payment details");
+        assert_eq!(details.recipient.as_deref(), Some("paid-recipient"));
+        assert_eq!(details.channel_id.as_deref(), Some("nested-channel"));
+        let (_, event) = x402_payment_event(&entry).expect("deposit event");
+        assert!(event.contains("channel nested-channel"));
     }
 
     #[test]

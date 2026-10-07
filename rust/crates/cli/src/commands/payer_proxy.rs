@@ -1194,8 +1194,11 @@ fn finish_observed_inference(
 }
 
 fn contains_sse_done(body: &[u8]) -> bool {
-    body.windows(b"data: [DONE]".len())
-        .any(|window| window == b"data: [DONE]")
+    body.split(|byte| *byte == b'\n').any(|line| {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        line.strip_prefix(b"data:")
+            .is_some_and(|data| data.trim_ascii() == b"[DONE]")
+    })
 }
 
 async fn deliver(
@@ -3633,6 +3636,16 @@ mod tests {
         assert_eq!(parsed["model"], "luna");
         assert_eq!(parsed["stream"], true);
         assert_eq!(parsed["messages"]["debuggerElided"], true);
+    }
+
+    #[test]
+    fn sse_done_requires_a_complete_data_field() {
+        assert!(contains_sse_done(b"data: [DONE]\n\n"));
+        assert!(contains_sse_done(b"data:[DONE]\r\n\r\n"));
+        assert!(!contains_sse_done(
+            br#"data: {"content":"literal data: [DONE] inside JSON"}\n\n"#,
+        ));
+        assert!(!contains_sse_done(b"data: [DONE] trailing\n\n"));
     }
 
     // ── OpenAI-compat dialect loopback ─────────────────────────────────────
