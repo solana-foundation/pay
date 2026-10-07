@@ -1627,8 +1627,7 @@ impl SessionMpp {
     ///
     /// Hosts expose this template through `PaymentState::session_mpp_handles`.
     /// External lifecycle reconciliation, operator vouchers, and disabled chain
-    /// adoption remain mandatory when deriving a policy backend. This constructor
-    /// does not enable the proxy's guarded deployment-policy rollout.
+    /// adoption remain mandatory when deriving a policy backend.
     pub fn new_for_deployment(
         config: SessionConfig,
         challenge_binding_secret: impl Into<String>,
@@ -1666,23 +1665,7 @@ impl SessionMpp {
         use sha2::Sha256;
 
         const MAX_POLICY_BACKENDS: usize = 128;
-        if matches!(self.deployment_store, DeploymentStoreAuthority::Static) {
-            return Err(Error::Config(
-                "deployment sessions require a template constructed with DeploymentSessionStore"
-                    .into(),
-            ));
-        }
-        if !self.external_reconciliation.load(Ordering::Acquire)
-            || self.voucher_signer() != SessionVoucherSigner::Operator
-            || self.reuse_from_chain
-            || self.channel_binding.is_some()
-        {
-            return Err(Error::Config(
-                "deployment sessions require an external lifecycle worker, operator vouchers, \
-                 and disabled chain adoption"
-                    .into(),
-            ));
-        }
+        self.validate_deployment_template()?;
         let payout = policy
             .effective_payout(&self.session_config.operator)
             .map_err(|error| Error::Config(error.to_string()))?;
@@ -1896,6 +1879,56 @@ impl SessionMpp {
     /// Token decimals for base-unit settlement amounts.
     pub fn decimals(&self) -> u8 {
         self.session_config.decimals
+    }
+
+    /// Validate a deployment template before opening the public listener.
+    /// Rechecked by `for_deployment_policy` so runtime changes cannot fall back.
+    pub fn validate_deployment_template(&self) -> Result<()> {
+        if matches!(self.deployment_store, DeploymentStoreAuthority::Static) {
+            return Err(Error::Config(
+                "deployment sessions require a template constructed with DeploymentSessionStore"
+                    .into(),
+            ));
+        }
+        if !self.external_reconciliation.load(Ordering::Acquire)
+            || self.voucher_signer() != SessionVoucherSigner::Operator
+            || self.reuse_from_chain
+            || self.channel_binding.is_some()
+            || self.deployment_blockhash_source.is_none()
+        {
+            return Err(Error::Config(
+                "deployment sessions require an external lifecycle worker, operator vouchers, \
+                 and disabled chain adoption"
+                    .into(),
+            ));
+        }
+        #[cfg(test)]
+        if matches!(self.deployment_store, DeploymentStoreAuthority::Test)
+            && self.network() == "localnet"
+        {
+            return Ok(());
+        }
+        #[cfg(feature = "test-support")]
+        if self.network() == "localnet" && self.decimals() == 6 {
+            return Ok(());
+        }
+        if !matches!(self.network(), "mainnet" | "devnet" | "testnet")
+            || self.decimals() != 6
+            || !self.accepts_currency(pay_types::Stablecoin::Usdc.mint(Some(self.network())))
+        {
+            return Err(Error::Config(
+                "deployment sessions require network-matched USDC with six decimals".into(),
+            ));
+        }
+        let signer = self.operator_runtime.payment_channel_signer();
+        if signer.as_ref().map(|signer| signer.pubkey().to_string())
+            != Some(self.session_config.operator.clone())
+        {
+            return Err(Error::Config(
+                "deployment session signer must match the configured operator".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Minimum accepted voucher increment in base units.
@@ -3123,6 +3156,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn deployment_template_rejects_wrong_voucher_signer_chain_adoption_and_mint() {
+        let mut template = policy_template();
+        template.session_config.voucher_signer = SessionVoucherSigner::Client;
+        assert!(template.validate_deployment_template().is_err());
+
+        let mut template = policy_template();
+        template.reuse_from_chain = true;
+        assert!(template.validate_deployment_template().is_err());
+
+        let mut template = policy_template();
+        template.session_config.network = "devnet".into();
+        assert!(template.validate_deployment_template().is_err());
+        template.session_config.currency = pay_types::stablecoin_mints::USDC_DEVNET.into();
+        let signer: Arc<dyn TransactionSigner> = Arc::from(test_session_signer());
+        template.session_config.operator = signer.pubkey().to_string();
+        template = template.with_payment_channel_signer(signer);
+        assert!(template.validate_deployment_template().is_ok());
+        template.session_config.operator = solana_pubkey::Pubkey::new_unique().to_string();
+        assert!(template.validate_deployment_template().is_err());
+    }
+
     /// Run with a dedicated disposable Redis via PAY_TEST_DEPLOYMENT_REDIS_URL.
     #[cfg(all(feature = "redis-session-store", feature = "network_tests"))]
     #[tokio::test(flavor = "multi_thread")]
@@ -3135,9 +3190,13 @@ mod tests {
         assert!(
             SessionMpp::new_for_deployment(test_session_config(), "test-secret", &store).is_err()
         );
+        let signer: Arc<dyn TransactionSigner> = Arc::from(test_session_signer());
         let config = SessionConfig {
+            operator: signer.pubkey().to_string(),
             voucher_signer: SessionVoucherSigner::Operator,
             rpc_url: Some("http://127.0.0.1:8899".into()),
+            currency: pay_types::stablecoin_mints::USDC_DEVNET.into(),
+            network: "devnet".into(),
             ..test_session_config()
         };
         let static_session = SessionMpp::new_with_channel_store(
@@ -3145,7 +3204,9 @@ mod tests {
             "test-secret",
             Arc::clone(&store.store),
         );
-        let session = SessionMpp::new_for_deployment(config, "test-secret", &store).unwrap();
+        let session = SessionMpp::new_for_deployment(config, "test-secret", &store)
+            .unwrap()
+            .with_payment_channel_signer(signer);
         let binding =
             test_policy_binding(1, &solana_pubkey::Pubkey::new_unique().to_string(), vec![]);
         assert!(session.for_deployment_policy(binding.clone()).is_err());
@@ -3162,6 +3223,7 @@ mod tests {
                 .for_deployment_policy(binding.clone())
                 .is_err()
         );
+        assert!(session.validate_deployment_template().is_ok());
         let backend = session.for_deployment_policy(binding).unwrap();
         assert!(matches!(
             backend.deployment_store,

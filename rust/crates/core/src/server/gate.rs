@@ -478,15 +478,10 @@ impl<S: PaymentState> PaymentGate<S> {
             }
         };
         let handles = self.state.session_mpp_handles();
-        let mut candidates = handles.iter().filter(|session| {
-            session.decimals() == 6
-                && session
-                    .accepts_currency(pay_types::Stablecoin::Usdc.mint(Some(session.network())))
-        });
-        let Some(template) = candidates.next() else {
+        let [template] = handles.as_slice() else {
             return deployment_policy_unavailable();
         };
-        if candidates.next().is_some() {
+        if template.validate_deployment_template().is_err() {
             return deployment_policy_unavailable();
         }
         let binding = match pay_types::deployment_policy::DeploymentSessionBinding::new(
@@ -505,6 +500,12 @@ impl<S: PaymentState> PaymentGate<S> {
         if let Err(error) = session.prepare_deployment_challenge().await {
             tracing::warn!(%error, "deployment finalized blockhash unavailable");
             return deployment_policy_unavailable();
+        }
+        if req.x402_payment.is_some() {
+            return GateDecision::Respond(GateResponse::json(
+                StatusCode::BAD_REQUEST,
+                Bytes::from_static(br#"{"error":"unsupported_deployment_payment_scheme"}"#),
+            ));
         }
         if let Some(auth) = req.authorization.filter(is_payment_authorization) {
             match parse_authorization(auth) {

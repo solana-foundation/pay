@@ -897,10 +897,8 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
         };
         ctx.request_path = format!("/{path}");
         let str_h = |n: &str| headers.get(n).and_then(|v| v.to_str().ok());
-        // HTTP/2 carries the request host in `:authority`, which Pingora
-        // exposes on the URI rather than in the regular header map. Preserve
-        // that hostname for routing and for the trusted upstream identity
-        // header used by wildcard compute/data gateways.
+        // Only the actual HTTP Host/:authority is eligible for payment
+        // identity. Forwarded-host headers are caller-controlled.
         let host = request_host(&headers, &uri);
 
         // Capture request-side facts for the PDB exchange emitted in `logging`.
@@ -1425,22 +1423,20 @@ fn header_pairs_from_owned(headers: Vec<(HeaderName, HeaderValue)>) -> Vec<(Stri
 }
 
 fn request_host(headers: &HeaderMap, uri: &Uri) -> Option<String> {
-    headers
-        // The external load balancer preserves the public TLS hostname here
-        // before Cloud Run rewrites Host/authority to its backend name.
-        .get("x-pay-forwarded-host")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string)
-        .or_else(|| {
-            headers
-                .get(http::header::HOST)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_string)
-        })
-        .or_else(|| {
-            uri.authority()
-                .map(|authority| authority.as_str().to_string())
-        })
+    let mut hosts = headers.get_all(http::header::HOST).iter();
+    let host = hosts.next().and_then(|value| value.to_str().ok());
+    if hosts.next().is_some() {
+        return None;
+    }
+    let authority = uri.authority().map(|authority| authority.as_str());
+    match (host, authority) {
+        (Some(host), Some(authority)) if host != authority => None,
+        (Some(host), _) => Some(host.to_string()),
+        (None, Some(authority)) if !headers.contains_key(http::header::HOST) => {
+            Some(authority.to_string())
+        }
+        _ => None,
+    }
 }
 
 fn is_control_plane(path: &str) -> bool {
@@ -1794,7 +1790,7 @@ mod tests {
     }
 
     #[test]
-    fn request_host_prefers_explicit_host_header() {
+    fn request_host_rejects_conflicting_host_and_authority() {
         let mut headers = HeaderMap::new();
         headers.insert(
             http::header::HOST,
@@ -1802,14 +1798,11 @@ mod tests {
         );
         let uri: Uri = "https://authority.example/latest".parse().unwrap();
 
-        assert_eq!(
-            request_host(&headers, &uri).as_deref(),
-            Some("explicit.example")
-        );
+        assert_eq!(request_host(&headers, &uri), None);
     }
 
     #[test]
-    fn request_host_accepts_load_balancer_forwarded_host() {
+    fn request_host_ignores_caller_forwarded_host() {
         let mut headers = HeaderMap::new();
         headers.insert(
             http::header::HOST,
@@ -1819,14 +1812,26 @@ mod tests {
             "x-pay-forwarded-host",
             HeaderValue::from_static("worker.cpu.gcp.gateway-402.com"),
         );
-        let uri: Uri = "https://rewritten-authority.run.app/latest"
-            .parse()
-            .unwrap();
+        let uri: Uri = "https://rewritten-backend.run.app/latest".parse().unwrap();
 
         assert_eq!(
             request_host(&headers, &uri).as_deref(),
-            Some("worker.cpu.gcp.gateway-402.com")
+            Some("rewritten-backend.run.app")
         );
+    }
+
+    #[test]
+    fn request_host_never_adopts_forwarded_host_without_authority() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-host",
+            HeaderValue::from_static("worker.cpu.gcp.gateway-402.com"),
+        );
+        headers.insert(
+            "x-pay-forwarded-host",
+            HeaderValue::from_static("worker.cpu.gcp.gateway-402.com"),
+        );
+        assert_eq!(request_host(&headers, &"/latest".parse().unwrap()), None);
     }
 
     fn body_signing_api() -> ApiSpec {

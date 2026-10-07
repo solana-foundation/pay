@@ -682,7 +682,9 @@ fn truncate_to_char_boundary(value: &str, max_bytes: usize) -> &str {
 /// Whether `candidate` names the same token as `configured` on `network`:
 /// the same string, or a symbol and a mint address that resolve to one mint.
 pub fn same_currency(configured: &str, candidate: &str, network: &str) -> bool {
-    if configured.eq_ignore_ascii_case(candidate) {
+    // Token symbols are case-insensitive, but Solana base58 addresses are not.
+    // The resolver below normalizes known symbols while leaving addresses exact.
+    if configured == candidate {
         return true;
     }
     let network = Some(network);
@@ -754,6 +756,26 @@ mod tests {
     use super::*;
 
     const SPLIT_RECIPIENT: &str = "CNR1b172rotbSG6kCpfR76KB2ios2y7X4p8yEEc7pjLu";
+
+    #[test]
+    fn currency_symbols_normalize_but_mint_addresses_remain_case_sensitive() {
+        let usdc = pay_types::Stablecoin::Usdc.mint(Some("mainnet"));
+        assert!(same_currency("usdc", usdc, "mainnet"));
+        assert!(same_currency(usdc, usdc, "mainnet"));
+        let mut modified = usdc.as_bytes().to_vec();
+        let index = modified
+            .iter()
+            .position(u8::is_ascii_alphabetic)
+            .expect("USDC mint has letters");
+        modified[index] = if modified[index].is_ascii_uppercase() {
+            modified[index].to_ascii_lowercase()
+        } else {
+            modified[index].to_ascii_uppercase()
+        };
+        let other = String::from_utf8(modified).unwrap();
+        assert!(!same_currency(&other, usdc, "mainnet"));
+        assert!(!same_currency("USDC", &other, "mainnet"));
+    }
 
     #[derive(Clone)]
     struct PathTestState;

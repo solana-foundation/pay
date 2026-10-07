@@ -277,6 +277,34 @@ async fn deployment_policy_http_funding_isolation_failure_and_reconnect() {
     harness.controls.set_policy(HOST_A, original_a.clone());
     harness.controls.set_policy(HOST_B, original_b);
 
+    // A wildcard host never falls through to the fleet x402 backend.
+    let response = harness
+        .client
+        .get(format!("{}/invoke", harness.gateway.url))
+        .header("host", HOST_A)
+        .header("payment-signature", "invalid-x402-payment")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        response
+            .text()
+            .await
+            .unwrap()
+            .contains("unsupported_deployment_payment_scheme")
+    );
+    let response = harness
+        .client
+        .get(format!("{}/invoke", harness.gateway.url))
+        .header("host", "backend.run.app")
+        .header("x-pay-forwarded-host", HOST_A)
+        .header("x-forwarded-host", HOST_A)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
     let a = open(&harness, HOST_A, &payer_key, 50_000).await;
     let b = open(&harness, HOST_B, &payer_key, 100_000).await;
     assert_ne!(a.id(), b.id());
@@ -317,6 +345,14 @@ async fn deployment_policy_http_funding_isolation_failure_and_reconnect() {
     let updated = open(&harness, HOST_A, &payer_key, 75_000).await;
     harness.controls.policies.write().unwrap().remove(HOST_A);
     rejected_without_charge(&harness, HOST_A, &updated).await;
+    let response = harness
+        .client
+        .get(format!("{}/.well-known/pay", harness.gateway.url))
+        .header("host", HOST_A)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(harness.channel(&a.id()).await.spent_amount, 100_000);
     assert_eq!(harness.channel(&b.id()).await.spent_amount, 200_000);
     assert_eq!(harness.channel(&updated.id()).await.spent_amount, 75_000);

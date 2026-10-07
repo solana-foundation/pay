@@ -72,17 +72,25 @@ during local Rust validation; release images must contain the intended UI assets
 
 ## Remaining rollout gates
 
-The proxy rejects deployment-policy environment configuration, and Terraform
-rejects enabling `compute_payment_policy_enabled`. Keep those explicit guards
-until a reviewed enablement change:
+The currently deployed proxy image rejects deployment-policy configuration.
+The reviewed Pay source accepts complete configuration only with one durable,
+externally reconciled operator-voucher USDC session backend; it never falls
+back to fleet pricing for deployment hosts. Production still sets
+`compute_payment_policy_enabled = false`. Before switching it on:
 
-1. Coordinates reviewed kit, Pay, and gateway revisions and compatible images.
-2. Verifies Redis persistence, recovery, and the worker's matching namespace.
-3. Provisions the internal proof outside source control and confirms private
-   service IAM, named Firestore access, and load-balancer-only public ingress.
-4. Exercises real funding, policy isolation, failure charging, restart recovery,
+1. Coordinate reviewed kit, Pay, and gateway revisions and compatible images.
+2. Verify Redis persistence, recovery, and the worker's matching namespace.
+3. Confirm the provisioned internal proof is accessible to compute and wallet
+   only; verify private service IAM, named Firestore access, and
+   load-balancer-only public ingress. The wallet gateway certificate must be
+   `ACTIVE`.
+4. Address existing gateway-exposed functions without policies: strict
+   deployment resolution intentionally makes their wildcard URLs unavailable.
+   Retire those test functions or obtain owner-authorized wallet policies;
+   never silently fall back to the fleet price.
+5. Exercise real funding, policy isolation, failure charging, restart recovery,
    policy update/deletion, payer closure, and original-recipient settlement.
-5. Records rollback behavior without silently restoring fleet pricing.
+6. Record rollback behavior without silently restoring fleet pricing.
 
 Bound ownership records are retained; bound rent reclamation is not implemented.
 Missing ownership blocks fleet orphan cleanup. See the

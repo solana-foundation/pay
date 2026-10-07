@@ -1442,7 +1442,8 @@ impl StartCommand {
             .map_err(pay_core::Error::Config)?;
 
         // Select the trusted constructor only after complete resolver config
-        // validation. Pingora's unconditional rollout guard remains in place.
+        // validation. Pingora also validates the finished session template
+        // before binding its public listener.
         let deployment_policy_mode =
             pay_core::server::deployment_policy::DeploymentPolicyResolver::from_env()
                 .map_err(|error| pay_core::Error::Config(error.to_string()))?
@@ -1851,6 +1852,20 @@ impl StartCommand {
                     &currency_configs,
                     &session_benchmark_test_mints,
                 )?;
+                if deployment_policy_mode
+                    && (currency_configs.len() != 1
+                        || currency_configs[0].2 != 6
+                        || !pay_core::server::payment::same_currency(
+                            &currency_configs[0].1,
+                            pay_types::Stablecoin::Usdc.mint(Some(network.slug())),
+                            network.slug(),
+                        ))
+                {
+                    return Err(pay_core::Error::Config(
+                        "deployment sessions require exactly one network-matched USDC currency"
+                            .into(),
+                    ));
+                }
                 let session_token_programs = resolve_session_currency_token_programs(
                     &currency_configs,
                     &session_benchmark_test_mints,
