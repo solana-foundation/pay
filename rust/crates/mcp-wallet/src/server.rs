@@ -2,7 +2,7 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -12,7 +12,7 @@ use rmcp::service::{RequestContext, RoleServer};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::driver::DriverRegistry;
@@ -172,4 +172,142 @@ fn tenant_from_headers(headers: &HeaderMap) -> Result<Tenant, ()> {
 }
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     left.len() == right.len() && left.iter().zip(right).fold(0u8, |a, (l, r)| a | (l ^ r)) == 0
+}
+
+#[derive(Clone)]
+struct ResolverState {
+    drivers: DriverRegistry,
+    proof: Vec<u8>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecipientRequest {
+    owner_key: String,
+    wallets: Vec<WalletRequest>,
+}
+
+/// Read-only service boundary. This proof is distinct from the public wallet
+/// proxy's proof: a paid consumer must never select another owner's wallets.
+pub fn recipient_router(drivers: DriverRegistry, proof: Vec<u8>) -> Router {
+    Router::new()
+        .route("/__402/resolve-recipients", post(resolve_recipients))
+        .with_state(ResolverState { drivers, proof })
+}
+
+async fn resolve_recipients(
+    State(state): State<ResolverState>,
+    headers: HeaderMap,
+    Json(request): Json<RecipientRequest>,
+) -> Response {
+    if state.proof.len() < 32
+        || !headers
+            .get("x-pay-wallet-resolver-proof")
+            .is_some_and(|value| constant_time_eq(value.as_bytes(), &state.proof))
+    {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if request.owner_key.len() != 16
+        || !request
+            .owner_key
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || request.wallets.is_empty()
+        || request.wallets.len() > 8
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    // This is ownership evidence from compute, not a payment session. The
+    // receive-wallet driver uses only the canonical key for external-ID lookup.
+    let tenant = Tenant {
+        payer: String::new(),
+        key: request.owner_key,
+        channel_id: String::new(),
+    };
+    let mut wallets = Vec::new();
+    for reference in request.wallets {
+        if reference.driver != crate::privy::DRIVER_ID
+            || crate::privy::validate_name(&reference.name).is_err()
+        {
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+        let driver = match state.drivers.get(&reference.driver) {
+            Ok(driver) => driver,
+            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        };
+        match driver.get(&tenant, reference).await {
+            Ok(wallet) => wallets.push(serde_json::json!({
+                "owner_key": tenant.key,
+                "reference": {"driver": wallet.driver, "name": wallet.name},
+                "chain": wallet.chain,
+                "address": wallet.address,
+            })),
+            Err(_) => return StatusCode::NOT_FOUND.into_response(),
+        }
+    }
+    Json(wallets).into_response()
+}
+
+#[cfg(test)]
+mod resolver_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn public_proxy_proof_cannot_resolve_another_owners_wallets() {
+        let resolver_proof = "resolver-only-proof-at-least-32-bytes";
+        let app = recipient_router(
+            DriverRegistry::default(),
+            resolver_proof.as_bytes().to_vec(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/__402/resolve-recipients",
+            listener.local_addr().unwrap()
+        );
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        let body = serde_json::json!({
+            "owner_key": "0123456789abcdef",
+            "wallets": [{"driver": "privy", "name": "tax"}]
+        });
+        for proof in [None, Some("public-proxy-proof-at-least-32-bytes")] {
+            let mut request = client
+                .post(&url)
+                .json(&body)
+                .header("x-pay-proxy-proof", "public-proxy-proof-at-least-32-bytes")
+                .header("x-pay-verified-payer", bs58::encode([1; 32]).into_string())
+                .header("x-pay-verified-channel", "channel");
+            if let Some(proof) = proof {
+                request = request.header("x-pay-wallet-resolver-proof", proof);
+            }
+            assert_eq!(
+                request.send().await.unwrap().status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        let response = client
+            .post(&url)
+            .json(&body)
+            .header("x-pay-wallet-resolver-proof", resolver_proof)
+            .send()
+            .await
+            .unwrap();
+        // Authentication succeeded; there is deliberately no driver configured.
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let mut invalid = body;
+        invalid["owner_key"] = serde_json::json!("../another-owner");
+        assert_eq!(
+            client
+                .post(&url)
+                .json(&invalid)
+                .header("x-pay-wallet-resolver-proof", resolver_proof)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        task.abort();
+        let _ = task.await;
+    }
 }

@@ -166,7 +166,7 @@ fn wallet_from_value(value: Value, name: String, purpose: Option<String>) -> Res
         lifecycle: "retained".into(),
     })
 }
-fn validate_name(value: &str) -> Result<()> {
+pub(crate) fn validate_name(value: &str) -> Result<()> {
     if value.is_empty()
         || value.len() > 40
         || !value

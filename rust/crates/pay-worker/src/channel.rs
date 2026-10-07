@@ -48,6 +48,44 @@ const OPEN_HEADER_LEN: usize = 29;
 /// allocation and reject plans that cannot be represented safely.
 const MAX_DISTRIBUTION_RECIPIENTS: usize = 64;
 
+/// Chain discovery cannot prove a channel was never deployment-bound. Only
+/// an extant legacy row permits the fleet reclamation path.
+pub fn is_recorded_legacy(
+    state: Option<&pay_kit::core::store::ChannelState>,
+) -> Result<bool, JobError> {
+    match state {
+        None => Ok(false),
+        Some(state) => pay_kit::mpp::server::session::channel_binding(state)
+            .map(|binding| binding.is_none())
+            .map_err(|error| JobError::Config(format!("channel ownership: {error}"))),
+    }
+}
+
+/// Bound payouts require positive mint-owner evidence; the legacy resolver's
+/// SPL fallback is not an ownership proof.
+pub async fn require_token_program(
+    rpc: &RpcClient,
+    rpc_url: &str,
+    mint: &Pubkey,
+    expected: &Pubkey,
+) -> Result<(), JobError> {
+    let accounts = rpc
+        .get_multiple_accounts_with_owner(rpc_url, &[mint.to_string()])
+        .await?;
+    if !matches!(*expected, SPL_TOKEN_PROGRAM_ID | TOKEN_2022_PROGRAM_ID)
+        || accounts
+            .into_iter()
+            .next()
+            .flatten()
+            .is_none_or(|account| account.owner != expected.to_string())
+    {
+        return Err(JobError::Config(
+            "bound mint token-program ownership mismatch".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Resolve the token program that owns `mint` (SPL Token vs Token-2022) by
 /// reading the mint account's owner. Falls back to SPL Token if unknown.
 pub async fn resolve_token_program(
@@ -141,6 +179,30 @@ pub async fn fetch_channel(
         .flatten())
 }
 
+/// Fetch a channel using its immutable session program, not the fleet default.
+pub async fn fetch_channel_for_program(
+    rpc: &RpcClient,
+    rpc_url: &str,
+    address: &Pubkey,
+    program_id: &Pubkey,
+) -> Result<Option<DecodedChannel>, JobError> {
+    let accounts = rpc
+        .get_multiple_accounts_with_owner(rpc_url, &[address.to_string()])
+        .await?;
+    let Some(account) = accounts.into_iter().next().flatten() else {
+        return Ok(None);
+    };
+    if account.owner != program_id.to_string() {
+        return Err(JobError::Config("session channel program mismatch".into()));
+    }
+    Ok(Channel::from_bytes(&account.data)
+        .ok()
+        .map(|channel| DecodedChannel {
+            address: *address,
+            channel,
+        }))
+}
+
 /// Fetch and decode up to 100 channels with one `getMultipleAccounts` call.
 ///
 /// Solana RPC accepts 100 addresses per request. Settlement workers should use
@@ -188,6 +250,28 @@ pub struct DistributionPreimage {
     /// `count(u32 LE) || entries(count × 34)` — borsh of `Vec<DistributionEntry>`.
     pub preimage_bytes: Vec<u8>,
     pub recipients: Vec<DistributionEntry>,
+}
+
+/// Reconstruct the original ordered payout without historical RPC availability.
+/// A snapshot is usable only when its commitment matches the funded channel.
+pub fn distribution_preimage_from_snapshot(
+    recipients: &[pay_kit::core::payment_channels::Distribution],
+    distribution_hash: &[u8; 32],
+) -> Result<DistributionPreimage, JobError> {
+    if recipients.len() > MAX_DISTRIBUTION_RECIPIENTS
+        || pay_kit::core::payment_channels::distribution_hash(recipients) != *distribution_hash
+    {
+        return Err(JobError::DistributionHashMismatch);
+    }
+    let mut preimage_bytes = (recipients.len() as u32).to_le_bytes().to_vec();
+    for recipient in recipients {
+        preimage_bytes.extend_from_slice(recipient.recipient.as_ref());
+        preimage_bytes.extend_from_slice(&recipient.bps.to_le_bytes());
+    }
+    Ok(DistributionPreimage {
+        recipients: decode_recipients(&preimage_bytes)?,
+        preimage_bytes,
+    })
 }
 
 /// Recover the distribution preimage for `channel` from its `open` (creation)
@@ -386,6 +470,13 @@ pub fn build_seal_ix(channel: &Pubkey) -> Instruction {
         .instruction()
 }
 
+/// Seal under the original channel program.
+pub fn build_seal_ix_for_program(channel: &Pubkey, program_id: &Pubkey) -> Instruction {
+    let mut instruction = build_seal_ix(channel);
+    instruction.program_id = to_address(program_id);
+    instruction
+}
+
 /// Permissionless rent reclaim for a fully distributed channel. The program
 /// enforces `clock.slot > open_slot + OPEN_SLOT_WINDOW` and returns the PDA's
 /// lamports to the channel-bound rent payer.
@@ -458,6 +549,23 @@ pub fn build_distribute_ix(
     token_program: &Pubkey,
     preimage: &DistributionPreimage,
 ) -> (Instruction, DistributeAccounts) {
+    build_distribute_ix_for_program(
+        channel,
+        treasury_owner,
+        token_program,
+        preimage,
+        &default_program_id(),
+    )
+}
+
+/// Distribute using the channel's original program and its event authority.
+pub fn build_distribute_ix_for_program(
+    channel: &DecodedChannel,
+    treasury_owner: &Pubkey,
+    token_program: &Pubkey,
+    preimage: &DistributionPreimage,
+    program_id: &Pubkey,
+) -> (Instruction, DistributeAccounts) {
     let channel_addr = channel.address;
     let payer = channel.payer();
     let rent_payer = channel.rent_payer();
@@ -483,7 +591,7 @@ pub fn build_distribute_ix(
         .map(|ata| solana_instruction::AccountMeta::new(to_address(ata), false))
         .collect();
 
-    let ix = DistributeBuilder::new()
+    let mut ix = DistributeBuilder::new()
         .channel(to_address(&channel_addr))
         .payer(to_address(&payer))
         .rent_payer(to_address(&rent_payer))
@@ -493,13 +601,14 @@ pub fn build_distribute_ix(
         .treasury_token_account(to_address(&treasury_ata))
         .mint(to_address(&mint))
         .token_program(to_address(token_program))
-        .event_authority(to_address(&event_authority()))
-        .self_program(to_address(&default_program_id()))
+        .event_authority(to_address(&find_event_authority_pda(program_id).0))
+        .self_program(to_address(program_id))
         .distribute_args(DistributeArgs {
             recipients: preimage.recipients.clone(),
         })
         .add_remaining_accounts(&remaining)
         .instruction();
+    ix.program_id = to_address(program_id);
 
     (
         ix,

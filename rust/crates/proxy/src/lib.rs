@@ -77,6 +77,7 @@ fn run_inner<S: PaymentState>(
     threads: Option<usize>,
     tls: Option<(&str, &str)>,
 ) -> anyhow::Result<()> {
+    reject_unsupported_deployment_policy_config(|name| std::env::var_os(name))?;
     // rustls 0.23 requires a process-default CryptoProvider. The dependency tree
     // enables BOTH ring (pingora) and aws-lc-rs (reqwest), so rustls can't pick
     // one automatically and pingora's TLS init panics. Install ring (what
@@ -86,7 +87,9 @@ fn run_inner<S: PaymentState>(
 
     let mut server = Server::new(None).map_err(|e| anyhow::anyhow!("pingora server: {e}"))?;
     server.bootstrap();
-    let gate = Http402Gate::new(state, control_plane);
+    let resolver = pay_core::server::deployment_policy::DeploymentPolicyResolver::from_env()?
+        .map(std::sync::Arc::new);
+    let gate = Http402Gate::new(state, control_plane).with_deployment_policy_resolver(resolver);
     let mut svc = http_proxy_service(&server.configuration, gate);
     // Pingora services default to a single worker thread — match the core count
     // so it spreads across cores like the tokio proxy did.
@@ -132,11 +135,14 @@ pub fn run_with_shutdown<S: PaymentState>(
     threads: Option<usize>,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
+    reject_unsupported_deployment_policy_config(|name| std::env::var_os(name))?;
     install_crypto_provider();
 
     let mut server = Server::new(None).map_err(|e| anyhow::anyhow!("pingora server: {e}"))?;
     server.bootstrap();
-    let gate = Http402Gate::new(state, control_plane);
+    let resolver = pay_core::server::deployment_policy::DeploymentPolicyResolver::from_env()?
+        .map(std::sync::Arc::new);
+    let gate = Http402Gate::new(state, control_plane).with_deployment_policy_resolver(resolver);
     let mut svc = http_proxy_service(&server.configuration, gate);
     let cores = threads.unwrap_or_else(|| {
         std::thread::available_parallelism()
@@ -167,6 +173,26 @@ pub fn run_with_shutdown<S: PaymentState>(
     Ok(())
 }
 
+/// Do not silently charge the fleet price when deployment policy mode is
+/// requested but channel-to-policy ownership is not yet implemented.
+fn reject_unsupported_deployment_policy_config(
+    mut get: impl FnMut(&str) -> Option<std::ffi::OsString>,
+) -> anyhow::Result<()> {
+    for name in [
+        "PAY_DEPLOYMENT_POLICY_URL",
+        "PAY_DEPLOYMENT_POLICY_AUDIENCE",
+        "PAY_DEPLOYMENT_POLICY_DOMAIN",
+    ] {
+        if get(name).is_some() {
+            anyhow::bail!(
+                "deployment payment policies are not supported by this proxy build; \
+                 durable channel-policy binding is required before setting {name}"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Pingora shutdown watcher driven by a caller-owned watch channel, with
 /// SIGTERM kept as a fallback so headless `kill` still works.
 #[cfg(unix)]
@@ -191,6 +217,32 @@ impl ShutdownSignalWatch for WatchShutdown {
                 }
                 _ = sigterm.recv() => return ShutdownSignal::GracefulTerminate,
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod deployment_policy_config_tests {
+    use super::reject_unsupported_deployment_policy_config;
+
+    #[test]
+    fn unconfigured_policy_mode_preserves_existing_proxy() {
+        assert!(reject_unsupported_deployment_policy_config(|_| None).is_ok());
+    }
+
+    #[test]
+    fn even_partial_or_empty_policy_config_fails_closed() {
+        for configured in [
+            "PAY_DEPLOYMENT_POLICY_URL",
+            "PAY_DEPLOYMENT_POLICY_AUDIENCE",
+            "PAY_DEPLOYMENT_POLICY_DOMAIN",
+        ] {
+            assert!(
+                reject_unsupported_deployment_policy_config(|name| {
+                    (name == configured).then(std::ffi::OsString::new)
+                })
+                .is_err()
+            );
         }
     }
 }

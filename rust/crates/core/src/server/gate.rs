@@ -31,6 +31,7 @@ use pay_types::metering::Scheme;
 use serde_json::json;
 
 use crate::PaymentState;
+use crate::server::deployment_policy::{DeploymentPolicyResolver, PolicyHost};
 use crate::server::metering;
 use crate::server::session::{DelegatedCapacityLease, SessionMpp, SessionOutcome};
 use crate::server::telemetry;
@@ -52,11 +53,23 @@ const PAYMENT_PAGE_CSP: &str = "\
 /// without bound.
 pub const MAX_BATCH_CACHED_RESPONSE_BYTES: usize = 1024 * 1024;
 
+/// Convert a wire path to the gate's static-route convention without collapsing
+/// distinct upstream paths. Reject ambiguous paths before policy resolution.
+pub fn gate_path(path: &str) -> Result<&str, GateResponse> {
+    if path.starts_with("//") {
+        return Err(GateResponse::json(
+            StatusCode::BAD_REQUEST,
+            Bytes::from_static(br#"{"error":"invalid_request_path"}"#),
+        ));
+    }
+    Ok(path.strip_prefix('/').unwrap_or(path))
+}
+
 /// Everything the gate needs from a request. No body — the decision is made
 /// from metadata alone, so the body can stream straight to the upstream.
 pub struct GateRequest<'a> {
     pub method: &'a Method,
-    /// Path with the leading `/` trimmed (e.g. `v1/chat`).
+    /// Path validated by [`gate_path`], with one leading `/` removed (e.g. `v1/chat`).
     pub path: &'a str,
     pub host: Option<&'a str>,
     pub accept: Option<&'a str>,
@@ -120,6 +133,24 @@ pub struct PaidRequestTelemetry {
     pub payment: Option<telemetry::PaymentAmount>,
 }
 
+/// Streaming media types handled consistently by both HTTP adapters.
+pub fn is_streaming_response(headers: &HeaderMap) -> bool {
+    headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| {
+            value.trim().eq_ignore_ascii_case("text/event-stream")
+                || value.trim().eq_ignore_ascii_case("application/x-ndjson")
+        })
+}
+
+/// The immutable admission price for a delegated request.
+pub enum SessionSettlementPlan {
+    Metered(Box<metering::UptoSettlementPlan>),
+    Fixed { base_units: u64 },
+}
+
 /// Session-stream metering context for a forwarded session request. The
 /// adapter attaches it so the response-stream metering layer can debit the
 /// channel as bytes flow back.
@@ -130,7 +161,7 @@ pub struct SessionForward {
     /// Response-metered settlement plan for a delegated session. The adapter
     /// rates actual usage and persists an operator-signed cumulative voucher
     /// before releasing the matching response bytes.
-    pub settlement: Option<Box<metering::UptoSettlementPlan>>,
+    pub settlement: Option<SessionSettlementPlan>,
     /// Remaining channel capacity available to the metered delivery.
     pub available_base_units: u64,
     /// Total channel authorization, used in receipt metadata even when this
@@ -140,10 +171,41 @@ pub struct SessionForward {
     /// upstream services use this as their tenant boundary.
     pub verified_payer: Option<String>,
     /// Releases the exclusive capacity reservation on every terminal path.
-    _reservation: Option<DelegatedCapacityLease>,
+    pub(crate) _reservation: Option<DelegatedCapacityLease>,
 }
 
 impl SessionForward {
+    pub async fn require_active(&self) -> Result<(), String> {
+        if let Some(lease) = &self._reservation {
+            lease
+                .require_active(self.available_base_units)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    pub fn deadline(&self) -> Option<tokio::time::Instant> {
+        self._reservation
+            .as_ref()
+            .and_then(DelegatedCapacityLease::deadline)
+    }
+
+    pub fn metered_plan(&self) -> Option<&metering::UptoSettlementPlan> {
+        match self.settlement.as_ref()? {
+            SessionSettlementPlan::Metered(plan) => Some(plan),
+            SessionSettlementPlan::Fixed { .. } => None,
+        }
+    }
+
+    pub fn metered_plan_mut(&mut self) -> Option<&mut metering::UptoSettlementPlan> {
+        match self.settlement.as_mut()? {
+            SessionSettlementPlan::Metered(plan) => Some(plan),
+            SessionSettlementPlan::Fixed { .. } => None,
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn delegated(
         handle: Arc<SessionMpp>,
         channel_id: String,
@@ -157,7 +219,7 @@ impl SessionForward {
             handle,
             channel_id,
             committed_base_units,
-            settlement: Some(Box::new(settlement)),
+            settlement: Some(SessionSettlementPlan::Metered(Box::new(settlement))),
             available_base_units: capacity_base_units.0,
             authorized_base_units: capacity_base_units.1,
             verified_payer: Some(verified_payer),
@@ -234,17 +296,28 @@ pub async fn settle_delegated_session(
     response_headers: &HeaderMap,
     response_body: Option<&[u8]>,
 ) -> Result<Option<ReceiptAnnotation>, String> {
-    let Some(plan) = pending.settlement.as_deref() else {
+    let Some(plan) = pending.settlement.as_ref() else {
         return Ok(None);
     };
-    let actual = metering::upto_actual_amount_from_response(
-        plan,
-        pending.available_base_units,
-        response_headers,
-        response_body,
-    )
-    .map_err(|error| error.to_string())?;
-    if actual.base_units == 0 {
+    let (base_units, usd) = match plan {
+        SessionSettlementPlan::Metered(plan) => {
+            let actual = metering::upto_actual_amount_from_response(
+                plan,
+                pending.available_base_units,
+                response_headers,
+                response_body,
+            )
+            .map_err(|error| error.to_string())?;
+            (actual.base_units, actual.usd)
+        }
+        SessionSettlementPlan::Fixed { base_units } => {
+            if *base_units > pending.available_base_units {
+                return Err("deployment price exceeds reserved channel capacity".into());
+            }
+            (*base_units, *base_units as f64 / 1_000_000.0)
+        }
+    };
+    if base_units == 0 {
         pending
             .handle
             .touch_channel(pending.channel_id.clone())
@@ -259,14 +332,18 @@ pub async fn settle_delegated_session(
 
     let acceptance = pending
         .handle
-        .authorize_delegated_usage(&pending.channel_id, actual.base_units)
+        .authorize_reserved_usage(
+            &pending.channel_id,
+            base_units,
+            pending._reservation.as_ref(),
+        )
         .await
         .map_err(|error| error.to_string())?;
     tracing::info!(
         channel = %pending.channel_id,
-        amount = actual.base_units,
+        amount = base_units,
         cumulative = acceptance.cumulative,
-        usd = actual.usd,
+        usd,
         "delegated MPP session voucher accepted"
     );
     let authorized = pending.authorized_base_units;
@@ -274,7 +351,7 @@ pub async fn settle_delegated_session(
         pending.handle.network(),
         pending.handle.currency(),
         &pending.channel_id,
-        actual.base_units,
+        base_units,
         acceptance.cumulative,
         authorized,
         acceptance.idle_timeout_seconds,
@@ -361,11 +438,111 @@ pub enum GateDecision {
 /// [`PaymentState`] (MPP / session / subscription backends + API specs).
 pub struct PaymentGate<S: PaymentState> {
     state: S,
+    deployment_policy_resolver: Option<Arc<DeploymentPolicyResolver>>,
 }
 
 impl<S: PaymentState> PaymentGate<S> {
     pub fn new(state: S) -> Self {
-        Self { state }
+        Self {
+            state,
+            deployment_policy_resolver: None,
+        }
+    }
+
+    pub fn with_deployment_policy_resolver(
+        mut self,
+        resolver: Option<Arc<DeploymentPolicyResolver>>,
+    ) -> Self {
+        self.deployment_policy_resolver = resolver;
+        self
+    }
+
+    async fn evaluate_deployment(
+        &self,
+        resolver: &DeploymentPolicyResolver,
+        hostname: &str,
+        req: &GateRequest<'_>,
+    ) -> GateDecision {
+        let mut path = format!("/{}", req.path);
+        if let Some(query) = req.query {
+            path.push('?');
+            path.push_str(query);
+        }
+        // Resolve on every admission. Backend caching must never extend the
+        // lifetime of a deleted or superseded policy.
+        let policy = match resolver.resolve(hostname, &path).await {
+            Ok(policy) => policy,
+            Err(error) => {
+                tracing::warn!(%error, "deployment payment policy resolution failed");
+                return deployment_policy_unavailable();
+            }
+        };
+        let handles = self.state.session_mpp_handles();
+        let mut candidates = handles.iter().filter(|session| {
+            session.decimals() == 6
+                && session
+                    .accepts_currency(pay_types::Stablecoin::Usdc.mint(Some(session.network())))
+        });
+        let Some(template) = candidates.next() else {
+            return deployment_policy_unavailable();
+        };
+        if candidates.next().is_some() {
+            return deployment_policy_unavailable();
+        }
+        let binding = match pay_types::deployment_policy::DeploymentSessionBinding::new(
+            policy.durable_policy(),
+        ) {
+            Ok(binding) => binding,
+            Err(_) => return deployment_policy_unavailable(),
+        };
+        let session = match template.for_deployment_policy(binding) {
+            Ok(session) => session,
+            Err(error) => {
+                tracing::warn!(%error, "deployment session backend unavailable");
+                return deployment_policy_unavailable();
+            }
+        };
+        if let Err(error) = session.prepare_deployment_challenge().await {
+            tracing::warn!(%error, "deployment finalized blockhash unavailable");
+            return deployment_policy_unavailable();
+        }
+        if let Some(auth) = req.authorization.filter(is_payment_authorization) {
+            match parse_authorization(auth) {
+                Ok(credential)
+                    if credential.challenge.intent.as_str() == "session"
+                        && credential.challenge.method.as_str() == "solana" =>
+                {
+                    return session_authorized(
+                        &session,
+                        Some(Arc::clone(&session)),
+                        credential,
+                        SessionPricing::Fixed(policy.price_micro_usd),
+                        req,
+                        hostname,
+                        req.path,
+                    )
+                    .await;
+                }
+                Err(_) => {
+                    return GateDecision::Respond(GateResponse::json(
+                        StatusCode::BAD_REQUEST,
+                        Bytes::from_static(br#"{"error":"malformed_credential"}"#),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        match session.challenge_header(None) {
+            Ok(challenge) => GateDecision::Respond(
+                GateResponse::json(
+                    StatusCode::PAYMENT_REQUIRED,
+                    Bytes::from_static(br#"{"error":"payment_required","scheme":"mpp-session"}"#),
+                )
+                .header(header::WWW_AUTHENTICATE, challenge)
+                .header(header::CACHE_CONTROL, "no-store"),
+            ),
+            Err(_) => deployment_policy_unavailable(),
+        }
     }
 
     /// Decide what to do with `req`. See the module docs for the full tree.
@@ -373,6 +550,20 @@ impl<S: PaymentState> PaymentGate<S> {
         use pay_kit::mpp::server::html as mpp_html;
 
         let path = req.path;
+        if let Some(resolver) = self.deployment_policy_resolver.as_deref() {
+            match req.host.map(|host| resolver.classify_host(host)) {
+                Some(Ok(PolicyHost::Apex)) => {}
+                Some(Ok(PolicyHost::Deployment(hostname))) => {
+                    return self.evaluate_deployment(resolver, &hostname, req).await;
+                }
+                _ => {
+                    return GateDecision::Respond(GateResponse::json(
+                        StatusCode::BAD_REQUEST,
+                        Bytes::from_static(br#"{"error":"invalid_deployment_host"}"#),
+                    ));
+                }
+            }
+        }
 
         // Control-plane + discovery surfaces stay unauthenticated.
         if path.starts_with("__402/") || path == "openapi.json" || path.starts_with(".well-known/")
@@ -503,7 +694,7 @@ impl<S: PaymentState> PaymentGate<S> {
                             session_mpps[index],
                             session_handles.get(index).cloned(),
                             cred,
-                            meter,
+                            SessionPricing::Metered(meter),
                             req,
                             subdomain,
                             path,
@@ -2187,12 +2378,25 @@ fn session_receipt_annotation(network: &str, reference: String) -> ReceiptAnnota
     }
 }
 
+fn deployment_policy_unavailable() -> GateDecision {
+    GateDecision::Respond(GateResponse::json(
+        StatusCode::SERVICE_UNAVAILABLE,
+        Bytes::from_static(br#"{"error":"deployment_payment_policy_unavailable"}"#),
+    ))
+}
+
+#[derive(Clone, Copy)]
+enum SessionPricing<'a> {
+    Metered(&'a pay_types::metering::Metering),
+    Fixed(u64),
+}
+
 /// Process a session credential and map the outcome to a [`GateDecision`].
 async fn session_authorized(
     sm: &SessionMpp,
     handle: Option<Arc<SessionMpp>>,
     credential: PaymentCredential,
-    meter: &pay_types::metering::Metering,
+    pricing: SessionPricing<'_>,
     req: &GateRequest<'_>,
     subdomain: &str,
     path: &str,
@@ -2223,7 +2427,9 @@ async fn session_authorized(
                 ));
             };
             let available_base_units = state.deposit.saturating_sub(state.cumulative);
-            if available_base_units == 0 {
+            if available_base_units == 0
+                || matches!(pricing, SessionPricing::Fixed(amount) if amount > available_base_units)
+            {
                 return GateDecision::Respond(GateResponse::json(
                     StatusCode::PAYMENT_REQUIRED,
                     serde_json::to_vec(&json!({
@@ -2234,13 +2440,16 @@ async fn session_authorized(
                     .unwrap_or_default(),
                 ));
             }
-            let per_request_base_units = meter
-                .upto
-                .as_ref()
-                .and_then(|upto| upto.max_usd)
-                .map(|usd| (usd * 10_f64.powi(sm.decimals() as i32)).ceil() as u64)
-                .unwrap_or(available_base_units)
-                .min(available_base_units);
+            let per_request_base_units = match pricing {
+                SessionPricing::Fixed(amount) => amount,
+                SessionPricing::Metered(meter) => meter
+                    .upto
+                    .as_ref()
+                    .and_then(|upto| upto.max_usd)
+                    .map(|usd| (usd * 10_f64.powi(sm.decimals() as i32)).ceil() as u64)
+                    .unwrap_or(available_base_units)
+                    .min(available_base_units),
+            };
             let reservation = match handle
                 .reserve_delegated_capacity(&state.channel_id, per_request_base_units)
                 .await
@@ -2270,23 +2479,29 @@ async fn session_authorized(
             };
             let variant = variant_hint_from_path(path);
             let ceiling_usd = per_request_base_units as f64 / 10_f64.powi(sm.decimals() as i32);
-            let settlement = metering::UptoSettlementPlan {
-                metering: meter.clone(),
-                variant_hint: variant,
-                request_properties: props,
-                ceiling_usd,
-                inferred_usage: None,
+            let settlement = match pricing {
+                SessionPricing::Fixed(base_units) => SessionSettlementPlan::Fixed { base_units },
+                SessionPricing::Metered(meter) => {
+                    SessionSettlementPlan::Metered(Box::new(metering::UptoSettlementPlan {
+                        metering: meter.clone(),
+                        variant_hint: variant,
+                        request_properties: props,
+                        ceiling_usd,
+                        inferred_usage: None,
+                    }))
+                }
             };
             GateDecision::Forward {
-                session: Some(Box::new(SessionForward::delegated(
+                session: Some(Box::new(SessionForward {
                     handle,
-                    state.channel_id,
-                    state.cumulative,
-                    settlement,
-                    (per_request_base_units, state.deposit),
-                    state.payer.clone(),
-                    reservation,
-                ))),
+                    channel_id: state.channel_id,
+                    committed_base_units: state.cumulative,
+                    settlement: Some(settlement),
+                    available_base_units: per_request_base_units,
+                    authorized_base_units: state.deposit,
+                    verified_payer: Some(state.payer.clone()),
+                    _reservation: Some(reservation),
+                })),
                 receipt: signature
                     .map(|reference| session_receipt_annotation(sm.network(), reference)),
                 upto: None,

@@ -52,6 +52,9 @@ pub const STRIP_HEADERS: &[&str] = &[
     "x-pay-verified-payer",
     "x-pay-verified-channel",
     "x-pay-original-host",
+    "x-pay-wallet-resolver-proof",
+    "x-pay-payment-policy",
+    "x-pay-payment-policy-version",
 ];
 
 /// Return an upstream URL that is safe to attach to logs and traces.
@@ -1254,9 +1257,9 @@ struct CachedToken {
 }
 
 /// A freshly-fetched token with the provider-reported lifetime.
-struct FetchedToken {
-    access_token: String,
-    expires_in_secs: u64,
+pub(super) struct FetchedToken {
+    pub(super) access_token: String,
+    pub(super) expires_in_secs: u64,
 }
 
 /// Cache key: one entry per distinct (token_url, scopes, audience, client_id)
@@ -1479,7 +1482,7 @@ async fn fetch_gcp_metadata_token(
 /// (Cloud Run / GCE), used to invoke IAM-protected services such as private
 /// Cloud Run. Unlike access tokens there is no ADC fallback: user credentials
 /// cannot mint audience-bound identity tokens.
-async fn fetch_gcp_metadata_identity_token(
+pub(super) async fn fetch_gcp_metadata_identity_token(
     client: &reqwest::Client,
     audience: &str,
 ) -> Result<FetchedToken, String> {
@@ -1501,11 +1504,15 @@ async fn fetch_gcp_metadata_identity_token(
         return Err(format!("GCP metadata identity endpoint returned {status}"));
     }
 
-    let token = resp
-        .text()
+    // Bound chunked bodies too; metadata credentials must never cause an
+    // unbounded allocation before the authenticated resolver request.
+    let bytes = super::deployment_policy::read_bounded_response(resp, 16 * 1024)
         .await
-        .map_err(|e| format!("Failed to read identity token: {e}"))?;
-    let token = token.trim().to_string();
+        .map_err(|_| "Failed to read bounded identity token".to_string())?;
+    let token = std::str::from_utf8(&bytes)
+        .map_err(|_| "Identity token is not UTF-8".to_string())?
+        .trim()
+        .to_string();
 
     // The /identity endpoint returns a raw JWT with no expiry envelope —
     // read the remaining lifetime from the token's own `exp` claim.

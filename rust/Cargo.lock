@@ -2443,7 +2443,7 @@ version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23f76610e969fa1784327ded240f1e28a3fd9520c9cec93b636fcf62dd37f772"
 dependencies = [
- "five8_core 0.1.2",
+ "five8_core 1.0.0",
 ]
 
 [[package]]
@@ -2452,7 +2452,7 @@ version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1a0f1728185f277989ca573a402716ae0beaaea3f76a8ff87ef9dd8fb19436c5"
 dependencies = [
- "five8_core 0.1.2",
+ "five8_core 1.0.0",
 ]
 
 [[package]]
@@ -5386,6 +5386,8 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "solana-pay-kit",
+ "solana-pubkey 3.0.0",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -5405,6 +5407,7 @@ dependencies = [
  "opentelemetry-semantic-conventions",
  "opentelemetry_sdk",
  "pay-api-core",
+ "pay-types",
  "redis",
  "serde",
  "serde_json",
@@ -8767,7 +8770,7 @@ dependencies = [
 [[package]]
 name = "solana-pay-kit"
 version = "0.10.0"
-source = "git+https://github.com/solana-foundation/pay-kit.git?rev=9f47b85f#9f47b85f245a0f34a77a2ae762adc94c5a1feeea"
+source = "git+https://github.com/solana-foundation/pay-kit.git?rev=1181a247cc35ba356c7af509c501413c0aee3c57#1181a247cc35ba356c7af509c501413c0aee3c57"
 dependencies = [
  "async-trait",
  "base64 0.22.1",

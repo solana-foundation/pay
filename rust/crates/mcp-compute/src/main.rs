@@ -5,6 +5,7 @@ use clap::Parser;
 use mcp_compute::binding::DataBindingClient;
 use mcp_compute::driver::ComputeDriver;
 use mcp_compute::google::{GoogleCloudFunctionsDriver, GoogleConfig};
+use mcp_compute::payment_service::PaymentService;
 use mcp_compute::trigger_driver::TriggerDriver;
 use mcp_compute::trigger_google::{GoogleTriggerConfig, GoogleTriggerDriver};
 use mcp_compute::{DriverRegistry, TriggerDriverRegistry, server};
@@ -40,6 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let google = GoogleCloudFunctionsDriver::new(GoogleConfig::from_env()?)?;
     let bindings = DataBindingClient::from_env(google.clone())?;
+    let payments = PaymentService::from_env(google.clone())?;
     let drivers = DriverRegistry::new([Arc::new(google) as Arc<dyn ComputeDriver>])?;
     let trigger_driver = Arc::new(GoogleTriggerDriver::new(GoogleTriggerConfig::from_env()?).await?)
         as Arc<dyn TriggerDriver>;
@@ -61,13 +63,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(address = %args.bind, "compute MCP listening");
     axum::serve(
         listener,
-        server::router(
+        server::router_with_payments(
             drivers,
             trigger_drivers,
             args.gateway_domain,
             allowed_hosts,
             bindings,
             executor_proof,
+            payments,
         ),
     )
     .await?;

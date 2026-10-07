@@ -122,6 +122,77 @@ struct GoogleOptions {
 }
 
 impl GoogleCloudFunctionsDriver {
+    pub(crate) fn project(&self) -> &str {
+        &self.config.project
+    }
+
+    /// Resolve a public selector through authenticated provider metadata. The
+    /// hostname supplies a lookup key, never an ownership assertion.
+    pub async fn payment_deployment(
+        &self,
+        hostname: &str,
+        path: Option<&str>,
+    ) -> Result<crate::payment_policy::DeploymentIdentity> {
+        let suffix = format!(".{}", self.config.gateway_domain);
+        let id = hostname.strip_suffix(&suffix).ok_or_else(|| {
+            ComputeError::InvalidRequest("hostname is outside the compute gateway domain".into())
+        })?;
+        validate_gateway_function_name(id)?;
+        let resource = format!(
+            "projects/{}/locations/{}/functions/{id}",
+            self.config.project, self.config.default_region
+        );
+        let value = self
+            .require_json(
+                Method::GET,
+                format!("{}/v2/{resource}", self.config.api_base),
+                None,
+            )
+            .await?;
+        let owner_key = tenant_label_from_resource(&resource)?;
+        if owner_key.len() != 16
+            || !owner_key.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || value.get("name").and_then(Value::as_str) != Some(resource.as_str())
+            || value.pointer("/labels/pay-tenant").and_then(Value::as_str) != Some(&owner_key)
+            || value.pointer("/labels/managed-by").and_then(Value::as_str) != Some("mcp-compute")
+            || value
+                .pointer("/labels/pay-exposure")
+                .and_then(Value::as_str)
+                != Some("gateway")
+            || value.get("state").and_then(Value::as_str) != Some("ACTIVE")
+        {
+            return Err(ComputeError::InvalidRequest(
+                "deployment is not an active owned gateway".into(),
+            ));
+        }
+        if let Some(path) = path {
+            let paths = value
+                .pointer("/serviceConfig/environmentVariables/PAY_INTERNAL_PUBLIC_PATHS")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    ComputeError::InvalidRequest("deployment has no public paths".into())
+                })?;
+            let paths: Vec<String> = serde_json::from_str(paths)?;
+            validate_public_paths(&paths)?;
+            if !path_is_public(&paths, path) {
+                return Err(ComputeError::InvalidRequest("path is not published".into()));
+            }
+        }
+        let created_at = value
+            .get("createTime")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                ComputeError::Provider("deployment creation identity is missing".into())
+            })?;
+        Ok(crate::payment_policy::DeploymentIdentity {
+            owner_key,
+            resource_name: resource,
+            created_at: created_at.into(),
+            hostname: hostname.into(),
+        })
+    }
+
     pub fn new(config: GoogleConfig) -> Result<Self> {
         validate_segment("project", &config.project)?;
         validate_segment("default region", &config.default_region)?;
@@ -136,7 +207,7 @@ impl GoogleCloudFunctionsDriver {
         })
     }
 
-    async fn access_token(&self) -> Result<String> {
+    pub(crate) async fn access_token(&self) -> Result<String> {
         if let Some(token) = &self.config.access_token {
             return Ok(token.clone());
         }
@@ -1104,12 +1175,7 @@ fn validate_public_paths(paths: &[String]) -> Result<Vec<String>> {
     normalized.sort();
     normalized.dedup();
     for path in &normalized {
-        if !path.starts_with('/')
-            || path.starts_with("//")
-            || path.len() > 256
-            || path.contains(['?', '#', '\r', '\n'])
-            || path.split('/').any(|segment| segment == "..")
-        {
+        if !safe_public_path(path) {
             return Err(ComputeError::InvalidRequest(format!(
                 "public gateway path `{path}` must be an exact safe absolute path"
             )));
@@ -1122,7 +1188,22 @@ fn path_is_public(public_paths: &[String], path_and_query: &str) -> bool {
     let requested_path = path_and_query
         .split_once('?')
         .map_or(path_and_query, |(path, _)| path);
-    public_paths.iter().any(|path| path == requested_path)
+    safe_public_path(requested_path) && public_paths.iter().any(|path| path == requested_path)
+}
+
+fn safe_public_path(path: &str) -> bool {
+    path.starts_with('/')
+        && !path.starts_with("//")
+        && path.len() <= 256
+        // Reject alternate encodings instead of interpreting them differently
+        // from the provider URL parser or the workload's HTTP framework.
+        && !path.bytes().any(|byte| byte.is_ascii_control())
+        && !path.contains(['?', '#', '%', '\\'])
+        && !path.split('/').any(|segment| matches!(segment, "." | ".."))
+        && path != "/internal"
+        && !path.starts_with("/internal/")
+        && path != "/__402"
+        && !path.starts_with("/__402/")
 }
 
 fn normalize_deployment(value: Value) -> Result<Deployment> {
@@ -1453,5 +1534,15 @@ mod tests {
         assert!(validate_public_paths(&["/summary?admin=true".into()]).is_err());
         assert!(path_is_public(&["/summary".into()], "/summary?limit=5"));
         assert!(!path_is_public(&["/summary".into()], "/refresh"));
+        for path in [
+            "/a/%2e%2e/refresh",
+            "/a/./refresh",
+            "/a\\refresh",
+            "/internal/run",
+            "/__402/payment-policy",
+        ] {
+            assert!(validate_public_paths(&[path.into()]).is_err());
+            assert!(!path_is_public(&[path.into()], path));
+        }
     }
 }

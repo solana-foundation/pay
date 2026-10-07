@@ -172,7 +172,7 @@ pub struct DelegatedSessionStreamMeter {
 
 impl DelegatedSessionStreamMeter {
     pub fn from_forward(forward: SessionForward) -> Result<Self, BoxError> {
-        let plan = forward.settlement.as_deref().ok_or_else(|| {
+        let plan = forward.metered_plan().ok_or_else(|| {
             box_error(std::io::Error::other(
                 "delegated stream forward is missing its settlement plan",
             ))
@@ -210,7 +210,7 @@ impl DelegatedSessionStreamMeter {
     }
 
     pub fn supports(forward: &SessionForward) -> bool {
-        let Some(plan) = forward.settlement.as_deref() else {
+        let Some(plan) = forward.metered_plan() else {
             return false;
         };
         spec_from_metering(
@@ -306,7 +306,7 @@ impl DelegatedSessionStreamMeter {
         context_length: u64,
         usage_only_chunk: bool,
     ) -> Result<(), BoxError> {
-        let plan = self.forward.settlement.as_deref().ok_or_else(|| {
+        let plan = self.forward.metered_plan().ok_or_else(|| {
             box_error(std::io::Error::other(
                 "delegated stream meter lost its settlement plan",
             ))

@@ -20,6 +20,9 @@ use sha2::{Digest, Sha256};
 
 use crate::binding::DataBindingClient;
 use crate::driver::{ComputeError, DriverRegistry};
+use crate::payment_service::{
+    DeletePaymentPolicyRequest, GetPaymentPolicyRequest, PaymentService, SetPaymentPolicyRequest,
+};
 use crate::trigger_driver::TriggerDriverRegistry;
 use crate::trigger_types::{
     CreateTriggerRequest, ExecuteTriggerRequest, ListTriggersRequest, TriggerRequest,
@@ -43,6 +46,7 @@ pub struct ComputeMcp {
     drivers: DriverRegistry,
     trigger_drivers: TriggerDriverRegistry,
     bindings: Option<DataBindingClient>,
+    payments: Option<PaymentService>,
 }
 
 impl ComputeMcp {
@@ -56,6 +60,7 @@ impl ComputeMcp {
             drivers,
             trigger_drivers,
             bindings,
+            payments: None,
         }
     }
 
@@ -84,6 +89,60 @@ impl ComputeMcp {
 
 #[tool_router]
 impl ComputeMcp {
+    #[tool(
+        description = "Delete a deployment payment policy using its observed version. Retains a revision tombstone; subsequent public resolution fails closed. Exact delete retries are idempotent."
+    )]
+    async fn delete_payment_policy(
+        &self,
+        Parameters(request): Parameters<DeletePaymentPolicyRequest>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let tenant = Self::tenant(&ctx)?;
+        let result = match &self.payments {
+            Some(service) => service.delete(&tenant, request).await,
+            None => Err(ComputeError::Configuration(
+                "deployment payment policies are not configured".into(),
+            )),
+        };
+        Self::result(result)
+    }
+
+    #[tool(
+        description = "Set a deployment-owned MPP selling price and wallet-reference splits. Requires ownership of the active gateway deployment and all recipient wallets. Integer price_micro_usd: 50000 means $0.05; split basis_points: 3000 means 30%. expected_version=0 creates, later updates require the observed version."
+    )]
+    async fn set_payment_policy(
+        &self,
+        Parameters(request): Parameters<SetPaymentPolicyRequest>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let tenant = Self::tenant(&ctx)?;
+        let result = match &self.payments {
+            Some(service) => service.set(&tenant, request).await,
+            None => Err(ComputeError::Configuration(
+                "deployment payment policies are not configured".into(),
+            )),
+        };
+        Self::result(result)
+    }
+
+    #[tool(
+        description = "Read the current payment policy and version for a payer-owned gateway deployment."
+    )]
+    async fn get_payment_policy(
+        &self,
+        Parameters(request): Parameters<GetPaymentPolicyRequest>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let tenant = Self::tenant(&ctx)?;
+        let result = match &self.payments {
+            Some(service) => service.get(&tenant, &request.hostname).await,
+            None => Err(ComputeError::Configuration(
+                "deployment payment policies are not configured".into(),
+            )),
+        };
+        Self::result(result)
+    }
+
     #[tool(
         description = "List configured serverless compute drivers and their capabilities. Call this before deploying when provider, runtime, timeout, or source support is uncertain."
     )]
@@ -376,18 +435,41 @@ pub fn router(
     bindings: Option<DataBindingClient>,
     executor_proof: Vec<u8>,
 ) -> Router {
+    router_with_payments(
+        drivers,
+        trigger_drivers,
+        gateway_domain,
+        allowed_hosts,
+        bindings,
+        executor_proof,
+        None,
+    )
+}
+
+pub fn router_with_payments(
+    drivers: DriverRegistry,
+    trigger_drivers: TriggerDriverRegistry,
+    gateway_domain: String,
+    allowed_hosts: Vec<String>,
+    bindings: Option<DataBindingClient>,
+    executor_proof: Vec<u8>,
+    payments: Option<PaymentService>,
+) -> Router {
     let transport = StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts);
     let mcp_drivers = drivers.clone();
     let mcp_trigger_drivers = trigger_drivers.clone();
     let mcp_bindings = bindings.clone();
+    let mcp_payments = payments.clone();
     let service: StreamableHttpService<ComputeMcp, LocalSessionManager> =
         StreamableHttpService::new(
             move || {
-                Ok(ComputeMcp::new(
+                let mut mcp = ComputeMcp::new(
                     mcp_drivers.clone(),
                     mcp_trigger_drivers.clone(),
                     mcp_bindings.clone(),
-                ))
+                );
+                mcp.payments = mcp_payments.clone();
+                Ok(mcp)
             },
             Default::default(),
             transport,
@@ -395,6 +477,13 @@ pub fn router(
     let mcp = Router::new()
         .nest_service("/mcp", service)
         .layer(middleware::from_fn(verified_tenant));
+    let payment_routes = match payments {
+        Some(payments) => payments.router(),
+        None => Router::new().route(
+            "/__402/payment-policy",
+            get(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+        ),
+    };
     Router::new()
         .route("/__402/health", get(health))
         .route("/internal/triggers/run", post(execute_trigger))
@@ -406,6 +495,7 @@ pub fn router(
             gateway_domain,
             executor_proof,
         })
+        .merge(payment_routes)
 }
 
 async fn execute_trigger(

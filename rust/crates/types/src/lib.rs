@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
+pub mod deployment_policy;
 pub mod metering;
 pub mod registry;
 pub mod splits;

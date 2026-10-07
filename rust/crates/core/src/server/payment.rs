@@ -57,7 +57,10 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
     let method = req.method().clone();
     let uri = req.uri().clone();
     let headers = req.headers().clone();
-    let path = uri.path().trim_start_matches('/').to_string();
+    let path = match crate::server::gate::gate_path(uri.path()) {
+        Ok(path) => path.to_string(),
+        Err(response) => return (response.status, response.body).into_response(),
+    };
 
     let str_header = |name: &str| {
         headers
@@ -122,8 +125,7 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
                     // response below. The client-voucher stream context waits
                     // for client commits and must not be installed here.
                     if sf
-                        .settlement
-                        .as_deref()
+                        .metered_plan()
                         .is_some_and(|plan| plan.variant_hint.is_none())
                     {
                         let force_stream_usage = path.ends_with("chat/completions");
@@ -133,7 +135,7 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
                                 Err(response) => return response,
                             };
                         req = restored;
-                        if let Some(plan) = sf.settlement.as_deref_mut() {
+                        if let Some(plan) = sf.metered_plan_mut() {
                             plan.variant_hint = body_variant;
                         }
                     }
@@ -151,10 +153,28 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
                 channel_id: verified_channel,
                 original_host: host,
             });
-            let mut response = next.run(req).await;
-            if let Some(sf) = delegated_session {
-                response = settle_axum_delegated_response(sf, response).await;
-            }
+            let deadline = delegated_session
+                .as_ref()
+                .and_then(|forward| forward.deadline());
+            let forwarding = async move {
+                if let Some(forward) = &delegated_session
+                    && forward.require_active().await.is_err()
+                {
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                }
+                let response = next.run(req).await;
+                match delegated_session {
+                    Some(sf) => settle_axum_delegated_response(sf, response).await,
+                    None => response,
+                }
+            };
+            let mut response = match deadline {
+                Some(deadline) => match tokio::time::timeout_at(deadline, forwarding).await {
+                    Ok(response) => response,
+                    Err(_) => return StatusCode::GATEWAY_TIMEOUT.into_response(),
+                },
+                None => forwarding.await,
+            };
             // x402 `upto`: settle the opened channel *after* serving — debit the
             // metered amount on success, refund on failure.
             if let Some(uf) = upto {
@@ -306,6 +326,9 @@ pub fn strip_internal_identity_headers(headers: &mut HeaderMap) {
     headers.remove("x-pay-verified-payer");
     headers.remove("x-pay-verified-channel");
     headers.remove("x-pay-original-host");
+    headers.remove("x-pay-wallet-resolver-proof");
+    headers.remove("x-pay-payment-policy");
+    headers.remove("x-pay-payment-policy-version");
 }
 
 /// Attach identity headers only after the payment gate has authenticated the
@@ -409,11 +432,11 @@ fn prepare_delegated_json_body(body: &[u8], force_stream_usage: bool) -> (Option
     )
 }
 
-async fn settle_axum_delegated_response(
+pub(super) async fn settle_axum_delegated_response(
     forward: crate::server::gate::SessionForward,
     response: Response,
 ) -> Response {
-    if !response.status().is_success() {
+    if !response.status().is_success() && forward.deadline().is_none() {
         // Dropping `forward` releases the capacity lease without charging for
         // a response that was not successfully served.
         return response;
@@ -428,6 +451,13 @@ async fn settle_axum_delegated_response(
                 .split(';')
                 .any(|part| part.trim().eq_ignore_ascii_case("text/event-stream"))
         });
+    if crate::server::gate::is_streaming_response(response.headers())
+        && forward.deadline().is_some()
+    {
+        // Fixed deployment charging is atomic on a completed response. Do not
+        // release a partial stream that could later fail without being charged.
+        return StatusCode::BAD_GATEWAY.into_response();
+    }
     if is_sse && session_stream::DelegatedSessionStreamMeter::supports(&forward) {
         let (mut parts, body) = response.into_parts();
         let meter = match session_stream::DelegatedSessionStreamMeter::from_forward(forward) {
@@ -453,8 +483,7 @@ async fn settle_axum_delegated_response(
     }
 
     let limit = forward
-        .settlement
-        .as_deref()
+        .metered_plan()
         .map(|plan| metering::upto_response_body_limit(&plan.metering))
         .unwrap_or(1024 * 1024);
     let (mut parts, body) = response.into_parts();
@@ -470,6 +499,10 @@ async fn settle_axum_delegated_response(
         }
     };
 
+    if !parts.status.is_success() {
+        parts.headers.remove(header::CONTENT_LENGTH);
+        return Response::from_parts(parts, Body::from(bytes));
+    }
     match crate::server::gate::settle_delegated_session(forward, &parts.headers, Some(&bytes)).await
     {
         Ok(receipt) => {
@@ -721,6 +754,87 @@ mod tests {
     use super::*;
 
     const SPLIT_RECIPIENT: &str = "CNR1b172rotbSG6kCpfR76KB2ios2y7X4p8yEEc7pjLu";
+
+    #[derive(Clone)]
+    struct PathTestState;
+
+    impl PaymentState for PathTestState {
+        fn apis(&self) -> &[pay_types::metering::ApiSpec] {
+            &[]
+        }
+
+        fn mpp(&self) -> Option<&pay_kit::mpp::server::Mpp> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn axum_rejects_ambiguous_paths_without_calling_upstream() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tower::ServiceExt;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let upstream_calls = calls.clone();
+        let app = axum::Router::new()
+            .fallback(move |uri: axum::http::Uri| {
+                upstream_calls.fetch_add(1, Ordering::SeqCst);
+                async move { uri.to_string() }
+            })
+            .layer(axum::middleware::from_fn_with_state(
+                PathTestState,
+                payment_middleware::<PathTestState>,
+            ));
+        for path in ["//foo", "///foo?x=1", "//.well-known/test"] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        }
+        for path in ["/foo", "/foo?x=%2F&x=2", "/foo//bar?x=1"] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                axum::body::to_bytes(response.into_body(), 1024)
+                    .await
+                    .unwrap(),
+                path
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn caller_cannot_forward_internal_policy_credentials() {
+        let mut headers = HeaderMap::new();
+        let internal = [
+            "x-pay-wallet-resolver-proof",
+            "x-pay-payment-policy",
+            "x-pay-payment-policy-version",
+        ];
+        for name in internal {
+            headers.append(name, HeaderValue::from_static("attacker"));
+            headers.append(name, HeaderValue::from_static("second-value"));
+            assert!(crate::server::proxy::STRIP_HEADERS.contains(&name));
+        }
+        headers.insert("accept", HeaderValue::from_static("application/json"));
+
+        strip_internal_identity_headers(&mut headers);
+
+        for name in internal {
+            assert!(!headers.contains_key(name));
+        }
+        assert_eq!(headers["accept"], "application/json");
+    }
 
     #[test]
     fn caller_cannot_spoof_internal_compute_identity() {

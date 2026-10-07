@@ -22,6 +22,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use pay_api_core::rpc::RpcClient;
 use pay_kit::core::payment_channels;
 use pay_kit::core::settlement::packing::{ChannelInstructionGroup, tx_size};
+use pay_kit::core::store::{ChannelStore, DEFAULT_FINALIZED_CHANNEL_RETENTION, RedisChannelStore};
 use pay_kit::core::tx::{TxV1Mode, TxVersion};
 use pay_kit::mpp::solana_keychain::TransactionSigner;
 use pay_worker::channel::{
@@ -211,20 +212,14 @@ fn init_tracing() {
 
 async fn run() -> Result<usize, JobError> {
     let dry_run = parse_dry_run();
-    let redis_url = if dry_run {
-        None
-    } else {
-        Some(
-            std::env::var("PAY_MPP_REDIS_URL")
-                .or_else(|_| std::env::var("PAY_SESSION_REDIS_URL"))
-                .map_err(|_| {
-                    JobError::Config(
-                        "PAY_MPP_REDIS_URL or PAY_SESSION_REDIS_URL is required when DRY_RUN=false"
-                            .into(),
-                    )
-                })?,
-        )
-    };
+    let redis_url = std::env::var("PAY_MPP_REDIS_URL")
+        .or_else(|_| std::env::var("PAY_SESSION_REDIS_URL"))
+        .ok();
+    if !dry_run && redis_url.is_none() {
+        return Err(JobError::Config(
+            "PAY_MPP_REDIS_URL or PAY_SESSION_REDIS_URL is required when DRY_RUN=false".into(),
+        ));
+    }
     let network = std::env::var("NETWORK")
         .ok()
         .map(|s| s.trim().to_string())
@@ -276,9 +271,47 @@ async fn run() -> Result<usize, JobError> {
     let mut acted = 0usize;
     let mut reclaim_candidates = Vec::new();
     let mut reclaim_leases = Vec::new();
+    let session_store = if let Some(url) = redis_url.as_deref() {
+        let prefix = std::env::var("PAY_MPP_REDIS_PREFIX")
+            .or_else(|_| std::env::var("PAY_SESSION_REDIS_PREFIX"))
+            .unwrap_or_else(|_| "pay:session:v1:".into());
+        Some(
+            RedisChannelStore::connect_with_finalized_retention(
+                url,
+                prefix,
+                DEFAULT_FINALIZED_CHANNEL_RETENTION,
+            )
+            .await
+            .map_err(|error| JobError::Config(format!("session binding lookup: {error}")))?,
+        )
+    } else {
+        None
+    };
 
     for address in &addresses {
-        let lease = if let Some(redis_url) = redis_url.as_deref() {
+        if let Some(store) = &session_store {
+            match store.get_channel(&address.to_string()).await {
+                Ok(state) => match channel::is_recorded_legacy(state.as_ref()) {
+                    Ok(true) => {}
+                    Ok(false) | Err(_) => {
+                        skipped += 1;
+                        warn!(channel = %address, "missing, bound, or malformed session ownership: fleet reclamation forbidden; restore a validated ownership snapshot and use settle-sessions");
+                        continue;
+                    }
+                },
+                Err(error) => {
+                    hard_failures += 1;
+                    warn!(channel = %address, %error, "cannot establish channel ownership; skipping reclamation");
+                    continue;
+                }
+            }
+        }
+        if session_store.is_none() {
+            skipped += 1;
+            warn!(channel = %address, "ownership eligibility unverified without Redis; no reclamation plan");
+            continue;
+        }
+        let lease = if let Some(redis_url) = redis_url.as_deref().filter(|_| !dry_run) {
             match ReclaimLease::acquire(redis_url, address).await {
                 Ok(Some(lease)) => Some(lease),
                 Ok(None) => {

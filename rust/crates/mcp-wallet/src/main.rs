@@ -42,8 +42,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         args.allowed_hosts
     };
+    let resolver = match std::env::var("WALLET_RESOLVER_INTERNAL_PROOF") {
+        Ok(value) if value.len() >= 32 && value.as_bytes() != proof => {
+            server::recipient_router(drivers.clone(), value.into_bytes())
+        }
+        Ok(_) => {
+            return Err(
+                "wallet resolver proof must be distinct and contain at least 32 bytes".into(),
+            );
+        }
+        Err(std::env::VarError::NotPresent) => axum::Router::new(),
+        Err(error) => return Err(error.into()),
+    };
     let listener = tokio::net::TcpListener::bind(args.bind).await?;
     tracing::info!(address=%args.bind,"wallet service listening");
-    axum::serve(listener, server::router(drivers, proof, allowed)).await?;
+    axum::serve(
+        listener,
+        server::router(drivers, proof, allowed).merge(resolver),
+    )
+    .await?;
     Ok(())
 }

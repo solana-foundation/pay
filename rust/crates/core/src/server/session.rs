@@ -384,12 +384,16 @@ impl SessionOperatorRuntime {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+        let server = Arc::clone(&self.server);
         self.channel_store
             .update_channel(
                 channel_id,
                 Box::new(move |state| {
                     let mut state = state
                         .ok_or_else(|| StoreError::Internal("Channel not found".to_string()))?;
+                    server
+                        .require_channel_binding(&state)
+                        .map_err(|error| StoreError::Internal(error.to_string()))?;
                     if state.sealed {
                         return Err(StoreError::Internal(
                             "Channel is already sealed".to_string(),
@@ -663,13 +667,79 @@ pub struct DelegatedCapacityLease {
     channel_id: String,
     cancel: watch::Sender<bool>,
     heartbeat: tokio::task::JoinHandle<()>,
+    durable_id: Option<String>,
+    deadline: tokio::time::Instant,
+    initial_cumulative: Option<u64>,
 }
 
 impl Drop for DelegatedCapacityLease {
     fn drop(&mut self) {
         let _ = self.cancel.send(true);
         self.heartbeat.abort();
+        if let Some(id) = self.durable_id.take() {
+            let store = Arc::clone(&self.runtime.channel_store);
+            let channel = self.channel_id.clone();
+            tokio::spawn(async move {
+                let result = store
+                    .update_channel(
+                        &channel,
+                        Box::new(move |state| {
+                            let mut state = state
+                                .ok_or_else(|| StoreError::Internal("Channel not found".into()))?;
+                            pay_types::deployment_policy::release(&mut state, &id)
+                                .map_err(|error| StoreError::Internal(error.to_string()))?;
+                            Ok(state)
+                        }),
+                    )
+                    .await;
+                if let Err(error) = result {
+                    tracing::warn!(%error, "failed to release deployment reservation; lease will expire");
+                }
+            });
+            return;
+        }
         self.runtime.release_capacity(&self.channel_id);
+    }
+}
+
+impl DelegatedCapacityLease {
+    pub fn deadline(&self) -> Option<tokio::time::Instant> {
+        self.durable_id.as_ref().map(|_| self.deadline)
+    }
+
+    pub async fn require_active(&self, amount: u64) -> Result<()> {
+        let Some(id) = self.durable_id.clone() else {
+            return Ok(());
+        };
+        if tokio::time::Instant::now() >= self.deadline {
+            return Err(Error::PaymentRejected(
+                "deployment request lifetime exceeded".into(),
+            ));
+        }
+        let server = Arc::clone(&self.runtime.server);
+        self.runtime
+            .channel_store
+            .update_channel(
+                &self.channel_id,
+                Box::new(move |state| {
+                    let state =
+                        state.ok_or_else(|| StoreError::Internal("Channel not found".into()))?;
+                    server
+                        .require_channel_binding(&state)
+                        .map_err(|error| StoreError::Internal(error.to_string()))?;
+                    pay_types::deployment_policy::require_reservation(
+                        &state,
+                        &id,
+                        amount,
+                        unix_millis(),
+                    )
+                    .map_err(|error| StoreError::Internal(error.to_string()))?;
+                    Ok(state)
+                }),
+            )
+            .await
+            .map_err(|error| Error::PaymentRejected(error.to_string()))?;
+        Ok(())
     }
 }
 
@@ -1010,7 +1080,10 @@ impl SessionLifecycleRunloop {
         let now_ms = unix_millis();
         let leased_owner = self.leased_owner(now_ms);
         for state in states {
-            if state.sealed || state.close_requested_at.is_some() {
+            if state.sealed
+                || state.close_requested_at.is_some()
+                || self.runtime.server.require_channel_binding(&state).is_err()
+            {
                 continue;
             }
             let locally_active_for_settlement = self.settlement_interval.is_some()
@@ -1327,8 +1400,8 @@ enum SessionCloseResult {
 
 /// Server-side session manager.
 ///
-/// Holds a [`SessionServer`] backed by an in-memory channel store.  For
-/// production, swap `MemoryChannelStore` with a persistent backend.
+/// Static sessions may use any [`ChannelStore`]. Deployment policy sessions
+/// require [`DeploymentSessionStore`] and [`Self::new_for_deployment`].
 ///
 /// Payment-channel sessions submit a client-signed open transaction that
 /// PayKit verifies against the challenge, broadcasts, and confirms.
@@ -1347,6 +1420,108 @@ pub struct SessionMpp {
     /// watermark) instead of rejecting it. Enables reusing channels opened by a
     /// prior run across a gateway restart (`session.reuse_from_chain` in yml).
     reuse_from_chain: bool,
+    channel_binding: Option<serde_json::Value>,
+    blockhash_cache: Option<BlockhashCache>,
+    deployment_blockhash_source: Option<Arc<DeploymentBlockhashSource>>,
+    external_reconciliation: Arc<AtomicBool>,
+    deployment_store: DeploymentStoreAuthority,
+    policy_backends: Mutex<VecDeque<(String, Arc<SessionMpp>)>>,
+}
+
+#[derive(Clone, Copy)]
+enum DeploymentStoreAuthority {
+    Static,
+    #[cfg(feature = "redis-session-store")]
+    Redis,
+    #[cfg(test)]
+    Test,
+}
+
+/// One lazy, finalized-only source per deployment template, shared by all its
+/// policy backends. No per-policy refresher task survives cache eviction.
+struct DeploymentBlockhashSource {
+    rpc_url: String,
+    cache: BlockhashCache,
+    refresh: tokio::sync::Mutex<()>,
+}
+
+impl DeploymentBlockhashSource {
+    fn new(rpc_url: String) -> Self {
+        Self {
+            rpc_url,
+            cache: BlockhashCache::new(),
+            refresh: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    async fn refresh_if_stale(&self) -> Result<()> {
+        let _guard = self.refresh.lock().await;
+        if self.cache.get().is_some() {
+            return Ok(());
+        }
+        let rpc_url = self.rpc_url.clone();
+        let entry = tokio::task::spawn_blocking(move || {
+            let commitment = solana_commitment_config::CommitmentConfig::finalized();
+            let rpc = pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient::new_with_timeout_and_commitment(
+                rpc_url,
+                Duration::from_secs(5),
+                commitment,
+            );
+            pay_kit::mpp::blockhash::fetch_blockhash_with_slot(&rpc, commitment)
+                .map_err(|_| Error::Mpp("deployment finalized blockhash is unavailable".into()))
+        })
+        .await
+        .map_err(|_| Error::Mpp("deployment finalized blockhash refresh failed".into()))??;
+        self.cache
+            .set(entry.blockhash, entry.last_valid_block_height, entry.slot);
+        Ok(())
+    }
+}
+
+/// Connected Redis infrastructure for deployment-owned sessions.
+///
+/// This type cannot be created from an arbitrary `ChannelStore` or a claimed
+/// durability flag. Construction fails closed when Redis is absent, invalid,
+/// unreachable, or not compiled in. Operators must separately configure Redis
+/// persistence/HA and the external worker to use the same namespace.
+pub struct DeploymentSessionStore {
+    store: Arc<dyn ChannelStore>,
+}
+
+impl DeploymentSessionStore {
+    /// Connect explicitly configured deployment storage; never fall back to memory.
+    /// `redis_url` is optional so missing configuration is an error rather than
+    /// a reason to select the static-session store.
+    pub async fn connect(redis_url: Option<&str>, prefix: &str) -> Result<Self> {
+        let redis_url = redis_url
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .ok_or_else(|| Error::Config("deployment sessions require a Redis URL".into()))?;
+        if prefix.trim().is_empty() {
+            return Err(Error::Config(
+                "deployment sessions require a nonempty Redis namespace".into(),
+            ));
+        }
+        #[cfg(feature = "redis-session-store")]
+        {
+            let store = pay_kit::mpp::store::RedisChannelStore::connect(redis_url, prefix)
+                .await
+                // Redis URLs may contain credentials; do not echo provider errors.
+                .map_err(|_| {
+                    Error::Config("failed to connect deployment session Redis store".into())
+                })?;
+            Ok(Self {
+                store: Arc::new(store),
+            })
+        }
+        #[cfg(not(feature = "redis-session-store"))]
+        {
+            let _ = redis_url;
+            Err(Error::Config(
+                "deployment sessions require the redis-session-store feature".into(),
+            ))
+        }
+    }
 }
 
 impl SessionMpp {
@@ -1374,7 +1549,10 @@ impl SessionMpp {
         )
     }
 
-    /// Create with a caller-provided durable channel store.
+    /// Create a static-session backend with a caller-provided store.
+    ///
+    /// This does not establish deployment durability, even if the caller supplies
+    /// Redis. Use [`Self::new_for_deployment`] for policy-scoped sessions.
     pub fn new_with_channel_store(
         config: SessionConfig,
         challenge_binding_secret: impl Into<String>,
@@ -1436,7 +1614,147 @@ impl SessionMpp {
             },
             operator_runtime,
             reuse_from_chain: false,
+            channel_binding: None,
+            blockhash_cache: None,
+            deployment_blockhash_source: None,
+            external_reconciliation: Arc::new(AtomicBool::new(false)),
+            deployment_store: DeploymentStoreAuthority::Static,
+            policy_backends: Mutex::new(VecDeque::new()),
         }
+    }
+
+    /// Create a deployment-capable template using explicitly connected Redis.
+    ///
+    /// Hosts expose this template through `PaymentState::session_mpp_handles`.
+    /// External lifecycle reconciliation, operator vouchers, and disabled chain
+    /// adoption remain mandatory when deriving a policy backend. This constructor
+    /// does not enable the proxy's guarded deployment-policy rollout.
+    pub fn new_for_deployment(
+        config: SessionConfig,
+        challenge_binding_secret: impl Into<String>,
+        store: &DeploymentSessionStore,
+    ) -> Result<Self> {
+        let rpc_url = config
+            .rpc_url
+            .as_deref()
+            .filter(|url| !url.trim().is_empty())
+            .ok_or_else(|| Error::Config("deployment sessions require an RPC URL".into()))?
+            .to_string();
+        let mut session = Self::new_with_channel_store(
+            config,
+            challenge_binding_secret,
+            Arc::clone(&store.store),
+        );
+        #[cfg(feature = "redis-session-store")]
+        {
+            session.deployment_store = DeploymentStoreAuthority::Redis;
+        }
+        session.deployment_blockhash_source =
+            Some(Arc::new(DeploymentBlockhashSource::new(rpc_url)));
+        Ok(session)
+    }
+
+    /// Build a request-only deployment backend without spawning another lifecycle
+    /// owner. The resolver must validate the policy before calling this method.
+    /// Eviction drops only cached request configuration; reservations, signers,
+    /// lifecycle touches, and durable channel state remain shared.
+    pub fn for_deployment_policy(
+        &self,
+        policy: pay_types::deployment_policy::DeploymentSessionBinding,
+    ) -> Result<Arc<Self>> {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        const MAX_POLICY_BACKENDS: usize = 128;
+        if matches!(self.deployment_store, DeploymentStoreAuthority::Static) {
+            return Err(Error::Config(
+                "deployment sessions require a template constructed with DeploymentSessionStore"
+                    .into(),
+            ));
+        }
+        if !self.external_reconciliation.load(Ordering::Acquire)
+            || self.voucher_signer() != SessionVoucherSigner::Operator
+            || self.reuse_from_chain
+            || self.channel_binding.is_some()
+        {
+            return Err(Error::Config(
+                "deployment sessions require an external lifecycle worker, operator vouchers, \
+                 and disabled chain adoption"
+                    .into(),
+            ));
+        }
+        let payout = policy
+            .effective_payout(&self.session_config.operator)
+            .map_err(|error| Error::Config(error.to_string()))?;
+        let binding = policy
+            .to_value()
+            .map_err(|error| Error::Config(error.to_string()))?;
+        let key = serde_json::to_string(&binding)
+            .map_err(|error| Error::Config(format!("invalid policy binding: {error}")))?;
+        let mut backends = self
+            .policy_backends
+            .lock()
+            .map_err(|_| Error::Config("deployment backend cache is unavailable".into()))?;
+        if let Some(index) = backends.iter().position(|(existing, _)| existing == &key) {
+            let entry = backends.remove(index).expect("located policy backend");
+            let backend = Arc::clone(&entry.1);
+            backends.push_back(entry);
+            return Ok(backend);
+        }
+        let mut config = self.session_config.clone();
+        config.recipient = payout.recipient;
+        config.splits = payout
+            .splits
+            .into_iter()
+            .map(|split| {
+                Ok(pay_kit::mpp::server::session::Split {
+                    recipient: solana_pubkey::Pubkey::from_str(&split.recipient)
+                        .map_err(|error| Error::Config(error.to_string()))?,
+                    bps: split.bps,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        config.amount = policy.policy.price_micro_usd;
+        let mut server = SessionServer::new(
+            config.clone(),
+            Arc::clone(&self.operator_runtime.channel_store),
+        )
+        .with_tx_v1(pay_kit::core::tx::TxV1Mode::Auto)
+        .with_channel_binding(binding.clone());
+        if let Some(source) = &self.deployment_blockhash_source {
+            server = server.with_blockhash_cache(source.cache.clone());
+        }
+        let server = Arc::new(server);
+        let mut operator_runtime = self.operator_runtime.clone();
+        operator_runtime.server = Arc::clone(&server);
+        let mut mac = Hmac::<Sha256>::new_from_slice(self.challenge_binding_secret.as_bytes())
+            .map_err(|_| Error::Config("invalid challenge binding key".into()))?;
+        mac.update(b"pay-deployment-session-v1\0");
+        mac.update(key.as_bytes());
+        let challenge_binding_secret = bs58::encode(mac.finalize().into_bytes()).into_string();
+        let backend = Arc::new(Self {
+            server,
+            session_config: config,
+            challenge_binding_secret,
+            realm: self.realm.clone(),
+            payment_channel_signer: Arc::clone(&self.payment_channel_signer),
+            payment_channel_payer_signer: Arc::clone(&self.payment_channel_payer_signer),
+            committed_watermarks: Arc::clone(&self.committed_watermarks),
+            lifecycle: self.lifecycle.clone(),
+            operator_runtime,
+            reuse_from_chain: false,
+            channel_binding: Some(binding),
+            blockhash_cache: None,
+            deployment_blockhash_source: self.deployment_blockhash_source.clone(),
+            external_reconciliation: Arc::clone(&self.external_reconciliation),
+            deployment_store: self.deployment_store,
+            policy_backends: Mutex::new(VecDeque::new()),
+        });
+        while backends.len() >= MAX_POLICY_BACKENDS {
+            backends.pop_front();
+        }
+        backends.push_back((key, Arc::clone(&backend)));
+        Ok(backend)
     }
 
     pub fn with_realm(mut self, realm: impl Into<String>) -> Self {
@@ -1460,14 +1778,22 @@ impl SessionMpp {
     /// the same channel store and config, and the cache only affects
     /// challenge issuance, which always goes through `self.server`.
     pub fn with_blockhash_cache(mut self, cache: BlockhashCache) -> Self {
-        let server = Arc::new(
-            SessionServer::new(
-                self.session_config.clone(),
-                Arc::clone(&self.operator_runtime.channel_store),
-            )
-            .with_tx_v1(pay_kit::core::tx::TxV1Mode::Auto)
-            .with_blockhash_cache(cache),
-        );
+        // A generic cache has no commitment provenance and must never replace
+        // the private finalized source of a policy-bound backend.
+        if self.channel_binding.is_some() {
+            return self;
+        }
+        let mut server = SessionServer::new(
+            self.session_config.clone(),
+            Arc::clone(&self.operator_runtime.channel_store),
+        )
+        .with_tx_v1(pay_kit::core::tx::TxV1Mode::Auto)
+        .with_blockhash_cache(cache.clone());
+        if let Some(binding) = self.channel_binding.clone() {
+            server = server.with_channel_binding(binding);
+        }
+        let server = Arc::new(server);
+        self.blockhash_cache = Some(cache);
         self.server = Arc::clone(&server);
         self.operator_runtime.server = server;
         self
@@ -1536,6 +1862,10 @@ impl SessionMpp {
         settlement_interval: Duration,
         reconciliation: SessionLifecycleReconciliation,
     ) {
+        self.external_reconciliation.store(
+            reconciliation == SessionLifecycleReconciliation::External,
+            Ordering::Release,
+        );
         let close_delay = (!close_delay.is_zero()).then_some(close_delay);
         let close_batch_interval = if close_batch_interval.is_zero() {
             Duration::from_secs(60)
@@ -1585,6 +1915,37 @@ impl SessionMpp {
         channel_id: &str,
         amount: u64,
     ) -> Result<DelegatedUsageAuthorization> {
+        self.authorize_reserved_usage(channel_id, amount, None)
+            .await
+    }
+
+    pub async fn authorize_reserved_usage(
+        &self,
+        channel_id: &str,
+        amount: u64,
+        lease: Option<&DelegatedCapacityLease>,
+    ) -> Result<DelegatedUsageAuthorization> {
+        let lease_id = lease.and_then(|lease| lease.durable_id.clone());
+        if self.channel_binding.is_some() && lease_id.is_none() {
+            return Err(Error::PaymentRejected(
+                "deployment charge requires a durable reservation".into(),
+            ));
+        }
+        if let Some(lease) = lease {
+            if lease.channel_id != channel_id {
+                return Err(Error::PaymentRejected(
+                    "reservation belongs to another channel".into(),
+                ));
+            }
+            lease.require_active(amount).await?;
+        }
+        if self.channel_binding.is_some() && amount != self.session_config.amount {
+            return Err(Error::PaymentRejected(
+                "deployment charge differs from policy price".into(),
+            ));
+        }
+        let deadline = lease.and_then(DelegatedCapacityLease::deadline);
+        let initial_cumulative = lease.and_then(|lease| lease.initial_cumulative);
         if self.voucher_signer() != SessionVoucherSigner::Operator {
             return Err(Error::Mpp(
                 "session does not delegate voucher authority to the operator".to_string(),
@@ -1609,6 +1970,9 @@ impl SessionMpp {
             .ok_or_else(|| {
                 Error::Mpp(format!("unknown delegated session channel: {channel_id}"))
             })?;
+        self.server
+            .require_channel_binding(&state)
+            .map_err(|error| Error::PaymentRejected(error.to_string()))?;
         let current = state.cumulative;
         let idle_timeout_seconds = state.idle_timeout_seconds.ok_or_else(|| {
             Error::Mpp(format!(
@@ -1652,15 +2016,40 @@ impl SessionMpp {
             .map_err(|e| Error::Mpp(format!("failed to sign delegated voucher: {e}")))?;
         let accepted = self
             .server
-            .verify_voucher(&VoucherPayload {
-                channel_id: channel_id.to_string(),
-                voucher: SignedVoucher {
-                    data,
-                    signer: operator.to_string(),
-                    signature: crate::b58::encode_64(&<[u8; 64]>::from(signature)),
-                    signature_type: VoucherSignatureType::Ed25519,
+            .verify_voucher_with_guard(
+                &VoucherPayload {
+                    channel_id: channel_id.to_string(),
+                    voucher: SignedVoucher {
+                        data,
+                        signer: operator.to_string(),
+                        signature: crate::b58::encode_64(&<[u8; 64]>::from(signature)),
+                        signature_type: VoucherSignatureType::Ed25519,
+                    },
                 },
-            })
+                move |state| {
+                    if let Some(id) = &lease_id {
+                        if initial_cumulative != Some(state.cumulative) {
+                            return Err(pay_kit::mpp::Error::Other(
+                                "deployment reservation was already consumed".into(),
+                            ));
+                        }
+                        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+                        {
+                            return Err(pay_kit::mpp::Error::Other(
+                                "deployment request lifetime exceeded".into(),
+                            ));
+                        }
+                        pay_types::deployment_policy::require_reservation(
+                            state,
+                            id,
+                            amount,
+                            unix_millis(),
+                        )
+                        .map_err(|error| pay_kit::mpp::Error::Other(error.to_string()))?;
+                    }
+                    Ok(())
+                },
+            )
             .await
             .map_err(|e| Error::PaymentRejected(e.to_string()))?;
         telemetry::record_payment_channel_voucher_cumulative(
@@ -1676,7 +2065,11 @@ impl SessionMpp {
             accepted.charged,
         );
         self.record_committed_watermark(channel_id.to_string(), accepted.cumulative);
-        self.touch_channel(channel_id.to_string()).await?;
+        // Bound voucher acceptance updates lifecycle in the same durable CAS.
+        // A second fallible write here could report a failed response after debit.
+        if self.channel_binding.is_none() {
+            self.touch_channel(channel_id.to_string()).await?;
+        }
         Ok(DelegatedUsageAuthorization {
             cumulative: accepted.cumulative,
             idle_timeout_seconds,
@@ -1688,6 +2081,12 @@ impl SessionMpp {
         channel_id: &str,
         amount: u64,
     ) -> Result<Option<DelegatedCapacityLease>> {
+        if self.channel_binding.is_some() {
+            return self
+                .reserve_deployment_capacity(channel_id, amount)
+                .await
+                .map(Some);
+        }
         self.touch_channel(channel_id.to_string()).await?;
         if !self.operator_runtime.reserve_capacity(channel_id, amount) {
             return Ok(None);
@@ -1730,12 +2129,114 @@ impl SessionMpp {
             channel_id: channel_id.to_string(),
             cancel,
             heartbeat,
+            durable_id: None,
+            deadline: tokio::time::Instant::now() + Duration::from_secs(300),
+            initial_cumulative: None,
         }))
+    }
+
+    async fn reserve_deployment_capacity(
+        &self,
+        channel_id: &str,
+        amount: u64,
+    ) -> Result<DelegatedCapacityLease> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+        let expires_at = unix_millis().saturating_add(300_000);
+        let id = uuid::Uuid::new_v4().to_string();
+        let reservation_id = id.clone();
+        let server = Arc::clone(&self.server);
+        let reserved = self
+            .operator_runtime
+            .channel_store
+            .update_channel(
+                channel_id,
+                Box::new(move |state| {
+                    let mut state =
+                        state.ok_or_else(|| StoreError::Internal("Channel not found".into()))?;
+                    server
+                        .require_channel_binding(&state)
+                        .map_err(|error| StoreError::Internal(error.to_string()))?;
+                    pay_types::deployment_policy::reserve(
+                        &mut state,
+                        &reservation_id,
+                        amount,
+                        unix_millis(),
+                        expires_at,
+                    )
+                    .map_err(|error| StoreError::Internal(error.to_string()))?;
+                    Ok(state)
+                }),
+            )
+            .await
+            .map_err(|error| Error::PaymentRejected(error.to_string()))?;
+        let (cancel, mut cancellation) = watch::channel(false);
+        let store = Arc::clone(&self.operator_runtime.channel_store);
+        let channel = channel_id.to_string();
+        let renewal_id = id.clone();
+        let server = Arc::clone(&self.server);
+        let heartbeat = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(10));
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.changed() => break,
+                    _ = tokio::time::sleep_until(deadline) => break,
+                    _ = interval.tick() => {}
+                }
+                let id = renewal_id.clone();
+                let server = Arc::clone(&server);
+                // Never extend past the immutable forwarding deadline.
+                if let Err(error) = store
+                    .update_channel(
+                        &channel,
+                        Box::new(move |state| {
+                            let mut state = state
+                                .ok_or_else(|| StoreError::Internal("Channel not found".into()))?;
+                            server
+                                .require_channel_binding(&state)
+                                .map_err(|error| StoreError::Internal(error.to_string()))?;
+                            pay_types::deployment_policy::renew(
+                                &mut state,
+                                &id,
+                                unix_millis(),
+                                expires_at,
+                            )
+                            .map_err(|error| StoreError::Internal(error.to_string()))?;
+                            Ok(state)
+                        }),
+                    )
+                    .await
+                {
+                    tracing::warn!(%error, "deployment reservation renewal failed");
+                    break;
+                }
+            }
+        });
+        Ok(DelegatedCapacityLease {
+            runtime: self.operator_runtime.clone(),
+            channel_id: channel_id.into(),
+            cancel,
+            heartbeat,
+            durable_id: Some(id),
+            deadline,
+            initial_cumulative: Some(reserved.cumulative),
+        })
     }
 
     /// Record channel activity so the lifecycle runloop can defer auto-close.
     pub async fn touch_channel(&self, channel_id: impl Into<String>) -> Result<()> {
         let channel_id = channel_id.into();
+        let state = self
+            .operator_runtime
+            .channel_store
+            .get_channel(&channel_id)
+            .await
+            .map_err(|error| Error::Mpp(error.to_string()))?
+            .ok_or_else(|| Error::PaymentRejected("unknown session channel".into()))?;
+        self.server
+            .require_channel_binding(&state)
+            .map_err(|error| Error::PaymentRejected(error.to_string()))?;
         if let Some(state) = self.lifecycle.touch(channel_id, unix_millis()).await?
             && (state.sealed || state.close_requested_at.is_some())
         {
@@ -1770,16 +2271,52 @@ impl SessionMpp {
         self.operator_runtime.settlement_signature(channel_id)
     }
 
+    /// Refresh the shared finalized source before issuing a deployment challenge.
+    /// RPC runs off the async executor, with single-flight refresh and a timeout.
+    /// Static sessions do not need this preparation.
+    pub async fn prepare_deployment_challenge(&self) -> Result<()> {
+        if self.channel_binding.is_some() {
+            self.deployment_blockhash_source
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::Config("deployment finalized blockhash source is missing".into())
+                })?
+                .refresh_if_stale()
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Build a [`PaymentChallenge`] for a new session.
     ///
     /// `amount` overrides the advertised per-unit price (base units) when the
     /// gate resolved an endpoint-specific price; `None` keeps the configured
-    /// default.
+    /// default. Deployment challenges require async preparation first and use a
+    /// cache-only builder, so expiry can never fall back to a confirmed RPC read.
     pub fn challenge(&self, amount: Option<u64>) -> Result<PaymentChallenge> {
-        let mut request = self
-            .server
-            .build_challenge_request()
-            .map_err(|e| Error::Mpp(format!("Failed to build session challenge: {e}")))?;
+        let request = if let Some(binding) = &self.channel_binding {
+            let source = self.deployment_blockhash_source.as_ref().ok_or_else(|| {
+                Error::Config("deployment finalized blockhash source is missing".into())
+            })?;
+            let entry = source.cache.get().ok_or_else(|| {
+                Error::Mpp("deployment finalized blockhash must be prepared".into())
+            })?;
+            let cache = BlockhashCache::new();
+            cache.set(entry.blockhash, entry.last_valid_block_height, entry.slot);
+            let mut config = self.session_config.clone();
+            // Only this short-lived challenge builder is cache-only. The actual
+            // session server retains RPC access for funding verification.
+            config.rpc_url = None;
+            SessionServer::new(config, Arc::clone(&self.operator_runtime.channel_store))
+                .with_tx_v1(pay_kit::core::tx::TxV1Mode::Auto)
+                .with_channel_binding(binding.clone())
+                .with_blockhash_cache(cache)
+                .build_challenge_request()
+        } else {
+            self.server.build_challenge_request()
+        };
+        let mut request =
+            request.map_err(|e| Error::Mpp(format!("Failed to build session challenge: {e}")))?;
         if let Some(amount) = amount {
             request.amount = amount.to_string();
         }
@@ -1941,6 +2478,11 @@ impl SessionMpp {
             }
 
             SessionAction::Voucher(p) => {
+                if self.channel_binding.is_some() {
+                    return Err(Error::PaymentRejected(
+                        "deployment requests require authenticated use, not voucher replay".into(),
+                    ));
+                }
                 // Reuse: adopt a prior-run channel from chain before verifying,
                 // so a voucher for a channel this process never opened is honored
                 // instead of rejected as unknown.
@@ -2025,6 +2567,15 @@ impl SessionMpp {
                     params.settled,
                 );
                 self.record_committed_watermark(params.channel_id.to_string(), params.settled);
+                if self.channel_binding.is_some() {
+                    // The durable worker is the sole settlement owner. The close
+                    // intent is persisted; never seal a bound record in a request
+                    // backend before payout/distribution has finished.
+                    return Ok(SessionOutcome::Closed {
+                        params: Box::new(params),
+                        signature: None,
+                    });
+                }
                 let settlement = self.submit_payment_channel_settlement(&params).await;
                 let signature = match settlement {
                     Ok(signature) => signature,
@@ -2226,6 +2777,9 @@ impl SessionMpp {
                     payload.channel_id
                 ))
             })?;
+        self.server
+            .require_channel_binding(&state)
+            .map_err(|error| Error::PaymentRejected(error.to_string()))?;
         if state.sealed || state.close_requested_at.is_some() {
             return Err(Error::PaymentRejected(
                 "payment channel close is pending".to_string(),
@@ -2421,6 +2975,652 @@ mod tests {
     fn test_session_mpp() -> SessionMpp {
         SessionMpp::new(test_session_config(), "test-secret")
             .with_blockhash_cache(test_blockhash_cache())
+    }
+
+    #[tokio::test]
+    async fn deployment_blockhash_source_is_finalized_shared_and_single_flight() {
+        use axum::{Json, Router, routing::post};
+        use std::sync::atomic::AtomicUsize;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let app = Router::new().route(
+            "/",
+            post(move |Json(request): Json<serde_json::Value>| {
+                let observed = Arc::clone(&observed);
+                async move {
+                    assert_eq!(request["method"], "getLatestBlockhash");
+                    assert_eq!(request["params"][0]["commitment"], "finalized");
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "result": {
+                            "context": {"slot": 789},
+                            "value": {
+                                "blockhash": TEST_BLOCKHASH,
+                                "lastValidBlockHeight": 900
+                            }
+                        }
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rpc_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut template = policy_template();
+        template.deployment_blockhash_source =
+            Some(Arc::new(DeploymentBlockhashSource::new(rpc_url)));
+        let seller = solana_pubkey::Pubkey::new_unique().to_string();
+        let first = template
+            .for_deployment_policy(test_policy_binding(1, &seller, vec![]))
+            .unwrap();
+        let second = template
+            .for_deployment_policy(test_policy_binding(2, &seller, vec![]))
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            first.deployment_blockhash_source.as_ref().unwrap(),
+            second.deployment_blockhash_source.as_ref().unwrap(),
+        ));
+        // The static cache is already warm, but must not be inherited.
+        assert!(first.challenge(None).is_err());
+        let (a, b) = tokio::join!(
+            first.prepare_deployment_challenge(),
+            second.prepare_deployment_challenge()
+        );
+        a.unwrap();
+        b.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let request: SessionRequest = first.challenge(None).unwrap().request.decode().unwrap();
+        assert_eq!(request.method_details.recent_slot, Some(789));
+        assert_eq!(
+            request.method_details.recent_blockhash.as_deref(),
+            Some(TEST_BLOCKHASH)
+        );
+        let static_request: SessionRequest =
+            template.challenge(None).unwrap().request.decode().unwrap();
+        assert_eq!(static_request.method_details.recent_slot, Some(TEST_SLOT));
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn deployment_finalized_source_error_never_falls_back_to_static_cache() {
+        let mut template = policy_template();
+        template.deployment_blockhash_source =
+            Some(Arc::new(DeploymentBlockhashSource::new("not-a-url".into())));
+        let backend = template
+            .for_deployment_policy(test_policy_binding(
+                1,
+                &solana_pubkey::Pubkey::new_unique().to_string(),
+                vec![],
+            ))
+            .unwrap();
+        assert!(backend.prepare_deployment_challenge().await.is_err());
+        assert!(backend.challenge(None).is_err());
+        assert!(template.challenge(None).is_ok());
+    }
+
+    #[tokio::test]
+    async fn deployment_store_configuration_fails_closed() {
+        for url in [None, Some(""), Some("  ")] {
+            assert!(
+                DeploymentSessionStore::connect(url, "pay:test:")
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            DeploymentSessionStore::connect(Some("redis://127.0.0.1:6379"), " ")
+                .await
+                .is_err()
+        );
+        let result = DeploymentSessionStore::connect(
+            Some("invalid://private-password@invalid"),
+            "pay:test:",
+        )
+        .await;
+        let Err(error) = result else {
+            panic!("invalid Redis configuration must not construct a deployment store");
+        };
+        assert!(!error.to_string().contains("private-password"));
+        #[cfg(not(feature = "redis-session-store"))]
+        assert!(matches!(
+            DeploymentSessionStore::connect(Some("redis://127.0.0.1:6379"), "pay:test:").await,
+            Err(Error::Config(message)) if message.contains("redis-session-store feature")
+        ));
+    }
+
+    #[test]
+    fn deployment_policy_rejects_static_and_arbitrary_memory_stores() {
+        let config = SessionConfig {
+            voucher_signer: SessionVoucherSigner::Operator,
+            ..test_session_config()
+        };
+        for session in [
+            SessionMpp::new(config.clone(), "test-secret"),
+            SessionMpp::new_with_channel_store(
+                config,
+                "test-secret",
+                Arc::new(MemoryChannelStore::new()),
+            ),
+        ] {
+            session.start_lifecycle_runloop_with_settlement_and_batching(
+                Duration::from_secs(300),
+                Duration::from_secs(60),
+                Duration::ZERO,
+                SessionLifecycleReconciliation::External,
+            );
+            let result = session.for_deployment_policy(test_policy_binding(
+                1,
+                &solana_pubkey::Pubkey::new_unique().to_string(),
+                vec![],
+            ));
+            assert!(
+                matches!(result, Err(Error::Config(message)) if message.contains("DeploymentSessionStore"))
+            );
+        }
+    }
+
+    /// Run with a dedicated disposable Redis via PAY_TEST_DEPLOYMENT_REDIS_URL.
+    #[cfg(all(feature = "redis-session-store", feature = "network_tests"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deployment_store_connects_and_authorizes_only_explicit_constructor() {
+        let url = std::env::var("PAY_TEST_DEPLOYMENT_REDIS_URL")
+            .expect("network_tests requires a dedicated PAY_TEST_DEPLOYMENT_REDIS_URL");
+        let store = DeploymentSessionStore::connect(Some(&url), "pay:deployment-constructor-test:")
+            .await
+            .unwrap();
+        assert!(
+            SessionMpp::new_for_deployment(test_session_config(), "test-secret", &store).is_err()
+        );
+        let config = SessionConfig {
+            voucher_signer: SessionVoucherSigner::Operator,
+            rpc_url: Some("http://127.0.0.1:8899".into()),
+            ..test_session_config()
+        };
+        let static_session = SessionMpp::new_with_channel_store(
+            config.clone(),
+            "test-secret",
+            Arc::clone(&store.store),
+        );
+        let session = SessionMpp::new_for_deployment(config, "test-secret", &store).unwrap();
+        let binding =
+            test_policy_binding(1, &solana_pubkey::Pubkey::new_unique().to_string(), vec![]);
+        assert!(session.for_deployment_policy(binding.clone()).is_err());
+        for template in [&static_session, &session] {
+            template.start_lifecycle_runloop_with_settlement_and_batching(
+                Duration::from_secs(300),
+                Duration::from_secs(60),
+                Duration::ZERO,
+                SessionLifecycleReconciliation::External,
+            );
+        }
+        assert!(
+            static_session
+                .for_deployment_policy(binding.clone())
+                .is_err()
+        );
+        let backend = session.for_deployment_policy(binding).unwrap();
+        assert!(matches!(
+            backend.deployment_store,
+            DeploymentStoreAuthority::Redis
+        ));
+        assert!(Arc::ptr_eq(
+            &store.store,
+            &backend.operator_runtime.channel_store
+        ));
+    }
+
+    fn policy_template() -> SessionMpp {
+        let mut session = SessionMpp::new(
+            SessionConfig {
+                voucher_signer: SessionVoucherSigner::Operator,
+                ..test_session_config()
+            },
+            "test-secret",
+        )
+        .with_blockhash_cache(test_blockhash_cache());
+        // Private unit-test injection only; no caller-provided store can claim
+        // deployment durability through the production API.
+        session.deployment_store = DeploymentStoreAuthority::Test;
+        let source = DeploymentBlockhashSource::new("unused-test-rpc".into());
+        source.cache.set(TEST_BLOCKHASH.to_string(), 42, TEST_SLOT);
+        session.deployment_blockhash_source = Some(Arc::new(source));
+        session.start_lifecycle_runloop_with_settlement_and_batching(
+            Duration::from_secs(300),
+            Duration::from_secs(60),
+            Duration::ZERO,
+            SessionLifecycleReconciliation::External,
+        );
+        session
+    }
+
+    fn test_policy_binding(
+        version: u64,
+        seller: &str,
+        splits: Vec<pay_kit::mpp::server::session::Split>,
+    ) -> pay_types::deployment_policy::DeploymentSessionBinding {
+        let primary_bps = 10_000 - splits.iter().map(|split| u64::from(split.bps)).sum::<u64>();
+        let mut allocations = vec![serde_json::json!({
+            "recipient": seller,
+            "amount_micro_usd": 50_000 * primary_bps / 10_000,
+            "basis_points": primary_bps,
+        })];
+        allocations.extend(splits.into_iter().map(|split| {
+            serde_json::json!({
+                "recipient": split.recipient.to_string(),
+                "amount_micro_usd": 50_000 * u64::from(split.bps) / 10_000,
+                "basis_points": split.bps,
+            })
+        }));
+        pay_types::deployment_policy::DeploymentSessionBinding::from_value(serde_json::json!({
+            "schema_version": 1,
+            "policy": {
+                "deployment": {
+                    "owner_key": "0123456789abcdef",
+                    "resource_name": "projects/test/locations/us-central1/services/service",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "hostname": "gcf-0123456789abcdef-service.example.com",
+                },
+                "version": version,
+                "price_micro_usd": 50_000,
+                "allocations": allocations,
+            },
+        }))
+        .unwrap()
+    }
+
+    async fn seed_deployment(backend: &SessionMpp, channel: &str) {
+        let mut state = test_channel_state(
+            channel,
+            CAP,
+            &backend.session_config.operator,
+            "operator",
+            "open",
+            &backend.session_config.operator,
+            None,
+        );
+        state.extra.insert("mppSessionBinding".into(), serde_json::json!({
+            "version": 1,
+            "policy": backend.channel_binding.clone().unwrap(),
+            "snapshot": pay_kit::mpp::server::session::SessionConfigSnapshot::capture(&backend.session_config),
+        }));
+        backend
+            .operator_runtime
+            .channel_store
+            .update_channel(channel, Box::new(move |_| Ok(state.clone())))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn deployment_reservation_is_durable_exclusive_and_scope_checked() {
+        let template = policy_template();
+        let seller = solana_pubkey::Pubkey::new_unique().to_string();
+        let binding = test_policy_binding(1, &seller, vec![]);
+        let backend = template.for_deployment_policy(binding.clone()).unwrap();
+        seed_deployment(&backend, "durable").await;
+        let lease = backend
+            .reserve_delegated_capacity("durable", 50_000)
+            .await
+            .unwrap()
+            .unwrap();
+        lease.require_active(50_000).await.unwrap();
+        assert!(
+            backend
+                .reserve_delegated_capacity("durable", 50_000)
+                .await
+                .is_err()
+        );
+        // Eviction/reconstruction must not reset capacity ownership.
+        template.policy_backends.lock().unwrap().clear();
+        let reconstructed = template.for_deployment_policy(binding).unwrap();
+        assert!(
+            reconstructed
+                .reserve_delegated_capacity("durable", 50_000)
+                .await
+                .is_err()
+        );
+        let state = backend
+            .operator_runtime
+            .channel_store
+            .get_channel("durable")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(template.server.require_channel_binding(&state).is_err());
+        let updated = template
+            .for_deployment_policy(test_policy_binding(2, &seller, vec![]))
+            .unwrap();
+        assert!(updated.server.require_channel_binding(&state).is_err());
+        assert!(
+            updated
+                .reserve_delegated_capacity("durable", 50_000)
+                .await
+                .is_err()
+        );
+        assert!(
+            backend
+                .authorize_delegated_usage("durable", 50_000)
+                .await
+                .is_err()
+        );
+        assert!(
+            backend
+                .authorize_reserved_usage("durable", 50_003, Some(&lease))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn deployment_only_complete_success_responses_are_charged() {
+        use crate::server::gate::{SessionForward, SessionSettlementPlan};
+        use axum::{body::Body, response::Response};
+        let signer: Arc<dyn TransactionSigner> = Arc::from(test_session_signer());
+        let mut template = policy_template();
+        template.session_config.operator = signer.pubkey().to_string();
+        template = template.with_payment_channel_signer(signer);
+        let backend = template
+            .for_deployment_policy(test_policy_binding(
+                1,
+                &solana_pubkey::Pubkey::new_unique().to_string(),
+                vec![],
+            ))
+            .unwrap();
+        for (status, content_type, broken, expected_charge) in [
+            (200, "application/json", false, 50_000),
+            (500, "application/json", false, 0),
+            (302, "application/json", false, 0),
+            (200, "text/event-stream", false, 0),
+            (200, "application/json", true, 0),
+        ] {
+            let channel = solana_pubkey::Pubkey::new_unique().to_string();
+            seed_deployment(&backend, &channel).await;
+            let lease = backend
+                .reserve_delegated_capacity(&channel, 50_000)
+                .await
+                .unwrap()
+                .unwrap();
+            let forward = SessionForward {
+                handle: Arc::clone(&backend),
+                channel_id: channel.clone(),
+                committed_base_units: 0,
+                settlement: Some(SessionSettlementPlan::Fixed { base_units: 50_000 }),
+                available_base_units: 50_000,
+                authorized_base_units: CAP,
+                verified_payer: None,
+                _reservation: Some(lease),
+            };
+            let body = if broken {
+                Body::from_stream(futures_util::stream::once(async {
+                    Err::<bytes::Bytes, _>(std::io::Error::other("truncated upstream"))
+                }))
+            } else {
+                Body::from("{}")
+            };
+            let response = Response::builder()
+                .status(status)
+                .header("content-type", content_type)
+                .body(body)
+                .unwrap();
+            let _ = crate::server::payment::settle_axum_delegated_response(forward, response).await;
+            let state = backend
+                .operator_runtime
+                .channel_store
+                .get_channel(&channel)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(state.spent_amount, expected_charge);
+            assert_eq!(state.cumulative, expected_charge);
+        }
+    }
+
+    #[tokio::test]
+    async fn deployment_exact_charge_and_expiry_close_are_serialized() {
+        let signer: Arc<dyn TransactionSigner> = Arc::from(test_session_signer());
+        let mut template = policy_template();
+        template.session_config.operator = signer.pubkey().to_string();
+        template = template.with_payment_channel_signer(signer);
+        let backend = template
+            .for_deployment_policy(test_policy_binding(
+                1,
+                &solana_pubkey::Pubkey::new_unique().to_string(),
+                vec![],
+            ))
+            .unwrap();
+        let channel = solana_pubkey::Pubkey::new_unique().to_string();
+        seed_deployment(&backend, &channel).await;
+        let lease = backend
+            .reserve_delegated_capacity(&channel, 50_000)
+            .await
+            .unwrap()
+            .unwrap();
+        let accepted = backend
+            .authorize_reserved_usage(&channel, 50_000, Some(&lease))
+            .await
+            .unwrap();
+        assert_eq!(accepted.cumulative, 50_000);
+        assert!(
+            backend
+                .authorize_reserved_usage(&channel, 50_000, Some(&lease))
+                .await
+                .is_err()
+        );
+        let state = backend
+            .operator_runtime
+            .channel_store
+            .get_channel(&channel)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.spent_amount, 50_000);
+        assert_eq!(state.cumulative, 50_000);
+        let id = lease.durable_id.clone().unwrap();
+        backend
+            .operator_runtime
+            .channel_store
+            .update_channel(
+                &channel,
+                Box::new(move |state| {
+                    let mut state = state.unwrap();
+                    state.lifecycle = Some(ChannelLifecycle {
+                        owner: "test".into(),
+                        close_after: 0,
+                    });
+                    assert!(
+                        !pay_types::deployment_policy::claim_close(
+                            &mut state,
+                            "worker",
+                            unix_millis(),
+                            unix_millis() + 1000
+                        )
+                        .unwrap()
+                    );
+                    // Force expiry in the same authoritative record, not in a cache.
+                    pay_types::deployment_policy::renew(&mut state, &id, 0, 1).unwrap();
+                    assert!(
+                        pay_types::deployment_policy::claim_close(
+                            &mut state,
+                            "worker",
+                            unix_millis(),
+                            unix_millis() + 1000
+                        )
+                        .unwrap()
+                    );
+                    Ok(state)
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            backend
+                .authorize_reserved_usage(&channel, 50_000, Some(&lease))
+                .await
+                .is_err()
+        );
+        assert!(
+            backend
+                .reserve_delegated_capacity(&channel, 50_000)
+                .await
+                .is_err()
+        );
+        let state = backend
+            .operator_runtime
+            .channel_store
+            .get_channel(&channel)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.spent_amount, 50_000);
+        assert_eq!(state.cumulative, 50_000);
+    }
+
+    #[tokio::test]
+    async fn deployment_stale_lease_cannot_commit_or_release_replacement() {
+        let template = policy_template();
+        let backend = template
+            .for_deployment_policy(test_policy_binding(
+                1,
+                &solana_pubkey::Pubkey::new_unique().to_string(),
+                vec![],
+            ))
+            .unwrap();
+        seed_deployment(&backend, "expiry").await;
+        let lease = backend
+            .reserve_delegated_capacity("expiry", 50_000)
+            .await
+            .unwrap()
+            .unwrap();
+        let id = lease.durable_id.clone().unwrap();
+        let state = backend
+            .operator_runtime
+            .channel_store
+            .update_channel(
+                "expiry",
+                Box::new(move |state| {
+                    let mut state = state.unwrap();
+                    pay_types::deployment_policy::release(&mut state, &id).unwrap();
+                    pay_types::deployment_policy::reserve(
+                        &mut state,
+                        "replacement",
+                        50_000,
+                        unix_millis(),
+                        unix_millis() + 300_000,
+                    )
+                    .unwrap();
+                    Ok(state)
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(lease.require_active(50_000).await.is_err());
+        assert!(
+            backend
+                .authorize_reserved_usage("expiry", 50_000, Some(&lease))
+                .await
+                .is_err()
+        );
+        drop(lease);
+        tokio::task::yield_now().await;
+        let state = backend
+            .operator_runtime
+            .channel_store
+            .get_channel(&state.channel_id)
+            .await
+            .unwrap()
+            .unwrap();
+        pay_types::deployment_policy::require_reservation(
+            &state,
+            "replacement",
+            50_000,
+            unix_millis(),
+        )
+        .unwrap();
+        assert_eq!(state.cumulative, 0);
+        assert_eq!(state.spent_amount, 0);
+    }
+
+    #[tokio::test]
+    async fn deployment_challenge_commits_exact_price_and_delegated_payout() {
+        use pay_kit::mpp::server::session::Split;
+
+        let template = policy_template();
+        let infrastructure = solana_pubkey::Pubkey::new_unique();
+        let tax = solana_pubkey::Pubkey::new_unique();
+        let profit = solana_pubkey::Pubkey::new_unique();
+        let backend = template
+            .for_deployment_policy(test_policy_binding(
+                1,
+                &infrastructure.to_string(),
+                vec![
+                    Split {
+                        recipient: tax,
+                        bps: 3_000,
+                    },
+                    Split {
+                        recipient: profit,
+                        bps: 1_000,
+                    },
+                ],
+            ))
+            .unwrap();
+        let challenge = backend.challenge(None).unwrap();
+        let request: SessionRequest = challenge.request.decode().unwrap();
+        assert_eq!(request.amount, "50000");
+        assert_eq!(request.recipient, template.session_config.operator);
+        let payouts = request.method_details.distribution_splits;
+        assert_eq!(payouts.len(), 3);
+        assert_eq!(payouts[0].recipient, tax.to_string());
+        assert_eq!(payouts[0].share_bps, 3_000);
+        assert_eq!(payouts[1].recipient, profit.to_string());
+        assert_eq!(payouts[1].share_bps, 1_000);
+        assert_eq!(payouts[2].recipient, infrastructure.to_string());
+        assert_eq!(payouts[2].share_bps, 6_000);
+        assert_eq!(
+            payouts
+                .iter()
+                .map(|split| 50_000 * u64::from(split.share_bps) / 10_000)
+                .collect::<Vec<_>>(),
+            vec![15_000, 5_000, 30_000],
+        );
+        assert!(Arc::ptr_eq(
+            &template.operator_runtime.reserved_capacity,
+            &backend.operator_runtime.reserved_capacity,
+        ));
+        assert!(template.lifecycle.tx.same_channel(&backend.lifecycle.tx));
+        assert!(!backend.reuse_from_chain);
+    }
+
+    #[tokio::test]
+    async fn deployment_cache_is_bounded_and_challenge_scope_survives_eviction() {
+        let template = policy_template();
+        let seller = solana_pubkey::Pubkey::new_unique().to_string();
+        let first = template
+            .for_deployment_policy(test_policy_binding(1, &seller, vec![]))
+            .unwrap();
+        let challenge = first.challenge(None).unwrap();
+        for version in 2..=140 {
+            let other = template
+                .for_deployment_policy(test_policy_binding(version, &seller, vec![]))
+                .unwrap();
+            assert!(!challenge.verify(&other.challenge_binding_secret));
+            assert!(template.lifecycle.tx.same_channel(&other.lifecycle.tx));
+        }
+        assert_eq!(template.policy_backends.lock().unwrap().len(), 128);
+        let restored = template
+            .for_deployment_policy(test_policy_binding(1, &seller, vec![]))
+            .unwrap();
+        assert!(!Arc::ptr_eq(&first, &restored));
+        assert!(challenge.verify(&restored.challenge_binding_secret));
+        assert_eq!(first.channel_binding, restored.channel_binding);
+        assert!(Arc::ptr_eq(
+            &first.operator_runtime.reserved_capacity,
+            &restored.operator_runtime.reserved_capacity,
+        ));
     }
 
     #[test]
@@ -3352,6 +4552,10 @@ mod tests {
     #[tokio::test]
     async fn delegated_capacity_lease_releases_on_drop() {
         let session = test_session_mpp();
+        seed_channel(
+            &session, "channel", CAP, "signer", "operator", "open", "payer", None,
+        )
+        .await;
         let first = session
             .reserve_delegated_capacity("channel", CAP)
             .await

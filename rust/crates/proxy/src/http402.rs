@@ -166,6 +166,8 @@ pub struct Http402Gate<S: PaymentState> {
     state: S,
     /// `host:port` of the internal axum service handling the control plane.
     control_plane: String,
+    deployment_policy_resolver:
+        Option<std::sync::Arc<pay_core::server::deployment_policy::DeploymentPolicyResolver>>,
 }
 
 impl<S: PaymentState> Http402Gate<S> {
@@ -173,7 +175,18 @@ impl<S: PaymentState> Http402Gate<S> {
         Self {
             state,
             control_plane: control_plane.into(),
+            deployment_policy_resolver: None,
         }
+    }
+
+    pub fn with_deployment_policy_resolver(
+        mut self,
+        resolver: Option<
+            std::sync::Arc<pay_core::server::deployment_policy::DeploymentPolicyResolver>,
+        >,
+    ) -> Self {
+        self.deployment_policy_resolver = resolver;
+        self
     }
 
     /// Resolve the API spec for a host — subdomain match, single-API fallback —
@@ -401,6 +414,35 @@ impl<S: PaymentState> Http402Gate<S> {
         uri: &Uri,
         headers: &http::HeaderMap,
     ) -> pingora::Result<bool> {
+        let deadline = ctx.session.as_ref().and_then(|forward| forward.deadline());
+        let forwarding =
+            self.forward_buffered_inner(session, ctx, path, host, method, uri, headers);
+        match deadline {
+            Some(deadline) => match tokio::time::timeout_at(deadline, forwarding).await {
+                Ok(result) => result,
+                Err(_) => {
+                    ctx.session.take();
+                    Err(pingora::Error::explain(
+                        pingora::ErrorType::HTTPStatus(504),
+                        "deployment request lifetime exceeded",
+                    ))
+                }
+            },
+            None => forwarding.await,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn forward_buffered_inner(
+        &self,
+        session: &mut Session,
+        ctx: &mut Ctx,
+        path: &str,
+        host: Option<&str>,
+        method: &http::Method,
+        uri: &Uri,
+        headers: &http::HeaderMap,
+    ) -> pingora::Result<bool> {
         let Some(api) = self.resolve_api(host.unwrap_or("")) else {
             let extra = self.drain_payment_headers(ctx, false).await;
             write_buffered_response(
@@ -462,7 +504,7 @@ impl<S: PaymentState> Http402Gate<S> {
             .or_else(|| {
                 ctx.session
                     .as_ref()
-                    .and_then(|pending| pending.settlement.as_deref())
+                    .and_then(|pending| pending.metered_plan())
             })
             .map(|plan| metering::upto_response_body_limit(&plan.metering))
             // Body-signing endpoints are buffered for request preparation, not
@@ -484,6 +526,11 @@ impl<S: PaymentState> Http402Gate<S> {
             upstream_req = upstream_req.header("content-length", "0");
         }
 
+        if let Some(forward) = &ctx.session {
+            forward.require_active().await.map_err(|error| {
+                pingora::Error::explain(pingora::ErrorType::HTTPStatus(503), error)
+            })?;
+        }
         let upstream = match upstream_req.send().await {
             Ok(resp) => resp,
             Err(e) => {
@@ -515,6 +562,19 @@ impl<S: PaymentState> Http402Gate<S> {
             );
         }
         let response_headers = filtered_response_headers(upstream.headers());
+        if is_streamed_response(&response_headers)
+            && ctx
+                .session
+                .as_ref()
+                .and_then(|forward| forward.deadline())
+                .is_some()
+        {
+            ctx.session.take();
+            return Err(pingora::Error::explain(
+                pingora::ErrorType::HTTPStatus(502),
+                "streaming is unsupported for fixed deployment charging",
+            ));
+        }
         let delegated_stream = ctx
             .session
             .as_ref()
@@ -707,7 +767,7 @@ impl<S: PaymentState> Http402Gate<S> {
             .or_else(|| {
                 ctx.session
                     .as_mut()
-                    .and_then(|pending| pending.settlement.as_deref_mut())
+                    .and_then(|pending| pending.metered_plan_mut())
             })
         else {
             return;
@@ -754,7 +814,15 @@ impl<S: PaymentState> Http402Gate<S> {
             Ok(body) => body,
             Err(e) => {
                 tracing::warn!(error = %e, "failed to buffer inline response for x402 upto");
-                Bytes::new()
+                let extra = self.drain_payment_headers(ctx, false).await;
+                return write_buffered_response(
+                    session,
+                    StatusCode::BAD_GATEWAY,
+                    HeaderMap::new(),
+                    Bytes::from_static(b"{\"error\":\"upstream_body_read_failed\"}"),
+                    extra,
+                )
+                .await;
             }
         };
         if status.is_success() {
@@ -820,7 +888,13 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
         // only a successfully verified delegated session may restore them.
         strip_internal_identity_headers(&mut headers);
 
-        let path = uri.path().trim_start_matches('/').to_string();
+        let path = match pay_core::server::gate::gate_path(uri.path()) {
+            Ok(path) => path.to_string(),
+            Err(response) => {
+                write_gate_response(session, response).await?;
+                return Ok(true);
+            }
+        };
         ctx.request_path = format!("/{path}");
         let str_h = |n: &str| headers.get(n).and_then(|v| v.to_str().ok());
         // HTTP/2 carries the request host in `:authority`, which Pingora
@@ -881,6 +955,7 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
         };
 
         let decision = PaymentGate::new(self.state.clone())
+            .with_deployment_policy_resolver(self.deployment_policy_resolver.clone())
             .evaluate(&gate_req)
             .await;
         match decision {
@@ -1472,14 +1547,7 @@ fn filtered_response_headers(headers: &reqwest::header::HeaderMap) -> HeaderMap 
 }
 
 fn is_streamed_response(headers: &HeaderMap) -> bool {
-    headers
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .map(|ct| {
-            let ct = ct.to_ascii_lowercase();
-            ct.starts_with("text/event-stream") || ct.starts_with("application/x-ndjson")
-        })
-        .unwrap_or(false)
+    pay_core::server::gate::is_streaming_response(headers)
 }
 
 fn is_sse_response(headers: &HeaderMap) -> bool {
@@ -1613,6 +1681,103 @@ mod tests {
         fn mpp(&self) -> Option<&pay_kit::mpp::server::Mpp> {
             None
         }
+    }
+
+    async fn request_session(path: &str) -> (pingora::proxy::Session, tokio::net::TcpStream) {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        client
+            .write_all(format!("GET {path} HTTP/1.1\r\nHost: invalid-host\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let stream = pingora::protocols::l4::stream::Stream::from(server);
+        let mut session = pingora::proxy::Session::new_h1(Box::new(stream));
+        assert!(session.read_request().await.unwrap());
+        (session, client)
+    }
+
+    #[tokio::test]
+    async fn pingora_rejects_ambiguous_paths_before_policy_or_upstream() {
+        use pingora::proxy::ProxyHttp;
+        use tokio::io::AsyncReadExt;
+        let resolver = pay_core::server::deployment_policy::DeploymentPolicyResolver::new(
+            "https://resolver.example/__402/payment-policy",
+            "https://resolver.example",
+            "gateway.example",
+        )
+        .unwrap();
+        let gate = Http402Gate::new(BodySigningState { apis: vec![] }, "127.0.0.1:1")
+            .with_deployment_policy_resolver(Some(std::sync::Arc::new(resolver)));
+        for path in ["//foo", "///foo?x=1", "//.well-known/test"] {
+            let (mut session, mut client) = request_session(path).await;
+            let mut ctx = gate.new_ctx();
+            assert!(gate.request_filter(&mut session, &mut ctx).await.unwrap());
+            assert!(ctx.target.is_none(), "must not plan upstream");
+            assert!(ctx.session.is_none());
+            drop(session);
+            let mut response = String::new();
+            client.read_to_string(&mut response).await.unwrap();
+            assert!(response.starts_with("HTTP/1.1 400"));
+            // The deliberately invalid host would instead fail policy host
+            // classification if the resolver were reached.
+            assert!(response.contains("invalid_request_path"), "{response}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pingora_preserves_normal_path_and_query() {
+        use pingora::proxy::ProxyHttp;
+        let mut api = body_signing_api();
+        api.routing = RoutingConfig::Proxy {
+            url: "http://127.0.0.1:1".into(),
+            path_rewrites: vec![],
+            auth: None,
+        };
+        let gate = Http402Gate::new(BodySigningState { apis: vec![api] }, "127.0.0.1:1");
+        for path in ["/foo", "/foo?x=%2F&x=2", "/foo//bar?x=1"] {
+            let (mut session, _client) = request_session(path).await;
+            let mut ctx = gate.new_ctx();
+            assert!(!gate.request_filter(&mut session, &mut ctx).await.unwrap());
+            match &ctx.target {
+                Some(super::Target::Api { path_and_query, .. }) => assert_eq!(path_and_query, path),
+                _ => panic!("expected real upstream target"),
+            }
+            assert_eq!(
+                session.req_header().uri.path_and_query().unwrap().as_str(),
+                path
+            );
+            assert_eq!(ctx.request_path, path.split('?').next().unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn inline_response_body_error_fails_closed() {
+        use pingora::proxy::ProxyHttp;
+        use tokio::io::AsyncReadExt;
+        let gate = Http402Gate::new(BodySigningState { apis: vec![] }, "127.0.0.1:1");
+        let (mut session, mut client) = request_session("/foo").await;
+        let mut ctx = gate.new_ctx();
+        let body = axum::body::Body::from_stream(futures_util::stream::once(async {
+            Err::<bytes::Bytes, _>(std::io::Error::other("broken upstream body"))
+        }));
+        let response = axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header("content-length", "15")
+            .body(body)
+            .unwrap();
+        gate.finish_buffered_axum_response(&mut session, &mut ctx, response)
+            .await
+            .unwrap();
+        drop(session);
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 502"), "{response}");
+        assert!(response.contains("upstream_body_read_failed"));
+        assert!(!response.contains("payment-receipt"));
     }
 
     #[test]

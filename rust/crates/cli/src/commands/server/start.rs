@@ -121,15 +121,65 @@ async fn channel_store(
     }
 }
 
-async fn session_channel_store()
--> pay_core::Result<(Arc<dyn pay_kit::mpp::store::ChannelStore>, bool)> {
-    channel_store(
-        &["PAY_MPP_REDIS_URL", "PAY_SESSION_REDIS_URL"],
-        &["PAY_MPP_REDIS_PREFIX", "PAY_SESSION_REDIS_PREFIX"],
-        "pay:session:v1:",
-        "MPP sessions",
-    )
-    .await
+enum ConfiguredSessionStore {
+    Static {
+        store: Arc<dyn pay_kit::mpp::store::ChannelStore>,
+        durable: bool,
+    },
+    Deployment(pay_core::server::session::DeploymentSessionStore),
+}
+
+impl ConfiguredSessionStore {
+    fn session(
+        &self,
+        config: pay_kit::mpp::server::session::SessionConfig,
+        secret: &str,
+    ) -> pay_core::Result<SessionMpp> {
+        match self {
+            Self::Static { store, .. } => Ok(SessionMpp::new_with_channel_store(
+                config,
+                secret,
+                Arc::clone(store),
+            )),
+            Self::Deployment(store) => SessionMpp::new_for_deployment(config, secret, store),
+        }
+    }
+
+    fn reconciliation(&self) -> SessionLifecycleReconciliation {
+        match self {
+            Self::Static { durable, .. } => session_lifecycle_reconciliation(*durable),
+            Self::Deployment(_) => SessionLifecycleReconciliation::External,
+        }
+    }
+}
+
+async fn session_channel_store(
+    deployment_policy_mode: bool,
+) -> pay_core::Result<ConfiguredSessionStore> {
+    const URLS: &[&str] = &["PAY_MPP_REDIS_URL", "PAY_SESSION_REDIS_URL"];
+    const PREFIXES: &[&str] = &["PAY_MPP_REDIS_PREFIX", "PAY_SESSION_REDIS_PREFIX"];
+    const PREFIX: &str = "pay:session:v1:";
+    if deployment_policy_mode {
+        let read = |names: &[&str]| -> pay_core::Result<Option<String>> {
+            for name in names {
+                match std::env::var(name) {
+                    Ok(value) if !value.trim().is_empty() => return Ok(Some(value.trim().into())),
+                    Ok(_) | Err(std::env::VarError::NotPresent) => {}
+                    Err(_) => return Err(pay_core::Error::Config(format!("invalid {name}"))),
+                }
+            }
+            Ok(None)
+        };
+        let url = read(URLS)?;
+        let prefix = read(PREFIXES)?.unwrap_or_else(|| PREFIX.into());
+        let store =
+            pay_core::server::session::DeploymentSessionStore::connect(url.as_deref(), &prefix)
+                .await?;
+        Ok(ConfiguredSessionStore::Deployment(store))
+    } else {
+        let (store, durable) = channel_store(URLS, PREFIXES, PREFIX, "MPP sessions").await?;
+        Ok(ConfiguredSessionStore::Static { store, durable })
+    }
 }
 
 async fn subscription_store() -> pay_core::Result<Arc<dyn pay_kit::mpp::store::Store>> {
@@ -1391,6 +1441,18 @@ impl StartCommand {
         api.resolve_env_templates()
             .map_err(pay_core::Error::Config)?;
 
+        // Select the trusted constructor only after complete resolver config
+        // validation. Pingora's unconditional rollout guard remains in place.
+        let deployment_policy_mode =
+            pay_core::server::deployment_policy::DeploymentPolicyResolver::from_env()
+                .map_err(|error| pay_core::Error::Config(error.to_string()))?
+                .is_some();
+        if deployment_policy_mode && api.session.is_none() {
+            return Err(pay_core::Error::Config(
+                "deployment payment policies require session configuration".into(),
+            ));
+        }
+
         // Resolve per-endpoint `schemes` defaults once, before the gate, the
         // OpenAPI builder, and the x402-backend probe read them — a session
         // spec that omits `schemes` keeps accepting `intent=session` instead of
@@ -1806,6 +1868,14 @@ impl StartCommand {
                     ConfigVoucherSigner::Client => VoucherSigner::Client,
                     ConfigVoucherSigner::Operator => VoucherSigner::Operator,
                 };
+                if deployment_policy_mode
+                    && (voucher_signer != VoucherSigner::Operator || sess.reuse_from_chain)
+                {
+                    return Err(pay_core::Error::Config(
+                        "deployment sessions require operator vouchers and disabled chain adoption"
+                            .into(),
+                    ));
+                }
                 if voucher_signer == VoucherSigner::Operator && fee_payer_signer.is_none() {
                     return Err(pay_core::Error::Config(
                         "operator-signed sessions require operator.fee_payer so the gateway can sign metered vouchers".to_string(),
@@ -1851,8 +1921,7 @@ impl StartCommand {
                     ));
                 }
 
-                let (session_channel_store, durable_session_store) =
-                    session_channel_store().await?;
+                let session_channel_store = session_channel_store(deployment_policy_mode).await?;
                 let mut session_mpps = Vec::with_capacity(currency_configs.len());
                 for ((_, session_mpp_currency, session_decimals), token_program) in
                     currency_configs.iter().zip(session_token_programs)
@@ -1888,11 +1957,7 @@ impl StartCommand {
                         token_program: Some(token_program),
                     };
 
-                    let mut smpp = SessionMpp::new_with_channel_store(
-                        config,
-                        session_secret.clone(),
-                        Arc::clone(&session_channel_store),
-                    )
+                    let mut smpp = session_channel_store.session(config, &session_secret)?
                         .with_realm(api.title.clone())
                         .with_blockhash_cache(blockhash_cache.clone())
                         .with_reuse_from_chain(sess.reuse_from_chain);
@@ -1905,7 +1970,7 @@ impl StartCommand {
                         Duration::from_millis(sess.close_delay_ms),
                         Duration::from_millis(sess.close_batch_interval_ms),
                         Duration::from_millis(sess.settlement_interval_ms),
-                        session_lifecycle_reconciliation(durable_session_store),
+                        session_channel_store.reconciliation(),
                     );
                     session_mpps.push(smpp);
                 }
@@ -4022,6 +4087,37 @@ mod tests {
     use solana_pubkey::Pubkey;
     use std::collections::HashMap;
     use std::str::FromStr;
+
+    #[tokio::test]
+    #[serial]
+    async fn configured_session_store_never_falls_back_in_deployment_mode() {
+        let names = ["PAY_MPP_REDIS_URL", "PAY_SESSION_REDIS_URL"];
+        let saved = names.map(std::env::var_os);
+        for name in names {
+            unsafe { std::env::remove_var(name) };
+        }
+        let static_store = super::session_channel_store(false).await;
+        let missing_deployment_store = super::session_channel_store(true).await;
+        unsafe { std::env::set_var(names[0], "invalid://test") };
+        let invalid_deployment_store = super::session_channel_store(true).await;
+        for (name, value) in names.into_iter().zip(saved) {
+            match value {
+                Some(value) => unsafe { std::env::set_var(name, value) },
+                None => unsafe { std::env::remove_var(name) },
+            }
+        }
+        let static_store = static_store.unwrap();
+        assert!(matches!(
+            static_store,
+            super::ConfiguredSessionStore::Static { durable: false, .. }
+        ));
+        assert_eq!(
+            static_store.reconciliation(),
+            super::SessionLifecycleReconciliation::Embedded
+        );
+        assert!(missing_deployment_store.is_err());
+        assert!(invalid_deployment_store.is_err());
+    }
 
     #[test]
     fn gateway_owns_session_lifecycle_for_memory_and_redis_stores() {

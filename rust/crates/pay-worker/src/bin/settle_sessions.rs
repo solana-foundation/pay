@@ -19,7 +19,10 @@ use pay_kit::core::settlement::worker::{RpcBroadcaster, SettlementConfig, spawn}
 use pay_kit::core::store::{
     ChannelState, ChannelStore, DEFAULT_FINALIZED_CHANNEL_RETENTION, RedisChannelStore, StoreError,
 };
-use pay_kit::core::tx_pipeline::{TxPipeline, TxPipelineConfig};
+use pay_kit::core::tx_pipeline::{TxPipeline, TxPipelineConfig, TxPipelineError};
+use pay_kit::mpp::server::session::{
+    SessionConfig, SessionConfigSnapshot, SessionServer, channel_binding, session_open_is_terminal,
+};
 use pay_kit::mpp::solana_keychain::TransactionSigner;
 use pay_worker::channel::{self, STATUS_CLOSING, STATUS_DISTRIBUTED, STATUS_OPEN, STATUS_SEALED};
 use pay_worker::config::Config;
@@ -54,6 +57,42 @@ struct LeaseHeartbeat {
 }
 
 impl LeaseHeartbeat {
+    fn start_bound_close(
+        store: RedisChannelStore,
+        channel_id: String,
+        owner: String,
+        ttl: Duration,
+    ) -> (Self, CancellationToken) {
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let lost = CancellationToken::new();
+        let task_lost = lost.clone();
+        let handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval((ttl / 3).max(Duration::from_millis(1)));
+            loop {
+                tokio::select! {
+                    () = task_cancel.cancelled() => return,
+                    _ = interval.tick() => {
+                        if let Err(error) = claim_due_close(
+                            &store, &channel_id, unix_now_millis(), unix_now() as u64, &owner, ttl,
+                        ).await {
+                            task_lost.cancel();
+                            warn!(%channel_id, %error, "bound close ownership lost; stopping renewal");
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        (
+            Self {
+                cancel,
+                handle: Some(handle),
+            },
+            lost,
+        )
+    }
+
     fn start(
         mut connection: redis::aio::ConnectionManager,
         lock_key: String,
@@ -544,6 +583,152 @@ impl SettlementRuntime {
     }
 }
 
+fn binding_error(error: impl std::fmt::Display) -> JobError {
+    JobError::Config(format!("deployment session binding: {error}"))
+}
+
+async fn restore_bound_session(
+    runtime: &SettlementRuntime,
+    session: &ChannelRuntime,
+    mut state: ChannelState,
+) -> Result<(ChannelState, Option<SessionConfig>), JobError> {
+    let Some(value) = channel_binding(&state).map_err(binding_error)? else {
+        return Ok((state, None));
+    };
+    let binding = pay_types::deployment_policy::DeploymentSessionBinding::from_value(value.clone())
+        .map_err(binding_error)?;
+    let snapshot = SessionConfigSnapshot::from_channel(&state)
+        .map_err(binding_error)?
+        .ok_or_else(|| binding_error("missing configuration snapshot"))?;
+    let mut config = SessionConfig {
+        rpc_url: Some(runtime.rpc_url.clone()),
+        fee_payer_signer: snapshot
+            .requires_fee_payer()
+            .then(|| runtime.signer.clone()),
+        ..SessionConfig::default()
+    };
+    snapshot.apply_to(&mut config).map_err(binding_error)?;
+    validate_bound_config(&binding, &config, &runtime.network, &runtime.operator)?;
+    let server = SessionServer::new(config.clone(), Arc::new(session.store.clone()))
+        .with_channel_binding(value);
+    if resume_scanned_pending_open(&state, runtime.dry_run, |id| {
+        let server = &server;
+        async move {
+            server
+                .resume_pending_open(&id)
+                .await
+                .map_err(binding_error)?;
+            Ok(())
+        }
+    })
+    .await?
+    {
+        state = session
+            .store
+            .get_channel(&state.channel_id)
+            .await
+            .map_err(binding_error)?
+            .ok_or_else(|| binding_error("recovered channel disappeared"))?;
+    }
+    server
+        .require_channel_binding(&state)
+        .map_err(binding_error)?;
+    Ok((state, Some(config)))
+}
+
+/// Recovery is driven by durable enumeration, not by another opening request.
+/// The callback is the kit verifier; keeping selection separate makes it
+/// testable without broadcasting a funding transaction.
+async fn resume_scanned_pending_open<F, Fut>(
+    state: &ChannelState,
+    dry_run: bool,
+    resume: F,
+) -> Result<bool, JobError>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<(), JobError>>,
+{
+    if !state
+        .pending_setup
+        .as_ref()
+        .is_some_and(|setup| setup.opens_channel)
+    {
+        return Ok(false);
+    }
+    if dry_run {
+        return Err(binding_error(
+            "pending open requires recovery; dry run leaves it untouched",
+        ));
+    }
+    resume(state.channel_id.clone()).await?;
+    Ok(true)
+}
+
+fn validate_bound_config(
+    binding: &pay_types::deployment_policy::DeploymentSessionBinding,
+    config: &SessionConfig,
+    network: &str,
+    operator: &Pubkey,
+) -> Result<(), JobError> {
+    let payout = binding
+        .effective_payout(&config.operator)
+        .map_err(binding_error)?;
+    if config.network != network
+        || config.operator != operator.to_string()
+        || config.recipient != payout.recipient
+        || config.amount != binding.policy.price_micro_usd
+        || config.decimals != 6
+        || config.splits.len() != payout.splits.len()
+        || config
+            .splits
+            .iter()
+            .zip(&payout.splits)
+            .any(|(a, b)| a.recipient.to_string() != b.recipient || a.bps != b.bps)
+    {
+        return Err(binding_error(
+            "snapshot differs from immutable payout or worker network",
+        ));
+    }
+    Ok(())
+}
+
+fn bound_preimage(
+    config: &SessionConfig,
+    onchain: &channel::DecodedChannel,
+) -> Result<channel::DistributionPreimage, JobError> {
+    let recipients = config
+        .splits
+        .iter()
+        .map(|split| payment_channels::Distribution {
+            recipient: split.recipient,
+            bps: split.bps,
+        })
+        .collect::<Vec<_>>();
+    channel::distribution_preimage_from_snapshot(&recipients, &onchain.channel.distribution_hash)
+}
+
+fn verify_bound_channel(
+    config: &SessionConfig,
+    state: &ChannelState,
+    onchain: &channel::DecodedChannel,
+) -> Result<(), JobError> {
+    if session_open_is_terminal(state)
+        || onchain.address.to_string() != state.channel_id
+        || onchain.payee().to_string() != config.recipient
+        || onchain.payer().to_string() != state.payer
+        || onchain.mint().to_string() != config.currency
+        || onchain.open_slot() != state.open_slot.unwrap_or_default()
+        || Pubkey::from(onchain.channel.authorized_signer.to_bytes()).to_string()
+            != state.authorized_signer
+    {
+        return Err(binding_error(
+            "on-chain channel differs from durable snapshot",
+        ));
+    }
+    bound_preimage(config, onchain)?;
+    Ok(())
+}
+
 async fn run_session(runtime: &SettlementRuntime) -> Result<SettleSessionsMetrics, JobError> {
     let started_at = Instant::now();
     let Some(session) = runtime.session.as_ref() else {
@@ -596,21 +781,74 @@ async fn run_session(runtime: &SettlementRuntime) -> Result<SettleSessionsMetric
         "settle-sessions reconciliation starting"
     );
 
-    let now = unix_now();
-    let now_ms = unix_now_millis();
     let channels_scanned = channels.len();
     let mut candidates = Vec::new();
     let mut skipped = 0_usize;
     let mut failures = 0_usize;
     let mut finalized = 0_usize;
     let mut inventory = LifecycleInventory::default();
+    let mut bound_configs = HashMap::new();
+    let mut bound_close_heartbeats = Vec::new();
+    let mut bound_close_ownership = HashMap::new();
     for scanned_state in channels {
-        let state = if !runtime.dry_run && channel_close_due(&scanned_state, now_ms) {
+        if session_open_is_terminal(&scanned_state) {
+            skipped += 1;
+            continue;
+        }
+        let (scanned_state, bound_config) =
+            match restore_bound_session(runtime, session, scanned_state).await {
+                Ok(restored) => restored,
+                Err(error) => {
+                    failures += 1;
+                    skipped += 1;
+                    warn!(%error, "bound session recovery failed; refusing legacy fallback");
+                    continue;
+                }
+            };
+        if let Some(config) = bound_config.as_ref() {
+            bound_configs.insert(scanned_state.channel_id.clone(), config.clone());
+        }
+        let now = unix_now();
+        let now_ms = unix_now_millis();
+        let scanned_state = if let Some(config) = bound_config.as_ref() {
+            match observe_bound_close(runtime, &session.store, scanned_state, config, now as u64)
+                .await
+            {
+                Ok(state) => state,
+                Err(error) => {
+                    failures += 1;
+                    skipped += 1;
+                    warn!(%error, "failed to observe bound channel close");
+                    continue;
+                }
+            }
+        } else {
+            scanned_state
+        };
+        let state = if runtime.dry_run && channel_close_due(&scanned_state, now_ms) {
+            match transition_due_close(
+                Some(scanned_state.clone()),
+                now_ms,
+                now as u64,
+                &lock.owner,
+                Duration::from_secs(runtime.lock_ttl),
+            ) {
+                Ok(state) => state,
+                Err(error) => {
+                    failures += 1;
+                    skipped += 1;
+                    warn!(channel_id = %scanned_state.channel_id, %error, "failed to plan due session close");
+                    continue;
+                }
+            }
+        } else if channel_close_due(&scanned_state, now_ms) {
             match claim_due_close(
                 &session.store,
                 &scanned_state.channel_id,
                 now_ms,
                 now as u64,
+                &lock.owner,
+                Duration::from_secs(runtime.lock_ttl),
             )
             .await
             {
@@ -630,6 +868,16 @@ async fn run_session(runtime: &SettlementRuntime) -> Result<SettleSessionsMetric
             scanned_state
         };
 
+        if bound_config.is_some() && !runtime.dry_run && channel_close_due(&state, now_ms) {
+            let (heartbeat, lost) = LeaseHeartbeat::start_bound_close(
+                session.store.clone(),
+                state.channel_id.clone(),
+                lock.owner.clone(),
+                Duration::from_secs(runtime.lock_ttl),
+            );
+            bound_close_heartbeats.push(heartbeat);
+            bound_close_ownership.insert(state.channel_id.clone(), lost);
+        }
         let resource_state = state.clone();
         let cleanup_ready =
             match ensure_resource_cleanup(runtime, &session.store, &state, false).await {
@@ -653,6 +901,7 @@ async fn run_session(runtime: &SettlementRuntime) -> Result<SettleSessionsMetric
             now_ms,
             &runtime.operator,
             &runtime.treasury_owner,
+            bound_config.as_ref(),
         )
         .await
         {
@@ -809,7 +1058,152 @@ async fn run_session(runtime: &SettlementRuntime) -> Result<SettleSessionsMetric
         Arc::new(RpcBroadcaster::new(runtime.rpc_url.clone())),
     );
     let mut submissions = JoinSet::new();
-    for candidate in candidates {
+    let pipeline = TxPipeline::new(runtime.rpc_url.clone(), TxPipelineConfig::default());
+    for mut candidate in candidates {
+        if bound_configs.contains_key(&candidate.channel_id)
+            && candidate.kind == CandidateKind::IdleClose
+        {
+            let Some(lost) = bound_close_ownership.get(&candidate.channel_id) else {
+                failures += 1;
+                continue;
+            };
+            let renew = || async {
+                if lost.is_cancelled() {
+                    return Err(TxPipelineError::SubmissionGuardRejected);
+                }
+                claim_due_close(
+                    &session.store,
+                    &candidate.channel_id,
+                    unix_now_millis(),
+                    unix_now() as u64,
+                    &lock.owner,
+                    Duration::from_secs(runtime.lock_ttl),
+                )
+                .await
+                .map_err(|_| TxPipelineError::SubmissionGuardRejected)
+            };
+            let refreshed = async {
+                let state = renew().await.map_err(binding_error)?;
+                reconcile_channel(
+                    &runtime.rpc,
+                    &runtime.rpc_url,
+                    state,
+                    unix_now(),
+                    unix_now_millis(),
+                    &runtime.operator,
+                    &runtime.treasury_owner,
+                    bound_configs.get(&candidate.channel_id),
+                )
+                .await?
+                .candidate
+                .ok_or_else(|| binding_error("close no longer actionable"))
+            }
+            .await;
+            match refreshed {
+                Ok(value) => candidate = value,
+                Err(error) => {
+                    failures += 1;
+                    warn!(channel_id = %candidate.channel_id, %error, "bound close refresh failed");
+                    continue;
+                }
+            }
+            let guard = || async {
+                if lost.is_cancelled() {
+                    return Err(TxPipelineError::SubmissionGuardRejected);
+                }
+                let state = claim_due_close(
+                    &session.store,
+                    &candidate.channel_id,
+                    unix_now_millis(),
+                    unix_now() as u64,
+                    &lock.owner,
+                    Duration::from_secs(runtime.lock_ttl),
+                )
+                .await
+                .map_err(|_| TxPipelineError::SubmissionGuardRejected)?;
+                let (state, config) = restore_bound_session(runtime, session, state)
+                    .await
+                    .map_err(|_| TxPipelineError::SubmissionGuardRejected)?;
+                let config = config.ok_or(TxPipelineError::SubmissionGuardRejected)?;
+                let fresh = reconcile_channel(
+                    &runtime.rpc,
+                    &runtime.rpc_url,
+                    state,
+                    unix_now(),
+                    unix_now_millis(),
+                    &runtime.operator,
+                    &runtime.treasury_owner,
+                    Some(&config),
+                )
+                .await
+                .map_err(|_| TxPipelineError::SubmissionGuardRejected)?;
+                if lost.is_cancelled()
+                    || fresh
+                        .candidate
+                        .is_none_or(|fresh| fresh.instructions != candidate.instructions)
+                {
+                    return Err(TxPipelineError::SubmissionGuardRejected);
+                }
+                // Chain reads can outlast the lease. Renew after them too,
+                // immediately before handing control back to the send boundary.
+                let latest = claim_due_close(
+                    &session.store,
+                    &candidate.channel_id,
+                    unix_now_millis(),
+                    unix_now() as u64,
+                    &lock.owner,
+                    Duration::from_secs(runtime.lock_ttl),
+                )
+                .await
+                .map_err(|_| TxPipelineError::SubmissionGuardRejected)?;
+                if lost.is_cancelled() || channel_binding(&latest).ok().flatten().is_none() {
+                    return Err(TxPipelineError::SubmissionGuardRejected);
+                }
+                Ok(())
+            };
+            // No independent settlement queue: the guard runs after pipeline
+            // pacing and again before every send attempt. A sent transaction
+            // cannot be retracted if ownership changes afterwards.
+            let result: Result<String, String> = async {
+                let blockhash = pipeline
+                    .latest_blockhash()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let mut transaction = pay_kit::core::tx::build_unsigned(
+                    pay_kit::core::tx::TxVersion::V0,
+                    &runtime.operator,
+                    &candidate.instructions,
+                    blockhash,
+                    SettlementConfig::new(runtime.operator, runtime.signer.clone())
+                        .compute_budget
+                        .as_ref(),
+                )
+                .map_err(|e| e.to_string())?;
+                guard().await.map_err(|e| e.to_string())?;
+                pay_kit::core::signing::sign_versioned_transaction_slot(
+                    runtime.signer.as_ref(),
+                    &mut transaction,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                pipeline
+                    .broadcast_verified_guarded(&transaction, guard)
+                    .await
+                    .map(|signature| signature.to_string())
+                    .map_err(|e| e.to_string())
+            }
+            .await;
+            submissions.spawn(async move {
+                (
+                    candidate.channel_id,
+                    candidate.kind,
+                    candidate.before,
+                    candidate.after,
+                    result,
+                )
+            });
+            continue;
+        }
         let handle = handle.clone();
         submissions.spawn(async move {
             let SettlementCandidate {
@@ -885,6 +1279,28 @@ async fn run_session(runtime: &SettlementRuntime) -> Result<SettleSessionsMetric
             if *kind != CandidateKind::IdleClose {
                 continue;
             }
+            if bound_configs.contains_key(channel_id) {
+                match session
+                    .store
+                    .update_channel(
+                        channel_id,
+                        Box::new(|current| {
+                            let mut state = current
+                                .ok_or_else(|| StoreError::Internal("Channel not found".into()))?;
+                            state.sealed = true;
+                            Ok(state)
+                        }),
+                    )
+                    .await
+                {
+                    Ok(_) => idle_closed += 1,
+                    Err(error) => {
+                        failures += 1;
+                        error!(%channel_id, %error, "closed bound channel but failed to retain sealed ownership record");
+                    }
+                }
+                continue;
+            }
             match session.store.mark_finalized(channel_id).await {
                 Ok(()) => idle_closed += 1,
                 Err(error) => {
@@ -925,6 +1341,9 @@ async fn run_session(runtime: &SettlementRuntime) -> Result<SettleSessionsMetric
         closes_finalized: 0,
         reclaims: 0,
     };
+    for heartbeat in bound_close_heartbeats {
+        heartbeat.shutdown().await;
+    }
     lock.release().await;
     Ok(metrics)
 }
@@ -1005,6 +1424,12 @@ async fn run_batch(runtime: &SettlementRuntime) -> Result<SettleSessionsMetrics,
     let mut due_channels = Vec::new();
     let now = unix_now();
     for state in channels {
+        if !channel::is_recorded_legacy(Some(&state)).unwrap_or(false) {
+            metrics.failures += 1;
+            metrics.skipped += 1;
+            warn!(channel_id = %state.channel_id, "bound or malformed session in batch namespace; refusing static batch settlement");
+            continue;
+        }
         if !batch_reconciliation_due(
             &state,
             now,
@@ -1426,6 +1851,10 @@ async fn ensure_resource_cleanup(
     state: &ChannelState,
     force: bool,
 ) -> Result<bool, JobError> {
+    // Deployment sessions fund invocation service, not fleet-owned resources.
+    if !channel::is_recorded_legacy(Some(state))? {
+        return Ok(false);
+    }
     if (!force && !resource_cleanup_required(state, unix_now_millis()))
         || !runtime.resource_cleaner.is_enabled()
     {
@@ -2105,6 +2534,7 @@ async fn reconcile_batch_channel(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn reconcile_channel(
     rpc: &RpcClient,
     rpc_url: &str,
@@ -2113,6 +2543,7 @@ async fn reconcile_channel(
     now_ms: u64,
     operator: &Pubkey,
     treasury_owner: &Pubkey,
+    bound_config: Option<&SessionConfig>,
 ) -> Result<ReconcileResult, JobError> {
     let state_channel_id = state.channel_id.clone();
     let absent_disposition = absent_onchain_store_disposition(&state);
@@ -2130,22 +2561,33 @@ async fn reconcile_channel(
 
     let channel_id = Pubkey::from_str(&state.channel_id)
         .map_err(|_| JobError::InvalidAddress(state.channel_id.clone()))?;
-    let onchain = match channel::fetch_channel(rpc, rpc_url, &channel_id).await {
-        Ok(Some(onchain)) => onchain,
-        Ok(None) => {
-            return Ok(ReconcileResult {
-                channel_id: state_channel_id,
-                candidate: None,
-                store_disposition: absent_disposition,
-                snapshot: ChannelInventorySnapshot::default(),
-                stablecoin_settled_base_units: None,
-                stablecoin_distributed_base_units: None,
-                escrow_active: Some(false),
-            });
-        }
-        Err(error) => return Err(error),
-    };
+    let program = bound_config
+        .and_then(|config| config.channel_program)
+        .unwrap_or_else(payment_channels::default_program_id);
+    let onchain =
+        match channel::fetch_channel_for_program(rpc, rpc_url, &channel_id, &program).await {
+            Ok(Some(onchain)) => onchain,
+            Ok(None) => {
+                return Ok(ReconcileResult {
+                    channel_id: state_channel_id,
+                    candidate: None,
+                    store_disposition: if bound_config.is_some() {
+                        StoreDisposition::Keep
+                    } else {
+                        absent_disposition
+                    },
+                    snapshot: ChannelInventorySnapshot::default(),
+                    stablecoin_settled_base_units: None,
+                    stablecoin_distributed_base_units: None,
+                    escrow_active: Some(false),
+                });
+            }
+            Err(error) => return Err(error),
+        };
 
+    if let Some(config) = bound_config {
+        verify_bound_channel(config, &state, &onchain)?;
+    }
     let snapshot = inventory_snapshot(
         state.sealed,
         onchain.channel.status,
@@ -2169,8 +2611,14 @@ async fn reconcile_channel(
         return Ok(ReconcileResult {
             channel_id: state_channel_id,
             candidate: None,
-            store_disposition: StoreDisposition::Expire {
-                newly_finalized: !state.sealed,
+            store_disposition: if bound_config.is_some() {
+                // Keep the ownership record: expiring it would permit the
+                // fleet reclamation job to mistake it for a legacy channel.
+                StoreDisposition::Keep
+            } else {
+                StoreDisposition::Expire {
+                    newly_finalized: !state.sealed,
+                }
             },
             snapshot,
             stablecoin_settled_base_units,
@@ -2197,6 +2645,11 @@ async fn reconcile_channel(
     if channel_close_due(&state, now_ms)
         || matches!(onchain.channel.status, STATUS_CLOSING | STATUS_SEALED)
     {
+        if bound_config.is_some() && state.close_requested_at.is_none() {
+            return Err(binding_error(
+                "bound close requires the durable close claim",
+            ));
+        }
         let candidate = build_idle_close_candidate(
             rpc,
             rpc_url,
@@ -2205,6 +2658,7 @@ async fn reconcile_channel(
             now,
             operator,
             treasury_owner,
+            bound_config,
         )
         .await?;
         return Ok(ReconcileResult {
@@ -2290,7 +2744,7 @@ async fn reconcile_channel(
         &signature,
         state.cumulative,
         expires_at,
-        &payment_channels::default_program_id(),
+        &program,
     )
     .map_err(|error| JobError::TxBuild(format!("settle instruction: {error}")))?;
     let after = inventory_snapshot(
@@ -2328,19 +2782,81 @@ fn channel_close_due(state: &ChannelState, now_ms: u64) -> bool {
                 .is_some_and(|lifecycle| lifecycle.close_after <= now_ms))
 }
 
+async fn observe_bound_close(
+    runtime: &SettlementRuntime,
+    store: &impl ChannelStore,
+    state: ChannelState,
+    config: &SessionConfig,
+    now_seconds: u64,
+) -> Result<ChannelState, JobError> {
+    let channel_id = Pubkey::from_str(&state.channel_id)
+        .map_err(|_| JobError::InvalidAddress(state.channel_id.clone()))?;
+    let program = config
+        .channel_program
+        .unwrap_or_else(payment_channels::default_program_id);
+    let Some(onchain) =
+        channel::fetch_channel_for_program(&runtime.rpc, &runtime.rpc_url, &channel_id, &program)
+            .await?
+    else {
+        return Ok(state);
+    };
+    verify_bound_channel(config, &state, &onchain)?;
+    if !matches!(onchain.channel.status, STATUS_CLOSING | STATUS_SEALED) {
+        return Ok(state);
+    }
+    if runtime.dry_run {
+        let mut state = state;
+        state.close_requested_at.get_or_insert(now_seconds);
+        return Ok(state);
+    }
+    record_bound_close(store, &state.channel_id, config, onchain, now_seconds).await
+}
+
+async fn record_bound_close(
+    store: &impl ChannelStore,
+    channel_id: &str,
+    config: &SessionConfig,
+    onchain: channel::DecodedChannel,
+    now_seconds: u64,
+) -> Result<ChannelState, JobError> {
+    let config = config.clone();
+    store
+        .update_channel(
+            channel_id,
+            Box::new(move |current| {
+                let mut current =
+                    current.ok_or_else(|| StoreError::Internal("Channel not found".into()))?;
+                // Verify against the state read by the atomic update, not the
+                // scan snapshot. Persist the external close even if a live
+                // reservation prevents acquiring close ownership this tick.
+                verify_bound_channel(&config, &current, &onchain)
+                    .map_err(|error| StoreError::Internal(error.to_string()))?;
+                current.close_requested_at.get_or_insert(now_seconds);
+                Ok(current)
+            }),
+        )
+        .await
+        .map_err(|error| JobError::Config(format!("record on-chain close: {error}")))
+}
+
 async fn claim_due_close(
-    store: &RedisChannelStore,
+    store: &impl ChannelStore,
     channel_id: &str,
     now_ms: u64,
     now_seconds: u64,
+    owner: &str,
+    ttl: Duration,
 ) -> Result<ChannelState, JobError> {
     const MAX_ATTEMPTS: usize = 3;
     let mut last_error = None;
     for _ in 0..MAX_ATTEMPTS {
+        let owner = owner.to_owned();
         let updated = store
             .update_channel(
                 channel_id,
-                Box::new(move |current| claim_channel_close(current, now_ms, now_seconds)),
+                Box::new(move |current| {
+                    transition_due_close(current, now_ms, now_seconds, &owner, ttl)
+                }),
             )
             .await;
         match updated {
@@ -2352,6 +2868,40 @@ async fn claim_due_close(
         "claim session close after {MAX_ATTEMPTS} attempts: {}",
         last_error.expect("at least one claim attempt")
     )))
+}
+
+// Dry runs apply the durable claim rules to a snapshot without persisting
+// ownership or starting a close heartbeat.
+fn transition_due_close(
+    current: Option<ChannelState>,
+    now_ms: u64,
+    now_seconds: u64,
+    owner: &str,
+    ttl: Duration,
+) -> Result<ChannelState, StoreError> {
+    let mut state = current.ok_or_else(|| StoreError::Internal("Channel not found".into()))?;
+    if session_open_is_terminal(&state) {
+        return Err(StoreError::Internal("session open is terminal".into()));
+    }
+    if let Some(value) = channel_binding(&state).map_err(|e| StoreError::Internal(e.to_string()))? {
+        pay_types::deployment_policy::DeploymentSessionBinding::from_value(value)
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        if !pay_types::deployment_policy::claim_close(
+            &mut state,
+            owner,
+            now_ms,
+            now_ms.saturating_add(ttl.as_millis() as u64),
+        )
+        .map_err(|e| StoreError::Internal(e.to_string()))?
+        {
+            return Err(StoreError::Internal(
+                "bound close lease or reservation contended".into(),
+            ));
+        }
+        Ok(state)
+    } else {
+        claim_channel_close(Some(state), now_ms, now_seconds)
+    }
 }
 
 fn claim_channel_close(
@@ -2366,6 +2916,7 @@ fn claim_channel_close(
     Ok(state)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn build_idle_close_candidate(
     rpc: &RpcClient,
     rpc_url: &str,
@@ -2374,7 +2925,11 @@ async fn build_idle_close_candidate(
     now: i64,
     operator: &Pubkey,
     treasury_owner: &Pubkey,
+    bound_config: Option<&SessionConfig>,
 ) -> Result<Option<SettlementCandidate>, JobError> {
+    let program = bound_config
+        .and_then(|config| config.channel_program)
+        .unwrap_or_else(payment_channels::default_program_id);
     if onchain.payee() != *operator {
         return Err(JobError::Config(format!(
             "channel {} payee {} differs from lifecycle operator {operator}",
@@ -2383,46 +2938,34 @@ async fn build_idle_close_candidate(
         )));
     }
 
-    let mut instructions = match onchain.channel.status {
-        status
-            if status == STATUS_OPEN
-                || (status == STATUS_CLOSING && now < onchain.close_deadline()) =>
-        {
-            let onchain_signer = Pubkey::from(onchain.channel.authorized_signer.to_bytes());
-            let (signature, cumulative, expires_at) = close_voucher(
-                state,
-                onchain.channel.settlement.settled,
-                &onchain_signer,
-                now,
-            )?;
-            payment_channels::build_settle_and_seal_instructions(
-                operator,
-                &onchain.address,
-                &onchain_signer,
-                signature.as_ref(),
-                cumulative,
-                expires_at,
-                &payment_channels::default_program_id(),
-            )
-            .map_err(|error| JobError::TxBuild(format!("settle-and-seal instruction: {error}")))?
-        }
-        STATUS_SEALED => Vec::new(),
-        STATUS_CLOSING if now >= onchain.close_deadline() => {
-            vec![channel::build_seal_ix(&onchain.address)]
-        }
-        STATUS_DISTRIBUTED => return Ok(None),
-        status => {
-            return Err(JobError::TxBuild(format!(
-                "channel {} has unknown status {status}",
-                state.channel_id
-            )));
-        }
+    let Some(mut instructions) =
+        close_settlement_instructions(state, onchain, now, operator, &program)?
+    else {
+        return Ok(None);
     };
 
-    let token_program = channel::resolve_token_program(rpc, rpc_url, &onchain.mint()).await?;
-    let preimage = channel::recover_distribution_preimage(rpc, rpc_url, onchain).await?;
-    instructions
-        .push(channel::build_distribute_ix(onchain, treasury_owner, &token_program, &preimage).0);
+    let (token_program, preimage) = if let Some(config) = bound_config {
+        let token_program = config
+            .token_program
+            .ok_or_else(|| binding_error("missing token program"))?;
+        channel::require_token_program(rpc, rpc_url, &onchain.mint(), &token_program).await?;
+        (token_program, bound_preimage(config, onchain)?)
+    } else {
+        (
+            channel::resolve_token_program(rpc, rpc_url, &onchain.mint()).await?,
+            channel::recover_distribution_preimage(rpc, rpc_url, onchain).await?,
+        )
+    };
+    instructions.push(
+        channel::build_distribute_ix_for_program(
+            onchain,
+            treasury_owner,
+            &token_program,
+            &preimage,
+            &program,
+        )
+        .0,
+    );
     let before = inventory_snapshot(
         state.sealed,
         onchain.channel.status,
@@ -2447,6 +2990,55 @@ async fn build_idle_close_candidate(
         before,
         after,
     }))
+}
+
+fn close_settlement_instructions(
+    state: &ChannelState,
+    onchain: &channel::DecodedChannel,
+    now: i64,
+    operator: &Pubkey,
+    program: &Pubkey,
+) -> Result<Option<Vec<solana_instruction::Instruction>>, JobError> {
+    let instructions = match onchain.channel.status {
+        status
+            if status == STATUS_OPEN
+                || (status == STATUS_CLOSING && now < onchain.close_deadline()) =>
+        {
+            let onchain_signer = Pubkey::from(onchain.channel.authorized_signer.to_bytes());
+            let (signature, cumulative, expires_at) = close_voucher(
+                state,
+                onchain.channel.settlement.settled,
+                &onchain_signer,
+                now,
+            )?;
+            payment_channels::build_settle_and_seal_instructions(
+                operator,
+                &onchain.address,
+                &onchain_signer,
+                signature.as_ref(),
+                cumulative,
+                expires_at,
+                program,
+            )
+            .map_err(|error| JobError::TxBuild(format!("settle-and-seal instruction: {error}")))?
+        }
+        STATUS_SEALED => Vec::new(),
+        STATUS_CLOSING if now >= onchain.close_deadline() => {
+            vec![channel::build_seal_ix_for_program(
+                &onchain.address,
+                program,
+            )]
+        }
+        STATUS_DISTRIBUTED => return Ok(None),
+        status => {
+            return Err(JobError::TxBuild(format!(
+                "channel {} has unknown status {status}",
+                state.channel_id
+            )));
+        }
+    };
+
+    Ok(Some(instructions))
 }
 
 fn close_voucher(
@@ -2668,6 +3260,728 @@ mod tests {
             schema_version: pay_kit::mpp::CHANNEL_STATE_SCHEMA_VERSION,
             extra: Default::default(),
         }
+    }
+
+    fn bound_fixture() -> (ChannelState, SessionConfig) {
+        use pay_types::deployment_policy::{
+            DeploymentIdentity, DeploymentSessionBinding, DurableDeploymentPolicy, PolicyAllocation,
+        };
+        let operator = Pubkey::new_unique();
+        let binding = DeploymentSessionBinding::new(DurableDeploymentPolicy {
+            deployment: DeploymentIdentity {
+                owner_key: "owner".into(),
+                resource_name: "service".into(),
+                created_at: "incarnation-1".into(),
+                hostname: "service.example.com".into(),
+            },
+            version: 1,
+            price_micro_usd: 50_000,
+            allocations: [(30_000, 6000), (15_000, 3000), (5000, 1000)]
+                .into_iter()
+                .map(|(amount_micro_usd, basis_points)| PolicyAllocation {
+                    recipient: Pubkey::new_unique().to_string(),
+                    amount_micro_usd,
+                    basis_points,
+                })
+                .collect(),
+        })
+        .unwrap();
+        let payout = binding.effective_payout(&operator.to_string()).unwrap();
+        let config = SessionConfig {
+            operator: operator.to_string(),
+            recipient: payout.recipient,
+            amount: binding.policy.price_micro_usd,
+            network: "devnet".into(),
+            splits: payout
+                .splits
+                .into_iter()
+                .map(|split| pay_kit::mpp::server::session::Split {
+                    recipient: split.recipient.parse().unwrap(),
+                    bps: split.bps,
+                })
+                .collect(),
+            ..SessionConfig::default()
+        };
+        let mut state = channel_state();
+        state.lifecycle = Some(ChannelLifecycle {
+            owner: "proxy".into(),
+            close_after: 1000,
+        });
+        state.extra.insert(
+            "mppSessionBinding".into(),
+            serde_json::json!({
+                "version": 1,
+                "policy": binding.to_value().unwrap(),
+                "snapshot": SessionConfigSnapshot::capture(&config),
+            }),
+        );
+        (state, config)
+    }
+
+    #[test]
+    fn restart_restores_original_terms_without_current_deployment() {
+        let (state, original) = bound_fixture();
+        let restored: ChannelState =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        let binding = pay_types::deployment_policy::DeploymentSessionBinding::from_value(
+            channel_binding(&restored).unwrap().unwrap(),
+        )
+        .unwrap();
+        let mut config = SessionConfig {
+            recipient: Pubkey::new_unique().to_string(),
+            amount: 999_999,
+            network: "mainnet".into(),
+            ..SessionConfig::default()
+        };
+        SessionConfigSnapshot::from_channel(&restored)
+            .unwrap()
+            .unwrap()
+            .apply_to(&mut config)
+            .unwrap();
+        validate_bound_config(
+            &binding,
+            &config,
+            "devnet",
+            &original.operator.parse().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(config.amount, 50_000);
+        assert_eq!(config.recipient, original.recipient);
+        assert_eq!(
+            config
+                .splits
+                .iter()
+                .map(|split| split.bps)
+                .collect::<Vec<_>>(),
+            vec![3000, 1000, 6000]
+        );
+        let server = SessionServer::new(config, pay_kit::core::store::MemoryChannelStore::new())
+            .with_channel_binding(binding.to_value().unwrap());
+        server.require_channel_binding(&restored).unwrap();
+    }
+
+    #[test]
+    fn fleet_reclamation_requires_recorded_legacy_ownership() {
+        assert!(!channel::is_recorded_legacy(None).unwrap());
+        assert!(channel::is_recorded_legacy(Some(&channel_state())).unwrap());
+        let (mut state, _) = bound_fixture();
+        assert!(!channel::is_recorded_legacy(Some(&state)).unwrap());
+        state
+            .extra
+            .insert("mppSessionBinding".into(), serde_json::Value::Null);
+        assert!(channel::is_recorded_legacy(Some(&state)).is_err());
+    }
+
+    #[tokio::test]
+    async fn durable_scan_resumes_pending_open_without_a_client_retry() {
+        use pay_kit::core::store::{MemoryChannelStore, PendingSetup};
+        let (mut state, _) = bound_fixture();
+        state.pending_setup = Some(PendingSetup {
+            payer_signature: "persisted-validated-signature".into(),
+            deposit: 50_000,
+            opens_channel: true,
+            expires_at: 1,
+        });
+        state.deposit = 0;
+        let store = MemoryChannelStore::new();
+        store
+            .put_channel(&state.channel_id, state.clone())
+            .await
+            .unwrap();
+        let scanned = store.list_channels().await.unwrap().pop().unwrap();
+        // The verifier is mocked here; kit tests cover actual signed-intent
+        // read-back and expired-challenge recovery. This tests worker selection.
+        let resumed = resume_scanned_pending_open(&scanned, false, |id| {
+            let store = &store;
+            async move {
+                store
+                    .update_channel(
+                        &id,
+                        Box::new(|current| {
+                            let mut state = current.unwrap();
+                            state.deposit = state.pending_setup.take().unwrap().deposit;
+                            Ok(state)
+                        }),
+                    )
+                    .await
+                    .map_err(binding_error)?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+        assert!(resumed);
+        let recovered = store.get_channel(&state.channel_id).await.unwrap().unwrap();
+        assert_eq!(recovered.deposit, 50_000);
+        assert_eq!(
+            channel_binding(&recovered).unwrap(),
+            channel_binding(&state).unwrap()
+        );
+        assert!(
+            !resume_scanned_pending_open(&recovered, false, |_| async {
+                panic!("active channel must not be reopened");
+            })
+            .await
+            .unwrap()
+        );
+        assert!(
+            resume_scanned_pending_open(&scanned, true, |_| async {
+                panic!("dry run must not broadcast recovery");
+            })
+            .await
+            .is_err()
+        );
+        assert!(
+            resume_scanned_pending_open(&scanned, false, |_| async {
+                Err(binding_error("uncertain confirmation"))
+            })
+            .await
+            .is_err()
+        );
+        state.pending_setup.as_mut().unwrap().opens_channel = false;
+        assert!(
+            !resume_scanned_pending_open(&state, false, |_| async {
+                panic!("top-up is not a pending open");
+            })
+            .await
+            .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_bindings_and_unrelated_channels_are_not_adopted() {
+        let (mut state, config) = bound_fixture();
+        let store = Arc::new(pay_kit::core::store::MemoryChannelStore::new());
+        let binding = channel_binding(&state).unwrap().unwrap();
+        let server = SessionServer::new(config, store.clone()).with_channel_binding(binding);
+        assert!(
+            server
+                .resume_pending_open(&Pubkey::new_unique().to_string())
+                .await
+                .is_err()
+        );
+        assert!(store.list_channels().await.unwrap().is_empty());
+        assert!(server.require_channel_binding(&channel_state()).is_err());
+        state.extra.get_mut("mppSessionBinding").unwrap()["version"] = serde_json::json!(99);
+        assert!(channel_binding(&state).is_err());
+        assert!(SessionConfigSnapshot::from_channel(&state).is_err());
+        assert!(server.require_channel_binding(&state).is_err());
+        store
+            .put_channel(&state.channel_id, state.clone())
+            .await
+            .unwrap();
+        assert!(
+            claim_due_close(
+                &store,
+                &state.channel_id,
+                1000,
+                1,
+                "worker",
+                Duration::from_secs(1)
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            store
+                .get_channel(&state.channel_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .close_requested_at
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn bound_distribution_instruction_preserves_exact_ordered_payout_and_program() {
+        use pay_kit::generated::payment_channels::generated::{
+            accounts::Channel, types::SettlementWatermarks,
+        };
+        let (state, original) = bound_fixture();
+        let mut config = SessionConfig::default();
+        SessionConfigSnapshot::capture(&original)
+            .apply_to(&mut config)
+            .unwrap();
+        // The instruction must use the stored program, never the fleet default.
+        config.channel_program = Some(Pubkey::new_unique());
+        let recipients: Vec<_> = config
+            .splits
+            .iter()
+            .map(|split| payment_channels::Distribution {
+                recipient: split.recipient,
+                bps: split.bps,
+            })
+            .collect();
+        let address = |value: &str| payment_channels::to_address(&value.parse().unwrap());
+        let mut onchain = channel::DecodedChannel {
+            address: state.channel_id.parse().unwrap(),
+            channel: Channel {
+                discriminator: 1,
+                version: 1,
+                bump: 1,
+                status: STATUS_SEALED,
+                salt: 0,
+                deposit: 50_000,
+                settlement: SettlementWatermarks {
+                    settled: 50_000,
+                    payout_watermark: 0,
+                },
+                closure_started_at: 0,
+                payer_withdrawn_at: 0,
+                grace_period: config.grace_period_seconds,
+                distribution_hash: payment_channels::distribution_hash(&recipients),
+                payer: address(&state.payer),
+                payee: address(&config.recipient),
+                authorized_signer: address(&state.authorized_signer),
+                mint: address(&config.currency),
+                rent_payer: address(&state.rent_payer),
+                open_slot: state.open_slot.unwrap(),
+            },
+        };
+        verify_bound_channel(&config, &state, &onchain).unwrap();
+        let preimage = bound_preimage(&config, &onchain).unwrap();
+        assert_eq!(
+            preimage
+                .recipients
+                .iter()
+                .map(|split| 50_000_u64 * u64::from(split.bps) / 10_000)
+                .collect::<Vec<_>>(),
+            vec![15_000, 5000, 30_000]
+        );
+        let (instruction, accounts) = channel::build_distribute_ix_for_program(
+            &onchain,
+            &Pubkey::new_unique(),
+            &config.token_program.unwrap(),
+            &preimage,
+            &config.channel_program.unwrap(),
+        );
+        assert_eq!(
+            instruction.program_id.to_bytes(),
+            config.channel_program.unwrap().to_bytes()
+        );
+        assert!(instruction.data.ends_with(&preimage.preimage_bytes));
+        for (split, ata) in config.splits.iter().zip(accounts.recipient_atas) {
+            assert_eq!(
+                ata,
+                pay_api_core::ata::associated_token_address(
+                    &split.recipient,
+                    &onchain.mint(),
+                    &config.token_program.unwrap(),
+                )
+            );
+            assert!(
+                instruction
+                    .accounts
+                    .iter()
+                    .any(|account| account.pubkey.to_bytes() == ata.to_bytes())
+            );
+        }
+        onchain.channel.distribution_hash[0] ^= 1;
+        assert!(verify_bound_channel(&config, &state, &onchain).is_err());
+        onchain.channel.distribution_hash = payment_channels::distribution_hash(&recipients);
+        onchain.channel.payee = payment_channels::to_address(&Pubkey::new_unique());
+        assert!(verify_bound_channel(&config, &state, &onchain).is_err());
+    }
+
+    fn closing_fixture() -> (ChannelState, SessionConfig, channel::DecodedChannel) {
+        use pay_kit::generated::payment_channels::generated::{
+            accounts::Channel, types::SettlementWatermarks,
+        };
+        let (mut state, mut config) = bound_fixture();
+        SessionConfigSnapshot::capture(&config)
+            .apply_to(&mut config)
+            .unwrap();
+        state.lifecycle.as_mut().unwrap().close_after = 1_000_000;
+        state.cumulative = 50_000;
+        state.highest_voucher_signature = Some(bs58::encode([42_u8; 64]).into_string());
+        state.highest_voucher_expires_at = Some(500);
+        let recipients = config
+            .splits
+            .iter()
+            .map(|split| payment_channels::Distribution {
+                recipient: split.recipient,
+                bps: split.bps,
+            })
+            .collect::<Vec<_>>();
+        let address = |value: &str| payment_channels::to_address(&value.parse().unwrap());
+        let onchain = channel::DecodedChannel {
+            address: state.channel_id.parse().unwrap(),
+            channel: Channel {
+                discriminator: 1,
+                version: 1,
+                bump: 1,
+                status: STATUS_CLOSING,
+                salt: 0,
+                deposit: 100_000,
+                settlement: SettlementWatermarks {
+                    settled: 10_000,
+                    payout_watermark: 0,
+                },
+                closure_started_at: 100,
+                payer_withdrawn_at: 0,
+                grace_period: 100,
+                distribution_hash: payment_channels::distribution_hash(&recipients),
+                payer: address(&state.payer),
+                payee: address(&config.recipient),
+                authorized_signer: address(&state.authorized_signer),
+                mint: address(&config.currency),
+                rent_payer: address(&state.rent_payer),
+                open_slot: state.open_slot.unwrap(),
+            },
+        };
+        (state, config, onchain)
+    }
+
+    #[tokio::test]
+    async fn dry_run_due_open_plans_close_without_persisting() {
+        let (mut state, config, mut onchain) = closing_fixture();
+        state.lifecycle.as_mut().unwrap().close_after = 120_000;
+        onchain.channel.status = STATUS_OPEN;
+        onchain.channel.closure_started_at = 0;
+        assert!(state.close_requested_at.is_none());
+        assert!(channel_close_due(&state, 120_000));
+        let store = pay_kit::core::store::MemoryChannelStore::new();
+        let id = state.channel_id.clone();
+        store.put_channel(&id, state.clone()).await.unwrap();
+        let planned = transition_due_close(
+            Some(state.clone()),
+            120_000,
+            120,
+            "worker",
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert_eq!(planned.close_requested_at, Some(120));
+        verify_bound_channel(&config, &planned, &onchain).unwrap();
+        assert!(
+            close_settlement_instructions(
+                &planned,
+                &onchain,
+                120,
+                &config.operator.parse().unwrap(),
+                &config.channel_program.unwrap(),
+            )
+            .unwrap()
+            .is_some()
+        );
+        assert_eq!(
+            serde_json::to_value(store.get_channel(&id).await.unwrap().unwrap()).unwrap(),
+            serde_json::to_value(state).unwrap(),
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_due_open_with_active_reservation_remains_unplanned() {
+        let (mut state, _, _) = closing_fixture();
+        pay_types::deployment_policy::reserve(&mut state, "request", 1, 120_000, 130_000).unwrap();
+        state.lifecycle.as_mut().unwrap().close_after = 120_000;
+        assert!(state.close_requested_at.is_none());
+        let store = pay_kit::core::store::MemoryChannelStore::new();
+        let id = state.channel_id.clone();
+        store.put_channel(&id, state.clone()).await.unwrap();
+        assert!(
+            transition_due_close(
+                Some(state.clone()),
+                120_000,
+                120,
+                "worker",
+                Duration::from_secs(10),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(store.get_channel(&id).await.unwrap().unwrap()).unwrap(),
+            serde_json::to_value(state).unwrap(),
+        );
+    }
+
+    #[tokio::test]
+    async fn external_close_before_idle_deadline_settles_latest_voucher_in_grace() {
+        let (state, config, onchain) = closing_fixture();
+        let store = pay_kit::core::store::MemoryChannelStore::new();
+        let id = state.channel_id.clone();
+        assert!(!channel_close_due(&state, 120_000));
+        store.put_channel(&id, state).await.unwrap();
+        // A voucher committed after the scan must be carried by the close.
+        store
+            .update_channel(
+                &id,
+                Box::new(|current| {
+                    let mut state = current.unwrap();
+                    state.cumulative = 60_000;
+                    state.highest_voucher_signature = Some(bs58::encode([43_u8; 64]).into_string());
+                    Ok(state)
+                }),
+            )
+            .await
+            .unwrap();
+        record_bound_close(&store, &id, &config, onchain.clone(), 120)
+            .await
+            .unwrap();
+        let state = claim_due_close(&store, &id, 120_000, 120, "worker", Duration::from_secs(10))
+            .await
+            .unwrap();
+        let program = config.channel_program.unwrap();
+        let actual = close_settlement_instructions(
+            &state,
+            &onchain,
+            120,
+            &config.operator.parse().unwrap(),
+            &program,
+        )
+        .unwrap()
+        .unwrap();
+        let expected = payment_channels::build_settle_and_seal_instructions(
+            &config.operator.parse().unwrap(),
+            &onchain.address,
+            &state.authorized_signer.parse().unwrap(),
+            Some(&[43_u8; 64]),
+            60_000,
+            500,
+            &program,
+        )
+        .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(state.close_requested_at, Some(120));
+    }
+
+    #[tokio::test]
+    async fn external_close_preserves_marker_while_reservation_defers_and_expiry_allows_takeover() {
+        let (mut state, config, onchain) = closing_fixture();
+        pay_types::deployment_policy::reserve(&mut state, "request", 1, 120_000, 130_000).unwrap();
+        let store = pay_kit::core::store::MemoryChannelStore::new();
+        let id = state.channel_id.clone();
+        store.put_channel(&id, state).await.unwrap();
+        record_bound_close(&store, &id, &config, onchain, 120)
+            .await
+            .unwrap();
+        assert!(
+            claim_due_close(&store, &id, 120_000, 120, "a", Duration::from_secs(10))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .get_channel(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .close_requested_at,
+            Some(120)
+        );
+        claim_due_close(&store, &id, 130_000, 130, "a", Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert!(
+            claim_due_close(&store, &id, 130_001, 130, "b", Duration::from_secs(10))
+                .await
+                .is_err()
+        );
+        claim_due_close(&store, &id, 140_000, 140, "b", Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert!(
+            claim_due_close(&store, &id, 140_001, 140, "a", Duration::from_secs(10))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn external_close_wrong_identity_never_writes_marker() {
+        let (state, config, onchain) = closing_fixture();
+        let store = pay_kit::core::store::MemoryChannelStore::new();
+        let id = state.channel_id.clone();
+        store.put_channel(&id, state).await.unwrap();
+        for mutation in 0..3 {
+            let mut wrong = onchain.clone();
+            match mutation {
+                0 => wrong.channel.payer = payment_channels::to_address(&Pubkey::new_unique()),
+                1 => wrong.channel.distribution_hash[0] ^= 1,
+                _ => wrong.address = Pubkey::new_unique(),
+            }
+            assert!(
+                record_bound_close(&store, &id, &config, wrong, 120)
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            store
+                .get_channel(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .close_requested_at
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn external_sealed_close_and_terminal_tombstone_fail_closed() {
+        let (mut state, config, mut onchain) = closing_fixture();
+        onchain.channel.status = STATUS_SEALED;
+        let store = pay_kit::core::store::MemoryChannelStore::new();
+        let id = state.channel_id.clone();
+        store.put_channel(&id, state.clone()).await.unwrap();
+        let marked = record_bound_close(&store, &id, &config, onchain.clone(), 120)
+            .await
+            .unwrap();
+        assert_eq!(marked.close_requested_at, Some(120));
+        state = marked;
+        state
+            .extra
+            .insert("mppSessionOpenTerminal".into(), serde_json::Value::Null);
+        let terminal = state.clone();
+        store
+            .update_channel(&id, Box::new(move |_| Ok(terminal)))
+            .await
+            .unwrap();
+        assert!(session_open_is_terminal(&state));
+        assert!(
+            record_bound_close(&store, &id, &config, onchain, 120)
+                .await
+                .is_err()
+        );
+        assert!(
+            claim_due_close(&store, &id, 120_000, 120, "a", Duration::from_secs(10))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(store.get_channel(&id).await.unwrap().unwrap()).unwrap(),
+            serde_json::to_value(state).unwrap(),
+        );
+    }
+
+    #[tokio::test]
+    async fn external_close_waits_for_pending_setup_and_authorization() {
+        use pay_kit::core::store::{PendingDelivery, PendingSetup};
+        let (mut state, config, onchain) = closing_fixture();
+        state.pending_setup = Some(PendingSetup {
+            payer_signature: "pending".into(),
+            deposit: 1,
+            opens_channel: false,
+            expires_at: 999,
+        });
+        let store = pay_kit::core::store::MemoryChannelStore::new();
+        let id = state.channel_id.clone();
+        store.put_channel(&id, state).await.unwrap();
+        record_bound_close(&store, &id, &config, onchain, 120)
+            .await
+            .unwrap();
+        assert!(
+            claim_due_close(&store, &id, 120_000, 120, "a", Duration::from_secs(10))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .get_channel(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .close_requested_at,
+            Some(120)
+        );
+        store
+            .update_channel(
+                &id,
+                Box::new(|current| {
+                    let mut state = current.unwrap();
+                    state.pending_setup = None;
+                    state.pending_deliveries.push(PendingDelivery {
+                        delivery_id: "pending-delivery".into(),
+                        amount: 1,
+                        sequence: 0,
+                        expires_at: 130,
+                        request_fingerprint: None,
+                        handler_succeeded: false,
+                    });
+                    Ok(state)
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            claim_due_close(&store, &id, 120_000, 120, "a", Duration::from_secs(10))
+                .await
+                .is_err()
+        );
+        claim_due_close(&store, &id, 130_000, 130, "a", Duration::from_secs(10))
+            .await
+            .unwrap();
+    }
+
+    async fn assert_reservation_close_exclusion(store: &impl ChannelStore) {
+        for _ in 0..20 {
+            let (state, _) = bound_fixture();
+            let id = state.channel_id.clone();
+            store.put_channel(&id, state).await.unwrap();
+            let (closed, reserved) = tokio::join!(
+                claim_due_close(store, &id, 1000, 1, "worker-a", Duration::from_secs(1)),
+                store.update_channel(
+                    &id,
+                    Box::new(|current| {
+                        let mut state = current.unwrap();
+                        pay_types::deployment_policy::reserve(
+                            &mut state, "request", 50_000, 1000, 2000,
+                        )
+                        .map_err(|error| StoreError::Internal(error.to_string()))?;
+                        Ok(state)
+                    })
+                ),
+            );
+            assert_ne!(
+                closed.is_ok(),
+                reserved.is_ok(),
+                "only one CAS contender may own lifecycle"
+            );
+            // A crash/expired reservation is recoverable; a live close owner
+            // excludes another external job even when the global job lock differs.
+            let recovered =
+                claim_due_close(store, &id, 2001, 2, "worker-b", Duration::from_secs(1))
+                    .await
+                    .unwrap();
+            assert!(recovered.close_requested_at.is_some());
+            assert!(
+                claim_due_close(store, &id, 2002, 2, "worker-c", Duration::from_secs(1))
+                    .await
+                    .is_err()
+            );
+            claim_due_close(store, &id, 2500, 2, "worker-b", Duration::from_secs(1))
+                .await
+                .unwrap();
+            assert!(
+                claim_due_close(store, &id, 3002, 3, "worker-c", Duration::from_secs(1))
+                    .await
+                    .is_err()
+            );
+            claim_due_close(store, &id, 3501, 3, "worker-c", Duration::from_secs(1))
+                .await
+                .unwrap();
+            store.delete_channel(&id).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_reservation_and_close_use_one_durable_transition() {
+        assert_reservation_close_exclusion(&pay_kit::core::store::MemoryChannelStore::new()).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable PAY_WORKER_TEST_REDIS_URL"]
+    async fn redis_cas_reservation_close_and_external_job_retries() {
+        let url = std::env::var("PAY_WORKER_TEST_REDIS_URL").unwrap();
+        let store = RedisChannelStore::connect_with_finalized_retention(
+            &url,
+            format!("pay-worker-test:{}:", unix_nanos()),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        assert_reservation_close_exclusion(&store).await;
     }
 
     #[test]
