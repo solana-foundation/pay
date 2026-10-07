@@ -64,6 +64,36 @@ impl ComputeMcp {
         }
     }
 
+    pub(crate) async fn delete_owned(
+        &self,
+        tenant: &Tenant,
+        request: ResourceRequest,
+    ) -> crate::driver::Result<crate::types::ComputeOperation> {
+        let driver = self.drivers.get(&request.provider)?;
+        let deployment = match driver.get(tenant, request.clone()).await {
+            Ok(deployment) => deployment,
+            // The driver owns idempotence and metadata lifecycle. Do not let a
+            // preflight lookup turn retries of successful deletions into errors.
+            Err(ComputeError::ResourceNotFound) => return driver.delete(tenant, request).await,
+            Err(error) => return Err(error),
+        };
+        let canonical = ResourceRequest {
+            provider: deployment.provider,
+            id: deployment.id,
+            region: Some(deployment.region),
+        };
+        self.trigger_drivers
+            .cleanup_target(
+                tenant,
+                &canonical.provider,
+                &canonical.id,
+                canonical.region.as_deref(),
+            )
+            .await
+            .map_err(|error| ComputeError::Provider(format!("trigger cleanup: {error}")))?;
+        driver.delete(tenant, canonical).await
+    }
+
     fn tenant(ctx: &RequestContext<RoleServer>) -> Result<Tenant, rmcp::ErrorData> {
         ctx.extensions
             .get::<http::request::Parts>()
@@ -240,33 +270,7 @@ impl ComputeMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let tenant = Self::tenant(&ctx)?;
-        let driver = match self.drivers.get(&request.provider) {
-            Ok(driver) => driver,
-            Err(error) => return Self::result::<serde_json::Value, _>(Err(error)),
-        };
-        let deployment = match driver.get(&tenant, request.clone()).await {
-            Ok(deployment) => deployment,
-            Err(error) => return Self::result::<serde_json::Value, _>(Err(error)),
-        };
-        let canonical = ResourceRequest {
-            provider: deployment.provider,
-            id: deployment.id,
-            region: Some(deployment.region),
-        };
-        if let Err(error) = self
-            .trigger_drivers
-            .cleanup_target(
-                &tenant,
-                &canonical.provider,
-                &canonical.id,
-                canonical.region.as_deref(),
-            )
-            .await
-        {
-            return Self::result::<serde_json::Value, _>(Err(error));
-        }
-        let result = driver.delete(&tenant, canonical).await;
-        Self::result(result)
+        Self::result(self.delete_owned(&tenant, request).await)
     }
 
     #[tool(
@@ -585,7 +589,9 @@ async fn gateway_invoke(State(state): State<AppState>, request: Request) -> Resp
         Err(error) => {
             let status = match error {
                 ComputeError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
-                ComputeError::ProviderNotFound(_) => StatusCode::NOT_FOUND,
+                ComputeError::ProviderNotFound(_) | ComputeError::ResourceNotFound => {
+                    StatusCode::NOT_FOUND
+                }
                 _ => StatusCode::BAD_GATEWAY,
             };
             (

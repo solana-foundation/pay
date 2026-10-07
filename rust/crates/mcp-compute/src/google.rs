@@ -14,6 +14,8 @@ use tokio::sync::RwLock;
 use zip::write::SimpleFileOptions;
 
 use crate::driver::{ComputeDriver, ComputeError, Result};
+use crate::payment_policy::DeploymentIdentity;
+use crate::payment_repository::{PolicyRepository, RETENTION_SECONDS, StoredPolicy};
 use crate::types::{
     ComputeOperation, DeployRequest, Deployment, DeploymentList, DriverCapabilities, Exposure,
     GatewayInvocation, GatewayInvokeRequest, InvocationResult, InvokeRequest, ListRequest,
@@ -24,6 +26,7 @@ pub const DRIVER_ID: &str = "google-cloud-functions";
 pub const GATEWAY_PREFIX: &str = "gcf-";
 const DEFAULT_API_BASE: &str = "https://cloudfunctions.googleapis.com";
 const DEFAULT_METADATA_BASE: &str = "http://metadata.google.internal/computeMetadata/v1";
+const METADATA_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_SOURCE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_SOURCE_FILES: usize = 256;
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
@@ -48,6 +51,7 @@ pub struct GoogleConfig {
     pub function_service_account: Option<String>,
     pub build_service_account: Option<String>,
     pub gateway_domain: String,
+    pub payment_policy_database: Option<String>,
 }
 
 impl GoogleConfig {
@@ -79,6 +83,15 @@ impl GoogleConfig {
             build_service_account: env_nonempty("COMPUTE_GOOGLE_BUILD_SERVICE_ACCOUNT"),
             gateway_domain: env_nonempty("COMPUTE_GATEWAY_DOMAIN")
                 .unwrap_or_else(|| "cpu.gcp.gateway-402.com".into()),
+            payment_policy_database: match std::env::var("COMPUTE_PAYMENT_POLICY_DATABASE") {
+                Ok(value) => Some(value),
+                Err(std::env::VarError::NotPresent) => None,
+                Err(_) => {
+                    return Err(ComputeError::Configuration(
+                        "invalid COMPUTE_PAYMENT_POLICY_DATABASE".into(),
+                    ));
+                }
+            },
         })
     }
 }
@@ -99,6 +112,7 @@ pub struct GoogleCloudFunctionsDriver {
     config: Arc<GoogleConfig>,
     client: reqwest::Client,
     token: Arc<RwLock<Option<CachedToken>>>,
+    policies: Option<PolicyRepository>,
 }
 
 #[derive(Clone)]
@@ -122,8 +136,235 @@ struct GoogleOptions {
 }
 
 impl GoogleCloudFunctionsDriver {
-    pub(crate) fn project(&self) -> &str {
-        &self.config.project
+    pub(crate) fn policy_repository(&self) -> Option<&PolicyRepository> {
+        self.policies.as_ref()
+    }
+
+    fn validate_policy_identity(&self, identity: &DeploymentIdentity) -> Result<()> {
+        let name = identity
+            .resource_name
+            .rsplit('/')
+            .next()
+            .unwrap_or_default();
+        validate_gateway_function_name(name)?;
+        let expected = format!(
+            "projects/{}/locations/{}/functions/{name}",
+            self.config.project, self.config.default_region,
+        );
+        if identity.resource_name != expected
+            || identity.owner_key.len() != 16
+            || !identity
+                .owner_key
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || tenant_label_from_resource(&expected)? != identity.owner_key
+            || identity.hostname != format!("{name}.{}", self.config.gateway_domain)
+        {
+            return Err(ComputeError::Configuration(
+                "payment policy identity is outside this driver".into(),
+            ));
+        }
+        let created = parse_creation_time(&identity.created_at)?;
+        if created > chrono::Utc::now() {
+            return Err(ComputeError::Configuration(
+                "payment policy incarnation is in the future".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn policy_identity(&self, resource: &str, value: &Value) -> Result<DeploymentIdentity> {
+        let owner_key = tenant_label_from_resource(resource)?;
+        if value.get("name").and_then(Value::as_str) != Some(resource)
+            || value.pointer("/labels/pay-tenant").and_then(Value::as_str)
+                != Some(owner_key.as_str())
+            || value.pointer("/labels/managed-by").and_then(Value::as_str) != Some("mcp-compute")
+        {
+            return Err(ComputeError::Provider(
+                "deployment ownership metadata is invalid".into(),
+            ));
+        }
+        let identity = DeploymentIdentity {
+            owner_key,
+            resource_name: resource.into(),
+            created_at: value
+                .get("createTime")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    ComputeError::Provider("deployment creation identity is missing".into())
+                })?
+                .into(),
+            hostname: format!(
+                "{}.{}",
+                resource.rsplit('/').next().unwrap_or_default(),
+                self.config.gateway_domain
+            ),
+        };
+        self.validate_policy_identity(&identity)?;
+        Ok(identity)
+    }
+
+    /// Only a 404 or a verified *newer* incarnation proves this identity absent.
+    /// DELETING and all other states of the same incarnation remain present.
+    async fn policy_incarnation_absent(&self, identity: &DeploymentIdentity) -> Result<bool> {
+        self.validate_policy_identity(identity)?;
+        let (status, value) = tokio::time::timeout(
+            Duration::from_secs(15),
+            self.send_json(
+                Method::GET,
+                format!("{}/v2/{}", self.config.api_base, identity.resource_name),
+                None,
+            ),
+        )
+        .await
+        .map_err(|_| ComputeError::Provider("provider verification timed out".into()))??;
+        if status == StatusCode::NOT_FOUND {
+            return Ok(true);
+        }
+        if !status.is_success() {
+            return Err(json_provider_error(status, &value));
+        }
+        let current = self.policy_identity(&identity.resource_name, &value)?;
+        let current_time = parse_creation_time(&current.created_at)?;
+        let stored_time = parse_creation_time(&identity.created_at)?;
+        if current_time < stored_time {
+            return Err(ComputeError::Provider(
+                "provider incarnation predates stored policy".into(),
+            ));
+        }
+        Ok(current_time > stored_time)
+    }
+
+    async fn retire_policy(&self, identity: &DeploymentIdentity) -> Result<()> {
+        let Some(repository) = &self.policies else {
+            return Ok(());
+        };
+        self.validate_policy_identity(identity)?;
+        let token = self.access_token().await?;
+        let stored = repository.load(&token, identity).await?;
+        if stored.as_ref().is_some_and(|stored| stored.retired) {
+            return Ok(());
+        }
+        let next = match &stored {
+            Some(stored) => stored.retire()?,
+            None => StoredPolicy {
+                deployment: identity.clone(),
+                policy: None,
+                retired: true,
+                absent_since: None,
+                update_time: String::new(),
+            },
+        };
+        // A conflict aborts deletion. The retry reads and retires the winning
+        // policy rather than allowing a concurrent set to escape retirement.
+        repository.write(&token, stored.as_ref(), &next).await
+    }
+
+    async fn reconcile_policy(
+        &self,
+        stored: &StoredPolicy,
+        dry_run: bool,
+        now: u64,
+    ) -> Result<bool> {
+        let repository = self.policies.as_ref().ok_or_else(|| {
+            ComputeError::Configuration("payment policy repository is not configured".into())
+        })?;
+        if !self.policy_incarnation_absent(&stored.deployment).await? {
+            // Never purge a pending retirement, even if malformed external
+            // metadata has incorrectly assigned it an old retention timestamp.
+            return Ok(false);
+        }
+        let expired = stored.retired
+            && stored.absent_since.is_some_and(|since| {
+                now.checked_sub(since)
+                    .is_some_and(|elapsed| elapsed >= RETENTION_SECONDS)
+            });
+        if stored.retired && stored.absent_since.is_some() && !expired {
+            return Ok(false);
+        }
+        tracing::info!(dry_run, action = if expired { "purge" } else { "retire" }, policy_key = %PolicyRepository::key(&stored.deployment), "orphan payment policy candidate");
+        if dry_run {
+            return Ok(true);
+        }
+        let token = self.access_token().await?;
+        if expired {
+            // Recheck after scan/retention selection; the DELETE also compares
+            // the document updateTime, never a caller-supplied version.
+            if !self.policy_incarnation_absent(&stored.deployment).await? {
+                return Ok(false);
+            }
+            repository.purge(&token, stored).await?;
+        } else {
+            let mut next = stored.retire()?;
+            next.absent_since = Some(now);
+            repository.write(&token, Some(stored), &next).await?;
+        }
+        Ok(true)
+    }
+
+    async fn delete_resource(
+        &self,
+        tenant: &Tenant,
+        request: ResourceRequest,
+        expected_cleanup: Option<(&str, &str)>,
+    ) -> Result<ComputeOperation> {
+        let resource = self.resource_name(tenant, &request.id, request.region.as_deref())?;
+        let url = format!("{}/v2/{resource}", self.config.api_base);
+        let (status, existing) = self.send_json(Method::GET, url.clone(), None).await?;
+        if status == StatusCode::NOT_FOUND {
+            // Periodic reconciliation retires metadata even when provider
+            // metadata (including createTime) no longer exists.
+            return Ok(deleted_operation(&resource));
+        }
+        if !status.is_success() {
+            return Err(json_provider_error(status, &existing));
+        }
+        require_tenant_label(tenant, &existing)?;
+        if let Some((lease, created_at)) = expected_cleanup
+            && (existing
+                .pointer("/labels/pay-channel")
+                .and_then(Value::as_str)
+                != Some(lease)
+                || existing.get("createTime").and_then(Value::as_str) != Some(created_at)
+                || existing
+                    .pointer("/labels/managed-by")
+                    .and_then(Value::as_str)
+                    != Some("mcp-compute")
+                || existing.get("name").and_then(Value::as_str) != Some(resource.as_str()))
+        {
+            return Err(ComputeError::Provider(
+                "deployment incarnation or channel lease changed during cleanup".into(),
+            ));
+        }
+        let identity = if self.policies.is_some()
+            && resource.starts_with(&format!(
+                "projects/{}/locations/{}/functions/",
+                self.config.project, self.config.default_region
+            )) {
+            let identity = self.policy_identity(&resource, &existing)?;
+            self.retire_policy(&identity).await?;
+            Some(identity)
+        } else {
+            None
+        };
+        // Google Functions DELETE has no incarnation precondition. This GET
+        // revalidation fences list-to-delete races, but cannot make provider
+        // deletion atomic with a concurrent out-of-band recreation.
+        let (status, value) = self.send_json(Method::DELETE, url, None).await?;
+        let operation = if status == StatusCode::NOT_FOUND {
+            deleted_operation(&resource)
+        } else if status.is_success() {
+            normalize_operation(value)?
+        } else {
+            return Err(json_provider_error(status, &value));
+        };
+        if let (Some(identity), Some(repository)) = (identity, &self.policies) {
+            let token = self.access_token().await?;
+            if let Some(stored) = repository.load(&token, &identity).await? {
+                self.reconcile_policy(&stored, false, policy_now()?).await?;
+            }
+        }
+        Ok(operation)
     }
 
     /// Resolve a public selector through authenticated provider metadata. The
@@ -196,6 +437,21 @@ impl GoogleCloudFunctionsDriver {
     pub fn new(config: GoogleConfig) -> Result<Self> {
         validate_segment("project", &config.project)?;
         validate_segment("default region", &config.default_region)?;
+        let policies = config.payment_policy_database.as_ref().map(|database| {
+            if !(4..=63).contains(&database.len())
+                || !database.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+                || !database.as_bytes().last().is_some_and(u8::is_ascii_alphanumeric)
+                || !database.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            {
+                return Err(ComputeError::Configuration(
+                    "COMPUTE_PAYMENT_POLICY_DATABASE must name an explicit database".into(),
+                ));
+            }
+            PolicyRepository::new(format!(
+                "https://firestore.googleapis.com/v1/projects/{}/databases/{database}/documents/pay_compute_payment_policies",
+                config.project,
+            ))
+        }).transpose()?;
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
@@ -204,6 +460,7 @@ impl GoogleCloudFunctionsDriver {
             config: Arc::new(config),
             client,
             token: Arc::new(RwLock::new(None)),
+            policies,
         })
     }
 
@@ -223,6 +480,7 @@ impl GoogleCloudFunctionsDriver {
         let response = self
             .client
             .get(url)
+            .timeout(METADATA_REQUEST_TIMEOUT)
             .header("Metadata-Flavor", "Google")
             .send()
             .await?;
@@ -255,6 +513,7 @@ impl GoogleCloudFunctionsDriver {
         let response = self
             .client
             .get(url)
+            .timeout(METADATA_REQUEST_TIMEOUT)
             .query(&[("audience", audience), ("format", "full")])
             .header("Metadata-Flavor", "Google")
             .send()
@@ -676,13 +935,19 @@ impl ComputeDriver for GoogleCloudFunctionsDriver {
 
     async fn get(&self, tenant: &Tenant, request: ResourceRequest) -> Result<Deployment> {
         let resource = self.resource_name(tenant, &request.id, request.region.as_deref())?;
-        let value = self
-            .require_json(
+        let (status, value) = self
+            .send_json(
                 Method::GET,
                 format!("{}/v2/{resource}", self.config.api_base),
                 None,
             )
             .await?;
+        if status == StatusCode::NOT_FOUND {
+            return Err(ComputeError::ResourceNotFound);
+        }
+        if !status.is_success() {
+            return Err(json_provider_error(status, &value));
+        }
         require_tenant_label(tenant, &value)?;
         normalize_deployment(value)
     }
@@ -722,23 +987,7 @@ impl ComputeDriver for GoogleCloudFunctionsDriver {
     }
 
     async fn delete(&self, tenant: &Tenant, request: ResourceRequest) -> Result<ComputeOperation> {
-        let resource = self.resource_name(tenant, &request.id, request.region.as_deref())?;
-        let existing = self
-            .require_json(
-                Method::GET,
-                format!("{}/v2/{resource}", self.config.api_base),
-                None,
-            )
-            .await?;
-        require_tenant_label(tenant, &existing)?;
-        let value = self
-            .require_json(
-                Method::DELETE,
-                format!("{}/v2/{resource}", self.config.api_base),
-                None,
-            )
-            .await?;
-        normalize_operation(value)
+        self.delete_resource(tenant, request, None).await
     }
 
     async fn operation(&self, tenant: &Tenant, id: &str) -> Result<ComputeOperation> {
@@ -891,29 +1140,37 @@ impl ComputeDriver for GoogleCloudFunctionsDriver {
                     "Google could not scan every function location during channel cleanup".into(),
                 ));
             }
-            resources.extend(
-                value
-                    .get("functions")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter(|function| {
-                        function
-                            .pointer("/labels/pay-channel")
+            for function in value
+                .get("functions")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|function| {
+                    function
+                        .pointer("/labels/pay-channel")
+                        .and_then(Value::as_str)
+                        == Some(lease_key.as_str())
+                        && function
+                            .pointer("/labels/managed-by")
                             .and_then(Value::as_str)
-                            == Some(lease_key.as_str())
-                            && function
-                                .pointer("/labels/managed-by")
-                                .and_then(Value::as_str)
-                                == Some("mcp-compute")
-                    })
-                    .filter_map(|function| {
-                        function
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
-                    }),
-            );
+                            == Some("mcp-compute")
+                })
+            {
+                let resource = function
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        ComputeError::Provider("listed function omitted resource name".into())
+                    })?;
+                let created_at = function
+                    .get("createTime")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        ComputeError::Provider("listed function omitted creation identity".into())
+                    })?;
+                parse_creation_time(created_at)?;
+                resources.push((resource.to_owned(), created_at.to_owned()));
+            }
             page_token = value
                 .get("nextPageToken")
                 .and_then(Value::as_str)
@@ -924,23 +1181,131 @@ impl ComputeDriver for GoogleCloudFunctionsDriver {
             }
         }
 
-        for resource in &resources {
+        for (resource, created_at) in &resources {
             let tenant = Tenant {
                 payer: String::new(),
                 key: tenant_label_from_resource(resource)?,
                 channel_id: channel_id.to_string(),
             };
-            self.delete(
+            self.delete_resource(
                 &tenant,
                 ResourceRequest {
                     provider: DRIVER_ID.into(),
                     id: resource.clone(),
                     region: None,
                 },
+                Some((&lease_key, created_at)),
             )
             .await?;
         }
         Ok(resources.len())
+    }
+
+    async fn reconcile_orphans(&self, dry_run: bool) -> Result<usize> {
+        let repository = self.policies.as_ref().ok_or_else(|| {
+            ComputeError::Configuration(
+                "COMPUTE_PAYMENT_POLICY_DATABASE is required for reconciliation".into(),
+            )
+        })?;
+        let started = Instant::now();
+        let scope = format!(
+            "{}\0{}",
+            self.config.default_region, self.config.gateway_domain
+        );
+        let token = self.access_token().await?;
+        let mut checkpoint = repository.checkpoint(&token, &scope).await?;
+        let mut candidates = 0;
+        let mut failures = 0;
+        for _ in 0..10 {
+            let token = self.access_token().await?;
+            let page = repository
+                .page(&token, checkpoint.page_token.as_deref())
+                .await;
+            let (documents, next_page) = match page {
+                Ok(page) => page,
+                Err(error) => {
+                    // Tokens may expire between scheduled runs. Reset progress
+                    // conservatively, surface the error, and restart next run.
+                    if !dry_run && checkpoint.page_token.is_some() {
+                        repository
+                            .advance_checkpoint(&token, &scope, &mut checkpoint, None)
+                            .await?;
+                    }
+                    return Err(error);
+                }
+            };
+            for document in documents {
+                let result = tokio::time::timeout(Duration::from_secs(10), async {
+                    let stored = PolicyRepository::decode(&document)?;
+                    repository.validate_name(&document, &stored)?;
+                    self.validate_policy_identity(&stored.deployment)?;
+                    self.reconcile_policy(&stored, dry_run, policy_now()?).await
+                })
+                .await;
+                match result {
+                    Ok(Ok(candidate)) => candidates += usize::from(candidate),
+                    Ok(Err(error)) => {
+                        failures += 1;
+                        tracing::warn!(%error, dry_run, "payment policy reconciliation failed; will retry on next scan");
+                    }
+                    Err(_) => {
+                        failures += 1;
+                        tracing::warn!(
+                            dry_run,
+                            "payment policy reconciliation timed out; will retry on next scan"
+                        );
+                    }
+                }
+            }
+            let complete = next_page.is_none();
+            if dry_run {
+                checkpoint.page_token = next_page;
+            } else {
+                repository
+                    .advance_checkpoint(&token, &scope, &mut checkpoint, next_page)
+                    .await?;
+            }
+            if complete || started.elapsed() >= Duration::from_secs(120) {
+                break;
+            }
+        }
+        tracing::info!(
+            dry_run,
+            candidates,
+            failures,
+            has_more = checkpoint.page_token.is_some(),
+            "payment policy reconciliation batch finished"
+        );
+        if failures != 0 {
+            return Err(ComputeError::Provider(format!(
+                "{failures} payment policy reconciliation records failed; retry required"
+            )));
+        }
+        Ok(candidates)
+    }
+}
+
+fn policy_now() -> Result<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|now| now.as_secs())
+        .map_err(|_| ComputeError::Configuration("system clock precedes Unix epoch".into()))
+}
+
+fn parse_creation_time(value: &str) -> Result<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|value| value.with_timezone(&chrono::Utc))
+        .map_err(|_| ComputeError::Configuration("invalid deployment creation identity".into()))
+}
+
+fn deleted_operation(resource: &str) -> ComputeOperation {
+    ComputeOperation {
+        provider: DRIVER_ID.into(),
+        id: resource.into(),
+        state: OperationState::Succeeded,
+        target_id: Some(resource.into()),
+        error: None,
+        metadata: json!({"alreadyAbsent": true}),
     }
 }
 
@@ -1406,6 +1771,10 @@ fn json_provider_error(status: StatusCode, value: &Value) -> ComputeError {
 }
 
 #[cfg(test)]
+#[path = "google_policy_tests.rs"]
+mod policy_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use axum::Router;
@@ -1435,6 +1804,7 @@ mod tests {
                             "functions": [
                                 {
                                     "name": "projects/project/locations/us-central1/functions/gcf-0123456789abcdef-weather",
+                                    "createTime": "2025-01-01T00:00:00Z",
                                     "labels": { "managed-by": "mcp-compute", "pay-channel": lease_key }
                                 },
                                 {
@@ -1448,7 +1818,8 @@ mod tests {
                         StatusCode::OK,
                         json!({
                             "name": "projects/project/locations/us-central1/functions/gcf-0123456789abcdef-weather",
-                            "labels": { "pay-tenant": "0123456789abcdef" }
+                            "createTime": "2025-01-01T00:00:00Z",
+                            "labels": { "managed-by": "mcp-compute", "pay-tenant": "0123456789abcdef", "pay-channel": lease_key }
                         }),
                     ),
                     ("DELETE", "/v2/projects/project/locations/us-central1/functions/gcf-0123456789abcdef-weather") => json_response(
@@ -1473,6 +1844,7 @@ mod tests {
             function_service_account: None,
             build_service_account: None,
             gateway_domain: "cpu.example.invalid".into(),
+            payment_policy_database: None,
         })
         .unwrap();
 

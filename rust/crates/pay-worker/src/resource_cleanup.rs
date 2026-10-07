@@ -29,6 +29,58 @@ pub struct CleanupSummary {
 }
 
 impl ResourceCleaner {
+    /// The isolated orphan job deliberately supports only compute drivers and
+    /// loads no financial, wallet, data, or trigger runtime.
+    pub fn for_reconciliation() -> Result<Self, JobError> {
+        let configured = std::env::var("PAY_RESOURCE_CLEANUP_DRIVERS")
+            .map_err(|_| JobError::Config("PAY_RESOURCE_CLEANUP_DRIVERS is required".into()))?;
+        let mut cleaner = Self::default();
+        for driver in configured
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if driver != COMPUTE_DRIVER {
+                return Err(JobError::Config(format!(
+                    "unsupported orphan reconciliation driver: {driver}"
+                )));
+            }
+            let config =
+                GoogleConfig::from_env().map_err(|error| JobError::Config(error.to_string()))?;
+            cleaner.compute.push(Arc::new(
+                GoogleCloudFunctionsDriver::new(config)
+                    .map_err(|error| JobError::Config(error.to_string()))?,
+            ));
+        }
+        if cleaner.compute.is_empty() {
+            return Err(JobError::Config(
+                "at least one reconciliation driver is required".into(),
+            ));
+        }
+        Ok(cleaner)
+    }
+
+    /// Failures are isolated from settlement by the separate scheduled job.
+    pub async fn reconcile_orphans(&self, dry_run: bool) -> Result<usize, JobError> {
+        let mut candidates = 0;
+        let mut first_error = None;
+        for driver in &self.compute {
+            match driver.reconcile_orphans(dry_run).await {
+                Ok(count) => candidates += count,
+                Err(error) => {
+                    tracing::error!(driver = driver.id(), %error, dry_run, "resource reconciliation failed");
+                    first_error.get_or_insert_with(|| {
+                        JobError::Config(format!("compute reconciliation: {error}"))
+                    });
+                }
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(candidates),
+        }
+    }
+
     /// Build exactly the configured provider drivers. An unknown or
     /// misconfigured driver aborts startup so production cannot silently leak
     /// resources after a channel becomes unusable.

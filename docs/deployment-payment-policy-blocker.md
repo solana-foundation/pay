@@ -88,6 +88,37 @@ Bound ownership records are retained; bound rent reclamation is not implemented.
 Missing ownership blocks fleet orphan cleanup. See the
 [worker operations guidance](../rust/crates/pay-worker/README.md).
 
+## Policy document cleanup
+
+With `COMPUTE_PAYMENT_POLICY_DATABASE` configured, the Google compute driver
+retires the matching policy before requesting function deletion. Both explicit
+deletion and channel resource garbage collection use this path; the MCP wrapper
+does not implement a separate Firestore cleanup rule.
+
+Retirement is permanent for that deployment incarnation. Even when no policy
+exists yet, the driver writes an identity-only fence so a concurrent first
+policy creation cannot race past deletion. Firestore mutations use update-time
+preconditions. Provider failures leave retirement intact; an accepted asynchronous
+delete or `DELETING` state does not establish that the function is gone.
+
+The independent `reconcile-resources` worker calls the driver's orphan hook.
+Verified provider absence or a verified newer incarnation starts seven-day
+retention. Reclamation rechecks provider state and conditionally deletes the
+old policy document. It does not remove Redis payout snapshots or wallets.
+
+Each pass processes at most 100 documents in ten-document pages, with a
+120-second soft budget, per-record deadlines, and bounded metadata-token
+retrieval. A separate Firestore checkpoint preserves pagination across runs.
+Bad rows are reported without starving later rows. Dry-run performs no writes,
+including checkpoint writes. Explicit deletion retries after provider absence
+succeed; the independent sweep completes orphan metadata cleanup.
+
+Policy reconciliation is scoped to the configured project, policy region, and
+gateway domain. Nondefault-region legacy function deletion is still supported.
+Google Functions DELETE has no atomic incarnation precondition: revalidation
+protects against changes observed after listing, but cannot eliminate an
+out-of-band recreation race between the final provider read and delete.
+
 ## External validation workload
 
 The SEC summarizer is a disposable end-to-end use case, not repository product

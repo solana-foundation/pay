@@ -4,6 +4,7 @@ pub mod binding;
 pub mod driver;
 pub mod google;
 pub mod payment_policy;
+mod payment_repository;
 pub mod payment_service;
 pub mod server;
 pub mod trigger_driver;

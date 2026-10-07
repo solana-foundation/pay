@@ -16,6 +16,8 @@ pub enum ComputeError {
     InvalidRequest(String),
     #[error("provider `{0}` is not configured")]
     ProviderNotFound(String),
+    #[error("compute resource was not found")]
+    ResourceNotFound,
     #[error("configuration error: {0}")]
     Configuration(String),
     #[error("provider request failed: {0}")]
@@ -43,6 +45,11 @@ pub trait ComputeDriver: Send + Sync {
     /// Delete all provider resources funded by `channel_id`. This must be
     /// idempotent because the lifecycle worker retries until it succeeds.
     async fn cleanup_channel(&self, channel_id: &str) -> Result<usize>;
+    /// Reconcile bounded provider-owned metadata independently of channel GC.
+    /// Dry runs validate and report candidates without any writes.
+    async fn reconcile_orphans(&self, _dry_run: bool) -> Result<usize> {
+        Ok(0)
+    }
 }
 
 #[derive(Clone, Default)]

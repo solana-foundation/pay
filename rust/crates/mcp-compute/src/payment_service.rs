@@ -6,23 +6,22 @@ use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router, routing::get};
-use reqwest::Method;
 use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
+use serde_json::json;
 
 use crate::driver::{ComputeError, Result};
 use crate::google::GoogleCloudFunctionsDriver;
 use crate::payment_policy::{
     Allocation, DeploymentIdentity, OwnedWallet, PaymentPolicy, PaymentPolicySpec, revision,
 };
+use crate::payment_repository::{PolicyRepository, StoredPolicy};
 use crate::types::Tenant;
 
 #[derive(Clone)]
 pub struct PaymentService {
     google: GoogleCloudFunctionsDriver,
-    documents_url: String,
+    repository: PolicyRepository,
     wallet_url: String,
     wallet_proof: String,
     client: reqwest::Client,
@@ -60,27 +59,22 @@ pub struct ResolvedPaymentPolicy {
     pub allocations: Vec<Allocation>,
 }
 
-struct StoredPolicy {
-    policy: PaymentPolicy,
-    update_time: String,
-}
-
 impl PaymentService {
-    pub fn from_env(google: GoogleCloudFunctionsDriver) -> Result<Option<Self>> {
-        let database = match std::env::var("COMPUTE_PAYMENT_POLICY_DATABASE") {
-            Ok(value) => value,
-            Err(std::env::VarError::NotPresent) => return Ok(None),
-            Err(_) => return Err(configuration("invalid payment policy database")),
-        };
-        if database.is_empty()
-            || !database
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        {
-            return Err(configuration(
-                "COMPUTE_PAYMENT_POLICY_DATABASE must name an explicit database",
-            ));
+    #[cfg(test)]
+    pub(crate) fn for_test(google: GoogleCloudFunctionsDriver, wallet_url: String) -> Self {
+        Self {
+            repository: google.policy_repository().unwrap().clone(),
+            google,
+            wallet_url,
+            wallet_proof: "fixture-wallet-proof".into(),
+            client: reqwest::Client::new(),
         }
+    }
+
+    pub fn from_env(google: GoogleCloudFunctionsDriver) -> Result<Option<Self>> {
+        let Some(repository) = google.policy_repository().cloned() else {
+            return Ok(None);
+        };
         let wallet_url = std::env::var("COMPUTE_WALLET_SERVICE_URL")
             .map_err(|_| configuration("COMPUTE_WALLET_SERVICE_URL is required"))?;
         let url = url::Url::parse(&wallet_url)
@@ -103,10 +97,7 @@ impl PaymentService {
             ));
         }
         Ok(Some(Self {
-            documents_url: format!(
-                "https://firestore.googleapis.com/v1/projects/{}/databases/{database}/documents/pay_compute_payment_policies",
-                google.project()
-            ),
+            repository,
             google,
             wallet_url: wallet_url.trim_end_matches('/').into(),
             wallet_proof,
@@ -117,45 +108,10 @@ impl PaymentService {
         }))
     }
 
-    fn document_url(&self, deployment: &DeploymentIdentity) -> String {
-        // The full canonical resource and owner participate; no caller-controlled
-        // path is concatenated into the Firestore document name.
-        let key = Sha256::digest(format!(
-            "{}\0{}\0{}",
-            deployment.owner_key, deployment.resource_name, deployment.created_at
-        ));
-        let key: String = key.iter().map(|byte| format!("{byte:02x}")).collect();
-        format!("{}/{key}", self.documents_url)
-    }
-
     async fn load(&self, deployment: &DeploymentIdentity) -> Result<Option<StoredPolicy>> {
-        let response = self
-            .client
-            .get(self.document_url(deployment))
-            .bearer_auth(self.google.access_token().await?)
-            .send()
-            .await?;
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        if !response.status().is_success() {
-            return Err(ComputeError::Provider(
-                "payment policy storage unavailable".into(),
-            ));
-        }
-        let value: Value = response.json().await?;
-        let policy = value
-            .pointer("/fields/policy/stringValue")
-            .and_then(Value::as_str)
-            .ok_or_else(|| configuration("stored payment policy is invalid"))?;
-        let update_time = value
-            .get("updateTime")
-            .and_then(Value::as_str)
-            .ok_or_else(|| configuration("stored policy revision is missing"))?;
-        Ok(Some(StoredPolicy {
-            policy: serde_json::from_str(policy)?,
-            update_time: update_time.into(),
-        }))
+        self.repository
+            .load(&self.google.access_token().await?, deployment)
+            .await
     }
 
     async fn wallets(
@@ -193,12 +149,9 @@ impl PaymentService {
         let stored = self.load(&deployment).await?.ok_or_else(|| {
             ComputeError::InvalidRequest("deployment has no payment policy".into())
         })?;
-        if stored.policy.deployment != deployment {
-            return Err(ComputeError::InvalidRequest(
-                "payment policy deployment identity changed".into(),
-            ));
-        }
-        Ok(stored.policy)
+        stored.policy.ok_or_else(|| {
+            ComputeError::InvalidRequest("deployment payment policy is retired".into())
+        })
     }
 
     pub async fn set(
@@ -213,8 +166,13 @@ impl PaymentService {
         require_owner(tenant, &deployment)?;
         request.policy.validate(now()?)?;
         let stored = self.load(&deployment).await?;
+        if stored.as_ref().is_some_and(|stored| stored.retired) {
+            return Err(ComputeError::InvalidRequest(
+                "deployment payment policy is permanently retired".into(),
+            ));
+        }
         let next = revision(
-            stored.as_ref().map(|value| &value.policy),
+            stored.as_ref().and_then(|value| value.policy.as_ref()),
             deployment.clone(),
             request.policy,
             request.expected_version,
@@ -222,43 +180,25 @@ impl PaymentService {
         )?;
         let wallets = self.wallets(&deployment, &next.spec).await?;
         next.resolve(&deployment, &wallets, now()?)?;
-        if stored.as_ref().is_some_and(|stored| stored.policy == next) {
+        if stored
+            .as_ref()
+            .is_some_and(|stored| stored.policy.as_ref() == Some(&next))
+        {
             return Ok(next);
         }
-        let mut outgoing = self
-            .client
-            .request(Method::PATCH, self.document_url(&deployment))
-            .bearer_auth(self.google.access_token().await?);
-        outgoing = match stored {
-            Some(stored) => outgoing.query(&[("currentDocument.updateTime", stored.update_time)]),
-            None => outgoing.query(&[("currentDocument.exists", "false")]),
-        };
-        let response = outgoing
-            .json(&json!({"fields": {"policy": {"stringValue": serde_json::to_string(&next)?}}}))
-            .send()
+        self.repository
+            .write(
+                &self.google.access_token().await?,
+                stored.as_ref(),
+                &StoredPolicy {
+                    deployment,
+                    policy: Some(next.clone()),
+                    retired: false,
+                    absent_since: None,
+                    update_time: String::new(),
+                },
+            )
             .await?;
-        if !response.status().is_success() {
-            let status = response.status();
-            // Firestore reports stale updateTime preconditions as HTTP 400.
-            // Only inspect the structured status; upstream messages may be sensitive.
-            let error = response.json::<Value>().await.ok();
-            let google_status = error
-                .as_ref()
-                .and_then(|value| value.pointer("/error/status"))
-                .and_then(Value::as_str);
-            if matches!(
-                status,
-                reqwest::StatusCode::CONFLICT | reqwest::StatusCode::PRECONDITION_FAILED
-            ) || matches!(
-                google_status,
-                Some("FAILED_PRECONDITION" | "ABORTED" | "ALREADY_EXISTS")
-            ) {
-                return Err(ComputeError::InvalidRequest(
-                    "payment policy version conflict; retry with current version".into(),
-                ));
-            }
-            return Err(ComputeError::Provider("payment policy write failed".into()));
-        }
         Ok(next)
     }
 
@@ -275,38 +215,28 @@ impl PaymentService {
         let Some(stored) = self.load(&deployment).await? else {
             return Ok(None);
         };
-        if stored.policy.deployment != deployment {
-            return Err(ComputeError::InvalidRequest(
-                "payment policy deployment identity changed".into(),
-            ));
+        let Some(policy) = &stored.policy else {
+            return Ok(None);
+        };
+        if policy.deleted {
+            return Ok(Some(policy.clone()));
         }
-        if stored.policy.deleted {
-            return Ok(Some(stored.policy));
-        }
-        if stored.policy.version != request.expected_version {
+        if policy.version != request.expected_version {
             return Err(ComputeError::InvalidRequest(
                 "payment policy version conflict".into(),
             ));
         }
-        let mut deleted = stored.policy;
+        let mut deleted = policy.clone();
         deleted.deleted = true;
         deleted.version = deleted
             .version
             .checked_add(1)
             .ok_or_else(|| configuration("payment policy version exhausted"))?;
-        let response = self
-            .client
-            .patch(self.document_url(&deployment))
-            .bearer_auth(self.google.access_token().await?)
-            .query(&[("currentDocument.updateTime", stored.update_time)])
-            .json(&json!({"fields": {"policy": {"stringValue": serde_json::to_string(&deleted)?}}}))
-            .send()
+        let mut next = stored.clone();
+        next.policy = Some(deleted.clone());
+        self.repository
+            .write(&self.google.access_token().await?, Some(&stored), &next)
             .await?;
-        if !response.status().is_success() {
-            return Err(ComputeError::Provider(
-                "payment policy delete failed or conflicted".into(),
-            ));
-        }
         Ok(Some(deleted))
     }
 
@@ -315,20 +245,23 @@ impl PaymentService {
         let stored = self.load(&deployment).await?.ok_or_else(|| {
             ComputeError::InvalidRequest("deployment has no payment policy".into())
         })?;
-        if stored.policy.deleted {
+        let policy = stored.policy.ok_or_else(|| {
+            ComputeError::InvalidRequest("deployment payment policy is retired".into())
+        })?;
+        if policy.deleted || stored.retired {
             return Err(ComputeError::InvalidRequest(
                 "payment policy was deleted".into(),
             ));
         }
-        stored.policy.spec.validate(now()?)?;
-        let wallets = self.wallets(&deployment, &stored.policy.spec).await?;
-        let allocations = stored.policy.resolve(&deployment, &wallets, now()?)?;
+        policy.spec.validate(now()?)?;
+        let wallets = self.wallets(&deployment, &policy.spec).await?;
+        let allocations = policy.resolve(&deployment, &wallets, now()?)?;
         Ok(ResolvedPaymentPolicy {
             deployment,
-            version: stored.policy.version,
-            price_micro_usd: stored.policy.spec.price_micro_usd,
-            expires_at: stored.policy.spec.expires_at,
-            schemes: stored.policy.spec.schemes,
+            version: policy.version,
+            price_micro_usd: policy.spec.price_micro_usd,
+            expires_at: policy.spec.expires_at,
+            schemes: policy.spec.schemes,
             allocations,
         })
     }
@@ -386,6 +319,8 @@ mod tests {
     use super::*;
     use crate::google::GoogleConfig;
     use axum::extract::Request;
+    use reqwest::Method;
+    use serde_json::Value;
     use std::sync::{Arc, Mutex};
 
     #[tokio::test]
@@ -464,11 +399,12 @@ mod tests {
             function_service_account: None,
             build_service_account: None,
             gateway_domain: "compute.example".into(),
+            payment_policy_database: None,
         })
         .unwrap();
         let service = PaymentService {
             google,
-            documents_url: format!("{base}/policies"),
+            repository: PolicyRepository::new(format!("{base}/policies")).unwrap(),
             wallet_url: base,
             wallet_proof: "test-wallet-resolver-proof-32-bytes".into(),
             client: reqwest::Client::new(),
@@ -562,7 +498,7 @@ mod tests {
                     if message == "payment policy version conflict; retry with current version"));
             } else {
                 assert!(matches!(error, ComputeError::Provider(ref message)
-                    if message == "payment policy write failed"));
+                    if message == "payment policy storage unavailable"));
             }
             assert!(patch_error.lock().unwrap().is_none());
             assert_eq!(service.get(&tenant, &hostname).await.unwrap(), first);

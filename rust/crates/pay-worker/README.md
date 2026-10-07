@@ -213,6 +213,40 @@ cargo test -p pay-worker --bin settle-sessions \
 It exercises concurrent request reservation and close claims, lease renewal,
 external-job contention, and takeover after expiry against Redis's real CAS.
 
+### Provider metadata reconciliation
+
+`reconcile-resources` is a separate one-shot command. It constructs only the
+selected provider drivers; it does not initialize Redis, chain RPC, a signer,
+wallet resolution, or the financial settlement runtime.
+
+For Google policy cleanup, configure:
+
+| Environment | Requirement |
+| --- | --- |
+| `PAY_RESOURCE_CLEANUP_DRIVERS` | `google-cloud-functions` |
+| `COMPUTE_GOOGLE_PROJECT` | Project containing the managed functions |
+| `COMPUTE_GOOGLE_REGION` | Policy region; must match the compute service |
+| `COMPUTE_GATEWAY_DOMAIN` | Gateway domain; must match the stored policy identities |
+| `COMPUTE_PAYMENT_POLICY_DATABASE` | Explicit named Firestore database, never `(default)` |
+| `DRY_RUN` | Defaults to `true`; only exact `false` enables mutation |
+
+The driver's ordinary deletion path retires policies before requesting provider
+deletion. The orphan hook handles out-of-band deletion and interrupted cleanup.
+It retains tombstones for seven days after verified absence or replacement,
+then rechecks provider state and uses Firestore CAS for physical reclamation.
+Provider errors are not absence evidence. Existing bound Redis records remain
+under the financial retention rules above.
+
+The bounded sweep stores progress in `pay_compute_policy_reconciliation`, separate
+from `pay_compute_payment_policies`. Dry runs write neither collection. Failed
+records are logged and produce a failed job for retry, while progress through
+other records is preserved.
+
+The gateway infrastructure provides an independently enabled ten-minute schedule
+with a dedicated service account. Manual executions remain dry-run by default.
+Only provider lookup and named-database credentials are needed; do not supply
+wallet proofs, Redis URLs, KMS keys, or chain RPC secrets to this job.
+
 ### Distribution preimage recovery
 
 `distribute` needs the full distribution plan (`count || entries`), but only its
