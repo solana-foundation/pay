@@ -318,6 +318,9 @@ pub struct ChannelsConfig {
     pub realm: String,
     #[serde(default)]
     pub mpp_challenge_binding_secret: Option<String>,
+    /// Lamports the USD charge reimburses, and the ceiling on the total fee
+    /// (signature fees plus any caller-set priority fee) the sponsor will
+    /// co-sign. The default covers two signatures with no priority fee.
     #[serde(default = "default_cancel_estimated_fee_lamports")]
     pub estimated_fee_lamports: u64,
     #[serde(default = "default_sol_price_asset")]
