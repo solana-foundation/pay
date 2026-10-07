@@ -18,7 +18,7 @@
     "@solana/mpp": "^0.5.2",
     "cors": "^2.8.6",
     "express": "^4.22.2",
-    "mppx": "^0.5.17",
+    "mppx": "^0.8.19",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "x402": "^1.2.0",
@@ -35,7 +35,19 @@
     "tsx": "^4.23.13",
     "typescript": "^5.9.3",
     "vite": "^6.4.3",
-    "vitest": "^3.2.7"
+    "vitest": "^4.1.11"
+  },
+  "pnpm": {
+    "overrides": {
+      "@modelcontextprotocol/sdk@<1.31.0": "^1.31.0",
+      "@walletconnect/ethereum-provider": "2.25.0",
+      "axios@<1.18.0": "^1.18.0",
+      "fast-uri@3.1.6": "^3.1.7",
+      "qs@<6.16.0": "^6.16.0",
+      "shell-quote@<1.11.0": "^1.11.0",
+      "uuid@<11.1.1": "^11.1.1",
+      "ws@>=8.0.0 <8.21.0": "^8.21.0"
+    }
   },
   "packageManager": "pnpm@9.15.0"
 }

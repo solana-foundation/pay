@@ -62,8 +62,10 @@ Set these in your Vercel project settings (all optional):
 | `RECIPIENT` | Solana address to receive payments (defaults to fee payer) |
 | `FEE_PAYER_KEY` | Base58-encoded keypair (generates ephemeral if unset) |
 | `RPC_URL` | Surfnet RPC (defaults to `https://402.surfnet.dev:8899`) |
-| `SECRET_KEY` | MPP secret key (defaults to `demo-secret-key`) |
+| `SECRET_KEY` | MPP signing secret, at least 32 bytes (defaults to a random key per process) |
 | `NETWORK` | Solana network (defaults to `localnet`) |
+
+Set a stable `SECRET_KEY` in your deployment's secret configuration so payment challenges remain valid across restarts and multiple instances. Generate one with `openssl rand -base64 32`; do not commit it.
 
 ## Endpoints
 

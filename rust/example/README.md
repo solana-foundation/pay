@@ -64,9 +64,11 @@ curl http://localhost:3402/health
 | `RPC_URL` | `https://402.surfnet.dev:8899` | Surfpool RPC endpoint |
 | `PORT` | `3402` | Server port |
 | `NETWORK` | `localnet` | Solana network |
-| `SECRET_KEY` | `test-secret-key-for-dev` | MPP secret key |
+| `SECRET_KEY` | *(random per process)* | MPP signing secret, at least 32 bytes |
 | `FEE_PAYER_KEY` | *(generated)* | Base58 keypair for fee payer |
 | `RECIPIENT` | *(fee payer)* | Payment recipient address |
+
+Set a stable `SECRET_KEY` in your deployment's secret configuration so payment challenges remain valid across restarts and multiple instances. Generate one with `openssl rand -base64 32`; do not commit it.
 
 ## How it works
 

@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import express from "express";
 import cors from "cors";
 import {
@@ -13,7 +14,8 @@ import type { SSEMessage } from "./types.js";
 const RPC_URL = process.env.RPC_URL || "https://402.surfnet.dev:8899";
 const NETWORK = process.env.NETWORK || "localnet";
 const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-const SECRET_KEY = process.env.SECRET_KEY || "demo-secret-key";
+// Set SECRET_KEY to share challenges across restarts or multiple instances.
+const SECRET_KEY = process.env.SECRET_KEY ?? randomBytes(32).toString("hex");
 
 // ── Correlation engine ──
 const correlation = new FlowCorrelation();

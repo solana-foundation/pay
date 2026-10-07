@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto'
 import express from 'express'
 import cors from 'cors'
 import { generateKeyPairSigner, createKeyPairSignerFromBytes, getBase58Codec } from '@solana/kit'
@@ -7,7 +8,8 @@ import { paymentMiddleware } from 'x402-express'
 const PORT = Number(process.env.PORT || 3402)
 const NETWORK = process.env.NETWORK || 'localnet'
 const RPC_URL = process.env.RPC_URL || 'https://402.surfnet.dev:8899'
-const SECRET_KEY = process.env.SECRET_KEY || 'test-secret-key-for-dev'
+// Set SECRET_KEY to share challenges across restarts or multiple instances.
+const SECRET_KEY = process.env.SECRET_KEY ?? randomBytes(32).toString('hex')
 
 // USDC mint (same address used on localnet via surfpool)
 const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
