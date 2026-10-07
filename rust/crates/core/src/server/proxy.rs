@@ -52,6 +52,7 @@ pub const STRIP_HEADERS: &[&str] = &[
     "x-pay-verified-payer",
     "x-pay-verified-channel",
     "x-pay-original-host",
+    "x-pay-gateway-host",
     "x-pay-wallet-resolver-proof",
     "x-pay-payment-policy",
     "x-pay-payment-policy-version",
