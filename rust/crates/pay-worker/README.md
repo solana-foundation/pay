@@ -156,9 +156,9 @@ the durable Redis store.
 ### Deployment-bound sessions (rollout guarded)
 
 The workspace pins the coordinated pay-kit binding/recovery APIs at
-`1181a247cc35ba356c7af509c501413c0aee3c57`. Locked tests use that published Git
-revision without local overrides. Production enablement remains guarded;
-local tests are not evidence of deployed settlement.
+`4c29fba423d94dbb088147ba47533d54034812bb`, the merged pay-kit `main` commit.
+Locked tests use that revision without local overrides. Production enablement
+remains guarded; local tests are not evidence of deployed settlement.
 
 The worker restores `SessionConfigSnapshot` from each durable binding and
 checks its ordered payout against the immutable deployment policy. It does
