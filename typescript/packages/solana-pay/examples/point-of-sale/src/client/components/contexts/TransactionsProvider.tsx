@@ -1,6 +1,6 @@
 import { findAssociatedTokenPda, TOKEN_PROGRAM_ADDRESS } from '@solana-program/token';
 import type { Address, Signature } from '@solana/kit';
-import { createSolanaRpc } from '@solana/kit';
+import { createSolanaRpc, MAX_SUPPORTED_TRANSACTION_VERSION } from '@solana/kit';
 import React, { FC, ReactNode, useEffect, useMemo, useState } from 'react';
 import { useConfig } from '../../hooks/useConfig';
 import { Transaction, TransactionsContext, TransactionConfirmationStatus } from '../../hooks/useTransactions';
@@ -112,7 +112,12 @@ export const TransactionsProvider: FC<TransactionsProviderProps> = ({ children, 
                 const [parsedTransactions, signatureStatuses] = await Promise.all([
                     Promise.all(
                         signatures.map((sig) =>
-                            rpc.getTransaction(sig, { maxSupportedTransactionVersion: 0, encoding: 'jsonParsed' }).send()
+                            rpc
+                                .getTransaction(sig, {
+                                    maxSupportedTransactionVersion: MAX_SUPPORTED_TRANSACTION_VERSION,
+                                    encoding: 'jsonParsed',
+                                })
+                                .send()
                         )
                     ),
                     rpc.getSignatureStatuses(signatures, { searchTransactionHistory: true }).send(),
