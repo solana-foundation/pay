@@ -79,6 +79,8 @@ pub struct PendingAuthorization {
     pub state: Option<String>,
     pub code_challenge: String,
     pub scope: String,
+    /// Display-only endpoint context, bound to this pending request.
+    pub resource_uri: Option<String>,
     created_at: Instant,
 }
 
@@ -648,6 +650,8 @@ pub struct AuthorizeQuery {
     /// RFC 8707; when present it must be our `/mcp`.
     #[serde(default)]
     pub resource: Option<String>,
+    #[serde(default)]
+    pub resource_uri: Option<String>,
 }
 
 /// Send the browser back to the client with an OAuth error (RFC 6749 §4.1.2.1).
@@ -743,6 +747,9 @@ pub async fn authorize(
     {
         return fail("invalid_target", "resource must be this server's /mcp.");
     }
+    if let Some(resource_uri) = &q.resource_uri {
+        crate::resource_context::validate(resource_uri)?;
+    }
 
     let request = PendingAuthorization {
         id: random_token(),
@@ -751,6 +758,7 @@ pub async fn authorize(
         state: state_param.map(str::to_string),
         code_challenge: code_challenge.to_string(),
         scope: SCOPE.to_string(),
+        resource_uri: q.resource_uri,
         created_at: Instant::now(),
     };
     let id = request.id.clone();
@@ -764,6 +772,8 @@ pub struct PendingView {
     pub client_name: String,
     pub redirect_host: String,
     pub scope: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_uri: Option<String>,
     /// Whether this browser already has a wallet to approve with. When
     /// not, the page offers `providers` to create one.
     pub has_wallet: bool,
@@ -828,6 +838,7 @@ pub async fn pending_view(
             .unwrap_or_else(|| crate::hosts::by_id(client.host).display_name.to_string()),
         redirect_host,
         scope: request.scope,
+        resource_uri: request.resource_uri,
         has_wallet: wallet.is_some(),
         wallet_address: wallet.map(|w| w.pubkey.clone()),
         providers: Vec::new(),
@@ -1438,6 +1449,7 @@ mod tests {
             state: Some("st4te".to_string()),
             code_challenge: pkce_challenge(VERIFIER),
             scope: SCOPE.to_string(),
+            resource_uri: None,
             created_at: Instant::now(),
         }
     }
@@ -2005,6 +2017,71 @@ mod tests {
         assert_eq!(location.origin().ascii_serialization(), "https://pay.test");
         assert_eq!(location.path(), "/connect");
         assert!(reply.query("request").is_some());
+    }
+
+    #[tokio::test]
+    async fn resource_context_is_bound_to_pending_consent_only() {
+        let app = app();
+        let client_id = register_grok(&app).await;
+        let resource = "http://localhost:8080/paid?x=one%2Ftwo&x=a+b";
+        let reply = get(
+            &app,
+            &authorize_path(&client_id, &[("resource_uri", resource)]),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
+        assert!(reply.query("resource_uri").is_none());
+        let id = reply.query("request").unwrap();
+        for _ in 0..2 {
+            let view = get(&app, &format!("/api/oauth/authorize/{id}")).await;
+            assert_eq!(view.json()["resource_uri"], resource);
+            assert_eq!(view.json()["scope"], "mcp");
+        }
+        let approved = post_json(
+            &app,
+            &format!("/api/oauth/authorize/{id}/approve"),
+            json!({"guest": true}),
+        )
+        .await;
+        let json = approved.json();
+        let callback = Url::parse(json["redirect"].as_str().unwrap()).unwrap();
+        assert!(callback.query_pairs().all(|(key, _)| key != "resource_uri"));
+        assert!(callback.query_pairs().any(|(key, _)| key == "code"));
+        let old = start_authorization(&app, &client_id, None).await;
+        let view = get(&app, &format!("/api/oauth/authorize/{old}")).await;
+        assert!(view.json().get("resource_uri").is_none());
+        for pairs in [
+            vec![("resource_uri", "javascript:alert(1)")],
+            vec![("resource_uri", resource), ("resource_uri", resource)],
+        ] {
+            let reply = get(&app, &authorize_path(&client_id, &pairs)).await;
+            assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+            assert!(!reply.headers.contains_key(header::LOCATION));
+        }
+        let valid = authorize_path(&client_id, &[("resource_uri", resource)]);
+        let no_pkce = valid.replace(
+            &format!("code_challenge={}", pkce_challenge(VERIFIER)),
+            "code_challenge=",
+        );
+        let reply = get(&app, &no_pkce).await;
+        assert_eq!(reply.query("error").as_deref(), Some("invalid_request"));
+        assert!(reply.query("resource_uri").is_none());
+        let foreign = valid.replace(
+            &url::form_urlencoded::byte_serialize(GROK_REDIRECT.as_bytes()).collect::<String>(),
+            "https%3A%2F%2Fevil.test%2Fcb",
+        );
+        let reply = get(&app, &foreign).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+        assert!(!reply.headers.contains_key(header::LOCATION));
+        let reply = get(
+            &app,
+            &authorize_path(
+                &client_id,
+                &[("resource_uri", resource), ("resource", resource)],
+            ),
+        )
+        .await;
+        assert_eq!(reply.query("error").as_deref(), Some("invalid_target"));
     }
 
     #[tokio::test]

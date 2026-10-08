@@ -32,6 +32,8 @@ pub mod oauth;
 #[cfg(feature = "privy")]
 pub mod privy;
 pub mod protocol;
+#[cfg(feature = "mcp")]
+mod resource_context;
 #[cfg(feature = "sell")]
 pub mod sell;
 #[cfg(feature = "mcp")]
@@ -368,6 +370,7 @@ pub fn router(state: AppState) -> Router {
             mcp::Auth {
                 cfg,
                 oauth: state.oauth.clone(),
+                pages_url: Some(state.pages_url().to_string()),
             },
             Arc::new(
                 tenants::CloudContext::new(state.tenants.clone())
@@ -383,6 +386,7 @@ pub fn router(state: AppState) -> Router {
             mcp: state.mcp.clone().map(|cfg| mcp::Auth {
                 cfg,
                 oauth: state.oauth.clone(),
+                pages_url: Some(state.pages_url().to_string()),
             }),
         });
         Arc::new(sell::SellState::new(

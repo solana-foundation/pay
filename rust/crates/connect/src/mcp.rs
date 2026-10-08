@@ -171,6 +171,7 @@ impl Config {
 pub struct Auth {
     pub cfg: Arc<Config>,
     pub oauth: Option<Arc<crate::oauth::Store>>,
+    pub pages_url: Option<String>,
 }
 
 impl Auth {
@@ -242,6 +243,38 @@ async fn require_bearer(State(auth): State<Auth>, mut req: Request, next: Next) 
             next.run(req).await
         }
         None => {
+            if req.method() == axum::http::Method::GET
+                && req.uri().path() == PATH
+                && !req.headers().contains_key(header::AUTHORIZATION)
+                && browser_navigation(req.headers())
+            {
+                match crate::resource_context::from_query(req.uri().query()) {
+                    Ok(Some(resource)) => {
+                        if let Some(pages) = &auth.pages_url {
+                            let Ok(mut url) = url::Url::parse(pages) else {
+                                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                            };
+                            url.set_path("/connect");
+                            url.set_query(None);
+                            url.set_fragment(None);
+                            url.query_pairs_mut().append_pair("resource_uri", &resource);
+                            let mut response =
+                                axum::response::Redirect::to(url.as_str()).into_response();
+                            response.headers_mut().insert(
+                                header::CACHE_CONTROL,
+                                HeaderValue::from_static("no-store"),
+                            );
+                            response.headers_mut().insert(
+                                header::REFERRER_POLICY,
+                                HeaderValue::from_static("no-referrer"),
+                            );
+                            return response;
+                        }
+                    }
+                    Err(error) => return error.into_response(),
+                    Ok(None) => {}
+                }
+            }
             // The scheme, never the value: enough to tell "no header" from
             // "wrong shape" from "unknown token" when a host cannot connect.
             let shape = match raw {
@@ -255,6 +288,22 @@ async fn require_bearer(State(auth): State<Auth>, mut req: Request, next: Next) 
             unauthorized(&auth.cfg)
         }
     }
+}
+
+fn browser_navigation(headers: &axum::http::HeaderMap) -> bool {
+    if let Some(mode) = headers.get("sec-fetch-mode") {
+        return mode == "navigate";
+    }
+    headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value.split(',').any(|part| {
+                part.split(';')
+                    .next()
+                    .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/html"))
+            })
+        })
 }
 
 fn unauthorized(cfg: &Config) -> Response {
@@ -295,6 +344,142 @@ pub(crate) mod tests {
         app_with_tenants(Arc::default())
     }
 
+    #[tokio::test]
+    async fn browser_context_handoff_preserves_mcp_authentication() {
+        let app = crate::router(
+            crate::AppState::new("https://cloud.test")
+                .with_mcp(Config::new(
+                    "https://cloud.test",
+                    vec!["tok-alpha".to_string()],
+                ))
+                .with_pages_url("https://pay.test/"),
+        );
+        let resource = "HTTPS://Example.COM/paid?q=a%2Fb&x=two+words";
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("resource_uri", resource)
+            .finish();
+        for mode in [Some("navigate"), None] {
+            let mut request = axum::http::Request::builder()
+                .uri(format!("/mcp?{query}"))
+                .header(header::ACCEPT, "text/html");
+            if let Some(mode) = mode {
+                request = request.header("sec-fetch-mode", mode);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(axum::body::Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SEE_OTHER);
+            let url =
+                url::Url::parse(response.headers()[header::LOCATION].to_str().unwrap()).unwrap();
+            assert_eq!(url.origin().ascii_serialization(), "https://pay.test");
+            assert_eq!(url.path(), "/connect");
+            assert_eq!(
+                url.query_pairs().collect::<Vec<_>>(),
+                vec![("resource_uri".into(), resource.into())]
+            );
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            assert_eq!(response.headers()[header::REFERRER_POLICY], "no-referrer");
+        }
+        for (method, query, accept, mode, bearer, status) in [
+            ("GET", "", "text/html", None, None, StatusCode::UNAUTHORIZED),
+            (
+                "GET",
+                "resource_uri=javascript:bad",
+                "text/html",
+                None,
+                None,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "GET",
+                "resource_uri=https://a.test&resource_uri=https://a.test",
+                "text/html",
+                None,
+                None,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "GET",
+                query.as_str(),
+                "application/json",
+                None,
+                None,
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                "GET",
+                query.as_str(),
+                "text/html",
+                Some("cors"),
+                None,
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                "GET",
+                query.as_str(),
+                "text/html",
+                None,
+                Some("expired"),
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                "POST",
+                query.as_str(),
+                "text/html",
+                Some("navigate"),
+                None,
+                StatusCode::UNAUTHORIZED,
+            ),
+        ] {
+            let mut request = axum::http::Request::builder()
+                .method(method)
+                .uri(format!("/mcp?{query}"))
+                .header(header::ACCEPT, accept);
+            if let Some(mode) = mode {
+                request = request.header("sec-fetch-mode", mode);
+            }
+            if let Some(bearer) = bearer {
+                request = request.header(header::AUTHORIZATION, bearer);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(axum::body::Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            assert!(!response.headers().contains_key(header::LOCATION));
+            if status == StatusCode::UNAUTHORIZED {
+                assert!(response.headers().contains_key(header::WWW_AUTHENTICATE));
+            }
+        }
+        // Valid authentication bypasses even malformed advisory context.
+        let mut baseline = None;
+        for path in ["/mcp", "/mcp?resource_uri=javascript:bad"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(path)
+                        .header(header::HOST, "cloud.test")
+                        .header(header::AUTHORIZATION, "Bearer tok-alpha")
+                        .header(header::ACCEPT, "text/html")
+                        .header("sec-fetch-mode", "navigate")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(!response.headers().contains_key(header::LOCATION));
+            if let Some(status) = baseline {
+                assert_eq!(response.status(), status);
+            } else {
+                baseline = Some(response.status());
+            }
+        }
+    }
+
     pub(crate) fn app_with_tenants(tenants: Arc<crate::tenants::TenantRegistry>) -> Router {
         router(
             Auth {
@@ -303,6 +488,7 @@ pub(crate) mod tests {
                     vec!["tok-alpha".to_string(), "tok-beta".to_string()],
                 )),
                 oauth: None,
+                pages_url: Some("https://pay.test".to_string()),
             },
             Arc::new(crate::tenants::CloudContext::new(tenants)),
         )
@@ -418,6 +604,7 @@ pub(crate) mod tests {
             Auth {
                 cfg: Arc::new(cfg),
                 oauth: None,
+                pages_url: None,
             },
             Arc::new(crate::tenants::CloudContext::new(Arc::default())),
         );
