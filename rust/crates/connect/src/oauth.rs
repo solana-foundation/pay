@@ -408,7 +408,13 @@ impl Store {
                 "redirect_uri does not match the request",
             ));
         }
-        if !is_base64url_alphabet(code_verifier) || !(43..=128).contains(&code_verifier.len()) {
+        // RFC 7636 permits the URI-unreserved alphabet, not just base64url:
+        // SDKs may generate verifiers containing '.' or '~'.
+        if !(43..=128).contains(&code_verifier.len())
+            || !code_verifier
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~'))
+        {
             return Err(TokenError::invalid_grant("code_verifier is malformed"));
         }
         if crate::protocol::pkce_challenge(code_verifier) != grant.code_challenge {
@@ -1582,6 +1588,27 @@ mod tests {
         // A wrong verifier burned the code.
         let again = store.exchange_code(&client.client_id, &code, VERIFIER, Some(GROK_REDIRECT));
         assert_eq!(again.unwrap_err().error, "invalid_grant");
+    }
+
+    #[test]
+    fn exchange_accepts_the_full_rfc7636_verifier_alphabet() {
+        let store = Store::new("https://cloud.test");
+        let (client, _) = store.register(grok_registration()).unwrap();
+        // The Python MCP SDK generates 128-character verifiers from this
+        // alphabet, including '.' and '~'.
+        let verifier = format!("{}.~", "a".repeat(126));
+        let mut request = pending_for(&client);
+        request.code_challenge = pkce_challenge(&verifier);
+        store.create_pending(request.clone()).unwrap();
+        let (_, code) = store.approve(&request.id, "sub_1").unwrap();
+
+        let tokens = store
+            .exchange_code(&client.client_id, &code, &verifier, Some(GROK_REDIRECT))
+            .unwrap();
+        assert_eq!(
+            store.authenticate(&tokens.access_token).unwrap().id,
+            "sub_1"
+        );
     }
 
     #[test]
