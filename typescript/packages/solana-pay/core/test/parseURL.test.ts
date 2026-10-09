@@ -77,10 +77,21 @@ describe('parseURL', () => {
             expect(() => parseURL(url)).toThrow('recipient invalid');
         });
 
-        it.each([['1milliondollars'], [-0.1], [-100]])('throws an error on invalid amount: %p', amount => {
-            const url = `solana:mvines9iiHiQTysrwkJjGf2gb9Ex9jXJX8ns3qwf2kN?amount=${amount}`;
+        it.each([['1milliondollars'], [-0.1], [-100], ['+1'], ['1.0000000001']])(
+            'throws an error on invalid amount: %p',
+            amount => {
+                const url = `solana:mvines9iiHiQTysrwkJjGf2gb9Ex9jXJX8ns3qwf2kN?amount=${amount}`;
 
-            expect(() => parseURL(url)).toThrow('amount invalid');
+                expect(() => parseURL(url)).toThrow('amount invalid');
+            },
+        );
+
+        it('accepts a 10-decimal SPL amount (mint precision is checked later)', () => {
+            const recipient = 'mvines9iiHiQTysrwkJjGf2gb9Ex9jXJX8ns3qwf2kN';
+            const splToken = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+            const url = `solana:${recipient}?amount=0.0000000001&spl-token=${splToken}`;
+
+            expect(parseURL(url).amount).toBe(0.0000000001);
         });
 
         it('throws an error on invalid token', () => {
