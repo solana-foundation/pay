@@ -1,5 +1,6 @@
 {
   "framework": null,
+  "installCommand": "pnpm install --frozen-lockfile --force",
   "buildCommand": "pnpm run build",
   "outputDirectory": "dist",
   "rewrites": [

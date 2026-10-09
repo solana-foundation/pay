@@ -17,6 +17,8 @@ const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 // Set SECRET_KEY to share challenges across restarts or multiple instances.
 const SECRET_KEY = process.env.SECRET_KEY ?? randomBytes(32).toString("hex");
 
+type AbsoluteUrl = `${string}://${string}`;
+
 // ── Correlation engine ──
 const correlation = new FlowCorrelation();
 
@@ -417,8 +419,9 @@ async function createApp() {
   });
 
   // ── x402 endpoints ──
-  const facilitatorUrl =
-    process.env.FACILITATOR_URL || productionUrl() + "/facilitator";
+  const facilitatorUrl = parseAbsoluteUrl(
+    process.env.FACILITATOR_URL || productionUrl() + "/facilitator",
+  );
 
   const x402App = express.Router();
 
@@ -555,6 +558,14 @@ function productionUrl(): string {
   if (process.env.VERCEL_URL) return `https://${process.env.VERCEL_URL}`;
   const port = process.env.PORT || "3000";
   return `http://localhost:${port}`;
+}
+
+function parseAbsoluteUrl(value: string): AbsoluteUrl {
+  const url = new URL(value);
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error(`Unsupported URL protocol: ${url.protocol}`);
+  }
+  return url.toString() as AbsoluteUrl;
 }
 
 function toWebRequest(req: express.Request): globalThis.Request {

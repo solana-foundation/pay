@@ -7,7 +7,7 @@
     "dev": "concurrently \"tsx watch api/index.ts\" \"vite\"",
     "dev:api": "tsx watch api/index.ts",
     "dev:web": "vite",
-    "build": "vite build && tsc --noEmit",
+    "build": "vite build && tsc --noEmit && tsc -p api/tsconfig.json --noEmit",
     "test": "vitest run",
     "start": "tsx api/index.ts",
     "proxy": "tsx proxy/server.ts",
