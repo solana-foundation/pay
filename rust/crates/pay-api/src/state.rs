@@ -174,7 +174,7 @@ fn spawn_confidential_workers(
             Network::Sandbox => "localnet",
         };
 
-        let handle = server::spawn_confidential_worker(
+        let handle = server::spawn_confidential_worker_with_tx_version(
             ConfidentialWorkerConfig {
                 network: cluster.to_string(),
                 rpc_url: net_cfg.rpc_url.clone(),
@@ -190,6 +190,7 @@ fn spawn_confidential_workers(
                 recipient_signer: None,
             },
             signer.clone(),
+            pay_kit::core::tx::TxVersion::V1,
         );
         handles.insert(*network, handle);
     }

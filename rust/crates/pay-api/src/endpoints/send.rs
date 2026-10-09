@@ -9,6 +9,7 @@ use axum::response::{IntoResponse, Response};
 use pay_api_core::ata::{SPL_TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, associated_token_address};
 use pay_api_core::{Error, Stablecoin};
 use pay_api_types::Network;
+use pay_kit::core::tx::TxVersion;
 use pay_kit::mpp::protocol::solana::{MethodDetails, Split};
 use pay_kit::mpp::server::{Config as MppConfig, Mpp};
 use pay_kit::mpp::{ChargeRequest as MppChargeRequest, PaymentCredential, Receipt};
@@ -474,7 +475,7 @@ fn build_charge_request(
         decimals: Some(resolved.coin.decimals),
         token_program: Some(resolved.coin.token_program.to_string()),
         fee_payer: Some(true),
-        transaction_versions: None,
+        transaction_versions: resolved.confidential.then_some(vec![TxVersion::V1]),
         fee_payer_key: Some(resolved.fee_payer_pubkey.clone()),
         splits: Some(splits),
         recent_blockhash,
@@ -1415,6 +1416,7 @@ mod tests {
             serde_json::from_value(request.method_details.clone().unwrap()).unwrap();
         assert_eq!(md.confidential, Some(true));
         assert_eq!(md.fee_payer, Some(true));
+        assert_eq!(md.transaction_versions, Some(vec![TxVersion::V1]));
         assert_eq!(
             md.fee_payer_key.as_deref(),
             Some(resolved.fee_payer_pubkey.as_str())
