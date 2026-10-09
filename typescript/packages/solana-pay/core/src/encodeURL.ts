@@ -97,6 +97,7 @@ function encodeTransferRequestURL({
     }
 
     if (memo) {
+        if (new TextEncoder().encode(memo).length > 566) throw new Error('memo invalid');
         url.searchParams.append('memo', memo);
     }
 

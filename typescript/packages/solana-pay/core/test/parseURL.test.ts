@@ -94,5 +94,26 @@ describe('parseURL', () => {
 
             expect(() => parseURL(url)).toThrow('reference invalid');
         });
+
+        it('accepts a memo of 566 UTF-8 bytes', () => {
+            const memo = 'a'.repeat(564) + 'é';
+            const url = `solana:mvines9iiHiQTysrwkJjGf2gb9Ex9jXJX8ns3qwf2kN?memo=${encodeURIComponent(memo)}`;
+
+            expect(parseURL(url).memo).toBe(memo);
+        });
+
+        it('throws an error on a memo over 566 UTF-8 bytes', () => {
+            const memo = 'a'.repeat(567);
+            const url = `solana:mvines9iiHiQTysrwkJjGf2gb9Ex9jXJX8ns3qwf2kN?memo=${encodeURIComponent(memo)}`;
+
+            expect(() => parseURL(url)).toThrow('memo invalid');
+        });
+
+        it('rejects a memo of 566 UTF-16 code units that is 567 UTF-8 bytes', () => {
+            const memo = 'a'.repeat(565) + 'é';
+            const url = `solana:mvines9iiHiQTysrwkJjGf2gb9Ex9jXJX8ns3qwf2kN?memo=${encodeURIComponent(memo)}`;
+
+            expect(() => parseURL(url)).toThrow('memo invalid');
+        });
     });
 });
