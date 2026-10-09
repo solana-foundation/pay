@@ -37,6 +37,9 @@ pub struct CallScope {
     /// Whether `curl` may read a local file as the request body. Only a
     /// process on the user's own machine has files to read.
     pub body_files: bool,
+    /// Network destinations `curl` may reach. Hosted contexts must use the
+    /// public-only policy; local contexts retain localhost/dev access.
+    pub outbound_policy: pay_core::client::fetch::OutboundPolicy,
 }
 
 impl CallScope {
@@ -134,6 +137,7 @@ impl PayContext for LocalContext {
             approval: Arc::new(LocalApproval),
             payment_permissions: self.permissions.clone(),
             body_files: true,
+            outbound_policy: pay_core::client::fetch::OutboundPolicy::Unrestricted,
         })
     }
 }
@@ -152,6 +156,7 @@ mod tests {
             approval: Arc::new(LocalApproval),
             payment_permissions: None,
             body_files: true,
+            outbound_policy: pay_core::client::fetch::OutboundPolicy::Unrestricted,
         };
         assert_eq!(
             scope.rpc_url("mainnet"),

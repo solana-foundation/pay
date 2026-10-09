@@ -2,7 +2,10 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 use rand::{RngCore, rngs::OsRng};
 use reqwest::Method;
@@ -19,6 +22,167 @@ pub const DEBUGGER_NO_FOLLOW_HEADER_VALUE: &str = "1";
 
 /// Maximum size of an owned request body, including multipart framing.
 pub const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+/// Maximum response body accepted by the hosted public-internet transport.
+pub const MAX_PUBLIC_RESPONSE_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+/// Network destinations an HTTP caller is allowed to reach.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OutboundPolicy {
+    /// Desktop/CLI behavior: permit local development endpoints and system
+    /// proxy configuration.
+    #[default]
+    Unrestricted,
+    /// Hosted behavior: connect directly only to globally routable HTTP(S)
+    /// destinations. DNS is resolved and filtered by the connector itself so
+    /// the address actually dialed is the address that passed validation.
+    PublicInternetOnly,
+}
+
+#[derive(Debug)]
+struct PublicDnsResolver;
+
+impl reqwest::dns::Resolve for PublicDnsResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let resolved = tokio::net::lookup_host((host.as_str(), 0))
+                .await
+                .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) })?;
+            let addresses = resolved.collect::<Vec<_>>();
+            if addresses.is_empty() {
+                return Err(Box::new(std::io::Error::other(
+                    "destination resolved to no addresses",
+                ))
+                    as Box<dyn std::error::Error + Send + Sync>);
+            }
+            if addresses.iter().any(|address| !is_public_ip(address.ip())) {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "destination resolved to a non-public address",
+                ))
+                    as Box<dyn std::error::Error + Send + Sync>);
+            }
+            Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+fn is_public_ip(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            let [a, b, c, _] = address.octets();
+            !(address.is_unspecified()
+                || address.is_private()
+                || address.is_loopback()
+                || address.is_link_local()
+                || address.is_broadcast()
+                || address.is_documentation()
+                || address.is_multicast()
+                || a == 0
+                || (a == 100 && (64..=127).contains(&b))
+                || (a == 192 && b == 0)
+                || (a == 192 && b == 88 && c == 99)
+                || (a == 198 && (18..=19).contains(&b))
+                || a >= 240)
+        }
+        IpAddr::V6(address) => address
+            .to_ipv4_mapped()
+            .map(|mapped| is_public_ip(IpAddr::V4(mapped)))
+            .unwrap_or_else(|| {
+                let segments = address.segments();
+                let first = segments[0];
+                // Global unicast currently occupies 2000::/3. Also exclude
+                // special-purpose ranges inside it that can tunnel or
+                // synthesize an IPv4 destination.
+                first & 0xe000 == 0x2000
+                    && !(first == 0x2001 && segments[1] <= 0x01ff)
+                    && !(first == 0x2001 && segments[1] == 0x0db8)
+                    && first != 0x2002
+                    && !(first == 0x3fff && segments[1] & 0xf000 == 0)
+            }),
+    }
+}
+
+fn validate_public_url(url: &reqwest::Url) -> Result<()> {
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(Error::RequestValidation(
+            "Hosted curl supports only http and https destinations.".to_string(),
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(Error::RequestValidation(
+            "Hosted curl does not allow credentials in destination URLs.".to_string(),
+        ));
+    }
+    let host = url.host_str().ok_or_else(|| {
+        Error::RequestValidation("Hosted curl requires a destination hostname.".to_string())
+    })?;
+    let ip_literal = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(address) = ip_literal.parse::<IpAddr>() {
+        if !is_public_ip(address) {
+            return Err(Error::RequestValidation(
+                "Hosted curl cannot connect to non-public network addresses.".to_string(),
+            ));
+        }
+        return Ok(());
+    }
+
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host == "localhost"
+        || host == "metadata"
+        || host == "metadata.google.internal"
+        || host == "metadata.goog"
+        || host.ends_with(".localhost")
+        || host.ends_with(".local")
+        || host.ends_with(".internal")
+    {
+        return Err(Error::RequestValidation(
+            "Hosted curl cannot connect to local or internal hostnames.".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_public_headers(headers: &[(String, String)]) -> Result<()> {
+    const FORBIDDEN: &[&str] = &[
+        "host",
+        "proxy-authorization",
+        "proxy-connection",
+        "forwarded",
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-proto",
+        "metadata-flavor",
+        "x-google-metadata-request",
+    ];
+    if let Some((name, _)) = headers.iter().find(|(name, _)| {
+        FORBIDDEN
+            .iter()
+            .any(|blocked| name.eq_ignore_ascii_case(blocked))
+            || name.to_ascii_lowercase().starts_with("x-forwarded-")
+    }) {
+        return Err(Error::RequestValidation(format!(
+            "Hosted curl does not allow the `{name}` request header."
+        )));
+    }
+    Ok(())
+}
+
+fn public_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 10 {
+            return attempt.error("too many redirects");
+        }
+        match validate_public_url(attempt.url()) {
+            Ok(()) => attempt.follow(),
+            Err(error) => attempt.error(error.to_string()),
+        }
+    })
+}
 
 /// One file included in a multipart request body.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -423,6 +587,32 @@ pub fn fetch_request_with_body_for(
     body: Option<&RequestBody>,
     redirect_policy: RedirectPolicy,
 ) -> Result<RunOutcome> {
+    fetch_request_with_body_for_policy(
+        client_app,
+        method,
+        url,
+        extra_headers,
+        body,
+        redirect_policy,
+        OutboundPolicy::Unrestricted,
+    )
+}
+
+/// Hosted-aware counterpart to [`fetch_request_with_body_for`].
+///
+/// `PublicInternetOnly` validates both the initial destination and every
+/// redirect, filters the DNS answers used by the connection, bypasses ambient
+/// proxy configuration, and rejects headers that can opt into cloud metadata
+/// APIs or override routing.
+pub fn fetch_request_with_body_for_policy(
+    client_app: ClientApp,
+    method: &str,
+    url: &str,
+    extra_headers: &[(String, String)],
+    body: Option<&RequestBody>,
+    redirect_policy: RedirectPolicy,
+    outbound_policy: OutboundPolicy,
+) -> Result<RunOutcome> {
     let method = Method::from_bytes(method.as_bytes())
         .map_err(|e| Error::Mpp(format!("Invalid HTTP method `{method}`: {e}")))?;
     let raw = fetch_raw_with_method(
@@ -432,6 +622,7 @@ pub fn fetch_request_with_body_for(
         extra_headers,
         body,
         redirect_policy,
+        outbound_policy,
     )?;
     if redirect_policy == RedirectPolicy::None && (300..400).contains(&raw.status) {
         let location = raw
@@ -468,6 +659,7 @@ pub fn fetch(url: &str, extra_headers: &[(String, String)]) -> Result<RunOutcome
         extra_headers,
         None,
         RedirectPolicy::Follow,
+        OutboundPolicy::Unrestricted,
     )?;
     Ok(raw_to_outcome(raw))
 }
@@ -522,6 +714,7 @@ pub fn fetch_raw_with_body_for(
         extra_headers,
         body,
         redirect_policy,
+        OutboundPolicy::Unrestricted,
     )
 }
 
@@ -574,11 +767,36 @@ fn fetch_raw_with_method(
     extra_headers: &[(String, String)],
     body: Option<&RequestBody>,
     redirect_policy: RedirectPolicy,
+    outbound_policy: OutboundPolicy,
 ) -> Result<RawResponse> {
-    let mut client_builder = Client::builder().user_agent(client_app.user_agent());
-    if redirect_policy == RedirectPolicy::None {
-        client_builder = client_builder.redirect(reqwest::redirect::Policy::none());
+    if outbound_policy == OutboundPolicy::PublicInternetOnly {
+        let parsed = reqwest::Url::parse(url).map_err(|error| {
+            Error::RequestValidation(format!("Invalid hosted curl destination: {error}"))
+        })?;
+        validate_public_url(&parsed)?;
+        validate_public_headers(extra_headers)?;
+        if std::env::var_os("PAY_DEBUGGER_PROXY").is_some() {
+            return Err(Error::RequestValidation(
+                "Hosted curl cannot use the local debugger proxy.".to_string(),
+            ));
+        }
     }
+
+    let mut client_builder = Client::builder().user_agent(client_app.user_agent());
+    if outbound_policy == OutboundPolicy::PublicInternetOnly {
+        client_builder = client_builder
+            .no_proxy()
+            .dns_resolver(Arc::new(PublicDnsResolver))
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(60));
+    }
+    client_builder = match (outbound_policy, redirect_policy) {
+        (_, RedirectPolicy::None) => client_builder.redirect(reqwest::redirect::Policy::none()),
+        (OutboundPolicy::PublicInternetOnly, RedirectPolicy::Follow) => {
+            client_builder.redirect(public_redirect_policy())
+        }
+        (OutboundPolicy::Unrestricted, RedirectPolicy::Follow) => client_builder,
+    };
     let client = client_builder
         .build()
         .map_err(|e| Error::Mpp(format!("Failed to create HTTP client: {e}")))?;
@@ -611,7 +829,7 @@ fn fetch_raw_with_method(
         req = req.body(body.0.clone());
     }
 
-    let resp = req
+    let mut resp = req
         .send()
         .map_err(|e| Error::Mpp(format!("Request failed: {e}")))?;
     // A debugger proxy represents the upstream URL on the caller's behalf;
@@ -636,10 +854,31 @@ fn fetch_raw_with_method(
     // replaces non-UTF-8 sequences with `U+FFFD`, irreversibly mangling
     // binary responses (images, PDFs, octet-streams). Callers that want
     // a string view ask for `body_text()` explicitly.
-    let body = resp
-        .bytes()
-        .map(|b| b.to_vec())
-        .map_err(|e| Error::Mpp(format!("Failed to read body: {e}")))?;
+    let body = if outbound_policy == OutboundPolicy::PublicInternetOnly {
+        if resp
+            .content_length()
+            .is_some_and(|length| length > MAX_PUBLIC_RESPONSE_BODY_BYTES as u64)
+        {
+            return Err(Error::RequestValidation(
+                "Hosted curl response exceeds the 64 MiB limit.".to_string(),
+            ));
+        }
+        let mut body = Vec::new();
+        resp.by_ref()
+            .take(MAX_PUBLIC_RESPONSE_BODY_BYTES as u64 + 1)
+            .read_to_end(&mut body)
+            .map_err(|error| Error::Mpp(format!("Failed to read body: {error}")))?;
+        if body.len() > MAX_PUBLIC_RESPONSE_BODY_BYTES {
+            return Err(Error::RequestValidation(
+                "Hosted curl response exceeds the 64 MiB limit.".to_string(),
+            ));
+        }
+        body
+    } else {
+        resp.bytes()
+            .map(|b| b.to_vec())
+            .map_err(|e| Error::Mpp(format!("Failed to read body: {e}")))?
+    };
 
     debug!(status, "Fetch complete");
 
@@ -649,6 +888,112 @@ fn fetch_raw_with_method(
         headers,
         body,
     })
+}
+
+#[cfg(test)]
+mod outbound_policy_tests {
+    use super::*;
+
+    #[test]
+    fn public_policy_rejects_special_use_addresses() {
+        for address in [
+            "0.0.0.0",
+            "10.0.0.1",
+            "100.64.0.1",
+            "127.0.0.1",
+            "169.254.169.254",
+            "172.16.0.1",
+            "192.0.0.1",
+            "192.168.0.1",
+            "198.18.0.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "224.0.0.1",
+            "240.0.0.1",
+            "::1",
+            "fd00::1",
+            "fe80::1",
+            "::ffff:127.0.0.1",
+            "2001:db8::1",
+            "2002:7f00:1::1",
+        ] {
+            let address = address.parse().unwrap();
+            assert!(!is_public_ip(address), "accepted {address}");
+        }
+    }
+
+    #[test]
+    fn public_policy_accepts_global_addresses() {
+        for address in ["1.1.1.1", "8.8.8.8", "2606:4700:4700::1111"] {
+            let address = address.parse().unwrap();
+            assert!(is_public_ip(address), "rejected {address}");
+        }
+    }
+
+    #[test]
+    fn public_policy_rejects_internal_urls_and_credentials() {
+        for url in [
+            "file:///etc/passwd",
+            "http://localhost/",
+            "http://metadata.google.internal/computeMetadata/v1/",
+            "https://user:password@example.com/",
+            "http://169.254.169.254/computeMetadata/v1/",
+            "http://[::ffff:127.0.0.1]/",
+            "http://2130706433/",
+            "http://0x7f000001/",
+            "http://0177.0.0.1/",
+        ] {
+            let url = reqwest::Url::parse(url).unwrap();
+            assert!(validate_public_url(&url).is_err(), "accepted {url}");
+        }
+        assert!(validate_public_url(&reqwest::Url::parse("https://example.com/").unwrap()).is_ok());
+    }
+
+    #[test]
+    fn public_policy_rejects_routing_and_metadata_headers() {
+        for header in [
+            "Host",
+            "Proxy-Authorization",
+            "Forwarded",
+            "X-Forwarded-For",
+            "Metadata-Flavor",
+            "X-Google-Metadata-Request",
+        ] {
+            assert!(
+                validate_public_headers(&[(header.to_string(), "value".to_string())]).is_err(),
+                "accepted {header}"
+            );
+        }
+        assert!(
+            validate_public_headers(&[("Authorization".to_string(), "Bearer value".to_string())])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn hosted_fetch_rejects_literal_private_target_before_connecting() {
+        let error = fetch_request_with_body_for_policy(
+            ClientApp::Mcp,
+            "GET",
+            "http://127.0.0.1:1/private",
+            &[],
+            None,
+            RedirectPolicy::Follow,
+            OutboundPolicy::PublicInternetOnly,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("non-public"));
+    }
+
+    #[tokio::test]
+    async fn public_dns_resolver_rejects_private_answers() {
+        use reqwest::dns::Resolve;
+
+        let result = PublicDnsResolver
+            .resolve("localhost".parse().unwrap())
+            .await;
+        assert!(result.is_err());
+    }
 }
 
 #[cfg(test)]

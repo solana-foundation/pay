@@ -1036,13 +1036,14 @@ fn do_paid_fetch(
         .map_err(|_| pay_core::Error::Mpp("MPP session request lock poisoned".to_string()))?;
 
     let fetch_request = |headers: &[(String, String)]| {
-        pay_core::client::fetch::fetch_request_with_body_for(
+        pay_core::client::fetch::fetch_request_with_body_for_policy(
             pay_core::ClientApp::Mcp,
             method,
             url,
             headers,
             body,
             redirect_policy,
+            scope.outbound_policy,
         )
     };
 
@@ -1871,6 +1872,7 @@ mod tests {
             approval: Arc::new(crate::context::LocalApproval),
             payment_permissions: None,
             body_files: true,
+            outbound_policy: pay_core::client::fetch::OutboundPolicy::Unrestricted,
         };
         let result = do_paid_fetch(
             "GET",

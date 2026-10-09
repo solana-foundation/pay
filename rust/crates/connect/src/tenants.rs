@@ -566,6 +566,10 @@ impl PayContext for CloudContext {
             payment_permissions: None,
             // The server has no access to the caller's files.
             body_files: false,
+            // Arbitrary public APIs remain available, but tenant-controlled
+            // requests cannot reach Cloud Run metadata, loopback, or private
+            // services from this privileged process.
+            outbound_policy: pay_core::client::fetch::OutboundPolicy::PublicInternetOnly,
         })
     }
 }
@@ -774,6 +778,7 @@ mod tests {
 
     const TOPUP: &str = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"topup","arguments":{"method":"mobile_wallet","amount_usdc":5}}}"#;
     const CURL_FILE: &str = r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"curl","arguments":{"url":"https://example.test/x","method":"POST","body_file":"/tmp/x.json"}}}"#;
+    const CURL_PRIVATE: &str = r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"curl","arguments":{"url":"http://127.0.0.1:1/private"}}}"#;
 
     async fn session(app: &axum::Router, bearer: &str) -> String {
         let (status, headers, body) = mcp_post(app, Some(bearer), None, INIT).await;
@@ -827,5 +832,18 @@ mod tests {
         assert_eq!(result["isError"], true, "{body}");
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("not available on this server"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn hosted_curl_rejects_non_public_destinations() {
+        let registry = Arc::new(TenantRegistry::new());
+        registry.bind(record(&crate::mcp::token_fingerprint("tok-alpha")));
+        let app = app_with_tenants(registry);
+        let sid = session(&app, "tok-alpha").await;
+        let (_, _, body) = mcp_post(&app, Some("tok-alpha"), Some(&sid), CURL_PRIVATE).await;
+        let result = &sse_json(&body)[0]["result"];
+        assert_eq!(result["isError"], true, "{body}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("non-public"), "{text}");
     }
 }

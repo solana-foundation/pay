@@ -58,7 +58,7 @@ figment = { workspace = true }
 toml = { workspace = true }
 tempfile = { workspace = true }
 shellexpand = { workspace = true }
-tokio = { workspace = true, features = ["time", "sync"] }
+tokio = { workspace = true, features = ["time", "sync", "net"] }
 hmac = "0.12"
 md-5 = "0.10"
 mime_guess = { workspace = true }
