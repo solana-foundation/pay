@@ -15,14 +15,16 @@
 //! 4. When done: close_header() triggers on-chain settlement
 //! ```
 
+use std::str::FromStr;
 use std::sync::Arc;
 
 use pay_kit::mpp::client::session::ActiveSession;
 use pay_kit::mpp::solana_keychain::{SolanaSigner, TransactionSigner};
 use pay_kit::mpp::{
     ClosePayload, PaymentChallenge, PaymentCredential, SessionAction, SessionAuthentication,
-    SessionAuthenticationType, SessionRequest, SessionVoucherSigner, SignedVoucher, UsePayload,
-    VoucherData, VoucherSignatureType, format_authorization, parse_www_authenticate,
+    SessionAuthenticationType, SessionRequest, SessionVoucherSigner, SignedVoucher, TopUpPayload,
+    UsePayload, VoucherData, VoucherSignatureType, format_authorization, parse_authorization,
+    parse_www_authenticate,
 };
 use solana_pubkey::Pubkey;
 use tokio::sync::Mutex;
@@ -538,6 +540,241 @@ pub fn open_operator_signed_session_authorizations(
     Ok((open_authorization, use_authorization))
 }
 
+/// Validated, locally cached terms for one operator-signed channel top-up.
+/// The gateway's capacity advisory is never used to choose any transaction account.
+pub struct ValidatedTopUp {
+    credential: PaymentCredential,
+    request: SessionRequest,
+    channel: Pubkey,
+    payer: Pubkey,
+    mint: Pubkey,
+    token_program: Pubkey,
+    program: Pubkey,
+    fee_payer: Pubkey,
+    amount: u64,
+}
+
+impl ValidatedTopUp {
+    /// Only the existing channel, verified proof, and original challenge are
+    /// allowed to supply account and transaction policy.
+    pub fn from_cached_use(
+        authorization: &str,
+        advisory_channel: &str,
+        required_capacity: &str,
+        available_capacity: &str,
+        network_override: Option<&str>,
+        per_request_cap: Option<u128>,
+    ) -> Result<Self> {
+        fn amount(value: &str) -> Result<u64> {
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(Error::Mpp("invalid session top-up capacity".into()));
+            }
+            value
+                .parse::<u64>()
+                .map_err(|_| Error::Mpp("session top-up capacity overflow".into()))
+        }
+        fn key(value: &str) -> Result<Pubkey> {
+            Pubkey::from_str(value).map_err(|_| Error::Mpp("invalid cached session account".into()))
+        }
+        let credential = parse_authorization(authorization)
+            .map_err(|_| Error::Mpp("invalid cached MPP session credential".into()))?;
+        if credential.challenge.method.as_str() != "solana"
+            || credential.challenge.intent.as_str() != "session"
+        {
+            return Err(Error::Mpp(
+                "cached credential is not a Solana session".into(),
+            ));
+        }
+        let request: SessionRequest = credential
+            .challenge
+            .request
+            .decode()
+            .map_err(|_| Error::Mpp("invalid cached MPP session terms".into()))?;
+        let action: SessionAction = credential
+            .payload_as()
+            .map_err(|_| Error::Mpp("invalid cached MPP session action".into()))?;
+        let SessionAction::Use(use_payload) = action else {
+            return Err(Error::Mpp("cached credential is not a session use".into()));
+        };
+        if request.method_details.voucher_signer != Some(SessionVoucherSigner::Operator)
+            || request.suggested_deposit.is_none()
+            || network_override.is_some_and(|network| network != request.method_details.network)
+        {
+            return Err(Error::Mpp(
+                "session top-up requires bounded operator-signed terms on the selected network"
+                    .into(),
+            ));
+        }
+        let channel = key(&use_payload.channel_id)?;
+        if use_payload.channel_id != channel.to_string()
+            || advisory_channel != use_payload.channel_id
+            || request
+                .method_details
+                .channel_id
+                .as_ref()
+                .is_some_and(|id| id != &use_payload.channel_id)
+        {
+            return Err(Error::Mpp("session top-up channel mismatch".into()));
+        }
+        let proof = &use_payload.authentication;
+        let payer = key(&proof.payer)?;
+        if proof.challenge_id != credential.challenge.id
+            || proof.payer != payer.to_string()
+            || !proof
+                .verify(&use_payload.channel_id)
+                .map_err(|_| Error::Mpp("invalid cached session proof".into()))?
+        {
+            return Err(Error::Mpp(
+                "cached session proof does not bind payer and channel".into(),
+            ));
+        }
+        let required = amount(required_capacity)?;
+        let available = amount(available_capacity)?;
+        let ceiling = amount(request.suggested_deposit.as_deref().unwrap())?
+            .checked_mul(2)
+            .ok_or_else(|| Error::Mpp("session top-up ceiling overflow".into()))?;
+        let additional = required
+            .checked_sub(available)
+            .ok_or_else(|| Error::Mpp("session top-up has no shortfall".into()))?;
+        if additional == 0
+            || additional > ceiling
+            || per_request_cap.is_some_and(|cap| u128::from(additional) > cap)
+        {
+            return Err(Error::Mpp(
+                "session top-up exceeds authorized bounds".into(),
+            ));
+        }
+        let details = &request.method_details;
+        let mint =
+            pay_kit::mpp::try_resolve_stablecoin_mint(&request.currency, Some(&details.network))
+                .map_err(|_| Error::Mpp("invalid cached session currency".into()))?
+                .ok_or_else(|| Error::Mpp("unsupported cached session currency".into()))?;
+        let mint = key(mint)?;
+        let token_program = key(details.token_program.as_deref().unwrap_or_else(|| {
+            pay_kit::mpp::default_token_program_for_currency(
+                &request.currency,
+                Some(&details.network),
+            )
+        }))?;
+        let program = key(&details.channel_program)?;
+        let fee_payer = if details.fee_payer == Some(true) {
+            key(details
+                .fee_payer_key
+                .as_deref()
+                .ok_or_else(|| Error::Mpp("sponsored session has no fee payer key".into()))?)?
+        } else {
+            if details.fee_payer_key.is_some() {
+                return Err(Error::Mpp("ambiguous session fee payer".into()));
+            }
+            payer
+        };
+        if details
+            .transaction_versions
+            .as_ref()
+            .is_some_and(|versions| !versions.contains(&pay_kit::core::tx::TxVersion::V0))
+        {
+            return Err(Error::Mpp(
+                "session does not accept v0 top-up transactions".into(),
+            ));
+        }
+        Ok(Self {
+            credential,
+            request,
+            channel,
+            payer,
+            mint,
+            token_program,
+            program,
+            fee_payer,
+            amount: additional,
+        })
+    }
+
+    pub fn amount(&self) -> u64 {
+        self.amount
+    }
+
+    /// Same MPP credential format as [`SessionHandle::topup_header`], reusing
+    /// the cached challenge echo rather than accepting a fresh untrusted one.
+    pub fn header(&self, transaction: &str) -> Result<String> {
+        let action = SessionAction::TopUp(TopUpPayload {
+            channel_id: self.channel.to_string(),
+            additional_amount: self.amount.to_string(),
+            transaction: transaction.to_owned(),
+        });
+        format_authorization(&PaymentCredential::new(
+            self.credential.challenge.clone(),
+            action,
+        ))
+        .map_err(|e| Error::Mpp(format!("failed to encode top-up authorization: {e}")))
+    }
+}
+
+/// Build a client-signed transaction only. The gateway co-signs the sponsored
+/// fee payer, broadcasts and confirms the top-up when it receives the header.
+pub fn sign_operator_session_topup(
+    terms: &ValidatedTopUp,
+    store: &dyn crate::accounts::AccountsStore,
+    account_override: Option<&str>,
+    resource_url: &str,
+) -> Result<String> {
+    use pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient;
+    let network = &terms.request.method_details.network;
+    canonical_session_origin(resource_url)?;
+    let context = crate::client::prompt::payment_prompt_context(None, &[Some(resource_url)]);
+    let limit = session_spend_limit(terms.amount, &terms.request);
+    let intent = crate::keystore::AuthIntent::authorize_spend_up_to(
+        limit.usd_amount.as_deref(),
+        &limit.display,
+        &context.operator,
+    );
+    let (signer, _) = crate::signer::load_signer_for_network_with_intent_and_override(
+        network,
+        store,
+        account_override,
+        &intent,
+        None,
+    )?;
+    if signer.pubkey() != terms.payer {
+        return Err(Error::Mpp(
+            "selected payer does not match cached session proof".into(),
+        ));
+    }
+    let rpc_url = std::env::var("PAY_RPC_URL")
+        .unwrap_or_else(|_| pay_kit::mpp::protocol::solana::default_rpc_url(network).to_owned());
+    let blockhash = RpcClient::new(rpc_url)
+        .get_latest_blockhash()
+        .map_err(|e| Error::Mpp(format!("failed to fetch top-up blockhash: {e}")))?;
+    let instruction = pay_kit::core::payment_channels::build_top_up_instruction(
+        &terms.payer,
+        &terms.channel,
+        &terms.mint,
+        terms.amount,
+        &terms.token_program,
+        &terms.program,
+    );
+    let mut tx = pay_kit::core::tx::build_unsigned(
+        pay_kit::core::tx::TxVersion::V0,
+        &terms.fee_payer,
+        &[instruction],
+        blockhash,
+        None,
+    )
+    .map_err(|e| Error::Mpp(format!("failed to build top-up transaction: {e}")))?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| Error::Mpp(format!("failed to start top-up signer: {e}")))?;
+    runtime
+        .block_on(pay_kit::core::signing::sign_versioned_transaction_slot(
+            &signer, &mut tx,
+        ))
+        .map_err(|e| Error::Mpp(format!("failed to sign top-up transaction: {e}")))?;
+    let transaction = pay_kit::core::tx::wire::encode(&tx)
+        .map_err(|e| Error::Mpp(format!("failed to encode top-up transaction: {e}")))?;
+    terms.header(&transaction)
+}
+
 fn parse_session_deposit(value: &str) -> Result<u64> {
     value.parse::<u64>().map_err(|_| {
         Error::Mpp(format!(
@@ -909,6 +1146,91 @@ mod tests {
         };
         assert!(payload.voucher.is_none());
         assert_eq!(payload.authentication, Some(proof));
+    }
+
+    #[test]
+    fn cached_operator_topup_uses_only_bound_terms_and_shortfall() {
+        let payer = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let channel = Pubkey::new_unique().to_string();
+        let mut request = test_request();
+        request.currency = "USDC".into();
+        request.suggested_deposit = Some("250000".into());
+        request.method_details.voucher_signer = Some(SessionVoucherSigner::Operator);
+        request.method_details.fee_payer = Some(true);
+        request.method_details.fee_payer_key = Some(Pubkey::new_unique().to_string());
+        let challenge = PaymentChallenge::with_challenge_binding_secret(
+            "secret",
+            "realm",
+            "solana",
+            "session",
+            Base64UrlJson::from_typed(&request).unwrap(),
+        );
+        let proof = SessionAuthentication::sign(challenge.id.clone(), &channel, &payer).unwrap();
+        let authorization = format_authorization(&PaymentCredential::new(
+            challenge.to_echo(),
+            SessionAction::Use(UsePayload {
+                channel_id: channel.clone(),
+                authentication: proof,
+            }),
+        ))
+        .unwrap();
+        let valid = |channel: &str, required: &str, available: &str, cap| {
+            ValidatedTopUp::from_cached_use(
+                &authorization,
+                channel,
+                required,
+                available,
+                Some("localnet"),
+                cap,
+            )
+        };
+        let terms = valid(&channel, "250000", "38", Some(250000)).unwrap();
+        assert_eq!(terms.amount(), 249962);
+        let credential = parse_authorization(&terms.header("AQAB").unwrap()).unwrap();
+        assert_eq!(credential.challenge.id, challenge.id);
+        let SessionAction::TopUp(payload) = credential.payload_as().unwrap() else {
+            panic!("expected top-up action");
+        };
+        assert_eq!(payload.channel_id, channel);
+        assert_eq!(payload.additional_amount, "249962");
+
+        assert!(valid(&Pubkey::new_unique().to_string(), "250000", "38", None).is_err());
+        assert!(valid(&channel, "500040", "38", None).is_err());
+        assert!(valid(&channel, "250000", "38", Some(249961)).is_err());
+        assert!(valid(&channel, "38", "38", None).is_err());
+        assert!(valid(&channel, "250000", "-1", None).is_err());
+        assert!(
+            ValidatedTopUp::from_cached_use(
+                &authorization,
+                &channel,
+                "250000",
+                "38",
+                Some("mainnet"),
+                None,
+            )
+            .is_err()
+        );
+
+        let mut forged = parse_authorization(&authorization).unwrap();
+        let SessionAction::Use(mut use_payload) =
+            serde_json::from_value::<SessionAction>(forged.payload.clone()).unwrap()
+        else {
+            unreachable!()
+        };
+        use_payload.authentication.payer = Pubkey::new_unique().to_string();
+        forged.payload = serde_json::to_value(SessionAction::Use(use_payload)).unwrap();
+        let forged = format_authorization(&forged).unwrap();
+        assert!(
+            ValidatedTopUp::from_cached_use(
+                &forged,
+                &channel,
+                "250000",
+                "38",
+                Some("localnet"),
+                None,
+            )
+            .is_err()
+        );
     }
 
     #[test]
