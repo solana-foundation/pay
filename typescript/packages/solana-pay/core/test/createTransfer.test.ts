@@ -140,21 +140,21 @@ describe('createTransfer', () => {
         const send = vi.fn();
         rpc.getMultipleAccounts = () => ({ send });
 
-        await expect(
-            createTransfer(rpc, sender, { recipient: ADDRESSES.recipient, amount: Infinity }),
-        ).rejects.toThrow(CreateTransferError);
-        await expect(
-            createTransfer(rpc, sender, { recipient: ADDRESSES.recipient, amount: Infinity }),
-        ).rejects.toThrow('amount invalid');
-        await expect(
-            createTransfer(rpc, sender, { recipient: ADDRESSES.recipient, amount: NaN }),
-        ).rejects.toThrow('amount invalid');
-        await expect(
-            createTransfer(rpc, sender, { recipient: ADDRESSES.recipient, amount: -1 }),
-        ).rejects.toThrow(CreateTransferError);
-        await expect(
-            createTransfer(rpc, sender, { recipient: ADDRESSES.recipient, amount: -1 }),
-        ).rejects.toThrow('amount invalid');
+        await expect(createTransfer(rpc, sender, { recipient: ADDRESSES.recipient, amount: Infinity })).rejects.toThrow(
+            CreateTransferError,
+        );
+        await expect(createTransfer(rpc, sender, { recipient: ADDRESSES.recipient, amount: Infinity })).rejects.toThrow(
+            'amount invalid',
+        );
+        await expect(createTransfer(rpc, sender, { recipient: ADDRESSES.recipient, amount: NaN })).rejects.toThrow(
+            'amount invalid',
+        );
+        await expect(createTransfer(rpc, sender, { recipient: ADDRESSES.recipient, amount: -1 })).rejects.toThrow(
+            CreateTransferError,
+        );
+        await expect(createTransfer(rpc, sender, { recipient: ADDRESSES.recipient, amount: -1 })).rejects.toThrow(
+            'amount invalid',
+        );
         expect(send).not.toHaveBeenCalled();
     });
 
