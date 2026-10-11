@@ -135,6 +135,23 @@ describe('createTransfer', () => {
         vi.clearAllMocks();
     });
 
+    it('rejects non-finite amounts before any RPC call', async () => {
+        const rpc = createMockRpc(new Map());
+        const send = vi.fn();
+        rpc.getMultipleAccounts = () => ({ send });
+
+        await expect(
+            createTransfer(rpc, sender, { recipient: ADDRESSES.recipient, amount: Infinity }),
+        ).rejects.toThrow(CreateTransferError);
+        await expect(
+            createTransfer(rpc, sender, { recipient: ADDRESSES.recipient, amount: Infinity }),
+        ).rejects.toThrow('amount invalid');
+        await expect(
+            createTransfer(rpc, sender, { recipient: ADDRESSES.recipient, amount: NaN }),
+        ).rejects.toThrow('amount invalid');
+        expect(send).not.toHaveBeenCalled();
+    });
+
     describe('SOL transfers', () => {
         it('should create valid SOL transfer with correct instruction shape', async () => {
             const accounts = new Map<string, any>([
