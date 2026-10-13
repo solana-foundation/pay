@@ -1150,6 +1150,37 @@ fn classify_402_inner(
         };
     }
 
+    // x402 offers that reach this point did not parse. When every offer names
+    // a non-Solana network, say so, so the caller sees a chain mismatch, not
+    // an unrecognized protocol. pay-kit reads a missing `network` as Solana,
+    // so such an offer (or any Solana slug) leaves the outcome unknown.
+    let mut x402_networks: Vec<&str> = Vec::new();
+    let mut any_solana_offer = false;
+    for offer in &advertised_challenges.x402 {
+        match offer.get("network").and_then(serde_json::Value::as_str) {
+            Some(network) if pay_kit::x402::exact::cluster_for_caip2_network(network).is_none() => {
+                if !x402_networks.contains(&network) {
+                    x402_networks.push(network);
+                }
+            }
+            _ => any_solana_offer = true,
+        }
+    }
+    if !x402_networks.is_empty() && !any_solana_offer {
+        let reason = format!(
+            "Server offers x402 on {} only; pay settles on Solana. \
+             This endpoint is not compatible with `pay`. \
+             Check if the provider supports Solana USDC.",
+            x402_networks.join(", ")
+        );
+        return RunOutcome::PaymentRejected {
+            reason,
+            retryable: false,
+            advertised_challenges,
+            resource_url: resource_url.to_string(),
+        };
+    }
+
     RunOutcome::UnknownPaymentRequired {
         headers: headers.to_vec(),
         advertised_challenges,
@@ -2793,6 +2824,119 @@ HTTP request sent, awaiting response...
                 );
             }
             other => panic!("Expected PaymentRejected, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_402_rejects_evm_only_x402_naming_the_network() {
+        use base64::Engine;
+
+        let payment_required = serde_json::json!({
+            pay_kit::x402::X402_VERSION_FIELD: pay_kit::x402::X402_VERSION_V2,
+            "accepts": [{
+                "scheme": pay_kit::x402::exact::EXACT_SCHEME,
+                "network": "eip155:8453",
+                "amount": "10000",
+                "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+                "payTo": "0x325bdF6F7efAB24a2210c48c1b64cAb2eAe1d430",
+                "maxTimeoutSeconds": 300
+            }]
+        });
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(payment_required.to_string().as_bytes());
+        let headers = vec![(pay_kit::x402::PAYMENT_REQUIRED_HEADER.to_string(), encoded)];
+
+        let outcome = classify_402(&headers, None, "https://base-only.example.com/api");
+        match outcome {
+            RunOutcome::PaymentRejected {
+                reason, retryable, ..
+            } => {
+                assert!(
+                    reason.contains("eip155:8453"),
+                    "Expected the offered network in the reason, got: {reason}"
+                );
+                assert!(!retryable);
+            }
+            other => panic!("Expected PaymentRejected, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_402_keeps_unparsed_solana_slug_x402_unknown() {
+        use base64::Engine;
+
+        // `mainnet-beta` is a Solana slug; an offer that fails to parse for
+        // another reason (here an unknown transaction version) is not a
+        // chain mismatch.
+        let payment_required = serde_json::json!({
+            pay_kit::x402::X402_VERSION_FIELD: pay_kit::x402::X402_VERSION_V2,
+            "accepts": [{
+                "scheme": pay_kit::x402::exact::EXACT_SCHEME,
+                "network": "mainnet-beta",
+                "amount": "10000",
+                "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                "payTo": "11111111111111111111111111111111",
+                "maxTimeoutSeconds": 300,
+                "extra": { "transactionVersions": ["not-a-version"] }
+            }]
+        });
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(payment_required.to_string().as_bytes());
+        let headers = vec![(pay_kit::x402::PAYMENT_REQUIRED_HEADER.to_string(), encoded)];
+
+        let outcome = classify_402(&headers, None, "https://solana-slug.example.com/api");
+        assert!(
+            matches!(outcome, RunOutcome::UnknownPaymentRequired { .. }),
+            "Expected UnknownPaymentRequired, got: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn classify_402_keeps_mixed_x402_offers_unknown() {
+        use base64::Engine;
+
+        // The rejection needs every offer to name a non-Solana network. A Base
+        // offer next to an unparsed Solana offer, or next to an unparsed offer
+        // with no `network`, is not a chain mismatch, in either order.
+        let base = serde_json::json!({
+            "scheme": pay_kit::x402::exact::EXACT_SCHEME,
+            "network": "eip155:8453",
+            "amount": "10000",
+            "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+            "payTo": "0x325bdF6F7efAB24a2210c48c1b64cAb2eAe1d430",
+            "maxTimeoutSeconds": 300
+        });
+        let unparsed_solana = serde_json::json!({
+            "scheme": pay_kit::x402::exact::EXACT_SCHEME,
+            "network": "mainnet-beta",
+            "amount": "10000",
+            "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            "payTo": "11111111111111111111111111111111",
+            "maxTimeoutSeconds": 300,
+            "extra": { "transactionVersions": ["not-a-version"] }
+        });
+        let mut unparsed_no_network = unparsed_solana.clone();
+        unparsed_no_network
+            .as_object_mut()
+            .expect("offer is an object")
+            .remove("network");
+
+        for other in [&unparsed_solana, &unparsed_no_network] {
+            for accepts in [vec![&base, other], vec![other, &base]] {
+                let payment_required = serde_json::json!({
+                    pay_kit::x402::X402_VERSION_FIELD: pay_kit::x402::X402_VERSION_V2,
+                    "accepts": accepts
+                });
+                let encoded = base64::engine::general_purpose::STANDARD
+                    .encode(payment_required.to_string().as_bytes());
+                let headers = vec![(pay_kit::x402::PAYMENT_REQUIRED_HEADER.to_string(), encoded)];
+
+                let outcome = classify_402(&headers, None, "https://mixed.example.com/api");
+                assert!(
+                    matches!(outcome, RunOutcome::UnknownPaymentRequired { .. }),
+                    "Expected UnknownPaymentRequired for {accepts:?}, got: {outcome:?}"
+                );
+            }
         }
     }
 
