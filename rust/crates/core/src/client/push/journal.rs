@@ -413,44 +413,45 @@ fn fee_payer_mode_label(mode: FeePayerMode) -> &'static str {
 }
 
 /// Load every event from a journal file, tolerating exactly one truncated
-/// final line (the crash-mid-write case) but rejecting any parse failure
-/// that is not the last line, and rejecting non-monotonic sequence numbers
-/// anywhere in the file.
+/// final line without a newline (the crash-mid-write case), but rejecting
+/// complete corrupted records and non-monotonic sequence numbers anywhere
+/// in the file.
 pub fn load_events(path: &Path) -> Result<Vec<JournalEvent>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let raw = std::fs::read_to_string(path)
+    let raw = std::fs::read(path)
         .map_err(|e| Error::Config(format!("failed to read journal {}: {e}", path.display())))?;
-    let lines: Vec<&str> = raw.split_inclusive('\n').collect();
+    let lines: Vec<&[u8]> = raw.split_inclusive(|&byte| byte == b'\n').collect();
 
     let mut events = Vec::with_capacity(lines.len());
     let last_index = lines.len().saturating_sub(1);
     let mut offset = 0usize;
+    let mut truncate_at = None;
     for (index, raw_line) in lines.iter().enumerate() {
-        let line = raw_line.trim_end_matches(['\r', '\n']);
-        if line.trim().is_empty() {
+        let text = std::str::from_utf8(raw_line);
+        if let Err(error) = text
+            && error.error_len().is_some()
+        {
+            // An invalid byte is corruption, even if the JSON parser would
+            // report EOF before reaching a string's closing quote.
+            return Err(Error::Config(format!(
+                "journal {} is corrupted at line {}: {error}",
+                path.display(),
+                index + 1
+            )));
+        }
+        if text.is_ok_and(|line| line.trim().is_empty()) {
             offset += raw_line.len();
             continue;
         }
-        match serde_json::from_str::<JournalEvent>(line) {
+        match serde_json::from_slice::<JournalEvent>(raw_line) {
             Ok(event) => events.push(event),
             Err(e) => {
-                if index == last_index {
-                    // Tolerate a crash mid-write: the last line may be a
-                    // partial JSON record that never finished fsync'ing.
-                    // Remove it before the append-mode writer reopens the
-                    // file so its next event cannot merge into invalid JSON.
-                    OpenOptions::new()
-                        .write(true)
-                        .open(path)
-                        .and_then(|file| file.set_len(offset as u64))
-                        .map_err(|error| {
-                            Error::Config(format!(
-                                "failed to truncate partial journal line in {}: {error}",
-                                path.display()
-                            ))
-                        })?;
+                if index == last_index && !raw_line.ends_with(b"\n") && e.is_eof() {
+                    // Only an unfinished final record can be discarded.
+                    // `offset` counts bytes, including multibyte history.
+                    truncate_at = Some(offset);
                     break;
                 }
                 return Err(Error::Config(format!(
@@ -472,6 +473,24 @@ pub fn load_events(path: &Path) -> Result<Vec<JournalEvent>> {
                 pair[1].sequence
             )));
         }
+    }
+
+    if let Some(offset) = truncate_at {
+        // Validate all history before changing the file, then durably remove
+        // the partial bytes before an append-mode writer can reopen it.
+        OpenOptions::new()
+            .write(true)
+            .open(path)
+            .and_then(|file| {
+                file.set_len(offset as u64)?;
+                file.sync_data()
+            })
+            .map_err(|error| {
+                Error::Config(format!(
+                    "failed to truncate partial journal line in {}: {error}",
+                    path.display()
+                ))
+            })?;
     }
 
     Ok(events)
@@ -748,6 +767,156 @@ mod tests {
 
         let events = load_events(&path).unwrap();
         assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn load_events_recovers_partial_utf8_tail_and_allows_append() {
+        for character in ['é', '中', '🦀'] {
+            for written_bytes in 1..character.len_utf8() {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("run.jsonl");
+                let mut journal = Journal::create_new(path.clone()).unwrap();
+                let first = journal
+                    .append_chunk_prepared(0, vec![2], "历史🦀".into())
+                    .unwrap();
+                let second = journal
+                    .append_chunk_prepared(1, vec![3], "café".into())
+                    .unwrap();
+                drop(journal);
+                let durable_bytes = std::fs::read(&path).unwrap();
+
+                let pending = JournalEvent {
+                    sequence: 3,
+                    timestamp: Utc::now(),
+                    kind: JournalEventKind::ChunkPrepared {
+                        chunk_index: 2,
+                        row_numbers: vec![4],
+                        memo: format!("pending {character}"),
+                    },
+                };
+                let pending = serde_json::to_string(&pending).unwrap();
+                let cut_at = pending.find(character).unwrap() + written_bytes;
+                let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+                file.write_all(&pending.as_bytes()[..cut_at]).unwrap();
+                file.sync_data().unwrap();
+                drop(file);
+                assert!(std::fs::read_to_string(&path).is_err());
+
+                let expected = vec![first, second];
+                assert_eq!(load_events(&path).unwrap(), expected);
+                assert_eq!(std::fs::read(&path).unwrap(), durable_bytes);
+
+                let (mut resumed, events) = Journal::open_existing(path.clone()).unwrap();
+                assert_eq!(events, expected);
+                let next = resumed
+                    .append_chunk_prepared(2, vec![4], "恢复后".into())
+                    .unwrap();
+                assert_eq!(next.sequence, 3);
+                let mut expected = expected;
+                expected.push(next);
+                assert_eq!(load_events(&path).unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn load_events_rejects_corrupt_final_records_without_truncating() {
+        let tails: &[&[u8]] = &[
+            b"not json at all",
+            b"{\"sequence\":}",
+            b"{}",
+            b"{\"sequence\":\"invalid\"}",
+            br#"{"sequence":2,"timestamp":"2026-01-01T00:00:00Z","kind":"unknown"}"#,
+            b"{}\xe4\xb8",
+            b"{\"memo\":\"\xff",
+            b"{\"memo\":\"\xe4A",
+            b"{\"memo\":\"\xe4\xb8\"}",
+        ];
+        for tail in tails {
+            for newline in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("run.jsonl");
+                let mut journal = Journal::create_new(path.clone()).unwrap();
+                journal
+                    .append_chunk_prepared(0, vec![2], "历史🦀".into())
+                    .unwrap();
+                drop(journal);
+                let mut contents = std::fs::read(&path).unwrap();
+                contents.extend_from_slice(tail);
+                if newline {
+                    contents.push(b'\n');
+                }
+                std::fs::write(&path, &contents).unwrap();
+
+                let err = load_events(&path).unwrap_err();
+                assert!(err.to_string().contains("corrupted at line 2"), "{err}");
+                assert_eq!(std::fs::read(&path).unwrap(), contents);
+            }
+        }
+    }
+
+    #[test]
+    fn load_events_rejects_newline_terminated_partial_records() {
+        for tail in [b"{\"sequence\":\n".as_slice(), b"{\"memo\":\"\xe4\xb8\n"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("run.jsonl");
+            std::fs::write(&path, tail).unwrap();
+
+            let err = load_events(&path).unwrap_err();
+            assert!(err.to_string().contains("corrupted at line 1"), "{err}");
+            assert_eq!(std::fs::read(&path).unwrap(), tail);
+        }
+    }
+
+    #[test]
+    fn load_events_rejects_invalid_utf8_before_the_last_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.jsonl");
+        let mut journal = Journal::create_new(path.clone()).unwrap();
+        let first = journal
+            .append_chunk_prepared(0, vec![2], "历史🦀".into())
+            .unwrap();
+        drop(journal);
+        let mut contents = std::fs::read(&path).unwrap();
+        contents.extend_from_slice(b"{\"memo\":\"\xe4\xb8\n");
+        let mut last = first;
+        last.sequence = 3;
+        contents.extend(serde_json::to_vec(&last).unwrap());
+        contents.push(b'\n');
+        std::fs::write(&path, &contents).unwrap();
+
+        let err = load_events(&path).unwrap_err();
+        assert!(err.to_string().contains("corrupted at line 2"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), contents);
+    }
+
+    #[test]
+    fn load_events_validates_sequences_before_truncating_tail() {
+        for sequence in [1, 2] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("run.jsonl");
+            let mut contents = serde_json::to_vec(&signed_event(0, 2, 1_000)).unwrap();
+            contents.push(b'\n');
+            contents.extend(serde_json::to_vec(&signed_event(1, sequence, 1_000)).unwrap());
+            contents.extend_from_slice(b"\n{\"memo\":\"\xe4\xb8");
+            std::fs::write(&path, &contents).unwrap();
+
+            let err = load_events(&path).unwrap_err();
+            assert!(err.to_string().contains("non-monotonic"), "{err}");
+            assert_eq!(std::fs::read(&path).unwrap(), contents);
+        }
+    }
+
+    #[test]
+    fn load_events_preserves_complete_final_record_without_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.jsonl");
+        let event = signed_event(0, 1, 1_000);
+        let contents = serde_json::to_vec(&event).unwrap();
+        std::fs::write(&path, &contents).unwrap();
+
+        assert_eq!(load_events(&path).unwrap(), vec![event]);
+        assert_eq!(std::fs::read(&path).unwrap(), contents);
     }
 
     #[test]
