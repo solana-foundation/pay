@@ -61,12 +61,18 @@ export function parseURL(url: URL | string): TransactionRequestURL | TransferReq
     return /[:%]/.test(url.pathname) ? parseTransactionRequestURL(url) : parseTransferRequestURL(url);
 }
 
+function requireSingle(searchParams: URLSearchParams, name: string, error: string): string | null {
+    const values = searchParams.getAll(name);
+    if (values.length > 1) throw new ParseURLError(error);
+    return values.length ? values[0] : null;
+}
+
 function parseTransactionRequestURL({ pathname, searchParams }: URL): TransactionRequestURL {
     const link = new URL(decodeURIComponent(pathname));
     if (link.protocol !== HTTPS_PROTOCOL) throw new ParseURLError('link invalid');
 
-    const label = searchParams.get('label') || undefined;
-    const message = searchParams.get('message') || undefined;
+    const label = requireSingle(searchParams, 'label', 'label invalid') || undefined;
+    const message = requireSingle(searchParams, 'message', 'message invalid') || undefined;
 
     return {
         link,
@@ -84,7 +90,7 @@ function parseTransferRequestURL({ pathname, searchParams }: URL): TransferReque
     }
 
     let amount: number | undefined;
-    const amountParam = searchParams.get('amount');
+    const amountParam = requireSingle(searchParams, 'amount', 'amount invalid');
     if (amountParam != null) {
         if (!/^\d+(\.\d+)?$/.test(amountParam)) throw new ParseURLError('amount invalid');
 
@@ -94,7 +100,7 @@ function parseTransferRequestURL({ pathname, searchParams }: URL): TransferReque
     }
 
     let splToken: SPLToken | undefined;
-    const splTokenParam = searchParams.get('spl-token');
+    const splTokenParam = requireSingle(searchParams, 'spl-token', 'spl-token invalid');
     if (splTokenParam != null) {
         try {
             splToken = address(splTokenParam);
@@ -113,9 +119,9 @@ function parseTransferRequestURL({ pathname, searchParams }: URL): TransferReque
         }
     }
 
-    const label = searchParams.get('label') || undefined;
-    const message = searchParams.get('message') || undefined;
-    const memo = searchParams.get('memo') || undefined;
+    const label = requireSingle(searchParams, 'label', 'label invalid') || undefined;
+    const message = requireSingle(searchParams, 'message', 'message invalid') || undefined;
+    const memo = requireSingle(searchParams, 'memo', 'memo invalid') || undefined;
 
     return {
         recipient,
