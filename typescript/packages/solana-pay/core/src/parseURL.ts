@@ -90,6 +90,7 @@ function parseTransferRequestURL({ pathname, searchParams }: URL): TransferReque
 
         amount = Number(amountParam);
         if (Number.isNaN(amount)) throw new ParseURLError('amount NaN');
+        if (!Number.isFinite(amount)) throw new ParseURLError('amount invalid');
         if (amount < 0) throw new ParseURLError('amount negative');
     }
 

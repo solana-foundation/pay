@@ -89,6 +89,12 @@ describe('parseURL', () => {
             expect(() => parseURL(url)).toThrow('token invalid');
         });
 
+        it('throws an error on a non-finite amount', () => {
+            const url = `solana:mvines9iiHiQTysrwkJjGf2gb9Ex9jXJX8ns3qwf2kN?amount=${'1' + '0'.repeat(400)}`;
+
+            expect(() => parseURL(url)).toThrow('amount invalid');
+        });
+
         it('throws an error on invalid reference', () => {
             const url = 'solana:mvines9iiHiQTysrwkJjGf2gb9Ex9jXJX8ns3qwf2kN?amount=1&reference=0xffff';
 
