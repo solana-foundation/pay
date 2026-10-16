@@ -10,13 +10,13 @@
 //! `pricing`, `protocol`, and `supported_usd` fields in the published index.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use pay_types::Stablecoin;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::client::fetch::fetch_raw;
+use crate::client::fetch::fetch_raw_with_timeout;
 use crate::client::runner::{self, RunOutcome};
 
 // ── Currency normalization ───────────────────────────────────────────────────
@@ -424,7 +424,9 @@ fn probe_endpoint(
         vec![]
     };
 
-    let raw = fetch_raw(method, url, &headers, body);
+    // 0 keeps the old behaviour (client default) instead of failing every probe at once.
+    let timeout = (config.timeout_secs > 0).then(|| Duration::from_secs(config.timeout_secs));
+    let raw = fetch_raw_with_timeout(method, url, &headers, body, timeout);
     let duration_ms = start.elapsed().as_millis() as u64;
 
     let (status, paid, probe_status, http_status) = match raw {
@@ -950,5 +952,68 @@ mod tests {
         assert_eq!(amount_to_usd("1000000", 6), Some(1.0));
         assert_eq!(amount_to_usd("0", 6), Some(0.0));
         assert_eq!(amount_to_usd("not a number", 6), None);
+    }
+
+    #[test]
+    fn probe_endpoint_applies_configured_timeout() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        // Accepts one connection, then never writes a response. The server has a
+        // bounded lifetime: it stops once the probe returns, or after 5 s.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/stalled", listener.local_addr().unwrap());
+        let (accepted_tx, accepted_rx) = mpsc::channel();
+        let (stop_tx, stop_rx) = mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let conn = loop {
+                match listener.accept() {
+                    Ok((conn, _)) => break Some(conn),
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break None,
+                }
+            };
+            let _ = accepted_tx.send(conn.is_some());
+            let _ = stop_rx.recv_timeout(Duration::from_secs(5));
+            drop(conn);
+        });
+
+        let config = ProbeConfig {
+            timeout_secs: 1,
+            ..ProbeConfig::default()
+        };
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(probe_endpoint("GET", &url, None, &config));
+        });
+
+        // Guard the test itself so a missing timeout fails instead of hanging.
+        let result = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("probe ignored timeout_secs = 1");
+        let _ = stop_tx.send(());
+        server.join().unwrap();
+
+        // The probe must have reached the stalled listener and waited out the
+        // timeout; an immediate connection error (e.g. via PAY_DEBUGGER_PROXY)
+        // would not exercise it.
+        assert!(
+            accepted_rx.recv().unwrap(),
+            "probe never reached the stalled listener (is PAY_DEBUGGER_PROXY set?)"
+        );
+        assert!(matches!(result.status, ProbeStatus::Error { .. }));
+        assert_eq!(result.probe_status, "error");
+        assert!(
+            (900..3_000).contains(&result.duration_ms),
+            "expected the 1 s timeout to end the probe, took {} ms",
+            result.duration_ms
+        );
     }
 }
