@@ -4087,7 +4087,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn signed_flat_request_rejects_insufficient_session_capacity_before_forwarding() {
+    async fn signed_requests_reject_insufficient_session_capacity_before_forwarding() {
         use crate::sell_inference::{SellInference, SellPricing};
         use crate::server::gate::{GateDecision, GateRequest, PaymentGate};
 
@@ -4174,6 +4174,88 @@ mod tests {
                 .cumulative,
             price_units
         );
+
+        // Response-metered streams need their full declared ceiling before
+        // upstream headers can be sent. Otherwise capacity failure truncates
+        // an already-started SSE response instead of requesting a top-up.
+        let mut metered_api = sale.api_spec();
+        let meter = metered_api
+            .endpoints
+            .iter_mut()
+            .find(|endpoint| endpoint.path == path)
+            .unwrap()
+            .metering
+            .as_mut()
+            .unwrap();
+        meter.dimensions = serde_yml::from_str(
+            r#"
+            - direction: input
+              unit: tokens
+              scale: 1000000
+              tiers: [{price_usd: 0.345}]
+            - direction: output
+              unit: tokens
+              scale: 1000000
+              tiers: [{price_usd: 2.875}]
+            "#,
+        )
+        .unwrap();
+        meter.upto.as_mut().unwrap().max_usd = Some(0.25);
+        let mut saved = store
+            .get_channel(&channel.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        saved.cumulative = CAP - 38;
+        store
+            .update_channel(&channel.to_string(), Box::new(move |_| Ok(saved.clone())))
+            .await
+            .unwrap();
+        let metered_gate = PaymentGate::new(State {
+            apis: vec![metered_api],
+            session: session.clone(),
+        });
+        let GateDecision::Respond(response) = metered_gate.evaluate(&request).await else {
+            panic!("metered stream must request a top-up before forwarding");
+        };
+        assert_eq!(response.status, http::StatusCode::PAYMENT_REQUIRED);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["error"], "session_cap_exhausted");
+        assert_eq!(body["channelId"], channel.to_string());
+        assert_eq!(body["requiredCapacity"], "250000");
+        assert_eq!(body["availableCapacity"], "38");
+        assert_eq!(
+            store
+                .get_channel(&channel.to_string())
+                .await
+                .unwrap()
+                .unwrap()
+                .cumulative,
+            CAP - 38
+        );
+        let mut topped_up = store
+            .get_channel(&channel.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        // Simulate the store after a confirmed top-up; this asserts admission,
+        // not on-chain transaction verification.
+        topped_up.deposit += 250_000 - 38;
+        store
+            .update_channel(
+                &channel.to_string(),
+                Box::new(move |_| Ok(topped_up.clone())),
+            )
+            .await
+            .unwrap();
+        let GateDecision::Forward {
+            session: Some(forward),
+            ..
+        } = metered_gate.evaluate(&request).await
+        else {
+            panic!("a confirmed top-up must make the original metered request admissible");
+        };
+        assert_eq!(forward.available_base_units, 250_000);
     }
 
     #[tokio::test]

@@ -127,6 +127,9 @@ struct PayerState {
     /// requests because the server reserves a session's remaining capacity
     /// while it meters a response.
     session_authorization: Arc<tokio::sync::Mutex<Option<String>>>,
+    /// Keep the exact signed top-up after an ambiguous send. Never prepare
+    /// another funding transaction for this process until it is reconciled.
+    topup_pending: tokio::sync::Mutex<Option<PaidHeaders>>,
     /// Batch vouchers advance a shared cumulative watermark. Serialize each
     /// challenge/retry cycle so concurrent agent requests cannot sign the same
     /// next watermark before either response confirms it.
@@ -136,6 +139,7 @@ struct PayerState {
     /// Logging directly avoids buffering SSE through the debugger forwarder.
     pdb: Option<pay_pdb::PdbState>,
     session_opener: SessionOpener,
+    topup_signer: TopUpSigner,
     client: reqwest::Client,
     store: Arc<dyn AccountsStore>,
     /// Forced network slug (`--sandbox` → `localnet`, `--mainnet` →
@@ -175,6 +179,9 @@ impl PayerState {
         // `no_proxy` keeps env proxies from hijacking localhost traffic.
         let client = reqwest::Client::builder()
             .no_proxy()
+            // A 307/308 on a paid request must not replay the business body
+            // (or its TopUp credential) without the proxy observing a result.
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(15))
             .read_timeout(Duration::from_secs(300))
             .build()
@@ -189,10 +196,12 @@ impl PayerState {
             require_payment: upstream.require_payment,
             payment_protocol: upstream.payment_protocol,
             session_authorization: Arc::new(tokio::sync::Mutex::new(None)),
+            topup_pending: tokio::sync::Mutex::new(None),
             batch_payment_lock: Arc::new(tokio::sync::Mutex::new(())),
             batch_channels: pay_core::client::batch::BatchChannelCache::new(),
             pdb: crate::debugger_proxy::pdb_state(),
             session_opener: build_session_authorization,
+            topup_signer: sign_session_topup,
             client,
             store,
             network_override,
@@ -208,6 +217,12 @@ impl PayerState {
     }
 
     #[cfg(test)]
+    fn with_topup_signer(mut self, signer: TopUpSigner) -> Self {
+        self.topup_signer = signer;
+        self
+    }
+
+    #[cfg(test)]
     fn with_pdb(mut self, pdb: pay_pdb::PdbState) -> Self {
         self.pdb = Some(pdb);
         self
@@ -216,6 +231,8 @@ impl PayerState {
 
 type SessionOpener =
     fn(&PayerState, &pay_core::mpp::Challenge) -> pay_core::Result<(PaidHeaders, String)>;
+type TopUpSigner =
+    fn(&PayerState, &pay_core::session::ValidatedTopUp) -> pay_core::Result<PaidHeaders>;
 
 /// Start the payer proxy on an ephemeral 127.0.0.1 port, on a dedicated
 /// runtime in a background thread (the `pay claude` main thread stays
@@ -383,6 +400,15 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
         .cloned()
         .map(PaidHeaders::mpp);
     let used_cached_session = cached_payment.is_some();
+    if state.payment_protocol == PaymentProtocol::MppSession
+        && state.topup_pending.lock().await.is_some()
+    {
+        return (
+            StatusCode::BAD_GATEWAY,
+            "payer proxy: previous session top-up outcome uncertain; no further payment will be signed until the session is reconciled",
+        )
+            .into_response();
+    }
 
     let first = match send_upstream(
         &state,
@@ -442,6 +468,88 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
                 .into_response();
         }
     };
+
+    // The capacity JSON is advisory, never a source of transaction accounts.
+    if state.payment_protocol == PaymentProtocol::MppSession
+        && used_cached_session
+        && has_session_topup_capacity_fields(&resp_body)
+    {
+        let Some(advisory) = parse_session_topup_advisory(&resp_body) else {
+            tracing::warn!("payer proxy: malformed session top-up advisory");
+            return buffered_response(status, &resp_headers, resp_body);
+        };
+        if resp_headers.contains_key(header::WWW_AUTHENTICATE) {
+            return buffered_response(status, &resp_headers, resp_body);
+        }
+        let cached = session_authorization
+            .as_deref()
+            .and_then(Option::as_ref)
+            .expect("cached session was sent");
+        let terms = pay_core::session::ValidatedTopUp::from_cached_use(
+            cached,
+            &advisory.channel_id,
+            &advisory.required_capacity,
+            &advisory.available_capacity,
+            state.network_override.as_deref(),
+            state.per_request_cap_base_units,
+        );
+        let terms = match terms {
+            Ok(terms) => terms,
+            Err(error) => {
+                tracing::warn!(%error, "payer proxy: refusing unverified session top-up");
+                return buffered_response(status, &resp_headers, resp_body);
+            }
+        };
+        let signer_state = state.clone();
+        let signed =
+            tokio::task::spawn_blocking(move || (signer_state.topup_signer)(&signer_state, &terms))
+                .await;
+        let signed = match signed {
+            Ok(Ok(headers)) => headers,
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "payer proxy: session top-up signing failed");
+                return buffered_response(status, &resp_headers, resp_body);
+            }
+            Err(error) => {
+                tracing::warn!(%error, "payer proxy: session top-up signer task failed");
+                return buffered_response(status, &resp_headers, resp_body);
+            }
+        };
+        // Exactly one send with TopUp on the original buffered request. Its
+        // outcome may be unknown, so retain these exact signed bytes and never
+        // create another top-up or replay the business request on uncertainty.
+        *state.topup_pending.lock().await = Some(signed.clone());
+        let result =
+            send_upstream(&state, &method, &url, &headers, body.clone(), Some(&signed)).await;
+        return match result {
+            Ok(response) if response.status().is_success() => {
+                *state.topup_pending.lock().await = None;
+                deliver(
+                    response,
+                    translated,
+                    session_authorization.take(),
+                    inference_capture,
+                )
+                .await
+            }
+            Ok(response) => {
+                tracing::warn!(status = %response.status(), "payer proxy: top-up response may be ambiguous");
+                (
+                    StatusCode::BAD_GATEWAY,
+                    "payer proxy: top-up outcome uncertain; original request was not retried",
+                )
+                    .into_response()
+            }
+            Err(error) => {
+                tracing::warn!(%error, "payer proxy: top-up send outcome uncertain");
+                (
+                    StatusCode::BAD_GATEWAY,
+                    "payer proxy: top-up outcome uncertain; original request was not retried",
+                )
+                    .into_response()
+            }
+        };
+    }
 
     let mut mpp_challenges = pay_core::mpp::parse_all(
         resp_headers
@@ -865,6 +973,33 @@ fn apply_batch_settlement(
         charged_cumulative_amount: Some(channel.charged_cumulative_amount().to_string()),
         ..pay_pdb::types::PaymentDetails::default()
     });
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SessionTopUpAdvisory {
+    error: String,
+    channel_id: String,
+    required_capacity: String,
+    available_capacity: String,
+    #[serde(default, rename = "message")]
+    _message: Option<String>,
+}
+
+// Older gateways return session_cap_exhausted with only a channelId and
+// message. Preserve the existing terminal/open-new-channel path for those.
+// A partially structured capacity advisory must instead fail closed.
+fn has_session_topup_capacity_fields(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .is_some_and(|value| {
+            value.get("requiredCapacity").is_some() || value.get("availableCapacity").is_some()
+        })
+}
+
+fn parse_session_topup_advisory(body: &[u8]) -> Option<SessionTopUpAdvisory> {
+    let advisory: SessionTopUpAdvisory = serde_json::from_slice(body).ok()?;
+    (advisory.error == "session_cap_exhausted").then_some(advisory)
 }
 
 fn cached_session_error_text(body: &[u8]) -> String {
@@ -1368,6 +1503,7 @@ fn translate_stream_response(
 /// The header(s) a paid retry must carry. MPP sets
 /// `Authorization: Payment <credential>`; x402 `upto` and `exact` set their
 /// version-appropriate payment header without clobbering an upstream key.
+#[derive(Clone)]
 struct PaidHeaders {
     headers: Vec<(String, String)>,
 }
@@ -1429,6 +1565,19 @@ fn build_session_authorization(
         )?;
 
     Ok((PaidHeaders::mpp(open_authorization), use_authorization))
+}
+
+fn sign_session_topup(
+    state: &PayerState,
+    terms: &pay_core::session::ValidatedTopUp,
+) -> pay_core::Result<PaidHeaders> {
+    let authorization = pay_core::session::sign_operator_session_topup(
+        terms,
+        state.store.as_ref(),
+        state.account_override.as_deref(),
+        &state.authorization_url,
+    )?;
+    Ok(PaidHeaders::mpp(authorization))
 }
 
 /// Select a payable MPP challenge and build the `Authorization: Payment …`
@@ -2920,6 +3069,335 @@ mod tests {
         );
     }
 
+    fn topup_test_channel() -> String {
+        solana_pubkey::Pubkey::new_from_array([5; 32]).to_string()
+    }
+
+    fn topup_test_challenge() -> pay_core::mpp::Challenge {
+        use pay_kit::mpp::Base64UrlJson;
+        let request = serde_json::json!({
+            "amount": "1",
+            "currency": "USDC",
+            "recipient": solana_pubkey::Pubkey::new_from_array([4; 32]).to_string(),
+            "suggestedDeposit": "250000",
+            "methodDetails": {
+                "network": "localnet",
+                "channelProgram": solana_pubkey::Pubkey::new_from_array([6; 32]).to_string(),
+                "voucherSigner": "operator",
+                "operator": solana_pubkey::Pubkey::new_from_array([7; 32]).to_string(),
+                "feePayer": true,
+                "feePayerKey": solana_pubkey::Pubkey::new_from_array([8; 32]).to_string(),
+                "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+            }
+        });
+        pay_core::mpp::Challenge::with_challenge_binding_secret(
+            "test",
+            "test",
+            "solana",
+            "session",
+            Base64UrlJson::from_value(&request).unwrap(),
+        )
+    }
+
+    fn open_topup_test_session(
+        _state: &PayerState,
+        challenge: &pay_core::mpp::Challenge,
+    ) -> pay_core::Result<(PaidHeaders, String)> {
+        use pay_kit::mpp::{PaymentCredential, SessionAction, SessionAuthentication, UsePayload};
+        let proof = SessionAuthentication::sign(
+            challenge.id.clone(),
+            &topup_test_channel(),
+            &ed25519_dalek::SigningKey::from_bytes(&[1; 32]),
+        )
+        .unwrap();
+        let use_header = pay_kit::mpp::format_authorization(&PaymentCredential::new(
+            challenge.to_echo(),
+            SessionAction::Use(UsePayload {
+                channel_id: topup_test_channel(),
+                authentication: proof,
+            }),
+        ))
+        .unwrap();
+        Ok((PaidHeaders::mpp("Payment fake-open".into()), use_header))
+    }
+
+    fn sign_topup_test_session(
+        _state: &PayerState,
+        terms: &pay_core::session::ValidatedTopUp,
+    ) -> pay_core::Result<PaidHeaders> {
+        assert_eq!(terms.amount(), 249962);
+        Ok(PaidHeaders::mpp(terms.header("AQAB")?))
+    }
+
+    #[derive(Clone, Copy)]
+    enum TopUpTestReply {
+        Success,
+        UncertainStatus,
+        Disconnected,
+    }
+
+    async fn topup_case(
+        advisory: serde_json::Value,
+        cap: Option<u128>,
+        topup_reply: TopUpTestReply,
+    ) -> (StatusCode, Vec<(String, String)>, String) {
+        use pay_kit::mpp::{SessionAction, parse_authorization};
+        let seen = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+        let recorded = seen.clone();
+        let app = Router::new().fallback(any(move |req: Request| {
+            let recorded = recorded.clone();
+            let advisory = advisory.clone();
+            async move {
+                let auth = req
+                    .headers()
+                    .get(header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("")
+                    .to_owned();
+                let body = axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES)
+                    .await
+                    .unwrap();
+                let contents = String::from_utf8(body.to_vec()).unwrap();
+                let prior_topup = recorded.lock().unwrap().iter().any(|(header, _)| {
+                    parse_authorization(header)
+                        .ok()
+                        .and_then(|credential| credential.payload_as::<SessionAction>().ok())
+                        .is_some_and(|action| matches!(action, SessionAction::TopUp(_)))
+                });
+                recorded.lock().unwrap().push((auth.clone(), contents));
+                if auth.is_empty() {
+                    return Response::builder()
+                        .status(StatusCode::PAYMENT_REQUIRED)
+                        .header(
+                            header::WWW_AUTHENTICATE,
+                            pay_kit::mpp::format_www_authenticate(&topup_test_challenge()).unwrap(),
+                        )
+                        .body(Body::empty())
+                        .unwrap();
+                }
+                if auth == "Payment fake-open" || prior_topup {
+                    return (StatusCode::OK, "paid").into_response();
+                }
+                let action = parse_authorization(&auth)
+                    .unwrap()
+                    .payload_as::<SessionAction>()
+                    .unwrap();
+                match action {
+                    SessionAction::Use(_) => {
+                        (StatusCode::PAYMENT_REQUIRED, advisory.to_string()).into_response()
+                    }
+                    SessionAction::TopUp(_)
+                        if matches!(topup_reply, TopUpTestReply::Disconnected) =>
+                    {
+                        panic!("upstream disconnected after receiving TopUp");
+                    }
+                    SessionAction::TopUp(_)
+                        if matches!(topup_reply, TopUpTestReply::UncertainStatus) =>
+                    {
+                        (StatusCode::INTERNAL_SERVER_ERROR, "unknown after send").into_response()
+                    }
+                    SessionAction::TopUp(_) => (StatusCode::OK, "topped up").into_response(),
+                    _ => panic!("unexpected payment action"),
+                }
+            }
+        }));
+        let upstream = spawn_server(app).await;
+        let state = PayerState::new(
+            PayerUpstream {
+                base_url: upstream,
+                host_header: None,
+                dialect: Dialect::Anthropic,
+                chat_path: "v1/chat/completions".into(),
+                responses_path: "v1/responses".into(),
+                require_payment: true,
+                payment_protocol: PaymentProtocol::MppSession,
+            },
+            Arc::new(MemoryAccountsStore::new()),
+            Some("localnet".into()),
+            None,
+        )
+        .unwrap()
+        .with_session_opener(open_topup_test_session)
+        .with_topup_signer(sign_topup_test_session);
+        let state = PayerState {
+            per_request_cap_base_units: cap,
+            ..state
+        };
+        let state = Arc::new(state);
+        let payer = spawn_server(router(state.clone())).await;
+        let client = reqwest::Client::new();
+        let first = client
+            .post(format!("{payer}/v1/messages"))
+            .body("first")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = client
+            .post(format!("{payer}/v1/messages"))
+            .body("second")
+            .send()
+            .await
+            .unwrap();
+        let status = second.status();
+        let text = second.text().await.unwrap();
+        // Never issue another signed top-up or send business work after an
+        // ambiguous funding response. A successful top-up remains reusable.
+        if status != StatusCode::PAYMENT_REQUIRED {
+            let third = client
+                .post(format!("{payer}/v1/messages"))
+                .body("third")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                third.status(),
+                if status == StatusCode::OK {
+                    StatusCode::OK
+                } else {
+                    StatusCode::BAD_GATEWAY
+                }
+            );
+            if status != StatusCode::OK {
+                assert_eq!(
+                    third.text().await.unwrap(),
+                    "payer proxy: previous session top-up outcome uncertain; no further payment will be signed until the session is reconciled"
+                );
+            }
+        }
+        assert_eq!(
+            state.topup_pending.lock().await.is_some(),
+            status == StatusCode::BAD_GATEWAY
+        );
+        if status == StatusCode::BAD_GATEWAY {
+            assert!(state.session_authorization.lock().await.is_some());
+        }
+        let records = seen.lock().unwrap().clone();
+        (status, records, text)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn topup_reuses_channel_and_original_buffered_request() {
+        let (status, seen, _) = topup_case(
+            serde_json::json!({
+                "error": "session_cap_exhausted",
+                "channelId": topup_test_channel(),
+                "requiredCapacity": "250000",
+                "availableCapacity": "38",
+            }),
+            Some(250000),
+            TopUpTestReply::Success,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(seen.len(), 5);
+        assert_eq!(
+            seen.iter()
+                .filter(|(auth, _)| auth == "Payment fake-open")
+                .count(),
+            1
+        );
+        assert_eq!(seen[2].1, seen[3].1);
+        assert_eq!(seen[2].0, seen[4].0, "cached Use must survive top-up");
+        assert!(matches!(
+            pay_kit::mpp::parse_authorization(&seen[3].0)
+                .unwrap()
+                .payload_as()
+                .unwrap(),
+            pay_kit::mpp::SessionAction::TopUp(_)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hostile_topup_terms_fail_closed() {
+        for advisory in [
+            serde_json::json!({"error":"session_cap_exhausted", "channelId": topup_test_channel(), "requiredCapacity":"900000", "availableCapacity":"38"}),
+            serde_json::json!({"error":"session_cap_exhausted", "channelId": solana_pubkey::Pubkey::new_from_array([9; 32]).to_string(), "requiredCapacity":"250000", "availableCapacity":"38"}),
+            serde_json::json!({"error":"session_cap_exhausted", "channelId": topup_test_channel(), "requiredCapacity":"250000", "availableCapacity":"38", "payer":"attacker"}),
+            serde_json::json!({"error":"session_cap_exhausted", "channelId": topup_test_channel(), "requiredCapacity":"250000", "availableCapacity":"38", "mint":"attacker"}),
+            serde_json::json!({"error":"session_cap_exhausted", "channelId": topup_test_channel(), "requiredCapacity":"250000", "availableCapacity":"38", "channelProgram":"attacker"}),
+            serde_json::json!({"error":"session_cap_exhausted", "channelId": topup_test_channel(), "requiredCapacity":"250000", "availableCapacity":"38", "network":"mainnet"}),
+            serde_json::json!({"error":"session_cap_exhausted", "channelId": topup_test_channel(), "requiredCapacity":"250000"}),
+        ] {
+            let (status, seen, _) = topup_case(advisory, None, TopUpTestReply::Success).await;
+            assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+            assert_eq!(seen.len(), 3, "hostile advice must not submit a payment");
+        }
+        let (status, seen, _) = topup_case(
+            serde_json::json!({
+                "error":"session_cap_exhausted", "channelId": topup_test_channel(),
+                "requiredCapacity":"250000", "availableCapacity":"38",
+            }),
+            Some(249961),
+            TopUpTestReply::Success,
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(seen.len(), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ambiguous_topup_response_never_replays_business_request() {
+        let (status, seen, text) = topup_case(
+            serde_json::json!({
+                "error":"session_cap_exhausted", "channelId": topup_test_channel(),
+                "requiredCapacity":"250000", "availableCapacity":"38",
+            }),
+            None,
+            TopUpTestReply::UncertainStatus,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(text.contains("outcome uncertain"));
+        assert_eq!(seen.len(), 4);
+        assert_eq!(seen.iter().filter(|(_, body)| body == "second").count(), 2);
+        assert_eq!(
+            seen.iter()
+                .filter(|(auth, _)| auth == "Payment fake-open")
+                .count(),
+            1
+        );
+        assert!(matches!(
+            pay_kit::mpp::parse_authorization(&seen[3].0)
+                .unwrap()
+                .payload_as::<pay_kit::mpp::SessionAction>()
+                .unwrap(),
+            pay_kit::mpp::SessionAction::TopUp(_)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn disconnected_topup_send_never_replays_business_request() {
+        let (status, seen, text) = topup_case(
+            serde_json::json!({
+                "error": "session_cap_exhausted",
+                "channelId": topup_test_channel(),
+                "requiredCapacity": "250000",
+                "availableCapacity": "38",
+            }),
+            None,
+            TopUpTestReply::Disconnected,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(text.contains("outcome uncertain"));
+        assert_eq!(seen.len(), 4);
+        assert_eq!(seen.iter().filter(|(_, body)| body == "second").count(), 2);
+        assert_eq!(
+            seen.iter()
+                .filter(|(auth, _)| auth == "Payment fake-open")
+                .count(),
+            1
+        );
+        assert!(matches!(
+            pay_kit::mpp::parse_authorization(&seen[3].0)
+                .unwrap()
+                .payload_as::<pay_kit::mpp::SessionAction>()
+                .unwrap(),
+            pay_kit::mpp::SessionAction::TopUp(_)
+        ));
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn session_open_credential_does_not_survive_a_paid_retry_transport_error() {
         fn open_test_session(
@@ -3136,7 +3614,7 @@ mod tests {
                         .status(StatusCode::PAYMENT_REQUIRED)
                         .header(header::CONTENT_TYPE, "application/json")
                         .body(Body::from(
-                            r#"{"error":"session_failed","message":"channel is already sealed"}"#,
+                            r#"{"error":"session_cap_exhausted","message":"The session spending cap has been exhausted; open a new session.","channelId":"legacy-channel"}"#,
                         ))
                         .unwrap(),
                     call => panic!("unexpected upstream call {call}"),

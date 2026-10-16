@@ -2416,6 +2416,32 @@ enum SessionPricing<'a> {
     Fixed(u64),
 }
 
+fn metered_session_topup(
+    channel_id: &str,
+    required_capacity: u64,
+    available_capacity: u64,
+) -> Option<GateDecision> {
+    if required_capacity <= available_capacity {
+        return None;
+    }
+    Some(GateDecision::Respond(
+        GateResponse::json(
+            StatusCode::PAYMENT_REQUIRED,
+            serde_json::to_vec(&json!({
+                // Older clients recognize this terminal error and open a new
+                // channel. New clients use the bounded quote to top up.
+                "error": "session_cap_exhausted",
+                "message": "This session needs a top-up before retrying the request.",
+                "channelId": channel_id,
+                "requiredCapacity": required_capacity.to_string(),
+                "availableCapacity": available_capacity.to_string(),
+            }))
+            .unwrap_or_default(),
+        )
+        .header(header::CACHE_CONTROL, "no-store"),
+    ))
+}
+
 /// Process a session credential and map the outcome to a [`GateDecision`].
 async fn session_authorized(
     sm: &SessionMpp,
@@ -2452,11 +2478,31 @@ async fn session_authorized(
                 ));
             };
             let available_base_units = state.deposit.saturating_sub(state.cumulative);
+            let metered_ceiling = match pricing {
+                SessionPricing::Fixed(_) => None,
+                SessionPricing::Metered(meter) => meter
+                    .upto
+                    .as_ref()
+                    .and_then(|upto| upto.max_usd)
+                    .filter(|usd| usd.is_finite() && *usd > 0.0)
+                    .map(|usd| (usd * 10_f64.powi(sm.decimals() as i32)).ceil() as u64),
+            };
             let indivisible_price = match pricing {
                 SessionPricing::Fixed(amount) => Some(amount),
                 SessionPricing::Metered(meter) => metering::flat_request_price(meter)
                     .map(|usd| (usd * 10_f64.powi(sm.decimals() as i32)).ceil() as u64),
             };
+            if indivisible_price.is_none()
+                && sm.voucher_signer() == pay_kit::mpp::SessionVoucherSigner::Operator
+                && let Some(required_capacity) = metered_ceiling
+                && let Some(response) = metered_session_topup(
+                    &state.channel_id,
+                    required_capacity,
+                    available_base_units,
+                )
+            {
+                return response;
+            }
             if available_base_units == 0
                 || indivisible_price.is_some_and(|amount| amount > available_base_units)
             {
@@ -2472,11 +2518,7 @@ async fn session_authorized(
             }
             let per_request_base_units = match pricing {
                 SessionPricing::Fixed(amount) => amount,
-                SessionPricing::Metered(meter) => meter
-                    .upto
-                    .as_ref()
-                    .and_then(|upto| upto.max_usd)
-                    .map(|usd| (usd * 10_f64.powi(sm.decimals() as i32)).ceil() as u64)
+                SessionPricing::Metered(_) => metered_ceiling
                     .unwrap_or(available_base_units)
                     .min(available_base_units),
             };
@@ -2616,6 +2658,33 @@ mod tests {
     // Ceiling $0.10 at 6 decimals == 100_000 base units (USDC).
     const CEILING_USD: f64 = 0.10;
     const CEILING_BASE: u64 = 100_000;
+
+    #[test]
+    fn metered_session_requests_topup_before_streaming_without_full_capacity() {
+        let GateDecision::Respond(response) =
+            metered_session_topup("channel-id", 250_000, 38).unwrap()
+        else {
+            panic!("insufficient capacity must be rejected before forwarding");
+        };
+        assert_eq!(response.status, StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&response.body).unwrap(),
+            json!({
+                "error": "session_cap_exhausted",
+                "message": "This session needs a top-up before retrying the request.",
+                "channelId": "channel-id",
+                "requiredCapacity": "250000",
+                "availableCapacity": "38",
+            })
+        );
+        assert!(
+            !response
+                .headers
+                .iter()
+                .any(|(name, _)| *name == header::WWW_AUTHENTICATE)
+        );
+        assert!(metered_session_topup("channel-id", 250_000, 250_000).is_none());
+    }
 
     /// A client that lost a successful batch response gets the payment result
     /// back, not a conflict.
