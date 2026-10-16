@@ -671,7 +671,10 @@ fn decode_compute_unit_price(
             "malformed compute-unit-price instruction",
         ));
     }
-    Ok(u64::from_le_bytes(ix.data[1..9].try_into().unwrap()))
+    let price_bytes: [u8; 8] = ix.data[1..9].try_into().map_err(|_| {
+        config_error(chunk_index, "malformed compute-unit-price instruction")
+    })?;
+    Ok(u64::from_le_bytes(price_bytes))
 }
 
 fn decode_compute_unit_limit(
@@ -692,7 +695,10 @@ fn decode_compute_unit_limit(
             "malformed compute-unit-limit instruction",
         ));
     }
-    Ok(u32::from_le_bytes(ix.data[1..5].try_into().unwrap()))
+    let limit_bytes: [u8; 4] = ix.data[1..5].try_into().map_err(|_| {
+        config_error(chunk_index, "malformed compute-unit-limit instruction")
+    })?;
+    Ok(u32::from_le_bytes(limit_bytes))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -805,7 +811,10 @@ fn validate_transfer_checked(
             "expected a transfer_checked instruction",
         ));
     }
-    let amount = u64::from_le_bytes(ix.data[1..9].try_into().unwrap());
+    let amount_bytes: [u8; 8] = ix.data[1..9].try_into().map_err(|_| {
+        config_error(chunk_index, "expected a transfer_checked instruction")
+    })?;
+    let amount = u64::from_le_bytes(amount_bytes);
     let ix_decimals = ix.data[9];
 
     let source = account_at(message, ix.accounts[0], chunk_index)?;
