@@ -126,6 +126,9 @@ pub fn synthesize_from_spec(api: &ApiSpec, ctx: &DiscoveryContext) -> Value {
         } else if let Some(metering) = &ep.metering {
             let flat = flat_price_usd(metering);
             for scheme in metering.accepted_schemes() {
+                if scheme == Scheme::X402Exact && ctx.fee_payer.is_none() {
+                    continue;
+                }
                 let info = scheme_offer_info(scheme);
                 // `upto` (a ceiling) and `session` (a channel cap) advertise a
                 // capped amount; session also carries the per-delivery unit price.
@@ -1286,6 +1289,57 @@ mod tests {
             "Fast Gemini model for low-latency generation."
         );
         assert_eq!(variants[0]["dimensions"][1]["tiers"][0]["price_usd"], 2.875);
+    }
+
+    #[test]
+    fn synthesized_openapi_offers_x402_exact_only_with_fee_payer() {
+        let metering: Metering = serde_json::from_value(json!({
+            "schemes": ["mpp-charge", "x402-exact"]
+        }))
+        .unwrap();
+        let api = ApiSpec {
+            name: "echo".to_string(),
+            subdomain: "echo".to_string(),
+            title: "Echo".to_string(),
+            description: "Echo".to_string(),
+            category: pay_types::metering::ApiCategory::AiMl,
+            version: "v1".to_string(),
+            env: Default::default(),
+            routing: pay_types::metering::RoutingConfig::Respond {},
+            accounting: Default::default(),
+            endpoints: vec![metered_ep(Post, "v1/echo", metering)],
+            free_tier: None,
+            quotas: None,
+            notes: None,
+            operator: None,
+            recipients: Default::default(),
+            session: None,
+            batch_settlement: None,
+        };
+        let offers = |fee_payer: Option<&str>| {
+            let doc = synthesize_from_spec(
+                &api,
+                &DiscoveryContext {
+                    network_slug: "mainnet",
+                    pay_to: Some("recipient"),
+                    fee_payer,
+                },
+            );
+            doc["paths"]["/v1/echo"]["post"]["x-payment-info"]["offers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|o| {
+                    format!(
+                        "{}:{}",
+                        o["method"].as_str().unwrap(),
+                        o["scheme"].as_str().unwrap()
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(offers(None), ["mpp:charge"]);
+        assert_eq!(offers(Some("fee-payer")), ["x402:exact", "mpp:charge"]);
     }
 
     #[test]

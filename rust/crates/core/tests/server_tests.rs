@@ -1100,3 +1100,123 @@ async fn respond_service_worker_always_served() {
         .unwrap();
     assert!(ct.contains("javascript"), "Service worker should return JS");
 }
+
+// ── x402 exact is only advertised when it can be settled ──
+
+#[derive(Clone)]
+struct X402TestState {
+    apis: Arc<Vec<ApiSpec>>,
+    mpp: Option<Mpp>,
+    x402: Arc<pay_kit::x402::server::X402>,
+    signer: Option<Arc<dyn pay_kit::solana_keychain::TransactionSigner>>,
+}
+
+impl PaymentState for X402TestState {
+    fn apis(&self) -> &[ApiSpec] {
+        &self.apis
+    }
+    fn mpp(&self) -> Option<&Mpp> {
+        self.mpp.as_ref()
+    }
+    fn x402(&self) -> Option<&pay_kit::x402::server::X402> {
+        Some(&self.x402)
+    }
+    fn fee_payer_signer(&self) -> Option<Arc<dyn pay_kit::solana_keychain::TransactionSigner>> {
+        self.signer.clone()
+    }
+}
+
+fn test_fee_payer() -> Arc<dyn pay_kit::solana_keychain::TransactionSigner> {
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+    let mut keypair = [0u8; 64];
+    keypair[..32].copy_from_slice(sk.as_bytes());
+    keypair[32..].copy_from_slice(sk.verifying_key().as_bytes());
+    Arc::new(pay_kit::solana_keychain::MemorySigner::from_bytes(&keypair).unwrap())
+}
+
+async fn start_x402_server(
+    fee_payer: Option<Arc<dyn pay_kit::solana_keychain::TransactionSigner>>,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let mut api = load_test_api();
+    for ep in api.endpoints.iter_mut() {
+        if ep.path == "v1/simple/echo"
+            && let Some(m) = ep.metering.as_mut()
+        {
+            m.schemes = Some(vec![
+                pay_types::metering::Scheme::MppCharge,
+                pay_types::metering::Scheme::X402Exact,
+            ]);
+        }
+    }
+    let mpp = Mpp::new(pay_kit::mpp::server::Config {
+        recipient: "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY".to_string(),
+        currency: "SOL".to_string(),
+        decimals: 9,
+        network: "localnet".to_string(),
+        rpc_url: Some("http://localhost:8899".to_string()),
+        challenge_binding_secret: Some("test-secret-key-do-not-use-32b-pad".to_string()),
+        ..Default::default()
+    })
+    .ok();
+    let x402 = pay_kit::x402::server::X402::new(pay_kit::x402::server::Config {
+        recipient: "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY".to_string(),
+        currencies: vec![pay_kit::x402::server::CurrencyConfig {
+            currency: "USDC".to_string(),
+            decimals: 6,
+            token_program: None,
+        }],
+        network: "devnet".to_string(),
+        rpc_url: Some("http://localhost:8899".to_string()),
+        resource: "simple".to_string(),
+        description: Some("Echo".to_string()),
+        max_age: Some(60),
+        fee_payer_key: fee_payer.as_ref().map(|s| s.pubkey().to_string()),
+    })
+    .unwrap();
+    let state = X402TestState {
+        apis: Arc::new(vec![api]),
+        mpp,
+        x402: Arc::new(x402),
+        signer: fee_payer,
+    };
+    let app = Router::new()
+        .fallback(any(echo_handler))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            pay_core::server::payment::payment_middleware::<X402TestState>,
+        ))
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let handle = tokio::spawn(async { axum::serve(listener, app).await.unwrap() });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    (url, handle)
+}
+
+async fn challenge_headers(url: &str) -> reqwest::header::HeaderMap {
+    let resp = reqwest::Client::new()
+        .post(format!("{url}/v1/simple/echo"))
+        .headers(client_with_host("testapi"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 402);
+    resp.headers().clone()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn x402_exact_advertised_with_fee_payer() {
+    let (url, _h) = start_x402_server(Some(test_fee_payer())).await;
+    let headers = challenge_headers(&url).await;
+    assert!(headers.get("payment-required").is_some());
+    assert!(headers.get("www-authenticate").is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn x402_exact_withheld_without_fee_payer() {
+    let (url, _h) = start_x402_server(None).await;
+    let headers = challenge_headers(&url).await;
+    assert!(headers.get("payment-required").is_none());
+    assert!(headers.get("www-authenticate").is_some());
+}
