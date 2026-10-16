@@ -903,18 +903,37 @@ fn filter_discovery(
 
 /// Strip upstream-auth metadata that doesn't apply to proxy callers. The
 /// proxy handles upstream credentials internally (Google OAuth2, API keys,
-/// etc.); leaving the auth schemes in the served doc misleads agents into
-/// attaching tokens that the proxy won't honor anyway. Removes:
+/// etc.); leaving named auth schemes in the served doc misleads agents into
+/// attaching tokens that the proxy won't honor anyway.
+///
+/// Removes:
 ///
 /// - `components.securitySchemes` (OpenAPI 3) — drops the bucket entirely.
-/// - `security:` arrays at the root and on every operation (OpenAPI 3).
+/// - named `security` requirements at the root and on every operation
+///   (OpenAPI 3). An empty `security: []` is the explicit no-auth marker
+///   and is kept; stripping it makes free routes look authenticated.
 /// - `auth:` block (Google Discovery) at the root.
 /// - `scopes:` array on every Discovery method, recursively through nested
 ///   resources.
+fn is_empty_security_array(value: &Value) -> bool {
+    value.as_array().is_some_and(|arr| arr.is_empty())
+}
+
+/// Strip named upstream-auth schemes; keep OpenAPI `security: []` (explicit no-auth).
+fn strip_security_field(obj: &mut serde_json::Map<String, Value>) {
+    match obj.get("security") {
+        Some(value) if is_empty_security_array(value) => {}
+        Some(_) => {
+            obj.remove("security");
+        }
+        None => {}
+    }
+}
+
 pub fn strip_upstream_auth(doc: &mut Value) {
     if let Some(obj) = doc.as_object_mut() {
         // OpenAPI 3 root-level security and securitySchemes bucket.
-        obj.remove("security");
+        strip_security_field(obj);
         if let Some(components) = obj.get_mut("components").and_then(|v| v.as_object_mut()) {
             components.remove("securitySchemes");
             if components.is_empty() {
@@ -933,7 +952,7 @@ pub fn strip_upstream_auth(doc: &mut Value) {
             };
             for &method in HTTP_METHODS {
                 if let Some(op) = item_obj.get_mut(method).and_then(|v| v.as_object_mut()) {
-                    op.remove("security");
+                    strip_security_field(op);
                 }
             }
         }
@@ -1875,6 +1894,44 @@ mod tests {
         assert!(!schemas.contains_key("Orphan"));
         assert!(!schemas.contains_key("Disjoint"));
         assert!(!schemas.contains_key("OtherOrphan"));
+    }
+
+    #[test]
+    fn strip_auth_preserves_empty_security_marker() {
+        let mut doc = json!({
+            "openapi": "3.0.0",
+            "security": [],
+            "paths": {
+                "/health": {
+                    "get": {
+                        "summary": "free",
+                        "security": []
+                    }
+                },
+                "/paid": {
+                    "post": {
+                        "summary": "paid",
+                        "security": [{"oauth2": ["scope.b"]}]
+                    }
+                }
+            },
+            "components": {
+                "securitySchemes": {
+                    "oauth2": {"type": "oauth2", "flows": {}}
+                }
+            }
+        });
+        strip_upstream_auth(&mut doc);
+
+        assert_eq!(doc["security"], json!([]));
+        assert_eq!(doc["paths"]["/health"]["get"]["security"], json!([]));
+        assert!(
+            !doc["paths"]["/paid"]["post"]
+                .as_object()
+                .unwrap()
+                .contains_key("security")
+        );
+        assert!(!doc.as_object().unwrap().contains_key("components"));
     }
 
     #[test]
