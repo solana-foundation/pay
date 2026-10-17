@@ -1848,6 +1848,7 @@ mod tests {
             secret_key_b58: Some(bs58::encode(TEST_KEYPAIR_BYTES).into_string()),
             created_at: Some("2026-04-27T00:00:00Z".to_string()),
             subscriptions: std::collections::BTreeMap::new(),
+            approver: None,
         };
         let mut file = AccountsFile::default();
         file.upsert("devnet", "default", account);

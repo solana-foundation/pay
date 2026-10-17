@@ -926,6 +926,7 @@ pub fn save_account(
             secret_key_b58: None,
             created_at: None,
             subscriptions: std::collections::BTreeMap::new(),
+            approver: None,
         },
     );
     accounts.save()
@@ -968,6 +969,7 @@ pub fn save_account_remote_with_auth(
             secret_key_b58: None,
             created_at: None,
             subscriptions: std::collections::BTreeMap::new(),
+            approver: None,
         },
     );
     accounts.save()

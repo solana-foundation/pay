@@ -543,6 +543,7 @@ fn resolve_signing_account(
             secret_key_b58: None,
             created_at: Some(Utc::now().to_rfc3339()),
             subscriptions: BTreeMap::new(),
+            approver: None,
         };
         let mut file = AccountsFile::default();
         file.upsert(network, &account_name, account);

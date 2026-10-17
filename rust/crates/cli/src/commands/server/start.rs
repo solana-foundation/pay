@@ -5039,6 +5039,7 @@ endpoints:
             secret_key_b58: Some(bs58::encode(&VALID_TEST_KEYPAIR_BYTES[..]).into_string()),
             created_at: Some("2026-04-10T00:00:00Z".to_string()),
             subscriptions: std::collections::BTreeMap::new(),
+            approver: None,
         };
         (acct, pubkey)
     }
@@ -5253,6 +5254,7 @@ endpoints:
             secret_key_b58: Some("abc".to_string()),
             created_at: Some("2026-04-10T00:00:00Z".to_string()),
             subscriptions: std::collections::BTreeMap::new(),
+            approver: None,
         };
         file.upsert(pay_core::accounts::MAINNET_NETWORK, "broken", bad);
         let store = MemoryAccountsStore::with_file(file);

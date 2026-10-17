@@ -48,9 +48,12 @@ hardware wallet is local but not exportable.
   `is_exportable()` first and returns one error for every non-exportable
   backend. `pay account export` and the export offer in `pay account destroy`
   both go through it.
-- **Approval.** `Gate::for_policy(auth_required, override)` picks the gate:
-  a caller-supplied override (MCP elicitation), else the platform prompt,
-  else nothing. `LocalKeystoreBackend::keystore` places it in front of the
+- **Approval.** `Gate::for_policy(auth_required, account.approval_override(override))`
+  picks the gate. Without an external `approver`: a caller-supplied override
+  (MCP elicitation, a tenant's spend policy), else the platform prompt, else
+  nothing. With one, the approver is always asked: alone in place of the
+  platform prompt, or after the caller's override, and both must approve.
+  `LocalKeystoreBackend::keystore` places the gate in front of the
   secret store. The file backend composes the platform prompt itself; 1Password
   ignores the gate because `op` prompts.
 - **Platform `cfg`.** Only inside `backend/local.rs`, one block per store,
@@ -62,6 +65,103 @@ hardware wallet is local but not exportable.
   signer sources, and `Account::descriptor()` all resolve through it. Apple
   Keychain keeps `keychain` as its flag while its id and `accounts.yml` value
   stay `apple-keychain`.
+
+## External approvers (headless hosts)
+
+A host with no screen (CI, cron, a server agent) cannot show Touch ID,
+Windows Hello or polkit, so an `auth_required` account there can only fail.
+An account can name a program that approves instead:
+
+```yaml
+accounts:
+  mainnet:
+    agent:
+      keystore: file
+      path: ~/.config/pay/agent.json
+      auth_required: true
+      approver:
+        command: /usr/local/bin/pay-approver
+        args: ["--channel", "payments"]   # optional
+        timeout_secs: 120                 # optional, default 120
+```
+
+`command` must be an absolute path; a bare name such as `pay-approver` or a
+relative path is refused, since it would be resolved through the caller's
+`PATH` or working directory. The approver starts with a cleared environment
+and runs from `/`: it gets `PATH=/usr/bin:/bin`, `HOME` from the user
+database (not the caller's `HOME`), and `LANG` only when it is a plain locale
+name. Nothing else from pay's environment reaches it, so the caller's
+`LD_PRELOAD`, `PATH` or credentials held in environment variables cannot
+influence or leak into it. Refer to tools outside `/usr/bin:/bin` by absolute
+path, or set `PATH` inside the approver.
+
+For every gated action pay runs the command and writes one JSON request to
+its stdin:
+
+```json
+{"version":1,"kind":"authorize_payment","message":"authorize payment of $0.05 for accessing API api.example.com","amount_minor_units":500,"moves_money":true,"recurring":false}
+```
+
+`amount_minor_units` is USD ten-thousandths (`$1` = `10000`) and is `null`
+when the action moves no money. `kind` is one of `authorize_payment`,
+`authorize_batch`, `create_account`, `import_account`, `export_account`,
+`delete_account`, `open_session`, `use_gateway_fee_payer`, `use_account`.
+
+Exit status `0` approves. Anything else denies, and so does a program that
+cannot start, is killed, or does not answer within `timeout_secs` (it is
+then killed and reaped, along with any helpers it started on Unix; the
+timeout also covers delivering the request). On Unix, anything the approver
+leaves running in its process group is killed once it answers, so it should
+hand longer work to a separate service.
+
+The approver can't be skipped. It replaces the platform prompt, and when the
+caller brings a gate of its own (MCP elicitation, a tenant's spend policy),
+both must approve: the caller is asked first, and if it says no, the approver
+is not asked at all. This matters on a headless host, where the MCP client
+answering an elicitation can be the agent itself. The approver is only
+consulted when `auth_required` applies, and it lives in `accounts.yml` next
+to `auth_required`, so it is never weaker than turning auth off. A minimal
+approver that approves single payments up to $1 and denies everything else:
+
+```sh
+#!/bin/sh
+req=$(cat)
+[ "$(printf '%s' "$req" | jq -r .kind)" = authorize_payment ] || exit 1
+printf '%s' "$req" | jq -e '.recurring == false' >/dev/null || exit 1
+[ "$(printf '%s' "$req" | jq -r '.amount_minor_units // 99999999')" -le 10000 ]
+```
+
+It expects `jq` in `/usr/bin`; where `jq` lives elsewhere (`/usr/local/bin`,
+Homebrew), use its absolute path. A missing `jq` makes every check fail, so
+the example then denies everything rather than approving.
+
+### Limits
+
+- **The boundary is the OS user.** The approver only constrains an agent that
+  runs as a different OS user from the one who owns `accounts.yml`, the
+  approver program and the key material. An agent running as the same user
+  can edit `accounts.yml` (or remove the approver), replace the approver
+  program, or read a file keystore directly. Run the agent as a separate user
+  or in a container that cannot write those files.
+- **Whoever launches pay controls it.** The process that starts pay sets its
+  environment and working directory. It can point pay at a different
+  `accounts.yml` (found through `HOME`), change its settings (`PAY_CONFIG`,
+  a `pay.toml` in the working directory, other `PAY_*` variables), or load
+  code into pay itself with `LD_PRELOAD`. So pay must also be launched by
+  something the agent cannot control, for example a system service running
+  as another user, not by the agent.
+- **The approver file is not checked for who can write it.** If the agent's
+  user can modify the approver program or a directory above it, it can
+  replace the approver. Keep it in a directory only root or the owner can
+  write. A possible follow-up is to refuse such a file, like ssh's
+  `StrictModes`.
+- **An approval is not bound to the exact transaction.** The request
+  describes the action (kind, amount, whether it recurs), but carries no
+  recipient, mint or transaction digest, so the approver cannot check that
+  what is signed is exactly what it approved.
+- **`message` is partly built from what the paid server sends.** Treat it as
+  untrusted display text, especially when a person or a model reads it; base
+  decisions on `kind`, `amount_minor_units`, `moves_money` and `recurring`.
 
 ## Adding a remote provider
 
