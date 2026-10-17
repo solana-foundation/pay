@@ -1,16 +1,51 @@
 //! macOS: Touch ID authentication + Apple Keychain storage.
 
+use crate::bounded_process;
 use crate::{AuthGate, AuthIntent, Error, Result, SecretStore, Zeroizing};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const HELPER_SOURCE: &str = include_str!("helper.swift");
 const CODESIGN: &str = "/usr/bin/codesign";
 const SWIFTC: &str = "/usr/bin/swiftc";
+const AUTH_TIMEOUT: Duration = Duration::from_secs(30);
+const AVAILABILITY_TIMEOUT: Duration = Duration::from_secs(2);
+
+// Security/AuthSession.h: query the calling process's security session, not
+// another user's console session. An SSH session can have enrolled biometrics
+// without a local graphical prompt path.
+const CALLER_SECURITY_SESSION: u32 = u32::MAX;
+const SESSION_HAS_GRAPHIC_ACCESS: u32 = 0x0010;
+const SESSION_IS_REMOTE: u32 = 0x1000;
+
+#[link(name = "Security", kind = "framework")]
+unsafe extern "C" {
+    fn SessionGetInfo(session: u32, session_id: *mut u32, attributes: *mut u32) -> i32;
+}
+
+fn has_local_graphical_session() -> bool {
+    let mut attributes = 0;
+    // SAFETY: SessionGetInfo writes to `attributes`; the optional session ID
+    // output is null, and the caller-session constant is defined by Security.
+    let status = unsafe {
+        SessionGetInfo(
+            CALLER_SECURITY_SESSION,
+            std::ptr::null_mut(),
+            &mut attributes,
+        )
+    };
+    session_can_show_touch_id(status, attributes)
+}
+
+fn session_can_show_touch_id(status: i32, attributes: u32) -> bool {
+    status == 0
+        && attributes & SESSION_HAS_GRAPHIC_ACCESS != 0
+        && attributes & SESSION_IS_REMOTE == 0
+}
 
 const ENTITLEMENTS_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -24,12 +59,20 @@ pub struct TouchId;
 
 impl AuthGate for TouchId {
     fn authenticate(&self, intent: &AuthIntent) -> Result<()> {
+        if !has_local_graphical_session() {
+            return Err(Error::AuthDenied(
+                "Touch ID approval requires a local graphical macOS session; no payment was signed"
+                    .to_string(),
+            ));
+        }
         let binary = helper_path()?;
         let message = intent.prompt_message();
-        let output = Command::new(&binary)
-            .args(["authenticate", &message])
-            .output()
-            .map_err(|e| Error::Backend(format!("pay.sh: {e}")))?;
+        let output = bounded_process::output(
+            &binary,
+            &["authenticate", &message],
+            AUTH_TIMEOUT,
+            "Touch ID authentication",
+        )?;
 
         if output.status.success() {
             Ok(())
@@ -44,13 +87,19 @@ impl AuthGate for TouchId {
     }
 
     fn is_available(&self) -> bool {
+        if !has_local_graphical_session() {
+            return false;
+        }
         helper_path()
             .ok()
             .and_then(|binary| {
-                Command::new(&binary)
-                    .args(["check-biometrics"])
-                    .output()
-                    .ok()
+                bounded_process::output(
+                    &binary,
+                    &["check-biometrics"],
+                    AVAILABILITY_TIMEOUT,
+                    "Touch ID availability check",
+                )
+                .ok()
             })
             .map(|out| String::from_utf8_lossy(&out.stdout).trim() == "yes")
             .unwrap_or(false)
@@ -435,10 +484,7 @@ fn current_euid() -> u32 {
 
 fn helper_run(args: &[&str]) -> Result<String> {
     let binary = helper_path()?;
-    let output = Command::new(&binary)
-        .args(args)
-        .output()
-        .map_err(|e| Error::Backend(format!("pay.sh: {e}")))?;
+    let output = bounded_process::output(&binary, args, AUTH_TIMEOUT, "Keychain helper")?;
 
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -505,6 +551,17 @@ fn extract_error(stderr: &[u8]) -> String {
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn touch_id_requires_a_local_graphical_security_session() {
+        assert!(session_can_show_touch_id(0, SESSION_HAS_GRAPHIC_ACCESS));
+        assert!(!session_can_show_touch_id(1, SESSION_HAS_GRAPHIC_ACCESS));
+        assert!(!session_can_show_touch_id(0, 0));
+        assert!(!session_can_show_touch_id(
+            0,
+            SESSION_HAS_GRAPHIC_ACCESS | SESSION_IS_REMOTE
+        ));
+    }
 
     struct TestDir(PathBuf);
 
