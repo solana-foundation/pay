@@ -9,8 +9,14 @@ use std::{str::FromStr, sync::Arc, time::Duration};
 
 use ed25519_dalek::SigningKey;
 use pay_core::client::session::SessionHandle;
+use pay_kit::core::{
+    payment_channels::build_top_up_instruction,
+    signing::sign_versioned_transaction_slot,
+    tx::{TxVersion, build_unsigned, wire},
+};
 use pay_kit::mpp::{
-    PaymentChallenge, PaymentCredential, SessionAction, SessionAuthentication, UsePayload,
+    PaymentChallenge, PaymentCredential, SessionAction, SessionAuthentication, TopUpPayload,
+    UsePayload,
     client::{
         PaymentChannelOpenOptions, PaymentChannelSessionOpenOptions,
         create_payment_channel_session_opener, session::ActiveSession,
@@ -218,6 +224,58 @@ async fn delivered(harness: &Harness, host: &str, opened: &Opened, spent: u64) {
     assert_eq!(harness.channel(&opened.id()).await.spent_amount, spent);
 }
 
+async fn topped_up(
+    harness: &Harness,
+    host: &str,
+    opened: &Opened,
+    payer: &SigningKey,
+    amount: u64,
+    expected_spent: u64,
+) {
+    let rpc = pay_kit::mpp::solana_rpc_client::nonblocking::rpc_client::RpcClient::new(
+        harness.endpoints.rpc.clone(),
+    );
+    let blockhash = rpc.get_latest_blockhash().await.unwrap();
+    let mint = Pubkey::from_str(pay_types::Stablecoin::Usdc.mint(Some("localnet"))).unwrap();
+    let channel = Pubkey::from_str(&opened.id()).unwrap();
+    let instruction = build_top_up_instruction(
+        &signer(payer).pubkey(),
+        &channel,
+        &mint,
+        amount,
+        &Pubkey::from_str(TOKEN_PROGRAM).unwrap(),
+        &Pubkey::from_str(PAYMENT_CHANNELS_PROGRAM_ID).unwrap(),
+    );
+    let mut transaction = build_unsigned(
+        TxVersion::V0,
+        &harness.operator.pubkey(),
+        &[instruction],
+        blockhash,
+        None,
+    )
+    .unwrap();
+    sign_versioned_transaction_slot(&signer(payer), &mut transaction)
+        .await
+        .unwrap();
+    let header = format_authorization(&PaymentCredential::new(
+        opened.challenge.to_echo(),
+        SessionAction::TopUp(TopUpPayload {
+            channel_id: opened.id(),
+            additional_amount: amount.to_string(),
+            transaction: wire::encode(&transaction).unwrap(),
+        }),
+    ))
+    .unwrap();
+    let response = harness.request(host, Some(&header)).await;
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    assert_eq!(status, StatusCode::OK, "top-up response: {body}");
+    assert_eq!(body, BODY);
+    let stored = harness.channel(&opened.id()).await;
+    assert_eq!(stored.deposit, DEPOSIT + amount);
+    assert_eq!(stored.spent_amount, expected_spent);
+}
+
 async fn rejected_without_charge(harness: &Harness, host: &str, opened: &Opened) {
     let before = harness.channel(&opened.id()).await.spent_amount;
     let response = harness.request(host, Some(&opened.use_header())).await;
@@ -266,6 +324,7 @@ async fn deployment_policy_http_funding_isolation_failure_and_reconnect() {
         channel_program: Some(Pubkey::from_str(PAYMENT_CHANNELS_PROGRAM_ID).unwrap()),
         token_program: Some(Pubkey::from_str(TOKEN_PROGRAM).unwrap()),
         voucher_signer: VoucherSigner::Operator,
+        fee_payer_signer: Some(operator.clone()),
         idle_timeout_seconds: 2,
         operator_signing_key: Some(operator_key),
         suggested_deposit: Some(DEPOSIT),
@@ -337,6 +396,7 @@ async fn deployment_policy_http_funding_isolation_failure_and_reconnect() {
     harness.reconnect().await;
     delivered(&harness, HOST_A, &a, 100_000).await;
     delivered(&harness, HOST_B, &b, 200_000).await;
+    topped_up(&harness, HOST_B, &b, &payer_key, 200_000, 300_000).await;
 
     harness.controls.set_policy(
         HOST_A,
@@ -356,7 +416,7 @@ async fn deployment_policy_http_funding_isolation_failure_and_reconnect() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(harness.channel(&a.id()).await.spent_amount, 100_000);
-    assert_eq!(harness.channel(&b.id()).await.spent_amount, 200_000);
+    assert_eq!(harness.channel(&b.id()).await.spent_amount, 300_000);
     assert_eq!(harness.channel(&updated.id()).await.spent_amount, 75_000);
 
     let wallets = [
@@ -394,7 +454,7 @@ async fn deployment_policy_http_funding_isolation_failure_and_reconnect() {
         run_worker(&rpc_url, &redis_url, &prefix, &operator_key),
         run_worker(&rpc_url, &redis_url, &prefix, &operator_key),
     );
-    let expected = [60_000, 30_000, 10_000, 200_000, 75_000];
+    let expected = [60_000, 30_000, 10_000, 300_000, 75_000];
     for ((wallet, before), delta) in wallets.iter().zip(&before).zip(expected) {
         assert_eq!(
             token_balance(&rpc_url, wallet, mint).await - before,
@@ -431,7 +491,7 @@ async fn deployment_policy_http_funding_isolation_failure_and_reconnect() {
     }
     assert_eq!(
         token_balance(&rpc_url, &payer.pubkey(), mint).await,
-        20_000_000 - 375_000,
+        20_000_000 - 475_000,
         "unused deposits return to the payer; only accepted requests are spent",
     );
     // A second process must not pay the same accepted vouchers again.
