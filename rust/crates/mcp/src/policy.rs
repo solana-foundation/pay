@@ -2,9 +2,9 @@
 //!
 //! A hosted tenant has no Touch ID. What stands in for it is a policy: a
 //! ceiling per call and a cap per day, checked against the intent's amount
-//! before a signature is released and recorded when it is. When the MCP
-//! client can also show a prompt, the policy runs first and the prompt
-//! second: a cap is a hard limit, a prompt is a courtesy.
+//! before wallet credentials are released. When the MCP client can also show
+//! a prompt, the policy is checked first and the allowance is recorded only
+//! after approval, with an atomic cap recheck: a prompt cannot waive a cap.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -138,6 +138,7 @@ pub struct PolicyGate {
     subject: String,
     policy: SpendPolicy,
     ledger: Arc<dyn SpendLedger>,
+    prompt: Option<Box<dyn AuthGate>>,
 }
 
 impl PolicyGate {
@@ -150,14 +151,13 @@ impl PolicyGate {
             subject: subject.into(),
             policy,
             ledger,
+            prompt: None,
         }
     }
-}
 
-impl AuthGate for PolicyGate {
-    fn authenticate(&self, intent: &AuthIntent) -> pay_keystore::Result<()> {
+    fn checked_amount(&self, intent: &AuthIntent) -> pay_keystore::Result<Option<u64>> {
         if !intent.moves_money() {
-            return Ok(());
+            return Ok(None);
         }
         let denied = |why: String| pay_keystore::Error::AuthDenied(why);
         if intent.is_recurring() {
@@ -182,22 +182,53 @@ impl AuthGate for PolicyGate {
                 dollars(ceiling)
             )));
         }
-        if let Err(next) =
-            self.ledger
-                .check_and_record(&self.subject, amount, self.policy.daily_cap)
+        Ok(Some(amount))
+    }
+
+    fn cap_error(&self, amount: u64, next: u64) -> pay_keystore::Error {
+        pay_keystore::Error::AuthDenied(format!(
+            "{} would take today's spend to {} against a daily cap of {}",
+            dollars(amount),
+            dollars(next),
+            dollars(self.policy.daily_cap.expect("cap was checked"))
+        ))
+    }
+}
+
+impl AuthGate for PolicyGate {
+    fn authenticate(&self, intent: &AuthIntent) -> pay_keystore::Result<()> {
+        let amount = self.checked_amount(intent)?;
+        if let Some(prompt) = &self.prompt {
+            if let Some(amount) = amount
+                && let Some(cap) = self.policy.daily_cap
+            {
+                let next = self
+                    .ledger
+                    .spent_today(&self.subject)
+                    .saturating_add(amount);
+                if next > cap {
+                    return Err(self.cap_error(amount, next));
+                }
+            }
+            prompt.authenticate(intent)?;
+        }
+        // Do not hold allowance while waiting on a person. Another call or a
+        // UTC rollover can change the budget, so only this atomic check may
+        // authorize credential release after the prompt succeeds.
+        if let Some(amount) = amount
+            && let Err(next) =
+                self.ledger
+                    .check_and_record(&self.subject, amount, self.policy.daily_cap)
         {
-            return Err(denied(format!(
-                "{} would take today's spend to {} against a daily cap of {}",
-                dollars(amount),
-                dollars(next),
-                dollars(self.policy.daily_cap.expect("cap was checked"))
-            )));
+            return Err(self.cap_error(amount, next));
         }
         Ok(())
     }
 
     fn is_available(&self) -> bool {
-        true
+        self.prompt
+            .as_ref()
+            .is_none_or(|prompt| prompt.is_available())
     }
 }
 
@@ -223,15 +254,19 @@ pub struct PolicyApproval {
 
 impl ApprovalPolicy for PolicyApproval {
     fn gate(&self, peer: Option<&Peer<RoleServer>>) -> AuthOverride {
-        let mut gates: Vec<Box<dyn AuthGate>> = vec![Box::new(PolicyGate::new(
-            self.subject.clone(),
-            self.policy,
-            self.ledger.clone(),
-        ))];
-        if let Some(peer) = peer.filter(|p| peer_supports_elicitation(p)) {
-            gates.push(Box::new(crate::ElicitationAuth::new(peer.clone())));
-        }
-        Some(Box::new(ChainedGate(gates)))
+        self.gate_with_prompt(
+            peer.filter(|p| peer_supports_elicitation(p)).map(|peer| {
+                Box::new(crate::ElicitationAuth::new(peer.clone())) as Box<dyn AuthGate>
+            }),
+        )
+    }
+}
+
+impl PolicyApproval {
+    fn gate_with_prompt(&self, prompt: Option<Box<dyn AuthGate>>) -> AuthOverride {
+        let mut gate = PolicyGate::new(self.subject.clone(), self.policy, self.ledger.clone());
+        gate.prompt = prompt;
+        Some(Box::new(gate))
     }
 }
 
@@ -248,6 +283,282 @@ mod tests {
 
     fn payment(amount: &str) -> AuthIntent {
         AuthIntent::authorize_payment_details(amount, "test", "api.test")
+    }
+
+    struct TestPrompt<F>(F);
+
+    impl<F> AuthGate for TestPrompt<F>
+    where
+        F: Fn(&AuthIntent) -> pay_keystore::Result<()> + Send + Sync,
+    {
+        fn authenticate(&self, intent: &AuthIntent) -> pay_keystore::Result<()> {
+            (self.0)(intent)
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+    }
+
+    fn approval(ledger: Arc<MemoryLedger>) -> PolicyApproval {
+        PolicyApproval {
+            subject: "sub".into(),
+            policy: SpendPolicy::dollars(1.0, 1.0),
+            ledger,
+        }
+    }
+
+    #[test]
+    fn declined_prompt_does_not_consume_budget_or_block_the_next_payment() {
+        let ledger = Arc::new(MemoryLedger::new());
+        let approval = approval(ledger.clone());
+        let gate = approval
+            .gate_with_prompt(Some(Box::new(TestPrompt(|_: &AuthIntent| {
+                Err(pay_keystore::Error::AuthDenied("user declined".into()))
+            }))))
+            .unwrap();
+
+        let error = gate.authenticate(&payment("$1")).unwrap_err();
+        assert!(error.to_string().contains("user declined"), "{error}");
+        assert_eq!(
+            ledger.spent_today("sub"),
+            0,
+            "a refusal must record nothing"
+        );
+        approval
+            .gate(None)
+            .unwrap()
+            .authenticate(&payment("$1"))
+            .unwrap();
+        assert_eq!(ledger.spent_today("sub"), 10_000);
+    }
+
+    #[test]
+    fn pending_prompt_is_not_recorded_and_success_is_recorded_once() {
+        let ledger = Arc::new(MemoryLedger::new());
+        let observed_ledger = ledger.clone();
+        let gate = approval(ledger.clone())
+            .gate_with_prompt(Some(Box::new(TestPrompt(move |_: &AuthIntent| {
+                assert_eq!(observed_ledger.spent_today("sub"), 0);
+                Ok(())
+            }))))
+            .unwrap();
+
+        gate.authenticate(&payment("$1")).unwrap();
+        assert_eq!(ledger.spent_today("sub"), 10_000);
+    }
+
+    #[test]
+    fn cap_is_rechecked_after_another_call_spends_during_the_prompt() {
+        let ledger = Arc::new(MemoryLedger::new());
+        let other_ledger = ledger.clone();
+        let gate = approval(ledger.clone())
+            .gate_with_prompt(Some(Box::new(TestPrompt(move |_: &AuthIntent| {
+                PolicyGate::new("sub", SpendPolicy::dollars(1.0, 1.0), other_ledger.clone())
+                    .authenticate(&payment("$1"))
+            }))))
+            .unwrap();
+
+        let error = gate.authenticate(&payment("$1")).unwrap_err();
+        assert!(error.to_string().contains("daily cap"), "{error}");
+        assert_eq!(ledger.spent_today("sub"), 10_000);
+    }
+
+    #[test]
+    fn concurrent_confirmed_prompts_cannot_exceed_the_daily_cap() {
+        let ledger = Arc::new(MemoryLedger::new());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let handles = (0..2)
+            .map(|_| {
+                let entered_tx = entered_tx.clone();
+                let release = release.clone();
+                let gate = approval(ledger.clone())
+                    .gate_with_prompt(Some(Box::new(TestPrompt(move |_: &AuthIntent| {
+                        entered_tx.send(()).unwrap();
+                        let (released, wake) = &*release;
+                        let _guard = wake
+                            .wait_while(released.lock().unwrap(), |ready| !*ready)
+                            .unwrap();
+                        Ok(())
+                    }))))
+                    .unwrap();
+                std::thread::spawn(move || gate.authenticate(&payment("$1")))
+            })
+            .collect::<Vec<_>>();
+        drop(entered_tx);
+        let first_prompt = entered_rx.recv_timeout(std::time::Duration::from_secs(5));
+        let second_prompt = entered_rx.recv_timeout(std::time::Duration::from_secs(5));
+        let spent_while_pending = ledger.spent_today("sub");
+        // Always release and join the workers before asserting, even on a regression.
+        *release.0.lock().unwrap() = true;
+        release.1.notify_all();
+        let results = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect::<Vec<_>>();
+
+        assert!(first_prompt.is_ok() && second_prompt.is_ok());
+        assert_eq!(spent_while_pending, 0);
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        let error = results.into_iter().find_map(Result::err).unwrap();
+        assert!(error.to_string().contains("daily cap"), "{error}");
+        assert_eq!(ledger.spent_today("sub"), 10_000);
+    }
+
+    #[test]
+    fn approval_after_day_rollover_checks_the_new_days_cap() {
+        let day = Arc::new(AtomicU64::new(100));
+        let ledger = ledger_at(day.clone());
+        let next_day_ledger = ledger.clone();
+        let gate = approval(ledger.clone())
+            .gate_with_prompt(Some(Box::new(TestPrompt(move |_: &AuthIntent| {
+                day.store(101, Ordering::SeqCst);
+                PolicyGate::new(
+                    "sub",
+                    SpendPolicy::dollars(1.0, 1.0),
+                    next_day_ledger.clone(),
+                )
+                .authenticate(&payment("$0.50"))
+            }))))
+            .unwrap();
+
+        let error = gate.authenticate(&payment("$0.60")).unwrap_err();
+        assert!(error.to_string().contains("daily cap"), "{error}");
+        assert_eq!(ledger.spent_today("sub"), 5_000);
+    }
+
+    #[test]
+    fn refusal_after_day_rollover_cannot_release_another_calls_budget() {
+        let day = Arc::new(AtomicU64::new(100));
+        let ledger = ledger_at(day.clone());
+        let next_day_ledger = ledger.clone();
+        let gate = approval(ledger.clone())
+            .gate_with_prompt(Some(Box::new(TestPrompt(move |_: &AuthIntent| {
+                day.store(101, Ordering::SeqCst);
+                PolicyGate::new(
+                    "sub",
+                    SpendPolicy::dollars(1.0, 1.0),
+                    next_day_ledger.clone(),
+                )
+                .authenticate(&payment("$1"))?;
+                Err(pay_keystore::Error::AuthDenied("user cancelled".into()))
+            }))))
+            .unwrap();
+
+        assert!(gate.authenticate(&payment("$1")).is_err());
+        assert_eq!(ledger.spent_today("sub"), 10_000);
+    }
+
+    #[test]
+    fn policy_refusals_do_not_ask_for_approval() {
+        let ledger = Arc::new(MemoryLedger::new());
+        let gate = approval(ledger.clone())
+            .gate_with_prompt(Some(Box::new(TestPrompt(|_: &AuthIntent| {
+                panic!("a prompt cannot override a policy refusal");
+            }))))
+            .unwrap();
+
+        for intent in [
+            payment("$1.01"),
+            AuthIntent::default_payment(),
+            AuthIntent::authorize_subscription("$1", "recurring", "api.test"),
+        ] {
+            assert!(gate.authenticate(&intent).is_err());
+            assert_eq!(ledger.spent_today("sub"), 0);
+        }
+        PolicyGate::new("sub", SpendPolicy::dollars(1.0, 1.0), ledger.clone())
+            .authenticate(&payment("$1"))
+            .unwrap();
+        assert!(gate.authenticate(&payment("$0.01")).is_err());
+        assert_eq!(ledger.spent_today("sub"), 10_000);
+    }
+
+    #[test]
+    fn non_payment_intents_still_prompt_without_recording_budget() {
+        let ledger = Arc::new(MemoryLedger::new());
+        let prompts = Arc::new(AtomicU64::new(0));
+        let observed_prompts = prompts.clone();
+        let gate = approval(ledger.clone())
+            .gate_with_prompt(Some(Box::new(TestPrompt(move |_: &AuthIntent| {
+                observed_prompts.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }))))
+            .unwrap();
+
+        gate.authenticate(&AuthIntent::use_account("read")).unwrap();
+        assert_eq!(prompts.load(Ordering::SeqCst), 1);
+        assert_eq!(ledger.spent_today("sub"), 0);
+    }
+
+    #[test]
+    fn credentials_are_released_only_after_approval_and_budget_admission() {
+        use pay_core::backend::Gate;
+        use pay_core::remote::{CredentialSource, Credentials, MemoryCredentials};
+
+        let credentials = Credentials::from([("fixture".into(), "not-a-real-credential".into())]);
+        let source = MemoryCredentials::new(credentials.clone());
+        let ledger = Arc::new(MemoryLedger::new());
+        let approval = approval(ledger.clone());
+        let denied = approval
+            .gate_with_prompt(Some(Box::new(TestPrompt(|_: &AuthIntent| {
+                Err(pay_keystore::Error::AuthDenied("user declined".into()))
+            }))))
+            .unwrap();
+        let error = source
+            .load("fixture", "fixture", Gate::Override(denied), &payment("$1"))
+            .unwrap_err();
+        assert!(error.to_string().contains("user declined"), "{error}");
+        assert_eq!(ledger.spent_today("sub"), 0);
+
+        let accepted = approval
+            .gate_with_prompt(Some(Box::new(TestPrompt(|_: &AuthIntent| Ok(())))))
+            .unwrap();
+        assert_eq!(
+            source
+                .load(
+                    "fixture",
+                    "fixture",
+                    Gate::Override(accepted),
+                    &payment("$1")
+                )
+                .unwrap(),
+            credentials
+        );
+        assert_eq!(ledger.spent_today("sub"), 10_000);
+        assert!(
+            source
+                .load(
+                    "fixture",
+                    "fixture",
+                    Gate::Override(approval.gate(None).unwrap()),
+                    &payment("$1")
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn unavailable_prompt_stays_unavailable_and_its_error_records_nothing() {
+        struct UnavailablePrompt;
+        impl AuthGate for UnavailablePrompt {
+            fn authenticate(&self, _: &AuthIntent) -> pay_keystore::Result<()> {
+                Err(pay_keystore::Error::Unavailable)
+            }
+            fn is_available(&self) -> bool {
+                false
+            }
+        }
+        let ledger = Arc::new(MemoryLedger::new());
+        let gate = approval(ledger.clone())
+            .gate_with_prompt(Some(Box::new(UnavailablePrompt)))
+            .unwrap();
+        assert!(!gate.is_available());
+        assert!(matches!(
+            gate.authenticate(&payment("$1")),
+            Err(pay_keystore::Error::Unavailable)
+        ));
+        assert_eq!(ledger.spent_today("sub"), 0);
     }
 
     #[test]
