@@ -6,6 +6,7 @@ use pay_kit::client::{
     AssetPermission, ClientPermissions, OriginPermissionOverride, PaymentCandidate, SolanaNetwork,
     UsdAmount,
 };
+use pay_kit::x402::exact::{SOLANA_DEVNET, SOLANA_MAINNET};
 use serde::Deserialize;
 
 use pay_core::client::{mpp, x402};
@@ -152,12 +153,14 @@ fn parse_usd(value: &str) -> Result<UsdAmount, String> {
 
 fn parse_network(value: &str) -> Result<SolanaNetwork, String> {
     match value {
-        "mainnet" | "mainnet-beta" | "solana:mainnet" => Ok(SolanaNetwork::Mainnet),
-        "devnet" | "solana:devnet" => Ok(SolanaNetwork::Devnet),
+        "mainnet" | "mainnet-beta" | "solana:mainnet" | SOLANA_MAINNET => {
+            Ok(SolanaNetwork::Mainnet)
+        }
+        "devnet" | "solana:devnet" | "solana-devnet" | SOLANA_DEVNET => Ok(SolanaNetwork::Devnet),
         "localnet" | "localhost" => Ok(SolanaNetwork::Localnet),
-        value => pay_kit::x402::exact::cluster_for_caip2_network(value)
-            .and_then(|cluster| cluster.parse().ok())
-            .ok_or_else(|| format!("invalid Solana network `{value}`")),
+        // The protocol helper defaults unknown `solana:*` IDs to mainnet.
+        // Permission checks must accept only explicitly supported networks.
+        _ => Err(format!("invalid Solana network `{value}`")),
     }
 }
 
@@ -274,6 +277,223 @@ fn permission_error(message: impl Into<String>) -> pay_core::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pay_kit::x402::exact::{SOLANA_TESTNET, mints};
+
+    #[test]
+    fn supported_network_identifiers_map_to_the_same_permission_network() {
+        for (expected, identifiers) in [
+            (
+                SolanaNetwork::Mainnet,
+                &["mainnet", "mainnet-beta", "solana:mainnet", SOLANA_MAINNET][..],
+            ),
+            (
+                SolanaNetwork::Devnet,
+                &["devnet", "solana:devnet", "solana-devnet", SOLANA_DEVNET][..],
+            ),
+            (SolanaNetwork::Localnet, &["localnet", "localhost"][..]),
+        ] {
+            for identifier in identifiers {
+                assert_eq!(parse_network(identifier).unwrap(), expected, "{identifier}");
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_networks_are_not_treated_as_mainnet() {
+        for network in [
+            SOLANA_TESTNET,
+            "testnet",
+            "solana-testnet",
+            "solana:testnet",
+            "solana:custom-cluster-id",
+            "solana:",
+            "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp-extra",
+            "eip155:8453",
+            "",
+        ] {
+            assert!(parse_network(network).is_err(), "{network}");
+        }
+    }
+
+    // Exercise the wire parsers as well as each scheme's permission adapter.
+    // In particular, do not supply `cluster: mainnet` to hide the canonical-ID bug.
+    fn authorize_x402_offer(
+        permissions: &McpPermissions,
+        scheme: &str,
+        network: &str,
+        asset: &str,
+        amount: &str,
+        resource_url: &str,
+    ) -> Result<(), pay_core::Error> {
+        let body = serde_json::json!({
+            "x402Version": 2,
+            "resource": { "url": resource_url },
+            "accepts": [{
+                "scheme": scheme,
+                "network": network,
+                "amount": amount,
+                "asset": asset,
+                "payTo": "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY",
+                "maxTimeoutSeconds": 300,
+                "extra": {
+                    "feePayer": "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
+                    "receiverAuthorizer": "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY",
+                    "withdrawDelay": 3600,
+                    "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+                }
+            }]
+        })
+        .to_string();
+        match scheme {
+            "exact" => permissions.authorize_x402(
+                &x402::parse(&[], Some(&body)).expect("valid exact fixture"),
+                resource_url,
+            ),
+            "upto" => permissions.authorize_upto(
+                &x402::parse_upto(&[], Some(&body)).expect("valid upto fixture"),
+                resource_url,
+            ),
+            "batch-settlement" => permissions.authorize_batch(
+                &x402::parse_batch(&[], Some(&body)).expect("valid batch fixture"),
+                resource_url,
+            ),
+            _ => panic!("unsupported test scheme: {scheme}"),
+        }
+    }
+
+    #[test]
+    fn canonical_mainnet_offers_pass_all_x402_permission_adapters() {
+        let permissions = McpPermissions::from_config(&PermissionConfig {
+            origins: Some(vec!["https://api.example.com".into()]),
+            networks: Some(vec!["mainnet".into()]),
+            max_payment: Some("$1.00".into()),
+            ..PermissionConfig::default()
+        })
+        .unwrap();
+        for scheme in ["exact", "upto", "batch-settlement"] {
+            assert!(
+                authorize_x402_offer(
+                    &permissions,
+                    scheme,
+                    SOLANA_MAINNET,
+                    mints::USDC_MAINNET,
+                    "10000",
+                    "https://api.example.com/report",
+                )
+                .is_ok(),
+                "{scheme}"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_networks_do_not_bypass_payment_restrictions() {
+        let permissions = McpPermissions::from_config(&PermissionConfig {
+            origins: Some(vec!["https://api.example.com".into()]),
+            networks: Some(vec!["mainnet".into()]),
+            max_payment: Some("$1.00".into()),
+            ..PermissionConfig::default()
+        })
+        .unwrap();
+        for scheme in ["exact", "upto", "batch-settlement"] {
+            for (network, asset, amount, url) in [
+                (
+                    SOLANA_DEVNET,
+                    mints::USDC_DEVNET,
+                    "10000",
+                    "https://api.example.com/report",
+                ),
+                (
+                    SOLANA_MAINNET,
+                    mints::USDC_MAINNET,
+                    "10000",
+                    "https://other.example/report",
+                ),
+                (
+                    SOLANA_MAINNET,
+                    "11111111111111111111111111111111",
+                    "10000",
+                    "https://api.example.com/report",
+                ),
+                (
+                    SOLANA_MAINNET,
+                    mints::USDC_MAINNET,
+                    "1000001",
+                    "https://api.example.com/report",
+                ),
+                (
+                    "solana:custom-cluster-id",
+                    mints::USDC_MAINNET,
+                    "10000",
+                    "https://api.example.com/report",
+                ),
+            ] {
+                assert!(
+                    matches!(
+                        authorize_x402_offer(&permissions, scheme, network, asset, amount, url),
+                        Err(pay_core::Error::PaymentRejected(_))
+                    ),
+                    "{scheme}: network={network}, asset={asset}, amount={amount}, url={url}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_devnet_offers_still_pass_when_allowed() {
+        let permissions = McpPermissions::from_config(&PermissionConfig {
+            networks: Some(vec!["devnet".into()]),
+            ..PermissionConfig::default()
+        })
+        .unwrap();
+        for scheme in ["exact", "upto", "batch-settlement"] {
+            assert!(
+                authorize_x402_offer(
+                    &permissions,
+                    scheme,
+                    SOLANA_DEVNET,
+                    mints::USDC_DEVNET,
+                    "10000",
+                    "https://api.example.com/report",
+                )
+                .is_ok(),
+                "{scheme}"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_network_ids_work_in_permission_configuration() {
+        let config: PermissionConfig = serde_yml::from_str(&format!(
+            r#"
+origins: [https://api.example.com]
+networks: [{SOLANA_MAINNET}]
+assets:
+  - network: {SOLANA_MAINNET}
+    asset: 11111111111111111111111111111111
+    max_payment_atomic: 42
+origin_overrides:
+  - origin: https://api.example.com
+    asset_caps:
+      - network: {SOLANA_MAINNET}
+        asset: 11111111111111111111111111111111
+        max_payment_atomic: 21
+"#,
+        ))
+        .unwrap();
+        let permissions = McpPermissions::from_config(&config).unwrap();
+        let mint = "11111111111111111111111111111111";
+        assert!(
+            permissions
+                .authorize("https://api.example.com/report", SOLANA_MAINNET, mint, 21)
+                .is_ok()
+        );
+        assert!(
+            permissions
+                .authorize("https://api.example.com/report", SOLANA_MAINNET, mint, 22)
+                .is_err()
+        );
+    }
 
     #[test]
     fn yaml_builds_the_same_permission_model_as_cli_flags() {
