@@ -8,6 +8,7 @@
 
 pub mod auth;
 mod error;
+pub mod external;
 mod status;
 pub mod store;
 
@@ -20,6 +21,7 @@ pub mod windows;
 
 pub use auth::{AuthGate, AuthIntent, PaymentLimit, USD_MINOR_UNITS_PER_DOLLAR};
 pub use error::{Error, Result};
+pub use external::{DEFAULT_APPROVER_TIMEOUT, ExternalApprover};
 pub use store::SecretStore;
 pub use zeroize::Zeroizing;
 

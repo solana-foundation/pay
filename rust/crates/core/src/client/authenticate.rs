@@ -289,6 +289,7 @@ mod tests {
                 secret_key_b58: None,
                 created_at: None,
                 subscriptions,
+                approver: None,
             },
         );
         let mut accounts = BTreeMap::new();

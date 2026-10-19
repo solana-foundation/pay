@@ -424,7 +424,7 @@ pub fn load_remote_signer_from_with_hardware_timeout(
         source.load(
             name,
             provider.id(),
-            Gate::for_policy(gated, auth_override),
+            Gate::for_policy(gated, account.approval_override(auth_override)),
             &account_intent,
         )?
     } else {
@@ -557,6 +557,7 @@ mod tests {
             secret_key_b58: None,
             created_at: None,
             subscriptions: BTreeMap::new(),
+            approver: None,
         }
     }
 

@@ -89,6 +89,7 @@ impl TenantRecord {
             secret_key_b58: None,
             created_at: None,
             subscriptions: Default::default(),
+            approver: None,
         }
     }
 }

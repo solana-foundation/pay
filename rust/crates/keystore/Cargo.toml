@@ -12,6 +12,9 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 zeroize = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 secret-service = { version = "3", features = ["rt-tokio-crypto-rust"] }
 tokio = { version = "1", features = ["rt"] }

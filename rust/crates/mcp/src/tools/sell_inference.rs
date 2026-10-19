@@ -237,7 +237,10 @@ fn creator_token(scope: &CallScope, peer: Option<&Peer<RoleServer>>) -> Result<S
         .load(
             &name,
             PAYCONNECT_PROVIDER,
-            pay_core::backend::Gate::for_policy(gated, scope.auth_override(peer)),
+            pay_core::backend::Gate::for_policy(
+                gated,
+                account.approval_override(scope.auth_override(peer)),
+            ),
             &intent,
         )
         .map_err(|e| format!("Could not read the pay-connect token of `{name}`: {e}"))?;

@@ -170,6 +170,44 @@ pub struct Account {
     /// subscriptions.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub subscriptions: BTreeMap<String, Subscription>,
+
+    /// A program that approves this account's gated actions instead of the
+    /// platform prompt, for hosts with no screen (CI, cron, servers). Only
+    /// consulted when `auth_required` applies. See [`ApproverConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approver: Option<ApproverConfig>,
+}
+
+/// An external approver for an account:
+///
+/// ```yaml
+/// approver:
+///   command: /usr/local/bin/my-approver
+///   args: ["--channel", "payments"]
+///   timeout_secs: 120
+/// ```
+///
+/// pay writes the request as JSON to the program's stdin; exit status `0`
+/// approves, anything else (including a crash or a timeout) denies. It lives
+/// in `accounts.yml`, next to `auth_required`, so whoever can change one can
+/// change the other: it is never weaker than turning auth off.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApproverConfig {
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+}
+
+impl ApproverConfig {
+    pub fn gate(&self) -> crate::keystore::ExternalApprover {
+        let timeout = self
+            .timeout_secs
+            .map(std::time::Duration::from_secs)
+            .unwrap_or(crate::keystore::DEFAULT_APPROVER_TIMEOUT);
+        crate::keystore::ExternalApprover::new(&self.command, self.args.clone(), timeout)
+    }
 }
 
 /// On-disk lifecycle marker for a stored subscription. Mirrors the spec's
@@ -313,7 +351,53 @@ impl Subscription {
     }
 }
 
+/// A caller's gate followed by the account's approver; both must approve.
+/// The caller is asked first, so a refusal there never reaches the approver.
+struct CallerThenApprover {
+    caller: Box<dyn crate::keystore::AuthGate>,
+    approver: Box<dyn crate::keystore::AuthGate>,
+}
+
+impl crate::keystore::AuthGate for CallerThenApprover {
+    fn authenticate(&self, intent: &crate::keystore::AuthIntent) -> crate::keystore::Result<()> {
+        self.caller.authenticate(intent)?;
+        self.approver.authenticate(intent)
+    }
+
+    fn is_available(&self) -> bool {
+        self.caller.is_available() && self.approver.is_available()
+    }
+
+    fn prompts_user(&self) -> bool {
+        self.caller.prompts_user() || self.approver.prompts_user()
+    }
+}
+
 impl Account {
+    /// The approval gate a caller should hand to [`Gate::for_policy`].
+    ///
+    /// Without an external approver this is the caller's own override (MCP
+    /// elicitation, a tenant's spend policy), or none, which leaves the
+    /// platform prompt. With one, the approver can never be skipped: it
+    /// replaces the platform prompt, and when the caller brings a gate of its
+    /// own, both must approve. That matters on a headless host, where the MCP
+    /// client answering an elicitation can be the agent itself.
+    ///
+    /// [`Gate::for_policy`]: crate::backend::Gate::for_policy
+    pub fn approval_override(
+        &self,
+        auth_override: crate::signer::AuthOverride,
+    ) -> crate::signer::AuthOverride {
+        let Some(cfg) = self.approver.as_ref() else {
+            return auth_override;
+        };
+        let approver: Box<dyn crate::keystore::AuthGate> = Box::new(cfg.gate());
+        Some(match auth_override {
+            Some(caller) => Box::new(CallerThenApprover { caller, approver }),
+            None => approver,
+        })
+    }
+
     /// Whether this account should require backend auth on secret-key access.
     pub fn auth_required_for_network(&self, network: &str) -> bool {
         self.backend != BackendKind::Ephemeral
@@ -936,6 +1020,7 @@ fn generate_ephemeral_account() -> Account {
         secret_key_b58: Some(crate::b58::encode_64(&full)),
         created_at: Some(now_rfc3339()),
         subscriptions: BTreeMap::new(),
+        approver: None,
     }
 }
 
@@ -1010,6 +1095,7 @@ mod tests {
             secret_key_b58: None,
             created_at: None,
             subscriptions: BTreeMap::new(),
+            approver: None,
         }
     }
 
@@ -1026,6 +1112,7 @@ mod tests {
             secret_key_b58: Some("test-secret-bytes-base58".to_string()),
             created_at: Some("2026-04-10T00:00:00Z".to_string()),
             subscriptions: BTreeMap::new(),
+            approver: None,
         }
     }
 
@@ -1110,6 +1197,7 @@ mod tests {
             secret_key_b58: None,
             created_at: None,
             subscriptions: BTreeMap::new(),
+            approver: None,
         };
         assert_eq!(
             acct.signer_source("legacy"),
@@ -1131,6 +1219,7 @@ mod tests {
             secret_key_b58: None,
             created_at: None,
             subscriptions: BTreeMap::new(),
+            approver: None,
         };
         assert_eq!(
             acct.signer_source("myacct"),
@@ -1157,6 +1246,7 @@ mod tests {
             secret_key_b58: Some(bs58::encode(&raw_bytes).into_string()),
             created_at: Some("2026-04-10T00:00:00Z".to_string()),
             subscriptions: BTreeMap::new(),
+            approver: None,
         };
         assert_eq!(acct.ephemeral_keypair_bytes(), Some(raw_bytes));
     }
@@ -1164,6 +1254,172 @@ mod tests {
     #[test]
     fn ephemeral_keypair_bytes_none_for_keychain_account() {
         assert!(keychain_account("pk").ephemeral_keypair_bytes().is_none());
+    }
+
+    #[test]
+    fn approver_round_trips_through_yaml_and_is_omitted_when_unset() {
+        let mut acct = keychain_account("pk");
+        assert!(!serde_yml::to_string(&acct).unwrap().contains("approver"));
+
+        acct.approver = Some(ApproverConfig {
+            command: "/usr/local/bin/approve".to_string(),
+            args: vec!["--channel".to_string(), "payments".to_string()],
+            timeout_secs: Some(30),
+        });
+        let yaml = serde_yml::to_string(&acct).unwrap();
+        let back: Account = serde_yml::from_str(&yaml).unwrap();
+        assert_eq!(back, acct);
+
+        let minimal: Account =
+            serde_yml::from_str("keystore: apple-keychain\napprover:\n  command: approve\n")
+                .unwrap();
+        let cfg = minimal.approver.unwrap();
+        assert!(cfg.args.is_empty());
+        assert_eq!(cfg.timeout_secs, None);
+    }
+
+    /// A caller gate (MCP elicitation, a tenant policy) with a fixed answer,
+    /// counting how often it is asked.
+    struct Caller {
+        approves: bool,
+        asked: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Caller {
+        fn new(approves: bool) -> (Self, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+            let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            (
+                Self {
+                    approves,
+                    asked: asked.clone(),
+                },
+                asked,
+            )
+        }
+    }
+
+    impl crate::keystore::AuthGate for Caller {
+        fn authenticate(&self, _: &crate::keystore::AuthIntent) -> crate::keystore::Result<()> {
+            self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.approves {
+                Ok(())
+            } else {
+                Err(crate::keystore::Error::AuthDenied("caller said no".into()))
+            }
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn approval_override_without_approver_keeps_caller_or_platform() {
+        let acct = keychain_account("pk");
+        assert!(
+            acct.approval_override(None).is_none(),
+            "no approver, no caller gate: platform prompt"
+        );
+
+        let (caller, asked) = Caller::new(false);
+        let gate = acct
+            .approval_override(Some(Box::new(caller)))
+            .expect("caller gate kept");
+        let err = gate
+            .authenticate(&crate::keystore::AuthIntent::default_payment())
+            .unwrap_err();
+        assert!(err.to_string().contains("caller said no"), "{err}");
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn approver_replaces_the_platform_prompt() {
+        let mut acct = keychain_account("pk");
+        acct.approver = Some(ApproverConfig {
+            command: "/nonexistent/approve".to_string(),
+            args: Vec::new(),
+            timeout_secs: None,
+        });
+        let gate = acct
+            .approval_override(None)
+            .expect("approver replaces the prompt");
+        assert!(!gate.is_available());
+    }
+
+    #[cfg(unix)]
+    mod approver_with_caller {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::Ordering;
+
+        /// An account whose approver exits with `code` and leaves a marker
+        /// file when it runs.
+        fn account(dir: &tempfile::TempDir, code: u8) -> (Account, std::path::PathBuf) {
+            let marker = dir.path().join("approver-ran");
+            let script = dir.path().join("approve.sh");
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\ncat >/dev/null\ntouch '{}'\nexit {code}\n",
+                    marker.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let mut acct = keychain_account("pk");
+            acct.approver = Some(ApproverConfig {
+                command: script.display().to_string(),
+                args: Vec::new(),
+                timeout_secs: Some(10),
+            });
+            (acct, marker)
+        }
+
+        fn payment() -> crate::keystore::AuthIntent {
+            crate::keystore::AuthIntent::authorize_payment_details(
+                "$0.05",
+                "accessing API",
+                "api.example.com",
+            )
+        }
+
+        #[test]
+        fn caller_yes_and_approver_no_is_denied() {
+            let dir = tempfile::tempdir().unwrap();
+            let (acct, marker) = account(&dir, 1);
+            let (caller, asked) = Caller::new(true);
+            let gate = acct.approval_override(Some(Box::new(caller))).unwrap();
+
+            let err = gate.authenticate(&payment()).unwrap_err();
+            assert!(err.to_string().contains("declined"), "{err}");
+            assert_eq!(asked.load(Ordering::SeqCst), 1, "caller asked first");
+            assert!(marker.exists(), "approver asked after the caller said yes");
+        }
+
+        #[test]
+        fn caller_no_is_denied_without_asking_the_approver() {
+            let dir = tempfile::tempdir().unwrap();
+            let (acct, marker) = account(&dir, 0);
+            let (caller, asked) = Caller::new(false);
+            let gate = acct.approval_override(Some(Box::new(caller))).unwrap();
+
+            let err = gate.authenticate(&payment()).unwrap_err();
+            assert!(err.to_string().contains("caller said no"), "{err}");
+            assert_eq!(asked.load(Ordering::SeqCst), 1);
+            assert!(!marker.exists(), "approver must not be asked");
+        }
+
+        #[test]
+        fn caller_yes_and_approver_yes_is_approved() {
+            let dir = tempfile::tempdir().unwrap();
+            let (acct, marker) = account(&dir, 0);
+            let (caller, asked) = Caller::new(true);
+            let gate = acct.approval_override(Some(Box::new(caller))).unwrap();
+
+            gate.authenticate(&payment()).unwrap();
+            assert_eq!(asked.load(Ordering::SeqCst), 1);
+            assert!(marker.exists(), "both were asked");
+            assert!(gate.is_available());
+        }
     }
 
     #[test]

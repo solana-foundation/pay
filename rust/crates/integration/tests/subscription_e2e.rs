@@ -136,6 +136,7 @@ fn persistence_round_trip_through_memory_store() {
             secret_key_b58: Some("test-secret-bytes".to_string()),
             created_at: Some("2026-05-29T00:00:00Z".to_string()),
             subscriptions: std::collections::BTreeMap::new(),
+            approver: None,
         },
     );
 
