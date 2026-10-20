@@ -293,11 +293,15 @@ pub fn select_challenge_by_balance<'a>(
     let Some(first) = candidates.first() else {
         return Ok(None);
     };
+    // Without balances to go on, still take the cheapest offer, never just
+    // the one the server listed first.
+    let cheapest = &challenges
+        [candidates[cheapest_candidate_index(candidates.iter().enumerate()).unwrap_or(0)].index];
 
     let network = normalize_network(&first.network);
     let pubkey = match account_pubkey_for_network(store, network, account_override)? {
         Some(pubkey) => pubkey,
-        None => return Ok(Some(&challenges[first.index])),
+        None => return Ok(Some(cheapest)),
     };
 
     let rpc_url = resolve_rpc_url(&first.network, first.embedded_blockhash.as_deref());
@@ -318,7 +322,7 @@ pub fn select_challenge_by_balance<'a>(
         Ok(balances) => balances,
         Err(e) => {
             warn!(error = %e, %rpc_url, %pubkey, "Could not fetch balances for MPP challenge selection");
-            return Ok(Some(&challenges[first.index]));
+            return Ok(Some(cheapest));
         }
     };
 
@@ -390,8 +394,12 @@ pub fn choose_payment(
         return Err(Error::Mpp("No usable payment challenge".to_string()));
     };
 
-    let legacy_first_mpp =
-        || ChosenPayment::Mpp(Box::new(mpp_challenges[candidates[0].index].clone()));
+    // Without balances to go on, take the cheapest MPP offer rather than the
+    // one the server listed first.
+    let legacy_first_mpp = || {
+        let index = cheapest_candidate_index(candidates.iter().enumerate()).unwrap_or(0);
+        ChosenPayment::Mpp(Box::new(mpp_challenges[candidates[index].index].clone()))
+    };
 
     let network = normalize_network(&first.network);
     let pubkey = match account_pubkey_for_network(store, network, account_override)? {
@@ -555,13 +563,34 @@ fn resolve_challenge_mint(currency: &str, network: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The cheapest candidate the wallet can fund. Server order only breaks ties,
+/// so a 402 cannot steer the wallet into a dearer offer by listing it first.
 fn select_candidate_index_for_balances(
     candidates: &[DecodedChargeCandidate],
     balances: &crate::client::balance::AccountBalances,
 ) -> Option<usize> {
+    cheapest_candidate_index(
+        candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| has_sufficient_balance(candidate, balances)),
+    )
+}
+
+/// The cheapest of `candidates` in stablecoin value, first on ties. Every
+/// candidate is a USD stablecoin (see [`resolve_challenge_mint`]), so amounts
+/// compare once scaled to a common number of decimals.
+fn cheapest_candidate_index<'a>(
+    candidates: impl Iterator<Item = (usize, &'a DecodedChargeCandidate)>,
+) -> Option<usize> {
+    const SCALE_DECIMALS: u32 = 18;
     candidates
-        .iter()
-        .position(|candidate| has_sufficient_balance(candidate, balances))
+        .min_by_key(|(_, candidate)| {
+            let decimals = Stablecoin::decimals_for_mint(&candidate.mint).unwrap_or(6) as u32;
+            u128::from(candidate.amount)
+                .saturating_mul(10u128.pow(SCALE_DECIMALS.saturating_sub(decimals)))
+        })
+        .map(|(index, _)| index)
 }
 
 fn has_sufficient_balance(
@@ -1004,6 +1033,78 @@ mod tests {
 
         let selected = select_candidate_index_for_balances(&candidates, &balances).unwrap();
         assert_eq!(candidates[selected].currency, "USDT");
+    }
+
+    fn funded(tokens: &[(&str, u64)]) -> crate::client::balance::AccountBalances {
+        crate::client::balance::AccountBalances {
+            sol_lamports: 0,
+            tokens: tokens
+                .iter()
+                .map(|(mint, amount)| token_balance(mint, *amount, "TOKEN"))
+                .collect(),
+            credits: vec![],
+            committable_channels: vec![],
+            channel_balances_unavailable: false,
+            credits_unavailable: false,
+            tokens_unavailable: false,
+        }
+    }
+
+    #[test]
+    fn balance_selector_picks_the_cheapest_funded_offer_not_the_first() {
+        use pay_kit::mpp::protocol::solana::mints::{USDC_MAINNET, USDT_MAINNET};
+        let challenges = vec![
+            challenge_for_currency("USDC", "100000000"),
+            challenge_for_currency("USDT", "1000000"),
+        ];
+        let candidates = decoded_charge_candidates(&challenges, None).unwrap();
+        let both = funded(&[(USDC_MAINNET, 100_000_000), (USDT_MAINNET, 1_000_000)]);
+        let selected = select_candidate_index_for_balances(&candidates, &both).unwrap();
+        assert_eq!(candidates[selected].currency, "USDT");
+
+        // Control: when only the dearer offer is funded, it is still payable.
+        let usdc_only = funded(&[(USDC_MAINNET, 100_000_000)]);
+        let selected = select_candidate_index_for_balances(&candidates, &usdc_only).unwrap();
+        assert_eq!(candidates[selected].currency, "USDC");
+    }
+
+    #[test]
+    fn equally_priced_offers_keep_server_order() {
+        use pay_kit::mpp::protocol::solana::mints::{USDC_MAINNET, USDT_MAINNET};
+        let challenges = vec![
+            challenge_for_currency("USDT", "1000000"),
+            challenge_for_currency("USDC", "1000000"),
+        ];
+        let candidates = decoded_charge_candidates(&challenges, None).unwrap();
+        let both = funded(&[(USDC_MAINNET, 1_000_000), (USDT_MAINNET, 1_000_000)]);
+        let selected = select_candidate_index_for_balances(&candidates, &both).unwrap();
+        assert_eq!(candidates[selected].currency, "USDT");
+    }
+
+    #[test]
+    fn without_balances_the_cheapest_offer_is_chosen() {
+        // No account on the network: the selector cannot read balances.
+        let store = crate::accounts::MemoryAccountsStore::new();
+        let challenges = vec![
+            challenge_for_currency("USDC", "100000000"),
+            challenge_for_currency("USDT", "1000000"),
+        ];
+        let selected = select_challenge_by_balance(&challenges, &store, None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            selected.request.decode::<ChargeRequest>().unwrap().currency,
+            "USDT"
+        );
+        let ChosenPayment::Mpp(chosen) =
+            choose_payment(&challenges, None, &[], &store, None, None).unwrap()
+        else {
+            panic!("expected an MPP charge");
+        };
+        assert_eq!(
+            chosen.request.decode::<ChargeRequest>().unwrap().currency,
+            "USDT"
+        );
     }
 
     #[test]
