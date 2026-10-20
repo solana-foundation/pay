@@ -195,6 +195,11 @@ impl DelegatedSessionStreamMeter {
                 "delegated stream forward is missing its settlement plan",
             ))
         })?;
+        if !stream_honors_meters(&plan.metering) {
+            return Err(box_error(std::io::Error::other(
+                "delegated stream cannot observe a configured usage meter; settle it buffered",
+            )));
+        }
         let spec = spec_from_metering(
             &plan.metering,
             SessionMeteringContext::new()
@@ -245,6 +250,9 @@ impl DelegatedSessionStreamMeter {
         let Some(plan) = forward.metered_plan() else {
             return false;
         };
+        if !stream_honors_meters(&plan.metering) {
+            return false;
+        }
         spec_from_metering(
             &plan.metering,
             SessionMeteringContext::new()
@@ -1200,6 +1208,49 @@ fn has_stream_observable_dimension(spec: &SessionMeterSpec) -> bool {
         .any(|dimension| is_response_measured(dimension.direction, dimension.unit))
 }
 
+/// Whether the stream meter observes every configured `meter` the way
+/// buffered settlement would. It reads provider token usage from canonical
+/// fields only, so a header meter, a custom JSON path, or a meter on any
+/// other unit must settle from the buffered response instead of being
+/// silently replaced by the stream's own heuristics.
+fn stream_honors_meters(metering: &Metering) -> bool {
+    metering
+        .dimensions
+        .iter()
+        .chain(metering.variants.iter().flat_map(|v| v.dimensions.iter()))
+        .all(|dimension| {
+            let Some(meter) = &dimension.meter else {
+                return true;
+            };
+            if meter.source != pay_types::metering::UsageMeterSource::ResponseJson
+                || dimension.unit != BillingUnit::Tokens
+            {
+                return false;
+            }
+            let canonical: &[&str] = match dimension.direction {
+                MeterDirection::Input => &[
+                    "/usage/prompt_tokens",
+                    "/usage/input_tokens",
+                    "/response/usage/input_tokens",
+                    "/message/usage/input_tokens",
+                    "/usageMetadata/promptTokenCount",
+                ],
+                MeterDirection::Output => &[
+                    "/usage/completion_tokens",
+                    "/usage/output_tokens",
+                    "/response/usage/output_tokens",
+                    "/message/usage/output_tokens",
+                    "/usageMetadata/candidatesTokenCount",
+                ],
+                _ => &[],
+            };
+            meter
+                .path
+                .as_deref()
+                .is_some_and(|path| canonical.contains(&path))
+        })
+}
+
 fn observes_unit(spec: &SessionMeterSpec, unit: BillingUnit) -> bool {
     spec.dimensions
         .iter()
@@ -2120,12 +2171,32 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
         dimensions: Vec<MeterDimension>,
         capacity: u64,
     ) -> DelegatedSessionStreamMeter {
+        DelegatedSessionStreamMeter::from_forward(
+            delegated_forward_with_capacity(session, channel_id, dimensions, capacity).await,
+        )
+        .unwrap()
+    }
+
+    async fn delegated_forward(
+        session: &Arc<SessionMpp>,
+        channel_id: &str,
+        dimensions: Vec<MeterDimension>,
+    ) -> SessionForward {
+        delegated_forward_with_capacity(session, channel_id, dimensions, 100_000).await
+    }
+
+    async fn delegated_forward_with_capacity(
+        session: &Arc<SessionMpp>,
+        channel_id: &str,
+        dimensions: Vec<MeterDimension>,
+        capacity: u64,
+    ) -> SessionForward {
         let reservation = session
             .reserve_delegated_capacity(channel_id, capacity)
             .await
             .unwrap()
             .expect("session capacity should be available");
-        let forward = SessionForward::delegated(
+        SessionForward::delegated(
             session.clone(),
             channel_id.to_string(),
             0,
@@ -2139,8 +2210,79 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             (capacity, 1_000_000),
             solana_pubkey::Pubkey::new_unique().to_string(),
             reservation,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_meter_the_stream_cannot_observe_settles_from_the_buffered_response() {
+        let metered = |meter| MeterDimension {
+            direction: MeterDirection::Output,
+            unit: BillingUnit::Bytes,
+            scale: 1,
+            period: None,
+            tiers: vec![PriceTier {
+                up_to: None,
+                price_usd: 0.000001,
+                condition: None,
+                notes: None,
+                splits: vec![],
+            }],
+            meter: Some(meter),
+        };
+        let header_meter = pay_types::metering::UsageMeter {
+            source: pay_types::metering::UsageMeterSource::ResponseHeader,
+            path: None,
+            header: Some("x-billable-bytes".into()),
+        };
+        let store: Arc<dyn ChannelStore> = Arc::new(MemoryChannelStore::new());
+        let channel = delegated_channel("header-meter", &store).await;
+        let forward = delegated_forward(
+            &channel.session,
+            &channel.channel_id,
+            vec![metered(header_meter)],
+        )
+        .await;
+        assert!(!DelegatedSessionStreamMeter::supports(&forward));
+
+        let body = "data: {\"payload\":\"ok\"}\n\n";
+        let response = axum::response::Response::builder()
+            .status(http::StatusCode::OK)
+            .header(http::header::CONTENT_TYPE, "text/event-stream")
+            .header("x-billable-bytes", "5000")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let response =
+            crate::server::payment::settle_axum_delegated_response(forward, response).await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let served = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(served, body.as_bytes());
+        // The configured header quantity is charged, not the wire bytes.
+        assert_eq!(
+            channel.session.committed_watermark(&channel.channel_id),
+            Some(5000)
         );
-        DelegatedSessionStreamMeter::from_forward(forward).unwrap()
+
+        // Canonical provider token paths stay on the streaming path.
+        let canonical = delegated_forward(
+            &channel.session,
+            &channel.channel_id,
+            vec![token_dimension(
+                MeterDirection::Output,
+                "/usage/completion_tokens",
+            )],
+        )
+        .await;
+        assert!(DelegatedSessionStreamMeter::supports(&canonical));
+        drop(canonical);
+        let custom = delegated_forward(
+            &channel.session,
+            &channel.channel_id,
+            vec![token_dimension(MeterDirection::Output, "/billing/tokens")],
+        )
+        .await;
+        assert!(!DelegatedSessionStreamMeter::supports(&custom));
     }
 
     fn token_dimension(direction: MeterDirection, path: &str) -> MeterDimension {
