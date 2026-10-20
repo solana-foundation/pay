@@ -461,6 +461,12 @@ impl Privy {
                 .min_by_key(|(_, at)| **at)
                 .map(|(sid, _)| sid.clone())
         {
+            // Forgetting a sign-out must not revive its tokens: first refuse
+            // every token issued so far, which signs everyone out, then
+            // make room.
+            self.not_before
+                .fetch_max(unix_now() + 1, std::sync::atomic::Ordering::SeqCst);
+            tracing::warn!("too many Privy sign-outs to remember; every earlier token is refused");
             revoked.remove(&oldest);
         }
         revoked.insert(session.to_string(), now);
@@ -1136,6 +1142,33 @@ pub(crate) mod tests {
         };
         assert!(privy.session_is_live(&cookie_session(unix())));
         assert!(!privy.session_is_live(&cookie_session(unix() - 120)));
+    }
+
+    /// A full sign-out list never forgets a sign-out in a way that lets its
+    /// token back in: it refuses every token issued so far instead.
+    #[test]
+    fn a_full_sign_out_list_refuses_rather_than_forgets() {
+        let app = FakeApp::new("http://unused");
+        let privy = Privy::new(app.cfg.clone()).unwrap();
+        let token = |sid: &str, iat: u64| {
+            app.token(json!({
+                "sub": USER, "aud": "app_test", "iss": ISSUER, "sid": sid,
+                "exp": unix() + 600, "iat": iat
+            }))
+        };
+        let victim = token("sess_victim", unix());
+        let bystander = token("sess_bystander", unix());
+        privy.revoke_session("sess_victim");
+        for i in 1..MAX_REVOKED_SESSIONS {
+            privy.revoke_session(&format!("sess_{i}"));
+        }
+        assert!(privy.verify(&victim).is_err());
+        assert!(privy.verify(&bystander).is_ok(), "not full yet");
+
+        privy.revoke_session("sess_one_too_many");
+        assert!(privy.verify(&victim).is_err(), "the evicted sign-out holds");
+        assert!(privy.verify(&bystander).is_err(), "everyone signs in again");
+        assert!(privy.verify(&token("sess_new", unix() + 2)).is_ok());
     }
 
     #[test]
