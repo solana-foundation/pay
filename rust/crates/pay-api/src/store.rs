@@ -170,22 +170,61 @@ fn encode(value: &serde_json::Value) -> Result<String, StoreError> {
     serde_json::to_string(value).map_err(|e| StoreError::Serialization(e.to_string()))
 }
 
+// Every write goes through one script so retention is decided in one place.
+//
+// Append-only records (the charge replay chain) live as a root key `k` and
+// generations `k:1`, `k:2`, ... A root that expired on its own while a
+// descendant survived would read as never reserved and be recreated. So a
+// record's keys expire together: each write refreshes the root and every
+// generation to one deadline, and a root is never recreated while its first
+// generation survives.
+//
 // Values are only ever written by this store as `serde_json::to_string`, which
 // is canonical for a decoded value, so the stored bytes compare exactly.
-const PUT_IF_EQ_SCRIPT: &str = r#"
-local current = redis.call('GET', KEYS[1])
-if ARGV[1] == 'absent' then
-  if current then return 0 end
-elseif current ~= ARGV[2] then
-  return 0
+const WRITE_SCRIPT: &str = r#"
+local key, mode, expected, value, ttl = KEYS[1], ARGV[1], ARGV[2], ARGV[3], ARGV[4]
+if mode == 'absent' then
+  if redis.call('EXISTS', key) == 1 or redis.call('EXISTS', key .. ':1') == 1 then
+    return 0
+  end
+elseif mode == 'eq' then
+  if redis.call('GET', key) ~= expected then return 0 end
 end
-if ARGV[4] == '' then
-  redis.call('SET', KEYS[1], ARGV[3])
-else
-  redis.call('SET', KEYS[1], ARGV[3], 'EX', ARGV[4])
+redis.call('SET', key, value, 'EX', ttl)
+local root = string.match(key, '^(.*):%d+$')
+if not root or redis.call('EXISTS', root) == 0 then root = key end
+redis.call('EXPIRE', root, ttl)
+local generation = 1
+while generation <= 1024 and redis.call('EXPIRE', root .. ':' .. generation, ttl) == 1 do
+  generation = generation + 1
 end
 return 1
 "#;
+
+impl RedisStore {
+    /// Write `value` under `key` when `mode` allows: `put` always, `absent`
+    /// only when the key (and any generation of it) is absent, `eq` only when
+    /// it holds `expected`.
+    async fn write(
+        &self,
+        key: &str,
+        mode: &str,
+        expected: Option<String>,
+        value: &serde_json::Value,
+    ) -> Result<bool, StoreError> {
+        let mut connection = self.connection.clone();
+        let written: i64 = redis::Script::new(WRITE_SCRIPT)
+            .key(format!("{}{key}", self.prefix))
+            .arg(mode)
+            .arg(expected.unwrap_or_default())
+            .arg(encode(value)?)
+            .arg(RECORD_TTL_SECONDS)
+            .invoke_async(&mut connection)
+            .await
+            .map_err(internal)?;
+        Ok(written == 1)
+    }
+}
 
 impl Store for RedisStore {
     fn get(&self, key: &str) -> StoreFuture<'_, Option<serde_json::Value>> {
@@ -205,18 +244,8 @@ impl Store for RedisStore {
     }
 
     fn put(&self, key: &str, value: serde_json::Value) -> StoreFuture<'_, ()> {
-        let mut connection = self.connection.clone();
-        let key = format!("{}{key}", self.prefix);
-        Box::pin(async move {
-            redis::cmd("SET")
-                .arg(key)
-                .arg(encode(&value)?)
-                .arg("EX")
-                .arg(RECORD_TTL_SECONDS)
-                .query_async::<()>(&mut connection)
-                .await
-                .map_err(internal)
-        })
+        let key = key.to_string();
+        Box::pin(async move { self.write(&key, "put", None, &value).await.map(|_| ()) })
     }
 
     fn delete(&self, key: &str) -> StoreFuture<'_, ()> {
@@ -232,20 +261,8 @@ impl Store for RedisStore {
     }
 
     fn put_if_absent(&self, key: &str, value: serde_json::Value) -> StoreFuture<'_, bool> {
-        let mut connection = self.connection.clone();
-        let key = format!("{}{key}", self.prefix);
-        Box::pin(async move {
-            let set: Option<String> = redis::cmd("SET")
-                .arg(key)
-                .arg(encode(&value)?)
-                .arg("NX")
-                .arg("EX")
-                .arg(RECORD_TTL_SECONDS)
-                .query_async(&mut connection)
-                .await
-                .map_err(internal)?;
-            Ok(set.is_some())
-        })
+        let key = key.to_string();
+        Box::pin(async move { self.write(&key, "absent", None, &value).await })
     }
 
     fn put_if_eq(
@@ -254,24 +271,13 @@ impl Store for RedisStore {
         expected: Option<serde_json::Value>,
         value: serde_json::Value,
     ) -> StoreFuture<'_, bool> {
-        let mut connection = self.connection.clone();
-        let key = format!("{}{key}", self.prefix);
+        let key = key.to_string();
         Box::pin(async move {
-            let expected = expected.as_ref().map(encode).transpose()?;
-            let written: i64 = redis::Script::new(PUT_IF_EQ_SCRIPT)
-                .key(key)
-                .arg(if expected.is_some() {
-                    "present"
-                } else {
-                    "absent"
-                })
-                .arg(expected.unwrap_or_default())
-                .arg(encode(&value)?)
-                .arg(RECORD_TTL_SECONDS)
-                .invoke_async(&mut connection)
-                .await
-                .map_err(internal)?;
-            Ok(written == 1)
+            let (mode, expected) = match expected {
+                Some(expected) => ("eq", Some(encode(&expected)?)),
+                None => ("absent", None),
+            };
+            self.write(&key, mode, expected, &value).await
         })
     }
 }
@@ -407,5 +413,77 @@ mod tests {
         assert_eq!(a.get("sig").await.unwrap(), None);
         a.put("k", json!({"x": 1})).await.unwrap();
         assert_eq!(b.get("k").await.unwrap(), Some(json!({"x": 1})));
+    }
+
+    #[tokio::test]
+    async fn redis_charge_replay_generations_expire_with_their_root() {
+        use pay_kit::mpp::store::{ChargeReplayStore, ChargeReservation};
+        let Some(redis) = spawn_redis().await else {
+            return;
+        };
+        let url = format!("redis://127.0.0.1:{}/", redis.1);
+        let store = StoreBackend::connect(&url)
+            .await
+            .unwrap()
+            .namespace("charge");
+        let replay = ChargeReplayStore::new(store);
+        let lease = std::time::Duration::from_secs(120);
+        let client = redis::Client::open(url).unwrap();
+        let mut connection = client.get_multiplexed_async_connection().await.unwrap();
+        let reader = connection.clone();
+        let root = "pay-api:charge:solana-charge:record:challenge";
+        let ttl = |key: String| {
+            let mut connection = reader.clone();
+            async move {
+                redis::cmd("TTL")
+                    .arg(key)
+                    .query_async::<i64>(&mut connection)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        assert_eq!(
+            replay
+                .reserve("challenge", "digest-a", lease)
+                .await
+                .unwrap(),
+            ChargeReservation::Reserved { generation: 0 }
+        );
+        // Age the root, then append the confirmed generation: the whole
+        // record shares the new deadline instead of the root lapsing first.
+        redis::cmd("EXPIRE")
+            .arg(root)
+            .arg(5)
+            .query_async::<()>(&mut connection)
+            .await
+            .unwrap();
+        replay.mark_confirmed("challenge", "sig-a").await.unwrap();
+        assert!(ttl(format!("{root}:1")).await > 100);
+        assert!(ttl(root.to_string()).await >= ttl(format!("{root}:1")).await);
+
+        // A root lost under a surviving generation (written before family
+        // expiry) is never recreated: the chain fails closed.
+        redis::cmd("DEL")
+            .arg(root)
+            .query_async::<()>(&mut connection)
+            .await
+            .unwrap();
+        assert!(
+            replay
+                .reserve("challenge", "digest-b", lease)
+                .await
+                .is_err()
+        );
+
+        // Positive control: an untouched challenge still reserves.
+        assert_eq!(
+            replay.reserve("fresh", "digest-a", lease).await.unwrap(),
+            ChargeReservation::Reserved { generation: 0 }
+        );
+        assert_eq!(
+            replay.reserve("fresh", "digest-a", lease).await.unwrap(),
+            ChargeReservation::InProgress
+        );
     }
 }
