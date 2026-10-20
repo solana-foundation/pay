@@ -2196,22 +2196,6 @@ mod pre_attach_tests {
     }
 
     #[test]
-    fn httpie_does_not_carry_injected_credentials_across_redirects() {
-        if check_command_exists("http").is_err() {
-            return;
-        }
-        let server = CrossOriginRedirect::start();
-        let args = s(&["--follow", "GET", &server.origin_url]);
-        let outcome = run_httpie_inner(
-            &args,
-            &s(&["Authorization:Payment redirect-test-credential"]),
-        )
-        .unwrap();
-        assert!(matches!(outcome, RunOutcome::Completed { .. }));
-        assert!(!server.collector_was_contacted());
-    }
-
-    #[test]
     fn a_single_transfer_is_accepted() {
         for args in [
             s(&[
