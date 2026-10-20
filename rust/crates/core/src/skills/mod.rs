@@ -1393,7 +1393,7 @@ pub fn parse_catalog_source(raw: &str, source_url: &str) -> Result<Catalog> {
 
     let source = reqwest::Url::parse(source_url)
         .map_err(|error| Error::Config(format!("invalid OpenAPI URL {source_url}: {error}")))?;
-    let service_url = doc
+    let service = doc
         .pointer("/servers/0/url")
         .and_then(serde_json::Value::as_str)
         .filter(|url| !url.contains('{'))
@@ -1404,10 +1404,16 @@ pub fn parse_catalog_source(raw: &str, source_url: &str) -> Result<Catalog> {
             origin.set_query(None);
             origin.set_fragment(None);
             origin
-        })
-        .to_string()
-        .trim_end_matches('/')
-        .to_string();
+        });
+    // The configured source is the only authority the user granted. A
+    // document that names another origin would publish payable endpoints
+    // on a host the user never chose.
+    if service.origin() != source.origin() {
+        return Err(Error::Config(format!(
+            "OpenAPI source {source_url} declares server {service}, which is not on the source's origin"
+        )));
+    }
+    let service_url = service.to_string().trim_end_matches('/').to_string();
     let host = reqwest::Url::parse(&service_url)
         .ok()
         .and_then(|url| url.host_str().map(str::to_string))
@@ -2151,6 +2157,69 @@ mod tests {
         assert!(service.has_metering);
         assert_eq!(service.min_price_usd, 0.4);
         assert_eq!(service.max_price_usd, 0.4);
+    }
+
+    fn payment_openapi_with_server(server: serde_json::Value) -> String {
+        serde_json::json!({
+            "openapi": "3.1.0",
+            "info": {"title": "Inference", "version": "1.0.0"},
+            "servers": [server],
+            "paths": {
+                "/v1/infer": {
+                    "post": {
+                        "summary": "Run inference",
+                        "x-payment-info": {
+                            "offers": [{"intent": "charge", "method": "x402", "amount": null}]
+                        },
+                        "responses": {
+                            "200": {"description": "OK"},
+                            "402": {"description": "Payment Required"}
+                        }
+                    }
+                }
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn openapi_source_rejects_a_server_on_another_origin() {
+        for server in [
+            "https://attacker.example/charge",
+            "http://catalog.example/charge",
+            "https://catalog.example:8443/charge",
+            "//attacker.example/charge",
+        ] {
+            let raw = payment_openapi_with_server(serde_json::json!({"url": server}));
+            let err = parse_catalog_source(&raw, "https://catalog.example/openapi.json")
+                .expect_err(server)
+                .to_string();
+            assert!(
+                err.contains("not on the source's origin"),
+                "{server}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn openapi_source_accepts_a_server_on_the_source_origin() {
+        for (server, expected) in [
+            (
+                "https://catalog.example/charge",
+                "https://catalog.example/charge",
+            ),
+            ("/charge", "https://catalog.example/charge"),
+        ] {
+            let raw = payment_openapi_with_server(serde_json::json!({"url": server}));
+            let catalog =
+                parse_catalog_source(&raw, "https://catalog.example/openapi.json").expect(server);
+            let service = &catalog.providers[0];
+            assert_eq!(service.meta.service_url, expected);
+            assert_eq!(
+                service.endpoints[0].full_path,
+                format!("{expected}/v1/infer")
+            );
+        }
     }
 
     #[tokio::test]
