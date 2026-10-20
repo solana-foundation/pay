@@ -699,7 +699,10 @@ impl<S: PaymentState> PaymentGate<S> {
         }
         if let Some(resolver) = self.deployment_policy_resolver.as_deref() {
             match req.host.map(|host| resolver.classify_host(host)) {
-                Some(Ok(PolicyHost::Apex)) => {}
+                // The apex is the control plane only. Static API routing
+                // (single-API fallback, endpoint-less passthrough) would admit
+                // unpaid traffic that no deployment policy priced.
+                Some(Ok(PolicyHost::Apex)) => return GateDecision::Local,
                 Some(Ok(PolicyHost::Deployment(hostname))) => {
                     return self.evaluate_deployment(resolver, &hostname, req).await;
                 }
@@ -3546,6 +3549,60 @@ mod tests {
             ..Default::default()
         })
         .unwrap()
+    }
+
+    #[derive(Clone)]
+    struct SingleProxyApi(Vec<pay_types::metering::ApiSpec>);
+    impl PaymentState for SingleProxyApi {
+        fn apis(&self) -> &[pay_types::metering::ApiSpec] {
+            &self.0
+        }
+        fn mpp(&self) -> Option<&pay_kit::mpp::server::Mpp> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn deployment_apex_never_reaches_static_api_routing() {
+        // One endpoint-less proxy API: on its own host every path passes
+        // through, which is what the apex must never inherit.
+        let api: pay_types::metering::ApiSpec = serde_json::from_value(json!({
+            "name": "compute", "subdomain": "compute", "title": "Compute",
+            "description": "", "category": "ai_ml", "version": "v1",
+            "routing": {"type": "proxy", "url": "https://upstream.example"},
+            "endpoints": []
+        }))
+        .unwrap();
+        let state = SingleProxyApi(vec![api]);
+        let request = |host| GateRequest {
+            method: &Method::POST,
+            path: "v1/run",
+            host: Some(host),
+            accept: None,
+            authorization: None,
+            content_length: None,
+            query: None,
+            x402_payment: None,
+        };
+
+        let static_gate = PaymentGate::new(state.clone());
+        assert!(matches!(
+            static_gate.evaluate(&request("compute.example")).await,
+            GateDecision::Passthrough(_)
+        ));
+
+        let resolver = DeploymentPolicyResolver::new(
+            "https://compute.example/__402/payment-policy",
+            "https://compute.example",
+            "compute.example",
+        )
+        .unwrap();
+        let gate =
+            PaymentGate::new(state).with_deployment_policy_resolver(Some(Arc::new(resolver)));
+        assert!(matches!(
+            gate.evaluate(&request("compute.example")).await,
+            GateDecision::Local
+        ));
     }
 
     #[test]
