@@ -1872,7 +1872,12 @@ mod tests {
                 json!({"chunks":[{"choices":[{"delta":{"content":"partial"}}]}]}),
             )
             .await;
-        body.next().await.unwrap().unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), body.next())
+                .await
+                .is_err(),
+            "an uncharged prefix is held"
+        );
         fixture.event(&rid, "complete", json!({})).await;
         let entry = fixture.state.registry.get(&fixture.id).unwrap();
         assert_eq!(entry.earned_usd(), 0.0, "enqueue is not payment settlement");
@@ -1922,7 +1927,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn signed_batch_stream_is_live_and_completion_replays_without_second_charge() {
+    async fn signed_batch_stream_is_held_until_completion_and_replays_without_second_charge() {
         let fixture = PaidBatchSeller::new().await;
         let (response, rid) = fixture.start().await;
         assert!(
@@ -1938,18 +1943,21 @@ mod tests {
                 json!({"chunks":[{"choices":[{"delta":{"content":"live"}}]}]}),
             )
             .await;
-        let first = tokio::time::timeout(Duration::from_secs(1), body.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        assert!(String::from_utf8_lossy(&first).contains("live"));
+        // A buyer cannot read an uncharged prefix and disconnect.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), body.next())
+                .await
+                .is_err(),
+            "partial output is held until the charge commits"
+        );
         assert_eq!(
             fixture.channel_state().await.cumulative,
             0,
             "partial answer is not a flat completion"
         );
         fixture.event(&rid, "complete", json!({})).await;
+        let first = body.next().await.unwrap().unwrap();
+        assert!(String::from_utf8_lossy(&first).contains("live"));
         let last = body.next().await.unwrap().unwrap();
         assert_eq!(last, "data: [DONE]\n\n");
         assert_eq!(
@@ -2007,11 +2015,17 @@ mod tests {
                     json!({"chunks":[{"choices":[{"delta":{"content":"partial"}}]}]}),
                 )
                 .await;
-            assert!(body.next().await.unwrap().is_ok());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), body.next())
+                    .await
+                    .is_err()
+            );
             if fail {
                 fixture
                     .event(&rid, "fail", json!({"message":"failed after text"}))
                     .await;
+                // The worker's own failure answer is released uncharged.
+                assert!(body.next().await.unwrap().is_ok());
                 assert!(
                     String::from_utf8_lossy(&body.next().await.unwrap().unwrap())
                         .contains("worker_failed")

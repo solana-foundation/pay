@@ -1,11 +1,13 @@
-//! Completion-billed live responses. Partial flat-price answers are not charged.
+//! Completion-billed responses. Partial flat-price answers are not charged,
+//! so they are never released either: the body is held until the handler's
+//! explicit completion has been committed.
 
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, header};
 use axum::response::Response;
 use futures_util::StreamExt;
@@ -208,9 +210,15 @@ impl DeliveryTask {
     }
 }
 
-/// Relay live bytes and commit only at the handler's explicit completion.
-/// The terminal success frame follows persistence, not merely a successful
-/// HTTP status. Replay capture is bounded and does not delay intermediate data.
+/// Upper bound on a completion-billed body held until its commit.
+const MAX_HELD_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Hold the body and commit only at the handler's explicit completion, then
+/// release it. Releasing any byte earlier would let a buyer read a useful
+/// prefix and disconnect before the charge, since partial answers are free.
+/// A body that errors or outgrows the bound before completing is withheld;
+/// one the handler ends without completing is released uncharged. Either way
+/// the authorization is released.
 pub(super) fn response(
     response: Response,
     completion: StreamCompletion,
@@ -222,8 +230,9 @@ pub(super) fn response(
     let status = parts.status;
     parts.headers.remove(header::CONTENT_LENGTH);
     let mut source = body.into_data_stream();
-    let mut capture = capture_replay.then(Vec::new);
     let stream = async_stream::stream! {
+        let mut held: Vec<Bytes> = Vec::new();
+        let mut held_bytes = 0usize;
         while let Some(chunk) = source.next().await {
             let bytes = match chunk {
                 Ok(bytes) => bytes,
@@ -233,27 +242,38 @@ pub(super) fn response(
                     return;
                 }
             };
-            if let Some(captured) = &mut capture {
-                if captured.len().saturating_add(bytes.len()) <= gate::MAX_BATCH_CACHED_RESPONSE_BYTES {
-                    captured.extend_from_slice(&bytes);
-                } else {
-                    // Existing replay behavior for oversized resources: return
-                    // the recorded payment result, never execute the seller twice.
-                    capture = None;
-                }
+            held_bytes = held_bytes.saturating_add(bytes.len());
+            if held_bytes > MAX_HELD_RESPONSE_BYTES {
+                let _ = delivery.finish(false, None).await;
+                yield Err(std::io::Error::other(format!(
+                    "completion-billed response exceeds {MAX_HELD_RESPONSE_BYTES} bytes"
+                )));
+                return;
             }
+            held.push(bytes);
             if completion.completed() {
-                let cached = capture.map(|bytes| gate::batch_cached_response(status, &headers, &bytes));
+                // Existing replay behavior for oversized resources: return the
+                // recorded payment result, never execute the seller twice.
+                let cached = (capture_replay && held_bytes <= gate::MAX_BATCH_CACHED_RESPONSE_BYTES)
+                    .then(|| gate::batch_cached_response(status, &headers, &held.concat()));
                 match delivery.finish_observed(true, cached, Some(completion)).await {
-                    Ok(_) => yield Ok(bytes),
+                    Ok(_) => {
+                        for bytes in held {
+                            yield Ok(bytes);
+                        }
+                    }
                     Err(error) => yield Err(std::io::Error::other(error)),
                 }
                 return;
             }
+        }
+        // EOF without explicit completion is the handler's own uncharged
+        // failure answer (typically an error frame), not a buyer disconnect:
+        // a dropped body never reaches here, so nothing leaks to one.
+        let _ = delivery.finish(false, None).await;
+        for bytes in held {
             yield Ok(bytes);
         }
-        // EOF without explicit completion is not a successful answer.
-        let _ = delivery.finish(false, None).await;
     };
     Response::from_parts(parts, Body::from_stream(stream))
 }
@@ -341,7 +361,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flat_session_stream_is_live_and_only_explicit_completion_charges() {
+    async fn flat_session_stream_releases_output_only_after_completion_commits() {
         for end in ["complete", "fail", "drop"] {
             let (forward, session, store, channel) = flat_session().await;
             let outcomes = Arc::new(Mutex::new(Vec::new()));
@@ -368,7 +388,14 @@ mod tests {
                 crate::server::payment::settle_axum_delegated_response(forward, response).await;
             let mut body = response.into_body().into_data_stream();
             sender.send(("data: partial\n\n", false)).unwrap();
-            assert_eq!(body.next().await.unwrap().unwrap(), "data: partial\n\n");
+            // An uncharged prefix is never released: a buyer could read it
+            // and disconnect before the completion that would charge it.
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(50), body.next())
+                    .await
+                    .is_err(),
+                "partial output is held until the charge commits"
+            );
             assert_eq!(
                 store
                     .get_channel(&channel)
@@ -381,6 +408,7 @@ mod tests {
             match end {
                 "complete" => {
                     sender.send(("data: [DONE]\n\n", true)).unwrap();
+                    assert_eq!(body.next().await.unwrap().unwrap(), "data: partial\n\n");
                     assert_eq!(body.next().await.unwrap().unwrap(), "data: [DONE]\n\n");
                     assert_eq!(
                         store
@@ -397,6 +425,8 @@ mod tests {
                         .send(("data: {\"error\":\"worker_failed\"}\n\n", false))
                         .unwrap();
                     drop(sender);
+                    // The handler's own failure answer is released uncharged.
+                    assert_eq!(body.next().await.unwrap().unwrap(), "data: partial\n\n");
                     assert!(body.next().await.unwrap().is_ok());
                     assert!(body.next().await.is_none());
                 }
