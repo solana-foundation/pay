@@ -727,6 +727,7 @@ mod tests {
             pubkey: ADDRESS.to_string(),
             credentials,
             policy: SpendPolicy::dollars(1.0, 10.0),
+            recipients: crate::tenants::DEFAULT_RECIPIENTS,
         });
         state
     }

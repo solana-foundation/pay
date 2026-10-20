@@ -630,6 +630,7 @@ impl Privy {
             pubkey: wallet.address.clone(),
             credentials,
             policy: crate::tenants::DEFAULT_POLICY,
+            recipients: crate::tenants::DEFAULT_RECIPIENTS,
         }
     }
 }
@@ -1772,6 +1773,7 @@ pub(crate) mod tests {
             pubkey: ADDRESS.to_string(),
             credentials,
             policy: pay_mcp::policy::SpendPolicy::dollars(1.0, 5.0),
+            recipients: crate::tenants::DEFAULT_RECIPIENTS,
         };
         let registry = TenantRegistry::new();
         for missing in [json!(null), json!({ "meta": null })] {

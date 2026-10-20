@@ -848,7 +848,7 @@ mod tests {
 
     #[test]
     fn hosted_permissions_refuse_native_sol_before_any_payment_is_built() {
-        let hosted = crate::McpPermissions::hosted();
+        let hosted = crate::McpPermissions::hosted(&crate::ApprovedRecipients::Any);
         assert!(
             hosted
                 .authorize_mpp(&mpp_charge("SOL", "1000000000"), "https://a.example/x")

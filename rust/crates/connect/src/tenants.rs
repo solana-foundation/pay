@@ -91,9 +91,21 @@ pub struct TenantRecord {
     /// Provider credentials that sign for this wallet.
     pub credentials: Credentials,
     pub policy: SpendPolicy,
+    /// Wallets this tenant's payments may reach.
+    pub recipients: pay_mcp::ApprovedRecipients,
 }
 
+/// Recipients a fresh connector wallet may pay: any, since a tenant has no
+/// way yet to approve specific ones. Every approval names each destination.
+pub const DEFAULT_RECIPIENTS: pay_mcp::ApprovedRecipients = pay_mcp::ApprovedRecipients::Any;
+
 impl TenantRecord {
+    /// The challenge-term checks every payment from this wallet passes
+    /// before it is built or signed.
+    pub fn payment_permissions(&self) -> pay_mcp::McpPermissions {
+        pay_mcp::McpPermissions::hosted(&self.recipients)
+    }
+
     /// The spend-ledger key: the provider wallet, not the subject, so every
     /// connection linked to one wallet shares one allowance.
     pub fn ledger_key(&self) -> String {
@@ -714,7 +726,7 @@ impl PayContext for CloudContext {
             approval: Arc::new(self.approval(&record)),
             // Fail closed on challenge-selected terms: mainnet stablecoins
             // only, before any payment is built or signed.
-            payment_permissions: Some(Arc::new(pay_mcp::McpPermissions::hosted())),
+            payment_permissions: Some(Arc::new(record.payment_permissions())),
             // The server has no access to the caller's files.
             body_files: false,
             // Arbitrary public APIs remain available, but tenant-controlled
@@ -743,7 +755,47 @@ mod tests {
             pubkey: "CcZFhGwFVkZevr555EZJpWbeq4irboT6zHfrSKWKCy3Z".to_string(),
             credentials,
             policy: SpendPolicy::dollars(1.0, 5.0),
+            recipients: DEFAULT_RECIPIENTS,
         }
+    }
+
+    #[test]
+    fn a_tenant_pays_only_the_recipients_it_approved() {
+        const PAYEE: &str = "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY";
+        const SPLIT: &str = "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin";
+        let charge = pay_kit::mpp::PaymentChallenge::new(
+            "id",
+            "realm",
+            "solana",
+            "charge",
+            pay_kit::mpp::Base64UrlJson::from_value(&serde_json::json!({
+                "amount": "5000000",
+                "currency": "USDC",
+                "recipient": PAYEE,
+                "methodDetails": {
+                    "network": "mainnet",
+                    "splits": [{ "recipient": SPLIT, "amount": "4000000" }],
+                },
+            }))
+            .unwrap(),
+        );
+        let url = "https://merchant.example/paid";
+        let mut tenant = record("sub_1");
+        tenant.recipients = pay_mcp::ApprovedRecipients::Only(vec![PAYEE.parse().unwrap()]);
+        assert!(
+            tenant
+                .payment_permissions()
+                .authorize_mpp(&charge, url)
+                .is_err(),
+            "the split goes to a wallet the tenant never approved"
+        );
+        tenant.recipients = DEFAULT_RECIPIENTS;
+        assert!(
+            tenant
+                .payment_permissions()
+                .authorize_mpp(&charge, url)
+                .is_ok()
+        );
     }
 
     #[test]

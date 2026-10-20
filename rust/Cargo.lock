@@ -5341,6 +5341,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "solana-pay-kit",
+ "solana-pubkey 3.0.0",
  "tempfile",
  "tokio",
  "tracing",
