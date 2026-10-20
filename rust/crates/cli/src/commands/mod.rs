@@ -329,9 +329,18 @@ impl Command {
         }
 
         let (outcome, tool) = match &self {
-            Command::Curl(cmd) => (pay_core::run_curl(&cmd.args)?, Tool::Curl(&cmd.args)),
-            Command::Wget(cmd) => (pay_core::run_wget(&cmd.args)?, Tool::Wget(&cmd.args)),
-            Command::Http(cmd) => (pay_core::run_httpie(&cmd.args)?, Tool::Http(&cmd.args)),
+            Command::Curl(cmd) => (
+                pay_core::run_curl(&cmd.args, network_override, account_override)?,
+                Tool::Curl(&cmd.args),
+            ),
+            Command::Wget(cmd) => (
+                pay_core::run_wget(&cmd.args, network_override, account_override)?,
+                Tool::Wget(&cmd.args),
+            ),
+            Command::Http(cmd) => (
+                pay_core::run_httpie(&cmd.args, network_override, account_override)?,
+                Tool::Http(&cmd.args),
+            ),
             Command::Fetch(cmd) => {
                 let prepared = cmd.prepare()?;
                 if prepared.body.is_some() && prepared.validation_body.is_none() {

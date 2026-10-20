@@ -155,13 +155,26 @@ pub enum RunOutcome {
 ///
 /// Appends `-D <tempfile>` after user args to capture response headers.
 /// stdout/stderr/stdin are inherited so the user sees normal curl output.
-pub fn run_curl(user_args: &[String]) -> Result<RunOutcome> {
+///
+/// `network_override` and `account_override` are the signing context the
+/// caller selected; a cached subscription bearer is only pre-attached when
+/// it belongs to that context.
+pub fn run_curl(
+    user_args: &[String],
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+) -> Result<RunOutcome> {
     if is_passthrough_metadata_request(user_args) {
         return run_plain_command("curl", user_args);
     }
 
     validate_curl_args_against_catalog(user_args)?;
-    let pre = pre_attach_cached_auth(user_args, ToolKind::Curl);
+    let pre = pre_attach_cached_auth(
+        user_args,
+        ToolKind::Curl,
+        network_override,
+        account_override,
+    );
     run_curl_inner(user_args, &pre)
 }
 
@@ -257,13 +270,24 @@ fn run_curl_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunO
 }
 
 /// Run `wget` with the given user args, detecting 402 + MPP challenges.
-pub fn run_wget(user_args: &[String]) -> Result<RunOutcome> {
+///
+/// See [`run_curl`] for the signing-context arguments.
+pub fn run_wget(
+    user_args: &[String],
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+) -> Result<RunOutcome> {
     if is_passthrough_metadata_request(user_args) {
         return run_plain_command("wget", user_args);
     }
 
     validate_wget_args_against_catalog(user_args)?;
-    let pre = pre_attach_cached_auth(user_args, ToolKind::Wget);
+    let pre = pre_attach_cached_auth(
+        user_args,
+        ToolKind::Wget,
+        network_override,
+        account_override,
+    );
     run_wget_inner(user_args, &pre)
 }
 
@@ -271,12 +295,23 @@ pub fn run_wget(user_args: &[String]) -> Result<RunOutcome> {
 ///
 /// HTTPie uses positional `Header:Value` request items rather than `-H` flags,
 /// so `extra_headers` for retry are appended as positional args.
-pub fn run_httpie(user_args: &[String]) -> Result<RunOutcome> {
+///
+/// See [`run_curl`] for the signing-context arguments.
+pub fn run_httpie(
+    user_args: &[String],
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+) -> Result<RunOutcome> {
     if is_passthrough_metadata_request(user_args) {
         return run_plain_command("http", user_args);
     }
 
-    let pre = pre_attach_cached_auth(user_args, ToolKind::Httpie);
+    let pre = pre_attach_cached_auth(
+        user_args,
+        ToolKind::Httpie,
+        network_override,
+        account_override,
+    );
     run_httpie_inner(user_args, &pre)
 }
 
@@ -1787,9 +1822,14 @@ fn httpie_url_shorthand(arg: &str) -> Option<String> {
 /// - curl/wget: `"Authorization: <token>"`
 /// - httpie: `"Authorization:<token>"` (no space — HTTPie request-item form)
 ///
-/// Empty vec when no tracked subscription matches the URL, so callers
-/// pass it through to the existing inner runner unchanged.
-fn pre_attach_cached_auth(args: &[String], tool: ToolKind) -> Vec<String> {
+/// Empty vec when no subscription of the selected account matches the URL,
+/// so callers pass it through to the existing inner runner unchanged.
+fn pre_attach_cached_auth(
+    args: &[String],
+    tool: ToolKind,
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+) -> Vec<String> {
     let Some(url) = resolve_request_url(args, tool) else {
         return Vec::new();
     };
@@ -1799,7 +1839,12 @@ fn pre_attach_cached_auth(args: &[String], tool: ToolKind) -> Vec<String> {
         return Vec::new();
     }
     let store = crate::accounts::FileAccountsStore::default_path();
-    let Some(token) = crate::client::authenticate::cached_header_for_resource(&store, &url) else {
+    let Some(token) = crate::client::authenticate::cached_header_for_account(
+        &store,
+        network_override,
+        account_override,
+        &url,
+    ) else {
         return Vec::new();
     };
     vec![formatted_header(tool, "Authorization", &token)]
@@ -2286,7 +2331,7 @@ mod pre_attach_tests {
     fn no_url_means_no_pre_attach() {
         let args = s(&["--help"]);
         assert_eq!(resolve_request_url(&args, ToolKind::Httpie), None);
-        assert!(pre_attach_cached_auth(&args, ToolKind::Httpie).is_empty());
+        assert!(pre_attach_cached_auth(&args, ToolKind::Httpie, None, None).is_empty());
     }
 }
 

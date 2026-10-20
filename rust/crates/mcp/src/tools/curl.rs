@@ -1163,7 +1163,12 @@ fn do_paid_fetch(
     // non-expired token), attach it BEFORE the first fetch. On hit the
     // server validates the token and skips the 402 entirely — no Touch
     // ID prompt, no extra round trip. On miss this is a no-op.
-    let cached_auth_header = pay_core::client::authenticate::cached_header_for_resource(store, url);
+    let cached_auth_header = pay_core::client::authenticate::cached_header_for_account(
+        store,
+        network_override.as_deref(),
+        account_override.as_deref(),
+        url,
+    );
     let mut initial_headers: Vec<(String, String)> = match cached_auth_header.as_deref() {
         Some(token)
             if !extra_headers
