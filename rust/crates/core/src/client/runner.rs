@@ -1693,7 +1693,9 @@ fn credential_redirect_guard(tool: ToolKind, injected: &[String]) -> &'static [&
         return &[];
     }
     match tool {
-        ToolKind::Curl => &["--no-location"],
+        // `--globoff` keeps `{a,b}` / `[1-9]` in the URL from expanding into
+        // more transfers that would carry the same credential.
+        ToolKind::Curl => &["--no-location", "--globoff"],
         ToolKind::Wget => &["--max-redirect=0"],
         ToolKind::Httpie => &["--no-follow"],
     }
@@ -1991,6 +1993,7 @@ mod pre_attach_tests {
     /// contacted once the wrapped tool has exited.
     struct CrossOriginRedirect {
         origin_url: String,
+        collector_url: String,
         origin: std::thread::JoinHandle<bool>,
         collector: std::thread::JoinHandle<bool>,
     }
@@ -2052,6 +2055,7 @@ mod pre_attach_tests {
             );
             Self {
                 origin_url,
+                collector_url: location,
                 origin,
                 collector,
             }
@@ -2074,7 +2078,7 @@ mod pre_attach_tests {
         let injected = s(&[PAYMENT_HEADER]);
         assert_eq!(
             credential_redirect_guard(ToolKind::Curl, &injected),
-            ["--no-location"]
+            ["--no-location", "--globoff"]
         );
         assert_eq!(
             credential_redirect_guard(ToolKind::Wget, &injected),
@@ -2261,6 +2265,21 @@ mod pre_attach_tests {
         // And so does the pre-signing validation the CLI runs.
         assert!(validate_curl_args_against_catalog(&args).is_err());
         assert!(validate_wget_args_against_catalog(&args).is_err());
+    }
+
+    #[test]
+    fn curl_url_globs_do_not_fan_credentials_out() {
+        if check_command_exists("curl").is_err() {
+            return;
+        }
+        let server = CrossOriginRedirect::start();
+        // Without --globoff this glob would be two transfers: the origin and
+        // the collector. With it, curl requests a literal (invalid) URL.
+        let collector = server.collector_url.clone();
+        let glob = format!("{{{},{}}}", server.origin_url, collector);
+        let _ = run_curl_inner(&s(&["-s", &glob]), &s(&[PAYMENT_HEADER]));
+        let _ = run_curl_inner(&s(&["-s", &server.origin_url]), &[]);
+        assert!(!server.collector_was_contacted());
     }
 
     #[test]
