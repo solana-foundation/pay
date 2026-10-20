@@ -143,11 +143,22 @@ pub struct PaidRequestTelemetry {
     pub payment: Option<telemetry::PaymentAmount>,
 }
 
+/// Whether a protected handler completed and its post-serve charge (an x402
+/// `batch-settlement` commit, a static delegated session) must land: any 2xx
+/// or 3xx, since a redirect can follow a completed side effect.
+pub fn handler_completed(status: StatusCode) -> bool {
+    status.is_success() || status.is_redirection()
+}
+
 /// Whether a protected handler completed and its delegated session must be
-/// charged: any 2xx, and for static sessions any 3xx, since a redirect can
-/// follow a completed side effect. Deployment leases charge only 2xx.
+/// charged: [`handler_completed`] for static sessions. Deployment leases
+/// charge only 2xx.
 pub fn session_response_served(status: StatusCode, deployment: bool) -> bool {
-    status.is_success() || (!deployment && status.is_redirection())
+    if deployment {
+        status.is_success()
+    } else {
+        handler_completed(status)
+    }
 }
 
 /// Streaming media types handled consistently by both HTTP adapters.
@@ -2174,8 +2185,9 @@ fn is_replayable_batch_response_header(name: &HeaderName) -> bool {
 /// Commit an x402 `batch-settlement` voucher after the resource was served
 /// (the adapter's post-response hook).
 ///
-/// This is the step that charges the client, so it runs only on a successful
-/// serve. On failure the outcome is dropped instead: the watermark never
+/// This is the step that charges the client, so it runs only for a response
+/// whose handler completed ([`handler_completed`], redirects included);
+/// `None` means nothing was served. On failure the outcome is dropped instead: the watermark never
 /// advances, the channel's in-flight guard is released, and the client may
 /// retry the identical voucher.
 ///
@@ -2188,10 +2200,10 @@ fn is_replayable_batch_response_header(name: &HeaderName) -> bool {
 pub async fn settle_batch<S: PaymentState>(
     state: &S,
     forward: BatchForward,
-    served_ok: bool,
+    response_status: Option<StatusCode>,
     cached: Option<pay_kit::core::store::CachedUpstreamResponse>,
 ) -> Result<Option<(HeaderName, HeaderValue)>, String> {
-    if !served_ok {
+    if !response_status.is_some_and(handler_completed) {
         release_batch(state, forward).await;
         return Ok(None);
     }

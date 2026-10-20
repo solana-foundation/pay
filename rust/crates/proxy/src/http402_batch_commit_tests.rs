@@ -350,3 +350,52 @@ async fn buffered_response_is_released_when_batch_commit_succeeds() {
     assert!(raw.to_ascii_lowercase().contains("payment-response"));
     assert!(raw.contains("protected-content"));
 }
+
+#[tokio::test]
+async fn streaming_redirect_commits_the_batch_voucher() {
+    for (status, committed) in [(303, 3_000), (307, 3_000), (404, 2_000), (500, 2_000)] {
+        let (state, store, channel_id, forward) = forwarded_batch().await;
+        let gate = Http402Gate::new(state, "127.0.0.1:1");
+        let (mut session, _client) = request_session().await;
+        let mut ctx = gate.new_ctx();
+        ctx.batch = Some(forward);
+        let mut response = ResponseHeader::build(status, None).unwrap();
+
+        gate.response_filter(&mut session, &mut response, &mut ctx)
+            .await
+            .unwrap();
+
+        let channel = store.get_channel(&channel_id).await.unwrap().unwrap();
+        assert_eq!(channel.cumulative, committed, "status {status}");
+        assert_eq!(
+            response.headers.get("payment-response").is_some(),
+            committed > 2_000,
+            "status {status}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn buffered_redirect_commits_the_batch_voucher() {
+    for (status, committed) in [(302, 3_000), (400, 2_000)] {
+        let (state, store, channel_id, forward) = forwarded_batch().await;
+        let gate = Http402Gate::new(state, "127.0.0.1:1");
+        let (mut session, mut client) = request_session().await;
+        let mut ctx = gate.new_ctx();
+        ctx.batch = Some(forward);
+        let served = axum::response::Response::builder()
+            .status(status)
+            .header("location", "/done")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        gate.finish_inline(&mut session, &mut ctx, served)
+            .await
+            .unwrap();
+
+        let raw = read_response(&mut client).await;
+        assert!(raw.starts_with(&format!("HTTP/1.1 {status}")), "{raw}");
+        let channel = store.get_channel(&channel_id).await.unwrap().unwrap();
+        assert_eq!(channel.cumulative, committed, "status {status}");
+    }
+}

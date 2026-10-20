@@ -305,7 +305,7 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
             // for a response that actually served. A failure drops the outcome,
             // leaving the client uncharged and free to retry it.
             if let Some(bf) = batch {
-                let mut served_ok = response.status().is_success();
+                let mut served_ok = crate::server::gate::handler_completed(response.status());
                 let mut cached = None;
                 let completion = response.extensions().get::<StreamCompletion>().cloned();
                 if served_ok && let Some(completion) = completion {

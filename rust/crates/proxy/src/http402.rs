@@ -307,9 +307,15 @@ impl<S: PaymentState> Http402Gate<S> {
         ctx: &mut Ctx,
         resp: axum::response::Response,
     ) -> pingora::Result<()> {
-        let served_ok = resp.status().is_success();
+        let status = resp.status();
         match self
-            .drain_payment_headers_with_response(ctx, served_ok, None, &HeaderMap::new(), None)
+            .drain_payment_headers_with_response(
+                ctx,
+                status.is_success(),
+                Some(status),
+                &HeaderMap::new(),
+                None,
+            )
             .await
         {
             Ok(extra) => write_axum_response(session, resp, extra).await,
@@ -373,7 +379,7 @@ impl<S: PaymentState> Http402Gate<S> {
             match settle_batch(
                 &self.state,
                 pending,
-                served_ok,
+                response_status,
                 response_status
                     .zip(response_body)
                     .filter(|(_, body)| body.len() <= MAX_BATCH_CACHED_RESPONSE_BYTES)
@@ -1297,8 +1303,7 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
         // to pay-worker. This must happen here (before headers are sent) so a
         // successful proxied response cannot drop its reservation uncharged.
         if let Some(pending) = ctx.batch.take() {
-            let served_ok = upstream_response.status.is_success();
-            if served_ok {
+            if pay_core::server::gate::handler_completed(upstream_response.status) {
                 match commit_batch(&self.state, &pending).await {
                     Ok(Some((name, value))) => {
                         let _ = upstream_response.insert_header(name.clone(), value.clone());
