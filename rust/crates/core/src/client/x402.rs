@@ -1701,6 +1701,50 @@ mod tests {
     }
 
     #[test]
+    fn an_exact_offer_without_a_network_is_never_payable() {
+        // draft x402 v2: `network` is a required PaymentRequirements field;
+        // a missing one must not be read as Solana mainnet.
+        let offer = |network: Option<&str>| {
+            let mut accept = serde_json::json!({
+                "scheme": "exact",
+                "amount": "10000",
+                "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                "payTo": "6cvgmdrsVxyiuPzqMCSBnS7fAmA5Mk2VG4BcfVhC8jdC",
+                "maxTimeoutSeconds": 300,
+                "extra": { "feePayer": "93syNmtT1tTd5ZtPwHqzGf6CM7fKhMmArpv4AM4FtyNX" }
+            });
+            if let Some(network) = network {
+                accept["network"] = network.into();
+            }
+            serde_json::json!({
+                "x402Version": 2,
+                "resource": { "url": "https://api.example.com/v1/test" },
+                "accepts": [accept]
+            })
+            .to_string()
+        };
+        let classify = |body: &str| {
+            crate::client::runner::classify_402(&[], Some(body), "https://api.example.com/v1/test")
+        };
+
+        let missing = offer(None);
+        assert!(parse(&[], Some(&missing)).is_none());
+        assert!(!matches!(
+            classify(&missing),
+            crate::client::runner::RunOutcome::X402Challenge { .. }
+        ));
+
+        // Control: the same offer naming mainnet is payable.
+        let named = offer(Some(SOLANA_MAINNET));
+        let challenge = parse(&[], Some(&named)).expect("a mainnet offer parses");
+        assert_eq!(challenge.requirements.network, SOLANA_MAINNET);
+        assert!(matches!(
+            classify(&named),
+            crate::client::runner::RunOutcome::X402Challenge { .. }
+        ));
+    }
+
+    #[test]
     fn parse_batch_prefers_the_allowlisted_blockrun_operator() {
         let exact = serde_json::json!({
             "scheme": "exact",
