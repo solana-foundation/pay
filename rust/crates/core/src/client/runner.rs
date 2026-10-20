@@ -204,6 +204,7 @@ fn run_curl_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunO
     for h in &headers {
         cmd.arg("-H").arg(h);
     }
+    cmd.args(credential_redirect_guard(ToolKind::Curl, extra_headers));
     cmd.arg("-D").arg(header_path);
     cmd.arg("-o").arg(body_path);
     cmd.stdin(Stdio::inherit())
@@ -319,6 +320,7 @@ fn run_wget_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunO
     for h in &headers {
         cmd.arg("--header").arg(h);
     }
+    cmd.args(credential_redirect_guard(ToolKind::Wget, extra_headers));
     cmd.stdin(Stdio::inherit());
     cmd.stdout(Stdio::inherit());
     cmd.stderr(Stdio::piped());
@@ -379,6 +381,7 @@ fn run_httpie_inner(user_args: &[String], extra_headers: &[String]) -> Result<Ru
     for h in &headers {
         cmd.arg(h);
     }
+    cmd.args(credential_redirect_guard(ToolKind::Httpie, extra_headers));
     cmd.arg("--no-all");
     cmd.arg("--print=hb");
     if stdout_is_tty {
@@ -1299,6 +1302,28 @@ fn headers_with_default_user_agent(
     headers
 }
 
+/// Flags that stop the wrapped tool from following redirects, appended after
+/// the user's args (so they win over `-L`, `--location-trusted`, `--follow`
+/// or a `--max-redirect` the caller passed) whenever Pay injects headers.
+///
+/// Every header Pay injects is a credential bound to the URL the 402 came
+/// from: a payment, a sign-in proof, or a cached subscription bearer. The
+/// wrapped tools forward custom headers across redirects (wget even does so
+/// by default, and curl only strips `Authorization`, not `X-PAYMENT`), so a
+/// redirect to another origin would hand the credential to that origin.
+/// Not following is the only boundary we can enforce from outside the tool;
+/// the caller sees the redirect response itself.
+fn credential_redirect_guard(tool: ToolKind, injected: &[String]) -> &'static [&'static str] {
+    if injected.is_empty() {
+        return &[];
+    }
+    match tool {
+        ToolKind::Curl => &["--no-location"],
+        ToolKind::Wget => &["--max-redirect=0"],
+        ToolKind::Httpie => &["--no-follow"],
+    }
+}
+
 fn formatted_header(tool: ToolKind, name: &str, value: &str) -> String {
     match tool {
         ToolKind::Curl | ToolKind::Wget => format!("{name}: {value}"),
@@ -1584,6 +1609,159 @@ mod pre_attach_tests {
         let extra = s(&["User-Agent: retry-client"]);
         let headers = headers_with_default_user_agent(&args, &extra, ToolKind::Curl);
         assert_eq!(headers, extra);
+    }
+
+    /// Loopback origin that answers its first request with a 302 to a
+    /// second, collector origin, and reports whether the collector was ever
+    /// contacted once the wrapped tool has exited.
+    struct CrossOriginRedirect {
+        origin_url: String,
+        origin: std::thread::JoinHandle<bool>,
+        collector: std::thread::JoinHandle<bool>,
+    }
+
+    /// Serve one request with `response`, or give up after `wait`. Returns
+    /// whether a request arrived.
+    fn serve_once(
+        listener: std::net::TcpListener,
+        wait: std::time::Duration,
+        response: String,
+    ) -> std::thread::JoinHandle<bool> {
+        use std::io::{Read, Write};
+        listener.set_nonblocking(true).unwrap();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + wait;
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(_) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(_) => return false,
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => request.extend_from_slice(&chunk[..n]),
+                }
+            }
+            let _ = stream.write_all(response.as_bytes());
+            true
+        })
+    }
+
+    impl CrossOriginRedirect {
+        fn start() -> Self {
+            let origin = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let collector = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let origin_url = format!("http://{}/start", origin.local_addr().unwrap());
+            let location = format!("http://{}/collect", collector.local_addr().unwrap());
+            let origin = serve_once(
+                origin,
+                std::time::Duration::from_secs(20),
+                format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                ),
+            );
+            let collector = serve_once(
+                collector,
+                std::time::Duration::from_secs(3),
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_string(),
+            );
+            Self {
+                origin_url,
+                origin,
+                collector,
+            }
+        }
+
+        fn collector_was_contacted(self) -> bool {
+            assert!(
+                self.origin.join().unwrap(),
+                "the tool never reached the origin"
+            );
+            self.collector.join().unwrap()
+        }
+    }
+
+    const PAYMENT_HEADER: &str = "Authorization: Payment redirect-test-credential";
+
+    #[test]
+    fn redirect_guard_only_applies_when_credentials_are_injected() {
+        assert!(credential_redirect_guard(ToolKind::Wget, &[]).is_empty());
+        let injected = s(&[PAYMENT_HEADER]);
+        assert_eq!(
+            credential_redirect_guard(ToolKind::Curl, &injected),
+            ["--no-location"]
+        );
+        assert_eq!(
+            credential_redirect_guard(ToolKind::Wget, &injected),
+            ["--max-redirect=0"]
+        );
+        assert_eq!(
+            credential_redirect_guard(ToolKind::Httpie, &injected),
+            ["--no-follow"]
+        );
+    }
+
+    #[test]
+    fn wget_follows_cross_origin_redirects_without_injected_credentials() {
+        // Control for the guard tests below: wget follows redirects by
+        // default, so the collector is reachable when nothing is injected.
+        if check_command_exists("wget").is_err() {
+            return;
+        }
+        let server = CrossOriginRedirect::start();
+        let args = s(&["-q", "-O", "-", &server.origin_url]);
+        run_wget_inner(&args, &[]).unwrap();
+        assert!(server.collector_was_contacted());
+    }
+
+    #[test]
+    fn wget_does_not_carry_injected_credentials_across_redirects() {
+        if check_command_exists("wget").is_err() {
+            return;
+        }
+        let server = CrossOriginRedirect::start();
+        // A caller-supplied redirect budget must not re-enable following.
+        let args = s(&["-q", "--max-redirect=5", "-O", "-", &server.origin_url]);
+        run_wget_inner(&args, &s(&[PAYMENT_HEADER])).unwrap();
+        assert!(!server.collector_was_contacted());
+    }
+
+    #[test]
+    fn curl_does_not_carry_injected_credentials_across_redirects() {
+        if check_command_exists("curl").is_err() {
+            return;
+        }
+        let server = CrossOriginRedirect::start();
+        let args = s(&["-s", "--location-trusted", &server.origin_url]);
+        let outcome = run_curl_inner(&args, &s(&[PAYMENT_HEADER])).unwrap();
+        assert!(matches!(outcome, RunOutcome::Completed { .. }));
+        assert!(!server.collector_was_contacted());
+    }
+
+    #[test]
+    fn httpie_does_not_carry_injected_credentials_across_redirects() {
+        if check_command_exists("http").is_err() {
+            return;
+        }
+        let server = CrossOriginRedirect::start();
+        let args = s(&["--follow", "GET", &server.origin_url]);
+        let outcome = run_httpie_inner(
+            &args,
+            &s(&["Authorization:Payment redirect-test-credential"]),
+        )
+        .unwrap();
+        assert!(matches!(outcome, RunOutcome::Completed { .. }));
+        assert!(!server.collector_was_contacted());
     }
 
     #[test]
