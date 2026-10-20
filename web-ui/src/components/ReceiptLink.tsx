@@ -8,9 +8,26 @@ import {
   responseHeader,
 } from "../utils/receipt";
 
+/** Origin of every receipt link Pay itself generates. */
+const RECEIPT_ORIGIN = "https://pay.sh";
+
+/** The upstream's `payment-receipt-url`, when it is a pay.sh link. The
+ *  header comes from whatever server answered, so anything else (a
+ *  `javascript:` URL, another host) is ignored in favour of the link derived
+ *  from the settlement signature. */
 function directReceiptUrl(flow: PaymentFlow): string | null {
-  const url = responseHeader(flow, "payment-receipt-url")?.trim();
-  return url || null;
+  const raw = responseHeader(flow, "payment-receipt-url")?.trim();
+  if (!raw) return null;
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return null;
+  }
+  if (url.origin !== RECEIPT_ORIGIN || url.username || url.password) {
+    return null;
+  }
+  return url.href;
 }
 
 export function receiptLinkHref(

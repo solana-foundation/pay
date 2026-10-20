@@ -143,6 +143,42 @@ describe("receipt parsing", () => {
     expect(href).toBe("https://pay.sh/receipt/settlement-signature?view=advanced");
   });
 
+  it("ignores a receipt url that is not a pay.sh link", () => {
+    for (const url of [
+      'javascript:fetch("/__402/pdb/logs")',
+      "JavaScript:alert(1)",
+      "data:text/html,<script>alert(1)</script>",
+      "http://pay.sh/receipt/sig",
+      "https://pay.sh.attacker.example/receipt/sig",
+      "https://attacker.example/receipt/sig",
+      "https://user:pass@pay.sh/receipt/sig",
+      "/receipt/sig",
+    ]) {
+      const href = receiptLinkHref(
+        flowWithHeaders({
+          "payment-receipt-url": url,
+          "payment-response": "settlement-signature",
+        }),
+        null,
+      );
+      expect(href, url).toBe(
+        "https://pay.sh/receipt/settlement-signature?view=advanced",
+      );
+    }
+  });
+
+  it("keeps a pay.sh receipt url from the upstream", () => {
+    const href = receiptLinkHref(
+      flowWithHeaders({
+        "payment-receipt-url": " https://pay.sh/receipt/channel-address?network=devnet ",
+        "payment-response": "settlement-signature",
+      }),
+      null,
+    );
+
+    expect(href).toBe("https://pay.sh/receipt/channel-address?network=devnet");
+  });
+
   it("links sandbox inference receipts", () => {
     const href = receiptLinkHref(
       flowWithHeaders({
