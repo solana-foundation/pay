@@ -385,25 +385,36 @@ pub async fn fetch_channels_each(
     rpc_url: &str,
     addresses: &[Pubkey],
 ) -> Result<Vec<Result<Option<DecodedChannel>, JobError>>, JobError> {
+    Ok(fetch_channels_each_at(rpc, rpc_url, addresses).await?.1)
+}
+
+/// [`fetch_channels_each`] with the slot the RPC node answered at, so a
+/// recorded observation can be fenced against a lagging node.
+pub async fn fetch_channels_each_at(
+    rpc: &RpcClient,
+    rpc_url: &str,
+    addresses: &[Pubkey],
+) -> Result<(u64, Vec<Result<Option<DecodedChannel>, JobError>>), JobError> {
     if addresses.len() > 100 {
         return Err(JobError::TxBuild(format!(
             "channel account batch has {} addresses; maximum is 100",
             addresses.len()
         )));
     }
-    let accounts = rpc
-        .get_multiple_accounts_with_owner(
+    let (slot, accounts) = rpc
+        .get_multiple_accounts_with_owner_at(
             rpc_url,
             &addresses
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>(),
+            pay_api_core::rpc::Commitment::Confirmed,
         )
         .await?;
     if accounts.len() != addresses.len() {
         return Err(JobError::Rpc(pay_api_core::Error::RpcMalformed));
     }
-    Ok(addresses
+    let channels = addresses
         .iter()
         .copied()
         .zip(accounts)
@@ -415,7 +426,8 @@ pub async fn fetch_channels_each(
             // shape; a decode failure means this is not a live channel.
             decode_v1_account(&address, &account.owner, &account.data)
         })
-        .collect())
+        .collect();
+    Ok((slot, channels))
 }
 
 /// The recovered distribution preimage: the raw `count || entries` bytes that

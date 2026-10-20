@@ -17,7 +17,8 @@ use pay_api_core::rpc::RpcClient;
 use pay_kit::core::payment_channels;
 use pay_kit::core::settlement::worker::{RpcBroadcaster, SettlementConfig, spawn};
 use pay_kit::core::store::{
-    ChannelState, ChannelStore, DEFAULT_FINALIZED_CHANNEL_RETENTION, RedisChannelStore, StoreError,
+    ChannelState, ChannelStore, DEFAULT_FINALIZED_CHANNEL_RETENTION, ObservationOutcome,
+    ObservedLifecycle, OnchainObservation, RedisChannelStore, StoreError,
 };
 use pay_kit::core::tx_pipeline::{TxPipeline, TxPipelineConfig, TxPipelineError};
 use pay_kit::mpp::server::session::{
@@ -35,7 +36,7 @@ use solana_pubkey::Pubkey;
 use solana_signature::Signature;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 const DEFAULT_REDIS_PREFIX: &str = "pay:session:v1:";
 const BATCH_REDIS_PREFIX_BASE: &str = "pay:batch:v1:";
@@ -1095,13 +1096,7 @@ async fn run_session(runtime: &SettlementRuntime) -> Result<SettleSessionsMetric
                                 "would delete Redis session for absent on-chain channel"
                             );
                         } else if cleanup_ready {
-                            match delete_fenced_channel(
-                                &session.store,
-                                &result.channel_id,
-                                unix_now() as u64,
-                            )
-                            .await
-                            {
+                            match delete_fenced_channel(&session.store, &result.channel_id).await {
                                 Ok(FencedDelete::Deleted) => info!(
                                     channel_id = %result.channel_id,
                                     "deleted Redis session for absent on-chain channel"
@@ -1619,9 +1614,9 @@ async fn run_batch(runtime: &SettlementRuntime) -> Result<SettleSessionsMetrics,
                         .map_err(|_| JobError::InvalidAddress(state.channel_id.clone()))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let channels =
-                channel::fetch_channels_each(&runtime.rpc, &runtime.rpc_url, &addresses).await?;
-            Ok::<_, JobError>(states.into_iter().zip(channels).collect::<Vec<_>>())
+            let (slot, channels) =
+                channel::fetch_channels_each_at(&runtime.rpc, &runtime.rpc_url, &addresses).await?;
+            Ok::<_, JobError>((slot, states.into_iter().zip(channels).collect::<Vec<_>>()))
         }
         .await;
         (count, fetched)
@@ -1632,10 +1627,13 @@ async fn run_batch(runtime: &SettlementRuntime) -> Result<SettleSessionsMetrics,
     .collect::<Vec<_>>()
     .await;
     let mut fetched_channels = Vec::with_capacity(metrics.channels_scanned);
+    // The slot each channel was read at, fencing its recorded observation.
+    let mut read_slots = HashMap::new();
     for (batch_size, fetched_batch) in fetched_batches {
         match fetched_batch {
-            Ok(channels) => {
+            Ok((slot, channels)) => {
                 for (state, fetched) in channels {
+                    read_slots.insert(state.channel_id.clone(), slot);
                     match fetched {
                         Ok(onchain) => fetched_channels.push((state, onchain)),
                         Err(error) => {
@@ -1719,17 +1717,25 @@ async fn run_batch(runtime: &SettlementRuntime) -> Result<SettleSessionsMetrics,
     for reconciliation in reconciliations {
         match reconciliation {
             Ok(result) => {
-                if let Some(observed) = result.observed
-                    && let Err(error) = update_batch_settled_watermark(
+                if let Some(observed) = result.observed {
+                    match update_batch_settled_watermark(
                         &batch.store,
                         &result.channel_id,
                         observed,
+                        read_slots.get(&result.channel_id).copied(),
                         now.max(0) as u64,
                     )
                     .await
-                {
-                    metrics.failures += 1;
-                    warn!(channel_id = %result.channel_id, %error, "failed to persist observed batch settlement watermark");
+                    {
+                        Ok(ObservationOutcome::Fresh) => {}
+                        Ok(ObservationOutcome::Behind { recorded }) => {
+                            debug!(channel_id = %result.channel_id, recorded, "batch channel read lagged the recorded slot; snapshot not renewed");
+                        }
+                        Err(error) => {
+                            metrics.failures += 1;
+                            warn!(channel_id = %result.channel_id, %error, "failed to persist observed batch settlement watermark");
+                        }
+                    }
                 }
                 if let Some(settled) = result.stablecoin_settled_base_units {
                     telemetry::record_channel_settled("x402/batch", &result.channel_id, settled);
@@ -1755,9 +1761,7 @@ async fn run_batch(runtime: &SettlementRuntime) -> Result<SettleSessionsMetrics,
                     metrics.skipped += 1;
                 }
                 if result.delete_absent && !runtime.dry_run {
-                    match delete_fenced_channel(&batch.store, &result.channel_id, unix_now() as u64)
-                        .await
-                    {
+                    match delete_fenced_channel(&batch.store, &result.channel_id).await {
                         Ok(FencedDelete::Deleted) => {}
                         Ok(FencedDelete::InFlight) => {
                             info!(channel_id = %result.channel_id, "retaining absent batch channel while new work is in flight");
@@ -1904,13 +1908,18 @@ async fn run_batch(runtime: &SettlementRuntime) -> Result<SettleSessionsMetrics,
                 &candidate.channel_id,
                 candidate.after.unsealed,
             );
+            // A confirmed settlement proves the watermark, and a sealing
+            // one the terminal state; neither is a read of an open channel,
+            // so an unsealed one never renews the snapshot.
             if let Err(error) = update_batch_settled_watermark(
                 &batch.store,
                 &candidate.channel_id,
                 ChainObservation {
                     settled: candidate.settled_on_chain,
-                    sealed: !candidate.after.unsealed,
+                    lifecycle: (!candidate.after.unsealed)
+                        .then_some(ObservedLifecycle::Terminal { started_at: None }),
                 },
+                None,
                 unix_now().max(0) as u64,
             )
             .await
@@ -1946,13 +1955,7 @@ async fn run_batch(runtime: &SettlementRuntime) -> Result<SettleSessionsMetrics,
                     }
                 }
                 BatchStoreAction::Delete => {
-                    match delete_fenced_channel(
-                        &batch.store,
-                        &candidate.channel_id,
-                        unix_now() as u64,
-                    )
-                    .await
-                    {
+                    match delete_fenced_channel(&batch.store, &candidate.channel_id).await {
                         Ok(FencedDelete::Deleted) => {}
                         Ok(FencedDelete::InFlight) => {
                             info!(channel_id = %candidate.channel_id, "retaining reclaimed batch channel while new work is in flight");
@@ -2023,47 +2026,34 @@ fn settlement_config(
 enum FencedDelete {
     Deleted,
     /// A reservation or setup admitted after the caller's snapshot is still
-    /// in flight; the record is kept for a later pass.
+    /// in flight, or the record changed under the delete; it is kept for a
+    /// later pass.
     InFlight,
 }
 
 /// Delete the record of a channel whose account is gone, without trusting
-/// the snapshot that proved it. One atomic transition rechecks that no
-/// reservation or setup is in flight and fences admission (every reservation
-/// refuses a sealed, close-requested record); only then is the record
-/// deleted, so a request admitted after the snapshot either keeps its record
-/// or is refused before its handler runs.
+/// the snapshot that proved it: the kit's [`ChannelStore::delete_channel_if`]
+/// rechecks, against the record it actually removes, that no reservation or
+/// setup is in flight. A request admitted after the snapshot either keeps its
+/// record or, once the record is gone, is refused as an unknown channel.
 async fn delete_fenced_channel(
     store: &impl ChannelStore,
     channel_id: &str,
-    now_seconds: u64,
 ) -> Result<FencedDelete, StoreError> {
-    const ABSENT: &str = "channel record already deleted";
-    const IN_FLIGHT: &str = "in-flight work retains the channel record";
-    let fenced = store
-        .update_channel(
+    if store
+        .delete_channel_if(
             channel_id,
-            Box::new(move |current| {
-                let mut state = current.ok_or_else(|| StoreError::Internal(ABSENT.into()))?;
-                if state.has_in_flight_authorization() {
-                    return Err(StoreError::Internal(IN_FLIGHT.into()));
-                }
-                state.sealed = true;
-                state.close_requested_at.get_or_insert(now_seconds);
-                Ok(state)
-            }),
+            Box::new(|state| !state.has_in_flight_authorization()),
         )
-        .await;
-    match fenced {
-        Ok(_) => {}
-        Err(StoreError::Internal(reason)) if reason == ABSENT => return Ok(FencedDelete::Deleted),
-        Err(StoreError::Internal(reason)) if reason == IN_FLIGHT => {
-            return Ok(FencedDelete::InFlight);
-        }
-        Err(error) => return Err(error),
+        .await?
+    {
+        return Ok(FencedDelete::Deleted);
     }
-    store.delete_channel(channel_id).await?;
-    Ok(FencedDelete::Deleted)
+    // Refused, changed concurrently, or already gone.
+    Ok(match store.get_channel(channel_id).await? {
+        None => FencedDelete::Deleted,
+        Some(_) => FencedDelete::InFlight,
+    })
 }
 
 async fn retain_sealed_record(
@@ -2409,33 +2399,56 @@ fn batch_reconciliation_due(
             || now_seconds.saturating_sub(state.last_activity_at) >= max_idle.as_secs())
 }
 
-/// What one chain read established about a batch channel.
+/// What one chain read (or confirmed transaction) established about a
+/// batch channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ChainObservation {
     settled: u64,
-    /// Sealed or distributed: no further voucher can ever be claimed.
-    sealed: bool,
+    /// The lifecycle the read showed; `None` when nothing was read beyond the
+    /// settlement watermark.
+    lifecycle: Option<ObservedLifecycle>,
 }
 
 impl ChainObservation {
-    fn of(onchain: &channel::DecodedChannel) -> Self {
+    /// The channel as read at `now` (unix seconds), fenced the way the
+    /// gateway fences its own reads.
+    fn of(onchain: &channel::DecodedChannel, now: i64) -> Self {
+        let status = onchain.channel.status;
+        let started_at =
+            (onchain.channel.closure_started_at != 0 || status != STATUS_OPEN).then(|| {
+                u64::try_from(onchain.channel.closure_started_at)
+                    .ok()
+                    .filter(|started| *started > 0)
+                    .unwrap_or(now.max(1) as u64)
+            });
+        let lifecycle = match (status, started_at) {
+            (STATUS_OPEN | STATUS_CLOSING, Some(started_at)) => {
+                ObservedLifecycle::Closing { started_at }
+            }
+            (STATUS_OPEN | STATUS_CLOSING, None) => ObservedLifecycle::Open,
+            _ => ObservedLifecycle::Terminal { started_at },
+        };
         Self {
             settled: onchain.channel.settlement.settled,
-            sealed: matches!(onchain.channel.status, STATUS_SEALED | STATUS_DISTRIBUTED),
+            lifecycle: Some(lifecycle),
         }
     }
 }
 
-/// Persist a chain observation. The gateway skips its own chain read while
-/// `onchain_checked_at` is fresh, so a terminal observation must fence the
-/// record in the same write that refreshes it: a fresh timestamp on a record
-/// still open in Redis would admit vouchers no one can claim.
+/// Persist a chain observation through the kit's
+/// [`ChannelState::record_onchain_observation`]: the lifecycle fences it
+/// carries (a close, a seal) land in the same write that renews the
+/// gateway's admission snapshot, and a read from a bank behind `slot`'s
+/// recorded predecessor applies its fences without renewing it.
 async fn update_batch_settled_watermark(
     store: &impl ChannelStore,
     channel_id: &str,
     observed: ChainObservation,
-    checked_at: u64,
-) -> Result<(), StoreError> {
+    slot: Option<u64>,
+    now: u64,
+) -> Result<ObservationOutcome, StoreError> {
+    let outcome = Arc::new(std::sync::Mutex::new(ObservationOutcome::Fresh));
+    let out = Arc::clone(&outcome);
     store
         .update_channel(
             channel_id,
@@ -2443,13 +2456,15 @@ async fn update_batch_settled_watermark(
                 let mut state = current
                     .ok_or_else(|| StoreError::Internal("batch channel not found".into()))?;
                 state.settled_on_chain = state.settled_on_chain.max(observed.settled);
-                state.sealed |= observed.sealed;
-                state.onchain_checked_at = state.onchain_checked_at.max(checked_at);
+                if let Some(lifecycle) = observed.lifecycle {
+                    *out.lock().unwrap_or_else(|e| e.into_inner()) = state
+                        .record_onchain_observation(OnchainObservation { slot, lifecycle }, now);
+                }
                 Ok(state)
             }),
         )
-        .await
-        .map(|_| ())
+        .await?;
+    Ok(*outcome.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
 /// The deployment this worker settles: canonical-program batch channels. A
@@ -2737,7 +2752,7 @@ async fn reconcile_batch_channel(
                         stablecoin_settled_base_units: settled_metric,
                         stablecoin_distributed_base_units: distributed_metric,
                         escrow_active: Some(true),
-                        observed: Some(ChainObservation::of(&onchain)),
+                        observed: Some(ChainObservation::of(&onchain, now)),
                     });
                 }
                 return Ok(BatchReconcileResult {
@@ -2763,7 +2778,7 @@ async fn reconcile_batch_channel(
                     stablecoin_settled_base_units: settled_metric,
                     stablecoin_distributed_base_units: distributed_metric,
                     escrow_active: Some(true),
-                    observed: Some(ChainObservation::of(&onchain)),
+                    observed: Some(ChainObservation::of(&onchain, now)),
                 });
             };
             instructions.push(distribution);
@@ -2794,7 +2809,7 @@ async fn reconcile_batch_channel(
                 stablecoin_settled_base_units: settled_metric,
                 stablecoin_distributed_base_units: distributed_metric,
                 escrow_active: Some(true),
-                observed: Some(ChainObservation::of(&onchain)),
+                observed: Some(ChainObservation::of(&onchain, now)),
             });
         }
         STATUS_CLOSING if now < onchain.close_deadline() => {
@@ -2855,7 +2870,7 @@ async fn reconcile_batch_channel(
                     stablecoin_settled_base_units: settled_metric,
                     stablecoin_distributed_base_units: distributed_metric,
                     escrow_active: Some(true),
-                    observed: Some(ChainObservation::of(&onchain)),
+                    observed: Some(ChainObservation::of(&onchain, now)),
                 });
             };
             instructions.push(distribution);
@@ -2896,7 +2911,7 @@ async fn reconcile_batch_channel(
                 stablecoin_settled_base_units: settled_metric,
                 stablecoin_distributed_base_units: distributed_metric,
                 escrow_active: Some(onchain.channel.status != STATUS_DISTRIBUTED),
-                observed: Some(ChainObservation::of(&onchain)),
+                observed: Some(ChainObservation::of(&onchain, now)),
             });
         }
         status => {
@@ -2923,7 +2938,7 @@ async fn reconcile_batch_channel(
         stablecoin_settled_base_units: settled_metric,
         stablecoin_distributed_base_units: distributed_metric,
         escrow_active: Some(onchain.channel.status != STATUS_DISTRIBUTED),
-        observed: Some(ChainObservation::of(&onchain)),
+        observed: Some(ChainObservation::of(&onchain, now)),
     })
 }
 
@@ -5585,7 +5600,7 @@ mod tests {
             .unwrap();
         assert!(matches!(reserved, BatchReservation::Reserved(_)));
         assert_eq!(
-            delete_fenced_channel(&store, &id, 10).await.unwrap(),
+            delete_fenced_channel(&store, &id).await.unwrap(),
             FencedDelete::InFlight
         );
         let kept = store.get_channel(&id).await.unwrap().unwrap();
@@ -5610,12 +5625,12 @@ mod tests {
             .unwrap();
         assert!(matches!(refused, BatchReservation::Closing));
         assert_eq!(
-            delete_fenced_channel(&store, &quiet_id, 10).await.unwrap(),
+            delete_fenced_channel(&store, &quiet_id).await.unwrap(),
             FencedDelete::Deleted
         );
         assert!(store.get_channel(&quiet_id).await.unwrap().is_none());
         assert_eq!(
-            delete_fenced_channel(&store, &quiet_id, 10).await.unwrap(),
+            delete_fenced_channel(&store, &quiet_id).await.unwrap(),
             FencedDelete::Deleted
         );
     }
@@ -6022,11 +6037,11 @@ mod tests {
             .unwrap()
             .observed
             .unwrap();
-        update_batch_settled_watermark(&store, &id, observed, 5)
+        update_batch_settled_watermark(&store, &id, observed, Some(40), 5)
             .await
             .unwrap();
         let fenced = store.get_channel(&id).await.unwrap().unwrap();
-        assert_eq!(fenced.onchain_checked_at, 5);
+        assert_eq!(fenced.onchain_observed_at(), 5);
         assert!(fenced.sealed, "a fresh snapshot of a distributed channel");
         assert!(matches!(
             reserve(id.clone(), 150).await,
@@ -6038,14 +6053,99 @@ mod tests {
         let open_id = open.channel_id.clone();
         store.put_channel(&open_id, open).await.unwrap();
         onchain.channel.status = STATUS_OPEN;
-        update_batch_settled_watermark(&store, &open_id, ChainObservation::of(&onchain), 5)
-            .await
-            .unwrap();
+        onchain.channel.closure_started_at = 0;
+        update_batch_settled_watermark(
+            &store,
+            &open_id,
+            ChainObservation::of(&onchain, 5),
+            Some(40),
+            5,
+        )
+        .await
+        .unwrap();
         assert!(!store.get_channel(&open_id).await.unwrap().unwrap().sealed);
         assert!(matches!(
             reserve(open_id, 50).await,
             BatchReservation::Reserved(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn observations_go_through_the_kit_admission_snapshot() {
+        let (_, mut onchain, _) = batch_closing_fixture();
+        let store = pay_kit::core::store::MemoryChannelStore::new();
+        let state = channel_state();
+        let id = state.channel_id.clone();
+        store.put_channel(&id, state).await.unwrap();
+        let read = || {
+            let (store, id) = (&store, id.clone());
+            async move { store.get_channel(&id).await.unwrap().unwrap() }
+        };
+
+        // An open read renews the snapshot the gateway admits on, not just
+        // `onchain_checked_at`.
+        onchain.channel.status = STATUS_OPEN;
+        onchain.channel.closure_started_at = 0;
+        let outcome = update_batch_settled_watermark(
+            &store,
+            &id,
+            ChainObservation::of(&onchain, 100),
+            Some(50),
+            100,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, ObservationOutcome::Fresh);
+        let recorded = read().await;
+        assert_eq!(recorded.onchain_observed_at(), 100);
+        assert_eq!(recorded.onchain_observed_slot(), 50);
+        assert!(recorded.close_requested_at.is_none());
+
+        // A lagging node's open read never renews it.
+        let outcome = update_batch_settled_watermark(
+            &store,
+            &id,
+            ChainObservation::of(&onchain, 200),
+            Some(49),
+            200,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, ObservationOutcome::Behind { recorded: 50 });
+        assert_eq!(read().await.onchain_observed_at(), 100);
+
+        // A closing read records the close even from a lagging node.
+        onchain.channel.status = STATUS_CLOSING;
+        onchain.channel.closure_started_at = 150;
+        update_batch_settled_watermark(
+            &store,
+            &id,
+            ChainObservation::of(&onchain, 300),
+            Some(48),
+            300,
+        )
+        .await
+        .unwrap();
+        let closing = read().await;
+        assert_eq!(closing.close_requested_at, Some(150));
+        assert!(!closing.sealed);
+
+        // A settlement-only update moves the watermark and nothing else.
+        update_batch_settled_watermark(
+            &store,
+            &id,
+            ChainObservation {
+                settled: 7,
+                lifecycle: None,
+            },
+            None,
+            400,
+        )
+        .await
+        .unwrap();
+        let settled = read().await;
+        assert!(settled.settled_on_chain >= 7);
+        assert_eq!(settled.onchain_observed_at(), 100);
     }
 
     #[tokio::test]
