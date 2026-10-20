@@ -7,7 +7,7 @@
 //! recognise it instead of charging again. A definitive answer clears it.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
@@ -18,9 +18,25 @@ type Digest32 = [u8; 32];
 /// Attempt identity and signing scope (payer and network).
 type Slot = (Digest32, Digest32);
 
-/// Material kept for unresolved attempts, by slot then by offer.
-static PENDING: LazyLock<Mutex<HashMap<Slot, HashMap<Digest32, Pending>>>> =
-    LazyLock::new(Mutex::default);
+/// Material kept for unresolved attempts, and the keys being built now.
+static STATE: LazyLock<Mutex<State>> = LazyLock::new(Mutex::default);
+/// Signalled whenever a build finishes, so callers waiting on it re-check.
+static BUILT: Condvar = Condvar::new();
+
+#[derive(Default)]
+struct State {
+    /// Pending material by slot, then by offer.
+    pending: HashMap<Slot, HashMap<Digest32, Pending>>,
+    /// Keys whose `make` is running: a concurrent caller for the same key
+    /// waits for its result instead of signing a second payment.
+    building: HashSet<(Slot, Digest32)>,
+}
+
+fn lock_state() -> MutexGuard<'static, State> {
+    STATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 struct Pending {
     value: String,
@@ -70,9 +86,9 @@ impl PaymentAttempt {
     /// is left for its own retry.
     pub fn resolved(&self) {
         let scopes = std::mem::take(&mut *self.scopes.lock().unwrap());
-        let mut pending = PENDING.lock().unwrap();
+        let mut state = lock_state();
         for scope in scopes {
-            pending.remove(&(self.identity, scope));
+            state.pending.remove(&(self.identity, scope));
         }
     }
 }
@@ -115,35 +131,65 @@ impl PaymentCacheKey {
 
     /// The material pending under this key, or a new value from `make` that
     /// stays pending for `ttl` until [`PaymentAttempt::resolved`].
+    ///
+    /// Single-flight per key: while one caller's `make` runs, others for the
+    /// same key wait and then receive its value, so concurrent duplicates of
+    /// one request never sign two payments. A failed `make` files nothing and
+    /// lets the next waiter build.
     pub(crate) fn reuse_or_insert(
         &self,
         ttl: Duration,
         make: impl FnOnce() -> Result<String>,
     ) -> Result<String> {
-        let now = Instant::now();
         let slot = (self.identity, self.scope);
-        if let Some(pending) = PENDING
-            .lock()
-            .unwrap()
-            .get(&slot)
-            .and_then(|offers| offers.get(&self.offer))
-            .filter(|pending| pending.expires > now)
-        {
-            return Ok(pending.value.clone());
+        let building = (slot, self.offer);
+        let mut state = lock_state();
+        loop {
+            let now = Instant::now();
+            if let Some(pending) = state
+                .pending
+                .get(&slot)
+                .and_then(|offers| offers.get(&self.offer))
+                .filter(|pending| pending.expires > now)
+            {
+                return Ok(pending.value.clone());
+            }
+            if !state.building.contains(&building) {
+                break;
+            }
+            state = BUILT
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
+        state.building.insert(building);
+        drop(state);
+
+        // Clears the reservation even if `make` panics, so waiters never hang.
+        struct Reservation((Slot, Digest32));
+        impl Drop for Reservation {
+            fn drop(&mut self) {
+                lock_state().building.remove(&self.0);
+                BUILT.notify_all();
+            }
+        }
+        let reservation = Reservation(building);
+
         let value = make()?;
-        let mut pending = PENDING.lock().unwrap();
-        pending.retain(|_, offers| {
+        let now = Instant::now();
+        let mut state = lock_state();
+        state.pending.retain(|_, offers| {
             offers.retain(|_, entry| entry.expires > now);
             !offers.is_empty()
         });
-        pending.entry(slot).or_default().insert(
+        state.pending.entry(slot).or_default().insert(
             self.offer,
             Pending {
                 value: value.clone(),
                 expires: now + ttl,
             },
         );
+        drop(state);
+        drop(reservation);
         Ok(value)
     }
 }
@@ -277,6 +323,53 @@ mod tests {
         );
         a_retry.resolved();
         b_retry.resolved();
+    }
+
+    #[test]
+    fn concurrent_misses_for_one_key_build_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let attempt = PaymentAttempt::new("POST", "https://a.example/race", Some(b"{}"));
+        let key = key(&attempt, "k", &["t"]);
+        let builds = Arc::new(AtomicUsize::new(0));
+        let start = Arc::new(std::sync::Barrier::new(4));
+        let values: Vec<String> = (0..4)
+            .map(|_| {
+                let (key, builds, start) = (key.clone(), builds.clone(), start.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    key.reuse_or_insert(Duration::from_secs(60), || {
+                        let n = builds.fetch_add(1, Ordering::SeqCst);
+                        // Hold the build open long enough for the others to miss.
+                        std::thread::sleep(Duration::from_millis(100));
+                        Ok(format!("value-{n}"))
+                    })
+                    .unwrap()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+        assert!(values.iter().all(|value| value == &values[0]));
+        attempt.resolved();
+    }
+
+    #[test]
+    fn a_failed_build_files_nothing_and_lets_the_next_caller_build() {
+        let attempt = PaymentAttempt::new("POST", "https://a.example/failed", Some(b"{}"));
+        let key = key(&attempt, "k", &["t"]);
+        let ttl = Duration::from_secs(60);
+        assert!(
+            key.reuse_or_insert(ttl, || Err(crate::Error::Mpp("declined".into())))
+                .is_err()
+        );
+        assert_eq!(
+            key.reuse_or_insert(ttl, || Ok("signed".to_string()))
+                .unwrap(),
+            "signed"
+        );
+        attempt.resolved();
     }
 
     #[test]
