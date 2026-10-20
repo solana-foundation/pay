@@ -2757,16 +2757,8 @@ async fn reconcile_batch_channel(
             )
         }
         STATUS_CLOSING if state.final_cumulative.is_none() => {
-            if now >= onchain.close_deadline()
-                && state.cumulative > onchain.channel.settlement.settled
-            {
-                return Err(JobError::Config(format!(
-                    "batch channel {} closed with {} accepted above the settled {}; refusing to \
-                     seal below it",
-                    state.channel_id,
-                    state.cumulative - onchain.channel.settlement.settled,
-                    onchain.channel.settlement.settled
-                )));
+            if now >= onchain.close_deadline() {
+                require_settled_covers_accepted(&state, &onchain, "seal")?;
             }
             // A live reservation defers the seal on both sides of the deadline.
             return Ok(BatchReconcileResult {
@@ -2812,15 +2804,7 @@ async fn reconcile_batch_channel(
             )
         }
         STATUS_CLOSING if now >= onchain.close_deadline() => {
-            if state.cumulative > onchain.channel.settlement.settled {
-                return Err(JobError::Config(format!(
-                    "batch channel {} closed with {} accepted above the settled {}; refusing to \
-                     seal below it",
-                    state.channel_id,
-                    state.cumulative - onchain.channel.settlement.settled,
-                    onchain.channel.settlement.settled
-                )));
-            }
+            require_settled_covers_accepted(&state, &onchain, "seal")?;
             instructions.push(channel::build_seal_ix(&channel_id));
             sealed_close(
                 &mut instructions,
@@ -2832,6 +2816,9 @@ async fn reconcile_batch_channel(
             )
         }
         STATUS_SEALED => {
+            // A permissionless seal can land before this worker ever reads
+            // Closing; finalizing then would silently drop the accepted delta.
+            require_settled_covers_accepted(&state, &onchain, "distribute")?;
             let Some(distribution) =
                 batch_distribution(rpc, rpc_url, &onchain, treasury_owner, token_programs).await?
             else {
@@ -2913,6 +2900,27 @@ async fn reconcile_batch_channel(
         escrow_active: Some(onchain.channel.status != STATUS_DISTRIBUTED),
         observed_settled_on_chain: Some(onchain.channel.settlement.settled),
     })
+}
+
+/// Refuse to `action` a batch channel whose on-chain settlement is below the
+/// cumulative this service accepted and served: that terminal step would
+/// finalize the record and drop the delta. The record stays, and the error
+/// surfaces every pass until an operator resolves it.
+fn require_settled_covers_accepted(
+    state: &ChannelState,
+    onchain: &channel::DecodedChannel,
+    action: &str,
+) -> Result<(), JobError> {
+    let settled = onchain.channel.settlement.settled;
+    if state.cumulative > settled {
+        return Err(JobError::Config(format!(
+            "batch channel {} closed with {} accepted above the settled {settled}; refusing to \
+             {action} below it",
+            state.channel_id,
+            state.cumulative - settled,
+        )));
+    }
+    Ok(())
 }
 
 /// The batch `distribute` for `onchain`, or `None` while the payer's refund
@@ -5874,7 +5882,7 @@ mod tests {
         settled.freeze_watermark_at(100);
         let past = onchain.close_deadline();
         let cases = [
-            (STATUS_SEALED, state.clone(), 0),
+            (STATUS_SEALED, settled.clone(), 0),
             (STATUS_CLOSING, frozen, 1_010),
             (STATUS_CLOSING, settled, past),
             (STATUS_OPEN, state, 0),
@@ -5927,6 +5935,37 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_channel_sealed_below_its_accepted_cumulative_is_never_finalized() {
+        let (state, mut onchain, operator) = batch_closing_fixture();
+        // A permissionless seal landed before the worker read Closing: 300
+        // was accepted and served, only 100 is settled on chain.
+        onchain.channel.status = STATUS_SEALED;
+        assert!(state.cumulative > onchain.channel.settlement.settled);
+        let error = reconcile_closing_batch(state.clone(), &onchain, &operator, 0)
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            error.to_string().contains("refusing to distribute below"),
+            "{error}"
+        );
+
+        // Fully settled, the same sealed channel pays out and finalizes.
+        let mut settled = state;
+        settled.cumulative = onchain.channel.settlement.settled;
+        let candidate = reconcile_closing_batch(settled, &onchain, &operator, 0)
+            .await
+            .unwrap()
+            .candidate
+            .unwrap();
+        assert_eq!(candidate.kind, BatchCandidateKind::Payout);
+        assert!(matches!(
+            candidate.store_action,
+            BatchStoreAction::MarkFinalized
+        ));
     }
 
     #[tokio::test]
