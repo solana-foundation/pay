@@ -1540,9 +1540,11 @@ fn do_paid_fetch(
             resource_url,
             ..
         } => {
-            if let Some(permissions) = &scope.payment_permissions {
-                permissions.authorize_session(&challenge, &resource_url)?;
-            }
+            let approved_payout = scope
+                .payment_permissions
+                .as_ref()
+                .map(|permissions| permissions.authorize_session(&challenge, &resource_url))
+                .transpose()?;
             let key = session_key.ok_or_else(|| {
                 pay_core::Error::Mpp(
                     "MPP session payments require an absolute HTTP(S) URL".to_string(),
@@ -1558,6 +1560,7 @@ fn do_paid_fetch(
                         url,
                         auth,
                         Some(&attempt),
+                        approved_payout.as_ref(),
                     )
                 })?;
             let mut headers = extra_headers.to_vec();

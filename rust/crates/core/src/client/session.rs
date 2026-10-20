@@ -325,6 +325,7 @@ pub fn open_payment_channel_session_header(
         sandbox,
         None,
         None,
+        None,
     )
 }
 
@@ -335,6 +336,10 @@ pub fn open_payment_channel_session_header(
 /// for the attempt's retries: the same payer, deposit and offer derive the
 /// same channel, so a retry after a lost response re-presents that channel
 /// (which the program refuses to open twice) instead of funding a second.
+///
+/// With an `approved_payout`, the open fails unless the channel's payee and
+/// distribution splits are exactly those, so a caller that checked the
+/// destinations against a policy signs only the payout it approved.
 #[allow(clippy::too_many_arguments)]
 pub fn open_payment_channel_session_header_with_override(
     challenge: &PaymentChallenge,
@@ -347,6 +352,7 @@ pub fn open_payment_channel_session_header_with_override(
     sandbox: bool,
     auth_override: crate::signer::AuthOverride,
     attempt: Option<&crate::client::attempt::PaymentAttempt>,
+    approved_payout: Option<&pay_kit::mpp::client::SessionPayout>,
 ) -> Result<(SessionHandle, String)> {
     use pay_kit::mpp::client::{
         DerivePaymentChannelOpenParams, PaymentChannelOpenOptions,
@@ -374,11 +380,25 @@ pub fn open_payment_channel_session_header_with_override(
     canonical_session_origin(resource_url)?;
     let prompt_context = crate::client::prompt::payment_prompt_context(None, &[Some(resource_url)]);
     let limit = session_spend_limit(deposit, request);
+    // The approval names who can settle the escrow: the channel payee and
+    // every distribution split with its share.
+    let split_shares: Vec<String> = details
+        .distribution_splits
+        .iter()
+        .map(|split| format!("{}.{:02}%", split.share_bps / 100, split.share_bps % 100))
+        .collect();
+    let splits: Vec<(&str, &str)> = details
+        .distribution_splits
+        .iter()
+        .zip(&split_shares)
+        .map(|(split, share)| (split.recipient.as_str(), share.as_str()))
+        .collect();
     let intent = crate::keystore::AuthIntent::authorize_spend_up_to(
         limit.usd_amount.as_deref(),
         &limit.display,
         &prompt_context.operator,
-    );
+    )
+    .with_payment_destinations(&request.recipient, &splits);
     let (signer, ephemeral_notice) =
         crate::signer::load_signer_for_network_with_intent_and_override(
             &network,
@@ -454,6 +474,7 @@ pub fn open_payment_channel_session_header_with_override(
         salt: Some(salt),
         // A Ledger signs v0 only; the kit negotiates against the challenge.
         max_tx_version: signer.max_tx_version(),
+        approved_payout: approved_payout.cloned(),
         ..PaymentChannelOpenOptions::default()
     };
 
@@ -553,6 +574,10 @@ fn session_offer_terms(request: &SessionRequest) -> Result<String> {
 /// Agent runtimes use this form because the operator, rather than the client,
 /// meters each response. Client-voucher sessions require the caller to advance
 /// a voucher by the delivered usage on every request.
+///
+/// `approved_payout`, when a policy checked the challenge's payee and
+/// distribution splits, holds the open to exactly that payout.
+#[allow(clippy::too_many_arguments)]
 pub fn open_operator_signed_session_authorizations(
     challenge: &PaymentChallenge,
     store: &dyn crate::accounts::AccountsStore,
@@ -561,6 +586,7 @@ pub fn open_operator_signed_session_authorizations(
     resource_url: &str,
     auth_override: crate::signer::AuthOverride,
     attempt: Option<&crate::client::attempt::PaymentAttempt>,
+    approved_payout: Option<&pay_kit::mpp::client::SessionPayout>,
 ) -> Result<(String, String)> {
     let request: SessionRequest = challenge
         .request
@@ -586,6 +612,7 @@ pub fn open_operator_signed_session_authorizations(
         sandbox,
         auth_override,
         attempt,
+        approved_payout,
     )?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -790,6 +817,7 @@ mod tests {
             false,
             None,
             attempt,
+            None,
         )
         .unwrap();
         tokio::runtime::Builder::new_current_thread()
@@ -823,6 +851,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         )
         .err()
         .expect("no wallet can open this session")
@@ -842,6 +871,132 @@ mod tests {
         assert!(err.contains("network mismatch"), "{err}");
         let err = open_on("mainnet-beta", Some("mainnet"), &store).to_string();
         assert!(!err.contains("network mismatch"), "{err}");
+    }
+
+    /// Open a session on `request` held to `approved`, returning the error.
+    fn open_approved(
+        request: &SessionRequest,
+        approved: &pay_kit::mpp::client::SessionPayout,
+        auth: crate::signer::AuthOverride,
+        store: &dyn crate::accounts::AccountsStore,
+    ) -> Result<(SessionHandle, String)> {
+        let challenge = PaymentChallenge::with_challenge_binding_secret(
+            "test-secret",
+            "test-realm",
+            "solana",
+            "session",
+            Base64UrlJson::from_typed(request).unwrap(),
+        );
+        open_payment_channel_session_header_with_override(
+            &challenge,
+            request,
+            store,
+            None,
+            None,
+            1_000_000,
+            "https://api.example/session",
+            false,
+            auth,
+            None,
+            Some(approved),
+        )
+    }
+
+    #[test]
+    fn a_session_opens_only_on_the_payout_it_was_approved_for() {
+        use pay_kit::mpp::client::SessionPayout;
+        let store = crate::accounts::MemoryAccountsStore::new();
+        let mut request = test_request();
+        request.currency = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string();
+        let approved = SessionPayout::from_request(&request).unwrap();
+
+        // The server swaps the payee after the payout was approved.
+        let mut redirected = request.clone();
+        redirected.recipient = Pubkey::new_unique().to_string();
+        let error = open_approved(&redirected, &approved, None, &store)
+            .err()
+            .expect("a redirected payee must not open");
+        assert!(error.to_string().contains("approved payee"), "{error}");
+
+        // Or adds a distribution split nobody approved.
+        let mut extra_split = request.clone();
+        extra_split
+            .method_details
+            .distribution_splits
+            .push(SessionSplit {
+                recipient: Pubkey::new_unique().to_string(),
+                share_bps: 500,
+            });
+        assert!(open_approved(&extra_split, &approved, None, &store).is_err());
+
+        // Control: the approved payout opens.
+        assert!(open_approved(&request, &approved, None, &store).is_ok());
+    }
+
+    #[test]
+    fn the_session_approval_names_its_payee_and_splits() {
+        use std::sync::{Arc, Mutex};
+        struct Recording(Arc<Mutex<Vec<crate::keystore::AuthIntent>>>);
+        impl crate::keystore::AuthGate for Recording {
+            fn authenticate(
+                &self,
+                intent: &crate::keystore::AuthIntent,
+            ) -> std::result::Result<(), crate::keystore::Error> {
+                self.0.lock().unwrap().push(intent.clone());
+                Err(crate::keystore::Error::AuthDenied("recorded".to_string()))
+            }
+            fn is_available(&self) -> bool {
+                true
+            }
+        }
+        let keypair = solana_keypair::Keypair::new();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string(&keypair.to_bytes().to_vec()).unwrap(),
+        )
+        .unwrap();
+        let mut file = crate::accounts::AccountsFile::default();
+        file.upsert(
+            "localnet",
+            "default",
+            crate::accounts::Account {
+                backend: crate::accounts::BackendKind::File,
+                provider: None,
+                active: true,
+                auth_required: Some(true),
+                pubkey: Some(solana_signer::Signer::pubkey(&keypair).to_string()),
+                vault: None,
+                account: None,
+                path: Some(path.to_string_lossy().into_owned()),
+                secret_key_b58: None,
+                created_at: None,
+                subscriptions: Default::default(),
+            },
+        );
+        let store = crate::accounts::MemoryAccountsStore::with_file(file);
+        let mut request = test_request();
+        request.currency = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string();
+        let approved = pay_kit::mpp::client::SessionPayout::from_request(&request).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let _ = open_approved(
+            &request,
+            &approved,
+            Some(Box::new(Recording(seen.clone()))),
+            &store,
+        );
+        let seen = seen.lock().unwrap();
+        let Some(crate::keystore::AuthIntent::AuthorizePayment { message, .. }) = seen.first()
+        else {
+            panic!("the session was never put to the approval gate");
+        };
+        let payee = &request.recipient;
+        assert!(
+            message.contains(&format!("to: {}", &payee[..4])),
+            "{message}"
+        );
+        assert!(message.contains("splits (1): 1.00%"), "{message}");
     }
 
     #[test]

@@ -6,6 +6,7 @@ use pay_kit::client::{
     AssetPermission, ClientPermissions, OriginPermissionOverride, PaymentCandidate,
     PaymentDestination, PaymentTerms, SolanaNetwork, UsdAmount,
 };
+use pay_kit::mpp::client::SessionPayout;
 use serde::Deserialize;
 use solana_pubkey::Pubkey;
 
@@ -340,25 +341,31 @@ impl McpPermissions {
         )
     }
 
-    /// Authorize the deposit an operator-signed session open would lock.
+    /// Authorize the deposit an operator-signed session open would lock and
+    /// the payout it commits it to: the channel payee and every distribution
+    /// split, each checked against the recipient allowlist. Returns that
+    /// payout, which the opener must be held to.
     pub fn authorize_session(
         &self,
         challenge: &mpp::Challenge,
         resource_url: &str,
-    ) -> Result<(), pay_core::Error> {
+    ) -> Result<SessionPayout, pay_core::Error> {
         let request: pay_kit::mpp::SessionRequest = challenge
             .request
             .decode()
             .map_err(|error| permission_error(format!("invalid MPP session: {error}")))?;
         let deposit = pay_core::session::operator_session_deposit(&request)
             .map_err(|error| permission_error(error.to_string()))?;
-        self.authorize(
+        let payout = SessionPayout::from_request(&request)
+            .map_err(|error| permission_error(format!("invalid MPP session payout: {error}")))?;
+        self.authorize_destinations(
             resource_url,
             &request.method_details.network,
             &request.currency,
             deposit,
-            &request.recipient,
-        )
+            &session_destinations(&payout, deposit)?,
+        )?;
+        Ok(payout)
     }
 
     /// Authorize the escrow a batch `open` or `top_up` would deposit.
@@ -383,6 +390,31 @@ impl McpPermissions {
             "{kind} is not supported when MCP payment permissions are enabled"
         )))
     }
+}
+
+/// Split a session deposit the way the channel would distribute it: each
+/// split its basis-point share, the payee the remainder.
+fn session_destinations(
+    payout: &SessionPayout,
+    deposit: u64,
+) -> Result<Vec<PaymentDestination>, pay_core::Error> {
+    let shares: u32 = payout.splits.iter().map(|split| u32::from(split.bps)).sum();
+    if shares > 10_000 {
+        return Err(permission_error("MPP session splits exceed the deposit"));
+    }
+    let mut destinations = vec![PaymentDestination::new(payout.payee, 0)];
+    let mut shared = 0u64;
+    for split in &payout.splits {
+        let share = u64::try_from(u128::from(deposit) * u128::from(split.bps) / 10_000)
+            .map_err(|_| permission_error("MPP session split overflows"))?;
+        shared = shared
+            .checked_add(share)
+            .filter(|shared| *shared <= deposit)
+            .ok_or_else(|| permission_error("MPP session splits exceed the deposit"))?;
+        destinations.push(PaymentDestination::new(split.recipient, share));
+    }
+    destinations[0].amount = deposit - shared;
+    Ok(destinations)
 }
 
 fn parse_recipient(recipient: &str) -> Result<Pubkey, pay_core::Error> {
@@ -642,6 +674,66 @@ assets:
                 .authorize_session(&session_challenge("SOL", "1"), "https://a.example/x")
                 .is_err()
         );
+    }
+
+    /// A mainnet USDC operator session paying `payee`, with one 25% split.
+    fn split_session(payee: &str, split: &str) -> mpp::Challenge {
+        let request = serde_json::json!({
+            "amount": "1",
+            "currency": "USDC",
+            "recipient": payee,
+            "suggestedDeposit": "1000000",
+            "methodDetails": {
+                "network": "mainnet",
+                "channelProgram": "11111111111111111111111111111111",
+                "voucherSigner": "operator",
+                "distributionSplits": [{ "recipient": split, "shareBps": 2500 }],
+            },
+        });
+        pay_kit::mpp::PaymentChallenge::new(
+            "id",
+            "realm",
+            "solana",
+            "session",
+            pay_kit::mpp::Base64UrlJson::from_value(&request).unwrap(),
+        )
+    }
+
+    #[test]
+    fn hosted_sessions_bind_the_payee_and_every_distribution_split() {
+        let url = "https://a.example/x";
+        let challenge = split_session(PAYEE, SPLIT);
+        let error = only(&[PAYEE])
+            .authorize_session(&challenge, url)
+            .unwrap_err();
+        assert!(error.to_string().contains(SPLIT), "{error}");
+        assert!(only(&[SPLIT]).authorize_session(&challenge, url).is_err());
+
+        // Control: approving both returns the payout the opener is held to.
+        let payout = only(&[PAYEE, SPLIT])
+            .authorize_session(&challenge, url)
+            .unwrap();
+        assert_eq!(payout.payee.to_string(), PAYEE);
+        assert_eq!(payout.splits.len(), 1);
+        assert_eq!(payout.splits[0].recipient.to_string(), SPLIT);
+        assert_eq!(payout.splits[0].bps, 2500);
+    }
+
+    #[test]
+    fn session_destinations_share_the_deposit_like_the_channel() {
+        let payout = SessionPayout {
+            payee: PAYEE.parse().unwrap(),
+            splits: vec![pay_kit::mpp::program::payment_channels::Distribution {
+                recipient: SPLIT.parse().unwrap(),
+                bps: 2500,
+            }],
+        };
+        let destinations = session_destinations(&payout, 1_000_001).unwrap();
+        assert_eq!(destinations[0].amount, 750_001);
+        assert_eq!(destinations[1].amount, 250_000);
+        let mut over = payout.clone();
+        over.splits[0].bps = 10_001;
+        assert!(session_destinations(&over, 1_000).is_err());
     }
 
     fn batch_challenge(min_deposit: &str) -> x402::BatchChallenge {

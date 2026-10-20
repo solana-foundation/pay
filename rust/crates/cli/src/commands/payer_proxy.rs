@@ -1428,6 +1428,7 @@ fn build_session_authorization(
             &state.authorization_url,
             None,
             None,
+            None,
         )?;
 
     Ok((PaidHeaders::mpp(open_authorization), use_authorization))
