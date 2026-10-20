@@ -164,11 +164,7 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
                     // Delegated sessions are settled from the completed
                     // response below. The client-voucher stream context waits
                     // for client commits and must not be installed here.
-                    if sf
-                        .metered_plan()
-                        .is_some_and(|plan| plan.variant_hint.is_none())
-                    {
-                        let force_stream_usage = path.ends_with("chat/completions");
+                    if let Some(force_stream_usage) = session_body_preparation(&path, &sf) {
                         let (restored, body_variant) =
                             match prepare_metered_request_body(req, force_stream_usage).await {
                                 Ok(result) => result,
@@ -437,15 +433,16 @@ pub fn inject_original_host_header(headers: &mut HeaderMap, original_host: Optio
 
 /// Only inference requests need body preparation; unrelated upto uploads keep
 /// their original streaming bodies and limits.
-#[allow(clippy::result_large_err)]
-async fn prepare_upto_request_body(
-    request: Request<Body>,
+/// Whether an x402 `upto` forward prices from its request body, and if so
+/// whether to force stream usage reporting. Shared by both adapters so a
+/// body-selected model is priced the same way whichever one serves it.
+fn upto_body_preparation(
     path: &str,
+    headers: &HeaderMap,
     plan: &metering::UptoSettlementPlan,
-) -> Result<(Request<Body>, Option<String>), Response> {
+) -> Option<bool> {
     let chat = path == "chat/completions" || path.ends_with("/chat/completions");
-    let json = request
-        .headers()
+    let json = headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split(';').next())
@@ -464,10 +461,100 @@ async fn prepare_upto_request_body(
     // Non-model uploads must retain their streaming body and original limits.
     // Outside the known chat API, require an explicit JSON content type rather
     // than sniffing (and therefore consuming) an arbitrary request body.
-    if !chat && !needs_model {
-        return Ok((request, plan.variant_hint.clone()));
+    (chat || needs_model).then_some(chat)
+}
+
+/// Whether a delegated session forward prices from its request body, and if
+/// so whether to force stream usage reporting. Client-voucher sessions are
+/// metered by the client's own commits and never read the body here.
+fn session_body_preparation(
+    path: &str,
+    forward: &crate::server::gate::SessionForward,
+) -> Option<bool> {
+    (forward.settlement.is_some()
+        && forward
+            .metered_plan()
+            .is_some_and(|plan| plan.variant_hint.is_none()))
+    .then(|| path.ends_with("chat/completions"))
+}
+
+/// Why a metered request body was refused before it could be priced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeteredBodyRejection {
+    TooLarge,
+    PaddedModel,
+}
+
+impl MeteredBodyRejection {
+    pub fn status(self) -> StatusCode {
+        match self {
+            Self::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::PaddedModel => StatusCode::BAD_REQUEST,
+        }
     }
-    let (request, model) = prepare_metered_request_body(request, chat).await?;
+
+    pub fn body(self) -> &'static str {
+        match self {
+            Self::TooLarge => r#"{"error":"request_body_too_large"}"#,
+            Self::PaddedModel => {
+                r#"{"error":"invalid_model","message":"model must not have leading or trailing whitespace"}"#
+            }
+        }
+    }
+
+    pub fn into_response(self) -> Response {
+        Response::builder()
+            .status(self.status())
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(self.body()))
+            .unwrap_or_else(|_| self.status().into_response())
+    }
+}
+
+/// Price a buffered metered forward from the exact body it will send: select
+/// the body's model variant for the session or `upto` plan, and record the
+/// body size as the missing-input bound. Returns the bytes to forward when
+/// the plan read the body (they may carry forced stream usage reporting), or
+/// `None` when the body is forwarded untouched.
+pub fn prepare_metered_forward_body(
+    path: &str,
+    headers: &HeaderMap,
+    body: &[u8],
+    session: Option<&mut crate::server::gate::SessionForward>,
+    upto: Option<&mut metering::UptoSettlementPlan>,
+) -> Result<Option<Vec<u8>>, MeteredBodyRejection> {
+    let mut prepared = None;
+    if let Some(plan) = upto
+        && let Some(force_stream_usage) = upto_body_preparation(path, headers, plan)
+    {
+        let (variant, bytes) = prepare_metered_body_bytes(body, force_stream_usage)?;
+        plan.variant_hint = plan.variant_hint.take().or(variant);
+        prepared = Some(bytes);
+    }
+    if let Some(forward) = session
+        && let Some(force_stream_usage) = session_body_preparation(path, forward)
+    {
+        let source = prepared.as_deref().unwrap_or(body);
+        let (variant, bytes) = prepare_metered_body_bytes(source, force_stream_usage)?;
+        forward.request_body_bytes = Some(bytes.len() as u64);
+        if let Some(plan) = forward.metered_plan_mut() {
+            plan.variant_hint = variant;
+        }
+        prepared = Some(bytes);
+    }
+    Ok(prepared)
+}
+
+#[allow(clippy::result_large_err)]
+async fn prepare_upto_request_body(
+    request: Request<Body>,
+    path: &str,
+    plan: &metering::UptoSettlementPlan,
+) -> Result<(Request<Body>, Option<String>), Response> {
+    let Some(force_stream_usage) = upto_body_preparation(path, request.headers(), plan) else {
+        return Ok((request, plan.variant_hint.clone()));
+    };
+    let (request, model) = prepare_metered_request_body(request, force_stream_usage).await?;
     Ok((request, plan.variant_hint.clone().or(model)))
 }
 
@@ -483,28 +570,30 @@ async fn prepare_metered_request_body(
         .await
         .map_err(|error| {
             tracing::warn!(%error, "failed to read metered request model");
-            Response::builder()
-                .status(StatusCode::PAYLOAD_TOO_LARGE)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"error":"request_body_too_large"}"#))
-                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+            MeteredBodyRejection::TooLarge.into_response()
         })?;
-    if has_padded_model(&bytes) {
-        // Pricing, the upstream, and seller accounting must all see one model
-        // identity; reject rather than normalize it for pricing only.
-        return Err(Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(
-                r#"{"error":"invalid_model","message":"model must not have leading or trailing whitespace"}"#,
-            ))
-            .unwrap_or_else(|_| StatusCode::BAD_REQUEST.into_response()));
-    }
-    let (variant, bytes) = prepare_metered_json_body(&bytes, force_stream_usage);
+    let (variant, bytes) = prepare_metered_body_bytes(&bytes, force_stream_usage)
+        .map_err(MeteredBodyRejection::into_response)?;
     if force_stream_usage && let Ok(content_length) = bytes.len().to_string().parse() {
         parts.headers.insert(header::CONTENT_LENGTH, content_length);
     }
     Ok((Request::from_parts(parts, Body::from(bytes)), variant))
+}
+
+/// The model a metered body selects and the bytes to forward for it.
+fn prepare_metered_body_bytes(
+    body: &[u8],
+    force_stream_usage: bool,
+) -> Result<(Option<String>, Vec<u8>), MeteredBodyRejection> {
+    if body.len() > MAX_METERED_MODEL_HINT_BODY_BYTES {
+        return Err(MeteredBodyRejection::TooLarge);
+    }
+    if has_padded_model(body) {
+        // Pricing, the upstream, and seller accounting must all see one model
+        // identity; reject rather than normalize it for pricing only.
+        return Err(MeteredBodyRejection::PaddedModel);
+    }
+    Ok(prepare_metered_json_body(body, force_stream_usage))
 }
 
 fn has_padded_model(body: &[u8]) -> bool {
@@ -1358,6 +1447,178 @@ apis:
             ceiling_usd: 1.0,
             inferred_usage: None,
         }
+    }
+
+    fn model_variant_plan() -> metering::UptoSettlementPlan {
+        metering::UptoSettlementPlan {
+            metering: serde_json::from_value(serde_json::json!({
+                "dimensions": [{
+                    "direction": "output",
+                    "unit": "tokens",
+                    "scale": 1,
+                    "tiers": [{"price_usd": 0.000001}]
+                }],
+                "variants": [{
+                    "param": "model",
+                    "value": "premium",
+                    "dimensions": [{
+                        "direction": "output",
+                        "unit": "tokens",
+                        "scale": 1,
+                        "tiers": [{"price_usd": 0.00001}]
+                    }]
+                }],
+                "upto": {"max_usd": 1.0}
+            }))
+            .unwrap(),
+            variant_hint: None,
+            request_properties: RequestProperties::default(),
+            ceiling_usd: 1.0,
+            inferred_usage: None,
+        }
+    }
+
+    fn session_forward(
+        settlement: Option<crate::server::gate::SessionSettlementPlan>,
+    ) -> crate::server::gate::SessionForward {
+        let key = || solana_pubkey::Pubkey::new_unique().to_string();
+        crate::server::gate::SessionForward {
+            handle: std::sync::Arc::new(crate::server::session::SessionMpp::new(
+                pay_kit::mpp::server::session::SessionConfig {
+                    operator: key(),
+                    recipient: key(),
+                    currency: key(),
+                    network: "localnet".to_string(),
+                    ..Default::default()
+                },
+                "test-secret",
+            )),
+            channel_id: key(),
+            committed_base_units: 0,
+            settlement,
+            available_base_units: 1_000_000,
+            authorized_base_units: 1_000_000,
+            verified_payer: None,
+            request_body_bytes: None,
+            payment_policy: None,
+            _reservation: None,
+        }
+    }
+
+    fn delegated_forward() -> crate::server::gate::SessionForward {
+        session_forward(Some(crate::server::gate::SessionSettlementPlan::Metered(
+            Box::new(model_variant_plan()),
+        )))
+    }
+
+    #[test]
+    fn buffered_delegated_session_prices_the_body_selected_model() {
+        let body = br#"{"model":"premium","stream":true}"#;
+        let mut forward = delegated_forward();
+
+        let forwarded = prepare_metered_forward_body(
+            "v1/chat/completions",
+            &HeaderMap::new(),
+            body,
+            Some(&mut forward),
+            None,
+        )
+        .unwrap()
+        .expect("a body-variant session reads its body");
+
+        let plan = forward.metered_plan().unwrap();
+        assert_eq!(plan.variant_hint.as_deref(), Some("premium"));
+        assert_eq!(forward.request_body_bytes, Some(forwarded.len() as u64));
+        let json: serde_json::Value = serde_json::from_slice(&forwarded).unwrap();
+        assert_eq!(json["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn buffered_metered_forwards_reject_a_padded_model() {
+        let body = br#"{"model":" premium"}"#;
+        let mut forward = delegated_forward();
+        assert_eq!(
+            prepare_metered_forward_body(
+                "v1/chat/completions",
+                &HeaderMap::new(),
+                body,
+                Some(&mut forward),
+                None
+            ),
+            Err(MeteredBodyRejection::PaddedModel)
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        let mut plan = model_variant_plan();
+        assert_eq!(
+            prepare_metered_forward_body("v1/generate", &headers, body, None, Some(&mut plan)),
+            Err(MeteredBodyRejection::PaddedModel)
+        );
+    }
+
+    #[test]
+    fn buffered_upto_prices_the_body_selected_model() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        let mut plan = model_variant_plan();
+
+        let forwarded = prepare_metered_forward_body(
+            "v1/generate",
+            &headers,
+            br#"{"model":"premium"}"#,
+            None,
+            Some(&mut plan),
+        )
+        .unwrap();
+
+        assert_eq!(
+            forwarded.as_deref(),
+            Some(br#"{"model":"premium"}"#.as_slice())
+        );
+        assert_eq!(plan.variant_hint.as_deref(), Some("premium"));
+    }
+
+    #[test]
+    fn buffered_forwards_keep_their_body_when_pricing_does_not_read_it() {
+        let body = br#"{"model":"premium","stream":true}"#;
+        // Client-voucher sessions are metered by the client's own commits.
+        let mut client_voucher = session_forward(None);
+        assert_eq!(
+            prepare_metered_forward_body(
+                "v1/chat/completions",
+                &HeaderMap::new(),
+                body,
+                Some(&mut client_voucher),
+                None,
+            ),
+            Ok(None)
+        );
+        assert_eq!(client_voucher.request_body_bytes, None);
+
+        // A path-selected variant is authoritative.
+        let mut forward = delegated_forward();
+        forward.metered_plan_mut().unwrap().variant_hint = Some("path-model".into());
+        assert_eq!(
+            prepare_metered_forward_body(
+                "v1/chat/completions",
+                &HeaderMap::new(),
+                body,
+                Some(&mut forward),
+                None
+            ),
+            Ok(None)
+        );
+        assert_eq!(
+            forward.metered_plan().unwrap().variant_hint.as_deref(),
+            Some("path-model")
+        );
     }
 
     #[tokio::test]

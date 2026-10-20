@@ -508,6 +508,31 @@ impl<S: PaymentState> Http402Gate<S> {
             }
         };
 
+        // Price the forward from the exact body it sends, as the axum adapter
+        // does: the body's model selects the variant the meter rates.
+        let mut forwarded_headers = headers.clone();
+        let body = match pay_core::server::payment::prepare_metered_forward_body(
+            path,
+            headers,
+            &body,
+            ctx.session.as_mut(),
+            ctx.upto
+                .as_mut()
+                .and_then(|pending| pending.settlement.as_mut()),
+        ) {
+            Ok(Some(prepared)) if prepared[..] != body[..] => {
+                forwarded_headers.insert(http::header::CONTENT_LENGTH, prepared.len().into());
+                Bytes::from(prepared)
+            }
+            Ok(_) => body,
+            Err(rejection) => {
+                self.finish_buffered_axum_response(session, ctx, rejection.into_response())
+                    .await?;
+                return Ok(true);
+            }
+        };
+        let headers = &forwarded_headers;
+
         let prepared = match self
             .prepare_buffered_request(
                 api,
