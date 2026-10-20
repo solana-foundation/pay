@@ -179,6 +179,8 @@ pub struct DelegatedSessionStreamMeter {
     /// This stream's charge in progress. It runs detached, so a cancelled
     /// stream still learns whether it landed before charging again.
     in_flight: Option<InFlightCharge>,
+    /// Released bytes stop at the last complete record; see [`RecordHold`].
+    record_hold: RecordHold,
 }
 
 /// One delegated charge for this stream, running to completion on its own
@@ -219,6 +221,7 @@ impl DelegatedSessionStreamMeter {
         let gate = SessionUsageGate::new(spec.clone(), settlement, forward.committed_base_units, 1)
             .map_err(box_error)?;
         let current = zero_observation(&spec);
+        let record_hold = RecordHold::for_spec(&spec);
         let priced_context_length = plan.request_properties.context_length;
         Ok(Self {
             forward,
@@ -231,6 +234,7 @@ impl DelegatedSessionStreamMeter {
             next_lifecycle_touch: Instant::now() + LIFECYCLE_TOUCH_INTERVAL,
             observer: None,
             in_flight: None,
+            record_hold,
         })
     }
 
@@ -479,21 +483,28 @@ impl DelegatedSessionStreamMeter {
         self.next_lifecycle_touch = now + LIFECYCLE_TOUCH_INTERVAL;
     }
 
-    /// Meter and durably authorize one response chunk before it is released.
-    pub async fn authorize_chunk(&mut self, chunk: &[u8], is_sse: bool) -> Result<(), BoxError> {
+    /// Meter and durably authorize one response chunk, returning the bytes
+    /// now safe to release: those up to the last complete record. The tail
+    /// of a partial record is held until it is parsed and metered.
+    pub async fn authorize_chunk(
+        &mut self,
+        chunk: &[u8],
+        is_sse: bool,
+    ) -> Result<Option<Bytes>, BoxError> {
         self.touch_channel_if_due();
         if let Some(decision) = self.observe_chunk(chunk, is_sse)? {
             self.settle(decision).await?;
         }
-        Ok(())
+        Ok(self.record_hold.push(chunk, is_sse))
     }
 
-    /// Persist any final cumulative usage before the response stream closes.
-    pub async fn finish_stream(&mut self, is_sse: bool) -> Result<(), BoxError> {
+    /// Persist any final cumulative usage before the response stream closes,
+    /// returning the final record's held bytes now that they are metered.
+    pub async fn finish_stream(&mut self, is_sse: bool) -> Result<Option<Bytes>, BoxError> {
         if let Some(decision) = self.finish(is_sse)? {
             self.settle(decision).await?;
         }
-        Ok(())
+        Ok(self.record_hold.finish())
     }
 
     /// Persist the usage a stream that ended early implies.
@@ -524,10 +535,10 @@ impl DelegatedStreamFinalizer {
             .expect("the meter is held until the stream completes")
     }
 
-    async fn finish(&mut self, is_sse: bool) -> Result<(), BoxError> {
-        self.meter().finish_stream(is_sse).await?;
+    async fn finish(&mut self, is_sse: bool) -> Result<Option<Bytes>, BoxError> {
+        let tail = self.meter().finish_stream(is_sse).await?;
         self.meter = None;
-        Ok(())
+        Ok(tail)
     }
 }
 
@@ -652,11 +663,14 @@ where
         // must never leave delivered usage unpaid.
         let mut held: Vec<Bytes> = Vec::new();
         let mut held_target = 0;
+        // A partial record's bytes wait for its boundary: its usage is only
+        // counted once the record parses.
+        let mut record_hold = RecordHold::for_spec(&meter.accumulator.spec);
         while let Some(next) = stream.next().await {
             let chunk = next.map_err(box_error)?;
             meter.touch_channel_if_due();
             let decision = meter.observe_chunk(&chunk, is_sse).map_err(box_error)?;
-            held.push(chunk);
+            held.extend(record_hold.push(&chunk, is_sse));
             match decision {
                 Some(decision) if decision.requires_voucher() => {
                     // Do not release the bytes that crossed the voucher
@@ -681,10 +695,99 @@ where
         if let Some(decision) = meter.finish(is_sse).map_err(box_error)? {
             settle_decision(&mut meter, decision).await?;
         }
+        held.extend(record_hold.finish());
         for chunk in held.drain(..) {
             yield chunk;
         }
     }
+}
+
+/// Wire bytes withheld until the stream record they belong to is complete.
+///
+/// The meter counts a record's text and usage only once the record parses,
+/// so releasing its first half early would deliver output that an abort
+/// leaves uncounted. Records end at a blank line for SSE and at a newline
+/// for NDJSON; the decoders bound how long one may grow.
+struct RecordHold {
+    held: Vec<u8>,
+    /// Whether SSE / NDJSON record contents feed the meter. Wire-measured
+    /// quantities (bytes, NDJSON characters) are counted on arrival.
+    sse_contents_metered: bool,
+    ndjson_contents_metered: bool,
+}
+
+impl RecordHold {
+    fn for_spec(spec: &SessionMeterSpec) -> Self {
+        let metered = |units: &[BillingUnit]| {
+            spec.dimensions
+                .iter()
+                .any(|dimension| units.contains(&dimension.unit))
+        };
+        Self {
+            held: Vec::new(),
+            sse_contents_metered: metered(&[
+                BillingUnit::Tokens,
+                BillingUnit::QuotaUnits,
+                BillingUnit::Characters,
+            ]),
+            ndjson_contents_metered: metered(&[BillingUnit::Tokens, BillingUnit::QuotaUnits]),
+        }
+    }
+
+    /// Add `chunk`; return the bytes through the last complete record.
+    fn push(&mut self, chunk: &[u8], is_sse: bool) -> Option<Bytes> {
+        let contents_metered = if is_sse {
+            self.sse_contents_metered
+        } else {
+            self.ndjson_contents_metered
+        };
+        if !contents_metered && self.held.is_empty() {
+            return (!chunk.is_empty()).then(|| Bytes::copy_from_slice(chunk));
+        }
+        self.held.extend_from_slice(chunk);
+        if !contents_metered {
+            return self.finish();
+        }
+        let end = if is_sse {
+            sse_record_end(&self.held)
+        } else {
+            self.held
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map_or(0, |index| index + 1)
+        };
+        (end > 0).then(|| Bytes::from(self.held.drain(..end).collect::<Vec<u8>>()))
+    }
+
+    /// The final record, once the stream has ended and it has been metered.
+    fn finish(&mut self) -> Option<Bytes> {
+        (!self.held.is_empty()).then(|| Bytes::from(std::mem::take(&mut self.held)))
+    }
+}
+
+/// Offset just past the last blank line (an SSE event terminator) in
+/// `bytes`, accepting `\n`, `\r\n` and `\r` line endings. A trailing `\r` may
+/// be half of a `\r\n`, so it is not yet a terminator.
+fn sse_record_end(bytes: &[u8]) -> usize {
+    let (mut end, mut line_empty, mut index) = (0, true, 0);
+    while index < bytes.len() {
+        let next = match bytes[index] {
+            b'\r' if index + 1 == bytes.len() => break,
+            b'\r' if bytes[index + 1] == b'\n' => index + 2,
+            b'\r' | b'\n' => index + 1,
+            _ => {
+                line_empty = false;
+                index += 1;
+                continue;
+            }
+        };
+        if line_empty {
+            end = next;
+        }
+        line_empty = true;
+        index = next;
+    }
+    end
 }
 
 /// Wrap a delegated-session response stream without buffering it.
@@ -707,11 +810,14 @@ where
         futures_util::pin_mut!(stream);
         while let Some(next) = stream.next().await {
             let chunk = next.map_err(box_error)?;
-            meter.meter().authorize_chunk(&chunk, is_sse).await?;
-            yield chunk;
+            if let Some(ready) = meter.meter().authorize_chunk(&chunk, is_sse).await? {
+                yield ready;
+            }
         }
 
-        meter.finish(is_sse).await?;
+        if let Some(tail) = meter.finish(is_sse).await? {
+            yield tail;
+        }
     }
 }
 
@@ -2409,6 +2515,58 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             served.extend_from_slice(&chunk?);
         }
         Ok(served)
+    }
+
+    #[test]
+    fn sse_record_end_finds_the_last_blank_line_in_any_line_ending() {
+        assert_eq!(sse_record_end(b"data: a"), 0);
+        assert_eq!(sse_record_end(b"data: a\n"), 0);
+        assert_eq!(sse_record_end(b"data: a\n\ndata: b"), 9);
+        assert_eq!(sse_record_end(b"data: a\r\n\r\ndata: b\r\n"), 11);
+        assert_eq!(
+            sse_record_end(b"data: a\r\r"),
+            0,
+            "a trailing CR may be CRLF"
+        );
+        assert_eq!(sse_record_end(b"data: a\r\rx"), 9);
+    }
+
+    #[tokio::test]
+    async fn delegated_streams_hold_a_partial_record_until_it_is_metered() {
+        let (session, channel_id, meter) = delegated_test_meter(
+            vec![token_dimension(
+                MeterDirection::Output,
+                "/usage/completion_tokens",
+            )],
+            "partial-record",
+        )
+        .await;
+        let event = usage_event(5);
+        let (head, tail) = event.split_at(event.len() / 2);
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+        let upstream = futures_util::stream::unfold(receiver, |mut receiver| async move {
+            receiver
+                .recv()
+                .await
+                .map(|chunk| (Ok::<_, std::io::Error>(chunk), receiver))
+        });
+        let metered = meter_delegated_response_stream(upstream, meter, true);
+        futures_util::pin_mut!(metered);
+
+        // Half an event is not released: its text and usage are not counted.
+        sender.send(Bytes::copy_from_slice(head)).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), metered.next())
+                .await
+                .is_err(),
+            "a partial record must not reach the client"
+        );
+        sender.send(Bytes::copy_from_slice(tail)).unwrap();
+        let released = metered.next().await.unwrap().unwrap();
+        assert_eq!(released.as_ref(), event.as_ref());
+        assert_eq!(session.committed_watermark(&channel_id), Some(5));
+        drop(sender);
+        assert!(metered.next().await.is_none());
     }
 
     #[tokio::test]

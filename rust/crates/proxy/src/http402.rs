@@ -827,19 +827,25 @@ impl<S: PaymentState> Http402Gate<S> {
             match chunk {
                 Ok(chunk) => {
                     observer.on_chunk(&chunk, request_start);
-                    if let Some(meter) = delegated_meter.as_mut() {
-                        meter
-                            .authorize_chunk(&chunk, is_sse)
-                            .await
-                            .map_err(|error| {
-                                pingora::Error::because(
-                                    pingora::ErrorType::ReadError,
-                                    "authorize delegated response stream chunk",
-                                    error,
-                                )
-                            })?;
+                    // A delegated meter releases only metered, complete records.
+                    let ready = match delegated_meter.as_mut() {
+                        Some(meter) => {
+                            meter
+                                .authorize_chunk(&chunk, is_sse)
+                                .await
+                                .map_err(|error| {
+                                    pingora::Error::because(
+                                        pingora::ErrorType::ReadError,
+                                        "authorize delegated response stream chunk",
+                                        error,
+                                    )
+                                })?
+                        }
+                        None => Some(chunk),
+                    };
+                    if let Some(ready) = ready {
+                        session.write_response_body(Some(ready), false).await?;
                     }
-                    session.write_response_body(Some(chunk), false).await?;
                 }
                 Err(error) => {
                     tracing::warn!(%error, "streaming body-signing upstream response failed");
@@ -862,13 +868,16 @@ impl<S: PaymentState> Http402Gate<S> {
             }
         }
         if let Some(meter) = delegated_meter.as_mut() {
-            meter.finish_stream(is_sse).await.map_err(|error| {
+            let tail = meter.finish_stream(is_sse).await.map_err(|error| {
                 pingora::Error::because(
                     pingora::ErrorType::ReadError,
                     "finish delegated response stream metering",
                     error,
                 )
             })?;
+            if let Some(tail) = tail {
+                session.write_response_body(Some(tail), false).await?;
+            }
         }
         observer.finish();
         if let Some(log_id) = ctx.log.as_ref().and_then(|log| log.log_id) {
