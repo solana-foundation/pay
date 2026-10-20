@@ -133,9 +133,10 @@ pub fn spec_from_metering(
 
 /// Price for one billable usage dimension.
 ///
-/// `price_micro_usd` is quoted per `scale` units. Token and provider-metered
-/// usage is prorated over the cumulative quantity before rounding to microUSD;
-/// discrete units such as requests are billed in whole blocks.
+/// `price_micro_usd` is quoted per `scale` units. Token, quota-unit and
+/// provider-metered usage is prorated over the cumulative quantity before
+/// rounding to microUSD; discrete units such as requests are billed in whole
+/// blocks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionMeterDimension {
     pub direction: MeterDirection,
@@ -159,7 +160,7 @@ impl SessionMeterDimension {
             scale,
             price_micro_usd,
             required: true,
-            aggregate: unit == BillingUnit::Tokens,
+            aggregate: unit.is_prorated(),
         }
     }
 
@@ -175,7 +176,7 @@ impl SessionMeterDimension {
             scale,
             price_micro_usd,
             required: false,
-            aggregate: unit == BillingUnit::Tokens,
+            aggregate: unit.is_prorated(),
         }
     }
 }
@@ -706,7 +707,7 @@ fn dimension_from_metering(
         dimension.scale,
         price_micro_usd,
     );
-    rated.aggregate |= dimension.meter.is_some();
+    rated.aggregate = dimension.is_aggregate_settled();
     Ok(rated)
 }
 
@@ -809,6 +810,37 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rated.current_base_units, 10_000);
+    }
+
+    #[test]
+    fn quota_units_are_prorated_like_every_other_aggregate_dimension() {
+        // $0.01 per 100 quota units: one observed unit costs $0.0001, the
+        // same proration x402 settlement applies, not a whole $0.01 block.
+        let rate = |unit| {
+            let metering = metering_with_dimensions(vec![one_tier_dimension(
+                MeterDirection::Output,
+                unit,
+                100,
+                0.01,
+            )]);
+            assert_eq!(
+                metering.dimensions[0].is_aggregate_settled(),
+                unit.is_prorated()
+            );
+            let spec = spec_from_metering(&metering, SessionMeteringContext::new()).unwrap();
+            rate_voucher_delta(
+                &spec,
+                StablecoinSettlement::usdc(),
+                &UsageObservation::new(),
+                &UsageObservation::new().with(MeterDirection::Output, unit, 1),
+            )
+            .unwrap()
+            .current_base_units
+        };
+
+        assert_eq!(rate(BillingUnit::QuotaUnits), 100);
+        // Discrete units keep whole-block billing.
+        assert_eq!(rate(BillingUnit::Requests), 10_000);
     }
 
     #[test]

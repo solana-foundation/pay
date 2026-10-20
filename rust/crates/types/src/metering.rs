@@ -1476,7 +1476,7 @@ impl MeterDimension {
     /// Settled from measured usage (`Σ quantity/scale × price`), so a fixed
     /// per-call scheme cannot know its amount before authorization.
     pub fn is_aggregate_settled(&self) -> bool {
-        matches!(self.unit, BillingUnit::Tokens | BillingUnit::QuotaUnits) || self.meter.is_some()
+        self.unit.is_prorated() || self.meter.is_some()
     }
 }
 
@@ -1656,6 +1656,14 @@ pub enum BillingUnit {
     #[serde(rename = "quota_units")]
     QuotaUnits,
     Instances,
+}
+
+impl BillingUnit {
+    /// Usage quantities priced by prorating over `scale` rather than in whole
+    /// blocks. The single rule every settlement path (x402 and sessions) uses.
+    pub fn is_prorated(self) -> bool {
+        matches!(self, Self::Tokens | Self::QuotaUnits)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
