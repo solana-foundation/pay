@@ -292,6 +292,9 @@ pub async fn forward_request_with_session_metering_and_identity(
             response_headers.insert(n, v);
         }
     }
+    prepared
+        .query_credentials
+        .scrub_response_headers(&mut response_headers);
 
     let mut resp = Response::builder().status(status);
     for (name, value) in &response_headers {
@@ -689,6 +692,86 @@ pub fn error_response(status: StatusCode, message: &str) -> Response {
 pub struct PreparedUpstreamRequest {
     pub url: reqwest::Url,
     pub headers: Vec<(String, String)>,
+    /// Credentials the gateway placed in the upstream query string. They
+    /// must never come back to the caller, e.g. in a relayed redirect.
+    pub query_credentials: QueryCredentials,
+}
+
+/// Gateway-injected query credentials (API keys, HMAC signatures, fetched
+/// access tokens), kept to scrub them from upstream response headers.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct QueryCredentials(Vec<String>);
+
+/// Response headers that carry URLs the caller follows or reads.
+pub const URL_RESPONSE_HEADERS: [axum::http::HeaderName; 2] = [
+    axum::http::header::LOCATION,
+    axum::http::header::CONTENT_LOCATION,
+];
+
+impl QueryCredentials {
+    fn push(&mut self, value: &str) {
+        if !value.is_empty() {
+            self.0.push(value.to_string());
+        }
+    }
+
+    fn exposed_in(&self, value: &str) -> bool {
+        self.0.iter().any(|secret| {
+            let encoded: String = url::form_urlencoded::byte_serialize(secret.as_bytes()).collect();
+            value.contains(secret.as_str()) || value.contains(&encoded)
+        })
+    }
+
+    /// `value` with every query pair carrying a credential removed, or
+    /// `None` when the credential cannot be removed from it.
+    fn scrub_url(&self, value: &str) -> Option<String> {
+        if !self.exposed_in(value) {
+            return Some(value.to_string());
+        }
+        let base = reqwest::Url::parse("http://relative.invalid/").ok()?;
+        let absolute = reqwest::Url::parse(value).is_ok();
+        let mut url = base.join(value).ok()?;
+        let kept: Vec<(String, String)> = url
+            .query_pairs()
+            .filter(|(_, pair)| !self.0.iter().any(|secret| secret == pair))
+            .map(|(key, pair)| (key.into_owned(), pair.into_owned()))
+            .collect();
+        url.set_query(None);
+        if !kept.is_empty() {
+            url.query_pairs_mut().extend_pairs(kept);
+        }
+        let scrubbed = if absolute {
+            url.to_string()
+        } else {
+            url[url::Position::BeforePath..].to_string()
+        };
+        (!self.exposed_in(&scrubbed)).then_some(scrubbed)
+    }
+
+    /// Remove injected credentials from URL-bearing response headers; a
+    /// header that would still expose one is dropped.
+    pub fn scrub_response_headers(&self, headers: &mut HeaderMap) {
+        if self.0.is_empty() {
+            return;
+        }
+        for name in URL_RESPONSE_HEADERS {
+            let values: Vec<HeaderValue> = headers.get_all(&name).iter().cloned().collect();
+            if values.is_empty() {
+                continue;
+            }
+            headers.remove(&name);
+            for value in values {
+                if let Some(scrubbed) = value
+                    .to_str()
+                    .ok()
+                    .and_then(|value| self.scrub_url(value))
+                    .and_then(|value| HeaderValue::from_str(&value).ok())
+                {
+                    headers.append(name.clone(), scrubbed);
+                }
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for PreparedUpstreamRequest {
@@ -715,6 +798,7 @@ impl PreparedUpstreamRequest {
         Ok(Self {
             url,
             headers: Vec::new(),
+            query_credentials: QueryCredentials::default(),
         })
     }
 
@@ -736,8 +820,9 @@ impl PreparedUpstreamRequest {
             .map(|(_, value)| value.as_str())
     }
 
-    fn append_query_param(&mut self, name: &str, value: &str) {
+    fn append_query_credential(&mut self, name: &str, value: &str) {
         self.url.query_pairs_mut().append_pair(name, value);
+        self.query_credentials.push(value);
     }
 
     fn set_query_param(&mut self, name: &str, value: &str) {
@@ -829,7 +914,7 @@ fn apply_prepared_request_auth(
                      can't inject `?{key}=...` into the upstream request."
                 ));
             }
-            prepared.append_query_param(key, &secret);
+            prepared.append_query_credential(key, &secret);
             Ok(())
         }
         AuthConfig::Hmac {
@@ -881,7 +966,7 @@ async fn apply_access_token_auth(
 
     let token = access_token(fetch).await?;
     let rendered = render_access_token_template(&inject.template, &token)?;
-    apply_hmac_target(
+    apply_credential_target(
         prepared,
         &inject.target.kind,
         &inject.target.name,
@@ -935,7 +1020,7 @@ fn apply_hmac_auth(
         key_id.as_deref(),
     )?;
 
-    apply_hmac_target(
+    apply_credential_target(
         prepared,
         &auth.signature.destination.kind,
         &auth.signature.destination.name,
@@ -954,6 +1039,20 @@ fn apply_hmac_target(
     match kind {
         HmacTargetType::Header => prepared.set_header(name, value),
         HmacTargetType::QueryParam => prepared.set_query_param(name, value),
+    }
+}
+
+/// Write a credential (signature, access token) to its target, remembering a
+/// query credential so it can be scrubbed from the response.
+fn apply_credential_target(
+    prepared: &mut PreparedUpstreamRequest,
+    kind: &HmacTargetType,
+    name: &str,
+    value: &str,
+) {
+    apply_hmac_target(prepared, kind, name, value);
+    if matches!(kind, HmacTargetType::QueryParam) {
+        prepared.query_credentials.push(value);
     }
 }
 
@@ -1803,6 +1902,7 @@ mod tests {
                 "authorization".to_string(),
                 "Bearer header-secret".to_string(),
             )],
+            query_credentials: QueryCredentials::default(),
         };
 
         let debug = format!("{request:?}");
@@ -1924,6 +2024,87 @@ mod tests {
     async fn client_voucher_request_priced_response_is_released() {
         let served = client_voucher_first_bytes("v1/flat").await.unwrap();
         assert!(served.starts_with(b"{\"text\":\"protected-content\""));
+    }
+
+    fn credentials(values: &[&str]) -> QueryCredentials {
+        let mut credentials = QueryCredentials::default();
+        for value in values {
+            credentials.push(value);
+        }
+        credentials
+    }
+
+    #[test]
+    fn query_credentials_are_scrubbed_from_relayed_urls() {
+        let credentials = credentials(&["s3cr3t", "a+b/c"]);
+        for (location, scrubbed) in [
+            (
+                "https://up.example/next?key=s3cr3t&page=2",
+                Some("https://up.example/next?page=2"),
+            ),
+            ("/next?sig=a%2Bb%2Fc", Some("/next")),
+            ("/next?sig=a%2Bb%2Fc#top", Some("/next#top")),
+            // A credential outside the query cannot be removed: drop it.
+            ("https://up.example/s3cr3t/next", None),
+            // Positive control: unrelated redirects are relayed untouched.
+            ("/next?page=2", Some("/next?page=2")),
+        ] {
+            assert_eq!(
+                credentials.scrub_url(location).as_deref(),
+                scrubbed,
+                "{location}"
+            );
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::LOCATION,
+            HeaderValue::from_static("/next?key=s3cr3t"),
+        );
+        headers.insert(
+            axum::http::header::CONTENT_LOCATION,
+            HeaderValue::from_static("/s3cr3t"),
+        );
+        headers.insert("x-other", HeaderValue::from_static("s3cr3t-unrelated"));
+        credentials.scrub_response_headers(&mut headers);
+        assert_eq!(headers.get(axum::http::header::LOCATION).unwrap(), "/next");
+        assert!(headers.get(axum::http::header::CONTENT_LOCATION).is_none());
+        assert!(headers.get("x-other").is_some());
+    }
+
+    #[tokio::test]
+    async fn upstream_redirects_never_relay_the_query_api_key() {
+        let upstream = axum::Router::new().fallback(|uri: Uri| async move {
+            (
+                StatusCode::FOUND,
+                [(
+                    axum::http::header::LOCATION,
+                    format!("/landing?{}", uri.query().unwrap_or("")),
+                )],
+            )
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, upstream).await });
+        let mut api = api_with_auth(Some(AuthConfig::QueryParam {
+            key: "key".to_string(),
+            // PATH is always set; its value stands in for the API key.
+            value_from_env: "PATH".to_string(),
+        }));
+        if let RoutingConfig::Proxy { url, .. } = &mut api.routing {
+            *url = format!("http://{addr}");
+        }
+        let uri: Uri = "/v1/data?page=2".parse().unwrap();
+
+        let response = forward_request(&api, Method::GET, &uri, &HeaderMap::new(), Bytes::new())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FOUND);
+        let location = response.headers()[axum::http::header::LOCATION]
+            .to_str()
+            .unwrap();
+        assert_eq!(location, "/landing?page=2");
     }
 
     fn api_with_auth(auth: Option<AuthConfig>) -> ApiSpec {
