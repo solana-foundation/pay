@@ -1719,11 +1719,11 @@ async fn run_batch(runtime: &SettlementRuntime) -> Result<SettleSessionsMetrics,
     for reconciliation in reconciliations {
         match reconciliation {
             Ok(result) => {
-                if let Some(settled_on_chain) = result.observed_settled_on_chain
+                if let Some(observed) = result.observed
                     && let Err(error) = update_batch_settled_watermark(
                         &batch.store,
                         &result.channel_id,
-                        settled_on_chain,
+                        observed,
                         now.max(0) as u64,
                     )
                     .await
@@ -1907,7 +1907,10 @@ async fn run_batch(runtime: &SettlementRuntime) -> Result<SettleSessionsMetrics,
             if let Err(error) = update_batch_settled_watermark(
                 &batch.store,
                 &candidate.channel_id,
-                candidate.settled_on_chain,
+                ChainObservation {
+                    settled: candidate.settled_on_chain,
+                    sealed: !candidate.after.unsealed,
+                },
                 unix_now().max(0) as u64,
             )
             .await
@@ -2335,7 +2338,7 @@ struct BatchReconcileResult {
     stablecoin_settled_base_units: Option<u64>,
     stablecoin_distributed_base_units: Option<u64>,
     escrow_active: Option<bool>,
-    observed_settled_on_chain: Option<u64>,
+    observed: Option<ChainObservation>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2406,10 +2409,31 @@ fn batch_reconciliation_due(
             || now_seconds.saturating_sub(state.last_activity_at) >= max_idle.as_secs())
 }
 
+/// What one chain read established about a batch channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChainObservation {
+    settled: u64,
+    /// Sealed or distributed: no further voucher can ever be claimed.
+    sealed: bool,
+}
+
+impl ChainObservation {
+    fn of(onchain: &channel::DecodedChannel) -> Self {
+        Self {
+            settled: onchain.channel.settlement.settled,
+            sealed: matches!(onchain.channel.status, STATUS_SEALED | STATUS_DISTRIBUTED),
+        }
+    }
+}
+
+/// Persist a chain observation. The gateway skips its own chain read while
+/// `onchain_checked_at` is fresh, so a terminal observation must fence the
+/// record in the same write that refreshes it: a fresh timestamp on a record
+/// still open in Redis would admit vouchers no one can claim.
 async fn update_batch_settled_watermark(
-    store: &RedisChannelStore,
+    store: &impl ChannelStore,
     channel_id: &str,
-    settled_on_chain: u64,
+    observed: ChainObservation,
     checked_at: u64,
 ) -> Result<(), StoreError> {
     store
@@ -2418,7 +2442,8 @@ async fn update_batch_settled_watermark(
             Box::new(move |current| {
                 let mut state = current
                     .ok_or_else(|| StoreError::Internal("batch channel not found".into()))?;
-                state.settled_on_chain = state.settled_on_chain.max(settled_on_chain);
+                state.settled_on_chain = state.settled_on_chain.max(observed.settled);
+                state.sealed |= observed.sealed;
                 state.onchain_checked_at = state.onchain_checked_at.max(checked_at);
                 Ok(state)
             }),
@@ -2611,7 +2636,7 @@ async fn reconcile_batch_channel(
             stablecoin_settled_base_units: None,
             stablecoin_distributed_base_units: None,
             escrow_active: Some(false),
-            observed_settled_on_chain: None,
+            observed: None,
         });
     };
     let channel_id = onchain.address;
@@ -2712,7 +2737,7 @@ async fn reconcile_batch_channel(
                         stablecoin_settled_base_units: settled_metric,
                         stablecoin_distributed_base_units: distributed_metric,
                         escrow_active: Some(true),
-                        observed_settled_on_chain: Some(onchain.channel.settlement.settled),
+                        observed: Some(ChainObservation::of(&onchain)),
                     });
                 }
                 return Ok(BatchReconcileResult {
@@ -2738,7 +2763,7 @@ async fn reconcile_batch_channel(
                     stablecoin_settled_base_units: settled_metric,
                     stablecoin_distributed_base_units: distributed_metric,
                     escrow_active: Some(true),
-                    observed_settled_on_chain: Some(onchain.channel.settlement.settled),
+                    observed: Some(ChainObservation::of(&onchain)),
                 });
             };
             instructions.push(distribution);
@@ -2769,7 +2794,7 @@ async fn reconcile_batch_channel(
                 stablecoin_settled_base_units: settled_metric,
                 stablecoin_distributed_base_units: distributed_metric,
                 escrow_active: Some(true),
-                observed_settled_on_chain: Some(onchain.channel.settlement.settled),
+                observed: Some(ChainObservation::of(&onchain)),
             });
         }
         STATUS_CLOSING if now < onchain.close_deadline() => {
@@ -2830,7 +2855,7 @@ async fn reconcile_batch_channel(
                     stablecoin_settled_base_units: settled_metric,
                     stablecoin_distributed_base_units: distributed_metric,
                     escrow_active: Some(true),
-                    observed_settled_on_chain: Some(onchain.channel.settlement.settled),
+                    observed: Some(ChainObservation::of(&onchain)),
                 });
             };
             instructions.push(distribution);
@@ -2871,7 +2896,7 @@ async fn reconcile_batch_channel(
                 stablecoin_settled_base_units: settled_metric,
                 stablecoin_distributed_base_units: distributed_metric,
                 escrow_active: Some(onchain.channel.status != STATUS_DISTRIBUTED),
-                observed_settled_on_chain: Some(onchain.channel.settlement.settled),
+                observed: Some(ChainObservation::of(&onchain)),
             });
         }
         status => {
@@ -2898,7 +2923,7 @@ async fn reconcile_batch_channel(
         stablecoin_settled_base_units: settled_metric,
         stablecoin_distributed_base_units: distributed_metric,
         escrow_active: Some(onchain.channel.status != STATUS_DISTRIBUTED),
-        observed_settled_on_chain: Some(onchain.channel.settlement.settled),
+        observed: Some(ChainObservation::of(&onchain)),
     })
 }
 
@@ -5965,6 +5990,61 @@ mod tests {
         assert!(matches!(
             candidate.store_action,
             BatchStoreAction::MarkFinalized
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_distributed_observation_fences_the_record_it_refreshes() {
+        let (mut state, mut onchain, operator) = batch_closing_fixture();
+        state.cumulative = 100;
+        let store = pay_kit::core::store::MemoryChannelStore::new();
+        let id = state.channel_id.clone();
+        let reserve = |id: String, cumulative| {
+            let store = &store;
+            async move {
+                store
+                    .reserve_authorization(
+                        &id,
+                        None,
+                        authorization(&format!("voucher-{cumulative}"), 50, cumulative),
+                        Box::new(|_| Ok(None)),
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        store.put_channel(&id, state.clone()).await.unwrap();
+
+        // The worker missed Closing and first reads the channel distributed.
+        onchain.channel.status = STATUS_DISTRIBUTED;
+        let observed = reconcile_closing_batch(state.clone(), &onchain, &operator, 0)
+            .await
+            .unwrap()
+            .observed
+            .unwrap();
+        update_batch_settled_watermark(&store, &id, observed, 5)
+            .await
+            .unwrap();
+        let fenced = store.get_channel(&id).await.unwrap().unwrap();
+        assert_eq!(fenced.onchain_checked_at, 5);
+        assert!(fenced.sealed, "a fresh snapshot of a distributed channel");
+        assert!(matches!(
+            reserve(id.clone(), 150).await,
+            BatchReservation::Closing
+        ));
+
+        // An open observation refreshes the snapshot and keeps admitting.
+        let open = channel_state();
+        let open_id = open.channel_id.clone();
+        store.put_channel(&open_id, open).await.unwrap();
+        onchain.channel.status = STATUS_OPEN;
+        update_batch_settled_watermark(&store, &open_id, ChainObservation::of(&onchain), 5)
+            .await
+            .unwrap();
+        assert!(!store.get_channel(&open_id).await.unwrap().unwrap().sealed);
+        assert!(matches!(
+            reserve(open_id, 50).await,
+            BatchReservation::Reserved(_)
         ));
     }
 
