@@ -1252,14 +1252,17 @@ fn do_paid_fetch(
                     if let Some(permissions) = &scope.payment_permissions {
                         permissions.authorize_mpp(ch.as_ref(), &resource_url)?;
                     }
+                    // An unresolved earlier try resends its credential, so a
+                    // retry after a lost response never signs a second charge.
                     let (auth_header, _ephemeral) = scope.with_approval(peer.as_ref(), |auth| {
-                        pay_core::client::mpp::build_credential_with_override(
+                        pay_core::client::mpp::build_credential_for_attempt(
                             ch.as_ref(),
                             store,
                             network_override.as_deref(),
                             account_override.as_deref(),
                             Some(url),
                             auth,
+                            &attempt,
                         )
                     })?;
                     headers.push(("Authorization".to_string(), auth_header));

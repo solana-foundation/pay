@@ -262,6 +262,92 @@ pub fn build_credential_with_override(
     Ok((header, ephemeral_notice))
 }
 
+const CHARGE_CREDENTIAL_KIND: &str = "mpp-charge-credential";
+/// How long an unresolved charge credential is resent: no longer than a
+/// challenge stays verifiable, after which the server would refuse it anyway.
+const CHARGE_CREDENTIAL_TTL_SECS: u64 = 300;
+
+/// [`build_credential_with_override`] for one logical request. While
+/// `attempt` is unresolved (the paid retry got a transport error, a timeout or
+/// a server error), a retry of the same request for the same charge terms
+/// resends the exact credential already signed instead of signing a second
+/// transfer. The server then recognises the transaction it may already have
+/// settled rather than being handed another one.
+///
+/// The cache key is the payer, network and the charge terms (realm, method,
+/// intent, digest and the decoded request minus the blockhash and slot hints
+/// every fresh challenge refreshes), never the challenge id, which changes on
+/// each 402.
+pub fn build_credential_for_attempt(
+    challenge: &Challenge,
+    store: &dyn AccountsStore,
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+    resource_url: Option<&str>,
+    auth_override: crate::signer::AuthOverride,
+    attempt: &crate::client::attempt::PaymentAttempt,
+) -> Result<(String, Option<ResolvedEphemeral>)> {
+    let build = |auth_override| {
+        build_credential_with_override(
+            challenge,
+            store,
+            network_override,
+            account_override,
+            resource_url,
+            auth_override,
+        )
+    };
+    let network = challenge_network(challenge, network_override)?;
+    // Signed material is reusable only by the wallet that signed it; with no
+    // payer known up front, sign afresh.
+    let Some(payer) = account_pubkey_for_network(store, &network, account_override)?
+        .and_then(|pubkey| pubkey.parse::<solana_pubkey::Pubkey>().ok())
+    else {
+        return build(auth_override);
+    };
+    let key = crate::client::attempt::PaymentCacheKey::new(
+        attempt,
+        &payer,
+        &network,
+        CHARGE_CREDENTIAL_KIND,
+        &[&charge_offer_terms(challenge)?],
+    );
+    let mut ephemeral_notice = None;
+    let header = key.reuse_or_insert(
+        std::time::Duration::from_secs(CHARGE_CREDENTIAL_TTL_SECS),
+        || {
+            let (header, notice) = build(auth_override)?;
+            ephemeral_notice = notice;
+            Ok(header)
+        },
+    )?;
+    Ok((header, ephemeral_notice))
+}
+
+/// The terms that identify a charge offer across challenges.
+fn charge_offer_terms(challenge: &Challenge) -> Result<String> {
+    let mut request: serde_json::Value = challenge
+        .request
+        .decode()
+        .map_err(|e| Error::Mpp(format!("Failed to decode challenge request: {e}")))?;
+    if let Some(details) = request
+        .get_mut("methodDetails")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for hint in ["recentBlockhash", "lastValidBlockHeight", "recentSlot"] {
+            details.remove(hint);
+        }
+    }
+    Ok(serde_json::json!({
+        "realm": challenge.realm,
+        "method": challenge.method.as_str(),
+        "intent": challenge.intent.as_str(),
+        "digest": challenge.digest,
+        "request": request,
+    })
+    .to_string())
+}
+
 /// The kit re-checks the challenge against the network the wallet was loaded
 /// for, so a challenge cannot be signed for a cluster other than the selected one.
 fn charge_build_options(
@@ -955,6 +1041,111 @@ mod tests {
             "Payment id=\"{currency}\", realm=\"test\", method=\"solana\", intent=\"charge\", request=\"{b64}\""
         );
         parse(&header).unwrap()
+    }
+
+    const CHARGE_PAYER: &str = "4BuiY9QUUfPoAGNJBja3JapAuVWMc9c7in6UCgyC2zPR";
+
+    /// A mainnet account whose pubkey is known but which cannot sign, so a
+    /// test passes only if the credential is resent rather than rebuilt.
+    fn unsignable_payer_store(pubkey: &str) -> crate::accounts::MemoryAccountsStore {
+        let mut file = crate::accounts::AccountsFile::default();
+        file.upsert(
+            "mainnet",
+            "default",
+            crate::accounts::Account {
+                backend: crate::accounts::BackendKind::Ephemeral,
+                provider: None,
+                active: true,
+                auth_required: Some(false),
+                pubkey: Some(pubkey.to_string()),
+                vault: None,
+                account: None,
+                path: None,
+                secret_key_b58: None,
+                created_at: None,
+                subscriptions: Default::default(),
+            },
+        );
+        crate::accounts::MemoryAccountsStore::with_file(file)
+    }
+
+    /// A fresh 402 for the same charge: new id and blockhash.
+    fn charge_challenge(id: &str, blockhash: &str, amount: &str) -> Challenge {
+        let request = serde_json::json!({
+            "amount": amount,
+            "currency": "USDC",
+            "recipient": "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY",
+            "methodDetails": { "network": "mainnet", "recentBlockhash": blockhash }
+        });
+        Challenge::new(
+            id,
+            "merchant",
+            "solana",
+            "charge",
+            pay_kit::mpp::Base64UrlJson::from_value(&request).unwrap(),
+        )
+    }
+
+    #[test]
+    fn an_ambiguous_charge_retry_resends_the_original_credential() {
+        let attempt = crate::client::attempt::PaymentAttempt::new(
+            "POST",
+            "https://merchant.example/charge",
+            Some(b"{}"),
+        );
+        let build = |store: &crate::accounts::MemoryAccountsStore, challenge: &Challenge| {
+            build_credential_for_attempt(
+                challenge,
+                store,
+                None,
+                None,
+                Some("https://merchant.example/charge"),
+                None,
+                &attempt,
+            )
+            .map(|(header, _)| header)
+        };
+        let first = charge_challenge("first", "11111111111111111111111111111111", "1000000");
+        // The first try signed this credential; its response was lost.
+        crate::client::attempt::PaymentCacheKey::new(
+            &attempt,
+            &CHARGE_PAYER.parse().unwrap(),
+            "mainnet",
+            CHARGE_CREDENTIAL_KIND,
+            &[&charge_offer_terms(&first).unwrap()],
+        )
+        .reuse_or_insert(std::time::Duration::from_secs(300), || {
+            Ok("Payment original-credential".to_string())
+        })
+        .unwrap();
+
+        // The retry's challenge has a new id and blockhash; the wallet
+        // cannot sign, so anything but a resend fails.
+        let store = unsignable_payer_store(CHARGE_PAYER);
+        let retry = charge_challenge(
+            "retry",
+            "SysvarRent111111111111111111111111111111111",
+            "1000000",
+        );
+        assert_eq!(
+            build(&store, &retry).unwrap(),
+            "Payment original-credential"
+        );
+
+        // A different price is a different charge, and another wallet never
+        // receives this one's credential.
+        let repriced = charge_challenge(
+            "repriced",
+            "SysvarRent111111111111111111111111111111111",
+            "2000000",
+        );
+        assert!(build(&store, &repriced).is_err());
+        let other_wallet = unsignable_payer_store("CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY");
+        assert!(build(&other_wallet, &retry).is_err());
+
+        // A definitive answer ends the attempt: the next call signs anew.
+        attempt.resolved();
+        assert!(build(&store, &retry).is_err());
     }
 
     #[test]
