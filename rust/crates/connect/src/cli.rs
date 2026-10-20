@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use solana_pubkey::Pubkey;
 
 use crate::AppState;
-use crate::oauth::{FundNext, PrivyLogin, approve_with_privy, privy_login};
+use crate::oauth::{FundNext, PrivyLogin, approve_with_cookie, approve_with_privy, privy_login};
 use crate::protocol::{
     ApiError, pkce_challenge, random_token, redirect_url, sha256_hex, validate_callback,
     validate_code_challenge, validate_state,
@@ -176,6 +176,21 @@ impl Store {
             .lock()
             .unwrap()
             .retain(|_, token| token.subject != subject);
+    }
+
+    /// Tie `subject`'s session-less link codes and CLI tokens (a guest's) to
+    /// the Privy `session` that attached a wallet to it.
+    pub fn adopt_session(&self, subject: &str, session: &str) {
+        for grant in self.grants.lock().unwrap().values_mut() {
+            if grant.subject == subject && grant.session.is_none() {
+                grant.session = Some(session.to_string());
+            }
+        }
+        for token in self.tokens.lock().unwrap().values_mut() {
+            if token.subject == subject && token.session.is_none() {
+                token.session = Some(session.to_string());
+            }
+        }
     }
 
     /// End every link code and CLI token approved in the Privy `session`.
@@ -413,27 +428,18 @@ pub async fn approve(
             let approval = approve_with_privy(&state, token).await?;
             (approval.subject, true, approval.session)
         }
-        None => (
-            state
-                .tenants()
-                .subject_from_cookie(&headers)
-                .filter(|subject| state.tenants().get(subject).is_some())
-                .ok_or_else(|| {
-                    ApiError::new(
-                        StatusCode::CONFLICT,
-                        "no_wallet",
-                        "This browser has no pay wallet yet. Sign in first.",
-                    )
-                })?,
-            false,
-            None,
-        ),
+        None => {
+            let login = approve_with_cookie(
+                &state,
+                &headers,
+                "This browser has no pay wallet yet. Sign in first.",
+            )?;
+            (login.subject, false, login.session)
+        }
     };
     if let Some(fund) = funding_next(&state, &id, &subject, fresh_login).await? {
-        if let Some(row) = state.cli().pending.lock().unwrap().get_mut(&id)
-            && session.is_some()
-        {
-            row.session = session.clone();
+        if let Some(row) = state.cli().pending.lock().unwrap().get_mut(&id) {
+            row.session = Some(session.id.clone());
         }
         tracing::info!(subject = %subject, address = %fund.address, "empty CLI wallet: funding before approval");
         let mut response = Json(Decision {
@@ -443,15 +449,17 @@ pub async fn approve(
         .into_response();
         response.headers_mut().insert(
             header::SET_COOKIE,
-            state
-                .tenants()
-                .subject_cookie(&subject, state.public_url().starts_with("https://")),
+            state.tenants().subject_cookie(
+                &subject,
+                &session,
+                state.public_url().starts_with("https://"),
+            ),
         );
         return Ok(response);
     }
     let (pending, code) = state
         .cli()
-        .approve(&id, subject.clone(), session)
+        .approve(&id, subject.clone(), Some(session.id.clone()))
         .ok_or_else(unknown_request)?;
     let mut response = Json(Decision {
         redirect: Some(redirect_url(&pending.callback, &code, &pending.state)),
@@ -461,9 +469,11 @@ pub async fn approve(
     if fresh_login {
         response.headers_mut().insert(
             header::SET_COOKIE,
-            state
-                .tenants()
-                .subject_cookie(&subject, state.public_url().starts_with("https://")),
+            state.tenants().subject_cookie(
+                &subject,
+                &session,
+                state.public_url().starts_with("https://"),
+            ),
         );
     }
     Ok(response)
@@ -659,8 +669,23 @@ mod tests {
     const WALLET: &str = "wallet_cli_test";
     const ADDRESS: &str = "CcZFhGwFVkZevr555EZJpWbeq4irboT6zHfrSKWKCy3Z";
 
+    /// The Privy app that signs the browser's session in; no provider API
+    /// is reached by a cookie approval.
+    fn privy() -> crate::privy::Privy {
+        crate::privy::Privy::new(crate::privy::tests::FakeApp::new("http://unused").cfg).unwrap()
+    }
+
+    fn session() -> crate::tenants::LoginSession {
+        crate::tenants::LoginSession {
+            id: "sess_cli".to_string(),
+            issued_at: 0,
+        }
+    }
+
     fn state() -> AppState {
-        let state = AppState::new("https://connect.test").with_pages_url("https://pages.test");
+        let state = AppState::new("https://connect.test")
+            .with_pages_url("https://pages.test")
+            .with_privy(privy());
         let credentials = [
             (
                 "app_id".to_string(),
@@ -726,7 +751,7 @@ mod tests {
             .map(|(_, value)| value.into_owned())
             .unwrap();
 
-        let set_cookie = state.tenants().subject_cookie(SUBJECT, true);
+        let set_cookie = state.tenants().subject_cookie(SUBJECT, &session(), true);
         let cookie = set_cookie.to_str().unwrap().split(';').next().unwrap();
         let view = app
             .clone()
@@ -871,6 +896,73 @@ mod tests {
         let (status, body) = json(replay).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"], "invalid_grant");
+    }
+
+    fn pending_link(state: &AppState, id: &str) {
+        state
+            .cli()
+            .insert_pending(
+                id.to_string(),
+                Pending {
+                    callback: CALLBACK.to_string(),
+                    state: STATE.to_string(),
+                    session: None,
+                    kind: PendingKind::Link {
+                        code_challenge: pkce_challenge(VERIFIER),
+                    },
+                    created_at: Instant::now(),
+                },
+            )
+            .unwrap();
+    }
+
+    async fn approve_by_cookie(app: &axum::Router, id: &str, cookie: &str) -> (StatusCode, Value) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/cli/{id}/approve"))
+                    .header(header::COOKIE, cookie)
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        json(response).await
+    }
+
+    /// A cookie approval is bound to the Privy session that set the cookie:
+    /// signing that session out ends the CLI token it produced, and the
+    /// cookie approves nothing afterwards.
+    #[tokio::test]
+    async fn cookie_links_end_with_the_privy_session_that_set_the_cookie() {
+        let state = state();
+        let app = crate::router(state.clone());
+        let set_cookie = state.tenants().subject_cookie(SUBJECT, &session(), true);
+        let cookie = set_cookie.to_str().unwrap().split(';').next().unwrap();
+
+        pending_link(&state, "link-1");
+        let (status, body) = approve_by_cookie(&app, "link-1", cookie).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let callback = url::Url::parse(body["redirect"].as_str().unwrap()).unwrap();
+        let code = callback
+            .query_pairs()
+            .find(|(key, _)| key == "code")
+            .map(|(_, value)| value.into_owned())
+            .unwrap();
+        let (subject, bound) = state.cli().exchange(&code, VERIFIER).unwrap();
+        assert_eq!(bound.as_deref(), Some("sess_cli"));
+        let token = state.cli().issue_token(subject, bound).unwrap();
+        assert!(state.cli().authenticate(&token).is_some());
+
+        state.privy().unwrap().revoke_session("sess_cli");
+        state.cli().revoke_session("sess_cli");
+        assert!(state.cli().authenticate(&token).is_none());
+        pending_link(&state, "link-2");
+        let (status, body) = approve_by_cookie(&app, "link-2", cookie).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"], "no_wallet");
     }
 
     #[tokio::test]

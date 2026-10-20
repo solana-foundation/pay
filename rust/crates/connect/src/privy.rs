@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::tenants::TenantRecord;
+use crate::tenants::{LoginSession, TenantRecord};
 
 pub const PROVIDER_ID: &str = "privy";
 pub const APP_ID_ENV: &str = "PRIVY_APP_ID";
@@ -130,8 +130,9 @@ pub fn default_jwks_url(app_id: &str) -> String {
 pub struct Identity {
     /// `did:privy:…`, stable for the user in this app.
     pub user_id: String,
-    /// The Privy session (`sid`) the token belongs to; always present.
-    pub session_id: Option<String>,
+    /// The Privy session (`sid`) the token belongs to, and when the token
+    /// was issued.
+    pub session: LoginSession,
 }
 
 #[derive(Deserialize)]
@@ -139,6 +140,8 @@ struct Claims {
     sub: String,
     #[serde(default)]
     sid: Option<String>,
+    #[serde(default)]
+    iat: Option<u64>,
 }
 
 /// A user's Solana wallet at Privy.
@@ -409,8 +412,17 @@ impl Privy {
         }
         Ok(Identity {
             user_id: data.claims.sub,
-            session_id: Some(session),
+            session: LoginSession {
+                id: session,
+                issued_at: data.claims.iat.unwrap_or(0),
+            },
         })
+    }
+
+    /// Whether credentials may still be derived from `session`: it has not
+    /// been signed out here.
+    pub fn session_is_live(&self, session: &LoginSession) -> bool {
+        !self.is_revoked(&session.id)
     }
 
     /// Refuse further sign-ins with `session` for as long as its access
@@ -1012,7 +1024,7 @@ pub(crate) mod tests {
         let privy = Privy::new(app.cfg.clone()).unwrap();
         let identity = privy.verify(&app.token_for(USER)).unwrap();
         assert_eq!(identity.user_id, USER);
-        assert_eq!(identity.session_id.as_deref(), Some("sess_1"));
+        assert_eq!(identity.session.id, "sess_1");
 
         let other_app = FakeApp::new("http://unused");
         assert!(

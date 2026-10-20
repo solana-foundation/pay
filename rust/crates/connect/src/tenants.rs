@@ -57,6 +57,24 @@ pub fn subject_for(provider_id: &str, account_identity: &str) -> String {
     format!("sub_{}", &hex[..32])
 }
 
+/// The upstream login session a browser or credential acts in: the
+/// provider's session id (Privy's `sid`) and when the token proving it was
+/// issued, in unix seconds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginSession {
+    pub id: String,
+    pub issued_at: u64,
+}
+
+/// What a browser's signed subject cookie says: who it is and the login
+/// session it was set in. A cookie never stands on its own; every approval
+/// made with it is bound to, and revoked with, that session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserLogin {
+    pub subject: String,
+    pub session: LoginSession,
+}
+
 /// One tenant's wallet and rules.
 #[derive(Clone)]
 pub struct TenantRecord {
@@ -275,15 +293,52 @@ impl TenantRegistry {
     /// Read a server-authenticated browser subject. Unsigned and tampered
     /// cookies are deliberately ignored.
     pub fn subject_from_cookie(&self, headers: &axum::http::HeaderMap) -> Option<String> {
-        let signed = cookie::value(headers, cookie::SUBJECT_NAME)?;
-        self.verify_cookie_value(b"subject", &signed)
-            .filter(|subject| !subject.is_empty() && subject.len() <= 128)
+        self.login_from_cookie(headers).map(|login| login.subject)
     }
 
-    pub fn subject_cookie(&self, subject: &str, secure: bool) -> axum::http::HeaderValue {
+    /// Who this browser signed in as, and in which login session. Whether
+    /// that session is still live is the caller's question to the provider.
+    pub fn login_from_cookie(&self, headers: &axum::http::HeaderMap) -> Option<BrowserLogin> {
+        use base64::Engine;
+        let signed = cookie::value(headers, cookie::SUBJECT_NAME)?;
+        let value = self.verify_cookie_value(b"subject", &signed)?;
+        let mut parts = value.split('~');
+        let (Some(subject), Some(id), Some(issued_at), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return None;
+        };
+        let id = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(id)
+            .ok()
+            .and_then(|id| String::from_utf8(id).ok())
+            .filter(|id| !id.is_empty())?;
+        if subject.is_empty() || subject.len() > 128 {
+            return None;
+        }
+        Some(BrowserLogin {
+            subject: subject.to_string(),
+            session: LoginSession {
+                id,
+                issued_at: issued_at.parse().ok()?,
+            },
+        })
+    }
+
+    /// Remember a browser as `subject`, signed in during `session`: the
+    /// cookie can approve again only while that session is live.
+    pub fn subject_cookie(
+        &self,
+        subject: &str,
+        session: &LoginSession,
+        secure: bool,
+    ) -> axum::http::HeaderValue {
+        use base64::Engine;
+        let id = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&session.id);
+        let value = format!("{subject}~{id}~{}", session.issued_at);
         cookie::set(
             cookie::SUBJECT_NAME,
-            &self.sign_cookie_value(b"subject", subject),
+            &self.sign_cookie_value(b"subject", &value),
             secure,
         )
     }
@@ -700,13 +755,17 @@ mod tests {
     fn subject_cookie_round_trips() {
         use axum::http::{HeaderMap, header};
         let registry = TenantRegistry::new();
-        let value = registry.subject_cookie("sub_abc", true);
+        let session = LoginSession {
+            id: "sess_1".to_string(),
+            issued_at: 1_700_000_000,
+        };
+        let value = registry.subject_cookie("sub_abc", &session, true);
         let text = value.to_str().unwrap();
-        assert!(text.starts_with("pay_subject=sub_abc."), "{text}");
+        assert!(text.starts_with("pay_subject=sub_abc~"), "{text}");
         assert!(text.ends_with("; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax; Secure"));
         assert!(
             !registry
-                .subject_cookie("s", false)
+                .subject_cookie("s", &session, false)
                 .to_str()
                 .unwrap()
                 .contains("Secure")
@@ -728,6 +787,26 @@ mod tests {
             registry.subject_from_cookie(&headers).as_deref(),
             Some("sub_abc")
         );
+        assert_eq!(
+            registry.login_from_cookie(&headers),
+            Some(BrowserLogin {
+                subject: "sub_abc".to_string(),
+                session: session.clone(),
+            })
+        );
+        // A signed subject without a login session (the old format) is
+        // not a login.
+        let mut sessionless = HeaderMap::new();
+        sessionless.insert(
+            header::COOKIE,
+            format!(
+                "pay_subject={}",
+                registry.sign_cookie_value(b"subject", "sub_abc")
+            )
+            .parse()
+            .unwrap(),
+        );
+        assert_eq!(registry.login_from_cookie(&sessionless), None);
 
         let mut tampered = HeaderMap::new();
         tampered.insert(

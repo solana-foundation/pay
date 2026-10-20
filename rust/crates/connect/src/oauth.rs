@@ -611,6 +611,22 @@ impl Store {
             .retain(|_, token| token.subject != subject);
     }
 
+    /// Tie `subject`'s session-less codes and tokens (a guest's) to the login
+    /// `session` that just attached a wallet to it, so signing that session
+    /// out ends them too.
+    pub fn adopt_session(&self, subject: &str, session: &str) {
+        for grant in self.codes.lock().unwrap().values_mut() {
+            if grant.subject == subject && grant.session.is_none() {
+                grant.session = Some(session.to_string());
+            }
+        }
+        for token in self.tokens.lock().unwrap().values_mut() {
+            if token.subject == subject && token.session.is_none() {
+                token.session = Some(session.to_string());
+            }
+        }
+    }
+
     /// End every code and token approved in the upstream login `session`.
     pub fn revoke_session(&self, session: &str) {
         let ours = |s: &Option<String>| s.as_deref() == Some(session);
@@ -1058,27 +1074,21 @@ pub async fn approve(
             let approval = approve_with_privy(&state, token).await?;
             (approval.subject, true, approval.bound, approval.session)
         }
-        None => (
-            state
-                .tenants()
-                .subject_from_cookie(&headers)
-                .filter(|s| state.tenants().get(s).is_some())
-                .ok_or_else(|| {
-                    ApiError::new(
-                        StatusCode::CONFLICT,
-                        "no_wallet",
-                        "This browser has no pay wallet yet. Sign in or create one first.",
-                    )
-                })?,
-            false,
-            None,
-            None,
-        ),
+        None => {
+            let login = approve_with_cookie(
+                &state,
+                &headers,
+                "This browser has no pay wallet yet. Sign in or create one first.",
+            )?;
+            (login.subject, false, None, login.session)
+        }
     };
     let cookie = fresh_login.then(|| {
-        state
-            .tenants()
-            .subject_cookie(&subject, state.public_url().starts_with("https://"))
+        state.tenants().subject_cookie(
+            &subject,
+            &session,
+            state.public_url().starts_with("https://"),
+        )
     });
     // After a Privy sign-in, a wallet with nothing to pay with goes to the
     // funding page first: a wallet created
@@ -1095,7 +1105,7 @@ pub async fn approve(
     if needs_funding {
         store.pending(&id).ok_or_else(unknown_request)?;
         store
-            .attach_session(&id, session.as_deref())
+            .attach_session(&id, Some(&session.id))
             .ok_or_else(unknown_request)?;
         tracing::info!(%subject, %address, "empty wallet: funding before approval");
         let mut response = Json(DecisionResponse {
@@ -1112,7 +1122,7 @@ pub async fn approve(
         return Ok(response);
     }
     let (request, code) = store
-        .approve_in_session(&id, &subject, session.as_deref())
+        .approve_in_session(&id, &subject, Some(&session.id))
         .ok_or_else(unknown_request)?;
     tracing::info!(client_id = %request.client_id, %subject, "oauth authorization approved");
     let mut response = Json(DecisionResponse {
@@ -1140,7 +1150,36 @@ pub(crate) enum Bound {
 pub(crate) struct PrivyApproval {
     pub subject: String,
     pub bound: Option<Bound>,
-    pub session: Option<String>,
+    pub session: crate::tenants::LoginSession,
+}
+
+/// The login this browser's subject cookie remembers, when its tenant is
+/// still bound and its login session has not been signed out. Whatever the
+/// cookie approves is bound to that session, so signing it out ends it.
+pub(crate) fn approve_with_cookie(
+    state: &AppState,
+    headers: &HeaderMap,
+    no_wallet: &'static str,
+) -> Result<crate::tenants::BrowserLogin, ApiError> {
+    state
+        .tenants()
+        .login_from_cookie(headers)
+        .filter(|login| state.tenants().get(&login.subject).is_some())
+        .filter(|login| session_is_live(state, &login.session))
+        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "no_wallet", no_wallet))
+}
+
+#[cfg(feature = "privy")]
+fn session_is_live(state: &AppState, session: &crate::tenants::LoginSession) -> bool {
+    state
+        .privy()
+        .is_some_and(|privy| privy.session_is_live(session))
+}
+
+/// Without Privy no login session exists to be live.
+#[cfg(not(feature = "privy"))]
+fn session_is_live(_state: &AppState, _session: &crate::tenants::LoginSession) -> bool {
+    false
 }
 
 /// A Privy access token → a bound tenant subject, and how the tenant was
@@ -1190,7 +1229,7 @@ pub(crate) async fn approve_with_privy(
             return Ok(PrivyApproval {
                 subject,
                 bound: None,
-                session: identity.session_id,
+                session: identity.session,
             });
         }
         invalidate_wallet_binding(state, &existing);
@@ -1245,7 +1284,7 @@ pub(crate) async fn approve_with_privy(
     Ok(PrivyApproval {
         subject,
         bound,
-        session: identity.session_id,
+        session: identity.session,
     })
 }
 
@@ -1584,11 +1623,21 @@ pub async fn link_complete(
         .claim_link(&ticket)
         .ok_or_else(unknown_link)?;
     let guest = claim.subject().to_string();
-    let PrivyApproval { subject, bound, .. } = approve_with_privy(&state, token).await?;
+    let PrivyApproval {
+        subject,
+        bound,
+        session,
+    } = approve_with_privy(&state, token).await?;
     let record = state.tenants().get(&subject).ok_or_else(unknown_request)?;
     let mut linked = (*record).clone();
     linked.subject = guest.clone();
     state.tenants().bind(linked);
+    // The guest's credentials now pay from this wallet: they belong to the
+    // session that attached it and end when it signs out.
+    if let Some(store) = state.oauth() {
+        store.adopt_session(&guest, &session.id);
+    }
+    state.cli().adopt_session(&guest, &session.id);
     claim.commit();
     tracing::info!(%guest, %subject, address = %record.pubkey, "guest connection linked to a wallet");
     let funded = !(bound == Some(Bound::Created)
@@ -1600,9 +1649,11 @@ pub async fn link_complete(
     .into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
-        state
-            .tenants()
-            .subject_cookie(&subject, state.public_url().starts_with("https://")),
+        state.tenants().subject_cookie(
+            &subject,
+            &session,
+            state.public_url().starts_with("https://"),
+        ),
     );
     Ok(response)
 }
@@ -1619,7 +1670,7 @@ pub async fn sign_out(State(state): State<AppState>, headers: HeaderMap) -> Resp
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.trim().strip_prefix("Bearer "))
-        && let Ok(Some(session)) = privy.verify(token).map(|identity| identity.session_id)
+        && let Ok(session) = privy.verify(token).map(|identity| identity.session.id)
     {
         privy.revoke_session(&session);
         if let Some(store) = state.oauth() {
@@ -3335,6 +3386,75 @@ mod tests {
             assert!(topup_text(&app, &access).await.contains(ADDRESS));
             let spent = get(&app, &format!("/api/oauth/link/{ticket}")).await;
             assert_eq!(spent.status, StatusCode::NOT_FOUND);
+
+            // It belongs to the session that attached the wallet now.
+            let out =
+                post_json_with(&app, "/api/session/logout", json!({}), None, Some(&token)).await;
+            assert_eq!(out.status, StatusCode::NO_CONTENT);
+            assert!(state.oauth().unwrap().authenticate(&access).is_none());
+        }
+
+        /// The subject cookie is a shortcut to a Privy login, not a login of
+        /// its own: what it approves is bound to the session that set it, and
+        /// once that session signs out the cookie approves nothing.
+        #[tokio::test]
+        async fn cookie_approvals_end_with_the_privy_session_that_set_the_cookie() {
+            let (app, state, fake, _) = privy_app().await;
+            let client_id = register_grok(&app).await;
+            let token = fake.token_for(USER);
+            privy_tokens(&app, &client_id, &token).await;
+
+            // A later approval in the same browser, by cookie only.
+            let first = start_authorization(&app, &client_id, None).await;
+            let first =
+                post_json_with(&app, &approve_path(&first), json!({}), None, Some(&token)).await;
+            let cookie = cookie_of(&first);
+            let by_cookie = |cookie: String| {
+                let app = app.clone();
+                let client_id = client_id.clone();
+                async move {
+                    let request = start_authorization(&app, &client_id, Some(&cookie)).await;
+                    post_json_as(&app, &approve_path(&request), json!({}), Some(&cookie)).await
+                }
+            };
+            let approved = by_cookie(cookie.clone()).await;
+            assert_eq!(approved.status, StatusCode::OK, "{}", approved.body);
+            let redirect = Url::parse(approved.json()["redirect"].as_str().unwrap()).unwrap();
+            let code = redirect
+                .query_pairs()
+                .find(|(k, _)| k == "code")
+                .map(|(_, v)| v.into_owned())
+                .unwrap();
+            let tokens = post_form(
+                &app,
+                "/oauth/token",
+                &[
+                    ("grant_type", "authorization_code"),
+                    ("client_id", &client_id),
+                    ("code", &code),
+                    ("code_verifier", VERIFIER),
+                    ("redirect_uri", GROK_REDIRECT),
+                ],
+            )
+            .await;
+            let access = tokens.json()["access_token"].as_str().unwrap().to_string();
+            let refresh = tokens.json()["refresh_token"].as_str().unwrap().to_string();
+            let oauth = state.oauth().unwrap();
+            assert!(oauth.authenticate(&access).is_some());
+
+            let out =
+                post_json_with(&app, "/api/session/logout", json!({}), None, Some(&token)).await;
+            assert_eq!(out.status, StatusCode::NO_CONTENT);
+            assert!(oauth.authenticate(&access).is_none(), "access revoked");
+            assert!(
+                oauth.refresh(&client_id, &refresh).is_err(),
+                "refresh revoked"
+            );
+
+            // The cookie a client kept from before the sign-out is dead too.
+            let refused = by_cookie(cookie).await;
+            assert_eq!(refused.status, StatusCode::CONFLICT, "{}", refused.body);
+            assert_eq!(refused.json()["error"], "no_wallet");
         }
 
         /// An existing wallet that pay-api reports empty is funded first too,
