@@ -22,7 +22,7 @@ use crate::server::session::{DelegatedUsageAuthorization, SessionMpp};
 use crate::server::session_metering::{
     GateMode, Result as MeteringResult, SessionGateDecision, SessionMeterDimension,
     SessionMeterSpec, SessionMeteringContext, SessionUsageGate, StablecoinSettlement,
-    UsageObservation, spec_from_metering,
+    UsageObservation, is_response_measured, spec_from_metering,
 };
 
 const COMMIT_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1195,15 +1195,9 @@ fn zero_observation(spec: &SessionMeterSpec) -> UsageObservation {
 }
 
 fn has_stream_observable_dimension(spec: &SessionMeterSpec) -> bool {
-    spec.dimensions.iter().any(|dimension| {
-        matches!(
-            (dimension.direction, dimension.unit),
-            (MeterDirection::Output, BillingUnit::Bytes)
-                | (MeterDirection::Output, BillingUnit::Characters)
-                | (MeterDirection::Output, BillingUnit::Tokens)
-                | (MeterDirection::Output, BillingUnit::QuotaUnits)
-        )
-    })
+    spec.dimensions
+        .iter()
+        .any(|dimension| is_response_measured(dimension.direction, dimension.unit))
 }
 
 fn observes_unit(spec: &SessionMeterSpec, unit: BillingUnit) -> bool {
