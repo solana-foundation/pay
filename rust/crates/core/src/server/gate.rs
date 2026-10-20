@@ -144,21 +144,10 @@ pub struct PaidRequestTelemetry {
 }
 
 /// Whether a protected handler completed and its post-serve charge (an x402
-/// `batch-settlement` commit, a static delegated session) must land: any 2xx
-/// or 3xx, since a redirect can follow a completed side effect.
+/// `batch-settlement` commit, a delegated session, static or deployment) must
+/// land: any 2xx or 3xx, since a redirect can follow a completed side effect.
 pub fn handler_completed(status: StatusCode) -> bool {
     status.is_success() || status.is_redirection()
-}
-
-/// Whether a protected handler completed and its delegated session must be
-/// charged: [`handler_completed`] for static sessions. Deployment leases
-/// charge only 2xx.
-pub fn session_response_served(status: StatusCode, deployment: bool) -> bool {
-    if deployment {
-        status.is_success()
-    } else {
-        handler_completed(status)
-    }
 }
 
 /// Streaming media types handled consistently by both HTTP adapters.
@@ -3035,21 +3024,13 @@ mod tests {
     }
 
     #[test]
-    fn delegated_sessions_charge_completed_redirects_only_with_successes() {
+    fn completed_handlers_include_redirects_but_not_errors() {
         for status in [200, 201, 204, 301, 302, 303, 307, 308] {
-            assert!(session_response_served(
-                StatusCode::from_u16(status).unwrap(),
-                false
-            ));
+            assert!(handler_completed(StatusCode::from_u16(status).unwrap()));
         }
         for status in [400, 402, 404, 429, 500, 502, 504] {
-            assert!(!session_response_served(
-                StatusCode::from_u16(status).unwrap(),
-                false
-            ));
+            assert!(!handler_completed(StatusCode::from_u16(status).unwrap()));
         }
-        assert!(session_response_served(StatusCode::OK, true));
-        assert!(!session_response_served(StatusCode::FOUND, true));
     }
 
     #[test]

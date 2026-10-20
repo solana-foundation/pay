@@ -3642,7 +3642,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deployment_only_complete_success_responses_are_charged() {
+    async fn deployment_only_completed_responses_are_charged() {
         use crate::server::gate::{SessionForward, SessionSettlementPlan};
         use axum::{body::Body, response::Response};
         let signer: Arc<dyn TransactionSigner> = Arc::from(test_session_signer());
@@ -3659,7 +3659,10 @@ mod tests {
         for (status, content_type, broken, expected_charge) in [
             (200, "application/json", false, 50_000),
             (500, "application/json", false, 0),
-            (302, "application/json", false, 0),
+            // A redirect can follow a completed side effect.
+            (302, "application/json", false, 50_000),
+            (307, "application/json", false, 50_000),
+            (308, "application/json", false, 50_000),
             (200, "text/event-stream", false, 0),
             (200, "application/json", true, 0),
         ] {
