@@ -234,14 +234,6 @@ impl FirestoreDriver {
         )
     }
 
-    fn document_url(&self, tenant: &Tenant, store_id: &str, key: &str) -> Result<String> {
-        validate_key(key)?;
-        Ok(format!(
-            "{}/documents/{key}",
-            self.store_url(tenant, store_id)?
-        ))
-    }
-
     async fn require_store(&self, tenant: &Tenant, id: &str) -> Result<Value> {
         self.require_json(Method::GET, self.store_url(tenant, id)?, None)
             .await
@@ -292,16 +284,69 @@ impl FirestoreDriver {
         .await
     }
 
-    async fn get_document_from_store(
-        &self,
-        tenant: &Tenant,
-        store_id: &str,
-        key: &str,
-    ) -> Result<Document> {
-        let value = self
-            .require_json(Method::GET, self.document_url(tenant, store_id, key)?, None)
+    /// Read `key` from the exact `store` incarnation the caller authorized.
+    ///
+    /// The store path is reusable: it can be deleted and recreated under
+    /// another channel after `store` was read, and a `retain` store leaves
+    /// its children behind for the next incarnation. So the parent and child
+    /// are read in one `batchGet` snapshot, the parent must still be the
+    /// authorized incarnation (same `createTime`, lease and ready phase), and
+    /// the child must have been created within it.
+    async fn read_document(&self, store: &Value, key: &str) -> Result<Document> {
+        validate_key(key)?;
+        let store_name = store
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| DataError::Provider("store omitted resource name".into()))?;
+        let generation = store
+            .get("createTime")
+            .and_then(Value::as_str)
+            .ok_or_else(|| DataError::Provider("store omitted createTime".into()))?;
+        let document_name = format!("{store_name}/documents/{key}");
+        let entries = self
+            .require_json(
+                Method::POST,
+                format!("{}:batchGet", self.documents_root()),
+                Some(&json!({ "documents": [store_name, document_name] })),
+            )
             .await?;
-        normalize_document(store_id, key, value)
+        let found = |name: &str| {
+            entries.as_array().into_iter().flatten().find_map(|entry| {
+                entry
+                    .get("found")
+                    .filter(|found| found.get("name").and_then(Value::as_str) == Some(name))
+            })
+        };
+        let current = found(store_name).ok_or_else(store_changed)?;
+        if current.get("createTime").and_then(Value::as_str) != Some(generation)
+            || firestore_string(current, "payChannel") != firestore_string(store, "payChannel")
+            || firestore_string(current, "tenant") != firestore_string(store, "tenant")
+        {
+            return Err(store_changed());
+        }
+        require_ready(current)?;
+        let document = found(&document_name).ok_or_else(|| {
+            DataError::Provider("Firestore returned 404 Not Found: document not found".into())
+        })?;
+        // Writes tag the incarnation they were made in; an untagged document
+        // predates tagging and belongs here only if created after the store.
+        let current_incarnation = match firestore_string(document, "storeGeneration") {
+            Some(tag) => tag == generation,
+            None => {
+                let created = document
+                    .get("createTime")
+                    .and_then(Value::as_str)
+                    .and_then(firestore_timestamp)
+                    .ok_or_else(|| DataError::Provider("document omitted createTime".into()))?;
+                firestore_timestamp(generation).is_some_and(|generation| created >= generation)
+            }
+        };
+        if !current_incarnation {
+            return Err(DataError::InvalidRequest(
+                "document was retained from an earlier incarnation of this store".into(),
+            ));
+        }
+        normalize_document(store_physical_id(store)?, key, document.clone())
     }
 
     async fn delete_store_snapshot(&self, tenant: &Tenant, store: &Value) -> Result<()> {
@@ -554,8 +599,7 @@ impl DataDriver for FirestoreDriver {
 
     async fn get_document(&self, tenant: &Tenant, request: DocumentRequest) -> Result<Document> {
         let store = self.require_ready_store(tenant, &request.store_id).await?;
-        let id = store_physical_id(&store)?;
-        self.get_document_from_store(tenant, id, &request.key).await
+        self.read_document(&store, &request.key).await
     }
 
     async fn put_document(&self, tenant: &Tenant, request: PutDocumentRequest) -> Result<Document> {
@@ -568,6 +612,11 @@ impl DataDriver for FirestoreDriver {
             )));
         }
         let document_name = self.document_resource_name(tenant, id, &request.key)?;
+        // Tags the write with the incarnation `commit_document_write` verifies.
+        let generation = store
+            .get("createTime")
+            .and_then(Value::as_str)
+            .ok_or_else(|| DataError::Provider("store omitted createTime".into()))?;
         let result = self
             .commit_document_write(
                 tenant,
@@ -575,7 +624,10 @@ impl DataDriver for FirestoreDriver {
                 json!({
                     "update": {
                         "name": document_name,
-                        "fields": { "payload": { "stringValue": payload } }
+                        "fields": {
+                            "payload": { "stringValue": payload },
+                            "storeGeneration": { "stringValue": generation }
+                        }
                     }
                 }),
             )
@@ -620,9 +672,7 @@ impl DataDriver for FirestoreDriver {
                 "store owner has not published paid gateway reads".into(),
             ));
         }
-        let document = self
-            .get_document_from_store(&tenant, &request.store_id, &request.key)
-            .await?;
+        let document = self.read_document(&store, &request.key).await?;
         let bytes = serde_json::to_vec(&document.value)?.len();
         let egress_gib = bytes as f64 / 1024_f64.powi(3);
         let billed_micro_usd = ((READ_MICRO_USD * GATEWAY_READ_OPERATIONS
@@ -751,6 +801,32 @@ fn normalize_document(store_id: &str, key: &str, value: Value) -> Result<Documen
             .and_then(Value::as_str)
             .map(str::to_string),
     })
+}
+
+fn store_changed() -> DataError {
+    DataError::InvalidRequest("document store changed while it was being read".into())
+}
+
+/// A Firestore RFC 3339 UTC timestamp as a comparable `(seconds, nanos)` key:
+/// `YYYY-MM-DDTHH:MM:SS[.fraction]Z`, with the fraction padded to nanos.
+fn firestore_timestamp(value: &str) -> Option<(String, u32)> {
+    let value = value.strip_suffix('Z')?;
+    let (seconds, fraction) = value.split_once('.').unwrap_or((value, ""));
+    let shape = seconds.len() == 19
+        && seconds
+            .bytes()
+            .enumerate()
+            .all(|(index, byte)| match index {
+                4 | 7 => byte == b'-',
+                10 => byte == b'T',
+                13 | 16 => byte == b':',
+                _ => byte.is_ascii_digit(),
+            });
+    if !shape || fraction.len() > 9 || !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let nanos = format!("{fraction:0<9}").parse().ok()?;
+    Some((seconds.to_string(), nanos))
 }
 
 fn store_physical_id(value: &Value) -> Result<&str> {
@@ -1093,6 +1169,22 @@ mod tests {
         );
         assert_eq!(commits.load(Ordering::SeqCst), 1);
         server.abort();
+    }
+
+    #[test]
+    fn firestore_timestamps_order_across_fraction_precision() {
+        let at = |value| firestore_timestamp(value).unwrap();
+        assert!(at("2026-01-01T00:00:00.5Z") > at("2026-01-01T00:00:00.123456Z"));
+        assert_eq!(at("2026-01-01T00:00:00Z"), at("2026-01-01T00:00:00.000Z"));
+        assert!(at("2026-01-01T00:00:01Z") > at("2026-01-01T00:00:00.999999999Z"));
+        for invalid in [
+            "",
+            "2026-01-01T00:00:00",
+            "2026-01-01 00:00:00Z",
+            "created-1",
+        ] {
+            assert!(firestore_timestamp(invalid).is_none(), "{invalid}");
+        }
     }
 
     #[test]

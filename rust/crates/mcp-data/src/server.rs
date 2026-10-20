@@ -681,20 +681,26 @@ mod tests {
                 observed.fetch_add(1, Ordering::SeqCst);
                 let path = request.uri().path().to_string();
                 let store_name = STORE_PATH.trim_start_matches("/v1/");
+                let store = serde_json::json!({
+                    "name": store_name,
+                    "createTime": "2026-10-19T00:00:00Z",
+                    "updateTime": "2026-10-19T00:00:00Z",
+                    "fields": {
+                        "phase": { "stringValue": "ready" },
+                        "gatewayReads": { "booleanValue": true }
+                    }
+                });
                 let body = if path == STORE_PATH {
-                    serde_json::json!({
-                        "name": store_name,
-                        "updateTime": "2026-10-19T00:00:00Z",
-                        "fields": {
-                            "phase": { "stringValue": "ready" },
-                            "gatewayReads": { "booleanValue": true }
-                        }
-                    })
-                } else if path == format!("{STORE_PATH}/documents/known-key") {
-                    serde_json::json!({
-                        "name": format!("{store_name}/documents/known-key"),
-                        "fields": { "payload": { "stringValue": "{\"secret\":\"published\"}" } }
-                    })
+                    store
+                } else if path.ends_with("/documents:batchGet") {
+                    serde_json::json!([
+                        { "found": store },
+                        { "found": {
+                            "name": format!("{store_name}/documents/known-key"),
+                            "createTime": "2026-10-19T00:00:01Z",
+                            "fields": { "payload": { "stringValue": "{\"secret\":\"published\"}" } }
+                        } }
+                    ])
                 } else {
                     return (StatusCode::NOT_FOUND, Json(serde_json::json!({}))).into_response();
                 };
