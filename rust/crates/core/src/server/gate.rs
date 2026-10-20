@@ -2571,16 +2571,36 @@ fn upto_collected_amount_usd(
 }
 
 /// Reconstruct a minimal URI from path + query for split-rule resolution.
-/// The protected route an MPP charge challenge is bound to: method, API and
-/// path with query, so a credential for one route never runs another's
-/// handler even when their payment terms are equal.
+/// The protected route an MPP charge challenge is bound to: method, full
+/// request authority and path with query, so a credential for one route never
+/// runs another's handler even when their payment terms are equal. The API is
+/// selected by the first host label alone, so the whole authority is bound:
+/// two hosts sharing that label may front different upstream operations.
 fn charge_route(req: &GateRequest<'_>, subdomain: &str, path: &str) -> String {
     let query = req.query.map(|q| format!("?{q}")).unwrap_or_default();
+    let authority = req
+        .host
+        .map(canonical_authority)
+        .filter(|authority| !authority.is_empty())
+        .unwrap_or_else(|| subdomain.to_string());
     format!(
-        "{} {subdomain}/{}{query}",
+        "{} {authority}/{}{query}",
         req.method,
         path.trim_start_matches('/')
     )
+}
+
+/// One spelling per authority: hostnames are case-insensitive and may carry
+/// a trailing root dot. The port is kept as presented, so `host` and
+/// `host:8443` are distinct routes.
+fn canonical_authority(host: &str) -> String {
+    let host = host.trim().to_ascii_lowercase();
+    match host.rsplit_once(':') {
+        Some((name, port)) if port.bytes().all(|b| b.is_ascii_digit()) => {
+            format!("{}:{port}", name.trim_end_matches('.'))
+        }
+        _ => host.trim_end_matches('.').to_string(),
+    }
 }
 
 /// The request identity an x402 `upto` authorization is bound to: method,
@@ -2980,6 +3000,39 @@ mod tests {
             network: "solana:devnet".to_string(),
             amount: "500".to_string(),
         }
+    }
+
+    #[test]
+    fn charge_route_binds_the_full_request_authority() {
+        let get = Method::GET;
+        let route = |host: Option<&'static str>| {
+            let mut request = req(&get, "reports");
+            request.host = host;
+            charge_route(&request, "api", "reports")
+        };
+        assert_eq!(
+            route(Some("api.example.com")),
+            "GET api.example.com/reports"
+        );
+        // Hosts sharing the API label are different routes.
+        assert_ne!(
+            route(Some("api.example.com")),
+            route(Some("api.attacker.net"))
+        );
+        assert_ne!(
+            route(Some("api.example.com")),
+            route(Some("api.example.com:8443"))
+        );
+        // Spellings of one authority are one route.
+        assert_eq!(
+            route(Some("API.Example.com.")),
+            route(Some("api.example.com"))
+        );
+        assert_eq!(
+            route(Some("api.example.com.:8443")),
+            route(Some("api.example.com:8443"))
+        );
+        assert_eq!(route(None), "GET api/reports");
     }
 
     #[test]
