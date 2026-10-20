@@ -57,6 +57,16 @@ pub const STRIP_HEADERS: &[&str] = &[
     "x-pay-wallet-resolver-proof",
     "x-pay-payment-policy",
     "x-pay-payment-policy-version",
+    // Caller-supplied proxy routing metadata. The gateway admitted the request
+    // for its own Host; a host-aware upstream must not be steered to another
+    // tenant or resource under the gateway's upstream credential.
+    "forwarded",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-forwarded-port",
+    "x-forwarded-prefix",
+    "x-forwarded-for",
+    "x-real-ip",
 ];
 
 /// Return an upstream URL that is safe to attach to logs and traces.
@@ -2274,6 +2284,43 @@ mod tests {
         assert!(STRIP_HEADERS.contains(&"x-pay-verified-payer"));
         assert!(STRIP_HEADERS.contains(&"x-pay-verified-channel"));
         assert!(STRIP_HEADERS.contains(&"x-pay-original-host"));
+    }
+
+    #[tokio::test]
+    async fn caller_proxy_routing_headers_never_reach_the_upstream() {
+        let api = make_api("test");
+        let mut headers = HeaderMap::new();
+        for name in [
+            "forwarded",
+            "x-forwarded-host",
+            "x-forwarded-proto",
+            "x-forwarded-port",
+            "x-forwarded-prefix",
+            "x-forwarded-for",
+            "x-real-ip",
+        ] {
+            headers.insert(name, HeaderValue::from_static("other-tenant.example"));
+        }
+        // Positive control: ordinary caller headers still pass through.
+        headers.insert("x-request-id", HeaderValue::from_static("abc"));
+        let UpstreamPlan::Forward(prepared) = prepare_upstream_with_identity(
+            &api,
+            &Method::POST,
+            &"/summary".parse().unwrap(),
+            &headers,
+            &[],
+            None,
+        )
+        .await
+        .unwrap() else {
+            panic!("expected proxy forwarding");
+        };
+        for (name, _) in &headers {
+            if name.as_str() != "x-request-id" {
+                assert_eq!(prepared.header_value(name.as_str()), None, "{name}");
+            }
+        }
+        assert_eq!(prepared.header_value("x-request-id"), Some("abc"));
     }
 
     #[tokio::test]
