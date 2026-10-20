@@ -603,16 +603,17 @@ async fn plan_steps(
                     instructions: vec![channel::build_seal_ix(&address)],
                     effect: "permissionlessly seal the channel (grace elapsed)".into(),
                 });
-                let dist = build_distribute_step(
-                    rpc,
-                    rpc_url,
-                    decoded,
-                    &me,
-                    treasury_owner,
-                    &token_program,
-                )
-                .await?;
-                steps.push(dist);
+                steps.extend(
+                    build_distribute_step(
+                        rpc,
+                        rpc_url,
+                        decoded,
+                        &me,
+                        treasury_owner,
+                        &token_program,
+                    )
+                    .await?,
+                );
             } else {
                 info!(
                     channel = %address,
@@ -623,10 +624,10 @@ async fn plan_steps(
             }
         }
         STATUS_SEALED => {
-            let dist =
+            steps.extend(
                 build_distribute_step(rpc, rpc_url, decoded, &me, treasury_owner, &token_program)
-                    .await?;
-            steps.push(dist);
+                    .await?,
+            );
         }
         STATUS_DISTRIBUTED => {
             let reclaim_slot = decoded
@@ -660,7 +661,10 @@ async fn plan_steps(
 }
 
 /// Build the `distribute` step, recovering + verifying the distribution
-/// preimage from the channel's open transaction first.
+/// preimage from the channel's open transaction first. A closed payer refund
+/// account is recreated only when the payer itself runs the job; any other
+/// operator would fund rent the payer reclaims by closing it again, so the
+/// step waits for the payer instead.
 async fn build_distribute_step(
     rpc: &RpcClient,
     rpc_url: &str,
@@ -668,7 +672,23 @@ async fn build_distribute_step(
     fee_payer: &Pubkey,
     treasury_owner: &Pubkey,
     token_program: &Pubkey,
-) -> Result<PlannedStep, JobError> {
+) -> Result<Option<PlannedStep>, JobError> {
+    let mut instructions = Vec::new();
+    if channel::payer_refund_account(rpc, rpc_url, decoded, token_program).await?
+        == channel::RefundAccount::Closed
+    {
+        if *fee_payer != decoded.payer() {
+            warn!(
+                channel = %decoded.address,
+                "payer refund account is closed; distribution waits for the payer to recreate it"
+            );
+            return Ok(None);
+        }
+        instructions.push(channel::payer_funded_refund_account_ix(
+            decoded,
+            token_program,
+        ));
+    }
     let preimage = channel::recover_distribution_preimage(rpc, rpc_url, decoded).await?;
     let recipients = preimage.recipients.len();
     let (ix, accounts) =
@@ -683,14 +703,12 @@ async fn build_distribute_step(
         recipient_atas = ?accounts.recipient_atas,
         "distribute accounts derived"
     );
-    Ok(PlannedStep {
+    instructions.push(ix);
+    Ok(Some(PlannedStep {
         kind: StepKind::Distribute,
-        instructions: vec![
-            channel::payer_refund_account_ix(fee_payer, decoded, token_program),
-            ix,
-        ],
+        instructions,
         effect: format!("refund payer + pay {recipients} recipient(s) + tombstone channel"),
-    })
+    }))
 }
 
 #[derive(Default)]

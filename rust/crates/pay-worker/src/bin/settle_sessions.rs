@@ -2618,8 +2618,14 @@ async fn reconcile_batch_channel(
                     onchain.channel.settlement.payout_watermark,
                     threshold,
                 )
-            });
-            if !should_distribute {
+            }) && target_settled
+                > onchain.channel.settlement.payout_watermark;
+            let distribution = if should_distribute {
+                batch_distribution(rpc, rpc_url, &onchain, treasury_owner, token_programs).await?
+            } else {
+                None
+            };
+            let Some(distribution) = distribution else {
                 if kind == BatchCandidateKind::Payout {
                     return Ok(BatchReconcileResult {
                         channel_id: state_channel_id,
@@ -2637,7 +2643,7 @@ async fn reconcile_batch_channel(
                     candidate: Some(BatchCandidate {
                         channel_id: state_channel_id,
                         instructions,
-                        kind,
+                        kind: BatchCandidateKind::Claim,
                         store_action: BatchStoreAction::Keep,
                         before: snapshot,
                         after: inventory_snapshot(
@@ -2657,37 +2663,8 @@ async fn reconcile_batch_channel(
                     escrow_active: Some(true),
                     observed_settled_on_chain: Some(onchain.channel.settlement.settled),
                 });
-            }
-            if target_settled <= onchain.channel.settlement.payout_watermark {
-                return Ok(BatchReconcileResult {
-                    channel_id: state_channel_id,
-                    candidate: None,
-                    delete_absent: false,
-                    snapshot,
-                    stablecoin_settled_base_units: settled_metric,
-                    stablecoin_distributed_base_units: distributed_metric,
-                    escrow_active: Some(true),
-                    observed_settled_on_chain: Some(onchain.channel.settlement.settled),
-                });
-            }
-            let token_program = token_programs
-                .get(&onchain.mint())
-                .copied()
-                .ok_or_else(|| {
-                    JobError::TxBuild(format!(
-                        "token program unavailable for batch channel mint {}",
-                        onchain.mint()
-                    ))
-                })?;
-            let preimage = channel::recover_distribution_preimage(rpc, rpc_url, &onchain).await?;
-            instructions.push(channel::payer_refund_account_ix(
-                operator,
-                &onchain,
-                &token_program,
-            ));
-            instructions.push(
-                channel::build_distribute_ix(&onchain, treasury_owner, &token_program, &preimage).0,
-            );
+            };
+            instructions.push(distribution);
             (
                 kind,
                 BatchStoreAction::Keep,
@@ -2748,36 +2725,13 @@ async fn reconcile_batch_channel(
                     JobError::TxBuild(format!("settle-and-seal instruction: {error}"))
                 })?,
             );
-            let token_program = token_programs
-                .get(&onchain.mint())
-                .copied()
-                .ok_or_else(|| {
-                    JobError::TxBuild(format!(
-                        "token program unavailable for batch channel mint {}",
-                        onchain.mint()
-                    ))
-                })?;
-            let preimage = channel::recover_distribution_preimage(rpc, rpc_url, &onchain).await?;
-            instructions.push(channel::payer_refund_account_ix(
-                operator,
-                &onchain,
-                &token_program,
-            ));
-            instructions.push(
-                channel::build_distribute_ix(&onchain, treasury_owner, &token_program, &preimage).0,
-            );
-            (
-                BatchCandidateKind::FinalizeClose,
-                BatchStoreAction::MarkFinalized,
-                inventory_snapshot(
-                    true,
-                    STATUS_DISTRIBUTED,
-                    target_settled,
-                    target_settled,
-                    state.cumulative,
-                    &onchain.mint(),
-                ),
+            sealed_close(
+                &mut instructions,
+                batch_distribution(rpc, rpc_url, &onchain, treasury_owner, token_programs).await?,
                 target_settled,
+                onchain.channel.settlement.payout_watermark,
+                state.cumulative,
+                &onchain.mint(),
             )
         }
         STATUS_CLOSING if now >= onchain.close_deadline() => {
@@ -2791,57 +2745,31 @@ async fn reconcile_batch_channel(
                 )));
             }
             instructions.push(channel::build_seal_ix(&channel_id));
-            let token_program = token_programs
-                .get(&onchain.mint())
-                .copied()
-                .ok_or_else(|| {
-                    JobError::TxBuild(format!(
-                        "token program unavailable for batch channel mint {}",
-                        onchain.mint()
-                    ))
-                })?;
-            let preimage = channel::recover_distribution_preimage(rpc, rpc_url, &onchain).await?;
-            instructions.push(channel::payer_refund_account_ix(
-                operator,
-                &onchain,
-                &token_program,
-            ));
-            instructions.push(
-                channel::build_distribute_ix(&onchain, treasury_owner, &token_program, &preimage).0,
-            );
-            (
-                BatchCandidateKind::FinalizeClose,
-                BatchStoreAction::MarkFinalized,
-                inventory_snapshot(
-                    true,
-                    STATUS_DISTRIBUTED,
-                    onchain.channel.settlement.settled,
-                    onchain.channel.settlement.settled,
-                    state.cumulative,
-                    &onchain.mint(),
-                ),
+            sealed_close(
+                &mut instructions,
+                batch_distribution(rpc, rpc_url, &onchain, treasury_owner, token_programs).await?,
                 onchain.channel.settlement.settled,
+                onchain.channel.settlement.payout_watermark,
+                state.cumulative,
+                &onchain.mint(),
             )
         }
         STATUS_SEALED => {
-            let token_program = token_programs
-                .get(&onchain.mint())
-                .copied()
-                .ok_or_else(|| {
-                    JobError::TxBuild(format!(
-                        "token program unavailable for batch channel mint {}",
-                        onchain.mint()
-                    ))
-                })?;
-            let preimage = channel::recover_distribution_preimage(rpc, rpc_url, &onchain).await?;
-            instructions.push(channel::payer_refund_account_ix(
-                operator,
-                &onchain,
-                &token_program,
-            ));
-            instructions.push(
-                channel::build_distribute_ix(&onchain, treasury_owner, &token_program, &preimage).0,
-            );
+            let Some(distribution) =
+                batch_distribution(rpc, rpc_url, &onchain, treasury_owner, token_programs).await?
+            else {
+                return Ok(BatchReconcileResult {
+                    channel_id: state_channel_id,
+                    candidate: None,
+                    delete_absent: false,
+                    snapshot,
+                    stablecoin_settled_base_units: settled_metric,
+                    stablecoin_distributed_base_units: distributed_metric,
+                    escrow_active: Some(true),
+                    observed_settled_on_chain: Some(onchain.channel.settlement.settled),
+                });
+            };
+            instructions.push(distribution);
             (
                 BatchCandidateKind::Payout,
                 BatchStoreAction::MarkFinalized,
@@ -2908,6 +2836,84 @@ async fn reconcile_batch_channel(
         escrow_active: Some(onchain.channel.status != STATUS_DISTRIBUTED),
         observed_settled_on_chain: Some(onchain.channel.settlement.settled),
     })
+}
+
+/// The batch `distribute` for `onchain`, or `None` while the payer's refund
+/// account is closed. The worker never recreates that account itself: its
+/// rent would return to the payer on the next close, so recreating it on
+/// every payout lets a payer drain the operator. The claim or seal lands
+/// alone and the payout follows once the payer recreates the account.
+async fn batch_distribution(
+    rpc: &RpcClient,
+    rpc_url: &str,
+    onchain: &channel::DecodedChannel,
+    treasury_owner: &Pubkey,
+    token_programs: &HashMap<Pubkey, Pubkey>,
+) -> Result<Option<solana_instruction::Instruction>, JobError> {
+    let token_program = token_programs
+        .get(&onchain.mint())
+        .copied()
+        .ok_or_else(|| {
+            JobError::TxBuild(format!(
+                "token program unavailable for batch channel mint {}",
+                onchain.mint()
+            ))
+        })?;
+    if channel::payer_refund_account(rpc, rpc_url, onchain, &token_program).await?
+        == channel::RefundAccount::Closed
+    {
+        warn!(
+            channel_id = %onchain.address,
+            "payer refund account is closed; deferring distribution"
+        );
+        return Ok(None);
+    }
+    let preimage = channel::recover_distribution_preimage(rpc, rpc_url, onchain).await?;
+    Ok(Some(
+        channel::build_distribute_ix(onchain, treasury_owner, &token_program, &preimage).0,
+    ))
+}
+
+/// Finish a batch close that seals `settled`: with its distribution it is
+/// terminal, without it only the seal lands and the record stays for the
+/// sealed-channel payout.
+fn sealed_close(
+    instructions: &mut Vec<solana_instruction::Instruction>,
+    distribution: Option<solana_instruction::Instruction>,
+    settled: u64,
+    payout_watermark: u64,
+    cumulative: u64,
+    mint: &Pubkey,
+) -> (
+    BatchCandidateKind,
+    BatchStoreAction,
+    ChannelInventorySnapshot,
+    u64,
+) {
+    match distribution {
+        Some(distribution) => {
+            instructions.push(distribution);
+            (
+                BatchCandidateKind::FinalizeClose,
+                BatchStoreAction::MarkFinalized,
+                inventory_snapshot(true, STATUS_DISTRIBUTED, settled, settled, cumulative, mint),
+                settled,
+            )
+        }
+        None => (
+            BatchCandidateKind::FinalizeClose,
+            BatchStoreAction::Keep,
+            inventory_snapshot(
+                true,
+                STATUS_SEALED,
+                settled,
+                payout_watermark,
+                cumulative,
+                mint,
+            ),
+            settled,
+        ),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3386,35 +3392,66 @@ async fn build_idle_close_candidate(
         return Ok(None);
     };
 
-    let (distribution, token_program) = if let Some(config) = bound_config {
-        let token_program = config
-            .token_program
-            .ok_or_else(|| binding_error("missing token program"))?;
-        channel::require_token_program(rpc, rpc_url, &onchain.mint(), &token_program).await?;
-        (
-            bound_distribution_instruction(config, onchain, treasury_owner, &token_program)?,
-            token_program,
-        )
-    } else {
-        let token_program = channel::resolve_token_program(rpc, rpc_url, &onchain.mint()).await?;
-        let preimage = channel::recover_distribution_preimage(rpc, rpc_url, onchain).await?;
-        (
-            channel::build_distribute_ix_for_program(
-                onchain,
-                treasury_owner,
-                &token_program,
-                &preimage,
-                &program,
-            )
-            .0,
-            token_program,
-        )
+    let token_program = match bound_config {
+        Some(config) => {
+            let token_program = config
+                .token_program
+                .ok_or_else(|| binding_error("missing token program"))?;
+            channel::require_token_program(rpc, rpc_url, &onchain.mint(), &token_program).await?;
+            token_program
+        }
+        None => channel::resolve_token_program(rpc, rpc_url, &onchain.mint()).await?,
     };
-    instructions.push(channel::payer_refund_account_ix(
-        operator,
-        onchain,
-        &token_program,
-    ));
+    // Never recreated at the operator's expense (see `batch_distribution`):
+    // with the payer's refund account closed only the close lands, and the
+    // sealed channel is distributed once the payer recreates it.
+    if channel::payer_refund_account(rpc, rpc_url, onchain, &token_program).await?
+        == channel::RefundAccount::Closed
+    {
+        warn!(
+            channel_id = %state.channel_id,
+            "payer refund account is closed; closing without distributing"
+        );
+        if instructions.is_empty() {
+            return Ok(None);
+        }
+        let before = inventory_snapshot(
+            state.sealed,
+            onchain.channel.status,
+            onchain.channel.settlement.settled,
+            onchain.channel.settlement.payout_watermark,
+            state.cumulative,
+            &onchain.mint(),
+        );
+        let after = inventory_snapshot(
+            true,
+            STATUS_SEALED,
+            onchain.channel.settlement.settled.max(state.cumulative),
+            onchain.channel.settlement.payout_watermark,
+            state.cumulative,
+            &onchain.mint(),
+        );
+        return Ok(Some(SettlementCandidate {
+            channel_id: state.channel_id.clone(),
+            instructions,
+            kind: CandidateKind::Watermark,
+            before,
+            after,
+        }));
+    }
+    let distribution = if let Some(config) = bound_config {
+        bound_distribution_instruction(config, onchain, treasury_owner, &token_program)?
+    } else {
+        let preimage = channel::recover_distribution_preimage(rpc, rpc_url, onchain).await?;
+        channel::build_distribute_ix_for_program(
+            onchain,
+            treasury_owner,
+            &token_program,
+            &preimage,
+            &program,
+        )
+        .0
+    };
     instructions.push(distribution);
     let before = inventory_snapshot(
         state.sealed,
@@ -4356,7 +4393,7 @@ mod tests {
         )
         .0;
         let distribution = candidate.instructions.last().unwrap();
-        assert_refund_account_precedes_distribute(&candidate.instructions, &operator);
+        assert_operator_funds_no_account(&candidate.instructions, &operator);
         assert_eq!(distribution.program_id, program);
         assert_eq!(distribution.data, base.data);
         assert_eq!(
@@ -5559,12 +5596,35 @@ mod tests {
         operator: &Pubkey,
         now: i64,
     ) -> Result<BatchReconcileResult, JobError> {
-        let rpc = RpcClient::new(Duration::from_millis(10)).unwrap();
-        let token_programs =
-            HashMap::from([(onchain.mint(), pay_api_core::ata::SPL_TOKEN_PROGRAM_ID)]);
-        reconcile_batch_channel(
+        reconcile_batch_with_refund_account(state, onchain, operator, now, None, true).await
+    }
+
+    /// Reconcile against an RPC whose only account read is the payer's
+    /// refund account, live or closed.
+    async fn reconcile_batch_with_refund_account(
+        state: ChannelState,
+        onchain: &channel::DecodedChannel,
+        operator: &Pubkey,
+        now: i64,
+        distribution_threshold_base_units: Option<u64>,
+        refund_live: bool,
+    ) -> Result<BatchReconcileResult, JobError> {
+        let token = pay_api_core::ata::SPL_TOKEN_PROGRAM_ID;
+        let refund =
+            pay_api_core::ata::associated_token_address(&onchain.payer(), &onchain.mint(), &token);
+        let (url, server) = spawn_rpc(move |request| {
+            assert_eq!(request["method"], "getMultipleAccounts");
+            assert_eq!(request["params"][0][0], refund.to_string());
+            let account = refund_live
+                .then(|| serde_json::json!({"owner": token.to_string(), "data": ["", "base64"]}));
+            serde_json::json!({"context": {"slot": 1}, "value": [account]})
+        })
+        .await;
+        let rpc = RpcClient::new(Duration::from_secs(5)).unwrap();
+        let token_programs = HashMap::from([(onchain.mint(), token)]);
+        let result = reconcile_batch_channel(
             &rpc,
-            "http://127.0.0.1:1",
+            &url,
             state,
             Some(onchain.clone()),
             now,
@@ -5572,9 +5632,11 @@ mod tests {
             operator,
             &Pubkey::new_unique(),
             &token_programs,
-            None,
+            distribution_threshold_base_units,
         )
-        .await
+        .await;
+        server.abort();
+        result
     }
 
     #[tokio::test]
@@ -5635,56 +5697,91 @@ mod tests {
         assert_eq!(candidate.settled_on_chain, 350);
     }
 
-    fn assert_refund_account_precedes_distribute(
+    /// The worker never funds an account creation: every ATA create it
+    /// would pay for is rent a payer can reclaim by closing the account.
+    fn assert_operator_funds_no_account(
         instructions: &[solana_instruction::Instruction],
         operator: &Pubkey,
     ) {
-        use pay_kit::generated::payment_channels::generated::instructions::DISTRIBUTE_DISCRIMINATOR;
-        let position = instructions
-            .iter()
-            .position(|ix| {
-                ix.data.first() == Some(&DISTRIBUTE_DISCRIMINATOR) && ix.accounts.len() >= 11
-            })
-            .expect("distribute instruction");
-        let create = &instructions[position - 1];
-        assert_eq!(
-            create.program_id,
-            payment_channels::to_address(&pay_api_core::ata::ATA_PROGRAM_ID)
-        );
-        assert_eq!(create.data, vec![1], "CreateIdempotent");
-        assert_eq!(
-            create.accounts[0].pubkey,
-            payment_channels::to_address(operator)
-        );
-        assert_eq!(
-            create.accounts[1].pubkey, instructions[position].accounts[4].pubkey,
-            "the refund account distribute writes"
+        let ata_program = payment_channels::to_address(&pay_api_core::ata::ATA_PROGRAM_ID);
+        assert!(
+            !instructions.iter().any(|ix| ix.program_id == ata_program
+                && ix.accounts.first().map(|meta| meta.pubkey)
+                    == Some(payment_channels::to_address(operator))),
+            "operator-funded account create"
         );
     }
 
-    #[tokio::test]
-    async fn every_batch_distribution_recreates_a_closed_payer_refund_account() {
-        let (state, mut onchain, operator) = batch_closing_fixture();
-        // Already sealed by another crank: distribute alone, refund account first.
-        onchain.channel.status = STATUS_SEALED;
-        let candidate = reconcile_closing_batch(state.clone(), &onchain, &operator, 0)
-            .await
-            .unwrap()
-            .candidate
-            .unwrap();
-        assert_eq!(candidate.instructions.len(), 2);
-        assert_refund_account_precedes_distribute(&candidate.instructions, &operator);
+    fn distributes(instructions: &[solana_instruction::Instruction]) -> bool {
+        use pay_kit::generated::payment_channels::generated::instructions::DISTRIBUTE_DISCRIMINATOR;
+        instructions
+            .iter()
+            .any(|ix| ix.data.first() == Some(&DISTRIBUTE_DISCRIMINATOR) && ix.accounts.len() >= 11)
+    }
 
-        // In-grace settle-and-seal plus distribute.
-        onchain.channel.status = STATUS_CLOSING;
-        let mut frozen = state;
+    #[tokio::test]
+    async fn batch_distribution_never_funds_the_payer_refund_account() {
+        let (state, mut onchain, operator) = batch_closing_fixture();
+        let mut frozen = state.clone();
         frozen.freeze_watermark_at(frozen.cumulative);
-        let candidate = reconcile_closing_batch(frozen, &onchain, &operator, 1_010)
+        let mut settled = state.clone();
+        settled.cumulative = 100;
+        settled.freeze_watermark_at(100);
+        let past = onchain.close_deadline();
+        let cases = [
+            (STATUS_SEALED, state.clone(), 0),
+            (STATUS_CLOSING, frozen, 1_010),
+            (STATUS_CLOSING, settled, past),
+            (STATUS_OPEN, state, 0),
+        ];
+        for (status, state, now) in cases {
+            onchain.channel.status = status;
+            // Live refund account: the payout rides along, with no create.
+            let live = reconcile_batch_with_refund_account(
+                state.clone(),
+                &onchain,
+                &operator,
+                now,
+                Some(1),
+                true,
+            )
             .await
             .unwrap()
             .candidate
             .unwrap();
-        assert_refund_account_precedes_distribute(&candidate.instructions, &operator);
+            assert!(distributes(&live.instructions), "status {status}");
+            assert_operator_funds_no_account(&live.instructions, &operator);
+
+            // Closed by the payer: the claim or seal lands alone and the
+            // record stays for the payout once the payer recreates it.
+            let closed = reconcile_batch_with_refund_account(
+                state,
+                &onchain,
+                &operator,
+                now,
+                Some(1),
+                false,
+            )
+            .await
+            .unwrap();
+            assert_operator_funds_no_account(
+                closed
+                    .candidate
+                    .as_ref()
+                    .map_or(&[][..], |candidate| &candidate.instructions),
+                &operator,
+            );
+            match closed.candidate {
+                None => assert_eq!(status, STATUS_SEALED),
+                Some(candidate) => {
+                    assert!(!distributes(&candidate.instructions), "status {status}");
+                    assert!(!candidate.instructions.is_empty());
+                    assert!(matches!(candidate.store_action, BatchStoreAction::Keep));
+                    assert_ne!(candidate.kind, BatchCandidateKind::ClaimAndPayout);
+                    assert!(!candidate.after.rent_unclaimed, "not distributed");
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -5849,7 +5946,8 @@ mod tests {
             .unwrap();
         assert_eq!(candidate.kind, BatchCandidateKind::FinalizeClose);
         assert_eq!(candidate.settled_on_chain, 100);
-        assert_eq!(candidate.instructions.len(), 3);
+        // Seal then distribute; the worker never funds a refund account.
+        assert_eq!(candidate.instructions.len(), 2);
     }
 
     fn test_runtime() -> SettlementRuntime {

@@ -43,14 +43,14 @@ pub const CHANNEL_ACCOUNT_SIZE: usize = 256;
 /// Accounts `distribute` names before its recipient-ATA tail.
 const DISTRIBUTE_FIXED_ACCOUNTS: usize = 11;
 
-/// Keys the payer refund-account create adds beyond `distribute`'s own: the
-/// associated-token and system programs.
+/// Keys a payer-funded refund-account create adds beyond `distribute`'s own:
+/// the associated-token and system programs.
 const REFUND_ACCOUNT_CREATE_KEYS: usize = 2;
 
 /// The most recipients whose distribution still fits one transaction on its
 /// own: a version-1 message's static keys hold the fixed `distribute`
-/// accounts, the refund-account create, a distinct fee payer and one ATA per
-/// recipient. A larger plan cannot be paid out by this worker, so recovery
+/// accounts, a payer-funded refund-account create, a distinct fee payer and
+/// one ATA per recipient. A larger plan cannot be paid out by this worker, so recovery
 /// reports it instead of retrying a transaction that can never be built.
 pub const MAX_DISTRIBUTION_RECIPIENTS: usize = pay_kit::core::tx::TxVersion::V1
     .limits()
@@ -718,26 +718,63 @@ pub fn build_top_up_ix(
         .instruction()
 }
 
-/// Idempotently create the payer's refund token account. `distribute` writes
-/// the refund there, and the payer can close an emptied account at any time;
-/// without it the distribution, and every channel co-batched with it, fails.
-pub fn payer_refund_account_ix(
-    fee_payer: &Pubkey,
+/// Whether the payer's refund token account, which `distribute` writes, is
+/// live at the confirmed commitment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefundAccount {
+    /// Owned by the channel's token program: `distribute` can land.
+    Live,
+    /// Absent (or not a token account): `distribute` would fail, and with it
+    /// every channel co-batched in the same transaction.
+    Closed,
+}
+
+/// Read the payer's refund account. The payer can close an emptied account at
+/// any time, and the worker never recreates it at the operator's expense (the
+/// rent would go straight back to the payer on the next close), so a closed
+/// account defers distribution until the payer recreates it.
+pub async fn payer_refund_account(
+    rpc: &RpcClient,
+    rpc_url: &str,
+    channel: &DecodedChannel,
+    token_program: &Pubkey,
+) -> Result<RefundAccount, JobError> {
+    let address = associated_token_address(&channel.payer(), &channel.mint(), token_program);
+    let account = rpc
+        .get_multiple_accounts_with_owner(rpc_url, &[address.to_string()])
+        .await?
+        .into_iter()
+        .next()
+        .flatten();
+    Ok(
+        if account.is_some_and(|account| account.owner == token_program.to_string()) {
+            RefundAccount::Live
+        } else {
+            RefundAccount::Closed
+        },
+    )
+}
+
+/// Idempotently create the payer's refund token account, funded by the payer
+/// itself. Only a payer-signed transaction can carry it: the funder is fixed
+/// to the channel payer so no operator ever pays rent the payer can reclaim.
+pub fn payer_funded_refund_account_ix(
     channel: &DecodedChannel,
     token_program: &Pubkey,
 ) -> Instruction {
     pay_kit::core::payment_channels::build_create_associated_token_account_instruction(
-        fee_payer,
+        &channel.payer(),
         &channel.payer(),
         &channel.mint(),
         token_program,
     )
 }
 
-/// When `instructions` (a close followed by the payer refund-account create
-/// and `distribute`) cannot be built as one `version` transaction, drop the
-/// distribution so the close lands alone; the next pass reads the sealed
-/// channel and distributes it by itself. Returns whether it split.
+/// When `instructions` (a close followed by `distribute`, optionally preceded
+/// by the payer's own refund-account create) cannot be built as one `version`
+/// transaction, drop the distribution so the close lands alone; the next pass
+/// reads the sealed channel and distributes it by itself. Returns whether it
+/// split.
 pub fn defer_oversized_distribution(
     instructions: &mut Vec<Instruction>,
     fee_payer: &Pubkey,
@@ -745,13 +782,19 @@ pub fn defer_oversized_distribution(
 ) -> bool {
     use pay_kit::generated::payment_channels::generated::instructions::DISTRIBUTE_DISCRIMINATOR;
     let ata_program = to_address(&pay_api_core::ata::ATA_PROGRAM_ID);
-    let Some(split) = instructions.windows(2).position(|pair| {
-        pair[0].program_id == ata_program
-            && pair[0].data == [1]
-            && pair[1].data.first() == Some(&DISTRIBUTE_DISCRIMINATOR)
+    let Some(mut split) = instructions.iter().rposition(|ix| {
+        ix.program_id != ata_program
+            && ix.data.first() == Some(&DISTRIBUTE_DISCRIMINATOR)
+            && ix.accounts.len() >= DISTRIBUTE_FIXED_ACCOUNTS
     }) else {
         return false;
     };
+    if split > 0
+        && instructions[split - 1].program_id == ata_program
+        && instructions[split - 1].data == [1]
+    {
+        split -= 1;
+    }
     if split == 0
         || pay_kit::core::tx::build_unsigned(
             version,
@@ -1103,7 +1146,7 @@ mod tests {
     }
 
     #[test]
-    fn payer_refund_account_is_recreated_idempotently_at_the_distribute_slot() {
+    fn only_the_payer_ever_funds_its_refund_account() {
         let mut bytes = vec![0; CHANNEL_ACCOUNT_SIZE];
         bytes[0] = 1;
         bytes[1] = 1;
@@ -1112,9 +1155,8 @@ mod tests {
             .unwrap();
         channel.channel.payer = to_address(&Pubkey::new_unique());
         channel.channel.mint = to_address(&Pubkey::new_unique());
-        let fee_payer = Pubkey::new_unique();
         for token_program in [SPL_TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID] {
-            let create = payer_refund_account_ix(&fee_payer, &channel, &token_program);
+            let create = payer_funded_refund_account_ix(&channel, &token_program);
             let (distribute, accounts) = build_distribute_ix(
                 &channel,
                 &Pubkey::new_unique(),
@@ -1124,19 +1166,78 @@ mod tests {
                     recipients: vec![],
                 },
             );
-            // CreateIdempotent, funded by the fee payer, for the exact refund account.
+            // CreateIdempotent for the exact refund account, funded by its owner.
             assert_eq!(create.data, vec![1]);
             assert_eq!(
                 create.program_id,
                 to_address(&pay_api_core::ata::ATA_PROGRAM_ID)
             );
-            assert_eq!(create.accounts[0].pubkey, to_address(&fee_payer));
+            assert_eq!(create.accounts[0].pubkey, channel.channel.payer);
             assert!(create.accounts[0].is_signer);
             assert_eq!(create.accounts[1].pubkey, to_address(&accounts.payer_ata));
             assert_eq!(distribute.accounts[4].pubkey, create.accounts[1].pubkey);
             assert_eq!(create.accounts[2].pubkey, channel.channel.payer);
             assert_eq!(create.accounts[5].pubkey, to_address(&token_program));
         }
+    }
+
+    #[tokio::test]
+    async fn a_closed_refund_account_is_reported_closed() {
+        use axum::{Json, Router, routing::post};
+        let rpc = RpcClient::new(std::time::Duration::from_secs(5)).unwrap();
+        let mut bytes = vec![0; CHANNEL_ACCOUNT_SIZE];
+        bytes[0] = 1;
+        bytes[1] = 1;
+        let mut channel = decode_v1_channel(&Pubkey::new_unique(), &bytes)
+            .unwrap()
+            .unwrap();
+        channel.channel.payer = to_address(&Pubkey::new_unique());
+        channel.channel.mint = to_address(&Pubkey::new_unique());
+        let refund =
+            associated_token_address(&channel.payer(), &channel.mint(), &SPL_TOKEN_PROGRAM_ID);
+        let system = Pubkey::default().to_string();
+        let cases = [
+            (Some(SPL_TOKEN_PROGRAM_ID.to_string()), RefundAccount::Live),
+            (None, RefundAccount::Closed),
+            (Some(system), RefundAccount::Closed),
+            (
+                Some(TOKEN_2022_PROGRAM_ID.to_string()),
+                RefundAccount::Closed,
+            ),
+        ];
+        for (owner, expected) in cases {
+            let app = Router::new().route(
+                "/",
+                post(move |Json(request): Json<serde_json::Value>| {
+                    let owner = owner.clone();
+                    async move {
+                        assert_eq!(request["method"], "getMultipleAccounts");
+                        assert_eq!(request["params"][0][0], refund.to_string());
+                        let account = owner.map(
+                            |owner| serde_json::json!({"owner": owner, "data": ["", "base64"]}),
+                        );
+                        Json(serde_json::json!({
+                            "jsonrpc": "2.0", "id": 1,
+                            "result": {"context": {"slot": 1}, "value": [account]}
+                        }))
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let read = payer_refund_account(&rpc, &url, &channel, &SPL_TOKEN_PROGRAM_ID)
+                .await
+                .unwrap();
+            server.abort();
+            assert_eq!(read, expected);
+        }
+        // An unreachable RPC never reads as closed.
+        assert!(
+            payer_refund_account(&rpc, "http://127.0.0.1:1", &channel, &SPL_TOKEN_PROGRAM_ID)
+                .await
+                .is_err()
+        );
     }
 
     #[test]
@@ -1192,13 +1293,9 @@ mod tests {
         (channel, preimage)
     }
 
-    fn payout(
-        channel: &DecodedChannel,
-        preimage: &DistributionPreimage,
-        fee_payer: &Pubkey,
-    ) -> Vec<Instruction> {
+    fn payout(channel: &DecodedChannel, preimage: &DistributionPreimage) -> Vec<Instruction> {
         vec![
-            payer_refund_account_ix(fee_payer, channel, &SPL_TOKEN_PROGRAM_ID),
+            payer_funded_refund_account_ix(channel, &SPL_TOKEN_PROGRAM_ID),
             build_distribute_ix(
                 channel,
                 &Pubkey::new_unique(),
@@ -1218,7 +1315,7 @@ mod tests {
         build_unsigned(
             TxVersion::V1,
             &fee_payer,
-            &payout(&channel, &preimage, &fee_payer),
+            &payout(&channel, &preimage),
             solana_hash::Hash::default(),
             None,
         )
@@ -1260,16 +1357,25 @@ mod tests {
         )
         .unwrap();
         let mut combined = close.clone();
-        combined.extend(payout(&channel, &preimage, &fee_payer));
+        combined.extend(payout(&channel, &preimage));
         assert!(defer_oversized_distribution(
             &mut combined,
             &fee_payer,
             TxVersion::V1
         ));
         assert_eq!(combined, close);
+        // Without the payer's own create, the distribution alone is split off.
+        let mut bare = close.clone();
+        bare.push(payout(&channel, &preimage).pop().unwrap());
+        assert!(defer_oversized_distribution(
+            &mut bare,
+            &fee_payer,
+            TxVersion::V1
+        ));
+        assert_eq!(bare, close);
 
         // A distribution alone is never split, and a fitting pair is kept.
-        let mut alone = payout(&channel, &preimage, &fee_payer);
+        let mut alone = payout(&channel, &preimage);
         assert!(!defer_oversized_distribution(
             &mut alone,
             &fee_payer,
@@ -1278,7 +1384,7 @@ mod tests {
         assert_eq!(alone.len(), 2);
         let (small, small_preimage) = recipients_channel(2);
         let mut fitting = vec![build_seal_ix(&small.address)];
-        fitting.extend(payout(&small, &small_preimage, &fee_payer));
+        fitting.extend(payout(&small, &small_preimage));
         assert!(!defer_oversized_distribution(
             &mut fitting,
             &fee_payer,
