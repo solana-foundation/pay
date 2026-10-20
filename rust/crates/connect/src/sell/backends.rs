@@ -41,10 +41,51 @@ fn validate_session_storage(channel_version: Option<u8>) -> Result<(), String> {
     Ok(())
 }
 
+/// An RPC endpoint URL. Providers carry credentials in its path or query,
+/// so it shows as its origin only; [`RpcUrl::expose`] is for the client that
+/// dials it, never for a log line.
+#[derive(Clone)]
+pub struct RpcUrl(String);
+
+impl RpcUrl {
+    pub fn new(url: impl Into<String>) -> Self {
+        Self(url.into())
+    }
+
+    /// The full URL, credentials included.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    /// `text` (an RPC error, say) with the full URL replaced by its origin.
+    pub fn redact_in(&self, text: &str) -> String {
+        text.replace(&self.0, &self.to_string())
+    }
+}
+
+impl std::fmt::Display for RpcUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match url::Url::parse(&self.0) {
+            Ok(url) if url.has_host() => {
+                let origin = url.origin().ascii_serialization();
+                let elided = url.path() != "/" || url.query().is_some();
+                write!(f, "{origin}{}", if elided { "/…" } else { "" })
+            }
+            _ => f.write_str("[unparseable RPC URL]"),
+        }
+    }
+}
+
+impl std::fmt::Debug for RpcUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RpcUrl({self})")
+    }
+}
+
 /// The deployment's signing identity behind every seller's endpoint.
 pub struct Operator {
     pub signer: Arc<dyn TransactionSigner>,
-    pub rpc_url: String,
+    pub rpc_url: RpcUrl,
     pub challenge_binding_secret: String,
     /// Shared by every backend; refreshed by [`Operator::spawn_blockhash_refresh`].
     pub blockhashes: BlockhashCache,
@@ -64,7 +105,7 @@ impl Operator {
     ) -> Self {
         Self {
             signer,
-            rpc_url: rpc_url.into(),
+            rpc_url: RpcUrl::new(rpc_url),
             challenge_binding_secret: challenge_binding_secret.into(),
             blockhashes: BlockhashCache::new(),
             batch_store: None,
@@ -132,10 +173,13 @@ impl Operator {
         let cache = self.blockhashes.clone();
         let rpc_url = self.rpc_url.clone();
         let refresh = move || {
-            let rpc = RpcClient::new(rpc_url.clone());
+            let rpc = RpcClient::new(rpc_url.expose().to_string());
             match pay_kit::mpp::blockhash::fetch_blockhash_with_slot(&rpc, rpc.commitment()) {
                 Ok(entry) => cache.set(entry.blockhash, entry.last_valid_block_height, entry.slot),
-                Err(error) => tracing::warn!(%error, "sell operator blockhash refresh failed"),
+                Err(error) => tracing::warn!(
+                    error = %rpc_url.redact_in(&error.to_string()),
+                    "sell operator blockhash refresh failed"
+                ),
             }
         };
         refresh();
@@ -209,7 +253,7 @@ impl EndpointBackends {
             api.batch_settlement = None;
         }
         let network = sale.network.as_str();
-        let rpc_url = Some(operator.rpc_url.clone());
+        let rpc_url = Some(operator.rpc_url.expose().to_string());
         let mints: Vec<String> = sale
             .currencies
             .iter()
@@ -453,6 +497,36 @@ impl PaymentState for EndpointBackends {
     }
     fn fee_payer_signer(&self) -> Option<Arc<dyn TransactionSigner>> {
         Some(self.signer.clone())
+    }
+}
+
+#[cfg(test)]
+mod rpc_url_tests {
+    use super::RpcUrl;
+
+    /// Credentials ride in the query (Helius) or the path (QuickNode,
+    /// Alchemy); neither reaches a log line.
+    #[test]
+    fn an_rpc_url_shows_only_its_origin() {
+        for (raw, shown) in [
+            (
+                "https://mainnet.helius-rpc.com/?api-key=secret-1",
+                "https://mainnet.helius-rpc.com/…",
+            ),
+            (
+                "https://x.solana-mainnet.quiknode.pro/secret-2/",
+                "https://x.solana-mainnet.quiknode.pro/…",
+            ),
+            ("http://127.0.0.1:8899", "http://127.0.0.1:8899"),
+            ("not a url secret-3", "[unparseable RPC URL]"),
+        ] {
+            let url = RpcUrl::new(raw);
+            assert_eq!(url.to_string(), shown);
+            assert!(!format!("{url:?}").contains("secret"));
+            assert_eq!(url.expose(), raw);
+            let error = format!("error sending request for url ({raw})");
+            assert!(!url.redact_in(&error).contains("secret"), "{raw}");
+        }
     }
 }
 
