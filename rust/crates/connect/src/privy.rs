@@ -1165,7 +1165,7 @@ pub(crate) mod tests {
     }
 
     /// A JWKS endpoint whose document the test can replace or break.
-    async fn mock_jwks(doc: Arc<Mutex<Option<String>>>) -> String {
+    pub(crate) async fn mock_jwks(doc: Arc<Mutex<Option<String>>>) -> String {
         async fn serve(
             State(doc): State<Arc<Mutex<Option<String>>>>,
         ) -> Result<String, axum::http::StatusCode> {
@@ -1185,7 +1185,7 @@ pub(crate) mod tests {
         format!("http://{addr}/jwks.json")
     }
 
-    fn jwk(kid: &str, key: &SigningKey) -> serde_json::Value {
+    pub(crate) fn jwk(kid: &str, key: &SigningKey) -> serde_json::Value {
         use base64::Engine;
         let b64 = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
         let point = key.verifying_key().to_encoded_point(false);
@@ -1193,7 +1193,7 @@ pub(crate) mod tests {
                 "x": b64(point.x().unwrap()), "y": b64(point.y().unwrap()) })
     }
 
-    fn signed_by(key: &SigningKey, kid: &str, user: &str) -> String {
+    pub(crate) fn signed_by(key: &SigningKey, kid: &str, user: &str) -> String {
         let pem = key.to_pkcs8_pem(p256::pkcs8::LineEnding::LF).unwrap();
         let encoding = jsonwebtoken::EncodingKey::from_ec_pem(pem.as_bytes()).unwrap();
         let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);

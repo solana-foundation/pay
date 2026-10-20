@@ -1690,31 +1690,55 @@ pub async fn link_complete(
 /// consent page asks for a sign-in again. The tenant itself is untouched.
 /// With the Privy access token as bearer, that Privy session is signed out
 /// here too: it cannot approve again, and every connector and CLI token
-/// approved in it is revoked.
+/// approved in it is revoked. A bearer that cannot be verified (keys that
+/// cannot be refreshed, say) is a failed sign-out, never a silent success.
 pub async fn sign_out(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    #[cfg(feature = "privy")]
-    if let Some(privy) = state.privy()
-        && let Some(token) = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.trim().strip_prefix("Bearer "))
-        && let Ok(session) = privy.verify(token).map(|identity| identity.session.id)
-    {
-        privy.revoke_session(&session);
-        if let Some(store) = state.oauth() {
-            store.revoke_session(&session);
-        }
-        state.cli().revoke_session(&session);
-        tracing::info!("privy session signed out; derived tokens revoked");
-    }
-    #[cfg(not(feature = "privy"))]
-    let _ = headers;
-    let mut response = StatusCode::NO_CONTENT.into_response();
+    let mut response = match sign_out_session(&state, &headers).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => error.into_response(),
+    };
     response.headers_mut().insert(
         header::SET_COOKIE,
         crate::tenants::cookie::clear(state.public_url().starts_with("https://")),
     );
     response
+}
+
+/// Sign out the Privy session the request's bearer proves, if it has one.
+#[cfg(feature = "privy")]
+async fn sign_out_session(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    let (Some(privy), Some(token)) = (
+        state.privy(),
+        headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().strip_prefix("Bearer ")),
+    ) else {
+        return Ok(());
+    };
+    // The same refresh-aware check approval uses: a token signed by a key
+    // rotated in since the last fetch must still sign its session out.
+    let session = privy.authenticate(token).await.map_err(|why| {
+        tracing::info!(%why, "privy sign-out token refused");
+        ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "invalid_login",
+            "Your Privy sign-in could not be verified, so it was not signed out. Try again.",
+        )
+    })?;
+    let session = session.session.id;
+    privy.revoke_session(&session);
+    if let Some(store) = state.oauth() {
+        store.revoke_session(&session);
+    }
+    state.cli().revoke_session(&session);
+    tracing::info!("privy session signed out; derived tokens revoked");
+    Ok(())
+}
+
+#[cfg(not(feature = "privy"))]
+async fn sign_out_session(_state: &AppState, _headers: &HeaderMap) -> Result<(), ApiError> {
+    Ok(())
 }
 
 /// `POST /oauth/revoke` (RFC 7009): always 200, whatever the token was.
@@ -3303,6 +3327,57 @@ mod tests {
                     assert_eq!(state.tenants().get(&subject).unwrap().wallet_id, "w_moving");
                 }
             }
+        }
+
+        /// Sign-out verifies like approval does: a token signed by a key
+        /// Privy rotated in since the last JWKS fetch still signs its session
+        /// out, and a token that cannot be verified is a failed sign-out.
+        #[tokio::test]
+        async fn signing_out_with_a_rotated_key_still_revokes() {
+            use crate::privy::tests::{jwk, mock_jwks, signed_by};
+            use p256::ecdsa::SigningKey;
+            let first = SigningKey::random(&mut rand::rngs::OsRng);
+            let rotated = SigningKey::random(&mut rand::rngs::OsRng);
+            let doc = Arc::new(std::sync::Mutex::new(Some(
+                json!({ "keys": [jwk("kid_1", &first)] }).to_string(),
+            )));
+            let mock = Arc::new(MockPrivy::default());
+            let mut cfg = FakeApp::new(&mock_privy(mock.clone()).await).cfg;
+            cfg.verification_key = None;
+            cfg.jwks_url = mock_jwks(doc.clone()).await;
+            let state = AppState::new("https://cloud.test")
+                .with_mcp(crate::mcp::Config::new("https://cloud.test", vec![]))
+                .with_privy(crate::privy::Privy::connect(cfg).await.unwrap())
+                .with_spend_history(Arc::new(crate::tenants::FixedHistory(0)));
+            let app = crate::router(state.clone());
+            let client_id = register_grok(&app).await;
+            let (access, _) =
+                privy_tokens(&app, &client_id, &signed_by(&first, "kid_1", USER)).await;
+            let oauth = state.oauth().unwrap();
+            assert!(oauth.authenticate(&access).is_some());
+
+            let garbage = post_json_with(
+                &app,
+                "/api/session/logout",
+                json!({}),
+                None,
+                Some("garbage"),
+            )
+            .await;
+            assert_eq!(garbage.status, StatusCode::UNAUTHORIZED, "{}", garbage.body);
+            assert!(oauth.authenticate(&access).is_some());
+
+            *doc.lock().unwrap() = Some(json!({ "keys": [jwk("kid_2", &rotated)] }).to_string());
+            let out = post_json_with(
+                &app,
+                "/api/session/logout",
+                json!({}),
+                None,
+                Some(&signed_by(&rotated, "kid_2", USER)),
+            )
+            .await;
+            assert_eq!(out.status, StatusCode::NO_CONTENT, "{}", out.body);
+            assert!(oauth.authenticate(&access).is_none(), "access revoked");
         }
 
         #[tokio::test]
