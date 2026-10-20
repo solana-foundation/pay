@@ -385,7 +385,11 @@ async fn reconcile_existing_claim(
             Err(already_redeemed_resp(&signature))
         }
         Landing::Replaceable(proof) => {
-            match release_signed_claim(cfg, code, &raw, ReleaseProof::CannotLand(proof)).await {
+            let Some(proof) = ReleaseProof::cannot_land(state, rpc_url, &signature, proof).await
+            else {
+                return Err(pending_resp(&signature));
+            };
+            match release_signed_claim(cfg, code, &raw, proof).await {
                 Ok(_) => Ok(()),
                 Err(error) => {
                     warn!(%error, "redemption claim store unavailable");
@@ -426,9 +430,47 @@ impl ChainState for Cluster<'_> {
 /// Why a claim holding a signed payout may be released: nothing signed
 /// under it can ever land.
 enum ReleaseProof {
-    /// The chain proves the payout failed for good or expired unseen.
-    CannotLand(Replaceable),
+    /// The chain proves the payout failed for good.
+    Failed(Replaceable),
+    /// Its blockhash expired unseen, and the ledger's history has no record
+    /// of it either.
+    ExpiredUnseen(Replaceable, HistoryAbsent),
     NeverBroadcast(NeverBroadcast),
+}
+
+/// The ledger's transaction history has no record of the payout.
+struct HistoryAbsent(());
+
+impl ReleaseProof {
+    /// Turn a chain proof into a release. An expiry proof rests on a null
+    /// status, which a lagging or history-less RPC node also returns for a
+    /// payout that landed, so it additionally needs `getTransaction` to find
+    /// nothing; any doubt keeps the claim.
+    async fn cannot_land(
+        state: &AppState,
+        rpc_url: &str,
+        signature: &Signature,
+        proof: Replaceable,
+    ) -> Option<Self> {
+        if proof.reason() == ReplaceReason::Failed {
+            return Some(Self::Failed(proof));
+        }
+        match state
+            .rpc
+            .get_transaction_json_parsed(rpc_url, &signature.to_string())
+            .await
+        {
+            Ok(None) => Some(Self::ExpiredUnseen(proof, HistoryAbsent(()))),
+            Ok(Some(_)) => {
+                warn!(%signature, "expired payout has no status but is in history; keeping claim");
+                None
+            }
+            Err(error) => {
+                warn!(%error, %signature, "redemption history lookup failed");
+                None
+            }
+        }
+    }
 }
 
 /// The RPC rejected the payout in preflight, so it was never forwarded.
@@ -449,10 +491,12 @@ async fn release_signed_claim(
     proof: ReleaseProof,
 ) -> Result<bool, redis::RedisError> {
     let reason = match proof {
-        ReleaseProof::CannotLand(proof) => match proof.reason() {
-            ReplaceReason::Failed => "payout failed for good",
-            ReplaceReason::Expired => "payout expired unseen",
-        },
+        ReleaseProof::Failed(proof) | ReleaseProof::ExpiredUnseen(proof, HistoryAbsent(())) => {
+            match proof.reason() {
+                ReplaceReason::Failed => "payout failed for good",
+                ReplaceReason::Expired => "payout expired unseen",
+            }
+        }
         ReleaseProof::NeverBroadcast(_) => "payout rejected in preflight",
     };
     info!(reason, "releasing redemption claim");
@@ -1805,6 +1849,39 @@ pub(crate) mod tests {
             assert_eq!(body["signature"], first.to_string());
             assert_eq!(h.sent().len(), 1);
             assert_eq!(h.claim().await, Some(ClaimState::Confirmed(first)));
+        }
+
+        #[tokio::test]
+        async fn an_expired_payout_still_in_history_keeps_its_claim() {
+            let Some(h) = Harness::new().await else {
+                return;
+            };
+            h.rpc.lock().unwrap().next_status = None;
+            let destination = Pubkey::new_unique();
+            let (status, _) = h.redeem(&destination).await;
+            assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+            let first = h.sent()[0];
+            // Expired at finalized commitment with a null status, yet the
+            // ledger has the payout: the null is a lagging node, not proof.
+            {
+                let hot = h.hot_wallet();
+                let landed = h.payout_tx(&hot, &hot, Value::Null);
+                let mut rpc = h.rpc.lock().unwrap();
+                rpc.block_height = 101;
+                rpc.last_valid_block_height = 200;
+                rpc.next_status = Some(finalized());
+                rpc.transactions.insert(first.to_string(), landed);
+            }
+            let (status, body) = h.redeem(&Pubkey::new_unique()).await;
+            assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
+            assert_eq!(h.sent().len(), 1);
+            assert_eq!(
+                h.claim().await,
+                Some(ClaimState::Pending {
+                    signature: first,
+                    last_valid_block_height: Some(100),
+                })
+            );
         }
 
         #[tokio::test]

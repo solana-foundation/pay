@@ -676,11 +676,7 @@ impl RpcClient {
             return Err(Error::RpcResponse(format!("HTTP {}", resp.status())));
         }
 
-        let parsed: ValueRpcEnvelope = resp.json().await.map_err(Error::RpcTransport)?;
-        if let Some(err) = parsed.error {
-            return Err(Error::RpcResponse(err.message));
-        }
-        parsed.result.ok_or(Error::RpcMalformed)
+        rpc_result(resp.json().await.map_err(Error::RpcTransport)?)
     }
 }
 
@@ -832,8 +828,27 @@ struct RpcError {
 
 #[derive(Deserialize)]
 struct ValueRpcEnvelope {
+    /// `Some(Value::Null)` for a present `null` result (an unknown
+    /// transaction), `None` when the member is missing.
+    #[serde(default, deserialize_with = "present")]
     result: Option<Value>,
     error: Option<RpcError>,
+}
+
+fn present<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<Value>, D::Error> {
+    Value::deserialize(deserializer).map(Some)
+}
+
+/// The `result` of a JSON-RPC response. A `null` result is an answer (for
+/// `getTransaction`, "no such transaction") and is returned as such; only a
+/// response with neither a result nor an error is malformed.
+fn rpc_result(envelope: ValueRpcEnvelope) -> Result<Value> {
+    if let Some(err) = envelope.error {
+        return Err(Error::RpcResponse(err.message));
+    }
+    envelope.result.ok_or(Error::RpcMalformed)
 }
 
 fn parse_das_price_per_token(result: &Value) -> Result<f64> {
@@ -858,6 +873,27 @@ fn json_number(value: &Value) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_null_result_is_an_answer_and_a_missing_one_is_malformed() {
+        let parse = |body: Value| rpc_result(serde_json::from_value(body).unwrap());
+        assert_eq!(
+            parse(json!({"jsonrpc": "2.0", "id": 1, "result": null})).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            parse(json!({"jsonrpc": "2.0", "id": 1, "result": 7})).unwrap(),
+            json!(7)
+        );
+        assert!(matches!(
+            parse(json!({"jsonrpc": "2.0", "id": 1})),
+            Err(Error::RpcMalformed)
+        ));
+        assert!(matches!(
+            parse(json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -1, "message": "no"}})),
+            Err(Error::RpcResponse(_))
+        ));
+    }
 
     #[test]
     fn a_confirmed_status_does_not_satisfy_finality() {
