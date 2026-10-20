@@ -10,11 +10,16 @@ use std::sync::Arc;
 
 use crate::context::{LocalContext, PayContext};
 use crate::tools;
+use pay_core::client::fetch::OutboundPolicy;
 
 pub struct PayMcp {
     tool_router: rmcp::handler::server::router::tool::ToolRouter<Self>,
     session_cache: Arc<tools::curl::SessionCache>,
     context: Arc<dyn PayContext>,
+    /// Where catalog tools may send provider-detail requests. Their URLs
+    /// come from remote catalog data, so a hosted server keeps them on the
+    /// public internet.
+    catalog_outbound: OutboundPolicy,
 }
 
 impl Default for PayMcp {
@@ -37,6 +42,7 @@ impl PayMcp {
             tool_router: Self::tool_router(),
             session_cache: Arc::new(tools::curl::SessionCache::default()),
             context,
+            catalog_outbound: OutboundPolicy::Unrestricted,
         }
     }
 
@@ -44,6 +50,7 @@ impl PayMcp {
     pub fn with_hosted_context(context: Arc<dyn PayContext>) -> Self {
         let mut server = Self::with_context(context);
         server.tool_router.disable_route("sell_inference");
+        server.catalog_outbound = OutboundPolicy::PublicInternetOnly;
         server
     }
 
@@ -103,7 +110,7 @@ clearly matches the task; otherwise inspect one likely provider with
         &self,
         Parameters(params): Parameters<tools::search_catalog::Params>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        tools::search_catalog::run(params).await
+        tools::search_catalog::run(params, self.catalog_outbound).await
     }
 
     #[tool(description = r#"List all available Pay APIs/skills.
@@ -139,7 +146,7 @@ not enough to make a precise paid-call plan.
         &self,
         Parameters(params): Parameters<tools::get_catalog_entry::Params>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        tools::get_catalog_entry::run(params).await
+        tools::get_catalog_entry::run(params, self.catalog_outbound).await
     }
 
     #[tool(
@@ -323,6 +330,13 @@ mod tests {
                     .contains("sell_inference")
             );
         }
+    }
+
+    #[test]
+    fn only_local_servers_fetch_catalog_details_from_local_hosts() {
+        assert_eq!(PayMcp::new().catalog_outbound, OutboundPolicy::Unrestricted);
+        let hosted = PayMcp::with_hosted_context(Arc::new(LocalContext::new()));
+        assert_eq!(hosted.catalog_outbound, OutboundPolicy::PublicInternetOnly);
     }
 
     #[test]

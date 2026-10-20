@@ -25,6 +25,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::client::fetch::OutboundPolicy;
 use crate::{ClientApp, Error, Result};
 
 /// Accept both `"1"` (string) and `1` (integer) for the version field.
@@ -905,6 +906,25 @@ pub async fn ensure_endpoints_for(
     service_name: &str,
     client_app: ClientApp,
 ) -> Result<()> {
+    ensure_endpoints_with_policy(
+        catalog,
+        service_name,
+        client_app,
+        OutboundPolicy::Unrestricted,
+    )
+    .await
+}
+
+/// [`ensure_endpoints_for`] with the caller's network policy applied to the
+/// provider-detail fetch. The detail URL is built from the catalog's
+/// `base_url`, which is remote data rather than operator configuration, so a
+/// hosted caller must pass [`OutboundPolicy::PublicInternetOnly`].
+pub async fn ensure_endpoints_with_policy(
+    catalog: &mut Catalog,
+    service_name: &str,
+    client_app: ClientApp,
+    outbound_policy: OutboundPolicy,
+) -> Result<()> {
     let base_url = catalog.base_url.clone();
     let idx = catalog
         .providers
@@ -947,7 +967,7 @@ pub async fn ensure_endpoints_for(
         return Ok(());
     }
 
-    let raw = fetch_url(&detail_url, client_app).await?;
+    let raw = fetch_detail_url(&detail_url, client_app, outbound_policy).await?;
     let detail = match parse_detail(&raw) {
         Ok(detail) => detail,
         Err(e) => {
@@ -1264,6 +1284,44 @@ async fn fetch_url(url: &str, client_app: ClientApp) -> Result<String> {
         .map_err(|e| Error::Config(format!("read {url}: {e}")))
 }
 
+/// Fetch a provider-detail document under `outbound_policy`.
+///
+/// `PublicInternetOnly` goes through the hosted curl transport, which checks
+/// the destination and every redirect, filters DNS answers and ignores
+/// ambient proxies.
+async fn fetch_detail_url(
+    url: &str,
+    client_app: ClientApp,
+    outbound_policy: OutboundPolicy,
+) -> Result<String> {
+    if outbound_policy == OutboundPolicy::Unrestricted {
+        return fetch_url(url, client_app).await;
+    }
+    let target = url.to_string();
+    let outcome = tokio::task::spawn_blocking(move || {
+        crate::client::fetch::fetch_request_with_body_for_policy(
+            client_app,
+            "GET",
+            &target,
+            &[],
+            None,
+            crate::client::fetch::RedirectPolicy::Follow,
+            outbound_policy,
+        )
+    })
+    .await
+    .map_err(|e| Error::Config(format!("fetch {url}: {e}")))?
+    .map_err(|e| Error::Config(format!("fetch {url}: {e}")))?;
+    match outcome {
+        crate::client::runner::RunOutcome::Completed {
+            exit_code: 0, body, ..
+        } => Ok(String::from_utf8_lossy(&body.unwrap_or_default()).into_owned()),
+        _ => Err(Error::Config(format!(
+            "{url} did not return a provider detail"
+        ))),
+    }
+}
+
 fn http_client(timeout: std::time::Duration, client_app: ClientApp) -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(timeout)
@@ -1374,6 +1432,7 @@ fn parse_catalog(raw: &str) -> Result<Catalog> {
 /// existing OpenAPI endpoint parser.
 pub fn parse_catalog_source(raw: &str, source_url: &str) -> Result<Catalog> {
     if let Ok(catalog) = parse_catalog(raw) {
+        check_detail_base_url(source_url, &catalog.base_url)?;
         return Ok(catalog);
     }
 
@@ -1493,6 +1552,55 @@ pub fn parse_catalog_source(raw: &str, source_url: &str) -> Result<Catalog> {
         provider_count: 1,
         providers: vec![service],
     })
+}
+
+/// A catalog's `base_url` decides where provider-detail requests go. On the
+/// source's own origin it carries the trust the user gave that source; on
+/// any other origin it must be a public HTTPS hostname, so a catalog cannot
+/// aim detail fetches at loopback, link-local or internal services.
+fn check_detail_base_url(source_url: &str, base_url: &str) -> Result<()> {
+    if base_url.is_empty() {
+        return Ok(());
+    }
+    let reject = |reason: &str| {
+        Err(Error::Config(format!(
+            "catalog {source_url} has base_url {base_url}, which {reason}"
+        )))
+    };
+    let Ok(base) = reqwest::Url::parse(base_url) else {
+        return reject("is not a URL");
+    };
+    if !base.username().is_empty() || base.password().is_some() {
+        return reject("carries credentials");
+    }
+    if !matches!(base.scheme(), "http" | "https") {
+        return reject("is not http(s)");
+    }
+    if reqwest::Url::parse(source_url).is_ok_and(|source| source.origin() == base.origin()) {
+        return Ok(());
+    }
+    if base.scheme() != "https" {
+        return reject("is on another origin and is not https");
+    }
+    let Some(host) = base.domain() else {
+        return reject("is on another origin and is not a hostname");
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let local = [
+        "localhost",
+        "metadata",
+        "metadata.google.internal",
+        "metadata.goog",
+    ]
+    .contains(&host.as_str())
+        || [".localhost", ".local", ".internal"]
+            .iter()
+            .any(|suffix| host.ends_with(suffix))
+        || !host.contains('.');
+    if local {
+        return reject("is on another origin and names a local host");
+    }
+    Ok(())
 }
 
 fn validate_payment_discovery_openapi(doc: &serde_json::Value, source_url: &str) -> Result<()> {
@@ -2857,6 +2965,142 @@ mod tests {
         let result = ensure_endpoints(&mut cat, "bigquery").await;
         assert!(result.is_ok());
         assert_eq!(cat.providers[0].endpoints.len(), count_before);
+    }
+
+    fn pay_catalog_with_base_url(base_url: &str) -> String {
+        serde_json::json!({
+            "version": "1",
+            "base_url": base_url,
+            "providers": [{
+                "fqn": "acme/provider",
+                "title": "Acme",
+                "description": "Acme provider",
+                "category": "data",
+                "service_url": "https://gw.example.com",
+                "sha": "unused"
+            }]
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn catalog_source_rejects_a_base_url_aimed_at_local_hosts() {
+        for base_url in [
+            "http://127.0.0.1:8080/v1",
+            "https://127.0.0.1/v1",
+            "https://[::1]/v1",
+            "https://169.254.169.254/latest",
+            "http://cdn.example.com/v1",
+            "https://localhost/v1",
+            "https://api.internal/v1",
+            "https://metadata.google.internal/v1",
+            "https://intranet/v1",
+            "https://user:pass@cdn.example.com/v1",
+            "file:///etc/passwd",
+        ] {
+            let raw = pay_catalog_with_base_url(base_url);
+            let err = parse_catalog_source(&raw, "https://catalog.example/v1/skills.json")
+                .expect_err(base_url)
+                .to_string();
+            assert!(err.contains("base_url"), "{base_url}: {err}");
+        }
+    }
+
+    #[test]
+    fn catalog_source_accepts_a_public_or_same_origin_base_url() {
+        for (source, base_url) in [
+            // The production catalog serves details from a CDN origin.
+            (
+                "https://catalog.pay.sh/v1/skills.json",
+                "https://storage.googleapis.com/pay-skills/v1",
+            ),
+            // A local catalog the user configured may name itself.
+            (
+                "http://127.0.0.1:1402/catalog.json",
+                "http://127.0.0.1:1402",
+            ),
+            ("https://catalog.example/v1/skills.json", ""),
+        ] {
+            let raw = pay_catalog_with_base_url(base_url);
+            let catalog = parse_catalog_source(&raw, source).expect(base_url);
+            assert_eq!(catalog.base_url, base_url);
+        }
+    }
+
+    /// A loopback listener that answers every request with a provider detail
+    /// and counts the connections it accepted.
+    fn detail_listener() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = hits.clone();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let body =
+                    r#"{"endpoints":[{"method":"GET","path":"status","description":"internal"}]}"#;
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        (base_url, hits)
+    }
+
+    fn loopback_detail_catalog(base_url: &str) -> Catalog {
+        let mut catalog = catalog_index_only();
+        catalog.base_url = base_url.to_string();
+        // A sha no other test or real cache uses, so the detail is fetched.
+        catalog.providers[0].sha = format!("outbound-policy-{}", rand::random::<u64>());
+        catalog
+    }
+
+    #[tokio::test]
+    async fn public_only_detail_fetch_refuses_a_loopback_base_url() {
+        let (base_url, hits) = detail_listener();
+        let mut catalog = loopback_detail_catalog(&base_url);
+
+        let err = ensure_endpoints_with_policy(
+            &mut catalog,
+            "bigquery",
+            ClientApp::Mcp,
+            OutboundPolicy::PublicInternetOnly,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("non-public"), "{err}");
+        assert!(!catalog.providers[0].endpoints_loaded());
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn unrestricted_detail_fetch_still_reaches_a_local_catalog() {
+        let (base_url, hits) = detail_listener();
+        let mut catalog = loopback_detail_catalog(&base_url);
+
+        ensure_endpoints_with_policy(
+            &mut catalog,
+            "bigquery",
+            ClientApp::Cli,
+            OutboundPolicy::Unrestricted,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(catalog.providers[0].endpoints[0].path, "status");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let cache = std::path::PathBuf::from(
+            shellexpand::tilde("~/.config/pay/skills/detail").into_owned(),
+        )
+        .join(format!("{}.json", catalog.providers[0].sha));
+        let _ = std::fs::remove_file(cache);
     }
 
     #[tokio::test]

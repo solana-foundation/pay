@@ -82,7 +82,10 @@ fn default_max_results() -> usize {
     5
 }
 
-pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
+pub async fn run(
+    params: Params,
+    outbound_policy: pay_core::client::fetch::OutboundPolicy,
+) -> Result<CallToolResult, rmcp::ErrorData> {
     let query = params.query.trim().to_string();
     if query.is_empty() {
         return Ok(super::tool_error("`query` must describe the user's task"));
@@ -111,6 +114,7 @@ pub async fn run(params: Params) -> Result<CallToolResult, rmcp::ErrorData> {
         category,
         max_results,
         pay_core::ClientApp::Mcp,
+        outbound_policy,
     )
     .await;
 
@@ -134,6 +138,7 @@ async fn build_search_catalog_response(
     category: Option<String>,
     max_results: usize,
     client_app: pay_core::ClientApp,
+    outbound_policy: pay_core::client::fetch::OutboundPolicy,
 ) -> SearchCatalogResponse {
     let lookup_limit = (max_results * ENDPOINT_LOOKUP_MULTIPLIER).clamp(max_results, 20);
     let preliminary = pay_core::skills::search_services_ranked(
@@ -146,8 +151,13 @@ async fn build_search_catalog_response(
     let mut endpoint_errors = HashMap::new();
     for candidate in &preliminary {
         let fqn = candidate.service.name.clone();
-        if let Err(err) =
-            pay_core::skills::ensure_endpoints_for(&mut catalog, &fqn, client_app).await
+        if let Err(err) = pay_core::skills::ensure_endpoints_with_policy(
+            &mut catalog,
+            &fqn,
+            client_app,
+            outbound_policy,
+        )
+        .await
         {
             endpoint_errors.insert(fqn, err.to_string());
         }
@@ -404,6 +414,7 @@ mod tests {
             None,
             5,
             pay_core::ClientApp::Cli,
+            pay_core::client::fetch::OutboundPolicy::Unrestricted,
         )
         .await;
 
@@ -437,11 +448,57 @@ mod tests {
             None,
             5,
             pay_core::ClientApp::Cli,
+            pay_core::client::fetch::OutboundPolicy::Unrestricted,
         )
         .await;
 
         assert!(response.candidates.is_empty());
         assert!(response.next_step.contains("refresh=true"));
+    }
+
+    #[tokio::test]
+    async fn hosted_search_does_not_fetch_details_from_a_loopback_base_url() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let catalog: pay_core::skills::Catalog = serde_json::from_value(serde_json::json!({
+            "version": "1",
+            "base_url": format!("http://{}", listener.local_addr().unwrap()),
+            "providers": [{
+                "fqn": "attacker/loopback/status",
+                "title": "Internal status",
+                "description": "Internal status lookups",
+                "category": "data",
+                "service_url": "https://gw.example.com",
+                "endpoint_count": 1,
+                "sha": format!(
+                    "hosted-search-{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                )
+            }]
+        }))
+        .unwrap();
+
+        let response = build_search_catalog_response(
+            catalog,
+            "internal status".to_string(),
+            None,
+            5,
+            pay_core::ClientApp::Mcp,
+            pay_core::client::fetch::OutboundPolicy::PublicInternetOnly,
+        )
+        .await;
+
+        let candidate = &response.candidates[0];
+        assert!(candidate.endpoints.is_empty());
+        let error = candidate.endpoint_lookup_error.as_deref().unwrap();
+        assert!(error.contains("non-public"), "{error}");
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
     }
 
     #[test]
@@ -526,6 +583,7 @@ mod tests {
                 case.category.clone(),
                 5,
                 pay_core::ClientApp::Cli,
+                pay_core::client::fetch::OutboundPolicy::Unrestricted,
             )
             .await;
             let actual = response.candidates.first();
