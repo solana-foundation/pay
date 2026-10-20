@@ -238,8 +238,19 @@ fn codex_acp_env(
     ])
 }
 
-#[cfg(not(windows))]
+/// The command that launches `harness`'s ACP adapter. Every adapter launch
+/// goes through here, so credentials meant for pay itself never reach the
+/// adapter or the agent it runs.
 pub(crate) fn adapter_command(harness: AcpHarness) -> Command {
+    let mut command = adapter_program_command(harness);
+    for name in super::acp_middleware::PARENT_ONLY_ENV {
+        command.env_remove(name);
+    }
+    command
+}
+
+#[cfg(not(windows))]
+fn adapter_program_command(harness: AcpHarness) -> Command {
     Command::new(harness.adapter_program())
 }
 
@@ -247,7 +258,7 @@ pub(crate) fn adapter_command(harness: AcpHarness) -> Command {
 // cmd.exe while keeping stdin/stdout inherited so ACP JSON-RPC remains
 // transparent. Goose is a native executable and does not need the shell.
 #[cfg(windows)]
-pub(crate) fn adapter_command(harness: AcpHarness) -> Command {
+fn adapter_program_command(harness: AcpHarness) -> Command {
     if harness == AcpHarness::Goose {
         return Command::new(harness.adapter_program());
     }
@@ -335,6 +346,46 @@ mod tests {
         assert_eq!(
             config["model_providers"][CODEX_PROVIDER_ID]["wire_api"],
             "responses"
+        );
+    }
+
+    #[test]
+    fn adapters_never_inherit_the_buzz_publisher_credentials() {
+        for harness in [AcpHarness::Goose, AcpHarness::Claude, AcpHarness::Codex] {
+            let command = adapter_command(harness);
+            let removed: Vec<_> = command
+                .get_envs()
+                .filter(|(_, value)| value.is_none())
+                .map(|(name, _)| name.to_string_lossy().into_owned())
+                .collect();
+            for name in ["BUZZ_PRIVATE_KEY", "BUZZ_RELAY_URL"] {
+                assert!(
+                    removed.iter().any(|r| r == name),
+                    "{harness:?}: {removed:?}"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_scrubbed_child_sees_launch_env_but_not_parent_secrets() {
+        // Stand-in for the adapter: the same scrub, then the launch env.
+        let mut command = Command::new("sh");
+        for name in super::super::acp_middleware::PARENT_ONLY_ENV {
+            command.env_remove(name);
+        }
+        let output = command
+            .env("ANTHROPIC_BASE_URL", "http://127.0.0.1:54321/v1")
+            .args([
+                "-c",
+                r#"printf '%s|%s|%s' "${BUZZ_PRIVATE_KEY-unset}" "${BUZZ_RELAY_URL-unset}" "$ANTHROPIC_BASE_URL""#,
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "unset|unset|http://127.0.0.1:54321/v1"
         );
     }
 

@@ -10,6 +10,10 @@ use pay_acp::{BuzzDelivery, BuzzDeliveryTracker};
 const BUZZ_RELAY_URL_ENV: &str = "BUZZ_RELAY_URL";
 const BUZZ_PRIVATE_KEY_ENV: &str = "BUZZ_PRIVATE_KEY";
 
+/// Credentials only the parent's fallback publisher uses. The ACP adapter
+/// and the agent it runs must not inherit them.
+pub(crate) const PARENT_ONLY_ENV: &[&str] = &[BUZZ_RELAY_URL_ENV, BUZZ_PRIVATE_KEY_ENV];
+
 /// Whether this ACP launch has the credentials needed to publish as a
 /// Buzz-managed agent.
 pub(super) fn buzz_delivery_available() -> bool {
