@@ -603,6 +603,21 @@ impl SessionStreamMeter {
         self.gate.record_commit(committed_base_units);
     }
 
+    /// Meter a complete (unstreamed) response body and wait until the
+    /// client's vouchers cover all of it. Its usage is only known once the
+    /// whole body is parsed, so the body must not be released before this
+    /// returns.
+    pub async fn settle_complete_body(mut self, body: &[u8], is_sse: bool) -> Result<(), BoxError> {
+        self.touch_channel_if_due();
+        if let Some(decision) = self.observe_chunk(body, is_sse).map_err(box_error)? {
+            settle_decision(&mut self, decision).await?;
+        }
+        if let Some(decision) = self.finish(is_sse).map_err(box_error)? {
+            settle_decision(&mut self, decision).await?;
+        }
+        Ok(())
+    }
+
     fn touch_channel_if_due(&mut self) {
         let now = Instant::now();
         if now < self.next_lifecycle_touch {

@@ -296,18 +296,40 @@ pub async fn forward_request_with_session_metering_and_identity(
         .split(';')
         .any(|part| part.trim().eq_ignore_ascii_case("text/event-stream"));
 
-    let stream = upstream_resp.bytes_stream();
-    if let Some(meter) = build_session_stream_meter(api, &method, uri, headers, session_context)
-        .map(|meter| meter.with_request_body_bytes(body.len() as u64))
-    {
+    let meter = match session_context {
+        Some(context) => {
+            ClientVoucherMeter::for_route(api, route, uri, headers, context).map_err(|error| {
+                // Releasing the response unmetered would hand out usage the
+                // client's vouchers never cover.
+                tracing::error!(%error, path = uri.path(), "session response metering unavailable");
+                error_response(StatusCode::BAD_GATEWAY, "Session metering unavailable")
+            })?
+        }
+        None => None,
+    };
+    let Some(meter) = meter.map(|meter| meter.with_request_body_bytes(body.len() as u64)) else {
         return Ok(resp
-            .body(Body::from_stream(session_stream::meter_response_stream(
-                stream, meter, is_sse,
-            )))
+            .body(Body::from_stream(upstream_resp.bytes_stream()))
+            .unwrap());
+    };
+    if crate::server::gate::is_streaming_response(&response_headers) {
+        return Ok(resp
+            .body(Body::from_stream(
+                meter.meter_stream(upstream_resp.bytes_stream(), is_sse),
+            ))
             .unwrap());
     }
-
-    Ok(resp.body(Body::from_stream(stream)).unwrap())
+    let body = collect_upstream_body(upstream_resp, meter.body_limit())
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "failed to buffer session-metered response");
+            error_response(StatusCode::BAD_GATEWAY, "Response metering failed")
+        })?;
+    if let Err(error) = meter.settle_body(&body).await {
+        tracing::warn!(%error, "session-metered response usage not covered");
+        return Err(session_voucher_required_response());
+    }
+    Ok(resp.body(Body::from(body)).unwrap())
 }
 
 /// Outcome of preparing an upstream request: either a locally-built response
@@ -533,33 +555,105 @@ pub async fn prepare_upstream_with_identity(
     Ok(UpstreamPlan::Forward(prepared))
 }
 
-fn build_session_stream_meter(
-    api: &ApiSpec,
-    method: &Method,
-    uri: &Uri,
-    headers: &HeaderMap,
-    session_context: Option<SessionStreamContext>,
-) -> Option<session_stream::SessionStreamMeter> {
-    let context = session_context?;
-    let match_method = if *method == Method::HEAD {
-        "GET"
-    } else {
-        method.as_str()
-    };
-    let path = uri.path().trim_start_matches('/');
-    let endpoint = metering::find_endpoint(api, match_method, path)?;
-    let metering = endpoint.metering.as_ref()?;
-    let props = payment::extract_request_properties(headers, path);
-    let variant_hint = payment::extract_variant_hint(path);
+/// Response meter for a client-voucher session forward: usage is released
+/// only once the client's vouchers cover it. Shared by both adapters and
+/// keyed to the endpoint the gate billed.
+pub struct ClientVoucherMeter {
+    meter: session_stream::SessionStreamMeter,
+    body_limit: usize,
+}
 
-    match session_stream::meter_from_config(metering, &props, variant_hint.as_deref(), context) {
-        Ok(Some(meter)) => Some(meter),
-        Ok(None) => None,
-        Err(error) => {
-            tracing::debug!(%error, path, "session stream metering disabled for endpoint");
-            None
-        }
+impl ClientVoucherMeter {
+    /// `Ok(None)` means the endpoint's price is not observable in the
+    /// response (request-only pricing, already covered by the admitting
+    /// voucher).
+    pub fn for_route(
+        api: &ApiSpec,
+        route: &UpstreamRoute,
+        uri: &Uri,
+        headers: &HeaderMap,
+        context: SessionStreamContext,
+    ) -> crate::server::session_metering::Result<Option<Self>> {
+        let Some(metering) = route.endpoint(api).and_then(|ep| ep.metering.as_ref()) else {
+            return Ok(None);
+        };
+        let path = uri.path().trim_start_matches('/');
+        let props = payment::extract_request_properties(headers, path);
+        let variant_hint = payment::extract_variant_hint(path);
+        let meter =
+            session_stream::meter_from_config(metering, &props, variant_hint.as_deref(), context)?;
+        Ok(meter.map(|meter| Self {
+            meter,
+            body_limit: metering::upto_response_body_limit(metering),
+        }))
     }
+
+    /// Use the exact forwarded request body size as the missing-input bound.
+    pub fn with_request_body_bytes(mut self, bytes: u64) -> Self {
+        self.meter = self.meter.with_request_body_bytes(bytes);
+        self
+    }
+
+    /// Largest complete response body this endpoint meters.
+    pub fn body_limit(&self) -> usize {
+        self.body_limit
+    }
+
+    /// Meter a streamed response: each chunk is withheld until a commit
+    /// covers the usage it carries.
+    pub fn meter_stream<S>(
+        self,
+        stream: S,
+        is_sse: bool,
+    ) -> impl futures_util::Stream<Item = Result<Bytes, session_stream::BoxError>> + Send + 'static
+    where
+        S: futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+    {
+        session_stream::meter_response_stream(stream, self.meter, is_sse)
+    }
+
+    /// Meter a complete response body, returning once the client's vouchers
+    /// cover it. Its usage is known only after the whole body is read.
+    pub async fn settle_body(self, body: &[u8]) -> Result<(), session_stream::BoxError> {
+        self.meter.settle_complete_body(body, false).await
+    }
+}
+
+/// Read a complete upstream response body, refusing one larger than `limit`.
+pub async fn collect_upstream_body(
+    response: reqwest::Response,
+    limit: usize,
+) -> Result<Bytes, session_stream::BoxError> {
+    use futures_util::StreamExt;
+    let too_large = || -> session_stream::BoxError {
+        Box::new(std::io::Error::other(
+            "response body exceeds configured limit",
+        ))
+    };
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(too_large());
+    }
+    let mut stream = response.bytes_stream();
+    let mut buf = bytes::BytesMut::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if buf.len().saturating_add(chunk.len()) > limit {
+            return Err(too_large());
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf.freeze())
+}
+
+/// The response for a client-voucher session whose usage no voucher covered.
+pub fn session_voucher_required_response() -> Response {
+    error_response(
+        StatusCode::PAYMENT_REQUIRED,
+        "Commit a session voucher covering this response",
+    )
 }
 
 /// Resolve the API spec from a Host header subdomain.
@@ -1734,6 +1828,92 @@ mod tests {
             batch_settlement: None,
             recipients: std::collections::HashMap::new(),
         }
+    }
+
+    /// A client-voucher session admitted at cumulative 1_000 requests `path`
+    /// from a JSON upstream reporting 50 completion tokens. Returns the first
+    /// body bytes released within 500ms, if any.
+    async fn client_voucher_first_bytes(path: &str) -> Option<Bytes> {
+        use futures_util::StreamExt;
+        let upstream = axum::Router::new().fallback(|| async {
+            (
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                r#"{"text":"protected-content","usage":{"completion_tokens":50}}"#,
+            )
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, upstream).await });
+
+        let metering = |dimension: serde_json::Value| {
+            serde_json::from_value(serde_json::json!({
+                "schemes": ["mpp-session"],
+                "dimensions": [dimension],
+            }))
+            .unwrap()
+        };
+        let mut api = make_api("test");
+        api.routing = RoutingConfig::Proxy {
+            url: format!("http://{addr}"),
+            path_rewrites: vec![],
+            auth: None,
+        };
+        let mut metered = endpoint_with_routing("v1/metered", None);
+        metered.metering = Some(metering(serde_json::json!({
+            "direction": "output", "unit": "tokens", "scale": 1,
+            "tiers": [{"price_usd": 0.000001}],
+            "meter": {"source": "response_json", "path": "/usage/completion_tokens"}
+        })));
+        let mut flat = endpoint_with_routing("v1/flat", None);
+        flat.metering = Some(metering(serde_json::json!({
+            "direction": "usage", "unit": "requests", "scale": 1,
+            "tiers": [{"price_usd": 0.001}]
+        })));
+        api.endpoints = vec![metered, flat];
+
+        let key = || solana_pubkey::Pubkey::new_unique().to_string();
+        let handle = std::sync::Arc::new(crate::server::session::SessionMpp::new(
+            pay_kit::mpp::server::session::SessionConfig {
+                operator: key(),
+                recipient: key(),
+                currency: key(),
+                network: "localnet".to_string(),
+                ..Default::default()
+            },
+            "test-secret",
+        ));
+        let uri: Uri = format!("/{path}").parse().unwrap();
+        let route = UpstreamRoute::for_tests(&api, &Method::POST, path);
+        let served = async {
+            let response = forward_request_with_session_metering(
+                &api,
+                &route,
+                Method::POST,
+                &uri,
+                &HeaderMap::new(),
+                Bytes::new(),
+                Some(SessionStreamContext::new(handle, key(), 1_000)),
+            )
+            .await
+            .unwrap();
+            response.into_body().into_data_stream().next().await
+        };
+        tokio::time::timeout(std::time::Duration::from_millis(500), served)
+            .await
+            .ok()
+            .flatten()
+            .map(|chunk| chunk.unwrap())
+    }
+
+    #[tokio::test]
+    async fn client_voucher_response_is_withheld_until_its_usage_is_covered() {
+        assert_eq!(client_voucher_first_bytes("v1/metered").await, None);
+    }
+
+    #[tokio::test]
+    async fn client_voucher_request_priced_response_is_released() {
+        let served = client_voucher_first_bytes("v1/flat").await.unwrap();
+        assert!(served.starts_with(b"{\"text\":\"protected-content\""));
     }
 
     fn api_with_auth(auth: Option<AuthConfig>) -> ApiSpec {

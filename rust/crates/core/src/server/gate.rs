@@ -239,6 +239,28 @@ impl SessionForward {
         }
     }
 
+    /// A session admitted on the client's own voucher at `cumulative`. Its
+    /// response is metered by waiting on the client's further commits.
+    pub fn client_voucher(
+        handle: Arc<SessionMpp>,
+        channel_id: String,
+        cumulative: u64,
+        verified_payer: Option<String>,
+    ) -> Self {
+        Self {
+            handle,
+            channel_id,
+            committed_base_units: cumulative,
+            settlement: None,
+            available_base_units: 0,
+            authorized_base_units: cumulative,
+            verified_payer,
+            request_body_bytes: None,
+            payment_policy: None,
+            _reservation: None,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn delegated(
         handle: Arc<SessionMpp>,
@@ -499,10 +521,14 @@ impl UpstreamRoute {
     /// Routing of the endpoint the gate selected, else the API default, so
     /// forwarding can never use a different endpoint than billing did.
     pub(crate) fn routing<'a>(&self, api: &'a ApiSpec) -> &'a RoutingConfig {
-        self.endpoint
-            .and_then(|i| api.endpoints.get(i))
+        self.endpoint(api)
             .and_then(|ep| ep.routing.as_ref())
             .unwrap_or(&api.routing)
+    }
+
+    /// The endpoint the gate selected (and billed) for this request.
+    pub(crate) fn endpoint<'a>(&self, api: &'a ApiSpec) -> Option<&'a Endpoint> {
+        self.endpoint.and_then(|i| api.endpoints.get(i))
     }
 
     /// Whether this admission covers `method` on the wire path `path` of `api`.
@@ -2869,18 +2895,12 @@ async fn session_authorized(
         }) => GateDecision::Forward {
             route: upstream,
             session: handle.map(|h| {
-                Box::new(SessionForward {
-                    handle: h,
+                Box::new(SessionForward::client_voucher(
+                    h,
                     channel_id,
-                    committed_base_units: cumulative,
-                    settlement: None,
-                    available_base_units: 0,
-                    authorized_base_units: cumulative,
+                    cumulative,
                     verified_payer,
-                    request_body_bytes: None,
-                    payment_policy: None,
-                    _reservation: None,
-                })
+                ))
             }),
             receipt: None,
             upto: None,
