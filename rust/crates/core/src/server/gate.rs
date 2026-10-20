@@ -1101,8 +1101,11 @@ impl<S: PaymentState> PaymentGate<S> {
             let amount = crate::server::payment::charge_amount_from_price(fixed_price.as_ref());
             // Parity with MPP charge external_id: resource plus per-challenge
             // suffix, so repeated same-route payments are distinct on-chain.
+            // The method is part of the binding: GET and POST may share one
+            // resource but are different operations.
+            let binding = x402_exact_binding(req, resource);
             let memo = crate::server::payment::resource_memo_with_nonce(
-                resource,
+                binding.as_deref(),
                 pay_kit::x402::exact::MAX_MEMO_BYTES,
             );
             match x402.payment_required_header(
@@ -1281,7 +1284,8 @@ impl<S: PaymentState> PaymentGate<S> {
                     .unwrap_or_default(),
             ))
         };
-        let memo = match x402_exact_payment_memo(x402, pay_header, resource) {
+        let binding = x402_exact_binding(req, resource);
+        let memo = match x402_exact_payment_memo(x402, pay_header, binding.as_deref()) {
             Ok(memo) => memo,
             Err(e) => return reject(e),
         };
@@ -2596,6 +2600,13 @@ fn reconstruct_uri(path: &str, query: Option<&str>) -> http::Uri {
     .unwrap_or_default()
 }
 
+/// The endpoint identity an x402 `exact` memo binds: request method plus the
+/// configured resource. `None` when the endpoint names no resource.
+fn x402_exact_binding(req: &GateRequest<'_>, resource: Option<&str>) -> Option<String> {
+    let resource = resource.map(str::trim).filter(|r| !r.is_empty())?;
+    Some(format!("{} {resource}", req.method))
+}
+
 fn x402_exact_payment_memo(
     x402: &X402,
     pay_header: &str,
@@ -2608,14 +2619,17 @@ fn x402_exact_payment_memo(
         Ok(envelope) => envelope,
         Err(_) => return Ok(None),
     };
-    let Some(memo) = envelope
-        .accepted
-        .as_ref()
-        .and_then(|accepted| accepted.get("extra"))
+    let Some(accepted) = envelope.accepted.as_ref() else {
+        return Ok(None);
+    };
+    // A resource-bound endpoint always advertises a memo; an offer echoed
+    // without one would verify unbound, so it never names this endpoint.
+    let Some(memo) = accepted
+        .get("extra")
         .and_then(|extra| extra.get("memo"))
         .and_then(|memo| memo.as_str())
     else {
-        return Ok(None);
+        return Err("x402 exact payment is missing the endpoint resource memo".to_string());
     };
     if crate::server::payment::resource_memo_matches(
         memo,
@@ -3326,14 +3340,43 @@ mod tests {
     }
 
     #[test]
-    fn x402_exact_payment_memo_falls_back_when_accepted_memo_is_absent() {
+    fn x402_exact_payment_memo_rejects_an_offer_echoed_without_memo() {
         let x402 = x402_test_server();
         let accepted = x402_accepted_with_memo(&x402, None);
         let header = x402_signature_header(Some(accepted));
 
+        assert!(
+            x402_exact_payment_memo(&x402, &header, Some("fortune"))
+                .unwrap_err()
+                .contains("missing the endpoint resource memo")
+        );
+        // Endpoints without a resource keep accepting memo-less offers.
+        assert_eq!(x402_exact_payment_memo(&x402, &header, None).unwrap(), None);
+    }
+
+    #[test]
+    fn x402_exact_binding_separates_methods_on_one_resource() {
+        let (get, post) = (Method::GET, Method::POST);
+        let binding = |method| x402_exact_binding(&req(method, "orders"), Some("orders"));
+        assert_eq!(binding(&get).as_deref(), Some("GET orders"));
+        assert_ne!(binding(&get), binding(&post));
+        assert_eq!(x402_exact_binding(&req(&get, "orders"), Some("  ")), None);
+
+        // A memo minted for GET does not verify at POST on the same resource.
+        let x402 = x402_test_server();
+        let memo = crate::server::payment::resource_memo_with_nonce(
+            binding(&get).as_deref(),
+            pay_kit::x402::exact::MAX_MEMO_BYTES,
+        )
+        .unwrap();
+        let header =
+            x402_signature_header(Some(x402_accepted_with_memo(&x402, Some(memo.as_str()))));
+        assert!(x402_exact_payment_memo(&x402, &header, binding(&post).as_deref()).is_err());
         assert_eq!(
-            x402_exact_payment_memo(&x402, &header, Some("fortune")).unwrap(),
-            None
+            x402_exact_payment_memo(&x402, &header, binding(&get).as_deref())
+                .unwrap()
+                .as_deref(),
+            Some(memo.as_str())
         );
     }
 
