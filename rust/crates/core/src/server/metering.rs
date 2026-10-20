@@ -302,11 +302,16 @@ pub fn effective_dimensions<'a>(
 }
 
 /// The authorized `x402-upto` ceiling: `upto.max_usd`, or the legacy
-/// single-dimension unit price. `None` when several dimensions are priced
-/// without an explicit ceiling, since no one unit price bounds their sum.
+/// single-dimension unit price. `None` without an explicit ceiling when
+/// several dimensions are priced (no one unit price bounds their sum) or a
+/// dimension is usage-metered (its price covers `scale` units, so one unit's
+/// share would cap a multi-unit response far below its measured cost).
 pub fn upto_max_usd(metering: &Metering, resolved_price: Option<&ResolvedPrice>) -> Option<f64> {
     if let Some(max_usd) = metering.upto.as_ref().and_then(|upto| upto.max_usd) {
         return Some(max_usd);
+    }
+    if metering.has_aggregate_dimensions() {
+        return None;
     }
     match resolved_price.map(|p| p.dimensions.as_slice()) {
         Some([d]) => Some(d.price_usd / d.scale.max(1) as f64),
@@ -1970,8 +1975,8 @@ mod tests {
     fn upto_max_usd_keeps_legacy_first_dimension_fallback() {
         let metering = upto_metering(
             vec![usage_dim(
-                MeterDirection::Input,
-                BillingUnit::Tokens,
+                MeterDirection::Usage,
+                BillingUnit::Requests,
                 1_000,
                 0.02,
                 None,
@@ -1981,6 +1986,33 @@ mod tests {
         let price = resolve_price(&metering, &RequestProperties::default(), None, None);
 
         assert_eq!(upto_max_usd(&metering, price.as_ref()), Some(0.00002));
+    }
+
+    #[test]
+    fn upto_max_usd_never_derives_a_ceiling_for_usage_metered_dimensions() {
+        // $1 per 1M tokens: one token's share would cap a 100k-token
+        // response worth $0.10 at $0.000001.
+        let tokens = upto_metering(
+            vec![usage_dim(
+                MeterDirection::Output,
+                BillingUnit::Tokens,
+                1_000_000,
+                1.0,
+                None,
+            )],
+            None,
+        );
+        let price = resolve_price(&tokens, &RequestProperties::default(), None, None);
+        assert_eq!(upto_max_usd(&tokens, price.as_ref()), None);
+
+        let explicit = Metering {
+            upto: Some(pay_types::metering::UptoMetering {
+                max_usd: Some(0.50),
+                ..Default::default()
+            }),
+            ..tokens
+        };
+        assert_eq!(upto_max_usd(&explicit, price.as_ref()), Some(0.50));
     }
 
     #[test]

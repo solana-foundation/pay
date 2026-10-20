@@ -1429,6 +1429,15 @@ impl Metering {
             .clone()
             .unwrap_or_else(|| vec![Scheme::MppCharge])
     }
+
+    /// Whether any dimension, at the top level or in a variant, is settled
+    /// from measured usage (see [`MeterDimension::is_aggregate_settled`]).
+    pub fn has_aggregate_dimensions(&self) -> bool {
+        self.dimensions
+            .iter()
+            .chain(self.variants.iter().flat_map(|v| v.dimensions.iter()))
+            .any(MeterDimension::is_aggregate_settled)
+    }
 }
 
 /// A variant represents a pricing path selected by a request parameter.
@@ -2488,12 +2497,7 @@ fn validate_fixed_scheme_dimensions(metering: &Metering, path: &str, errs: &mut 
     if fixed.is_empty() {
         return;
     }
-    let aggregate = metering
-        .dimensions
-        .iter()
-        .chain(metering.variants.iter().flat_map(|v| v.dimensions.iter()))
-        .any(MeterDimension::is_aggregate_settled);
-    if aggregate {
+    if metering.has_aggregate_dimensions() {
         errs.push(format!(
             "endpoint `{path}`: usage-metered dimensions (tokens, quota_units, or a `meter`) \
              cannot be charged per call by {fixed:?}; list only `mpp-session` / `x402-upto` \
@@ -2502,12 +2506,14 @@ fn validate_fixed_scheme_dimensions(metering: &Metering, path: &str, errs: &mut 
     }
 }
 
-/// A multi-dimension `x402-upto` endpoint needs an explicit `upto.max_usd`:
-/// no single dimension's unit price bounds the summed usage.
+/// An `x402-upto` endpoint needs an explicit `upto.max_usd` when it has
+/// several dimensions or a usage-metered one: no unit price bounds summed
+/// usage, and a dimension priced per `scale` units has no per-call price.
 fn validate_upto_ceiling(metering: &Metering, path: &str, errs: &mut Vec<String>) {
-    let multi_dimensional =
-        metering.dimensions.len() > 1 || metering.variants.iter().any(|v| v.dimensions.len() > 1);
-    if multi_dimensional
+    let unbounded = metering.dimensions.len() > 1
+        || metering.variants.iter().any(|v| v.dimensions.len() > 1)
+        || metering.has_aggregate_dimensions();
+    if unbounded
         && metering.accepted_schemes().contains(&Scheme::X402Upto)
         && metering
             .upto
@@ -2516,7 +2522,7 @@ fn validate_upto_ceiling(metering: &Metering, path: &str, errs: &mut Vec<String>
             .is_none()
     {
         errs.push(format!(
-            "endpoint `{path}`: x402-upto with several pricing dimensions requires `upto.max_usd`"
+            "endpoint `{path}`: x402-upto with several or usage-metered pricing dimensions requires `upto.max_usd`"
         ));
     }
 }
@@ -4365,6 +4371,43 @@ endpoints:
                 .any(|e| e.contains("`v1/multi`") && e.contains("single pricing dimension")),
             "{errs:?}"
         );
+    }
+
+    #[test]
+    fn validate_upto_requires_explicit_ceiling_for_a_usage_metered_dimension() {
+        let yaml = |upto: &str| {
+            format!(
+                r#"
+name: t
+subdomain: t
+title: T
+description: T
+category: ai_ml
+version: v1
+routing: {{type: respond}}
+endpoints:
+  - method: POST
+    path: v1/generate
+    metering:
+      schemes: [x402-upto]
+{upto}
+      dimensions:
+        - direction: output
+          unit: tokens
+          scale: 1000000
+          meter: {{source: response_json, path: /usage/output_tokens}}
+          tiers: [{{price_usd: 1.0}}]
+"#
+            )
+        };
+        let implicit: ApiSpec = serde_yml::from_str(&yaml("")).unwrap();
+        let errs = validate_api_spec(&implicit);
+        assert!(
+            errs.iter().any(|e| e.contains("requires `upto.max_usd`")),
+            "{errs:?}"
+        );
+        let explicit: ApiSpec = serde_yml::from_str(&yaml("      upto: {max_usd: 2.0}")).unwrap();
+        assert!(validate_api_spec(&explicit).is_empty());
     }
 
     #[test]

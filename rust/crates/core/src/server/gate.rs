@@ -1149,7 +1149,10 @@ impl<S: PaymentState> PaymentGate<S> {
             // debits actual usage and refunds the rest.
             let amount = metering::upto_max_usd(meter, price.as_ref())
                 .map(|usd| format!("{usd}"))
-                .ok_or_else(|| "x402-upto with several dimensions requires upto.max_usd".into());
+                .ok_or_else(|| {
+                    "x402-upto with several or usage-metered dimensions requires upto.max_usd"
+                        .into()
+                });
             let route = upto_route(req, path);
             match amount.and_then(|amount| {
                 upto.payment_required_header_for_route(&amount, Some(&route))
@@ -1376,7 +1379,7 @@ impl<S: PaymentState> PaymentGate<S> {
             return GateDecision::Respond(GateResponse::json(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Bytes::from_static(
-                    br#"{"error":"payment_configuration_error","message":"x402-upto with several dimensions requires upto.max_usd"}"#,
+                    br#"{"error":"payment_configuration_error","message":"x402-upto with several or usage-metered dimensions requires upto.max_usd"}"#,
                 ),
             ));
         };
