@@ -105,7 +105,7 @@ impl WalletDriver for PrivyWalletDriver {
         }
         let external_id = self.external_id(tenant, &request.name)?;
         if let Some(value) = self.get_external(&external_id).await? {
-            return wallet_from_value(value, request.name, request.purpose);
+            return wallet_from_value(value, &external_id, request.name, request.purpose);
         }
         let display_name = match &request.purpose {
             Some(p) => format!("Pay {} ({p})", request.name),
@@ -121,13 +121,13 @@ impl WalletDriver for PrivyWalletDriver {
             )
             .await?;
         if status.is_success() {
-            wallet_from_value(value, request.name, request.purpose)
+            wallet_from_value(value, &external_id, request.name, request.purpose)
         } else if status == StatusCode::CONFLICT {
             let value = self
                 .get_external(&external_id)
                 .await?
                 .ok_or_else(|| provider(status, &value))?;
-            wallet_from_value(value, request.name, request.purpose)
+            wallet_from_value(value, &external_id, request.name, request.purpose)
         } else {
             Err(provider(status, &value))
         }
@@ -139,11 +139,30 @@ impl WalletDriver for PrivyWalletDriver {
             .get_external(&external_id)
             .await?
             .ok_or_else(|| WalletError::InvalidRequest("wallet was not found".into()))?;
-        wallet_from_value(value, request.name, None)
+        wallet_from_value(value, &external_id, request.name, None)
     }
 }
 
-fn wallet_from_value(value: Value, name: String, purpose: Option<String>) -> Result<Wallet> {
+/// Build the wallet for `external_id` from a Privy response. The lookup URL
+/// is owner-scoped, but the response is what names the payout address, so it
+/// must itself be the requested owner's Solana wallet: a response for any
+/// other external ID or chain is rejected rather than relabelled.
+fn wallet_from_value(
+    value: Value,
+    external_id: &str,
+    name: String,
+    purpose: Option<String>,
+) -> Result<Wallet> {
+    if value.get("external_id").and_then(Value::as_str) != Some(external_id) {
+        return Err(WalletError::Provider(
+            "Privy wallet response is for a different external ID".into(),
+        ));
+    }
+    if value.get("chain_type").and_then(Value::as_str) != Some("solana") {
+        return Err(WalletError::Provider(
+            "Privy wallet response is not a Solana wallet".into(),
+        ));
+    }
     let id = value
         .get("id")
         .and_then(Value::as_str)
@@ -152,15 +171,11 @@ fn wallet_from_value(value: Value, name: String, purpose: Option<String>) -> Res
         .get("address")
         .and_then(Value::as_str)
         .ok_or_else(|| WalletError::Provider("Privy wallet response has no address".into()))?;
-    let chain = value
-        .get("chain_type")
-        .and_then(Value::as_str)
-        .unwrap_or("solana");
     Ok(Wallet {
         driver: DRIVER_ID.into(),
         id: id.into(),
         name,
-        chain: chain.into(),
+        chain: "solana".into(),
         address: address.into(),
         purpose,
         lifecycle: "retained".into(),
@@ -203,5 +218,36 @@ mod tests {
             d.external_id(&t, "tax").unwrap(),
             "pay-0123456789abcdef-tax"
         );
+    }
+
+    #[test]
+    fn only_the_requested_solana_wallet_is_accepted() {
+        let requested = "pay-0123456789abcdef-tax";
+        let wallet = |external_id: Option<&str>, chain: Option<&str>| {
+            let mut value =
+                json!({"id": "w1", "address": "So11111111111111111111111111111111111111112"});
+            if let Some(external_id) = external_id {
+                value["external_id"] = json!(external_id);
+            }
+            if let Some(chain) = chain {
+                value["chain_type"] = json!(chain);
+            }
+            wallet_from_value(value, requested, "tax".into(), None)
+        };
+        let accepted = wallet(Some(requested), Some("solana")).unwrap();
+        assert_eq!(accepted.chain, "solana");
+        assert_eq!(
+            accepted.address,
+            "So11111111111111111111111111111111111111112"
+        );
+        for (returned, chain) in [
+            (Some("pay-fedcba9876543210-tax"), Some("solana")),
+            (Some("pay-0123456789abcdef-other"), Some("solana")),
+            (None, Some("solana")),
+            (Some(requested), Some("ethereum")),
+            (Some(requested), None),
+        ] {
+            assert!(wallet(returned, chain).is_err(), "{returned:?} {chain:?}");
+        }
     }
 }
