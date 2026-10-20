@@ -363,16 +363,19 @@ impl Store {
     /// Consume the pending request and mint a code for `subject`.
     /// Returns the code, or `None` when the request is unknown or expired.
     pub fn approve(&self, id: &str, subject: &str) -> Option<(PendingAuthorization, String)> {
-        self.approve_in_session(id, subject, None)
+        self.approve_in_session(id, subject, None, || true)
     }
 
     /// [`Store::approve`], binding the code and every token derived from it
     /// to the upstream login `session`, so [`Store::revoke_session`] ends them.
+    /// `live` says whether that session is still signed in; it is asked while
+    /// codes are locked, so a sign-out either sees the new code or refuses it.
     pub fn approve_in_session(
         &self,
         id: &str,
         subject: &str,
         session: Option<&str>,
+        live: impl FnOnce() -> bool,
     ) -> Option<(PendingAuthorization, String)> {
         let request = self.pending.lock().unwrap().remove(id)?;
         if self.now().saturating_duration_since(request.created_at) > REQUEST_TTL {
@@ -395,6 +398,9 @@ impl Store {
         };
         let now = self.now();
         let mut codes = self.codes.lock().unwrap();
+        if session.is_some() && !live() {
+            return None;
+        }
         insert_bounded(&mut codes, sha256_hex(&code), grant, |g| {
             now.saturating_duration_since(g.created_at) > CODE_TTL
         })
@@ -628,9 +634,14 @@ impl Store {
         }
     }
 
-    /// End every code and token approved in the upstream login `session`.
+    /// End every pending approval, code and token of the upstream login
+    /// `session`: nothing it began can finish after it signs out.
     pub fn revoke_session(&self, session: &str) {
         let ours = |s: &Option<String>| s.as_deref() == Some(session);
+        self.pending
+            .lock()
+            .unwrap()
+            .retain(|_, request| !ours(&request.session));
         self.codes
             .lock()
             .unwrap()
@@ -1123,7 +1134,9 @@ pub async fn approve(
         return Ok(response);
     }
     let (request, code) = store
-        .approve_in_session(&id, &subject, Some(&session.id))
+        .approve_in_session(&id, &subject, Some(&session.id), || {
+            session_is_live(&state, &session)
+        })
         .ok_or_else(unknown_request)?;
     tracing::info!(client_id = %request.client_id, %subject, "oauth authorization approved");
     let mut response = Json(DecisionResponse {
@@ -1171,7 +1184,7 @@ pub(crate) fn approve_with_cookie(
 }
 
 #[cfg(feature = "privy")]
-fn session_is_live(state: &AppState, session: &crate::tenants::LoginSession) -> bool {
+pub(crate) fn session_is_live(state: &AppState, session: &crate::tenants::LoginSession) -> bool {
     state
         .privy()
         .is_some_and(|privy| privy.session_is_live(session))
@@ -1179,7 +1192,7 @@ fn session_is_live(state: &AppState, session: &crate::tenants::LoginSession) -> 
 
 /// Without Privy no login session exists to be live.
 #[cfg(not(feature = "privy"))]
-fn session_is_live(_state: &AppState, _session: &crate::tenants::LoginSession) -> bool {
+pub(crate) fn session_is_live(_state: &AppState, _session: &crate::tenants::LoginSession) -> bool {
     false
 }
 
@@ -1912,6 +1925,25 @@ mod tests {
         );
     }
 
+    /// A session signed out while its approval was still in flight gets no
+    /// code: liveness is checked as the code is stored.
+    #[test]
+    fn a_signed_out_session_cannot_mint_a_code() {
+        let store = Store::new("https://cloud.test/");
+        let (client, _) = store.register(grok_registration()).unwrap();
+        for live in [false, true] {
+            let request = pending_for(&client);
+            let id = request.id.clone();
+            store.create_pending(request).unwrap();
+            assert_eq!(
+                store
+                    .approve_in_session(&id, "sub_1", Some("sess_a"), || live)
+                    .is_some(),
+                live
+            );
+        }
+    }
+
     #[test]
     fn revoking_a_session_ends_its_codes_and_tokens_only() {
         let store = Store::new("https://cloud.test/");
@@ -1921,7 +1953,9 @@ mod tests {
             let request = pending_for(&client);
             let id = request.id.clone();
             store.create_pending(request).unwrap();
-            let (_, code) = store.approve_in_session(&id, "sub_1", session).unwrap();
+            let (_, code) = store
+                .approve_in_session(&id, "sub_1", session, || true)
+                .unwrap();
             let tokens = store
                 .exchange_code(&client.client_id, &code, VERIFIER, None)
                 .unwrap();
@@ -1935,10 +1969,17 @@ mod tests {
         let id = pending.id.clone();
         store.create_pending(pending).unwrap();
         let (_, unused_code) = store
-            .approve_in_session(&id, "sub_1", Some("sess_a"))
+            .approve_in_session(&id, "sub_1", Some("sess_a"), || true)
             .unwrap();
+        // An approval parked for funding in that session.
+        let parked = pending_for(&client);
+        let parked_id = parked.id.clone();
+        store.create_pending(parked).unwrap();
+        store.attach_session(&parked_id, Some("sess_a")).unwrap();
 
         store.revoke_session("sess_a");
+        assert!(store.pending(&parked_id).is_none(), "cannot resume");
+        assert!(store.approve(&parked_id, "sub_1").is_none());
         assert!(store.authenticate(&issued[0].access_token).is_none());
         assert!(
             store

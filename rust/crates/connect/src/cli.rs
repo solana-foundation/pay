@@ -92,11 +92,15 @@ impl Store {
         (Instant::now().saturating_duration_since(row.created_at) <= REQUEST_TTL).then_some(row)
     }
 
+    /// Consume a pending link and mint its code, bound to `session`. `live`
+    /// says whether that session is still signed in; it is asked while
+    /// grants are locked, so a sign-out either sees the code or refuses it.
     fn approve(
         &self,
         id: &str,
         subject: String,
         session: Option<String>,
+        live: impl FnOnce() -> bool,
     ) -> Option<(Pending, String)> {
         let mut rows = self.pending.lock().unwrap();
         let pending = rows.get(id)?;
@@ -112,6 +116,9 @@ impl Store {
         }
         let code = random_token();
         let mut grants = self.grants.lock().unwrap();
+        if session.is_some() && !live() {
+            return None;
+        }
         if grants.len() >= MAX_ROWS {
             let now = Instant::now();
             grants.retain(|_, row| now.saturating_duration_since(row.created_at) <= CODE_TTL);
@@ -193,9 +200,14 @@ impl Store {
         }
     }
 
-    /// End every link code and CLI token approved in the Privy `session`.
+    /// End every pending link, link code and CLI token of the Privy
+    /// `session`: nothing it began can finish after it signs out.
     pub fn revoke_session(&self, session: &str) {
         let ours = |s: &Option<String>| s.as_deref() == Some(session);
+        self.pending
+            .lock()
+            .unwrap()
+            .retain(|_, pending| !ours(&pending.session));
         self.grants
             .lock()
             .unwrap()
@@ -459,7 +471,9 @@ pub async fn approve(
     }
     let (pending, code) = state
         .cli()
-        .approve(&id, subject.clone(), Some(session.id.clone()))
+        .approve(&id, subject.clone(), Some(session.id.clone()), || {
+            crate::oauth::session_is_live(&state, &session)
+        })
         .ok_or_else(unknown_request)?;
     let mut response = Json(Decision {
         redirect: Some(redirect_url(&pending.callback, &code, &pending.state)),
@@ -959,9 +973,21 @@ mod tests {
         let token = state.cli().issue_token(subject, bound).unwrap();
         assert!(state.cli().authenticate(&token).is_some());
 
+        // A link parked for funding in that session.
+        pending_link(&state, "parked");
+        state
+            .cli()
+            .pending
+            .lock()
+            .unwrap()
+            .get_mut("parked")
+            .unwrap()
+            .session = Some("sess_cli".to_string());
+
         state.privy().unwrap().revoke_session("sess_cli");
         state.cli().revoke_session("sess_cli");
         assert!(state.cli().authenticate(&token).is_none());
+        assert!(!state.cli().is_link_pending("parked"), "cannot resume");
         pending_link(&state, "link-2");
         let (status, body) = approve_by_cookie(&app, "link-2", cookie).await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
