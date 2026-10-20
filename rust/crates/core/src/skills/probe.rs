@@ -16,7 +16,7 @@ use pay_types::Stablecoin;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::client::fetch::fetch_raw;
+use crate::client::fetch::{RedirectPolicy, fetch_raw_with_body_for};
 use crate::client::runner::{self, RunOutcome};
 
 // ── Currency normalization ───────────────────────────────────────────────────
@@ -388,6 +388,7 @@ fn probe_status_str(status: &ProbeStatus, http_status: u16, paid: &PaidEndpoint)
             401 | 403 => "auth_required",
             404 => "not_found",
             405 => "method_not_allowed",
+            300..=399 => "redirected",
             // 400 = server schema-validates the body before reaching the
             // paywall (e.g. stabledomains POST /api/register needs a domain).
             // 5xx = same shape with a less helpful error code.
@@ -424,7 +425,18 @@ fn probe_endpoint(
         vec![]
     };
 
-    let raw = fetch_raw(method, url, &headers, body);
+    // Probes never follow redirects: the provider controls `Location`, and a
+    // followed 307/308 would replay a generated POST body against a target
+    // nobody reviewed. A redirect is recorded as its own status instead.
+    let body = body.map(crate::client::fetch::RequestBody::from);
+    let raw = fetch_raw_with_body_for(
+        crate::ClientApp::Cli,
+        method,
+        url,
+        &headers,
+        body.as_ref(),
+        RedirectPolicy::None,
+    );
     let duration_ms = start.elapsed().as_millis() as u64;
 
     let (status, paid, probe_status, http_status) = match raw {
@@ -950,5 +962,78 @@ mod tests {
         assert_eq!(amount_to_usd("1000000", 6), Some(1.0));
         assert_eq!(amount_to_usd("0", 6), Some(0.0));
         assert_eq!(amount_to_usd("not a number", 6), None);
+    }
+
+    /// Serve every connection on a loopback port with `response`, counting
+    /// the requests that arrive.
+    fn serve(response: String) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (url, hits)
+    }
+
+    fn metered_provider(service_url: String) -> pay_types::registry::ProbeProvider {
+        pay_types::registry::ProbeProvider {
+            fqn: "acme/provider".into(),
+            service_url,
+            endpoints: vec![
+                pay_types::registry::ProbeEndpoint {
+                    method: "GET".into(),
+                    path: "read".into(),
+                    metered: true,
+                    body: None,
+                },
+                pay_types::registry::ProbeEndpoint {
+                    method: "POST".into(),
+                    path: "mutate".into(),
+                    metered: true,
+                    body: Some(r#"{"action":"update"}"#.into()),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn probe_records_a_redirect_without_following_it() {
+        let (target, target_hits) =
+            serve("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".into());
+        let (origin, origin_hits) = serve(format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: {target}/private\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        ));
+
+        let report = probe_provider(&metered_provider(origin), &ProbeConfig::default());
+
+        assert_eq!(origin_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(target_hits.load(Ordering::SeqCst), 0);
+        assert!(!report.pass);
+        for endpoint in &report.endpoints {
+            assert_eq!(endpoint.http_status, 307, "{}", endpoint.method);
+            assert_eq!(endpoint.probe_status, "redirected", "{}", endpoint.method);
+        }
+    }
+
+    #[test]
+    fn probe_still_classifies_a_direct_response() {
+        let (origin, origin_hits) =
+            serve("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".into());
+
+        let report = probe_provider(&metered_provider(origin), &ProbeConfig::default());
+
+        assert_eq!(origin_hits.load(Ordering::SeqCst), 2);
+        for endpoint in &report.endpoints {
+            assert_eq!(endpoint.http_status, 200, "{}", endpoint.method);
+            assert_eq!(endpoint.probe_status, "free", "{}", endpoint.method);
+        }
     }
 }
