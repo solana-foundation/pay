@@ -254,9 +254,10 @@ fn x402_exact_backend(
         .with_tx_v1(pay_kit::core::tx::TxV1Mode::Auto))
 }
 
-/// Consumed MPP charge signatures. Replicas behind a deployment policy must
-/// share it; a single hosted gateway without Redis is warned that a restart
-/// forgets which payments were already served.
+/// Consumed MPP charge signatures and challenge generations. Outside local
+/// test clusters a gateway refuses to start without a shared durable store:
+/// a process-local one is forgotten on restart and not seen by a second
+/// replica, so one credential could be served more than once.
 async fn charge_replay_store(
     network: &SolanaNetwork,
     deployment_policy_mode: bool,
@@ -274,15 +275,11 @@ async fn charge_replay_store(
         ));
     }
     if !durable && requires_durable_store(network, deployment_policy_mode) {
-        eprintln!(
-            "{}",
-            format!(
-                "warning: MPP charges on {} use an in-memory replay store; set PAY_MPP_REDIS_URL \
-                 before running more than one gateway",
-                network.slug()
-            )
-            .yellow()
-        );
+        return Err(pay_core::Error::Config(format!(
+            "MPP charges on {} need a durable replay store; set PAY_MPP_REDIS_URL and build \
+             with redis-session-store",
+            network.slug()
+        )));
     }
     Ok(store)
 }
@@ -4327,6 +4324,36 @@ mod tests {
         devnet.unwrap();
         localnet.unwrap();
         no_subscriptions.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn hosted_mpp_charges_refuse_a_process_local_replay_store() {
+        let names = ["PAY_MPP_REDIS_URL", "PAY_SESSION_REDIS_URL"];
+        let saved = names.map(std::env::var_os);
+        for name in names {
+            unsafe { std::env::remove_var(name) };
+        }
+        let mainnet = super::charge_replay_store(&SolanaNetwork::Mainnet, false).await;
+        let custom =
+            super::charge_replay_store(&SolanaNetwork::Unknown("custom".into()), false).await;
+        let deployment = super::charge_replay_store(&SolanaNetwork::Devnet, true).await;
+        let devnet = super::charge_replay_store(&SolanaNetwork::Devnet, false).await;
+        let localnet = super::charge_replay_store(&SolanaNetwork::Localnet, false).await;
+        for (name, value) in names.into_iter().zip(saved) {
+            if let Some(value) = value {
+                unsafe { std::env::set_var(name, value) };
+            }
+        }
+        for refused in [mainnet, custom, deployment] {
+            assert!(
+                refused.is_err(),
+                "a hosted charge gateway fell back to memory"
+            );
+        }
+        // Local test clusters may still run on process memory.
+        devnet.unwrap();
+        localnet.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
