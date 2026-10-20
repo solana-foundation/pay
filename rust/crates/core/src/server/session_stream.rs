@@ -2508,11 +2508,14 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
     /// read never answers (cancelling an attempt in the lifecycle touch after
     /// its voucher saved), or with `slow_write`, the write that saved it is
     /// slow to return (cancelling the attempt inside the commit itself).
+    /// Once armed with [`Self::hold_reads_in_lockstep`], its next reads also
+    /// wait for each other, so two replicas observe the same watermark.
     struct StallingStore {
         inner: MemoryChannelStore,
         stall_at: u64,
         slow_write: bool,
         stalled: std::sync::atomic::AtomicBool,
+        lockstep: std::sync::Mutex<Option<(Arc<tokio::sync::Barrier>, usize)>>,
     }
 
     impl StallingStore {
@@ -2522,7 +2525,25 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
                 stall_at,
                 slow_write,
                 stalled: std::sync::atomic::AtomicBool::new(false),
+                lockstep: std::sync::Mutex::new(None),
             })
+        }
+
+        /// Make the next `readers` reads wait until all of them have arrived.
+        fn hold_reads_in_lockstep(&self, readers: usize) {
+            *self.lockstep.lock().unwrap() =
+                Some((Arc::new(tokio::sync::Barrier::new(readers)), readers));
+        }
+
+        fn lockstep_barrier(&self) -> Option<Arc<tokio::sync::Barrier>> {
+            let mut lockstep = self.lockstep.lock().unwrap();
+            let (barrier, remaining) = lockstep.as_mut()?;
+            let barrier = Arc::clone(barrier);
+            *remaining -= 1;
+            if *remaining == 0 {
+                *lockstep = None;
+            }
+            Some(barrier)
         }
 
         async fn after_write(&self, channel_id: &str) {
@@ -2564,8 +2585,13 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             channel_id: &str,
         ) -> StoreFuture<'_, Option<pay_kit::mpp::store::ChannelState>> {
             let channel_id = channel_id.to_string();
+            let lockstep = self.lockstep_barrier();
             Box::pin(async move {
                 let state = self.inner.get_channel(&channel_id).await?;
+                // Return the snapshot only once every lockstep reader holds one.
+                if let Some(barrier) = lockstep {
+                    barrier.wait().await;
+                }
                 if !self.slow_write
                     && state
                         .as_ref()
@@ -2767,6 +2793,32 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
 
         let state = store.get_channel(&channel_id).await.unwrap().unwrap();
         assert_eq!(state.cumulative, 12, "each stream pays its own usage");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replicas_racing_one_watermark_each_pay_their_own_request() {
+        let store = StallingStore::new(u64::MAX, false);
+        let shared: Arc<dyn ChannelStore> = store.clone();
+        let channel = delegated_channel("racing-replicas", &shared).await;
+        let channel_id = channel.channel_id.clone();
+        let second = delegated_replica(
+            &channel.config,
+            &channel.operator,
+            "racing-replicas",
+            &shared,
+        );
+        // Both replicas read the channel at cumulative 0 and sign the same
+        // deterministic voucher for 25; only one of them may land it.
+        store.hold_reads_in_lockstep(2);
+        let (first, second) = tokio::join!(
+            channel.session.authorize_delegated_usage(&channel_id, 25),
+            second.authorize_delegated_usage(&channel_id, 25),
+        );
+        let mut cumulatives = [first.unwrap().cumulative, second.unwrap().cumulative];
+        cumulatives.sort_unstable();
+        assert_eq!(cumulatives, [25, 50], "each request is charged once");
+        let state = store.inner.get_channel(&channel_id).await.unwrap().unwrap();
+        assert_eq!(state.cumulative, 50);
     }
 
     #[tokio::test]

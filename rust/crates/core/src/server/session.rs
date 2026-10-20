@@ -226,6 +226,20 @@ pub struct DelegatedUsageAuthorization {
     pub idle_timeout_seconds: u32,
 }
 
+/// Attempts per delegated commit before a channel that keeps advancing under
+/// other replicas is reported as busy.
+const DELEGATED_COMMIT_ATTEMPTS: usize = 4;
+/// Fence error raised inside the store update when another writer advanced
+/// the watermark a delegated voucher was signed from.
+const DELEGATED_WATERMARK_MOVED: &str = "delegated session watermark moved";
+
+/// Outcome of one fenced delegated commit round.
+enum DelegatedCommit {
+    Committed(DelegatedUsageAuthorization),
+    /// Another writer advanced the channel; nothing was written.
+    WatermarkMoved,
+}
+
 #[derive(Clone)]
 struct SessionOperatorRuntime {
     server: Arc<SessionServer<Arc<dyn ChannelStore>>>,
@@ -2118,9 +2132,45 @@ impl SessionMpp {
                 "session does not delegate voucher authority to the operator".to_string(),
             ));
         }
-        // Serialize read/sign/verify so concurrent responses cannot construct
-        // two vouchers from the same cumulative watermark.
+        // Serialize read/sign/verify so concurrent responses on this replica
+        // cannot construct two vouchers from the same cumulative watermark.
+        // Other replicas share only the store, so each attempt is also fenced
+        // on the watermark it signed from (see `try_commit_reserved_usage`).
         let _guard = self.operator_runtime.delegated_voucher_lock.lock().await;
+        for _ in 0..DELEGATED_COMMIT_ATTEMPTS {
+            match self
+                .try_commit_reserved_usage(
+                    channel_id,
+                    amount,
+                    lease_id.clone(),
+                    deadline,
+                    initial_cumulative,
+                )
+                .await?
+            {
+                DelegatedCommit::Committed(accepted) => return Ok(accepted),
+                DelegatedCommit::WatermarkMoved => continue,
+            }
+        }
+        Err(Error::PaymentRejected(format!(
+            "delegated session channel {channel_id} kept advancing concurrently; retry the request"
+        )))
+    }
+
+    /// One read/sign/commit round of [`Self::commit_reserved_usage`]. The
+    /// commit is fenced on the watermark the voucher was signed from: if
+    /// another replica advanced the channel in between, nothing is written
+    /// and the caller re-reads. Without the fence an identical deterministic
+    /// voucher would land as a no-charge replay and release a second response
+    /// for one debit.
+    async fn try_commit_reserved_usage(
+        &self,
+        channel_id: &str,
+        amount: u64,
+        lease_id: Option<String>,
+        deadline: Option<tokio::time::Instant>,
+        initial_cumulative: Option<u64>,
+    ) -> Result<DelegatedCommit> {
         // The durable store is authoritative. Reading it on every delegated
         // authorization also lets a restarted or different gateway replica
         // continue from a watermark advanced by another process.
@@ -2148,10 +2198,10 @@ impl SessionMpp {
         })?;
         self.record_committed_watermark(channel_id.to_string(), current);
         if amount == 0 {
-            return Ok(DelegatedUsageAuthorization {
+            return Ok(DelegatedCommit::Committed(DelegatedUsageAuthorization {
                 cumulative: current,
                 idle_timeout_seconds,
-            });
+            }));
         }
         let cumulative = current
             .checked_add(amount)
@@ -2181,7 +2231,7 @@ impl SessionMpp {
             .sign_message(&message)
             .await
             .map_err(|e| Error::Mpp(format!("failed to sign delegated voucher: {e}")))?;
-        let accepted = self
+        let accepted = match self
             .server
             .verify_voucher_with_guard(
                 &VoucherPayload {
@@ -2194,6 +2244,9 @@ impl SessionMpp {
                     },
                 },
                 move |state| {
+                    if state.cumulative != current {
+                        return Err(pay_kit::mpp::Error::Other(DELEGATED_WATERMARK_MOVED.into()));
+                    }
                     if let Some(id) = &lease_id {
                         if initial_cumulative != Some(state.cumulative) {
                             return Err(pay_kit::mpp::Error::Other(
@@ -2218,7 +2271,27 @@ impl SessionMpp {
                 },
             )
             .await
-            .map_err(|e| Error::PaymentRejected(e.to_string()))?;
+        {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                let message = error.to_string();
+                // The kit reports a lost race that our fence did not see
+                // first (a different signature at the same cumulative).
+                if message.contains(DELEGATED_WATERMARK_MOVED)
+                    || message.contains("watermark advanced")
+                {
+                    return Ok(DelegatedCommit::WatermarkMoved);
+                }
+                return Err(Error::PaymentRejected(message));
+            }
+        };
+        // The fence makes a replay unreachable; never let one through as a
+        // fresh, paid execution if that ever changes.
+        if accepted.replay || accepted.charged != amount {
+            return Err(Error::PaymentRejected(format!(
+                "delegated voucher for channel {channel_id} did not charge this request"
+            )));
+        }
         telemetry::record_payment_channel_voucher_cumulative(
             channel_id,
             self.currency(),
@@ -2232,10 +2305,10 @@ impl SessionMpp {
             accepted.charged,
         );
         self.record_committed_watermark(channel_id.to_string(), accepted.cumulative);
-        Ok(DelegatedUsageAuthorization {
+        Ok(DelegatedCommit::Committed(DelegatedUsageAuthorization {
             cumulative: accepted.cumulative,
             idle_timeout_seconds,
-        })
+        }))
     }
 
     pub async fn reserve_delegated_capacity(
