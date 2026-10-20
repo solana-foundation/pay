@@ -664,7 +664,7 @@ pub struct OnChainSpendHistory {
     http: reqwest::Client,
 }
 
-/// Signature pages read per wallet; a wallet past this many transactions
+/// Signature pages read per address; an address past this many transactions
 /// today is reported as unknown rather than undercounted.
 const HISTORY_PAGES: usize = 4;
 const HISTORY_PAGE: usize = 1_000;
@@ -701,6 +701,75 @@ impl OnChainSpendHistory {
     }
 }
 
+impl OnChainSpendHistory {
+    /// The wallet's stablecoin token accounts, under either token program.
+    /// A delegate's transfer names only the token account, never the owner,
+    /// so the owner's own signature index misses it.
+    async fn stablecoin_accounts(&self, wallet: &str) -> Result<Vec<String>, String> {
+        use pay_kit::mpp::protocol::solana::{is_known_stablecoin_mint, programs};
+        let mut accounts = Vec::new();
+        for program in [programs::TOKEN_PROGRAM, programs::TOKEN_2022_PROGRAM] {
+            let found = self
+                .rpc(
+                    "getTokenAccountsByOwner",
+                    json!([wallet, { "programId": program },
+                           { "encoding": "jsonParsed", "commitment": "confirmed" }]),
+                )
+                .await?;
+            let found = found["value"]
+                .as_array()
+                .ok_or("getTokenAccountsByOwner: not a list")?;
+            for entry in found {
+                let pubkey = entry["pubkey"]
+                    .as_str()
+                    .ok_or("getTokenAccountsByOwner: account without pubkey")?;
+                let mint = entry["account"]["data"]["parsed"]["info"]["mint"]
+                    .as_str()
+                    .ok_or_else(|| format!("getTokenAccountsByOwner: {pubkey} has no mint"))?;
+                if is_known_stablecoin_mint(mint) {
+                    accounts.push(pubkey.to_string());
+                }
+            }
+        }
+        Ok(accounts)
+    }
+
+    /// Signatures of `address`'s successful transactions since `day_start`.
+    async fn signatures_today(&self, address: &str, day_start: i64) -> Result<Vec<String>, String> {
+        let mut before: Option<String> = None;
+        let mut signatures = Vec::new();
+        for _ in 0..HISTORY_PAGES {
+            let mut config = json!({ "limit": HISTORY_PAGE, "commitment": "confirmed" });
+            if let Some(before) = &before {
+                config["before"] = json!(before);
+            }
+            let page = self
+                .rpc("getSignaturesForAddress", json!([address, config]))
+                .await?;
+            let page = page
+                .as_array()
+                .ok_or("getSignaturesForAddress: not a list")?;
+            for entry in page {
+                // An unknown block time counts as today.
+                if entry["blockTime"].as_i64().is_some_and(|t| t < day_start) {
+                    return Ok(signatures);
+                }
+                let signature = entry["signature"].as_str().ok_or("signature missing")?;
+                before = Some(signature.to_string());
+                if entry["err"].is_null() {
+                    signatures.push(signature.to_string());
+                }
+            }
+            if page.len() < HISTORY_PAGE {
+                return Ok(signatures);
+            }
+        }
+        Err(format!(
+            "{address} has too many transactions today to count"
+        ))
+    }
+}
+
 #[async_trait::async_trait]
 impl crate::tenants::SpendHistory for OnChainSpendHistory {
     async fn spent_today(&self, wallet: &str) -> Result<u64, String> {
@@ -709,45 +778,27 @@ impl crate::tenants::SpendHistory for OnChainSpendHistory {
             .map_err(|e| e.to_string())?
             .as_secs();
         let day_start = (now / 86_400 * 86_400) as i64;
-        let mut before: Option<String> = None;
-        let mut raw = 0_u64;
-        for _ in 0..HISTORY_PAGES {
-            let mut config = json!({ "limit": HISTORY_PAGE, "commitment": "confirmed" });
-            if let Some(before) = &before {
-                config["before"] = json!(before);
-            }
-            let page = self
-                .rpc("getSignaturesForAddress", json!([wallet, config]))
-                .await?;
-            let page = page
-                .as_array()
-                .ok_or("getSignaturesForAddress: not a list")?;
-            for entry in page {
-                // An unknown block time counts as today.
-                if entry["blockTime"].as_i64().is_some_and(|t| t < day_start) {
-                    return Ok(raw.div_ceil(100));
-                }
-                let signature = entry["signature"].as_str().ok_or("signature missing")?;
-                before = Some(signature.to_string());
-                if !entry["err"].is_null() {
-                    continue;
-                }
-                let tx = self
-                    .rpc(
-                        "getTransaction",
-                        json!([signature, { "encoding": "json", "commitment": "confirmed",
-                                            "maxSupportedTransactionVersion": 0 }]),
-                    )
-                    .await?;
-                let tx: ConfirmedTransaction = serde_json::from_value(tx)
-                    .map_err(|e| format!("getTransaction {signature}: history unavailable: {e}"))?;
-                raw = raw.saturating_add(tx.stablecoin_outflow(wallet));
-            }
-            if page.len() < HISTORY_PAGE {
-                return Ok(raw.div_ceil(100));
-            }
+        // The owner's own transactions, and every transaction touching one of
+        // its stablecoin accounts, each counted once.
+        let mut signatures = std::collections::BTreeSet::new();
+        signatures.extend(self.signatures_today(wallet, day_start).await?);
+        for account in self.stablecoin_accounts(wallet).await? {
+            signatures.extend(self.signatures_today(&account, day_start).await?);
         }
-        Err(format!("{wallet} has too many transactions today to count"))
+        let mut raw = 0_u64;
+        for signature in signatures {
+            let tx = self
+                .rpc(
+                    "getTransaction",
+                    json!([signature, { "encoding": "json", "commitment": "confirmed",
+                                        "maxSupportedTransactionVersion": 0 }]),
+                )
+                .await?;
+            let tx: ConfirmedTransaction = serde_json::from_value(tx)
+                .map_err(|e| format!("getTransaction {signature}: history unavailable: {e}"))?;
+            raw = raw.saturating_add(tx.stablecoin_outflow(wallet));
+        }
+        Ok(raw.div_ceil(100))
     }
 }
 
@@ -1481,16 +1532,40 @@ pub(crate) mod tests {
                                         "uiTokenAmount": { "amount": (10_000_000 - amount).to_string() } }] } })
         };
         let rpc = move |Json(request): Json<serde_json::Value>| async move {
+            use pay_kit::mpp::protocol::solana::programs;
+            let account = |pubkey: &str, mint: &str| json!({ "pubkey": pubkey, "account": { "data": { "parsed": { "info": { "mint": mint } } } } });
             let result = match request["method"].as_str().unwrap() {
-                "getSignaturesForAddress" => json!([
-                    { "signature": "today_1", "blockTime": now, "err": null },
-                    { "signature": "today_failed", "blockTime": now, "err": { "x": 1 } },
-                    { "signature": "today_2", "blockTime": day_start, "err": null },
-                    { "signature": "yesterday", "blockTime": day_start - 1, "err": null },
-                ]),
+                "getTokenAccountsByOwner" => {
+                    assert_eq!(request["params"][0], ADDRESS);
+                    match request["params"][1]["programId"].as_str().unwrap() {
+                        programs::TOKEN_PROGRAM => json!({ "value": [
+                            account("usdc_account", mints::USDC_MAINNET),
+                            account("meme_account", "MemeMint1111111111111111111111111111111111"),
+                        ] }),
+                        programs::TOKEN_2022_PROGRAM => json!({ "value": [] }),
+                        other => panic!("{other}"),
+                    }
+                }
+                "getSignaturesForAddress" => match request["params"][0].as_str().unwrap() {
+                    ADDRESS => json!([
+                        { "signature": "today_1", "blockTime": now, "err": null },
+                        { "signature": "today_failed", "blockTime": now, "err": { "x": 1 } },
+                        { "signature": "today_2", "blockTime": day_start, "err": null },
+                        { "signature": "yesterday", "blockTime": day_start - 1, "err": null },
+                    ]),
+                    // A delegate's transfer names the token account, not the
+                    // owner; the owner's own transfers name both.
+                    "usdc_account" => json!([
+                        { "signature": "delegated", "blockTime": now, "err": null },
+                        { "signature": "today_1", "blockTime": now, "err": null },
+                        { "signature": "yesterday", "blockTime": day_start - 1, "err": null },
+                    ]),
+                    other => panic!("{other} must not be read"),
+                },
                 "getTransaction" => match request["params"][0].as_str().unwrap() {
                     "today_1" => debit(1_000_001),
                     "today_2" => debit(500_000),
+                    "delegated" => debit(2_000_000),
                     other => panic!("{other} must not be read"),
                 },
                 other => panic!("{other}"),
@@ -1504,8 +1579,9 @@ pub(crate) mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let history = OnChainSpendHistory::new(format!("http://{addr}/"));
-        // 1.500001 USDC rounds up to 15,001 minor units.
-        assert_eq!(history.spent_today(ADDRESS).await.unwrap(), 15_001);
+        // 3.500001 USDC, the delegated transfer and each transaction counted
+        // once, rounds up to 35,001 minor units.
+        assert_eq!(history.spent_today(ADDRESS).await.unwrap(), 35_001);
         assert!(
             OnChainSpendHistory::new("http://127.0.0.1:1/")
                 .spent_today(ADDRESS)
@@ -1527,6 +1603,7 @@ pub(crate) mod tests {
                 let transaction = transaction.clone();
                 async move {
                     let result = match request["method"].as_str().unwrap() {
+                        "getTokenAccountsByOwner" => json!({ "value": [] }),
                         "getSignaturesForAddress" => {
                             json!([{ "signature": "today", "blockTime": now, "err": null }])
                         }
