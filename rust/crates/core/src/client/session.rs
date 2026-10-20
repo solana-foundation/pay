@@ -358,9 +358,19 @@ pub fn open_payment_channel_session_header_with_override(
 
     crate::mpp_channel_profile::validate_challenge(request)?;
     let details = &request.method_details;
-    let network = network_override
-        .map(str::to_string)
-        .unwrap_or_else(|| details.network.clone());
+    // One canonical slug for account selection, approval policy and RPC: a
+    // `mainnet-beta` challenge is a mainnet payment in every respect.
+    let challenge_network = crate::accounts::canonical_network(&details.network);
+    let network = match network_override.map(crate::accounts::canonical_network) {
+        Some(selected) if selected != challenge_network => {
+            return Err(Error::Mpp(format!(
+                "MPP session network mismatch: payer requires `{selected}`, gateway offered `{}`",
+                details.network
+            )));
+        }
+        Some(selected) => selected.to_string(),
+        None => challenge_network.to_string(),
+    };
     canonical_session_origin(resource_url)?;
     let prompt_context = crate::client::prompt::payment_prompt_context(None, &[Some(resource_url)]);
     let limit = session_spend_limit(deposit, request);
@@ -561,15 +571,8 @@ pub fn open_operator_signed_session_authorizations(
             "agent payer requires an operator-signed MPP session".to_string(),
         ));
     }
-    if let Some(forced) = network_override
-        && forced != request.method_details.network
-    {
-        return Err(Error::Mpp(format!(
-            "MPP session network mismatch: payer requires `{forced}`, gateway offered `{}`",
-            request.method_details.network
-        )));
-    }
-
+    // The opener rejects a network override that differs from the
+    // challenge's (canonical) network before loading any wallet.
     let deposit = operator_session_deposit(&request)?;
     let sandbox = network_override == Some("localnet");
     let (handle, open_authorization) = open_payment_channel_session_header_with_override(
@@ -793,6 +796,52 @@ mod tests {
             .build()
             .unwrap()
             .block_on(handle.channel_id())
+    }
+
+    fn open_on(
+        network: &str,
+        network_override: Option<&str>,
+        store: &crate::accounts::MemoryAccountsStore,
+    ) -> Error {
+        let mut request = test_request();
+        request.method_details.network = network.to_string();
+        let challenge = PaymentChallenge::with_challenge_binding_secret(
+            "test-secret",
+            "test-realm",
+            "solana",
+            "session",
+            Base64UrlJson::from_typed(&request).unwrap(),
+        );
+        open_payment_channel_session_header_with_override(
+            &challenge,
+            &request,
+            store,
+            network_override,
+            None,
+            1_000_000,
+            "https://api.example/session",
+            false,
+            None,
+            None,
+        )
+        .err()
+        .expect("no wallet can open this session")
+    }
+
+    #[test]
+    fn a_mainnet_beta_session_is_a_mainnet_payment() {
+        let store = crate::accounts::MemoryAccountsStore::new();
+        // The alias selects (and would gate) the mainnet account, exactly
+        // like the canonical name does.
+        for network in ["mainnet-beta", "mainnet"] {
+            let err = open_on(network, None, &store).to_string();
+            assert!(err.contains("network `mainnet`"), "{network}: {err}");
+        }
+        // A forced network must match the challenge's canonical network.
+        let err = open_on("mainnet-beta", Some("devnet"), &store).to_string();
+        assert!(err.contains("network mismatch"), "{err}");
+        let err = open_on("mainnet-beta", Some("mainnet"), &store).to_string();
+        assert!(!err.contains("network mismatch"), "{err}");
     }
 
     #[test]

@@ -242,6 +242,8 @@ pub fn load_signer_for_network_with_intent_and_override(
     intent: &AuthIntent,
     auth_override: AuthOverride,
 ) -> Result<(ResolvedSigner, Option<ResolvedEphemeral>)> {
+    // Select the account and judge its approval policy on the same slug.
+    let network = crate::accounts::canonical_network(network);
     let file = store.load()?;
     match select_account(&file, network, account_override)? {
         AccountSelection::Configured { name, account } => {
@@ -334,6 +336,7 @@ pub fn backend_for_network(
     store: &dyn AccountsStore,
     account_override: Option<&str>,
 ) -> Result<Option<&'static dyn SigningBackend>> {
+    let network = crate::accounts::canonical_network(network);
     let file = store.load()?;
     match select_account(&file, network, account_override)? {
         AccountSelection::Configured { account, .. } => account.descriptor().map(Some),

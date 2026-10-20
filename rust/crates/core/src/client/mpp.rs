@@ -71,7 +71,7 @@ pub fn challenge_network(challenge: &Challenge, network_override: Option<&str>) 
     if blockhash.is_some_and(|value| value.starts_with(SURFPOOL_BLOCKHASH_PREFIX)) {
         Ok("localnet".to_string())
     } else {
-        Ok(normalize_network(network).to_string())
+        Ok(crate::accounts::canonical_network(network).to_string())
     }
 }
 
@@ -159,7 +159,7 @@ pub fn build_credential_with_override(
         .and_then(|v| v.as_str())
         .unwrap_or("mainnet")
         .to_string();
-    let challenge_network = normalize_network(&challenge_network).to_string();
+    let challenge_network = crate::accounts::canonical_network(&challenge_network).to_string();
     let embedded_blockhash = request
         .method_details
         .as_ref()
@@ -384,7 +384,7 @@ pub fn select_challenge_by_balance<'a>(
     let cheapest = &challenges
         [candidates[cheapest_candidate_index(candidates.iter().enumerate()).unwrap_or(0)].index];
 
-    let network = normalize_network(&first.network);
+    let network = crate::accounts::canonical_network(&first.network);
     let pubkey = match account_pubkey_for_network(store, network, account_override)? {
         Some(pubkey) => pubkey,
         None => return Ok(Some(cheapest)),
@@ -487,7 +487,7 @@ pub fn choose_payment(
         ChosenPayment::Mpp(Box::new(mpp_challenges[candidates[index].index].clone()))
     };
 
-    let network = normalize_network(&first.network);
+    let network = crate::accounts::canonical_network(&first.network);
     let pubkey = match account_pubkey_for_network(store, network, account_override)? {
         Some(pubkey) => pubkey,
         None => return Ok(legacy_first_mpp()),
@@ -596,7 +596,7 @@ fn decoded_charge_candidates(
             .network
             .clone()
             .unwrap_or_else(|| "mainnet".to_string());
-        let challenge_network = normalize_network(&challenge_network).to_string();
+        let challenge_network = crate::accounts::canonical_network(&challenge_network).to_string();
         if let Some(forced) = network_override {
             if forced != challenge_network {
                 continue;
@@ -719,13 +719,6 @@ fn resolve_rpc_url(network: &str, embedded_blockhash: Option<&str>) -> String {
     })
 }
 
-fn normalize_network(network: &str) -> &str {
-    match network {
-        "mainnet-beta" => "mainnet",
-        other => other,
-    }
-}
-
 pub(crate) fn should_auto_fund_surfpool(
     network_override: Option<&str>,
     embedded_blockhash: Option<&str>,
@@ -735,7 +728,10 @@ pub(crate) fn should_auto_fund_surfpool(
 }
 
 fn is_sandbox_network(network: &str) -> bool {
-    matches!(normalize_network(network), "localnet" | "sandbox")
+    matches!(
+        crate::accounts::canonical_network(network),
+        "localnet" | "sandbox"
+    )
 }
 
 fn charge_prompt_reason<'a>(

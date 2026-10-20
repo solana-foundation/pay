@@ -196,7 +196,7 @@ pub fn decode(challenge: &Challenge) -> Result<DecodedSubscriptionChallenge> {
         period_count,
         request,
         method_details,
-        network: normalize_network(&network).to_string(),
+        network: crate::accounts::canonical_network(&network).to_string(),
         decimals,
         currency_label,
     })
@@ -643,13 +643,6 @@ fn resolve_rpc_url(network: &str, embedded_blockhash: Option<&str>) -> String {
     })
 }
 
-fn normalize_network(network: &str) -> &str {
-    match network {
-        "mainnet-beta" => "mainnet",
-        other => other,
-    }
-}
-
 /// Lookup the account name that the signer loader would resolve to. This
 /// keeps persistence aligned with whichever wallet actually signed.
 fn resolve_account_name(
@@ -889,8 +882,11 @@ mod tests {
 
     #[test]
     fn normalize_network_collapses_mainnet_beta() {
-        assert_eq!(normalize_network("mainnet-beta"), "mainnet");
-        assert_eq!(normalize_network("devnet"), "devnet");
+        assert_eq!(
+            crate::accounts::canonical_network("mainnet-beta"),
+            "mainnet"
+        );
+        assert_eq!(crate::accounts::canonical_network("devnet"), "devnet");
     }
 
     #[test]
