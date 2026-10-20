@@ -164,6 +164,9 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
                     // Delegated sessions are settled from the completed
                     // response below. The client-voucher stream context waits
                     // for client commits and must not be installed here.
+                    if let Err(rejection) = require_identity_encoding(req.headers()) {
+                        return rejection.into_response();
+                    }
                     if let Some(force_stream_usage) = session_body_preparation(&path, &sf) {
                         let (restored, body_variant) =
                             match prepare_metered_request_body(req, force_stream_usage).await {
@@ -483,6 +486,9 @@ fn session_body_preparation(
 pub enum MeteredBodyRejection {
     TooLarge,
     PaddedModel,
+    /// A compressed body hides its size and model from the meter, which
+    /// would rate input by transport bytes the upstream then expands.
+    EncodedBody,
 }
 
 impl MeteredBodyRejection {
@@ -490,6 +496,7 @@ impl MeteredBodyRejection {
         match self {
             Self::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::PaddedModel => StatusCode::BAD_REQUEST,
+            Self::EncodedBody => StatusCode::UNSUPPORTED_MEDIA_TYPE,
         }
     }
 
@@ -498,6 +505,9 @@ impl MeteredBodyRejection {
             Self::TooLarge => r#"{"error":"request_body_too_large"}"#,
             Self::PaddedModel => {
                 r#"{"error":"invalid_model","message":"model must not have leading or trailing whitespace"}"#
+            }
+            Self::EncodedBody => {
+                r#"{"error":"unsupported_content_encoding","message":"metered requests must be sent uncompressed"}"#
             }
         }
     }
@@ -523,6 +533,12 @@ pub fn prepare_metered_forward_body(
     session: Option<&mut crate::server::gate::SessionForward>,
     upto: Option<&mut metering::UptoSettlementPlan>,
 ) -> Result<Option<Vec<u8>>, MeteredBodyRejection> {
+    let delegated = session
+        .as_ref()
+        .is_some_and(|forward| forward.settlement.is_some());
+    if delegated || upto.is_some() {
+        require_identity_encoding(headers)?;
+    }
     let mut prepared = None;
     if let Some(plan) = upto
         && let Some(force_stream_usage) = upto_body_preparation(path, headers, plan)
@@ -545,12 +561,35 @@ pub fn prepare_metered_forward_body(
     Ok(prepared)
 }
 
+/// Metered forwards rate the body they send, so it must be sent as is: the
+/// size bounding unreported input usage and the model selecting the price
+/// are only meaningful on uncompressed bytes.
+pub fn require_identity_encoding(headers: &HeaderMap) -> Result<(), MeteredBodyRejection> {
+    let identity = headers
+        .get_all(header::CONTENT_ENCODING)
+        .iter()
+        .all(|value| {
+            value.to_str().is_ok_and(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .all(|coding| coding.is_empty() || coding.eq_ignore_ascii_case("identity"))
+            })
+        });
+    if identity {
+        Ok(())
+    } else {
+        Err(MeteredBodyRejection::EncodedBody)
+    }
+}
+
 #[allow(clippy::result_large_err)]
 async fn prepare_upto_request_body(
     request: Request<Body>,
     path: &str,
     plan: &metering::UptoSettlementPlan,
 ) -> Result<(Request<Body>, Option<String>), Response> {
+    require_identity_encoding(request.headers()).map_err(MeteredBodyRejection::into_response)?;
     let Some(force_stream_usage) = upto_body_preparation(path, request.headers(), plan) else {
         return Ok((request, plan.variant_hint.clone()));
     };
@@ -1558,6 +1597,81 @@ apis:
             prepare_metered_forward_body("v1/generate", &headers, body, None, Some(&mut plan)),
             Err(MeteredBodyRejection::PaddedModel)
         );
+    }
+
+    #[test]
+    fn metered_forwards_reject_compressed_bodies() {
+        let body = br#"{"model":"premium"}"#;
+        let encoded = |value: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static(value));
+            headers
+        };
+        for coding in ["gzip", "identity, br", "GZIP"] {
+            let mut forward = delegated_forward();
+            assert_eq!(
+                prepare_metered_forward_body(
+                    "v1/chat/completions",
+                    &encoded(coding),
+                    body,
+                    Some(&mut forward),
+                    None,
+                ),
+                Err(MeteredBodyRejection::EncodedBody),
+                "{coding}"
+            );
+            let mut plan = model_variant_plan();
+            assert_eq!(
+                prepare_metered_forward_body(
+                    "v1/generate",
+                    &encoded(coding),
+                    body,
+                    None,
+                    Some(&mut plan)
+                ),
+                Err(MeteredBodyRejection::EncodedBody),
+                "{coding}"
+            );
+        }
+
+        // Positive controls: an explicit identity coding, and a client-voucher
+        // session whose meter never reads the body.
+        let mut forward = delegated_forward();
+        assert!(
+            prepare_metered_forward_body(
+                "v1/chat/completions",
+                &encoded("identity"),
+                body,
+                Some(&mut forward),
+                None,
+            )
+            .unwrap()
+            .is_some()
+        );
+        let mut client_voucher = session_forward(None);
+        assert_eq!(
+            prepare_metered_forward_body(
+                "v1/chat/completions",
+                &encoded("gzip"),
+                body,
+                Some(&mut client_voucher),
+                None,
+            ),
+            Ok(None)
+        );
+    }
+
+    #[tokio::test]
+    async fn axum_upto_rejects_a_compressed_body() {
+        let request = Request::builder()
+            .header(header::CONTENT_ENCODING, "gzip")
+            .body(Body::from("compressed"))
+            .unwrap();
+        let response =
+            prepare_upto_request_body(request, "v1/chat/completions", &model_variant_plan())
+                .await
+                .unwrap_err();
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
     }
 
     #[test]
