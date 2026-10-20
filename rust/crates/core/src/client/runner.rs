@@ -170,8 +170,11 @@ pub fn run_curl_with_headers(user_args: &[String], extra_headers: &[String]) -> 
     run_curl_inner(user_args, extra_headers)
 }
 
-/// Validate a curl invocation against cached Pay catalog OpenAPI metadata.
+/// Validate a curl invocation before Pay attaches or signs anything for it:
+/// it must name a single transfer (see [`ensure_single_transfer`]) and match
+/// cached Pay catalog OpenAPI metadata.
 pub fn validate_curl_args_against_catalog(user_args: &[String]) -> Result<()> {
+    ensure_single_transfer(user_args, ToolKind::Curl)?;
     let request = ParsedCurlRequest::from_args(user_args);
     if let Some(url) = request.url.as_deref() {
         crate::skills::validate_cached_catalog_request(
@@ -185,6 +188,9 @@ pub fn validate_curl_args_against_catalog(user_args: &[String]) -> Result<()> {
 
 fn run_curl_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunOutcome> {
     check_command_exists("curl")?;
+    if !extra_headers.is_empty() {
+        ensure_single_transfer(user_args, ToolKind::Curl)?;
+    }
 
     let header_file = NamedTempFile::new()?;
     let header_path = header_file.path();
@@ -290,8 +296,11 @@ pub fn run_wget_with_headers(user_args: &[String], extra_headers: &[String]) -> 
     run_wget_inner(user_args, extra_headers)
 }
 
-/// Validate a wget invocation against cached Pay catalog OpenAPI metadata.
+/// Validate a wget invocation before Pay attaches or signs anything for it:
+/// it must name a single transfer (see [`ensure_single_transfer`]) and match
+/// cached Pay catalog OpenAPI metadata.
 pub fn validate_wget_args_against_catalog(user_args: &[String]) -> Result<()> {
+    ensure_single_transfer(user_args, ToolKind::Wget)?;
     let request = ParsedWgetRequest::from_args(user_args);
     if let Some(url) = request.url.as_deref() {
         crate::skills::validate_cached_catalog_request(
@@ -305,6 +314,9 @@ pub fn validate_wget_args_against_catalog(user_args: &[String]) -> Result<()> {
 
 fn run_wget_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunOutcome> {
     check_command_exists("wget")?;
+    if !extra_headers.is_empty() {
+        ensure_single_transfer(user_args, ToolKind::Wget)?;
+    }
 
     let has_server_response = user_args
         .iter()
@@ -1302,6 +1314,369 @@ fn headers_with_default_user_agent(
     headers
 }
 
+/// Reject a curl or wget invocation that would make more than one transfer.
+///
+/// Headers Pay injects (a payment, a sign-in proof, a cached subscription
+/// bearer) and the caller's shared body apply to every transfer in the
+/// command, while the 402 and its credential belong to one URL. A second
+/// URL, `--next`, a config or input file, URL globbing, variable expansion
+/// or a recursive crawl would hand them to destinations nobody paid. Unknown
+/// options are read as flags, so a value they take counts as another URL:
+/// the check errs toward refusing the command.
+fn ensure_single_transfer(args: &[String], tool: ToolKind) -> Result<()> {
+    let refuse = |why: &str| {
+        Err(Error::RequestValidation(format!(
+            "pay sends payment credentials to a single URL, but this command {why}. \
+             Run one `pay {}` per URL.",
+            match tool {
+                ToolKind::Curl => "curl",
+                ToolKind::Wget => "wget",
+                ToolKind::Httpie => "http",
+            }
+        )))
+    };
+    let spec = match tool {
+        ToolKind::Curl => &CURL_OPTIONS,
+        ToolKind::Wget => &WGET_OPTIONS,
+        // HTTPie takes exactly one URL by construction.
+        ToolKind::Httpie => return Ok(()),
+    };
+
+    let mut targets = 0usize;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if arg == "--" {
+            targets += args.len() - i - 1;
+            break;
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            let (name, inline_value) = match long.split_once('=') {
+                Some((name, value)) => (name, Some(value)),
+                None => (long, None),
+            };
+            if spec.multi_transfer_long.contains(&name)
+                || spec
+                    .multi_transfer_long_prefixes
+                    .iter()
+                    .any(|p| name.starts_with(p))
+            {
+                return refuse(&format!("uses `--{name}`"));
+            }
+            let is_url = spec.url_long == Some(name);
+            let takes_value = is_url || spec.value_long.contains(&name);
+            let value = match inline_value {
+                Some(value) => Some(value),
+                None if takes_value => {
+                    i += 1;
+                    args.get(i).map(String::as_str)
+                }
+                None => None,
+            };
+            if is_url {
+                if value.is_some_and(|v| v.starts_with('@')) {
+                    return refuse("reads URLs from a file");
+                }
+                targets += 1;
+            }
+        } else if let Some(shorts) = arg.strip_prefix('-').filter(|s| !s.is_empty()) {
+            let mut chars = shorts.char_indices();
+            while let Some((at, c)) = chars.next() {
+                if spec.multi_transfer_short.contains(c) {
+                    return refuse(&format!("uses `-{c}`"));
+                }
+                if spec.boolean_prefix_short.contains(c) {
+                    // wget's `-nv`, `-nc`, ...: the next letter is part of
+                    // the flag name, not another option.
+                    chars.next();
+                    continue;
+                }
+                if spec.value_short.contains(c) {
+                    if at + c.len_utf8() == shorts.len() {
+                        i += 1;
+                    }
+                    break;
+                }
+            }
+        } else {
+            targets += 1;
+        }
+        i += 1;
+    }
+    if targets > 1 {
+        return refuse(&format!("names {targets} URLs"));
+    }
+    Ok(())
+}
+
+/// What [`ensure_single_transfer`] needs to know about a tool's options.
+struct TransferOptions {
+    /// Short options that consume a value (attached or as the next arg).
+    value_short: &'static str,
+    /// Short letters that start a two-letter boolean flag (wget's `-n?`).
+    boolean_prefix_short: &'static str,
+    /// Short options that add transfers on their own.
+    multi_transfer_short: &'static str,
+    /// Long options (without `--`) that consume a value.
+    value_long: &'static [&'static str],
+    /// Long options that add transfers on their own.
+    multi_transfer_long: &'static [&'static str],
+    multi_transfer_long_prefixes: &'static [&'static str],
+    /// The long option whose value is a URL, if the tool has one.
+    url_long: Option<&'static str>,
+}
+
+static CURL_OPTIONS: TransferOptions = TransferOptions {
+    value_short: "ECbcdDFPHmoxUQreXYytzTuAw",
+    boolean_prefix_short: "",
+    // `-:` is `--next`, `-K` reads a config file that can add URLs.
+    multi_transfer_short: ":K",
+    value_long: &[
+        "abstract-unix-socket",
+        "alt-svc",
+        "aws-sigv4",
+        "cacert",
+        "capath",
+        "cert",
+        "cert-type",
+        "ciphers",
+        "connect-timeout",
+        "connect-to",
+        "continue-at",
+        "cookie",
+        "cookie-jar",
+        "create-file-mode",
+        "crlfile",
+        "curves",
+        "data",
+        "data-ascii",
+        "data-binary",
+        "data-raw",
+        "data-urlencode",
+        "delegation",
+        "dns-interface",
+        "dns-ipv4-addr",
+        "dns-ipv6-addr",
+        "dns-servers",
+        "doh-url",
+        "dump-header",
+        "ech",
+        "egd-file",
+        "engine",
+        "etag-compare",
+        "etag-save",
+        "expect100-timeout",
+        "form",
+        "form-string",
+        "ftp-account",
+        "ftp-alternative-to-user",
+        "ftp-method",
+        "ftp-port",
+        "ftp-ssl-ccc-mode",
+        "happy-eyeballs-timeout-ms",
+        "haproxy-clientip",
+        "header",
+        "hostpubmd5",
+        "hostpubsha256",
+        "hsts",
+        "interface",
+        "ip-tos",
+        "ipfs-gateway",
+        "json",
+        "keepalive-cnt",
+        "keepalive-time",
+        "key",
+        "key-type",
+        "knownhosts",
+        "krb",
+        "libcurl",
+        "limit-rate",
+        "local-port",
+        "login-options",
+        "mail-auth",
+        "mail-from",
+        "mail-rcpt",
+        "max-filesize",
+        "max-redirs",
+        "max-time",
+        "netrc-file",
+        "noproxy",
+        "oauth2-bearer",
+        "output",
+        "output-dir",
+        "parallel-max",
+        "pass",
+        "pinnedpubkey",
+        "preproxy",
+        "proto",
+        "proto-default",
+        "proto-redir",
+        "proxy",
+        "proxy1.0",
+        "proxy-cacert",
+        "proxy-capath",
+        "proxy-cert",
+        "proxy-cert-type",
+        "proxy-ciphers",
+        "proxy-crlfile",
+        "proxy-header",
+        "proxy-key",
+        "proxy-key-type",
+        "proxy-pass",
+        "proxy-pinnedpubkey",
+        "proxy-service-name",
+        "proxy-tls13-ciphers",
+        "proxy-tlsauthtype",
+        "proxy-tlspassword",
+        "proxy-tlsuser",
+        "proxy-user",
+        "pubkey",
+        "quote",
+        "random-file",
+        "range",
+        "rate",
+        "referer",
+        "request",
+        "request-target",
+        "resolve",
+        "retry",
+        "retry-delay",
+        "retry-max-time",
+        "sasl-authzid",
+        "service-name",
+        "sigalgs",
+        "socks4",
+        "socks4a",
+        "socks5",
+        "socks5-gssapi-service",
+        "socks5-hostname",
+        "speed-limit",
+        "speed-time",
+        "ssl-sessions",
+        "stderr",
+        "telnet-option",
+        "tftp-blksize",
+        "time-cond",
+        "tls-max",
+        "tls13-ciphers",
+        "tlsauthtype",
+        "tlspassword",
+        "tlsuser",
+        "trace",
+        "trace-ascii",
+        "trace-config",
+        "unix-socket",
+        "upload-file",
+        "upload-flags",
+        "url-query",
+        "user",
+        "user-agent",
+        "vlan-priority",
+        "write-out",
+    ],
+    // `--variable` and `--expand-*` can synthesise URLs at run time.
+    multi_transfer_long: &["next", "config", "variable"],
+    multi_transfer_long_prefixes: &["expand-"],
+    url_long: Some("url"),
+};
+
+static WGET_OPTIONS: TransferOptions = TransferOptions {
+    value_short: "oaBtOTwQPUlARDIX",
+    boolean_prefix_short: "n",
+    // `-i` reads URLs from a file; `-r`, `-m` and `-p` crawl; `-e` runs
+    // wgetrc commands, which can set any of those.
+    multi_transfer_short: "irmpe",
+    value_long: &[
+        "output-file",
+        "append-output",
+        "report-speed",
+        "base",
+        "rejected-log",
+        "tries",
+        "retry-on-http-error",
+        "output-document",
+        "start-pos",
+        "progress",
+        "timeout",
+        "dns-timeout",
+        "connect-timeout",
+        "read-timeout",
+        "wait",
+        "waitretry",
+        "quota",
+        "bind-address",
+        "limit-rate",
+        "restrict-file-names",
+        "prefer-family",
+        "user",
+        "password",
+        "use-askpass",
+        "local-encoding",
+        "remote-encoding",
+        "directory-prefix",
+        "cut-dirs",
+        "http-user",
+        "http-password",
+        "default-page",
+        "header",
+        "compression",
+        "proxy-user",
+        "proxy-password",
+        "referer",
+        "user-agent",
+        "load-cookies",
+        "save-cookies",
+        "post-data",
+        "post-file",
+        "method",
+        "body-data",
+        "body-file",
+        "secure-protocol",
+        "certificate",
+        "certificate-type",
+        "private-key",
+        "private-key-type",
+        "ca-certificate",
+        "ca-directory",
+        "crl-file",
+        "pinnedpubkey",
+        "random-file",
+        "ciphers",
+        "ftp-user",
+        "ftp-password",
+        "warc-file",
+        "warc-header",
+        "warc-max-size",
+        "warc-dedup",
+        "warc-tempdir",
+        "level",
+        "backups",
+        "accept",
+        "reject",
+        "accept-regex",
+        "reject-regex",
+        "regex-type",
+        "domains",
+        "exclude-domains",
+        "follow-tags",
+        "ignore-tags",
+        "include-directories",
+        "exclude-directories",
+        "max-redirect",
+    ],
+    multi_transfer_long: &[
+        "input-file",
+        "input-metalink",
+        "recursive",
+        "mirror",
+        "page-requisites",
+        "execute",
+        "config",
+    ],
+    multi_transfer_long_prefixes: &[],
+    url_long: None,
+};
+
 /// Flags that stop the wrapped tool from following redirects, appended after
 /// the user's args (so they win over `-L`, `--location-trusted`, `--follow`
 /// or a `--max-redirect` the caller passed) whenever Pay injects headers.
@@ -1762,6 +2137,130 @@ mod pre_attach_tests {
         .unwrap();
         assert!(matches!(outcome, RunOutcome::Completed { .. }));
         assert!(!server.collector_was_contacted());
+    }
+
+    #[test]
+    fn a_single_transfer_is_accepted() {
+        for args in [
+            s(&[
+                "-sS",
+                "-H",
+                "Accept: x",
+                "-d",
+                "a=1",
+                "https://a.example/paid",
+            ]),
+            s(&["-o", "out.json", "--url", "https://a.example/paid"]),
+            s(&[
+                "-X",
+                "POST",
+                "-ehttps://referer.example",
+                "https://a.example/paid",
+            ]),
+            s(&[
+                "--max-time",
+                "5",
+                "-w",
+                "%{http_code}",
+                "https://a.example/paid",
+            ]),
+        ] {
+            assert!(
+                ensure_single_transfer(&args, ToolKind::Curl).is_ok(),
+                "{args:?}"
+            );
+        }
+        for args in [
+            s(&["-q", "-O", "-", "https://a.example/paid"]),
+            s(&[
+                "-nv",
+                "--header",
+                "Accept: x",
+                "-Oout",
+                "https://a.example/paid",
+            ]),
+            s(&["--post-data=a=1", "-U", "agent", "https://a.example/paid"]),
+        ] {
+            assert!(
+                ensure_single_transfer(&args, ToolKind::Wget).is_ok(),
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn curl_invocations_with_more_than_one_transfer_are_refused() {
+        for args in [
+            s(&["https://a.example/paid", "https://collector.example/"]),
+            s(&["https://a.example/paid", "collector.example"]),
+            s(&[
+                "--url",
+                "https://a.example/paid",
+                "https://collector.example/",
+            ]),
+            s(&[
+                "https://a.example/paid",
+                "--next",
+                "https://collector.example/",
+            ]),
+            s(&["https://a.example/paid", "-:", "https://collector.example/"]),
+            s(&["-K", "urls.txt", "https://a.example/paid"]),
+            s(&["-sK", "urls.txt"]),
+            s(&["--url", "@urls.txt"]),
+            s(&["--variable", "u=x", "--expand-url", "{{u}}"]),
+            s(&[
+                "-d",
+                "a=1",
+                "--",
+                "https://a.example/paid",
+                "https://c.example/",
+            ]),
+        ] {
+            assert!(
+                ensure_single_transfer(&args, ToolKind::Curl).is_err(),
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wget_invocations_with_more_than_one_transfer_are_refused() {
+        for args in [
+            s(&["https://a.example/paid", "https://collector.example/"]),
+            s(&["-i", "urls.txt"]),
+            s(&["--input-file=urls.txt"]),
+            s(&["-r", "https://a.example/paid"]),
+            s(&["-qm", "https://a.example/paid"]),
+            s(&["--page-requisites", "https://a.example/paid"]),
+            s(&["-e", "recursive=on", "https://a.example/paid"]),
+        ] {
+            assert!(
+                ensure_single_transfer(&args, ToolKind::Wget).is_err(),
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn credentials_are_never_injected_into_a_multi_transfer_command() {
+        // The public retry entry points refuse before spawning anything.
+        let args = s(&["https://a.example/paid", "https://collector.example/"]);
+        let payment = s(&[PAYMENT_HEADER]);
+        if check_command_exists("curl").is_ok() {
+            assert!(matches!(
+                run_curl_inner(&args, &payment),
+                Err(Error::RequestValidation(_))
+            ));
+        }
+        if check_command_exists("wget").is_ok() {
+            assert!(matches!(
+                run_wget_inner(&args, &payment),
+                Err(Error::RequestValidation(_))
+            ));
+        }
+        // And so does the pre-signing validation the CLI runs.
+        assert!(validate_curl_args_against_catalog(&args).is_err());
+        assert!(validate_wget_args_against_catalog(&args).is_err());
     }
 
     #[test]
