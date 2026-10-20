@@ -519,8 +519,6 @@ fn redeem_memo(code: &str) -> String {
 struct HeliusTx {
     signature: String,
     #[serde(default)]
-    timestamp: Option<i64>,
-    #[serde(default)]
     instructions: Vec<HeliusIx>,
 }
 
@@ -608,16 +606,10 @@ async fn find_prior_burn(
                 }
             }
         }
-        // Underfull page → end of history.
+        // Underfull page → end of history. Only the end of history proves a
+        // code unused: redemptions predating the Redis claim store live
+        // nowhere else, so a scan that cannot reach it fails closed below.
         if txs.len() < HELIUS_PAGE_LIMIT {
-            return Ok(None);
-        }
-        if let Some(cutoff) = cfg.legacy_scan_cutoff_unix_seconds
-            && txs
-                .last()
-                .and_then(|tx| tx.timestamp)
-                .is_some_and(|timestamp| timestamp <= cutoff)
-        {
             return Ok(None);
         }
         cursor = txs.last().map(|t| t.signature.clone());
@@ -970,7 +962,6 @@ pub struct RedemptionState {
     pub solana_rpc_api_key: String,
     pub helius_base: String,
     pub max_scan_pages: usize,
-    pub legacy_scan_cutoff_unix_seconds: Option<i64>,
     /// How long a request waits for its payout to confirm before answering
     /// with a pending status.
     pub confirm_timeout: std::time::Duration,
@@ -1061,7 +1052,6 @@ impl RedemptionState {
             solana_rpc_api_key: cfg.solana_rpc_api_key.clone(),
             helius_base: cfg.helius_base.clone(),
             max_scan_pages: cfg.max_scan_pages.unwrap_or(DEFAULT_MAX_SCAN_PAGES),
-            legacy_scan_cutoff_unix_seconds: cfg.legacy_scan_cutoff_unix_seconds,
             confirm_timeout: REDEEM_CONFIRM_TIMEOUT,
             grants,
             http_client,
@@ -1226,7 +1216,7 @@ pub(crate) mod tests {
 
         use axum::Json;
         use axum::Router;
-        use axum::extract::State;
+        use axum::extract::{Query, State};
         use axum::http::StatusCode;
         use axum::routing::{get, post};
         use pay_api_types::Network;
@@ -1413,8 +1403,24 @@ pub(crate) mod tests {
             )
         }
 
-        async fn helius_handler(State(history): State<Arc<Mutex<Vec<Value>>>>) -> Json<Value> {
-            Json(Value::Array(history.lock().unwrap().clone()))
+        /// Newest-first history paged like the provider: `limit` entries
+        /// strictly older than `before-signature`.
+        async fn helius_handler(
+            State(history): State<Arc<Mutex<Vec<Value>>>>,
+            Query(query): Query<HashMap<String, String>>,
+        ) -> Json<Value> {
+            let history = history.lock().unwrap();
+            let start = query
+                .get("before-signature")
+                .and_then(|before| history.iter().position(|tx| tx["signature"] == **before))
+                .map_or(0, |position| position + 1);
+            let limit = query
+                .get("limit")
+                .and_then(|limit| limit.parse().ok())
+                .unwrap_or(usize::MAX);
+            Json(Value::Array(
+                history.iter().skip(start).take(limit).cloned().collect(),
+            ))
         }
 
         pub(super) struct Harness {
@@ -1483,7 +1489,6 @@ pub(crate) mod tests {
                     solana_rpc_api_key: "key".to_string(),
                     helius_base: helius_url,
                     max_scan_pages: 2,
-                    legacy_scan_cutoff_unix_seconds: None,
                     confirm_timeout: Duration::from_millis(300),
                     grants,
                     http_client: reqwest::Client::new(),
@@ -1874,6 +1879,57 @@ pub(crate) mod tests {
             assert_eq!(body["signature"], "PriorSig");
             assert!(h.sent().is_empty());
             assert_eq!(h.claim().await, None);
+        }
+
+        /// `count` memo-less history entries named `{prefix}-{index}`.
+        fn filler(h: &Harness, prefix: &str, count: usize, timestamp: i64) {
+            let mut history = h.history.lock().unwrap();
+            for index in 0..count {
+                history.push(json!({
+                    "signature": format!("{prefix}-{index}"),
+                    "timestamp": timestamp,
+                    "instructions": [],
+                }));
+            }
+        }
+
+        #[tokio::test]
+        async fn a_payout_older_than_the_claim_store_still_blocks_the_code() {
+            let Some(mut h) = Harness::new().await else {
+                return;
+            };
+            h.cfg.max_scan_pages = 4;
+            // Two full pages of newer activity end exactly at the Redis
+            // rollout; the legacy payout sits on the page after them.
+            let rollout = 1_000;
+            filler(&h, "newer", 100, rollout + 1);
+            filler(&h, "rollout", 100, rollout);
+            let hot = h.hot_wallet();
+            h.index_candidate("LegacySig", h.payout_tx(&hot, &hot, Value::Null));
+            filler(&h, "older", 10, rollout - 1);
+            let (status, body) = h.redeem(&Pubkey::new_unique()).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+            assert_eq!(body["signature"], "LegacySig");
+            assert!(h.sent().is_empty());
+        }
+
+        #[tokio::test]
+        async fn history_beyond_the_page_cap_fails_closed() {
+            let Some(h) = Harness::new().await else {
+                return;
+            };
+            // Two full pages with no end of history in reach (cap is two).
+            filler(&h, "busy", 250, 1_000);
+            let (status, body) = h.redeem(&Pubkey::new_unique()).await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+            assert!(h.sent().is_empty());
+
+            // Positive control: history that ends within the cap proves the
+            // code unused and pays it.
+            h.history.lock().unwrap().truncate(150);
+            let (status, body) = h.redeem(&Pubkey::new_unique()).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(h.sent().len(), 1);
         }
 
         #[tokio::test]

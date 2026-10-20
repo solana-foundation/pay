@@ -434,16 +434,12 @@ pub struct RedemptionConfig {
     #[serde(default = "default_helius_base")]
     pub helius_base: String,
 
-    /// Max history pages to walk on the Helius dedup scan.
+    /// Max history pages to walk on the Helius dedup scan. Only the end of
+    /// the hot wallet's history proves a code unused (redemptions predating
+    /// the Redis claim store live nowhere else), so a scan that cannot reach
+    /// it within this many pages fails closed.
     #[serde(default)]
     pub max_scan_pages: Option<usize>,
-
-    /// Unix timestamp at which Redis became the authoritative redemption
-    /// claim store. The history scan stops once it reaches this boundary:
-    /// newer redemptions are already protected by Redis, while older ones
-    /// still need the legacy memo lookup.
-    #[serde(default)]
-    pub legacy_scan_cutoff_unix_seconds: Option<i64>,
 
     /// Redis URL for durable, atomic redemption claims. Required while
     /// redemption is enabled so claims survive replicas and restarts.
@@ -497,7 +493,6 @@ impl Default for RedemptionConfig {
             solana_rpc_api_key: String::new(),
             helius_base: default_helius_base(),
             max_scan_pages: None,
-            legacy_scan_cutoff_unix_seconds: None,
             claim_store_url: String::new(),
             codes: Vec::new(),
             campaigns: Vec::new(),
@@ -633,15 +628,6 @@ fn validate_redemption_config(redemption: &RedemptionConfig) -> Result<(), Strin
     }
     if redemption.max_scan_pages == Some(0) {
         return Err("redemption.max_scan_pages must be greater than zero".into());
-    }
-    if redemption
-        .legacy_scan_cutoff_unix_seconds
-        .unwrap_or_default()
-        <= 0
-    {
-        return Err(
-            "redemption.legacy_scan_cutoff_unix_seconds must be set to the Redis claim-store rollout time when redemption.enabled is true".into(),
-        );
     }
     if redemption.codes.is_empty()
         && !redemption
@@ -1396,7 +1382,6 @@ mod tests {
         let redemption = RedemptionConfig {
             solana_rpc_api_key: "test-key".to_string(),
             claim_store_url: "redis://127.0.0.1/".to_string(),
-            legacy_scan_cutoff_unix_seconds: Some(1),
             campaigns: vec![
                 RedemptionCampaignConfig {
                     id: "anthropic-tokyo-Q2-2026".to_string(),
@@ -1442,20 +1427,6 @@ mod tests {
         let error = validate_redemption_config(&redemption)
             .expect_err("enabled redemption requires an atomic claim store");
         assert!(error.contains("redemption.claim_store_url is required"));
-    }
-
-    #[test]
-    fn rejects_redemption_without_a_legacy_scan_cutoff() {
-        let redemption = RedemptionConfig {
-            solana_rpc_api_key: "test-key".to_string(),
-            claim_store_url: "redis://127.0.0.1/".to_string(),
-            codes: vec!["CODE123".to_string()],
-            ..RedemptionConfig::default()
-        };
-
-        let error = validate_redemption_config(&redemption)
-            .expect_err("redemption must bound its legacy history scan");
-        assert!(error.contains("redemption.legacy_scan_cutoff_unix_seconds"));
     }
 
     #[test]
