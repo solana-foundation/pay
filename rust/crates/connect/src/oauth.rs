@@ -3343,7 +3343,8 @@ mod tests {
             // A new Privy session for the same user still works.
             let fresh = fake.token(json!({
                 "sub": USER, "aud": "app_test", "iss": "privy.io", "sid": "sess_2",
-                "exp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + 600
+                "exp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + 600,
+                "iat": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
             }));
             let (access, _) = privy_tokens(&app, &client_id, &fresh).await;
             assert!(oauth.authenticate(&access).is_some());

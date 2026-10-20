@@ -678,7 +678,10 @@ mod tests {
     fn session() -> crate::tenants::LoginSession {
         crate::tenants::LoginSession {
             id: "sess_cli".to_string(),
-            issued_at: 0,
+            issued_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
         }
     }
 

@@ -140,8 +140,9 @@ struct Claims {
     sub: String,
     #[serde(default)]
     sid: Option<String>,
-    #[serde(default)]
-    iat: Option<u64>,
+    /// When the token was issued; a token without it cannot be placed
+    /// against what this process has seen.
+    iat: u64,
 }
 
 /// A user's Solana wallet at Privy.
@@ -256,6 +257,11 @@ pub struct Privy {
     validation: jsonwebtoken::Validation,
     /// Sessions signed out here, by `sid`, with when.
     revoked: std::sync::Mutex<std::collections::HashMap<String, Instant>>,
+    /// Unix second before which no token is accepted. Sign-outs are
+    /// remembered in this process only, so a token issued before it started
+    /// may belong to a session signed out on a previous run: it is refused,
+    /// and its holder signs in again.
+    not_before: std::sync::atomic::AtomicU64,
 }
 
 impl Privy {
@@ -309,6 +315,7 @@ impl Privy {
             max_age: JWKS_MAX_AGE,
             validation,
             revoked: Default::default(),
+            not_before: std::sync::atomic::AtomicU64::new(unix_now()),
         })
     }
 
@@ -407,22 +414,25 @@ impl Privy {
             .sid
             .filter(|sid| !sid.trim().is_empty())
             .ok_or_else(|| "the token carries no Privy session".to_string())?;
-        if self.is_revoked(&session) {
+        let session = LoginSession {
+            id: session,
+            issued_at: data.claims.iat,
+        };
+        if !self.session_is_live(&session) {
             return Err("the Privy session was signed out".to_string());
         }
         Ok(Identity {
             user_id: data.claims.sub,
-            session: LoginSession {
-                id: session,
-                issued_at: data.claims.iat.unwrap_or(0),
-            },
+            session,
         })
     }
 
-    /// Whether credentials may still be derived from `session`: it has not
-    /// been signed out here.
+    /// Whether credentials may still be derived from `session`: it was not
+    /// signed out here, and was proven by a token issued since this process
+    /// began remembering sign-outs.
     pub fn session_is_live(&self, session: &LoginSession) -> bool {
-        !self.is_revoked(&session.id)
+        session.issued_at >= self.not_before.load(std::sync::atomic::Ordering::SeqCst)
+            && !self.is_revoked(&session.id)
     }
 
     /// Refuse further sign-ins with `session` for as long as its access
@@ -602,6 +612,13 @@ impl Privy {
             policy: crate::tenants::DEFAULT_POLICY,
         }
     }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 async fn fetch_jwks(http: &reqwest::Client, url: &str) -> Result<String, ConfigError> {
@@ -1071,12 +1088,40 @@ pub(crate) mod tests {
             "a signed-out session is refused"
         );
         let other = app.token(json!({
-            "sub": USER, "aud": "app_test", "iss": ISSUER, "sid": "sess_2", "exp": unix() + 60
+            "sub": USER, "aud": "app_test", "iss": ISSUER, "sid": "sess_2", "exp": unix() + 60,
+            "iat": unix()
         }));
         assert!(
             privy.verify(&other).is_ok(),
             "other sessions are unaffected"
         );
+    }
+
+    /// Sign-outs live in this process only; a token issued before it began
+    /// may belong to a session signed out on a previous run, so it is
+    /// refused rather than trusted.
+    #[test]
+    fn tokens_from_before_this_process_are_refused() {
+        let app = FakeApp::new("http://unused");
+        let privy = Privy::new(app.cfg.clone()).unwrap();
+        let token = |iat: u64| {
+            app.token(json!({
+                "sub": USER, "aud": "app_test", "iss": ISSUER, "sid": "sess_1",
+                "exp": unix() + 600, "iat": iat
+            }))
+        };
+        assert!(privy.verify(&token(unix())).is_ok());
+        assert!(privy.verify(&token(unix() - 120)).is_err());
+        let undated = app.token(json!({
+            "sub": USER, "aud": "app_test", "iss": ISSUER, "sid": "sess_1", "exp": unix() + 600
+        }));
+        assert!(privy.verify(&undated).is_err(), "no iat, no placement");
+        let cookie_session = |issued_at| LoginSession {
+            id: "sess_1".to_string(),
+            issued_at,
+        };
+        assert!(privy.session_is_live(&cookie_session(unix())));
+        assert!(!privy.session_is_live(&cookie_session(unix() - 120)));
     }
 
     #[test]
@@ -1096,7 +1141,8 @@ pub(crate) mod tests {
             let key = jsonwebtoken::EncodingKey::from_ec_pem(pem.as_bytes()).unwrap();
             jsonwebtoken::encode(
                 &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256),
-                &json!({ "sub": USER, "aud": "app_test", "iss": ISSUER, "sid": "sess_1", "exp": unix() + 60 }),
+                &json!({ "sub": USER, "aud": "app_test", "iss": ISSUER, "sid": "sess_1",
+                         "exp": unix() + 60, "iat": unix() }),
                 &key,
             )
             .unwrap()
@@ -1152,7 +1198,8 @@ pub(crate) mod tests {
         let encoding = jsonwebtoken::EncodingKey::from_ec_pem(pem.as_bytes()).unwrap();
         let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
         header.kid = Some(kid.to_string());
-        let claims = json!({ "sub": user, "aud": "app_test", "iss": ISSUER, "sid": "sess_1", "exp": unix() + 600 });
+        let claims = json!({ "sub": user, "aud": "app_test", "iss": ISSUER, "sid": "sess_1",
+                             "exp": unix() + 600, "iat": unix() });
         jsonwebtoken::encode(&header, &claims, &encoding).unwrap()
     }
 
