@@ -2339,6 +2339,12 @@ mod pre_attach_tests {
     struct EventText(std::sync::Arc<std::sync::Mutex<String>>);
 
     impl tracing::Subscriber for EventText {
+        fn register_callsite(
+            &self,
+            _: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
         fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
             true
         }
@@ -2370,8 +2376,15 @@ mod pre_attach_tests {
         if check_command_exists("curl").is_err() {
             return;
         }
+        // A process-wide subscriber: a scoped one races other tests over
+        // the callsite interest cache and can miss the event.
+        static EVENTS: std::sync::OnceLock<EventText> = std::sync::OnceLock::new();
+        let events = EVENTS.get_or_init(|| {
+            let events = EventText::default();
+            let _ = tracing::subscriber::set_global_default(events.clone());
+            events
+        });
         let server = CrossOriginRedirect::start();
-        let events = EventText::default();
         let args = s(&[
             "-s",
             "-H",
@@ -2380,9 +2393,7 @@ mod pre_attach_tests {
             "user:caller-password",
             &server.origin_url,
         ]);
-        tracing::subscriber::with_default(events.clone(), || {
-            run_curl_inner(&args, &s(&[PAYMENT_HEADER])).unwrap();
-        });
+        run_curl_inner(&args, &s(&[PAYMENT_HEADER])).unwrap();
         let _ = server.collector_was_contacted();
         let logged = events.0.lock().unwrap().clone();
         // Positive control: the event was captured and names the headers.
