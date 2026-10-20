@@ -1095,10 +1095,20 @@ async fn run_session(runtime: &SettlementRuntime) -> Result<SettleSessionsMetric
                                 "would delete Redis session for absent on-chain channel"
                             );
                         } else if cleanup_ready {
-                            match session.store.delete_channel(&result.channel_id).await {
-                                Ok(()) => info!(
+                            match delete_fenced_channel(
+                                &session.store,
+                                &result.channel_id,
+                                unix_now() as u64,
+                            )
+                            .await
+                            {
+                                Ok(FencedDelete::Deleted) => info!(
                                     channel_id = %result.channel_id,
                                     "deleted Redis session for absent on-chain channel"
+                                ),
+                                Ok(FencedDelete::InFlight) => info!(
+                                    channel_id = %result.channel_id,
+                                    "retaining Redis session while new work is in flight"
                                 ),
                                 Err(error) => {
                                     failures += 1;
@@ -1744,12 +1754,19 @@ async fn run_batch(runtime: &SettlementRuntime) -> Result<SettleSessionsMetrics,
                 } else {
                     metrics.skipped += 1;
                 }
-                if result.delete_absent
-                    && !runtime.dry_run
-                    && let Err(error) = batch.store.delete_channel(&result.channel_id).await
-                {
-                    metrics.failures += 1;
-                    warn!(channel_id = %result.channel_id, %error, "failed to delete absent batch channel");
+                if result.delete_absent && !runtime.dry_run {
+                    match delete_fenced_channel(&batch.store, &result.channel_id, unix_now() as u64)
+                        .await
+                    {
+                        Ok(FencedDelete::Deleted) => {}
+                        Ok(FencedDelete::InFlight) => {
+                            info!(channel_id = %result.channel_id, "retaining absent batch channel while new work is in flight");
+                        }
+                        Err(error) => {
+                            metrics.failures += 1;
+                            warn!(channel_id = %result.channel_id, %error, "failed to delete absent batch channel");
+                        }
+                    }
                 }
             }
             Err(error) => {
@@ -1926,9 +1943,21 @@ async fn run_batch(runtime: &SettlementRuntime) -> Result<SettleSessionsMetrics,
                     }
                 }
                 BatchStoreAction::Delete => {
-                    if let Err(error) = batch.store.delete_channel(&candidate.channel_id).await {
-                        metrics.failures += 1;
-                        warn!(channel_id = %candidate.channel_id, %error, "failed to delete reclaimed batch channel");
+                    match delete_fenced_channel(
+                        &batch.store,
+                        &candidate.channel_id,
+                        unix_now() as u64,
+                    )
+                    .await
+                    {
+                        Ok(FencedDelete::Deleted) => {}
+                        Ok(FencedDelete::InFlight) => {
+                            info!(channel_id = %candidate.channel_id, "retaining reclaimed batch channel while new work is in flight");
+                        }
+                        Err(error) => {
+                            metrics.failures += 1;
+                            warn!(channel_id = %candidate.channel_id, %error, "failed to delete reclaimed batch channel");
+                        }
                     }
                 }
             }
@@ -1984,6 +2013,54 @@ fn settlement_config(
         config.max_voucher_settlements_per_tx = config.max_voucher_settlements_per_tx.min(14);
     }
     config
+}
+
+/// Outcome of [`delete_fenced_channel`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FencedDelete {
+    Deleted,
+    /// A reservation or setup admitted after the caller's snapshot is still
+    /// in flight; the record is kept for a later pass.
+    InFlight,
+}
+
+/// Delete the record of a channel whose account is gone, without trusting
+/// the snapshot that proved it. One atomic transition rechecks that no
+/// reservation or setup is in flight and fences admission (every reservation
+/// refuses a sealed, close-requested record); only then is the record
+/// deleted, so a request admitted after the snapshot either keeps its record
+/// or is refused before its handler runs.
+async fn delete_fenced_channel(
+    store: &impl ChannelStore,
+    channel_id: &str,
+    now_seconds: u64,
+) -> Result<FencedDelete, StoreError> {
+    const ABSENT: &str = "channel record already deleted";
+    const IN_FLIGHT: &str = "in-flight work retains the channel record";
+    let fenced = store
+        .update_channel(
+            channel_id,
+            Box::new(move |current| {
+                let mut state = current.ok_or_else(|| StoreError::Internal(ABSENT.into()))?;
+                if state.has_in_flight_authorization() {
+                    return Err(StoreError::Internal(IN_FLIGHT.into()));
+                }
+                state.sealed = true;
+                state.close_requested_at.get_or_insert(now_seconds);
+                Ok(state)
+            }),
+        )
+        .await;
+    match fenced {
+        Ok(_) => {}
+        Err(StoreError::Internal(reason)) if reason == ABSENT => return Ok(FencedDelete::Deleted),
+        Err(StoreError::Internal(reason)) if reason == IN_FLIGHT => {
+            return Ok(FencedDelete::InFlight);
+        }
+        Err(error) => return Err(error),
+    }
+    store.delete_channel(channel_id).await?;
+    Ok(FencedDelete::Deleted)
 }
 
 async fn retain_sealed_record(
@@ -3722,7 +3799,7 @@ fn default_batch_redis_prefix(network: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pay_kit::core::store::ChannelLifecycle;
+    use pay_kit::core::store::{AuthorizationRequest, BatchReservation, ChannelLifecycle};
 
     #[test]
     fn default_batch_prefix_matches_the_gateway_per_network_namespace() {
@@ -5440,6 +5517,74 @@ mod tests {
             serde_json::json!({"context": {"slot": slot}, "value": [null]})
         })
         .await
+    }
+
+    fn authorization(id: &str, amount: u64, cumulative: u64) -> AuthorizationRequest {
+        AuthorizationRequest {
+            authorization_id: id.into(),
+            request_fingerprint: format!("{id}-fingerprint"),
+            amount,
+            cumulative,
+            lease: Duration::from_secs(300),
+            now: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn absent_channel_cleanup_keeps_work_admitted_after_the_snapshot() {
+        let store = pay_kit::core::store::MemoryChannelStore::new();
+        let state = channel_state();
+        let id = state.channel_id.clone();
+        store.put_channel(&id, state).await.unwrap();
+
+        // The reconciliation snapshot sees nothing in flight, then a request
+        // is admitted before the cleanup runs.
+        let snapshot = store.get_channel(&id).await.unwrap().unwrap();
+        assert!(!snapshot.has_in_flight_authorization());
+        let reserved = store
+            .reserve_authorization(
+                &id,
+                None,
+                authorization("late", 100, 100),
+                Box::new(|_| Ok(None)),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(reserved, BatchReservation::Reserved(_)));
+        assert_eq!(
+            delete_fenced_channel(&store, &id, 10).await.unwrap(),
+            FencedDelete::InFlight
+        );
+        let kept = store.get_channel(&id).await.unwrap().unwrap();
+        assert_eq!(kept.pending_deliveries.len(), 1);
+        assert!(!kept.sealed && kept.close_requested_at.is_none());
+
+        // With nothing in flight the record goes, and is fenced on the way:
+        // a request racing the delete is refused, never admitted.
+        let quiet = channel_state();
+        let quiet_id = quiet.channel_id.clone();
+        store.put_channel(&quiet_id, quiet).await.unwrap();
+        let fenced = retain_sealed_record(&store, &quiet_id).await;
+        assert!(fenced.is_ok());
+        let refused = store
+            .reserve_authorization(
+                &quiet_id,
+                None,
+                authorization("racing", 100, 100),
+                Box::new(|_| Ok(None)),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(refused, BatchReservation::Closing));
+        assert_eq!(
+            delete_fenced_channel(&store, &quiet_id, 10).await.unwrap(),
+            FencedDelete::Deleted
+        );
+        assert!(store.get_channel(&quiet_id).await.unwrap().is_none());
+        assert_eq!(
+            delete_fenced_channel(&store, &quiet_id, 10).await.unwrap(),
+            FencedDelete::Deleted
+        );
     }
 
     #[tokio::test]
