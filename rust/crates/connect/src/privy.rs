@@ -21,8 +21,8 @@
 //! `\n` escapes accepted) or `PRIVY_JWKS_URL` (default: the app's JWKS at
 //! auth.privy.io; it can hold several keys during a rotation). The JWKS is
 //! refetched every few minutes and replaced wholesale, so a key Privy
-//! retires stops verifying; keys that cannot be refreshed for an hour stop
-//! verifying too.
+//! retires stops verifying; keys due for a refetch that fails stop verifying
+//! too, and a `kid` the current set does not name never verifies.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
@@ -49,8 +49,6 @@ const ISSUER: &str = "privy.io";
 const JWKS_REFRESH_AFTER: Duration = Duration::from_secs(5 * 60);
 /// Least time between refetches, so unknown `kid`s cannot hammer Privy.
 const JWKS_RETRY_AFTER: Duration = Duration::from_secs(30);
-/// Beyond this age without a successful refetch the keys are not trusted.
-const JWKS_MAX_AGE: Duration = Duration::from_secs(60 * 60);
 /// How long a revoked session is remembered: past the lifetime of any
 /// access token issued for it.
 const REVOKED_SESSION_TTL: Duration = Duration::from_secs(2 * 60 * 60);
@@ -253,7 +251,8 @@ pub struct Privy {
     refresh: tokio::sync::Mutex<Option<Instant>>,
     refresh_after: Duration,
     retry_after: Duration,
-    max_age: Duration,
+    /// The last refetch failed: a set due for one is no longer confirmed.
+    refresh_failed: std::sync::atomic::AtomicBool,
     validation: jsonwebtoken::Validation,
     /// Sessions signed out here, by `sid`, with when.
     revoked: std::sync::Mutex<std::collections::HashMap<String, Instant>>,
@@ -312,7 +311,7 @@ impl Privy {
             refresh: tokio::sync::Mutex::new(None),
             refresh_after: JWKS_REFRESH_AFTER,
             retry_after: JWKS_RETRY_AFTER,
-            max_age: JWKS_MAX_AGE,
+            refresh_failed: std::sync::atomic::AtomicBool::new(false),
             validation,
             revoked: Default::default(),
             not_before: std::sync::atomic::AtomicU64::new(unix_now()),
@@ -359,12 +358,18 @@ impl Privy {
                     keys,
                     fetched_at: Some(Instant::now()),
                 });
+                self.refresh_failed
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
             }
-            Err(error) => tracing::error!(
-                %error,
-                age_secs = set.fetched_at.map(|at| at.elapsed().as_secs()),
-                "Privy JWKS refresh failed; keeping the last set until it expires"
-            ),
+            Err(error) => {
+                self.refresh_failed
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                tracing::error!(
+                    %error,
+                    age_secs = set.fetched_at.map(|at| at.elapsed().as_secs()),
+                    "Privy JWKS refresh failed; sign-ins fail until it succeeds"
+                )
+            }
         }
     }
 
@@ -381,18 +386,27 @@ impl Privy {
     }
 
     /// Verify an access token the browser obtained from Privy: signature,
-    /// issuer, audience (this app), expiry. The subject is the user.
-    pub fn verify(&self, access_token: &str) -> Result<Identity, String> {
+    /// issuer, audience (this app), expiry. The subject is the user. Only
+    /// [`Privy::authenticate`] calls this, after refreshing what is due.
+    fn verify(&self, access_token: &str) -> Result<Identity, String> {
         let token = access_token.trim();
         let kid = jsonwebtoken::decode_header(token)
             .map_err(|e| e.to_string())?
             .kid;
         let set = self.key_set();
-        if set
-            .fetched_at
-            .is_some_and(|at| at.elapsed() >= self.max_age)
-        {
-            return Err("the Privy verification keys could not be refreshed".to_string());
+        if let Some(fetched_at) = set.fetched_at {
+            // A set due for a refetch is trusted only while refetches work;
+            // an outage must not keep a key Privy has retired alive.
+            if fetched_at.elapsed() >= self.refresh_after
+                && self
+                    .refresh_failed
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err("the Privy verification keys could not be refreshed".to_string());
+            }
+            if kid.is_some() && !set.keys.knows(kid.as_deref()) {
+                return Err("the token's signing key is not in the app's JWKS".to_string());
+            }
         }
         let mut last = String::from("no verification key");
         let mut data = None;
@@ -1279,16 +1293,23 @@ pub(crate) mod tests {
         let mut privy = Privy::connect(cfg).await.unwrap();
         let token = signed_by(&key, "kid_1", USER);
         *doc.lock().unwrap() = None;
+        // Keys not yet due for a refetch need no JWKS.
+        assert!(privy.authenticate(&token).await.is_ok());
+        // Once due, a failed refetch fails closed: the key may be retired.
         privy.refresh_after = Duration::ZERO;
         privy.retry_after = Duration::ZERO;
-        // A failed refresh keeps the last set while it is young enough.
-        assert!(privy.authenticate(&token).await.is_ok());
-        privy.max_age = Duration::ZERO;
         assert!(privy.authenticate(&token).await.is_err(), "fails closed");
+        // Also while refetches are throttled after the failure.
+        privy.retry_after = Duration::from_secs(60);
+        assert!(privy.authenticate(&token).await.is_err(), "still closed");
+        // A working refetch restores sign-ins.
+        privy.retry_after = Duration::ZERO;
+        *doc.lock().unwrap() = Some(json!({ "keys": [jwk("kid_1", &key)] }).to_string());
+        assert!(privy.authenticate(&token).await.is_ok());
         // A configured PEM never ages.
         let app = FakeApp::new("http://unused");
         let mut pem = Privy::new(app.cfg.clone()).unwrap();
-        pem.max_age = Duration::ZERO;
+        pem.refresh_after = Duration::ZERO;
         assert!(pem.authenticate(&app.token_for(USER)).await.is_ok());
     }
 
