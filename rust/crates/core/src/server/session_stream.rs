@@ -778,10 +778,10 @@ struct StreamUsageAccumulator {
 impl StreamUsageAccumulator {
     fn new(spec: SessionMeterSpec, hints: SessionUsageHints) -> Self {
         Self {
+            ndjson: NdjsonUsageDecoder::for_spec(&spec),
             spec,
             hints,
             sse: SseUsageDecoder::default(),
-            ndjson: NdjsonUsageDecoder::default(),
             ndjson_utf8_tail: Vec::new(),
             output_bytes: 0,
             output_chars: 0,
@@ -1047,16 +1047,31 @@ struct SseUsageEvent {
 #[derive(Debug, Clone, Default)]
 struct NdjsonUsageDecoder {
     buffer: Vec<u8>,
+    /// Usage is read from record contents (tokens, quota units), so a
+    /// malformed record would release output the meter never counted.
+    records_carry_usage: bool,
 }
 
 impl NdjsonUsageDecoder {
+    fn for_spec(spec: &SessionMeterSpec) -> Self {
+        Self {
+            buffer: Vec::new(),
+            records_carry_usage: spec.dimensions.iter().any(|dimension| {
+                matches!(
+                    dimension.unit,
+                    BillingUnit::Tokens | BillingUnit::QuotaUnits
+                )
+            }),
+        }
+    }
+
     fn push_chunk(&mut self, chunk: &[u8]) -> MeteringResult<Vec<Value>> {
         self.buffer.extend_from_slice(chunk);
         let mut values = Vec::new();
         while let Some(index) = self.buffer.iter().position(|byte| *byte == b'\n') {
             let line = self.buffer[..index].to_vec();
             self.buffer.drain(..=index);
-            if let Some(value) = parse_ndjson_record(&line)? {
+            if let Some(value) = parse_ndjson_record(&line, self.records_carry_usage)? {
                 values.push(value);
             }
         }
@@ -1072,11 +1087,14 @@ impl NdjsonUsageDecoder {
 
     fn finish(&mut self) -> MeteringResult<Option<Value>> {
         let line = std::mem::take(&mut self.buffer);
-        parse_ndjson_record(&line)
+        parse_ndjson_record(&line, self.records_carry_usage)
     }
 }
 
-fn parse_ndjson_record(line: &[u8]) -> MeteringResult<Option<Value>> {
+/// `None` for a blank line, or a malformed record when usage is measured from
+/// the wire alone. When records carry usage, a malformed one is an error:
+/// skipping it would release output to the client unmetered.
+fn parse_ndjson_record(line: &[u8], records_carry_usage: bool) -> MeteringResult<Option<Value>> {
     let line = std::str::from_utf8(line).map_err(|error| {
         crate::server::session_metering::SessionMeteringError::InvalidStream(error.to_string())
     })?;
@@ -1084,7 +1102,15 @@ fn parse_ndjson_record(line: &[u8]) -> MeteringResult<Option<Value>> {
     if line.is_empty() {
         return Ok(None);
     }
-    Ok(serde_json::from_str(line).ok())
+    match serde_json::from_str(line) {
+        Ok(value) => Ok(Some(value)),
+        Err(_) if !records_carry_usage => Ok(None),
+        Err(error) => Err(
+            crate::server::session_metering::SessionMeteringError::InvalidStream(format!(
+                "malformed NDJSON record: {error}"
+            )),
+        ),
+    }
 }
 
 fn count_stream_utf8_chars(tail: &mut Vec<u8>, chunk: &[u8]) -> MeteringResult<u64> {
@@ -1647,6 +1673,56 @@ mod tests {
                 .observation()
                 .get(MeterDirection::Output, BillingUnit::Tokens),
             Some(5)
+        );
+    }
+
+    #[test]
+    fn ndjson_decoder_rejects_malformed_records_and_skips_blank_lines() {
+        let accumulator = || {
+            StreamUsageAccumulator::new(
+                SessionMeterSpec::new([SessionMeterDimension::required(
+                    MeterDirection::Output,
+                    BillingUnit::Tokens,
+                    1,
+                    1,
+                )]),
+                SessionUsageHints::default(),
+            )
+        };
+
+        let mut blank = accumulator();
+        assert!(
+            blank
+                .observe_chunk(b"\n  \n{\"usage\":{\"completion_tokens\":5}}\n", false)
+                .unwrap()
+        );
+
+        let error = accumulator()
+            .observe_chunk(b"{\"choices\":[{\"text\":\"unmetered\"}\n", false)
+            .unwrap_err();
+        assert!(error.to_string().contains("malformed NDJSON"), "{error}");
+
+        // A malformed final record without a newline fails closed too.
+        let mut tail = accumulator();
+        tail.observe_chunk(b"{\"choices\":", false).unwrap();
+        assert!(tail.finish_ndjson().is_err());
+
+        // Wire-measured pricing counts the record's bytes either way.
+        let mut bytes = StreamUsageAccumulator::new(
+            SessionMeterSpec::new([SessionMeterDimension::required(
+                MeterDirection::Output,
+                BillingUnit::Bytes,
+                1,
+                1,
+            )]),
+            SessionUsageHints::default(),
+        );
+        assert!(bytes.observe_chunk(b"not json\n", false).unwrap());
+        assert_eq!(
+            bytes
+                .observation()
+                .get(MeterDirection::Output, BillingUnit::Bytes),
+            Some(9)
         );
     }
 
