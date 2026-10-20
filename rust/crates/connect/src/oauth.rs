@@ -1279,7 +1279,15 @@ pub(crate) async fn approve_with_privy(
         let record = privy.tenant_record(&subject, &wallet);
         seed_spend(state, &record).await?;
         tracing::info!(%subject, address = %wallet.address, ?bound, "privy tenant bound");
-        state.tenants().bind(record);
+        let stale = state.tenants().bind_owner(record);
+        if !stale.is_empty() {
+            revoke_subjects(state, &stale);
+            tracing::warn!(
+                wallet = %wallet.id,
+                evicted = stale.len(),
+                "privy wallet now belongs to another user; former bindings revoked"
+            );
+        }
     }
     Ok(PrivyApproval {
         subject,
@@ -1312,20 +1320,26 @@ async fn seed_spend(
 /// on that wallet and revoke every credential they hold.
 #[cfg(feature = "privy")]
 fn invalidate_wallet_binding(state: &AppState, stale: &crate::tenants::TenantRecord) {
-    for subject in state
+    let subjects = state
         .tenants()
-        .remove_wallet(&stale.provider, &stale.wallet_id)
-    {
-        if let Some(store) = state.oauth() {
-            store.revoke_subject(&subject);
-        }
-        state.cli().revoke_subject(&subject);
-    }
+        .remove_wallet(&stale.provider, &stale.wallet_id);
+    revoke_subjects(state, &subjects);
     tracing::warn!(
         wallet = %stale.wallet_id,
         address = %stale.pubkey,
         "privy wallet binding changed; tenant credentials revoked"
     );
+}
+
+/// End every OAuth and CLI credential held by unbound `subjects`.
+#[cfg(feature = "privy")]
+fn revoke_subjects(state: &AppState, subjects: &[String]) {
+    for subject in subjects {
+        if let Some(store) = state.oauth() {
+            store.revoke_subject(subject);
+        }
+        state.cli().revoke_subject(subject);
+    }
 }
 
 #[cfg(not(feature = "privy"))]
@@ -3169,6 +3183,55 @@ mod tests {
             let rebound = state.tenants().get(&subject).unwrap();
             assert_ne!(rebound.wallet_id, wallet, "a new wallet for the user");
             assert_eq!(oauth.authenticate(&fresh).unwrap().id, subject);
+        }
+
+        /// A wallet Privy moved to another user is that user's alone once
+        /// they bind it: the former owner's subject, its linked connections
+        /// and every credential they hold are gone.
+        #[tokio::test]
+        async fn binding_a_moved_wallet_evicts_its_former_owner() {
+            const NEW_USER: &str = "did:privy:new_owner";
+            let (app, state, fake, mock) = privy_app().await;
+            let client_id = register_grok(&app).await;
+            let (access, refresh) = privy_tokens(&app, &client_id, &fake.token_for(USER)).await;
+            let former = crate::privy::subject_for_user(USER);
+            let wallet = state.tenants().get(&former).unwrap().wallet_id.clone();
+            state.tenants().bind({
+                let mut linked = (*state.tenants().get(&former).unwrap()).clone();
+                linked.subject = "guest_linked".to_string();
+                linked
+            });
+            let cli_token = state.cli().issue_token(former.clone(), None).unwrap();
+
+            // Another user signing in with their own wallet changes nothing.
+            mock.wallets.lock().unwrap().insert(
+                "did:privy:bystander".to_string(),
+                (
+                    "w_other".to_string(),
+                    vec![crate::privy::tests::SIGNER.to_string()],
+                ),
+            );
+            privy_tokens(&app, &client_id, &fake.token_for("did:privy:bystander")).await;
+            let oauth = state.oauth().unwrap();
+            assert!(oauth.authenticate(&access).is_some());
+            assert!(state.tenants().get("guest_linked").is_some());
+
+            {
+                let mut wallets = mock.wallets.lock().unwrap();
+                let entry = wallets.remove(USER).unwrap();
+                wallets.insert(NEW_USER.to_string(), entry);
+            }
+            privy_tokens(&app, &client_id, &fake.token_for(NEW_USER)).await;
+            let owner = crate::privy::subject_for_user(NEW_USER);
+            assert_eq!(state.tenants().get(&owner).unwrap().wallet_id, wallet);
+            assert!(state.tenants().get(&former).is_none());
+            assert!(state.tenants().get("guest_linked").is_none());
+            assert!(oauth.authenticate(&access).is_none(), "access revoked");
+            assert!(
+                oauth.refresh(&client_id, &refresh).is_err(),
+                "refresh revoked"
+            );
+            assert!(state.cli().authenticate(&cli_token).is_none());
         }
 
         #[tokio::test]

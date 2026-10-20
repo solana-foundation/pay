@@ -432,6 +432,28 @@ impl TenantRegistry {
             .insert(record.subject.clone(), Arc::new(record));
     }
 
+    /// Bind the provider wallet's owner, in one step unbinding every other
+    /// subject still on that wallet: a former owner, or connections that
+    /// former owner linked. Returns those subjects, whose credentials the
+    /// caller must revoke.
+    pub fn bind_owner(&self, record: TenantRecord) -> Vec<String> {
+        let mut tenants = self.tenants.lock().unwrap();
+        let stale: Vec<String> = tenants
+            .values()
+            .filter(|t| {
+                t.provider == record.provider
+                    && t.wallet_id == record.wallet_id
+                    && t.subject != record.subject
+            })
+            .map(|t| t.subject.clone())
+            .collect();
+        for subject in &stale {
+            tenants.remove(subject);
+        }
+        tenants.insert(record.subject.clone(), Arc::new(record));
+        stale
+    }
+
     pub fn get(&self, subject: &str) -> Option<Arc<TenantRecord>> {
         self.tenants.lock().unwrap().get(subject).cloned()
     }
