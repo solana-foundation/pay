@@ -6,6 +6,7 @@
 //! [`Operator`] as fee payer, session operator and settlement signer. The
 //! gate's verification and settlement code then runs unchanged.
 
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -79,6 +80,26 @@ impl std::fmt::Display for RpcUrl {
 impl std::fmt::Debug for RpcUrl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "RpcUrl({self})")
+    }
+}
+
+/// One endpoint's MPP session channel records, one store per settlement mint.
+///
+/// Owned by the endpoint, not by a pricing generation: a reprice rebuilds the
+/// backends but must keep serving, metering and settling the channels buyers
+/// already funded. Never shared across endpoints, whose channels pay
+/// different sellers.
+#[derive(Clone, Default)]
+pub struct SessionStores(Arc<std::sync::Mutex<HashMap<String, Arc<dyn ChannelStore>>>>);
+
+impl SessionStores {
+    fn for_mint(&self, mint: &str) -> Arc<dyn ChannelStore> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(mint.to_string())
+            .or_insert_with(|| Arc::new(pay_kit::core::store::MemoryChannelStore::new()))
+            .clone()
     }
 }
 
@@ -238,6 +259,17 @@ impl EndpointBackends {
         operator: &Operator,
         public_url: &str,
     ) -> Result<Self, String> {
+        Self::build_with_session_stores(sale, operator, public_url, &SessionStores::default())
+    }
+
+    /// [`Self::build`] over the endpoint's existing session channel records,
+    /// so channels opened under an earlier pricing generation keep working.
+    pub fn build_with_session_stores(
+        sale: &SellInference,
+        operator: &Operator,
+        public_url: &str,
+        session_stores: &SessionStores,
+    ) -> Result<Self, String> {
         let problems = sale.validate();
         if !problems.is_empty() {
             return Err(problems.join("; "));
@@ -356,12 +388,13 @@ impl EndpointBackends {
                 };
                 // Endpoints share the operator's root secret; derive one per
                 // endpoint so a clone's session cannot be replayed into it.
-                let session = SessionMpp::new(
+                let session = SessionMpp::new_with_channel_store(
                     config,
                     pay_core::server::session::endpoint_challenge_binding_secret(
                         &operator.challenge_binding_secret,
                         &sale.endpoint_id,
                     ),
+                    session_stores.for_mint(mint),
                 )
                 .with_realm(sale.title.clone())
                 .with_blockhash_cache(operator.blockhashes.clone())
@@ -597,6 +630,62 @@ mod tests {
         let store = operator.batch_store.as_ref().unwrap();
         assert!(Arc::ptr_eq(first.x402_batch().unwrap().store(), store));
         assert!(Arc::ptr_eq(repriced.x402_batch().unwrap().store(), store));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repriced_backends_keep_the_endpoints_session_channels() {
+        let operator = operator();
+        let stores = SessionStores::default();
+        let build = |usd, stores: &SessionStores| {
+            EndpointBackends::build_with_session_stores(
+                &sale(SellPricing::PerRequest { usd }),
+                &operator,
+                "https://connect.test",
+                stores,
+            )
+            .unwrap()
+        };
+        let first = build(0.02, &stores);
+        let session = first.sessions.first().unwrap().clone();
+        let channel = solana_pubkey::Pubkey::new_unique().to_string();
+        stores
+            .for_mint(session.currency())
+            .put_channel(
+                &channel,
+                pay_core::server::session::test_channel_state(
+                    &channel,
+                    1_000_000,
+                    operator.pubkey(),
+                    "operator",
+                    "opening",
+                    solana_pubkey::Pubkey::new_unique().to_string(),
+                    None,
+                ),
+            )
+            .await
+            .unwrap();
+        session.touch_channel(channel.clone()).await.unwrap();
+
+        // A reprice serves the channel the buyer already funded.
+        let repriced = build(0.03, &stores);
+        repriced
+            .sessions
+            .first()
+            .unwrap()
+            .touch_channel(channel.clone())
+            .await
+            .unwrap();
+        // Another endpoint's stores never see it.
+        let other = build(0.03, &SessionStores::default());
+        assert!(
+            other
+                .sessions
+                .first()
+                .unwrap()
+                .touch_channel(channel)
+                .await
+                .is_err()
+        );
     }
 
     #[test]

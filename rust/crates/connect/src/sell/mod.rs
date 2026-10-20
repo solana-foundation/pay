@@ -16,6 +16,6 @@ pub mod backends;
 pub mod queue;
 pub mod routes;
 
-pub use backends::{EndpointBackends, Operator};
+pub use backends::{EndpointBackends, Operator, SessionStores};
 pub use queue::{EndpointQueue, Event, ParkedRequest, QueueError};
 pub use routes::{EndpointRegistry, SellState, router};

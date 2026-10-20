@@ -31,7 +31,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tower::ServiceExt;
 
-use super::backends::{EndpointBackends, Operator};
+use super::backends::{EndpointBackends, Operator, SessionStores};
 use super::queue::{Admission, EndpointQueue, Event, QueueError};
 use crate::protocol::ApiError;
 
@@ -229,6 +229,8 @@ pub struct EndpointEntry {
     token_hash: [u8; 32],
     pub queue: Arc<EndpointQueue>,
     live: RwLock<Arc<Live>>,
+    /// Session channels outlive pricing generations; see [`SessionStores`].
+    session_stores: SessionStores,
     /// Stop taking requests once this much has been earned (micro-USD).
     earn_cap_micro: u64,
     /// Earned and temporarily reserved capacity are updated under one lock so
@@ -650,8 +652,13 @@ fn live_for(
     entry: &Arc<EndpointEntry>,
     sale: SellInference,
 ) -> Result<Arc<Live>, ApiError> {
-    let backends = EndpointBackends::build(&sale, &state.operator, &state.public_url)
-        .map_err(|message| ApiError::bad_request("invalid_endpoint", message))?;
+    let backends = EndpointBackends::build_with_session_stores(
+        &sale,
+        &state.operator,
+        &state.public_url,
+        &entry.session_stores,
+    )
+    .map_err(|message| ApiError::bad_request("invalid_endpoint", message))?;
     let routes = Router::new()
         .route(&format!("/{}", sale.chat_path()), post(chat_completions))
         .route(&format!("/{}", sale.models_path()), get(models))
@@ -732,6 +739,7 @@ async fn create(
             gated: Router::new(),
             streaming: Router::new(),
         })),
+        session_stores: SessionStores::default(),
         earn_cap_micro: (input.earn_cap_usd * USD_MICRO).round() as u64,
         earnings: Mutex::new(Earnings::default()),
     });
