@@ -1278,6 +1278,20 @@ pub(crate) async fn approve_with_privy(
         }
         let record = privy.tenant_record(&subject, &wallet);
         seed_spend(state, &record).await?;
+        // The provider may have moved the wallet while we waited on it and
+        // on its history: bind only what it still confirms is this user's.
+        let confirmed = privy
+            .solana_wallet(&identity.user_id)
+            .await
+            .map_err(provider_error)?;
+        if confirmed.as_ref() != Some(&wallet) {
+            tracing::warn!(%subject, wallet = %wallet.id, "privy wallet changed during provisioning");
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "wallet_changed",
+                "Your Privy wallet changed while it was being prepared. Approve again.",
+            ));
+        }
         tracing::info!(%subject, address = %wallet.address, ?bound, "privy tenant bound");
         let stale = state.tenants().bind_owner(record);
         if !stale.is_empty() {
@@ -3232,6 +3246,63 @@ mod tests {
                 "refresh revoked"
             );
             assert!(state.cli().authenticate(&cli_token).is_none());
+        }
+
+        /// A wallet the provider moves while it is being bound (here: while
+        /// its spend history is read) is not bound to the user who lost it.
+        #[tokio::test]
+        async fn a_wallet_moved_during_provisioning_is_not_bound() {
+            struct MoveDuringHistory(Arc<MockPrivy>, std::sync::atomic::AtomicBool);
+            #[async_trait::async_trait]
+            impl crate::tenants::SpendHistory for MoveDuringHistory {
+                async fn spent_today(&self, _wallet: &str) -> Result<u64, String> {
+                    if self.1.load(std::sync::atomic::Ordering::SeqCst) {
+                        let mut wallets = self.0.wallets.lock().unwrap();
+                        let wallet = wallets.remove(USER).unwrap();
+                        wallets.insert("did:privy:recipient".to_string(), wallet);
+                    }
+                    Ok(0)
+                }
+            }
+            for moves in [false, true] {
+                let mock = Arc::new(MockPrivy::default());
+                mock.wallets.lock().unwrap().insert(
+                    USER.to_string(),
+                    (
+                        "w_moving".to_string(),
+                        vec![crate::privy::tests::SIGNER.to_string()],
+                    ),
+                );
+                let fake = FakeApp::new(&mock_privy(mock.clone()).await);
+                let state = AppState::new("https://cloud.test")
+                    .with_mcp(crate::mcp::Config::new("https://cloud.test", vec![]))
+                    .with_privy(crate::privy::Privy::new(fake.cfg.clone()).unwrap())
+                    .with_spend_history(Arc::new(MoveDuringHistory(
+                        mock.clone(),
+                        std::sync::atomic::AtomicBool::new(moves),
+                    )))
+                    .with_wallet_probe(Arc::new(crate::FixedProbe(false)));
+                let app = crate::router(state.clone());
+                let client_id = register_grok(&app).await;
+                let request_id = start_authorization(&app, &client_id, None).await;
+                let approved = post_json_with(
+                    &app,
+                    &approve_path(&request_id),
+                    json!({}),
+                    None,
+                    Some(&fake.token_for(USER)),
+                )
+                .await;
+                let subject = crate::privy::subject_for_user(USER);
+                if moves {
+                    assert_eq!(approved.status, StatusCode::CONFLICT, "{}", approved.body);
+                    assert_eq!(approved.json()["error"], "wallet_changed");
+                    assert!(state.tenants().get(&subject).is_none());
+                } else {
+                    assert_eq!(approved.status, StatusCode::OK, "{}", approved.body);
+                    assert_eq!(state.tenants().get(&subject).unwrap().wallet_id, "w_moving");
+                }
+            }
         }
 
         #[tokio::test]
