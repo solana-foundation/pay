@@ -24,24 +24,25 @@ fn redacted_headers(headers: &HashMap<String, String>) -> HashMap<String, String
     headers
         .iter()
         .map(|(name, value)| {
-            let sensitive = matches!(
-                name.to_ascii_lowercase().as_str(),
-                "authorization"
-                    | "proxy-authorization"
-                    | "x-api-key"
-                    | "api-key"
-                    | "apikey"
-                    | "x-auth-token"
-                    | "x-access-token"
-                    | "x-goog-api-key"
-                    | "payment-signature"
-                    | "x-payment"
-                    | "payment-response"
-                    | "x-payment-response"
-                    | "payment-receipt"
-                    | "cookie"
-                    | "set-cookie"
-            );
+            let sensitive = is_credential_name(name)
+                || matches!(
+                    name.to_ascii_lowercase().as_str(),
+                    "authorization"
+                        | "proxy-authorization"
+                        | "x-api-key"
+                        | "api-key"
+                        | "apikey"
+                        | "x-auth-token"
+                        | "x-access-token"
+                        | "x-goog-api-key"
+                        | "payment-signature"
+                        | "x-payment"
+                        | "payment-response"
+                        | "x-payment-response"
+                        | "payment-receipt"
+                        | "cookie"
+                        | "set-cookie"
+                );
             (
                 name.clone(),
                 if sensitive {
@@ -54,6 +55,65 @@ fn redacted_headers(headers: &HashMap<String, String>) -> HashMap<String, String
         .collect()
 }
 
+/// Split a field or header name into lowercase words at `-`, `_`, `.`,
+/// spaces and camelCase boundaries, so `accessToken`, `access-token`,
+/// `ACCESS_TOKEN` and `access_token` all read as `["access", "token"]`.
+fn name_words(name: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut prev: Option<char> = None;
+    let chars: Vec<char> = name.chars().collect();
+    for (index, &ch) in chars.iter().enumerate() {
+        if !ch.is_alphanumeric() {
+            if !word.is_empty() {
+                words.push(std::mem::take(&mut word));
+            }
+            prev = None;
+            continue;
+        }
+        let next_lower = chars.get(index + 1).is_some_and(|c| c.is_lowercase());
+        let boundary = ch.is_uppercase()
+            && prev.is_some_and(|p| {
+                p.is_lowercase() || p.is_numeric() || next_lower && p.is_uppercase()
+            });
+        if boundary && !word.is_empty() {
+            words.push(std::mem::take(&mut word));
+        }
+        word.extend(ch.to_lowercase());
+        prev = Some(ch);
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    words
+}
+
+/// Whether a JSON field or header name holds a credential, whatever its
+/// casing or separators. One rule for every captured name, so a new
+/// spelling of a secret is caught by its words rather than a fixed list.
+fn is_credential_name(name: &str) -> bool {
+    let words = name_words(name);
+    let has = |word: &str| words.iter().any(|w| w == word);
+    const SECRET_WORDS: &[&str] = &[
+        "authorization",
+        "apikey",
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "passphrase",
+        "credential",
+        "credentials",
+        "cookie",
+        "mnemonic",
+    ];
+    const KEY_QUALIFIERS: &[&str] = &["api", "private", "secret", "access", "signing", "session"];
+    SECRET_WORDS.iter().any(|word| has(word))
+        || words
+            .windows(2)
+            .any(|pair| pair[1] == "key" && KEY_QUALIFIERS.contains(&pair[0].as_str()))
+}
+
 fn redacted_request_body(body: Option<&str>) -> Option<String> {
     let body = body?;
     let Ok(mut json) = serde_json::from_str::<serde_json::Value>(body) else {
@@ -64,18 +124,7 @@ fn redacted_request_body(body: Option<&str>) -> Option<String> {
         match value {
             serde_json::Value::Object(object) => {
                 for (key, value) in object {
-                    let key = key.to_ascii_lowercase().replace('-', "_");
-                    if matches!(
-                        key.as_str(),
-                        "authorization"
-                            | "api_key"
-                            | "apikey"
-                            | "access_token"
-                            | "refresh_token"
-                            | "password"
-                            | "secret"
-                            | "client_secret"
-                    ) {
+                    if is_credential_name(key) {
                         *value = serde_json::Value::String(REDACTED.into());
                     } else {
                         redact(value);
@@ -3950,6 +3999,68 @@ mod tests {
         assert!(captured.contains(REDACTED));
         assert!(captured.chars().count() <= 4097);
         assert!(redacted_request_body(Some("not-json secret")).is_none());
+    }
+
+    #[test]
+    fn credential_fields_are_redacted_in_any_spelling() {
+        let body = serde_json::json!({
+            "accessToken": "camel-access",
+            "refreshToken": "camel-refresh",
+            "clientSecret": "camel-client-secret",
+            "idToken": "camel-id",
+            "privateKey": "camel-private",
+            "APIKey": "upper-api",
+            "x-api-key": "kebab-api",
+            "SESSION_TOKEN": "screaming-session",
+            "nested": [{"accessToken": "nested-camel-access"}],
+            "model": "gpt-5",
+            "max_tokens": 128,
+            "maxTokens": 256,
+            "keyword": "kept",
+            "prompt": "hello",
+        })
+        .to_string();
+        let captured = redacted_request_body(Some(&body)).unwrap();
+        for secret in [
+            "camel-access",
+            "camel-refresh",
+            "camel-client-secret",
+            "camel-id",
+            "camel-private",
+            "upper-api",
+            "kebab-api",
+            "screaming-session",
+            "nested-camel-access",
+        ] {
+            assert!(!captured.contains(secret), "{secret} leaked: {captured}");
+        }
+        let captured: serde_json::Value = serde_json::from_str(&captured).unwrap();
+        assert_eq!(captured["model"], "gpt-5");
+        assert_eq!(captured["max_tokens"], 128);
+        assert_eq!(captured["maxTokens"], 256);
+        assert_eq!(captured["keyword"], "kept");
+        assert_eq!(captured["prompt"], "hello");
+    }
+
+    #[test]
+    fn credential_headers_are_redacted_in_any_spelling() {
+        let headers = HashMap::from([
+            ("X-Session-Token".to_string(), "session".to_string()),
+            ("x-csrf-token".to_string(), "csrf".to_string()),
+            (
+                "payment-receipt-url".to_string(),
+                "https://pay.sh/receipt/s".to_string(),
+            ),
+            (
+                "www-authenticate".to_string(),
+                "Payment realm=\"x\"".to_string(),
+            ),
+        ]);
+        let redacted = redacted_headers(&headers);
+        assert_eq!(redacted["X-Session-Token"], REDACTED);
+        assert_eq!(redacted["x-csrf-token"], REDACTED);
+        assert_eq!(redacted["payment-receipt-url"], "https://pay.sh/receipt/s");
+        assert_eq!(redacted["www-authenticate"], "Payment realm=\"x\"");
     }
 
     #[test]
