@@ -35,10 +35,9 @@ use pay_core::server::gate::{
 use pay_core::server::metering::{self, UptoSettlementPlan};
 use pay_core::server::payment::{TrustedPaymentIdentity, strip_internal_identity_headers};
 use pay_core::server::proxy::{
-    ClientVoucherMeter, QueryCredentials, STRIP_HEADERS, URL_RESPONSE_HEADERS, UpstreamPlan,
-    collect_upstream_body, prepare_upstream_with_identity, redact_url_in_error,
-    routing_signs_request_body, upstream_error_for_logging, upstream_http_client,
-    upstream_url_for_logging,
+    ClientVoucherMeter, STRIP_HEADERS, URL_RESPONSE_HEADERS, UpstreamPlan, UrlCredentials,
+    collect_upstream_body, prepare_upstream_with_identity, routing_signs_request_body,
+    upstream_http_client,
 };
 use pay_core::server::session_stream::{
     BoxError, DelegatedSessionStreamMeter, SessionStreamContext,
@@ -54,6 +53,9 @@ const BUFFERED_REQUEST_BODY_LIMIT: usize = 16 * 1024 * 1024;
 const DEFAULT_RESPONSE_BODY_LIMIT: usize = 1024 * 1024;
 
 /// Where a non-`Respond` request should be proxied.
+// One per request, and the API target is the common case: boxing it would
+// only add an allocation.
+#[allow(clippy::large_enum_variant)]
 enum Target {
     /// Real API upstream resolved from the endpoint spec via `prepare_upstream`.
     Api {
@@ -68,7 +70,7 @@ enum Target {
         headers: Vec<(String, String)>,
         /// Credentials injected into the upstream query, scrubbed from the
         /// response before it reaches the caller.
-        query_credentials: QueryCredentials,
+        url_credentials: UrlCredentials,
     },
     /// Internal axum service that serves the control plane.
     ControlPlane,
@@ -610,8 +612,8 @@ impl<S: PaymentState> Http402Gate<S> {
         let upstream = match upstream_req.send().await {
             Ok(resp) => resp,
             Err(e) => {
-                let error = upstream_error_for_logging(&e);
-                let upstream = upstream_url_for_logging(&prepared.url);
+                let error = prepared.error_for_logging(&e);
+                let upstream = prepared.url_for_logging();
                 telemetry::record_upstream_error(&api.subdomain, uri.path(), &upstream, &error);
                 tracing::error!(%error, %upstream, "buffered upstream request failed");
                 let extra = self.drain_payment_headers(ctx, false).await;
@@ -633,13 +635,13 @@ impl<S: PaymentState> Http402Gate<S> {
             telemetry::record_upstream_error(
                 &api.subdomain,
                 uri.path(),
-                &upstream_url_for_logging(&prepared.url),
+                &prepared.url_for_logging(),
                 &format!("upstream returned {status}"),
             );
         }
         let mut response_headers = filtered_response_headers(upstream.headers());
         prepared
-            .query_credentials
+            .url_credentials
             .scrub_response_headers(&mut response_headers);
         // A client-voucher session pays as it reads: its whole response goes
         // through the meter that waits on the client's commits.
@@ -706,11 +708,11 @@ impl<S: PaymentState> Http402Gate<S> {
         let body = match collect_upstream_body(upstream, response_limit).await {
             Ok(body) => body,
             Err(e) => {
-                let error = redact_url_in_error(&e.to_string(), &prepared.url);
+                let error = prepared.redact_for_logging(&e.to_string());
                 telemetry::record_upstream_error(
                     &api.subdomain,
                     uri.path(),
-                    &upstream_url_for_logging(&prepared.url),
+                    &prepared.url_for_logging(),
                     &error,
                 );
                 tracing::warn!(%error, "failed to buffer upstream response body");
@@ -1341,10 +1343,10 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
         ctx: &mut Ctx,
     ) -> pingora::Result<()> {
         if let Some(Target::Api {
-            query_credentials, ..
+            url_credentials, ..
         }) = &ctx.target
         {
-            scrub_query_credentials(query_credentials, upstream_response);
+            scrub_url_credentials(url_credentials, upstream_response);
         }
         if upstream_response.status.is_server_error()
             && let Some(Target::Api {
@@ -1703,7 +1705,7 @@ fn is_control_plane(path: &str) -> bool {
 
 /// Remove gateway query credentials from a natively proxied response's
 /// URL-bearing headers before they are written downstream.
-fn scrub_query_credentials(credentials: &QueryCredentials, response: &mut ResponseHeader) {
+fn scrub_url_credentials(credentials: &UrlCredentials, response: &mut ResponseHeader) {
     let mut scrubbed = response.headers.clone();
     credentials.scrub_response_headers(&mut scrubbed);
     for name in URL_RESPONSE_HEADERS {
@@ -1724,8 +1726,8 @@ fn target_from_prepared(
     prepared: pay_core::server::proxy::PreparedUpstreamRequest,
     subdomain: String,
 ) -> Target {
+    let upstream = prepared.url_for_logging();
     let url = prepared.url;
-    let upstream = upstream_url_for_logging(&url);
     let tls = url.scheme() == "https";
     let host = url.host_str().unwrap_or("").to_string();
     let port = url
@@ -1750,7 +1752,7 @@ fn target_from_prepared(
         subdomain,
         upstream,
         headers: prepared.headers,
-        query_credentials: prepared.query_credentials,
+        url_credentials: prepared.url_credentials,
     }
 }
 
@@ -2982,7 +2984,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_responses_never_relay_query_credentials() {
+    async fn native_responses_never_relay_url_credentials() {
         let mut api = body_signing_api();
         api.routing = RoutingConfig::Proxy {
             url: "https://upstream.example".to_string(),
@@ -3024,7 +3026,7 @@ mod tests {
         };
         let echoed = format!("/landing?{}", prepared.url.query().unwrap());
         let super::Target::Api {
-            query_credentials, ..
+            url_credentials, ..
         } = super::target_from_prepared(prepared, "signed".to_string())
         else {
             panic!("expected an API target");
@@ -3033,7 +3035,7 @@ mod tests {
         let mut response = super::ResponseHeader::build(302, None).unwrap();
         response.insert_header("location", echoed.as_str()).unwrap();
         response.insert_header("x-other", "kept").unwrap();
-        super::scrub_query_credentials(&query_credentials, &mut response);
+        super::scrub_url_credentials(&url_credentials, &mut response);
 
         assert_eq!(response.headers["location"], "/landing?page=2");
         assert_eq!(response.headers["x-other"], "kept");

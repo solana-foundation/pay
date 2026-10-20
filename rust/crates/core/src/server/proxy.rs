@@ -249,7 +249,7 @@ pub async fn forward_request_with_session_metering_and_identity(
     for (name, value) in &prepared.headers {
         upstream_req = upstream_req.header(name.as_str(), value);
     }
-    let upstream_url = upstream_url_for_logging(&prepared.url);
+    let upstream_url = prepared.url_for_logging();
 
     // Forward body. Always set content-length for POST/PUT/PATCH
     // (some upstreams like Google APIs require it even when empty).
@@ -260,7 +260,7 @@ pub async fn forward_request_with_session_metering_and_identity(
     }
 
     let upstream_resp = upstream_req.send().await.map_err(|e| {
-        let error = upstream_error_for_logging(&e);
+        let error = prepared.error_for_logging(&e);
         telemetry::record_upstream_error(&api.subdomain, uri.path(), &upstream_url, &error);
         tracing::error!(%error, upstream = %upstream_url, "Upstream request failed");
         error_response(StatusCode::BAD_GATEWAY, "Upstream request failed")
@@ -293,7 +293,7 @@ pub async fn forward_request_with_session_metering_and_identity(
         }
     }
     prepared
-        .query_credentials
+        .url_credentials
         .scrub_response_headers(&mut response_headers);
 
     let mut resp = Response::builder().status(status);
@@ -437,8 +437,16 @@ pub async fn prepare_upstream_with_identity(
         telemetry::record_upstream_error(&api.subdomain, uri.path(), "[invalid upstream URL]", &e);
         error_response(StatusCode::BAD_GATEWAY, &e)
     })?;
+    if let RoutingConfig::Proxy { path_rewrites, .. } = routing {
+        // Rewrite values come from the environment and may be credentials.
+        for rewrite in path_rewrites {
+            if let Ok(value) = std::env::var(&rewrite.env) {
+                prepared.url_credentials.push_path(&value);
+            }
+        }
+    }
 
-    let upstream_log_url = upstream_url_for_logging(&prepared.url);
+    let upstream_log_url = prepared.url_for_logging();
     tracing::debug!(
         subdomain = %api.subdomain,
         upstream = %upstream_log_url,
@@ -498,7 +506,7 @@ pub async fn prepare_upstream_with_identity(
                 telemetry::record_upstream_error(
                     &api.subdomain,
                     uri.path(),
-                    &upstream_url_for_logging(&prepared.url),
+                    &prepared.url_for_logging(),
                     &e,
                 );
                 error_response(StatusCode::BAD_GATEWAY, &e)
@@ -533,7 +541,7 @@ pub async fn prepare_upstream_with_identity(
                     telemetry::record_upstream_error(
                         &api.subdomain,
                         uri.path(),
-                        &upstream_url_for_logging(&prepared.url),
+                        &prepared.url_for_logging(),
                         &format!("OAuth2 token error: {e}"),
                     );
                     tracing::error!(error = %e, "Failed to fetch OAuth2 token");
@@ -555,7 +563,7 @@ pub async fn prepare_upstream_with_identity(
                     telemetry::record_upstream_error(
                         &api.subdomain,
                         uri.path(),
-                        &upstream_url_for_logging(&prepared.url),
+                        &prepared.url_for_logging(),
                         &e,
                     );
                     tracing::error!(error = %e, "Failed to fetch access token");
@@ -692,15 +700,22 @@ pub fn error_response(status: StatusCode, message: &str) -> Response {
 pub struct PreparedUpstreamRequest {
     pub url: reqwest::Url,
     pub headers: Vec<(String, String)>,
-    /// Credentials the gateway placed in the upstream query string. They
-    /// must never come back to the caller, e.g. in a relayed redirect.
-    pub query_credentials: QueryCredentials,
+    /// Secrets the gateway placed in the upstream URL. They must never come
+    /// back to the caller (e.g. in a relayed redirect) or reach a log.
+    pub url_credentials: UrlCredentials,
 }
 
-/// Gateway-injected query credentials (API keys, HMAC signatures, fetched
-/// access tokens), kept to scrub them from upstream response headers.
+/// Secrets the gateway placed in an upstream URL: query credentials (API
+/// keys, HMAC signatures, fetched access tokens) and environment-backed path
+/// rewrite values. Kept to scrub them from responses and diagnostics.
 #[derive(Clone, Default, PartialEq, Eq)]
-pub struct QueryCredentials(Vec<String>);
+pub struct UrlCredentials {
+    /// Whole query values: redacted wherever they appear.
+    query: Vec<String>,
+    /// Path segments a rewrite inserted: redacted where they form a segment,
+    /// since a short identifier can also occur as unrelated text.
+    path_segments: Vec<String>,
+}
 
 /// Response headers that carry URLs the caller follows or reads.
 pub const URL_RESPONSE_HEADERS: [axum::http::HeaderName; 2] = [
@@ -708,17 +723,96 @@ pub const URL_RESPONSE_HEADERS: [axum::http::HeaderName; 2] = [
     axum::http::header::CONTENT_LOCATION,
 ];
 
-impl QueryCredentials {
+impl UrlCredentials {
     fn push(&mut self, value: &str) {
         if !value.is_empty() {
-            self.0.push(value.to_string());
+            self.query.push(value.to_string());
         }
     }
 
+    /// Record a value a path rewrite inserted into the upstream path.
+    fn push_path(&mut self, value: &str) {
+        self.path_segments.extend(
+            value
+                .split('/')
+                .filter(|segment| !segment.is_empty())
+                .map(str::to_string),
+        );
+    }
+
+    /// `url` safe for logs, traces and telemetry: query values and any path
+    /// segment carrying a secret are redacted.
+    pub fn url_for_logging(&self, url: &reqwest::Url) -> String {
+        let mut safe = upstream_url_for_logging(url);
+        if let Ok(mut parsed) = reqwest::Url::parse(&safe)
+            && let Some(segments) = parsed.path_segments().map(|segments| {
+                segments
+                    .map(|segment| {
+                        let decoded = percent_encoding::percent_decode_str(segment)
+                            .decode_utf8_lossy()
+                            .into_owned();
+                        if self.path_segments.contains(&decoded)
+                            || self
+                                .query
+                                .iter()
+                                .any(|secret| decoded.contains(secret.as_str()))
+                        {
+                            "[REDACTED]".to_string()
+                        } else {
+                            decoded
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            && parsed
+                .path_segments_mut()
+                .map(|mut path| {
+                    path.clear().extend(segments);
+                })
+                .is_ok()
+        {
+            safe = parsed.to_string();
+        }
+        self.redact(&safe)
+    }
+
+    /// A reqwest failure safe for logs: its attached URL is redacted.
+    pub fn error_for_logging(&self, error: &reqwest::Error) -> String {
+        let mut safe = error.to_string();
+        if let Some(url) = error.url() {
+            safe = safe.replace(url.as_str(), &self.url_for_logging(url));
+        }
+        self.redact(&safe)
+    }
+
+    /// `text` with every secret, raw or percent-encoded, replaced.
+    pub fn redact(&self, text: &str) -> String {
+        let mut safe = text.to_string();
+        for secret in &self.query {
+            for form in Self::forms(secret) {
+                safe = safe.replace(&form, "[REDACTED]");
+            }
+        }
+        safe
+    }
+
+    fn forms(secret: &str) -> [String; 3] {
+        [
+            secret.to_string(),
+            url::form_urlencoded::byte_serialize(secret.as_bytes()).collect(),
+            percent_encoding::utf8_percent_encode(secret, percent_encoding::NON_ALPHANUMERIC)
+                .to_string(),
+        ]
+    }
+
     fn exposed_in(&self, value: &str) -> bool {
-        self.0.iter().any(|secret| {
-            let encoded: String = url::form_urlencoded::byte_serialize(secret.as_bytes()).collect();
-            value.contains(secret.as_str()) || value.contains(&encoded)
+        self.query.iter().any(|secret| {
+            Self::forms(secret)
+                .iter()
+                .any(|form| value.contains(form.as_str()))
+                || percent_encoding::percent_decode_str(value)
+                    .decode_utf8_lossy()
+                    .contains(secret.as_str())
         })
     }
 
@@ -733,7 +827,7 @@ impl QueryCredentials {
         let mut url = base.join(value).ok()?;
         let kept: Vec<(String, String)> = url
             .query_pairs()
-            .filter(|(_, pair)| !self.0.iter().any(|secret| secret == pair))
+            .filter(|(_, pair)| !self.query.iter().any(|secret| secret == pair))
             .map(|(key, pair)| (key.into_owned(), pair.into_owned()))
             .collect();
         url.set_query(None);
@@ -751,7 +845,7 @@ impl QueryCredentials {
     /// Remove injected credentials from URL-bearing response headers; a
     /// header that would still expose one is dropped.
     pub fn scrub_response_headers(&self, headers: &mut HeaderMap) {
-        if self.0.is_empty() {
+        if self.query.is_empty() {
             return;
         }
         for name in URL_RESPONSE_HEADERS {
@@ -783,7 +877,7 @@ impl std::fmt::Debug for PreparedUpstreamRequest {
             .collect::<Vec<_>>();
         formatter
             .debug_struct("PreparedUpstreamRequest")
-            .field("url", &upstream_url_for_logging(&self.url))
+            .field("url", &self.url_for_logging())
             .field("header_names", &header_names)
             .finish()
     }
@@ -798,8 +892,24 @@ impl PreparedUpstreamRequest {
         Ok(Self {
             url,
             headers: Vec::new(),
-            query_credentials: QueryCredentials::default(),
+            url_credentials: UrlCredentials::default(),
         })
+    }
+
+    /// The upstream URL safe for logs, traces and telemetry.
+    pub fn url_for_logging(&self) -> String {
+        self.url_credentials.url_for_logging(&self.url)
+    }
+
+    /// A reqwest failure for this request, safe for logs.
+    pub fn error_for_logging(&self, error: &reqwest::Error) -> String {
+        self.url_credentials.error_for_logging(error)
+    }
+
+    /// Free text that may quote this request's URL, safe for logs.
+    pub fn redact_for_logging(&self, text: &str) -> String {
+        self.url_credentials
+            .redact(&text.replace(self.url.as_str(), &self.url_for_logging()))
     }
 
     fn add_forwarded_header(&mut self, name: &str, value: &str) {
@@ -822,7 +932,7 @@ impl PreparedUpstreamRequest {
 
     fn append_query_credential(&mut self, name: &str, value: &str) {
         self.url.query_pairs_mut().append_pair(name, value);
-        self.query_credentials.push(value);
+        self.url_credentials.push(value);
     }
 
     fn set_query_param(&mut self, name: &str, value: &str) {
@@ -1052,7 +1162,7 @@ fn apply_credential_target(
 ) {
     apply_hmac_target(prepared, kind, name, value);
     if matches!(kind, HmacTargetType::QueryParam) {
-        prepared.query_credentials.push(value);
+        prepared.url_credentials.push(value);
     }
 }
 
@@ -1902,7 +2012,7 @@ mod tests {
                 "authorization".to_string(),
                 "Bearer header-secret".to_string(),
             )],
-            query_credentials: QueryCredentials::default(),
+            url_credentials: UrlCredentials::default(),
         };
 
         let debug = format!("{request:?}");
@@ -2026,8 +2136,46 @@ mod tests {
         assert!(served.starts_with(b"{\"text\":\"protected-content\""));
     }
 
-    fn credentials(values: &[&str]) -> QueryCredentials {
-        let mut credentials = QueryCredentials::default();
+    #[tokio::test]
+    async fn path_rewrite_secrets_never_reach_upstream_logs() {
+        // SAFETY: test-only variable read by this test alone.
+        unsafe { std::env::set_var("_TEST_PATH_REWRITE_SECRET", "user/p4ss") };
+        let mut api = make_api("test");
+        if let RoutingConfig::Proxy { path_rewrites, .. } = &mut api.routing {
+            path_rewrites.push(pay_types::metering::PathRewrite {
+                prefix: "live/{credentials}".to_string(),
+                env: "_TEST_PATH_REWRITE_SECRET".to_string(),
+            });
+        }
+        let prepared = prepare_upstream_with_identity(
+            &api,
+            &Method::GET,
+            &"/live/x/stream-1?page=2".parse().unwrap(),
+            &HeaderMap::new(),
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+        let UpstreamPlan::Forward(prepared) = prepared else {
+            panic!("expected proxy forwarding");
+        };
+        assert!(prepared.url.path().contains("p4ss"), "{}", prepared.url);
+
+        let logged = prepared.url_for_logging();
+        assert_eq!(
+            logged,
+            "https://api.example.com/live/[REDACTED]/[REDACTED]/stream-1?page=%5BREDACTED%5D"
+        );
+        assert!(!format!("{prepared:?}").contains("p4ss"));
+        let quoted = format!("error sending request for url ({})", prepared.url);
+        assert!(!prepared.redact_for_logging(&quoted).contains("p4ss"));
+        // Positive control: an unrelated segment keeps its value.
+        assert!(logged.contains("stream-1"));
+    }
+
+    fn credentials(values: &[&str]) -> UrlCredentials {
+        let mut credentials = UrlCredentials::default();
         for value in values {
             credentials.push(value);
         }
@@ -2035,7 +2183,7 @@ mod tests {
     }
 
     #[test]
-    fn query_credentials_are_scrubbed_from_relayed_urls() {
+    fn url_credentials_are_scrubbed_from_relayed_urls() {
         let credentials = credentials(&["s3cr3t", "a+b/c"]);
         for (location, scrubbed) in [
             (
