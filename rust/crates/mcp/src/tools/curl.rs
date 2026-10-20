@@ -1553,13 +1553,16 @@ fn do_paid_fetch(
                 })?;
             let mut headers = extra_headers.to_vec();
             headers.push(("Authorization".to_string(), open_authorization));
-            let retry = paid_fetch(&headers)?;
-            if matches!(&retry, RunOutcome::Completed { .. }) {
-                // Only retain a session after the gateway accepted its open
-                // request; otherwise the channel may not exist remotely.
-                session_cache.store(key, use_authorization);
+            // Retain the channel's reusable authorization before the open is
+            // sent. If the answer is lost, the next request presents it
+            // instead of funding a second channel; a gateway that never saw
+            // the open answers that with a 402, which drops it.
+            session_cache.store(key.clone(), use_authorization);
+            let retry = paid_fetch(&headers);
+            if !session_open_may_have_landed(&retry) {
+                session_cache.remove(&key);
             }
-            interpret_retry(retry)
+            interpret_retry(retry?)
         }
         RunOutcome::SubscriptionChallenge {
             challenge,
@@ -1721,6 +1724,19 @@ fn commit_batch_settlement(
     ) {
         tracing::warn!(%error, "batch-settlement receipt not adopted; the next request retries the same credential");
     }
+}
+
+/// Whether a session open's paid retry leaves the channel possibly open.
+/// Only a fresh challenge or a payment rejection proves the gateway refused
+/// the open; any response it completed, and any failure without an answer,
+/// may follow an accepted open.
+fn session_open_may_have_landed(
+    retry: &Result<pay_core::client::runner::RunOutcome, pay_core::Error>,
+) -> bool {
+    matches!(
+        retry,
+        Ok(pay_core::client::runner::RunOutcome::Completed { .. }) | Err(_)
+    )
 }
 
 fn interpret_retry(
@@ -2208,6 +2224,37 @@ mod tests {
         assert_eq!(session_payer(&store, Some("mainnet"), Some("b")), "PubkeyB");
         assert_eq!(session_payer(&store, None, None), "PubkeyA");
         assert_eq!(session_payer(&store, Some("devnet"), None), "");
+    }
+
+    #[test]
+    fn a_session_open_without_a_definitive_refusal_keeps_its_channel() {
+        use pay_core::client::runner::RunOutcome;
+        let completed = |exit_code| {
+            Ok(RunOutcome::Completed {
+                exit_code,
+                body: None,
+                content_type: None,
+                response_headers: Vec::new(),
+            })
+        };
+        // The gateway answered, or the answer was lost after the open left.
+        assert!(session_open_may_have_landed(&completed(0)));
+        assert!(session_open_may_have_landed(&completed(1)));
+        assert!(session_open_may_have_landed(&Err(pay_core::Error::Mpp(
+            "Request failed: connection reset".to_string()
+        ))));
+        // The gateway refused the open: no channel to reuse.
+        assert!(!session_open_may_have_landed(&Ok(
+            RunOutcome::PaymentRejected {
+                reason: "insufficient deposit".to_string(),
+                retryable: false,
+                advertised_challenges: Default::default(),
+                resource_url: "https://api.example.com/v1".to_string(),
+            }
+        )));
+        assert!(!session_open_may_have_landed(&Ok(x402_outcome(
+            "https://api.example.com/v1"
+        ))));
     }
 
     #[test]
