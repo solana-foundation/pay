@@ -796,7 +796,10 @@ impl crate::tenants::SpendHistory for OnChainSpendHistory {
                 .await?;
             let tx: ConfirmedTransaction = serde_json::from_value(tx)
                 .map_err(|e| format!("getTransaction {signature}: history unavailable: {e}"))?;
-            raw = raw.saturating_add(tx.stablecoin_outflow(wallet));
+            let outflow = tx
+                .stablecoin_outflow(wallet)
+                .map_err(|e| format!("getTransaction {signature}: {e}"))?;
+            raw = raw.saturating_add(outflow);
         }
         Ok(raw.div_ceil(100))
     }
@@ -807,6 +810,7 @@ impl crate::tenants::SpendHistory for OnChainSpendHistory {
 #[derive(Deserialize)]
 struct ConfirmedTransaction {
     meta: TransactionMeta,
+    transaction: TransactionBody,
 }
 
 #[derive(Deserialize)]
@@ -815,13 +819,61 @@ struct TransactionMeta {
     err: Option<serde_json::Value>,
     pre_token_balances: Vec<serde_json::Value>,
     post_token_balances: Vec<serde_json::Value>,
+    #[serde(default)]
+    inner_instructions: Option<Vec<InnerInstructions>>,
+    /// Keys a version-0 transaction loaded from lookup tables.
+    #[serde(default)]
+    loaded_addresses: Option<LoadedAddresses>,
 }
 
+#[derive(Deserialize)]
+struct TransactionBody {
+    message: Message,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Message {
+    account_keys: Vec<String>,
+    instructions: Vec<Instruction>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Instruction {
+    program_id_index: usize,
+    /// Base58, as `json` encoding returns it.
+    data: String,
+}
+
+#[derive(Deserialize)]
+struct InnerInstructions {
+    instructions: Vec<Instruction>,
+}
+
+#[derive(Deserialize)]
+struct LoadedAddresses {
+    #[serde(default)]
+    writable: Vec<String>,
+    #[serde(default)]
+    readonly: Vec<String>,
+}
+
+/// Token-2022 instruction tags whose amounts live in encrypted balances:
+/// `ConfidentialTransferExtension`, `ConfidentialTransferFeeExtension`,
+/// `ConfidentialMintBurnExtension`. Public balance deltas do not show them.
+const CONFIDENTIAL_TOKEN_INSTRUCTIONS: [u8; 3] = [27, 37, 42];
+
 impl ConfirmedTransaction {
-    /// Raw six-decimal stablecoin units `owner`'s token accounts lost.
-    fn stablecoin_outflow(&self, owner: &str) -> u64 {
+    /// Raw six-decimal stablecoin units `owner`'s token accounts lost. An
+    /// error when the transaction moved confidential balances, whose amounts
+    /// cannot be read from it: unknown spend is not zero spend.
+    fn stablecoin_outflow(&self, owner: &str) -> Result<u64, String> {
         if self.meta.err.is_some() {
-            return 0;
+            return Ok(0);
+        }
+        if self.moves_confidential_balances()? {
+            return Err("confidential token history is not auditable".to_string());
         }
         let balances = |entries: &[serde_json::Value]| -> BTreeMap<u64, u64> {
             entries
@@ -842,9 +894,50 @@ impl ConfirmedTransaction {
         };
         let pre = balances(&self.meta.pre_token_balances);
         let post = balances(&self.meta.post_token_balances);
-        pre.iter()
+        Ok(pre
+            .iter()
             .map(|(index, before)| before.saturating_sub(post.get(index).copied().unwrap_or(0)))
-            .fold(0, u64::saturating_add)
+            .fold(0, u64::saturating_add))
+    }
+
+    /// Whether any instruction, top-level or inner, is a Token-2022
+    /// confidential-balance instruction. Unreadable instructions count as one.
+    fn moves_confidential_balances(&self) -> Result<bool, String> {
+        let token_2022 = pay_kit::mpp::protocol::solana::programs::TOKEN_2022_PROGRAM;
+        let loaded = self.meta.loaded_addresses.as_ref();
+        let keys: Vec<&str> = self
+            .transaction
+            .message
+            .account_keys
+            .iter()
+            .chain(loaded.into_iter().flat_map(|l| l.writable.iter()))
+            .chain(loaded.into_iter().flat_map(|l| l.readonly.iter()))
+            .map(String::as_str)
+            .collect();
+        let inner = self
+            .meta
+            .inner_instructions
+            .iter()
+            .flatten()
+            .flat_map(|set| set.instructions.iter());
+        for instruction in self.transaction.message.instructions.iter().chain(inner) {
+            let program = keys
+                .get(instruction.program_id_index)
+                .ok_or("an instruction names a program outside the transaction")?;
+            if *program != token_2022 {
+                continue;
+            }
+            let data = bs58::decode(&instruction.data)
+                .into_vec()
+                .map_err(|e| format!("unreadable Token-2022 instruction: {e}"))?;
+            if data
+                .first()
+                .is_none_or(|tag| CONFIDENTIAL_TOKEN_INSTRUCTIONS.contains(tag))
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }
 
@@ -1475,6 +1568,52 @@ pub(crate) mod tests {
         }
     }
 
+    /// A transaction body with nothing in it but balances.
+    static NO_INSTRUCTIONS: std::sync::LazyLock<serde_json::Value> = std::sync::LazyLock::new(
+        || json!({ "message": { "accountKeys": [], "instructions": [] } }),
+    );
+
+    /// A confidential debit changes no public balance, so a transaction
+    /// carrying one is unknown spend, never zero; other Token-2022
+    /// instructions are read as usual.
+    #[test]
+    fn confidential_token_instructions_make_history_unauditable() {
+        use pay_kit::mpp::protocol::solana::programs;
+        let tx = |instructions: serde_json::Value, inner: serde_json::Value| {
+            serde_json::from_value::<ConfirmedTransaction>(json!({
+                "transaction": { "message": {
+                    "accountKeys": [ADDRESS, programs::TOKEN_2022_PROGRAM],
+                    "instructions": instructions } },
+                "meta": { "err": null, "preTokenBalances": [], "postTokenBalances": [],
+                          "innerInstructions": inner,
+                          "loadedAddresses": { "writable": [], "readonly": [programs::TOKEN_PROGRAM] } }
+            }))
+            .unwrap()
+        };
+        let ix = |program: usize, data: &[u8]| json!({ "programIdIndex": program, "accounts": [], "data": bs58::encode(data).into_string() });
+        // TransferChecked under Token-2022, Transfer under the token program
+        // (tag 27 is not confidential there).
+        let public = tx(json!([ix(1, &[12, 0]), ix(2, &[27])]), json!([]));
+        assert_eq!(public.stablecoin_outflow(ADDRESS), Ok(0));
+        for tag in CONFIDENTIAL_TOKEN_INSTRUCTIONS {
+            let top = tx(json!([ix(1, &[tag, 7])]), json!([]));
+            assert!(top.stablecoin_outflow(ADDRESS).is_err(), "tag {tag}");
+            let inner = tx(
+                json!([]),
+                json!([{ "index": 0, "instructions": [ix(1, &[tag, 7])] }]),
+            );
+            assert!(
+                inner.stablecoin_outflow(ADDRESS).is_err(),
+                "inner tag {tag}"
+            );
+        }
+        let unreadable = tx(
+            json!([{ "programIdIndex": 1, "accounts": [], "data": "0OIl" }]),
+            json!([]),
+        );
+        assert!(unreadable.stablecoin_outflow(ADDRESS).is_err());
+    }
+
     #[test]
     fn outflow_counts_only_the_owners_stablecoin_debits() {
         use pay_kit::mpp::protocol::solana::mints;
@@ -1483,7 +1622,7 @@ pub(crate) mod tests {
             json!({ "accountIndex": index, "owner": owner, "mint": mint,
                     "uiTokenAmount": { "amount": amount.to_string(), "decimals": 6 } })
         };
-        let tx = json!({ "meta": { "err": null,
+        let tx = json!({ "transaction": NO_INSTRUCTIONS.clone(), "meta": { "err": null,
             "preTokenBalances": [
                 balance(1, ADDRESS, usdc, 5_000_000),
                 balance(2, "someone", usdc, 0),
@@ -1499,6 +1638,7 @@ pub(crate) mod tests {
             serde_json::from_value::<ConfirmedTransaction>(tx.clone())
                 .unwrap()
                 .stablecoin_outflow(owner)
+                .unwrap()
         };
         assert_eq!(outflow(&tx, ADDRESS), 1_250_000);
         assert_eq!(outflow(&tx, "someone"), 0, "an inflow is not spend");
@@ -1525,7 +1665,7 @@ pub(crate) mod tests {
             .as_secs() as i64;
         let day_start = now / 86_400 * 86_400;
         let debit = |amount: u64| {
-            json!({ "meta": { "err": null,
+            json!({ "transaction": NO_INSTRUCTIONS.clone(), "meta": { "err": null,
                 "preTokenBalances": [{ "accountIndex": 1, "owner": ADDRESS, "mint": mints::USDC_MAINNET,
                                        "uiTokenAmount": { "amount": "10000000" } }],
                 "postTokenBalances": [{ "accountIndex": 1, "owner": ADDRESS, "mint": mints::USDC_MAINNET,
@@ -1641,10 +1781,12 @@ pub(crate) mod tests {
             assert!(registry.seed_spend(&tenant, &history).await.is_err());
         }
         // A failed seed left the wallet unseeded: complete history still lands.
-        let full = spend_rpc(json!({ "meta": { "err": null,
+        let full = spend_rpc(
+            json!({ "transaction": NO_INSTRUCTIONS.clone(), "meta": { "err": null,
             "preTokenBalances": [{ "accountIndex": 1, "owner": ADDRESS, "mint": mints::USDC_MAINNET,
                                    "uiTokenAmount": { "amount": "5000000" } }],
-            "postTokenBalances": [] } }))
+            "postTokenBalances": [] } }),
+        )
         .await;
         assert_eq!(full.spent_today(ADDRESS).await.unwrap(), 50_000);
         registry.seed_spend(&tenant, &full).await.unwrap();
