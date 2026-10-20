@@ -3,14 +3,17 @@
 //! The kit uses a challenge's `recentBlockhash` only once the client's own
 //! RPC confirms it is live (`isBlockhashValid`), so a test that signs a
 //! canned challenge needs an RPC that answers it. This one confirms every
-//! blockhash and answers every other method with a JSON-RPC error, so a test
-//! can never reach a real cluster through it.
+//! blockhash, serves a fixed latest blockhash, and answers every other method
+//! with a JSON-RPC error, so a test can never reach a real cluster through it.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::OnceLock;
 
 static URL: OnceLock<String> = OnceLock::new();
+
+/// The blockhash `getLatestBlockhash` answers with.
+pub const BLOCKHASH: &str = "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi";
 
 /// Start the RPC once per process. From then on every payment builder in the
 /// process uses it in place of `PAY_RPC_URL` (see
@@ -81,6 +84,14 @@ fn answer(call: &serde_json::Value) -> serde_json::Value {
             "jsonrpc": "2.0",
             "id": id,
             "result": { "context": { "slot": 1 }, "value": true },
+        }),
+        Some("getLatestBlockhash") => serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "context": { "slot": 1 },
+                "value": { "blockhash": BLOCKHASH, "lastValidBlockHeight": 1_000 },
+            },
         }),
         _ => serde_json::json!({
             "jsonrpc": "2.0",

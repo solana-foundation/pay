@@ -3444,6 +3444,81 @@ mod tests {
         );
     }
 
+    /// Pay's own client against pay's resource-bound exact route: the
+    /// credential it builds names the route's resource and carries the
+    /// endpoint memo, so the kit's fail-closed binding accepts it, and the
+    /// same credential stripped of its resource is refused.
+    #[test]
+    fn pay_clients_satisfy_the_exact_resource_binding() {
+        let rpc = crate::test_rpc::install_blockhash_rpc();
+        let x402 = X402::new(pay_kit::x402::server::Config {
+            rpc_url: Some(rpc.to_string()),
+            ..x402_test_config()
+        })
+        .unwrap();
+        let binding = x402_exact_binding(&req(&Method::GET, "fortune"), Some("fortune"));
+        let memo = crate::server::payment::resource_memo_with_nonce(
+            binding.as_deref(),
+            pay_kit::x402::exact::MAX_MEMO_BYTES,
+        );
+        let (name, required) = x402
+            .payment_required_header(
+                "0.01",
+                ExactOptions {
+                    memo: memo.as_deref(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let challenge =
+            crate::client::x402::parse(&[(name.to_string(), required)], None).expect("x402 offer");
+        let store = crate::accounts::MemoryAccountsStore::new();
+        let built = crate::client::x402::build_payment_with_override(
+            &challenge,
+            &store,
+            Some("devnet"),
+            None,
+            Some("https://api.example.com/fortune"),
+            None,
+        )
+        .unwrap();
+        let credential = built.headers[0].1.clone();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let verify = |header: &str| {
+            let memo = x402_exact_payment_memo(&x402, header, binding.as_deref()).unwrap();
+            runtime.block_on(x402.process_payment(
+                header,
+                "0.01",
+                ExactOptions {
+                    memo: memo.as_deref(),
+                    ..Default::default()
+                },
+            ))
+        };
+        verify(&credential).expect("pay's credential satisfies the binding");
+
+        let mut envelope: serde_json::Value = serde_json::from_slice(
+            &base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &credential)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(envelope["resource"]["url"], "fortune");
+        envelope.as_object_mut().unwrap().remove("resource");
+        let unbound = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            serde_json::to_vec(&envelope).unwrap(),
+        );
+        let error = verify(&unbound).unwrap_err();
+        assert!(
+            error.to_string().contains("Resource binding missing"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn mpp_charge_payment_external_id_accepts_resource_nonce_memo() {
         let credential = mpp_credential_with_external_id(Some("fortune#012"));
@@ -3500,7 +3575,11 @@ mod tests {
     }
 
     fn x402_test_server() -> X402 {
-        X402::new(pay_kit::x402::server::Config {
+        X402::new(x402_test_config()).unwrap()
+    }
+
+    fn x402_test_config() -> pay_kit::x402::server::Config {
+        pay_kit::x402::server::Config {
             recipient: "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY".to_string(),
             currencies: vec![pay_kit::x402::server::CurrencyConfig {
                 currency: "USDC".to_string(),
@@ -3513,8 +3592,7 @@ mod tests {
             description: Some("Fortune".to_string()),
             max_age: Some(60),
             fee_payer_key: None,
-        })
-        .unwrap()
+        }
     }
 
     fn x402_accepted_with_memo(x402: &X402, memo: Option<&str>) -> serde_json::Value {
