@@ -245,6 +245,49 @@ impl AuthIntent {
         }
     }
 
+    /// Name where a payment's funds go, so approving the prompt approves the
+    /// destinations and not just the amount: the primary recipient and every
+    /// split (recipient and display amount). Long lists stay bounded; the
+    /// count is always shown. Non-payment intents are returned unchanged.
+    pub fn with_payment_destinations(&self, recipient: &str, splits: &[(&str, &str)]) -> Self {
+        const LISTED_SPLITS: usize = 3;
+        match self {
+            Self::AuthorizePayment {
+                message,
+                limit,
+                amount_minor_units,
+                recurring,
+            } => {
+                let mut message = format!("{message}\n\nto: {}", abbreviate_address(recipient));
+                if !splits.is_empty() {
+                    let listed = splits
+                        .iter()
+                        .take(LISTED_SPLITS)
+                        .map(|(recipient, amount)| {
+                            format!(
+                                "{} {}",
+                                truncate_detail(&prompt_detail(amount), 24),
+                                abbreviate_address(recipient)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    message.push_str(&format!("\n\nsplits ({}): {listed}", splits.len()));
+                    if splits.len() > LISTED_SPLITS {
+                        message.push_str(&format!(", +{} more", splits.len() - LISTED_SPLITS));
+                    }
+                }
+                Self::AuthorizePayment {
+                    message,
+                    limit: *limit,
+                    amount_minor_units: *amount_minor_units,
+                    recurring: *recurring,
+                }
+            }
+            other => other.clone(),
+        }
+    }
+
     pub fn default_payment() -> Self {
         Self::AuthorizePayment {
             message: "authorize a payment with pay".to_string(),
@@ -486,6 +529,19 @@ fn meaningful_operator(value: &str) -> Option<String> {
         return None;
     }
     Some(truncate_detail(value, 64))
+}
+
+/// `AbCd...WxYz` for a base58 address: enough to recognise and compare it,
+/// short enough for a system prompt.
+fn abbreviate_address(value: &str) -> String {
+    let value = prompt_detail(value);
+    let chars: Vec<char> = value.chars().collect();
+    if chars.len() <= 12 {
+        return value;
+    }
+    let head: String = chars[..4].iter().collect();
+    let tail: String = chars[chars.len() - 4..].iter().collect();
+    format!("{head}...{tail}")
 }
 
 fn truncate_detail(value: &str, max_chars: usize) -> String {
@@ -956,6 +1012,39 @@ mod tests {
         assert_eq!(AuthIntent::create_account("a").amount_minor_units(), None);
         assert!(AuthIntent::default_payment().moves_money());
         assert!(!AuthIntent::create_account("a").moves_money());
+    }
+
+    #[test]
+    fn payment_destinations_are_named_in_the_prompt() {
+        let base = AuthIntent::authorize_payment_details("$1.00", "api call", "api.example.com");
+        let AuthIntent::AuthorizePayment { message, .. } = base.with_payment_destinations(
+            "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY",
+            &[("4BuiY9QUUfPoAGNJBja3JapAuVWMc9c7in6UCgyC2zPR", "$0.10")],
+        ) else {
+            panic!("payment intent");
+        };
+        assert!(message.contains("to: CXhr...6MPY"), "{message}");
+        assert!(
+            message.contains("splits (1): $0.10 4Bui...2zPR"),
+            "{message}"
+        );
+        // The amount and operator lines are kept.
+        assert!(message.contains("amount: $1.00"), "{message}");
+
+        let many: Vec<(&str, &str)> = (0..5)
+            .map(|_| ("4BuiY9QUUfPoAGNJBja3JapAuVWMc9c7in6UCgyC2zPR", "$0.01"))
+            .collect();
+        let AuthIntent::AuthorizePayment { message, .. } =
+            base.with_payment_destinations("CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY", &many)
+        else {
+            panic!("payment intent");
+        };
+        assert!(message.contains("splits (5)"), "{message}");
+        assert!(message.contains("+2 more"), "{message}");
+
+        // Non-payment intents are untouched.
+        let sign_in = AuthIntent::SignIn("sign in".to_string());
+        assert_eq!(sign_in.with_payment_destinations("x", &[]), sign_in);
     }
 
     #[test]

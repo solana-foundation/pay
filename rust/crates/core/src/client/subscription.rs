@@ -293,7 +293,8 @@ pub fn build_credential_with_authenticate_and_override(
         &amount_label,
         &intent_reason,
         &prompt_context.operator,
-    );
+    )
+    .with_payment_destinations(&decoded.request.recipient, &[]);
 
     // Same intent-vs-network check as charge — refuse to sign if the user
     // forced a network slug that contradicts the server.

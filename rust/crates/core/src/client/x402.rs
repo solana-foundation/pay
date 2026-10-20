@@ -252,7 +252,8 @@ pub fn build_payment_for_attempt(
         &amount,
         &prompt_context.reason,
         &prompt_context.operator,
-    );
+    )
+    .with_payment_destinations(&requirements.recipient, &[]);
     let (signer, ephemeral_notice) =
         crate::signer::load_signer_for_network_payment_with_intent_and_override(
             &network,

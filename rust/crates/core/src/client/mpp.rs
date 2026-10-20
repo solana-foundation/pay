@@ -122,23 +122,53 @@ pub fn build_credential_with_override(
     // Reject untrusted hook descriptors before loading a wallet or asking it
     // to sign. The SDK checks the same exact descriptor again when building.
     let channel_hooks = crate::mpp_channel_profile::validate_charge_challenge(&request)?;
+    let decimals = request
+        .method_details
+        .as_ref()
+        .and_then(|details| details.get("decimals"))
+        .map(|decimals| {
+            decimals
+                .as_u64()
+                .ok_or_else(|| {
+                    Error::InvalidChallenge("asset decimals must be an integer".to_string())
+                })
+                .and_then(crate::client::prompt::Decimals::new)
+        })
+        .transpose()?;
     let amount = crate::client::prompt::payment_display_amount(
         &request.amount,
         &request.currency,
-        request
-            .method_details
-            .as_ref()
-            .and_then(|details| details.get("decimals"))
-            .map(|decimals| {
-                decimals
-                    .as_u64()
-                    .ok_or_else(|| {
-                        Error::InvalidChallenge("asset decimals must be an integer".to_string())
-                    })
-                    .and_then(crate::client::prompt::Decimals::new)
-            })
-            .transpose()?,
+        decimals,
     )?;
+    // The approval names every destination the transaction pays, so a
+    // challenge cannot redirect an approved amount without the prompt
+    // showing it.
+    let recipient = request.recipient.as_deref().ok_or_else(|| {
+        Error::InvalidChallenge("charge challenge is missing a recipient".to_string())
+    })?;
+    let splits: Vec<pay_kit::mpp::protocol::solana::Split> = request
+        .method_details
+        .as_ref()
+        .and_then(|details| details.get("splits"))
+        .map(|splits| serde_json::from_value(splits.clone()))
+        .transpose()
+        .map_err(|e| Error::InvalidChallenge(format!("invalid charge splits: {e}")))?
+        .unwrap_or_default();
+    let split_amounts = splits
+        .iter()
+        .map(|split| {
+            crate::client::prompt::payment_display_amount(
+                &split.amount,
+                &request.currency,
+                decimals,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let destinations: Vec<(&str, &str)> = splits
+        .iter()
+        .zip(&split_amounts)
+        .map(|(split, amount)| (split.recipient.as_str(), amount.as_str()))
+        .collect();
     let prompt_context = crate::client::prompt::payment_prompt_context(
         charge_prompt_reason(
             request.description.as_deref(),
@@ -150,7 +180,8 @@ pub fn build_credential_with_override(
         &amount,
         &prompt_context.reason,
         &prompt_context.operator,
-    );
+    )
+    .with_payment_destinations(recipient, &destinations);
 
     let challenge_network = request
         .method_details
@@ -865,6 +896,70 @@ mod tests {
             }))
             .unwrap(),
         )
+    }
+
+    #[test]
+    fn the_charge_approval_names_its_recipient_and_splits() {
+        use std::sync::{Arc, Mutex};
+        struct Recording(Arc<Mutex<Vec<crate::keystore::AuthIntent>>>);
+        impl crate::keystore::AuthGate for Recording {
+            fn authenticate(
+                &self,
+                intent: &crate::keystore::AuthIntent,
+            ) -> std::result::Result<(), crate::keystore::Error> {
+                self.0.lock().unwrap().push(intent.clone());
+                // Stop before any RPC: only the prompt is under test.
+                Err(crate::keystore::Error::AuthDenied("recorded".to_string()))
+            }
+            fn is_available(&self) -> bool {
+                true
+            }
+        }
+
+        let keypair = solana_keypair::Keypair::new();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string(&keypair.to_bytes().to_vec()).unwrap(),
+        )
+        .unwrap();
+        let mut file = crate::accounts::AccountsFile::default();
+        file.upsert(
+            "mainnet",
+            "default",
+            crate::accounts::Account {
+                backend: crate::accounts::BackendKind::File,
+                provider: None,
+                active: true,
+                auth_required: Some(true),
+                pubkey: Some(solana_signer::Signer::pubkey(&keypair).to_string()),
+                vault: None,
+                account: None,
+                path: Some(path.to_string_lossy().into_owned()),
+                secret_key_b58: None,
+                created_at: None,
+                subscriptions: Default::default(),
+            },
+        );
+        let store = crate::accounts::MemoryAccountsStore::with_file(file);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let _ = build_credential_with_override(
+            &split_charge(false),
+            &store,
+            Some("mainnet"),
+            None,
+            Some("https://merchant.example/paid"),
+            Some(Box::new(Recording(seen.clone()))),
+        );
+        let seen = seen.lock().unwrap();
+        let Some(crate::keystore::AuthIntent::AuthorizePayment { message, .. }) = seen.first()
+        else {
+            panic!("the payment was never put to the approval gate");
+        };
+        assert!(message.contains("to: CXhr...6MPY"), "{message}");
+        assert!(message.contains("splits (8)"), "{message}");
+        assert!(message.contains("+5 more"), "{message}");
     }
 
     #[test]
