@@ -2007,8 +2007,14 @@ impl StartCommand {
                     &rpc_url,
                 )?;
 
-                let session_secret = std::env::var("PAY_MPP_SECRET")
-                    .unwrap_or_else(|_| challenge_binding_secret.clone());
+                // Operators commonly share one `PAY_MPP_SECRET` across APIs;
+                // scope it to this API so its session challenges never
+                // verify at another (replicas of one API derive the same).
+                let session_secret = pay_core::server::session::endpoint_challenge_binding_secret(
+                    &std::env::var("PAY_MPP_SECRET")
+                        .unwrap_or_else(|_| challenge_binding_secret.clone()),
+                    &api.subdomain,
+                );
                 let (channel_program_id, channel_version, channel_hooks) =
                     pay_core::mpp_channel_profile::server_profile()?;
                 if channel_version == Some(2) && sess.reuse_from_chain {

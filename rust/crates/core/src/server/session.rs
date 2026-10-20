@@ -2511,6 +2511,14 @@ impl SessionMpp {
         credential: &pay_kit::mpp::PaymentCredential,
     ) -> Result<SessionRequest> {
         let echo = &credential.challenge;
+        // The HMAC only proves some server holding this secret minted the
+        // challenge; operators can share a root secret across APIs, so the
+        // echo must also name this backend before anything else is trusted.
+        if echo.realm != self.realm || echo.method.as_str() != METHOD {
+            return Err(Error::Mpp(
+                terminal_errors::CHALLENGE_ECHO_MISMATCH.to_string(),
+            ));
+        }
         if let Some(request) =
             VERIFIED_CHALLENGES.with_borrow(|cache| cache.get(&self.challenge_binding_secret, echo))
         {
@@ -4086,7 +4094,7 @@ mod tests {
         // challenge id no longer matches this server's HMAC.
         let forged = PaymentChallenge::with_challenge_binding_secret(
             "attacker-secret",
-            "test-realm",
+            DEFAULT_REALM,
             METHOD,
             INTENT,
             session.challenge(None).unwrap().request,
@@ -4407,6 +4415,64 @@ mod tests {
         // Its own challenge passes the echo check and reaches the payload.
         let error = target
             .process_credential(credential(&target))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("Unrecognized session action"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_secret_challenges_stay_in_their_realm() {
+        let backend = |realm: &str| {
+            SessionMpp::new(test_session_config(), "shared-root-secret")
+                .with_realm(realm)
+                .with_blockhash_cache(test_blockhash_cache())
+        };
+        let (api_a, api_b) = (backend("API-A"), backend("API-B"));
+        let credential = |challenge: PaymentChallenge| {
+            PaymentCredential::new(
+                challenge.to_echo(),
+                serde_json::json!({ "action": "mystery" }),
+            )
+        };
+
+        // A's challenge carries a valid HMAC under the shared secret, but
+        // names another realm: B must treat it as foreign.
+        let error = api_b
+            .process_credential(credential(api_a.challenge(None).unwrap()))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(terminal_errors::CHALLENGE_ECHO_MISMATCH),
+            "{error}"
+        );
+
+        // A challenge bound under B's realm but another method is foreign too.
+        let wrong_method = PaymentChallenge::with_challenge_binding_secret(
+            "shared-root-secret",
+            "API-B",
+            "tempo",
+            INTENT,
+            api_b.challenge(None).unwrap().request,
+        );
+        let error = api_b
+            .process_credential(credential(wrong_method))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(terminal_errors::CHALLENGE_ECHO_MISMATCH),
+            "{error}"
+        );
+
+        // B's own challenge passes the echo check and reaches the payload.
+        let error = api_b
+            .process_credential(credential(api_b.challenge(None).unwrap()))
             .await
             .unwrap_err();
         assert!(
