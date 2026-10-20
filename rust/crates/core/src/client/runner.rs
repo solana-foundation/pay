@@ -212,7 +212,7 @@ fn run_curl_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunO
 
     let headers = headers_with_default_user_agent(user_args, extra_headers, ToolKind::Curl);
 
-    debug!(args = ?user_args, extra = ?headers, "Running curl");
+    log_invocation(ToolKind::Curl, user_args, &headers);
 
     // Body goes to `-o body_file` so we can swallow it on 402; stdout is piped
     // so curl's `-w` writeout (which it emits to stdout after the transfer) is
@@ -372,7 +372,7 @@ fn run_wget_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunO
     cmd.stdout(Stdio::inherit());
     cmd.stderr(Stdio::piped());
 
-    debug!(args = ?user_args, extra = ?headers, "Running wget");
+    log_invocation(ToolKind::Wget, user_args, &headers);
 
     let output = cmd.output()?;
     let exit_code = output.status.code().unwrap_or(1);
@@ -409,7 +409,7 @@ fn run_httpie_inner(user_args: &[String], extra_headers: &[String]) -> Result<Ru
 
     let headers = headers_with_default_user_agent(user_args, extra_headers, ToolKind::Httpie);
 
-    debug!(args = ?user_args, extra = ?headers, "Running httpie");
+    log_invocation(ToolKind::Httpie, user_args, &headers);
 
     // HTTPie has no `-D <file>` equivalent, so we capture stdout and parse the
     // response status from the first `HTTP/x.y <code>` line. We force three flags
@@ -1736,6 +1736,29 @@ fn credential_redirect_guard(tool: ToolKind, injected: &[String]) -> &'static [&
     }
 }
 
+/// Debug-log a wrapped tool invocation without any header value or argument.
+///
+/// Injected headers are payment credentials, sign-in proofs or subscription
+/// bearers, and the caller's own args can hold `-H Authorization: ...`,
+/// `-u user:pass` or a request body. A debug filter must never turn into a
+/// credential sink, so only header names and the argument count are logged.
+fn log_invocation(tool: ToolKind, user_args: &[String], headers: &[String]) {
+    let header_names: Vec<&str> = headers
+        .iter()
+        .map(|header| {
+            header
+                .split_once(':')
+                .map_or("<malformed>", |(name, _)| name.trim())
+        })
+        .collect();
+    debug!(
+        tool = ?tool,
+        arg_count = user_args.len(),
+        headers = ?header_names,
+        "Running wrapped HTTP client"
+    );
+}
+
 fn formatted_header(tool: ToolKind, name: &str, value: &str) -> String {
     match tool {
         ToolKind::Curl | ToolKind::Wget => format!("{name}: {value}"),
@@ -2325,6 +2348,69 @@ mod pre_attach_tests {
         let _ = run_curl_inner(&s(&["-s", &glob]), &s(&[PAYMENT_HEADER]));
         let _ = run_curl_inner(&s(&["-s", &server.origin_url]), &[]);
         assert!(!server.collector_was_contacted());
+    }
+
+    /// Collects every formatted field of every event it sees.
+    #[derive(Clone, Default)]
+    struct EventText(std::sync::Arc<std::sync::Mutex<String>>);
+
+    impl tracing::Subscriber for EventText {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Visitor<'a>(&'a mut String);
+            impl tracing::field::Visit for Visitor<'_> {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    use std::fmt::Write;
+                    let _ = write!(self.0, "{}={value:?};", field.name());
+                }
+            }
+            event.record(&mut Visitor(&mut self.0.lock().unwrap()));
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn invocation_logs_carry_header_names_but_no_secrets() {
+        if check_command_exists("curl").is_err() {
+            return;
+        }
+        let server = CrossOriginRedirect::start();
+        let events = EventText::default();
+        let args = s(&[
+            "-s",
+            "-H",
+            "X-Api-Key: caller-secret",
+            "-u",
+            "user:caller-password",
+            &server.origin_url,
+        ]);
+        tracing::subscriber::with_default(events.clone(), || {
+            run_curl_inner(&args, &s(&[PAYMENT_HEADER])).unwrap();
+        });
+        let _ = server.collector_was_contacted();
+        let logged = events.0.lock().unwrap().clone();
+        // Positive control: the event was captured and names the headers.
+        assert!(logged.contains("Authorization"), "{logged}");
+        assert!(logged.contains("User-Agent"), "{logged}");
+        for secret in [
+            "redirect-test-credential",
+            "caller-secret",
+            "caller-password",
+        ] {
+            assert!(!logged.contains(secret), "{secret} leaked: {logged}");
+        }
     }
 
     #[test]
