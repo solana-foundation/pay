@@ -1554,6 +1554,7 @@ fn do_paid_fetch(
                         account_override.as_deref(),
                         url,
                         auth,
+                        Some(&attempt),
                     )
                 })?;
             let mut headers = extra_headers.to_vec();

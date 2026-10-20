@@ -1427,6 +1427,7 @@ fn build_session_authorization(
             state.account_override.as_deref(),
             &state.authorization_url,
             None,
+            None,
         )?;
 
     Ok((PaidHeaders::mpp(open_authorization), use_authorization))

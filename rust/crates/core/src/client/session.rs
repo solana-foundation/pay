@@ -324,11 +324,17 @@ pub fn open_payment_channel_session_header(
         resource_url,
         sandbox,
         None,
+        None,
     )
 }
 
 /// Variant of [`open_payment_channel_session_header`] that lets an MCP host
 /// route the wallet approval through its own authenticated approval surface.
+///
+/// With an `attempt`, an open that got no definitive answer keeps its salt
+/// for the attempt's retries: the same payer, deposit and offer derive the
+/// same channel, so a retry after a lost response re-presents that channel
+/// (which the program refuses to open twice) instead of funding a second.
 #[allow(clippy::too_many_arguments)]
 pub fn open_payment_channel_session_header_with_override(
     challenge: &PaymentChallenge,
@@ -340,6 +346,7 @@ pub fn open_payment_channel_session_header_with_override(
     resource_url: &str,
     sandbox: bool,
     auth_override: crate::signer::AuthOverride,
+    attempt: Option<&crate::client::attempt::PaymentAttempt>,
 ) -> Result<(SessionHandle, String)> {
     use pay_kit::mpp::client::{
         DerivePaymentChannelOpenParams, PaymentChannelOpenOptions,
@@ -416,7 +423,22 @@ pub fn open_payment_channel_session_header_with_override(
         }
     };
 
-    let salt = rand::random::<u64>();
+    let salt = match attempt {
+        Some(attempt) => crate::client::attempt::PaymentCacheKey::new(
+            attempt,
+            &payer,
+            &network,
+            SESSION_OPEN_SALT_KIND,
+            &[&session_offer_terms(request)?, &deposit.to_string()],
+        )
+        .reuse_or_insert(
+            std::time::Duration::from_secs(SESSION_OPEN_SALT_TTL_SECS),
+            || Ok(rand::random::<u64>().to_string()),
+        )?
+        .parse::<u64>()
+        .map_err(|_| Error::Mpp("corrupt pending session salt".to_string()))?,
+        None => rand::random::<u64>(),
+    };
     let open_options = PaymentChannelOpenOptions {
         deposit: Some(deposit),
         salt: Some(salt),
@@ -495,6 +517,26 @@ pub fn open_payment_channel_session_header_with_override(
     Ok((handle, auth_header))
 }
 
+const SESSION_OPEN_SALT_KIND: &str = "mpp-session-open-salt";
+/// How long an unresolved open keeps its salt: the challenge lifetime the
+/// gateways issue, after which a stale open can no longer be submitted.
+const SESSION_OPEN_SALT_TTL_SECS: u64 = 300;
+
+/// The terms that identify a session offer across challenges: every request
+/// field except the blockhash and slot hints a fresh challenge refreshes.
+fn session_offer_terms(request: &SessionRequest) -> Result<String> {
+    let mut terms = serde_json::to_value(request)?;
+    if let Some(details) = terms
+        .get_mut("methodDetails")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for hint in ["recentBlockhash", "lastValidBlockHeight", "recentSlot"] {
+            details.remove(hint);
+        }
+    }
+    Ok(terms.to_string())
+}
+
 /// Open an operator-metered MPP payment-channel session and return its first
 /// `open` authorization plus the reusable `use` authorization.
 ///
@@ -508,6 +550,7 @@ pub fn open_operator_signed_session_authorizations(
     account_override: Option<&str>,
     resource_url: &str,
     auth_override: crate::signer::AuthOverride,
+    attempt: Option<&crate::client::attempt::PaymentAttempt>,
 ) -> Result<(String, String)> {
     let request: SessionRequest = challenge
         .request
@@ -539,6 +582,7 @@ pub fn open_operator_signed_session_authorizations(
         resource_url,
         sandbox,
         auth_override,
+        attempt,
     )?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -710,6 +754,70 @@ mod tests {
             "session",
             Base64UrlJson::from_typed(&request).unwrap(),
         )
+    }
+
+    /// Open an operator-signed session on a fresh challenge for the same
+    /// offer (new blockhash, slot and challenge id) and return its channel.
+    fn open_channel(
+        store: &crate::accounts::MemoryAccountsStore,
+        operator: &str,
+        attempt: Option<&crate::client::attempt::PaymentAttempt>,
+    ) -> String {
+        let mut request = test_request();
+        request.currency = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string();
+        request.recipient = "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY".to_string();
+        request.method_details.distribution_splits = vec![];
+        request.method_details.voucher_signer = Some(SessionVoucherSigner::Operator);
+        request.method_details.operator = Some(operator.to_string());
+        let challenge = PaymentChallenge::with_challenge_binding_secret(
+            "test-secret",
+            "test-realm",
+            "solana",
+            "session",
+            Base64UrlJson::from_typed(&request).unwrap(),
+        );
+        let (handle, _) = open_payment_channel_session_header_with_override(
+            &challenge,
+            &request,
+            store,
+            None,
+            None,
+            1_000_000,
+            "https://api.example/session",
+            false,
+            None,
+            attempt,
+        )
+        .unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(handle.channel_id())
+    }
+
+    #[test]
+    fn an_unresolved_session_open_keeps_its_channel_across_retries() {
+        let store = crate::accounts::MemoryAccountsStore::new();
+        let operator = Pubkey::new_unique().to_string();
+        let attempt = crate::client::attempt::PaymentAttempt::new(
+            "POST",
+            "https://api.example/session",
+            Some(b"{}"),
+        );
+        let first = open_channel(&store, &operator, Some(&attempt));
+        // The response was lost: the retry re-derives the same channel, so it
+        // cannot fund a second one.
+        assert_eq!(open_channel(&store, &operator, Some(&attempt)), first);
+
+        // Controls: a definitive answer ends the attempt, and opens outside
+        // an attempt always pick a new channel.
+        attempt.resolved();
+        assert_ne!(open_channel(&store, &operator, Some(&attempt)), first);
+        attempt.resolved();
+        assert_ne!(
+            open_channel(&store, &operator, None),
+            open_channel(&store, &operator, None)
+        );
     }
 
     #[test]
