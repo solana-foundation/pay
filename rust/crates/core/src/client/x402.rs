@@ -308,14 +308,10 @@ pub fn build_payment_for_attempt(
                     &payer,
                     &network,
                     "x402-payment-identifier",
-                    &[
-                        &requirements.network,
-                        requirements.cluster.as_deref().unwrap_or_default(),
-                        &requirements.amount,
-                        &requirements.currency,
-                        &requirements.recipient,
-                        &requirements.resource,
-                    ],
+                    &[&payment_identifier_terms(
+                        requirements,
+                        challenge.extensions.as_ref(),
+                    )?],
                 )
                 .reuse_or_insert(
                     std::time::Duration::from_secs(
@@ -655,6 +651,40 @@ pub fn build_upto_payment_with_override(
         headers: vec![(X402_V2_PAYMENT_HEADER, header)],
         ephemeral_notice,
     })
+}
+
+/// The offer terms an x402 `payment-identifier` is reused for: every field
+/// of the requirements and the advertised extensions except the ones a fresh
+/// 402 for the same offer legitimately changes (the blockhash and slot the
+/// transaction is built against, and the raw wire echo that carries them).
+///
+/// A memo, order reference, fee payer or any other field the server adds
+/// changes what is being paid for, so it gets its own identifier rather than
+/// replaying another order's.
+fn payment_identifier_terms(
+    requirements: &PaymentRequirements,
+    extensions: Option<&serde_json::Value>,
+) -> Result<String> {
+    const VOLATILE: [&str; 5] = [
+        "recentBlockhash",
+        "recent_blockhash",
+        "lastValidBlockHeight",
+        "recentSlot",
+        "accepted",
+    ];
+    let strip = |value: &mut serde_json::Value| {
+        if let Some(object) = value.as_object_mut() {
+            for key in VOLATILE {
+                object.remove(key);
+            }
+        }
+    };
+    let mut terms = serde_json::to_value(requirements)?;
+    strip(&mut terms);
+    if let Some(extra) = terms.get_mut("extra") {
+        strip(extra);
+    }
+    Ok(serde_json::json!({ "requirements": terms, "extensions": extensions }).to_string())
 }
 
 const UPTO_HEADER_KIND: &str = "x402-upto-header";
@@ -2010,6 +2040,14 @@ mod tests {
     }
 
     fn payment_identifier_challenge(blockhash_seed: u8, amount: &str) -> Challenge {
+        payment_identifier_challenge_with_extra(blockhash_seed, amount, None)
+    }
+
+    fn payment_identifier_challenge_with_extra(
+        blockhash_seed: u8,
+        amount: &str,
+        extra: Option<serde_json::Value>,
+    ) -> Challenge {
         Challenge {
             x402_version: pay_kit::x402::X402_VERSION_V2,
             requirements: serde_json::from_value(serde_json::json!({
@@ -2021,6 +2059,7 @@ mod tests {
                 "resource": "https://provider.example/resource",
                 "maxAge": 300,
                 "recentBlockhash": bs58::encode([blockhash_seed; 32]).into_string(),
+                "extra": extra,
             }))
             .unwrap(),
             siwx: None,
@@ -2090,6 +2129,50 @@ mod tests {
         assert_ne!(
             sent_payment_identifier(&first),
             sent_payment_identifier(&next)
+        );
+        attempt.resolved();
+    }
+
+    #[test]
+    fn a_payment_identifier_is_not_reused_for_another_order() {
+        let store = payment_identifier_store();
+        let attempt = crate::client::attempt::PaymentAttempt::new(
+            "POST",
+            "https://provider.example/resource",
+            Some(b"{\"sku\":\"widget\"}"),
+        );
+        let build = |challenge: &Challenge| {
+            build_payment_for_attempt(
+                challenge,
+                &store,
+                Some("devnet"),
+                None,
+                Some("https://provider.example/resource"),
+                None,
+                Some(&attempt),
+            )
+            .unwrap()
+        };
+        let order = |seed, memo: &str| {
+            payment_identifier_challenge_with_extra(
+                seed,
+                "1000",
+                Some(serde_json::json!({ "memo": memo, "recentSlot": seed.to_string() })),
+            )
+        };
+        let first = build(&order(1, "order-A"));
+        // Positive control: a fresh blockhash and slot for the same order
+        // is a retry and keeps its identifier.
+        let retry = build(&order(2, "order-A"));
+        assert_eq!(
+            sent_payment_identifier(&first),
+            sent_payment_identifier(&retry)
+        );
+        // A different memo is a different order.
+        let other = build(&order(2, "order-B"));
+        assert_ne!(
+            sent_payment_identifier(&first),
+            sent_payment_identifier(&other)
         );
         attempt.resolved();
     }
