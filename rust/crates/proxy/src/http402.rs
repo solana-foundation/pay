@@ -1222,18 +1222,11 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                         ctx.session = Some(forward);
                     }
                 }
-                let session_metered = delegated_session || ctx.client_meter.is_some();
-                let response_metered_upto = ctx
-                    .upto
-                    .as_ref()
-                    .and_then(|pending| pending.settlement.as_ref())
-                    .is_some_and(|plan| {
-                        metering::upto_requires_response_body(
-                            &plan.metering,
-                            plan.variant_hint.as_deref(),
-                        )
-                    });
-                if session_metered || response_metered_upto {
+                if settles_on_completed_body(
+                    delegated_session,
+                    ctx.client_meter.is_some(),
+                    ctx.upto.is_some(),
+                ) {
                     return self
                         .forward_buffered(
                             session,
@@ -1377,9 +1370,9 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
             }
         }
         // Start the inference telemetry observer for hosts that opted into
-        // in-flight tracking. Response-body-metered x402-upto requests never
-        // reach this path because they are buffered before downstream headers
-        // are written so the PAYMENT-RESPONSE receipt can be attached.
+        // in-flight tracking. x402-upto requests never reach this path: they
+        // are buffered so they settle on a completed body, before downstream
+        // headers carry the PAYMENT-RESPONSE receipt.
         let observe_inference = ctx.log.as_ref().is_some_and(|log| log.log_id.is_some());
         if observe_inference {
             ctx.observer = Some(crate::observer::StreamObserver::new(is_streamed_response(
@@ -1387,29 +1380,15 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
             )));
         }
 
-        // x402 `upto`: the upstream responded. Settle the channel now (debit
-        // on a 2xx, refund otherwise) and attach the PAYMENT-RESPONSE receipt
-        // before the response streams downstream. Response-body-metered upto
-        // requests were handled by `forward_upto_buffered`, so this inline path
-        // only covers fixed-amount plans.
+        // x402 `upto` settles only once its body completed, on the buffered
+        // path. Charging here, at headers, would keep the payment of a
+        // response that then fails mid-body: refund and withhold instead.
         if let Some(pending) = ctx.upto.take() {
-            let served_ok = upstream_response.status.is_success();
-            match self
-                .settle_pending_upto(pending, served_ok, &upstream_response.headers, None)
-                .await
-            {
-                Ok(Some((name, value))) => {
-                    let _ = upstream_response.insert_header(name.clone(), value.clone());
-                    ctx.logged_payment_headers.push((name, value));
-                }
-                Ok(None) => {}
-                // Headers are not yet sent: fail the request instead of
-                // releasing a response whose charge did not settle.
-                Err(error) => {
-                    tracing::error!(%error, "x402 upto settlement failed; withholding response");
-                    return Err(batch_commit_failed_error());
-                }
-            }
+            tracing::error!("x402 upto reached the native response path; refunding");
+            let _ = self
+                .settle_pending_upto(pending, false, &upstream_response.headers, None)
+                .await;
+            return Err(batch_commit_failed_error());
         }
         // Batch authorization is also post-response. Unlike `upto`, its hot
         // path commits only Redis state; on-chain claim/distribution belongs
@@ -1493,9 +1472,9 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
         // An x402 `upto` channel still held here means a terminal hook did not
         // drain it (for example, response_filter never ran because upstream
         // connect/response failed). Refund rather than stranding funds. A
-        // successful response-body-metered channel is settled before headers
-        // are written in `forward_upto_buffered`, so its receipt reaches the
-        // client as a normal PAYMENT-RESPONSE header.
+        // successful channel is settled on the buffered path before headers
+        // are written, so its receipt reaches the client as a normal
+        // PAYMENT-RESPONSE header.
         let mut deferred_payment_headers = Vec::new();
         if let Some(forward) = ctx.batch_cache.take()
             && let Some(capture) = ctx.batch_response.take()
@@ -1657,6 +1636,14 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
 /// ASCII byte, which would silently drop a `WWW-Authenticate` whose challenge
 /// description carries a non-ASCII char (e.g. an em-dash). PDB's correlation
 /// engine keys on that header, so dropping it means the flow never appears.
+/// Whether a payment-backed forward must read its whole upstream body before
+/// it settles and releases the response: delegated sessions and metered
+/// client vouchers rate the body, and x402 `upto` (fixed price included)
+/// charges only for a response that was delivered complete.
+fn settles_on_completed_body(delegated_session: bool, client_metered: bool, upto: bool) -> bool {
+    delegated_session || client_metered || upto
+}
+
 fn header_pairs(headers: &HeaderMap) -> Vec<(String, String)> {
     headers
         .iter()
@@ -2970,6 +2957,17 @@ mod tests {
         let served = client_voucher_response("v1/flat", std::time::Duration::from_secs(5)).await;
         assert!(served.starts_with("HTTP/1.1 200"), "{served}");
         assert!(served.contains("protected-content"), "{served}");
+    }
+
+    #[test]
+    fn every_upto_settles_on_a_completed_body() {
+        // Fixed-price upto included: charging at headers keeps the payment of
+        // a body that then fails.
+        assert!(super::settles_on_completed_body(false, false, true));
+        assert!(super::settles_on_completed_body(true, false, false));
+        assert!(super::settles_on_completed_body(false, true, false));
+        // Request-priced client vouchers, exact and batch stay native.
+        assert!(!super::settles_on_completed_body(false, false, false));
     }
 
     #[test]
