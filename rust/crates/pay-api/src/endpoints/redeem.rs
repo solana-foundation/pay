@@ -267,8 +267,8 @@ async fn redeem(
         return pending_resp(&signature);
     }
 
-    match await_signature(state, &rpc_url, &signature, cfg.confirm_timeout).await {
-        PayoutStatus::Confirmed => {}
+    let finalized = match await_signature(state, &rpc_url, &signature, cfg.confirm_timeout).await {
+        PayoutStatus::Finalized(finalized) => finalized,
         PayoutStatus::Failed => {
             // Released only once the failure is final, as for any retry.
             warn!(%signature, "redemption payout failed on-chain");
@@ -277,17 +277,12 @@ async fn redeem(
                 Err(response) => response,
             };
         }
+        // Confirmed but not yet final stays pending: a confirmed block can
+        // still be dropped, and a terminal claim would consume the code.
         PayoutStatus::Pending => return pending_resp(&signature),
-    }
+    };
 
-    if let Err(error) = transition_claim(
-        cfg,
-        &req.code,
-        &pending,
-        Some(&ClaimState::Confirmed(signature).encode()),
-    )
-    .await
-    {
+    if let Err(error) = mark_claim_redeemed(cfg, &req.code, &pending, signature, finalized).await {
         // The pending claim already prevents another payout and reconciles
         // to confirmed on the next attempt.
         warn!(%error, %signature, "failed to mark redemption claim confirmed");
@@ -369,14 +364,22 @@ async fn reconcile_existing_claim(
     };
     match landing {
         Landing::Confirmed => {
-            if let Err(error) = transition_claim(
-                cfg,
-                code,
-                &raw,
-                Some(&ClaimState::Confirmed(signature).encode()),
-            )
-            .await
+            let status = match state
+                .rpc
+                .get_signature_status(rpc_url, &signature.to_string())
+                .await
             {
+                Ok(status) => classify_signature_status(status.as_ref()),
+                Err(error) => {
+                    warn!(%error, %signature, "redemption finality lookup failed");
+                    return Err(pending_resp(&signature));
+                }
+            };
+            let PayoutStatus::Finalized(finalized) = status else {
+                // Landed but not final: the pending claim keeps the code.
+                return Err(pending_resp(&signature));
+            };
+            if let Err(error) = mark_claim_redeemed(cfg, code, &raw, signature, finalized).await {
                 warn!(%error, %signature, "failed to mark redemption claim confirmed");
             }
             Err(already_redeemed_resp(&signature))
@@ -456,11 +459,36 @@ async fn release_signed_claim(
     transition_claim(cfg, code, expected, None).await
 }
 
+/// Proof a payout is finalized without error. Only
+/// [`classify_signature_status`] makes one, and only it unlocks the terminal
+/// claim: anything short of finality can still be rolled back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FinalizedPayout(());
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PayoutStatus {
-    Confirmed,
+    Finalized(FinalizedPayout),
     Failed,
+    /// Unseen, processed, or confirmed but not yet final.
     Pending,
+}
+
+/// Record the code as redeemed for good. Terminal, so it takes the proof
+/// that the payout behind `expected` is finalized.
+async fn mark_claim_redeemed(
+    cfg: &RedemptionState,
+    code: &str,
+    expected: &str,
+    signature: Signature,
+    _finalized: FinalizedPayout,
+) -> Result<bool, redis::RedisError> {
+    transition_claim(
+        cfg,
+        code,
+        expected,
+        Some(&ClaimState::Confirmed(signature).encode()),
+    )
+    .await
 }
 
 fn classify_signature_status(status: Option<&serde_json::Value>) -> PayoutStatus {
@@ -474,12 +502,12 @@ fn classify_signature_status(status: Option<&serde_json::Value>) -> PayoutStatus
         .get("confirmationStatus")
         .and_then(serde_json::Value::as_str)
     {
-        Some("confirmed" | "finalized") => PayoutStatus::Confirmed,
+        Some("finalized") => PayoutStatus::Finalized(FinalizedPayout(())),
         _ => PayoutStatus::Pending,
     }
 }
 
-/// Poll the payout signature until it confirms, fails, or `timeout` elapses.
+/// Poll the payout signature until it finalizes, fails, or `timeout` elapses.
 async fn await_signature(
     state: &AppState,
     rpc_url: &str,
@@ -1308,7 +1336,7 @@ pub(crate) mod tests {
                     lands_after_tip_read: None,
                     sent: Vec::new(),
                     statuses: HashMap::new(),
-                    next_status: Some(confirmed()),
+                    next_status: Some(finalized()),
                     block_height: 50,
                     last_valid_block_height: 100,
                     transactions: HashMap::new(),
@@ -1318,6 +1346,10 @@ pub(crate) mod tests {
 
         pub(super) fn confirmed() -> Value {
             json!({ "err": null, "confirmationStatus": "confirmed" })
+        }
+
+        pub(super) fn finalized() -> Value {
+            json!({ "err": null, "confirmationStatus": "finalized" })
         }
 
         pub(super) fn failed() -> Value {
@@ -1644,7 +1676,7 @@ pub(crate) mod tests {
             assert!(body.get("signature").is_none());
             assert_eq!(h.claim().await, None);
 
-            h.rpc.lock().unwrap().next_status = Some(confirmed());
+            h.rpc.lock().unwrap().next_status = Some(finalized());
             let (status, body) = h.redeem(&destination).await;
             assert_eq!(status, StatusCode::OK, "{body}");
             assert_eq!(h.sent().len(), 2);
@@ -1669,7 +1701,7 @@ pub(crate) mod tests {
             {
                 let mut rpc = h.rpc.lock().unwrap();
                 rpc.statuses.insert(first.to_string(), failed());
-                rpc.next_status = Some(confirmed());
+                rpc.next_status = Some(finalized());
             }
             let (status, body) = h.redeem(&destination).await;
             assert_eq!(status, StatusCode::OK, "{body}");
@@ -1707,13 +1739,72 @@ pub(crate) mod tests {
                 let mut rpc = h.rpc.lock().unwrap();
                 rpc.block_height = 101;
                 rpc.last_valid_block_height = 200;
-                rpc.next_status = Some(confirmed());
+                rpc.next_status = Some(finalized());
             }
             let (status, body) = h.redeem(&destination).await;
             assert_eq!(status, StatusCode::OK, "{body}");
             let sent = h.sent();
             assert_eq!(sent.len(), 2);
             assert_eq!(h.claim().await, Some(ClaimState::Confirmed(sent[1])));
+        }
+
+        #[tokio::test]
+        async fn a_payout_confirmed_short_of_finality_never_consumes_the_code() {
+            let Some(h) = Harness::new().await else {
+                return;
+            };
+            h.rpc.lock().unwrap().next_status = Some(confirmed());
+            let destination = Pubkey::new_unique();
+            let (status, body) = h.redeem(&destination).await;
+            assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
+            let first = h.sent()[0];
+            let pending = Some(ClaimState::Pending {
+                signature: first,
+                last_valid_block_height: Some(100),
+            });
+            assert_eq!(h.claim().await, pending);
+
+            // A retry while it is still only confirmed keeps it pending.
+            let (status, _) = h.redeem(&destination).await;
+            assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+            assert_eq!(h.claim().await, pending);
+
+            // The confirmed block is dropped and the blockhash expires: the
+            // code was never redeemed, so it pays out.
+            {
+                let mut rpc = h.rpc.lock().unwrap();
+                rpc.statuses.remove(&first.to_string());
+                rpc.block_height = 101;
+                rpc.last_valid_block_height = 200;
+                rpc.next_status = Some(finalized());
+            }
+            let (status, body) = h.redeem(&destination).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let sent = h.sent();
+            assert_eq!(sent.len(), 2);
+            assert_eq!(h.claim().await, Some(ClaimState::Confirmed(sent[1])));
+        }
+
+        #[tokio::test]
+        async fn a_confirmed_payout_is_terminal_once_finalized() {
+            let Some(h) = Harness::new().await else {
+                return;
+            };
+            h.rpc.lock().unwrap().next_status = Some(confirmed());
+            let destination = Pubkey::new_unique();
+            let (status, _) = h.redeem(&destination).await;
+            assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+            let first = h.sent()[0];
+            h.rpc
+                .lock()
+                .unwrap()
+                .statuses
+                .insert(first.to_string(), finalized());
+            let (status, body) = h.redeem(&destination).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+            assert_eq!(body["signature"], first.to_string());
+            assert_eq!(h.sent().len(), 1);
+            assert_eq!(h.claim().await, Some(ClaimState::Confirmed(first)));
         }
 
         #[tokio::test]
@@ -1732,7 +1823,7 @@ pub(crate) mod tests {
             {
                 let mut rpc = h.rpc.lock().unwrap();
                 rpc.block_height = 101;
-                rpc.lands_after_tip_read = Some(confirmed());
+                rpc.lands_after_tip_read = Some(finalized());
             }
             let (status, body) = h.redeem(&destination).await;
             assert_eq!(status, StatusCode::CONFLICT, "{body}");
@@ -1764,7 +1855,7 @@ pub(crate) mod tests {
                 let mut rpc = h.rpc.lock().unwrap();
                 rpc.status_slot = 10;
                 rpc.last_valid_block_height = 200;
-                rpc.next_status = Some(confirmed());
+                rpc.next_status = Some(finalized());
             }
             let (status, body) = h.redeem(&destination).await;
             assert_eq!(status, StatusCode::OK, "{body}");
@@ -1786,7 +1877,7 @@ pub(crate) mod tests {
                 .lock()
                 .unwrap()
                 .statuses
-                .insert(first.to_string(), confirmed());
+                .insert(first.to_string(), finalized());
             let (status, body) = h.redeem(&destination).await;
             assert_eq!(status, StatusCode::CONFLICT);
             assert_eq!(body["signature"], first.to_string());
