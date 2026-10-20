@@ -147,7 +147,7 @@ fn payment_header(requirements: &BatchRequirements, fee_payer: &Pubkey) -> (Stri
 }
 
 fn channel_state(channel_id: &str, payer: &Pubkey, rent_payer: &Pubkey) -> ChannelState {
-    ChannelState {
+    let mut state = ChannelState {
         channel_id: channel_id.to_string(),
         authorized_signer: payer.to_string(),
         deposit: 5_000,
@@ -178,7 +178,17 @@ fn channel_state(channel_id: &str, payer: &Pubkey, rent_payer: &Pubkey) -> Chann
         lifecycle: None,
         schema_version: 2,
         extra: Default::default(),
-    }
+    };
+    // A fresh observation of the open channel stands in for the gateway's
+    // own chain read, so admission needs no RPC.
+    state.record_onchain_observation(
+        pay_kit::mpp::store::OnchainObservation {
+            slot: None,
+            lifecycle: pay_kit::mpp::store::ObservedLifecycle::Open,
+        },
+        now(),
+    );
+    state
 }
 
 fn now() -> u64 {
@@ -199,13 +209,11 @@ async fn forwarded_batch() -> (State, Arc<MemoryChannelStore>, String, BatchForw
     let requirements = batch.requirements("0.001").unwrap();
     let (channel_id, header) = payment_header(&requirements, &fee_payer_pubkey);
     let (_, payer) = payer();
-    store
-        .put_channel(
-            &channel_id,
-            channel_state(&channel_id, &payer, &fee_payer_pubkey),
-        )
-        .await
-        .unwrap();
+    let mut state = channel_state(&channel_id, &payer, &fee_payer_pubkey);
+    // Admission requires the record to carry this deployment's binding.
+    state.set_binding(&batch.binding());
+    state.set_grace_period(3_600);
+    store.put_channel(&channel_id, state).await.unwrap();
     let state = State {
         apis: vec![api()],
         batch,

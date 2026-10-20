@@ -2276,9 +2276,12 @@ impl SessionMpp {
             Err(error) => {
                 let message = error.to_string();
                 // The kit reports a lost race that our fence did not see
-                // first (a different signature at the same cumulative).
+                // first: a different signature at the same cumulative, or
+                // this exact deterministic voucher already landed by another
+                // replica (the kit refuses that replay before our fence runs).
                 if message.contains(DELEGATED_WATERMARK_MOVED)
                     || message.contains("watermark advanced")
+                    || message.contains("voucher was already accepted")
                 {
                     return Ok(DelegatedCommit::WatermarkMoved);
                 }

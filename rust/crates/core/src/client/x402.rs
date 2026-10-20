@@ -223,7 +223,7 @@ pub fn build_payment_for_attempt(
         should_auto_fund_surfpool_for_x402(network_override, embedded_blockhash);
     let network = network_override.map(str::to_string).unwrap_or(cluster);
 
-    let rpc_url = std::env::var("PAY_RPC_URL").unwrap_or_else(|_| {
+    let rpc_url = crate::config::payment_rpc_url().unwrap_or_else(|| {
         if surfpool_detected {
             // `default_rpc_url("localnet")` is `http://localhost:8899`
             // (the in-process test-validator default). For an
@@ -433,7 +433,7 @@ fn resolve_channel_route(
     )?;
 
     let network = network_override.map(str::to_string).unwrap_or(cluster);
-    let rpc_url = std::env::var("PAY_RPC_URL").unwrap_or_else(|_| {
+    let rpc_url = crate::config::payment_rpc_url().unwrap_or_else(|| {
         if surfpool_detected {
             crate::config::SANDBOX_RPC_URL.to_string()
         } else {
@@ -2013,6 +2013,7 @@ mod tests {
     }
 
     fn payment_identifier_store() -> MemoryAccountsStore {
+        crate::test_rpc::install_blockhash_rpc();
         const TEST_KEYPAIR_BYTES: [u8; 64] = [
             41, 99, 180, 88, 51, 57, 48, 80, 61, 63, 219, 75, 176, 49, 116, 254, 227, 176, 196,
             204, 122, 47, 166, 133, 155, 252, 217, 0, 253, 17, 49, 143, 47, 94, 121, 167, 195, 136,

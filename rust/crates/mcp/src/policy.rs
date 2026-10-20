@@ -758,6 +758,7 @@ mod tests {
         assert_eq!(ledger.spent_today("tenant"), 0, "nothing recorded as USD");
 
         // Control: the same store and policy sign an in-policy USDC payment.
+        pay_core::test_rpc::install_blockhash_rpc();
         let gate = PolicyGate::new("tenant", SpendPolicy::dollars(1.0, 10.0), ledger.clone());
         let requirements: pay_kit::x402::exact::PaymentRequirements =
             serde_json::from_value(serde_json::json!({

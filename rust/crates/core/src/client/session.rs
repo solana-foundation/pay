@@ -396,8 +396,8 @@ pub fn open_payment_channel_session_header_with_override(
 
     if sandbox && ephemeral_notice.is_some() {
         let pubkey = payer.to_string();
-        let rpc =
-            std::env::var("PAY_RPC_URL").unwrap_or_else(|_| default_rpc_url(&network).to_string());
+        let rpc = crate::config::payment_rpc_url()
+            .unwrap_or_else(|| default_rpc_url(&network).to_string());
         if let Err(e) = rt.block_on(crate::client::sandbox::fund_via_surfpool(&rpc, &pubkey)) {
             tracing::warn!(error = %e, "Surfpool auto-fund failed — USDC balance may be 0");
         }

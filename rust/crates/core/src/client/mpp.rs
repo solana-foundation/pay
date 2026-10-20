@@ -739,7 +739,7 @@ fn account_pubkey_for_network(
 }
 
 fn resolve_rpc_url(network: &str, embedded_blockhash: Option<&str>) -> String {
-    std::env::var("PAY_RPC_URL").unwrap_or_else(|_| {
+    crate::config::payment_rpc_url().unwrap_or_else(|| {
         if network == "localnet"
             && embedded_blockhash.is_some_and(|h| h.starts_with(SURFPOOL_BLOCKHASH_PREFIX))
         {

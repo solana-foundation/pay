@@ -458,7 +458,12 @@ mod tests {
             .query_async::<()>(&mut connection)
             .await
             .unwrap();
-        replay.mark_confirmed("challenge", "sig-a").await.unwrap();
+        assert!(
+            replay
+                .mark_confirmed("challenge", 0, "sig-a")
+                .await
+                .unwrap()
+        );
         assert!(ttl(format!("{root}:1")).await > 100);
         assert!(ttl(root.to_string()).await >= ttl(format!("{root}:1")).await);
 

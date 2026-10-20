@@ -18,6 +18,9 @@ pub mod user_agent;
 
 pub mod mpp_channel_profile;
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_rpc;
+
 // Client modules (CLI)
 pub mod client;
 

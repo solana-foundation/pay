@@ -85,4 +85,5 @@ pyroscope_pprofrs = { version = "0.2", optional = true }
 pay-core = { workspace = true, features = ["server", "otel", "ledger"] }
 
 [dev-dependencies]
+pay-core = { workspace = true, features = ["test-support"] }
 serial_test = "3"

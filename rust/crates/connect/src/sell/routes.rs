@@ -1773,13 +1773,31 @@ mod tests {
             let payment = base64::engine::general_purpose::STANDARD
                 .encode(serde_json::to_vec(&payload).unwrap());
             let store = batch.store().clone();
-            store.put_channel(&channel.to_string(), serde_json::from_value(json!({
+            let mut record: pay_kit::core::store::ChannelState = serde_json::from_value(json!({
                 "channel_id": channel.to_string(),
                 "authorized_signer": payer, "payer": config.payer,
                 "deposit": 1_000_000, "cumulative": 0, "sealed": false,
                 "open_slot": config.open_slot, "voucher_signer": "client",
-                "onchain_checked_at": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
-            })).unwrap()).await.unwrap();
+            }))
+            .unwrap();
+            // Admission needs this deployment's binding and a fresh
+            // observation of the open channel in place of a chain read.
+            record.set_binding(&batch.binding());
+            record.set_grace_period(config.withdraw_delay);
+            record.record_onchain_observation(
+                pay_kit::core::store::OnchainObservation {
+                    slot: None,
+                    lifecycle: pay_kit::core::store::ObservedLifecycle::Open,
+                },
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            );
+            store
+                .put_channel(&channel.to_string(), record)
+                .await
+                .unwrap();
             let buyer = Router::new()
                 .route(&format!("/{}", sale.chat_path()), post(chat_completions))
                 .layer(middleware::from_fn_with_state(

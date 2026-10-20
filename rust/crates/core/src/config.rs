@@ -6,6 +6,16 @@ use std::path::{Path, PathBuf};
 pub const LOCAL_RPC_URL: &str = "http://localhost:8899";
 pub const SANDBOX_RPC_URL: &str = "https://402.surfnet.dev:8899";
 
+/// The RPC every payment builder uses when set: `PAY_RPC_URL`, or in tests
+/// the local RPC from [`crate::test_rpc::install_blockhash_rpc`].
+pub fn payment_rpc_url() -> Option<String> {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(url) = crate::test_rpc::installed() {
+        return Some(url.to_string());
+    }
+    std::env::var("PAY_RPC_URL").ok()
+}
+
 /// Logging format for operational logs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
