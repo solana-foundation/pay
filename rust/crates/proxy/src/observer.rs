@@ -153,6 +153,7 @@ impl StreamObserver {
     fn refresh_rate(&mut self, now: Instant) {
         if !self.authoritative {
             self.usage.tokens_completion = (self.events > 0).then_some(self.events);
+            self.usage.tokens_completion_estimated = self.events > 0;
         }
         let (Some(first), Some(tokens)) = (self.first_chunk_at, self.usage.tokens_completion)
         else {
@@ -256,6 +257,7 @@ fn record_authoritative_completion(
         record_cumulative(&mut usage.tokens_completion, value);
     } else {
         usage.tokens_completion = Some(value);
+        usage.tokens_completion_estimated = false;
         *authoritative = true;
     }
 }
@@ -303,11 +305,13 @@ mod tests {
             );
         }
         assert_eq!(obs.usage.tokens_completion, Some(5));
+        assert!(obs.usage.tokens_completion_estimated);
         obs.on_chunk(
             b"data: {\"choices\":[],\"usage\":{\"completion_tokens\":3}}\n\n",
             anchor,
         );
         obs.finish();
+        assert!(!obs.usage.tokens_completion_estimated);
         assert_eq!(obs.usage.tokens_completion, Some(3));
     }
 

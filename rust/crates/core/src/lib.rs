@@ -188,5 +188,8 @@ pub struct InferenceUsage {
     /// Authoritative when the upstream reported usage; otherwise approximated
     /// live from stream events and overwritten if a final count arrives.
     pub tokens_completion: Option<u64>,
+    /// `tokens_completion` is the live stream-event approximation, not a
+    /// provider count: telemetry only, never a settlement quantity.
+    pub tokens_completion_estimated: bool,
     pub tokens_per_sec: Option<f64>,
 }

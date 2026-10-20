@@ -572,7 +572,10 @@ fn inferred_quantity_for_dim(
 ) -> Option<u64> {
     let tokens = match dim.direction {
         MeterDirection::Input => usage.tokens_prompt,
-        MeterDirection::Output => usage.tokens_completion,
+        // A stream-event approximation can undercount a multi-token delta.
+        MeterDirection::Output => usage
+            .tokens_completion
+            .filter(|_| !usage.tokens_completion_estimated),
         _ => None,
     }?;
     match dim.unit {
@@ -2980,6 +2983,64 @@ mod tests {
             (actual.usd - gemma_wrong).abs() > 1e-9,
             "must not fall back to the first variant's rate"
         );
+    }
+
+    #[test]
+    fn upto_never_settles_an_estimated_completion_count() {
+        // Output $1/1M tokens, read from the response JSON.
+        let metering = Metering {
+            dimensions: vec![usage_dim(
+                MeterDirection::Output,
+                BillingUnit::Tokens,
+                1_000_000,
+                1.0,
+                Some(response_json("/usage/completion_tokens")),
+            )],
+            upto: Some(pay_types::metering::UptoMetering {
+                max_usd: Some(0.50),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let plan = |estimated| UptoSettlementPlan {
+            metering: metering.clone(),
+            variant_hint: None,
+            request_properties: RequestProperties::default(),
+            ceiling_usd: 0.50,
+            // Three content deltas, however many tokens each carried.
+            inferred_usage: Some(crate::InferenceUsage {
+                tokens_completion: Some(3),
+                tokens_completion_estimated: estimated,
+                ..Default::default()
+            }),
+        };
+        let body = br#"{"usage":{"completion_tokens":400}}"#;
+
+        // The provider's count in the body is what settles.
+        let actual =
+            upto_actual_amount_from_response(&plan(true), 500_000, &HeaderMap::new(), Some(body))
+                .unwrap();
+        assert_eq!(actual.base_units, 400);
+        // Without it the missing-usage policy applies, not the estimate.
+        let actual = upto_actual_amount_from_response(
+            &plan(true),
+            500_000,
+            &HeaderMap::new(),
+            Some(br#"{"text":"no usage"}"#),
+        );
+        assert!(
+            actual
+                .as_ref()
+                .map_or(true, |actual| actual.base_units != 3),
+            "{actual:?}"
+        );
+
+        // Positive control: an authoritative observer count still supersedes
+        // the body.
+        let actual =
+            upto_actual_amount_from_response(&plan(false), 500_000, &HeaderMap::new(), Some(body))
+                .unwrap();
+        assert_eq!(actual.base_units, 3);
     }
 
     #[test]
