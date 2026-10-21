@@ -1201,25 +1201,37 @@ fn check_command_exists(cmd: &str) -> Result<()> {
 
 /// Parse HTTP headers from curl's `-D` dump format.
 ///
-/// Handles redirect chains by taking the LAST header block (the final response).
+/// Retain the final response's initial headers, excluding trailers. A new
+/// response can follow redirect trailers without an intervening blank line.
+/// This handles valid HTTP framing; a textual dump cannot distinguish a
+/// malformed trailer that exactly mimics a complete response status line.
 fn parse_http_headers(raw: &str) -> (Option<u16>, Vec<(String, String)>) {
-    let blocks: Vec<&str> = raw.split("\r\n\r\n").filter(|b| !b.is_empty()).collect();
-    let block = match blocks.last() {
-        Some(b) => b,
-        None => return (None, vec![]),
-    };
-
     let mut status_code = None;
     let mut headers = Vec::new();
+    let mut reading_headers = false;
 
-    for line in block.lines() {
-        let line = line.trim();
-        if line.starts_with("HTTP/") {
-            status_code = line
+    for line in raw.lines() {
+        // Inspect the untrimmed line and the whole version token: trailers
+        // such as `HTTP/1.1: ...` or ` HTTP/1.1 402 ...` are not responses.
+        let status_line =
+            line.strip_prefix("HTTP/")
+                .and_then(|suffix| suffix.split_once(' '))
+                .filter(|(version, _)| {
+                    let mut parts = version.split('.');
+                    parts.by_ref().take(2).all(|part| {
+                        !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())
+                    }) && parts.next().is_none()
+                });
+        if let Some((_, status)) = status_line {
+            status_code = status
                 .split_whitespace()
-                .nth(1)
+                .next()
                 .and_then(|s| s.parse::<u16>().ok());
-        } else if let Some((key, value)) = line.split_once(':') {
+            headers.clear();
+            reading_headers = true;
+        } else if line.trim().is_empty() {
+            reading_headers = false;
+        } else if reading_headers && let Some((key, value)) = line.split_once(':') {
             headers.push((key.trim().to_lowercase(), value.trim().to_string()));
         }
     }
@@ -1817,6 +1829,63 @@ mod tests {
         let raw = "HTTP/1.1 301 Moved\r\nLocation: https://new.example.com\r\n\r\nHTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n";
         let (status, _headers) = parse_http_headers(raw);
         assert_eq!(status, Some(200));
+    }
+
+    #[test]
+    fn curl_trailers_preserve_the_response_status_and_headers() {
+        for version in ["HTTP/1.0", "HTTP/1.1", "HTTP/2", "HTTP/3"] {
+            let raw = format!(
+                "{version} 402 Payment Required\r\nWWW-Authenticate: Payment original\r\n\r\nX-Timing: 7\r\n\r\n"
+            );
+            let (status, headers) = parse_http_headers(&raw);
+            assert_eq!(status, Some(402), "{version}");
+            assert_eq!(
+                headers,
+                vec![("www-authenticate".into(), "Payment original".into())]
+            );
+        }
+    }
+
+    #[test]
+    fn curl_trailers_before_a_redirect_target_do_not_hide_the_next_response() {
+        // curl does not add a blank line between old trailers and the next status line.
+        let raw = "HTTP/1.1 302 Found\r\nLocation: /paid\r\n\r\nX-Old-Trailer: old\r\nHTTP/1.1 100 Continue\r\nX-Interim: old\r\n\r\nHTTP/2 402 Payment Required\r\nWWW-Authenticate: Payment first\r\nWWW-Authenticate: Payment second\r\n\r\nX-Final-Trailer: timing\r\n";
+        let (status, headers) = parse_http_headers(raw);
+        assert_eq!(status, Some(402));
+        assert_eq!(
+            headers,
+            vec![
+                ("www-authenticate".into(), "Payment first".into()),
+                ("www-authenticate".into(), "Payment second".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn curl_trailer_field_names_and_continuations_are_not_status_lines() {
+        // These status-looking trailer fields/continuations are accepted and dumped by curl.
+        let raw = "HTTP/1.1 402 Payment Required\r\nWWW-Authenticate: Payment old\r\n\r\nHTTP/1.1 200 OK\r\nPayment-Response: original-receipt\r\n\r\nHTTP/1.1: 402 Payment Required\r\n HTTP/1.1 402 Payment Required\r\nWWW-Authenticate: Payment trailer\r\nPayment-Response: trailer-receipt\r\n";
+        let (status, headers) = parse_http_headers(raw);
+        assert_eq!(status, Some(200));
+        assert_eq!(
+            headers,
+            vec![("payment-response".into(), "original-receipt".into())]
+        );
+    }
+
+    #[test]
+    fn curl_malformed_final_status_does_not_reuse_an_earlier_402() {
+        let raw = "HTTP/1.1 402 Payment Required\r\nWWW-Authenticate: Payment old\r\n\r\nHTTP/1.1 invalid\r\nX-Final: value\r\n\r\nX-Trailer: ignored\r\n";
+        let (status, headers) = parse_http_headers(raw);
+        assert_eq!(status, None);
+        assert_eq!(headers, vec![("x-final".into(), "value".into())]);
+    }
+
+    #[test]
+    fn curl_headers_without_a_response_status_are_not_used() {
+        let (status, headers) = parse_http_headers("WWW-Authenticate: Payment trailer\r\n\r\n");
+        assert_eq!(status, None);
+        assert!(headers.is_empty());
     }
 
     #[test]
