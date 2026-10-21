@@ -1,0 +1,54 @@
+name: POS example
+
+on:
+  pull_request:
+    paths:
+      - 'typescript/packages/solana-pay/examples/point-of-sale/**'
+      - 'typescript/packages/solana-pay/core/**'
+      - 'typescript/pnpm-lock.yaml'
+      - 'typescript/package.json'
+      - 'typescript/pnpm-workspace.yaml'
+      - '.github/workflows/pos-example.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'typescript/packages/solana-pay/examples/point-of-sale/**'
+      - 'typescript/packages/solana-pay/core/**'
+      - 'typescript/pnpm-lock.yaml'
+      - 'typescript/package.json'
+      - 'typescript/pnpm-workspace.yaml'
+      - '.github/workflows/pos-example.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  pos-example:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      NEXT_TELEMETRY_DISABLED: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: pnpm
+          cache-dependency-path: typescript/pnpm-lock.yaml
+      - name: Install and build the local SDK
+        working-directory: typescript
+        run: |
+          pnpm install --frozen-lockfile --ignore-scripts
+          pnpm --filter @solana/pay build
+      - name: Install the example
+        working-directory: typescript/packages/solana-pay/examples/point-of-sale
+        run: npm install --ignore-scripts --no-audit --no-fund
+      - name: Run payment regressions and build the example
+        working-directory: typescript/packages/solana-pay/examples/point-of-sale
+        run: |
+          npm test
+          npx --no-install tsc --noEmit --incremental false
+          npm run build

@@ -18,6 +18,7 @@ export interface PaymentContextState {
     setMemo(memo: string | undefined): void;
     reference: Address | undefined;
     signature: Signature | undefined;
+    submissionError: string | undefined;
     status: PaymentStatus;
     confirmations: Confirmations;
     progress: number;
