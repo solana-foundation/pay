@@ -56,6 +56,8 @@ struct HttpCase {
     content_type: String,
     body: Vec<u8>,
     fault: Option<String>,
+    headers: Vec<(String, String)>,
+    receipt: Option<serde_json::Value>,
 }
 
 impl HttpCase {
@@ -65,6 +67,8 @@ impl HttpCase {
             content_type: content_type.to_string(),
             body: body.to_vec(),
             fault: None,
+            headers: Vec::new(),
+            receipt: None,
         }
     }
 }
@@ -164,7 +168,7 @@ fn assert_worker_succeeded(result: WorkerResult) {
     assert!(result.output.contains(WORKER_OK), "{}", result.output);
 }
 
-// The nine public test cases run this worker in a fresh process. Keeping the
+// Public test cases run this worker in a fresh process. Keeping the
 // runtime here lets the parent enforce a deadline even during runtime shutdown.
 #[test]
 #[ignore = "subprocess worker; invoked with an explicit serialized HTTP case"]
@@ -185,10 +189,14 @@ async fn call_http(case: &HttpCase) -> CallToolResult {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/response", listener.local_addr().unwrap());
     let response = format!(
-        "HTTP/1.1 {} Test\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {} Test\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n",
         case.status,
         case.content_type,
-        case.body.len()
+        case.body.len(),
+        case.headers
+            .iter()
+            .map(|(name, value)| format!("{name}: {value}\r\n"))
+            .collect::<String>()
     );
     let response = [response.as_bytes(), &case.body].concat();
     let requests = Arc::new(AtomicUsize::new(0));
@@ -226,6 +234,19 @@ async fn call_http(case: &HttpCase) -> CallToolResult {
     );
     let server = server.unwrap();
     let client = client.unwrap();
+    let tools = client.list_all_tools().await.unwrap();
+    let curl = tools.iter().find(|tool| tool.name == "curl").unwrap();
+    let output_schema = curl
+        .output_schema
+        .as_ref()
+        .expect("curl advertises its metadata schema");
+    assert_eq!(output_schema["properties"]["schema_version"]["minimum"], 1);
+    assert_eq!(output_schema["properties"]["schema_version"]["maximum"], 1);
+    assert!(
+        serde_json::to_string(output_schema)
+            .unwrap()
+            .contains("merchant_reported_success")
+    );
     let result = {
         let request = client.call_tool(
             CallToolRequestParams::new("curl")
@@ -284,6 +305,18 @@ async fn check_http(case: &HttpCase) {
     );
     let wire = serde_json::to_value(&result).unwrap();
     assert_eq!(wire["isError"], expected_error);
+    let receipt = case
+        .receipt
+        .clone()
+        .unwrap_or_else(|| json!({"state":"missing"}));
+    assert_eq!(
+        wire["structuredContent"],
+        json!({"schema_version":1,"payment_receipt":receipt})
+    );
+    assert!(
+        !wire.to_string().contains("fixture-secret"),
+        "raw receipt extensions or headers leaked"
+    );
     let expected_blocks = if case.content_type == "application/pdf" {
         2
     } else {
@@ -340,6 +373,122 @@ async fn check_http(case: &HttpCase) {
             std::str::from_utf8(&case.body).unwrap()
         };
         assert_eq!(content.as_text().unwrap().text, expected);
+    }
+}
+
+#[test]
+fn x402_evidence_on_an_unpaid_response_is_unverified_and_bounded() {
+    let mut case = HttpCase::new(200, "application/json", br#"{"result":"ok"}"#);
+    let header = STANDARD.encode(
+        json!({
+            "transaction": "fixture-reference", "network": "solana:mainnet",
+            "success": true, "authorization": "fixture-secret",
+            "url": "https://untrusted.example/receipt"
+        })
+        .to_string(),
+    );
+    case.headers = vec![
+        ("PAYMENT-RESPONSE".into(), header),
+        ("Set-Cookie".into(), "fixture-secret".into()),
+    ];
+    case.receipt = Some(
+        json!({"state":"merchant_reported", "verification":"unverified",
+        "protocol":"x402", "reference":"fixture-reference", "network":"solana:mainnet", "merchant_reported_success":true}),
+    );
+    // NoPayment panics if a signing gate is touched; the fixture sees one request.
+    assert_worker_succeeded(run_worker(worker_command(&case), TEST_TIMEOUT));
+}
+
+#[test]
+fn mpp_evidence_survives_http_failure_with_an_image_body() {
+    use pay_kit::mpp::{MethodName, Receipt, ReceiptKind, format_receipt};
+    let receipt = ReceiptKind::Charge(Receipt::success(
+        MethodName::new("solana"),
+        "fixture-reference",
+        "fixture-secret",
+    ));
+    let mut case = HttpCase::new(502, "image/png", b"\x89PNG\r\n\x1a\n\xff");
+    case.headers = vec![("Payment-Receipt".into(), format_receipt(&receipt).unwrap())];
+    case.receipt = Some(
+        json!({"state":"merchant_reported", "verification":"unverified", "protocol":"mpp", "reference":"fixture-reference", "merchant_reported_success":true}),
+    );
+    assert_worker_succeeded(run_worker(worker_command(&case), TEST_TIMEOUT));
+}
+
+#[test]
+fn duplicate_receipt_headers_are_not_selected_by_precedence() {
+    let mut case = HttpCase::new(200, "text/plain", b"result");
+    case.headers = vec![
+        ("Payment-Response".into(), "first".into()),
+        ("payment-response".into(), "second".into()),
+    ];
+    case.receipt = Some(json!({"state":"invalid_or_ambiguous"}));
+    assert_worker_succeeded(run_worker(worker_command(&case), TEST_TIMEOUT));
+}
+
+#[test]
+fn malformed_receipt_does_not_hide_http_failure_or_pdf_body() {
+    let mut case = HttpCase::new(502, "application/pdf", b"%PDF-1.7\x00\xff");
+    case.headers = vec![("Payment-Receipt".into(), "fixture-secret".into())];
+    case.receipt = Some(json!({"state":"invalid_or_ambiguous"}));
+    assert_worker_succeeded(run_worker(worker_command(&case), TEST_TIMEOUT));
+}
+
+#[test]
+fn x402_explicit_outcomes_are_preserved_without_changing_body_text() {
+    for success in [true, false] {
+        let mut case = HttpCase::new(200, "application/json", br#"{"result":"ok"}"#);
+        case.headers = vec![(
+            "Payment-Response".into(),
+            STANDARD.encode(
+                json!({
+            "success":success, "transaction":"fixture-reference"})
+                .to_string(),
+            ),
+        )];
+        case.receipt = Some(
+            json!({"state":"merchant_reported", "verification":"unverified",
+            "protocol":"x402", "reference":"fixture-reference", "merchant_reported_success":success}),
+        );
+        assert_worker_succeeded(run_worker(worker_command(&case), TEST_TIMEOUT));
+    }
+}
+
+#[test]
+fn non_receipt_and_conflicting_json_is_invalid_on_the_mcp_wire() {
+    for value in [
+        json!({}),
+        json!(true),
+        json!([]),
+        json!(null),
+        json!({"network":"devnet"}),
+        json!({"success":"false", "transaction":"ref"}),
+        json!({"transaction":"first", "signature":"second"}),
+    ] {
+        let mut case = HttpCase::new(200, "text/plain", b"unchanged response");
+        case.headers = vec![(
+            "Payment-Response".into(),
+            STANDARD.encode(value.to_string()),
+        )];
+        case.receipt = Some(json!({"state":"invalid_or_ambiguous"}));
+        assert_worker_succeeded(run_worker(worker_command(&case), TEST_TIMEOUT));
+    }
+}
+
+#[test]
+fn repeated_json_keys_are_invalid_on_the_mcp_wire() {
+    for payload in [
+        r#"{"success":false,"success":true,"transaction":"ref"}"#,
+        r#"{"success":true,"success":false,"transaction":"ref"}"#,
+        r#"{"transaction":"first","transaction":"second"}"#,
+        r#"{"success":true,"receipt":{"transaction":"first","transaction":"second"}}"#,
+    ] {
+        for value in [payload.to_string(), STANDARD.encode(payload)] {
+            let mut case = HttpCase::new(200, "text/plain", b"unchanged response");
+            case.headers = vec![("Payment-Response".into(), value)];
+            case.receipt = Some(json!({"state":"invalid_or_ambiguous"}));
+            assert_worker_succeeded(run_worker(worker_command(&case), TEST_TIMEOUT));
+        }
     }
 }
 

@@ -3,6 +3,7 @@ pub mod curl;
 pub mod get_balance;
 pub mod get_catalog_entry;
 pub mod list_catalog;
+mod receipt;
 pub mod search_catalog;
 pub mod sell_inference;
 pub mod topup;

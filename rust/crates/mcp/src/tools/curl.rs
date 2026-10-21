@@ -14,6 +14,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
+use super::receipt::ReceiptEvidence;
+
 /// Reusable MPP session authorizations for one MCP server connection.
 ///
 /// The `PayMcp` instance is created for one stdio MCP connection. Keys are
@@ -914,6 +916,18 @@ struct PaidFetchResult {
     exit_code: i32,
     body: Vec<u8>,
     content_type: Option<String>,
+    receipt: ReceiptEvidence,
+}
+
+#[derive(serde::Serialize, JsonSchema)]
+struct CurlMetadata {
+    #[schemars(range(min = 1, max = 1))]
+    schema_version: u8,
+    payment_receipt: ReceiptEvidence,
+}
+
+pub(crate) fn output_schema() -> Arc<rmcp::model::JsonObject> {
+    rmcp::handler::server::tool::schema_for_type::<CurlMetadata>()
 }
 
 impl PaidFetchResult {
@@ -928,11 +942,22 @@ impl PaidFetchResult {
                 "Request completed."
             },
         );
-        if is_error {
+        let metadata = CurlMetadata {
+            schema_version: 1,
+            payment_receipt: self.receipt,
+        };
+        // Keep the HTTP body/content blocks byte-for-byte compatible. Receipt
+        // metadata belongs only in the separately advertised structured output.
+        let mut result = if is_error {
             CallToolResult::error(content)
         } else {
             CallToolResult::success(content)
-        }
+        };
+        result.structured_content = Some(
+            serde_json::to_value(metadata)
+                .expect("receipt metadata contains only JSON-compatible values"),
+        );
+        result
     }
 }
 
@@ -1612,16 +1637,7 @@ fn do_paid_fetch(
         RunOutcome::UnknownPaymentRequired { .. } => Err(pay_core::Error::Mpp(
             "402 Payment Required but no recognized protocol".to_string(),
         )),
-        RunOutcome::Completed {
-            exit_code,
-            body,
-            content_type,
-            ..
-        } => Ok(PaidFetchResult {
-            exit_code,
-            body: body.unwrap_or_default(),
-            content_type,
-        }),
+        completed @ RunOutcome::Completed { .. } => interpret_retry(completed),
     }
 }
 
@@ -1732,11 +1748,12 @@ fn interpret_retry(
             exit_code,
             body,
             content_type,
-            ..
+            response_headers,
         } => Ok(PaidFetchResult {
             exit_code,
             body: body.unwrap_or_default(),
             content_type,
+            receipt: ReceiptEvidence::from_headers(&response_headers),
         }),
         RunOutcome::PaymentRejected { reason, .. } => Err(pay_core::Error::PaymentRejected(reason)),
         _ => Err(pay_core::Error::Mpp(
@@ -1833,7 +1850,49 @@ mod tests {
                 let result = response.into_tool_result();
                 assert_eq!(result.is_error, Some(exit_code != 0));
                 assert_eq!(result.content[0].as_text().unwrap().text, expected_text);
+                assert_eq!(
+                    result.content.len(),
+                    1,
+                    "missing evidence adds no text block"
+                );
+                assert_eq!(
+                    result.structured_content.unwrap(),
+                    serde_json::json!({
+                        "schema_version": 1, "payment_receipt": {"state":"missing"}
+                    })
+                );
             }
+        }
+    }
+
+    #[test]
+    fn interpret_retry_keeps_receipt_evidence_independent_of_http_success() {
+        for exit_code in [0, 1, 22] {
+            let result = interpret_retry(pay_core::client::runner::RunOutcome::Completed {
+                exit_code,
+                body: Some(b"merchant response".to_vec()),
+                content_type: Some("text/plain".into()),
+                response_headers: vec![("Payment-Response".into(),
+                    r#"{"success":false,"transaction":"fixture-reference","secret":"fixture-secret"}"#.into())],
+            }).unwrap().into_tool_result();
+            assert_eq!(result.is_error, Some(exit_code != 0));
+            assert_eq!(
+                result.content[0].as_text().unwrap().text,
+                "merchant response"
+            );
+            assert_eq!(result.content.len(), 1);
+            assert_eq!(
+                result.structured_content.as_ref().unwrap(),
+                &serde_json::json!({
+                    "schema_version": 1, "payment_receipt": {"state":"merchant_reported", "verification":"unverified",
+                        "protocol":"x402", "reference":"fixture-reference", "merchant_reported_success":false}
+                })
+            );
+            assert!(
+                !serde_json::to_string(&result)
+                    .unwrap()
+                    .contains("fixture-secret")
+            );
         }
     }
 

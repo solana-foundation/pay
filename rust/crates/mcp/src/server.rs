@@ -48,6 +48,7 @@ impl PayMcp {
     }
 
     #[tool(
+        output_schema = tools::curl::output_schema(),
         description = r#"Make an HTTP request through Pay with 402 Payment Required handling.
 
 Use this as the primary HTTP tool for Pay gateway URLs and for any URL that
@@ -58,6 +59,20 @@ stablecoins such as USDC, USDT, PYUSD, CASH, or USDG; it does not need SOL for n
 Server-side fee payers handle transaction fees and setup costs. Copy URLs
 returned by `search_catalog` or `get_catalog_entry` exactly; do not replace
 them with upstream API hosts.
+
+Completed HTTP responses preserve the HTTP body in `content` and include a
+separate metadata envelope in `structuredContent`: `schema_version: 1` and
+`payment_receipt`. Structured content is metadata, not the HTTP response body;
+no receipt text is appended to the body. Receipt state is `missing`,
+`invalid_or_ambiguous`, or `merchant_reported`. Merchant-reported evidence includes
+`verification: "unverified"`, a protocol, `merchant_reported_success` (true, false,
+or null when the merchant did not specify an outcome), and optional opaque
+reference/network identifiers. Empty or non-receipt JSON and conflicting claims
+are invalid. Reference/network identifiers are limited to 128 ASCII bytes.
+These are merchant claims even on an unpaid response, not proof this call paid,
+settlement, or resource delivery. Missing/invalid evidence does not prove no charge
+occurred; do not blindly retry an ambiguous paid request. HTTP errors remain
+independent of receipt metadata.
 
 `body` may be a string or a JSON value. JSON values are serialized before the
 request and `Content-Type: application/json` is added when no content type is
