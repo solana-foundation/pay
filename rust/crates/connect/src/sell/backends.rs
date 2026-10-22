@@ -83,23 +83,71 @@ impl std::fmt::Debug for RpcUrl {
     }
 }
 
-/// One endpoint's MPP session channel records, one store per settlement mint.
+/// One endpoint's MPP session backends, one per settlement mint, each over
+/// its own channel store.
 ///
 /// Owned by the endpoint, not by a pricing generation: a reprice rebuilds the
-/// backends but must keep serving, metering and settling the channels buyers
-/// already funded. Never shared across endpoints, whose channels pay
-/// different sellers.
+/// other backends but must keep serving, metering and settling the channels
+/// buyers already funded. Each [`SessionMpp`] runs the only lifecycle runloop
+/// over its store, so every generation reuses it rather than starting a
+/// second runloop that would settle and close the same channels again.
+/// Never shared across endpoints, whose channels pay different sellers.
 #[derive(Clone, Default)]
-pub struct SessionStores(Arc<std::sync::Mutex<HashMap<String, Arc<dyn ChannelStore>>>>);
+pub struct SessionStores(Arc<std::sync::Mutex<HashMap<String, EndpointSession>>>);
+
+struct EndpointSession {
+    /// Everything the session backend was built from. A generation asking
+    /// for other terms cannot be served by this backend, and must not start
+    /// a second one over the same channels.
+    terms: String,
+    session: Arc<SessionMpp>,
+    #[cfg(test)]
+    store: Arc<dyn ChannelStore>,
+}
 
 impl SessionStores {
-    fn for_mint(&self, mint: &str) -> Arc<dyn ChannelStore> {
-        self.0
+    /// The endpoint's session backend for `mint`: built by `build` over a
+    /// fresh channel store the first time, the same instance after that.
+    fn session_for(
+        &self,
+        mint: &str,
+        terms: String,
+        build: impl FnOnce(Arc<dyn ChannelStore>) -> SessionMpp,
+    ) -> Result<Arc<SessionMpp>, String> {
+        let mut sessions = self
+            .0
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .entry(mint.to_string())
-            .or_insert_with(|| Arc::new(pay_kit::core::store::MemoryChannelStore::new()))
-            .clone()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(existing) = sessions.get(mint) {
+            if existing.terms != terms {
+                return Err(
+                    "MPP session terms cannot change while the endpoint's channels are live".into(),
+                );
+            }
+            return Ok(existing.session.clone());
+        }
+        let store: Arc<dyn ChannelStore> =
+            Arc::new(pay_kit::core::store::MemoryChannelStore::new());
+        let session = Arc::new(build(store.clone()));
+        sessions.insert(
+            mint.to_string(),
+            EndpointSession {
+                terms,
+                session: session.clone(),
+                #[cfg(test)]
+                store,
+            },
+        );
+        Ok(session)
+    }
+
+    #[cfg(test)]
+    fn for_mint(&self, mint: &str) -> Arc<dyn ChannelStore> {
+        let sessions = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        sessions[mint].store.clone()
     }
 }
 
@@ -386,29 +434,41 @@ impl EndpointBackends {
                     channel_hooks: channel_hooks.clone(),
                     token_program: Some(token_program),
                 };
-                // Endpoints share the operator's root secret; derive one per
-                // endpoint so a clone's session cannot be replayed into it.
-                let session = SessionMpp::new_with_channel_store(
-                    config,
-                    pay_core::server::session::endpoint_challenge_binding_secret(
-                        &operator.challenge_binding_secret,
-                        &sale.endpoint_id,
-                    ),
-                    session_stores.for_mint(mint),
-                )
-                .with_realm(sale.title.clone())
-                .with_blockhash_cache(operator.blockhashes.clone())
-                .with_payment_channel_signer(operator.signer.clone());
-                // Embedded reconciliation: this process pushes watermarks and
-                // closes idle channels. A settlement worker takes over when
-                // pay-connect's session state moves to Redis.
-                session.start_lifecycle_runloop_with_settlement_and_batching(
-                    std::time::Duration::from_millis(spec.close_delay_ms),
-                    std::time::Duration::from_millis(spec.close_batch_interval_ms),
-                    std::time::Duration::from_millis(spec.settlement_interval_ms),
-                    pay_core::server::session::SessionLifecycleReconciliation::Embedded,
+                let terms = format!(
+                    "{}|{}|{}|{}|{:?}",
+                    sale.recipient,
+                    sale.title,
+                    operator.pubkey(),
+                    cap_base,
+                    spec
                 );
-                sessions.push(Arc::new(session));
+                let session = session_stores.session_for(mint, terms, |store| {
+                    // Endpoints share the operator's root secret; derive one
+                    // per endpoint so a clone's session cannot be replayed
+                    // into it.
+                    let session = SessionMpp::new_with_channel_store(
+                        config,
+                        pay_core::server::session::endpoint_challenge_binding_secret(
+                            &operator.challenge_binding_secret,
+                            &sale.endpoint_id,
+                        ),
+                        store,
+                    )
+                    .with_realm(sale.title.clone())
+                    .with_blockhash_cache(operator.blockhashes.clone())
+                    .with_payment_channel_signer(operator.signer.clone());
+                    // Embedded reconciliation: this process pushes watermarks
+                    // and closes idle channels. A settlement worker takes over
+                    // when pay-connect's session state moves to Redis.
+                    session.start_lifecycle_runloop_with_settlement_and_batching(
+                        std::time::Duration::from_millis(spec.close_delay_ms),
+                        std::time::Duration::from_millis(spec.close_batch_interval_ms),
+                        std::time::Duration::from_millis(spec.settlement_interval_ms),
+                        pay_core::server::session::SessionLifecycleReconciliation::Embedded,
+                    );
+                    session
+                })?;
+                sessions.push(session);
             }
         }
 
@@ -675,6 +735,11 @@ mod tests {
             .touch_channel(channel.clone())
             .await
             .unwrap();
+        // One backend, so one lifecycle runloop, settles the endpoint's channels.
+        assert!(Arc::ptr_eq(
+            first.sessions.first().unwrap(),
+            repriced.sessions.first().unwrap()
+        ));
         // Another endpoint's stores never see it.
         let other = build(0.03, &SessionStores::default());
         assert!(
@@ -686,6 +751,28 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_terms_cannot_change_under_live_channels() {
+        let operator = operator();
+        let stores = SessionStores::default();
+        let build = |sale: &SellInference| {
+            EndpointBackends::build_with_session_stores(
+                sale,
+                &operator,
+                "https://connect.test",
+                &stores,
+            )
+        };
+        let mut terms = sale(SellPricing::PerRequest { usd: 0.02 });
+        build(&terms).unwrap();
+        // Same session terms at a new price: served by the same backend.
+        terms.pricing = SellPricing::PerRequest { usd: 0.05 };
+        build(&terms).unwrap();
+        terms.session_cap_usd *= 2.0;
+        let error = build(&terms).err().unwrap();
+        assert!(error.contains("session terms"), "{error}");
     }
 
     #[test]

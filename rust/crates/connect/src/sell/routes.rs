@@ -772,8 +772,8 @@ async fn update(
     let mut sale = entry.sale();
     sale.pricing = input.pricing.into();
     let live = live_for(&state, &entry, sale)?;
-    // Requests already in flight retain this generation. Once the old router
-    // drops, its session lifecycle detaches until its channels finish.
+    // Requests already in flight retain this generation. Both generations
+    // share the endpoint's session backends and their one lifecycle runloop.
     *entry.live.write().unwrap_or_else(|p| p.into_inner()) = live;
     tracing::info!(endpoint = %id, "sell_inference pricing updated");
     Ok(Json(view_of(&state, &entry, None)))
