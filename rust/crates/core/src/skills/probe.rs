@@ -220,9 +220,12 @@ pub fn extract_paid_endpoint(headers: &[(String, String)], body: Option<&str>) -
     // Some servers (e.g. Vercel-hosted ones) ship an empty response body and
     // put the entire envelope in the `payment-required` header (base64 JSON).
     // Fall back to that when the body doesn't carry the envelope itself.
-    let parsed_body: Option<Value> = body
-        .and_then(|b| serde_json::from_str(b).ok())
-        .or_else(|| parse_payment_required_header(headers));
+    let body_json: Option<Value> = body.and_then(|b| serde_json::from_str(b).ok());
+    let parsed_body: Option<Value> = match (body_json, parse_payment_required_header(headers)) {
+        (Some(b), _) if b.get("accepts").is_some() => Some(b),
+        (_, Some(h)) => Some(h),
+        (b, None) => b,
+    };
 
     if let Some(json) = &parsed_body {
         // Walk accepts[] for Solana entries.
@@ -803,6 +806,57 @@ mod tests {
         );
         assert_eq!(paid.description.as_deref(), Some("Test endpoint"));
         assert!(!paid.siwx_required);
+    }
+
+    #[test]
+    fn extract_reads_header_when_json_body_has_no_accepts() {
+        use base64::Engine;
+        let envelope = x402_body(vec![serde_json::json!({
+            "scheme": "exact",
+            "network": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+            "amount": "3000",
+            "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            "payTo": "3Wuj6VjJXuCmQZjGRhW56xbEk6TzCyMEUVRZgLBYNE2Z",
+        })]);
+        let headers = vec![(
+            "payment-required".to_string(),
+            base64::engine::general_purpose::STANDARD.encode(envelope),
+        )];
+        let body = r#"{"success":false,"message":"Payment is required to access this resource"}"#;
+        let paid = extract_paid_endpoint(&headers, Some(body));
+        assert_eq!(paid.protocols, vec!["x402".to_string()]);
+        assert_eq!(paid.supported_usd, vec!["USDC".to_string()]);
+        assert_eq!(paid.price_usd, Some(0.003));
+        assert_eq!(
+            paid.recipients,
+            vec!["3Wuj6VjJXuCmQZjGRhW56xbEk6TzCyMEUVRZgLBYNE2Z".to_string()]
+        );
+    }
+
+    #[test]
+    fn extract_prefers_body_envelope_over_header() {
+        use base64::Engine;
+        let header_env = x402_body(vec![serde_json::json!({
+            "scheme": "exact",
+            "network": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+            "amount": "90000",
+            "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            "payTo": "HeaderRecipient",
+        })]);
+        let body = x402_body(vec![serde_json::json!({
+            "scheme": "exact",
+            "network": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+            "amount": "10000",
+            "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            "payTo": "BodyRecipient",
+        })]);
+        let headers = vec![(
+            "payment-required".to_string(),
+            base64::engine::general_purpose::STANDARD.encode(header_env),
+        )];
+        let paid = extract_paid_endpoint(&headers, Some(&body));
+        assert_eq!(paid.price_usd, Some(0.01));
+        assert_eq!(paid.recipients, vec!["BodyRecipient".to_string()]);
     }
 
     #[test]
