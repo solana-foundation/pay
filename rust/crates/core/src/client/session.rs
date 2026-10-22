@@ -351,6 +351,13 @@ pub fn open_payment_channel_session_header_with_override(
 
     crate::mpp_channel_profile::validate_challenge(request)?;
     let details = &request.method_details;
+    // Enforce explicit CLI network intent before wallet access, as charge and
+    // subscription payments do, including the Surfpool blockhash check.
+    crate::client::mpp::check_client_network_intent(
+        network_override,
+        &details.network,
+        details.recent_blockhash.as_deref(),
+    )?;
     let network = network_override
         .map(str::to_string)
         .unwrap_or_else(|| details.network.clone());
@@ -710,6 +717,172 @@ mod tests {
             "session",
             Base64UrlJson::from_typed(&request).unwrap(),
         )
+    }
+
+    const WALLET_ACCESS_SENTINEL: &str = "fixture stopped before loading wallet";
+
+    #[derive(Default)]
+    struct StopAtWalletStore(std::sync::atomic::AtomicUsize);
+
+    impl crate::accounts::AccountsStore for StopAtWalletStore {
+        fn load(&self) -> Result<crate::accounts::AccountsFile> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(Error::Config(WALLET_ACCESS_SENTINEL.into()))
+        }
+
+        fn save(&self, _: &crate::accounts::AccountsFile) -> Result<()> {
+            panic!("session preflight must not write wallet state");
+        }
+    }
+
+    fn session_preflight_error(
+        request: &SessionRequest,
+        network_override: Option<&str>,
+        use_override_entry_point: bool,
+    ) -> (Error, usize) {
+        let store = StopAtWalletStore::default();
+        let challenge = PaymentChallenge::with_challenge_binding_secret(
+            "test-secret",
+            "test-realm",
+            "solana",
+            "session",
+            Base64UrlJson::from_typed(request).unwrap(),
+        );
+        let result = if use_override_entry_point {
+            open_payment_channel_session_header_with_override(
+                &challenge,
+                request,
+                &store,
+                network_override,
+                None,
+                1_000_000,
+                "https://merchant.example/session",
+                network_override == Some("localnet"),
+                None,
+            )
+        } else {
+            open_payment_channel_session_header(
+                &challenge,
+                request,
+                &store,
+                network_override,
+                None,
+                1_000_000,
+                "https://merchant.example/session",
+                network_override == Some("localnet"),
+            )
+        };
+        let error = match result {
+            Ok(_) => panic!("fixture must stop before wallet loading"),
+            Err(error) => error,
+        };
+        (error, store.0.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    #[test]
+    fn session_open_rejects_network_mismatches_before_wallet_access() {
+        for forced in ["mainnet", "devnet", "localnet"] {
+            for offered in ["mainnet", "devnet", "localnet"] {
+                if forced == offered {
+                    continue;
+                }
+                for voucher_signer in [SessionVoucherSigner::Client, SessionVoucherSigner::Operator]
+                {
+                    let mut request = test_request();
+                    request.method_details.network = offered.into();
+                    request.method_details.voucher_signer = Some(voucher_signer);
+                    request.method_details.operator = Some(Pubkey::new_unique().to_string());
+                    for use_override_entry_point in [false, true] {
+                        let (error, loads) = session_preflight_error(
+                            &request,
+                            Some(forced),
+                            use_override_entry_point,
+                        );
+                        assert_eq!(loads, 0, "wallet accessed for {forced} vs {offered}");
+                        let Error::PaymentRejected(message) = error else {
+                            panic!("expected network rejection for {forced} vs {offered}: {error}");
+                        };
+                        assert!(message.contains(forced), "{message}");
+                        assert!(message.contains(offered), "{message}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn session_open_rejects_non_surfpool_blockhash_before_wallet_access() {
+        let request = test_request();
+        for use_override_entry_point in [false, true] {
+            let (error, loads) =
+                session_preflight_error(&request, Some("localnet"), use_override_entry_point);
+            assert_eq!(loads, 0);
+            let Error::PaymentRejected(message) = error else {
+                panic!("expected sandbox blockhash rejection: {error}");
+            };
+            assert!(message.contains("Surfpool"), "{message}");
+            assert!(
+                message.contains(request.method_details.recent_blockhash.as_deref().unwrap()),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn operator_session_open_rejects_non_surfpool_blockhash_before_wallet_access() {
+        let store = StopAtWalletStore::default();
+        let challenge = test_challenge_signed_by(SessionVoucherSigner::Operator);
+        let result = open_operator_signed_session_authorizations(
+            &challenge,
+            &store,
+            Some("localnet"),
+            None,
+            "https://merchant.example/session",
+            None,
+        );
+        assert_eq!(store.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let Err(Error::PaymentRejected(message)) = result else {
+            panic!("operator entry point must enforce sandbox blockhash intent");
+        };
+        assert!(message.contains("Surfpool"), "{message}");
+    }
+
+    #[test]
+    fn session_open_matching_networks_reach_wallet_access() {
+        for (network, blockhash) in [
+            ("mainnet", Some("ordinary-blockhash")),
+            ("devnet", Some("ordinary-blockhash")),
+            ("localnet", Some("SURFNETxSAFEHASH-fixture")),
+            ("localnet", None),
+        ] {
+            let mut request = test_request();
+            request.method_details.network = network.into();
+            request.method_details.recent_blockhash = blockhash.map(str::to_owned);
+            for use_override_entry_point in [false, true] {
+                let (error, loads) =
+                    session_preflight_error(&request, Some(network), use_override_entry_point);
+                assert_eq!(loads, 1, "matching {network} should pass network preflight");
+                assert!(
+                    matches!(error, Error::Config(ref message) if message == WALLET_ACCESS_SENTINEL)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn session_open_without_override_follows_challenge_network() {
+        for network in ["mainnet", "devnet", "localnet"] {
+            let mut request = test_request();
+            request.method_details.network = network.into();
+            for use_override_entry_point in [false, true] {
+                let (error, loads) =
+                    session_preflight_error(&request, None, use_override_entry_point);
+                assert_eq!(loads, 1, "no override should pass network preflight");
+                assert!(
+                    matches!(error, Error::Config(ref message) if message == WALLET_ACCESS_SENTINEL)
+                );
+            }
+        }
     }
 
     #[test]
