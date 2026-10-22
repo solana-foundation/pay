@@ -1967,6 +1967,16 @@ async fn run_batch(runtime: &SettlementRuntime) -> Result<SettleSessionsMetrics,
                     }
                 }
             }
+            if candidate.forfeited_accepted > 0 {
+                error!(
+                    scheme = "x402/batch",
+                    channel_id = %candidate.channel_id,
+                    %signature,
+                    settled = candidate.settled_on_chain,
+                    forfeited = candidate.forfeited_accepted,
+                    "batch channel sealed below its accepted cumulative was distributed; the accepted delta above settled is forfeited"
+                );
+            }
             info!(
                 scheme = "x402/batch",
                 stage = candidate.kind.label(),
@@ -2367,6 +2377,9 @@ struct BatchCandidate {
     before: ChannelInventorySnapshot,
     after: ChannelInventorySnapshot,
     settled_on_chain: u64,
+    /// Accepted cumulative above what a sealed channel settled. Sealing is
+    /// terminal, so this payout forfeits it; reported once it lands.
+    forfeited_accepted: u64,
 }
 
 fn batch_reconciliation_due(
@@ -2679,6 +2692,7 @@ async fn reconcile_batch_channel(
     );
     let distributed_metric = stablecoin_base_units_option(&onchain.mint(), distributed);
     let mut instructions = Vec::new();
+    let mut forfeited_accepted = 0;
     let (kind, store_action, after, confirmed_settled) = match onchain.channel.status {
         STATUS_OPEN => {
             let mut target_settled = onchain.channel.settlement.settled;
@@ -2780,6 +2794,7 @@ async fn reconcile_batch_channel(
                             &onchain.mint(),
                         ),
                         settled_on_chain: target_settled,
+                        forfeited_accepted: 0,
                     }),
                     delete_absent: false,
                     snapshot,
@@ -2885,8 +2900,14 @@ async fn reconcile_batch_channel(
         }
         STATUS_SEALED => {
             // A permissionless seal can land before this worker ever reads
-            // Closing; finalizing then would silently drop the accepted delta.
-            require_settled_covers_accepted(&state, &onchain, "distribute")?;
+            // Closing, below the accepted cumulative. Sealing is terminal: no
+            // settle can raise it any more, and holding the channel would only
+            // strand the settled payout (anyone can still crank `distribute`).
+            // So it is distributed, and the forfeited delta reported once the
+            // payout lands rather than dropped silently.
+            forfeited_accepted = state
+                .cumulative
+                .saturating_sub(onchain.channel.settlement.settled);
             let Some(distribution) = batch_distribution(
                 rpc,
                 rpc_url,
@@ -2969,6 +2990,7 @@ async fn reconcile_batch_channel(
             before: snapshot,
             after,
             settled_on_chain: confirmed_settled,
+            forfeited_accepted,
         }),
         delete_absent: false,
         snapshot,
@@ -2979,10 +3001,10 @@ async fn reconcile_batch_channel(
     })
 }
 
-/// Refuse to `action` a batch channel whose on-chain settlement is below the
-/// cumulative this service accepted and served: that terminal step would
-/// finalize the record and drop the delta. The record stays, and the error
-/// surfaces every pass until an operator resolves it.
+/// Refuse to `action` (seal) a batch channel whose on-chain settlement is
+/// below the cumulative this service accepted and served: sealing it would
+/// forfeit the delta for good. The record stays, and the error surfaces every
+/// pass until an operator resolves it.
 fn require_settled_covers_accepted(
     state: &ChannelState,
     onchain: &channel::DecodedChannel,
@@ -6142,22 +6164,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_channel_sealed_below_its_accepted_cumulative_is_never_finalized() {
+    async fn a_channel_sealed_below_its_accepted_cumulative_is_distributed_and_reports_the_loss() {
         let (state, mut onchain, operator) = batch_closing_fixture();
         // A permissionless seal landed before the worker read Closing: 300
-        // was accepted and served, only 100 is settled on chain.
+        // was accepted and served, only 100 is settled on chain, and a sealed
+        // channel can never settle more.
         onchain.channel.status = STATUS_SEALED;
         assert!(state.cumulative > onchain.channel.settlement.settled);
-        let error = reconcile_closing_batch(state.clone(), &onchain, &operator, 0)
+        let candidate = reconcile_closing_batch(state.clone(), &onchain, &operator, 0)
             .await
-            .err()
+            .unwrap()
+            .candidate
             .unwrap();
-        assert!(
-            error.to_string().contains("refusing to distribute below"),
-            "{error}"
-        );
+        assert_eq!(candidate.kind, BatchCandidateKind::Payout);
+        assert!(distributes(&candidate.instructions));
+        assert_eq!(candidate.settled_on_chain, 100);
+        assert_eq!(candidate.forfeited_accepted, 200);
+        assert!(candidate.after.rent_unclaimed, "distributed");
 
-        // Fully settled, the same sealed channel pays out and finalizes.
+        // Positive control: fully settled, the same payout forfeits nothing.
         let mut settled = state;
         settled.cumulative = onchain.channel.settlement.settled;
         let candidate = reconcile_closing_batch(settled, &onchain, &operator, 0)
@@ -6166,6 +6191,7 @@ mod tests {
             .candidate
             .unwrap();
         assert_eq!(candidate.kind, BatchCandidateKind::Payout);
+        assert_eq!(candidate.forfeited_accepted, 0);
         assert!(matches!(
             candidate.store_action,
             BatchStoreAction::MarkFinalized
