@@ -1605,18 +1605,43 @@ fn reads_body_from_stdin(args: &[String], tool: ToolKind) -> bool {
             (ToolKind::Curl, OptionName::Short('T') | OptionName::Long("upload-file")) => {
                 matches!(value, "-" | ".")
             }
+            // `--data-raw` and `--form-string` are always literal.
             (
                 ToolKind::Curl,
-                OptionName::Short('d' | 'F')
-                | OptionName::Long(
-                    "data" | "data-ascii" | "data-binary" | "data-raw" | "data-urlencode" | "json"
-                    | "form" | "form-string",
-                ),
-            ) => value.contains("@-") || value.contains("<-"),
+                OptionName::Short('d')
+                | OptionName::Long("data" | "data-ascii" | "data-binary" | "json"),
+            ) => value == "@-",
+            (ToolKind::Curl, OptionName::Long("data-urlencode")) => {
+                curl_urlencode_reads_stdin(value)
+            }
+            (ToolKind::Curl, OptionName::Short('F') | OptionName::Long("form")) => {
+                curl_form_reads_stdin(value)
+            }
             (ToolKind::Wget, OptionName::Long("post-file" | "body-file")) => value == "-",
             _ => false,
         }
     })
+}
+
+/// `--data-urlencode` reads a file when an `@` comes before any `=`
+/// (`@file`, `name@file`); the file `-` is stdin.
+fn curl_urlencode_reads_stdin(value: &str) -> bool {
+    match value.find(['=', '@']) {
+        Some(at) if value[at..].starts_with('@') => &value[at + 1..] == "-",
+        _ => false,
+    }
+}
+
+/// `-F name=@file` uploads and `-F name=<file` inlines a file, optionally
+/// followed by `;type=...` parameters; the file `-` is stdin.
+fn curl_form_reads_stdin(value: &str) -> bool {
+    let Some((_, content)) = value.split_once('=') else {
+        return false;
+    };
+    let Some(file) = content.strip_prefix(['@', '<']) else {
+        return false;
+    };
+    file.split(';').next() == Some("-")
 }
 
 /// Heuristic: find the URL from command args.
@@ -3292,6 +3317,36 @@ mod pre_attach_tests {
             assert!(pays(&["-L", "-d", "@-"], ToolKind::Curl, &via(status)).is_err());
             assert!(pays(&["-L", "-T", "-"], ToolKind::Curl, &via(status)).is_err());
             assert!(pays(&["--post-file=-"], ToolKind::Wget, &via(status)).is_err());
+            for stdin in [
+                &["--data-binary", "@-"][..],
+                &["--json", "@-"],
+                &["--data-urlencode", "@-"],
+                &["--data-urlencode", "q@-"],
+                &["-F", "f=@-"],
+                &["-F", "f=<-;type=text/plain"],
+            ] {
+                let args = [&["-L"][..], stdin].concat();
+                assert!(
+                    pays(&args, ToolKind::Curl, &via(status)).is_err(),
+                    "{stdin:?}"
+                );
+            }
+            // Bodies that only look like stdin are literal and can be resent.
+            for literal in [
+                &["--data-raw", "@-"][..],
+                &["--data-raw", "a<-b"],
+                &["--form-string", "f=@-"],
+                &["--form-string", "f=<-"],
+                &["-d", "a@-b"],
+                &["--data-urlencode", "q=@-"],
+                &["-F", "f=a<-b"],
+            ] {
+                let args = [&["-L"][..], literal].concat();
+                assert!(
+                    pays(&args, ToolKind::Curl, &via(status)).is_ok(),
+                    "{literal:?}"
+                );
+            }
         }
         // Positive controls: a GET or HEAD is the same request after any
         // redirect, and without a redirect any request is replayed as is.
