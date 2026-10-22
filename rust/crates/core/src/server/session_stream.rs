@@ -172,7 +172,9 @@ pub struct DelegatedSessionStreamMeter {
     accumulator: StreamUsageAccumulator,
     current: UsageObservation,
     priced_context_length: Option<u64>,
-    clamp_reprice_to_authorized: bool,
+    /// The next charge settles at most the authorization instead of
+    /// failing: a usage-only reprice, or the stream's final charge.
+    clamp_charge_to_authorized: bool,
     authorization_exhausted: bool,
     next_lifecycle_touch: Instant,
     observer: Option<MeteredSettlement>,
@@ -229,7 +231,7 @@ impl DelegatedSessionStreamMeter {
             accumulator: StreamUsageAccumulator::new(spec, hints),
             current,
             priced_context_length,
-            clamp_reprice_to_authorized: false,
+            clamp_charge_to_authorized: false,
             authorization_exhausted: false,
             next_lifecycle_touch: Instant::now() + LIFECYCLE_TOUCH_INTERVAL,
             observer: None,
@@ -266,11 +268,13 @@ impl DelegatedSessionStreamMeter {
         .is_ok_and(|spec| has_stream_observable_dimension(&spec))
     }
 
-    /// Observe one chunk and refuse it unless the stream, released so far
-    /// plus this chunk, could still be paid for in full: missing provider
-    /// usage settles at its upper bounds once the stream ends, so live lower
-    /// bounds alone would let output out that the final charge cannot cover.
-    /// A refused chunk is not counted toward the stream's usage.
+    /// Observe one chunk and refuse it unless its live usage fits the
+    /// request's authorization. Live usage is a lower bound (provider usage,
+    /// else whitespace words); missing usage settles at its upper bounds once
+    /// the stream ends, capped at the authorization (see [`Self::settle`]).
+    /// Withholding on the upper bound instead would cut ordinary answers whose
+    /// provider usage only arrives in the final chunk. A refused chunk is not
+    /// counted toward the stream's usage.
     fn observe_chunk(
         &mut self,
         chunk: &[u8],
@@ -281,22 +285,28 @@ impl DelegatedSessionStreamMeter {
             self.gate.clone(),
             self.current.clone(),
             self.priced_context_length,
-            self.clamp_reprice_to_authorized,
+            self.clamp_charge_to_authorized,
         );
         let decision = self.observe_unreleased_chunk(chunk, is_sse)?;
+        let authorized = self.authorized_base_units();
         // A clamped reprice already settles for everything authorized.
-        if decision.is_some()
-            && !self.clamp_reprice_to_authorized
-            && let Err(error) = self.ensure_worst_case_authorized()
+        if let Some(target) = decision
+            .as_ref()
+            .map(SessionGateDecision::target_cumulative_base_units)
+            && !self.clamp_charge_to_authorized
+            && target > authorized
         {
             (
                 self.accumulator,
                 self.gate,
                 self.current,
                 self.priced_context_length,
-                self.clamp_reprice_to_authorized,
+                self.clamp_charge_to_authorized,
             ) = released;
-            return Err(error);
+            return Err(box_error(std::io::Error::other(format!(
+                "delegated session {} requires cumulative {target}, above authorized {authorized}",
+                self.forward.channel_id
+            ))));
         }
         Ok(decision)
     }
@@ -305,23 +315,6 @@ impl DelegatedSessionStreamMeter {
         self.forward
             .committed_base_units
             .saturating_add(self.forward.available_base_units)
-    }
-
-    fn ensure_worst_case_authorized(&self) -> Result<(), BoxError> {
-        let worst_case = self
-            .gate
-            .clone()
-            .observe(self.accumulator.upper_bound_observation(), GateMode::Final)
-            .map_err(box_error)?
-            .target_cumulative_base_units();
-        let authorized = self.authorized_base_units();
-        if worst_case > authorized {
-            return Err(box_error(std::io::Error::other(format!(
-                "delegated session {} could owe cumulative {worst_case} without provider usage, above authorized {authorized}",
-                self.forward.channel_id
-            ))));
-        }
-        Ok(())
     }
 
     fn observe_unreleased_chunk(
@@ -359,30 +352,34 @@ impl DelegatedSessionStreamMeter {
         self.final_decision()
     }
 
+    /// The stream's final charge. Its output is already released, so the
+    /// charge is capped at the request's authorization rather than refused:
+    /// missing provider usage rates at upper bounds that can exceed what the
+    /// live lower bounds admitted, and the buyer never authorized more.
     fn final_decision(&mut self) -> MeteringResult<Option<SessionGateDecision>> {
         if !self.accumulator.has_observation() || self.authorization_exhausted {
             return Ok(None);
         }
-        self.gate
-            .observe(self.current.clone(), GateMode::Final)
-            .map(Some)
+        let decision = self.gate.observe(self.current.clone(), GateMode::Final)?;
+        self.clamp_charge_to_authorized = true;
+        Ok(Some(decision))
     }
 
     async fn settle(&mut self, decision: SessionGateDecision) -> Result<(), BoxError> {
         self.resolve_in_flight().await?;
-        let clamp_reprice_to_authorized = std::mem::take(&mut self.clamp_reprice_to_authorized);
+        let clamp_charge_to_authorized = std::mem::take(&mut self.clamp_charge_to_authorized);
         if !decision.requires_voucher() {
             return Ok(());
         }
         let requested_target = decision.target_cumulative_base_units();
         let committed = self.gate.committed_base_units();
         let authorized = self.authorized_base_units();
-        let target = if clamp_reprice_to_authorized {
+        let target = if clamp_charge_to_authorized {
             requested_target.min(authorized)
         } else {
             requested_target
         };
-        let exhausted_by_reprice = clamp_reprice_to_authorized && requested_target > authorized;
+        let exhausted_by_clamp = clamp_charge_to_authorized && requested_target > authorized;
         if target > authorized {
             return Err(box_error(std::io::Error::other(format!(
                 "delegated session {} requires cumulative {target}, above authorized {authorized}",
@@ -391,7 +388,7 @@ impl DelegatedSessionStreamMeter {
         }
         let amount = target.saturating_sub(committed);
         if amount == 0 {
-            self.authorization_exhausted |= exhausted_by_reprice;
+            self.authorization_exhausted |= exhausted_by_clamp;
             return Ok(());
         }
         let handle = Arc::clone(&self.forward.handle);
@@ -403,7 +400,7 @@ impl DelegatedSessionStreamMeter {
             }),
         });
         self.resolve_in_flight().await?;
-        self.authorization_exhausted |= exhausted_by_reprice;
+        self.authorization_exhausted |= exhausted_by_clamp;
         self.forward
             .handle
             .touch_after_delegated_usage(&self.forward.channel_id)
@@ -468,7 +465,7 @@ impl DelegatedSessionStreamMeter {
         self.accumulator.reconfigure(spec, hints);
         self.gate = gate;
         self.priced_context_length = Some(context_length);
-        self.clamp_reprice_to_authorized = usage_only_chunk;
+        self.clamp_charge_to_authorized = usage_only_chunk;
         Ok(())
     }
 
@@ -1122,14 +1119,6 @@ impl StreamUsageAccumulator {
         } else {
             floor
         }
-    }
-
-    /// The observation this stream would settle if it ended now: missing
-    /// provider usage at its upper bounds.
-    fn upper_bound_observation(&self) -> UsageObservation {
-        let mut bounded = self.clone();
-        bounded.finished = true;
-        bounded.observation()
     }
 
     fn observation(&self) -> UsageObservation {
@@ -2833,6 +2822,26 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
         label: &str,
         capacity: u64,
     ) -> (Arc<SessionMpp>, String, Vec<u8>, Result<(), BoxError>) {
+        // One whitespace word, 512 UTF-8 bytes: the live lower bound is far
+        // below what the stream settles if the provider never reports usage.
+        capacity_bound_chunks(
+            label,
+            capacity,
+            vec![
+                sse_text_event(&"!?".repeat(256)),
+                b"data: [DONE]\n\n".to_vec(),
+            ],
+        )
+        .await
+    }
+
+    /// Streams `chunks` under `capacity`, returning what reached the client
+    /// and how the stream ended.
+    async fn capacity_bound_chunks(
+        label: &str,
+        capacity: u64,
+        chunks: Vec<Vec<u8>>,
+    ) -> (Arc<SessionMpp>, String, Vec<u8>, Result<(), BoxError>) {
         let store: Arc<dyn ChannelStore> = Arc::new(MemoryChannelStore::new());
         let channel = delegated_channel(label, &store).await;
         let meter = delegated_meter_with_capacity(
@@ -2845,12 +2854,11 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             capacity,
         )
         .await;
-        // One whitespace word, 512 UTF-8 bytes: the live lower bound is far
-        // below what the stream settles if the provider never reports usage.
-        let upstream = futures_util::stream::iter([
-            Ok::<_, std::io::Error>(Bytes::from(sse_text_event(&"!?".repeat(256)))),
-            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
-        ]);
+        let upstream = futures_util::stream::iter(
+            chunks
+                .into_iter()
+                .map(|chunk| Ok::<_, std::io::Error>(Bytes::from(chunk))),
+        );
         let metered = meter_delegated_response_stream(upstream, meter, true);
         futures_util::pin_mut!(metered);
         let mut served = Vec::new();
@@ -2868,29 +2876,25 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
     }
 
     #[tokio::test]
-    async fn delegated_stream_withholds_output_its_authorization_cannot_cover() {
+    async fn delegated_stream_missing_usage_settles_its_whole_authorization() {
+        // SOLA1-274: the text is released at its one-word lower bound and
+        // the provider never reports usage. The 512-byte bound exceeds the
+        // authorization, so the charge is the whole authorization, never the
+        // provisional lower bound, and the stream does not fail after the
+        // output is out.
         let (session, channel_id, served, outcome) =
             capacity_bound_stream("bound-above-capacity", 100).await;
 
-        assert!(served.is_empty(), "the text must not be released");
-        let error = outcome.expect_err("the stream must fail");
-        assert!(
-            error.to_string().contains("above authorized 100"),
-            "unexpected error: {error}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(
-            session.committed_watermark(&channel_id).unwrap_or(0),
-            0,
-            "nothing was released, so nothing is charged"
-        );
+        outcome.expect("a capped final charge does not fail the stream");
+        assert!(served.ends_with(b"data: [DONE]\n\n"));
+        assert_eq!(session.committed_watermark(&channel_id), Some(100));
         assert!(
             session
                 .reserve_delegated_capacity(&channel_id, 1)
                 .await
                 .unwrap()
                 .is_some(),
-            "the refused stream releases its capacity"
+            "the finished stream releases its capacity"
         );
     }
 
@@ -2902,6 +2906,62 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
         outcome.unwrap();
         assert!(served.ends_with(b"data: [DONE]\n\n"));
         assert_eq!(session.committed_watermark(&channel_id), Some(512));
+    }
+
+    /// 60 events of 4 words and 20 bytes, then the usage `include_usage`
+    /// delivers in the final chunk.
+    fn answer_with_trailing_usage() -> (Vec<Vec<u8>>, Vec<u8>) {
+        let event = sse_text_event("The quick brown fox ");
+        let mut chunks = vec![event.clone(); 60];
+        chunks.push(b"data: {\"choices\":[],\"usage\":{\"completion_tokens\":300}}\n\n".to_vec());
+        chunks.push(b"data: [DONE]\n\n".to_vec());
+        (chunks, event)
+    }
+
+    #[tokio::test]
+    async fn a_stream_whose_usage_arrives_last_is_not_cut_at_its_byte_bound() {
+        let (chunks, event) = answer_with_trailing_usage();
+        let expected: Vec<u8> = chunks.concat();
+        let (session, channel_id, served, outcome) =
+            capacity_bound_chunks("usage-arrives-last", 1_000, chunks).await;
+
+        outcome.expect("the answer fits its authorization");
+        assert_eq!(
+            served
+                .windows(event.len())
+                .filter(|window| *window == event)
+                .count(),
+            60,
+            "every event is delivered"
+        );
+        assert!(served == expected, "the whole stream is relayed");
+        assert_eq!(
+            session.committed_watermark(&channel_id),
+            Some(300),
+            "the provider's usage is the charge, not the byte bound"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stream_whose_live_usage_exceeds_its_authorization_is_cut() {
+        let (chunks, event) = answer_with_trailing_usage();
+        // 4 words per event: the 26th crosses 100.
+        let (session, channel_id, served, outcome) =
+            capacity_bound_chunks("live-usage-exceeds", 100, chunks).await;
+
+        assert!(
+            outcome.is_err(),
+            "output beyond the authorization is withheld"
+        );
+        assert!(
+            served == event.repeat(25),
+            "25 events fit, the 26th is withheld"
+        );
+        assert_eq!(
+            settled_watermark(&session, &channel_id, 100).await,
+            Some(100),
+            "the cut stream settles no more than its authorization"
+        );
     }
 
     async fn interrupted_meter(
