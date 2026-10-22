@@ -104,6 +104,15 @@ fn main() {
     // rustls's process-wide provider before either subsystem can initialize.
     pay_proxy::install_crypto_provider();
 
+    // The `buzz` shim inside a Buzz-managed ACP adapter. Internal, and kept
+    // ahead of argument parsing and config so it has no other side effect.
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == commands::acp_buzz_relay::RELAY_ARG)
+    {
+        std::process::exit(commands::acp_buzz_relay::run_client());
+    }
+
     if commands::help::root_overview_help_requested() {
         if commands::help::args_include_no_dna() {
             no_dna::enable_for_process();

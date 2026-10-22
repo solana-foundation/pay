@@ -2,7 +2,9 @@
 //!
 //! ACP uses stdin/stdout for JSON-RPC. Launches are transparent outside Buzz;
 //! Buzz-managed launches add a stream middleware that publishes final assistant
-//! text when the model did not invoke `buzz messages send` itself. Provider
+//! text when the model did not invoke `buzz messages send` itself. The model's
+//! own `buzz messages send` is relayed through this process, which keeps the
+//! Buzz key ([`super::acp_buzz_relay`]). Provider
 //! selection uses the existing stderr-backed TUI when interactive, while
 //! `--provider`/`--model` (or their environment equivalents) make managed,
 //! headless launches deterministic.

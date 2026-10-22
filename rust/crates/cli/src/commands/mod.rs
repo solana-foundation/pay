@@ -1,5 +1,6 @@
 pub mod account;
 pub mod acp;
+pub(crate) mod acp_buzz_relay;
 mod acp_middleware;
 pub(crate) mod agent;
 pub(crate) mod agent_args;

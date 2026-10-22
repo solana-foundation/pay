@@ -10,8 +10,9 @@ use pay_acp::{BuzzDelivery, BuzzDeliveryTracker};
 const BUZZ_RELAY_URL_ENV: &str = "BUZZ_RELAY_URL";
 const BUZZ_PRIVATE_KEY_ENV: &str = "BUZZ_PRIVATE_KEY";
 
-/// Credentials only the parent's fallback publisher uses. The ACP adapter
-/// and the agent it runs must not inherit them.
+/// Credentials only the parent uses, for its fallback publisher and for the
+/// agent's relayed sends ([`super::acp_buzz_relay`]). The ACP adapter and the
+/// agent it runs must not inherit them.
 pub(crate) const PARENT_ONLY_ENV: &[&str] = &[BUZZ_RELAY_URL_ENV, BUZZ_PRIVATE_KEY_ENV];
 
 /// Whether this ACP launch has the credentials needed to publish as a
@@ -27,6 +28,21 @@ fn nonempty_env(name: &str) -> bool {
 /// Run an ACP child with stdin/stdout relayed byte-for-byte while observing
 /// complete NDJSON frames for Buzz delivery state.
 pub(super) fn run(mut command: Command) -> io::Result<i32> {
+    let tracker = Arc::new(Mutex::new(BuzzDeliveryTracker::default()));
+    // The agent's own `buzz messages send` goes through the parent, which
+    // holds the key the adapter is denied.
+    let _relay = match std::env::current_exe().and_then(|pay| {
+        super::acp_buzz_relay::BuzzRelay::start(Arc::clone(&tracker), "buzz".into(), &pay)
+    }) {
+        Ok(relay) => {
+            command.envs(relay.child_env()?);
+            Some(relay)
+        }
+        Err(error) => {
+            tracing::warn!(%error, "Pay ACP could not relay the agent's `buzz messages send`");
+            None
+        }
+    };
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -41,7 +57,6 @@ pub(super) fn run(mut command: Command) -> io::Result<i32> {
         .take()
         .ok_or_else(|| io::Error::other("ACP child stdout was not piped"))?;
 
-    let tracker = Arc::new(Mutex::new(BuzzDeliveryTracker::default()));
     let input_tracker = Arc::clone(&tracker);
     thread::spawn(move || relay_client_input(io::stdin(), child_stdin, input_tracker));
 
