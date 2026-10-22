@@ -1,7 +1,7 @@
 //! `POST /v1/redeem`
 //!
 //! Activation-campaign redemption. Takes a code + destination, looks up
-//! the gateway hot wallet's recent transactions via Helius, atomically claims
+//! the gateway hot wallet's pre-claim-store transactions via Helius, atomically claims
 //! the code in Redis, then builds + signs + broadcasts a transaction that pays
 //! the code's campaign amount of the configured token to the destination and
 //! stamps `Redeem code <code>` as a memo. Success is only reported once the
@@ -55,8 +55,9 @@ static MEMO_PROGRAM_ID: LazyLock<Pubkey> =
 /// have to use this exact phrasing + a real code to collide.
 const REDEEM_MEMO_PREFIX: &str = "Redeem code ";
 
-/// Cap on Helius pages walked per request. Eight pages covers the
-/// current campaigns with slack.
+/// Cap on Helius pages walked per request. The scan only walks the frozen
+/// pre-rollout history, so the cap has to cover that history once; eight
+/// pages covers it with slack.
 const DEFAULT_MAX_SCAN_PAGES: usize = 8;
 
 /// Helius enhanced-transactions page limit.
@@ -619,6 +620,12 @@ enum DedupScanError {
 /// `Redeem code <code>`. History matches are only candidates: each is fetched
 /// from the trusted RPC and must be a successful hot-wallet payout carrying
 /// the memo. Returns the verified signature when found.
+///
+/// Only legacy history is walked: every payout since the Redis rollout holds
+/// a durable claim, so the scan starts strictly before
+/// [`RedemptionState::legacy_scan_before`] and runs to the end of the frozen
+/// pre-rollout history. Its cost is fixed by that history, not by how much
+/// the wallet has done since.
 async fn find_prior_burn(
     state: &AppState,
     rpc_url: &str,
@@ -633,7 +640,7 @@ async fn find_prior_burn(
     let http = &cfg.http_client;
     let needle = redeem_memo(code);
     let hot_wallet_str = hot_wallet.to_string();
-    let mut cursor: Option<String> = None;
+    let mut cursor = cfg.legacy_scan_before.to_string();
 
     for page in 0..cfg.max_scan_pages {
         let mut url = reqwest::Url::parse(&format!(
@@ -651,9 +658,7 @@ async fn find_prior_burn(
             // silently exclude prior burns from the scan. Match purely on
             // the memo content so reclassification can't cause a miss.
             q.append_pair("limit", &HELIUS_PAGE_LIMIT.to_string());
-            if let Some(c) = cursor.as_deref() {
-                q.append_pair("before-signature", c);
-            }
+            q.append_pair("before-signature", &cursor);
         }
         let txs: Vec<HeliusTx> = http
             .get(url)
@@ -684,7 +689,9 @@ async fn find_prior_burn(
         if txs.len() < HELIUS_PAGE_LIMIT {
             return Ok(None);
         }
-        cursor = txs.last().map(|t| t.signature.clone());
+        if let Some(last) = txs.last() {
+            cursor.clone_from(&last.signature);
+        }
         if page + 1 == cfg.max_scan_pages {
             return Err(DedupScanError::PageCap);
         }
@@ -1034,6 +1041,9 @@ pub struct RedemptionState {
     pub solana_rpc_api_key: String,
     pub helius_base: String,
     pub max_scan_pages: usize,
+    /// The legacy history scan covers only transactions strictly older than
+    /// this one; see `redemption.legacy_scan_before_signature`.
+    pub legacy_scan_before: Signature,
     /// How long a request waits for its payout to confirm before answering
     /// with a pending status.
     pub confirm_timeout: std::time::Duration,
@@ -1111,6 +1121,10 @@ impl RedemptionState {
             .pool_idle_timeout(std::time::Duration::from_secs(30))
             .build()
             .expect("reqwest::Client builds with default tls");
+        let legacy_scan_before = crate::config::parse_legacy_scan_before_signature(
+            cfg.legacy_scan_before_signature.as_deref(),
+        )
+        .map_err(Error::SendNotConfigured)?;
         let claim_store = redis::Client::open(cfg.claim_store_url.as_str()).map_err(|error| {
             Error::SendNotConfigured(format!("invalid redemption.claim_store_url: {error}"))
         })?;
@@ -1124,6 +1138,7 @@ impl RedemptionState {
             solana_rpc_api_key: cfg.solana_rpc_api_key.clone(),
             helius_base: cfg.helius_base.clone(),
             max_scan_pages: cfg.max_scan_pages.unwrap_or(DEFAULT_MAX_SCAN_PAGES),
+            legacy_scan_before,
             confirm_timeout: REDEEM_CONFIRM_TIMEOUT,
             grants,
             http_client,
@@ -1222,6 +1237,7 @@ pub(crate) mod tests {
             enabled: true,
             amount: 5_000_000,
             claim_store_url: "redis://127.0.0.1/".to_string(),
+            legacy_scan_before_signature: Some(Signature::from([7u8; 64]).to_string()),
             codes: vec!["LEGACY123".to_string()],
             campaigns: vec![
                 RedemptionCampaignConfig {
@@ -1480,23 +1496,29 @@ pub(crate) mod tests {
         }
 
         /// Newest-first history paged like the provider: `limit` entries
-        /// strictly older than `before-signature`.
+        /// strictly older than `before-signature`, which must be in history.
         async fn helius_handler(
             State(history): State<Arc<Mutex<Vec<Value>>>>,
             Query(query): Query<HashMap<String, String>>,
-        ) -> Json<Value> {
+        ) -> Result<Json<Value>, StatusCode> {
             let history = history.lock().unwrap();
-            let start = query
-                .get("before-signature")
-                .and_then(|before| history.iter().position(|tx| tx["signature"] == **before))
-                .map_or(0, |position| position + 1);
+            let start = match query.get("before-signature") {
+                Some(before) => {
+                    history
+                        .iter()
+                        .position(|tx| tx["signature"] == **before)
+                        .ok_or(StatusCode::BAD_REQUEST)?
+                        + 1
+                }
+                None => 0,
+            };
             let limit = query
                 .get("limit")
                 .and_then(|limit| limit.parse().ok())
                 .unwrap_or(usize::MAX);
-            Json(Value::Array(
+            Ok(Json(Value::Array(
                 history.iter().skip(start).take(limit).cloned().collect(),
-            ))
+            )))
         }
 
         pub(super) struct Harness {
@@ -1509,6 +1531,13 @@ pub(crate) mod tests {
         }
 
         pub(super) const CODE: &str = "TESTCODE1";
+
+        /// The first hot-wallet transaction after the Redis rollout. The
+        /// harness history starts with it, so entries pushed after it are
+        /// legacy history and entries inserted before it are newer.
+        pub(super) fn rollout_signature() -> Signature {
+            Signature::from([7u8; 64])
+        }
 
         async fn serve(router: Router) -> String {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1527,7 +1556,10 @@ pub(crate) mod tests {
                         .with_state(rpc.clone()),
                 )
                 .await;
-                let history = Arc::new(Mutex::new(Vec::new()));
+                let history = Arc::new(Mutex::new(vec![json!({
+                    "signature": rollout_signature().to_string(),
+                    "instructions": [],
+                })]));
                 let helius_url = serve(
                     Router::new()
                         .route("/v0/addresses/{address}/transactions", get(helius_handler))
@@ -1565,6 +1597,7 @@ pub(crate) mod tests {
                     solana_rpc_api_key: "key".to_string(),
                     helius_base: helius_url,
                     max_scan_pages: 2,
+                    legacy_scan_before: rollout_signature(),
                     confirm_timeout: Duration::from_millis(300),
                     grants,
                     http_client: reqwest::Client::new(),
@@ -2049,6 +2082,46 @@ pub(crate) mod tests {
             assert_eq!(h.claim().await, None);
         }
 
+        /// `count` memo-less entries newer than the Redis rollout.
+        fn post_rollout_activity(h: &Harness, count: usize) {
+            let mut history = h.history.lock().unwrap();
+            for index in 0..count {
+                history.insert(
+                    0,
+                    json!({ "signature": format!("recent-{index}"), "instructions": [] }),
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn post_rollout_history_does_not_count_against_the_scan_budget() {
+            let Some(h) = Harness::new().await else {
+                return;
+            };
+            // Ten times the page cap of activity since the rollout, which
+            // Redis claims already cover.
+            post_rollout_activity(&h, 10 * 2 * super::super::HELIUS_PAGE_LIMIT);
+            filler(&h, "legacy", 50, 1_000);
+            let (status, body) = h.redeem(&Pubkey::new_unique()).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(h.sent().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_legacy_payout_behind_post_rollout_history_still_blocks_the_code() {
+            let Some(h) = Harness::new().await else {
+                return;
+            };
+            post_rollout_activity(&h, 10 * 2 * super::super::HELIUS_PAGE_LIMIT);
+            filler(&h, "legacy", 150, 1_000);
+            let hot = h.hot_wallet();
+            h.index_candidate("LegacySig", h.payout_tx(&hot, &hot, Value::Null));
+            let (status, body) = h.redeem(&Pubkey::new_unique()).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+            assert_eq!(body["signature"], "LegacySig");
+            assert!(h.sent().is_empty());
+        }
+
         /// `count` memo-less history entries named `{prefix}-{index}`.
         fn filler(h: &Harness, prefix: &str, count: usize, timestamp: i64) {
             let mut history = h.history.lock().unwrap();
@@ -2086,7 +2159,8 @@ pub(crate) mod tests {
             let Some(h) = Harness::new().await else {
                 return;
             };
-            // Two full pages with no end of history in reach (cap is two).
+            // Two full pages of legacy history with no end in reach (cap is
+            // two): a code cannot be proven unused.
             filler(&h, "busy", 250, 1_000);
             let (status, body) = h.redeem(&Pubkey::new_unique()).await;
             assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
