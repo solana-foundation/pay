@@ -164,7 +164,7 @@ async fn gate_adapter<S: PaymentState>(state: S, req: Request<Body>, next: Next)
                     // Delegated sessions are settled from the completed
                     // response below. The client-voucher stream context waits
                     // for client commits and must not be installed here.
-                    if let Err(rejection) = require_identity_encoding(req.headers()) {
+                    if let Err(rejection) = require_readable_body(req.headers(), Some(&sf), None) {
                         return rejection.into_response();
                     }
                     if let Some(force_stream_usage) = session_body_preparation(&path, &sf) {
@@ -533,12 +533,7 @@ pub fn prepare_metered_forward_body(
     session: Option<&mut crate::server::gate::SessionForward>,
     upto: Option<&mut metering::UptoSettlementPlan>,
 ) -> Result<Option<Vec<u8>>, MeteredBodyRejection> {
-    let delegated = session
-        .as_ref()
-        .is_some_and(|forward| forward.settlement.is_some());
-    if delegated || upto.is_some() {
-        require_identity_encoding(headers)?;
-    }
+    require_readable_body(headers, session.as_deref(), upto.as_deref())?;
     let mut prepared = None;
     if let Some(plan) = upto
         && let Some(force_stream_usage) = upto_body_preparation(path, headers, plan)
@@ -559,6 +554,31 @@ pub fn prepare_metered_forward_body(
         prepared = Some(bytes);
     }
     Ok(prepared)
+}
+
+/// Whether pricing a forward reads its request body: a usage-metered price
+/// bounds unreported input by the body's size and may select its price from
+/// the body's model. Fixed and flat per-request prices never look at it.
+fn prices_from_request_body(plan: &metering::UptoSettlementPlan) -> bool {
+    metering::flat_request_price(&plan.metering).is_none()
+}
+
+/// Refuse a compressed body on a forward whose price reads it (see
+/// [`require_identity_encoding`]); any other forward relays it as sent.
+fn require_readable_body(
+    headers: &HeaderMap,
+    session: Option<&crate::server::gate::SessionForward>,
+    upto: Option<&metering::UptoSettlementPlan>,
+) -> Result<(), MeteredBodyRejection> {
+    let reads_body = session
+        .and_then(crate::server::gate::SessionForward::metered_plan)
+        .into_iter()
+        .chain(upto)
+        .any(prices_from_request_body);
+    if reads_body {
+        require_identity_encoding(headers)?;
+    }
+    Ok(())
 }
 
 /// Metered forwards rate the body they send, so it must be sent as is: the
@@ -589,7 +609,8 @@ async fn prepare_upto_request_body(
     path: &str,
     plan: &metering::UptoSettlementPlan,
 ) -> Result<(Request<Body>, Option<String>), Response> {
-    require_identity_encoding(request.headers()).map_err(MeteredBodyRejection::into_response)?;
+    require_readable_body(request.headers(), None, Some(plan))
+        .map_err(MeteredBodyRejection::into_response)?;
     let Some(force_stream_usage) = upto_body_preparation(path, request.headers(), plan) else {
         return Ok((request, plan.variant_hint.clone()));
     };
@@ -1655,6 +1676,56 @@ apis:
                 None,
             ),
             Ok(None)
+        );
+    }
+
+    #[test]
+    fn compressed_bodies_pass_when_the_price_never_reads_them() {
+        let body = br#"{"model":"premium"}"#;
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        let flat_plan = || metering::UptoSettlementPlan {
+            metering: serde_json::from_value(serde_json::json!({
+                "dimensions": [{
+                    "direction": "usage",
+                    "unit": "requests",
+                    "scale": 1,
+                    "tiers": [{"price_usd": 0.01}]
+                }]
+            }))
+            .unwrap(),
+            ..model_variant_plan()
+        };
+
+        // A fixed-price deployment session and a flat per-request price.
+        let mut fixed = session_forward(Some(crate::server::gate::SessionSettlementPlan::Fixed {
+            base_units: 1_000,
+        }));
+        assert_eq!(
+            prepare_metered_forward_body("v1/upload", &headers, body, Some(&mut fixed), None),
+            Ok(None)
+        );
+        let mut flat = session_forward(Some(crate::server::gate::SessionSettlementPlan::Metered(
+            Box::new(flat_plan()),
+        )));
+        assert!(
+            prepare_metered_forward_body("v1/upload", &headers, body, Some(&mut flat), None)
+                .is_ok()
+        );
+        let mut plan = flat_plan();
+        assert!(
+            prepare_metered_forward_body("v1/upload", &headers, body, None, Some(&mut plan))
+                .is_ok()
+        );
+        assert_eq!(
+            require_readable_body(&headers, Some(&fixed), None),
+            Ok(()),
+            "the axum delegated check agrees"
+        );
+        // Positive control: a usage-metered price still reads the body.
+        assert_eq!(
+            require_readable_body(&headers, Some(&delegated_forward()), None),
+            Err(MeteredBodyRejection::EncodedBody)
         );
     }
 
