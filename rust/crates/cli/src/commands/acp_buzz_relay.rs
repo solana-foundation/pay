@@ -18,9 +18,10 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -34,6 +35,12 @@ const TOKEN_ENV: &str = "PAY_ACP_BUZZ_RELAY_TOKEN";
 /// A message, its attachments excluded, fits well within this.
 const MAX_REQUEST_BYTES: u64 = 4 * 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
+/// The shim sends its whole request at once, so a few at a time suffice.
+/// Excess connections are closed before any thread is started for them.
+const MAX_CONNECTIONS: usize = 4;
+/// Reading one request may take this long in total, however slowly the
+/// bytes arrive, so a peer without the token cannot hold a slot.
+const REQUEST_DEADLINE: Duration = Duration::from_secs(5);
 /// The `messages send` options an agent may pass. Attachments read local
 /// files, `--broadcast` leaves the relay, and global options would pick
 /// another identity or relay.
@@ -71,6 +78,43 @@ pub(super) struct BuzzRelay {
     addr: SocketAddr,
     token: String,
     shim_dir: tempfile::TempDir,
+    /// Connections being served; at most [`Limits::max_connections`].
+    #[cfg(test)]
+    active: Arc<AtomicUsize>,
+}
+
+#[derive(Clone, Copy)]
+struct Limits {
+    max_connections: usize,
+    request_deadline: Duration,
+}
+
+impl Limits {
+    const DEFAULT: Self = Self {
+        max_connections: MAX_CONNECTIONS,
+        request_deadline: REQUEST_DEADLINE,
+    };
+}
+
+/// One of the relay's bounded connection slots, released on every exit path
+/// of the connection's worker, including a worker that never started.
+struct Slot(Arc<AtomicUsize>);
+
+impl Slot {
+    fn acquire(active: &Arc<AtomicUsize>, max: usize) -> Option<Self> {
+        active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < max).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| Self(Arc::clone(active)))
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl BuzzRelay {
@@ -82,6 +126,15 @@ impl BuzzRelay {
         buzz: PathBuf,
         client_exe: &Path,
     ) -> io::Result<Self> {
+        Self::start_with(tracker, buzz, client_exe, Limits::DEFAULT)
+    }
+
+    fn start_with(
+        tracker: Arc<Mutex<BuzzDeliveryTracker>>,
+        buzz: PathBuf,
+        client_exe: &Path,
+        limits: Limits,
+    ) -> io::Result<Self> {
         let listener = TcpListener::bind(("127.0.0.1", 0))?;
         let addr = listener.local_addr()?;
         let token = hex_token();
@@ -89,21 +142,34 @@ impl BuzzRelay {
         write_shim(shim_dir.path(), client_exe)?;
 
         let expected = token.clone();
+        let active = Arc::new(AtomicUsize::new(0));
+        let slots = Arc::clone(&active);
         thread::Builder::new()
             .name("pay-acp-buzz-relay".into())
             .spawn(move || {
                 for stream in listener.incoming().flatten() {
+                    // Over the cap: closed here, before any worker exists.
+                    let Some(slot) = Slot::acquire(&slots, limits.max_connections) else {
+                        continue;
+                    };
                     let (tracker, buzz, expected) =
                         (Arc::clone(&tracker), buzz.clone(), expected.clone());
+                    // A worker that fails to start drops its closure, and
+                    // with it the slot.
                     let _ = thread::Builder::new()
                         .name("pay-acp-buzz-send".into())
-                        .spawn(move || serve(stream, &expected, &tracker, &buzz));
+                        .spawn(move || {
+                            let _slot = slot;
+                            serve(stream, &expected, &tracker, &buzz, limits.request_deadline);
+                        });
                 }
             })?;
         Ok(Self {
             addr,
             token,
             shim_dir,
+            #[cfg(test)]
+            active,
         })
     }
 
@@ -162,15 +228,14 @@ fn serve(
     expected_token: &str,
     tracker: &Mutex<BuzzDeliveryTracker>,
     buzz: &Path,
+    deadline: Duration,
 ) {
-    let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
-    let mut line = String::new();
-    let read = BufReader::new((&stream).take(MAX_REQUEST_BYTES)).read_line(&mut line);
-    let response = match read
-        .ok()
-        .and_then(|_| serde_json::from_str::<Request>(&line).ok())
-    {
+    // A peer that cannot finish its request in time gets no answer.
+    let Ok(line) = read_request(&stream, Instant::now() + deadline) else {
+        return;
+    };
+    let response = match serde_json::from_slice::<Request>(&line).ok() {
         None => Response::refused("malformed relay request"),
         Some(request) if !constant_time_eq(&request.token, expected_token) => {
             Response::refused("this relay belongs to another launch")
@@ -196,6 +261,32 @@ fn serve(
     if let Ok(mut body) = serde_json::to_vec(&response) {
         body.push(b'\n');
         let _ = stream.write_all(&body);
+    }
+}
+
+/// One newline-terminated request of at most [`MAX_REQUEST_BYTES`], read
+/// before `deadline` in total: each read waits only for what remains.
+fn read_request(mut stream: &TcpStream, deadline: Instant) -> io::Result<Vec<u8>> {
+    let mut request = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        stream.set_read_timeout(Some(remaining))?;
+        let read = stream.read(&mut chunk)?;
+        if read == 0 {
+            return Ok(request);
+        }
+        request.extend_from_slice(&chunk[..read]);
+        if let Some(end) = request.iter().position(|byte| *byte == b'\n') {
+            request.truncate(end);
+            return Ok(request);
+        }
+        if request.len() as u64 > MAX_REQUEST_BYTES {
+            return Err(io::Error::other("relay request too large"));
+        }
     }
 }
 
@@ -507,5 +598,131 @@ mod tests {
         }
         // Nothing the adapter receives carries the key.
         assert!(env.iter().all(|(_, value)| value != "parent-key"));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod limit_tests {
+    use super::*;
+
+    const CHANNEL: &str = "82f078b8-29e4-40b8-9daf-79e7f79c482d";
+
+    /// A relay over a stand-in `buzz` that echoes its arguments.
+    fn relay(limits: Limits) -> (BuzzRelay, tempfile::TempDir) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let fake = tempfile::tempdir().unwrap();
+        let buzz = fake.path().join("buzz");
+        std::fs::write(&buzz, "#!/bin/sh\nprintf 'sent %s' \"$*\"\n").unwrap();
+        std::fs::set_permissions(&buzz, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut tracker = BuzzDeliveryTracker::default();
+        let prompt = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": "s",
+                "prompt": [{"type": "text", "text": format!("[Context]\nChannel: {CHANNEL}\n")}]
+            }
+        });
+        tracker.observe_client_frame(prompt.to_string().as_bytes());
+        let relay = BuzzRelay::start_with(
+            Arc::new(Mutex::new(tracker)),
+            buzz,
+            Path::new("/nonexistent/pay"),
+            limits,
+        )
+        .unwrap();
+        (relay, fake)
+    }
+
+    fn wait_for(active: &AtomicUsize, expected: usize) {
+        let until = Instant::now() + Duration::from_secs(5);
+        while active.load(Ordering::Acquire) != expected {
+            assert!(
+                Instant::now() < until,
+                "active connections never reached {expected}"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn send(relay: &BuzzRelay) -> io::Result<Response> {
+        send_request(
+            relay.addr,
+            &Request {
+                token: relay.token.clone(),
+                args: ["messages", "send", "--channel", CHANNEL, "--content", "hi"]
+                    .map(String::from)
+                    .to_vec(),
+                stdin: String::new(),
+            },
+        )
+    }
+
+    /// The peer's connection was closed without an answer.
+    fn closed_unanswered(mut stream: TcpStream) -> bool {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut answer = Vec::new();
+        match stream.read_to_end(&mut answer) {
+            Ok(_) => answer.is_empty(),
+            Err(error) => {
+                error.kind() != io::ErrorKind::WouldBlock && error.kind() != io::ErrorKind::TimedOut
+            }
+        }
+    }
+
+    #[test]
+    fn connections_beyond_the_cap_are_closed_until_a_slot_frees() {
+        let (relay, _fake) = relay(Limits {
+            max_connections: 2,
+            request_deadline: Duration::from_secs(30),
+        });
+        // Two peers without the token hold every slot.
+        let held: Vec<_> = (0..2)
+            .map(|_| TcpStream::connect(relay.addr).unwrap())
+            .collect();
+        wait_for(&relay.active, 2);
+
+        let excess = TcpStream::connect(relay.addr).unwrap();
+        assert!(closed_unanswered(excess));
+        assert!(send(&relay).is_err(), "a send got a worker past the cap");
+        assert_eq!(relay.active.load(Ordering::Acquire), 2);
+
+        drop(held);
+        wait_for(&relay.active, 0);
+        let sent = send(&relay).unwrap();
+        assert_eq!(sent.code, 0);
+        assert_eq!(
+            String::from_utf8(BASE64.decode(sent.stdout).unwrap()).unwrap(),
+            format!("sent messages send --channel={CHANNEL} --content=hi")
+        );
+        wait_for(&relay.active, 0);
+    }
+
+    #[test]
+    fn trickled_input_is_cut_at_the_request_deadline() {
+        let deadline = Duration::from_millis(300);
+        let (relay, _fake) = relay(Limits {
+            max_connections: 1,
+            request_deadline: deadline,
+        });
+        let mut trickle = TcpStream::connect(relay.addr).unwrap();
+        wait_for(&relay.active, 1);
+        // One byte every 50 ms never trips an idle timeout, only the total.
+        let started = Instant::now();
+        while relay.active.load(Ordering::Acquire) == 1 {
+            assert!(
+                started.elapsed() < deadline * 5,
+                "a trickling peer kept its worker past the deadline"
+            );
+            let _ = trickle.write_all(b"{");
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(started.elapsed() >= deadline - Duration::from_millis(50));
+        assert!(closed_unanswered(trickle));
+        // The freed slot serves an authenticated send.
+        assert_eq!(send(&relay).unwrap().code, 0);
     }
 }
