@@ -23,6 +23,7 @@ use std::time::SystemTime;
 /// meters each use against one channel's remaining capacity.
 #[derive(Default)]
 pub(crate) struct SessionCache {
+    authority_operations: crate::authority::Operations,
     authorizations: Mutex<HashMap<String, String>>,
     request_lock: Mutex<()>,
     /// Open x402 `batch-settlement` channels for this connection.
@@ -95,6 +96,10 @@ fn session_payer(
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Params {
+    #[schemars(
+        description = "Stable caller-scoped operation ID. Required only when the server enables an external spending authority; reusing it never starts another attempt."
+    )]
+    pub operation_id: Option<String>,
     #[schemars(description = "The URL to fetch (e.g. https://api.example.com/data)")]
     pub url: String,
     #[schemars(description = "HTTP method. Defaults to GET.")]
@@ -224,6 +229,7 @@ pub async fn run(
     peer: rmcp::Peer<rmcp::service::RoleServer>,
     session_cache: Arc<SessionCache>,
     scope: crate::context::CallScope,
+    authority: Option<crate::authority::AuthorityBinding>,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
     if params.body.is_some() && params.body_file.is_some() {
         return Ok(super::tool_error(
@@ -271,6 +277,23 @@ pub async fn run(
         RedirectPolicy::Follow
     };
 
+    let authority = match authority
+        .map(|binding| {
+            session_cache.authority_operations.start(
+                binding,
+                params.operation_id.as_deref(),
+                &method,
+                &url,
+                &headers,
+                body.as_ref(),
+            )
+        })
+        .transpose()
+    {
+        Ok(authority) => authority,
+        Err(error) => return Ok(pay_error_to_tool_result(error)),
+    };
+    let using_authority = authority.is_some();
     let response = tokio::task::spawn_blocking(move || {
         do_paid_fetch(
             &method,
@@ -281,10 +304,20 @@ pub async fn run(
             Some(peer),
             session_cache.as_ref(),
             &scope,
+            authority.as_ref(),
         )
     })
     .await
-    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+    .map_err(|e| {
+        rmcp::ErrorData::internal_error(
+            if using_authority {
+                "External spending authority: EXECUTION_INTERRUPTED".to_string()
+            } else {
+                e.to_string()
+            },
+            None,
+        )
+    })?;
 
     match response {
         Ok(response) => Ok(response.into_tool_result()),
@@ -1107,6 +1140,7 @@ fn do_paid_fetch(
     peer: Option<rmcp::Peer<rmcp::service::RoleServer>>,
     session_cache: &SessionCache,
     scope: &crate::context::CallScope,
+    authority: Option<&crate::authority::AuthorityAttempt>,
 ) -> Result<PaidFetchResult, pay_core::Error> {
     use pay_core::client::runner::RunOutcome;
 
@@ -1119,6 +1153,13 @@ fn do_paid_fetch(
         .lock()
         .map_err(|_| pay_core::Error::Mpp("MPP session request lock poisoned".to_string()))?;
 
+    // A quoted URL is immutable in authority mode: neither probe nor paid retry
+    // may redirect to a different resource without a fresh authorization.
+    let redirect_policy = if authority.is_some() {
+        RedirectPolicy::None
+    } else {
+        redirect_policy
+    };
     let fetch_request = |headers: &[(String, String)]| {
         pay_core::client::fetch::fetch_request_with_body_for_policy(
             pay_core::ClientApp::Mcp,
@@ -1163,7 +1204,10 @@ fn do_paid_fetch(
     // non-expired token), attach it BEFORE the first fetch. On hit the
     // server validates the token and skips the 402 entirely — no Touch
     // ID prompt, no extra round trip. On miss this is a no-op.
-    let cached_auth_header = pay_core::client::authenticate::cached_header_for_resource(store, url);
+    let cached_auth_header = authority
+        .is_none()
+        .then(|| pay_core::client::authenticate::cached_header_for_resource(store, url))
+        .flatten();
     let mut initial_headers: Vec<(String, String)> = match cached_auth_header.as_deref() {
         Some(token)
             if !extra_headers
@@ -1182,13 +1226,18 @@ fn do_paid_fetch(
         account_override.as_deref(),
     );
     let session_key = session_cache_key(&payer, method, url).ok();
-    let cached_session = session_key.as_deref().and_then(|key| {
-        (!initial_headers
-            .iter()
-            .any(|(name, _)| name.eq_ignore_ascii_case("authorization")))
-        .then(|| session_cache.authorization(key))
-        .flatten()
-    });
+    // With an external spending authority gating the flow, cached payment
+    // sessions must not shortcut it: only reuse sessions in authority-free runs.
+    let cached_session = session_key
+        .as_deref()
+        .filter(|_| authority.is_none())
+        .and_then(|key| {
+            (!initial_headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("authorization")))
+            .then(|| session_cache.authorization(key))
+            .flatten()
+        });
     if let Some(authorization) = cached_session.as_ref() {
         initial_headers.push(("Authorization".to_string(), authorization.clone()));
     }
@@ -1197,16 +1246,33 @@ fn do_paid_fetch(
     if scope.outbound_policy == pay_core::client::fetch::OutboundPolicy::PublicInternetOnly {
         reject_cross_origin_challenge(url, &outcome)?;
     }
-    if let Some(payment_network) = outcome.payment_network(network_override.as_deref())? {
+    // Fail closed before hardware/account probing or any signing-capability path.
+    if authority.is_some()
+        && !matches!(
+            &outcome,
+            RunOutcome::X402Challenge { .. } | RunOutcome::Completed { .. }
+        )
+    {
+        return Err(crate::authority::unsupported());
+    }
+    // With an external authority, hardware/account probing is deferred until
+    // after the authority verdict (see the X402Challenge arm below).
+    if authority.is_none()
+        && let Some(payment_network) = outcome.payment_network(network_override.as_deref())?
+    {
         account_override =
             prepare_hardware_account(store, &payment_network, account_override, peer.as_ref())?;
     }
-    let signer_support = outcome.configured_signer_support(
-        store,
-        network_override.as_deref(),
-        account_override.as_deref(),
-    )?;
-    let outcome = outcome.for_signer_support(signer_support);
+    let outcome = if authority.is_none() {
+        let signer_support = outcome.configured_signer_support(
+            store,
+            network_override.as_deref(),
+            account_override.as_deref(),
+        )?;
+        outcome.for_signer_support(signer_support)
+    } else {
+        outcome
+    };
 
     // A reused authorization that receives a 402 is no longer trustworthy.
     // Drop it before negotiating a fresh session from the server challenge.
@@ -1313,6 +1379,25 @@ fn do_paid_fetch(
         } => {
             if let Some(permissions) = &scope.payment_permissions {
                 permissions.authorize_x402(&challenge, &resource_url)?;
+            }
+            if let Some(authority) = authority {
+                let network = pay_core::client::x402::challenge_network(
+                    &challenge,
+                    network_override.as_deref(),
+                );
+                authority.authorize(&challenge, &network)?;
+                let selected = prepare_hardware_account(
+                    store,
+                    &network,
+                    account_override.clone(),
+                    peer.as_ref(),
+                )?;
+                // An interactive wallet switch changes the execution identity.
+                // Do not silently apply an earlier authority decision to it.
+                if selected != account_override {
+                    return Err(crate::authority::unsupported());
+                }
+                account_override = selected;
             }
             let built_payment = scope.with_approval(peer.as_ref(), |auth| {
                 pay_core::client::x402::build_payment_for_attempt(
@@ -2163,6 +2248,7 @@ mod tests {
             None,
             &cache,
             &scope,
+            None,
         );
         assert!(result.is_err());
     }
@@ -2628,5 +2714,101 @@ mod tests {
             Some("video/mp4")
         );
         assert_eq!(sniff_media_mime(b"just some plain text here"), None);
+    }
+}
+
+#[cfg(test)]
+mod external_authority_cache_tests {
+    use super::*;
+    use crate::authority::{
+        AuthorityBinding, AuthorityDecision, AuthorityUnavailable, SpendRequest, SpendingAuthority,
+    };
+    use std::{future::Future, pin::Pin};
+    struct Deny;
+    impl SpendingAuthority for Deny {
+        fn authorize(
+            &self,
+            _: SpendRequest,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<AuthorityDecision, AuthorityUnavailable>> + Send + '_>,
+        > {
+            Box::pin(async { Ok(AuthorityDecision::Deny) })
+        }
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cached_session_is_not_attached_before_external_authority() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/resource", listener.local_addr().unwrap());
+        let response_url = url.clone();
+        let merchant = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut raw = Vec::new();
+            loop {
+                let mut buf = [0; 2048];
+                let n = stream.read(&mut buf).unwrap();
+                assert_ne!(n, 0);
+                raw.extend_from_slice(&buf[..n]);
+                if raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let head = String::from_utf8(raw).unwrap().to_ascii_lowercase();
+            assert!(!head.contains("authorization:"));
+            assert!(!head.contains("payment-signature:"));
+            let challenge = serde_json::json!({"x402Version":2,"resource":{"url":response_url},"accepts":[{"scheme":"exact","network":"solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp","asset":"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v","amount":"10000","payTo":"11111111111111111111111111111111","maxTimeoutSeconds":60,"extra":{"decimals":6}}]});
+            let body = challenge.to_string();
+            let header = general_purpose::STANDARD.encode(body.as_bytes());
+            use std::io::Write;
+            write!(stream,"HTTP/1.1 402 Payment Required\r\nPayment-Required: {header}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+        });
+        let scope = crate::context::CallScope {
+            accounts: Arc::new(pay_core::accounts::MemoryAccountsStore::new()),
+            network_override: None,
+            account_override: None,
+            rpc_url_override: None,
+            approval: Arc::new(crate::context::LocalApproval),
+            payment_permissions: None,
+            body_files: false,
+            outbound_policy: pay_core::client::fetch::OutboundPolicy::Unrestricted,
+        };
+        let cache = SessionCache::default();
+        cache.store(
+            // do_paid_fetch derives the payer via session_payer(); with an empty
+            // MemoryAccountsStore that is the empty string, so preload the key the
+            // production flow would actually compute.
+            session_cache_key("", "GET", &url).unwrap(),
+            "must-not-be-attached".into(),
+        );
+        let attempt = cache
+            .authority_operations
+            .start(
+                AuthorityBinding::new("trusted", Arc::new(Deny)),
+                Some("cache-test"),
+                "GET",
+                &url,
+                &[],
+                None,
+            )
+            .unwrap();
+        let result = tokio::task::spawn_blocking(move || {
+            do_paid_fetch(
+                "GET",
+                &url,
+                &[],
+                None,
+                RedirectPolicy::Follow,
+                None,
+                &cache,
+                &scope,
+                Some(&attempt),
+            )
+        })
+        .await
+        .unwrap();
+        assert!(result.err().unwrap().to_string().contains("DENIED"));
+        merchant.join().unwrap();
     }
 }
