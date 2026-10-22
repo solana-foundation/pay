@@ -103,10 +103,6 @@ struct CodeGrant {
 enum TokenKind {
     Access,
     Refresh,
-    /// A rotated-out refresh token, kept until it would have expired so a
-    /// replay revokes its family. It lives in the token table itself: a
-    /// rotation that cannot record it cannot happen.
-    Retired,
 }
 
 /// A live token, keyed by its hash.
@@ -185,6 +181,12 @@ fn unix_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// The grant family a refresh token names (see [`Store::refresh`]).
+fn family_of(refresh_token: &str) -> Option<&str> {
+    let (family, secret) = refresh_token.split_once('.')?;
+    (!family.is_empty() && !secret.is_empty()).then_some(family)
 }
 
 /// Insert into a bounded map, sweeping expired rows when it is full.
@@ -487,6 +489,12 @@ impl Store {
 
     /// Refresh grant with rotation: the presented refresh token is retired
     /// and a new pair is issued.
+    ///
+    /// A refresh token is `<family>.<secret>`, so a rotated-out token still
+    /// names its family with no marker row kept for it: replay detection
+    /// costs no storage and cannot be crowded out. The family id only ever
+    /// appears inside the family's own refresh tokens, so whoever can name
+    /// it already holds one of them.
     pub fn refresh(
         &self,
         client_id: &str,
@@ -495,18 +503,17 @@ impl Store {
         let mut tokens = self.tokens.lock().unwrap();
         let refresh_hash = sha256_hex(refresh_token);
         let Some(record) = tokens.remove(&refresh_hash) else {
+            if let Some(family) = family_of(refresh_token)
+                && tokens.values().any(|token| token.family == family)
+            {
+                // A rotated-out token coming back means it leaked: end its family.
+                tokens.retain(|_, token| token.family != family);
+                tracing::warn!("refresh token reused; its grant family is revoked");
+            }
             return Err(TokenError::invalid_grant(
                 "unknown or already used refresh token",
             ));
         };
-        if record.kind == TokenKind::Retired {
-            // A rotated-out token coming back means it leaked: end its family.
-            tokens.retain(|_, token| token.family != record.family);
-            tracing::warn!("refresh token reused; its grant family is revoked");
-            return Err(TokenError::invalid_grant(
-                "unknown or already used refresh token",
-            ));
-        }
         if record.kind != TokenKind::Refresh {
             return Err(TokenError::invalid_grant("not a refresh token"));
         }
@@ -518,15 +525,11 @@ impl Store {
         if self.now() > record.expires_at {
             return Err(TokenError::invalid_grant("the refresh token has expired"));
         }
-        // The marker takes the presented token's row before the new pair is
-        // issued, so the pair exists only if the marker does.
-        tokens.insert(
-            refresh_hash.clone(),
-            TokenRecord {
-                kind: TokenKind::Retired,
-                ..record.clone()
-            },
-        );
+        // The new pair supersedes the family's access tokens, so a family
+        // holds one pair however often it rotates.
+        let superseded: Vec<(String, TokenRecord)> = tokens
+            .extract_if(|_, token| token.family == record.family)
+            .collect();
         match Self::issue_into(
             &mut tokens,
             self.now(),
@@ -538,6 +541,7 @@ impl Store {
         ) {
             Ok(issued) => Ok(issued),
             Err(err) => {
+                tokens.extend(superseded);
                 tokens.insert(refresh_hash, record);
                 Err(err)
             }
@@ -579,7 +583,7 @@ impl Store {
             ));
         }
         let access_token = random_token();
-        let refresh_token = random_token();
+        let refresh_token = format!("{family}.{}", random_token());
         for (token, kind, ttl) in [
             (&access_token, TokenKind::Access, ACCESS_TTL),
             (&refresh_token, TokenKind::Refresh, REFRESH_TTL),
@@ -1894,21 +1898,27 @@ mod tests {
         );
     }
 
-    /// Every rotation leaves a replay marker: when the table cannot hold one
-    /// the rotation does not happen, so a replay always ends the family.
+    /// A replay needs no stored marker, so it ends the family even when the
+    /// token table is full of other grants' rows.
     #[test]
-    fn a_rotation_that_cannot_record_its_marker_issues_nothing() {
+    fn a_replay_revokes_its_family_when_the_table_is_full() {
         let store = Store::new("https://cloud.test/");
         let (client, _) = store.register(grok_registration()).unwrap();
         let pair = issued_pair(&store, &client);
+        let first = store
+            .refresh(&client.client_id, &pair.refresh_token)
+            .unwrap();
+        let rotated = store
+            .refresh(&client.client_id, &first.refresh_token)
+            .unwrap();
         {
             let far = Instant::now() + REFRESH_TTL;
             let mut tokens = store.tokens.lock().unwrap();
-            for index in tokens.len()..MAX_ROWS - 1 {
+            for index in tokens.len()..MAX_ROWS {
                 tokens.insert(
                     format!("filler-{index}"),
                     TokenRecord {
-                        kind: TokenKind::Retired,
+                        kind: TokenKind::Access,
                         client_id: "other".to_string(),
                         subject: "other".to_string(),
                         scope: SCOPE.to_string(),
@@ -1919,31 +1929,87 @@ mod tests {
                 );
             }
         }
-        let full = store.refresh(&client.client_id, &pair.refresh_token);
-        assert_eq!(full.unwrap_err().error, "temporarily_unavailable");
-        assert!(
-            store.authenticate(&pair.access_token).is_some(),
-            "nothing lost"
-        );
-
-        // With room, the rotation succeeds and the old token is a marker.
-        store
-            .tokens
-            .lock()
-            .unwrap()
-            .retain(|hash, _| !hash.starts_with("filler-"));
-        let rotated = store
-            .refresh(&client.client_id, &pair.refresh_token)
+        // A rotation frees the rows it fills, so a full table still rotates.
+        let latest = store
+            .refresh(&client.client_id, &rotated.refresh_token)
             .unwrap();
-        assert!(store.authenticate(&rotated.access_token).is_some());
+        assert!(store.authenticate(&latest.access_token).is_some());
+
+        // Replaying any rotated-out generation still ends the family.
         assert!(
             store
                 .refresh(&client.client_id, &pair.refresh_token)
                 .is_err()
         );
         assert!(
-            store.authenticate(&rotated.access_token).is_none(),
+            store.authenticate(&latest.access_token).is_none(),
             "the replay ended the family"
+        );
+        assert!(
+            store
+                .refresh(&client.client_id, &latest.refresh_token)
+                .is_err()
+        );
+        assert_eq!(store.tokens.lock().unwrap().len(), MAX_ROWS - 2);
+    }
+
+    /// Rotation does not grow the table: one client refreshing in a loop
+    /// cannot starve other grants of refreshes or new code exchanges.
+    #[test]
+    fn looping_refreshes_do_not_exhaust_the_token_table() {
+        let store = Store::new("https://cloud.test/");
+        let (client, _) = store.register(grok_registration()).unwrap();
+        let bystander = issued_pair(&store, &client);
+        let looping = issued_pair(&store, &client);
+        let mut current = looping.clone();
+        for _ in 0..MAX_ROWS {
+            current = store
+                .refresh(&client.client_id, &current.refresh_token)
+                .unwrap();
+        }
+        assert_eq!(store.tokens.lock().unwrap().len(), 4, "one pair per family");
+        assert!(
+            store.authenticate(&looping.access_token).is_none(),
+            "a rotation supersedes the family's access tokens"
+        );
+        assert!(store.authenticate(&current.access_token).is_some());
+
+        let rotated = store
+            .refresh(&client.client_id, &bystander.refresh_token)
+            .unwrap();
+        assert!(store.authenticate(&rotated.access_token).is_some());
+        let fresh = issued_pair(&store, &client);
+        assert!(store.authenticate(&fresh.access_token).is_some());
+
+        // The loop's first token is still recognised as a replay.
+        assert!(
+            store
+                .refresh(&client.client_id, &looping.refresh_token)
+                .is_err()
+        );
+        assert!(store.authenticate(&current.access_token).is_none());
+        assert!(store.authenticate(&rotated.access_token).is_some());
+    }
+
+    /// Only a token naming a live family revokes it: an unknown token, or
+    /// one naming another family, leaves this one alone.
+    #[test]
+    fn an_unknown_refresh_token_revokes_nothing() {
+        let store = Store::new("https://cloud.test/");
+        let (client, _) = store.register(grok_registration()).unwrap();
+        let pair = issued_pair(&store, &client);
+        for stray in [
+            random_token(),
+            format!("{}.{}", random_token(), random_token()),
+            ".".to_string(),
+            pair.access_token.clone(),
+        ] {
+            assert!(store.refresh(&client.client_id, &stray).is_err());
+        }
+        assert!(
+            store
+                .refresh(&client.client_id, &pair.refresh_token)
+                .is_ok()
         );
     }
 
