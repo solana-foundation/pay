@@ -1766,7 +1766,7 @@ async fn sign_out_session(state: &AppState, headers: &HeaderMap) -> Result<(), A
     };
     // The same refresh-aware check approval uses: a token signed by a key
     // rotated in since the last fetch must still sign its session out.
-    let session = privy.authenticate(token).await.map_err(|why| {
+    let session = privy.identify_for_sign_out(token).await.map_err(|why| {
         tracing::info!(%why, "privy sign-out token refused");
         ApiError::new(
             StatusCode::UNAUTHORIZED,
@@ -3603,6 +3603,63 @@ mod tests {
             .await;
             assert_eq!(out.status, StatusCode::NO_CONTENT, "{}", out.body);
             assert!(oauth.authenticate(&access).is_none(), "access revoked");
+        }
+
+        /// Sign-out ends what a session approved even when its Privy token
+        /// is no longer accepted for sign-in: refused by a raised token
+        /// floor (a full sign-out list), or expired.
+        #[tokio::test]
+        async fn signing_out_a_refused_or_expired_privy_token_still_revokes() {
+            let (app, state, fake, _) = privy_app().await;
+            let client_id = register_grok(&app).await;
+            let oauth = state.oauth().unwrap();
+
+            // Refused: other users' sign-outs fill the list and raise the floor.
+            let token = fake.token_for(USER);
+            let (access, refresh) = privy_tokens(&app, &client_id, &token).await;
+            let privy = state.privy().unwrap();
+            for i in 0..=crate::privy::MAX_REVOKED_SESSIONS {
+                privy.revoke_session(&format!("sub_{i}"), &format!("sess_other_{i}"));
+            }
+            let request_id = start_authorization(&app, &client_id, None).await;
+            let refused = post_json_with(
+                &app,
+                &approve_path(&request_id),
+                json!({}),
+                None,
+                Some(&token),
+            )
+            .await;
+            assert_eq!(refused.status, StatusCode::UNAUTHORIZED, "{}", refused.body);
+            assert!(oauth.authenticate(&access).is_some());
+            let out =
+                post_json_with(&app, "/api/session/logout", json!({}), None, Some(&token)).await;
+            assert_eq!(out.status, StatusCode::NO_CONTENT, "{}", out.body);
+            assert!(oauth.authenticate(&access).is_none(), "access revoked");
+            assert!(oauth.refresh(&client_id, &refresh).is_err());
+
+            // Expired: the token that approved has lapsed by sign-out time.
+            // Past the raised floor, so these tokens sign in.
+            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let live = |sid: &str, exp: u64| {
+                fake.token(json!({
+                    "sub": USER, "aud": "app_test", "iss": "privy.io", "sid": sid,
+                    "exp": exp, "iat": now
+                }))
+            };
+            let (access, _) =
+                privy_tokens(&app, &client_id, &live("sess_expiring", now + 600)).await;
+            let (other, _) = privy_tokens(&app, &client_id, &live("sess_other", now + 600)).await;
+            let expired = live("sess_expiring", now - 120);
+            let out =
+                post_json_with(&app, "/api/session/logout", json!({}), None, Some(&expired)).await;
+            assert_eq!(out.status, StatusCode::NO_CONTENT, "{}", out.body);
+            assert!(oauth.authenticate(&access).is_none(), "access revoked");
+            assert!(oauth.authenticate(&other).is_some(), "other sessions live");
         }
 
         #[tokio::test]

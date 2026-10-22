@@ -57,7 +57,7 @@ const REVOKED_SESSION_TTL: Duration = Duration::from_secs(2 * 60 * 60);
 /// so no one user can fill the list.
 const MAX_SIGN_OUTS_PER_USER: usize = 8;
 /// Most revoked sessions remembered at once.
-const MAX_REVOKED_SESSIONS: usize = 65_536;
+pub(crate) const MAX_REVOKED_SESSIONS: usize = 65_536;
 
 #[derive(Clone)]
 pub struct Config {
@@ -379,6 +379,8 @@ pub struct Privy {
     /// The last refetch failed: a set due for one is no longer confirmed.
     refresh_failed: std::sync::atomic::AtomicBool,
     validation: jsonwebtoken::Validation,
+    /// [`Privy::validation`] without the expiry check, for sign-outs.
+    sign_out_validation: jsonwebtoken::Validation,
     /// Sign-outs remembered in this process.
     revoked: std::sync::Mutex<SignOuts>,
     /// Unix second before which no token is accepted. Sign-outs are
@@ -424,6 +426,8 @@ impl Privy {
         validation.set_issuer(&[ISSUER]);
         validation.set_audience(&[cfg.app_id.as_str()]);
         validation.set_required_spec_claims(&["exp", "sub", "aud", "iss"]);
+        let mut sign_out_validation = validation.clone();
+        sign_out_validation.validate_exp = false;
         let http = reqwest::Client::builder()
             .use_rustls_tls()
             .timeout(std::time::Duration::from_secs(20))
@@ -438,6 +442,7 @@ impl Privy {
             retry_after: JWKS_RETRY_AFTER,
             refresh_failed: std::sync::atomic::AtomicBool::new(false),
             validation,
+            sign_out_validation,
             revoked: Default::default(),
             not_before: std::sync::atomic::AtomicU64::new(unix_now()),
         })
@@ -454,6 +459,22 @@ impl Privy {
     /// Verify a token against keys refreshed from the JWKS when they have
     /// aged or do not name the token's `kid`.
     pub async fn authenticate(&self, access_token: &str) -> Result<Identity, String> {
+        self.refresh_keys_for(access_token).await?;
+        self.verify(access_token)
+    }
+
+    /// Who a sign-out bearer proves, and which session to end: a token
+    /// Privy signed for this app, refreshing keys as [`Privy::authenticate`]
+    /// does, even when it has expired or its session is already refused
+    /// here. Ending a session needs proof it was the caller's, not that it
+    /// is still live; refusing an expired or signed-out token would leave
+    /// what it approved live.
+    pub async fn identify_for_sign_out(&self, access_token: &str) -> Result<Identity, String> {
+        self.refresh_keys_for(access_token).await?;
+        self.decode(access_token, &self.sign_out_validation)
+    }
+
+    async fn refresh_keys_for(&self, access_token: &str) -> Result<(), String> {
         let kid = jsonwebtoken::decode_header(access_token.trim())
             .map_err(|e| e.to_string())?
             .kid;
@@ -463,7 +484,7 @@ impl Privy {
         {
             self.refresh_jwks().await;
         }
-        self.verify(access_token)
+        Ok(())
     }
 
     async fn refresh_jwks(&self) {
@@ -514,6 +535,20 @@ impl Privy {
     /// issuer, audience (this app), expiry. The subject is the user. Only
     /// [`Privy::authenticate`] calls this, after refreshing what is due.
     fn verify(&self, access_token: &str) -> Result<Identity, String> {
+        let identity = self.decode(access_token, &self.validation)?;
+        if !self.session_is_live(&subject_for_user(&identity.user_id), &identity.session) {
+            return Err("the Privy session was signed out".to_string());
+        }
+        Ok(identity)
+    }
+
+    /// The identity a token signed by the app's keys proves, under
+    /// `validation`, whether or not its session is still live.
+    fn decode(
+        &self,
+        access_token: &str,
+        validation: &jsonwebtoken::Validation,
+    ) -> Result<Identity, String> {
         let token = access_token.trim();
         let kid = jsonwebtoken::decode_header(token)
             .map_err(|e| e.to_string())?
@@ -536,7 +571,7 @@ impl Privy {
         let mut last = String::from("no verification key");
         let mut data = None;
         for key in set.keys.candidates(kid.as_deref()) {
-            match jsonwebtoken::decode::<Claims>(token, key, &self.validation) {
+            match jsonwebtoken::decode::<Claims>(token, key, validation) {
                 Ok(d) => {
                     data = Some(d);
                     break;
@@ -557,9 +592,6 @@ impl Privy {
             id: session,
             issued_at: data.claims.iat,
         };
-        if !self.session_is_live(&subject_for_user(&data.claims.sub), &session) {
-            return Err("the Privy session was signed out".to_string());
-        }
         Ok(Identity {
             user_id: data.claims.sub,
             session,
