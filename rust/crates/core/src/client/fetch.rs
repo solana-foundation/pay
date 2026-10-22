@@ -204,7 +204,7 @@ pub fn same_origin(left: &str, right: &str) -> bool {
 }
 
 /// Same origin, or an `http` → `https` upgrade of the same host on default ports.
-fn is_same_origin_redirect(from: &reqwest::Url, to: &reqwest::Url) -> bool {
+pub(crate) fn is_same_origin_redirect(from: &reqwest::Url, to: &reqwest::Url) -> bool {
     if from.origin() == to.origin() {
         return true;
     }

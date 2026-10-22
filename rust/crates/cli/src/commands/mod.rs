@@ -1453,8 +1453,13 @@ fn pay_mpp_and_retry(
         .map(str::to_string)
         .or_else(|| mpp_challenge_network(challenge));
     let verbose = ctx.verbose;
-    let retry_outcome =
-        retry_with_header(ctx.tool, "Authorization", &auth_header, ctx.fetch_headers)?;
+    let retry_outcome = retry_with_header(
+        ctx.tool,
+        resource_url,
+        "Authorization",
+        &auth_header,
+        ctx.fetch_headers,
+    )?;
     handle_retry_outcome(
         retry_outcome,
         is_json,
@@ -1497,6 +1502,7 @@ fn pay_subscription_and_retry(
 
     let retry_outcome = retry_with_header(
         ctx.tool,
+        resource_url,
         "Authorization",
         &built.authorization,
         ctx.fetch_headers,
@@ -1686,7 +1692,12 @@ fn pay_x402_and_retry(
         challenge.requirements.recent_blockhash.as_deref(),
     );
     let verbose = ctx.verbose;
-    let retry_outcome = retry_with_headers(ctx.tool, &built_payment.headers, ctx.fetch_headers)?;
+    let retry_outcome = retry_with_headers(
+        ctx.tool,
+        resource_url,
+        &built_payment.headers,
+        ctx.fetch_headers,
+    )?;
     handle_retry_outcome(
         retry_outcome,
         is_json,
@@ -1704,12 +1715,14 @@ fn pay_x402_and_retry(
 /// Every x402 payment-channel scheme follows this shape; only the header it
 /// builds and the label on the receipt differ, so `build` supplies those and
 /// the rest stays in one place.
+#[allow(clippy::too_many_arguments)]
 fn pay_channel_and_retry(
     scheme: &'static str,
     amount: &str,
     asset: &str,
     network: &str,
     recent_blockhash: Option<&str>,
+    resource_url: &str,
     ctx: PaymentRetryContext<'_, '_>,
     build: impl FnOnce(&pay_core::accounts::FileAccountsStore) -> pay_core::Result<x402::BuiltPayment>,
 ) -> pay_core::Result<()> {
@@ -1734,7 +1747,12 @@ fn pay_channel_and_retry(
     let receipt_network =
         x402_receipt_network(ctx.network_override, network, None, recent_blockhash);
     let verbose = ctx.verbose;
-    let retry_outcome = retry_with_headers(ctx.tool, &built_payment.headers, ctx.fetch_headers)?;
+    let retry_outcome = retry_with_headers(
+        ctx.tool,
+        resource_url,
+        &built_payment.headers,
+        ctx.fetch_headers,
+    )?;
     handle_retry_outcome(
         retry_outcome,
         is_json,
@@ -1761,6 +1779,7 @@ fn pay_upto_and_retry(
         &requirements.asset,
         &requirements.network,
         requirements.extra.recent_blockhash.as_deref(),
+        resource_url,
         ctx,
         |store| {
             x402::build_upto_payment(
@@ -1797,6 +1816,7 @@ fn pay_batch_and_retry(
         &requirements.asset,
         &requirements.network,
         requirements.extra.recent_blockhash.as_deref(),
+        resource_url,
         ctx,
         |store| {
             let channels = pay_core::client::batch::BatchChannelCache::new();
@@ -1872,7 +1892,12 @@ fn pay_x402_siwx_and_retry(
 
     let receipt_network = ctx.network_override.map(str::to_string);
     let verbose = ctx.verbose;
-    let retry_outcome = retry_with_headers(ctx.tool, &built_payment.headers, ctx.fetch_headers)?;
+    let retry_outcome = retry_with_headers(
+        ctx.tool,
+        resource_url,
+        &built_payment.headers,
+        ctx.fetch_headers,
+    )?;
     handle_retry_outcome(
         retry_outcome,
         is_json,
@@ -1930,7 +1955,13 @@ fn pay_session_and_retry(
     let receipt_network = network_override
         .map(str::to_string)
         .or_else(|| mpp_challenge_network(challenge));
-    let retry_outcome = retry_with_header(tool, "Authorization", &auth_header, fetch_headers)?;
+    let retry_outcome = retry_with_header(
+        tool,
+        resource_url,
+        "Authorization",
+        &auth_header,
+        fetch_headers,
+    )?;
     handle_retry_outcome(
         retry_outcome,
         is_json,
@@ -2012,14 +2043,18 @@ fn render_generated_wallet_notice(
     Ok(())
 }
 
+/// Retry `tool`'s request with `headers_to_add`, sent to `resource_url`:
+/// the URL of the 402 they answer (the outcome's `resource_url`).
 fn retry_with_header(
     tool: &Tool,
+    resource_url: &str,
     header_name: &str,
     header_value: &str,
     fetch_headers: Option<Vec<(String, String)>>,
 ) -> pay_core::Result<RunOutcome> {
     retry_with_headers(
         tool,
+        resource_url,
         &[(header_name, header_value.to_string())],
         fetch_headers,
     )
@@ -2027,21 +2062,22 @@ fn retry_with_header(
 
 fn retry_with_headers(
     tool: &Tool,
+    resource_url: &str,
     headers_to_add: &[(&str, String)],
     fetch_headers: Option<Vec<(String, String)>>,
 ) -> pay_core::Result<RunOutcome> {
     match tool {
         Tool::Curl(args) => {
             let extra = retry_header_args(headers_to_add);
-            run_curl_with_headers(args, &extra)
+            run_curl_with_headers(args, resource_url, &extra)
         }
         Tool::Wget(args) => {
             let extra = retry_header_args(headers_to_add);
-            run_wget_with_headers(args, &extra)
+            run_wget_with_headers(args, resource_url, &extra)
         }
         Tool::Http(args) => {
             let extra = retry_header_args_httpie(headers_to_add);
-            run_httpie_with_headers(args, &extra)
+            run_httpie_with_headers(args, resource_url, &extra)
         }
         Tool::Fetch {
             method,

@@ -169,18 +169,24 @@ pub fn run_curl(
     }
 
     validate_curl_args_against_catalog(user_args)?;
-    let pre = pre_attach_cached_auth(
-        user_args,
+    run_initial(
         ToolKind::Curl,
+        user_args,
         network_override,
         account_override,
-    );
-    run_curl_inner(user_args, &pre)
+    )
 }
 
 /// Run `curl` with extra headers injected (used for retry after payment).
-pub fn run_curl_with_headers(user_args: &[String], extra_headers: &[String]) -> Result<RunOutcome> {
-    run_curl_inner(user_args, extra_headers)
+///
+/// `resource_url` is the URL of the 402 the headers answer (the outcome's
+/// `resource_url`); the request goes straight there. See [`run_paid`].
+pub fn run_curl_with_headers(
+    user_args: &[String],
+    resource_url: &str,
+    extra_headers: &[String],
+) -> Result<RunOutcome> {
+    run_paid(ToolKind::Curl, user_args, resource_url, extra_headers)
 }
 
 /// Validate a curl invocation before Pay attaches or signs anything for it:
@@ -199,7 +205,13 @@ pub fn validate_curl_args_against_catalog(user_args: &[String]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn run_curl_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunOutcome> {
+    let named = resolve_request_url(user_args, ToolKind::Curl).unwrap_or_default();
+    run_with_headers(ToolKind::Curl, user_args, extra_headers, &named)
+}
+
+fn curl_hop(user_args: &[String], extra_headers: &[String], named: &str) -> Result<Hop> {
     check_command_exists("curl")?;
     if !extra_headers.is_empty() {
         ensure_single_transfer(user_args, ToolKind::Curl)?;
@@ -237,8 +249,10 @@ fn run_curl_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunO
     // would silently mangle binary responses (images, PDFs, …) before we
     // ever print them.
     let body = std::fs::read(body_path).unwrap_or_default();
-    let (status_code, headers) = parse_http_headers(&headers_raw);
-    let url = find_url_in_args(user_args).unwrap_or_default();
+    let chain = parse_http_header_blocks(&headers_raw);
+    let last = chain.last().cloned().unwrap_or_default();
+    let status_code = last.status;
+    let url = resolve_request_url(user_args, ToolKind::Curl).unwrap_or_default();
 
     debug!(?status_code, exit_code, "curl finished");
 
@@ -246,8 +260,19 @@ fn run_curl_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunO
         // Swallow stderr/stdout/body on 402 — CLI handles display.
         // 402 challenge bodies are JSON per spec; lossy decode is fine.
         let body_text = String::from_utf8_lossy(&body);
-        return Ok(classify_402(&headers, Some(&body_text), &url));
+        let url = payment_url(&url, &chain, named)?;
+        return Ok(Hop::Done(classify_402(
+            &last.headers,
+            Some(&body_text),
+            &url,
+        )));
     }
+    if !extra_headers.is_empty()
+        && let Some(next) = credential_free_redirect(user_args, ToolKind::Curl, &last)
+    {
+        return Ok(Hop::Redirect(next));
+    }
+    let headers = last.headers;
 
     // Not 402 — re-emit stderr (progress bar etc.), body, then any -w writeout.
     // `write_all(&body)` so binary bytes pass through untouched; print!
@@ -261,12 +286,12 @@ fn run_curl_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunO
     if !writeout.is_empty() {
         print!("{writeout}");
     }
-    Ok(RunOutcome::Completed {
+    Ok(Hop::Done(RunOutcome::Completed {
         exit_code,
         body: None,
         content_type: None,
         response_headers: headers,
-    })
+    }))
 }
 
 /// Run `wget` with the given user args, detecting 402 + MPP challenges.
@@ -282,13 +307,12 @@ pub fn run_wget(
     }
 
     validate_wget_args_against_catalog(user_args)?;
-    let pre = pre_attach_cached_auth(
-        user_args,
+    run_initial(
         ToolKind::Wget,
+        user_args,
         network_override,
         account_override,
-    );
-    run_wget_inner(user_args, &pre)
+    )
 }
 
 /// Run `http` (HTTPie) with the given user args, detecting 402 + MPP challenges.
@@ -306,13 +330,12 @@ pub fn run_httpie(
         return run_plain_command("http", user_args);
     }
 
-    let pre = pre_attach_cached_auth(
-        user_args,
+    run_initial(
         ToolKind::Httpie,
+        user_args,
         network_override,
         account_override,
-    );
-    run_httpie_inner(user_args, &pre)
+    )
 }
 
 /// Run `http` with extra headers injected (used for retry after payment).
@@ -321,14 +344,103 @@ pub fn run_httpie(
 /// (e.g. `"Authorization:Bearer …"`), already formatted by the caller.
 pub fn run_httpie_with_headers(
     user_args: &[String],
+    resource_url: &str,
     extra_headers: &[String],
 ) -> Result<RunOutcome> {
-    run_httpie_inner(user_args, extra_headers)
+    run_paid(ToolKind::Httpie, user_args, resource_url, extra_headers)
 }
 
 /// Run `wget` with extra headers injected (used for retry after payment).
-pub fn run_wget_with_headers(user_args: &[String], extra_headers: &[String]) -> Result<RunOutcome> {
-    run_wget_inner(user_args, extra_headers)
+/// See [`run_curl_with_headers`].
+pub fn run_wget_with_headers(
+    user_args: &[String],
+    resource_url: &str,
+    extra_headers: &[String],
+) -> Result<RunOutcome> {
+    run_paid(ToolKind::Wget, user_args, resource_url, extra_headers)
+}
+
+/// Redirect hops Pay steps itself for a credential-bearing request before
+/// giving up, matching the built-in fetch's limit.
+const MAX_CREDENTIAL_REDIRECTS: usize = 10;
+
+/// One run of a wrapped tool.
+enum Hop {
+    Done(RunOutcome),
+    /// The tool ran with Pay headers and redirects off, and the response
+    /// is a redirect the caller asked to follow: these are the args for the
+    /// next hop. Nothing of this response was shown to the caller.
+    Redirect(Vec<String>),
+}
+
+fn run_hop(tool: ToolKind, args: &[String], extra_headers: &[String], named: &str) -> Result<Hop> {
+    match tool {
+        ToolKind::Curl => curl_hop(args, extra_headers, named),
+        ToolKind::Wget => wget_hop(args, extra_headers, named),
+        ToolKind::Httpie => httpie_hop(args, extra_headers, named),
+    }
+}
+
+/// The first request of a `pay curl|wget|http` command.
+///
+/// A cached subscription bearer is attached per destination: each redirect
+/// hop the caller asked to follow is a new request, and it carries only the
+/// bearer cached for its own URL (if any). Hops without one run with the
+/// tool's own redirect handling.
+fn run_initial(
+    tool: ToolKind,
+    user_args: &[String],
+    network_override: Option<&str>,
+    account_override: Option<&str>,
+) -> Result<RunOutcome> {
+    let named = resolve_request_url(user_args, tool).unwrap_or_default();
+    let mut args = user_args.to_vec();
+    for _ in 0..=MAX_CREDENTIAL_REDIRECTS {
+        let pre = pre_attach_cached_auth(&args, tool, network_override, account_override);
+        match run_hop(tool, &args, &pre, &named)? {
+            Hop::Done(outcome) => return Ok(outcome),
+            Hop::Redirect(next) => args = next,
+        }
+    }
+    Err(too_many_redirects(&named))
+}
+
+/// The paid retry: the request with Pay's headers, sent to `resource_url`.
+///
+/// The headers go to `resource_url` only. If it answers with a redirect the
+/// caller asked to follow (`curl -L`, wget's default, `http --follow`) and
+/// the request is a bodyless read, the next hop runs without any Pay header,
+/// with the tool's own redirect handling from there on.
+fn run_paid(
+    tool: ToolKind,
+    user_args: &[String],
+    resource_url: &str,
+    extra_headers: &[String],
+) -> Result<RunOutcome> {
+    let args = paid_request_args(user_args, tool, resource_url);
+    let named = resolve_request_url(&args, tool).unwrap_or_default();
+    run_with_headers(tool, &args, extra_headers, &named)
+}
+
+fn run_with_headers(
+    tool: ToolKind,
+    args: &[String],
+    extra_headers: &[String],
+    named: &str,
+) -> Result<RunOutcome> {
+    match run_hop(tool, args, extra_headers, named)? {
+        Hop::Done(outcome) => Ok(outcome),
+        Hop::Redirect(next) => match run_hop(tool, &next, &[], named)? {
+            Hop::Done(outcome) => Ok(outcome),
+            // A hop without Pay headers runs with the tool's own redirect
+            // handling and never stops at a redirect.
+            Hop::Redirect(_) => Err(too_many_redirects(named)),
+        },
+    }
+}
+
+fn too_many_redirects(url: &str) -> Error {
+    Error::RequestValidation(format!("{url} redirected too many times"))
 }
 
 /// Validate a wget invocation before Pay attaches or signs anything for it:
@@ -347,7 +459,13 @@ pub fn validate_wget_args_against_catalog(user_args: &[String]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn run_wget_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunOutcome> {
+    let named = resolve_request_url(user_args, ToolKind::Wget).unwrap_or_default();
+    run_with_headers(ToolKind::Wget, user_args, extra_headers, &named)
+}
+
+fn wget_hop(user_args: &[String], extra_headers: &[String], named: &str) -> Result<Hop> {
     check_command_exists("wget")?;
     if !extra_headers.is_empty() {
         ensure_single_transfer(user_args, ToolKind::Wget)?;
@@ -378,8 +496,10 @@ fn run_wget_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunO
     let exit_code = output.status.code().unwrap_or(1);
     let stderr_text = String::from_utf8_lossy(&output.stderr);
 
-    let (status_code, headers) = parse_wget_headers(&stderr_text);
-    let url = find_url_in_args(user_args).unwrap_or_default();
+    let chain = parse_wget_header_blocks(&stderr_text);
+    let last = chain.last().cloned().unwrap_or_default();
+    let status_code = last.status;
+    let url = resolve_request_url(user_args, ToolKind::Wget).unwrap_or_default();
 
     debug!(?status_code, exit_code, "wget finished");
 
@@ -389,20 +509,29 @@ fn run_wget_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunO
         // result, we can't surface server `verification_failed` reasons for
         // wget retries (only curl/fetch). The retry path falls back to a
         // generic "still 402" message.
-        return Ok(classify_402(&headers, None, &url));
+        let url = payment_url(&url, &chain, named)?;
+        return Ok(Hop::Done(classify_402(&last.headers, None, &url)));
     }
+    // wget writes nothing for a redirect it does not follow, so dropping
+    // this run's stderr is all it takes to hide the hop.
+    if !extra_headers.is_empty()
+        && let Some(next) = credential_free_redirect(user_args, ToolKind::Wget, &last)
+    {
+        return Ok(Hop::Redirect(next));
+    }
+    let headers = last.headers;
 
     // Re-emit stderr on success
     eprint!("{stderr_text}");
-    Ok(RunOutcome::Completed {
+    Ok(Hop::Done(RunOutcome::Completed {
         exit_code,
         body: None,
         content_type: None,
         response_headers: headers,
-    })
+    }))
 }
 
-fn run_httpie_inner(user_args: &[String], extra_headers: &[String]) -> Result<RunOutcome> {
+fn httpie_hop(user_args: &[String], extra_headers: &[String], named: &str) -> Result<Hop> {
     use std::io::IsTerminal;
 
     check_command_exists("http")?;
@@ -459,21 +588,38 @@ fn run_httpie_inner(user_args: &[String], extra_headers: &[String]) -> Result<Ru
 
     debug!(?status_code, exit_code, "httpie finished");
 
+    // `--no-all` hides the hops HTTPie followed, so the 402 is taken to
+    // come from the URL on the command line.
+    let last = ResponseHead {
+        status: status_code,
+        headers,
+    };
     if status_code == Some(402) {
         // Swallow stdout/stderr on 402 — CLI handles display
-        return Ok(classify_402(&headers, body.as_deref(), &url));
+        let url = payment_url(&url, std::slice::from_ref(&last), named)?;
+        return Ok(Hop::Done(classify_402(
+            &last.headers,
+            body.as_deref(),
+            &url,
+        )));
     }
+    if !extra_headers.is_empty()
+        && let Some(next) = credential_free_redirect(user_args, ToolKind::Httpie, &last)
+    {
+        return Ok(Hop::Redirect(next));
+    }
+    let headers = last.headers;
 
     if !stderr_text.is_empty() {
         eprint!("{stderr_text}");
     }
     print!("{stdout_text}");
-    Ok(RunOutcome::Completed {
+    Ok(Hop::Done(RunOutcome::Completed {
         exit_code,
         body: None,
         content_type: None,
         response_headers: headers,
-    })
+    }))
 }
 
 /// Parse HTTPie's combined stdout into `(status, response_headers, body)`.
@@ -1249,67 +1395,153 @@ fn check_command_exists(cmd: &str) -> Result<()> {
     }
 }
 
+/// One response head (status line and headers) out of a tool's trace.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ResponseHead {
+    status: Option<u16>,
+    headers: Vec<(String, String)>,
+}
+
+impl ResponseHead {
+    #[cfg(test)]
+    fn into_parts(self) -> (Option<u16>, Vec<(String, String)>) {
+        (self.status, self.headers)
+    }
+
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    }
+
+    fn redirect_location(&self) -> Option<&str> {
+        self.status
+            .filter(|status| (300..400).contains(status))
+            .and_then(|_| self.header("location"))
+    }
+}
+
 /// Parse HTTP headers from curl's `-D` dump format.
 ///
 /// Handles redirect chains by taking the LAST header block (the final response).
+#[cfg(test)]
 fn parse_http_headers(raw: &str) -> (Option<u16>, Vec<(String, String)>) {
-    let blocks: Vec<&str> = raw.split("\r\n\r\n").filter(|b| !b.is_empty()).collect();
-    let block = match blocks.last() {
-        Some(b) => b,
-        None => return (None, vec![]),
-    };
+    parse_http_header_blocks(raw)
+        .pop()
+        .map_or((None, Vec::new()), ResponseHead::into_parts)
+}
 
-    let mut status_code = None;
-    let mut headers = Vec::new();
-
-    for line in block.lines() {
-        let line = line.trim();
-        if line.starts_with("HTTP/") {
-            status_code = line
-                .split_whitespace()
-                .nth(1)
-                .and_then(|s| s.parse::<u16>().ok());
-        } else if let Some((key, value)) = line.split_once(':') {
-            headers.push((key.trim().to_lowercase(), value.trim().to_string()));
-        }
-    }
-
-    (status_code, headers)
+/// Every response head in curl's `-D` dump, in the order curl received them
+/// (one per redirect hop when curl followed redirects).
+fn parse_http_header_blocks(raw: &str) -> Vec<ResponseHead> {
+    raw.split("\r\n\r\n")
+        .filter(|b| !b.trim().is_empty())
+        .map(|block| {
+            let mut status = None;
+            let mut headers = Vec::new();
+            for line in block.lines() {
+                let line = line.trim();
+                if line.starts_with("HTTP/") {
+                    status = line
+                        .split_whitespace()
+                        .nth(1)
+                        .and_then(|s| s.parse::<u16>().ok());
+                } else if let Some((key, value)) = line.split_once(':') {
+                    headers.push((key.trim().to_lowercase(), value.trim().to_string()));
+                }
+            }
+            ResponseHead { status, headers }
+        })
+        .collect()
 }
 
 /// Parse HTTP headers from wget's `--server-response` stderr output.
+#[cfg(test)]
 fn parse_wget_headers(stderr: &str) -> (Option<u16>, Vec<(String, String)>) {
-    let mut status_code = None;
-    let mut headers = Vec::new();
+    parse_wget_header_blocks(stderr)
+        .pop()
+        .map_or((None, Vec::new()), ResponseHead::into_parts)
+}
 
-    let mut current_status = None;
-    let mut current_headers = Vec::new();
-
+/// Every response head in wget's `--server-response` output, one per hop.
+fn parse_wget_header_blocks(stderr: &str) -> Vec<ResponseHead> {
+    let mut blocks: Vec<ResponseHead> = Vec::new();
     for line in stderr.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with("HTTP/") {
-            if current_status.is_some() {
-                status_code = current_status;
-                headers = std::mem::take(&mut current_headers);
-            }
-            current_status = trimmed
-                .split_whitespace()
-                .nth(1)
-                .and_then(|s| s.parse::<u16>().ok());
-        } else if let Some((key, value)) = trimmed.split_once(':') {
+            blocks.push(ResponseHead {
+                status: trimmed
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|s| s.parse::<u16>().ok()),
+                headers: Vec::new(),
+            });
+        } else if let Some(block) = blocks.last_mut()
+            && let Some((key, value)) = trimmed.split_once(':')
+        {
             let key = key.trim();
             if !key.is_empty() && !key.contains(' ') {
-                current_headers.push((key.to_lowercase(), value.trim().to_string()));
+                block
+                    .headers
+                    .push((key.to_lowercase(), value.trim().to_string()));
             }
         }
     }
+    blocks
+}
 
-    if current_status.is_some() {
-        status_code = current_status;
-        headers = current_headers;
+/// The URL that produced the last response in `chain`, given the URL the
+/// tool was asked for: each redirect hop the tool followed moves it to the
+/// hop's `Location`, resolved against the URL that sent it.
+fn answering_url(requested: &str, chain: &[ResponseHead]) -> String {
+    let Ok(mut current) = url::Url::parse(requested) else {
+        return requested.to_string();
+    };
+    let Some((_last, followed)) = chain.split_last() else {
+        return requested.to_string();
+    };
+    let mut moved = false;
+    for head in followed {
+        if let Some(next) = head
+            .redirect_location()
+            .and_then(|location| current.join(location).ok())
+        {
+            moved |= next != current;
+            current = next;
+        }
     }
+    if moved {
+        current.into()
+    } else {
+        requested.to_string()
+    }
+}
 
-    (status_code, headers)
+/// The URL Pay pays for when a 402 arrives at the end of `chain`.
+///
+/// Without injected headers the tool follows redirects the caller asked for
+/// (`curl -L`, wget's default), so the 402 may come from a later hop: a
+/// trailing-slash redirect or an `http` to `https` upgrade. The credential is
+/// built for, and later sent straight to, the URL that asked for it, so it
+/// never rides a redirect. A 402 from another origin than the one the caller
+/// named is refused: Pay only pays the origin on the command line.
+fn payment_url(requested: &str, chain: &[ResponseHead], named: &str) -> Result<String> {
+    let answering = answering_url(requested, chain);
+    if answering == named {
+        return Ok(answering);
+    }
+    let same_origin = match (url::Url::parse(named), url::Url::parse(&answering)) {
+        (Ok(from), Ok(to)) => crate::client::fetch::is_same_origin_redirect(&from, &to),
+        _ => false,
+    };
+    if !same_origin {
+        return Err(Error::RequestValidation(format!(
+            "{named} redirected to {answering}, which asked for payment. Pay only pays \
+             the origin named on the command line; request {answering} directly."
+        )));
+    }
+    Ok(answering)
 }
 
 /// Heuristic: find the URL from command args.
@@ -1370,78 +1602,164 @@ fn ensure_single_transfer(args: &[String], tool: ToolKind) -> Result<()> {
             }
         )))
     };
-    let spec = match tool {
-        ToolKind::Curl => &CURL_OPTIONS,
-        ToolKind::Wget => &WGET_OPTIONS,
+    let Some(spec) = transfer_options(tool) else {
         // HTTPie takes exactly one URL by construction.
-        ToolKind::Httpie => return Ok(()),
+        return Ok(());
     };
-
-    let mut targets = 0usize;
-    let mut i = 0;
-    while i < args.len() {
-        let arg = args[i].as_str();
-        if arg == "--" {
-            targets += args.len() - i - 1;
-            break;
-        }
-        if let Some(long) = arg.strip_prefix("--") {
-            let (name, inline_value) = match long.split_once('=') {
-                Some((name, value)) => (name, Some(value)),
-                None => (long, None),
-            };
-            if spec.multi_transfer_long.contains(&name)
-                || spec
-                    .multi_transfer_long_prefixes
-                    .iter()
-                    .any(|p| name.starts_with(p))
+    let line = CommandLine::parse(args, spec);
+    for option in &line.options {
+        match option.name {
+            OptionName::Long(name)
+                if spec.multi_transfer_long.contains(&name)
+                    || spec
+                        .multi_transfer_long_prefixes
+                        .iter()
+                        .any(|p| name.starts_with(p)) =>
             {
                 return refuse(&format!("uses `--{name}`"));
             }
-            let is_url = spec.url_long == Some(name);
-            let takes_value = is_url || spec.value_long.contains(&name);
-            let value = match inline_value {
-                Some(value) => Some(value),
-                None if takes_value => {
-                    i += 1;
-                    args.get(i).map(String::as_str)
-                }
-                None => None,
-            };
-            if is_url {
-                if value.is_some_and(|v| v.starts_with('@')) {
-                    return refuse("reads URLs from a file");
-                }
-                targets += 1;
+            OptionName::Short(c) if spec.multi_transfer_short.contains(c) => {
+                return refuse(&format!("uses `-{c}`"));
             }
-        } else if let Some(shorts) = arg.strip_prefix('-').filter(|s| !s.is_empty()) {
-            let mut chars = shorts.char_indices();
-            while let Some((at, c)) = chars.next() {
-                if spec.multi_transfer_short.contains(c) {
-                    return refuse(&format!("uses `-{c}`"));
-                }
-                if spec.boolean_prefix_short.contains(c) {
-                    // wget's `-nv`, `-nc`, ...: the next letter is part of
-                    // the flag name, not another option.
-                    chars.next();
-                    continue;
-                }
-                if spec.value_short.contains(c) {
-                    if at + c.len_utf8() == shorts.len() {
-                        i += 1;
-                    }
-                    break;
-                }
-            }
-        } else {
-            targets += 1;
+            _ => {}
         }
-        i += 1;
     }
-    if targets > 1 {
-        return refuse(&format!("names {targets} URLs"));
+    for target in &line.targets {
+        if target.via_option && target.value.starts_with('@') {
+            return refuse("reads URLs from a file");
+        }
+    }
+    if line.targets.len() > 1 {
+        return refuse(&format!("names {} URLs", line.targets.len()));
     }
     Ok(())
+}
+
+fn transfer_options(tool: ToolKind) -> Option<&'static TransferOptions> {
+    match tool {
+        ToolKind::Curl => Some(&CURL_OPTIONS),
+        ToolKind::Wget => Some(&WGET_OPTIONS),
+        ToolKind::Httpie => None,
+    }
+}
+
+/// A curl or wget command line split the way the tool reads it: options
+/// with the value each one consumes, and the transfer targets (URLs).
+///
+/// Every check over a command line goes through this one reading, so an
+/// option is never seen as a flag by one check and as a URL by another.
+/// Unknown options are read as flags: a value they take then counts as
+/// another target, which errs toward refusing the command.
+struct CommandLine<'a> {
+    options: Vec<ParsedOption<'a>>,
+    targets: Vec<TargetArg<'a>>,
+}
+
+struct ParsedOption<'a> {
+    name: OptionName<'a>,
+    value: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OptionName<'a> {
+    Long(&'a str),
+    Short(char),
+}
+
+/// Where a transfer target sits in the argument list.
+struct TargetArg<'a> {
+    index: usize,
+    value: &'a str,
+    /// The target is the value of the tool's URL option (`--url X` or
+    /// `--url=X`) rather than a positional argument.
+    via_option: bool,
+    /// `args[index]` is `--url=<value>`, not the bare value.
+    inline: bool,
+}
+
+impl<'a> CommandLine<'a> {
+    fn parse(args: &'a [String], spec: &TransferOptions) -> Self {
+        let mut options = Vec::new();
+        let mut targets = Vec::new();
+        let mut i = 0;
+        while i < args.len() {
+            let arg = args[i].as_str();
+            if arg == "--" {
+                targets.extend((i + 1..args.len()).map(|index| TargetArg {
+                    index,
+                    value: args[index].as_str(),
+                    via_option: false,
+                    inline: false,
+                }));
+                break;
+            }
+            if let Some(long) = arg.strip_prefix("--") {
+                let (name, inline_value) = match long.split_once('=') {
+                    Some((name, value)) => (name, Some(value)),
+                    None => (long, None),
+                };
+                let is_url = spec.url_long == Some(name);
+                let takes_value = is_url || spec.value_long.contains(&name);
+                let value = match inline_value {
+                    Some(value) => Some(value),
+                    None if takes_value => {
+                        i += 1;
+                        args.get(i).map(String::as_str)
+                    }
+                    None => None,
+                };
+                if is_url && let Some(value) = value {
+                    targets.push(TargetArg {
+                        index: i,
+                        value,
+                        via_option: true,
+                        inline: inline_value.is_some(),
+                    });
+                }
+                options.push(ParsedOption {
+                    name: OptionName::Long(name),
+                    value,
+                });
+            } else if let Some(shorts) = arg.strip_prefix('-').filter(|s| !s.is_empty()) {
+                let mut chars = shorts.char_indices();
+                while let Some((at, c)) = chars.next() {
+                    if spec.boolean_prefix_short.contains(c) {
+                        // wget's `-nv`, `-nc`, ...: the next letter is part of
+                        // the flag name, not another option.
+                        chars.next();
+                        continue;
+                    }
+                    if spec.value_short.contains(c) {
+                        let rest = &shorts[at + c.len_utf8()..];
+                        let value = if rest.is_empty() {
+                            i += 1;
+                            args.get(i).map(String::as_str)
+                        } else {
+                            Some(rest)
+                        };
+                        options.push(ParsedOption {
+                            name: OptionName::Short(c),
+                            value,
+                        });
+                        break;
+                    }
+                    options.push(ParsedOption {
+                        name: OptionName::Short(c),
+                        value: None,
+                    });
+                }
+            } else {
+                targets.push(TargetArg {
+                    index: i,
+                    value: arg,
+                    via_option: false,
+                    inline: false,
+                });
+            }
+            i += 1;
+        }
+        Self { options, targets }
+    }
 }
 
 /// What [`ensure_single_transfer`] needs to know about a tool's options.
@@ -1721,8 +2039,9 @@ static WGET_OPTIONS: TransferOptions = TransferOptions {
 /// wrapped tools forward custom headers across redirects (wget even does so
 /// by default, and curl only strips `Authorization`, not `X-PAYMENT`), so a
 /// redirect to another origin would hand the credential to that origin.
-/// Not following is the only boundary we can enforce from outside the tool;
-/// the caller sees the redirect response itself.
+/// Not following is the only boundary we can enforce from outside the tool.
+/// When the caller asked to follow, Pay takes the next hop itself without
+/// its headers (see [`credential_free_redirect`]).
 fn credential_redirect_guard(tool: ToolKind, injected: &[String]) -> &'static [&'static str] {
     if injected.is_empty() {
         return &[];
@@ -1734,6 +2053,170 @@ fn credential_redirect_guard(tool: ToolKind, injected: &[String]) -> &'static [&
         ToolKind::Wget => &["--max-redirect=0"],
         ToolKind::Httpie => &["--no-follow"],
     }
+}
+
+/// Whether the caller's own args ask the tool to follow redirects: `-L`,
+/// `--location` or `--location-trusted` for curl, wget's default unless
+/// `--max-redirect=0`, `--follow` / `-F` for HTTPie. The last word wins.
+fn follows_redirects(args: &[String], tool: ToolKind) -> bool {
+    match tool {
+        ToolKind::Curl => {
+            let line = CommandLine::parse(args, &CURL_OPTIONS);
+            line.options
+                .iter()
+                .fold(false, |follow, option| match option.name {
+                    OptionName::Short('L') | OptionName::Long("location" | "location-trusted") => {
+                        true
+                    }
+                    OptionName::Long("no-location") => false,
+                    _ => follow,
+                })
+        }
+        ToolKind::Wget => {
+            let line = CommandLine::parse(args, &WGET_OPTIONS);
+            line.options
+                .iter()
+                .fold(true, |follow, option| match option.name {
+                    OptionName::Long("max-redirect") => {
+                        option.value.is_none_or(|v| v.trim() != "0")
+                    }
+                    _ => follow,
+                })
+        }
+        ToolKind::Httpie => args.iter().fold(false, |follow, arg| match arg.as_str() {
+            "--follow" | "-F" => true,
+            "--no-follow" => false,
+            _ => follow,
+        }),
+    }
+}
+
+/// Whether the request is a bodyless `GET` or `HEAD`, the only kind Pay
+/// replays at a redirect target: a body was sent to the URL it was bound to
+/// and is not forwarded anywhere else.
+fn is_bodyless_read(args: &[String], tool: ToolKind) -> bool {
+    let read_method = |method: &str| matches!(method.to_ascii_uppercase().as_str(), "GET" | "HEAD");
+    match tool {
+        ToolKind::Curl => {
+            let line = CommandLine::parse(args, &CURL_OPTIONS);
+            line.options.iter().all(|option| match option.name {
+                OptionName::Short('d' | 'F' | 'T')
+                | OptionName::Long(
+                    "data" | "data-ascii" | "data-binary" | "data-raw" | "data-urlencode" | "json"
+                    | "form" | "form-string" | "upload-file",
+                ) => false,
+                OptionName::Short('X') | OptionName::Long("request") => {
+                    option.value.is_some_and(read_method)
+                }
+                _ => true,
+            })
+        }
+        ToolKind::Wget => {
+            let line = CommandLine::parse(args, &WGET_OPTIONS);
+            line.options.iter().all(|option| match option.name {
+                OptionName::Long("post-data" | "post-file" | "body-data" | "body-file") => false,
+                OptionName::Long("method") => option.value.is_some_and(read_method),
+                _ => true,
+            })
+        }
+        ToolKind::Httpie => {
+            let mut positionals = args.iter().filter(|arg| !arg.starts_with('-'));
+            let mut first = positionals.next();
+            if let Some(method) = first.filter(|m| m.chars().all(|c| c.is_ascii_alphabetic())) {
+                if !read_method(method) {
+                    return false;
+                }
+                first = positionals.next();
+            }
+            // After the URL, only header (`Name:value`) and query
+            // (`name==value`) items: anything else is body data.
+            first.is_some()
+                && positionals.all(|item| {
+                    item.contains("==")
+                        || item.split_once(':').is_some_and(|(name, value)| {
+                            !name.is_empty()
+                                && !name.contains('=')
+                                && !value.starts_with('=')
+                                && !value.starts_with('@')
+                        })
+                })
+                && !args.iter().any(|arg| {
+                    matches!(
+                        arg.as_str(),
+                        "--form" | "-f" | "--multipart" | "--raw" | "--json" | "-j"
+                    )
+                })
+        }
+    }
+}
+
+/// `args` with the request URL `from` replaced by `to`, or `None` when the
+/// URL is not a single argument Pay can locate.
+fn retarget_args(args: &[String], tool: ToolKind, from: &str, to: &str) -> Option<Vec<String>> {
+    let index = match transfer_options(tool) {
+        Some(spec) => {
+            let line = CommandLine::parse(args, spec);
+            let [target] = line.targets.as_slice() else {
+                return None;
+            };
+            if target.value != from {
+                return None;
+            }
+            let mut retargeted = args.to_vec();
+            retargeted[target.index] = if target.inline {
+                format!("--url={to}")
+            } else {
+                to.to_string()
+            };
+            return Some(retargeted);
+        }
+        None => args.iter().position(|arg| {
+            find_url_in_args(std::slice::from_ref(arg))
+                .or_else(|| httpie_url_shorthand(arg))
+                .as_deref()
+                == Some(from)
+        })?,
+    };
+    let mut retargeted = args.to_vec();
+    retargeted[index] = to.to_string();
+    Some(retargeted)
+}
+
+/// The paid request's args aimed at `resource_url`, the URL whose 402 the
+/// credential answers (see [`payment_url`]), so the credential goes straight
+/// there instead of to a URL that redirects to it.
+fn paid_request_args(args: &[String], tool: ToolKind, resource_url: &str) -> Vec<String> {
+    match resolve_request_url(args, tool) {
+        Some(requested) if requested != resource_url && !resource_url.is_empty() => {
+            retarget_args(args, tool, &requested, resource_url).unwrap_or_else(|| args.to_vec())
+        }
+        _ => args.to_vec(),
+    }
+}
+
+/// After a paid request answered with a redirect the caller asked the tool
+/// to follow, the args for the next hop, which runs with no Pay header.
+///
+/// The tool runs credential-bearing requests with redirects off (see
+/// [`credential_redirect_guard`]); this is how `pay curl -L` and `pay wget`
+/// still reach a resource the paid URL redirects to (a download link, a
+/// canonical path) without the payment, sign-in proof or subscription bearer
+/// ever leaving the URL it was bound to.
+fn credential_free_redirect(
+    args: &[String],
+    tool: ToolKind,
+    response: &ResponseHead,
+) -> Option<Vec<String>> {
+    let location = response.redirect_location()?;
+    if !follows_redirects(args, tool) || !is_bodyless_read(args, tool) {
+        return None;
+    }
+    let requested = resolve_request_url(args, tool)?;
+    let next = url::Url::parse(&requested).ok()?.join(location).ok()?;
+    if !matches!(next.scheme(), "http" | "https") {
+        return None;
+    }
+    retarget_args(args, tool, &requested, next.as_str())
 }
 
 /// Debug-log a wrapped tool invocation without any header value or argument.
@@ -1775,11 +2258,20 @@ fn formatted_header(tool: ToolKind, name: &str, value: &str) -> String {
 /// SIWMPP cache lookup (URL-prefix match against tracked subscriptions)
 /// sees the same URL the request will actually hit.
 fn resolve_request_url(args: &[String], tool: ToolKind) -> Option<String> {
+    if let Some(spec) = transfer_options(tool) {
+        // The transfer target, not the first URL-looking argument: `-e
+        // https://referer.example` is an option value.
+        let line = CommandLine::parse(args, spec);
+        let [target] = line.targets.as_slice() else {
+            return None;
+        };
+        return [target.value]
+            .into_iter()
+            .find(|url| url.starts_with("http://") || url.starts_with("https://"))
+            .map(str::to_string);
+    }
     if let Some(u) = find_url_in_args(args) {
         return Some(u);
-    }
-    if !matches!(tool, ToolKind::Httpie) {
-        return None;
     }
     args.iter().find_map(|a| httpie_url_shorthand(a))
 }
@@ -2057,51 +2549,65 @@ mod pre_attach_tests {
     }
 
     /// Loopback origin that answers its first request with a 302 to a
-    /// second, collector origin, and reports whether the collector was ever
-    /// contacted once the wrapped tool has exited.
+    /// second, collector origin, and reports what each one received once
+    /// the wrapped tool has exited.
     struct CrossOriginRedirect {
         origin_url: String,
         collector_url: String,
-        origin: std::thread::JoinHandle<bool>,
-        collector: std::thread::JoinHandle<bool>,
+        origin: std::thread::JoinHandle<Vec<String>>,
+        collector: std::thread::JoinHandle<Vec<String>>,
     }
 
-    /// Serve one request with `response`, or give up after `wait`. Returns
-    /// whether a request arrived.
-    fn serve_once(
+    /// Serve one connection per entry of `responses`, in order, or give up
+    /// after `wait`. Returns the raw head of every request that arrived.
+    fn serve(
         listener: std::net::TcpListener,
         wait: std::time::Duration,
-        response: String,
-    ) -> std::thread::JoinHandle<bool> {
+        responses: Vec<String>,
+    ) -> std::thread::JoinHandle<Vec<String>> {
         use std::io::{Read, Write};
         listener.set_nonblocking(true).unwrap();
         std::thread::spawn(move || {
             let deadline = std::time::Instant::now() + wait;
-            let mut stream = loop {
-                match listener.accept() {
-                    Ok((stream, _)) => break stream,
-                    Err(_) if std::time::Instant::now() < deadline => {
-                        std::thread::sleep(std::time::Duration::from_millis(10));
+            let mut requests = Vec::new();
+            for response in responses {
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(_) if std::time::Instant::now() < deadline => {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        Err(_) => return requests,
                     }
-                    Err(_) => return false,
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&chunk[..n]),
+                    }
                 }
-            };
-            stream.set_nonblocking(false).unwrap();
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-                .unwrap();
-            let mut request = Vec::new();
-            let mut chunk = [0u8; 1024];
-            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-                match stream.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => request.extend_from_slice(&chunk[..n]),
-                }
+                let _ = stream.write_all(response.as_bytes());
+                requests.push(String::from_utf8_lossy(&request).into_owned());
             }
-            let _ = stream.write_all(response.as_bytes());
-            true
+            requests
         })
     }
+
+    fn redirect_to(location: &str) -> String {
+        format!(
+            "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+    }
+
+    const OK_RESPONSE: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+    const PAYMENT_REQUIRED_RESPONSE: &str =
+        "HTTP/1.1 402 Payment Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
     impl CrossOriginRedirect {
         fn start() -> Self {
@@ -2109,17 +2615,15 @@ mod pre_attach_tests {
             let collector = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let origin_url = format!("http://{}/start", origin.local_addr().unwrap());
             let location = format!("http://{}/collect", collector.local_addr().unwrap());
-            let origin = serve_once(
+            let origin = serve(
                 origin,
                 std::time::Duration::from_secs(20),
-                format!(
-                    "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                ),
+                vec![redirect_to(&location)],
             );
-            let collector = serve_once(
+            let collector = serve(
                 collector,
                 std::time::Duration::from_secs(3),
-                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_string(),
+                vec![OK_RESPONSE.to_string()],
             );
             Self {
                 origin_url,
@@ -2129,16 +2633,23 @@ mod pre_attach_tests {
             }
         }
 
+        /// What the origin and the collector each received.
+        fn requests(self) -> (String, Option<String>) {
+            let origin = self.origin.join().unwrap().pop();
+            let collector = self.collector.join().unwrap().pop();
+            (
+                origin.expect("the tool never reached the origin"),
+                collector,
+            )
+        }
+
         fn collector_was_contacted(self) -> bool {
-            assert!(
-                self.origin.join().unwrap(),
-                "the tool never reached the origin"
-            );
-            self.collector.join().unwrap()
+            self.requests().1.is_some()
         }
     }
 
     const PAYMENT_HEADER: &str = "Authorization: Payment redirect-test-credential";
+    const PAYMENT_SECRET: &str = "redirect-test-credential";
 
     #[test]
     fn redirect_guard_only_applies_when_credentials_are_injected() {
@@ -2172,27 +2683,309 @@ mod pre_attach_tests {
     }
 
     #[test]
-    fn wget_does_not_carry_injected_credentials_across_redirects() {
+    fn wget_follows_a_paid_redirect_without_the_credential() {
         if check_command_exists("wget").is_err() {
             return;
         }
         let server = CrossOriginRedirect::start();
-        // A caller-supplied redirect budget must not re-enable following.
         let args = s(&["-q", "--max-redirect=5", "-O", "-", &server.origin_url]);
+        let outcome = run_wget_inner(&args, &s(&[PAYMENT_HEADER])).unwrap();
+        assert!(matches!(
+            outcome,
+            RunOutcome::Completed { exit_code: 0, .. }
+        ));
+        let (origin, collector) = server.requests();
+        assert!(
+            origin.contains(PAYMENT_SECRET),
+            "the paid URL got the credential"
+        );
+        let collector = collector.expect("wget stopped at the paid redirect");
+        assert!(!collector.contains(PAYMENT_SECRET), "{collector}");
+    }
+
+    #[test]
+    fn wget_does_not_follow_a_paid_redirect_the_caller_turned_off() {
+        if check_command_exists("wget").is_err() {
+            return;
+        }
+        let server = CrossOriginRedirect::start();
+        let args = s(&["-q", "--max-redirect", "0", "-O", "-", &server.origin_url]);
         run_wget_inner(&args, &s(&[PAYMENT_HEADER])).unwrap();
         assert!(!server.collector_was_contacted());
     }
 
     #[test]
-    fn curl_does_not_carry_injected_credentials_across_redirects() {
+    fn curl_follows_a_paid_redirect_without_the_credential() {
         if check_command_exists("curl").is_err() {
             return;
         }
         let server = CrossOriginRedirect::start();
+        // Even `--location-trusted`, which forwards credentials by design,
+        // must not hand Pay's header to the next hop.
         let args = s(&["-s", "--location-trusted", &server.origin_url]);
         let outcome = run_curl_inner(&args, &s(&[PAYMENT_HEADER])).unwrap();
-        assert!(matches!(outcome, RunOutcome::Completed { .. }));
-        assert!(!server.collector_was_contacted());
+        assert!(matches!(
+            outcome,
+            RunOutcome::Completed { exit_code: 0, .. }
+        ));
+        let (origin, collector) = server.requests();
+        assert!(
+            origin.contains(PAYMENT_SECRET),
+            "the paid URL got the credential"
+        );
+        let collector = collector.expect("curl stopped at the paid redirect");
+        assert!(!collector.contains(PAYMENT_SECRET), "{collector}");
+    }
+
+    #[test]
+    fn curl_does_not_follow_a_paid_redirect_unless_asked() {
+        if check_command_exists("curl").is_err() {
+            return;
+        }
+        for flags in [
+            vec!["-s"],
+            vec!["-sL", "--no-location"],
+            vec!["-sL", "-d", "a=1"],
+        ] {
+            let server = CrossOriginRedirect::start();
+            let mut args = s(&flags);
+            args.push(server.origin_url.clone());
+            run_curl_inner(&args, &s(&[PAYMENT_HEADER])).unwrap();
+            assert!(!server.collector_was_contacted(), "{flags:?}");
+        }
+    }
+
+    /// `/a` redirects to `/a/` (a trailing-slash canonicalisation, the same
+    /// shape as an `http` to `https` upgrade), and `/a/` is the paid
+    /// resource: it asks for payment, then serves the paid retry.
+    fn trailing_slash_paywall() -> (String, std::thread::JoinHandle<Vec<String>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/a", listener.local_addr().unwrap());
+        let server = serve(
+            listener,
+            std::time::Duration::from_secs(20),
+            vec![
+                redirect_to("/a/"),
+                PAYMENT_REQUIRED_RESPONSE.to_string(),
+                OK_RESPONSE.to_string(),
+            ],
+        );
+        (url, server)
+    }
+
+    fn request_path(request: &str) -> &str {
+        request.split_whitespace().nth(1).unwrap_or_default()
+    }
+
+    fn pay_behind_a_redirect(tool: ToolKind, args: Vec<String>, url: &str) {
+        let first = match tool {
+            ToolKind::Curl => run_curl_inner(&args, &[]),
+            ToolKind::Wget => run_wget_inner(&args, &[]),
+            ToolKind::Httpie => unreachable!(),
+        }
+        .unwrap();
+        let RunOutcome::UnknownPaymentRequired { resource_url, .. } = first else {
+            panic!("expected the 402 from {url}/: {first:?}");
+        };
+        assert_eq!(resource_url, format!("{url}/"));
+        let paid = run_paid(tool, &args, &resource_url, &s(&[PAYMENT_HEADER])).unwrap();
+        assert!(
+            matches!(paid, RunOutcome::Completed { exit_code: 0, .. }),
+            "{paid:?}"
+        );
+    }
+
+    #[test]
+    fn curl_pays_the_url_that_asked_for_payment_behind_a_redirect() {
+        if check_command_exists("curl").is_err() {
+            return;
+        }
+        let (url, server) = trailing_slash_paywall();
+        pay_behind_a_redirect(ToolKind::Curl, s(&["-sL", &url]), &url);
+        let requests = server.join().unwrap();
+        let seen: Vec<(&str, bool)> = requests
+            .iter()
+            .map(|r| (request_path(r), r.contains(PAYMENT_SECRET)))
+            .collect();
+        assert_eq!(seen, [("/a", false), ("/a/", false), ("/a/", true)]);
+    }
+
+    #[test]
+    fn wget_pays_the_url_that_asked_for_payment_behind_a_redirect() {
+        if check_command_exists("wget").is_err() {
+            return;
+        }
+        let (url, server) = trailing_slash_paywall();
+        pay_behind_a_redirect(ToolKind::Wget, s(&["-q", "-O", "-", &url]), &url);
+        let requests = server.join().unwrap();
+        let seen: Vec<(&str, bool)> = requests
+            .iter()
+            .map(|r| (request_path(r), r.contains(PAYMENT_SECRET)))
+            .collect();
+        assert_eq!(seen, [("/a", false), ("/a/", false), ("/a/", true)]);
+    }
+
+    #[test]
+    fn a_402_from_another_origin_is_not_paid() {
+        if check_command_exists("curl").is_err() {
+            return;
+        }
+        let origin = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin_url = format!("http://{}/start", origin.local_addr().unwrap());
+        let other_url = format!("http://{}/paid", other.local_addr().unwrap());
+        let wait = std::time::Duration::from_secs(20);
+        let origin = serve(origin, wait, vec![redirect_to(&other_url)]);
+        let other = serve(other, wait, vec![PAYMENT_REQUIRED_RESPONSE.to_string()]);
+        let outcome = run_curl_inner(&s(&["-sL", &origin_url]), &[]);
+        assert!(
+            matches!(&outcome, Err(Error::RequestValidation(m)) if m.contains(&other_url)),
+            "{outcome:?}"
+        );
+        assert_eq!(origin.join().unwrap().len(), 1);
+        assert_eq!(other.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_paying_url_follows_the_redirect_chain_within_one_origin() {
+        let head = |status, location: Option<&str>| ResponseHead {
+            status: Some(status),
+            headers: location
+                .map(|l| vec![("location".to_string(), l.to_string())])
+                .unwrap_or_default(),
+        };
+        let chain = [
+            head(301, Some("https://a.example/x")),
+            head(302, Some("/x/")),
+            head(402, None),
+        ];
+        assert_eq!(
+            payment_url("http://a.example/x", &chain, "http://a.example/x").unwrap(),
+            "https://a.example/x/"
+        );
+        // No redirect: the URL as the caller wrote it.
+        assert_eq!(
+            payment_url(
+                "http://a.example/x",
+                &[head(402, None)],
+                "http://a.example/x"
+            )
+            .unwrap(),
+            "http://a.example/x"
+        );
+        // A redirect the tool did not follow (the last head) does not move it.
+        assert_eq!(
+            answering_url("http://a.example/x", &[head(302, Some("/y"))]),
+            "http://a.example/x"
+        );
+        for elsewhere in [
+            "https://b.example/x",
+            "https://a.example:8443/x",
+            "http://b.a.example/",
+        ] {
+            let chain = [head(302, Some(elsewhere)), head(402, None)];
+            assert!(
+                payment_url("http://a.example/x", &chain, "http://a.example/x").is_err(),
+                "{elsewhere}"
+            );
+        }
+    }
+
+    #[test]
+    fn redirect_following_reads_the_callers_flags() {
+        assert!(follows_redirects(&s(&["-sL", "u"]), ToolKind::Curl));
+        assert!(follows_redirects(
+            &s(&["--location-trusted", "u"]),
+            ToolKind::Curl
+        ));
+        assert!(!follows_redirects(&s(&["-s", "u"]), ToolKind::Curl));
+        assert!(!follows_redirects(
+            &s(&["-L", "--no-location", "u"]),
+            ToolKind::Curl
+        ));
+        // `-e L` is a referer value, not `-L`.
+        assert!(!follows_redirects(&s(&["-eL", "u"]), ToolKind::Curl));
+        assert!(follows_redirects(&s(&["-q", "u"]), ToolKind::Wget));
+        assert!(follows_redirects(
+            &s(&["--max-redirect=3", "u"]),
+            ToolKind::Wget
+        ));
+        assert!(!follows_redirects(
+            &s(&["--max-redirect=0", "u"]),
+            ToolKind::Wget
+        ));
+        assert!(!follows_redirects(
+            &s(&["--max-redirect", "0", "u"]),
+            ToolKind::Wget
+        ));
+        assert!(follows_redirects(&s(&["--follow", "u"]), ToolKind::Httpie));
+        assert!(!follows_redirects(&s(&["u"]), ToolKind::Httpie));
+    }
+
+    #[test]
+    fn only_bodyless_reads_are_replayed_at_a_redirect_target() {
+        assert!(is_bodyless_read(&s(&["-sL", "u"]), ToolKind::Curl));
+        assert!(is_bodyless_read(&s(&["-I", "u"]), ToolKind::Curl));
+        assert!(is_bodyless_read(&s(&["-X", "GET", "u"]), ToolKind::Curl));
+        for args in [
+            s(&["-d", "a=1", "u"]),
+            s(&["-sd", "a=1", "u"]),
+            s(&["--json", "{}", "u"]),
+            s(&["-F", "f=@x", "u"]),
+            s(&["-T", "file", "u"]),
+            s(&["-X", "DELETE", "u"]),
+        ] {
+            assert!(!is_bodyless_read(&args, ToolKind::Curl), "{args:?}");
+        }
+        assert!(is_bodyless_read(&s(&["-q", "u"]), ToolKind::Wget));
+        assert!(!is_bodyless_read(
+            &s(&["--post-data=a", "u"]),
+            ToolKind::Wget
+        ));
+        assert!(!is_bodyless_read(
+            &s(&["--method=PUT", "u"]),
+            ToolKind::Wget
+        ));
+        assert!(is_bodyless_read(
+            &s(&["GET", "u", "Accept:x", "q==1"]),
+            ToolKind::Httpie
+        ));
+        assert!(!is_bodyless_read(&s(&["u", "a=1"]), ToolKind::Httpie));
+        assert!(!is_bodyless_read(&s(&["POST", "u"]), ToolKind::Httpie));
+    }
+
+    #[test]
+    fn the_paid_request_is_retargeted_in_place() {
+        let to = "https://a.example/x/";
+        assert_eq!(
+            paid_request_args(
+                &s(&["-sL", "-e", "https://ref.example", "http://a.example/x"]),
+                ToolKind::Curl,
+                to
+            ),
+            s(&["-sL", "-e", "https://ref.example", to])
+        );
+        assert_eq!(
+            paid_request_args(&s(&["--url=http://a.example/x"]), ToolKind::Curl, to),
+            s(&[&format!("--url={to}")])
+        );
+        assert_eq!(
+            paid_request_args(&s(&["-q", "http://a.example/x"]), ToolKind::Wget, to),
+            s(&["-q", to])
+        );
+        assert_eq!(
+            paid_request_args(
+                &s(&["--follow", "http://a.example/x"]),
+                ToolKind::Httpie,
+                to
+            ),
+            s(&["--follow", to])
+        );
+        // Unchanged when it already targets the URL.
+        assert_eq!(
+            paid_request_args(&s(&["-q", to]), ToolKind::Wget, to),
+            s(&["-q", to])
+        );
     }
 
     #[test]
