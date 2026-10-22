@@ -2404,7 +2404,10 @@ mod pre_attach_tests {
             "caller-secret",
             "caller-password",
         ] {
-            assert!(!logged.contains(secret), "{secret} leaked: {logged}");
+            assert!(
+                !logged.contains(secret),
+                "a caller credential leaked into the logged event"
+            );
         }
     }
 

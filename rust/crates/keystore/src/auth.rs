@@ -1023,13 +1023,19 @@ mod tests {
         ) else {
             panic!("payment intent");
         };
-        assert!(message.contains("to: CXhr...6MPY"), "{message}");
+        assert!(
+            message.contains("to: CXhr...6MPY"),
+            "the prompt names the recipient"
+        );
         assert!(
             message.contains("splits (1): $0.10 4Bui...2zPR"),
-            "{message}"
+            "the prompt lists the split"
         );
         // The amount and operator lines are kept.
-        assert!(message.contains("amount: $1.00"), "{message}");
+        assert!(
+            message.contains("amount: $1.00"),
+            "the prompt keeps the amount"
+        );
 
         let many: Vec<(&str, &str)> = (0..5)
             .map(|_| ("4BuiY9QUUfPoAGNJBja3JapAuVWMc9c7in6UCgyC2zPR", "$0.01"))
@@ -1039,8 +1045,14 @@ mod tests {
         else {
             panic!("payment intent");
         };
-        assert!(message.contains("splits (5)"), "{message}");
-        assert!(message.contains("+2 more"), "{message}");
+        assert!(
+            message.contains("splits (5)"),
+            "the prompt counts every split"
+        );
+        assert!(
+            message.contains("+2 more"),
+            "the prompt elides extra splits"
+        );
 
         // Non-payment intents are untouched.
         let sign_in = AuthIntent::SignIn("sign in".to_string());

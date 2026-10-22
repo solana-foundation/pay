@@ -4032,7 +4032,10 @@ mod tests {
             "screaming-session",
             "nested-camel-access",
         ] {
-            assert!(!captured.contains(secret), "{secret} leaked: {captured}");
+            assert!(
+                !captured.contains(secret),
+                "a credential leaked into the captured body"
+            );
         }
         let captured: serde_json::Value = serde_json::from_str(&captured).unwrap();
         assert_eq!(captured["model"], "gpt-5");
