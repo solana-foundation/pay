@@ -2430,6 +2430,10 @@ impl StartCommand {
                     } else {
                         None
                     },
+                    // The `payment-identifier` extension stays off, as before
+                    // the kit added it.
+                    payment_identifier:
+                        pay_kit::x402::server::PaymentIdentifierPolicy::NotAdvertised,
                 };
                 let (exact_store, durable_exact_store) = x402_exact_replay_store().await?;
                 if !durable_exact_store
@@ -4261,6 +4265,7 @@ mod tests {
                 description: None,
                 max_age: Some(300),
                 fee_payer_key: None,
+                payment_identifier: pay_kit::x402::server::PaymentIdentifierPolicy::NotAdvertised,
             },
             store,
         )

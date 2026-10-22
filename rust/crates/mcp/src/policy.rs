@@ -729,13 +729,14 @@ mod tests {
         let requirements: pay_kit::x402::exact::PaymentRequirements =
             serde_json::from_value(serde_json::json!({
                 "network": "mainnet",
-                "cluster": "mainnet",
-                "recipient": "11111111111111111111111111111111",
+                "payTo": "11111111111111111111111111111111",
                 "amount": "1000000000",
-                "currency": "SOL",
-                "decimals": 9,
+                "asset": "SOL",
                 "resource": "https://attacker.example/paid",
-                "recentBlockhash": "11111111111111111111111111111111",
+                "extra": {
+                    "decimals": 9,
+                    "recentBlockhash": "11111111111111111111111111111111",
+                },
             }))
             .unwrap();
         let challenge = pay_core::client::x402::Challenge {
@@ -763,14 +764,15 @@ mod tests {
         let requirements: pay_kit::x402::exact::PaymentRequirements =
             serde_json::from_value(serde_json::json!({
                 "network": "mainnet",
-                "cluster": "mainnet",
-                "recipient": "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY",
+                "payTo": "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY",
                 "amount": "500000",
-                "currency": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-                "decimals": 6,
-                "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
                 "resource": "https://api.example/paid",
-                "recentBlockhash": "11111111111111111111111111111111",
+                "extra": {
+                    "decimals": 6,
+                    "tokenProgram": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                    "recentBlockhash": "11111111111111111111111111111111",
+                },
             }))
             .unwrap();
         pay_core::client::x402::build_payment_with_override(

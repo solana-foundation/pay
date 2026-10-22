@@ -562,7 +562,15 @@ async fn middleware_returns_one_challenge_per_configured_currency() {
             request.currency
         })
         .collect();
-    assert_eq!(currencies, ["USDC", "CASH", "USDT"]);
+    // The wire currency is the mint, never the configured symbol.
+    assert_eq!(
+        currencies,
+        [
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            "CASHx9KJUStyftLFWGvEVf59SGeG9sh5FfcnZMVPCASH",
+            "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+        ]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

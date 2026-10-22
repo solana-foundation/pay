@@ -3592,6 +3592,7 @@ mod tests {
             description: Some("Fortune".to_string()),
             max_age: Some(60),
             fee_payer_key: None,
+            payment_identifier: pay_kit::x402::server::PaymentIdentifierPolicy::NotAdvertised,
         }
     }
 

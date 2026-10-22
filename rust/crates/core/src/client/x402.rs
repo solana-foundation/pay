@@ -2094,17 +2094,18 @@ mod tests {
         amount: &str,
         extra: Option<serde_json::Value>,
     ) -> Challenge {
+        // The kit reads each term from its x402 field only (RULINGS X1).
+        let mut extra = extra.unwrap_or_else(|| serde_json::json!({}));
+        extra["recentBlockhash"] = bs58::encode([blockhash_seed; 32]).into_string().into();
         Challenge {
             x402_version: pay_kit::x402::X402_VERSION_V2,
             requirements: serde_json::from_value(serde_json::json!({
                 "network": SOLANA_DEVNET,
-                "cluster": "devnet",
-                "recipient": "4BuiY9QUUfPoAGNJBja3JapAuVWMc9c7in6UCgyC2zPR",
+                "payTo": "4BuiY9QUUfPoAGNJBja3JapAuVWMc9c7in6UCgyC2zPR",
                 "amount": amount,
-                "currency": "SOL",
+                "asset": "SOL",
                 "resource": "https://provider.example/resource",
-                "maxAge": 300,
-                "recentBlockhash": bs58::encode([blockhash_seed; 32]).into_string(),
+                "maxTimeoutSeconds": 300,
                 "extra": extra,
             }))
             .unwrap(),

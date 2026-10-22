@@ -583,9 +583,9 @@ assets:
             x402_version: 2,
             requirements: serde_json::from_value(serde_json::json!({
                 "network": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
-                "recipient": SPLIT,
+                "payTo": SPLIT,
                 "amount": "1000",
-                "currency": USDC,
+                "asset": USDC,
                 "resource": "https://merchant.example/paid",
             }))
             .unwrap(),
