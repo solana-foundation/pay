@@ -186,18 +186,30 @@ impl Store {
     }
 
     /// Tie `subject`'s session-less link codes and CLI tokens (a guest's) to
-    /// the Privy `session` that attached a wallet to it.
-    pub fn adopt_session(&self, subject: &str, session: &str) {
-        for grant in self.grants.lock().unwrap().values_mut() {
+    /// the Privy `session` that attached a wallet to it. `live` is asked
+    /// while each map is locked, as in [`crate::oauth::Store::adopt_session`];
+    /// false once the session is signed out.
+    pub fn adopt_session(&self, subject: &str, session: &str, live: impl Fn() -> bool) -> bool {
+        let mut grants = self.grants.lock().unwrap();
+        if !live() {
+            return false;
+        }
+        for grant in grants.values_mut() {
             if grant.subject == subject && grant.session.is_none() {
                 grant.session = Some(session.to_string());
             }
         }
-        for token in self.tokens.lock().unwrap().values_mut() {
+        drop(grants);
+        let mut tokens = self.tokens.lock().unwrap();
+        if !live() {
+            return false;
+        }
+        for token in tokens.values_mut() {
             if token.subject == subject && token.session.is_none() {
                 token.session = Some(session.to_string());
             }
         }
+        true
     }
 
     /// End every pending link, link code and CLI token of the Privy
@@ -1207,6 +1219,28 @@ mod tests {
         assert_eq!(tokens.len(), MAX_ROWS);
         assert!(!tokens.contains_key(&oldest));
         assert!(tokens.contains_key(&sha256_hex(&fresh)));
+    }
+
+    #[test]
+    fn a_signed_out_session_cannot_adopt_guest_tokens() {
+        let store = Store::default();
+        let guest = store.issue_token(SUBJECT.to_string(), None).unwrap();
+        // Sign-out finished first: the session is revoked and purged.
+        store.revoke_session("sess_a");
+        assert!(!store.adopt_session(SUBJECT, "sess_a", || false));
+        assert!(
+            store
+                .tokens
+                .lock()
+                .unwrap()
+                .values()
+                .all(|token| token.session.is_none()),
+            "nothing adopted into a signed-out session"
+        );
+        // Control: a live session adopts them, and its sign-out ends them.
+        assert!(store.adopt_session(SUBJECT, "sess_a", || true));
+        store.revoke_session("sess_a");
+        assert!(store.authenticate(&guest).is_none());
     }
 
     #[test]

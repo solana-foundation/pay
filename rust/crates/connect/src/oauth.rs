@@ -620,18 +620,31 @@ impl Store {
 
     /// Tie `subject`'s session-less codes and tokens (a guest's) to the login
     /// `session` that just attached a wallet to it, so signing that session
-    /// out ends them too.
-    pub fn adopt_session(&self, subject: &str, session: &str) {
-        for grant in self.codes.lock().unwrap().values_mut() {
+    /// out ends them too. `live` is asked while each map is locked: a
+    /// sign-out marks the session revoked before it purges these maps, so
+    /// adoption either lands before the purge or sees the sign-out. Returns
+    /// false, adopting nothing further, once the session is signed out.
+    pub fn adopt_session(&self, subject: &str, session: &str, live: impl Fn() -> bool) -> bool {
+        let mut codes = self.codes.lock().unwrap();
+        if !live() {
+            return false;
+        }
+        for grant in codes.values_mut() {
             if grant.subject == subject && grant.session.is_none() {
                 grant.session = Some(session.to_string());
             }
         }
-        for token in self.tokens.lock().unwrap().values_mut() {
+        drop(codes);
+        let mut tokens = self.tokens.lock().unwrap();
+        if !live() {
+            return false;
+        }
+        for token in tokens.values_mut() {
             if token.subject == subject && token.session.is_none() {
                 token.session = Some(session.to_string());
             }
         }
+        true
     }
 
     /// End every pending approval, code and token of the upstream login
@@ -1671,15 +1684,24 @@ pub async fn link_complete(
         session,
     } = approve_with_privy(&state, token).await?;
     let record = state.tenants().get(&subject).ok_or_else(unknown_request)?;
+    // The guest's credentials are about to pay from this wallet: they belong
+    // to the session that attaches it and end when it signs out. They are
+    // adopted before the wallet is bound, so a sign-out racing this link
+    // either revokes them or leaves the guest without the wallet.
+    let live = || session_is_live(&state, &session);
+    let adopted = state
+        .oauth()
+        .is_none_or(|store| store.adopt_session(&guest, &session.id, live));
+    if !(adopted && state.cli().adopt_session(&guest, &session.id, live)) {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "invalid_login",
+            "You signed out before the wallet was linked. Sign in again.",
+        ));
+    }
     let mut linked = (*record).clone();
     linked.subject = guest.clone();
     state.tenants().bind(linked);
-    // The guest's credentials now pay from this wallet: they belong to the
-    // session that attached it and end when it signs out.
-    if let Some(store) = state.oauth() {
-        store.adopt_session(&guest, &session.id);
-    }
-    state.cli().adopt_session(&guest, &session.id);
     claim.commit();
     tracing::info!(%guest, %subject, address = %record.pubkey, "guest connection linked to a wallet");
     let funded = !(bound == Some(Bound::Created)
@@ -1942,6 +1964,39 @@ mod tests {
                 live
             );
         }
+    }
+
+    /// A guest link racing a sign-out of the session that approved it: once
+    /// the sign-out is through, adoption refuses rather than attach the
+    /// guest's tokens to a session nothing will revoke again.
+    #[test]
+    fn a_signed_out_session_cannot_adopt_guest_tokens() {
+        let store = Store::new("https://cloud.test/");
+        let (client, _) = store.register(grok_registration()).unwrap();
+        let request = pending_for(&client);
+        let id = request.id.clone();
+        store.create_pending(request).unwrap();
+        let (_, code) = store.approve(&id, "guest_1").unwrap();
+        let guest = store
+            .exchange_code(&client.client_id, &code, VERIFIER, None)
+            .unwrap();
+
+        store.revoke_session("sess_a");
+        assert!(!store.adopt_session("guest_1", "sess_a", || false));
+        assert!(
+            store
+                .tokens
+                .lock()
+                .unwrap()
+                .values()
+                .all(|token| token.session.is_none()),
+            "nothing adopted into a signed-out session"
+        );
+
+        // Control: a live session adopts them, and its sign-out ends them.
+        assert!(store.adopt_session("guest_1", "sess_a", || true));
+        store.revoke_session("sess_a");
+        assert!(store.authenticate(&guest.access_token).is_none());
     }
 
     #[test]
