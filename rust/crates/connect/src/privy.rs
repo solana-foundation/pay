@@ -883,8 +883,13 @@ impl OnChainSpendHistory {
         Ok(accounts)
     }
 
-    /// Signatures of `address`'s successful transactions since `day_start`.
-    async fn signatures_today(&self, address: &str, day_start: i64) -> Result<Vec<String>, String> {
+    /// Signatures of `address`'s successful transactions since `day_start`,
+    /// or `None` when there are more than can be read.
+    async fn signatures_today(
+        &self,
+        address: &str,
+        day_start: i64,
+    ) -> Result<Option<Vec<String>>, String> {
         let mut before: Option<String> = None;
         let mut signatures = Vec::new();
         for _ in 0..HISTORY_PAGES {
@@ -901,7 +906,7 @@ impl OnChainSpendHistory {
             for entry in page {
                 // An unknown block time counts as today.
                 if entry["blockTime"].as_i64().is_some_and(|t| t < day_start) {
-                    return Ok(signatures);
+                    return Ok(Some(signatures));
                 }
                 let signature = entry["signature"].as_str().ok_or("signature missing")?;
                 before = Some(signature.to_string());
@@ -910,12 +915,10 @@ impl OnChainSpendHistory {
                 }
             }
             if page.len() < HISTORY_PAGE {
-                return Ok(signatures);
+                return Ok(Some(signatures));
             }
         }
-        Err(format!(
-            "{address} has too many transactions today to count"
-        ))
+        Ok(None)
     }
 }
 
@@ -930,9 +933,20 @@ impl crate::tenants::SpendHistory for OnChainSpendHistory {
         // The owner's own transactions, and every transaction touching one of
         // its stablecoin accounts, each counted once.
         let mut signatures = std::collections::BTreeSet::new();
-        signatures.extend(self.signatures_today(wallet, day_start).await?);
-        for account in self.stablecoin_accounts(wallet).await? {
-            signatures.extend(self.signatures_today(&account, day_start).await?);
+        let mut addresses = vec![wallet.to_string()];
+        addresses.extend(self.stablecoin_accounts(wallet).await?);
+        for address in addresses {
+            match self.signatures_today(&address, day_start).await? {
+                Some(today) => signatures.extend(today),
+                // Anyone can push an address past what can be read by
+                // naming it in cheap transactions. That history is not
+                // unavailable, it is uncountable: today's allowance is
+                // treated as spent, and the wallet still signs in.
+                None => {
+                    tracing::warn!(%address, "too many transactions today to count; no spend left today");
+                    return Ok(crate::tenants::UNCOUNTABLE_SPEND);
+                }
+            }
         }
         let mut raw = 0_u64;
         for signature in signatures {
@@ -983,8 +997,16 @@ struct TransactionBody {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Message {
+    header: MessageHeader,
     account_keys: Vec<String>,
     instructions: Vec<Instruction>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MessageHeader {
+    /// The first this many account keys signed the transaction.
+    num_required_signatures: usize,
 }
 
 #[derive(Deserialize)]
@@ -1015,13 +1037,17 @@ const CONFIDENTIAL_TOKEN_INSTRUCTIONS: [u8; 3] = [27, 37, 42];
 
 impl ConfirmedTransaction {
     /// Raw six-decimal stablecoin units `owner`'s token accounts lost. An
-    /// error when the transaction moved confidential balances, whose amounts
-    /// cannot be read from it: unknown spend is not zero spend.
+    /// error when `owner` signed a transaction that moved confidential
+    /// balances, whose amounts cannot be read from it: unknown spend is not
+    /// zero spend. Only the account owner can debit a confidential balance
+    /// (Token-2022 takes no delegate for it), so a confidential instruction
+    /// in a transaction `owner` did not sign, which anyone can send naming
+    /// the wallet or its accounts, spent nothing of theirs.
     fn stablecoin_outflow(&self, owner: &str) -> Result<u64, String> {
         if self.meta.err.is_some() {
             return Ok(0);
         }
-        if self.moves_confidential_balances()? {
+        if self.signed_by(owner) && self.moves_confidential_balances()? {
             return Err("confidential token history is not auditable".to_string());
         }
         let balances = |entries: &[serde_json::Value]| -> BTreeMap<u64, u64> {
@@ -1047,6 +1073,16 @@ impl ConfirmedTransaction {
             .iter()
             .map(|(index, before)| before.saturating_sub(post.get(index).copied().unwrap_or(0)))
             .fold(0, u64::saturating_add))
+    }
+
+    /// Whether `key` is one of the transaction's signers.
+    fn signed_by(&self, key: &str) -> bool {
+        let message = &self.transaction.message;
+        message
+            .account_keys
+            .iter()
+            .take(message.header.num_required_signatures)
+            .any(|signer| signer == key)
     }
 
     /// Whether any instruction, top-level or inner, is a Token-2022
@@ -1761,7 +1797,7 @@ pub(crate) mod tests {
 
     /// A transaction body with nothing in it but balances.
     static NO_INSTRUCTIONS: std::sync::LazyLock<serde_json::Value> = std::sync::LazyLock::new(
-        || json!({ "message": { "accountKeys": [], "instructions": [] } }),
+        || json!({ "message": { "header": { "numRequiredSignatures": 0 }, "accountKeys": [], "instructions": [] } }),
     );
 
     /// A confidential debit changes no public balance, so a transaction
@@ -1773,6 +1809,7 @@ pub(crate) mod tests {
         let tx = |instructions: serde_json::Value, inner: serde_json::Value| {
             serde_json::from_value::<ConfirmedTransaction>(json!({
                 "transaction": { "message": {
+                    "header": { "numRequiredSignatures": 1 },
                     "accountKeys": [ADDRESS, programs::TOKEN_2022_PROGRAM],
                     "instructions": instructions } },
                 "meta": { "err": null, "preTokenBalances": [], "postTokenBalances": [],
@@ -1803,6 +1840,43 @@ pub(crate) mod tests {
             json!([]),
         );
         assert!(unreadable.stablecoin_outflow(ADDRESS).is_err());
+    }
+
+    /// Only the owner can debit a confidential balance, so a confidential
+    /// instruction in a transaction the wallet did not sign (anyone can send
+    /// one naming the wallet) leaves its history countable.
+    #[test]
+    fn confidential_instructions_the_wallet_did_not_sign_spend_nothing() {
+        use pay_kit::mpp::protocol::solana::{mints, programs};
+        let balance = |amount: u64| {
+            json!([{ "accountIndex": 2, "owner": ADDRESS, "mint": mints::USDC_MAINNET,
+                     "uiTokenAmount": { "amount": amount.to_string() } }])
+        };
+        // The confidential instruction is always Token-2022, the last key.
+        let tx = |signers: usize, keys: &[&str]| {
+            serde_json::from_value::<ConfirmedTransaction>(json!({
+                "transaction": { "message": {
+                    "header": { "numRequiredSignatures": signers },
+                    "accountKeys": keys,
+                    "instructions": [{ "programIdIndex": keys.len() - 1, "accounts": [],
+                                       "data": bs58::encode([27, 7]).into_string() }] } },
+                "meta": { "err": null, "preTokenBalances": balance(5_000_000),
+                          "postTokenBalances": balance(4_000_000) }
+            }))
+            .unwrap()
+        };
+        let attacker = "Attacker11111111111111111111111111111111111";
+        let token_2022 = programs::TOKEN_2022_PROGRAM;
+        // The attacker signs; the wallet is only named.
+        let theirs = tx(1, &[attacker, ADDRESS, token_2022]);
+        assert_eq!(theirs.stablecoin_outflow(ADDRESS), Ok(1_000_000));
+        let unsigned = tx(0, &[ADDRESS, token_2022]);
+        assert_eq!(unsigned.stablecoin_outflow(ADDRESS), Ok(1_000_000));
+        // The wallet among the signers: unauditable, as before.
+        let cosigned = tx(2, &[attacker, ADDRESS, token_2022]);
+        assert!(cosigned.stablecoin_outflow(ADDRESS).is_err());
+        let signed = tx(1, &[ADDRESS, token_2022]);
+        assert!(signed.stablecoin_outflow(ADDRESS).is_err());
     }
 
     #[test]
@@ -1919,6 +1993,75 @@ pub(crate) mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// Anyone can flood a wallet's token account with dust transfers. History
+    /// too long to read leaves no allowance today, but the wallet still binds.
+    #[tokio::test]
+    async fn uncountable_history_spends_the_day_without_blocking_sign_in() {
+        use crate::tenants::{SpendHistory, TenantRegistry, UNCOUNTABLE_SPEND};
+        use pay_kit::mpp::protocol::solana::{mints, programs};
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let rpc = move |Json(request): Json<serde_json::Value>| async move {
+            let result = match request["method"].as_str().unwrap() {
+                "getTokenAccountsByOwner" => {
+                    match request["params"][1]["programId"].as_str().unwrap() {
+                        programs::TOKEN_PROGRAM => json!({ "value": [{ "pubkey": "usdc_account",
+                            "account": { "data": { "parsed": { "info": { "mint": mints::USDC_MAINNET } } } } }] }),
+                        _ => json!({ "value": [] }),
+                    }
+                }
+                "getSignaturesForAddress" => match request["params"][0].as_str().unwrap() {
+                    ADDRESS => json!([]),
+                    // Every page full of today's dust.
+                    _ => {
+                        let page = request["params"][1]["before"].as_str().unwrap_or("").len();
+                        json!(
+                            (0..HISTORY_PAGE)
+                                .map(|i| json!({ "signature": format!("dust_{page}_{i}"),
+                                             "blockTime": now, "err": null }))
+                                .collect::<Vec<_>>()
+                        )
+                    }
+                },
+                other => panic!("{other} must not be called"),
+            };
+            Json(json!({ "jsonrpc": "2.0", "id": 1, "result": result }))
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/", post(rpc)))
+                .await
+                .unwrap();
+        });
+        let history = OnChainSpendHistory::new(format!("http://{addr}/"));
+        assert_eq!(history.spent_today(ADDRESS).await, Ok(UNCOUNTABLE_SPEND));
+
+        let mut credentials = pay_core::remote::Credentials::new();
+        credentials.insert("secret_key".to_string(), "sk_test_1".to_string());
+        let tenant = TenantRecord {
+            subject: "sub_1".to_string(),
+            account_name: "grok".to_string(),
+            provider: PROVIDER_ID.to_string(),
+            wallet_id: "w_1".to_string(),
+            pubkey: ADDRESS.to_string(),
+            credentials,
+            policy: pay_mcp::policy::SpendPolicy::dollars(1.0, 5.0),
+            recipients: crate::tenants::DEFAULT_RECIPIENTS,
+        };
+        let registry = TenantRegistry::new();
+        registry.seed_spend(&tenant, &history).await.unwrap();
+        assert!(registry.reserve_cli_transaction(&tenant, 1).is_err());
+        let fresh = TenantRegistry::new();
+        fresh
+            .seed_spend(&tenant, &crate::tenants::FixedHistory(0))
+            .await
+            .unwrap();
+        assert!(fresh.reserve_cli_transaction(&tenant, 1).is_ok());
     }
 
     #[tokio::test]

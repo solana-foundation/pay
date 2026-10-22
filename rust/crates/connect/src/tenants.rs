@@ -145,9 +145,15 @@ struct LinkTicket {
 #[async_trait::async_trait]
 pub trait SpendHistory: Send + Sync {
     /// USD minor units `wallet` paid out in stablecoins during the current
-    /// UTC day. An error means unknown, and binding fails closed.
+    /// UTC day. An error means unavailable, and binding fails closed;
+    /// [`UNCOUNTABLE_SPEND`] means binding succeeds with nothing left today.
     async fn spent_today(&self, wallet: &str) -> Result<u64, String>;
 }
+
+/// What [`SpendHistory::spent_today`] answers for a wallet whose history
+/// today exists but is too long to count: more than any daily cap, so the
+/// wallet signs in but pays nothing more until the UTC day turns.
+pub const UNCOUNTABLE_SPEND: u64 = u64::MAX;
 
 /// A history with a fixed answer, for tests.
 pub struct FixedHistory(pub u64);
@@ -259,7 +265,11 @@ impl TenantRegistry {
         if self.seeded.lock().unwrap().contains(&key) {
             return Ok(());
         }
-        let spent = history.spent_today(&tenant.pubkey).await?;
+        let mut spent = history.spent_today(&tenant.pubkey).await?;
+        if spent == UNCOUNTABLE_SPEND {
+            // Exactly the cap: nothing more today, and a refusal that reads.
+            spent = tenant.policy.daily_cap.unwrap_or(UNCOUNTABLE_SPEND);
+        }
         if self.seeded.lock().unwrap().insert(key.clone()) {
             let _ = self.ledger.check_and_record(&key, spent, None);
         }
