@@ -633,17 +633,31 @@ impl SessionStreamMeter {
     /// client's vouchers cover all of it. Its usage is only known once the
     /// whole body is parsed, so the body must not be released before this
     /// returns.
-    pub async fn settle_complete_body(mut self, body: &[u8], is_sse: bool) -> Result<(), BoxError> {
+    pub async fn settle_complete_body(
+        mut self,
+        body: &[u8],
+        is_sse: bool,
+    ) -> Result<(), CompleteBodyError> {
         self.touch_channel_if_due();
         let changed = self
             .accumulator
             .observe_complete_body(body, is_sse)
-            .map_err(box_error)?;
-        if let Some(decision) = self.observe_usage_change(changed).map_err(box_error)? {
-            settle_decision(&mut self, decision).await?;
+            .map_err(CompleteBodyError::Unmeterable)?;
+        if let Some(decision) = self
+            .observe_usage_change(changed)
+            .map_err(CompleteBodyError::Unmeterable)?
+        {
+            settle_decision(&mut self, decision)
+                .await
+                .map_err(CompleteBodyError::Uncovered)?;
         }
-        if let Some(decision) = self.finish(is_sse).map_err(box_error)? {
-            settle_decision(&mut self, decision).await?;
+        if let Some(decision) = self
+            .finish(is_sse)
+            .map_err(CompleteBodyError::Unmeterable)?
+        {
+            settle_decision(&mut self, decision)
+                .await
+                .map_err(CompleteBodyError::Uncovered)?;
         }
         Ok(())
     }
@@ -656,6 +670,18 @@ impl SessionStreamMeter {
         self.context.touch_channel_unconfirmed();
         self.next_lifecycle_touch = now + LIFECYCLE_TOUCH_INTERVAL;
     }
+}
+
+/// Why a complete response body was not settled. Either way it must not be
+/// released.
+#[derive(Debug, thiserror::Error)]
+pub enum CompleteBodyError {
+    /// The body does not carry the endpoint's usage in a readable form.
+    #[error("response cannot be metered: {0}")]
+    Unmeterable(crate::server::session_metering::SessionMeteringError),
+    /// The client's vouchers did not cover the body's usage.
+    #[error("response usage not covered: {0}")]
+    Uncovered(BoxError),
 }
 
 /// Wrap an upstream byte stream with session metering backpressure.

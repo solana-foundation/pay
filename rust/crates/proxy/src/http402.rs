@@ -648,6 +648,7 @@ impl<S: PaymentState> Http402Gate<S> {
         let mut client_meter = ctx
             .client_meter
             .take()
+            .and_then(|meter| meter.for_status(status))
             .map(|meter| meter.with_request_body_bytes(body.len() as u64));
         let client_voucher = client_meter.is_some();
         if let Some(meter) = client_meter.take_if(|_| !is_streamed_response(&response_headers)) {
@@ -915,14 +916,9 @@ impl<S: PaymentState> Http402Gate<S> {
                 return Ok(true);
             }
         };
-        if let Err(error) = meter.settle_body(&body).await {
-            tracing::warn!(%error, "session-metered response usage not covered");
-            self.finish_buffered_axum_response(
-                session,
-                ctx,
-                pay_core::server::proxy::session_voucher_required_response(),
-            )
-            .await?;
+        if let Err(response) = meter.settle_body(&body).await {
+            self.finish_buffered_axum_response(session, ctx, response)
+                .await?;
             return Ok(true);
         }
         let extra = self.drain_payment_headers(ctx, status.is_success()).await;
@@ -2820,17 +2816,32 @@ mod tests {
     /// Serves one client-voucher session request on `path` through the
     /// buffered adapter and returns what reached the client within `wait`.
     async fn client_voucher_response(path: &str, wait: std::time::Duration) -> String {
+        client_voucher_response_from(
+            path,
+            wait,
+            (
+                StatusCode::OK,
+                "application/json",
+                r#"{"text":"protected-content","usage":{"completion_tokens":50}}"#,
+            ),
+        )
+        .await
+    }
+
+    /// [`client_voucher_response`] from an upstream answering `upstream`.
+    async fn client_voucher_response_from(
+        path: &str,
+        wait: std::time::Duration,
+        (status, content_type, body): (StatusCode, &'static str, &'static str),
+    ) -> String {
         use pay_types::metering::{
             BillingUnit, Endpoint, HttpMethod, MeterDimension, MeterDirection, Metering, PriceTier,
             Scheme, UsageMeter, UsageMeterSource,
         };
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let upstream = axum::Router::new().fallback(|| async {
-            (
-                [(http::header::CONTENT_TYPE, "application/json")],
-                r#"{"text":"protected-content","usage":{"completion_tokens":50}}"#,
-            )
+        let upstream = axum::Router::new().fallback(move || async move {
+            (status, [(http::header::CONTENT_TYPE, content_type)], body)
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_addr = listener.local_addr().unwrap();
@@ -2983,6 +2994,38 @@ mod tests {
             !served.contains("protected-content"),
             "usage beyond the admitting voucher must be withheld: {served}"
         );
+    }
+
+    #[tokio::test]
+    async fn client_voucher_upstream_error_is_relayed_unmetered() {
+        let served = client_voucher_response_from(
+            "v1/metered",
+            std::time::Duration::from_secs(5),
+            (
+                StatusCode::BAD_GATEWAY,
+                "text/html",
+                "<html><body>upstream-down</body></html>",
+            ),
+        )
+        .await;
+        assert!(served.starts_with("HTTP/1.1 502"), "{served}");
+        assert!(served.contains("upstream-down"), "{served}");
+    }
+
+    #[tokio::test]
+    async fn client_voucher_unmeterable_answer_is_a_gateway_error() {
+        let served = client_voucher_response_from(
+            "v1/metered",
+            std::time::Duration::from_secs(5),
+            (
+                StatusCode::OK,
+                "text/html",
+                "<html>protected-content</html>",
+            ),
+        )
+        .await;
+        assert!(served.starts_with("HTTP/1.1 502"), "{served}");
+        assert!(!served.contains("protected-content"), "{served}");
     }
 
     #[tokio::test]

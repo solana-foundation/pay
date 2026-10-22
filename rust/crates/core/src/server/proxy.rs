@@ -320,7 +320,10 @@ pub async fn forward_request_with_session_metering_and_identity(
         }
         None => None,
     };
-    let Some(meter) = meter.map(|meter| meter.with_request_body_bytes(body.len() as u64)) else {
+    let Some(meter) = meter
+        .and_then(|meter| meter.for_status(status))
+        .map(|meter| meter.with_request_body_bytes(body.len() as u64))
+    else {
         return Ok(resp
             .body(Body::from_stream(upstream_resp.bytes_stream()))
             .unwrap());
@@ -338,10 +341,7 @@ pub async fn forward_request_with_session_metering_and_identity(
             tracing::warn!(%error, "failed to buffer session-metered response");
             error_response(StatusCode::BAD_GATEWAY, "Response metering failed")
         })?;
-    if let Err(error) = meter.settle_body(&body).await {
-        tracing::warn!(%error, "session-metered response usage not covered");
-        return Err(session_voucher_required_response());
-    }
+    meter.settle_body(&body).await?;
     Ok(resp.body(Body::from(body)).unwrap())
 }
 
@@ -615,6 +615,14 @@ impl ClientVoucherMeter {
         self
     }
 
+    /// The meter for an upstream response with `status`, or `None` to relay
+    /// it as sent. Like every other session mode, only a completed handler
+    /// (2xx or 3xx) is charged; an upstream error page carries no paid
+    /// output and need not parse as the endpoint's usage format.
+    pub fn for_status(self, status: StatusCode) -> Option<Self> {
+        crate::server::gate::handler_completed(status).then_some(self)
+    }
+
     /// Largest complete response body this endpoint meters.
     pub fn body_limit(&self) -> usize {
         self.body_limit
@@ -634,9 +642,25 @@ impl ClientVoucherMeter {
     }
 
     /// Meter a complete response body, returning once the client's vouchers
-    /// cover it. Its usage is known only after the whole body is read.
-    pub async fn settle_body(self, body: &[u8]) -> Result<(), session_stream::BoxError> {
-        self.meter.settle_complete_body(body, false).await
+    /// cover it. Its usage is known only after the whole body is read. On
+    /// failure the body must not be released; the error is the response to
+    /// send instead.
+    #[allow(clippy::result_large_err)]
+    pub async fn settle_body(self, body: &[u8]) -> Result<(), Response> {
+        match self.meter.settle_complete_body(body, false).await {
+            Ok(()) => Ok(()),
+            Err(error @ session_stream::CompleteBodyError::Unmeterable(_)) => {
+                tracing::warn!(%error, "session-metered response cannot be metered");
+                Err(error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "Response metering failed",
+                ))
+            }
+            Err(error @ session_stream::CompleteBodyError::Uncovered(_)) => {
+                tracing::warn!(%error, "session-metered response usage not covered");
+                Err(session_voucher_required_response())
+            }
+        }
     }
 }
 
@@ -2062,15 +2086,35 @@ mod tests {
         }
     }
 
+    /// A JSON upstream answer reporting 50 completion tokens.
+    const METERED_ANSWER: (StatusCode, &str, &str) = (
+        StatusCode::OK,
+        "application/json",
+        r#"{"text":"protected-content","usage":{"completion_tokens":50}}"#,
+    );
+
     /// A client-voucher session admitted at cumulative 1_000 requests `path`
     /// from a JSON upstream reporting 50 completion tokens. Returns the first
     /// body bytes released within 500ms, if any.
     async fn client_voucher_first_bytes(path: &str) -> Option<Bytes> {
+        client_voucher_exchange(path, METERED_ANSWER)
+            .await
+            .and_then(|(_, first)| first)
+    }
+
+    /// A client-voucher session admitted at cumulative 1_000 requests `path`
+    /// from an upstream answering `upstream`. Returns the status and first
+    /// body bytes released within 500ms, if any.
+    async fn client_voucher_exchange(
+        path: &str,
+        (status, content_type, body): (StatusCode, &'static str, &'static str),
+    ) -> Option<(StatusCode, Option<Bytes>)> {
         use futures_util::StreamExt;
-        let upstream = axum::Router::new().fallback(|| async {
+        let upstream = axum::Router::new().fallback(move || async move {
             (
-                [(axum::http::header::CONTENT_TYPE, "application/json")],
-                r#"{"text":"protected-content","usage":{"completion_tokens":50}}"#,
+                status,
+                [(axum::http::header::CONTENT_TYPE, content_type)],
+                body,
             )
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2127,19 +2171,53 @@ mod tests {
                 Some(SessionStreamContext::new(handle, key(), 1_000)),
             )
             .await
-            .unwrap();
-            response.into_body().into_data_stream().next().await
+            .unwrap_or_else(|response| response);
+            let status = response.status();
+            let first = response.into_body().into_data_stream().next().await;
+            (status, first.map(|chunk| chunk.unwrap()))
         };
         tokio::time::timeout(std::time::Duration::from_millis(500), served)
             .await
             .ok()
-            .flatten()
-            .map(|chunk| chunk.unwrap())
     }
 
     #[tokio::test]
     async fn client_voucher_response_is_withheld_until_its_usage_is_covered() {
         assert_eq!(client_voucher_first_bytes("v1/metered").await, None);
+    }
+
+    #[tokio::test]
+    async fn client_voucher_upstream_error_is_relayed_unmetered() {
+        let page = "<html><body>502 Bad Gateway</body></html>";
+        let (status, first) =
+            client_voucher_exchange("v1/metered", (StatusCode::BAD_GATEWAY, "text/html", page))
+                .await
+                .expect("an upstream error waits on no voucher");
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(first.as_deref(), Some(page.as_bytes()));
+    }
+
+    #[tokio::test]
+    async fn client_voucher_unmeterable_answer_is_a_gateway_error() {
+        let (status, first) = client_voucher_exchange(
+            "v1/metered",
+            (
+                StatusCode::OK,
+                "text/html",
+                "<html>protected-content</html>",
+            ),
+        )
+        .await
+        .expect("an unmeterable answer waits on no voucher");
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "a body the meter cannot read is no voucher shortfall"
+        );
+        assert!(
+            !String::from_utf8_lossy(&first.unwrap_or_default()).contains("protected-content"),
+            "the unmetered answer is never released"
+        );
     }
 
     #[tokio::test]
