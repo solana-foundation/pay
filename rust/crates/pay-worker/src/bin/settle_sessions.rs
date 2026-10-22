@@ -2738,7 +2738,15 @@ async fn reconcile_batch_channel(
             }) && target_settled
                 > onchain.channel.settlement.payout_watermark;
             let distribution = if should_distribute {
-                batch_distribution(rpc, rpc_url, &onchain, treasury_owner, token_programs).await?
+                batch_distribution(
+                    rpc,
+                    rpc_url,
+                    &onchain,
+                    treasury_owner,
+                    token_programs,
+                    channel::DistributeStage::Open,
+                )
+                .await?
             } else {
                 None
             };
@@ -2836,7 +2844,17 @@ async fn reconcile_batch_channel(
             );
             sealed_close(
                 &mut instructions,
-                batch_distribution(rpc, rpc_url, &onchain, treasury_owner, token_programs).await?,
+                batch_distribution(
+                    rpc,
+                    rpc_url,
+                    &onchain,
+                    treasury_owner,
+                    token_programs,
+                    channel::DistributeStage::Sealed {
+                        settled: target_settled,
+                    },
+                )
+                .await?,
                 target_settled,
                 onchain.channel.settlement.payout_watermark,
                 state.cumulative,
@@ -2848,7 +2866,17 @@ async fn reconcile_batch_channel(
             instructions.push(channel::build_seal_ix(&channel_id));
             sealed_close(
                 &mut instructions,
-                batch_distribution(rpc, rpc_url, &onchain, treasury_owner, token_programs).await?,
+                batch_distribution(
+                    rpc,
+                    rpc_url,
+                    &onchain,
+                    treasury_owner,
+                    token_programs,
+                    channel::DistributeStage::Sealed {
+                        settled: onchain.channel.settlement.settled,
+                    },
+                )
+                .await?,
                 onchain.channel.settlement.settled,
                 onchain.channel.settlement.payout_watermark,
                 state.cumulative,
@@ -2859,8 +2887,17 @@ async fn reconcile_batch_channel(
             // A permissionless seal can land before this worker ever reads
             // Closing; finalizing then would silently drop the accepted delta.
             require_settled_covers_accepted(&state, &onchain, "distribute")?;
-            let Some(distribution) =
-                batch_distribution(rpc, rpc_url, &onchain, treasury_owner, token_programs).await?
+            let Some(distribution) = batch_distribution(
+                rpc,
+                rpc_url,
+                &onchain,
+                treasury_owner,
+                token_programs,
+                channel::DistributeStage::Sealed {
+                    settled: onchain.channel.settlement.settled,
+                },
+            )
+            .await?
             else {
                 return Ok(BatchReconcileResult {
                     channel_id: state_channel_id,
@@ -2963,17 +3000,19 @@ fn require_settled_covers_accepted(
     Ok(())
 }
 
-/// The batch `distribute` for `onchain`, or `None` while the payer's refund
-/// account is closed. The worker never recreates that account itself: its
-/// rent would return to the payer on the next close, so recreating it on
-/// every payout lets a payer drain the operator. The claim or seal lands
-/// alone and the payout follows once the payer recreates the account.
+/// The batch `distribute` for `onchain` at `stage`, or `None` while a refund
+/// is due and the payer's refund account is closed. The worker never
+/// recreates that account itself: its rent would return to the payer on the
+/// next close, so recreating it on every payout lets a payer drain the
+/// operator. The claim or seal lands alone and the payout follows once the
+/// payer recreates the account. A payout that refunds nothing never waits.
 async fn batch_distribution(
     rpc: &RpcClient,
     rpc_url: &str,
     onchain: &channel::DecodedChannel,
     treasury_owner: &Pubkey,
     token_programs: &HashMap<Pubkey, Pubkey>,
+    stage: channel::DistributeStage,
 ) -> Result<Option<solana_instruction::Instruction>, JobError> {
     let token_program = token_programs
         .get(&onchain.mint())
@@ -2984,7 +3023,15 @@ async fn batch_distribution(
                 onchain.mint()
             ))
         })?;
-    if channel::payer_refund_account(rpc, rpc_url, onchain, &token_program).await?
+    if channel::payer_refund_account(
+        rpc,
+        rpc_url,
+        onchain,
+        &token_program,
+        &payment_channels::default_program_id(),
+        stage,
+    )
+    .await?
         == channel::RefundAccount::Closed
     {
         warn!(
@@ -3511,8 +3558,10 @@ async fn build_idle_close_candidate(
         )));
     }
 
-    let Some(mut instructions) =
-        close_settlement_instructions(state, onchain, now, operator, &program)?
+    let Some(CloseSettlement {
+        mut instructions,
+        settled: close_settled,
+    }) = close_settlement_instructions(state, onchain, now, operator, &program)?
     else {
         return Ok(None);
     };
@@ -3528,9 +3577,19 @@ async fn build_idle_close_candidate(
         None => channel::resolve_token_program(rpc, rpc_url, &onchain.mint()).await?,
     };
     // Never recreated at the operator's expense (see `batch_distribution`):
-    // with the payer's refund account closed only the close lands, and the
-    // sealed channel is distributed once the payer recreates it.
-    if channel::payer_refund_account(rpc, rpc_url, onchain, &token_program).await?
+    // with a refund due and the payer's refund account closed only the close
+    // lands, and the sealed channel is distributed once the payer recreates it.
+    if channel::payer_refund_account(
+        rpc,
+        rpc_url,
+        onchain,
+        &token_program,
+        &program,
+        channel::DistributeStage::Sealed {
+            settled: close_settled,
+        },
+    )
+    .await?
         == channel::RefundAccount::Closed
     {
         warn!(
@@ -3604,14 +3663,23 @@ async fn build_idle_close_candidate(
     }))
 }
 
+/// The instructions that seal a channel for an idle close, and the settled
+/// amount the sealed channel carries once they land.
+#[derive(Debug)]
+struct CloseSettlement {
+    instructions: Vec<solana_instruction::Instruction>,
+    settled: u64,
+}
+
 fn close_settlement_instructions(
     state: &ChannelState,
     onchain: &channel::DecodedChannel,
     now: i64,
     operator: &Pubkey,
     program: &Pubkey,
-) -> Result<Option<Vec<solana_instruction::Instruction>>, JobError> {
-    let instructions = match onchain.channel.status {
+) -> Result<Option<CloseSettlement>, JobError> {
+    let settled = onchain.channel.settlement.settled;
+    let (instructions, settled) = match onchain.channel.status {
         status
             if status == STATUS_OPEN
                 || (status == STATUS_CLOSING && now < onchain.close_deadline()) =>
@@ -3623,7 +3691,7 @@ fn close_settlement_instructions(
                 &onchain_signer,
                 now,
             )?;
-            payment_channels::build_settle_and_seal_instructions(
+            let instructions = payment_channels::build_settle_and_seal_instructions(
                 operator,
                 &onchain.address,
                 &onchain_signer,
@@ -3632,15 +3700,17 @@ fn close_settlement_instructions(
                 expires_at,
                 program,
             )
-            .map_err(|error| JobError::TxBuild(format!("settle-and-seal instruction: {error}")))?
+            .map_err(|error| JobError::TxBuild(format!("settle-and-seal instruction: {error}")))?;
+            (instructions, cumulative)
         }
-        STATUS_SEALED => Vec::new(),
-        STATUS_CLOSING if now >= onchain.close_deadline() => {
+        STATUS_SEALED => (Vec::new(), settled),
+        STATUS_CLOSING if now >= onchain.close_deadline() => (
             vec![channel::build_seal_ix_for_program(
                 &onchain.address,
                 program,
-            )]
-        }
+            )],
+            settled,
+        ),
         STATUS_DISTRIBUTED => return Ok(None),
         status => {
             return Err(JobError::TxBuild(format!(
@@ -3650,7 +3720,10 @@ fn close_settlement_instructions(
         }
     };
 
-    Ok(Some(instructions))
+    Ok(Some(CloseSettlement {
+        instructions,
+        settled,
+    }))
 }
 
 fn close_voucher(
@@ -4509,7 +4582,8 @@ mod tests {
         let program = restored.channel_program.unwrap();
         let close = close_settlement_instructions(&claimed, &onchain, 120, &operator, &program)
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .instructions;
         assert_eq!(&candidate.instructions[..close.len()], &close);
         assert!(close.iter().any(|ix| ix.program_id == program));
         let preimage = bound_preimage(&restored, &onchain).unwrap();
@@ -4829,7 +4903,8 @@ mod tests {
             &program,
         )
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .instructions;
         let expected = payment_channels::build_settle_and_seal_instructions(
             &config.operator.parse().unwrap(),
             &onchain.address,
@@ -5921,11 +5996,12 @@ mod tests {
         settled.cumulative = 100;
         settled.freeze_watermark_at(100);
         let past = onchain.close_deadline();
+        // Every case refunds the payer (deposit 1000 above what settles), so
+        // the payout reads its refund account.
         let cases = [
             (STATUS_SEALED, settled.clone(), 0),
             (STATUS_CLOSING, frozen, 1_010),
             (STATUS_CLOSING, settled, past),
-            (STATUS_OPEN, state, 0),
         ];
         for (status, state, now) in cases {
             onchain.channel.status = status;
@@ -5975,6 +6051,94 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_payout_that_refunds_nothing_never_waits_for_the_refund_account() {
+        let (state, onchain, operator) = batch_closing_fixture();
+        let mut open = onchain.clone();
+        open.channel.status = STATUS_OPEN;
+        // Exactly the deposit settles at the seal: nothing to refund.
+        let mut exact = onchain.clone();
+        exact.channel.deposit = state.cumulative;
+        let mut sealed_exact = exact.clone();
+        sealed_exact.channel.status = STATUS_SEALED;
+        sealed_exact.channel.settlement.settled = state.cumulative;
+        // The payer already withdrew its headroom.
+        let mut withdrawn = sealed_exact.clone();
+        withdrawn.channel.deposit = 1_000;
+        withdrawn.channel.payer_withdrawn_at = 1;
+        // A payer close in grace settles the frozen watermark.
+        let mut frozen = state.clone();
+        frozen.freeze_watermark_at(frozen.cumulative);
+        let cases = [
+            ("open claim and payout", &state, open, 0),
+            ("exact settle and seal", &frozen, exact, 1_010),
+            ("sealed at its deposit", &state, sealed_exact, 0),
+            ("sealed after withdrawal", &state, withdrawn, 0),
+        ];
+        for (case, state, onchain, now) in cases {
+            let candidate = reconcile_batch_with_refund_account(
+                state.clone(),
+                &onchain,
+                &operator,
+                now,
+                Some(1),
+                false,
+            )
+            .await
+            .unwrap()
+            .candidate
+            .unwrap_or_else(|| panic!("{case}: no candidate"));
+            assert!(distributes(&candidate.instructions), "{case}");
+            assert_operator_funds_no_account(&candidate.instructions, &operator);
+        }
+
+        // Positive control: with a refund due the same sealed payout waits.
+        let mut refunding = onchain;
+        refunding.channel.status = STATUS_SEALED;
+        refunding.channel.settlement.settled = state.cumulative;
+        let deferred =
+            reconcile_batch_with_refund_account(state, &refunding, &operator, 0, Some(1), false)
+                .await
+                .unwrap();
+        assert!(deferred.candidate.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_idle_close_that_refunds_nothing_distributes_past_a_closed_refund_account() {
+        let (state, mut onchain, operator) = batch_closing_fixture();
+        onchain.channel.status = STATUS_OPEN;
+        onchain.channel.closure_started_at = 0;
+        let rpc = RpcClient::new(Duration::from_secs(5)).unwrap();
+        // Every account read is null: the payer's refund account is closed.
+        let (url, server) = absent_everywhere(0).await;
+        let treasury = Pubkey::new_unique();
+        let close = |onchain: channel::DecodedChannel| {
+            let (rpc, url, state) = (&rpc, url.clone(), state.clone());
+            async move {
+                build_idle_close_candidate(
+                    rpc, &url, &state, &onchain, 120, &operator, &treasury, None,
+                )
+                .await
+                .unwrap()
+                .unwrap()
+            }
+        };
+
+        // The close settles exactly the deposit, so distribute refunds
+        // nothing and rides along.
+        let mut exact = onchain.clone();
+        exact.channel.deposit = state.cumulative;
+        let candidate = close(exact).await;
+        assert!(distributes(&candidate.instructions));
+        assert_eq!(candidate.kind, CandidateKind::IdleClose);
+
+        // Positive control: headroom is refunded, so only the close lands.
+        let candidate = close(onchain).await;
+        assert!(!distributes(&candidate.instructions));
+        assert_eq!(candidate.kind, CandidateKind::Watermark);
+        server.abort();
     }
 
     #[tokio::test]
@@ -6204,6 +6368,7 @@ mod tests {
             )
             .unwrap()
             .unwrap()
+            .instructions
             .is_empty()
         );
 

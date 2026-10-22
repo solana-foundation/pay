@@ -661,10 +661,10 @@ async fn plan_steps(
 }
 
 /// Build the `distribute` step, recovering + verifying the distribution
-/// preimage from the channel's open transaction first. A closed payer refund
-/// account is recreated only when the payer itself runs the job; any other
-/// operator would fund rent the payer reclaims by closing it again, so the
-/// step waits for the payer instead.
+/// preimage from the channel's open transaction first. When a refund is due,
+/// a closed payer refund account is recreated only when the payer itself
+/// runs the job; any other operator would fund rent the payer reclaims by
+/// closing it again, so the step waits for the payer instead.
 async fn build_distribute_step(
     rpc: &RpcClient,
     rpc_url: &str,
@@ -674,7 +674,20 @@ async fn build_distribute_step(
     token_program: &Pubkey,
 ) -> Result<Option<PlannedStep>, JobError> {
     let mut instructions = Vec::new();
-    if channel::payer_refund_account(rpc, rpc_url, decoded, token_program).await?
+    // Planned only for a channel sealed (now, or by the preceding step) at
+    // its current settlement; one that refunds nothing never waits.
+    let stage = channel::DistributeStage::Sealed {
+        settled: decoded.channel.settlement.settled,
+    };
+    if channel::payer_refund_account(
+        rpc,
+        rpc_url,
+        decoded,
+        token_program,
+        &pay_kit::core::payment_channels::default_program_id(),
+        stage,
+    )
+    .await?
         == channel::RefundAccount::Closed
     {
         if *fee_payer != decoded.payer() {
@@ -996,6 +1009,81 @@ fn redact(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sealed v1 channel with an empty distribution plan: `deposit` held,
+    /// `settled` settled.
+    fn sealed_channel(deposit: u64, settled: u64) -> DecodedChannel {
+        use pay_kit::generated::payment_channels::generated::{
+            accounts::Channel, types::SettlementWatermarks,
+        };
+        let address = |tag| payment_channels::to_address(&pubkey(tag, 0));
+        DecodedChannel {
+            address: pubkey(9, 0),
+            channel: Channel {
+                discriminator: 1,
+                version: 1,
+                bump: 1,
+                status: STATUS_SEALED,
+                salt: 0,
+                deposit,
+                settlement: SettlementWatermarks {
+                    settled,
+                    payout_watermark: 0,
+                },
+                closure_started_at: 1,
+                payer_withdrawn_at: 0,
+                grace_period: 0,
+                distribution_hash: payment_channels::distribution_hash(&[]),
+                payer: address(3),
+                payee: address(4),
+                authorized_signer: address(5),
+                mint: address(6),
+                rent_payer: address(4),
+                open_slot: 1,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn a_distribute_that_refunds_nothing_skips_the_closed_refund_account() {
+        use axum::{Json, Router, routing::post};
+        // Every account read is null: the payer's refund account is closed.
+        let app = Router::new().route(
+            "/",
+            post(|Json(request): Json<serde_json::Value>| async move {
+                assert_eq!(request["method"], "getMultipleAccounts");
+                Json(serde_json::json!({
+                    "jsonrpc": "2.0", "id": request["id"],
+                    "result": {"context": {"slot": 1}, "value": [null]}
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let rpc = RpcClient::new(Duration::from_secs(5)).unwrap();
+        let operator = pubkey(4, 0);
+        let token = pay_api_core::ata::SPL_TOKEN_PROGRAM_ID;
+        let step = |channel: DecodedChannel| {
+            let (rpc, url) = (&rpc, url.clone());
+            async move {
+                build_distribute_step(rpc, &url, &channel, &operator, &pubkey(7, 0), &token)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // Fully spent: distribute refunds nothing and never reads the account.
+        let planned = step(sealed_channel(300, 300))
+            .await
+            .expect("distribute step");
+        assert!(planned.kind == StepKind::Distribute);
+        assert_eq!(planned.instructions.len(), 1, "no account create");
+
+        // Positive control: headroom is refunded, so the step waits.
+        assert!(step(sealed_channel(1_000, 300)).await.is_none());
+        server.abort();
+    }
 
     fn pubkey(tag: u8, index: usize) -> Pubkey {
         let mut bytes = [0_u8; 32];

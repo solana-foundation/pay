@@ -730,10 +730,42 @@ pub fn build_top_up_ix(
         .instruction()
 }
 
-/// Whether the payer's refund token account, which `distribute` writes, is
-/// live at the confirmed commitment.
+/// The channel state a `distribute` runs against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DistributeStage {
+    /// The channel stays open: `distribute` pays the settled delta and never
+    /// touches the payer's refund account.
+    Open,
+    /// The channel is sealed at `settled`, possibly by an earlier instruction
+    /// of the same transaction.
+    Sealed { settled: u64 },
+}
+
+impl DecodedChannel {
+    /// Whether a `distribute` of this channel under `program` at `stage`
+    /// writes the payer's refund account. The payment-channels program only
+    /// does so on SEALED, while unwithdrawn headroom remains
+    /// (`payer_withdrawn_at == 0 && deposit > settled`). Any other program is
+    /// assumed to always write it.
+    pub fn distribute_refunds_payer(&self, program: &Pubkey, stage: DistributeStage) -> bool {
+        if *program != default_program_id() {
+            return true;
+        }
+        match stage {
+            DistributeStage::Open => false,
+            DistributeStage::Sealed { settled } => {
+                self.channel.payer_withdrawn_at == 0 && self.channel.deposit > settled
+            }
+        }
+    }
+}
+
+/// Whether the payer's refund token account, which `distribute` may write,
+/// is live at the confirmed commitment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefundAccount {
+    /// This `distribute` refunds nothing, so it never reads the account.
+    NotRead,
     /// Owned by the channel's token program: `distribute` can land.
     Live,
     /// Absent (or not a token account): `distribute` would fail, and with it
@@ -741,16 +773,23 @@ pub enum RefundAccount {
     Closed,
 }
 
-/// Read the payer's refund account. The payer can close an emptied account at
-/// any time, and the worker never recreates it at the operator's expense (the
-/// rent would go straight back to the payer on the next close), so a closed
-/// account defers distribution until the payer recreates it.
+/// Read the payer's refund account when the `distribute` at `stage` writes
+/// it. The payer can close an emptied account at any time, and the worker
+/// never recreates it at the operator's expense (the rent would go straight
+/// back to the payer on the next close), so a closed account defers that
+/// distribution until the payer recreates it. A distribution that refunds
+/// nothing is never deferred.
 pub async fn payer_refund_account(
     rpc: &RpcClient,
     rpc_url: &str,
     channel: &DecodedChannel,
     token_program: &Pubkey,
+    program: &Pubkey,
+    stage: DistributeStage,
 ) -> Result<RefundAccount, JobError> {
+    if !channel.distribute_refunds_payer(program, stage) {
+        return Ok(RefundAccount::NotRead);
+    }
     let address = associated_token_address(&channel.payer(), &channel.mint(), token_program);
     let account = rpc
         .get_multiple_accounts_with_owner(rpc_url, &[address.to_string()])
@@ -1193,10 +1232,10 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_closed_refund_account_is_reported_closed() {
-        use axum::{Json, Router, routing::post};
-        let rpc = RpcClient::new(std::time::Duration::from_secs(5)).unwrap();
+    /// A sealed `distribute` that still owes the payer headroom.
+    const REFUNDING: DistributeStage = DistributeStage::Sealed { settled: 0 };
+
+    fn refund_test_channel() -> DecodedChannel {
         let mut bytes = vec![0; CHANNEL_ACCOUNT_SIZE];
         bytes[0] = 1;
         bytes[1] = 1;
@@ -1205,6 +1244,53 @@ mod tests {
             .unwrap();
         channel.channel.payer = to_address(&Pubkey::new_unique());
         channel.channel.mint = to_address(&Pubkey::new_unique());
+        channel.channel.deposit = 1_000;
+        channel
+    }
+
+    #[test]
+    fn only_a_sealed_distribute_with_headroom_refunds_the_payer() {
+        let mut channel = refund_test_channel();
+        let v1 = default_program_id();
+        let sealed = |settled| DistributeStage::Sealed { settled };
+        assert!(!channel.distribute_refunds_payer(&v1, DistributeStage::Open));
+        assert!(!channel.distribute_refunds_payer(&v1, sealed(1_000)));
+        assert!(channel.distribute_refunds_payer(&v1, sealed(999)));
+        // Another program's distribute is assumed to always refund.
+        assert!(channel.distribute_refunds_payer(&Pubkey::new_unique(), DistributeStage::Open));
+        // Headroom the payer already withdrew is not refunded again.
+        channel.channel.payer_withdrawn_at = 1;
+        assert!(!channel.distribute_refunds_payer(&v1, sealed(0)));
+    }
+
+    #[tokio::test]
+    async fn a_distribute_that_refunds_nothing_never_reads_the_refund_account() {
+        let rpc = RpcClient::new(std::time::Duration::from_secs(5)).unwrap();
+        let channel = refund_test_channel();
+        // The RPC is unreachable: any read would error.
+        for stage in [
+            DistributeStage::Open,
+            DistributeStage::Sealed { settled: 1_000 },
+        ] {
+            let read = payer_refund_account(
+                &rpc,
+                "http://127.0.0.1:1",
+                &channel,
+                &SPL_TOKEN_PROGRAM_ID,
+                &default_program_id(),
+                stage,
+            )
+            .await
+            .unwrap();
+            assert_eq!(read, RefundAccount::NotRead, "{stage:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_closed_refund_account_is_reported_closed() {
+        use axum::{Json, Router, routing::post};
+        let rpc = RpcClient::new(std::time::Duration::from_secs(5)).unwrap();
+        let channel = refund_test_channel();
         let refund =
             associated_token_address(&channel.payer(), &channel.mint(), &SPL_TOKEN_PROGRAM_ID);
         let system = Pubkey::default().to_string();
@@ -1238,17 +1324,31 @@ mod tests {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
             let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-            let read = payer_refund_account(&rpc, &url, &channel, &SPL_TOKEN_PROGRAM_ID)
-                .await
-                .unwrap();
+            let read = payer_refund_account(
+                &rpc,
+                &url,
+                &channel,
+                &SPL_TOKEN_PROGRAM_ID,
+                &default_program_id(),
+                REFUNDING,
+            )
+            .await
+            .unwrap();
             server.abort();
             assert_eq!(read, expected);
         }
         // An unreachable RPC never reads as closed.
         assert!(
-            payer_refund_account(&rpc, "http://127.0.0.1:1", &channel, &SPL_TOKEN_PROGRAM_ID)
-                .await
-                .is_err()
+            payer_refund_account(
+                &rpc,
+                "http://127.0.0.1:1",
+                &channel,
+                &SPL_TOKEN_PROGRAM_ID,
+                &default_program_id(),
+                REFUNDING,
+            )
+            .await
+            .is_err()
         );
     }
 
