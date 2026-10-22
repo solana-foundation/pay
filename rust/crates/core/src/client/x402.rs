@@ -1509,41 +1509,6 @@ mod tests {
     }
 
     #[test]
-    fn format_value_zero() {
-        assert_eq!(crate::client::prompt::format_value(0.0), "0");
-    }
-
-    #[test]
-    fn format_value_large() {
-        assert_eq!(crate::client::prompt::format_value(1.5), "1.50");
-    }
-
-    #[test]
-    fn format_value_preserves_fractional_cent_fees() {
-        assert_eq!(crate::client::prompt::format_value(1.0015), "1.0015");
-    }
-
-    #[test]
-    fn format_value_cents() {
-        assert_eq!(crate::client::prompt::format_value(0.01), "0.01");
-    }
-
-    #[test]
-    fn format_value_milli() {
-        assert_eq!(crate::client::prompt::format_value(0.005), "0.005");
-    }
-
-    #[test]
-    fn format_value_micro() {
-        assert_eq!(crate::client::prompt::format_value(0.0005), "0.0005");
-    }
-
-    #[test]
-    fn format_value_tiny() {
-        assert_eq!(crate::client::prompt::format_value(0.00005), "0.000050");
-    }
-
-    #[test]
     fn format_amount_usdc() {
         assert_eq!(format_amount("1000000", "USDC"), "$1.00");
     }
