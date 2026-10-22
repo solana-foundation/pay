@@ -259,6 +259,18 @@ pub async fn forward_request_with_session_metering_and_identity(
         upstream_req = upstream_req.header("content-length", "0");
     }
 
+    // Build the response meter before spending an upstream call on it.
+    let meter = match session_context {
+        Some(context) => {
+            ClientVoucherMeter::for_route(api, route, uri, headers, context).map_err(|error| {
+                // Releasing the response unmetered would hand out usage the
+                // client's vouchers never cover.
+                tracing::error!(%error, path = uri.path(), "session response metering unavailable");
+                error_response(StatusCode::BAD_GATEWAY, "Session metering unavailable")
+            })?
+        }
+        None => None,
+    };
     let upstream_resp = upstream_req.send().await.map_err(|e| {
         let error = prepared.error_for_logging(&e);
         telemetry::record_upstream_error(&api.subdomain, uri.path(), &upstream_url, &error);
@@ -309,17 +321,6 @@ pub async fn forward_request_with_session_metering_and_identity(
         .split(';')
         .any(|part| part.trim().eq_ignore_ascii_case("text/event-stream"));
 
-    let meter = match session_context {
-        Some(context) => {
-            ClientVoucherMeter::for_route(api, route, uri, headers, context).map_err(|error| {
-                // Releasing the response unmetered would hand out usage the
-                // client's vouchers never cover.
-                tracing::error!(%error, path = uri.path(), "session response metering unavailable");
-                error_response(StatusCode::BAD_GATEWAY, "Session metering unavailable")
-            })?
-        }
-        None => None,
-    };
     let Some(meter) = meter
         .and_then(|meter| meter.for_status(status))
         .map(|meter| meter.with_request_body_bytes(body.len() as u64))
@@ -2099,18 +2100,23 @@ mod tests {
     async fn client_voucher_first_bytes(path: &str) -> Option<Bytes> {
         client_voucher_exchange(path, METERED_ANSWER)
             .await
+            .0
             .and_then(|(_, first)| first)
     }
 
     /// A client-voucher session admitted at cumulative 1_000 requests `path`
     /// from an upstream answering `upstream`. Returns the status and first
-    /// body bytes released within 500ms, if any.
+    /// body bytes released within 500ms, if any, and how many requests
+    /// reached the upstream.
     async fn client_voucher_exchange(
         path: &str,
         (status, content_type, body): (StatusCode, &'static str, &'static str),
-    ) -> Option<(StatusCode, Option<Bytes>)> {
+    ) -> (Option<(StatusCode, Option<Bytes>)>, usize) {
         use futures_util::StreamExt;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&hits);
         let upstream = axum::Router::new().fallback(move || async move {
+            counted.fetch_add(1, Ordering::SeqCst);
             (
                 status,
                 [(axum::http::header::CONTENT_TYPE, content_type)],
@@ -2145,7 +2151,14 @@ mod tests {
             "direction": "usage", "unit": "requests", "scale": 1,
             "tiers": [{"price_usd": 0.001}]
         })));
-        api.endpoints = vec![metered, flat];
+        // Scale 0 fails meter construction.
+        let mut misconfigured = endpoint_with_routing("v1/misconfigured", None);
+        misconfigured.metering = Some(metering(serde_json::json!({
+            "direction": "output", "unit": "tokens", "scale": 0,
+            "tiers": [{"price_usd": 0.000001}],
+            "meter": {"source": "response_json", "path": "/usage/completion_tokens"}
+        })));
+        api.endpoints = vec![metered, flat, misconfigured];
 
         let key = || solana_pubkey::Pubkey::new_unique().to_string();
         let handle = std::sync::Arc::new(crate::server::session::SessionMpp::new(
@@ -2176,9 +2189,10 @@ mod tests {
             let first = response.into_body().into_data_stream().next().await;
             (status, first.map(|chunk| chunk.unwrap()))
         };
-        tokio::time::timeout(std::time::Duration::from_millis(500), served)
+        let served = tokio::time::timeout(std::time::Duration::from_millis(500), served)
             .await
-            .ok()
+            .ok();
+        (served, hits.load(Ordering::SeqCst))
     }
 
     #[tokio::test]
@@ -2192,6 +2206,7 @@ mod tests {
         let (status, first) =
             client_voucher_exchange("v1/metered", (StatusCode::BAD_GATEWAY, "text/html", page))
                 .await
+                .0
                 .expect("an upstream error waits on no voucher");
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert_eq!(first.as_deref(), Some(page.as_bytes()));
@@ -2208,6 +2223,7 @@ mod tests {
             ),
         )
         .await
+        .0
         .expect("an unmeterable answer waits on no voucher");
         assert_eq!(
             status,
@@ -2218,6 +2234,18 @@ mod tests {
             !String::from_utf8_lossy(&first.unwrap_or_default()).contains("protected-content"),
             "the unmetered answer is never released"
         );
+    }
+
+    #[tokio::test]
+    async fn client_voucher_meter_failure_never_calls_the_upstream() {
+        let (served, hits) = client_voucher_exchange("v1/misconfigured", METERED_ANSWER).await;
+        let (status, _) = served.expect("a meter failure answers at once");
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(hits, 0, "no upstream call is spent on an unmeterable route");
+
+        // Positive control: a route whose meter builds reaches the upstream.
+        let (_, hits) = client_voucher_exchange("v1/flat", METERED_ANSWER).await;
+        assert_eq!(hits, 1);
     }
 
     #[tokio::test]
