@@ -29,6 +29,8 @@ const COMMIT_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const COMMIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const LIFECYCLE_TOUCH_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_NDJSON_RECORD_BYTES: usize = 1024 * 1024;
+/// Generous enough for streamed base64 image events.
+const MAX_SSE_EVENT_BYTES: usize = 16 * 1024 * 1024;
 
 pub type BoxError = Box<dyn StdError + Send + Sync>;
 
@@ -489,10 +491,11 @@ impl DelegatedSessionStreamMeter {
         is_sse: bool,
     ) -> Result<Option<Bytes>, BoxError> {
         self.touch_channel_if_due();
+        let ready = self.record_hold.push(chunk, is_sse).map_err(box_error)?;
         if let Some(decision) = self.observe_chunk(chunk, is_sse)? {
             self.settle(decision).await?;
         }
-        Ok(self.record_hold.push(chunk, is_sse))
+        Ok(ready)
     }
 
     /// Persist any final cumulative usage before the response stream closes,
@@ -677,8 +680,9 @@ where
         while let Some(next) = stream.next().await {
             let chunk = next.map_err(box_error)?;
             meter.touch_channel_if_due();
+            let ready = record_hold.push(&chunk, is_sse).map_err(box_error)?;
             let decision = meter.observe_chunk(&chunk, is_sse).map_err(box_error)?;
-            held.extend(record_hold.push(&chunk, is_sse));
+            held.extend(ready);
             match decision {
                 Some(decision) if decision.requires_voucher() => {
                     // Do not release the bytes that crossed the voucher
@@ -715,7 +719,9 @@ where
 /// The meter counts a record's text and usage only once the record parses,
 /// so releasing its first half early would deliver output that an abort
 /// leaves uncounted. Records end at a blank line for SSE and at a newline
-/// for NDJSON; the decoders bound how long one may grow.
+/// for NDJSON. A partial record longer than the decoders accept fails the
+/// stream before it is metered, so the hold never grows without bound and
+/// never releases bytes it could not meter.
 struct RecordHold {
     held: Vec<u8>,
     /// Whether SSE / NDJSON record contents feed the meter. Wire-measured
@@ -743,34 +749,48 @@ impl RecordHold {
     }
 
     /// Add `chunk`; return the bytes through the last complete record.
-    fn push(&mut self, chunk: &[u8], is_sse: bool) -> Option<Bytes> {
+    fn push(&mut self, chunk: &[u8], is_sse: bool) -> MeteringResult<Option<Bytes>> {
         let contents_metered = if is_sse {
             self.sse_contents_metered
         } else {
             self.ndjson_contents_metered
         };
         if !contents_metered && self.held.is_empty() {
-            return (!chunk.is_empty()).then(|| Bytes::copy_from_slice(chunk));
+            return Ok((!chunk.is_empty()).then(|| Bytes::copy_from_slice(chunk)));
         }
         self.held.extend_from_slice(chunk);
         if !contents_metered {
-            return self.finish();
+            return Ok(self.finish());
         }
-        let end = if is_sse {
-            sse_record_end(&self.held)
+        let (end, limit, kind) = if is_sse {
+            (sse_record_end(&self.held), MAX_SSE_EVENT_BYTES, "SSE event")
         } else {
-            self.held
+            let end = self
+                .held
                 .iter()
                 .rposition(|byte| *byte == b'\n')
-                .map_or(0, |index| index + 1)
+                .map_or(0, |index| index + 1);
+            (end, MAX_NDJSON_RECORD_BYTES, "NDJSON record")
         };
-        (end > 0).then(|| Bytes::from(self.held.drain(..end).collect::<Vec<u8>>()))
+        if self.held.len() - end > limit {
+            return Err(record_too_large(kind, limit));
+        }
+        Ok((end > 0).then(|| Bytes::from(self.held.drain(..end).collect::<Vec<u8>>())))
     }
 
     /// The final record, once the stream has ended and it has been metered.
     fn finish(&mut self) -> Option<Bytes> {
         (!self.held.is_empty()).then(|| Bytes::from(std::mem::take(&mut self.held)))
     }
+}
+
+fn record_too_large(
+    kind: &str,
+    limit: usize,
+) -> crate::server::session_metering::SessionMeteringError {
+    crate::server::session_metering::SessionMeteringError::InvalidStream(format!(
+        "{kind} exceeds {limit} bytes"
+    ))
 }
 
 /// Offset just past the last blank line (an SSE event terminator) in
@@ -1215,11 +1235,7 @@ impl NdjsonUsageDecoder {
             }
         }
         if self.buffer.len() > MAX_NDJSON_RECORD_BYTES {
-            return Err(
-                crate::server::session_metering::SessionMeteringError::InvalidStream(format!(
-                    "NDJSON record exceeds {MAX_NDJSON_RECORD_BYTES} bytes"
-                )),
-            );
+            return Err(record_too_large("NDJSON record", MAX_NDJSON_RECORD_BYTES));
         }
         Ok(values)
     }
@@ -1300,6 +1316,9 @@ impl SseUsageDecoder {
             let block = self.buffer[..index].to_string();
             self.buffer.drain(..index + 2);
             events.push(parse_sse_event(&block));
+        }
+        if self.buffer.len() + self.pending.len() > MAX_SSE_EVENT_BYTES {
+            return Err(record_too_large("SSE event", MAX_SSE_EVENT_BYTES));
         }
         Ok(events)
     }
@@ -2962,6 +2981,44 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             Some(100),
             "the cut stream settles no more than its authorization"
         );
+    }
+
+    /// One SSE text event of `text_bytes` bytes, sent in 1 MiB pieces.
+    fn event_in_pieces(text_bytes: usize) -> Vec<Vec<u8>> {
+        in_pieces(&sse_text_event(&"x".repeat(text_bytes)))
+    }
+
+    fn in_pieces(bytes: &[u8]) -> Vec<Vec<u8>> {
+        bytes.chunks(1024 * 1024).map(<[u8]>::to_vec).collect()
+    }
+
+    #[tokio::test]
+    async fn a_delegated_stream_refuses_an_sse_record_too_large_to_hold() {
+        // An upstream that never ends its event.
+        let event = sse_text_event(&"x".repeat(MAX_SSE_EVENT_BYTES));
+        let unterminated = &event[..event.len() - 2];
+        let (session, channel_id, served, outcome) =
+            capacity_bound_chunks("record-too-large", 100_000, in_pieces(unterminated)).await;
+
+        let error = outcome.expect_err("an unbounded record must not be buffered");
+        assert!(
+            error.to_string().contains("SSE event exceeds"),
+            "unexpected error: {error}"
+        );
+        assert!(served.is_empty(), "the unmetered record is never released");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(session.committed_watermark(&channel_id).unwrap_or(0), 0);
+    }
+
+    #[tokio::test]
+    async fn a_delegated_stream_holds_a_large_sse_record_within_the_bound() {
+        let chunks = event_in_pieces(MAX_SSE_EVENT_BYTES - 1024);
+        let expected = chunks.concat();
+        let (_, _, served, outcome) =
+            capacity_bound_chunks("record-within-bound", 100_000, chunks).await;
+
+        outcome.expect("a record within the bound is metered and released");
+        assert!(served == expected, "the whole record is released");
     }
 
     async fn interrupted_meter(
