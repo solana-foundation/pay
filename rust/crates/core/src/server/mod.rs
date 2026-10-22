@@ -19,6 +19,9 @@ pub mod metering;
 pub mod openapi;
 
 #[cfg(feature = "server")]
+pub mod metered_body;
+
+#[cfg(feature = "server")]
 pub mod payment;
 
 #[cfg(feature = "server")]
