@@ -367,6 +367,28 @@ pub fn upto_response_body_limit(metering: &Metering) -> usize {
         .unwrap_or(DEFAULT_LIMIT)
 }
 
+/// Largest upstream body buffered for an x402 `upto` response whose price
+/// does not read it: the buffer only holds the charge until the body
+/// completed, so it is bounded like other buffered forwards, not by the
+/// metering parser's limit.
+pub const UPTO_BUFFERED_RESPONSE_LIMIT: usize = 16 * 1024 * 1024;
+
+/// Largest upstream body an x402 `upto` forward buffers before it settles.
+/// A body-metered plan keeps the metering limit; a header-metered or
+/// fixed-price plan only waits for completion, so it takes the operator's
+/// configured `response_body.max_bytes` or [`UPTO_BUFFERED_RESPONSE_LIMIT`].
+pub fn upto_buffered_response_limit(metering: &Metering, variant_hint: Option<&str>) -> usize {
+    if upto_requires_response_body(metering, variant_hint) {
+        return upto_response_body_limit(metering);
+    }
+    metering
+        .upto
+        .as_ref()
+        .and_then(|upto| upto.response_body.as_ref())
+        .and_then(|body| body.max_bytes)
+        .unwrap_or(UPTO_BUFFERED_RESPONSE_LIMIT)
+}
+
 /// A request-only meter has an indivisible price, unlike consumable tokens.
 /// Return it only when no response, variant, or accounting state is needed.
 pub(super) fn flat_request_price(metering: &Metering) -> Option<f64> {
@@ -2745,6 +2767,56 @@ mod tests {
             }),
         );
         assert!(upto_requires_response_body(&preset, None));
+    }
+
+    #[test]
+    fn header_metered_upto_buffers_beyond_the_body_metering_limit() {
+        let header_dim = || {
+            usage_dim(
+                MeterDirection::Usage,
+                BillingUnit::Tokens,
+                1_000,
+                0.02,
+                Some(response_header("x-usage-tokens")),
+            )
+        };
+        let header = upto_metering(
+            vec![header_dim()],
+            Some(pay_types::metering::UptoMetering::default()),
+        );
+        assert_eq!(
+            upto_buffered_response_limit(&header, None),
+            UPTO_BUFFERED_RESPONSE_LIMIT
+        );
+        assert!(UPTO_BUFFERED_RESPONSE_LIMIT > upto_response_body_limit(&header));
+        // An operator-configured bound still applies.
+        let bounded = upto_metering(
+            vec![header_dim()],
+            Some(pay_types::metering::UptoMetering {
+                response_body: Some(pay_types::metering::UptoResponseBody {
+                    mode: pay_types::metering::UptoResponseBodyMode::Buffer,
+                    max_bytes: Some(4096),
+                }),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(upto_buffered_response_limit(&bounded, None), 4096);
+
+        // Positive control: a body-metered plan keeps the metering limit.
+        let json = upto_metering(
+            vec![usage_dim(
+                MeterDirection::Usage,
+                BillingUnit::Tokens,
+                1_000,
+                0.02,
+                Some(response_json("/usage/tokens")),
+            )],
+            Some(pay_types::metering::UptoMetering::default()),
+        );
+        assert_eq!(
+            upto_buffered_response_limit(&json, None),
+            upto_response_body_limit(&json)
+        );
     }
 
     #[test]

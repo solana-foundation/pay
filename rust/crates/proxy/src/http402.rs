@@ -575,20 +575,14 @@ impl<S: PaymentState> Http402Gate<S> {
             }
         };
 
-        let response_limit = ctx
-            .upto
-            .as_ref()
-            .and_then(|pending| pending.settlement.as_ref())
-            .or_else(|| {
-                ctx.session
-                    .as_ref()
-                    .and_then(|pending| pending.metered_plan())
-            })
-            .map(|plan| metering::upto_response_body_limit(&plan.metering))
-            // Body-signing endpoints are buffered for request preparation, not
-            // response metering. Allow their normal API responses up to the same
-            // bounded size as their requests.
-            .unwrap_or(BUFFERED_REQUEST_BODY_LIMIT);
+        let response_limit = buffered_response_limit(
+            ctx.upto
+                .as_ref()
+                .and_then(|pending| pending.settlement.as_ref()),
+            ctx.session
+                .as_ref()
+                .and_then(|pending| pending.metered_plan()),
+        );
 
         let client = upstream_http_client();
         let mut upstream_req = client.request(
@@ -1650,6 +1644,27 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
 /// charges only for a response that was delivered complete.
 fn settles_on_completed_body(delegated_session: bool, client_metered: bool, upto: bool) -> bool {
     delegated_session || client_metered || upto
+}
+
+/// Largest upstream body a buffered forward reads. An `upto` plan is
+/// bounded by what its pricing reads: a header-metered response is buffered
+/// only so the charge waits for a complete body, not to be parsed.
+fn buffered_response_limit(
+    upto: Option<&UptoSettlementPlan>,
+    session: Option<&UptoSettlementPlan>,
+) -> usize {
+    if let Some(plan) = upto {
+        return metering::upto_buffered_response_limit(
+            &plan.metering,
+            plan.variant_hint.as_deref(),
+        );
+    }
+    session
+        .map(|plan| metering::upto_response_body_limit(&plan.metering))
+        // Fixed-price upto and body-signing endpoints are buffered for
+        // completion or request preparation, not response metering. Allow
+        // their normal API responses up to the same bounded size as requests.
+        .unwrap_or(BUFFERED_REQUEST_BODY_LIMIT)
 }
 
 fn header_pairs(headers: &HeaderMap) -> Vec<(String, String)> {
@@ -3124,6 +3139,38 @@ mod tests {
 
         assert_eq!(response.headers["location"], "/landing?page=2");
         assert_eq!(response.headers["x-other"], "kept");
+    }
+
+    #[test]
+    fn header_metered_upto_responses_are_not_capped_at_the_metering_limit() {
+        let plan = |meter: serde_json::Value| pay_core::server::metering::UptoSettlementPlan {
+            metering: serde_json::from_value(serde_json::json!({
+                "dimensions": [{
+                    "direction": "usage", "unit": "tokens", "scale": 1000,
+                    "tiers": [{"price_usd": 0.02}], "meter": meter,
+                }],
+                "upto": {"max_usd": 1.0},
+            }))
+            .unwrap(),
+            variant_hint: None,
+            request_properties: Default::default(),
+            ceiling_usd: 1.0,
+            inferred_usage: None,
+        };
+        let header = plan(serde_json::json!({"source": "response_header", "header": "x-usage"}));
+        let body = plan(serde_json::json!({"source": "response_json", "path": "/usage"}));
+        // A header-metered body is buffered only so the charge waits for it.
+        assert!(super::buffered_response_limit(Some(&header), None) > 2 * 1024 * 1024);
+        // Positive control: a body-metered plan keeps its 1 MiB parse bound,
+        // and a fixed-price upto keeps the generic buffered bound.
+        assert_eq!(
+            super::buffered_response_limit(Some(&body), None),
+            1024 * 1024
+        );
+        assert_eq!(
+            super::buffered_response_limit(None, None),
+            super::BUFFERED_REQUEST_BODY_LIMIT
+        );
     }
 
     #[test]
