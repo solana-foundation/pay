@@ -262,7 +262,7 @@ impl Command {
 
         match self {
             Command::Account { command } => match command {
-                Some(cmd) => return cmd.run(),
+                Some(cmd) => return cmd.run(network_override),
                 None => return account::run_default(),
             },
             Command::Whoami(cmd) => return cmd.run(network_override, account_override),
